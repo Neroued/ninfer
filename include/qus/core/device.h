@@ -1,12 +1,51 @@
 #pragma once
-// qus::core — DeviceContext: device selection/props, the compute stream (+ optional load
-// stream), CUDA_CHECK error handling, lightweight log/assert, NVTX/timing hooks.
-// L0 infrastructure. See docs/l0-infrastructure-design.md §5.1.
-// NOTE: structure stub — no implementation yet.
+
+#include <cuda_runtime.h>
+
+#include <cstddef>
 
 namespace qus {
 
-// TODO(impl): struct DeviceContext { int device; cudaStream_t stream, load_stream; ... };
-// TODO(impl): CUDA_CHECK macro; NVTX range / timer helpers.
+void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
-}  // namespace qus
+#define CUDA_CHECK(expr) ::qus::cuda_check((expr), #expr, __FILE__, __LINE__)
+
+struct DeviceContext {
+    int device               = 0;
+    cudaStream_t stream      = nullptr;
+    cudaStream_t load_stream = nullptr;
+    cudaDeviceProp props{};
+
+    explicit DeviceContext(int device_id = 0);
+    ~DeviceContext();
+
+    DeviceContext(const DeviceContext&)            = delete;
+    DeviceContext& operator=(const DeviceContext&) = delete;
+    DeviceContext(DeviceContext&& other) noexcept;
+    DeviceContext& operator=(DeviceContext&& other) noexcept;
+
+    int sm() const noexcept;
+    std::size_t total_vram() const noexcept;
+    void synchronize() const;
+};
+
+class CudaEventTimer {
+public:
+    explicit CudaEventTimer(const DeviceContext& ctx);
+    ~CudaEventTimer();
+
+    CudaEventTimer(const CudaEventTimer&)            = delete;
+    CudaEventTimer& operator=(const CudaEventTimer&) = delete;
+    CudaEventTimer(CudaEventTimer&& other) noexcept;
+    CudaEventTimer& operator=(CudaEventTimer&& other) noexcept;
+
+    void start();
+    float stop_ms();
+
+private:
+    cudaStream_t stream_ = nullptr;
+    cudaEvent_t start_   = nullptr;
+    cudaEvent_t stop_    = nullptr;
+};
+
+} // namespace qus

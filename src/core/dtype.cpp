@@ -1,4 +1,21 @@
-// qus::core — DType sizes (stub). See include/qus/core/dtype.h.
 #include "qus/core/dtype.h"
 
-// TODO(impl): dtype_size(DType).
+#include <stdexcept>
+
+namespace qus {
+
+std::size_t dtype_size(DType dtype) {
+    switch (dtype) {
+    case DType::BF16:
+        return 2;
+    case DType::FP32:
+        return 4;
+    case DType::I32:
+        return 4;
+    case DType::U8:
+        return 1;
+    }
+    throw std::invalid_argument("invalid DType");
+}
+
+} // namespace qus

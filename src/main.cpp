@@ -3,7 +3,7 @@
 #include "qus/runtime/engine.h"
 
 int main(int /*argc*/, char** /*argv*/) {
-  // TODO(impl): parse args; Engine.load(weight_file); prefill(prompt_ids);
-  //             decode loop -> emit token ids; report tok/s.
-  return 0;
+    // TODO(impl): parse args; Engine.load(weight_file); prefill(prompt_ids);
+    //             decode loop -> emit token ids; report tok/s.
+    return 0;
 }

@@ -1,11 +1,36 @@
 #pragma once
-// qus::core — KVCache: contiguous per-(full-attn-layer) K/V buffers in the Cache region,
-// position-indexed and append-only (no paging). Sized from (max_context, dims).
-// L0 infrastructure. See docs/l0-infrastructure-design.md §5.3.
-// NOTE: structure stub — no implementation yet.
+
+#include "qus/core/arena.h"
+#include "qus/core/tensor.h"
+
+#include <cstdint>
+#include <vector>
 
 namespace qus {
 
-// TODO(impl): struct KVCache { Tensor k[N_FULL], v[N_FULL]; uint32_t pos; append(...); };
+struct KVSlot {
+    Tensor k;
+    Tensor v;
+};
 
-}  // namespace qus
+struct KVCache {
+    std::vector<Tensor> k;
+    std::vector<Tensor> v;
+    std::uint32_t pos         = 0;
+    std::uint32_t max_context = 0;
+    std::int32_t num_kv_heads = 0;
+    std::int32_t head_dim     = 0;
+    DType dtype               = DType::BF16;
+
+    KVCache() = default;
+    KVCache(DeviceArena& cache_arena, std::uint32_t full_layers, std::uint32_t max_context,
+            std::int32_t num_kv_heads, std::int32_t head_dim, DType dtype = DType::BF16);
+
+    std::uint32_t layer_count() const noexcept;
+    KVSlot slot(std::uint32_t layer, std::uint32_t position) const;
+    KVSlot append_slot(std::uint32_t layer) const;
+    void advance();
+    void reset() noexcept;
+};
+
+} // namespace qus

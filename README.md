@@ -71,4 +71,7 @@ NVIDIA RTX 5090 (Blackwell, sm_120, 32 GB) · CUDA 13.1 · gcc 13.3 · CMake 3.2
 
 - [`docs/design.md`](docs/design.md) — master design & goal document (scope, boundaries,
   architecture, data flow, memory, numerics, roadmap).
+- [`docs/qwen3.6-27b-architecture.md`](docs/qwen3.6-27b-architecture.md) — exact model
+  architecture reference: per-layer parameters, computation flow, Gated-DeltaNet math,
+  operator inventory, and the offline weight-transform/tensor map.
 - `tools/weight_format.md` — the offline-tooling ↔ runtime file-format contract (to be written).

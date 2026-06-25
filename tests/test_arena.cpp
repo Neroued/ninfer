@@ -91,6 +91,21 @@ int main() {
     }
     failures += expect_size(arena.used(), 81, "arena.used after second allocation");
 
+    const std::size_t mark = arena.mark();
+    qus::Tensor transient  = arena.alloc(qus::DType::U8, {11}, 128);
+    if (arena.used() <= mark) {
+        ++failures;
+        std::cerr << "transient allocation did not advance arena mark\n";
+    }
+    arena.rewind(mark);
+    failures += expect_size(arena.used(), mark, "arena.used after rewind");
+    qus::Tensor reused = arena.alloc(qus::DType::U8, {5}, 128);
+    failures += expect_ptr(reused.data, transient.data, "allocation after rewind pointer");
+    const std::size_t used_before_future_rewind = arena.used();
+    arena.rewind(arena.capacity());
+    failures +=
+        expect_size(arena.used(), used_before_future_rewind, "arena.used after future rewind");
+
     failures += expect_throws<std::invalid_argument>(
         [&] { (void)arena.alloc(qus::DType::U8, {1}, 3); }, "invalid alignment");
     failures += expect_throws<std::bad_alloc>(

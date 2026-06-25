@@ -73,5 +73,7 @@ NVIDIA RTX 5090 (Blackwell, sm_120, 32 GB) · CUDA 13.1 · gcc 13.3 · CMake 3.2
   architecture, data flow, memory, numerics, roadmap).
 - [`docs/qwen3.6-27b-architecture.md`](docs/qwen3.6-27b-architecture.md) — exact model
   architecture reference: per-layer parameters, computation flow, Gated-DeltaNet math,
-  operator inventory, and the offline weight-transform/tensor map.
-- `tools/weight_format.md` — the offline-tooling ↔ runtime file-format contract (to be written).
+  operator inventory, and runtime tensor-transform ownership.
+- [`docs/q5090_packed_file_format_v1.md`](docs/q5090_packed_file_format_v1.md) — canonical
+  packed-weight ABI consumed by the C++ runtime.
+- [`tools/q5090_convert`](tools/q5090_convert) — canonical safetensors-to-q5090 converter.

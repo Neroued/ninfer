@@ -73,5 +73,20 @@ add_test(NAME qus_state_store_test COMMAND qus_state_store_test)
 add_executable(qus_weight_store_test ${CMAKE_SOURCE_DIR}/tests/test_weight_store.cpp)
 target_link_libraries(qus_weight_store_test PRIVATE qus_core)
 target_include_directories(qus_weight_store_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(qus_weight_store_test PRIVATE QUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 add_test(NAME qus_weight_store_test COMMAND qus_weight_store_test)
+
+add_executable(qus_q5090_parser_test ${CMAKE_SOURCE_DIR}/tests/test_q5090_parser.cpp)
+target_link_libraries(qus_q5090_parser_test PRIVATE qus_core)
+target_include_directories(qus_q5090_parser_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(qus_q5090_parser_test PRIVATE QUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+add_test(NAME qus_q5090_parser_test COMMAND qus_q5090_parser_test)
+
+add_executable(qus_weight_store_real_file_test ${CMAKE_SOURCE_DIR}/tests/test_weight_store_real.cpp)
+target_link_libraries(qus_weight_store_real_file_test PRIVATE qus_core)
+target_include_directories(qus_weight_store_real_file_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(qus_weight_store_real_file_test PRIVATE QUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
+add_test(NAME qus_weight_store_real_file_test COMMAND qus_weight_store_real_file_test)

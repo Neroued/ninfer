@@ -117,7 +117,7 @@ tower, excluded here).
 | `linear_attn.in_proj_z.weight` | `[6144, 5120]` | output gate z (V-shaped) |
 | `linear_attn.in_proj_b.weight` | `[48, 5120]` | β pre-activation (per V-head) |
 | `linear_attn.in_proj_a.weight` | `[48, 5120]` | α pre-activation (per V-head) |
-| `linear_attn.A_log` | `[48]` | log-decay base; **use fp32**; precompute `−exp` |
+| `linear_attn.A_log` | `[48]` | log-decay base; stored raw, runtime computes `-exp(A_log)` |
 | `linear_attn.dt_bias` | `[48]` | softplus bias (per V-head) |
 | `linear_attn.conv1d.weight` | `[10240, 1, 4]` | depthwise causal conv over `[q;k;v]` |
 | `linear_attn.norm.weight` | `[128]` | gated RMSNorm, **plain w (NO +1)** |
@@ -164,7 +164,7 @@ MTP shares the main `embed_tokens` and `lm_head` (`mtp_use_dedicated_embeddings=
 | **Layer RMSNorm** (input, post-attn, final) | **`x/rms(x) · (1 + w)`**, variance in **fp32**, `ε=1e-6` |
 | **QK-norm** (q_norm, k_norm) | same **(1+w)** RMSNorm, over `dh=256` per head, fp32 |
 | **GDN gated norm** (`linear_attn.norm`) | **plain `x/rms(x) · w`** (ones-init, **NO +1**), fp32, over `dv=128`, then `· SiLU(z)` |
-| GDN `A_log`, gates `g`,`β` | **fp32** (`g=−exp(A_log)·softplus(a+dt_bias)`) |
+| GDN `A_log`, gates `g`,`β` | **fp32** (`g=-exp(A_log)·softplus(a+dt_bias)`) |
 | GDN recurrent / chunk math | accumulate in **fp32**; SSM state stored **fp32** |
 | q,k L2-norm (GDN) | fp32, `ε=1e-6` |
 | Softmax / reductions (full attn) | fp32 accumulate; scale `1/sqrt(256)` |
@@ -244,7 +244,7 @@ k        = reshape(qkv[:,   2048:4096 ], [T, 16, 128])
 v        = reshape(qkv[:,   4096:10240], [T, 48, 128])
 
 # --- gates (fp32) ---
-g        = -exp(A_log) * softplus(a + dt_bias)        # [T, 48]  (log-decay, log α_t)
+g        = -exp(A_log) * softplus(a + dt_bias)        # [T, 48]  (log-decay, log alpha_t)
 beta     = sigmoid(b)                                 # [T, 48]
 
 # --- q/k L2 norm (per head, dk=128) ---
@@ -324,7 +324,7 @@ effectively a no-op, but include it to match the reference exactly. Decode uses 
 - Conv is **depthwise, causal, kernel 4, no bias**, over the **10240 `[q;k;v]` channels
   only** (not `z`, `a`, `b`); activation **SiLU**. Decode keeps a rolling conv state of width
   `W−1 = 3`.
-- `g = −exp(A_log)·softplus(a + dt_bias)` (numerically: softplus guarded at threshold 20),
+- `g = -exp(A_log)·softplus(a + dt_bias)` (numerically: softplus guarded at threshold 20),
   `β = σ(b)` — both per v-head, fp32. (FLA carries `g` in log-space; the FlashInfer path
   passes `exp(g)`.)
 
@@ -412,7 +412,7 @@ Shapes use the symbols from §2 (decode T=1).
 |---|---|---|---|---|
 | L1 | `causal_conv1d_prefill` | qkv[T,10240] → +SiLU | P | depthwise k=4, write conv_state |
 | L2 | `causal_conv1d_decode` | qkv[1,10240], conv_state → +SiLU | D | rolling state width 3 |
-| L3 | `gdn_gating` | a,b[T,48],A_log,dt_bias → g,β[T,48] | P,D | fp32; `−exp·softplus`, `σ` |
+| L3 | `gdn_gating` | a,b[T,48],A_log,dt_bias → g,β[T,48] | P,D | fp32; `-exp·softplus`, `σ` |
 | L4 | `l2norm_headwise` | q,k[T,16,128] → normed | P,D | per head, ε=1e-6 |
 | L5 | `gated_delta_recurrent` | q,k,v,g,β,state → o[1,48,128] | D | §7.1; q-scale 1/√128 |
 | L6 | `gated_delta_chunked` | q,k,v,g,β,state → o[T,48,128] | P | §7.2; chunk 64, WY/UT |
@@ -430,20 +430,18 @@ Sub-kernels for L6 (chunked GDN) if not writing one monolithic kernel: `cumsum` 
 
 ---
 
-## 11. Fusion opportunities & offline weight transforms
+## 11. Fusion opportunities & runtime transform ownership
 
-### 11.1 Offline (Python packer — bake into the fixed weight file)
-- **`+1` into RMSNorm weights** for all `*norm.weight` **except** `linear_attn.norm.weight`
-  (so the runtime norm kernel is a uniform plain multiply).
-- **Precompute `A = −exp(A_log)`** (fp32) so decode does `g = A · softplus(a+dt_bias)`.
-- Optionally **fold the `1/sqrt(dk)=1/√128` q-scale** into the GDN path (or keep in kernel).
-- Optionally **fuse projections**: `in_proj_qkv ⊕ in_proj_z` → one GEMM; `in_proj_a ⊕
-  in_proj_b` → one GEMM; `gate_proj ⊕ up_proj` → one GEMM (`gate_up`). `q_proj` already
-  contains the gate.
-- Choose a **V-head layout** for GDN (HF stores V grouped; llama.cpp tiles it because
-  `Hv>Hk`) — pick whatever the kernel wants and pre-permute `in_proj_qkv` V-rows, `in_proj_z`,
-  `in_proj_a/b`, `A_log`, `dt_bias`, conv V-channels, and `out_proj` columns consistently.
-- `conv1d.weight` squeeze `[10240,1,4] → [10240,4]`.
+### 11.1 Canonical q5090 storage
+- q5090 stores model-semantic tensors raw. RMSNorm weights are not stored with `+1` folded in,
+  `A_log` is not exponentiated, and `conv1d.weight` keeps its `[10240,1,4]` shape.
+- Runtime kernels apply the semantic transforms: RMSNorm `1 + w` where required,
+  `A = -exp(A_log)` for GDN gating, and the `1/sqrt(dk)=1/sqrt(128)` scale in the GDN path.
+- Projection fusion is a runtime/kernel scheduling choice. The stored file keeps independently
+  named tensors and source identifiers so fused kernels can consume multiple q5090 payloads
+  without changing the ABI.
+- GDN head/channel interpretation is a runtime contract between the q5090 `source_kind` and the
+  kernels. The file does not rename or semantically remap tensors to a different framework.
 
 ### 11.2 Runtime kernel fusion (per the design.md optimization ladder)
 - **fused add + RMSNorm** (residual add folded into the next norm).
@@ -473,26 +471,26 @@ full-attn layers' KV grows. See [`design.md`](design.md) §5/§8 for the memory 
 
 ---
 
-## 13. Cross-implementation tensor map (for the offline packer)
+## 13. Cross-implementation tensor map
 
-| Ours / HF (`model.language_model.layers.{i}.`) | llama.cpp GGUF (`blk.{i}.`) | Transform at pack |
+| Ours / HF (`model.language_model.layers.{i}.`) | llama.cpp GGUF (`blk.{i}.`) | Runtime treatment |
 |---|---|---|
-| `input_layernorm.weight` | `attn_norm.weight` | `+1` |
-| `post_attention_layernorm.weight` | `post_attention_norm.weight` | `+1` |
+| `input_layernorm.weight` | `attn_norm.weight` | apply `1+w` in RMSNorm |
+| `post_attention_layernorm.weight` | `post_attention_norm.weight` | apply `1+w` in RMSNorm |
 | `self_attn.q_proj.weight` | `attn_q.weight` | (Q‖gate) |
 | `self_attn.{k,v,o}_proj.weight` | `attn_{k,v,output}.weight` | — |
-| `self_attn.{q,k}_norm.weight` | `attn_{q,k}_norm.weight` | `+1` |
-| `linear_attn.in_proj_qkv.weight` | `attn_qkv.weight` | V-reorder |
-| `linear_attn.in_proj_z.weight` | `attn_gate.weight` | V-reorder |
-| `linear_attn.in_proj_b.weight` | `ssm_beta.weight` | V-reorder |
-| `linear_attn.in_proj_a.weight` | `ssm_alpha.weight` | V-reorder |
-| `linear_attn.A_log` | `ssm_a` | `−exp(A_log)`, V-reorder |
-| `linear_attn.dt_bias` | `ssm_dt.bias` | V-reorder |
-| `linear_attn.conv1d.weight` | `ssm_conv1d.weight` | squeeze, V-reorder |
-| `linear_attn.norm.weight` | `ssm_norm.weight` | **no +1** |
-| `linear_attn.out_proj.weight` | `ssm_out.weight` | col-reorder |
+| `self_attn.{q,k}_norm.weight` | `attn_{q,k}_norm.weight` | apply `1+w` in QK norm |
+| `linear_attn.in_proj_qkv.weight` | `attn_qkv.weight` | split Q/K/V in runtime |
+| `linear_attn.in_proj_z.weight` | `attn_gate.weight` | V-head interpretation in runtime |
+| `linear_attn.in_proj_b.weight` | `ssm_beta.weight` | V-head interpretation in runtime |
+| `linear_attn.in_proj_a.weight` | `ssm_alpha.weight` | V-head interpretation in runtime |
+| `linear_attn.A_log` | `ssm_a` | compute `-exp(A_log)` in runtime |
+| `linear_attn.dt_bias` | `ssm_dt.bias` | softplus bias in runtime |
+| `linear_attn.conv1d.weight` | `ssm_conv1d.weight` | preserve `[10240,1,4]`, kernel views as needed |
+| `linear_attn.norm.weight` | `ssm_norm.weight` | plain weight, no `1+w` |
+| `linear_attn.out_proj.weight` | `ssm_out.weight` | V-space projection in runtime |
 | `mlp.{gate,up,down}_proj.weight` | `ffn_{gate,up,down}.weight` | — |
-| `embed_tokens` / `norm` / `lm_head` | `token_embd` / `output_norm` / `output` | norm: `+1` |
+| `embed_tokens` / `norm` / `lm_head` | `token_embd` / `output_norm` / `output` | output norm applies `1+w` |
 
 Global GGUF hparam repurposing (FYI): `ssm.state_size`=`dk`(128), `ssm.time_step_rank`=`Hv`(48),
 `ssm.group_count`=`Hk`(16), `ssm.inner_size`=`value_dim`(6144), `ssm.conv_kernel`=`W`(4).

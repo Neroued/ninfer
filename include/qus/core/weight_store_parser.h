@@ -1,0 +1,113 @@
+#pragma once
+
+#include "qus/core/tensor.h"
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace qus {
+
+inline constexpr std::uint32_t kQ5090NoLayer = 0xFFFFFFFFU;
+
+struct Q5090Expectations {
+    std::optional<std::uint32_t> layer_count;
+    std::optional<std::uint32_t> hidden_size;
+    std::optional<std::uint32_t> intermediate_size;
+    std::optional<std::uint32_t> vocab_size;
+    std::optional<std::uint32_t> num_attention_heads;
+    std::optional<std::uint32_t> num_key_value_heads;
+    std::optional<std::uint32_t> head_dim;
+    std::optional<std::uint32_t> gdn_key_heads;
+    std::optional<std::uint32_t> gdn_value_heads;
+    std::optional<std::uint32_t> gdn_key_head_dim;
+    std::optional<std::uint32_t> gdn_value_head_dim;
+    std::optional<std::uint32_t> gdn_conv_width;
+    std::optional<std::uint32_t> full_attention_interval;
+    std::optional<std::uint32_t> max_position_embeddings;
+};
+
+struct ParsedQ5090Header {
+    std::uint32_t tensor_count            = 0;
+    std::uint32_t module_count            = 0;
+    std::uint32_t layer_count             = 0;
+    std::uint32_t flags                   = 0;
+    std::uint64_t module_index_offset     = 0;
+    std::uint64_t module_index_bytes      = 0;
+    std::uint64_t tensor_index_offset     = 0;
+    std::uint64_t tensor_index_bytes      = 0;
+    std::uint64_t string_table_offset     = 0;
+    std::uint64_t string_table_bytes      = 0;
+    std::uint64_t payload_offset          = 0;
+    std::uint64_t payload_bytes           = 0;
+    std::uint32_t hidden_size             = 0;
+    std::uint32_t intermediate_size       = 0;
+    std::uint32_t vocab_size              = 0;
+    std::uint32_t num_attention_heads     = 0;
+    std::uint32_t num_key_value_heads     = 0;
+    std::uint32_t head_dim                = 0;
+    std::uint32_t gdn_key_heads           = 0;
+    std::uint32_t gdn_value_heads         = 0;
+    std::uint32_t gdn_key_head_dim        = 0;
+    std::uint32_t gdn_value_head_dim      = 0;
+    std::uint32_t gdn_conv_width          = 0;
+    std::uint32_t full_attention_interval = 0;
+    std::uint32_t max_position_embeddings = 0;
+    std::array<std::uint8_t, 32> sha256_safetensors_index{};
+};
+
+struct ParsedQ5090Module {
+    ModuleKind module_kind           = ModuleKind::TextCore;
+    std::uint32_t module_version     = 0;
+    std::uint64_t tensor_index_begin = 0;
+    std::uint64_t tensor_index_count = 0;
+    std::uint64_t payload_offset     = 0;
+    std::uint64_t payload_bytes      = 0;
+    LoadPolicy load_policy           = LoadPolicy::Resident;
+    std::uint32_t flags              = 0;
+};
+
+struct ParsedQ5090Tensor {
+    std::string name;
+    std::uint32_t name_offset                 = 0;
+    std::uint32_t name_len                    = 0;
+    std::uint64_t name_hash                   = 0;
+    QType qtype                               = QType::Q4G64_F16S;
+    QuantLayout layout                        = QuantLayout::TileN64K64;
+    ModuleKind module_kind                    = ModuleKind::TextCore;
+    std::uint32_t ndim                        = 0;
+    std::array<std::uint32_t, 4> shape        = {1, 1, 1, 1};
+    std::array<std::uint32_t, 4> padded_shape = {1, 1, 1, 1};
+    std::uint32_t group_size                  = 0;
+    ScaleDType scale_dtype                    = ScaleDType::None;
+    std::uint64_t payload_offset              = 0;
+    std::uint64_t payload_bytes               = 0;
+    std::uint32_t source_layer                = kQ5090NoLayer;
+    std::uint32_t source_kind                 = 0;
+    std::uint32_t crc32                       = 0;
+};
+
+struct ParsedQ5090File {
+    ParsedQ5090Header header;
+    std::vector<ParsedQ5090Module> modules;
+    std::vector<ParsedQ5090Tensor> tensors;
+};
+
+struct Q5090Progress {
+    std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
+    std::uint64_t min_interval_bytes = 256ULL * 1024ULL * 1024ULL;
+};
+
+std::uint64_t q5090_fnv1a64(std::string_view name);
+std::uint32_t q5090_crc32(std::span<const std::byte> bytes);
+ParsedQ5090File parse_q5090_file(std::span<const std::byte> file,
+                                 const Q5090Expectations& expected = {},
+                                 Q5090Progress* progress           = nullptr);
+
+} // namespace qus

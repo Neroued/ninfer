@@ -121,6 +121,12 @@ Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape
     return Tensor(ptr, dtype, shape);
 }
 
+std::size_t DeviceArena::mark() const noexcept { return off_; }
+
+void DeviceArena::rewind(std::size_t mark) noexcept {
+    if (mark <= off_) { off_ = mark; }
+}
+
 void DeviceArena::reset() noexcept { off_ = 0; }
 
 void* DeviceArena::base() const noexcept { return base_; }

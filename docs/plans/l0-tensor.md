@@ -92,11 +92,11 @@ element-count mismatches. Throw `std::overflow_error` for byte-size overflow.
   not compact or copy.
 - `view` and `reshape` are conservative: they require canonical contiguous input rather than
   trying to infer more complex strided reshapes.
-- `QuantLayout::W4A16KernelPackedV1` is the sole v1 serialized kernel-packed W4A16 layout tag.
-  The exact byte/interleave contract is specified later in `tools/weight_format.md` during the
-  `weight_store` component.
-- `QuantWeight` defaults to a v1 kernel-packed W4A16 descriptor with null payload pointers and
-  zero logical dimensions.
+- `QuantLayout` names q5090 serialized payload layouts: `TileN64K64`, `TileN64K128`,
+  `RowGroupedG64`, and `Contiguous`. `W4A16KernelPackedV1` remains a compatibility alias for
+  `TileN64K64`.
+- `QuantWeight` defaults to a q5090 descriptor with null payload pointers and zero logical
+  dimensions.
 
 ## Tests
 

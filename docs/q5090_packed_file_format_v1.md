@@ -9,8 +9,8 @@ consume it with no runtime repacking.
 The policy document decides *which qtype/layout each tensor gets*. This document decides
 *how those bytes are laid out on disk*. Read them together.
 
-> This format **supersedes** the older `tools/weight_format.md` (`QUSWGT01`) and the stub
-> two-stage `tools/quantize` + `tools/pack` pipeline. The C++ side adapts to this format.
+> This is the canonical packed-weight ABI for the C++ runtime. The runtime consumes this format
+> directly; there is no alternate in-tree weight-file path.
 
 ## 0. Conventions
 

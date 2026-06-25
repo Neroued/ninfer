@@ -20,6 +20,8 @@ public:
     DeviceArena& operator=(DeviceArena&& other) noexcept;
 
     Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape, std::size_t align = 256);
+    std::size_t mark() const noexcept;
+    void rewind(std::size_t mark) noexcept;
     void reset() noexcept;
 
     void* base() const noexcept;

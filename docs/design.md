@@ -310,21 +310,23 @@ into a megakernel.
 bf16 safetensors ─┐
                   │  (Python, in-repo, offline)
                   ▼
-        quantize (→ stable 4-bit, sensitive tensors high-precision)
+        tools/q5090_convert
+        quantize selected tensors; keep control tensors high-precision
                   ▼
-        relayout / pack (→ kernel-optimal: weight permutation,
-                          4-bit interleave, scale layout)
+        encode q5090 payload layouts
+        (tile/interleave bytes + inline scales; no semantic math folds)
                   ▼
-        ONE fixed weight file  ──────────►  C++/CUDA runtime: mmap + load + run
-                                            (no quant, no relayout at runtime)
+        ONE fixed q5090 file ──────────► C++/CUDA runtime: validate + load + run
+                                          (runtime applies model math transforms)
 ```
 
 - The **file format** is a stable, self-describing container: header (magic, version, dims,
-  per-tensor dtype/layout/offset/scale metadata) + tensor blobs. Spec lives in
-  `tools/weight_format.md`.
-- Python owns quantization *and* layout; everything in the file is pre-shaped for the kernels.
-- The C++ loader validates the header against the model card's `constexpr` config and fails
-  fast on mismatch.
+  module index, tensor index, string table, payload offsets, qtypes, layouts, CRCs) + tensor
+  blobs. Spec lives in [`q5090_packed_file_format_v1.md`](q5090_packed_file_format_v1.md).
+- Python owns quantization and byte-level payload layout. It does not fold RMSNorm `+1`,
+  log-decay exponentiation, or other model-semantic transforms into the stored weights.
+- The C++ loader validates q5090 metadata against the model card's `constexpr` config, checks
+  payload CRCs, uploads selected modules, and fails fast on mismatch.
 
 ---
 
@@ -364,9 +366,8 @@ qwen3.6-ultraspeed/
   docs/design.md            # this document
   CMakeLists.txt
   tools/                    # Python offline tooling (in-repo)
-    quantize/               # bf16 safetensors -> stable 4-bit
-    pack/                   # stable 4-bit -> kernel-optimal fixed file
-    weight_format.md        # the file-format spec (Python<->C++ contract)
+    q5090_convert/          # bf16 safetensors -> canonical q5090 packed file
+  docs/q5090_packed_file_format_v1.md  # file-format spec (Python<->C++ contract)
   include/qus/
     core/                   # mem pool, allocators, tensor, loader (public headers)
     kernels/                # kernel API headers

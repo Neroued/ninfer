@@ -151,21 +151,30 @@ struct DeviceContext {
 ```
 
 ### 5.2 WeightStore / Loader
-Reads the **one fixed weight file**, validates its header against the `constexpr` config, and
-uploads tensors into the **Weights** region. Exposes typed `Tensor` / `QuantWeight` views by
-name/role.
+Reads the **one fixed q5090 weight file**, validates its header and tensor table against the
+`constexpr` config, checks payload CRCs, and uploads selected modules into the **Weights** region.
+Exposes typed `Tensor` / `QuantWeight` views by name or by q5090 module/source id.
 ```cpp
 class WeightStore {
 public:
-  void load(const char* path, DeviceArena& weights, DeviceContext& ctx);  // mmap header -> validate -> H2D upload
-  QuantWeight qweight(string_view role, int layer) const;  // e.g. "q_proj", "in_proj_qkv"
-  Tensor      weight (string_view role, int layer) const;  // bf16 "sensitive" tensors, norms, etc.
+  explicit WeightStore(Q5090Expectations expected = {});
+  void load(const char* path, DeviceArena& weights, DeviceContext& ctx,
+            const LoadOptions& options = {});
+
+  const Tensor*      tensor (string_view name) const;
+  const QuantWeight* qweight(string_view name) const;
+  const Tensor*      tensor (ModuleKind module, uint32_t source_kind, uint32_t source_layer) const;
+  const QuantWeight* qweight(ModuleKind module, uint32_t source_kind, uint32_t source_layer) const;
 };
 ```
-- Header carries magic/version/dims + a tensor table (name → dtype/layout/offset/scale). Fails
-  fast on any mismatch vs config. (Format spec: `tools/weight_format.md`, to be written.)
-- Upload path: read file (mmap or stream) → pinned host staging → async `cudaMemcpy` on
-  `load_stream` → tensors live in Weights region.
+- q5090 carries a module index (`TEXT_CORE`, `MTP_DRAFT`, `VISION_ENCODER`), tensor index,
+  string table, payload spans, qtypes/layouts, and CRC32 per payload. Format spec:
+  [`q5090_packed_file_format_v1.md`](q5090_packed_file_format_v1.md).
+- `LoadOptions` defaults to TEXT only; MTP and vision payloads are opt-in. Unselected module
+  metadata remains queryable, but payload pointers stay null.
+- Upload path: read file → strict parse/CRC → async `cudaMemcpy` on `load_stream` → tensors live
+  in Weights region. Optional progress callbacks report read, CRC, and upload phases for large
+  q5090 files.
 
 ### 5.3 KVCache (full-attention layers)
 Contiguous per-layer K/V in the Cache region; **position-indexed**, append-only.

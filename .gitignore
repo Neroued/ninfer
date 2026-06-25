@@ -26,6 +26,8 @@ venv/
 *.bin
 *.safetensors
 *.gguf
+out/
+*.log
 
 # Editor / OS
 .vscode/

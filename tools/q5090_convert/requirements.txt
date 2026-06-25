@@ -1,0 +1,6 @@
+# Offline converter dependencies. Use a CUDA-enabled env (e.g. conda `vllm-bench`,
+# `unsloth`, or `py311`) for GPU acceleration on the RTX 5090.
+torch>=2.4
+numpy>=1.24
+safetensors>=0.4
+# triton is optional (not required by the reference packer); present in the target envs.

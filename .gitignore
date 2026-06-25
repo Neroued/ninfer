@@ -1,0 +1,34 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.obj
+*.so
+*.a
+compile_commands.json
+.cache/
+
+# CUDA / profiling artifacts
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# Python tooling
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Weight artifacts (large; produced by offline tooling)
+*.qus
+*.bin
+*.safetensors
+*.gguf
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

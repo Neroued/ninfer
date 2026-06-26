@@ -1,0 +1,23 @@
+# Register a unit-test executable linked against qus_core.
+#   qus_add_test(<name> SOURCES <files...> [NEEDS_SOURCE_DIR])
+# qus_core PUBLIC-exports include/, so tests need no extra include dirs.
+# NEEDS_SOURCE_DIR defines QUS_SOURCE_DIR for tests that read repo fixtures.
+function(qus_add_test name)
+  cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES" ${ARGN})
+  add_executable(${name} ${arg_SOURCES})
+  target_link_libraries(${name} PRIVATE qus_core)
+  if(arg_NEEDS_SOURCE_DIR)
+    target_compile_definitions(${name} PRIVATE QUS_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  endif()
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+qus_add_test(qus_l0_tests                    SOURCES test_dtype.cpp)
+qus_add_test(qus_device_test                 SOURCES test_device.cpp)
+qus_add_test(qus_tensor_test                 SOURCES test_tensor.cpp)
+qus_add_test(qus_arena_test                  SOURCES test_arena.cpp)
+qus_add_test(qus_kv_cache_test               SOURCES test_kv_cache.cpp)
+qus_add_test(qus_state_store_test            SOURCES test_state_store.cpp)
+qus_add_test(qus_weight_store_test           SOURCES test_weight_store.cpp       NEEDS_SOURCE_DIR)
+qus_add_test(qus_q5090_parser_test           SOURCES test_q5090_parser.cpp       NEEDS_SOURCE_DIR)
+qus_add_test(qus_weight_store_real_file_test SOURCES test_weight_store_real.cpp  NEEDS_SOURCE_DIR)

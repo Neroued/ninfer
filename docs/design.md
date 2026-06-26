@@ -189,13 +189,20 @@ only**. These dimensions are the "固化" truth everything specializes to.
 card. Adding another model later = a new L2 card reusing L0/L1, never an engine rewrite.
 No dynamic graph is built at runtime — the schedule is the C++ in the model card.
 
-### Kernel API/impl/dispatch split
-Each operator is:
-- a **public header** (`include/qus/kernels/...`) defining a generic, shape-parameterized API;
-- one or more **CUDA implementations** (`src/kernels/.../*.cu`), possibly fused/specialized;
-- a **dispatcher** that selects the best impl given known dims + phase (prefill vs decode).
+### Kernel api/wrapper/launcher/kernel split
+Each operator is organized **by layer, not by operator family** (one flat folder per layer), in
+four layers that read top-to-bottom as the call chain:
+- **api** — a public header (`include/qus/kernels/<op>.h`) declaring the generic,
+  shape-parameterized entry point(s) L2 calls;
+- **wrapper** — host C++ (`src/kernels/wrapper/<op>.cpp`) that validates parameters and
+  **dispatches** to the right impl by phase (prefill vs decode) + dims;
+- **launcher** — `src/kernels/launcher/<op>[_<variant>].cu` that configures grid/block/stream and
+  launches the kernel;
+- **kernel** — `src/kernels/kernel/<op>[_<variant>].cuh` with the `__global__`/`__device__` compute.
 
-A CUDA Graph (later) simply records whatever impls the dispatcher chose for the decode step.
+Parameter checks live in the wrapper; dispatch is the wrapper's routing logic (no separate
+dispatcher object). A CUDA Graph (later) simply records whatever impls the wrappers launched for
+the decode step. Full conventions: [`l1-kernel-layering.md`](l1-kernel-layering.md).
 
 ---
 
@@ -374,8 +381,10 @@ qwen3.6-ultraspeed/
     model/                  # model config + model-card interface
   src/
     core/                   # infra impl
-    kernels/                # cuda impls + dispatch
-      gemm/ attention/ gdn/ norm/ rope/ activation/ sampling/
+    kernels/                # L1 ops, organized by layer (see l1-kernel-layering.md)
+      wrapper/              # <op>.cpp     — validate params + dispatch
+      launcher/             # <op>.cu/.h   — grid/block/stream + launch
+      kernel/               # <op>.cuh     — __global__ / __device__ compute
     model/qwen3_6_27b.cpp   # the model card / static graph
     runtime/                # engine: load + prefill + decode loop
     main.cpp                # bench driver: ids in -> ids out

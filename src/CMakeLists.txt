@@ -10,6 +10,7 @@ target_include_directories(qus_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
 # Internal L1 layer headers resolve as "kernels/launcher/<op>.h" (wrapper -> launcher seam).
 target_include_directories(qus_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(qus_core PUBLIC CUDA::cudart)
+target_compile_options(qus_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 set_target_properties(qus_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 # --- Driver executable (token-ids in -> token-ids out) -----------------------

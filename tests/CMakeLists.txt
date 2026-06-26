@@ -12,6 +12,8 @@ function(qus_add_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
 qus_add_test(qus_l0_tests                    SOURCES test_dtype.cpp)
 qus_add_test(qus_device_test                 SOURCES test_device.cpp)
 qus_add_test(qus_tensor_test                 SOURCES test_tensor.cpp)
@@ -22,3 +24,4 @@ qus_add_test(qus_state_store_test            SOURCES test_state_store.cpp)
 qus_add_test(qus_weight_store_test           SOURCES test_weight_store.cpp       NEEDS_SOURCE_DIR)
 qus_add_test(qus_q5090_parser_test           SOURCES test_q5090_parser.cpp       NEEDS_SOURCE_DIR)
 qus_add_test(qus_weight_store_real_file_test SOURCES test_weight_store_real.cpp  NEEDS_SOURCE_DIR)
+qus_add_test(qus_silu_and_mul_test SOURCES kernels/test_silu_and_mul.cpp)

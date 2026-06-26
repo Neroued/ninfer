@@ -12,7 +12,7 @@ namespace qus::kernels::detail {
 
 void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
     const std::int64_t n = out.numel();
-    constexpr int kBlock = 256;
+    constexpr int kBlock = 1024;
     const int grid       = static_cast<int>((n + kBlock - 1) / kBlock);
 
     silu_and_mul_kernel<<<grid, kBlock, 0, stream>>>(

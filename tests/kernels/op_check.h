@@ -45,6 +45,10 @@ struct Tolerance {
                 /*worst_ratio_max*/ 2.0, /*rel_l2_tol*/ 1e-5};
     }
 
+    static constexpr Tolerance linear_bf16() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
+
+    static constexpr Tolerance attention_bf16() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
+
     static constexpr Tolerance gdn_output_bf16() { return {1e-3, 1.0e-2, 2e-3, 5.0, 8e-3}; }
 
     static constexpr Tolerance gdn_state_fp32() { return {5e-4, 5.0e-3, 2e-2, 5.0, 5e-3}; }

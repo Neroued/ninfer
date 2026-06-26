@@ -60,10 +60,18 @@ int test_weight_from_dense() {
     const qus::Tensor t(&blob, qus::DType::BF16, {48, 5120});
 
     const qus::Weight w = qus::weight_from_dense(t);
-    failures += (w.qtype == qus::QType::BF16_CTRL) ? 0 : fail("weight_from_dense: qtype not BF16_CTRL");
-    failures += (w.layout == qus::QuantLayout::Contiguous) ? 0 : fail("weight_from_dense: layout not Contiguous");
+    failures +=
+        (w.qtype == qus::QType::BF16_CTRL) ? 0 : fail("weight_from_dense: qtype not BF16_CTRL");
+    failures += (w.layout == qus::QuantLayout::Contiguous)
+                    ? 0
+                    : fail("weight_from_dense: layout not Contiguous");
+    failures += (w.q5090_scale_dtype == qus::ScaleDType::None)
+                    ? 0
+                    : fail("weight_from_dense: scale dtype not None");
     failures += (w.qdata == &blob) ? 0 : fail("weight_from_dense: qdata mismatch");
     failures += (w.payload == &blob) ? 0 : fail("weight_from_dense: payload mismatch");
+    failures += check_i64(static_cast<std::int64_t>(w.payload_bytes),
+                          static_cast<std::int64_t>(t.bytes()), "weight_from_dense payload_bytes");
     failures += (w.scales == nullptr) ? 0 : fail("weight_from_dense: scales not null");
     failures += check_i64(w.n, 48, "weight_from_dense n");
     failures += check_i64(w.k, 5120, "weight_from_dense k");
@@ -71,6 +79,10 @@ int test_weight_from_dense() {
     failures += check_i64(w.ndim, 2, "weight_from_dense ndim");
     failures += check_i64(w.shape[0], 48, "weight_from_dense shape[0]");
     failures += check_i64(w.shape[1], 5120, "weight_from_dense shape[1]");
+    failures += check_i64(w.padded_shape[0], 48, "weight_from_dense padded_shape[0]");
+    failures += check_i64(w.padded_shape[1], 5120, "weight_from_dense padded_shape[1]");
+    failures += check_i64(w.padded_shape[2], 1, "weight_from_dense padded_shape[2]");
+    failures += check_i64(w.padded_shape[3], 1, "weight_from_dense padded_shape[3]");
     return failures;
 }
 

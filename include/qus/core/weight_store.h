@@ -29,11 +29,11 @@ public:
               const LoadOptions& options = {});
 
     const Tensor* tensor(std::string_view name) const noexcept;
-    const QuantWeight* qweight(std::string_view name) const noexcept;
+    const Weight* qweight(std::string_view name) const noexcept;
     const Tensor* tensor(ModuleKind module, std::uint32_t source_kind,
                          std::uint32_t source_layer) const noexcept;
-    const QuantWeight* qweight(ModuleKind module, std::uint32_t source_kind,
-                               std::uint32_t source_layer) const noexcept;
+    const Weight* qweight(ModuleKind module, std::uint32_t source_kind,
+                          std::uint32_t source_layer) const noexcept;
 
     std::size_t tensor_count() const noexcept;
     std::size_t quant_count() const noexcept;
@@ -57,7 +57,7 @@ private:
         ModuleKind module          = ModuleKind::TextCore;
         std::uint32_t source_kind  = 0;
         std::uint32_t source_layer = kQ5090NoLayer;
-        QuantWeight weight;
+        Weight weight;
     };
 
     struct ModuleState {

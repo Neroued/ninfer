@@ -126,7 +126,7 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
         !store.module_loaded(qus::ModuleKind::VisionEncoder) ? 0 : fail("VISION loaded by default");
 
     const auto& text_q = find_tensor(parsed, "model.language_model.layers.0.mlp.gate_proj.weight");
-    const qus::QuantWeight* text_weight =
+    const qus::Weight* text_weight =
         store.qweight("model.language_model.layers.0.mlp.gate_proj.weight");
     failures += text_weight != nullptr ? 0 : fail("missing text quant weight");
     if (text_weight != nullptr) {
@@ -151,16 +151,16 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
                                         "text tensor");
     }
 
-    const qus::QuantWeight* by_source = store.qweight(
+    const qus::Weight* by_source = store.qweight(
         qus::ModuleKind::TextCore, static_cast<std::uint32_t>(qus::SourceKind::MlpGate), 0);
     failures += by_source == text_weight ? 0 : fail("source lookup mismatch");
 
-    const qus::QuantWeight* mtp = store.qweight("mtp.fc.weight");
+    const qus::Weight* mtp = store.qweight("mtp.fc.weight");
     failures += mtp != nullptr ? 0 : fail("missing MTP metadata");
     if (mtp != nullptr) {
         failures += mtp->payload == nullptr ? 0 : fail("MTP payload loaded by default");
     }
-    const qus::QuantWeight* vision = store.qweight("model.visual.patch_embed.proj.weight");
+    const qus::Weight* vision = store.qweight("model.visual.patch_embed.proj.weight");
     failures += vision != nullptr ? 0 : fail("missing VISION metadata");
     if (vision != nullptr) {
         failures += vision->payload == nullptr ? 0 : fail("VISION payload loaded by default");
@@ -172,7 +172,7 @@ int expect_module_payload(const qus::WeightStore& store, const qus::ParsedQ5090F
                           const std::vector<std::byte>& file, std::string_view name,
                           bool should_be_loaded) {
     const qus::ParsedQ5090Tensor& meta = find_tensor(parsed, name);
-    const qus::QuantWeight* weight     = store.qweight(name);
+    const qus::Weight* weight          = store.qweight(name);
     if (weight == nullptr) { return fail("missing quant weight metadata"); }
     if (!should_be_loaded) {
         return weight->payload == nullptr ? 0 : fail("unexpected loaded payload");

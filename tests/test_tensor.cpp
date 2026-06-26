@@ -162,7 +162,7 @@ int main() {
 
     int qblob    = 0;
     float scales = 0.0f;
-    qus::QuantWeight qw{};
+    qus::Weight qw{};
     qw.qdata  = &qblob;
     qw.scales = &scales;
     qw.n      = 7;
@@ -172,7 +172,7 @@ int main() {
     if (qw.qdata != &qblob || qw.scales != &scales || qw.n != 7 || qw.k != 11 || qw.group != 128 ||
         qw.layout != qus::QuantLayout::W4A16KernelPackedV1) {
         ++failures;
-        std::cerr << "QuantWeight did not preserve descriptor fields\n";
+        std::cerr << "Weight did not preserve descriptor fields\n";
     }
 
     return failures == 0 ? 0 : fail("tensor test failed");

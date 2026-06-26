@@ -161,9 +161,9 @@ bool is_quant_layout(QuantLayout layout) {
            layout == QuantLayout::RowGroupedG64;
 }
 
-QuantWeight make_quant_descriptor(const ParsedQ5090Tensor& tensor, void* payload) {
+Weight make_quant_descriptor(const ParsedQ5090Tensor& tensor, void* payload) {
     check_int32_shape(tensor);
-    QuantWeight weight{};
+    Weight weight{};
     weight.payload           = payload;
     weight.payload_bytes     = tensor.payload_bytes;
     weight.qtype             = tensor.qtype;
@@ -284,7 +284,7 @@ const Tensor* WeightStore::tensor(std::string_view name) const noexcept {
     return nullptr;
 }
 
-const QuantWeight* WeightStore::qweight(std::string_view name) const noexcept {
+const Weight* WeightStore::qweight(std::string_view name) const noexcept {
     for (const QuantRecord& record : quant_) {
         if (record.name == name) { return &record.weight; }
     }
@@ -302,8 +302,8 @@ const Tensor* WeightStore::tensor(ModuleKind module, std::uint32_t source_kind,
     return nullptr;
 }
 
-const QuantWeight* WeightStore::qweight(ModuleKind module, std::uint32_t source_kind,
-                                        std::uint32_t source_layer) const noexcept {
+const Weight* WeightStore::qweight(ModuleKind module, std::uint32_t source_kind,
+                                   std::uint32_t source_layer) const noexcept {
     for (const QuantRecord& record : quant_) {
         if (record.module == module && record.source_kind == source_kind &&
             record.source_layer == source_layer) {

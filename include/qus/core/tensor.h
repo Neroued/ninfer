@@ -116,7 +116,7 @@ enum class SourceKind : std::uint32_t {
     VisMergerNormB    = 80,
 };
 
-struct QuantWeight {
+struct Weight {
     const void* payload          = nullptr;
     std::uint64_t payload_bytes  = 0;
     QType qtype                  = QType::Q4G64_F16S;

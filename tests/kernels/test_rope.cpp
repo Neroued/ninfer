@@ -1,0 +1,335 @@
+// Correctness + coverage for rope, against the frozen op-test standard
+// (docs/l1-op-test-standard.md): fp64 golden from bf16-rounded q/k,
+// positions read from device, composite tolerance bf16_elementwise.
+#include "qus/kernels/rope.h"
+#include "kernels/op_tester.h"
+
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using namespace qus;
+using namespace qus::test;
+
+namespace {
+
+constexpr std::int32_t kHeadDim = 256;
+constexpr std::int32_t kQHeads = 24;
+constexpr std::int32_t kKHeads = 4;
+constexpr int kRotaryDim = 64;
+constexpr float kTheta = 1.0e7f;
+
+std::size_t tensor_size(std::int32_t heads, std::int32_t T) {
+    return static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(heads) *
+           static_cast<std::size_t>(T);
+}
+
+std::size_t index_of(std::int32_t heads, std::int32_t t, std::int32_t h, std::int32_t d) {
+    return (static_cast<std::size_t>(t) * static_cast<std::size_t>(heads) +
+            static_cast<std::size_t>(h)) *
+               static_cast<std::size_t>(kHeadDim) +
+           static_cast<std::size_t>(d);
+}
+
+std::vector<std::uint16_t> bf16_bits(const std::vector<float>& h) {
+    std::vector<std::uint16_t> b(h.size());
+    for (std::size_t i = 0; i < h.size(); ++i) b[i] = f32_to_bf16(h[i]);
+    return b;
+}
+
+std::vector<std::uint16_t> from_device_bf16_bits(const DBuf& d, std::size_t n) {
+    std::vector<std::uint16_t> b(n);
+    cudaMemcpy(b.data(), d.p, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
+    return b;
+}
+
+void cpu_rope_one(const std::vector<float>& in, const std::vector<int>& positions,
+                  std::int32_t heads, std::int32_t T, int rotary_dim, float theta,
+                  std::vector<double>& out) {
+    out.resize(in.size());
+    for (std::size_t i = 0; i < in.size(); ++i) out[i] = static_cast<double>(in[i]);
+
+    const int half = rotary_dim / 2;
+    for (std::int32_t t = 0; t < T; ++t) {
+        for (std::int32_t h = 0; h < heads; ++h) {
+            for (int i = 0; i < half; ++i) {
+                const double freq =
+                    std::pow(static_cast<double>(theta), -2.0 * static_cast<double>(i) /
+                                                           static_cast<double>(rotary_dim));
+                const double ang = static_cast<double>(positions[t]) * freq;
+                const double c = std::cos(ang);
+                const double s = std::sin(ang);
+                const std::size_t idx1 = index_of(heads, t, h, i);
+                const std::size_t idx2 = index_of(heads, t, h, i + half);
+                const double x1 = static_cast<double>(in[idx1]);
+                const double x2 = static_cast<double>(in[idx2]);
+                out[idx1] = x1 * c - x2 * s;
+                out[idx2] = x2 * c + x1 * s;
+            }
+        }
+    }
+}
+
+int check_passthrough_bits(const char* tag, const std::vector<std::uint16_t>& got,
+                           const std::vector<std::uint16_t>& before, std::int32_t heads,
+                           std::int32_t T, int rotary_dim) {
+    for (std::int32_t t = 0; t < T; ++t) {
+        for (std::int32_t h = 0; h < heads; ++h) {
+            for (std::int32_t d = rotary_dim; d < kHeadDim; ++d) {
+                const std::size_t idx = index_of(heads, t, h, d);
+                if (got[idx] != before[idx]) {
+                    std::cerr << tag << ": pass-through dim changed at t=" << t << " h=" << h
+                              << " d=" << d << " got_bits=0x" << std::hex << got[idx]
+                              << " before_bits=0x" << before[idx] << std::dec << '\n';
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int check_all_bits_same(const char* tag, const std::vector<std::uint16_t>& got,
+                        const std::vector<std::uint16_t>& before) {
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        if (got[i] != before[i]) {
+            std::cerr << tag << ": identity changed index " << i << " got_bits=0x" << std::hex
+                      << got[i] << " before_bits=0x" << before[i] << std::dec << '\n';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int one_shape(const char* tag, std::int32_t T, std::uint32_t seed) {
+    const std::size_t qn = tensor_size(kQHeads, T);
+    const std::size_t kn = tensor_size(kKHeads, T);
+    std::vector<float> q(qn), k(kn);
+    std::vector<int> positions(static_cast<std::size_t>(T));
+    fill_uniform(q, seed, -8.f, 8.f);
+    fill_uniform(k, seed + 1000u, -8.f, 8.f);
+    fill_iota_i32(positions, 0);
+    round_to_bf16(q);
+    round_to_bf16(k);
+
+    const std::vector<std::uint16_t> q_before = bf16_bits(q);
+    const std::vector<std::uint16_t> k_before = bf16_bits(k);
+
+    std::vector<double> q_ref, k_ref;
+    cpu_rope_one(q, positions, kQHeads, T, kRotaryDim, kTheta, q_ref);
+    cpu_rope_one(k, positions, kKHeads, T, kRotaryDim, kTheta, k_ref);
+
+    DBuf dpos = to_device_i32(positions);
+    DBuf dq = to_device_bf16(q), dk = to_device_bf16(k);
+    Tensor tpos(dpos.p, DType::I32, {T});
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, T});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, T});
+
+    kernels::rope(tpos, kRotaryDim, kTheta, tq, tk, nullptr);
+    cudaDeviceSynchronize();
+
+    int f = 0;
+    f += verify((std::string(tag) + " q").c_str(), from_device_bf16(dq, qn), q_ref,
+                Tolerance::bf16_elementwise());
+    f += verify((std::string(tag) + " k").c_str(), from_device_bf16(dk, kn), k_ref,
+                Tolerance::bf16_elementwise());
+    f += check_passthrough_bits((std::string(tag) + " q").c_str(),
+                                from_device_bf16_bits(dq, qn), q_before, kQHeads, T, kRotaryDim);
+    f += check_passthrough_bits((std::string(tag) + " k").c_str(),
+                                from_device_bf16_bits(dk, kn), k_before, kKHeads, T, kRotaryDim);
+    return f;
+}
+
+int identity_positions_zero_case() {
+    constexpr std::int32_t T = 7;
+    const std::size_t qn = tensor_size(kQHeads, T);
+    const std::size_t kn = tensor_size(kKHeads, T);
+    std::vector<float> q(qn), k(kn);
+    std::vector<int> positions(static_cast<std::size_t>(T), 0);
+    fill_uniform(q, 2026u, -8.f, 8.f);
+    fill_uniform(k, 3026u, -8.f, 8.f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    const std::vector<std::uint16_t> q_before = bf16_bits(q);
+    const std::vector<std::uint16_t> k_before = bf16_bits(k);
+
+    DBuf dpos = to_device_i32(positions);
+    DBuf dq = to_device_bf16(q), dk = to_device_bf16(k);
+    Tensor tpos(dpos.p, DType::I32, {T});
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, T});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, T});
+    kernels::rope(tpos, kRotaryDim, kTheta, tq, tk, nullptr);
+    cudaDeviceSynchronize();
+
+    int f = 0;
+    f += check_all_bits_same("rope positions=0 identity q", from_device_bf16_bits(dq, qn),
+                             q_before);
+    f += check_all_bits_same("rope positions=0 identity k", from_device_bf16_bits(dk, kn),
+                             k_before);
+    return f;
+}
+
+template <typename Fn>
+int expect_invalid(const char* label, Fn&& fn) {
+    try {
+        fn();
+    } catch (const std::invalid_argument&) {
+        return 0;
+    }
+    std::cerr << label << ": expected invalid_argument\n";
+    return 1;
+}
+
+template <typename Fn>
+int expect_overflow(const char* label, Fn&& fn) {
+    try {
+        fn();
+    } catch (const std::overflow_error&) {
+        return 0;
+    } catch (const std::invalid_argument& e) {
+        std::cerr << label << ": expected overflow_error, got invalid_argument: " << e.what()
+                  << '\n';
+        return 1;
+    }
+    std::cerr << label << ": expected overflow_error\n";
+    return 1;
+}
+
+int validation_checks() {
+    int f = 0;
+    Tensor pos(nullptr, DType::I32, {7});
+    Tensor q(nullptr, DType::BF16, {kHeadDim, kQHeads, 7});
+    Tensor k(nullptr, DType::BF16, {kHeadDim, kKHeads, 7});
+
+    try {
+        Tensor empty_pos(nullptr, DType::I32, {1});
+        Tensor empty_q(nullptr, DType::BF16, {kHeadDim, kQHeads, 1});
+        Tensor empty_k(nullptr, DType::BF16, {kHeadDim, kKHeads, 1});
+        empty_pos.ne[0] = 0;
+        empty_q.ne[2] = 0;
+        empty_k.ne[2] = 0;
+        kernels::rope(empty_pos, kRotaryDim, kTheta, empty_q, empty_k, nullptr);
+    } catch (const std::exception& e) {
+        std::cerr << "validation empty T: expected no throw, got " << e.what() << '\n';
+        ++f;
+    }
+
+    f += expect_invalid("validation q dtype", [&] {
+        Tensor bad = q;
+        bad.dtype = DType::FP32;
+        kernels::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
+    });
+    f += expect_invalid("validation k dtype", [&] {
+        Tensor bad = k;
+        bad.dtype = DType::FP32;
+        kernels::rope(pos, kRotaryDim, kTheta, q, bad, nullptr);
+    });
+    f += expect_invalid("validation positions dtype", [&] {
+        Tensor bad = pos;
+        bad.dtype = DType::BF16;
+        kernels::rope(bad, kRotaryDim, kTheta, q, k, nullptr);
+    });
+    f += expect_invalid("validation q head dim", [&] {
+        Tensor bad = q;
+        bad.ne[0] = 255;
+        kernels::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
+    });
+    f += expect_invalid("validation k head dim", [&] {
+        Tensor bad = k;
+        bad.ne[0] = 255;
+        kernels::rope(pos, kRotaryDim, kTheta, q, bad, nullptr);
+    });
+    f += expect_invalid("validation q T mismatch", [&] {
+        Tensor bad = q;
+        bad.ne[2] = 8;
+        kernels::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
+    });
+    f += expect_invalid("validation k T mismatch", [&] {
+        Tensor bad = k;
+        bad.ne[2] = 8;
+        kernels::rope(pos, kRotaryDim, kTheta, q, bad, nullptr);
+    });
+    f += expect_invalid("validation positions shape rank", [&] {
+        Tensor bad = pos;
+        bad.ne[1] = 2;
+        kernels::rope(bad, kRotaryDim, kTheta, q, k, nullptr);
+    });
+    f += expect_invalid("validation positions length", [&] {
+        Tensor bad = pos;
+        bad.ne[0] = 8;
+        kernels::rope(bad, kRotaryDim, kTheta, q, k, nullptr);
+    });
+    f += expect_invalid("validation q non-contiguous", [&] {
+        Tensor bad = q;
+        bad.nb[0] = 4;
+        kernels::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
+    });
+    f += expect_invalid("validation k non-contiguous", [&] {
+        Tensor bad = k;
+        bad.nb[0] = 4;
+        kernels::rope(pos, kRotaryDim, kTheta, q, bad, nullptr);
+    });
+    f += expect_invalid("validation positions non-contiguous", [&] {
+        Tensor bad = pos;
+        bad.nb[0] = 8;
+        kernels::rope(bad, kRotaryDim, kTheta, q, k, nullptr);
+    });
+    f += expect_invalid("validation null data", [&] {
+        kernels::rope(pos, kRotaryDim, kTheta, q, k, nullptr);
+    });
+    f += expect_invalid("validation negative dim", [&] {
+        Tensor bad = q;
+        bad.ne[2] = -1;
+        kernels::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
+    });
+    f += expect_invalid("validation rotary <= 0", [&] {
+        kernels::rope(pos, 0, kTheta, q, k, nullptr);
+    });
+    f += expect_invalid("validation rotary > head dim", [&] {
+        kernels::rope(pos, 258, kTheta, q, k, nullptr);
+    });
+    f += expect_invalid("validation rotary odd", [&] {
+        kernels::rope(pos, 63, kTheta, q, k, nullptr);
+    });
+    f += expect_invalid("validation theta finite positive", [&] {
+        kernels::rope(pos, kRotaryDim, -1.0f, q, k, nullptr);
+    });
+    f += expect_overflow("validation overflow dims", [&] {
+        Tensor huge_pos = pos;
+        Tensor huge_q = q;
+        Tensor huge_k = k;
+        for (int d = 0; d < 4; ++d) {
+            huge_pos.ne[d] = std::numeric_limits<std::int32_t>::max();
+            huge_q.ne[d] = std::numeric_limits<std::int32_t>::max();
+            huge_k.ne[d] = std::numeric_limits<std::int32_t>::max();
+        }
+        kernels::rope(huge_pos, kRotaryDim, kTheta, huge_q, huge_k, nullptr);
+    });
+
+    return f;
+}
+
+} // namespace
+
+int main() {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 0;
+    }
+
+    int f = 0;
+    f += validation_checks();
+    for (std::uint32_t seed : {1u, 7u, 99u}) {
+        f += one_shape("rope T=1", 1, seed);
+        f += one_shape("rope T=7", 7, seed);
+        f += one_shape("rope T=4096", 4096, seed);
+    }
+    f += identity_positions_zero_case();
+
+    std::cout << (f ? "FAIL" : "OK") << " rope correctness\n";
+    return f ? 1 : 0;
+}

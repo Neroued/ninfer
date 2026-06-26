@@ -30,3 +30,4 @@ qus_add_test(qus_sigmoid_gate_mul_test SOURCES kernels/test_sigmoid_gate_mul.cpp
 qus_add_test(qus_rmsnorm_test SOURCES kernels/test_rmsnorm.cpp)
 qus_add_test(qus_l2norm_test SOURCES kernels/test_l2norm.cpp)
 qus_add_test(qus_gdn_gating_test SOURCES kernels/test_gdn_gating.cpp)
+qus_add_test(qus_rope_test SOURCES kernels/test_rope.cpp)

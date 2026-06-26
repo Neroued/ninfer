@@ -25,3 +25,4 @@ qus_add_test(qus_weight_store_test           SOURCES test_weight_store.cpp      
 qus_add_test(qus_q5090_parser_test           SOURCES test_q5090_parser.cpp       NEEDS_SOURCE_DIR)
 qus_add_test(qus_weight_store_real_file_test SOURCES test_weight_store_real.cpp  NEEDS_SOURCE_DIR)
 qus_add_test(qus_silu_and_mul_test SOURCES kernels/test_silu_and_mul.cpp)
+qus_add_test(qus_residual_add_test SOURCES kernels/test_residual_add.cpp)

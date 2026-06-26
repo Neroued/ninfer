@@ -47,6 +47,27 @@ std::vector<std::uint16_t> from_device_bf16_bits(const DBuf& d, std::size_t n) {
     return b;
 }
 
+std::vector<std::uint16_t> from_device_bf16_bits_ptr(const void* p, std::size_t n) {
+    std::vector<std::uint16_t> b(n);
+    cudaMemcpy(b.data(), p, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
+    return b;
+}
+
+std::vector<double> from_device_bf16_ptr(const void* p, std::size_t n) {
+    const std::vector<std::uint16_t> b = from_device_bf16_bits_ptr(p, n);
+    std::vector<double> o(n);
+    for (std::size_t i = 0; i < n; ++i) o[i] = double(bf16_to_f32(b[i]));
+    return o;
+}
+
+DBuf to_device_bf16_unaligned(const std::vector<float>& h) {
+    std::vector<std::uint16_t> b(h.size() + 1);
+    for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
+    DBuf d(b.size() * sizeof(std::uint16_t));
+    cudaMemcpy(d.p, b.data(), d.bytes, cudaMemcpyHostToDevice);
+    return d;
+}
+
 void cpu_rope_one(const std::vector<float>& in, const std::vector<int>& positions,
                   std::int32_t heads, std::int32_t T, int rotary_dim, float theta,
                   std::vector<double>& out) {
@@ -141,6 +162,48 @@ int one_shape(const char* tag, std::int32_t T, std::uint32_t seed) {
                                 from_device_bf16_bits(dq, qn), q_before, kQHeads, T, kRotaryDim);
     f += check_passthrough_bits((std::string(tag) + " k").c_str(),
                                 from_device_bf16_bits(dk, kn), k_before, kKHeads, T, kRotaryDim);
+    return f;
+}
+
+int unaligned_data_case() {
+    constexpr std::int32_t T = 7;
+    const std::size_t qn = tensor_size(kQHeads, T);
+    const std::size_t kn = tensor_size(kKHeads, T);
+    std::vector<float> q(qn), k(kn);
+    std::vector<int> positions(static_cast<std::size_t>(T));
+    fill_uniform(q, 1234u, -8.f, 8.f);
+    fill_uniform(k, 4321u, -8.f, 8.f);
+    fill_iota_i32(positions, 0);
+    round_to_bf16(q);
+    round_to_bf16(k);
+
+    const std::vector<std::uint16_t> q_before = bf16_bits(q);
+    const std::vector<std::uint16_t> k_before = bf16_bits(k);
+
+    std::vector<double> q_ref, k_ref;
+    cpu_rope_one(q, positions, kQHeads, T, kRotaryDim, kTheta, q_ref);
+    cpu_rope_one(k, positions, kKHeads, T, kRotaryDim, kTheta, k_ref);
+
+    DBuf dpos = to_device_i32(positions);
+    DBuf dq = to_device_bf16_unaligned(q), dk = to_device_bf16_unaligned(k);
+    auto* qptr = static_cast<std::uint16_t*>(dq.p) + 1;
+    auto* kptr = static_cast<std::uint16_t*>(dk.p) + 1;
+    Tensor tpos(dpos.p, DType::I32, {T});
+    Tensor tq(qptr, DType::BF16, {kHeadDim, kQHeads, T});
+    Tensor tk(kptr, DType::BF16, {kHeadDim, kKHeads, T});
+
+    kernels::rope(tpos, kRotaryDim, kTheta, tq, tk, nullptr);
+    cudaDeviceSynchronize();
+
+    int f = 0;
+    f += verify("rope unaligned q", from_device_bf16_ptr(qptr, qn), q_ref,
+                Tolerance::bf16_elementwise());
+    f += verify("rope unaligned k", from_device_bf16_ptr(kptr, kn), k_ref,
+                Tolerance::bf16_elementwise());
+    f += check_passthrough_bits("rope unaligned q", from_device_bf16_bits_ptr(qptr, qn),
+                                q_before, kQHeads, T, kRotaryDim);
+    f += check_passthrough_bits("rope unaligned k", from_device_bf16_bits_ptr(kptr, kn),
+                                k_before, kKHeads, T, kRotaryDim);
     return f;
 }
 
@@ -329,6 +392,7 @@ int main() {
         f += one_shape("rope T=4096", 4096, seed);
     }
     f += identity_positions_zero_case();
+    f += unaligned_data_case();
 
     std::cout << (f ? "FAIL" : "OK") << " rope correctness\n";
     return f ? 1 : 0;

@@ -1,7 +1,8 @@
-// Performance bench for gqa_attention_decode at Qwen3.6-27B decode shapes.
+// Performance bench for gqa_attention at Qwen3.6-27B decode/prefill shapes.
 // The GB/s readout is informational; correctness is covered by
 // tests/kernels/test_gqa_attention.cpp.
 //   ./qus_gqa_attention_bench --decode
+//   ./qus_gqa_attention_bench --prefill
 #include "qus/kernels/gqa_attention.h"
 #include "qus_bench_common.h"
 
@@ -46,6 +47,38 @@ void run_decode(KVCache& kv, const Tensor& q, const Tensor& k, const Tensor& v, 
     print_result(tag, r);
 }
 
+void run_prefill(KVCache& kv, std::int32_t tokens) {
+    const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
+                           static_cast<std::size_t>(tokens);
+    const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
+                            static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
+    DBuf q   = make_bf16(qn);
+    DBuf k   = make_bf16(kvn);
+    DBuf v   = make_bf16(kvn);
+    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+
+    Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+
+    const double causal_pairs = static_cast<double>(tokens) * static_cast<double>(tokens + 1) * 0.5;
+    const double q_elements   = static_cast<double>(qn);
+    const double kv_elements  = static_cast<double>(kvn);
+    const double bytes =
+        (4.0 * kv_elements + q_elements + q_elements +
+         2.0 * causal_pairs * static_cast<double>(kQHeads) * static_cast<double>(kHeadDim)) *
+        2.0;
+
+    const Result r = bench_loop(
+        [&](cudaStream_t s) { kernels::gqa_attention_prefill(tq, tk, tv, kScale, kv, 0, tout, s); },
+        bytes);
+
+    char tag[96];
+    std::snprintf(tag, sizeof(tag), "gqa_attention prefill T=%d", tokens);
+    print_result(tag, r);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -55,11 +88,13 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    bool decode = false;
+    bool decode  = false;
+    bool prefill = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--decode")) decode = true;
+        if (!std::strcmp(argv[i], "--prefill")) prefill = true;
     }
-    if (!decode) { decode = true; }
+    if (!decode && !prefill) { decode = true; }
 
     constexpr std::int32_t max_context = 32769;
     const std::size_t layer_elements   = static_cast<std::size_t>(kKVHeads) *
@@ -86,6 +121,10 @@ int main(int argc, char** argv) {
     if (decode) {
         run_decode(kv, tq, tk, tv, tout, 2048);
         run_decode(kv, tq, tk, tv, tout, 32768);
+    }
+    if (prefill) {
+        run_prefill(kv, 128);
+        run_prefill(kv, 2048);
     }
     return 0;
 }

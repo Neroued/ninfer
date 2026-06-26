@@ -46,7 +46,9 @@ __device__ __forceinline__ float gqa_block_sum_256(float value, float* scratch) 
     if (warp == 0) { value = gqa_warp_sum(value); }
     if (tid == 0) { scratch[0] = value; }
     __syncthreads();
-    return scratch[0];
+    value = scratch[0];
+    __syncthreads();
+    return value;
 }
 
 __global__ void gqa_attention_decode_append_kernel(const __nv_bfloat16* k, const __nv_bfloat16* v,

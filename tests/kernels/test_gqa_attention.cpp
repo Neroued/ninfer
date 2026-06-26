@@ -1,6 +1,7 @@
-// Correctness + coverage for gqa_attention_decode, against the frozen op-test
-// standard (docs/l1-op-test-standard.md): fp64 golden from bf16-rounded
-// q/k/v/cache inputs, device scalar pos, composite tolerance attention_bf16.
+// Correctness + coverage for gqa_attention prefill/decode, against the frozen
+// op-test standard (docs/l1-op-test-standard.md): fp64 golden from
+// bf16-rounded q/k/v/cache inputs, device scalar pos for decode, composite
+// tolerance attention_bf16.
 #include "qus/core/arena.h"
 #include "qus/core/kv_cache.h"
 #include "qus/kernels/gqa_attention.h"
@@ -34,9 +35,21 @@ std::size_t q_index(std::int32_t q_head, std::int32_t d) {
            static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(q_head);
 }
 
+std::size_t q_index(std::int32_t q_head, std::int32_t d, std::int32_t token) {
+    return q_index(q_head, d) + static_cast<std::size_t>(kHeadDim) *
+                                    static_cast<std::size_t>(kQHeads) *
+                                    static_cast<std::size_t>(token);
+}
+
 std::size_t kv_tensor_index(std::int32_t kv_head, std::int32_t d) {
     return static_cast<std::size_t>(d) +
            static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kv_head);
+}
+
+std::size_t kv_tensor_index(std::int32_t kv_head, std::int32_t d, std::int32_t token) {
+    return kv_tensor_index(kv_head, d) + static_cast<std::size_t>(kHeadDim) *
+                                             static_cast<std::size_t>(kKVHeads) *
+                                             static_cast<std::size_t>(token);
 }
 
 std::size_t cache_index(std::int32_t kv_head, std::int32_t d, std::int32_t position) {
@@ -111,6 +124,65 @@ void cpu_gqa_decode(const std::vector<float>& q, const std::vector<float>& cache
                        static_cast<double>(cache_v[cache_index(kvh, d, j)]);
             }
             out[q_index(qh, d)] = acc;
+        }
+    }
+}
+
+void cpu_gqa_prefill(const std::vector<float>& q, const std::vector<float>& k,
+                     const std::vector<float>& v, std::int32_t tokens,
+                     std::vector<float>& expected_cache_k, std::vector<float>& expected_cache_v,
+                     std::vector<double>& out) {
+    out.assign(static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
+                   static_cast<std::size_t>(tokens),
+               0.0);
+    expected_cache_k.assign(static_cast<std::size_t>(kHeadDim) *
+                                static_cast<std::size_t>(kKVHeads) *
+                                static_cast<std::size_t>(tokens),
+                            0.0f);
+    expected_cache_v.assign(expected_cache_k.size(), 0.0f);
+
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t h = 0; h < kKVHeads; ++h) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                expected_cache_k[cache_index(h, d, t)] = k[kv_tensor_index(h, d, t)];
+                expected_cache_v[cache_index(h, d, t)] = v[kv_tensor_index(h, d, t)];
+            }
+        }
+    }
+
+    std::vector<double> scores(static_cast<std::size_t>(tokens));
+    std::vector<double> probs(static_cast<std::size_t>(tokens));
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t qh = 0; qh < kQHeads; ++qh) {
+            const std::int32_t kvh = qh / 6;
+            double max_score       = -std::numeric_limits<double>::infinity();
+            for (std::int32_t j = 0; j <= t; ++j) {
+                double dot = 0.0;
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    dot += static_cast<double>(q[q_index(qh, d, t)]) *
+                           static_cast<double>(k[kv_tensor_index(kvh, d, j)]);
+                }
+                const double score                  = dot * static_cast<double>(kScale);
+                scores[static_cast<std::size_t>(j)] = score;
+                max_score                           = std::max(max_score, score);
+            }
+
+            double denom = 0.0;
+            for (std::int32_t j = 0; j <= t; ++j) {
+                const double p = std::exp(scores[static_cast<std::size_t>(j)] - max_score);
+                probs[static_cast<std::size_t>(j)] = p;
+                denom += p;
+            }
+            for (std::int32_t j = 0; j <= t; ++j) { probs[static_cast<std::size_t>(j)] /= denom; }
+
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                double acc = 0.0;
+                for (std::int32_t j = 0; j <= t; ++j) {
+                    acc += probs[static_cast<std::size_t>(j)] *
+                           static_cast<double>(v[kv_tensor_index(kvh, d, j)]);
+                }
+                out[q_index(qh, d, t)] = acc;
+            }
         }
     }
 }
@@ -195,6 +267,154 @@ int one_decode_case(std::int32_t pos, std::uint32_t seed,
     return f;
 }
 
+int one_prefill_case(std::int32_t tokens, std::uint32_t seed) {
+    const std::size_t qn =
+        static_cast<std::size_t>(kHeadDim) * kQHeads * static_cast<std::size_t>(tokens);
+    const std::size_t kvn =
+        static_cast<std::size_t>(kHeadDim) * kKVHeads * static_cast<std::size_t>(tokens);
+
+    std::vector<float> q(qn), k(kvn), v(kvn);
+    fill_uniform(q, seed, -0.25f, 0.25f);
+    fill_uniform(k, seed + 1000u, -0.25f, 0.25f);
+    fill_uniform(v, seed + 2000u, -1.0f, 1.0f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    round_to_bf16(v);
+
+    std::vector<float> expected_cache_k, expected_cache_v;
+    std::vector<double> ref;
+    cpu_gqa_prefill(q, k, v, tokens, expected_cache_k, expected_cache_v, ref);
+
+    DBuf dq   = to_device_bf16(q);
+    DBuf dk   = to_device_bf16(k);
+    DBuf dv   = to_device_bf16(v);
+    DBuf dout = DBuf(qn * sizeof(std::uint16_t));
+
+    const std::size_t layer_bytes = kvn * sizeof(std::uint16_t);
+    DeviceArena cache_arena(2 * (layer_bytes + 256) + 4096);
+    KVCache kv(cache_arena, 1, static_cast<std::uint32_t>(tokens), kKVHeads, kHeadDim, DType::BF16);
+    cudaMemset(kv.k[0].data, 0, layer_bytes);
+    cudaMemset(kv.v[0].data, 0, layer_bytes);
+
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+
+    kernels::gqa_attention_prefill(tq, tk, tv, kScale, kv, 0, tout, nullptr);
+    cudaDeviceSynchronize();
+
+    int f             = 0;
+    std::string label = "gqa prefill T=" + std::to_string(tokens);
+    f += verify(label.c_str(), from_device_bf16(dout, qn), ref, Tolerance::attention_bf16());
+    f += check_bits_equal((label + " k fill").c_str(), from_device_bf16_bits(kv.k[0].data, kvn),
+                          bf16_bits(expected_cache_k));
+    f += check_bits_equal((label + " v fill").c_str(), from_device_bf16_bits(kv.v[0].data, kvn),
+                          bf16_bits(expected_cache_v));
+    if (kv.pos != 0) {
+        std::cerr << label << ": prefill op must not advance host KVCache.pos; got " << kv.pos
+                  << '\n';
+        ++f;
+    }
+    return f;
+}
+
+int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed) {
+    const std::size_t q_prefill_n =
+        static_cast<std::size_t>(kHeadDim) * kQHeads * static_cast<std::size_t>(tokens);
+    const std::size_t kv_prefill_n =
+        static_cast<std::size_t>(kHeadDim) * kKVHeads * static_cast<std::size_t>(tokens);
+    constexpr std::size_t q_decode_n =
+        static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads);
+    constexpr std::size_t kv_decode_n =
+        static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kKVHeads);
+    const std::size_t cache_n = kv_decode_n * static_cast<std::size_t>(tokens + 1);
+
+    std::vector<float> q_prefill(q_prefill_n), k_prefill(kv_prefill_n), v_prefill(kv_prefill_n);
+    std::vector<float> q_decode(q_decode_n), k_decode(kv_decode_n), v_decode(kv_decode_n);
+    fill_uniform(q_prefill, seed, -0.25f, 0.25f);
+    fill_uniform(k_prefill, seed + 1000u, -0.25f, 0.25f);
+    fill_uniform(v_prefill, seed + 2000u, -1.0f, 1.0f);
+    fill_uniform(q_decode, seed + 3000u, -0.25f, 0.25f);
+    fill_uniform(k_decode, seed + 4000u, -0.25f, 0.25f);
+    fill_uniform(v_decode, seed + 5000u, -1.0f, 1.0f);
+    round_to_bf16(q_prefill);
+    round_to_bf16(k_prefill);
+    round_to_bf16(v_prefill);
+    round_to_bf16(q_decode);
+    round_to_bf16(k_decode);
+    round_to_bf16(v_decode);
+
+    std::vector<float> expected_cache_k(cache_n), expected_cache_v(cache_n);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t h = 0; h < kKVHeads; ++h) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                expected_cache_k[cache_index(h, d, t)] = k_prefill[kv_tensor_index(h, d, t)];
+                expected_cache_v[cache_index(h, d, t)] = v_prefill[kv_tensor_index(h, d, t)];
+            }
+        }
+    }
+    for (std::int32_t h = 0; h < kKVHeads; ++h) {
+        for (std::int32_t d = 0; d < kHeadDim; ++d) {
+            expected_cache_k[cache_index(h, d, tokens)] = k_decode[kv_tensor_index(h, d)];
+            expected_cache_v[cache_index(h, d, tokens)] = v_decode[kv_tensor_index(h, d)];
+        }
+    }
+
+    std::vector<double> ref;
+    cpu_gqa_decode(q_decode, expected_cache_k, expected_cache_v, tokens, ref);
+
+    DBuf dq_prefill   = to_device_bf16(q_prefill);
+    DBuf dk_prefill   = to_device_bf16(k_prefill);
+    DBuf dv_prefill   = to_device_bf16(v_prefill);
+    DBuf dout_prefill = DBuf(q_prefill_n * sizeof(std::uint16_t));
+    DBuf dq_decode    = to_device_bf16(q_decode);
+    DBuf dk_decode    = to_device_bf16(k_decode);
+    DBuf dv_decode    = to_device_bf16(v_decode);
+    DBuf dpos         = to_device_i32(std::vector<int>{tokens});
+    DBuf dout_decode  = DBuf(q_decode_n * sizeof(std::uint16_t));
+
+    const std::size_t layer_bytes = cache_n * sizeof(std::uint16_t);
+    DeviceArena cache_arena(2 * (layer_bytes + 256) + 4096);
+    KVCache kv(cache_arena, 1, static_cast<std::uint32_t>(tokens + 1), kKVHeads, kHeadDim,
+               DType::BF16);
+    cudaMemset(kv.k[0].data, 0, layer_bytes);
+    cudaMemset(kv.v[0].data, 0, layer_bytes);
+
+    Tensor tq_prefill(dq_prefill.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk_prefill(dk_prefill.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv_prefill(dv_prefill.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tout_prefill(dout_prefill.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tq_decode(dq_decode.p, DType::BF16, {kHeadDim, kQHeads, 1});
+    Tensor tk_decode(dk_decode.p, DType::BF16, {kHeadDim, kKVHeads, 1});
+    Tensor tv_decode(dv_decode.p, DType::BF16, {kHeadDim, kKVHeads, 1});
+    Tensor tpos(dpos.p, DType::I32, {1});
+    Tensor tout_decode(dout_decode.p, DType::BF16, {kHeadDim, kQHeads, 1});
+
+    kernels::gqa_attention_prefill(tq_prefill, tk_prefill, tv_prefill, kScale, kv, 0, tout_prefill,
+                                   nullptr);
+    kernels::gqa_attention_decode(tq_decode, tk_decode, tv_decode, tpos, kScale, kv, 0, tout_decode,
+                                  nullptr);
+    cudaDeviceSynchronize();
+
+    int f             = 0;
+    std::string label = "gqa prefill->decode T=" + std::to_string(tokens);
+    f += verify(label.c_str(), from_device_bf16(dout_decode, q_decode_n), ref,
+                Tolerance::attention_bf16());
+    f +=
+        check_bits_equal((label + " k cache").c_str(), from_device_bf16_bits(kv.k[0].data, cache_n),
+                         bf16_bits(expected_cache_k));
+    f +=
+        check_bits_equal((label + " v cache").c_str(), from_device_bf16_bits(kv.v[0].data, cache_n),
+                         bf16_bits(expected_cache_v));
+    if (kv.pos != 0) {
+        std::cerr << label << ": attention ops must not advance host KVCache.pos; got " << kv.pos
+                  << '\n';
+        ++f;
+    }
+    return f;
+}
+
 template <typename Fn>
 int expect_invalid(const char* label, Fn&& fn) {
     try {
@@ -223,8 +443,18 @@ int validation_checks() {
     Tensor out(dout.p, DType::BF16, {kHeadDim, kQHeads, 1});
 
     int f = 0;
-    f += expect_invalid("gqa prefill unsupported", [&] {
-        kernels::gqa_attention_prefill(q, k, v, kScale, kv, 0, out, nullptr);
+    f += expect_invalid("gqa prefill q shape", [&] {
+        Tensor bad(dq.p, DType::BF16, {kHeadDim, kQHeads, 2});
+        kernels::gqa_attention_prefill(bad, k, v, kScale, kv, 0, out, nullptr);
+    });
+    f += expect_invalid("gqa prefill k shape", [&] {
+        Tensor bad(dk.p, DType::BF16, {kHeadDim, kKVHeads, 2});
+        kernels::gqa_attention_prefill(q, bad, v, kScale, kv, 0, out, nullptr);
+    });
+    f += expect_invalid("gqa prefill zero T", [&] {
+        Tensor bad = q;
+        bad.ne[2]  = 0;
+        kernels::gqa_attention_prefill(bad, k, v, kScale, kv, 0, out, nullptr);
     });
     f += expect_invalid("gqa decode pos dtype", [&] {
         Tensor bad = scalar_pos;
@@ -255,6 +485,11 @@ int main() {
     }
 
     int f = 0;
+    f += one_prefill_case(1, 101u);
+    f += one_prefill_case(7, 107u);
+    f += one_prefill_case(128, 113u);
+    f += one_prefill_case(512, 127u);
+    f += one_prefill_decode_consistency_case(128, 131u);
     f += one_decode_case(1, 11u);
     f += one_decode_case(17, 17u);
     f += one_decode_case(2048, 23u);

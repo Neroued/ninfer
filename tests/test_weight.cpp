@@ -54,11 +54,46 @@ int test_as_dense_fp32() {
     return failures;
 }
 
+int test_weight_from_dense() {
+    int failures = 0;
+    int blob     = 0;
+    const qus::Tensor t(&blob, qus::DType::BF16, {48, 5120});
+
+    const qus::Weight w = qus::weight_from_dense(t);
+    failures += (w.qtype == qus::QType::BF16_CTRL) ? 0 : fail("weight_from_dense: qtype not BF16_CTRL");
+    failures += (w.layout == qus::QuantLayout::Contiguous) ? 0 : fail("weight_from_dense: layout not Contiguous");
+    failures += (w.qdata == &blob) ? 0 : fail("weight_from_dense: qdata mismatch");
+    failures += (w.payload == &blob) ? 0 : fail("weight_from_dense: payload mismatch");
+    failures += (w.scales == nullptr) ? 0 : fail("weight_from_dense: scales not null");
+    failures += check_i64(w.n, 48, "weight_from_dense n");
+    failures += check_i64(w.k, 5120, "weight_from_dense k");
+    failures += check_i64(w.group, 0, "weight_from_dense group");
+    failures += check_i64(w.ndim, 2, "weight_from_dense ndim");
+    failures += check_i64(w.shape[0], 48, "weight_from_dense shape[0]");
+    failures += check_i64(w.shape[1], 5120, "weight_from_dense shape[1]");
+    return failures;
+}
+
+int test_round_trip() {
+    int failures = 0;
+    int blob     = 0;
+    const qus::Tensor t(&blob, qus::DType::BF16, {48, 5120});
+
+    const qus::Tensor back = qus::as_dense(qus::weight_from_dense(t));
+    failures += (back.data == t.data) ? 0 : fail("round-trip: data changed");
+    failures += (back.dtype == t.dtype) ? 0 : fail("round-trip: dtype changed");
+    failures += check_i64(back.ne[0], t.ne[0], "round-trip ne[0]");
+    failures += check_i64(back.ne[1], t.ne[1], "round-trip ne[1]");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += test_as_dense_bf16();
     failures += test_as_dense_fp32();
+    failures += test_weight_from_dense();
+    failures += test_round_trip();
     return failures == 0 ? 0 : fail("weight bridge test failed");
 }

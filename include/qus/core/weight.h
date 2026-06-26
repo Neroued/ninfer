@@ -22,4 +22,22 @@ inline Tensor as_dense(const Weight& w) {
     }
 }
 
+// Inverse of as_dense: wrap a dense contiguous seam param (e.g. GDN in_a/in_b) as a Weight so the
+// one generic linear() verb can consume it. Seam linears are 2-D weight matrices [n, k].
+inline Weight weight_from_dense(const Tensor& t) {
+    Weight w{};
+    w.qtype    = (t.dtype == DType::FP32) ? QType::FP32_CTRL : QType::BF16_CTRL;
+    w.layout   = QuantLayout::Contiguous;
+    w.qdata    = t.data;
+    w.payload  = t.data;
+    w.scales   = nullptr;
+    w.n        = t.ne[0];
+    w.k        = t.ne[1];
+    w.group    = 0;
+    w.ndim     = 2;
+    w.shape[0] = t.ne[0];
+    w.shape[1] = t.ne[1];
+    return w;
+}
+
 } // namespace qus

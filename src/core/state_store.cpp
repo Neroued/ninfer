@@ -60,7 +60,7 @@ GdnState::GdnState(DeviceArena& cache_arena, std::uint32_t gdn_layers, std::int3
 
     const Tensor conv_shape(nullptr, conv_dtype_in, {conv_dim_in, conv_width_in});
     const Tensor ssm_shape(nullptr, DType::FP32,
-                           {value_heads_in, value_head_dim_in, key_head_dim_in});
+                           {key_head_dim_in, value_head_dim_in, value_heads_in});
     preflight_state_arena(cache_arena, gdn_layers, conv_shape.bytes(), ssm_shape.bytes());
 
     conv.reserve(gdn_layers);
@@ -68,7 +68,7 @@ GdnState::GdnState(DeviceArena& cache_arena, std::uint32_t gdn_layers, std::int3
     for (std::uint32_t layer = 0; layer < gdn_layers; ++layer) {
         conv.push_back(cache_arena.alloc(conv_dtype_in, {conv_dim_in, conv_width_in}));
         ssm.push_back(
-            cache_arena.alloc(DType::FP32, {value_heads_in, value_head_dim_in, key_head_dim_in}));
+            cache_arena.alloc(DType::FP32, {key_head_dim_in, value_head_dim_in, value_heads_in}));
     }
     reset();
 }

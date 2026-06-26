@@ -88,7 +88,7 @@ int main() {
     failures += expect_size(state.ssm.size(), 3, "state.ssm.size");
     for (std::size_t layer = 0; layer < state.layer_count(); ++layer) {
         failures += check_shape(state.conv[layer], {10, 3, 1, 1}, "state.conv");
-        failures += check_shape(state.ssm[layer], {4, 5, 6, 1}, "state.ssm");
+        failures += check_shape(state.ssm[layer], {6, 5, 4, 1}, "state.ssm");
         if (state.conv[layer].dtype != qus::DType::BF16) {
             ++failures;
             std::cerr << "conv dtype is not BF16\n";

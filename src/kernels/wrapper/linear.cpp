@@ -40,6 +40,17 @@ std::uint64_t checked_mul_u64(std::uint64_t a, std::uint64_t b) {
     return a * b;
 }
 
+std::int32_t align_up_checked(std::int32_t x, std::int32_t m, const char* label) {
+    const std::int64_t xi = x;
+    const std::int64_t mi = m;
+    const std::int64_t y  = ((xi + mi - 1) / mi) * mi;
+    if (y > std::numeric_limits<std::int32_t>::max()) {
+        throw std::overflow_error(std::string("linear: ") + label +
+                                  " padded shape overflows int32");
+    }
+    return static_cast<std::int32_t>(y);
+}
+
 void require_matrix_shapes(const Tensor& x, const Weight& w, const Tensor& out) {
     if (x.ne[2] != 1 || x.ne[3] != 1) {
         throw std::invalid_argument("linear: x must have shape [K,T]");
@@ -61,17 +72,29 @@ void require_matrix_shapes(const Tensor& x, const Weight& w, const Tensor& out) 
     }
 }
 
+void require_weight_2d(const Weight& w, const char* label) {
+    if (w.ndim != 2) {
+        throw std::invalid_argument(std::string("linear: ") + label + " weight must be 2-D [N,K]");
+    }
+    if (w.shape[0] <= 0 || w.shape[1] <= 0) {
+        throw std::invalid_argument(std::string("linear: ") + label +
+                                    " weight shape must be positive");
+    }
+    if (w.shape[0] != w.n || w.shape[1] != w.k) {
+        throw std::invalid_argument(std::string("linear: ") + label +
+                                    " weight shape must match n/k");
+    }
+    if (w.shape[2] != 1 || w.shape[3] != 1 || w.padded_shape[2] != 1 || w.padded_shape[3] != 1) {
+        throw std::invalid_argument(std::string("linear: ") + label +
+                                    " weight trailing dimensions must be 1");
+    }
+}
+
 void require_dense_metadata(const Weight& w) {
     if (w.layout != QuantLayout::Contiguous) {
         throw std::invalid_argument("linear: dense weight must be Contiguous");
     }
-    if (w.ndim != 2) { throw std::invalid_argument("linear: dense weight must be 2-D [N,K]"); }
-    if (w.shape[0] <= 0 || w.shape[1] <= 0) {
-        throw std::invalid_argument("linear: dense weight shape must be positive");
-    }
-    if (w.shape[0] != w.n || w.shape[1] != w.k) {
-        throw std::invalid_argument("linear: dense weight shape must match n/k");
-    }
+    require_weight_2d(w, "dense");
     if (w.group != 0 || w.group_size != 0) {
         throw std::invalid_argument("linear: dense weight group must be zero");
     }
@@ -92,12 +115,56 @@ void require_dense_metadata(const Weight& w) {
     }
 }
 
+void require_q4_metadata(const Weight& w) {
+    if (w.layout != QuantLayout::TileN64K64) {
+        throw std::invalid_argument("linear: Q4G64_F16S weight must be TileN64K64");
+    }
+    require_weight_2d(w, "Q4G64_F16S");
+    if (w.group != 64 || w.group_size != 64) {
+        throw std::invalid_argument("linear: Q4G64_F16S weight group must be 64");
+    }
+    if (w.q5090_scale_dtype != ScaleDType::FP16) {
+        throw std::invalid_argument("linear: Q4G64_F16S weight scale dtype must be FP16");
+    }
+    if (w.padded_shape[0] != align_up_checked(w.shape[0], 64, "Q4G64_F16S") ||
+        w.padded_shape[1] != align_up_checked(w.shape[1], 64, "Q4G64_F16S")) {
+        throw std::invalid_argument("linear: Q4G64_F16S padded shape is invalid");
+    }
+    const std::uint64_t nt       = static_cast<std::uint64_t>(w.padded_shape[0] / 64);
+    const std::uint64_t kg       = static_cast<std::uint64_t>(w.padded_shape[1] / 64);
+    const std::uint64_t expected = checked_mul_u64(checked_mul_u64(nt, kg), 2176u);
+    if (w.payload_bytes < expected) {
+        throw std::invalid_argument("linear: Q4G64_F16S payload is too small");
+    }
+}
+
 bool is_empty_T(const Tensor& x, const Tensor& out) { return x.ne[1] == 0 || out.ne[1] == 0; }
 
-void require_non_empty_tensors(const Tensor& x, const Tensor& out) {
-    if (!x.is_contiguous() || !out.is_contiguous()) {
+bool is_contiguous_allow_zero(const Tensor& t) {
+    std::int64_t expected = static_cast<std::int64_t>(dtype_size(t.dtype));
+    for (int i = 0; i < 4; ++i) {
+        if (t.ne[i] < 0) { return false; }
+        if (t.ne[i] != 1 && t.nb[i] != expected) { return false; }
+        if (i < 3 && t.ne[i] != 1) {
+            if (t.ne[i] == 0) {
+                expected = 0;
+            } else if (expected > std::numeric_limits<std::int64_t>::max() / t.ne[i]) {
+                return false;
+            } else {
+                expected *= t.ne[i];
+            }
+        }
+    }
+    return true;
+}
+
+void require_tensor_strides(const Tensor& x, const Tensor& out) {
+    if (!is_contiguous_allow_zero(x) || !is_contiguous_allow_zero(out)) {
         throw std::invalid_argument("linear: x/out must be contiguous");
     }
+}
+
+void require_tensor_data(const Tensor& x, const Tensor& out) {
     if (x.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("linear: x/out data must be non-null");
     }
@@ -118,11 +185,12 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
     case QType::FP32_CTRL: {
         require_dense_metadata(w);
         require_matrix_shapes(x, w, out);
-        if (is_empty_T(x, out)) { return; }
-        require_non_empty_tensors(x, out);
+        require_tensor_strides(x, out);
         if (w.qdata == nullptr) {
             throw std::invalid_argument("linear: dense weight data must be non-null");
         }
+        if (is_empty_T(x, out)) { return; }
+        require_tensor_data(x, out);
         const Tensor dense = as_dense(w);
         if (x.ne[1] == 1) {
             detail::linear_dense_gemv_launch(x, dense, out, stream);
@@ -130,6 +198,21 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
             detail::linear_dense_gemm_launch(x, dense, out, stream);
         }
     } break;
+    case QType::Q4G64_F16S:
+        require_q4_metadata(w);
+        require_matrix_shapes(x, w, out);
+        require_tensor_strides(x, out);
+        if (w.payload == nullptr && w.qdata == nullptr) {
+            throw std::invalid_argument("linear: Q4G64_F16S payload must be non-null");
+        }
+        if (is_empty_T(x, out)) { return; }
+        require_tensor_data(x, out);
+        if (x.ne[1] == 1) {
+            detail::linear_q4_gemv_launch(x, w, out, stream);
+        } else {
+            detail::linear_q4_gemm_launch(x, w, out, stream);
+        }
+        break;
     default:
         throw std::invalid_argument("linear: unsupported weight qtype");
     }

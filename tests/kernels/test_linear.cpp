@@ -3,11 +3,16 @@
 // bf16-rounded inputs and weights, composite tolerance linear_bf16.
 #include "qus/kernels/linear.h"
 #include "kernels/op_tester.h"
+#include "kernels/q5090_pack.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using namespace qus;
@@ -21,6 +26,8 @@ const char* qtype_name(QType qtype) {
         return "bf16";
     case QType::FP32_CTRL:
         return "fp32";
+    case QType::Q4G64_F16S:
+        return "q4";
     default:
         return "unsupported";
     }
@@ -63,6 +70,41 @@ void cpu_linear_dense(const std::vector<float>& x, const std::vector<float>& wei
     }
 }
 
+void cpu_linear_dequant(const std::vector<float>& x, const std::vector<float>& weight,
+                        std::int32_t n, std::int32_t k, std::int32_t t, std::vector<double>& out) {
+    out.assign(static_cast<std::size_t>(n) * t, 0.0);
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const std::int32_t n_threads =
+        std::min<std::int32_t>(n, static_cast<std::int32_t>(std::min<unsigned>(hw, 16u)));
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(n_threads));
+
+    for (std::int32_t tid = 0; tid < n_threads; ++tid) {
+        const std::int32_t row_begin =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(n) * tid) / n_threads);
+        const std::int32_t row_end =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(n) * (tid + 1)) / n_threads);
+        threads.emplace_back([&, row_begin, row_end] {
+            std::unique_ptr<double[]> acc(new double[static_cast<std::size_t>(t)]);
+            for (std::int32_t row = row_begin; row < row_end; ++row) {
+                std::fill(acc.get(), acc.get() + t, 0.0);
+                const float* wrow = weight.data() + static_cast<std::size_t>(row) * k;
+                for (std::int32_t kk = 0; kk < k; ++kk) {
+                    const double wv = static_cast<double>(wrow[kk]);
+                    for (std::int32_t col = 0; col < t; ++col) {
+                        acc[col] +=
+                            wv * static_cast<double>(x[static_cast<std::size_t>(col) * k + kk]);
+                    }
+                }
+                for (std::int32_t col = 0; col < t; ++col) {
+                    out[static_cast<std::size_t>(col) * n + row] = acc[col];
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+}
+
 int one_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype,
                     std::uint32_t seed) {
     std::vector<float> x(static_cast<std::size_t>(k) * t);
@@ -91,6 +133,51 @@ int one_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype,
                   Tolerance::linear_bf16());
 }
 
+int one_q4_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    constexpr std::int32_t kMaxT = 64;
+    std::vector<float> source_weight(static_cast<std::size_t>(n) * k);
+    fill_uniform(source_weight, seed + 2000u, -0.125f, 0.125f);
+    round_to_bf16(source_weight);
+    q5090::PackedWeight packed = q5090::pack_q4_tile_n64_k64(source_weight, n, k);
+    std::vector<float>().swap(source_weight);
+
+    std::vector<float> x(static_cast<std::size_t>(k) * kMaxT);
+    fill_uniform(x, seed, -3.0f, 3.0f);
+    round_to_bf16(x);
+
+    std::vector<double> ref_max_t;
+    cpu_linear_dequant(x, packed.dequant, n, k, kMaxT, ref_max_t);
+
+    DBuf dx = to_device_bf16(x);
+    DBuf dweight(packed.payload.size());
+    cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
+
+    int failures = 0;
+    for (std::int32_t t : {1, 2, 7, 64}) {
+        DBuf dout(static_cast<std::size_t>(n) * t * 2u);
+        Tensor tx(dx.p, DType::BF16, {k, t});
+        Tensor tout(dout.p, DType::BF16, {n, t});
+        try {
+            kernels::linear(tx, packed.device_weight(dweight.p), tout, nullptr);
+            cudaDeviceSynchronize();
+        } catch (const std::exception& e) {
+            std::cerr << "linear q4 [" << n << "," << k << "] T=" << t << " seed=" << seed
+                      << ": unexpected exception: " << e.what() << '\n';
+            ++failures;
+            continue;
+        }
+
+        const std::vector<double> ref(ref_max_t.begin(),
+                                      ref_max_t.begin() + static_cast<std::size_t>(n) * t);
+        const std::string label = "linear " + std::string(qtype_name(QType::Q4G64_F16S)) + " [" +
+                                  std::to_string(n) + "," + std::to_string(k) +
+                                  "] T=" + std::to_string(t) + " seed=" + std::to_string(seed);
+        failures += verify(label.c_str(), from_device_bf16(dout, static_cast<std::size_t>(n) * t),
+                           ref, Tolerance::linear_bf16());
+    }
+    return failures;
+}
+
 int unsupported_qtype_validation() {
     int f = 0;
     std::vector<float> x(4, 1.0f);
@@ -105,13 +192,6 @@ int unsupported_qtype_validation() {
     try {
         kernels::linear(tx, w, tout, nullptr);
         std::cerr << "linear unsupported W8 qtype: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
-
-    w.qtype = QType::Q4G64_F16S;
-    try {
-        kernels::linear(tx, w, tout, nullptr);
-        std::cerr << "linear unsupported Q4 qtype: expected invalid_argument\n";
         ++f;
     } catch (const std::invalid_argument&) {}
 
@@ -161,6 +241,68 @@ int dense_metadata_validation() {
         ++f;
     } catch (const std::invalid_argument&) {}
 
+    try {
+        Tensor empty_tx(nullptr, DType::BF16, {4, 1});
+        Tensor empty_out(nullptr, DType::BF16, {2, 1});
+        empty_tx.ne[1]  = 0;
+        empty_out.ne[1] = 0;
+        kernels::linear(empty_tx, w, empty_out, nullptr);
+    } catch (const std::exception& e) {
+        std::cerr << "linear dense empty T: expected no throw, got " << e.what() << '\n';
+        ++f;
+    }
+
+    return f;
+}
+
+int q4_metadata_validation() {
+    int f                    = 0;
+    constexpr std::int32_t n = 64;
+    constexpr std::int32_t k = 64;
+    std::vector<float> source(static_cast<std::size_t>(n) * k);
+    fill_uniform(source, 123u, -0.125f, 0.125f);
+    round_to_bf16(source);
+    q5090::PackedWeight packed = q5090::pack_q4_tile_n64_k64(source, n, k);
+
+    std::vector<float> x(k, 1.0f);
+    round_to_bf16(x);
+    DBuf dx = to_device_bf16(x);
+    DBuf dout(static_cast<std::size_t>(n) * 2u);
+    Tensor tx(dx.p, DType::BF16, {k, 1});
+    Tensor tout(dout.p, DType::BF16, {n, 1});
+
+    try {
+        Weight bad        = packed.device_weight(dx.p);
+        bad.payload_bytes = 0;
+        kernels::linear(tx, bad, tout, nullptr);
+        std::cerr << "linear Q4 payload size: expected invalid_argument\n";
+        ++f;
+    } catch (const std::invalid_argument&) {}
+
+    try {
+        Tensor empty_tx  = tx;
+        Tensor empty_out = tout;
+        empty_tx.ne[1]   = 0;
+        empty_out.ne[1]  = 0;
+        Weight bad       = packed.device_weight(nullptr);
+        kernels::linear(empty_tx, bad, empty_out, nullptr);
+        std::cerr << "linear Q4 empty T null payload: expected invalid_argument\n";
+        ++f;
+    } catch (const std::invalid_argument&) {}
+
+    try {
+        Tensor empty_tx  = tx;
+        Tensor empty_out = tout;
+        empty_tx.data    = nullptr;
+        empty_out.data   = nullptr;
+        empty_tx.ne[1]   = 0;
+        empty_out.ne[1]  = 0;
+        kernels::linear(empty_tx, packed.device_weight(dx.p), empty_out, nullptr);
+    } catch (const std::exception& e) {
+        std::cerr << "linear Q4 empty T: expected no throw, got " << e.what() << '\n';
+        ++f;
+    }
+
     return f;
 }
 
@@ -175,6 +317,7 @@ int main() {
     int f = 0;
     f += unsupported_qtype_validation();
     f += dense_metadata_validation();
+    f += q4_metadata_validation();
 
     for (std::uint32_t seed : {1u, 7u, 99u}) {
         for (QType qtype : {QType::BF16_CTRL, QType::FP32_CTRL}) {
@@ -185,6 +328,12 @@ int main() {
     for (QType qtype : {QType::BF16_CTRL, QType::FP32_CTRL}) {
         f += one_dense_shape(5120, 6144, 1, qtype, 17u);
         f += one_dense_shape(5120, 6144, 7, qtype, 17u);
+    }
+    for (auto [n, k] : {std::pair<std::int32_t, std::int32_t>{6144, 5120},
+                        std::pair<std::int32_t, std::int32_t>{1024, 5120},
+                        std::pair<std::int32_t, std::int32_t>{2048, 5120},
+                        std::pair<std::int32_t, std::int32_t>{17408, 5120}}) {
+        f += one_q4_shape(n, k, 23u);
     }
 
     std::cout << (f ? "FAIL" : "OK") << " linear correctness\n";

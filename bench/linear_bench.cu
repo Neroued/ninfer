@@ -1,7 +1,7 @@
 // Performance bench for linear at real Qwen3.6 shapes. Dense in_a/in_b use
 // [48,5120]; Q4 decode uses mlp_gate/mlp_up [17408,5120]. The printed GB/s is
 // informational only; the gate is deferred for this correctness task.
-//   ./qus_linear_bench [--decode] [--prefill] [--bf16] [--fp32] [--q4]
+//   ./qus_linear_bench [--decode] [--prefill] [--bf16] [--fp32] [--q4] [--q6]
 #include "qus/kernels/linear.h"
 #include "qus_bench_common.h"
 
@@ -20,6 +20,9 @@ constexpr std::int32_t kDenseK = 5120;
 constexpr std::int32_t kQ4N    = 17408;
 constexpr std::int32_t kQ4K    = 5120;
 constexpr std::int32_t kQ4Tile = 2176;
+constexpr std::int32_t kQ6N    = 248320;
+constexpr std::int32_t kQ6K    = 5120;
+constexpr std::int32_t kQ6Tile = 3200;
 
 DBuf make_f32(std::size_t n) {
     std::vector<float> h(n);
@@ -82,22 +85,22 @@ void run_dense(std::int32_t t, QType qtype, const char* phase) {
     print_result(tag, r);
 }
 
-DBuf make_q4_payload() {
+DBuf make_tile_payload(std::int32_t n, std::int32_t k, std::int32_t tilew) {
     constexpr std::uint16_t kScaleOne = 0x3c00u;
-    const std::int32_t nt             = kQ4N / 64;
-    const std::int32_t kg             = kQ4K / 64;
-    std::vector<std::uint8_t> payload(static_cast<std::size_t>(nt) * kg * kQ4Tile);
+    const std::int32_t nt             = n / 64;
+    const std::int32_t kg             = k / 64;
+    std::vector<std::uint8_t> payload(static_cast<std::size_t>(nt) * kg * tilew);
     for (std::int32_t tile = 0; tile < nt; ++tile) {
         for (std::int32_t g = 0; g < kg; ++g) {
             const std::size_t base =
-                (static_cast<std::size_t>(tile) * kg + g) * static_cast<std::size_t>(kQ4Tile);
+                (static_cast<std::size_t>(tile) * kg + g) * static_cast<std::size_t>(tilew);
             for (std::int32_t row = 0; row < 64; ++row) {
                 payload[base + static_cast<std::size_t>(row) * 2] =
                     static_cast<std::uint8_t>(kScaleOne & 0xffu);
                 payload[base + static_cast<std::size_t>(row) * 2 + 1] =
                     static_cast<std::uint8_t>(kScaleOne >> 8);
             }
-            for (std::int32_t i = 64 * 2; i < kQ4Tile; ++i) {
+            for (std::int32_t i = 64 * 2; i < tilew; ++i) {
                 payload[base + i] = static_cast<std::uint8_t>((i + tile + g) & 0xff);
             }
         }
@@ -106,6 +109,10 @@ DBuf make_q4_payload() {
     cudaMemcpy(d.p, payload.data(), payload.size(), cudaMemcpyHostToDevice);
     return d;
 }
+
+DBuf make_q4_payload() { return make_tile_payload(kQ4N, kQ4K, kQ4Tile); }
+
+DBuf make_q6_payload() { return make_tile_payload(kQ6N, kQ6K, kQ6Tile); }
 
 Weight q4_weight(void* payload) {
     Weight w{};
@@ -124,6 +131,27 @@ Weight q4_weight(void* payload) {
     w.scales            = nullptr;
     w.n                 = kQ4N;
     w.k                 = kQ4K;
+    w.group             = 64;
+    return w;
+}
+
+Weight q6_weight(void* payload) {
+    Weight w{};
+    w.payload           = payload;
+    w.payload_bytes     = static_cast<std::uint64_t>(kQ6N / 64) * (kQ6K / 64) * kQ6Tile;
+    w.qtype             = QType::Q6G64_F16S;
+    w.layout            = QuantLayout::TileN64K64;
+    w.q5090_scale_dtype = ScaleDType::FP16;
+    w.group_size        = 64;
+    w.shape[0]          = kQ6N;
+    w.shape[1]          = kQ6K;
+    w.padded_shape[0]   = kQ6N;
+    w.padded_shape[1]   = kQ6K;
+    w.ndim              = 2;
+    w.qdata             = payload;
+    w.scales            = nullptr;
+    w.n                 = kQ6N;
+    w.k                 = kQ6K;
     w.group             = 64;
     return w;
 }
@@ -147,6 +175,25 @@ void run_q4_decode() {
     print_result("linear q4 decode [17408,5120] T=1", r);
 }
 
+void run_q6_decode() {
+    constexpr std::int32_t t    = 1;
+    const std::size_t x_elems   = static_cast<std::size_t>(kQ6K) * t;
+    const std::size_t out_elems = static_cast<std::size_t>(kQ6N) * t;
+
+    DBuf x    = make_bf16(x_elems);
+    DBuf wbuf = make_q6_payload();
+    DBuf out  = make_zeros(out_elems * sizeof(std::uint16_t));
+
+    Tensor tx(x.p, DType::BF16, {kQ6K, t});
+    Tensor tout(out.p, DType::BF16, {kQ6N, t});
+    Weight w = q6_weight(wbuf.p);
+
+    const double bytes = static_cast<double>(x_elems) * 2.0 + static_cast<double>(w.payload_bytes) +
+                         static_cast<double>(out_elems) * 2.0;
+    const Result r = bench_loop([&](cudaStream_t s) { kernels::linear(tx, w, tout, s); }, bytes);
+    print_result("linear q6 decode [248320,5120] T=1", r);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -156,7 +203,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    bool decode = false, prefill = false, bf16 = false, fp32 = false, q4 = false;
+    bool decode = false, prefill = false, bf16 = false, fp32 = false, q4 = false, q6 = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--decode"))
             decode = true;
@@ -168,14 +215,17 @@ int main(int argc, char** argv) {
             fp32 = true;
         else if (!std::strcmp(argv[i], "--q4"))
             q4 = true;
+        else if (!std::strcmp(argv[i], "--q6"))
+            q6 = true;
     }
     if (!decode && !prefill) { decode = prefill = true; }
-    if (!bf16 && !fp32 && !q4) { bf16 = fp32 = q4 = true; }
+    if (!bf16 && !fp32 && !q4 && !q6) { bf16 = fp32 = q4 = q6 = true; }
 
     if (decode && bf16) run_dense(1, QType::BF16_CTRL, "decode");
     if (decode && fp32) run_dense(1, QType::FP32_CTRL, "decode");
     if (prefill && bf16) run_dense(7, QType::BF16_CTRL, "prefill");
     if (prefill && fp32) run_dense(7, QType::FP32_CTRL, "prefill");
     if (decode && q4) run_q4_decode();
+    if (decode && q6) run_q6_decode();
     return 0;
 }

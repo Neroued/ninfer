@@ -115,26 +115,28 @@ void require_dense_metadata(const Weight& w) {
     }
 }
 
-void require_q4_metadata(const Weight& w) {
+void require_tile_lowbit_metadata(const Weight& w, const char* label, std::uint64_t bytes_per_row) {
     if (w.layout != QuantLayout::TileN64K64) {
-        throw std::invalid_argument("linear: Q4G64_F16S weight must be TileN64K64");
+        throw std::invalid_argument(std::string("linear: ") + label + " weight must be TileN64K64");
     }
-    require_weight_2d(w, "Q4G64_F16S");
+    require_weight_2d(w, label);
     if (w.group != 64 || w.group_size != 64) {
-        throw std::invalid_argument("linear: Q4G64_F16S weight group must be 64");
+        throw std::invalid_argument(std::string("linear: ") + label + " weight group must be 64");
     }
     if (w.q5090_scale_dtype != ScaleDType::FP16) {
-        throw std::invalid_argument("linear: Q4G64_F16S weight scale dtype must be FP16");
+        throw std::invalid_argument(std::string("linear: ") + label +
+                                    " weight scale dtype must be FP16");
     }
-    if (w.padded_shape[0] != align_up_checked(w.shape[0], 64, "Q4G64_F16S") ||
-        w.padded_shape[1] != align_up_checked(w.shape[1], 64, "Q4G64_F16S")) {
-        throw std::invalid_argument("linear: Q4G64_F16S padded shape is invalid");
+    if (w.padded_shape[0] != align_up_checked(w.shape[0], 64, label) ||
+        w.padded_shape[1] != align_up_checked(w.shape[1], 64, label)) {
+        throw std::invalid_argument(std::string("linear: ") + label + " padded shape is invalid");
     }
     const std::uint64_t nt       = static_cast<std::uint64_t>(w.padded_shape[0] / 64);
     const std::uint64_t kg       = static_cast<std::uint64_t>(w.padded_shape[1] / 64);
-    const std::uint64_t expected = checked_mul_u64(checked_mul_u64(nt, kg), 2176u);
+    const std::uint64_t tilew    = checked_mul_u64(64u, bytes_per_row) + 64u * 2u;
+    const std::uint64_t expected = checked_mul_u64(checked_mul_u64(nt, kg), tilew);
     if (w.payload_bytes < expected) {
-        throw std::invalid_argument("linear: Q4G64_F16S payload is too small");
+        throw std::invalid_argument(std::string("linear: ") + label + " payload is too small");
     }
 }
 
@@ -199,7 +201,7 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
         }
     } break;
     case QType::Q4G64_F16S:
-        require_q4_metadata(w);
+        require_tile_lowbit_metadata(w, "Q4G64_F16S", 32u);
         require_matrix_shapes(x, w, out);
         require_tensor_strides(x, out);
         if (w.payload == nullptr && w.qdata == nullptr) {
@@ -211,6 +213,36 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
             detail::linear_q4_gemv_launch(x, w, out, stream);
         } else {
             detail::linear_q4_gemm_launch(x, w, out, stream);
+        }
+        break;
+    case QType::Q5G64_F16S:
+        require_tile_lowbit_metadata(w, "Q5G64_F16S", 40u);
+        require_matrix_shapes(x, w, out);
+        require_tensor_strides(x, out);
+        if (w.payload == nullptr && w.qdata == nullptr) {
+            throw std::invalid_argument("linear: Q5G64_F16S payload must be non-null");
+        }
+        if (is_empty_T(x, out)) { return; }
+        require_tensor_data(x, out);
+        if (x.ne[1] == 1) {
+            detail::linear_q5_gemv_launch(x, w, out, stream);
+        } else {
+            detail::linear_q5_gemm_launch(x, w, out, stream);
+        }
+        break;
+    case QType::Q6G64_F16S:
+        require_tile_lowbit_metadata(w, "Q6G64_F16S", 48u);
+        require_matrix_shapes(x, w, out);
+        require_tensor_strides(x, out);
+        if (w.payload == nullptr && w.qdata == nullptr) {
+            throw std::invalid_argument("linear: Q6G64_F16S payload must be non-null");
+        }
+        if (is_empty_T(x, out)) { return; }
+        require_tensor_data(x, out);
+        if (x.ne[1] == 1) {
+            detail::linear_q6_gemv_launch(x, w, out, stream);
+        } else {
+            detail::linear_q6_gemm_launch(x, w, out, stream);
         }
         break;
     default:

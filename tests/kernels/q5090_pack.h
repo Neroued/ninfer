@@ -125,6 +125,10 @@ inline QuantSpec quant_spec(QType qtype) {
     switch (qtype) {
     case QType::Q4G64_F16S:
         return {4, 64, 7, -8};
+    case QType::Q5G64_F16S:
+        return {5, 64, 15, -16};
+    case QType::Q6G64_F16S:
+        return {6, 64, 31, -32};
     default:
         throw std::invalid_argument("q5090 test packer: unsupported qtype");
     }
@@ -287,6 +291,16 @@ inline PackedWeight pack_tile_lowbit(const std::vector<float>& source, std::int3
 inline PackedWeight pack_q4_tile_n64_k64(const std::vector<float>& source, std::int32_t n,
                                          std::int32_t k) {
     return pack_tile_lowbit(source, n, k, QType::Q4G64_F16S);
+}
+
+inline PackedWeight pack_q5_tile_n64_k64(const std::vector<float>& source, std::int32_t n,
+                                         std::int32_t k) {
+    return pack_tile_lowbit(source, n, k, QType::Q5G64_F16S);
+}
+
+inline PackedWeight pack_q6_tile_n64_k64(const std::vector<float>& source, std::int32_t n,
+                                         std::int32_t k) {
+    return pack_tile_lowbit(source, n, k, QType::Q6G64_F16S);
 }
 
 } // namespace qus::test::q5090

@@ -28,6 +28,10 @@ const char* qtype_name(QType qtype) {
         return "fp32";
     case QType::Q4G64_F16S:
         return "q4";
+    case QType::Q5G64_F16S:
+        return "q5";
+    case QType::Q6G64_F16S:
+        return "q6";
     default:
         return "unsupported";
     }
@@ -133,27 +137,28 @@ int one_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype,
                   Tolerance::linear_bf16());
 }
 
-int one_q4_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
-    constexpr std::int32_t kMaxT = 64;
+int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
+                    const std::vector<std::int32_t>& ts, std::uint32_t seed) {
+    const std::int32_t max_t = *std::max_element(ts.begin(), ts.end());
     std::vector<float> source_weight(static_cast<std::size_t>(n) * k);
     fill_uniform(source_weight, seed + 2000u, -0.125f, 0.125f);
     round_to_bf16(source_weight);
-    q5090::PackedWeight packed = q5090::pack_q4_tile_n64_k64(source_weight, n, k);
+    q5090::PackedWeight packed = q5090::pack_tile_lowbit(source_weight, n, k, qtype);
     std::vector<float>().swap(source_weight);
 
-    std::vector<float> x(static_cast<std::size_t>(k) * kMaxT);
+    std::vector<float> x(static_cast<std::size_t>(k) * max_t);
     fill_uniform(x, seed, -3.0f, 3.0f);
     round_to_bf16(x);
 
     std::vector<double> ref_max_t;
-    cpu_linear_dequant(x, packed.dequant, n, k, kMaxT, ref_max_t);
+    cpu_linear_dequant(x, packed.dequant, n, k, max_t, ref_max_t);
 
     DBuf dx = to_device_bf16(x);
     DBuf dweight(packed.payload.size());
     cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
 
     int failures = 0;
-    for (std::int32_t t : {1, 2, 7, 64}) {
+    for (std::int32_t t : ts) {
         DBuf dout(static_cast<std::size_t>(n) * t * 2u);
         Tensor tx(dx.p, DType::BF16, {k, t});
         Tensor tout(dout.p, DType::BF16, {n, t});
@@ -161,21 +166,25 @@ int one_q4_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
             kernels::linear(tx, packed.device_weight(dweight.p), tout, nullptr);
             cudaDeviceSynchronize();
         } catch (const std::exception& e) {
-            std::cerr << "linear q4 [" << n << "," << k << "] T=" << t << " seed=" << seed
-                      << ": unexpected exception: " << e.what() << '\n';
+            std::cerr << "linear " << qtype_name(qtype) << " [" << n << "," << k << "] T=" << t
+                      << " seed=" << seed << ": unexpected exception: " << e.what() << '\n';
             ++failures;
             continue;
         }
 
         const std::vector<double> ref(ref_max_t.begin(),
                                       ref_max_t.begin() + static_cast<std::size_t>(n) * t);
-        const std::string label = "linear " + std::string(qtype_name(QType::Q4G64_F16S)) + " [" +
+        const std::string label = "linear " + std::string(qtype_name(qtype)) + " [" +
                                   std::to_string(n) + "," + std::to_string(k) +
                                   "] T=" + std::to_string(t) + " seed=" + std::to_string(seed);
         failures += verify(label.c_str(), from_device_bf16(dout, static_cast<std::size_t>(n) * t),
                            ref, Tolerance::linear_bf16());
     }
     return failures;
+}
+
+int one_q4_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    return one_quant_shape(QType::Q4G64_F16S, n, k, {1, 2, 7, 64}, seed);
 }
 
 int unsupported_qtype_validation() {
@@ -255,14 +264,14 @@ int dense_metadata_validation() {
     return f;
 }
 
-int q4_metadata_validation() {
+int lowbit_metadata_validation(QType qtype) {
     int f                    = 0;
     constexpr std::int32_t n = 64;
     constexpr std::int32_t k = 64;
     std::vector<float> source(static_cast<std::size_t>(n) * k);
     fill_uniform(source, 123u, -0.125f, 0.125f);
     round_to_bf16(source);
-    q5090::PackedWeight packed = q5090::pack_q4_tile_n64_k64(source, n, k);
+    q5090::PackedWeight packed = q5090::pack_tile_lowbit(source, n, k, qtype);
 
     std::vector<float> x(k, 1.0f);
     round_to_bf16(x);
@@ -275,7 +284,7 @@ int q4_metadata_validation() {
         Weight bad        = packed.device_weight(dx.p);
         bad.payload_bytes = 0;
         kernels::linear(tx, bad, tout, nullptr);
-        std::cerr << "linear Q4 payload size: expected invalid_argument\n";
+        std::cerr << "linear " << qtype_name(qtype) << " payload size: expected invalid_argument\n";
         ++f;
     } catch (const std::invalid_argument&) {}
 
@@ -286,7 +295,8 @@ int q4_metadata_validation() {
         empty_out.ne[1]  = 0;
         Weight bad       = packed.device_weight(nullptr);
         kernels::linear(empty_tx, bad, empty_out, nullptr);
-        std::cerr << "linear Q4 empty T null payload: expected invalid_argument\n";
+        std::cerr << "linear " << qtype_name(qtype)
+                  << " empty T null payload: expected invalid_argument\n";
         ++f;
     } catch (const std::invalid_argument&) {}
 
@@ -299,7 +309,8 @@ int q4_metadata_validation() {
         empty_out.ne[1]  = 0;
         kernels::linear(empty_tx, packed.device_weight(dx.p), empty_out, nullptr);
     } catch (const std::exception& e) {
-        std::cerr << "linear Q4 empty T: expected no throw, got " << e.what() << '\n';
+        std::cerr << "linear " << qtype_name(qtype) << " empty T: expected no throw, got "
+                  << e.what() << '\n';
         ++f;
     }
 
@@ -317,7 +328,9 @@ int main() {
     int f = 0;
     f += unsupported_qtype_validation();
     f += dense_metadata_validation();
-    f += q4_metadata_validation();
+    f += lowbit_metadata_validation(QType::Q4G64_F16S);
+    f += lowbit_metadata_validation(QType::Q5G64_F16S);
+    f += lowbit_metadata_validation(QType::Q6G64_F16S);
 
     for (std::uint32_t seed : {1u, 7u, 99u}) {
         for (QType qtype : {QType::BF16_CTRL, QType::FP32_CTRL}) {
@@ -335,6 +348,12 @@ int main() {
                         std::pair<std::int32_t, std::int32_t>{17408, 5120}}) {
         f += one_q4_shape(n, k, 23u);
     }
+    for (auto [n, k] : {std::pair<std::int32_t, std::int32_t>{6144, 5120},
+                        std::pair<std::int32_t, std::int32_t>{5120, 6144},
+                        std::pair<std::int32_t, std::int32_t>{5120, 17408}}) {
+        f += one_quant_shape(QType::Q5G64_F16S, n, k, {1, 7}, 29u);
+    }
+    f += one_quant_shape(QType::Q6G64_F16S, 4096, 5120, {1, 7}, 31u);
 
     std::cout << (f ? "FAIL" : "OK") << " linear correctness\n";
     return f ? 1 : 0;

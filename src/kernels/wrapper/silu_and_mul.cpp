@@ -22,6 +22,9 @@ void silu_and_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_
         throw std::invalid_argument("silu_and_mul: gate/up/out must be contiguous");
     }
     if (out.numel() == 0) { return; }
+    if (gate.data == nullptr || up.data == nullptr || out.data == nullptr) {
+        throw std::invalid_argument("silu_and_mul: gate/up/out data must be non-null");
+    }
 
     detail::silu_and_mul_launch(gate, up, out, stream);  // single variant -> direct dispatch
 }

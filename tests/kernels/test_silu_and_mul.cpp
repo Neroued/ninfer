@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
 #include <vector>
 
 using namespace qus;
@@ -41,6 +42,54 @@ static int one_shape(const char* tag, int n, std::uint32_t seed, float lo, float
     return verify(tag, from_device_bf16(dout, n), ref, Tolerance::bf16_elementwise());
 }
 
+static DBuf to_device_bf16_unaligned(const std::vector<float>& h) {
+    std::vector<std::uint16_t> b(h.size() + 1);
+    b[0] = 0;
+    for (std::size_t i = 0; i < h.size(); ++i) b[i + 1] = f32_to_bf16(h[i]);
+    DBuf d(b.size() * 2);
+    cudaMemcpy(d.p, b.data(), b.size() * 2, cudaMemcpyHostToDevice);
+    return d;
+}
+
+static int unaligned_data_case() {
+    constexpr int n = 255;
+    std::vector<float> g(n), u(n);
+    fill_uniform(g, 2026u, -8.f, 8.f);
+    fill_uniform(u, 3026u, -8.f, 8.f);
+    round_to_bf16(g);
+    round_to_bf16(u);
+
+    std::vector<double> ref(n);
+    cpu_silu_and_mul(g, u, ref);
+
+    DBuf dg = to_device_bf16_unaligned(g), du = to_device_bf16_unaligned(u),
+         dout(static_cast<std::size_t>(n + 1) * 2);
+    auto* gptr = static_cast<unsigned char*>(dg.p) + 2;
+    auto* uptr = static_cast<unsigned char*>(du.p) + 2;
+    auto* optr = static_cast<unsigned char*>(dout.p) + 2;
+    Tensor tg(gptr, DType::BF16, {n}), tu(uptr, DType::BF16, {n}), tout(optr, DType::BF16, {n});
+    kernels::silu_and_mul(tg, tu, tout, nullptr);
+    cudaDeviceSynchronize();
+
+    DBuf packed(static_cast<std::size_t>(n) * 2);
+    cudaMemcpy(packed.p, optr, static_cast<std::size_t>(n) * 2, cudaMemcpyDeviceToDevice);
+    return verify("silu unaligned data", from_device_bf16(packed, n), ref,
+                  Tolerance::bf16_elementwise());
+}
+
+static int null_validation_case() {
+    try {
+        Tensor gate(nullptr, DType::BF16, {1});
+        Tensor up(nullptr, DType::BF16, {1});
+        Tensor out(nullptr, DType::BF16, {1});
+        kernels::silu_and_mul(gate, up, out, nullptr);
+    } catch (const std::invalid_argument&) {
+        return 0;
+    }
+    std::cerr << "silu null validation: expected invalid_argument\n";
+    return 1;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -57,6 +106,8 @@ int main() {
     }
     // Stress: large magnitudes break range-limited approximations of silu.
     f += one_shape("silu stress [-30,30]", 65536, 4242u, -30.f, 30.f);
+    f += unaligned_data_case();
+    f += null_validation_case();
 
     std::cout << (f ? "FAIL" : "OK") << " silu_and_mul correctness\n";
     return f ? 1 : 0;

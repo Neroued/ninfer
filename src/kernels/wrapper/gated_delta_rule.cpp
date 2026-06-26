@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace qus::kernels {
 namespace {
@@ -90,6 +91,61 @@ std::size_t transient_scratch_bytes(const Tensor& q, const Tensor& k, const Tens
     return checked_add(bytes, 4 * 256);
 }
 
+std::size_t align_up(std::size_t offset, std::size_t align) {
+    return (offset + align - 1) & ~(align - 1);
+}
+
+Tensor scratch_tensor(unsigned char* base, std::size_t& offset, DType dtype,
+                      std::initializer_list<std::int32_t> shape) {
+    offset = align_up(offset, 256);
+    Tensor t(base + offset, dtype, shape);
+    offset = checked_add(offset, t.bytes());
+    return t;
+}
+
+struct ScratchBuffer {
+    void* ptr            = nullptr;
+    std::size_t capacity = 0;
+
+    ScratchBuffer() = default;
+
+    ~ScratchBuffer() {
+        if (ptr != nullptr) { cudaFree(ptr); }
+    }
+
+    ScratchBuffer(const ScratchBuffer&)            = delete;
+    ScratchBuffer& operator=(const ScratchBuffer&) = delete;
+
+    ScratchBuffer(ScratchBuffer&& other) noexcept : ptr(other.ptr), capacity(other.capacity) {
+        other.ptr      = nullptr;
+        other.capacity = 0;
+    }
+
+    ScratchBuffer& operator=(ScratchBuffer&& other) noexcept {
+        if (this != &other) {
+            if (ptr != nullptr) { cudaFree(ptr); }
+            ptr            = other.ptr;
+            capacity       = other.capacity;
+            other.ptr      = nullptr;
+            other.capacity = 0;
+        }
+        return *this;
+    }
+
+    void* get(std::size_t bytes) {
+        if (capacity >= bytes) { return ptr; }
+        if (ptr != nullptr) { CUDA_CHECK(cudaFree(ptr)); }
+        CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        capacity = bytes;
+        return ptr;
+    }
+};
+
+ScratchBuffer& recurrent_scratch_for(cudaStream_t stream) {
+    thread_local std::unordered_map<cudaStream_t, ScratchBuffer> scratch_by_stream;
+    return scratch_by_stream[stream];
+}
+
 } // namespace
 
 void gated_delta_rule_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -97,20 +153,19 @@ void gated_delta_rule_recurrent(const Tensor& q, const Tensor& k, const Tensor& 
                                 cudaStream_t stream) {
     validate_recurrent(q, k, v, g, beta, scale, ssm_state, out);
 
-    DeviceArena scratch(transient_scratch_bytes(q, k, v, out));
-    Tensor q_f32   = scratch.alloc(DType::FP32, {q.ne[0], q.ne[1], q.ne[2]});
-    Tensor k_f32   = scratch.alloc(DType::FP32, {k.ne[0], k.ne[1], k.ne[2]});
-    Tensor v_f32   = scratch.alloc(DType::FP32, {v.ne[0], v.ne[1], v.ne[2]});
-    Tensor out_f32 = scratch.alloc(DType::FP32, {out.ne[0], out.ne[1], out.ne[2]});
+    auto* scratch_base = static_cast<unsigned char*>(
+        recurrent_scratch_for(stream).get(transient_scratch_bytes(q, k, v, out)));
+    std::size_t off = 0;
+    Tensor q_f32    = scratch_tensor(scratch_base, off, DType::FP32, {q.ne[0], q.ne[1], q.ne[2]});
+    Tensor k_f32    = scratch_tensor(scratch_base, off, DType::FP32, {k.ne[0], k.ne[1], k.ne[2]});
+    Tensor v_f32    = scratch_tensor(scratch_base, off, DType::FP32, {v.ne[0], v.ne[1], v.ne[2]});
+    Tensor out_f32 =
+        scratch_tensor(scratch_base, off, DType::FP32, {out.ne[0], out.ne[1], out.ne[2]});
 
-    detail::gdn_cast_bf16_to_f32_launch(q, q_f32, stream);
-    detail::gdn_cast_bf16_to_f32_launch(k, k_f32, stream);
-    detail::gdn_cast_bf16_to_f32_launch(v, v_f32, stream);
+    detail::gdn_cast_qkv_bf16_to_f32_launch(q, k, v, q_f32, k_f32, v_f32, stream);
     detail::gated_delta_rule_recurrent_launch(q_f32, k_f32, v_f32, g, beta, scale, ssm_state,
                                               out_f32, stream);
     detail::gdn_cast_f32_to_bf16_launch(out_f32, out, stream);
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 void gated_delta_rule_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

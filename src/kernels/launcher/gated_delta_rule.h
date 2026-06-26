@@ -7,6 +7,9 @@
 namespace qus::kernels::detail {
 
 void gdn_cast_bf16_to_f32_launch(const Tensor& in, Tensor& out, cudaStream_t stream);
+void gdn_cast_qkv_bf16_to_f32_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                     Tensor& q_out, Tensor& k_out, Tensor& v_out,
+                                     cudaStream_t stream);
 void gdn_cast_f32_to_bf16_launch(const Tensor& in, Tensor& out, cudaStream_t stream);
 
 void gated_delta_rule_recurrent_launch(const Tensor& q, const Tensor& k, const Tensor& v,

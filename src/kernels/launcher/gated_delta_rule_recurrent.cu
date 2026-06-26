@@ -26,6 +26,20 @@ void gdn_cast_bf16_to_f32_launch(const Tensor& in, Tensor& out, cudaStream_t str
     CUDA_CHECK(cudaGetLastError());
 }
 
+void gdn_cast_qkv_bf16_to_f32_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                     Tensor& q_out, Tensor& k_out, Tensor& v_out,
+                                     cudaStream_t stream) {
+    const std::int64_t q_n   = q.numel();
+    const std::int64_t k_n   = k.numel();
+    const std::int64_t v_n   = v.numel();
+    const std::int64_t total = q_n + k_n + v_n;
+    gdn_cast_qkv_bf16_to_f32_kernel<<<linear_grid(total), kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data), static_cast<float*>(q_out.data),
+        static_cast<float*>(k_out.data), static_cast<float*>(v_out.data), q_n, k_n, v_n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void gdn_cast_f32_to_bf16_launch(const Tensor& in, Tensor& out, cudaStream_t stream) {
     const std::int64_t n = in.numel();
     gdn_cast_f32_to_bf16_kernel<<<linear_grid(n), kBlock, 0, stream>>>(

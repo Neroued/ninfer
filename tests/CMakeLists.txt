@@ -27,3 +27,4 @@ qus_add_test(qus_weight_store_real_file_test SOURCES test_weight_store_real.cpp 
 qus_add_test(qus_silu_and_mul_test SOURCES kernels/test_silu_and_mul.cpp)
 qus_add_test(qus_residual_add_test SOURCES kernels/test_residual_add.cpp)
 qus_add_test(qus_sigmoid_gate_mul_test SOURCES kernels/test_sigmoid_gate_mul.cpp)
+qus_add_test(qus_rmsnorm_test SOURCES kernels/test_rmsnorm.cpp)

@@ -41,7 +41,7 @@ struct EngineOptions {
     std::uint32_t max_ctx    = 2048;
     std::size_t weight_bytes = 0;
     std::size_t cache_bytes  = 0;
-    std::size_t work_bytes   = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    std::size_t work_bytes   = 4ULL * 1024ULL * 1024ULL * 1024ULL;
     Q5090Progress* progress  = nullptr;
     int eos_token_id         = -1;
 };

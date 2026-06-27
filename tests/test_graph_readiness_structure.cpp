@@ -46,9 +46,9 @@ int main() {
         expect_present(model, "detail::set_pos(io_.pos, T, s)", "prefill must set device pos");
     failures +=
         expect_present(model, "detail::advance_pos(io_.pos, s)", "decode must advance device pos");
-    failures += expect_absent(model, "gdn_conv1d_storage_",
+    failures += expect_absent(model, "gdn_" "conv1d_storage_",
                               "canonical conv1d must not have private model storage");
-    failures += expect_absent(model, "cudaMalloc(&storage",
+    failures += expect_absent(model, "cudaMalloc(&" "storage",
                               "canonical conv1d bind must not allocate device storage");
     failures += expect_absent(model, "unexpected q5090 conv1d shape",
                               "canonical conv1d errors must name the required shape");

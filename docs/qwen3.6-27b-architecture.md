@@ -119,7 +119,7 @@ tower, excluded here).
 | `linear_attn.in_proj_a.weight` | `[48, 5120]` | α pre-activation (per V-head) |
 | `linear_attn.A_log` | `[48]` | log-decay base; stored raw, runtime computes `-exp(A_log)` |
 | `linear_attn.dt_bias` | `[48]` | softplus bias (per V-head) |
-| `linear_attn.conv1d.weight` | `[10240, 1, 4]` | depthwise causal conv over `[q;k;v]` |
+| `linear_attn.conv1d.weight` | HF raw `[10240, 1, 4]`; q5090 canonical `[10240, 4, 1]` | depthwise causal conv over `[q;k;v]` |
 | `linear_attn.norm.weight` | `[128]` | gated RMSNorm, **plain w (NO +1)** |
 | `linear_attn.out_proj.weight` | `[5120, 6144]` | V-space → hidden |
 | `post_attention_layernorm.weight` | `[5120]` | pre-MLP RMSNorm **(1+w)** |
@@ -438,8 +438,11 @@ Sub-kernels for L6 (chunked GDN) if not writing one monolithic kernel: `cumsum` 
 ## 11. Fusion opportunities & runtime transform ownership
 
 ### 11.1 Canonical q5090 storage
-- q5090 stores model-semantic tensors raw. RMSNorm weights are not stored with `+1` folded in,
-  `A_log` is not exponentiated, and `conv1d.weight` keeps its `[10240,1,4]` shape.
+- q5090 stores model-semantic tensors without mathematical folding. RMSNorm weights are not stored with
+  `+1` folded in, and `A_log` is not exponentiated.
+- M2.8/M3 canonical TEXT_CORE q5090 stores `conv1d.weight` in the runtime-native logical shape
+  `[10240,4,1]`. The HF raw source shape `[10240,1,4]` is a legacy compatibility input shape, not the
+  official M3 baseline layout.
 - Runtime kernels apply the semantic transforms: RMSNorm `1 + w` where required,
   `A = -exp(A_log)` for GDN gating, and the `1/sqrt(dk)=1/sqrt(128)` scale in the GDN path.
 - Projection fusion is a runtime/kernel scheduling choice. The stored file keeps independently
@@ -491,7 +494,7 @@ full-attn layers' KV grows. See [`design.md`](design.md) §5/§8 for the memory 
 | `linear_attn.in_proj_a.weight` | `ssm_alpha.weight` | V-head interpretation in runtime |
 | `linear_attn.A_log` | `ssm_a` | compute `-exp(A_log)` in runtime |
 | `linear_attn.dt_bias` | `ssm_dt.bias` | softplus bias in runtime |
-| `linear_attn.conv1d.weight` | `ssm_conv1d.weight` | preserve `[10240,1,4]`, kernel views as needed |
+| `linear_attn.conv1d.weight` | `ssm_conv1d.weight` | HF raw `[10240,1,4]`; q5090 canonical `[10240,4,1]` for direct runtime view |
 | `linear_attn.norm.weight` | `ssm_norm.weight` | plain weight, no `1+w` |
 | `linear_attn.out_proj.weight` | `ssm_out.weight` | V-space projection in runtime |
 | `mlp.{gate,up,down}_proj.weight` | `ffn_{gate,up,down}.weight` | — |

@@ -19,9 +19,14 @@ The policy document decides *which qtype/layout each tensor gets*. This document
 - Offsets are **absolute** file offsets unless stated otherwise.
 - File starts with a 4096-byte header. Module index, tensor index and string table follow.
   The payload region starts at a 4096-byte boundary; each tensor payload is **256-byte aligned**.
-- **No baked runtime transforms.** Weights are stored faithfully: `A_log`/`dt_bias` upcast
-  to FP32 (they are bf16 on disk), RMSNorm weights stored raw (no `+1`), `conv1d` kept at its
-  raw `[10240,1,4]` shape. Any fold (e.g. `+1` into norms, `A = -exp(A_log)`) is the runtime's job.
+- **No baked runtime math transforms.** Weights are stored without mathematical folding:
+  `A_log`/`dt_bias` upcast to FP32 (they are bf16 on disk), RMSNorm weights stored raw (no `+1`), and
+  folds such as `A = -exp(A_log)` remain the runtime's job.
+- **Canonical TEXT_CORE conv1d layout.** For M2.8/M3 canonical artifacts,
+  `linear_attn.conv1d.weight` is a contiguous BF16 tensor with logical shape `[10240,4,1]`
+  (`[conv_dim,gdn_conv_k,1]`). This is a TEXT_CORE tensor logical-shape policy, not a binary container
+  ABI redesign. Pre-M2.8 artifacts that keep raw `[10240,1,4]` are legacy compatibility artifacts and
+  are not the official M3 baseline.
 
 ## 1. File structure
 
@@ -243,7 +248,9 @@ for token_id in 0 .. vocab-1:
 ### 7.5 `CONTIGUOUS` (BF16_CTRL / FP32_CTRL)
 
 Raw row-major elements in the stated dtype (bf16 = 2 B, fp32 = 4 B). `group_size=0`,
-`scale_dtype=none`. Shape preserved (e.g. `conv1d` stays `[10240,1,4]`).
+`scale_dtype=none`. Shape is the canonical tensor-plan shape. For M2.8/M3 TEXT_CORE artifacts,
+`linear_attn.conv1d.weight` uses `[10240,4,1]`; older `[10240,1,4]` payloads are legacy compatibility
+inputs only.
 
 ## 8. Padding rules
 

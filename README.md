@@ -9,14 +9,15 @@ format offline; the runtime just loads one fixed file and runs.
 
 ## Current status
 
-M2 correctness baseline is implemented. M2.5 hardening/documentation sync is in progress, with
+M2 correctness baseline is implemented. M2.5 hardening/documentation sync is mostly landed, with
 graph-readiness fixes, EOS handling, FileTap parity dumps, and hardening cleanup structure already
-landed. M3 per-kernel performance optimization is the next main milestone.
+present. M2.8 benchmark/I/O/memory observability is now the active pre-M3 gate; M3 per-kernel
+performance optimization follows after M2.8 readiness.
 
 Current code includes L0 infrastructure, the q5090 `WeightStore`/loader and unified `Weight` handle,
 the 13 public L1 operator APIs and implementations, the L2 `Qwen3_6_27B` model card, the `Engine`,
 and parity tooling for block parity and greedy token matching. No performance numbers are claimed
-here; performance gating remains an M3+ activity.
+here; performance claims require the M2.8 e2e benchmark/report standard.
 
 ## Goal
 
@@ -79,6 +80,10 @@ NVIDIA RTX 5090 (Blackwell, sm_120, 32 GB) · CUDA 13.1 · gcc 13.3 · CMake 3.2
 
 - [`docs/design.md`](docs/design.md) — master design & goal document (scope, boundaries,
   architecture, data flow, memory, numerics, roadmap).
+- [`docs/m2.8-pre-m3-standard.md`](docs/m2.8-pre-m3-standard.md) — authoritative pre-M3
+  benchmark/I/O/memory/readiness standard and active gate before M3 optimization.
+- [`docs/m2.8-pre-m3-standard.zh.md`](docs/m2.8-pre-m3-standard.zh.md) — Chinese review aid for
+  the M2.8 standard; the English standard is authoritative.
 - [`docs/qwen3.6-27b-architecture.md`](docs/qwen3.6-27b-architecture.md) — exact model
   architecture reference: per-layer parameters, computation flow, Gated-DeltaNet math,
   operator inventory, and runtime tensor-transform ownership.

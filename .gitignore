@@ -35,3 +35,4 @@ out/
 *.swp
 .DS_Store
 profiles/
+.chatgpt/

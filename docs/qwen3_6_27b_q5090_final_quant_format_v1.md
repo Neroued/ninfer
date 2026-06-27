@@ -241,7 +241,7 @@ model.language_model.layers.{L}.
 | `input_layernorm.weight` | `[5120]` | `BF16_CTRL` | contiguous | RMSNorm；不量化 |
 | `linear_attn.A_log` | `[48]` | `FP32_CTRL` | contiguous | GDN decay/transition 标量；保持 FP32 |
 | `linear_attn.dt_bias` | `[48]` | `FP32_CTRL` | contiguous | 时间/门控 bias；保持 FP32 |
-| `linear_attn.conv1d.weight` | `[10240,1,4]` | `BF16_CTRL` | contiguous | conv 小权重；保持 BF16 |
+| `linear_attn.conv1d.weight` | `[10240,4,1]` | `BF16_CTRL` | contiguous | conv 小权重；保持 BF16；M2.8/M3 canonical runtime-native layout |
 | `linear_attn.in_proj_a.weight` | `[48,5120]` | `BF16_CTRL` | contiguous | 小 gate/control projection；保持 BF16 |
 | `linear_attn.in_proj_b.weight` | `[48,5120]` | `BF16_CTRL` | contiguous | 小 gate/control projection；保持 BF16 |
 | `linear_attn.in_proj_qkv.weight::q` | rows `[0:2048]` of `[10240,5120]` | `Q4G64_F16S` | `TILE_N64_K64` | GDN query projection |
@@ -250,6 +250,18 @@ model.language_model.layers.{L}.
 | `linear_attn.in_proj_z.weight` | `[6144,5120]` | `Q5G64_F16S` | `TILE_N64_K64` | GDN output/value gate，敏感 |
 | `linear_attn.norm.weight` | `[128]` | `BF16_CTRL` | contiguous | GDN 内部 norm；不量化 |
 | `linear_attn.out_proj.weight` | `[5120,6144]` | `Q5G64_F16S` | `TILE_N64_K64` | GDN 输出回 hidden，敏感 |
+
+M2.8/M3 canonical TEXT_CORE policy requires `linear_attn.conv1d.weight` to be emitted in the
+runtime-native logical shape `[10240,4,1]`. This is a tensor-plan logical-shape policy change, not a q5090
+binary container ABI redesign. Legacy `[10240,1,4]` artifacts may be read only by an explicitly labelled
+compatibility path and are not the official M3 baseline.
+
+This policy requires synchronized updates in:
+
+- `tools/q5090_convert/tensor_plan.py`;
+- `tests/fixtures/make_q5090_fixture.py`;
+- `src/model/qwen3_6_27b.cpp::bind_conv1d_view`;
+- q5090 parser, fixture, and model-bind tests that assert conv1d shape or hidden allocation behavior.
 | `post_attention_layernorm.weight` | `[5120]` | `BF16_CTRL` | contiguous | RMSNorm；不量化 |
 | `mlp.gate_proj.weight` | `[17408,5120]` | `Q4G64_F16S` | `TILE_N64_K64` | FFN gate |
 | `mlp.up_proj.weight` | `[17408,5120]` | `Q4G64_F16S` | `TILE_N64_K64` | FFN up |
@@ -878,7 +890,7 @@ conv_state 约数 MiB 量级
 [ ] read model.language_model.layers.{L}.input_layernorm.weight -> BF16_CTRL
 [ ] read model.language_model.layers.{L}.linear_attn.A_log -> FP32_CTRL
 [ ] read model.language_model.layers.{L}.linear_attn.dt_bias -> FP32_CTRL
-[ ] read model.language_model.layers.{L}.linear_attn.conv1d.weight -> BF16_CTRL
+[ ] read model.language_model.layers.{L}.linear_attn.conv1d.weight -> BF16_CTRL contiguous [10240,4,1]
 [ ] read model.language_model.layers.{L}.linear_attn.in_proj_a.weight -> BF16_CTRL
 [ ] read model.language_model.layers.{L}.linear_attn.in_proj_b.weight -> BF16_CTRL
 [ ] split model.language_model.layers.{L}.linear_attn.in_proj_qkv.weight rows[0:2048] -> Q4G64_F16S .q

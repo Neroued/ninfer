@@ -1,12 +1,13 @@
 # qwen3.6-ultraspeed — Master Design & Goal Document
 
-> Status: **M2 correctness baseline implemented; M2.5 hardening/documentation sync in progress;
-> M3 performance optimization next**.
+> Status: **M2 correctness baseline implemented; M2.5 hardening/documentation sync mostly landed;
+> M2.8 benchmark/I/O/memory observability is the active pre-M3 gate; M3 performance optimization follows
+> after M2.8 readiness**.
 > Date: original design 2026-06-25; status synchronized 2026-06-27.
 > This document remains the architectural source of truth for *what we are building and why*.
-> The implementation has caught up through M2 and much of M2.5; some roadmap items below are now
-> complete history. Kernel-level micro-decisions remain flexible; architecture, scope, and
-> boundaries are fixed here.
+> The implementation has caught up through M2 and much of M2.5; M2.8 now defines the measurement and
+> readiness gate required before M3 headline kernel work. Kernel-level micro-decisions remain flexible;
+> architecture, scope, and boundaries are fixed here.
 
 ---
 
@@ -408,8 +409,12 @@ qwen3.6-ultraspeed/
 - **M2.5 — Hardening/documentation sync:** mostly landed / in progress; graph-readiness fixes, EOS
   handling, parity tap structure, and cleanup structural checks are present. Keep unknown or
   environment-heavy gates as verify-current items.
-- **M3 — Per-kernel optimization:** next; each kernel to roofline (W4A16 GEMV, GQA, GDN, conv,
-  RoPE, SwiGLU, argmax).
+- **M2.8 — Pre-M3 benchmark/I/O/memory observability gate:** active; implement the authoritative
+  standard in `docs/m2.8-pre-m3-standard.md`, including e2e timing/reporting, canonical prompt fixtures,
+  Engine/arena memory stats, hidden-allocation accounting, regression comparison, and an M3 readiness
+  note.
+- **M3 — Per-kernel optimization:** follows M2.8 readiness; each kernel to roofline (W4A16 GEMV, GQA,
+  GDN, conv, RoPE, SwiGLU, argmax).
 - **M4 — Fusion:** fuse adjacent ops; reduce launches/round-trips.
 - **M5 — Launch-overhead elimination:** CUDA Graph decode replay; explore megakernel.
 - **Later:** MTP speculative decode → fp8/fp4 prefill → 256K/fp8-KV → sampler → tokenizer →

@@ -94,5 +94,6 @@ They should not be treated as an automatic job runner. A new chat still needs a 
 
 Older top-level docs may lag implementation. Before using milestone labels, verify them against
 current code and plans through the repo MCP. As of this documentation sync, the repo state is:
-M2 correctness baseline implemented; M2.5 hardening/documentation sync in progress with many
-hardening items landed; M3 performance optimization is the next main phase.
+M2 correctness baseline implemented; M2.5 hardening/documentation sync mostly landed; M2.8
+benchmark/I/O/memory observability is the active pre-M3 gate; M3 performance optimization follows
+after M2.8 readiness.

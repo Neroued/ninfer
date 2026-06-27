@@ -1,0 +1,3 @@
+A prompt has 37 tokens and max_new_tokens is 9. The prefill call returns the first generated token.
+How many post-prefill decode_step calls are requested, and what minimum max_ctx is required?
+Show the formula before the numeric answer.

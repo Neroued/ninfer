@@ -1,0 +1,10 @@
+Review this tiny pseudocode and describe the bug:
+
+state.reset()
+for token in prompt:
+    logits = model.step(token)
+for i in range(max_new_tokens):
+    token = argmax(logits)
+    logits = model.step(token)
+
+Explain whether the loop counts the prefill token as generated output.

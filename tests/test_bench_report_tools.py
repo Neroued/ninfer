@@ -202,5 +202,200 @@ class ReportCommonTests(unittest.TestCase):
             common.validate_report(bad)
 
 
+class CompareReportTests(unittest.TestCase):
+    def test_identical_reports_compare_cleanly(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        result = compare_e2e_reports.compare_reports(report(), report(), required_cases=["cn_short"])
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.warnings, [])
+
+    def test_generated_token_mismatch_is_hard_failure(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        candidate = report()
+        candidate["cases"][0]["repeats"][0]["generated_token_ids"] = [10, 99, 12]
+        result = compare_e2e_reports.compare_reports(report(), candidate)
+        self.assertTrue(any(item["code"] == "generated_token_ids_changed" for item in result.failures))
+
+    def test_fixture_identity_change_is_hard_failure(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        candidate = report()
+        candidate["cases"][0]["prompt_ids_sha256"] = "different"
+        result = compare_e2e_reports.compare_reports(report(), candidate)
+        self.assertTrue(any(item["code"] == "case_identity_changed" for item in result.failures))
+
+    def test_eos_policy_change_is_hard_failure(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        candidate = report()
+        candidate["cases"][0]["eos_token_id"] = 151645
+        result = compare_e2e_reports.compare_reports(report(), candidate)
+        self.assertTrue(any(item["code"] == "case_identity_changed" for item in result.failures))
+
+    def test_missing_q5090_identity_is_hard_failure_by_default(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        baseline = report()
+        candidate = report()
+        for value in (baseline, candidate):
+            del value["weights"]["q5090_path"]
+            del value["weights"]["q5090_file_size_bytes"]
+            del value["weights"]["q5090_sha256"]
+        result = compare_e2e_reports.compare_reports(baseline, candidate)
+        self.assertTrue(any(item["code"] == "q5090_identity_missing" for item in result.failures))
+
+    def test_skip_token_check_preserves_case_identity(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        candidate = report()
+        candidate["cases"][0]["eos_token_id"] = 151645
+        candidate["weights"]["q5090_sha256"] = "different"
+        candidate["cases"][0]["repeats"][0]["generated_token_ids"] = [10, 99, 12]
+        result = compare_e2e_reports.compare_reports(report(), candidate, skip_token_id_check=True)
+        self.assertTrue(any(item["code"] == "case_identity_changed" for item in result.failures))
+        self.assertFalse(any(item["code"] == "q5090_identity_changed" for item in result.failures))
+        self.assertFalse(any(item["code"] == "generated_token_ids_changed" for item in result.failures))
+
+    def test_duplicate_case_names_return_schema_failure(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        candidate = report()
+        candidate["cases"].append(candidate["cases"][0])
+        result = compare_e2e_reports.compare_reports(report(), candidate)
+        self.assertTrue(any(item["code"] == "schema_invalid" for item in result.failures))
+
+    def test_missing_required_cases_are_hard_failures(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        baseline_missing = report()
+        baseline_missing["cases"] = [baseline_missing["cases"][0]]
+        baseline_result = compare_e2e_reports.compare_reports(
+            baseline_missing,
+            report(),
+            required_cases=["long_2k"],
+        )
+        self.assertTrue(any(item["code"] == "missing_baseline_case" for item in baseline_result.failures))
+
+        candidate_missing = report()
+        candidate_missing["cases"] = [candidate_missing["cases"][0]]
+        candidate_result = compare_e2e_reports.compare_reports(
+            report(),
+            candidate_missing,
+            required_cases=["long_2k"],
+        )
+        self.assertTrue(any(item["code"] == "missing_candidate_case" for item in candidate_result.failures))
+
+    def test_performance_warning_can_be_promoted(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        candidate = report(tok_s=90.0)
+        warned = compare_e2e_reports.compare_reports(report(), candidate)
+        self.assertFalse(warned.failures)
+        self.assertTrue(any(item["code"] == "throughput_drop" for item in warned.warnings))
+
+        failed = compare_e2e_reports.compare_reports(
+            report(),
+            candidate,
+            fail_on_performance_regression=True,
+        )
+        self.assertTrue(any(item["code"] == "throughput_drop" for item in failed.failures))
+
+    def test_phase_time_warning(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        candidate = report()
+        candidate["cases"][0]["summary"]["prefill_time_s_median"] = 0.03
+        result = compare_e2e_reports.compare_reports(report(), candidate)
+        self.assertTrue(any(item["code"] == "phase_time_increase" for item in result.warnings))
+
+    def test_memory_warning_requires_percent_and_absolute_threshold(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        baseline = report(workspace_peak=256 * 1024 * 1024)
+        candidate = report(workspace_peak=400 * 1024 * 1024)
+        result = compare_e2e_reports.compare_reports(baseline, candidate)
+        self.assertTrue(any(item["code"] == "memory_peak_increase" for item in result.warnings))
+
+    def test_memory_warning_can_be_promoted(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        baseline = report(workspace_peak=256 * 1024 * 1024)
+        candidate = report(workspace_peak=400 * 1024 * 1024)
+        result = compare_e2e_reports.compare_reports(
+            baseline,
+            candidate,
+            fail_on_memory_regression=True,
+        )
+        self.assertTrue(any(item["code"] == "memory_peak_increase" for item in result.failures))
+
+    def test_top_level_policy_changes_are_warnings(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        candidate = report()
+        candidate["engine"]["workspace_lifetime_policy"] = "block_scoped_mixer_mlp_rewind"
+        candidate["weights"]["load_strategy"] = "streaming_upload"
+        candidate["memory"]["accounting_scope"] = "engine_arenas_only"
+        result = compare_e2e_reports.compare_reports(report(), candidate)
+        codes = {item["code"] for item in result.warnings}
+        self.assertIn("workspace_lifetime_policy_changed", codes)
+        self.assertIn("load_strategy_changed", codes)
+        self.assertIn("memory_accounting_scope_changed", codes)
+
+    def test_cli_writes_json_result(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / "baseline.json"
+            candidate = root / "candidate.json"
+            output = root / "compare.json"
+            baseline.write_text(json.dumps(report()), encoding="utf-8")
+            changed = report(tok_s=90.0)
+            candidate.write_text(json.dumps(changed), encoding="utf-8")
+            rc = compare_e2e_reports.main(
+                [
+                    "--baseline",
+                    str(baseline),
+                    "--candidate",
+                    str(candidate),
+                    "--output-json",
+                    str(output),
+                ]
+            )
+            self.assertEqual(rc, 0)
+            value = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(value["artifact_type"], "qus_e2e_compare_result")
+            self.assertEqual(value["status"], "warning")
+
+    def test_cli_writes_failure_json_result(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            baseline = root / "baseline.json"
+            candidate = root / "candidate.json"
+            output = root / "compare.json"
+            baseline.write_text(json.dumps(report()), encoding="utf-8")
+            bad = report()
+            del bad["weights"]
+            candidate.write_text(json.dumps(bad), encoding="utf-8")
+            rc = compare_e2e_reports.main(
+                [
+                    "--baseline",
+                    str(baseline),
+                    "--candidate",
+                    str(candidate),
+                    "--output-json",
+                    str(output),
+                ]
+            )
+            self.assertEqual(rc, 1)
+            value = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(value["artifact_type"], "qus_e2e_compare_result")
+            self.assertEqual(value["status"], "fail")
+
+
 if __name__ == "__main__":
     unittest.main()

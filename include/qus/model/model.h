@@ -68,6 +68,12 @@ class Qwen3_6_27B {
 public:
     Qwen3_6_27B(DeviceContext& ctx, WeightStore& weights, WorkspaceArena& work, KVCache& kv,
                 GdnState& state, StepState& io);
+    ~Qwen3_6_27B();
+
+    Qwen3_6_27B(const Qwen3_6_27B&)            = delete;
+    Qwen3_6_27B& operator=(const Qwen3_6_27B&) = delete;
+    Qwen3_6_27B(Qwen3_6_27B&&)                 = delete;
+    Qwen3_6_27B& operator=(Qwen3_6_27B&&)      = delete;
 
     [[nodiscard]] const Weight* embed() const noexcept { return embed_; }
 
@@ -135,6 +141,7 @@ private:
     std::array<Weight, ModelConfig::n_gdn()> gdn_in_a_{};
     std::array<Weight, ModelConfig::n_gdn()> gdn_in_b_{};
     std::array<Tensor, ModelConfig::n_gdn()> gdn_conv1d_views_{};
+    std::array<void*, ModelConfig::n_gdn()> gdn_conv1d_storage_{};
 };
 
 } // namespace qus::model

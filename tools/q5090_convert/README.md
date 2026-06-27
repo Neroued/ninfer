@@ -24,6 +24,10 @@ faithfully (no baked runtime transforms); the C++ runtime adapts to this format.
 | `verify.py` | reparse + per-tensor round-trip dequant error metrics |
 | `tests/` | CPU round-trip tests for packing/quant/layouts/container |
 
+GDN `linear_attn.conv1d.weight` is transformed from HF raw `[10240,1,4]` into q5090 canonical
+`[10240,4,1]` with runtime-native tap-major payload order. This is an offline converter transform; the
+runtime model bind path does not allocate temporary conv1d storage.
+
 ## Usage
 
 Run from the repo root with a CUDA-enabled env:

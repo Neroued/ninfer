@@ -12,10 +12,10 @@ The policy document decides *which qtype/layout each tensor gets*. This document
 > This is the canonical packed-weight ABI for the C++ runtime. The runtime consumes this format
 > directly; there is no alternate in-tree weight-file path.
 >
-> Implementation status, 2026-06-27: the checked-in converter plan, fixture generator, and runtime
-> `bind_conv1d_view` still need the M2.8 conv1d canonical-layout sync. Until that implementation lands,
-> artifacts that keep raw `[10240,1,4]` conv1d payloads are pre-M2.8 legacy compatibility artifacts and
-> are not official M2.8/M3 canonical q5090 files.
+> Implementation status, 2026-06-27: P1 implements the canonical conv1d sync across converter output,
+> q5090 fixtures, runtime binding, and tests. Official M2.8/M3 q5090 artifacts must use `[10240,4,1]`.
+> Existing raw `[10240,1,4]` q5090 files are legacy pre-M2.8 artifacts. They must be regenerated before
+> they are used as official M2.8/M3 baseline inputs.
 
 ## 0. Conventions
 
@@ -30,8 +30,8 @@ The policy document decides *which qtype/layout each tensor gets*. This document
 - **Canonical TEXT_CORE conv1d layout.** For M2.8/M3 canonical artifacts,
   `linear_attn.conv1d.weight` is a contiguous BF16 tensor with logical shape `[10240,4,1]`
   (`[conv_dim,gdn_conv_k,1]`). This is a TEXT_CORE tensor logical-shape policy, not a binary container
-  ABI redesign. Pre-M2.8 artifacts that keep raw `[10240,1,4]` are legacy compatibility artifacts and
-  are not the official M3 baseline.
+  ABI redesign. Existing raw `[10240,1,4]` q5090 files are legacy pre-M2.8 artifacts. They must be
+  regenerated before they are used as official M2.8/M3 baseline inputs.
 
 ## 1. File structure
 
@@ -254,8 +254,8 @@ for token_id in 0 .. vocab-1:
 
 Raw row-major elements in the stated dtype (bf16 = 2 B, fp32 = 4 B). `group_size=0`,
 `scale_dtype=none`. Shape is the canonical tensor-plan shape. For M2.8/M3 TEXT_CORE artifacts,
-`linear_attn.conv1d.weight` uses `[10240,4,1]`; older `[10240,1,4]` payloads are legacy compatibility
-inputs only.
+`linear_attn.conv1d.weight` uses `[10240,4,1]`. Existing raw `[10240,1,4]` q5090 files are legacy
+pre-M2.8 artifacts. They must be regenerated before they are used as official M2.8/M3 baseline inputs.
 
 ## 8. Padding rules
 

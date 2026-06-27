@@ -257,14 +257,14 @@ model.language_model.layers.{L}.
 
 M2.8/M3 canonical TEXT_CORE policy requires `linear_attn.conv1d.weight` to be emitted in the
 runtime-native logical shape `[10240,4,1]`. This is a tensor-plan logical-shape policy change, not a q5090
-binary container ABI redesign. Legacy `[10240,1,4]` artifacts may be read only by an explicitly labelled
-compatibility path and are not the official M3 baseline.
+binary container ABI redesign.
 
-Implementation status, 2026-06-27: the checked-in converter plan, fixture generator, and runtime
-`bind_conv1d_view` still need this sync. Until that implementation lands, generated q5090 artifacts with
-raw `[10240,1,4]` conv1d are pre-M2.8 legacy artifacts, not official M2.8/M3 canonical artifacts.
+Implementation status, 2026-06-27: P1 implements the canonical conv1d sync across converter output,
+q5090 fixtures, runtime binding, and tests. Official M2.8/M3 q5090 artifacts must use `[10240,4,1]`.
+Existing raw `[10240,1,4]` q5090 files are legacy pre-M2.8 artifacts. They must be regenerated before
+they are used as official M2.8/M3 baseline inputs.
 
-This policy requires synchronized updates in:
+This policy is synchronized in:
 
 - `tools/q5090_convert/tensor_plan.py`;
 - `tests/fixtures/make_q5090_fixture.py`;

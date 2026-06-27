@@ -59,6 +59,172 @@ std::string run_command_capture(const std::string& command) {
     return out;
 }
 
+const char* json_bool(bool value) { return value ? "true" : "false"; }
+
+std::size_t arena_slack(const ArenaMemoryStats& arena) {
+    return arena.capacity_bytes > arena.used_bytes ? arena.capacity_bytes - arena.used_bytes : 0;
+}
+
+std::size_t payload_overhead(const EngineMemoryStats& memory) {
+    return memory.weights.used_bytes > memory.q5090_loaded_payload_bytes
+               ? memory.weights.used_bytes - memory.q5090_loaded_payload_bytes
+               : 0;
+}
+
+void write_arena(std::ostream& out, const char* name, const ArenaMemoryStats& arena,
+                 const std::string& indent) {
+    out << indent << "{\n"
+        << indent << "  \"name\": \"" << name << "\",\n"
+        << indent << "  \"present\": " << json_bool(arena.present) << ",\n"
+        << indent << "  \"capacity_bytes\": " << arena.capacity_bytes << ",\n"
+        << indent << "  \"used_bytes\": " << arena.used_bytes << ",\n"
+        << indent << "  \"peak_used_bytes\": " << arena.peak_used_bytes << "\n"
+        << indent << "}";
+}
+
+void write_memory(std::ostream& out, const EngineMemoryStats& memory, const std::string& indent) {
+    out << indent << "{\n"
+        << indent << "  \"accounting_scope\": \"engine_owned_device_arenas_complete\",\n"
+        << indent << "  \"hidden_device_allocations\": false,\n"
+        << indent << "  \"loaded\": " << json_bool(memory.loaded) << ",\n"
+        << indent << "  \"device\": " << memory.device << ",\n"
+        << indent << "  \"max_context\": " << memory.max_context << ",\n"
+        << indent << "  \"position\": " << memory.position << ",\n"
+        << indent << "  \"arenas\": [\n";
+    write_arena(out, "weights", memory.weights, indent + "    ");
+    out << ",\n";
+    write_arena(out, "cache", memory.cache, indent + "    ");
+    out << ",\n";
+    write_arena(out, "workspace", memory.workspace, indent + "    ");
+    out << "\n"
+        << indent << "  ],\n"
+        << indent << "  \"q5090_loaded_payload_bytes\": " << memory.q5090_loaded_payload_bytes
+        << ",\n"
+        << indent << "  \"q5090_tensor_count\": " << memory.q5090_tensor_count << ",\n"
+        << indent << "  \"q5090_quant_count\": " << memory.q5090_quant_count << ",\n"
+        << indent
+        << "  \"known_exclusions\": [\"host_q5090_file_buffer\", \"cuda_driver_runtime\", "
+           "\"profiler_overhead\", \"os_process_rss\", \"profiles_artifacts\"]\n"
+        << indent << "}";
+}
+
+void write_token_array(std::ostream& out, const std::vector<int>& ids) {
+    out << "[";
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        if (i != 0) { out << ", "; }
+        out << ids[i];
+    }
+    out << "]";
+}
+
+std::uint64_t max_peak(const std::vector<RepeatReport>& repeats,
+                       ArenaMemoryStats EngineMemoryStats::*arena_member) {
+    std::uint64_t max_value = 0;
+    for (const RepeatReport& repeat : repeats) {
+        const ArenaMemoryStats& arena = repeat.memory.*arena_member;
+        max_value = std::max<std::uint64_t>(max_value, arena.peak_used_bytes);
+    }
+    return max_value;
+}
+
+void write_repeat(std::ostream& out, const RepeatReport& repeat, const std::string& indent) {
+    out << indent << "{\n"
+        << indent << "  \"repeat_index\": " << repeat.repeat_index << ",\n"
+        << indent << "  \"prefill_time_s\": " << repeat.prefill_time_s << ",\n"
+        << indent << "  \"decode_time_s\": " << repeat.decode_time_s << ",\n"
+        << indent << "  \"e2e_excluding_load_time_s\": "
+        << repeat.e2e_excluding_load_time_s() << ",\n"
+        << indent << "  \"prompt_tokens\": " << repeat.prompt_tokens << ",\n"
+        << indent << "  \"prefill_output_tokens\": " << repeat.prefill_output_tokens << ",\n"
+        << indent << "  \"decode_loop_tokens\": " << repeat.decode_loop_tokens << ",\n"
+        << indent << "  \"generated_tokens_total\": " << repeat.generated_tokens_total() << ",\n"
+        << indent << "  \"decode_eager_tok_s\": ";
+    if (repeat.decode_eager_tok_s_valid()) {
+        out << repeat.decode_eager_tok_s();
+    } else {
+        out << "null";
+    }
+    out << ",\n"
+        << indent << "  \"decode_eager_tok_s_valid\": "
+        << json_bool(repeat.decode_eager_tok_s_valid()) << ",\n"
+        << indent << "  \"e2e_excluding_load_tok_s\": "
+        << repeat.e2e_excluding_load_tok_s() << ",\n"
+        << indent << "  \"stop_reason\": \"" << json_escape(repeat.stop_reason) << "\",\n"
+        << indent << "  \"generated_token_ids\": ";
+    write_token_array(out, repeat.generated_token_ids);
+    out << ",\n" << indent << "  \"memory\": ";
+    write_memory(out, repeat.memory, indent + "  ");
+    out << "\n" << indent << "}";
+}
+
+void write_case_summary(std::ostream& out, const CaseReport& case_report,
+                        const std::string& indent) {
+    std::vector<double> prefill_times;
+    std::vector<double> decode_times;
+    std::vector<double> decode_tok_s;
+    std::vector<double> e2e_tok_s;
+    prefill_times.reserve(case_report.repeats.size());
+    decode_times.reserve(case_report.repeats.size());
+    decode_tok_s.reserve(case_report.repeats.size());
+    e2e_tok_s.reserve(case_report.repeats.size());
+    for (const RepeatReport& repeat : case_report.repeats) {
+        prefill_times.push_back(repeat.prefill_time_s);
+        decode_times.push_back(repeat.decode_time_s);
+        if (repeat.decode_eager_tok_s_valid()) { decode_tok_s.push_back(repeat.decode_eager_tok_s()); }
+        e2e_tok_s.push_back(repeat.e2e_excluding_load_tok_s());
+    }
+
+    out << indent << "{\n"
+        << indent << "  \"prefill_time_s_median\": " << median(prefill_times) << ",\n"
+        << indent << "  \"decode_time_s_median\": " << median(decode_times) << ",\n"
+        << indent << "  \"decode_eager_tok_s_median\": " << median(decode_tok_s) << ",\n"
+        << indent << "  \"e2e_excluding_load_tok_s_median\": " << median(e2e_tok_s)
+        << ",\n"
+        << indent << "  \"deterministic_token_ids\": " << json_bool(case_report.deterministic)
+        << ",\n"
+        << indent << "  \"max_weight_arena_peak_used_bytes\": "
+        << max_peak(case_report.repeats, &EngineMemoryStats::weights) << ",\n"
+        << indent << "  \"max_cache_arena_peak_used_bytes\": "
+        << max_peak(case_report.repeats, &EngineMemoryStats::cache) << ",\n"
+        << indent << "  \"max_workspace_arena_peak_used_bytes\": "
+        << max_peak(case_report.repeats, &EngineMemoryStats::workspace) << "\n"
+        << indent << "}";
+}
+
+void write_case(std::ostream& out, const CaseReport& case_report, const std::string& indent) {
+    out << indent << "{\n"
+        << indent << "  \"name\": \"" << json_escape(case_report.input.name) << "\",\n"
+        << indent << "  \"fixture_set\": \"" << json_escape(case_report.fixture_set) << "\",\n"
+        << indent << "  \"fixture_manifest_path\": \""
+        << json_escape(case_report.fixture_manifest_path) << "\",\n"
+        << indent << "  \"fixture_manifest_sha256\": \""
+        << json_escape(case_report.fixture_manifest_sha256) << "\",\n"
+        << indent << "  \"prompt_ids_path\": \""
+        << json_escape(case_report.input.prompt_ids_path) << "\",\n"
+        << indent << "  \"prompt_ids_sha256\": \"" << json_escape(case_report.prompt_ids_sha256)
+        << "\",\n"
+        << indent << "  \"prompt_tokens\": " << case_report.input.prompt_tokens() << ",\n"
+        << indent << "  \"requested_max_new_tokens\": "
+        << case_report.input.requested_max_new_tokens << ",\n"
+        << indent << "  \"max_context\": " << case_report.input.max_context << ",\n"
+        << indent << "  \"decode_loop_tokens_requested\": "
+        << case_report.input.decode_loop_tokens_requested() << ",\n"
+        << indent << "  \"required_max_context\": " << case_report.input.required_max_context()
+        << ",\n"
+        << indent << "  \"warmup_repeats\": " << case_report.warmup_repeats << ",\n"
+        << indent << "  \"measured_repeats\": " << case_report.measured_repeats << ",\n"
+        << indent << "  \"deterministic_token_ids\": "
+        << json_bool(case_report.deterministic) << ",\n"
+        << indent << "  \"repeats\": [\n";
+    for (std::size_t i = 0; i < case_report.repeats.size(); ++i) {
+        if (i != 0) { out << ",\n"; }
+        write_repeat(out, case_report.repeats[i], indent + "    ");
+    }
+    out << "\n" << indent << "  ],\n" << indent << "  \"summary\": ";
+    write_case_summary(out, case_report, indent + "  ");
+    out << "\n" << indent << "}";
+}
+
 } // namespace
 
 std::size_t CaseRunInput::decode_loop_tokens_requested() const noexcept {
@@ -226,6 +392,97 @@ void ensure_parent_dir(const std::string& path) {
     const std::filesystem::path p(path);
     const std::filesystem::path parent = p.parent_path();
     if (!parent.empty()) { std::filesystem::create_directories(parent); }
+}
+
+void write_error_report(const std::string& path, std::string_view phase, std::string_view message) {
+    ensure_parent_dir(path);
+    std::ofstream out(path);
+    if (!out) { return; }
+    out << "{\n"
+        << "  \"schema_version\": 1,\n"
+        << "  \"artifact_type\": \"qus_e2e_benchmark_report\",\n"
+        << "  \"status\": \"error\",\n"
+        << "  \"error\": {\n"
+        << "    \"phase\": \"" << json_escape(phase) << "\",\n"
+        << "    \"message\": \"" << json_escape(message) << "\"\n"
+        << "  }\n"
+        << "}\n";
+}
+
+void write_raw_report(const std::string& path, const RawReport& report) {
+    ensure_parent_dir(path);
+    std::ofstream out(path);
+    if (!out) { throw std::runtime_error("failed to open output JSON: " + path); }
+
+    out << "{\n"
+        << "  \"schema_version\": 1,\n"
+        << "  \"artifact_type\": \"qus_e2e_benchmark_report\",\n"
+        << "  \"status\": \"ok\",\n"
+        << "  \"run\": {\n"
+        << "    \"binary\": \"" << json_escape(report.binary) << "\",\n"
+        << "    \"command\": \"" << json_escape(report.command) << "\",\n"
+        << "    \"git_commit\": \"" << json_escape(report.git_commit) << "\",\n"
+        << "    \"worktree_dirty\": " << json_bool(report.worktree_dirty) << ",\n"
+        << "    \"load_time_s\": " << report.load_time_s << "\n"
+        << "  },\n"
+        << "  \"environment\": {\n"
+        << "    \"cuda_runtime_version\": \""
+        << json_escape(report.environment.cuda_runtime_version) << "\",\n"
+        << "    \"cuda_driver_version\": \""
+        << json_escape(report.environment.cuda_driver_version) << "\",\n"
+        << "    \"gpu_name\": \"" << json_escape(report.environment.gpu_name) << "\",\n"
+        << "    \"device_id\": " << report.environment.device_id << "\n"
+        << "  },\n"
+        << "  \"engine\": {\n"
+        << "    \"max_context\": " << report.max_context << ",\n"
+        << "    \"workspace_lifetime_policy\": \"step_reset\",\n"
+        << "    \"decode_metric\": \"decode_eager_tok_s\",\n"
+        << "    \"sampling_location\": \"device_argmax\",\n"
+        << "    \"token_readback\": \"per_step_sync_d2h\",\n"
+        << "    \"includes_token_readback\": true,\n"
+        << "    \"timing_boundary\": \"host_visible_phase_end\"\n"
+        << "  },\n"
+        << "  \"weights\": {\n"
+        << "    \"q5090_path\": \"" << json_escape(report.q5090_path) << "\",\n"
+        << "    \"q5090_file_size_bytes\": " << report.q5090_file_size_bytes << ",\n"
+        << "    \"q5090_sha256\": \"" << json_escape(report.q5090_sha256) << "\",\n"
+        << "    \"q5090_conv1d_layout\": \"runtime_native_conv_dim_by_kernel\",\n"
+        << "    \"load_strategy\": \"full_file_host_vector_then_h2d_payload_upload\",\n"
+        << "    \"default_weight_arena_policy\": \"q5090_file_size_plus_256MiB\",\n"
+        << "    \"estimated_host_file_buffer_bytes\": " << report.q5090_file_size_bytes << ",\n"
+        << "    \"selected_modules\": {\n"
+        << "      \"text_core\": true,\n"
+        << "      \"mtp\": false,\n"
+        << "      \"vision\": false\n"
+        << "    },\n"
+        << "    \"q5090_loaded_payload_bytes\": "
+        << report.post_load_memory.q5090_loaded_payload_bytes << ",\n"
+        << "    \"weight_arena_capacity_bytes\": "
+        << report.post_load_memory.weights.capacity_bytes << ",\n"
+        << "    \"weight_arena_used_bytes\": " << report.post_load_memory.weights.used_bytes
+        << ",\n"
+        << "    \"weight_arena_peak_used_bytes\": "
+        << report.post_load_memory.weights.peak_used_bytes << ",\n"
+        << "    \"weight_arena_slack_bytes\": "
+        << arena_slack(report.post_load_memory.weights) << ",\n"
+        << "    \"weight_payload_to_arena_used_overhead_bytes\": "
+        << payload_overhead(report.post_load_memory) << "\n"
+        << "  },\n"
+        << "  \"memory\": ";
+    write_memory(out, report.post_load_memory, "  ");
+    out << ",\n"
+        << "  \"summary\": {\n"
+        << "    \"case_count\": " << report.cases.size() << ",\n"
+        << "    \"load_time_s\": " << report.load_time_s << "\n"
+        << "  },\n"
+        << "  \"cases\": [\n";
+    for (std::size_t i = 0; i < report.cases.size(); ++i) {
+        if (i != 0) { out << ",\n"; }
+        write_case(out, report.cases[i], "    ");
+    }
+    out << "\n"
+        << "  ]\n"
+        << "}\n";
 }
 
 } // namespace qus::bench::e2e

@@ -39,6 +39,70 @@ struct RunOptions {
     int eos_token_id = -1;
 };
 
+struct RepeatReport {
+    int repeat_index = 0;
+    double prefill_time_s = 0.0;
+    double decode_time_s = 0.0;
+    std::size_t prompt_tokens = 0;
+    int prefill_output_tokens = 1;
+    std::size_t decode_loop_tokens = 0;
+    std::vector<int> generated_token_ids;
+    std::string stop_reason = "max_new_tokens";
+    EngineMemoryStats memory;
+
+    [[nodiscard]] std::size_t generated_tokens_total() const noexcept {
+        return static_cast<std::size_t>(prefill_output_tokens) + decode_loop_tokens;
+    }
+    [[nodiscard]] double e2e_excluding_load_time_s() const noexcept {
+        return prefill_time_s + decode_time_s;
+    }
+    [[nodiscard]] bool decode_eager_tok_s_valid() const noexcept {
+        return decode_loop_tokens > 0 && decode_time_s > 0.0;
+    }
+    [[nodiscard]] double decode_eager_tok_s() const noexcept {
+        return decode_eager_tok_s_valid() ? static_cast<double>(decode_loop_tokens) / decode_time_s
+                                          : 0.0;
+    }
+    [[nodiscard]] double e2e_excluding_load_tok_s() const noexcept {
+        const double denom = e2e_excluding_load_time_s();
+        return denom > 0.0 ? static_cast<double>(generated_tokens_total()) / denom : 0.0;
+    }
+};
+
+struct CaseReport {
+    CaseRunInput input;
+    std::string prompt_ids_sha256;
+    std::string fixture_set = "m2.8-v1";
+    std::string fixture_manifest_path = "bench/fixtures/prompts/m2.8-v1.manifest.json";
+    std::string fixture_manifest_sha256;
+    int warmup_repeats = 0;
+    int measured_repeats = 0;
+    bool deterministic = true;
+    std::vector<RepeatReport> repeats;
+};
+
+struct EnvironmentReport {
+    std::string cuda_runtime_version;
+    std::string cuda_driver_version;
+    std::string gpu_name;
+    int device_id = 0;
+};
+
+struct RawReport {
+    std::string command;
+    std::string binary = "qus_e2e_bench";
+    std::string git_commit;
+    bool worktree_dirty = false;
+    double load_time_s = 0.0;
+    EnvironmentReport environment;
+    std::string q5090_path;
+    std::uint64_t q5090_file_size_bytes = 0;
+    std::string q5090_sha256;
+    std::uint32_t max_context = 0;
+    EngineMemoryStats post_load_memory;
+    std::vector<CaseReport> cases;
+};
+
 std::vector<int> parse_ids_file(const std::string& path);
 CaseSpec parse_case_arg(const std::string& value);
 RunOptions parse_args(int argc, char** argv);
@@ -51,5 +115,7 @@ std::uint64_t file_size_or_zero(const std::string& path);
 std::string current_git_commit_or_empty();
 bool current_git_worktree_dirty();
 void ensure_parent_dir(const std::string& path);
+void write_error_report(const std::string& path, std::string_view phase, std::string_view message);
+void write_raw_report(const std::string& path, const RawReport& report);
 
 } // namespace qus::bench::e2e

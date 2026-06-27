@@ -3,11 +3,13 @@
 #include "qus/core/device.h"
 #include "qus/core/weight_store_parser.h"
 #include "qus/kernels/causal_conv1d.h"
+#include "qus/kernels/argmax.h"
 #include "qus/kernels/gated_delta_rule.h"
 #include "qus/kernels/gdn_gating.h"
 #include "qus/kernels/gqa_attention.h"
 #include "qus/kernels/l2norm.h"
 #include "qus/kernels/linear.h"
+#include "qus/kernels/embed_gather.h"
 #include "qus/kernels/residual_add.h"
 #include "qus/kernels/rmsnorm.h"
 #include "qus/kernels/rope.h"
@@ -17,8 +19,10 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace qus::model {
 namespace {
@@ -104,6 +108,26 @@ Tensor conv_state_for_kernel(Tensor& state) {
     if (state.ne[1] == kCfg.gdn_conv_k) { return state.slice(1, 0, kCfg.gdn_conv_k - 1); }
     return state;
 }
+
+void copy_i32_to_device(const int* src, Tensor& dst) {
+    CUDA_CHECK(cudaMemcpy(dst.data, src, static_cast<std::size_t>(dst.ne[0]) * sizeof(int),
+                          cudaMemcpyHostToDevice));
+}
+
+class ScopedPositions {
+public:
+    ScopedPositions(const Tensor*& slot, const Tensor& positions) : slot_(slot) {
+        slot_ = &positions;
+    }
+
+    ScopedPositions(const ScopedPositions&)            = delete;
+    ScopedPositions& operator=(const ScopedPositions&) = delete;
+
+    ~ScopedPositions() { slot_ = nullptr; }
+
+private:
+    const Tensor*& slot_;
+};
 
 } // namespace
 
@@ -193,7 +217,8 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
     kernels::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, nullptr, qn, s);
     kernels::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, nullptr, kn, s);
-    kernels::rope(io_.pos, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    const Tensor& positions = active_positions_ != nullptr ? *active_positions_ : io_.pos;
+    kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
     if (ph == Phase::Prefill) {
@@ -316,12 +341,59 @@ void Qwen3_6_27B::run_layers(Tensor& x, Phase ph) {
 }
 
 void Qwen3_6_27B::prefill(std::span<const int> ids) {
-    (void)ids;
-    throw std::runtime_error("Qwen3_6_27B::prefill is implemented in m2-4");
+    if (ids.empty()) { throw std::invalid_argument("Qwen3_6_27B::prefill requires tokens"); }
+    if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("Qwen3_6_27B::prefill token count exceeds int32");
+    }
+
+    cudaStream_t s = ctx_.stream;
+    const int T    = static_cast<int>(ids.size());
+    work_.reset();
+
+    Tensor ids_device = work_.alloc(DType::I32, {T});
+    copy_i32_to_device(ids.data(), ids_device);
+
+    std::vector<int> positions_host(static_cast<std::size_t>(T));
+    for (int i = 0; i < T; ++i) { positions_host[static_cast<std::size_t>(i)] = i; }
+    Tensor positions = work_.alloc(DType::I32, {T});
+    copy_i32_to_device(positions_host.data(), positions);
+    ScopedPositions scoped_positions(active_positions_, positions);
+
+    Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, T});
+    kernels::embed_gather(ids_device, *embed_, x, s);
+    run_layers(x, Phase::Prefill);
+
+    Tensor xf = work_.alloc(DType::BF16, {kCfg.hidden, T});
+    kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, xf, s);
+    Tensor last = xf.slice(1, T - 1, 1);
+    kernels::linear(last, *lm_head_, io_.logits, s);
+    kernels::argmax(io_.logits, io_.token, s);
+
+    kv_.pos     = static_cast<std::uint32_t>(T);
+    pos_upload_ = T;
+    CUDA_CHECK(cudaMemcpyAsync(io_.pos.data, &pos_upload_, sizeof(pos_upload_),
+                               cudaMemcpyHostToDevice, s));
+    work_.reset();
 }
 
 void Qwen3_6_27B::decode_step() {
-    throw std::runtime_error("Qwen3_6_27B::decode_step is implemented in m2-4");
+    cudaStream_t s = ctx_.stream;
+    work_.reset();
+
+    Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+    kernels::embed_gather(io_.token, *embed_, x, s);
+    run_layers(x, Phase::Decode);
+
+    Tensor xf = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+    kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, xf, s);
+    kernels::linear(xf, *lm_head_, io_.logits, s);
+    kernels::argmax(io_.logits, io_.token, s);
+
+    kv_.advance();
+    pos_upload_ = static_cast<int>(kv_.pos);
+    CUDA_CHECK(cudaMemcpyAsync(io_.pos.data, &pos_upload_, sizeof(pos_upload_),
+                               cudaMemcpyHostToDevice, s));
+    work_.reset();
 }
 
 } // namespace qus::model

@@ -72,10 +72,11 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
 DeviceArena::~DeviceArena() { free_device(base_); }
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
-    : base_(other.base_), cap_(other.cap_), off_(other.off_) {
+    : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_) {
     other.base_ = nullptr;
     other.cap_  = 0;
     other.off_  = 0;
+    other.peak_ = 0;
 }
 
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
@@ -85,10 +86,12 @@ DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     base_ = other.base_;
     cap_  = other.cap_;
     off_  = other.off_;
+    peak_ = other.peak_;
 
     other.base_ = nullptr;
     other.cap_  = 0;
     other.off_  = 0;
+    other.peak_ = 0;
     return *this;
 }
 
@@ -118,6 +121,7 @@ Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape
 
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
     off_      = end;
+    if (off_ > peak_) { peak_ = off_; }
     return Tensor(ptr, dtype, shape);
 }
 
@@ -134,6 +138,10 @@ void* DeviceArena::base() const noexcept { return base_; }
 std::size_t DeviceArena::used() const noexcept { return off_; }
 
 std::size_t DeviceArena::capacity() const noexcept { return cap_; }
+
+std::size_t DeviceArena::peak_used() const noexcept { return peak_; }
+
+void DeviceArena::reset_peak() noexcept { peak_ = off_; }
 
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }

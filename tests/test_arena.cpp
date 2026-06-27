@@ -72,6 +72,7 @@ int main() {
     qus::DeviceArena arena(1024);
     failures += expect_size(arena.capacity(), 1024, "arena.capacity");
     failures += expect_size(arena.used(), 0, "arena.used initial");
+    failures += expect_size(arena.peak_used(), 0, "arena.peak initial");
     if (arena.base() == nullptr) {
         ++failures;
         std::cerr << "arena base is null\n";
@@ -82,6 +83,7 @@ int main() {
     failures += expect_ptr(a.data, base, "first allocation pointer");
     failures += expect_size(a.bytes(), 30, "first allocation bytes");
     failures += expect_size(arena.used(), 30, "arena.used after first allocation");
+    failures += expect_size(arena.peak_used(), 30, "arena.peak after first allocation");
 
     qus::Tensor b = arena.alloc(qus::DType::U8, {17}, 64);
     failures += expect_ptr(b.data, base + 64, "second allocation pointer");
@@ -90,6 +92,7 @@ int main() {
         std::cerr << "second allocation is not 64-byte aligned\n";
     }
     failures += expect_size(arena.used(), 81, "arena.used after second allocation");
+    failures += expect_size(arena.peak_used(), 81, "arena.peak after second allocation");
 
     const std::size_t mark = arena.mark();
     qus::Tensor transient  = arena.alloc(qus::DType::U8, {11}, 128);
@@ -97,7 +100,10 @@ int main() {
         ++failures;
         std::cerr << "transient allocation did not advance arena mark\n";
     }
+    failures += expect_size(arena.peak_used(), arena.used(), "arena.peak after transient");
+    const std::size_t peak_after_transient = arena.peak_used();
     arena.rewind(mark);
+    failures += expect_size(arena.peak_used(), peak_after_transient, "arena.peak after rewind");
     failures += expect_size(arena.used(), mark, "arena.used after rewind");
     qus::Tensor reused = arena.alloc(qus::DType::U8, {5}, 128);
     failures += expect_ptr(reused.data, transient.data, "allocation after rewind pointer");
@@ -106,10 +112,18 @@ int main() {
     failures +=
         expect_size(arena.used(), used_before_future_rewind, "arena.used after future rewind");
 
+    const std::size_t used_before_failures = arena.used();
+    const std::size_t peak_before_failures = arena.peak_used();
     failures += expect_throws<std::invalid_argument>(
         [&] { (void)arena.alloc(qus::DType::U8, {1}, 3); }, "invalid alignment");
+    failures += expect_size(arena.used(), used_before_failures,
+                            "arena.used after invalid alignment");
+    failures += expect_size(arena.peak_used(), peak_before_failures,
+                            "arena.peak after invalid alignment");
     failures += expect_throws<std::bad_alloc>(
         [&] { (void)arena.alloc(qus::DType::FP32, {300}, 256); }, "arena oom");
+    failures += expect_size(arena.used(), used_before_failures, "arena.used after oom");
+    failures += expect_size(arena.peak_used(), peak_before_failures, "arena.peak after oom");
     failures += expect_throws<std::overflow_error>(
         [&] {
             (void)arena.alloc(qus::DType::U8, {std::numeric_limits<std::int32_t>::max(),
@@ -119,15 +133,21 @@ int main() {
 
     arena.reset();
     failures += expect_size(arena.used(), 0, "arena.used after reset");
+    failures += expect_size(arena.peak_used(), peak_before_failures, "arena.peak after reset");
+    arena.reset_peak();
+    failures += expect_size(arena.peak_used(), 0, "arena.peak after reset_peak on empty arena");
     qus::Tensor c = arena.alloc(qus::DType::U8, {4});
     failures += expect_ptr(c.data, base, "allocation after reset pointer");
+    failures += expect_size(arena.peak_used(), 4, "arena.peak after reset allocation");
 
     qus::DeviceArena moved(std::move(arena));
     if (arena.base() != nullptr || arena.capacity() != 0 || arena.used() != 0) {
         ++failures;
         std::cerr << "move construction did not clear source arena\n";
     }
+    failures += expect_size(arena.peak_used(), 0, "moved-from arena peak");
     failures += expect_size(moved.capacity(), 1024, "moved arena capacity");
+    failures += expect_size(moved.peak_used(), 4, "moved arena peak");
 
     qus::DeviceArena assigned(128);
     assigned = std::move(moved);
@@ -135,10 +155,13 @@ int main() {
         ++failures;
         std::cerr << "move assignment did not clear source arena\n";
     }
+    failures += expect_size(moved.peak_used(), 0, "move-assigned-from arena peak");
+    failures += expect_size(assigned.peak_used(), 4, "move-assigned arena peak");
     void* assigned_base = assigned.base();
     assigned            = std::move(assigned);
     failures += expect_ptr(assigned.base(), assigned_base, "arena self-move base");
     failures += expect_size(assigned.capacity(), 1024, "arena self-move capacity");
+    failures += expect_size(assigned.peak_used(), 4, "arena self-move peak");
 
     qus::PinnedHostBuffer pinned(128);
     if (pinned.data() == nullptr) {

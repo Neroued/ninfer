@@ -27,11 +27,14 @@ public:
     void* base() const noexcept;
     std::size_t used() const noexcept;
     std::size_t capacity() const noexcept;
+    std::size_t peak_used() const noexcept;
+    void reset_peak() noexcept;
 
 private:
-    void* base_      = nullptr;
-    std::size_t cap_ = 0;
-    std::size_t off_ = 0;
+    void* base_       = nullptr;
+    std::size_t cap_  = 0;
+    std::size_t off_  = 0;
+    std::size_t peak_ = 0;
 };
 
 class PinnedHostBuffer {

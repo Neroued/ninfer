@@ -139,6 +139,11 @@ def _prepare_source(reader: ShardReader, spec: tp.TensorSpec) -> torch.Tensor:
         if t.numel() != int(torch.tensor(spec.reshape).prod()):
             raise ValueError(f"{spec.src_name}: cannot reshape {tuple(t.shape)} -> {spec.reshape}")
         t = t.reshape(spec.reshape)
+    if spec.transform is not None:
+        if spec.transform == tp.TRANSFORM_GDN_CONV1D_RUNTIME_NATIVE:
+            t = tp.runtime_native_gdn_conv1d(t)
+        else:
+            raise ValueError(f"{spec.name}: unknown tensor transform {spec.transform!r}")
     if spec.layout != qt.LAYOUT_CONTIGUOUS and t.dim() != 2:
         raise ValueError(f"{spec.name}: quant layout needs 2D, got {tuple(t.shape)}")
     return t.contiguous()

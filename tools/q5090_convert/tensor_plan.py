@@ -10,7 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+import torch
+
 from . import qtypes as qt
+
+
+TRANSFORM_GDN_CONV1D_RUNTIME_NATIVE = "gdn_conv1d_runtime_native"
 
 
 @dataclass
@@ -24,6 +29,7 @@ class TensorSpec:
     source_layer: int = qt.NO_LAYER
     row_slice: Optional[Tuple[int, int]] = None   # take src.weight[start:end] rows
     reshape: Optional[Tuple[int, ...]] = None      # reshape source before encoding
+    transform: Optional[str] = None
 
 
 # GDN fused in_proj_qkv row splits: q=16*128, k=16*128, v=48*128 -> [10240, 5120]
@@ -35,8 +41,34 @@ _ATTN_Q = (0, 6144)
 _ATTN_GATE = (6144, 12288)
 
 
+def runtime_native_gdn_conv1d(t: "torch.Tensor"):
+    if t.dim() != 3 or t.shape[1] != 1:
+        raise ValueError(f"gdn conv1d expected [C,1,K], got {tuple(t.shape)}")
+    c = int(t.shape[0])
+    k = int(t.shape[2])
+    if k != 4:
+        raise ValueError(f"gdn conv1d expected kernel width 4, got {k}")
+
+    # q5090 Tensor uses dim0-fastest runtime order. The returned tensor deliberately
+    # has metadata shape [C,K,1] while its flat bytes are [K,C].
+    return t[:, 0, :].transpose(0, 1).contiguous().reshape(c, k, 1)
+
+
 def _bf16(name, src, sk, layer=qt.NO_LAYER, module=qt.MODULE_TEXT) -> TensorSpec:
     return TensorSpec(name, qt.QT_BF16, qt.LAYOUT_CONTIGUOUS, module, src, sk, layer)
+
+
+def _bf16_conv1d(name, src, sk, layer=qt.NO_LAYER, module=qt.MODULE_TEXT) -> TensorSpec:
+    return TensorSpec(
+        name,
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        module,
+        src,
+        sk,
+        layer,
+        transform=TRANSFORM_GDN_CONV1D_RUNTIME_NATIVE,
+    )
 
 
 def _fp32(name, src, sk, layer, module=qt.MODULE_TEXT) -> TensorSpec:
@@ -66,7 +98,12 @@ def build_text_specs(layer_types: List[str]) -> List[TensorSpec]:
             s += [
                 _fp32(p + "linear_attn.A_log", p + "linear_attn.A_log", qt.SK_GDN_A_LOG, li),
                 _fp32(p + "linear_attn.dt_bias", p + "linear_attn.dt_bias", qt.SK_GDN_DT_BIAS, li),
-                _bf16(p + "linear_attn.conv1d.weight", p + "linear_attn.conv1d.weight", qt.SK_GDN_CONV1D, li),
+                _bf16_conv1d(
+                    p + "linear_attn.conv1d.weight",
+                    p + "linear_attn.conv1d.weight",
+                    qt.SK_GDN_CONV1D,
+                    li,
+                ),
                 _bf16(p + "linear_attn.in_proj_a.weight", p + "linear_attn.in_proj_a.weight", qt.SK_GDN_IN_PROJ_A, li),
                 _bf16(p + "linear_attn.in_proj_b.weight", p + "linear_attn.in_proj_b.weight", qt.SK_GDN_IN_PROJ_B, li),
                 _tile(p + "linear_attn.in_proj_qkv.q", qt.QT_Q4G64, qkv, qt.SK_GDN_IN_PROJ_Q, li, row_slice=_GDN_Q),

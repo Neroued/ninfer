@@ -177,9 +177,14 @@ void write_case_summary(std::ostream& out, const CaseReport& case_report,
     out << indent << "{\n"
         << indent << "  \"prefill_time_s_median\": " << median(prefill_times) << ",\n"
         << indent << "  \"decode_time_s_median\": " << median(decode_times) << ",\n"
-        << indent << "  \"decode_eager_tok_s_median\": " << median(decode_tok_s) << ",\n"
-        << indent << "  \"e2e_excluding_load_tok_s_median\": " << median(e2e_tok_s)
-        << ",\n"
+        << indent << "  \"decode_eager_tok_s_median\": ";
+    if (decode_tok_s.empty()) {
+        out << "null";
+    } else {
+        out << median(decode_tok_s);
+    }
+    out << ",\n"
+        << indent << "  \"e2e_excluding_load_tok_s_median\": " << median(e2e_tok_s) << ",\n"
         << indent << "  \"deterministic_token_ids\": " << json_bool(case_report.deterministic)
         << ",\n"
         << indent << "  \"max_weight_arena_peak_used_bytes\": "

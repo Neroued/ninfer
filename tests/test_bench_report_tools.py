@@ -187,6 +187,12 @@ class ReportCommonTests(unittest.TestCase):
         with self.assertRaises(common.ReportValidationError):
             common.validate_report(bad)
 
+    def test_validate_report_rejects_bad_zero_decode_summary_throughput(self) -> None:
+        bad = report()
+        bad["cases"][1]["summary"]["decode_eager_tok_s_median"] = 0.0
+        with self.assertRaises(common.ReportValidationError):
+            common.validate_report(bad)
+
     def test_case_map_and_generated_ids(self) -> None:
         cases = common.case_map(report())
         self.assertEqual(sorted(cases), ["cn_short", "long_2k"])

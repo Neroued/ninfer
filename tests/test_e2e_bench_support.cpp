@@ -200,6 +200,16 @@ int test_raw_report_json_is_valid() {
     case_report.repeats.push_back(repeat);
     case_report.repeats.push_back(zero_decode_repeat);
 
+    qus::bench::e2e::CaseReport zero_decode_case = case_report;
+    zero_decode_case.input.name = "long_2k";
+    zero_decode_case.input.prompt_ids_path = "long_2k.ids";
+    zero_decode_case.input.prompt_ids = {1, 2, 3, 4};
+    zero_decode_case.input.requested_max_new_tokens = 1;
+    zero_decode_case.prompt_ids_sha256 = "long-ids-sha";
+    zero_decode_case.measured_repeats = 1;
+    zero_decode_case.repeats.clear();
+    zero_decode_case.repeats.push_back(zero_decode_repeat);
+
     qus::bench::e2e::RawReport report;
     report.command = "qus_e2e_bench --case cn_short:prompt.ids:3";
     report.git_commit = "abc";
@@ -214,6 +224,7 @@ int test_raw_report_json_is_valid() {
     report.max_context = 8;
     report.post_load_memory = memory;
     report.cases.push_back(case_report);
+    report.cases.push_back(zero_decode_case);
 
     const auto path = std::filesystem::temp_directory_path() / "qus_e2e_raw_report.json";
     qus::bench::e2e::write_raw_report(path.string(), report);
@@ -278,6 +289,9 @@ int test_raw_report_json_is_valid() {
                         text.find("\"decode_eager_tok_s_valid\": false") != std::string::npos
                     ? 0
                     : fail("zero decode throughput null handling missing");
+    failures += text.find("\"decode_eager_tok_s_median\": null") != std::string::npos
+                    ? 0
+                    : fail("zero decode summary throughput null handling missing");
     failures += text.find("\"generated_token_ids\": [10, 11, 12]") != std::string::npos
                     ? 0
                     : fail("generated ids missing");

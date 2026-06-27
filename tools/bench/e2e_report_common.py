@@ -174,9 +174,25 @@ def _validate_case(case: dict[str, Any]) -> None:
     repeats = require_list(case["repeats"], f"{name}.repeats")
     if len(repeats) != measured_repeats:
         raise ReportValidationError(f"{name}.repeats length must equal measured_repeats")
-    require_mapping(case["summary"], f"{name}.summary")
+    summary = require_mapping(case["summary"], f"{name}.summary")
+    checked_repeats = []
     for repeat in repeats:
-        _validate_repeat(require_mapping(repeat, f"{name}.repeat"), name)
+        checked_repeat = require_mapping(repeat, f"{name}.repeat")
+        _validate_repeat(checked_repeat, name)
+        checked_repeats.append(checked_repeat)
+
+    if "decode_eager_tok_s_median" not in summary:
+        raise ReportValidationError(f"{name}.summary missing decode_eager_tok_s_median")
+    has_valid_decode_throughput = any(
+        repeat["decode_eager_tok_s_valid"] is True for repeat in checked_repeats
+    )
+    decode_median = summary["decode_eager_tok_s_median"]
+    if has_valid_decode_throughput:
+        require_number(decode_median, f"{name}.summary.decode_eager_tok_s_median")
+    elif decode_median is not None:
+        raise ReportValidationError(
+            f"{name}.summary zero decode throughput median must be null"
+        )
 
 
 def validate_report(report: dict[str, Any], require_ok: bool = True) -> None:

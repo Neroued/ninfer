@@ -21,6 +21,7 @@ struct CaseRunInput {
     std::string prompt_ids_path;
     std::vector<int> prompt_ids;
     int requested_max_new_tokens = 0;
+    int eos_token_id = -1;
     std::uint32_t max_context = 0;
 
     [[nodiscard]] std::size_t prompt_tokens() const noexcept { return prompt_ids.size(); }

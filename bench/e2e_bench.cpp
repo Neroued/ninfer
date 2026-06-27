@@ -107,6 +107,7 @@ int main(int argc, char** argv) {
             input.prompt_ids_path = spec.prompt_ids_path;
             input.prompt_ids = qus::bench::e2e::parse_ids_file(spec.prompt_ids_path);
             input.requested_max_new_tokens = spec.max_new_tokens;
+            input.eos_token_id = options.eos_token_id;
             input.max_context = options.max_ctx;
             qus::bench::e2e::validate_case_context(input);
             case_inputs.push_back(std::move(input));

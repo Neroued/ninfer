@@ -260,6 +260,9 @@ int test_raw_report_json_is_valid() {
                         text.find("\"prompt_ids_sha256\": \"ids-sha\"") != std::string::npos
                     ? 0
                     : fail("raw report fixture identity missing");
+    failures += text.find("\"eos_token_id\": -1") != std::string::npos
+                    ? 0
+                    : fail("case eos_token_id missing");
     failures += text.find("\"prefill_time_s_median\"") != std::string::npos &&
                         text.find("\"decode_eager_tok_s_median\"") != std::string::npos &&
                         text.find("\"deterministic_token_ids\"") != std::string::npos &&

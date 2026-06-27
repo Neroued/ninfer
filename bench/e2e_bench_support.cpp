@@ -206,6 +206,7 @@ void write_case(std::ostream& out, const CaseReport& case_report, const std::str
         << indent << "  \"prompt_tokens\": " << case_report.input.prompt_tokens() << ",\n"
         << indent << "  \"requested_max_new_tokens\": "
         << case_report.input.requested_max_new_tokens << ",\n"
+        << indent << "  \"eos_token_id\": " << case_report.input.eos_token_id << ",\n"
         << indent << "  \"max_context\": " << case_report.input.max_context << ",\n"
         << indent << "  \"decode_loop_tokens_requested\": "
         << case_report.input.decode_loop_tokens_requested() << ",\n"

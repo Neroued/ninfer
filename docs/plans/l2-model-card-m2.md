@@ -1,12 +1,16 @@
 # M2 — Model Card + Engine Integration & Validation — Plan (Codex-self-contained)
 
+> **Current status:** M2 implementation exists; this plan is retained as implementation history and
+> validation reference. The current tree contains the L2 model card, Engine, q5090 oracle,
+> block-parity tooling, and greedy-match tooling. Performance optimization remains M3+.
+
 > Self-contained for Codex. Reuses the execution machinery in
 > [`docs/plans/l1-tier1-simple-ops.md`](l1-tier1-simple-ops.md) (subagent workflow + prompt templates
 > + ncu procedure) and the frozen test framework. The design is
 > [`docs/l2-model-card-design.md`](../l2-model-card-design.md) — **read it fully** (the §4 schedule is
 > aligned to the real L1 op signatures). All 13 L1 ops are implemented and tested.
 
-**Goal:** Build the L2 model card (`config.h` + `model.h` + `qwen3_6_27b.cpp`) and the `Engine`, wiring
+**Historical goal:** Build the L2 model card (`config.h` + `model.h` + `qwen3_6_27b.cpp`) and the `Engine`, wiring
 every L1 op into the prefill/decode schedule, then **validate the wiring** against a self-contained
 oracle over our own dequantized weights: block parity + end-to-end greedy match (NOT vLLM/llama.cpp,
 which can't read q5090). This is the M2 correctness baseline (`design.md` §12) — the first time the full
@@ -21,7 +25,7 @@ the q5090 file under `out/` (see `out/manifest.json`); reference model in `~/vll
 
 ---
 
-## Hard rules
+## Hard rules (retained)
 - Build the card per `l2-model-card-design.md` §1–§11 (don't re-derive decisions). No virtual dispatch,
   no per-step `cudaMalloc`, device-side `pos`/`token`, work_ bump-reset each step (design §6).
 - L1 ops + the frozen test framework are read-only.
@@ -29,7 +33,7 @@ the q5090 file under `out/` (see `out/manifest.json`); reference model in `~/vll
   `clang-format --dry-run --Werror <…>` (exit 0; repo `.clang-format`).
 - Work on `master`, one commit per task.
 
-## Components to build
+## Components built by current code
 - `include/qus/model/config.h` — `ModelConfig` (constexpr, design §3.1) + `is_full`/`full_idx`/`gdn_idx`
   + `kCfg` + derived consts (`kAttnScale=1/√256`, `kGdnScale=1/√128`, `rms_eps`, rope dims).
 - `include/qus/model/model.h` — `Qwen3_6_27B`: `FullLayerW`/`GdnLayerW`/`MlpW` (over `const Weight*` /
@@ -73,7 +77,23 @@ q5090 format, and would add quant noise + heavy internal hooks).
 
 ---
 
-## Tasks (each: build + test/sanitizer + clang-format + commit)
+## Current completion status
+
+- **m2-1:** implemented and covered by `tests/test_model_config.cpp`.
+- **m2-2:** implemented via model bindings / `StepState`; covered by `tests/test_model_bind.cpp`.
+- **m2-3:** implemented via `attn_mix` / `gdn_mix` / `mlp_tail` / `run_layers`; covered by
+  `tests/test_model_blocks.cpp`.
+- **m2-4:** implemented via `Engine::load`, `prefill`, `decode_step`, and `generate`; covered by
+  engine load/smoke structure and parity tooling.
+- **m2-5:** implemented in `tools/parity/ref_model.py`.
+- **m2-6:** implemented in `tools/parity/block_parity.py` plus `tools/parity/block_dump.cpp`,
+  including decode `T=1` and chunked prefill coverage.
+- **m2-7:** implemented in `tools/parity/greedy_match.py` with `FileTap` layer localization.
+
+This status records that the implementation artifacts exist and have user-side testing history. This
+documentation sync does not rerun real-weight parity, long CUDA tests, sanitizers, or benchmarks.
+
+## Tasks (historical checklist; originally build + test/sanitizer + clang-format + commit)
 
 ### Task m2-1 — `ModelConfig` (config.h)
 - **Reading:** design §3.1, `qwen3.6-27b-architecture.md` §2.

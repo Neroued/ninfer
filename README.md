@@ -7,8 +7,16 @@ No dynamic compute graph, no general-purpose model zoo — the computation for t
 is hand-written and specialized to the hardware. Weights are pre-quantized to a static 4-bit
 format offline; the runtime just loads one fixed file and runs.
 
-> **Status:** design / spec phase. See [`docs/design.md`](docs/design.md) for the full goal
-> document. Implementation has not started yet.
+## Current status
+
+M2 correctness baseline is implemented. M2.5 hardening/documentation sync is in progress, with
+graph-readiness fixes, EOS handling, FileTap parity dumps, and hardening cleanup structure already
+landed. M3 per-kernel performance optimization is the next main milestone.
+
+Current code includes L0 infrastructure, the q5090 `WeightStore`/loader and unified `Weight` handle,
+the 13 public L1 operator APIs and implementations, the L2 `Qwen3_6_27B` model card, the `Engine`,
+and parity tooling for block parity and greedy token matching. No performance numbers are claimed
+here; performance gating remains an M3+ activity.
 
 ## Goal
 

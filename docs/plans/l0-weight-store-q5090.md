@@ -1,11 +1,19 @@
 # L0 WeightStore q5090 Implementation Plan
 
+> **Current status:** historical plan. The q5090 parser/loader, module-selective `WeightStore`,
+> q5090 parser tests, real-file smoke path, and unified `Weight` handle now exist in the current
+> tree. This plan is retained for ABI and validation history; checklist items below describe how the
+> implementation was driven, not work that is still missing.
+>
+> **Naming note:** the original plan used the pre-unification name `QuantWeight`. Current code uses
+> `Weight` for q5090 quantized payload descriptors and dense control weights.
+
 > For agentic workers: REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > or superpowers:executing-plans to implement this plan task-by-task. Track steps with
 > checkbox syntax. User instruction overrides the generic skill default: do not commit
 > unless explicitly told.
 
-**Goal:** Replace the obsolete pre-q5090 pipeline with a strict q5090
+**Historical goal:** Replace the obsolete pre-q5090 pipeline with a strict q5090
 `Q5090MIXEDV1` parser/loader that matches `tools/q5090_convert` byte-for-byte.
 
 **Architecture:** Keep L0 model-agnostic. A device-free parser validates the entire
@@ -37,7 +45,7 @@ standard library for test fixture generation only. No zlib or third-party C++ li
 - Modify `include/qus/core/tensor.h`
   - Replace old W4-only `QuantLayout` with q5090 layouts.
   - Add q5090 qtype, module kind, scale dtype, load policy, and source kind enums.
-  - Generalize `QuantWeight` to describe one raw q5090 payload with inline scales.
+  - Generalize `Weight` to describe one raw q5090 payload with inline scales.
 - Modify `include/qus/core/arena.h` and `src/core/arena.cu`
   - Add `std::size_t mark() const noexcept` and `void rewind(std::size_t mark) noexcept`.
 - Rewrite `include/qus/core/weight_store.h`
@@ -108,7 +116,7 @@ enum class LoadPolicy : std::uint32_t {
     CpuPinnedThenGpu = 2,
 };
 
-struct QuantWeight {
+struct Weight {
     const void* payload = nullptr;
     std::uint64_t payload_bytes = 0;
     QType qtype = QType::Q4G64_F16S;
@@ -125,7 +133,7 @@ struct QuantWeight {
 ```
 
 `CONTIGUOUS` tensors are exposed as `Tensor` views. Quantized tensors are exposed as
-`QuantWeight` descriptors. There is no separate scales pointer; tile payloads already
+`Weight` descriptors. There is no separate scales pointer; tile payloads already
 contain FP16 scales inline.
 
 `WeightStore` API:
@@ -162,11 +170,11 @@ public:
               const LoadOptions& options = {});
 
     const Tensor* tensor(std::string_view name) const noexcept;
-    const QuantWeight* qweight(std::string_view name) const noexcept;
+    const Weight* qweight(std::string_view name) const noexcept;
     const Tensor* tensor(ModuleKind module, std::uint32_t source_kind,
                          std::uint32_t source_layer) const noexcept;
-    const QuantWeight* qweight(ModuleKind module, std::uint32_t source_kind,
-                               std::uint32_t source_layer) const noexcept;
+    const Weight* qweight(ModuleKind module, std::uint32_t source_kind,
+                          std::uint32_t source_layer) const noexcept;
 
     std::size_t tensor_count() const noexcept;
     std::size_t quant_count() const noexcept;
@@ -298,7 +306,7 @@ Overflow:
     payload pointers and `module_loaded() == false`
 - Count APIs include parsed metadata from every module. `tensor_count()`, `quant_count()`,
   and `module_tensor_count()` do not depend on upload selection.
-- For unselected modules, `Tensor::data == nullptr` or `QuantWeight::payload == nullptr`,
+- For unselected modules, `Tensor::data == nullptr` or `Weight::payload == nullptr`,
   while shape, padded shape, qtype/layout, payload bytes, source kind, and source layer
   remain populated.
 - `loaded_payload_bytes()` is the sum of selected module `payload_bytes`, including
@@ -376,7 +384,8 @@ Transform ownership fix:
 - [ ] Add `qus_q5090_parser_test` as a host-only target that links `qus_core` but does
   not construct `DeviceContext`, `DeviceArena`, or call CUDA device discovery.
 - [ ] Run: `cmake --build build -j && ctest --test-dir build -R qus_q5090_parser_test --output-on-failure`
-- [ ] Expected before implementation: compile or test failure proving q5090 parser/API is missing.
+- [ ] Historical RED expectation: this failed before the q5090 parser/API existed; in the current
+  implementation this path should build and pass when run in a suitable environment.
 
 ### Task 3: Parser GREEN implementation
 
@@ -422,7 +431,8 @@ Transform ownership fix:
   metadata-only.
 - [ ] Load with both flags; assert TEXT, MTP, and VISION payloads are all uploaded.
 - [ ] Add failure test for missing required TEXT_CORE tensor and for small arena rewind.
-- [ ] Expected before implementation: test fails because upload/options API is missing.
+- [ ] Historical RED expectation: this failed before upload/options API existed; in the current
+  implementation this path should build and pass when run in a suitable environment.
 
 ### Task 6: GPU upload GREEN implementation
 
@@ -482,7 +492,8 @@ Plan review:
   `tools/q5090_convert/*.py`, and pasted requirements.
 - Reviewer checks byte-layout fidelity, validation coverage, no external dependencies,
   transform neutrality, module selection, and deletion completeness.
-- Revise this file before implementation.
+- Historical note: this review gate required revising the plan before implementation; the file is
+  now retained as post-implementation history.
 
 Implementation review:
 
@@ -501,7 +512,7 @@ Final review:
 - No obsolete pre-q5090 loader or files remain.
 - Loader parses and validates q5090 metadata and payload CRCs for all modules.
 - Default load uploads TEXT_CORE only; MTP/VISION upload only when requested.
-- `QuantWeight` describes inline-scale q5090 payloads and never assumes separate FP32
+- `Weight` describes inline-scale q5090 payloads and never assumes separate FP32
   scales.
 - Loader applies no numeric transforms.
 - Required TEXT_CORE tensor names can be enforced by caller-supplied options.

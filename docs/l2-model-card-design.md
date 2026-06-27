@@ -1,9 +1,11 @@
 # L2 Model Card Design — qwen3.6-ultraspeed
 
-> Status: design (approved in brainstorm). Date: 2026-06-26; §4 schedule updated 2026-06-27 to the
-> implemented L1 op signatures. All 13 L1 ops are done; building this card
-> (`config.h`/`model.h`/`qwen3_6_27b.cpp` + the Engine) is the **M2 integration** work — see
-> [`docs/plans/l2-model-card-m2.md`](plans/l2-model-card-m2.md).
+> Status: implemented design/reference. Date: 2026-06-26; §4 schedule updated 2026-06-27 to the
+> implemented L1 op signatures; status synchronized after M2 implementation.
+> The L2 model card (`config.h`/`model.h`/`qwen3_6_27b.cpp`) and the `Engine`
+> (`engine.h`/`engine.cpp`) now exist. This document remains the design/reference for that
+> implementation and for future graph/fusion work. See
+> [`docs/plans/l2-model-card-m2.md`](plans/l2-model-card-m2.md) for retained M2 history.
 > Scope: the **L2 model card** — the hand-written static forward schedule for Qwen3.6-27B that
 > issues L1 kernel calls in order, plus the prefill/decode drivers and KV/state lifecycle. It
 > sits above L1 kernels and L0 infra. See [`design.md`](design.md) §5/§6/§7 (system architecture
@@ -11,7 +13,8 @@
 > and [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md) §6/§9 (computation order). The
 > precision/quant seam — the `Weight` handle that replaces `LinearW` — is specified in
 > [`weight-handle-design.md`](weight-handle-design.md).
-> Implements the stubs `include/qus/model/{config,model}.h` and `src/model/qwen3_6_27b.cpp`.
+> Current implementation files: `include/qus/model/{config,model}.h`,
+> `src/model/qwen3_6_27b.cpp`, `include/qus/runtime/engine.h`, and `src/runtime/engine.cpp`.
 
 ---
 
@@ -354,7 +357,7 @@ if constexpr (Tap::enabled) tap_(TapId::AfterMixer, l, x);  // D2H copy + tagged
 ```
 
 Release (`NullTap`) compiles the taps out entirely, leaving the decode body pristine for capture.
-The parity build (`FileTap`) is used only during M2 and never during capture.
+The parity build (`FileTap`) is used only for debug/parity runs and never during capture.
 
 ---
 

@@ -1,10 +1,12 @@
 # qwen3.6-ultraspeed — Master Design & Goal Document
 
-> Status: **design / spec phase** (no implementation yet).
-> Date: 2026-06-25.
-> This document is the single source of truth for *what we are building and why*. It guides
-> all subsequent implementation. Kernel-level micro-decisions are deliberately left open;
-> architecture, scope, and boundaries are fixed here.
+> Status: **M2 correctness baseline implemented; M2.5 hardening/documentation sync in progress;
+> M3 performance optimization next**.
+> Date: original design 2026-06-25; status synchronized 2026-06-27.
+> This document remains the architectural source of truth for *what we are building and why*.
+> The implementation has caught up through M2 and much of M2.5; some roadmap items below are now
+> complete history. Kernel-level micro-decisions remain flexible; architecture, scope, and
+> boundaries are fixed here.
 
 ---
 
@@ -358,7 +360,7 @@ Tools: **nsys** (timeline, launch overhead), **ncu** (per-kernel roofline),
 
 - **Per-layer numerical parity**: dump activations from HF/vLLM for fixed inputs; compare
   cosine similarity / max-abs-error per layer.
-- **End-to-end greedy token-match**: identical prompt + greedy must match vLLM & llama.cpp
+- **End-to-end greedy token-match**: identical prompt + greedy must match the q5090 oracle
   token-for-token (greedy determinism makes this nearly free).
 - **compute-sanitizer** clean (memcheck/racecheck) at each stage.
 - **Perf tracking** vs the §1 roofline at every ladder stage.
@@ -396,11 +398,17 @@ qwen3.6-ultraspeed/
 
 ## 14. Roadmap / milestones
 
-- **M0 — Skeleton:** repo, CMake, L0 infra (memory pool, tensor, loader stub), model config.
-- **M1 — Weight pipeline:** Python quantize + pack; file format; C++ loader; load full model.
-- **M2 — Correctness baseline:** eager forward for all op types; greedy decode;
-  per-layer parity + greedy token-match vs reference.
-- **M3 — Per-kernel optimization:** each kernel to roofline (W4A16 GEMV, GQA, GDN, conv,
+- **M0 — Skeleton:** implemented; repo, CMake, L0 infra, tensor/device arenas, and model config exist.
+- **M1 — Weight pipeline:** implemented; q5090 Python converter, fixed file format, C++ parser/loader,
+  and full-model load path exist.
+- **L1 — Operator layer:** implemented; the 13 public operator APIs and their current CUDA
+  implementations exist, with focused kernel tests.
+- **M2 — Correctness baseline:** implemented; L2 model card, Engine, block parity tooling, greedy
+  token-match tooling, and FileTap localization exist.
+- **M2.5 — Hardening/documentation sync:** mostly landed / in progress; graph-readiness fixes, EOS
+  handling, parity tap structure, and cleanup structural checks are present. Keep unknown or
+  environment-heavy gates as verify-current items.
+- **M3 — Per-kernel optimization:** next; each kernel to roofline (W4A16 GEMV, GQA, GDN, conv,
   RoPE, SwiGLU, argmax).
 - **M4 — Fusion:** fuse adjacent ops; reduce launches/round-trips.
 - **M5 — Launch-overhead elimination:** CUDA Graph decode replay; explore megakernel.
@@ -409,7 +417,7 @@ qwen3.6-ultraspeed/
 
 ---
 
-## 15. Open questions (to resolve during implementation, non-blocking)
+## 15. Open questions (to resolve during optimization/future phases, non-blocking)
 - `lm_head` precision (decode-bandwidth vs quality) — decide by measurement.
 - Exact GDN state layout & chunk size for the prefill scan.
 - W4A16 weight packing/interleave layout that best feeds the GEMV access pattern.

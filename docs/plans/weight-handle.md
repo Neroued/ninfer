@@ -1,19 +1,24 @@
 # Weight Handle Implementation Plan
 
+> **Current status:** historical plan. The unified `Weight` handle, `as_dense`, `weight_from_dense`,
+> L1 `linear`/`embed_gather` signatures, and L2 card bindings now exist. This file is retained as
+> the implementation history and contract rationale, not as a statement that downstream layers are
+> missing.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `Weight` the one tagged weight handle for all precisions (dense `BF16_CTRL`/`FP32_CTRL`
-*and* quantized Q4/Q5/Q6/W8), and add the `as_dense` / `weight_from_dense` bridges, so the future
-`linear` / `embed_gather` ops take a single `const Weight&` instead of a `Tensor`-vs-`QuantWeight`
-union.
+**Historical goal:** Make `Weight` the one tagged weight handle for all precisions (dense
+`BF16_CTRL`/`FP32_CTRL` *and* quantized Q4/Q5/Q6/W8), and add the `as_dense` /
+`weight_from_dense` bridges, so `linear` / `embed_gather` take a single `const Weight&` instead of a
+`Tensor`-vs-`QuantWeight` union.
 
 **Architecture:** Pure L0 change. (1) Clean-rename `QuantWeight` → `Weight` (no alias, no
 backward-compat shim). (2) Add a small header-only `include/qus/core/weight.h` with two inline
 projection helpers. The on-disk packer, the file format, the `Tensor` type, and every existing kernel
-are untouched. The L1 operator signatures and the L2 card bindings consume this handle and are
-specified in §"Downstream adoption" but are **not** built here (those layers are still stubs).
+are untouched. The L1 operator signatures and the L2 card bindings now consume this handle; §"Downstream
+adoption" is retained as the historical contract that those layers implemented.
 
 **Tech Stack:** C++20, CUDA 13.1 (sm_120), CMake ≥ 3.28, gcc 13.3. Tests are framework-free
 `int main()` executables returning a failure count (see `tests/test_tensor.cpp`), registered via
@@ -401,13 +406,11 @@ git commit -m "feat(core): add weight_from_dense() bridge + as_dense round-trip 
 
 ---
 
-## Downstream adoption (NOT executable here — contract for the consuming layers)
+## Downstream adoption (implemented contract for the consuming layers)
 
-The L1 `linear`/`embed_gather` ops and the L2 card are still stubs (`include/qus/kernels/` has only
-`silu_and_mul`; `src/model/qwen3_6_27b.cpp` is a TODO). When those layers are built, they MUST
-consume the handle from this plan as follows (full detail in
-[`../weight-handle-design.md`](../weight-handle-design.md) §5–§6). Listed here so the contract is
-locked; do **not** create empty API headers now (YAGNI / no placeholders).
+The L1 `linear`/`embed_gather` ops and the L2 card now consume the handle from this plan as follows
+(full detail in [`../weight-handle-design.md`](../weight-handle-design.md) §5–§6). This section is
+kept as the locked contract that current code is expected to preserve.
 
 - **L1 `linear` / `embed_gather` api** (`include/qus/kernels/linear.h`, `.../embed_gather.h`): the
   weight argument is `const Weight&` (never a union). The **wrapper** validates then dispatches with
@@ -425,9 +428,8 @@ locked; do **not** create empty API headers now (YAGNI / no placeholders).
 
 ## Follow-ups / out of scope
 
-- **Doc sync (optional, cosmetic):** older L0 docs still say `QuantWeight`
-  (`docs/plans/l0-tensor.md`, `docs/plans/l0-weight-store-q5090.md`,
-  `docs/l0-infrastructure-design.md`). Update on next edit; not required for this change.
+- **Doc sync:** older historical docs may still mention `QuantWeight` when describing the
+  pre-unification state. Current code and active contracts use `Weight`.
 - **Deferred store unification (post-M2):** collapse `TensorRecord`/`QuantRecord` into one
   `WeightRecord` so `WeightStore` returns `const Weight*` for *every* param and `weight_from_dense`
   disappears (spec §8). Larger L0 + test change; defer until after correctness.

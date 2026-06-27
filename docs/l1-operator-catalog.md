@@ -1,9 +1,10 @@
 # L1 Operator Catalog — qwen3.6-ultraspeed
 
-> Status: design (brainstorm). Date: 2026-06-26.
+> Status: implemented API contract. Date: 2026-06-26; status synchronized 2026-06-27.
 > Scope: the **complete, finalized list of L1 operators** the text-only v1 model card calls, each
 > with its generic (algorithm-based) name and its public **api signature**. This is the naming +
-> declaration contract; **implementations are a separate phase**.
+> declaration contract; the 13 public headers now exist in `include/qus/kernels/` and the current
+> implementations live under `src/kernels/`.
 >
 > This catalog *inherits* its structure and seam from two approved docs and does not re-derive them:
 > - **[`l1-kernel-layering.md`](l1-kernel-layering.md)** — the api→wrapper→launcher→kernel split,
@@ -18,9 +19,9 @@
 
 ## 1. Purpose & decisions
 
-The model card (L2) issues a fixed schedule of kernel calls. Before implementing it, we fix the
-**operator surface**: what ops exist, what they're called, and what their signatures are — so the
-card can be written against a stable API while kernels are filled in later.
+The model card (L2) issues a fixed schedule of kernel calls. This catalog fixes the
+**operator surface**: what ops exist, what they're called, and what their signatures are. The
+implemented card and kernels are expected to keep matching this API/naming contract.
 
 **Naming guiding rule:** name by the **algorithm/operation**, not by the model that uses it. Drop
 brand prefixes; keep field-standard algorithm names. (`gemma_rmsnorm` is a brand name for a
@@ -75,10 +76,9 @@ Inherited verbatim from the two source docs; restated here only where this catal
 - **Numerics (intrinsic, not parameters):** bf16 in/out activations; fp32 accumulate in
   norms/softmax/reductions/recurrence. Kernels own **all** model-semantic transforms — `(1+w)`,
   `-exp(A_log)`, softplus, the `1/√256` and `1/√128` scales, partial-RoPE rotation.
-- **New shared header:** `include/qus/kernels/phase.h` with `enum class Phase { Prefill, Decode }`.
-  `l1-kernel-layering.md` §8 deferred this until the first multi-variant op; this catalog has several
-  (attention, conv1d, gated_delta_rule), so it lands now. The card passes `Phase` at the call site;
-  most ops encode phase in the entry name instead.
+- **Phase ownership:** phase-split public ops encode phase in the entry name (`_prefill`,
+  `_decode`, `_recurrent`, `_chunked`). The model card owns its local `Phase` enum for schedule
+  helpers; no extra L1 `phase.h` public header is required by the current implementation.
 
 ---
 
@@ -306,17 +306,15 @@ ops when their milestone arrives:
    `const Weight*` and uses the `linear` / `embed_gather` verbs; only a historical
    "`Weight` replaces `LinearW`" note remains.
 3. **Legacy family-header stubs — already removed.** The L1 restructure deleted
-   `gemm/norm/attention/gdn/rope/activation/sampling/dispatch.h`; only `silu_and_mul.h` remains.
-   There is no `dispatch.h` (dispatch lives in each wrapper). The per-op headers in §10 — including a
-   per-op `rope.h` — are **created during implementation**, not now.
+   `gemm/norm/attention/gdn/rope/activation/sampling/dispatch.h`. There is no `dispatch.h`
+   (dispatch lives in each wrapper). The per-op headers in §10 — including `rope.h` — now exist.
 
 ---
 
-## 10. File manifest (api headers created by this catalog)
+## 10. File manifest (implemented public api headers)
 
 ```
 include/qus/kernels/
-  phase.h               # enum class Phase { Prefill, Decode }
   linear.h              # seam (Weight)
   embed_gather.h        # seam (Weight)
   rmsnorm.h
@@ -333,8 +331,8 @@ include/qus/kernels/
 ```
 
 Each spawns its `src/kernels/wrapper/<op>.cpp` + `launcher/<op>[_<variant>].{h,cu}` +
-`kernel/<op>[_<variant>].cuh` per `l1-kernel-layering.md` §3. Only `silu_and_mul.h` exists today; the
-rest are created during implementation. (The legacy family headers were already removed — §9.)
+`kernel/<op>[_<variant>].cuh` per `l1-kernel-layering.md` §3. These 13 public headers are present in
+the current tree; the legacy family headers were already removed (§9).
 
 ---
 

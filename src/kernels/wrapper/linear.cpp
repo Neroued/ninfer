@@ -172,6 +172,19 @@ void require_tensor_data(const Tensor& x, const Tensor& out) {
     }
 }
 
+void require_aligned_16(const void* p, const char* label) {
+    if ((reinterpret_cast<std::uintptr_t>(p) & 0xfu) != 0) {
+        throw std::invalid_argument(std::string("linear: dense ") + label +
+                                    " data must be 16-byte aligned");
+    }
+}
+
+void require_dense_alignment(const Tensor& x, const Weight& w, const Tensor& out) {
+    require_aligned_16(x.data, "x");
+    require_aligned_16(w.qdata, "weight");
+    require_aligned_16(out.data, "out");
+}
+
 } // namespace
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -193,6 +206,7 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
         }
         if (is_empty_T(x, out)) { return; }
         require_tensor_data(x, out);
+        require_dense_alignment(x, w, out);
         const Tensor dense = as_dense(w);
         if (x.ne[1] == 1) {
             detail::linear_dense_gemv_launch(x, dense, out, stream);

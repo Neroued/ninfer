@@ -137,6 +137,52 @@ int one_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype,
                   Tolerance::linear_bf16());
 }
 
+int fp32_ctrl_first_column_consistency(std::int32_t n, std::int32_t k, std::int32_t t) {
+    std::vector<float> x_one(static_cast<std::size_t>(k), 0.0f);
+    std::vector<float> x_many(static_cast<std::size_t>(k) * t, 0.0f);
+    std::vector<float> weight(static_cast<std::size_t>(n) * k, 0.0f);
+    for (std::int32_t kk = 0; kk < std::min<std::int32_t>(k, 16); ++kk) {
+        x_one[kk] = 3.0f;
+        for (std::int32_t col = 0; col < t; ++col) {
+            x_many[static_cast<std::size_t>(col) * k + kk] = 3.0f;
+        }
+    }
+    for (std::int32_t row = 0; row < n; ++row) {
+        for (std::int32_t kk = 0; kk < std::min<std::int32_t>(k, 16); ++kk) {
+            weight[static_cast<std::size_t>(row) * k + kk] = 1.003f;
+        }
+    }
+
+    DBuf dx_one  = to_device_bf16(x_one);
+    DBuf dx_many = to_device_bf16(x_many);
+    DBuf dw      = to_device_f32(weight);
+    DBuf out_one(static_cast<std::size_t>(n) * 2u);
+    DBuf out_many(static_cast<std::size_t>(n) * t * 2u);
+
+    Tensor tx_one(dx_one.p, DType::BF16, {k, 1});
+    Tensor tx_many(dx_many.p, DType::BF16, {k, t});
+    Tensor tout_one(out_one.p, DType::BF16, {n, 1});
+    Tensor tout_many(out_many.p, DType::BF16, {n, t});
+    Weight w = dense_weight(dw.p, QType::FP32_CTRL, n, k);
+
+    kernels::linear(tx_one, w, tout_one, nullptr);
+    kernels::linear(tx_many, w, tout_many, nullptr);
+    cudaDeviceSynchronize();
+
+    const std::vector<double> got_one = from_device_bf16(out_one, n);
+    const std::vector<double> got_many =
+        from_device_bf16(out_many, static_cast<std::size_t>(n) * t);
+    for (std::int32_t row = 0; row < n; ++row) {
+        if (got_one[row] != got_many[row]) {
+            std::cerr << "linear fp32 first-column consistency [" << n << "," << k << "] T=" << t
+                      << ": row " << row << " T=1=" << got_one[row] << " T>1=" << got_many[row]
+                      << '\n';
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
                     const std::vector<std::int32_t>& ts, std::uint32_t seed) {
     const std::int32_t max_t = *std::max_element(ts.begin(), ts.end());
@@ -264,6 +310,51 @@ int dense_metadata_validation() {
     return f;
 }
 
+int dense_alignment_validation() {
+    int f                    = 0;
+    constexpr std::int32_t n = 2;
+    constexpr std::int32_t k = 5;
+    DBuf dx(static_cast<std::size_t>(k) * 2u + 16u);
+    DBuf dw(static_cast<std::size_t>(n) * k * 2u + 16u);
+    DBuf dout(static_cast<std::size_t>(n) * 2u + 16u);
+    cudaMemset(dx.p, 0, dx.bytes);
+    cudaMemset(dw.p, 0, dw.bytes);
+    cudaMemset(dout.p, 0, dout.bytes);
+
+    auto* x_bytes   = static_cast<unsigned char*>(dx.p);
+    auto* w_bytes   = static_cast<unsigned char*>(dw.p);
+    auto* out_bytes = static_cast<unsigned char*>(dout.p);
+    Tensor tx(dx.p, DType::BF16, {k, 1});
+    Tensor tout(dout.p, DType::BF16, {n, 1});
+    Weight w = dense_weight(dw.p, QType::BF16_CTRL, n, k);
+
+    try {
+        Tensor bad_x(x_bytes + 2, DType::BF16, {k, 1});
+        kernels::linear(bad_x, w, tout, nullptr);
+        cudaDeviceSynchronize();
+        std::cerr << "linear dense unaligned x: expected invalid_argument\n";
+        ++f;
+    } catch (const std::invalid_argument&) {}
+
+    try {
+        Weight bad_w = dense_weight(w_bytes + 2, QType::BF16_CTRL, n, k);
+        kernels::linear(tx, bad_w, tout, nullptr);
+        cudaDeviceSynchronize();
+        std::cerr << "linear dense unaligned weight: expected invalid_argument\n";
+        ++f;
+    } catch (const std::invalid_argument&) {}
+
+    try {
+        Tensor bad_out(out_bytes + 2, DType::BF16, {n, 1});
+        kernels::linear(tx, w, bad_out, nullptr);
+        cudaDeviceSynchronize();
+        std::cerr << "linear dense unaligned out: expected invalid_argument\n";
+        ++f;
+    } catch (const std::invalid_argument&) {}
+
+    return f;
+}
+
 int lowbit_metadata_validation(QType qtype) {
     int f                    = 0;
     constexpr std::int32_t n = 64;
@@ -328,6 +419,7 @@ int main() {
     int f = 0;
     f += unsupported_qtype_validation();
     f += dense_metadata_validation();
+    f += dense_alignment_validation();
     f += lowbit_metadata_validation(QType::Q4G64_F16S);
     f += lowbit_metadata_validation(QType::Q5G64_F16S);
     f += lowbit_metadata_validation(QType::Q6G64_F16S);
@@ -339,12 +431,15 @@ int main() {
         }
     }
     for (QType qtype : {QType::BF16_CTRL, QType::FP32_CTRL}) {
+        if (qtype == QType::BF16_CTRL) { f += one_dense_shape(64, 64, 32, qtype, 11u); }
         f += one_dense_shape(64, 96, 64, qtype, 13u);
         f += one_dense_shape(96, 513, 33, qtype, 15u);
         f += one_dense_shape(5120, 6144, 1, qtype, 17u);
         f += one_dense_shape(5120, 6144, 7, qtype, 17u);
         f += one_dense_shape(37, 513, 19, qtype, 19u);
     }
+    f += fp32_ctrl_first_column_consistency(48, 64, 7);
+    f += fp32_ctrl_first_column_consistency(64, 64, 32);
     for (auto [n, k] : {std::pair<std::int32_t, std::int32_t>{6144, 5120},
                         std::pair<std::int32_t, std::int32_t>{1024, 5120},
                         std::pair<std::int32_t, std::int32_t>{2048, 5120},

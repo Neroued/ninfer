@@ -341,6 +341,7 @@ int main() {
     for (QType qtype : {QType::BF16_CTRL, QType::FP32_CTRL}) {
         f += one_dense_shape(5120, 6144, 1, qtype, 17u);
         f += one_dense_shape(5120, 6144, 7, qtype, 17u);
+        f += one_dense_shape(37, 513, 19, qtype, 19u);
     }
     for (auto [n, k] : {std::pair<std::int32_t, std::int32_t>{6144, 5120},
                         std::pair<std::int32_t, std::int32_t>{1024, 5120},

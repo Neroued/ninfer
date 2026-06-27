@@ -1,7 +1,7 @@
 // Performance bench for linear at real Qwen3.6 shapes. Dense in_a/in_b use
 // [48,5120]; Q4 decode uses mlp_gate/mlp_up [17408,5120]. The printed GB/s is
-// informational only; the gate is deferred for this correctness task.
-//   ./qus_linear_bench [--decode] [--prefill] [--bf16] [--fp32] [--q4] [--q6]
+// informational only; ncu is the performance evidence.
+//   ./qus_linear_bench [--decode] [--prefill] [--bf16] [--fp32] [--q4] [--q6] [--stress]
 #include "qus/kernels/linear.h"
 #include "qus_bench_common.h"
 
@@ -15,14 +15,17 @@ using namespace qus::bench;
 
 namespace {
 
-constexpr std::int32_t kDenseN = 48;
-constexpr std::int32_t kDenseK = 5120;
-constexpr std::int32_t kQ4N    = 17408;
-constexpr std::int32_t kQ4K    = 5120;
-constexpr std::int32_t kQ4Tile = 2176;
-constexpr std::int32_t kQ6N    = 248320;
-constexpr std::int32_t kQ6K    = 5120;
-constexpr std::int32_t kQ6Tile = 3200;
+constexpr std::int32_t kDenseN       = 48;
+constexpr std::int32_t kDenseK       = 5120;
+constexpr std::int32_t kDenseStressN = 5120;
+constexpr std::int32_t kDenseStressK = 6144;
+constexpr std::int32_t kDenseStressT = 64;
+constexpr std::int32_t kQ4N          = 17408;
+constexpr std::int32_t kQ4K          = 5120;
+constexpr std::int32_t kQ4Tile       = 2176;
+constexpr std::int32_t kQ6N          = 248320;
+constexpr std::int32_t kQ6K          = 5120;
+constexpr std::int32_t kQ6Tile       = 3200;
 
 DBuf make_f32(std::size_t n) {
     std::vector<float> h(n);
@@ -60,18 +63,19 @@ Weight dense_weight(void* data, QType qtype, std::int32_t n, std::int32_t k) {
 
 const char* qtype_name(QType qtype) { return (qtype == QType::FP32_CTRL) ? "fp32" : "bf16"; }
 
-void run_dense(std::int32_t t, QType qtype, const char* phase) {
-    const std::size_t x_elems   = static_cast<std::size_t>(kDenseK) * t;
-    const std::size_t w_elems   = static_cast<std::size_t>(kDenseN) * kDenseK;
-    const std::size_t out_elems = static_cast<std::size_t>(kDenseN) * t;
+void run_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype,
+                     const char* phase) {
+    const std::size_t x_elems   = static_cast<std::size_t>(k) * t;
+    const std::size_t w_elems   = static_cast<std::size_t>(n) * k;
+    const std::size_t out_elems = static_cast<std::size_t>(n) * t;
 
     DBuf x    = make_bf16(x_elems);
     DBuf wbuf = make_weight(qtype, w_elems);
     DBuf out  = make_zeros(out_elems * sizeof(std::uint16_t));
 
-    Tensor tx(x.p, DType::BF16, {kDenseK, t});
-    Tensor tout(out.p, DType::BF16, {kDenseN, t});
-    Weight w = dense_weight(wbuf.p, qtype, kDenseN, kDenseK);
+    Tensor tx(x.p, DType::BF16, {k, t});
+    Tensor tout(out.p, DType::BF16, {n, t});
+    Weight w = dense_weight(wbuf.p, qtype, n, k);
 
     const double weight_bytes = static_cast<double>(w_elems) *
                                 ((qtype == QType::FP32_CTRL) ? 4.0 : 2.0) * static_cast<double>(t);
@@ -80,9 +84,16 @@ void run_dense(std::int32_t t, QType qtype, const char* phase) {
     const Result r = bench_loop([&](cudaStream_t s) { kernels::linear(tx, w, tout, s); }, bytes);
 
     char tag[96];
-    std::snprintf(tag, sizeof(tag), "linear %s %s [%d,%d] T=%d", qtype_name(qtype), phase, kDenseN,
-                  kDenseK, t);
+    std::snprintf(tag, sizeof(tag), "linear %s %s [%d,%d] T=%d", qtype_name(qtype), phase, n, k, t);
     print_result(tag, r);
+}
+
+void run_dense(std::int32_t t, QType qtype, const char* phase) {
+    run_dense_shape(kDenseN, kDenseK, t, qtype, phase);
+}
+
+void run_dense_stress(QType qtype) {
+    run_dense_shape(kDenseStressN, kDenseStressK, kDenseStressT, qtype, "stress-prefill");
 }
 
 DBuf make_tile_payload(std::int32_t n, std::int32_t k, std::int32_t tilew) {
@@ -204,6 +215,7 @@ int main(int argc, char** argv) {
     }
 
     bool decode = false, prefill = false, bf16 = false, fp32 = false, q4 = false, q6 = false;
+    bool stress = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--decode"))
             decode = true;
@@ -217,9 +229,17 @@ int main(int argc, char** argv) {
             q4 = true;
         else if (!std::strcmp(argv[i], "--q6"))
             q6 = true;
+        else if (!std::strcmp(argv[i], "--stress"))
+            stress = true;
     }
     if (!decode && !prefill) { decode = prefill = true; }
     if (!bf16 && !fp32 && !q4 && !q6) { bf16 = fp32 = q4 = q6 = true; }
+
+    if (stress) {
+        if (bf16) run_dense_stress(QType::BF16_CTRL);
+        if (fp32) run_dense_stress(QType::FP32_CTRL);
+        return 0;
+    }
 
     if (decode && bf16) run_dense(1, QType::BF16_CTRL, "decode");
     if (decode && fp32) run_dense(1, QType::FP32_CTRL, "decode");

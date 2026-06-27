@@ -46,6 +46,31 @@ dim3 tiled_gemm_grid_for(std::int32_t n, std::int32_t t) {
 
 bool is_fp32_weight(const Tensor& weight) { return weight.dtype == DType::FP32; }
 
+bool is_full_bf16_tiled_gemm(std::int32_t n, std::int32_t k, std::int32_t t, bool weight_fp32) {
+    return !weight_fp32 && n >= kDenseGemmBlockM && t >= kDenseGemmBlockN &&
+           (n % kDenseGemmBlockM) == 0 && (t % kDenseGemmBlockN) == 0 &&
+           (k % kDenseGemmBlockK) == 0;
+}
+
+bool is_full_bf16_half_wide_gemm(std::int32_t n, std::int32_t k, std::int32_t t, bool weight_fp32) {
+    return !weight_fp32 && n >= kDenseGemmBlockM && t >= kDenseGemmWideBlockN &&
+           (n % kDenseGemmBlockM) == 0 && (t % kDenseGemmWideBlockN) == 0 &&
+           (k % kDenseGemmHalfBlockK) == 0;
+}
+
+dim3 tiled_gemm_half_wide_grid_for(std::int32_t n, std::int32_t t) {
+    const std::int64_t grid_m =
+        (static_cast<std::int64_t>(n) + kDenseGemmHalfBlockM - 1) / kDenseGemmHalfBlockM;
+    const std::int64_t grid_n =
+        (static_cast<std::int64_t>(t) + kDenseGemmWideBlockN - 1) / kDenseGemmWideBlockN;
+    if (grid_m > std::numeric_limits<unsigned>::max() ||
+        grid_n > std::numeric_limits<unsigned>::max()) {
+        throw std::overflow_error("linear: dense launch grid exceeds CUDA limit");
+    }
+    return dim3(static_cast<unsigned>(std::max<std::int64_t>(1, grid_m)),
+                static_cast<unsigned>(std::max<std::int64_t>(1, grid_n)));
+}
+
 } // namespace
 
 void linear_dense_gemv_launch(const Tensor& x, const Tensor& weight, Tensor& out,
@@ -64,7 +89,19 @@ void linear_dense_gemm_launch(const Tensor& x, const Tensor& weight, Tensor& out
     const std::int32_t k   = x.ne[0];
     const std::int32_t t   = x.ne[1];
     const bool weight_fp32 = is_fp32_weight(weight);
-    if (weight_fp32 && n >= kDenseGemmBlockM && t >= kDenseGemmBlockN) {
+    if (is_full_bf16_half_wide_gemm(n, k, t, weight_fp32)) {
+        linear_dense_gemm_bf16_half_wide_full_kernel<<<tiled_gemm_half_wide_grid_for(n, t),
+                                                       kDenseGemmHalfThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data), static_cast<__nv_bfloat16*>(out.data),
+            n, k);
+    } else if (is_full_bf16_tiled_gemm(n, k, t, weight_fp32)) {
+        linear_dense_gemm_bf16_full_kernel<<<tiled_gemm_grid_for(n, t), kDenseGemmThreads, 0,
+                                             stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data), static_cast<__nv_bfloat16*>(out.data),
+            n, k);
+    } else if (n >= kDenseGemmBlockM && t >= kDenseGemmBlockN) {
         linear_dense_gemm_kernel<<<tiled_gemm_grid_for(n, t), kDenseGemmThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), weight.data,
             static_cast<__nv_bfloat16*>(out.data), n, k, t, weight_fp32);

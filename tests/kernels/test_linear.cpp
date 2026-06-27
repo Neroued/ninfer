@@ -339,6 +339,8 @@ int main() {
         }
     }
     for (QType qtype : {QType::BF16_CTRL, QType::FP32_CTRL}) {
+        f += one_dense_shape(64, 96, 64, qtype, 13u);
+        f += one_dense_shape(96, 513, 33, qtype, 15u);
         f += one_dense_shape(5120, 6144, 1, qtype, 17u);
         f += one_dense_shape(5120, 6144, 7, qtype, 17u);
         f += one_dense_shape(37, 513, 19, qtype, 19u);

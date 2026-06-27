@@ -23,10 +23,21 @@ constexpr int kDenseGemvWarps       = kDenseGemvThreads / 32;
 constexpr int kDenseMmaTileElements = kDenseMmaM * kDenseMmaK;
 constexpr int kDenseGemmBlockM      = 64;
 constexpr int kDenseGemmBlockN      = 32;
+constexpr int kDenseGemmBlockK      = 64;
 constexpr int kDenseGemmWarpRows    = kDenseGemmBlockM / kDenseMmaM;
 constexpr int kDenseGemmWarpCols    = kDenseGemmBlockN / kDenseMmaN;
-constexpr int kDenseGemmBlockA      = kDenseGemmBlockM * kDenseMmaK;
-constexpr int kDenseGemmBlockB      = kDenseMmaK * kDenseGemmBlockN;
+constexpr int kDenseGemmBlockA      = kDenseGemmBlockM * kDenseGemmBlockK;
+constexpr int kDenseGemmBlockB      = kDenseGemmBlockK * kDenseGemmBlockN;
+constexpr int kDenseGemmWideBlockN  = 64;
+constexpr int kDenseGemmWideAccCols = 2;
+constexpr int kDenseGemmWideWarpColGroups =
+    kDenseGemmWideBlockN / (kDenseMmaN * kDenseGemmWideAccCols);
+constexpr int kDenseGemmHalfBlockM     = 32;
+constexpr int kDenseGemmHalfBlockK     = 96;
+constexpr int kDenseGemmHalfWarps      = 4;
+constexpr int kDenseGemmHalfThreads    = kDenseGemmHalfWarps * 32;
+constexpr int kDenseGemmHalfBlockA     = kDenseGemmHalfBlockM * kDenseGemmHalfBlockK;
+constexpr int kDenseGemmHalfWideBlockB = kDenseGemmHalfBlockK * kDenseGemmWideBlockN;
 
 template <int Width = 32>
 __device__ __forceinline__ float dense_warp_reduce_sum(float v) {
@@ -55,6 +66,58 @@ __device__ __forceinline__ float dense_block_reduce_sum(float v) {
 
 __device__ __forceinline__ float2 bf162_to_float2(__nv_bfloat162 v) {
     return __bfloat1622float2(v);
+}
+
+__device__ __forceinline__ __nv_bfloat16 dense_zero_bf16() { return __float2bfloat16(0.0f); }
+
+__device__ __forceinline__ void dense_cp_async_16(void* smem_dst, const void* gmem_src) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(
+                     static_cast<unsigned>(__cvta_generic_to_shared(smem_dst))),
+                 "l"(gmem_src));
+#else
+    *reinterpret_cast<int4*>(smem_dst) = *reinterpret_cast<const int4*>(gmem_src);
+#endif
+}
+
+__device__ __forceinline__ void dense_cp_async_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n");
+#endif
+}
+
+__device__ __forceinline__ void dense_cp_async_wait_all() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_all;\n");
+#endif
+}
+
+template <int BlockM, int BlockN, int BlockK>
+__device__ __forceinline__ void
+dense_gemm_issue_bf16_full_tile(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                __nv_bfloat16* smem_a, __nv_bfloat16* smem_b, std::int32_t k,
+                                std::int32_t row0, std::int32_t col0, std::int32_t k0) {
+    constexpr int kVecElems = 8; // int4 holds eight bf16 values.
+    constexpr int kBlockA   = BlockM * BlockK;
+    constexpr int kBlockB   = BlockK * BlockN;
+
+    auto* smem_a_vec = reinterpret_cast<int4*>(smem_a);
+    for (int v = threadIdx.x; v < kBlockA / kVecElems; v += blockDim.x) {
+        const int i              = v * kVecElems;
+        const std::int32_t r     = i / BlockK;
+        const std::int32_t kk    = i - r * BlockK;
+        const std::int64_t g_idx = static_cast<std::int64_t>(row0 + r) * k + k0 + kk;
+        dense_cp_async_16(smem_a_vec + v, weight + g_idx);
+    }
+
+    auto* smem_b_vec = reinterpret_cast<int4*>(smem_b);
+    for (int v = threadIdx.x; v < kBlockB / kVecElems; v += blockDim.x) {
+        const int i              = v * kVecElems;
+        const std::int32_t c     = i / BlockK;
+        const std::int32_t kk    = i - c * BlockK;
+        const std::int64_t g_idx = k0 + kk + static_cast<std::int64_t>(k) * (col0 + c);
+        dense_cp_async_16(smem_b_vec + v, x + g_idx);
+    }
 }
 
 } // namespace
@@ -136,34 +199,83 @@ __global__ void linear_dense_gemm_kernel(const __nv_bfloat16* x, const void* wei
     wmma::fragment<wmma::accumulator, kDenseMmaM, kDenseMmaN, kDenseMmaK, float> c_frag;
     wmma::fill_fragment(c_frag, 0.0f);
 
-    for (std::int32_t k0 = 0; k0 < k; k0 += kDenseMmaK) {
-        for (int i = threadIdx.x; i < kDenseGemmBlockA; i += blockDim.x) {
-            const std::int32_t r   = i / kDenseMmaK;
-            const std::int32_t kk  = i - r * kDenseMmaK;
-            const std::int32_t row = row0 + r;
-            const std::int32_t col = k0 + kk;
-            __nv_bfloat16 v        = __float2bfloat16(0.0f);
-            if (row < n && col < k) {
-                const std::int64_t idx = static_cast<std::int64_t>(row) * k + col;
-                v = weight_fp32 ? __float2bfloat16(static_cast<const float*>(weight)[idx])
-                                : static_cast<const __nv_bfloat16*>(weight)[idx];
+    for (std::int32_t k0 = 0; k0 < k; k0 += kDenseGemmBlockK) {
+        const bool full_a           = row0 + kDenseGemmBlockM <= n && k0 + kDenseGemmBlockK <= k;
+        const bool full_b           = col0 + kDenseGemmBlockN <= t && k0 + kDenseGemmBlockK <= k;
+        const bool bf16_vec_aligned = (k & 7) == 0;
+        const bool fp32_vec_aligned = (k & 3) == 0;
+
+        if (!weight_fp32 && full_a && bf16_vec_aligned) {
+            constexpr int kVecElems = 8; // int4 holds eight bf16 values.
+            const auto* w_bf16      = static_cast<const __nv_bfloat16*>(weight);
+            auto* smem_a_vec        = reinterpret_cast<int4*>(smem_a);
+            for (int v = threadIdx.x; v < kDenseGemmBlockA / kVecElems; v += blockDim.x) {
+                const int i              = v * kVecElems;
+                const std::int32_t r     = i / kDenseGemmBlockK;
+                const std::int32_t kk    = i - r * kDenseGemmBlockK;
+                const std::int64_t g_idx = static_cast<std::int64_t>(row0 + r) * k + k0 + kk;
+                smem_a_vec[v]            = *reinterpret_cast<const int4*>(w_bf16 + g_idx);
             }
-            smem_a[i] = v;
+        } else if (weight_fp32 && full_a && fp32_vec_aligned) {
+            constexpr int kVecElems = 4; // float4 source converted to four bf16 values.
+            const auto* w_f32       = static_cast<const float*>(weight);
+            for (int v = threadIdx.x; v < kDenseGemmBlockA / kVecElems; v += blockDim.x) {
+                const int i              = v * kVecElems;
+                const std::int32_t r     = i / kDenseGemmBlockK;
+                const std::int32_t kk    = i - r * kDenseGemmBlockK;
+                const std::int64_t g_idx = static_cast<std::int64_t>(row0 + r) * k + k0 + kk;
+                const float4 wv          = *reinterpret_cast<const float4*>(w_f32 + g_idx);
+                smem_a[i]                = __float2bfloat16(wv.x);
+                smem_a[i + 1]            = __float2bfloat16(wv.y);
+                smem_a[i + 2]            = __float2bfloat16(wv.z);
+                smem_a[i + 3]            = __float2bfloat16(wv.w);
+            }
+        } else {
+            for (int i = threadIdx.x; i < kDenseGemmBlockA; i += blockDim.x) {
+                const std::int32_t r   = i / kDenseGemmBlockK;
+                const std::int32_t kk  = i - r * kDenseGemmBlockK;
+                const std::int32_t row = row0 + r;
+                const std::int32_t col = k0 + kk;
+                __nv_bfloat16 v        = dense_zero_bf16();
+                if (row < n && col < k) {
+                    const std::int64_t idx = static_cast<std::int64_t>(row) * k + col;
+                    v = weight_fp32 ? __float2bfloat16(static_cast<const float*>(weight)[idx])
+                                    : static_cast<const __nv_bfloat16*>(weight)[idx];
+                }
+                smem_a[i] = v;
+            }
         }
-        for (int i = threadIdx.x; i < kDenseGemmBlockB; i += blockDim.x) {
-            const std::int32_t kk  = i & (kDenseMmaK - 1);
-            const std::int32_t c   = i >> 4;
-            const std::int32_t row = k0 + kk;
-            const std::int32_t col = col0 + c;
-            __nv_bfloat16 v        = __float2bfloat16(0.0f);
-            if (row < k && col < t) { v = x[row + static_cast<std::int64_t>(k) * col]; }
-            smem_b[i] = v;
+
+        if (full_b && bf16_vec_aligned) {
+            constexpr int kVecElems = 8; // int4 holds eight bf16 values.
+            auto* smem_b_vec        = reinterpret_cast<int4*>(smem_b);
+            for (int v = threadIdx.x; v < kDenseGemmBlockB / kVecElems; v += blockDim.x) {
+                const int i              = v * kVecElems;
+                const std::int32_t c     = i / kDenseGemmBlockK;
+                const std::int32_t kk    = i - c * kDenseGemmBlockK;
+                const std::int64_t g_idx = k0 + kk + static_cast<std::int64_t>(k) * (col0 + c);
+                smem_b_vec[v]            = *reinterpret_cast<const int4*>(x + g_idx);
+            }
+        } else {
+            for (int i = threadIdx.x; i < kDenseGemmBlockB; i += blockDim.x) {
+                const std::int32_t c   = i / kDenseGemmBlockK;
+                const std::int32_t kk  = i - c * kDenseGemmBlockK;
+                const std::int32_t row = k0 + kk;
+                const std::int32_t col = col0 + c;
+                __nv_bfloat16 v        = dense_zero_bf16();
+                if (row < k && col < t) { v = x[row + static_cast<std::int64_t>(k) * col]; }
+                smem_b[i] = v;
+            }
         }
         __syncthreads();
 
-        wmma::load_matrix_sync(a_frag, smem_a + warp_m * kDenseMmaM * kDenseMmaK, kDenseMmaK);
-        wmma::load_matrix_sync(b_frag, smem_b + warp_n * kDenseMmaN * kDenseMmaK, kDenseMmaK);
-        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        for (int kk = 0; kk < kDenseGemmBlockK; kk += kDenseMmaK) {
+            wmma::load_matrix_sync(a_frag, smem_a + warp_m * kDenseMmaM * kDenseGemmBlockK + kk,
+                                   kDenseGemmBlockK);
+            wmma::load_matrix_sync(b_frag, smem_b + warp_n * kDenseMmaN * kDenseGemmBlockK + kk,
+                                   kDenseGemmBlockK);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
         __syncthreads();
     }
 
@@ -179,6 +291,164 @@ __global__ void linear_dense_gemm_kernel(const __nv_bfloat16* x, const void* wei
         if (row < n && col < t) {
             out[row + static_cast<std::int64_t>(n) * col] = __float2bfloat16(tile_c[i]);
         }
+    }
+}
+
+__global__ void linear_dense_gemm_bf16_full_kernel(const __nv_bfloat16* x,
+                                                   const __nv_bfloat16* weight, __nv_bfloat16* out,
+                                                   std::int32_t n, std::int32_t k) {
+    using namespace nvcuda;
+
+    __shared__ __align__(16) __nv_bfloat16 smem_a[2][kDenseGemmBlockA];
+    __shared__ __align__(16) __nv_bfloat16 smem_b[2][kDenseGemmBlockB];
+    __shared__ __align__(16) float smem_c[kDenseGemmWarps][kDenseMmaTileElements];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const int warp_m             = warp / kDenseGemmWarpCols;
+    const int warp_n             = warp - warp_m * kDenseGemmWarpCols;
+    const std::int32_t row0      = static_cast<std::int32_t>(blockIdx.x) * kDenseGemmBlockM;
+    const std::int32_t col0      = static_cast<std::int32_t>(blockIdx.y) * kDenseGemmBlockN;
+    const std::int32_t warp_row0 = row0 + warp_m * kDenseMmaM;
+    const std::int32_t warp_col0 = col0 + warp_n * kDenseMmaN;
+
+    wmma::fragment<wmma::matrix_a, kDenseMmaM, kDenseMmaN, kDenseMmaK, __nv_bfloat16,
+                   wmma::row_major>
+        a_frag;
+    wmma::fragment<wmma::matrix_b, kDenseMmaM, kDenseMmaN, kDenseMmaK, __nv_bfloat16,
+                   wmma::col_major>
+        b_frag;
+    wmma::fragment<wmma::accumulator, kDenseMmaM, kDenseMmaN, kDenseMmaK, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    dense_gemm_issue_bf16_full_tile<kDenseGemmBlockM, kDenseGemmBlockN, kDenseGemmBlockK>(
+        x, weight, smem_a[0], smem_b[0], k, row0, col0, 0);
+    dense_cp_async_commit();
+    dense_cp_async_wait_all();
+    __syncthreads();
+
+    int stage = 0;
+    for (std::int32_t k0 = 0; k0 < k; k0 += kDenseGemmBlockK) {
+        const std::int32_t next_k0 = k0 + kDenseGemmBlockK;
+        const int next_stage       = stage ^ 1;
+        if (next_k0 < k) {
+            dense_gemm_issue_bf16_full_tile<kDenseGemmBlockM, kDenseGemmBlockN, kDenseGemmBlockK>(
+                x, weight, smem_a[next_stage], smem_b[next_stage], k, row0, col0, next_k0);
+            dense_cp_async_commit();
+        }
+
+        for (int kk = 0; kk < kDenseGemmBlockK; kk += kDenseMmaK) {
+            wmma::load_matrix_sync(a_frag,
+                                   smem_a[stage] + warp_m * kDenseMmaM * kDenseGemmBlockK + kk,
+                                   kDenseGemmBlockK);
+            wmma::load_matrix_sync(b_frag,
+                                   smem_b[stage] + warp_n * kDenseMmaN * kDenseGemmBlockK + kk,
+                                   kDenseGemmBlockK);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        if (next_k0 < k) { dense_cp_async_wait_all(); }
+        __syncthreads();
+        stage = next_stage;
+    }
+
+    float* tile_c = smem_c[warp];
+    wmma::store_matrix_sync(tile_c, c_frag, kDenseMmaM, wmma::mem_col_major);
+    __syncwarp();
+
+    for (int i = lane; i < kDenseMmaTileElements; i += 32) {
+        const std::int32_t r                          = i & (kDenseMmaM - 1);
+        const std::int32_t c                          = i >> 4;
+        const std::int32_t row                        = warp_row0 + r;
+        const std::int32_t col                        = warp_col0 + c;
+        out[row + static_cast<std::int64_t>(n) * col] = __float2bfloat16(tile_c[i]);
+    }
+}
+
+__global__ void linear_dense_gemm_bf16_half_wide_full_kernel(const __nv_bfloat16* x,
+                                                             const __nv_bfloat16* weight,
+                                                             __nv_bfloat16* out, std::int32_t n,
+                                                             std::int32_t k) {
+    using namespace nvcuda;
+
+    __shared__ __align__(16) __nv_bfloat16 smem_a[2][kDenseGemmHalfBlockA];
+    __shared__ __align__(16) __nv_bfloat16 smem_b[2][kDenseGemmHalfWideBlockB];
+    __shared__ __align__(
+        16) float smem_c[kDenseGemmHalfWarps][kDenseGemmWideAccCols][kDenseMmaTileElements];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    const int warp_m             = warp / kDenseGemmWideWarpColGroups;
+    const int warp_n_group       = warp - warp_m * kDenseGemmWideWarpColGroups;
+    const std::int32_t row0      = static_cast<std::int32_t>(blockIdx.x) * kDenseGemmHalfBlockM;
+    const std::int32_t col0      = static_cast<std::int32_t>(blockIdx.y) * kDenseGemmWideBlockN;
+    const std::int32_t warp_row0 = row0 + warp_m * kDenseMmaM;
+    const std::int32_t warp_col0 = col0 + warp_n_group * kDenseGemmWideAccCols * kDenseMmaN;
+
+    wmma::fragment<wmma::matrix_a, kDenseMmaM, kDenseMmaN, kDenseMmaK, __nv_bfloat16,
+                   wmma::row_major>
+        a_frag;
+    wmma::fragment<wmma::matrix_b, kDenseMmaM, kDenseMmaN, kDenseMmaK, __nv_bfloat16,
+                   wmma::col_major>
+        b_frag;
+    wmma::fragment<wmma::accumulator, kDenseMmaM, kDenseMmaN, kDenseMmaK, float>
+        c_frag[kDenseGemmWideAccCols];
+#pragma unroll
+    for (int c = 0; c < kDenseGemmWideAccCols; ++c) { wmma::fill_fragment(c_frag[c], 0.0f); }
+
+    dense_gemm_issue_bf16_full_tile<kDenseGemmHalfBlockM, kDenseGemmWideBlockN,
+                                    kDenseGemmHalfBlockK>(x, weight, smem_a[0], smem_b[0], k, row0,
+                                                          col0, 0);
+    dense_cp_async_commit();
+    dense_cp_async_wait_all();
+    __syncthreads();
+
+    int stage = 0;
+    for (std::int32_t k0 = 0; k0 < k; k0 += kDenseGemmHalfBlockK) {
+        const std::int32_t next_k0 = k0 + kDenseGemmHalfBlockK;
+        const int next_stage       = stage ^ 1;
+        if (next_k0 < k) {
+            dense_gemm_issue_bf16_full_tile<kDenseGemmHalfBlockM, kDenseGemmWideBlockN,
+                                            kDenseGemmHalfBlockK>(
+                x, weight, smem_a[next_stage], smem_b[next_stage], k, row0, col0, next_k0);
+            dense_cp_async_commit();
+        }
+
+        for (int kk = 0; kk < kDenseGemmHalfBlockK; kk += kDenseMmaK) {
+            wmma::load_matrix_sync(a_frag,
+                                   smem_a[stage] + warp_m * kDenseMmaM * kDenseGemmHalfBlockK + kk,
+                                   kDenseGemmHalfBlockK);
+#pragma unroll
+            for (int c = 0; c < kDenseGemmWideAccCols; ++c) {
+                const int tile_col = warp_n_group * kDenseGemmWideAccCols + c;
+                wmma::load_matrix_sync(
+                    b_frag, smem_b[stage] + tile_col * kDenseMmaN * kDenseGemmHalfBlockK + kk,
+                    kDenseGemmHalfBlockK);
+                wmma::mma_sync(c_frag[c], a_frag, b_frag, c_frag[c]);
+            }
+        }
+
+        if (next_k0 < k) { dense_cp_async_wait_all(); }
+        __syncthreads();
+        stage = next_stage;
+    }
+
+#pragma unroll
+    for (int tc = 0; tc < kDenseGemmWideAccCols; ++tc) {
+        float* tile_c = smem_c[warp][tc];
+        wmma::store_matrix_sync(tile_c, c_frag[tc], kDenseMmaM, wmma::mem_col_major);
+        __syncwarp();
+
+        for (int i = lane; i < kDenseMmaTileElements; i += 32) {
+            const std::int32_t r                          = i & (kDenseMmaM - 1);
+            const std::int32_t c                          = i >> 4;
+            const std::int32_t row                        = warp_row0 + r;
+            const std::int32_t col                        = warp_col0 + tc * kDenseMmaN + c;
+            out[row + static_cast<std::int64_t>(n) * col] = __float2bfloat16(tile_c[i]);
+        }
+        __syncwarp();
     }
 }
 

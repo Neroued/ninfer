@@ -109,12 +109,13 @@ void cpu_linear_dequant(const std::vector<float>& x, const std::vector<float>& w
     for (auto& thread : threads) { thread.join(); }
 }
 
-int one_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype,
-                    std::uint32_t seed) {
+int one_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype, std::uint32_t seed,
+                    float x_abs = 8.0f, float weight_abs = 0.125f,
+                    const char* case_name = nullptr) {
     std::vector<float> x(static_cast<std::size_t>(k) * t);
     std::vector<float> weight(static_cast<std::size_t>(n) * k);
-    fill_uniform(x, seed, -3.0f, 3.0f);
-    fill_uniform(weight, seed + 1000u, -0.125f, 0.125f);
+    fill_uniform(x, seed, -x_abs, x_abs);
+    fill_uniform(weight, seed + 1000u, -weight_abs, weight_abs);
     round_to_bf16(x);
     round_to_bf16(weight);
 
@@ -130,7 +131,8 @@ int one_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype,
     kernels::linear(tx, dense_weight(dw.p, qtype, n, k), tout, nullptr);
     cudaDeviceSynchronize();
 
-    const std::string label = "linear " + std::string(qtype_name(qtype)) + " [" +
+    const std::string suffix = case_name ? (" " + std::string(case_name)) : std::string();
+    const std::string label  = "linear " + std::string(qtype_name(qtype)) + suffix + " [" +
                               std::to_string(n) + "," + std::to_string(k) +
                               "] T=" + std::to_string(t) + " seed=" + std::to_string(seed);
     return verify(label.c_str(), from_device_bf16(dout, static_cast<std::size_t>(n) * t), ref,
@@ -184,16 +186,17 @@ int fp32_ctrl_first_column_consistency(std::int32_t n, std::int32_t k, std::int3
 }
 
 int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
-                    const std::vector<std::int32_t>& ts, std::uint32_t seed) {
+                    const std::vector<std::int32_t>& ts, std::uint32_t seed, float x_abs = 8.0f,
+                    float weight_abs = 0.125f, const char* case_name = nullptr) {
     const std::int32_t max_t = *std::max_element(ts.begin(), ts.end());
     std::vector<float> source_weight(static_cast<std::size_t>(n) * k);
-    fill_uniform(source_weight, seed + 2000u, -0.125f, 0.125f);
+    fill_uniform(source_weight, seed + 2000u, -weight_abs, weight_abs);
     round_to_bf16(source_weight);
     q5090::PackedWeight packed = q5090::pack_tile_lowbit(source_weight, n, k, qtype);
     std::vector<float>().swap(source_weight);
 
     std::vector<float> x(static_cast<std::size_t>(k) * max_t);
-    fill_uniform(x, seed, -3.0f, 3.0f);
+    fill_uniform(x, seed, -x_abs, x_abs);
     round_to_bf16(x);
 
     std::vector<double> ref_max_t;
@@ -220,7 +223,8 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
 
         const std::vector<double> ref(ref_max_t.begin(),
                                       ref_max_t.begin() + static_cast<std::size_t>(n) * t);
-        const std::string label = "linear " + std::string(qtype_name(qtype)) + " [" +
+        const std::string suffix = case_name ? (" " + std::string(case_name)) : std::string();
+        const std::string label  = "linear " + std::string(qtype_name(qtype)) + suffix + " [" +
                                   std::to_string(n) + "," + std::to_string(k) +
                                   "] T=" + std::to_string(t) + " seed=" + std::to_string(seed);
         failures += verify(label.c_str(), from_device_bf16(dout, static_cast<std::size_t>(n) * t),
@@ -437,9 +441,17 @@ int main() {
         f += one_dense_shape(5120, 6144, 1, qtype, 17u);
         f += one_dense_shape(5120, 6144, 7, qtype, 17u);
         f += one_dense_shape(37, 513, 19, qtype, 19u);
+        f += one_dense_shape(80, 130, 17, qtype, 101u, 8.0f, 1.5f, "stress");
     }
+    f += one_dense_shape(96, 128, 512, QType::BF16_CTRL, 53u);
     f += fp32_ctrl_first_column_consistency(48, 64, 7);
     f += fp32_ctrl_first_column_consistency(64, 64, 32);
+    f += one_quant_shape(QType::Q4G64_F16S, 70, 130, {1, 5}, 41u);
+    f += one_quant_shape(QType::Q4G64_F16S, 70, 130, {1, 9}, 103u, 8.0f, 1.25f, "stress");
+    f += one_quant_shape(QType::Q5G64_F16S, 70, 130, {1, 9}, 107u, 8.0f, 1.25f, "stress");
+    f += one_quant_shape(QType::Q6G64_F16S, 70, 130, {1, 9}, 109u, 8.0f, 1.25f, "stress");
+    f += one_quant_shape(QType::Q4G64_F16S, 128, 128, {512}, 43u);
+    f += one_quant_shape(QType::Q6G64_F16S, 128, 128, {512}, 47u);
     for (auto [n, k] : {std::pair<std::int32_t, std::int32_t>{6144, 5120},
                         std::pair<std::int32_t, std::int32_t>{1024, 5120},
                         std::pair<std::int32_t, std::int32_t>{2048, 5120},

@@ -189,11 +189,15 @@ int expect_module_payload(const qus::WeightStore& store, const qus::ParsedQ5090F
 
 template <typename Exception, typename Fn>
 int expect_throws_without_arena_growth(qus::DeviceArena& arena, Fn&& fn, std::string_view label) {
-    const std::size_t before = arena.used();
+    const std::size_t before_used = arena.used();
+    const std::size_t before_peak = arena.peak_used();
     try {
         fn();
     } catch (const Exception&) {
-        return arena.used() == before ? 0 : fail("arena grew after failed load");
+        int failures = 0;
+        failures += arena.used() == before_used ? 0 : fail("arena used grew after failed load");
+        failures += arena.peak_used() == before_peak ? 0 : fail("arena peak grew after failed load");
+        return failures;
     }
     std::cerr << label << " did not throw\n";
     return 1;
@@ -227,6 +231,23 @@ int main() {
     qus::WeightStore default_store(expectations());
     default_store.load(fixture_path.c_str(), default_arena, ctx);
     failures += expect_default_text_load(default_store, parsed, file);
+    failures += default_arena.used() >= default_store.loaded_payload_bytes()
+                    ? 0
+                    : fail("default arena used is smaller than loaded payload bytes");
+    failures += default_arena.peak_used() >= default_arena.used()
+                    ? 0
+                    : fail("default arena peak is smaller than used");
+    default_arena.reset_peak();
+    failures += default_arena.peak_used() == default_arena.used()
+                    ? 0
+                    : fail("default arena reset_peak did not reset to current used");
+    default_store.clear();
+    failures += default_store.tensor_count() == 0 ? 0 : fail("clear tensor_count mismatch");
+    failures += default_store.quant_count() == 0 ? 0 : fail("clear quant_count mismatch");
+    failures += default_store.loaded_payload_bytes() == 0 ? 0 : fail("clear loaded bytes mismatch");
+    failures += !default_store.module_loaded(qus::ModuleKind::TextCore)
+                    ? 0
+                    : fail("clear TEXT module still loaded");
 
     qus::LoadOptions mtp_options;
     mtp_options.load_mtp = true;

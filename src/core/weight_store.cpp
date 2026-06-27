@@ -267,6 +267,7 @@ void WeightStore::load(const char* path, DeviceArena& weights, DeviceContext& ct
         cuda_throw(cudaStreamSynchronize(ctx.load_stream), "cudaStreamSynchronize(load_stream)");
     } catch (...) {
         weights.rewind(mark);
+        weights.reset_peak();
         throw;
     }
 

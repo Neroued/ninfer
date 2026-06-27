@@ -127,7 +127,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--fixture", default="/tmp/qus_q5090_model_blocks_random.qus")
     ap.add_argument("--dump-exe", default=str(ROOT / "build/tests/qus_block_dump"))
-    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--device", default="cpu")
     ap.add_argument("--regenerate", action="store_true")
     args = ap.parse_args()
 

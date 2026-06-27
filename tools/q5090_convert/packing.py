@@ -17,6 +17,7 @@ import torch
 
 _CHUNK_BITS_BUDGET = 256 * 1024 * 1024       # numpy temp cap
 _TORCH_CHUNK_BYTES = 4 * 1024 * 1024 * 1024  # gpu temp cap for the expanded-bit array
+_UNPACK_G64_INDEX_CACHE = {}
 
 
 def bytes_per_group(gs: int, bits: int) -> int:
@@ -73,6 +74,46 @@ def unpack_w8_groups(packed_uint8: np.ndarray) -> np.ndarray:
 
 # ----------------------------- torch GPU path -----------------------------
 
+def _sign_extend_torch(u: torch.Tensor, bits: int) -> torch.Tensor:
+    sign_bit = 1 << (bits - 1)
+    span = 1 << bits
+    return torch.where((u & sign_bit) != 0, u - span, u).to(torch.int8)
+
+
+def _unpack_g64_indices(device: torch.device, bits: int, bpr: int):
+    key = (device.type, device.index if device.index is not None else -1, bits, bpr)
+    cached = _UNPACK_G64_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    lanes = torch.arange(64, device=device, dtype=torch.int64)
+    bitpos = lanes * bits
+    byte_idx = torch.div(bitpos, 8, rounding_mode="floor")
+    hi_idx = torch.clamp(byte_idx + 1, max=bpr - 1)
+    shift = bitpos - byte_idx * 8
+    cached = (byte_idx, hi_idx, shift)
+    _UNPACK_G64_INDEX_CACHE[key] = cached
+    return cached
+
+
+def _unpack_g64_fast_torch(packed: torch.Tensor, bits: int) -> torch.Tensor:
+    """Fast q5090 G64 unpack without materializing every bit separately."""
+    g, bpr = packed.shape
+    dev = packed.device
+
+    if bits == 4:
+        nibbles = packed.to(torch.int16)
+        out = torch.empty((g, 64), dtype=torch.int8, device=dev)
+        out[:, 0::2] = _sign_extend_torch(nibbles & 0x0f, 4)
+        out[:, 1::2] = _sign_extend_torch((nibbles >> 4) & 0x0f, 4)
+        return out
+
+    byte_idx, hi_idx, shift = _unpack_g64_indices(dev, bits, bpr)
+    lo = packed.index_select(1, byte_idx).to(torch.int16)
+    hi = packed.index_select(1, hi_idx).to(torch.int16)
+    u = ((lo >> shift) | (hi << (8 - shift))) & ((1 << bits) - 1)
+    return _sign_extend_torch(u, bits)
+
+
 def pack_lowbit_torch(codes: torch.Tensor, bits: int) -> torch.Tensor:
     """[G, gs] int codes (device) -> [G, bytes_per_group] uint8 (device)."""
     g, gs = codes.shape
@@ -94,6 +135,9 @@ def pack_lowbit_torch(codes: torch.Tensor, bits: int) -> torch.Tensor:
 def unpack_lowbit_torch(packed: torch.Tensor, bits: int, gs: int) -> torch.Tensor:
     """[G, bytes_per_group] uint8 (device) -> [G, gs] sign-extended int8 (device)."""
     g, bpr = packed.shape
+    if gs == 64 and bits in (4, 5, 6):
+        return _unpack_g64_fast_torch(packed, bits)
+
     dev = packed.device
     shifts8 = torch.arange(8, device=dev, dtype=torch.int32)
     wbits = (1 << torch.arange(bits, device=dev, dtype=torch.int32))

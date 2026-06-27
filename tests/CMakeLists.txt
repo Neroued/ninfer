@@ -35,6 +35,11 @@ target_link_libraries(qus_block_dump PRIVATE qus_core)
 target_compile_definitions(qus_block_dump PRIVATE QUS_MODEL_TESTING=1)
 target_include_directories(qus_block_dump PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+add_executable(qus_layer_dump ${PROJECT_SOURCE_DIR}/tools/parity/layer_dump.cpp)
+target_link_libraries(qus_layer_dump PRIVATE qus_core)
+target_compile_definitions(qus_layer_dump PRIVATE QUS_MODEL_TESTING=1)
+target_include_directories(qus_layer_dump PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
 qus_add_test(qus_silu_and_mul_test SOURCES kernels/test_silu_and_mul.cpp)
 qus_add_test(qus_residual_add_test SOURCES kernels/test_residual_add.cpp)
 qus_add_test(qus_sigmoid_gate_mul_test SOURCES kernels/test_sigmoid_gate_mul.cpp)

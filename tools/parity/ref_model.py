@@ -23,7 +23,10 @@ import torch
 import torch.nn.functional as F
 
 from tools.q5090_convert import format as fmt
+from tools.q5090_convert import qtypes as qt
 from tools.q5090_convert.layouts import decode_tensor
+
+torch.set_grad_enabled(False)
 
 
 D = 5120
@@ -203,14 +206,74 @@ class Q5090File:
         payload = self._mm[e.payload_offset : e.payload_offset + e.payload_bytes]
         return decode_tensor(payload, e.qtype, e.layout, e.shape, e.padded_shape, device=device).float()
 
+    def row_grouped_rows(self, name: str, rows: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+        e = self.entries[name]
+        if e.layout != qt.LAYOUT_ROW_GROUPED_G64:
+            raise ValueError(f"{name} is not ROW_GROUPED_G64")
+        if e.qtype not in qt.QUANT_SPECS:
+            raise ValueError(f"{name} is not a low-bit row-grouped tensor")
+        spec = qt.QUANT_SPECS[e.qtype]
+        n, k = e.shape
+        _, kp = e.padded_shape
+        kg = kp // spec.group_size
+        roww = 2 + spec.bytes_per_group
+        out = []
+        for row in rows.detach().cpu().tolist():
+            if row < 0 or row >= n:
+                raise IndexError(f"{name} row out of range: {row}")
+            offset = e.payload_offset + row * kg * roww
+            payload = self._mm[offset : offset + kg * roww]
+            out.append(decode_tensor(payload, e.qtype, e.layout, [1, k], [1, kp], device=device))
+        return torch.cat(out, dim=0).float()
+
+    def tiled_row_chunks(
+        self,
+        name: str,
+        device: torch.device | str,
+        rows_per_chunk: int = 8192,
+    ):
+        e = self.entries[name]
+        if e.layout not in (qt.LAYOUT_TILE_N64_K64, qt.LAYOUT_TILE_N64_K128):
+            raise ValueError(f"{name} is not a tiled tensor")
+        n, k = e.shape
+        np_, kp = e.padded_shape
+        if rows_per_chunk % 64 != 0:
+            raise ValueError("rows_per_chunk must be a multiple of 64")
+        spec = qt.QUANT_SPECS[e.qtype]
+        kg = kp // spec.group_size
+        tilew = 64 * 2 + 64 * spec.bytes_per_group
+        for row0 in range(0, n, rows_per_chunk):
+            row1 = min(n, row0 + rows_per_chunk)
+            tile0 = row0 // 64
+            tile_rows = ((row1 - row0 + 63) // 64) * 64
+            tiles = tile_rows // 64
+            offset = e.payload_offset + tile0 * kg * tilew
+            payload = self._mm[offset : offset + tiles * kg * tilew]
+            chunk = decode_tensor(
+                payload,
+                e.qtype,
+                e.layout,
+                [row1 - row0, k],
+                [tile_rows, kp],
+                device=device,
+            ).float()
+            yield row0, row1, chunk
+
     def close(self) -> None:
         self._mm.close()
         self._fh.close()
 
 
 class RefModel:
-    def __init__(self, weights: str | Path, device: str = "cuda", cache_globals: bool = True):
-        self.device = torch.device(device if device != "cuda" or torch.cuda.is_available() else "cpu")
+    def __init__(self, weights: str | Path, device: str = "cuda", cache_globals: bool = False):
+        if device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but this Python has CPU-only PyTorch. "
+                "Run with a CUDA torch environment, for example "
+                "/home/neroued/miniconda3/envs/vllm-bench/bin/python, "
+                "or pass --device cpu explicitly."
+            )
+        self.device = torch.device(device)
         self.q5090 = Q5090File(weights)
         self.cache_globals = cache_globals
         self._globals: Dict[str, torch.Tensor] = {}
@@ -235,6 +298,12 @@ class RefModel:
 
     def embed(self, ids: Iterable[int]) -> torch.Tensor:
         idx = torch.tensor(list(ids), device=self.device, dtype=torch.long)
+        if not self.cache_globals:
+            return bf16(
+                self.q5090.row_grouped_rows(
+                    "model.language_model.embed_tokens.weight", idx, self.device
+                )
+            )
         return bf16(self.weight("model.language_model.embed_tokens.weight").index_select(0, idx))
 
     def gqa_attention(
@@ -249,7 +318,14 @@ class RefModel:
         if phase == "prefill":
             self.kv[fidx] = (k.clone(), v.clone())
             k_all, v_all = self.kv[fidx]
-            starts = [0] * T
+            k_rep = k_all.repeat_interleave(H_Q // H_KV, dim=1).float()
+            v_rep = v_all.repeat_interleave(H_Q // H_KV, dim=1).float()
+            scores = torch.einsum("thd,shd->ths", q.float(), k_rep) * ATTN_SCALE
+            t_idx = torch.arange(T, device=self.device)
+            s_idx = torch.arange(k_all.shape[0], device=self.device)
+            scores = scores.masked_fill(s_idx[None, None, :] > t_idx[:, None, None], -torch.inf)
+            probs = torch.softmax(scores, dim=-1)
+            return bf16(torch.einsum("ths,shd->thd", probs, v_rep))
         else:
             old_k, old_v = self.kv.get(
                 fidx,
@@ -260,17 +336,11 @@ class RefModel:
             )
             self.kv[fidx] = (torch.cat([old_k, k], dim=0), torch.cat([old_v, v], dim=0))
             k_all, v_all = self.kv[fidx]
-            starts = [k_all.shape[0] - 1]
-
-        out = torch.empty(T, H_Q, DH, device=self.device, dtype=torch.float32)
-        for t in range(T):
-            end = (t + 1) if phase == "prefill" else (starts[t] + 1)
-            for h in range(H_Q):
-                hk = h // (H_Q // H_KV)
-                scores = (k_all[:end, hk, :].float() @ q[t, h, :].float()) * ATTN_SCALE
-                probs = torch.softmax(scores, dim=0)
-                out[t, h, :] = probs @ v_all[:end, hk, :].float()
-        return bf16(out)
+            k_rep = k_all.repeat_interleave(H_Q // H_KV, dim=1).float()
+            v_rep = v_all.repeat_interleave(H_Q // H_KV, dim=1).float()
+            scores = torch.einsum("thd,shd->ths", q.float(), k_rep) * ATTN_SCALE
+            probs = torch.softmax(scores, dim=-1)
+            return bf16(torch.einsum("ths,shd->thd", probs, v_rep))
 
     def gdn_recurrent(
         self,
@@ -284,19 +354,15 @@ class RefModel:
         T = q.shape[0]
         state = self.ssm[gidx]
         out = torch.empty(T, GDN_HV, GDN_DV, device=self.device, dtype=torch.float32)
+        hv_to_hk = torch.arange(GDN_HV, device=self.device, dtype=torch.long) // GDN_GROUP
         for t in range(T):
-            for hv in range(GDN_HV):
-                hk = hv // GDN_GROUP
-                alpha = torch.exp(g[t, hv])
-                st = state[hv]
-                kt = k[t, hk].float()
-                vt = v[t, hv].float()
-                qt = q[t, hk].float()
-                st.mul_(alpha)
-                sk = st @ kt
-                delta = beta[t, hv] * (vt - sk)
-                st.add_(delta[:, None] * kt[None, :])
-                out[t, hv] = st @ qt * GDN_SCALE
+            kt = k[t].float().index_select(0, hv_to_hk)
+            qt = q[t].float().index_select(0, hv_to_hk)
+            state.mul_(torch.exp(g[t].float()).view(GDN_HV, 1, 1))
+            sk = torch.bmm(state, kt.unsqueeze(-1)).squeeze(-1)
+            delta = beta[t].float().unsqueeze(-1) * (v[t].float() - sk)
+            state.add_(delta.unsqueeze(-1) * kt.unsqueeze(1))
+            out[t] = torch.bmm(state, qt.unsqueeze(-1)).squeeze(-1) * GDN_SCALE
         return bf16(out)
 
     def attn_mix(self, layer: int, x: torch.Tensor, phase: str, positions: torch.Tensor) -> torch.Tensor:
@@ -368,7 +434,15 @@ class RefModel:
 
     def logits_last(self, x: torch.Tensor) -> torch.Tensor:
         xf = rmsnorm(x, self.weight("model.language_model.norm.weight"), unit_offset=True)
-        return linear(xf[-1:, :], self.weight("lm_head.weight"))[0]
+        if self.cache_globals:
+            return linear(xf[-1:, :], self.weight("lm_head.weight"))[0]
+
+        xlast = xf[-1:, :].float()
+        logits = torch.empty(V, device=self.device, dtype=torch.float32)
+        for row0, row1, weight in self.q5090.tiled_row_chunks("lm_head.weight", self.device):
+            logits[row0:row1] = (xlast @ weight.float().t())[0]
+            del weight
+        return bf16(logits)
 
     def forward(
         self,
@@ -414,10 +488,16 @@ def main() -> None:
     ap.add_argument("--decode", type=int, default=1)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-cache-globals", action="store_true")
+    ap.add_argument("--cache-globals", action="store_true")
     args = ap.parse_args()
 
-    model = RefModel(args.weights, device=args.device, cache_globals=not args.no_cache_globals)
-    tokens = model.forward(parse_prompt(args.prompt), args.decode)
+    model = RefModel(
+        args.weights,
+        device=args.device,
+        cache_globals=args.cache_globals and not args.no_cache_globals,
+    )
+    with torch.inference_mode():
+        tokens = model.forward(parse_prompt(args.prompt), args.decode)
     print(" ".join(str(t) for t in tokens))
 
 

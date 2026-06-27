@@ -1,7 +1,7 @@
 # QUS Packed Weight File Format `q5090_w4g64_mixed_v1` (binary spec)
 
-This document is the **exact binary contract** produced by the offline converter
-(`tools/q5090_convert/`) for Qwen3.6-27B. It finalizes section 7 of
+This document is the **M2.8/M3 canonical binary contract** that the offline converter
+(`tools/q5090_convert/`) must produce for Qwen3.6-27B. It finalizes section 7 of
 [qwen3_6_27b_q5090_final_quant_format_v1.md](qwen3_6_27b_q5090_final_quant_format_v1.md)
 (the quantization *policy*) into precise byte offsets so the C++ runtime can mmap and
 consume it with no runtime repacking.
@@ -11,6 +11,11 @@ The policy document decides *which qtype/layout each tensor gets*. This document
 
 > This is the canonical packed-weight ABI for the C++ runtime. The runtime consumes this format
 > directly; there is no alternate in-tree weight-file path.
+>
+> Implementation status, 2026-06-27: the checked-in converter plan, fixture generator, and runtime
+> `bind_conv1d_view` still need the M2.8 conv1d canonical-layout sync. Until that implementation lands,
+> artifacts that keep raw `[10240,1,4]` conv1d payloads are pre-M2.8 legacy compatibility artifacts and
+> are not official M2.8/M3 canonical q5090 files.
 
 ## 0. Conventions
 

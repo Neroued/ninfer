@@ -443,6 +443,9 @@ Sub-kernels for L6 (chunked GDN) if not writing one monolithic kernel: `cumsum` 
 - M2.8/M3 canonical TEXT_CORE q5090 stores `conv1d.weight` in the runtime-native logical shape
   `[10240,4,1]`. The HF raw source shape `[10240,1,4]` is a legacy compatibility input shape, not the
   official M3 baseline layout.
+- Implementation status, 2026-06-27: the checked-in converter, fixture generator, and runtime bind path
+  still need the M2.8 conv1d canonical-layout sync before generated q5090 files can be official
+  M2.8/M3 canonical artifacts.
 - Runtime kernels apply the semantic transforms: RMSNorm `1 + w` where required,
   `A = -exp(A_log)` for GDN gating, and the `1/sqrt(dk)=1/sqrt(128)` scale in the GDN path.
 - Projection fusion is a runtime/kernel scheduling choice. The stored file keeps independently

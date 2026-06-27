@@ -19,4 +19,16 @@ baseline without relying on chat history:
 - tokenizer provenance.
 
 Smoke runs do not satisfy the M3 gate. Official M3-gate summaries must follow
-`docs/m2.8-pre-m3-standard.md`.
+`docs/m2.8-pre-m3-standard.md` and `docs/bench/e2e-report-schema.md`.
+
+Committed summary files use:
+
+```json
+{
+  "artifact_type": "qus_e2e_baseline_summary",
+  "schema_version": 1,
+  "baseline_class": "smoke"
+}
+```
+
+`baseline_class` is either `smoke` or `m3_gate`.

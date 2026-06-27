@@ -236,7 +236,7 @@ Qwen3.6 的主要矩阵维度均可被 64 整除，padding 主要来自小 contr
 model.language_model.layers.{L}.
 ```
 
-| Tensor / logical slice | 原始 shape | qtype | layout | 说明 |
+| Tensor / logical slice | 逻辑/存储 shape | qtype | layout | 说明 |
 |---|---:|---|---|---|
 | `input_layernorm.weight` | `[5120]` | `BF16_CTRL` | contiguous | RMSNorm；不量化 |
 | `linear_attn.A_log` | `[48]` | `FP32_CTRL` | contiguous | GDN decay/transition 标量；保持 FP32 |
@@ -250,11 +250,19 @@ model.language_model.layers.{L}.
 | `linear_attn.in_proj_z.weight` | `[6144,5120]` | `Q5G64_F16S` | `TILE_N64_K64` | GDN output/value gate，敏感 |
 | `linear_attn.norm.weight` | `[128]` | `BF16_CTRL` | contiguous | GDN 内部 norm；不量化 |
 | `linear_attn.out_proj.weight` | `[5120,6144]` | `Q5G64_F16S` | `TILE_N64_K64` | GDN 输出回 hidden，敏感 |
+| `post_attention_layernorm.weight` | `[5120]` | `BF16_CTRL` | contiguous | RMSNorm；不量化 |
+| `mlp.gate_proj.weight` | `[17408,5120]` | `Q4G64_F16S` | `TILE_N64_K64` | FFN gate |
+| `mlp.up_proj.weight` | `[17408,5120]` | `Q4G64_F16S` | `TILE_N64_K64` | FFN up |
+| `mlp.down_proj.weight` | `[5120,17408]` | `Q5G64_F16S` | `TILE_N64_K64` | FFN down，跨中间维聚合，敏感 |
 
 M2.8/M3 canonical TEXT_CORE policy requires `linear_attn.conv1d.weight` to be emitted in the
 runtime-native logical shape `[10240,4,1]`. This is a tensor-plan logical-shape policy change, not a q5090
 binary container ABI redesign. Legacy `[10240,1,4]` artifacts may be read only by an explicitly labelled
 compatibility path and are not the official M3 baseline.
+
+Implementation status, 2026-06-27: the checked-in converter plan, fixture generator, and runtime
+`bind_conv1d_view` still need this sync. Until that implementation lands, generated q5090 artifacts with
+raw `[10240,1,4]` conv1d are pre-M2.8 legacy artifacts, not official M2.8/M3 canonical artifacts.
 
 This policy requires synchronized updates in:
 
@@ -262,10 +270,6 @@ This policy requires synchronized updates in:
 - `tests/fixtures/make_q5090_fixture.py`;
 - `src/model/qwen3_6_27b.cpp::bind_conv1d_view`;
 - q5090 parser, fixture, and model-bind tests that assert conv1d shape or hidden allocation behavior.
-| `post_attention_layernorm.weight` | `[5120]` | `BF16_CTRL` | contiguous | RMSNorm；不量化 |
-| `mlp.gate_proj.weight` | `[17408,5120]` | `Q4G64_F16S` | `TILE_N64_K64` | FFN gate |
-| `mlp.up_proj.weight` | `[17408,5120]` | `Q4G64_F16S` | `TILE_N64_K64` | FFN up |
-| `mlp.down_proj.weight` | `[5120,17408]` | `Q5G64_F16S` | `TILE_N64_K64` | FFN down，跨中间维聚合，敏感 |
 
 线性/GDN 单层大小明细：
 
@@ -320,7 +324,7 @@ model.language_model.layers.{L}.linear_attn.in_proj_qkv.v
 model.language_model.layers.{L}.
 ```
 
-| Tensor / logical slice | 原始 shape | qtype | layout | 说明 |
+| Tensor / logical slice | 逻辑/存储 shape | qtype | layout | 说明 |
 |---|---:|---|---|---|
 | `input_layernorm.weight` | `[5120]` | `BF16_CTRL` | contiguous | RMSNorm；不量化 |
 | `self_attn.q_proj.weight::q` | rows `[0:6144]` of `[12288,5120]` | `Q4G64_F16S` | `TILE_N64_K64` | full attention query projection |

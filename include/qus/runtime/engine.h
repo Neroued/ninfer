@@ -16,6 +16,26 @@
 
 namespace qus {
 
+struct ArenaMemoryStats {
+    bool present = false;
+    std::size_t capacity_bytes = 0;
+    std::size_t used_bytes = 0;
+    std::size_t peak_used_bytes = 0;
+};
+
+struct EngineMemoryStats {
+    bool loaded = false;
+    int device = 0;
+    std::uint32_t max_context = 0;
+    std::uint32_t position = 0;
+    ArenaMemoryStats weights;
+    ArenaMemoryStats cache;
+    ArenaMemoryStats workspace;
+    std::size_t q5090_loaded_payload_bytes = 0;
+    std::size_t q5090_tensor_count = 0;
+    std::size_t q5090_quant_count = 0;
+};
+
 struct EngineOptions {
     int device               = 0;
     std::uint32_t max_ctx    = 2048;
@@ -40,6 +60,10 @@ public:
     [[nodiscard]] std::uint32_t position() const noexcept;
 
     [[nodiscard]] std::uint32_t max_context() const noexcept { return options_.max_ctx; }
+
+    [[nodiscard]] EngineMemoryStats memory_stats() const noexcept;
+
+    void reset_memory_peaks() noexcept;
 
 private:
     [[nodiscard]] static Q5090Expectations expectations();

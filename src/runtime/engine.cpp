@@ -28,6 +28,16 @@ std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
 
 std::size_t align_slack(std::size_t tensors) { return checked_mul(tensors, 256, "arena size"); }
 
+ArenaMemoryStats arena_stats(const std::optional<DeviceArena>& arena) noexcept {
+    ArenaMemoryStats stats;
+    if (!arena) { return stats; }
+    stats.present = true;
+    stats.capacity_bytes = arena->capacity();
+    stats.used_bytes = arena->used();
+    stats.peak_used_bytes = arena->peak_used();
+    return stats;
+}
+
 } // namespace
 
 Engine::Engine(EngineOptions options) : options_(options) {
@@ -141,6 +151,29 @@ void Engine::require_loaded() const {
 }
 
 std::uint32_t Engine::position() const noexcept { return kv_ ? kv_->pos : 0; }
+
+EngineMemoryStats Engine::memory_stats() const noexcept {
+    EngineMemoryStats stats;
+    stats.loaded = loaded();
+    stats.device = options_.device;
+    stats.max_context = options_.max_ctx;
+    stats.position = position();
+    stats.weights = arena_stats(weight_arena_);
+    stats.cache = arena_stats(cache_arena_);
+    stats.workspace = arena_stats(work_);
+    if (weights_) {
+        stats.q5090_loaded_payload_bytes = weights_->loaded_payload_bytes();
+        stats.q5090_tensor_count = weights_->tensor_count();
+        stats.q5090_quant_count = weights_->quant_count();
+    }
+    return stats;
+}
+
+void Engine::reset_memory_peaks() noexcept {
+    if (weight_arena_) { weight_arena_->reset_peak(); }
+    if (cache_arena_) { cache_arena_->reset_peak(); }
+    if (work_) { work_->reset_peak(); }
+}
 
 int Engine::read_token() {
     int token = 0;

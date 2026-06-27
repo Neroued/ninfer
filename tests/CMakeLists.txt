@@ -30,6 +30,7 @@ qus_add_test(qus_model_bind_test             SOURCES test_model_bind.cpp        
 qus_add_test(qus_model_blocks_test           SOURCES test_model_blocks.cpp      NEEDS_SOURCE_DIR)
 target_compile_definitions(qus_model_blocks_test PRIVATE QUS_MODEL_TESTING=1)
 qus_add_test(qus_engine_load_test            SOURCES test_engine_load.cpp       NEEDS_SOURCE_DIR)
+qus_add_test(qus_engine_memory_stats_test    SOURCES test_engine_memory_stats.cpp NEEDS_SOURCE_DIR)
 qus_add_test(qus_graph_readiness_structure_test
              SOURCES test_graph_readiness_structure.cpp NEEDS_SOURCE_DIR)
 qus_add_test(qus_runtime_tap_structure_test

@@ -27,8 +27,8 @@ Build an individual benchmark target when iterating:
 cmake --build build -j --target qus_argmax_bench
 ```
 
-`qus_e2e_bench` is not registered yet. When M2.8 implements it, it should build as a benchmark target
-but remain outside default real-weight CTest execution.
+`qus_e2e_bench` is registered as a benchmark target. It builds with `cmake --build build -j --target
+qus_e2e_bench` and remains outside default real-weight CTest execution.
 
 ## Prompt Fixtures
 
@@ -73,6 +73,19 @@ qus_e2e_bench \
   [--device <cuda-device>] \
   [--eos-token-id <id>]
 ```
+
+Minimal local error-report smoke:
+
+```bash
+printf '1 2 3\n' > /tmp/qus_e2e_smoke.ids
+./build/bench/qus_e2e_bench \
+  --weights /tmp/missing.qus \
+  --output-json profiles/e2e/error-smoke.json \
+  --case smoke:/tmp/qus_e2e_smoke.ids:1 \
+  --max-ctx 3
+```
+
+The command exits nonzero and writes a schema-v1 error report when the output path is writable.
 
 Smoke baseline minimum:
 

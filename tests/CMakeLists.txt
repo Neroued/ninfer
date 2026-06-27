@@ -26,6 +26,8 @@ qus_add_test(qus_q5090_parser_test           SOURCES test_q5090_parser.cpp      
 qus_add_test(qus_weight_store_real_file_test SOURCES test_weight_store_real.cpp  NEEDS_SOURCE_DIR)
 qus_add_test(qus_model_config_test           SOURCES test_model_config.cpp)
 qus_add_test(qus_model_bind_test             SOURCES test_model_bind.cpp        NEEDS_SOURCE_DIR)
+qus_add_test(qus_model_blocks_test           SOURCES test_model_blocks.cpp      NEEDS_SOURCE_DIR)
+target_compile_definitions(qus_model_blocks_test PRIVATE QUS_MODEL_TESTING=1)
 qus_add_test(qus_silu_and_mul_test SOURCES kernels/test_silu_and_mul.cpp)
 qus_add_test(qus_residual_add_test SOURCES kernels/test_residual_add.cpp)
 qus_add_test(qus_sigmoid_gate_mul_test SOURCES kernels/test_sigmoid_gate_mul.cpp)

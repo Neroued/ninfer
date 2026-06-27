@@ -82,6 +82,35 @@ public:
     void prefill(std::span<const int> ids);
     void decode_step();
 
+#ifdef QUS_MODEL_TESTING
+    struct TestScheduleEntry {
+        bool is_full = false;
+        int index    = 0;
+    };
+
+    void test_attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
+        attn_mix(w, x, fidx, ph);
+    }
+
+    void test_gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
+        gdn_mix(w, x, gidx, ph);
+    }
+
+    void test_mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
+        mlp_tail(post_norm, m, x, ph);
+    }
+
+    void test_run_layers(Tensor& x, Phase ph) { run_layers(x, ph); }
+
+    [[nodiscard]] static constexpr TestScheduleEntry test_schedule_entry(int layer) {
+        return TestScheduleEntry{
+            ModelConfig::is_full(layer),
+            ModelConfig::is_full(layer) ? ModelConfig::full_idx(layer)
+                                        : ModelConfig::gdn_idx(layer),
+        };
+    }
+#endif
+
 private:
     void bind();
     void attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph);

@@ -28,7 +28,8 @@ class FixtureTensor:
     module_kind: int
     source_kind: int
     source_layer: int
-    values: torch.Tensor
+    values: torch.Tensor | None = None
+    zero_shape: tuple[int, ...] | None = None
 
 
 def make_values(shape: tuple[int, ...], offset: float) -> torch.Tensor:
@@ -37,6 +38,83 @@ def make_values(shape: tuple[int, ...], offset: float) -> torch.Tensor:
         count *= dim
     base = torch.arange(count, dtype=torch.float32).reshape(shape)
     return (base + offset) / 17.0
+
+
+def make_zero_spec(
+    name: str,
+    qtype: int,
+    layout: int,
+    module_kind: int,
+    source_kind: int,
+    source_layer: int,
+    shape: tuple[int, ...],
+) -> FixtureTensor:
+    return FixtureTensor(name, qtype, layout, module_kind, source_kind, source_layer, None, shape)
+
+
+def align_up(x: int, multiple: int) -> int:
+    return (x + multiple - 1) // multiple * multiple
+
+
+def encode_zero_tensor(
+    shape: tuple[int, ...], qtype: int, layout: int
+) -> tuple[bytes, List[int], List[int], int, int]:
+    logical = list(shape)
+    if layout == qt.LAYOUT_CONTIGUOUS:
+        if qtype == qt.QT_BF16:
+            elem_size = 2
+        elif qtype == qt.QT_FP32:
+            elem_size = 4
+        else:
+            raise ValueError(f"zero contiguous qtype must be BF16/FP32, got {qtype}")
+        count = 1
+        for dim in shape:
+            count *= dim
+        return bytes(count * elem_size), logical, logical, 0, qt.SCALE_NONE
+
+    if layout == qt.LAYOUT_TILE_N64_K64:
+        if qtype not in (qt.QT_Q4G64, qt.QT_Q5G64, qt.QT_Q6G64):
+            raise ValueError(f"zero tile64 qtype is unsupported: {qtype}")
+        n, k = shape
+        spec = qt.QUANT_SPECS[qtype]
+        np_ = align_up(n, 64)
+        kp = align_up(k, spec.group_size)
+        nt = np_ // 64
+        kg = kp // spec.group_size
+        tilew = 64 * 2 + 64 * spec.bytes_per_group
+        return bytes(nt * kg * tilew), logical, [np_, kp], spec.group_size, qt.SCALE_FP16
+
+    if layout == qt.LAYOUT_TILE_N64_K128:
+        if qtype != qt.QT_W8G128:
+            raise ValueError(f"zero tile128 qtype is unsupported: {qtype}")
+        n, k = shape
+        spec = qt.QUANT_SPECS[qtype]
+        np_ = align_up(n, 64)
+        kp = align_up(k, spec.group_size)
+        nt = np_ // 64
+        kg = kp // spec.group_size
+        tilew = 64 * 2 + 64 * spec.group_size
+        return bytes(nt * kg * tilew), logical, [np_, kp], spec.group_size, qt.SCALE_FP16
+
+    if layout == qt.LAYOUT_ROW_GROUPED_G64:
+        if qtype not in (qt.QT_Q4G64, qt.QT_Q5G64, qt.QT_Q6G64):
+            raise ValueError(f"zero row-grouped qtype is unsupported: {qtype}")
+        n, k = shape
+        spec = qt.QUANT_SPECS[qtype]
+        kp = align_up(k, spec.group_size)
+        kg = kp // spec.group_size
+        roww = 2 + spec.bytes_per_group
+        return bytes(n * kg * roww), logical, [n, kp], spec.group_size, qt.SCALE_FP16
+
+    raise ValueError(f"unknown layout {layout}")
+
+
+def encode_fixture_tensor(spec: FixtureTensor) -> tuple[bytes, List[int], List[int], int, int]:
+    if spec.values is not None:
+        return encode_tensor(spec.values, spec.qtype, spec.layout, torch.device("cpu"))
+    if spec.zero_shape is not None:
+        return encode_zero_tensor(spec.zero_shape, spec.qtype, spec.layout)
+    raise ValueError(f"fixture tensor has neither values nor zero shape: {spec.name}")
 
 
 def build_specs() -> List[FixtureTensor]:
@@ -135,7 +213,7 @@ def build_specs() -> List[FixtureTensor]:
     ]
 
 
-def build_model_bind_specs() -> List[FixtureTensor]:
+def build_model_bind_specs(real_sample_blocks: bool = False) -> List[FixtureTensor]:
     no_layer = qt.NO_LAYER
     specs = [
         FixtureTensor(
@@ -151,6 +229,9 @@ def build_model_bind_specs() -> List[FixtureTensor]:
 
     for layer in range(64):
         p = f"model.language_model.layers.{layer}."
+        sample_full = real_sample_blocks and layer == 3
+        sample_gdn = real_sample_blocks and layer == 0
+        sample_mlp = sample_full or sample_gdn
         specs.append(
             FixtureTensor(
                 p + "input_layernorm.weight",
@@ -165,41 +246,41 @@ def build_model_bind_specs() -> List[FixtureTensor]:
         if (layer + 1) % 4 == 0:
             specs.extend(
                 [
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "self_attn.q_proj.q",
                         qt.QT_Q4G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_ATTN_Q,
                         layer,
-                        make_values((8, 8), 200.0 + layer),
+                        (6144, 5120) if sample_full else (8, 8),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "self_attn.q_proj.gate",
                         qt.QT_Q5G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_ATTN_GATE,
                         layer,
-                        make_values((8, 8), 300.0 + layer),
+                        (6144, 5120) if sample_full else (8, 8),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "self_attn.k_proj.weight",
                         qt.QT_Q4G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_ATTN_K,
                         layer,
-                        make_values((8, 8), 400.0 + layer),
+                        (1024, 5120) if sample_full else (8, 8),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "self_attn.v_proj.weight",
                         qt.QT_Q5G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_ATTN_V,
                         layer,
-                        make_values((8, 8), 500.0 + layer),
+                        (1024, 5120) if sample_full else (8, 8),
                     ),
                     FixtureTensor(
                         p + "self_attn.q_norm.weight",
@@ -219,14 +300,14 @@ def build_model_bind_specs() -> List[FixtureTensor]:
                         layer,
                         make_values((256,), 700.0 + layer),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "self_attn.o_proj.weight",
                         qt.QT_Q5G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_ATTN_O,
                         layer,
-                        make_values((8, 8), 800.0 + layer),
+                        (5120, 6144) if sample_full else (8, 8),
                     ),
                 ]
             )
@@ -251,68 +332,68 @@ def build_model_bind_specs() -> List[FixtureTensor]:
                         layer,
                         make_values((48,), 1000.0 + layer),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "linear_attn.conv1d.weight",
                         qt.QT_BF16,
                         qt.LAYOUT_CONTIGUOUS,
                         qt.MODULE_TEXT,
                         qt.SK_GDN_CONV1D,
                         layer,
-                        make_values((10240, 1, 4), 1100.0 + layer),
+                        (10240, 1, 4),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "linear_attn.in_proj_a.weight",
                         qt.QT_BF16,
                         qt.LAYOUT_CONTIGUOUS,
                         qt.MODULE_TEXT,
                         qt.SK_GDN_IN_PROJ_A,
                         layer,
-                        make_values((48, 8), 1200.0 + layer),
+                        (48, 5120) if sample_gdn else (48, 8),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "linear_attn.in_proj_b.weight",
                         qt.QT_BF16,
                         qt.LAYOUT_CONTIGUOUS,
                         qt.MODULE_TEXT,
                         qt.SK_GDN_IN_PROJ_B,
                         layer,
-                        make_values((48, 8), 1300.0 + layer),
+                        (48, 5120) if sample_gdn else (48, 8),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "linear_attn.in_proj_qkv.q",
                         qt.QT_Q4G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_GDN_IN_PROJ_Q,
                         layer,
-                        make_values((8, 8), 1400.0 + layer),
+                        (2048, 5120) if sample_gdn else (8, 8),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "linear_attn.in_proj_qkv.k",
                         qt.QT_Q4G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_GDN_IN_PROJ_K,
                         layer,
-                        make_values((8, 8), 1500.0 + layer),
+                        (2048, 5120) if sample_gdn else (8, 8),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "linear_attn.in_proj_qkv.v",
                         qt.QT_Q5G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_GDN_IN_PROJ_V,
                         layer,
-                        make_values((8, 8), 1600.0 + layer),
+                        (6144, 5120) if sample_gdn else (8, 8),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "linear_attn.in_proj_z.weight",
                         qt.QT_Q5G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_GDN_IN_PROJ_Z,
                         layer,
-                        make_values((8, 8), 1700.0 + layer),
+                        (6144, 5120) if sample_gdn else (8, 8),
                     ),
                     FixtureTensor(
                         p + "linear_attn.norm.weight",
@@ -323,14 +404,14 @@ def build_model_bind_specs() -> List[FixtureTensor]:
                         layer,
                         make_values((128,), 1800.0 + layer),
                     ),
-                    FixtureTensor(
+                    make_zero_spec(
                         p + "linear_attn.out_proj.weight",
                         qt.QT_Q5G64,
                         qt.LAYOUT_TILE_N64_K64,
                         qt.MODULE_TEXT,
                         qt.SK_GDN_OUT_PROJ,
                         layer,
-                        make_values((8, 8), 1900.0 + layer),
+                        (5120, 6144) if sample_gdn else (8, 8),
                     ),
                 ]
             )
@@ -345,32 +426,32 @@ def build_model_bind_specs() -> List[FixtureTensor]:
                     layer,
                     make_values((5120,), 2000.0 + layer),
                 ),
-                FixtureTensor(
+                make_zero_spec(
                     p + "mlp.gate_proj.weight",
                     qt.QT_Q4G64,
                     qt.LAYOUT_TILE_N64_K64,
                     qt.MODULE_TEXT,
                     qt.SK_MLP_GATE,
                     layer,
-                    make_values((8, 8), 2100.0 + layer),
+                    (17408, 5120) if sample_mlp else (8, 8),
                 ),
-                FixtureTensor(
+                make_zero_spec(
                     p + "mlp.up_proj.weight",
                     qt.QT_Q4G64,
                     qt.LAYOUT_TILE_N64_K64,
                     qt.MODULE_TEXT,
                     qt.SK_MLP_UP,
                     layer,
-                    make_values((8, 8), 2200.0 + layer),
+                    (17408, 5120) if sample_mlp else (8, 8),
                 ),
-                FixtureTensor(
+                make_zero_spec(
                     p + "mlp.down_proj.weight",
                     qt.QT_Q5G64,
                     qt.LAYOUT_TILE_N64_K64,
                     qt.MODULE_TEXT,
                     qt.SK_MLP_DOWN,
                     layer,
-                    make_values((8, 8), 2300.0 + layer),
+                    (5120, 17408) if sample_mlp else (8, 8),
                 ),
             ]
         )
@@ -414,7 +495,12 @@ def module_counts(specs: List[FixtureTensor]) -> list[tuple[int, int, int]]:
 
 
 def build_file(out_path: Path, profile: str) -> None:
-    specs = build_model_bind_specs() if profile == "model-bind" else build_specs()
+    if profile == "model-bind":
+        specs = build_model_bind_specs()
+    elif profile == "model-blocks":
+        specs = build_model_bind_specs(real_sample_blocks=True)
+    else:
+        specs = build_specs()
     entries = [
         fmt.TensorEntry(
             name=spec.name,
@@ -443,9 +529,7 @@ def build_file(out_path: Path, profile: str) -> None:
 
     payloads: list[bytes] = []
     for spec, entry in zip(specs, entries):
-        payload, logical, padded, group, scale_dtype = encode_tensor(
-            spec.values, spec.qtype, spec.layout, torch.device("cpu")
-        )
+        payload, logical, padded, group, scale_dtype = encode_fixture_tensor(spec)
         entry.shape = logical
         entry.padded_shape = padded
         entry.group_size = group
@@ -537,7 +621,9 @@ def build_file(out_path: Path, profile: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
-    parser.add_argument("--profile", choices=("default", "model-bind"), default="default")
+    parser.add_argument(
+        "--profile", choices=("default", "model-bind", "model-blocks"), default="default"
+    )
     args = parser.parse_args()
     build_file(Path(args.out), args.profile)
 

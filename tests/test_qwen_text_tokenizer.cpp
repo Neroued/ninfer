@@ -1,3 +1,4 @@
+#include "qus/text/chat_template.h"
 #include "qus/text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
@@ -596,6 +597,39 @@ int test_hf_golden_text_cases() {
     return 0;
 }
 
+int test_hf_golden_message_cases() {
+    const auto tokenizer_path =
+        std::filesystem::path("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16");
+    if (!std::filesystem::exists(tokenizer_path / "tokenizer.json")) {
+        std::cout << "skipping golden message cases: local tokenizer not present\n";
+        return 0;
+    }
+    const auto fixture_path = repo_file("tests/fixtures/text/qwen36_text_golden.json");
+    std::ifstream in(fixture_path);
+    const auto fixture = nlohmann::json::parse(in);
+    const qus::text::QwenTokenizer tok(tokenizer_path);
+    for (const auto& item : fixture.at("message_cases")) {
+        std::vector<qus::text::ChatMessage> messages;
+        for (const auto& msg : item.at("messages")) {
+            messages.push_back(
+                {msg.at("role").get<std::string>(), msg.at("content").get<std::string>()});
+        }
+        const std::string rendered = qus::text::render_qwen_chat(messages);
+        if (rendered != item.at("rendered").get<std::string>()) {
+            std::cerr << "rendered prompt mismatch for " << item.at("name").get<std::string>()
+                      << '\n';
+            return 1;
+        }
+        const std::vector<int> actual   = tok.encode(rendered);
+        const std::vector<int> expected = item.at("ids").get<std::vector<int>>();
+        if (actual != expected) {
+            std::cerr << "message ids mismatch for " << item.at("name").get<std::string>() << '\n';
+            return 1;
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -619,6 +653,7 @@ int main() {
         failures += test_decode_rejects_sparse_invalid_id();
         failures += test_added_token_encode_decode();
         failures += test_hf_golden_text_cases();
+        failures += test_hf_golden_message_cases();
         return failures == 0 ? 0 : fail("qwen tokenizer metadata test failed");
     } catch (const std::exception& ex) {
         std::cerr << "qwen tokenizer metadata test failed: " << ex.what() << '\n';

@@ -388,8 +388,8 @@ points, eligible warps per scheduler rose from 0.77 to 1.09, issued warp per sch
 0.44 to 0.50, and roofline DRAM rose by 4.19 points with no spills or correctness regression. The
 tradeoff is higher register pressure, lower achieved occupancy, more total SM instructions, and
 higher MIO/LG throttle. This still does not meet the Task 4 target (`>=70%` DRAM and near `C =
-82.76%`). The next round should continue Q5 `mlp.down`, likely targeting unchanged global-load
-traffic or `x` reuse rather than adding still more in-flight groups without reducing load traffic.
+82.76%`). The accepted duration delta was effectively flat, so Q5 required a final diminishing-returns
+check rather than more open-ended tuning.
 
 ### Verification
 
@@ -401,6 +401,17 @@ compute-sanitizer ./build/tests/qus_linear_test
 
 All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
 errors`.
+
+## Q5 Stop Condition - Q5 mlp.down [5120,17408]
+
+Q5 `mlp.down` stops here under the Task 4 diminishing-returns rule. Round 5 was accepted because its
+diagnosed limiter improved, but the duration delta was effectively flat (`71.14 us -> 71.10 us`).
+A follow-up Q5 round-6 experiment changed only the launch shape to a 64-thread CTA and was rejected
+and reverted: duration regressed (`70.91 us -> 71.17 us`), DRAM regressed (`52.79% -> 52.01%`),
+global-load traffic was unchanged, there were no spills, and verification passed. A prior shared-`x`
+staging experiment was also rejected, but the stop decision is the round-5 flat duration plus the
+round-6 regression. Best accepted Q5 remains round 5 at 53.27% DRAM with no spills and the documented
+L1TEX/global-load limiter.
 
 ## Q4 Round 1 - Q4 mlp.gate/up [17408,5120]
 

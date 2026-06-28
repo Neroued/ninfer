@@ -290,10 +290,10 @@ QwenTokenizer::QwenTokenizer(const std::filesystem::path& tokenizer_dir)
 
 std::vector<int> QwenTokenizer::encode(std::string_view text, EncodeOptions options) const {
     for (const AddedToken& token : added_tokens_) {
-        if (token.single_word || token.lstrip || token.rstrip) {
+        if (token.single_word || token.lstrip || token.rstrip || token.normalized) {
             throw std::logic_error(
                 "QwenTokenizer::encode only supports Qwen added tokens with single_word=false, "
-                "lstrip=false, and rstrip=false");
+                "lstrip=false, rstrip=false, and normalized=false");
         }
     }
 

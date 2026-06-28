@@ -92,6 +92,26 @@ bool decode_throws_out_of_range_containing(const qus::text::QwenTokenizer& token
     return false;
 }
 
+bool decode_throws_invalid_containing(const qus::text::QwenTokenizer& tokenizer,
+                                      const std::vector<int>& ids, std::string_view expected) {
+    try {
+        (void)tokenizer.decode(ids);
+    } catch (const std::invalid_argument& ex) {
+        return std::string_view(ex.what()).find(expected) != std::string_view::npos;
+    }
+    return false;
+}
+
+bool encode_throws_logic_containing(const qus::text::QwenTokenizer& tokenizer,
+                                    std::string_view text, std::string_view expected) {
+    try {
+        (void)tokenizer.encode(text);
+    } catch (const std::logic_error& ex) {
+        return std::string_view(ex.what()).find(expected) != std::string_view::npos;
+    }
+    return false;
+}
+
 int test_valid_minimal_metadata() {
     TempDir dir;
     write_tokenizer_json(dir.path, minimal_tokenizer_json(R"({"a":0,"b":1})"));
@@ -291,6 +311,110 @@ int test_minimal_added_token_encode_decode() {
     const std::string stop_trimmed =
         tokenizer.decode(with_stop, qus::text::DecodeOptions{false, {3}});
     failures += check(stop_trimmed == "<think></think>", "minimal terminal stop decode mismatch");
+
+    const std::vector<int> with_interior_stop{3, 4, 3};
+    const std::string interior_stop_preserved =
+        tokenizer.decode(with_interior_stop, qus::text::DecodeOptions{false, {3}});
+    failures += check(interior_stop_preserved == "<|im_end|><think>",
+                      "minimal interior stop decode mismatch");
+    return failures;
+}
+
+int test_byte_level_vocab_decode() {
+    TempDir dir;
+    write_tokenizer_json(
+        dir.path,
+        minimal_tokenizer_json(
+            R"({"Ġ":0,"Ċ":1,"Ã©":2,"€":3})",
+            R"([{"id":4,"content":"<extra>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}])"));
+    const qus::text::QwenTokenizer tokenizer(dir.path);
+
+    int failures = 0;
+    failures += check(tokenizer.decode(std::vector<int>{0}) == " ", "space byte decode mismatch");
+    failures +=
+        check(tokenizer.decode(std::vector<int>{1}) == "\n", "newline byte decode mismatch");
+    failures += check(tokenizer.decode(std::vector<int>{2}) == "é", "utf-8 byte decode mismatch");
+    failures += check(decode_throws_invalid_containing(tokenizer, {3}, "3"),
+                      "invalid byte alphabet token accepted");
+    return failures;
+}
+
+int test_added_token_same_position_first_loaded_wins() {
+    int failures = 0;
+    {
+        TempDir dir;
+        write_tokenizer_json(
+            dir.path,
+            minimal_tokenizer_json(
+                R"({"!":0})",
+                R"([{"id":1,"content":"<tag>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},{"id":2,"content":"<tag>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}])"));
+        const qus::text::QwenTokenizer tokenizer(dir.path);
+
+        failures += check(tokenizer.encode("<tag>") == std::vector<int>{1},
+                          "same-position added token tie did not choose first loaded token");
+    }
+    {
+        TempDir dir;
+        write_tokenizer_json(
+            dir.path,
+            minimal_tokenizer_json(
+                R"({"!":0})",
+                R"([{"id":1,"content":"<tag>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},{"id":2,"content":"<tag>x","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}])"));
+        const qus::text::QwenTokenizer tokenizer(dir.path);
+
+        failures +=
+            check(encode_throws_logic_containing(tokenizer, "<tag>x", "ordinary BPE"),
+                  "same-position overlapping added token did not choose first loaded token");
+    }
+    return failures;
+}
+
+int test_encode_rejects_unsupported_added_token_flags() {
+    int failures = 0;
+    {
+        TempDir dir;
+        write_tokenizer_json(
+            dir.path,
+            minimal_tokenizer_json(
+                R"({"!":0})",
+                R"([{"id":1,"content":"<x>","single_word":true,"lstrip":false,"rstrip":false,"normalized":false,"special":false}])"));
+        const qus::text::QwenTokenizer tokenizer(dir.path);
+        failures += check(encode_throws_logic_containing(tokenizer, "<x>", "single_word=false"),
+                          "single_word=true added token encode accepted");
+    }
+    {
+        TempDir dir;
+        write_tokenizer_json(
+            dir.path,
+            minimal_tokenizer_json(
+                R"({"!":0})",
+                R"([{"id":1,"content":"<x>","single_word":false,"lstrip":true,"rstrip":false,"normalized":false,"special":false}])"));
+        const qus::text::QwenTokenizer tokenizer(dir.path);
+        failures += check(encode_throws_logic_containing(tokenizer, "<x>", "lstrip=false"),
+                          "lstrip=true added token encode accepted");
+    }
+    {
+        TempDir dir;
+        write_tokenizer_json(
+            dir.path,
+            minimal_tokenizer_json(
+                R"({"!":0})",
+                R"([{"id":1,"content":"<x>","single_word":false,"lstrip":false,"rstrip":true,"normalized":false,"special":false}])"));
+        const qus::text::QwenTokenizer tokenizer(dir.path);
+        failures += check(encode_throws_logic_containing(tokenizer, "<x>", "rstrip=false"),
+                          "rstrip=true added token encode accepted");
+    }
+    {
+        TempDir dir;
+        write_tokenizer_json(
+            dir.path,
+            minimal_tokenizer_json(
+                R"({"!":0})",
+                R"([{"id":1,"content":"<x>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}])"));
+        const qus::text::QwenTokenizer tokenizer(dir.path);
+        failures += check(encode_throws_logic_containing(tokenizer, "<x>", "normalized=false"),
+                          "normalized=true added token encode accepted");
+    }
     return failures;
 }
 
@@ -344,6 +468,9 @@ int main() {
         failures += test_rejects_invalid_generation_config_eos_token_id();
         failures += test_load_real_tokenizer_metadata();
         failures += test_minimal_added_token_encode_decode();
+        failures += test_byte_level_vocab_decode();
+        failures += test_added_token_same_position_first_loaded_wins();
+        failures += test_encode_rejects_unsupported_added_token_flags();
         failures += test_decode_rejects_sparse_invalid_id();
         failures += test_added_token_encode_decode();
         return failures == 0 ? 0 : fail("qwen tokenizer metadata test failed");

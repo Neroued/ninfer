@@ -82,6 +82,16 @@ bool throws_generation_invalid_containing(const std::filesystem::path& dir,
     return false;
 }
 
+bool decode_throws_out_of_range_containing(const qus::text::QwenTokenizer& tokenizer,
+                                           const std::vector<int>& ids, std::string_view expected) {
+    try {
+        (void)tokenizer.decode(ids);
+    } catch (const std::out_of_range& ex) {
+        return std::string_view(ex.what()).find(expected) != std::string_view::npos;
+    }
+    return false;
+}
+
 int test_valid_minimal_metadata() {
     TempDir dir;
     write_tokenizer_json(dir.path, minimal_tokenizer_json(R"({"a":0,"b":1})"));
@@ -257,6 +267,69 @@ int test_load_real_tokenizer_metadata() {
     return failures;
 }
 
+int test_minimal_added_token_encode_decode() {
+    TempDir dir;
+    write_tokenizer_json(
+        dir.path,
+        minimal_tokenizer_json(
+            R"({"!":0,"A":1})",
+            R"([{"id":2,"content":"<|im_start|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},{"id":3,"content":"<|im_end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},{"id":4,"content":"<think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},{"id":5,"content":"</think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}])"));
+    const qus::text::QwenTokenizer tokenizer(dir.path);
+
+    const std::vector<int> ids = tokenizer.encode("<|im_start|><|im_end|><think></think>");
+    int failures               = 0;
+    failures += check(ids == std::vector<int>{2, 3, 4, 5}, "minimal added token ids mismatch");
+
+    const std::string raw = tokenizer.decode(ids, qus::text::DecodeOptions{false, {}});
+    failures +=
+        check(raw == "<|im_start|><|im_end|><think></think>", "minimal raw decode mismatch");
+
+    const std::string clean = tokenizer.decode(ids, qus::text::DecodeOptions{true, {}});
+    failures += check(clean == "<think></think>", "minimal clean decode mismatch");
+
+    const std::vector<int> with_stop{4, 5, 3};
+    const std::string stop_trimmed =
+        tokenizer.decode(with_stop, qus::text::DecodeOptions{false, {3}});
+    failures += check(stop_trimmed == "<think></think>", "minimal terminal stop decode mismatch");
+    return failures;
+}
+
+int test_decode_rejects_sparse_invalid_id() {
+    TempDir dir;
+    write_tokenizer_json(
+        dir.path,
+        minimal_tokenizer_json(
+            R"({"":0})",
+            R"([{"id":5,"content":"<extra>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}])"));
+    const qus::text::QwenTokenizer tokenizer(dir.path);
+
+    int failures = 0;
+    failures += check(tokenizer.decode(std::vector<int>{0}).empty(),
+                      "valid empty vocab token decode mismatch");
+    failures += check(decode_throws_out_of_range_containing(tokenizer, {3}, "3"),
+                      "sparse invalid token id accepted");
+    return failures;
+}
+
+int test_added_token_encode_decode() {
+    const auto tokenizer_path =
+        std::filesystem::path("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16");
+    if (!std::filesystem::exists(tokenizer_path / "tokenizer.json")) {
+        std::cout << "skipping added token test: local tokenizer not present\n";
+        return 0;
+    }
+    const qus::text::QwenTokenizer tok(tokenizer_path);
+    const std::vector<int> ids = tok.encode("<|im_start|><|im_end|><think></think>");
+    if (ids != std::vector<int>{248045, 248046, 248068, 248069}) {
+        return fail("added token ids mismatch");
+    }
+    const std::string raw = tok.decode(ids, qus::text::DecodeOptions{false, {}});
+    if (raw != "<|im_start|><|im_end|><think></think>") { return fail("raw decode mismatch"); }
+    const std::string clean = tok.decode(ids, qus::text::DecodeOptions{true, {}});
+    if (clean != "<think></think>") { return fail("clean decode mismatch"); }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -270,6 +343,9 @@ int main() {
         failures += test_rejects_malformed_added_token_fields();
         failures += test_rejects_invalid_generation_config_eos_token_id();
         failures += test_load_real_tokenizer_metadata();
+        failures += test_minimal_added_token_encode_decode();
+        failures += test_decode_rejects_sparse_invalid_id();
+        failures += test_added_token_encode_decode();
         return failures == 0 ? 0 : fail("qwen tokenizer metadata test failed");
     } catch (const std::exception& ex) {
         std::cerr << "qwen tokenizer metadata test failed: " << ex.what() << '\n';

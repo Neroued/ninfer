@@ -47,6 +47,7 @@ public:
 private:
     std::filesystem::path tokenizer_dir_;
     std::vector<std::string> id_to_token_;
+    std::vector<bool> valid_token_ids_;
     std::vector<AddedToken> added_tokens_;
     std::vector<int> default_stop_token_ids_;
 };

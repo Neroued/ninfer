@@ -5,8 +5,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -199,6 +202,66 @@ std::vector<int> load_default_stop_token_ids(const std::filesystem::path& path) 
     throw std::invalid_argument("field eos_token_id must be integer or array in " + path.string());
 }
 
+std::unordered_map<std::uint32_t, char> build_byte_level_decoder() {
+    std::unordered_map<std::uint32_t, char> decoder;
+    std::uint32_t next = 256;
+    for (int byte = 0; byte <= std::numeric_limits<unsigned char>::max(); ++byte) {
+        const bool visible = (byte >= 33 && byte <= 126) || (byte >= 161 && byte <= 172) ||
+                             (byte >= 174 && byte <= 255);
+        const std::uint32_t codepoint = visible ? static_cast<std::uint32_t>(byte) : next++;
+        decoder.emplace(codepoint, static_cast<char>(static_cast<unsigned char>(byte)));
+    }
+    return decoder;
+}
+
+std::vector<std::uint32_t> utf8_codepoints(std::string_view text, std::string_view context) {
+    std::vector<std::uint32_t> codepoints;
+    for (std::size_t i = 0; i < text.size();) {
+        const unsigned char first = static_cast<unsigned char>(text[i]);
+        std::uint32_t codepoint   = 0;
+        std::size_t length        = 0;
+        if (first <= 0x7F) {
+            codepoint = first;
+            length    = 1;
+        } else if ((first & 0xE0U) == 0xC0U) {
+            codepoint = first & 0x1FU;
+            length    = 2;
+        } else if ((first & 0xF0U) == 0xE0U) {
+            codepoint = first & 0x0FU;
+            length    = 3;
+        } else if ((first & 0xF8U) == 0xF0U) {
+            codepoint = first & 0x07U;
+            length    = 4;
+        } else {
+            throw std::invalid_argument("invalid UTF-8 leading byte in " + std::string(context));
+        }
+
+        if (i + length > text.size()) {
+            throw std::invalid_argument("truncated UTF-8 sequence in " + std::string(context));
+        }
+        for (std::size_t j = 1; j < length; ++j) {
+            const unsigned char next = static_cast<unsigned char>(text[i + j]);
+            if ((next & 0xC0U) != 0x80U) {
+                throw std::invalid_argument("invalid UTF-8 continuation byte in " +
+                                            std::string(context));
+            }
+            codepoint = (codepoint << 6U) | (next & 0x3FU);
+        }
+        codepoints.push_back(codepoint);
+        i += length;
+    }
+    return codepoints;
+}
+
+bool is_added_token_id(const std::vector<AddedToken>& added_tokens, int id) {
+    return std::any_of(added_tokens.begin(), added_tokens.end(),
+                       [id](const AddedToken& token) { return token.id == id; });
+}
+
+bool is_stop_token_id(std::span<const int> stop_token_ids, int id) {
+    return std::find(stop_token_ids.begin(), stop_token_ids.end(), id) != stop_token_ids.end();
+}
+
 } // namespace
 
 QwenTokenizer::QwenTokenizer(const std::filesystem::path& tokenizer_dir)
@@ -209,22 +272,108 @@ QwenTokenizer::QwenTokenizer(const std::filesystem::path& tokenizer_dir)
 
     VocabMetadata vocab_metadata = load_vocab(model, tokenizer_json);
     id_to_token_                 = std::move(vocab_metadata.id_to_token);
+    valid_token_ids_.resize(id_to_token_.size());
+    for (const int id : vocab_metadata.occupied_ids) {
+        valid_token_ids_.at(static_cast<std::size_t>(id)) = true;
+    }
     added_tokens_ =
         load_added_tokens(root, tokenizer_json, id_to_token_, vocab_metadata.occupied_ids);
+    if (valid_token_ids_.size() < id_to_token_.size()) {
+        valid_token_ids_.resize(id_to_token_.size());
+    }
+    for (const AddedToken& token : added_tokens_) {
+        valid_token_ids_.at(static_cast<std::size_t>(token.id)) = true;
+    }
     default_stop_token_ids_ =
         load_default_stop_token_ids(tokenizer_dir_ / "generation_config.json");
 }
 
 std::vector<int> QwenTokenizer::encode(std::string_view text, EncodeOptions options) const {
-    (void)text;
-    (void)options;
-    throw std::logic_error("QwenTokenizer::encode is not implemented yet");
+    for (const AddedToken& token : added_tokens_) {
+        if (token.single_word || token.lstrip || token.rstrip) {
+            throw std::logic_error(
+                "QwenTokenizer::encode only supports Qwen added tokens with single_word=false, "
+                "lstrip=false, and rstrip=false");
+        }
+    }
+
+    if (text.empty()) { return {}; }
+    if (!options.parse_added_tokens) {
+        throw std::logic_error("QwenTokenizer::encode ordinary BPE text is not implemented yet");
+    }
+
+    std::vector<int> ids;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        std::size_t match_pos         = std::string_view::npos;
+        const AddedToken* match_token = nullptr;
+        for (const AddedToken& token : added_tokens_) {
+            if (token.content.empty()) { continue; }
+            const std::size_t found = text.find(token.content, pos);
+            if (found == std::string_view::npos) { continue; }
+            if (match_token == nullptr || found < match_pos) {
+                match_pos   = found;
+                match_token = &token;
+            }
+        }
+
+        if (match_token == nullptr) {
+            throw std::logic_error(
+                "QwenTokenizer::encode ordinary BPE text is not implemented yet");
+        }
+        if (match_pos > pos) {
+            throw std::logic_error(
+                "QwenTokenizer::encode ordinary BPE text is not implemented yet");
+        }
+
+        ids.push_back(match_token->id);
+        pos += match_token->content.size();
+    }
+    return ids;
 }
 
 std::string QwenTokenizer::decode(std::span<const int> ids, DecodeOptions options) const {
-    (void)ids;
-    (void)options;
-    throw std::logic_error("QwenTokenizer::decode is not implemented yet");
+    static const std::unordered_map<std::uint32_t, char> byte_decoder = build_byte_level_decoder();
+
+    std::string text;
+    const std::size_t terminal_stop_index =
+        (!ids.empty() && is_stop_token_id(options.stop_token_ids, ids.back())) ? ids.size() - 1
+                                                                               : ids.size();
+
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const int id = ids[i];
+        if (i == terminal_stop_index) { continue; }
+        if (options.skip_special_tokens && is_special_token(id)) { continue; }
+        if (id < 0) {
+            throw std::invalid_argument("QwenTokenizer::decode received negative token id " +
+                                        std::to_string(id));
+        }
+        const auto index = static_cast<std::size_t>(id);
+        if (index >= id_to_token_.size() || index >= valid_token_ids_.size() ||
+            !valid_token_ids_.at(index)) {
+            throw std::out_of_range("QwenTokenizer::decode token id " + std::to_string(id) +
+                                    " is outside loaded vocabulary");
+        }
+
+        const std::string& token = id_to_token_.at(index);
+        if (is_added_token_id(added_tokens_, id)) {
+            text += token;
+            continue;
+        }
+
+        const std::vector<std::uint32_t> codepoints =
+            utf8_codepoints(token, "QwenTokenizer::decode token id " + std::to_string(id));
+        for (const std::uint32_t codepoint : codepoints) {
+            const auto byte = byte_decoder.find(codepoint);
+            if (byte == byte_decoder.end()) {
+                throw std::invalid_argument(
+                    "QwenTokenizer::decode token id " + std::to_string(id) +
+                    " contains a character outside the byte-level alphabet");
+            }
+            text.push_back(byte->second);
+        }
+    }
+    return text;
 }
 
 bool QwenTokenizer::is_special_token(int id) const noexcept {

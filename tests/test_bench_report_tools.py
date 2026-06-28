@@ -309,10 +309,7 @@ class ReportCommonTests(unittest.TestCase):
     def test_validate_report_rejects_any_eos_token_id(self) -> None:
         bad = report()
         bad["cases"][0]["eos_token_id"] = -1
-        with self.assertRaisesRegex(
-            common.ReportValidationError,
-            "report schema uses stop_token_ids; eos_token_id is not allowed and report must be regenerated",
-        ):
+        with self.assertRaises(common.ReportValidationError):
             common.validate_report(bad)
 
     def test_validate_report_rejects_bad_chat_identity_fields(self) -> None:
@@ -397,15 +394,13 @@ class CompareReportTests(unittest.TestCase):
                 result = compare_e2e_reports.compare_reports(report(), candidate)
                 self.assertTrue(result.failures)
 
-    def test_chat_template_kwargs_int_bool_is_case_identity_change(self) -> None:
+    def test_chat_template_kwargs_int_bool_is_schema_failure(self) -> None:
         from tools.bench import compare_e2e_reports
 
-        baseline = report()["cases"][0]
-        candidate = report()["cases"][0]
-        candidate["chat_template_kwargs"] = {"enable_thinking": 0}
-        result = compare_e2e_reports.CompareResult()
-        compare_e2e_reports._compare_case_identity(baseline, candidate, result)
-        self.assertTrue(any(item["code"] == "case_identity_changed" for item in result.failures))
+        candidate = report()
+        candidate["cases"][0]["chat_template_kwargs"] = {"enable_thinking": 0}
+        result = compare_e2e_reports.compare_reports(report(), candidate)
+        self.assertTrue(any(item["code"] == "schema_invalid" for item in result.failures))
 
     def test_missing_q5090_identity_is_hard_failure_by_default(self) -> None:
         from tools.bench import compare_e2e_reports

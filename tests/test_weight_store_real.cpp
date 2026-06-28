@@ -3,9 +3,12 @@
 #include "qus/core/weight_store.h"
 #include "qus/core/weight_store_parser.h"
 
+#include "../third_party/nlohmann/json.hpp"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -13,7 +16,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <iterator>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -22,6 +24,8 @@
 #include <vector>
 
 namespace {
+
+using Json = nlohmann::json;
 
 constexpr std::uint64_t kGiB                = 1024ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kProgressChunkBytes = 256ULL * 1024ULL * 1024ULL;
@@ -112,10 +116,16 @@ std::vector<std::byte> read_binary(const std::filesystem::path& path,
     return bytes;
 }
 
-std::string read_text(const std::filesystem::path& path) {
+Json read_manifest_json(const std::filesystem::path& path) {
     std::ifstream in(path);
     if (!in) { throw std::runtime_error("failed to open manifest"); }
-    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    Json manifest;
+    try {
+        in >> manifest;
+    } catch (const nlohmann::json::exception& e) {
+        throw std::runtime_error(std::string("failed to parse manifest JSON: ") + e.what());
+    }
+    return manifest;
 }
 
 qus::Q5090Expectations expectations() {
@@ -137,26 +147,131 @@ qus::Q5090Expectations expectations() {
     return expected;
 }
 
-int expect_manifest_tokens(const std::string& manifest) {
+int expect_string_field(const Json& object, const char* key, const char* expected,
+                        const char* message) {
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_string() || it->get<std::string>() != expected) {
+        return fail(message);
+    }
+    return 0;
+}
+
+int expect_uint_field(const Json& object, const char* key, std::uint64_t expected,
+                      const char* message) {
+    const auto it = object.find(key);
+    if (it == object.end()) { return fail(message); }
+    if (it->is_number_unsigned()) {
+        return it->get<std::uint64_t>() == expected ? 0 : fail(message);
+    }
+    if (it->is_number_integer()) {
+        const std::int64_t value = it->get<std::int64_t>();
+        return value >= 0 && static_cast<std::uint64_t>(value) == expected ? 0 : fail(message);
+    }
+    return fail(message);
+}
+
+int expect_bool_field(const Json& object, const char* key, bool expected, const char* message) {
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_boolean() || it->get<bool>() != expected) {
+        return fail(message);
+    }
+    return 0;
+}
+
+template <std::size_t N>
+int expect_string_array_field(const Json& object, const char* key,
+                              const std::array<const char*, N>& expected, const char* message) {
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_array() || it->size() != expected.size()) {
+        return fail(message);
+    }
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (!(*it)[i].is_string() || (*it)[i].get<std::string>() != expected[i]) {
+            return fail(message);
+        }
+    }
+    return 0;
+}
+
+int expect_empty_array_field(const Json& object, const char* key, const char* message) {
+    const auto it = object.find(key);
+    if (it == object.end() || !it->is_array() || !it->empty()) { return fail(message); }
+    return 0;
+}
+
+int expect_manifest_segment(const Json& segment, const char* kind, const char* policy,
+                            std::uint64_t tensor_count, std::uint64_t payload_bytes,
+                            std::uint64_t load_policy) {
+    if (!segment.is_object()) { return fail("manifest segment must be object"); }
     int failures = 0;
-    failures += manifest.find("\"kind\": \"TEXT_CORE\"") != std::string::npos
-                    ? 0
-                    : fail("manifest missing TEXT");
-    failures += manifest.find("\"kind\": \"MTP_DRAFT\"") != std::string::npos
-                    ? 0
-                    : fail("manifest missing MTP");
-    failures += manifest.find("\"kind\": \"VISION_ENCODER\"") != std::string::npos
-                    ? 0
-                    : fail("manifest missing VISION");
-    failures += manifest.find("\"tensor_count\": 963") != std::string::npos
-                    ? 0
-                    : fail("manifest TEXT count mismatch");
-    failures += manifest.find("\"tensor_count\": 15") != std::string::npos
-                    ? 0
-                    : fail("manifest MTP count mismatch");
-    failures += manifest.find("\"tensor_count\": 333") != std::string::npos
-                    ? 0
-                    : fail("manifest VISION count mismatch");
+    failures += expect_string_field(segment, "kind", kind, "manifest segment kind mismatch");
+    failures += expect_string_field(segment, "policy", policy, "manifest segment policy mismatch");
+    failures += expect_uint_field(segment, "tensor_count", tensor_count,
+                                  "manifest segment tensor_count mismatch");
+    failures += expect_uint_field(segment, "payload_bytes", payload_bytes,
+                                  "manifest segment payload_bytes mismatch");
+    failures +=
+        expect_uint_field(segment, "load_policy", load_policy, "manifest segment load_policy mismatch");
+    return failures;
+}
+
+int expect_manifest_fields(const Json& manifest, std::uint64_t file_size) {
+    if (!manifest.is_object()) { return fail("manifest root must be object"); }
+
+    int failures = 0;
+    failures += expect_string_field(manifest, "format", "q5090_w4g64_mixed_v1_final",
+                                    "manifest format mismatch");
+    failures += expect_uint_field(manifest, "format_version", 1, "manifest format_version mismatch");
+    failures +=
+        expect_string_field(manifest, "model", "Qwen/Qwen3.6-27B", "manifest model mismatch");
+    failures += expect_string_field(manifest, "binary_spec", "docs/q5090_packed_file_format_v1.md",
+                                    "manifest binary_spec mismatch");
+    failures += expect_uint_field(manifest, "file_bytes", file_size, "manifest file_bytes mismatch");
+    failures += expect_uint_field(manifest, "hidden_size", 5120, "manifest hidden_size mismatch");
+    failures +=
+        expect_uint_field(manifest, "intermediate_size", 17408, "manifest intermediate_size mismatch");
+    failures += expect_uint_field(manifest, "vocab_size", 248320, "manifest vocab_size mismatch");
+    failures +=
+        expect_uint_field(manifest, "num_hidden_layers", 64, "manifest num_hidden_layers mismatch");
+    failures += expect_bool_field(manifest, "zero_point", false, "manifest zero_point mismatch");
+    failures +=
+        expect_empty_array_field(manifest, "disabled_segments", "manifest disabled_segments mismatch");
+    failures += expect_string_array_field(
+        manifest, "qtypes",
+        std::array<const char*, 6>{"Q4G64_F16S", "Q5G64_F16S", "Q6G64_F16S", "W8G128_F16S",
+                                  "BF16_CTRL", "FP32_CTRL"},
+        "manifest qtypes mismatch");
+    failures += expect_string_array_field(
+        manifest, "layouts",
+        std::array<const char*, 4>{"TILE_N64_K64", "TILE_N64_K128", "ROW_GROUPED_G64",
+                                  "CONTIGUOUS"},
+        "manifest layouts mismatch");
+
+    const auto alignment_it = manifest.find("alignment");
+    if (alignment_it == manifest.end() || !alignment_it->is_object()) {
+        failures += fail("manifest alignment mismatch");
+    } else {
+        failures += expect_uint_field(*alignment_it, "file_header", 4096,
+                                      "manifest alignment.file_header mismatch");
+        failures += expect_uint_field(*alignment_it, "tensor_payload", 256,
+                                      "manifest alignment.tensor_payload mismatch");
+        failures += expect_uint_field(*alignment_it, "payload_region", 4096,
+                                      "manifest alignment.payload_region mismatch");
+    }
+
+    const auto segments_it = manifest.find("segments");
+    if (segments_it == manifest.end() || !segments_it->is_array() || segments_it->size() != 3) {
+        failures += fail("manifest segments mismatch");
+    } else {
+        failures += expect_manifest_segment((*segments_it)[0], "TEXT_CORE", "q5090_w4g64_mixed_v1",
+                                            963, 16378329088ULL, 0);
+        failures += expect_manifest_segment((*segments_it)[1], "MTP_DRAFT", "mtp_w8g128_v1", 15,
+                                            431361024ULL, 0);
+        failures += expect_manifest_segment((*segments_it)[2], "VISION_ENCODER",
+                                            "vision_q4mix_merger_w8g128_v1", 333, 294184960ULL, 1);
+        failures += expect_string_field((*segments_it)[2], "fallback", "vision_merger_bf16_strict",
+                                        "manifest VISION fallback mismatch");
+    }
     return failures;
 }
 
@@ -265,7 +380,8 @@ int main() {
     }
 
     int failures = 0;
-    failures += expect_manifest_tokens(read_text(manifest_path));
+    const std::uint64_t manifest_file_size = std::filesystem::file_size(file_path);
+    failures += expect_manifest_fields(read_manifest_json(manifest_path), manifest_file_size);
 
     ProgressPrinter printer;
     qus::Q5090Progress progress;

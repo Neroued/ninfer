@@ -14,7 +14,7 @@ namespace {
 
 void usage(const char* argv0) {
     std::cerr << "usage: " << argv0
-              << " <weights.qus> [--max-context N] [--max-new N] [--eos-token N] "
+              << " <weights.qus> [--max-context N] [--max-new N] [--stop-token-id N]... "
                  "<token-id> [token-id...]\n";
 }
 
@@ -39,8 +39,8 @@ int main(int argc, char** argv) {
     try {
         const std::string path = argv[1];
         int max_new            = 16;
-        int eos_token          = -1;
         std::uint32_t max_ctx  = 2048;
+        std::vector<int> stop_tokens;
         std::vector<int> prompt;
 
         for (int i = 2; i < argc; ++i) {
@@ -48,9 +48,9 @@ int main(int argc, char** argv) {
             if (arg == "--max-new") {
                 if (++i >= argc) { throw std::invalid_argument("--max-new needs a value"); }
                 max_new = parse_int(argv[i], "max-new");
-            } else if (arg == "--eos-token") {
-                if (++i >= argc) { throw std::invalid_argument("--eos-token needs a value"); }
-                eos_token = parse_int(argv[i], "eos-token");
+            } else if (arg == "--stop-token-id") {
+                if (++i >= argc) { throw std::invalid_argument("--stop-token-id needs a value"); }
+                stop_tokens.push_back(parse_int(argv[i], "stop-token-id"));
             } else if (arg == "--max-context") {
                 if (++i >= argc) { throw std::invalid_argument("--max-context needs a value"); }
                 max_ctx = static_cast<std::uint32_t>(parse_int(argv[i], "max-context"));
@@ -64,8 +64,8 @@ int main(int argc, char** argv) {
         }
 
         qus::EngineOptions options;
-        options.max_ctx      = max_ctx;
-        options.eos_token_id = eos_token;
+        options.max_ctx        = max_ctx;
+        options.stop_token_ids = stop_tokens;
         qus::Engine engine(options);
         engine.load(path);
 

@@ -41,9 +41,15 @@ ArenaMemoryStats arena_stats(const std::optional<DeviceArena>& arena) noexcept {
 } // namespace
 
 Engine::Engine(EngineOptions options) : options_(options) {
-    if (options_.eos_token_id < -1) {
-        throw std::invalid_argument("Engine eos_token_id must be -1 or nonnegative");
+    for (const int id : options_.stop_token_ids) {
+        if (id < 0) {
+            throw std::invalid_argument("Engine stop_token_ids must be nonnegative");
+        }
     }
+    std::sort(options_.stop_token_ids.begin(), options_.stop_token_ids.end());
+    options_.stop_token_ids.erase(
+        std::unique(options_.stop_token_ids.begin(), options_.stop_token_ids.end()),
+        options_.stop_token_ids.end());
     if (options_.max_ctx == 0) { throw std::invalid_argument("Engine max_ctx must be nonzero"); }
     if (options_.work_bytes == 0) {
         throw std::invalid_argument("Engine work_bytes must be nonzero");
@@ -182,8 +188,9 @@ int Engine::read_token() {
     return token;
 }
 
-bool Engine::is_eos_token(int token) const noexcept {
-    return options_.eos_token_id >= 0 && token == options_.eos_token_id;
+bool Engine::is_stop_token(int token) const noexcept {
+    return std::binary_search(options_.stop_token_ids.begin(), options_.stop_token_ids.end(),
+                              token);
 }
 
 int Engine::prefill(std::span<const int> ids) {
@@ -217,11 +224,11 @@ std::vector<int> Engine::generate(std::span<const int> prompt, int max_new_token
     out.reserve(static_cast<std::size_t>(max_new_tokens));
     int token = prefill(prompt);
     out.push_back(token);
-    if (is_eos_token(token)) { return out; }
+    if (is_stop_token(token)) { return out; }
     while (static_cast<int>(out.size()) < max_new_tokens) {
         token = decode_step();
         out.push_back(token);
-        if (is_eos_token(token)) { break; }
+        if (is_stop_token(token)) { break; }
     }
     return out;
 }

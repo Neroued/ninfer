@@ -21,10 +21,17 @@ namespace {
 
 constexpr std::int32_t kVocab = 16;
 constexpr std::int32_t kD     = 128;
+constexpr std::int32_t kQwenHiddenD = 5120;
 constexpr std::int32_t kGroup = 64;
 constexpr std::int32_t kBpr   = 48;
 constexpr std::int32_t kRoww  = 2 + kBpr;
-constexpr std::int32_t kKg    = kD / kGroup;
+
+static std::int32_t groups_for_d(std::int32_t d) {
+    if (d <= 0 || d % kGroup != 0) {
+        throw std::invalid_argument("embed_gather test d must be positive and divisible by 64");
+    }
+    return d / kGroup;
+}
 
 static std::uint16_t f32_to_f16(float x) {
     std::uint32_t bits;
@@ -87,12 +94,12 @@ static float f16_to_f32(std::uint16_t h) {
     return out;
 }
 
-static std::vector<float> make_source_table() {
-    std::vector<float> table(static_cast<std::size_t>(kVocab) * kD);
+static std::vector<float> make_source_table(std::int32_t d) {
+    std::vector<float> table(static_cast<std::size_t>(kVocab) * d);
     for (std::int32_t row = 0; row < kVocab; ++row) {
-        for (std::int32_t col = 0; col < kD; ++col) {
+        for (std::int32_t col = 0; col < d; ++col) {
             const float wave = std::sin(0.17f * static_cast<float>(row * 13 + col));
-            table[static_cast<std::size_t>(row) * kD + col] =
+            table[static_cast<std::size_t>(row) * d + col] =
                 0.125f * static_cast<float>(row - 7) + 0.03125f * static_cast<float>((col % 17) - 8) + wave;
         }
     }
@@ -129,12 +136,14 @@ static int unpack_q6_code(const std::uint8_t* packed, std::int32_t c) {
 }
 
 static std::vector<std::uint8_t> encode_q6_row_grouped(const std::vector<float>& src,
+                                                       std::int32_t d,
                                                        std::vector<float>& deq) {
-    std::vector<std::uint8_t> payload(static_cast<std::size_t>(kVocab) * kKg * kRoww);
+    const std::int32_t kg = groups_for_d(d);
+    std::vector<std::uint8_t> payload(static_cast<std::size_t>(kVocab) * kg * kRoww);
     deq.assign(src.size(), 0.0f);
     for (std::int32_t row = 0; row < kVocab; ++row) {
-        for (std::int32_t g = 0; g < kKg; ++g) {
-            const std::size_t base = static_cast<std::size_t>(row) * kD + g * kGroup;
+        for (std::int32_t g = 0; g < kg; ++g) {
+            const std::size_t base = static_cast<std::size_t>(row) * d + g * kGroup;
             float maxabs = 0.0f;
             for (std::int32_t i = 0; i < kGroup; ++i) {
                 maxabs = std::max(maxabs, std::abs(src[base + i]));
@@ -155,7 +164,7 @@ static std::vector<std::uint8_t> encode_q6_row_grouped(const std::vector<float>&
                 deq[base + i] = static_cast<float>(q) * scale;
             }
 
-            const std::size_t off = (static_cast<std::size_t>(row) * kKg + g) * kRoww;
+            const std::size_t off = (static_cast<std::size_t>(row) * kg + g) * kRoww;
             payload[off + 0] = static_cast<std::uint8_t>(scale_h & 0xffu);
             payload[off + 1] = static_cast<std::uint8_t>(scale_h >> 8);
             pack_q6_group(codes, payload.data() + off + 2);
@@ -165,100 +174,106 @@ static std::vector<std::uint8_t> encode_q6_row_grouped(const std::vector<float>&
 }
 
 static void cpu_gather(const std::vector<float>& table, const std::vector<int>& ids,
+                       std::int32_t d,
                        std::vector<double>& out) {
-    out.assign(static_cast<std::size_t>(kD) * ids.size(), 0.0);
+    out.assign(static_cast<std::size_t>(d) * ids.size(), 0.0);
     for (std::size_t t = 0; t < ids.size(); ++t) {
         const std::int32_t row = ids[t];
-        for (std::int32_t d = 0; d < kD; ++d) {
-            out[static_cast<std::size_t>(t) * kD + d] =
-                static_cast<double>(table[static_cast<std::size_t>(row) * kD + d]);
+        for (std::int32_t col = 0; col < d; ++col) {
+            out[static_cast<std::size_t>(t) * d + col] =
+                static_cast<double>(table[static_cast<std::size_t>(row) * d + col]);
         }
     }
 }
 
-static Weight dense_weight(void* data) {
+static Weight dense_weight(void* data, std::int32_t d = kD) {
     Weight w{};
     w.qtype           = QType::BF16_CTRL;
     w.layout          = QuantLayout::Contiguous;
     w.q5090_scale_dtype = ScaleDType::None;
     w.payload         = data;
-    w.payload_bytes   = static_cast<std::uint64_t>(kVocab) * kD * 2u;
+    w.payload_bytes   = static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(d) * 2u;
     w.qdata           = data;
     w.scales          = nullptr;
     w.group_size      = 0;
     w.group           = 0;
     w.ndim            = 2;
     w.shape[0]        = kVocab;
-    w.shape[1]        = kD;
+    w.shape[1]        = d;
     w.padded_shape[0] = kVocab;
-    w.padded_shape[1] = kD;
+    w.padded_shape[1] = d;
     w.n               = kVocab;
-    w.k               = kD;
+    w.k               = d;
     return w;
 }
 
-static Weight q6_weight(void* payload) {
+static Weight q6_weight(void* payload, std::int32_t d = kD) {
+    const std::int32_t kg = groups_for_d(d);
     Weight w{};
     w.qtype           = QType::Q6G64_F16S;
     w.layout          = QuantLayout::RowGroupedG64;
     w.q5090_scale_dtype = ScaleDType::FP16;
     w.payload         = payload;
-    w.payload_bytes   = static_cast<std::uint64_t>(kVocab) * kKg * kRoww;
+    w.payload_bytes   = static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * kRoww;
     w.qdata           = payload;
     w.scales          = nullptr;
     w.group_size      = kGroup;
     w.group           = kGroup;
     w.ndim            = 2;
     w.shape[0]        = kVocab;
-    w.shape[1]        = kD;
+    w.shape[1]        = d;
     w.padded_shape[0] = kVocab;
-    w.padded_shape[1] = kD;
+    w.padded_shape[1] = d;
     w.n               = kVocab;
-    w.k               = kD;
+    w.k               = d;
     return w;
 }
 
-static int one_dense_shape(std::int32_t T) {
-    std::vector<float> src = make_source_table();
+static int one_dense_shape(std::int32_t T, std::int32_t d) {
+    std::vector<float> src = make_source_table(d);
     round_to_bf16(src);
     const std::vector<int> ids = ids_for_T(T);
 
     std::vector<double> ref;
-    cpu_gather(src, ids, ref);
+    cpu_gather(src, ids, d, ref);
 
     DBuf dtable = to_device_bf16(src);
     DBuf dids = to_device_i32(ids);
-    DBuf dout(static_cast<std::size_t>(kD) * T * 2u);
+    DBuf dout(static_cast<std::size_t>(d) * T * 2u);
+    cudaMemset(dout.p, 0x7d, dout.bytes);
     Tensor tids(dids.p, DType::I32, {T});
-    Tensor tout(dout.p, DType::BF16, {kD, T});
-    kernels::embed_gather(tids, dense_weight(dtable.p), tout, nullptr);
+    Tensor tout(dout.p, DType::BF16, {d, T});
+    kernels::embed_gather(tids, dense_weight(dtable.p, d), tout, nullptr);
     cudaDeviceSynchronize();
 
-    return verify((std::string("embed_gather dense T=") + std::to_string(T)).c_str(),
-                  from_device_bf16(dout, static_cast<std::size_t>(kD) * T), ref,
+    return verify((std::string("embed_gather dense d=") + std::to_string(d) +
+                   " T=" + std::to_string(T)).c_str(),
+                  from_device_bf16(dout, static_cast<std::size_t>(d) * T), ref,
                   Tolerance::bf16_elementwise());
 }
 
-static int one_q6_shape(std::int32_t T) {
-    const std::vector<float> src = make_source_table();
+static int one_q6_shape(std::int32_t T, std::int32_t d) {
+    const std::vector<float> src = make_source_table(d);
     std::vector<float> deq;
-    std::vector<std::uint8_t> payload = encode_q6_row_grouped(src, deq);
+    std::vector<std::uint8_t> payload = encode_q6_row_grouped(src, d, deq);
     const std::vector<int> ids = ids_for_T(T);
 
     std::vector<double> ref;
-    cpu_gather(deq, ids, ref);
+    cpu_gather(deq, ids, d, ref);
 
     DBuf dtable(payload.size());
     cudaMemcpy(dtable.p, payload.data(), payload.size(), cudaMemcpyHostToDevice);
     DBuf dids = to_device_i32(ids);
-    DBuf dout(static_cast<std::size_t>(kD) * T * 2u);
+    DBuf dout(static_cast<std::size_t>(d) * T * 2u);
+    cudaMemset(dout.p, 0x7d, dout.bytes);
     Tensor tids(dids.p, DType::I32, {T});
-    Tensor tout(dout.p, DType::BF16, {kD, T});
-    kernels::embed_gather(tids, q6_weight(dtable.p), tout, nullptr);
+    Tensor tout(dout.p, DType::BF16, {d, T});
+    kernels::embed_gather(tids, q6_weight(dtable.p, d), tout, nullptr);
     cudaDeviceSynchronize();
 
-    return verify((std::string("embed_gather q6 T=") + std::to_string(T)).c_str(),
-                  from_device_bf16(dout, static_cast<std::size_t>(kD) * T), ref,
+    return verify((std::string("embed_gather q6 d=") + std::to_string(d) +
+                   " T=" + std::to_string(T)).c_str(),
+                  from_device_bf16(dout, static_cast<std::size_t>(d) * T), ref,
                   Tolerance::bf16_elementwise());
 }
 
@@ -397,9 +412,11 @@ int main() {
     int f = 0;
     f += validation_checks();
     for (std::int32_t T : {1, 4, 64}) {
-        f += one_dense_shape(T);
-        f += one_q6_shape(T);
+        f += one_dense_shape(T, kD);
+        f += one_q6_shape(T, kD);
     }
+    f += one_dense_shape(5, kQwenHiddenD);
+    f += one_q6_shape(5, kQwenHiddenD);
 
     std::cout << (f ? "FAIL" : "OK") << " embed_gather correctness\n";
     return f ? 1 : 0;

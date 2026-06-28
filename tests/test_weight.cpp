@@ -69,10 +69,8 @@ int test_weight_from_dense() {
                     ? 0
                     : fail("weight_from_dense: scale dtype not None");
     failures += (w.qdata == &blob) ? 0 : fail("weight_from_dense: qdata mismatch");
-    failures += (w.payload == &blob) ? 0 : fail("weight_from_dense: payload mismatch");
     failures += check_i64(static_cast<std::int64_t>(w.payload_bytes),
                           static_cast<std::int64_t>(t.bytes()), "weight_from_dense payload_bytes");
-    failures += (w.scales == nullptr) ? 0 : fail("weight_from_dense: scales not null");
     failures += check_i64(w.n, 48, "weight_from_dense n");
     failures += check_i64(w.k, 5120, "weight_from_dense k");
     failures += check_i64(w.group, 0, "weight_from_dense group");

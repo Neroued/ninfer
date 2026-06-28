@@ -1,17 +1,20 @@
 #include "e2e_bench_support.h"
 
+#include <nlohmann/json.hpp>
+
+#include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace {
+
+using Json = nlohmann::json;
 
 int fail(std::string_view message) {
     std::cerr << message << '\n';
@@ -30,6 +33,12 @@ int expect_u64(std::uint64_t actual, std::uint64_t expected, std::string_view la
 
 int expect_int(int actual, int expected, std::string_view label) {
     if (actual == expected) { return 0; }
+    std::cerr << label << " expected " << expected << ", got " << actual << '\n';
+    return 1;
+}
+
+int expect_double(double actual, double expected, std::string_view label) {
+    if (std::abs(actual - expected) < 1e-9) { return 0; }
     std::cerr << label << " expected " << expected << ", got " << actual << '\n';
     return 1;
 }
@@ -63,10 +72,55 @@ int expect_contains(const std::string& actual, std::string_view expected, std::s
     return 1;
 }
 
-int expect_not_contains(const std::string& actual, std::string_view unexpected,
-                        std::string_view label) {
-    if (actual.find(unexpected) == std::string::npos) { return 0; }
-    std::cerr << label << " expected not to find `" << unexpected << "` in:\n" << actual << '\n';
+int expect_json_value(const Json& actual, const Json& expected, std::string_view label) {
+    if (actual == expected) { return 0; }
+    std::cerr << label << " expected " << expected.dump() << ", got " << actual.dump() << '\n';
+    return 1;
+}
+
+int expect_json_null(const Json& actual, std::string_view label) {
+    if (actual.is_null()) { return 0; }
+    std::cerr << label << " expected null, got " << actual.dump() << '\n';
+    return 1;
+}
+
+int expect_json_int_vector(const Json& actual, const std::vector<int>& expected,
+                           std::string_view label) {
+    if (!actual.is_array()) {
+        std::cerr << label << " expected array, got " << actual.dump() << '\n';
+        return 1;
+    }
+    std::vector<int> parsed;
+    parsed.reserve(actual.size());
+    for (const Json& item : actual) {
+        if (!item.is_number_integer()) {
+            std::cerr << label << " expected integer entries, got " << actual.dump() << '\n';
+            return 1;
+        }
+        parsed.push_back(item.get<int>());
+    }
+    return expect_int_vector(parsed, expected, label);
+}
+
+bool json_contains_key_recursive(const Json& value, const std::string& key) {
+    if (value.is_object()) {
+        if (value.contains(key)) { return true; }
+        for (const auto& item : value.items()) {
+            if (json_contains_key_recursive(item.value(), key)) { return true; }
+        }
+    } else if (value.is_array()) {
+        for (const Json& item : value) {
+            if (json_contains_key_recursive(item, key)) { return true; }
+        }
+    }
+    return false;
+}
+
+int expect_json_not_contains_key(const Json& actual, std::string_view key,
+                                 std::string_view label) {
+    const std::string key_string(key);
+    if (!json_contains_key_recursive(actual, key_string)) { return 0; }
+    std::cerr << label << " expected no `" << key << "` key in:\n" << actual.dump(2) << '\n';
     return 1;
 }
 
@@ -85,6 +139,16 @@ std::filesystem::path temp_file(std::string_view stem, std::string_view contents
     if (!out) { throw std::runtime_error("failed to create temp file"); }
     out << contents;
     return path;
+}
+
+Json parse_json_file(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    if (!in) { throw std::runtime_error("failed to open JSON file: " + path.string()); }
+    try {
+        return Json::parse(in);
+    } catch (const nlohmann::json::exception& e) {
+        throw std::runtime_error("invalid JSON in " + path.string() + ": " + e.what());
+    }
 }
 
 std::filesystem::path repo_file(std::string_view relative) {
@@ -419,21 +483,16 @@ int test_json_helpers() {
 int test_error_report_json_is_valid() {
     const auto path = std::filesystem::temp_directory_path() / "qus_e2e_error_report.json";
     qus::bench::e2e::write_error_report(path.string(), "load", "missing \"file\"");
-    const std::string command = "python3 -m json.tool \"" + path.string() + "\" > /dev/null";
-    const int rc = std::system(command.c_str());
-    if (rc != 0) { return fail("error report is not valid JSON"); }
-    std::ifstream in(path);
-    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const Json report = parse_json_file(path);
+    const Json& error = report.at("error");
     int failures = 0;
-    failures += text.find("\"status\": \"error\"") != std::string::npos
-                    ? 0
-                    : fail("error report missing status");
-    failures += text.find("\"phase\": \"load\"") != std::string::npos
-                    ? 0
-                    : fail("error report missing phase");
-    failures += text.find("missing \\\"file\\\"") != std::string::npos
-                    ? 0
-                    : fail("error report did not escape message");
+    failures += expect_json_value(report.at("schema_version"), 1, "error report schema version");
+    failures += expect_json_value(report.at("artifact_type"), "qus_e2e_benchmark_report",
+                                  "error report artifact type");
+    failures += expect_json_value(report.at("status"), "error", "error report status");
+    failures += expect_bool(error.is_object(), "error report error object");
+    failures += expect_json_value(error.at("phase"), "load", "error report phase");
+    failures += expect_json_value(error.at("message"), "missing \"file\"", "error report message");
     return failures;
 }
 
@@ -515,95 +574,165 @@ int test_raw_report_json_is_valid() {
 
     const auto path = std::filesystem::temp_directory_path() / "qus_e2e_raw_report.json";
     qus::bench::e2e::write_raw_report(path.string(), report);
-    const std::string command = "python3 -m json.tool \"" + path.string() + "\" > /dev/null";
-    const int rc = std::system(command.c_str());
-    if (rc != 0) { return fail("raw report is not valid JSON"); }
-    std::ifstream in(path);
-    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const Json raw = parse_json_file(path);
+    const Json& run = raw.at("run");
+    const Json& environment = raw.at("environment");
+    const Json& engine = raw.at("engine");
+    const Json& weights = raw.at("weights");
+    const Json& memory_report = raw.at("memory");
+    const Json& summary = raw.at("summary");
+    const Json& cases = raw.at("cases");
+    const Json& cn_case = cases.at(0);
+    const Json& long_case = cases.at(1);
+    const Json& cn_summary = cn_case.at("summary");
+    const Json& long_summary = long_case.at("summary");
+    const Json& cn_repeat = cn_case.at("repeats").at(0);
+    const Json& zero_decode_repeat_json = cn_case.at("repeats").at(1);
     int failures = 0;
-    failures += text.find("\"artifact_type\": \"qus_e2e_benchmark_report\"") != std::string::npos
-                    ? 0
-                    : fail("raw report artifact_type missing");
-    failures += text.find("\"run\"") != std::string::npos &&
-                        text.find("\"environment\"") != std::string::npos &&
-                        text.find("\"engine\"") != std::string::npos &&
-                        text.find("\"weights\"") != std::string::npos &&
-                        text.find("\"memory\"") != std::string::npos &&
-                        text.find("\"summary\"") != std::string::npos &&
-                        text.find("\"cases\"") != std::string::npos
-                    ? 0
-                    : fail("raw report required sections missing");
-    failures += text.find("\"gpu_name\": \"test gpu\"") != std::string::npos
-                    ? 0
-                    : fail("raw report environment missing");
-    failures += text.find("\"workspace_lifetime_policy\": \"block_scoped_mixer_mlp_rewind\"") !=
-                        std::string::npos
-                    ? 0
-                    : fail("raw report workspace lifetime policy missing");
-    failures += text.find("\"token_readback\": \"per_step_sync_d2h\"") != std::string::npos &&
-                        text.find("\"includes_token_readback\": true") != std::string::npos
-                    ? 0
-                    : fail("raw report engine constants missing");
-    failures += text.find("\"q5090_conv1d_layout\": \"runtime_native_conv_dim_by_kernel\"") !=
-                            std::string::npos &&
-                        text.find("\"text_core\": true") != std::string::npos &&
-                        text.find("\"mtp\": false") != std::string::npos &&
-                        text.find("\"vision\": false") != std::string::npos
-                    ? 0
-                    : fail("raw report weights constants missing");
-    failures += text.find("\"accounting_scope\": \"engine_owned_device_arenas_complete\"") !=
-                            std::string::npos &&
-                        text.find("\"hidden_device_allocations\": false") != std::string::npos
-                    ? 0
-                    : fail("raw report memory constants missing");
-    failures += text.find("\"fixture_set\": \"m2.8-v1\"") != std::string::npos &&
-                        text.find("\"prompt_ids_sha256\": \"ids-sha\"") != std::string::npos
-                    ? 0
-                    : fail("raw report fixture identity missing");
-    failures += text.find("\"prompt_format\": \"qwen3.6-chat-template\"") != std::string::npos &&
-                        text.find("\"messages_path\": \"bench/fixtures/prompts/cn_short.messages.json\"") !=
-                            std::string::npos &&
-                        text.find("\"messages_sha256\": \"messages-sha\"") != std::string::npos &&
-                        text.find("\"rendered_prompt_sha256\": \"rendered-sha\"") !=
-                            std::string::npos
-                    ? 0
-                    : fail("raw report chat identity missing");
-    failures += text.find("\"add_generation_prompt\": true") != std::string::npos &&
-                        text.find("\"add_special_tokens\": false") != std::string::npos &&
-                        text.find("\"chat_template_kwargs\"") != std::string::npos &&
-                        text.find("\"enable_thinking\": false") != std::string::npos
-                    ? 0
-                    : fail("raw report chat template kwargs missing");
-    failures += text.find("\"stop_token_ids\": [248046, 248044]") != std::string::npos
-                    ? 0
-                    : fail("case stop_token_ids missing");
-    failures += expect_not_contains(text, "\"eos_token_id\"", "case eos_token_id removed");
-    failures += text.find("\"prefill_time_s_median\"") != std::string::npos &&
-                        text.find("\"prefill_prompt_tok_s_median\"") != std::string::npos &&
-                        text.find("\"decode_eager_tok_s_median\"") != std::string::npos &&
-                        text.find("\"deterministic_token_ids\"") != std::string::npos &&
-                        text.find("\"max_workspace_arena_peak_used_bytes\"") != std::string::npos
-                    ? 0
-                    : fail("raw report summary fields missing");
-    failures += text.find("\"prefill_prompt_tok_s\": 300") != std::string::npos
-                    ? 0
-                    : fail("repeat prefill prompt throughput missing");
-    failures += text.find("\"prefill_prompt_tok_s_median\": 300") != std::string::npos
-                    ? 0
-                    : fail("summary prefill prompt throughput missing");
-    failures += text.find("\"decode_eager_tok_s_valid\": true") != std::string::npos
-                    ? 0
-                    : fail("decode validity missing");
-    failures += text.find("\"decode_eager_tok_s\": null") != std::string::npos &&
-                        text.find("\"decode_eager_tok_s_valid\": false") != std::string::npos
-                    ? 0
-                    : fail("zero decode throughput null handling missing");
-    failures += text.find("\"decode_eager_tok_s_median\": null") != std::string::npos
-                    ? 0
-                    : fail("zero decode summary throughput null handling missing");
-    failures += text.find("\"generated_token_ids\": [10, 11, 12]") != std::string::npos
-                    ? 0
-                    : fail("generated ids missing");
+    failures += expect_json_value(raw.at("schema_version"), 1, "raw report schema version");
+    failures += expect_json_value(raw.at("artifact_type"), "qus_e2e_benchmark_report",
+                                  "raw report artifact_type");
+    failures += expect_json_value(raw.at("status"), "ok", "raw report status");
+    failures += expect_bool(run.is_object(), "raw report run section");
+    failures += expect_bool(environment.is_object(), "raw report environment section");
+    failures += expect_bool(engine.is_object(), "raw report engine section");
+    failures += expect_bool(weights.is_object(), "raw report weights section");
+    failures += expect_bool(memory_report.is_object(), "raw report memory section");
+    failures += expect_bool(summary.is_object(), "raw report summary section");
+    failures += expect_bool(cases.is_array(), "raw report cases section");
+    failures += expect_u64(cases.size(), 2, "raw report case count");
+
+    failures += expect_json_value(run.at("binary"), "qus_e2e_bench", "raw report binary");
+    failures += expect_json_value(run.at("command"), "qus_e2e_bench --case cn_short:prompt.ids:3",
+                                  "raw report command");
+    failures += expect_json_value(run.at("git_commit"), "abc", "raw report git commit");
+    failures += expect_json_value(run.at("worktree_dirty"), false, "raw report dirty flag");
+    failures += expect_double(run.at("load_time_s").get<double>(), 1.25,
+                              "raw report run load time");
+
+    failures += expect_json_value(environment.at("cuda_runtime_version"), "12.4",
+                                  "raw report cuda runtime");
+    failures += expect_json_value(environment.at("cuda_driver_version"), "12.4",
+                                  "raw report cuda driver");
+    failures += expect_json_value(environment.at("gpu_name"), "test gpu",
+                                  "raw report environment gpu");
+    failures += expect_json_value(environment.at("device_id"), 0, "raw report device id");
+
+    failures += expect_json_value(engine.at("max_context"), 8, "raw report max context");
+    failures += expect_json_value(engine.at("workspace_lifetime_policy"),
+                                  "block_scoped_mixer_mlp_rewind",
+                                  "raw report workspace lifetime policy");
+    failures += expect_json_value(engine.at("decode_metric"), "decode_eager_tok_s",
+                                  "raw report decode metric");
+    failures += expect_json_value(engine.at("sampling_location"), "device_argmax",
+                                  "raw report sampling location");
+    failures += expect_json_value(engine.at("token_readback"), "per_step_sync_d2h",
+                                  "raw report token readback");
+    failures += expect_json_value(engine.at("includes_token_readback"), true,
+                                  "raw report includes token readback");
+    failures += expect_json_value(engine.at("timing_boundary"), "host_visible_phase_end",
+                                  "raw report timing boundary");
+
+    failures += expect_json_value(weights.at("q5090_path"), "weights.qus",
+                                  "raw report weights path");
+    failures += expect_json_value(weights.at("q5090_file_size_bytes"), 1234,
+                                  "raw report weights file size");
+    failures += expect_json_value(weights.at("q5090_sha256"), "weights-sha",
+                                  "raw report weights sha");
+    failures += expect_json_value(weights.at("q5090_conv1d_layout"),
+                                  "runtime_native_conv_dim_by_kernel",
+                                  "raw report conv1d layout");
+    failures += expect_json_value(weights.at("selected_modules").at("text_core"), true,
+                                  "raw report text core selected");
+    failures += expect_json_value(weights.at("selected_modules").at("mtp"), false,
+                                  "raw report mtp not selected");
+    failures += expect_json_value(weights.at("selected_modules").at("vision"), false,
+                                  "raw report vision not selected");
+    failures += expect_json_value(weights.at("q5090_loaded_payload_bytes"), 700,
+                                  "raw report loaded payload");
+    failures += expect_json_value(weights.at("weight_arena_slack_bytes"), 200,
+                                  "raw report weight arena slack");
+    failures += expect_json_value(weights.at("weight_payload_to_arena_used_overhead_bytes"), 100,
+                                  "raw report weight payload overhead");
+
+    failures += expect_json_value(memory_report.at("accounting_scope"),
+                                  "engine_owned_device_arenas_complete",
+                                  "raw report memory accounting scope");
+    failures += expect_json_value(memory_report.at("hidden_device_allocations"), false,
+                                  "raw report hidden allocation flag");
+    failures += expect_json_value(memory_report.at("loaded"), true, "raw report memory loaded");
+    failures += expect_json_value(memory_report.at("device"), 0, "raw report memory device");
+    failures += expect_json_value(memory_report.at("max_context"), 8,
+                                  "raw report memory max context");
+    failures += expect_u64(memory_report.at("arenas").size(), 3, "raw report arena count");
+    failures += expect_json_value(memory_report.at("arenas").at(0).at("name"), "weights",
+                                  "raw report weight arena");
+    failures += expect_json_value(memory_report.at("arenas").at(1).at("name"), "cache",
+                                  "raw report cache arena");
+    failures += expect_json_value(memory_report.at("arenas").at(2).at("name"), "workspace",
+                                  "raw report workspace arena");
+    failures += expect_json_value(memory_report.at("q5090_tensor_count"), 10,
+                                  "raw report tensor count");
+    failures += expect_json_value(memory_report.at("q5090_quant_count"), 6,
+                                  "raw report quant count");
+
+    failures += expect_json_value(summary.at("case_count"), 2, "raw report summary case count");
+    failures += expect_double(summary.at("load_time_s").get<double>(), 1.25,
+                              "raw report summary load time");
+
+    failures += expect_json_value(cn_case.at("name"), "cn_short", "raw report case name");
+    failures += expect_json_value(cn_case.at("fixture_set"), "m2.8-v1",
+                                  "raw report fixture set");
+    failures += expect_json_value(cn_case.at("fixture_manifest_sha256"), "manifest-sha",
+                                  "raw report fixture manifest sha");
+    failures += expect_json_value(cn_case.at("prompt_ids_sha256"), "ids-sha",
+                                  "raw report fixture ids sha");
+    failures += expect_json_value(cn_case.at("prompt_format"), "qwen3.6-chat-template",
+                                  "raw report prompt format");
+    failures += expect_json_value(cn_case.at("messages_path"),
+                                  "bench/fixtures/prompts/cn_short.messages.json",
+                                  "raw report messages path");
+    failures += expect_json_value(cn_case.at("messages_sha256"), "messages-sha",
+                                  "raw report messages sha");
+    failures += expect_json_value(cn_case.at("rendered_prompt_sha256"), "rendered-sha",
+                                  "raw report rendered prompt sha");
+    failures += expect_json_value(cn_case.at("add_generation_prompt"), true,
+                                  "raw report add generation prompt");
+    failures += expect_json_value(cn_case.at("add_special_tokens"), false,
+                                  "raw report add special tokens");
+    failures += expect_json_value(cn_case.at("chat_template_kwargs").at("enable_thinking"), false,
+                                  "raw report enable thinking");
+    failures += expect_json_int_vector(cn_case.at("stop_token_ids"), {248046, 248044},
+                                       "raw report stop token ids");
+    failures += expect_json_not_contains_key(raw, "eos_token_id", "raw report eos token id removed");
+
+    failures += expect_bool(cn_summary.contains("prefill_time_s_median"),
+                            "raw report prefill median field");
+    failures += expect_double(cn_summary.at("prefill_prompt_tok_s_median").get<double>(), 300.0,
+                              "raw report summary prefill prompt throughput");
+    failures += expect_double(cn_summary.at("decode_eager_tok_s_median").get<double>(), 100.0,
+                              "raw report summary decode throughput");
+    failures += expect_json_value(cn_summary.at("deterministic_token_ids"), true,
+                                  "raw report deterministic summary");
+    failures += expect_json_value(cn_summary.at("max_workspace_arena_peak_used_bytes"), 0,
+                                  "raw report max workspace peak summary");
+
+    failures += expect_double(cn_repeat.at("prefill_prompt_tok_s").get<double>(), 300.0,
+                              "raw report repeat prefill prompt throughput");
+    failures += expect_json_value(cn_repeat.at("decode_eager_tok_s_valid"), true,
+                                  "raw report decode validity");
+    failures += expect_double(cn_repeat.at("decode_eager_tok_s").get<double>(), 100.0,
+                              "raw report repeat decode throughput");
+    failures += expect_json_int_vector(cn_repeat.at("generated_token_ids"), {10, 11, 12},
+                                       "raw report generated ids");
+
+    failures += expect_json_null(zero_decode_repeat_json.at("decode_eager_tok_s"),
+                                 "zero decode throughput null");
+    failures += expect_json_value(zero_decode_repeat_json.at("decode_eager_tok_s_valid"), false,
+                                  "zero decode throughput validity");
+    failures += expect_json_null(long_summary.at("decode_eager_tok_s_median"),
+                                 "zero decode summary throughput null");
+    failures += expect_json_value(long_case.at("name"), "long_2k", "zero decode case name");
     return failures;
 }
 

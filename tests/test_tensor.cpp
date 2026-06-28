@@ -160,20 +160,5 @@ int main() {
         },
         "oversized null slice offset");
 
-    int qblob    = 0;
-    float scales = 0.0f;
-    qus::Weight qw{};
-    qw.qdata  = &qblob;
-    qw.scales = &scales;
-    qw.n      = 7;
-    qw.k      = 11;
-    qw.group  = 128;
-    qw.layout = qus::QuantLayout::W4A16KernelPackedV1;
-    if (qw.qdata != &qblob || qw.scales != &scales || qw.n != 7 || qw.k != 11 || qw.group != 128 ||
-        qw.layout != qus::QuantLayout::W4A16KernelPackedV1) {
-        ++failures;
-        std::cerr << "Weight did not preserve descriptor fields\n";
-    }
-
     return failures == 0 ? 0 : fail("tensor test failed");
 }

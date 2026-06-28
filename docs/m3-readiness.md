@@ -1,36 +1,81 @@
 # M3 Readiness
 
-> Status: pending regeneration of the Qwen3.6 chat-template M2.8 baseline.
-> Scope: placeholder for the official M3 entry evidence package for qwen3.6-ultraspeed.
+> Status: complete for the regenerated Qwen3.6 chat-template M2.8 baseline.
+> Scope: official M3 entry evidence package for qwen3.6-ultraspeed.
 
-The previous pre-chat-template baseline evidence is no longer valid for M3 readiness. The controller must
-rerun the official baseline with `.messages.json` prompt fixtures rendered through the Qwen3.6 chat
-template, fixed prompt ids, and stop tokens `[248046, 248044]`.
+The previous pre-chat-template and whitespace-output smoke observations are superseded. The current
+baseline was regenerated on real q5090 weights with `.messages.json` prompt fixtures rendered through
+the Qwen3.6 chat template, fixed prompt ids, and stop tokens `[248046, 248044]`.
 
-Final readiness will be filled after the real q5090 runs produce valid local raw reports and committed
-chat-template output/prefill gate summaries under `docs/bench/baselines/`.
+## Baseline Identity
 
-## Latest Local Smoke Observation
+- Commit: `7f61950236135e6a196928673396995c643df52b`
+- Worktree state recorded by benchmark: clean
+- GPU: NVIDIA GeForce RTX 5090, driver `591.86`
+- q5090: `out/qwen3_6_27b.q5090_w4g64_mixed_v1.qus`
+- q5090 SHA256: `9c468418a26d2b243e00bb63eecd0e02be0cbfe577e35559202a00a2918cd2db`
+- Fixture manifest: `bench/fixtures/prompts/m2.8-v1.manifest.json`
+- Max context: `8192`
+- Workspace policy: `block_scoped_mixer_mlp_rewind`
+- Hidden device allocations: `false`
 
-Commit `9e878885ee547e7b98ffe680e5f395a38f8e2b9b` replaced the fixture prompts with common user
-questions and added the decoded-text nonempty gate. A local `cn_short` smoke run on that clean commit
-still generated only whitespace tokens, so `tools/bench/make_baseline_summary.py --baseline-class smoke`
-correctly rejected the decoded manifest with:
+## Evidence Artifacts
 
-```text
-decoded manifest must contain nonempty clean output for cn_short
-```
+- Output gate raw report: `profiles/e2e/m3-output-gate.json`
+- Output gate decoded sidecars: `profiles/e2e/m3-output-gate.decoded/`
+- Output gate summary: `docs/bench/baselines/m3-output-gate-summary.json`
+- Prefill gate raw report: `profiles/e2e/m3-prefill-gate.json`
+- Prefill gate summary: `docs/bench/baselines/m3-prefill-gate-summary.json`
+- L1 microbench snapshot: `profiles/microbench/l1-microbench-20260628-235356.log`
 
-No new smoke summary is committed yet. The remaining blocker is therefore not only prompt wording; the
-current real-weight inference path must first produce nonempty assistant text for the short common
-questions.
+Raw reports, decoded sidecars, and microbench logs remain local under ignored `profiles/`. The
+committed summaries under `docs/bench/baselines/` contain the auditable report hashes, q5090 identity,
+tokenizer identity, case identity, timing summary, and memory summary.
 
-## Pending Evidence
+## Output Gate
 
-- Local raw e2e reports under `profiles/e2e/` for `m3_output_gate` and `m3_prefill_gate`.
-- Committed baseline summaries with `prompt_format`, `stop_token_ids`, tokenizer chat-template hash, and
-  generation-config hash.
-- Required output-gate cases `cn_short`, `en_short`, `code_short`, and `math_short`; required prefill-gate
-  case `long_2k`.
-- Memory accounting, hidden allocation status, workspace lifetime policy, q5090 identity, and first-wave
-  M3 target ordering from the regenerated run.
+Command class: `m3_output_gate`
+
+Required cases were run with `max_new_tokens=96`, `warmup_repeats=1`, and `measured_repeats=3`.
+Decoded clean output was nonempty for all measured repeats of `cn_short`, `en_short`, `code_short`,
+and `math_short`.
+
+| Case | Prompt tokens | Median prefill s | Median prefill tok/s | Median decode s | Median decode tok/s | Deterministic |
+|---|---:|---:|---:|---:|---:|---|
+| `cn_short` | 31 | 1.02391 | 30.2761 | 6.44325 | 3.88003 | true |
+| `en_short` | 26 | 0.898695 | 28.9308 | 24.6520 | 3.85364 | true |
+| `code_short` | 54 | 1.66028 | 32.5247 | 24.8044 | 3.82996 | true |
+| `math_short` | 46 | 1.42937 | 32.1820 | 24.7461 | 3.83898 | true |
+
+## Prefill Gate
+
+Command class: `m3_prefill_gate`
+
+The required `long_2k` case was run with `max_new_tokens=1`, `warmup_repeats=0`, and
+`measured_repeats=1`.
+
+| Case | Prompt tokens | Median prefill s | Median prefill tok/s | Decode tok/s | Deterministic |
+|---|---:|---:|---:|---:|---|
+| `long_2k` | 7932 | 243.324 | 32.5984 | n/a | true |
+
+`decode_eager_tok_s` is intentionally not valid for this case because `max_new_tokens=1` produces no
+decode loop tokens after prefill.
+
+## Memory Summary
+
+Both official gate summaries recorded complete engine-owned arena accounting and no hidden device
+allocations.
+
+| Arena | Capacity bytes | Used bytes | Peak used bytes |
+|---|---:|---:|---:|
+| `weights` | 17372552192 | 16378329088 | 16378329088 |
+| `cache` | 758454024 | 691312128 | 691312128 |
+| `workspace` | 4294967296 | 0 | 0 |
+
+## M3 Starting Point
+
+The regenerated baseline is valid as the entry point for M3 performance optimization. The headline
+single-stream decode rate across the short output-gate cases is currently about `3.83-3.88 tok/s`,
+and long prompt prefill is currently about `32.6 prompt tok/s`. Per-kernel optimization should use the
+local L1 microbench snapshot as the convenience baseline and collect `ncu` evidence for each targeted
+kernel family before making performance claims.

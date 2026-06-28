@@ -308,3 +308,96 @@ compute-sanitizer ./build/tests/qus_linear_test
 
 All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
 errors`.
+
+## Round 5 - Q5 mlp.down [5120,17408]
+
+Subagent model/effort: gpt-5.5, xhigh.
+
+Target: Q5 `mlp.down [5120,17408]`, launch 0 of:
+
+```bash
+./build/bench/qus_linear_bench --decode --q5
+```
+
+NCU kernel filter:
+
+```bash
+--kernel-name regex:'linear_tuned_lowbit_gemv_kernel' --launch-skip 0 --launch-count 1
+```
+
+Artifacts:
+
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/baseline_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/baseline_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/baseline_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/baseline_stalls.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/baseline_instr.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/baseline_sched.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/after_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/after_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/after_roofline_repeat.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/after_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/after_stalls.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/after_instr.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round5-q5-mlp-down/after_sched.ncu.{rep,csv,txt}`
+
+### Diagnosis
+
+The round-5 baseline confirmed the remaining limiter was L1TEX long-scoreboard latency, not spills
+or missing load coalescing. Global-load instructions, L1TEX sectors, and global-load data bytes were
+unchanged from round 4, while long scoreboard was still 73.30% of active-warp issue stalls and the
+scheduler had only 0.77 eligible warps per scheduler. The kernel still had zero local/shared memory
+spilling, leaving some register headroom for more in-flight independent K64 groups.
+
+Single change: replace the Q5-only two-K64 full-group path with a four-K64 full-group path. Each lane
+issues scale, packed-payload, and `x` loads for four consecutive full K64 groups before consuming
+them; the existing tail-safe per-group path remains responsible for non-multiple or partial final
+groups. This keeps the row-group warp schedule, one-warp-per-row ownership, public APIs, q5090 ABI,
+tests, CMake, registry routing, and externally workspace-free contract unchanged.
+
+### Metrics
+
+Headline DRAM/SOL values use the roofline report. The first after roofline report was a noisy outlier
+against the basic and detailed passes, so the accepted headline uses the repeat roofline capture kept
+as `after_roofline_repeat`.
+
+| metric | before | after |
+| --- | ---: | ---: |
+| NCU duration | 71.14 us | 71.10 us |
+| DRAM throughput | 49.08% | 53.27% |
+| Memory SOL | 71.31% | 71.97% |
+| Compute SOL | 71.31% | 71.97% |
+| L1/TEX throughput | 78.18% | 81.95% |
+| achieved occupancy | 65.71% | 56.35% |
+| registers/thread | 38 | 40 |
+| spills/local memory | 0 | 0 |
+| long scoreboard | 73.30% | 60.69% |
+| second stall | wait, 6.82% | not selected, 9.42% |
+| LG throttle | 5.61% | 6.51% |
+| MIO throttle | 3.52% | 7.29% |
+| eligible warps/scheduler | 0.77 | 1.09 |
+| issued warp/scheduler | 0.44 | 0.50 |
+| global-load instructions | 6,963,200 | 6,963,200 |
+| global-load L1TEX sectors | 13,926,400 | 13,926,400 |
+| global-load data bytes | 286.88 MB | 286.88 MB |
+| total SM instructions | 36,956,160 | 40,325,120 |
+| source branch instructions | 389,120 | 378,880 |
+
+Accepted with concern: the diagnosed limiter improved. Long-scoreboard stall share dropped by 12.61
+points, eligible warps per scheduler rose from 0.77 to 1.09, issued warp per scheduler rose from
+0.44 to 0.50, and roofline DRAM rose by 4.19 points with no spills or correctness regression. The
+tradeoff is higher register pressure, lower achieved occupancy, more total SM instructions, and
+higher MIO/LG throttle. This still does not meet the Task 4 target (`>=70%` DRAM and near `C =
+82.76%`). The next round should continue Q5 `mlp.down`, likely targeting unchanged global-load
+traffic or `x` reuse rather than adding still more in-flight groups without reducing load traffic.
+
+### Verification
+
+```bash
+cmake --build build -j
+ctest --test-dir build -R qus_linear_test --output-on-failure
+compute-sanitizer ./build/tests/qus_linear_test
+```
+
+All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
+errors`.

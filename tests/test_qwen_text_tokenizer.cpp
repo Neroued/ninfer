@@ -133,6 +133,16 @@ int test_rejects_added_token_duplicate_or_overlap_id() {
         write_tokenizer_json(
             dir.path,
             minimal_tokenizer_json(
+                R"({"a":0,"":1})",
+                R"([{"id":1,"content":"<empty-overlap>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}])"));
+        failures += check(throws_invalid_containing(dir.path, "added_tokens"),
+                          "added token overlapping empty model.vocab token id accepted");
+    }
+    {
+        TempDir dir;
+        write_tokenizer_json(
+            dir.path,
+            minimal_tokenizer_json(
                 R"({"a":0,"b":1})",
                 R"([{"id":2,"content":"<x>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},{"id":2,"content":"<y>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}])"));
         failures += check(throws_invalid_containing(dir.path, "added_tokens"),

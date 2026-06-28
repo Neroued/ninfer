@@ -17,6 +17,11 @@ using Json = nlohmann::json;
 
 constexpr std::int64_t kMaxTokenId = 1'000'000;
 
+struct VocabMetadata {
+    std::vector<std::string> id_to_token;
+    std::unordered_set<int> occupied_ids;
+};
+
 Json read_json_file(const std::filesystem::path& path, const char* label) {
     std::ifstream in(path);
     if (!in) {
@@ -102,7 +107,7 @@ bool require_bool_field(const Json& object, const char* field, const std::filesy
     return object.at(field).get<bool>();
 }
 
-std::vector<std::string> load_vocab(const Json& model, const std::filesystem::path& path) {
+VocabMetadata load_vocab(const Json& model, const std::filesystem::path& path) {
     if (!model.contains("type") || !model.at("type").is_string() ||
         model.at("type").get<std::string>() != "BPE") {
         throw std::invalid_argument("field model.type must be BPE in " + path.string());
@@ -113,21 +118,21 @@ std::vector<std::string> load_vocab(const Json& model, const std::filesystem::pa
     }
 
     int max_id = -1;
-    std::unordered_set<int> seen_ids;
+    VocabMetadata metadata;
     for (const auto& item : vocab.items()) {
         const int id = parse_token_id(item.value(), "model.vocab", path);
-        if (!seen_ids.insert(id).second) {
+        if (!metadata.occupied_ids.insert(id).second) {
             throw std::invalid_argument("field model.vocab has duplicate id in " + path.string());
         }
         max_id = std::max(max_id, id);
     }
 
-    std::vector<std::string> id_to_token(static_cast<std::size_t>(max_id + 1));
+    metadata.id_to_token.resize(static_cast<std::size_t>(max_id + 1));
     for (const auto& item : vocab.items()) {
-        id_to_token.at(static_cast<std::size_t>(
+        metadata.id_to_token.at(static_cast<std::size_t>(
             parse_token_id(item.value(), "model.vocab", path))) = item.key();
     }
-    return id_to_token;
+    return metadata;
 }
 
 AddedToken parse_added_token(const Json& item, const std::filesystem::path& path) {
@@ -149,7 +154,8 @@ AddedToken parse_added_token(const Json& item, const std::filesystem::path& path
 }
 
 std::vector<AddedToken> load_added_tokens(const Json& root, const std::filesystem::path& path,
-                                          std::vector<std::string>& id_to_token) {
+                                          std::vector<std::string>& id_to_token,
+                                          const std::unordered_set<int>& occupied_vocab_ids) {
     const Json& added = require_array_field(root, "added_tokens", path);
     std::vector<AddedToken> tokens;
     tokens.reserve(added.size());
@@ -157,7 +163,7 @@ std::vector<AddedToken> load_added_tokens(const Json& root, const std::filesyste
     for (const Json& item : added) {
         AddedToken token = parse_added_token(item, path);
         const auto index = static_cast<std::size_t>(token.id);
-        if (index < id_to_token.size() && !id_to_token.at(index).empty()) {
+        if (occupied_vocab_ids.contains(token.id)) {
             throw std::invalid_argument("field added_tokens overlaps existing id in " +
                                         path.string());
         }
@@ -201,8 +207,10 @@ QwenTokenizer::QwenTokenizer(const std::filesystem::path& tokenizer_dir)
     const Json root                            = read_json_file(tokenizer_json, "tokenizer.json");
     const Json& model = require_object_field(root, "model", tokenizer_json);
 
-    id_to_token_  = load_vocab(model, tokenizer_json);
-    added_tokens_ = load_added_tokens(root, tokenizer_json, id_to_token_);
+    VocabMetadata vocab_metadata = load_vocab(model, tokenizer_json);
+    id_to_token_                 = std::move(vocab_metadata.id_to_token);
+    added_tokens_ =
+        load_added_tokens(root, tokenizer_json, id_to_token_, vocab_metadata.occupied_ids);
     default_stop_token_ids_ =
         load_default_stop_token_ids(tokenizer_dir_ / "generation_config.json");
 }

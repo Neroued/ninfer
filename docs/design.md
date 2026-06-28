@@ -124,7 +124,9 @@ only**. These dimensions are the "固化" truth everything specializes to.
 
 ### 4.1 In scope (v1)
 - Text-only decoder forward (prefill + decode).
-- **token-ids in → token-ids out**; tokenizer/detokenizer done **outside** (Python/HF).
+- Primary user CLI: text/messages in -> text out through a project-owned Qwen3.6 C++ text frontend.
+- Core Engine, M2.8 benchmark, and parity tools: token ids in/out for stable performance and debug
+  contracts.
 - **Greedy (argmax)** next-token selection.
 - **128K** context, **bf16 KV**.
 - **W4A16** linear layers (bf16 activations, 4-bit weights dequantized to bf16).
@@ -148,9 +150,8 @@ only**. These dimensions are the "固化" truth everything specializes to.
 2. fp8/fp4 **prefill** kernels.
 3. **256K** context / **fp8 KV**.
 4. Full sampler (temperature / top-k / top-p / RNG).
-5. C++ tokenizer.
-6. Vision / multimodal path.
-7. Multi-GPU, tensor/pipeline parallelism, continuous batching, paged attention.
+5. Vision / multimodal path.
+6. Multi-GPU, tensor/pipeline parallelism, continuous batching, paged attention.
 
 ### 4.5 Decisions log (from brainstorm)
 | # | Decision | Choice |
@@ -162,7 +163,7 @@ only**. These dimensions are the "固化" truth everything specializes to.
 | 5 | Compute precision | bf16 activations + W4A16 baseline; fp8/fp4 prefill later |
 | 6 | Context / KV | 128K, bf16 KV; pool runtime-sized |
 | 7 | 固化/自由 | Model-card graph + generic kernel API + routed specialized impls |
-| 8 | Runtime I/O | ids in/out, tokenizer in Python, greedy |
+| 8 | Runtime I/O | primary `qus` text/messages in -> text out; Engine/bench/parity use token ids |
 | 9 | Weight pipeline | Python (quant+pack) → fixed file; C++ only loads |
 | 10 | Execution model | Optimization ladder, correctness-gated |
 
@@ -238,8 +239,10 @@ the decode step. Full conventions: [`l1-kernel-layering.md`](l1-kernel-layering.
 - KV/state lifecycle and position bookkeeping.
 
 ### Runtime / driver
-- Engine init (load weights, size pools), the prefill+decode loop, bench harness
-  (`ids in → ids out`).
+- Primary `src/main.cpp` CLI: Qwen3.6 chat text/messages -> C++ text frontend -> Engine ->
+  decoded text.
+- Engine init (load weights, size pools), the prefill+decode loop, benchmark harness, and parity
+  tooling keep token ids in/out internally.
 
 ---
 
@@ -390,9 +393,9 @@ qwen3.6-ultraspeed/
       kernel/               # <op>.cuh     — __global__ / __device__ compute
     model/qwen3_6_27b.cpp   # the model card / static graph
     runtime/                # engine: load + prefill + decode loop
-    main.cpp                # bench driver: ids in -> ids out
-  tests/                    # parity + kernel unit tests
-  bench/                    # benchmark scripts
+    main.cpp                # primary text CLI
+  tests/                    # parity + kernel unit tests; parity remains token-id based
+  bench/                    # benchmark scripts and .ids fixture consumers
 ```
 
 ---
@@ -417,7 +420,7 @@ qwen3.6-ultraspeed/
   GDN, conv, RoPE, SwiGLU, argmax).
 - **M4 — Fusion:** fuse adjacent ops; reduce launches/round-trips.
 - **M5 — Launch-overhead elimination:** CUDA Graph decode replay; explore megakernel.
-- **Later:** MTP speculative decode → fp8/fp4 prefill → 256K/fp8-KV → sampler → tokenizer →
+- **Later:** MTP speculative decode → fp8/fp4 prefill → 256K/fp8-KV → sampler →
   vision → (multi-GPU/batching, only if ever needed).
 
 ---

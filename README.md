@@ -35,14 +35,15 @@ attention** (16 layers), SwiGLU MLP, vocab 248320. v1 freezes to the **text deco
 
 ## Scope (v1)
 
-- Text-only; **token-ids in → token-ids out** (tokenizer runs in Python, outside the engine).
+- Text-only; the primary `qus` binary accepts Qwen3.6 chat text and prints decoded text.
+  The runtime engine and benchmark/parity tools still use token ids internally.
 - **Greedy** decoding, **bf16 KV**, current M2.8 official **max_ctx = 8192**.
 - **W4A16**: 4-bit weights, bf16 activations.
 - Single sequence (batch = 1), single GPU.
 
 128K context is a later target, not part of the current M2.8 gate. Deferred (in order):
 MTP speculative decode → fp8/fp4 prefill → 128K/256K context and fp8-KV → full sampler →
-C++ tokenizer → vision → multi-GPU/batching.
+vision → multi-GPU/batching.
 
 ## Architecture (3 layers)
 
@@ -61,7 +62,7 @@ bf16 safetensors ──(Python, offline)──> quantize + relayout/pack ──>
                                                                           │
                                                           (C++/CUDA runtime) mmap + load + run
                                                                           │
-                                              token-ids in ──> forward ──> greedy ──> token-ids out
+           text/messages -> C++ Qwen tokenizer/chat template -> token ids -> forward -> greedy -> ids -> text
 ```
 
 ## Build (intended)
@@ -72,6 +73,17 @@ Requires CUDA 13.1+ (sm_120), gcc 13+, CMake 3.28+.
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
+
+## Usage
+
+```bash
+./build/src/qus /path/to/weights.qus \
+  --tokenizer /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16 \
+  --prompt "用三句话解释 prefill 和 decode 的区别。" \
+  --max-new 128
+```
+
+`bench/qus_e2e_bench` still consumes `.ids` fixtures for stable benchmark contracts.
 
 ## Toolchain target
 

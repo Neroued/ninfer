@@ -48,13 +48,20 @@ struct Q5Codec {
         const float scale = __half2float(__ushort_as_half(sb));
         const std::uint8_t* packed =
             payload + off + 64 * 2 + static_cast<std::int64_t>(rit) * kBytesPerRowPerGroup;
+        const auto* words = reinterpret_cast<const std::uint32_t*>(packed);
+        std::uint32_t w[11];
+#pragma unroll
+        for (int j = 0; j < 10; ++j) {
+            w[j] = words[j];
+        }
+        w[10] = 0u;
+#pragma unroll
         for (int lane = 0; lane < kGroupK; ++lane) {
-            std::uint32_t u = 0;
             const int bitpos = lane * kBits;
-            for (int b = 0; b < kBits; ++b) {
-                if ((packed[(bitpos + b) >> 3] & (1u << ((bitpos + b) & 7))) != 0) { u |= 1u << b; }
-            }
-            const int s = (u & 0x10u) ? (static_cast<int>(u) - 32) : static_cast<int>(u);  // bit 4
+            const int wi     = bitpos >> 5;
+            const int sh     = bitpos & 31;
+            const std::uint32_t bits = __funnelshift_r(w[wi], w[wi + 1], sh);
+            const int s = static_cast<int>(bits << 27) >> 27;
             out[lane] = static_cast<float>(s) * scale;
         }
     }
@@ -76,13 +83,20 @@ struct Q6Codec {
         const float scale = __half2float(__ushort_as_half(sb));
         const std::uint8_t* packed =
             payload + off + 64 * 2 + static_cast<std::int64_t>(rit) * kBytesPerRowPerGroup;
+        const auto* words = reinterpret_cast<const std::uint32_t*>(packed);
+        std::uint32_t w[13];
+#pragma unroll
+        for (int j = 0; j < 12; ++j) {
+            w[j] = words[j];
+        }
+        w[12] = 0u;
+#pragma unroll
         for (int lane = 0; lane < kGroupK; ++lane) {
-            std::uint32_t u = 0;
             const int bitpos = lane * kBits;
-            for (int b = 0; b < kBits; ++b) {
-                if ((packed[(bitpos + b) >> 3] & (1u << ((bitpos + b) & 7))) != 0) { u |= 1u << b; }
-            }
-            const int s = (u & 0x20u) ? (static_cast<int>(u) - 64) : static_cast<int>(u);  // bit 5
+            const int wi     = bitpos >> 5;
+            const int sh     = bitpos & 31;
+            const std::uint32_t bits = __funnelshift_r(w[wi], w[wi + 1], sh);
+            const int s = static_cast<int>(bits << 26) >> 26;
             out[lane] = static_cast<float>(s) * scale;
         }
     }

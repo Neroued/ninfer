@@ -1,6 +1,6 @@
 [
   {
     "role": "user",
-    "content": "Explain in three concise paragraphs why an inference benchmark should separate model loading, prefill,\nand decode timing. Include one sentence about why repeated runs must record generated token ids.\n"
+    "content": "Explain in three short bullets why backing up important files is useful."
   }
 ]

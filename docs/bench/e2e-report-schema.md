@@ -9,7 +9,7 @@
 |---|---|
 | `qus_e2e_benchmark_report` | Raw e2e benchmark JSON report. |
 | `qus_decoded_text_artifacts` | Sidecar manifest for decoded text files. |
-| `qus_e2e_baseline_summary` | Committed audit summary for an official smoke or M3-gate baseline. |
+| `qus_e2e_baseline_summary` | Committed audit summary for an official smoke, M3 output-gate, or M3 prefill-gate baseline. |
 | `qus_e2e_compare_result` | Optional structured result from comparing two raw e2e reports. |
 
 ## Raw E2E Report
@@ -75,7 +75,7 @@ Required fields:
 
 The current official/runtime workspace lifetime policy is `block_scoped_mixer_mlp_rewind`.
 Historical P6 short smoke artifacts may record `step_reset`; those are legacy smoke observations and do
-not represent the current M3-gate policy.
+not represent the current M3 gate package policy.
 
 ## Weights
 
@@ -106,7 +106,7 @@ Required fields:
 }
 ```
 
-Official M3-gate baselines require `q5090_sha256`.
+Official M3 output-gate and prefill-gate baselines require `q5090_sha256`.
 
 ## Memory
 
@@ -204,6 +204,7 @@ At minimum, each measured repeat stores:
   "prefill_output_tokens": 1,
   "decode_loop_tokens": 0,
   "generated_tokens_total": 1,
+  "prefill_prompt_tok_s": 0.0,
   "decode_eager_tok_s": null,
   "decode_eager_tok_s_valid": false,
   "e2e_excluding_load_tok_s": 0.0,
@@ -220,6 +221,7 @@ Required timing formulas:
 ```text
 e2e_excluding_load_time_s = prefill_time_s + decode_time_s
 decode_eager_tok_s = decode_loop_tokens / decode_time_s
+prefill_prompt_tok_s = prompt_tokens / prefill_time_s
 e2e_excluding_load_tok_s = generated_tokens_total / e2e_excluding_load_time_s
 ```
 
@@ -277,24 +279,33 @@ Manifest shape:
   "artifacts": [
     {
       "case_index": 0,
+      "case_name": "cn_short",
       "repeat_index": 0,
       "raw_text_path": "profiles/e2e/example.decoded/case0/repeat_0.raw.txt",
-      "clean_text_path": "profiles/e2e/example.decoded/case0/repeat_0.clean.txt"
+      "clean_text_path": "profiles/e2e/example.decoded/case0/repeat_0.clean.txt",
+      "raw_text_chars": 12,
+      "clean_text_chars": 10,
+      "clean_text_sha256": "",
+      "clean_text_nonempty_after_strip": true
     }
   ]
 }
 ```
 
+`smoke` and `m3_output_gate` summaries require decoded manifests and reject output cases whose clean
+decoded text is empty after stripping whitespace. This is a readability smoke check only, not semantic
+grading.
+
 ## Committed Baseline Summary
 
-Raw reports stay local under `profiles/e2e/`. Official smoke or M3-gate summaries are committed under
-`docs/bench/baselines/` and use:
+Raw reports stay local under `profiles/e2e/`. Official smoke, M3 output-gate, or M3 prefill-gate
+summaries are committed under `docs/bench/baselines/` and use:
 
 ```json
 {
   "artifact_type": "qus_e2e_baseline_summary",
   "schema_version": 1,
-  "baseline_class": "m3_gate",
+  "baseline_class": "m3_output_gate",
   "source_report_path": "profiles/e2e/example.json",
   "source_report_sha256": "",
   "command": "",
@@ -311,10 +322,11 @@ Raw reports stay local under `profiles/e2e/`. Official smoke or M3-gate summarie
 }
 ```
 
-`baseline_class` is `smoke` or `m3_gate`. Smoke summaries do not satisfy M3 readiness.
-`decoded_manifest_path` and `decoded_manifest_sha256` are present only when
-`--decoded-manifest` is provided. `readability_gate` is `not_run` without decoded artifacts and
-`human_smoke_only` when decoded text sidecars are attached.
+`baseline_class` is `smoke`, `m3_output_gate`, or `m3_prefill_gate`. Smoke summaries do not satisfy
+M3 readiness. `m3_output_gate` and `m3_prefill_gate` are both required for M3 readiness.
+`decoded_manifest_path` and `decoded_manifest_sha256` are present when `--decoded-manifest` is
+provided. `smoke` and `m3_output_gate` require a decoded manifest; `m3_prefill_gate` may use
+`readability_gate: not_run`.
 Any decoded manifest referenced by a committed summary must be the redacted form: local tokenizer paths
 must be empty, and raw unredacted decoded manifests stay local.
 

@@ -180,7 +180,11 @@ def _compare_perf(
     result: CompareResult,
     fail_on_performance_regression: bool,
 ) -> None:
-    for key in ("decode_eager_tok_s_median", "e2e_excluding_load_tok_s_median"):
+    for key in (
+        "prefill_prompt_tok_s_median",
+        "decode_eager_tok_s_median",
+        "e2e_excluding_load_tok_s_median",
+    ):
         old = common.numeric_summary(base_case, key)
         new = common.numeric_summary(cand_case, key)
         if old is not None and new is not None and common.pct_change(old, new) < -PERF_THRESHOLD:

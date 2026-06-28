@@ -87,6 +87,9 @@ struct RepeatReport {
         return decode_eager_tok_s_valid() ? static_cast<double>(decode_loop_tokens) / decode_time_s
                                           : 0.0;
     }
+    [[nodiscard]] double prefill_prompt_tok_s() const noexcept {
+        return prefill_time_s > 0.0 ? static_cast<double>(prompt_tokens) / prefill_time_s : 0.0;
+    }
     [[nodiscard]] double e2e_excluding_load_tok_s() const noexcept {
         const double denom = e2e_excluding_load_time_s();
         return denom > 0.0 ? static_cast<double>(generated_tokens_total()) / denom : 0.0;

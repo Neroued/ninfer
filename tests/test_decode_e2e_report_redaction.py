@@ -99,6 +99,10 @@ class DecodeE2EReportRedactionTests(unittest.TestCase):
             self.assertEqual(clean_path.name, "repeat_0.clean.txt")
             self.assertEqual(raw_path.read_text(encoding="utf-8"), "A\x00BC")
             self.assertEqual(clean_path.read_text(encoding="utf-8"), "ABC")
+            self.assertEqual(artifact["raw_text_chars"], 4)
+            self.assertEqual(artifact["clean_text_chars"], 3)
+            self.assertEqual(artifact["clean_text_sha256"], tokenizer_common.sha256_text("ABC"))
+            self.assertTrue(artifact["clean_text_nonempty_after_strip"])
 
 
 if __name__ == "__main__":

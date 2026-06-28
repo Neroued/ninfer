@@ -109,14 +109,22 @@ The command exits nonzero and writes a schema-v1 error report when the output pa
 Smoke baseline minimum:
 
 ```text
-cn_short, max_new_tokens >= 8, repeats >= 1
+cn_short, max_new_tokens >= 96, repeats >= 1, decoded clean output nonempty
 ```
 
-M3 gate baseline minimum:
+M3 output gate baseline minimum:
 
 ```text
-cn_short, max_new_tokens >= 128, warmup_repeats >= 1, repeats >= 3
-long_2k, prompt_tokens >= 2048, repeats >= 1
+cn_short, en_short, code_short, math_short
+max_new_tokens >= 96 for each short case
+warmup_repeats >= 1, repeats >= 3
+decoded clean output nonempty for each short case
+```
+
+M3 prefill gate baseline minimum:
+
+```text
+long_2k, prompt_tokens >= 2048, max_new_tokens == 1, repeats >= 1
 ```
 
 ## Artifacts
@@ -149,6 +157,7 @@ python3 tools/bench/decode_e2e_report.py \
 ```
 
 Decoded text is for human smoke review only, not an automated correctness gate.
+Smoke and M3 output-gate summaries require decoded sidecars and reject empty clean decoded output.
 
 Profiler outputs are local:
 
@@ -200,10 +209,19 @@ generation; the summary tool rejects unredacted manifests.
 
 ```bash
 python3 tools/bench/make_baseline_summary.py \
-  --report profiles/e2e/m3-gate.json \
-  --output docs/bench/baselines/m3-gate-summary.json \
-  --baseline-class m3_gate \
-  --decoded-manifest profiles/e2e/m3-gate.decoded/manifest.json
+  --report profiles/e2e/m3-output-gate.json \
+  --output docs/bench/baselines/m3-output-gate-summary.json \
+  --baseline-class m3_output_gate \
+  --decoded-manifest profiles/e2e/m3-output-gate.decoded/manifest.json
+```
+
+For the long prefill gate:
+
+```bash
+python3 tools/bench/make_baseline_summary.py \
+  --report profiles/e2e/m3-prefill-gate.json \
+  --output docs/bench/baselines/m3-prefill-gate-summary.json \
+  --baseline-class m3_prefill_gate
 ```
 
 ## Performance Claims

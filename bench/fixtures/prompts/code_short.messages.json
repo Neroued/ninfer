@@ -1,6 +1,6 @@
 [
   {
     "role": "user",
-    "content": "Review this tiny pseudocode and describe the bug:\n\nstate.reset()\nfor token in prompt:\n    logits = model.step(token)\nfor i in range(max_new_tokens):\n    token = argmax(logits)\n    logits = model.step(token)\n\nExplain whether the loop counts the prefill token as generated output.\n"
+    "content": "下面这段 Python 代码有什么问题？请指出 bug 并给出修正建议：\n\n```python\ndef average(nums):\n    return sum(nums) / len(nums)\n\nprint(average([]))\n```"
   }
 ]

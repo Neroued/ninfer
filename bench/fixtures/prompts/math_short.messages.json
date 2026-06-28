@@ -1,6 +1,6 @@
 [
   {
     "role": "user",
-    "content": "A prompt has 37 tokens and max_new_tokens is 9. The prefill call returns the first generated token.\nHow many post-prefill decode_step calls are requested, and what minimum max_ctx is required?\nShow the formula before the numeric answer.\n"
+    "content": "一个杯子 12 元，买 3 个杯子和 2 个 5 元的勺子，一共多少钱？请给出计算过程和答案。"
   }
 ]

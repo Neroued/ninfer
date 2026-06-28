@@ -176,6 +176,10 @@ def decode_report(
                     "repeat_index": repeat_index,
                     "raw_text_path": str(raw_path),
                     "clean_text_path": str(clean_path),
+                    "raw_text_chars": len(raw_decoded),
+                    "clean_text_chars": len(clean_decoded),
+                    "clean_text_sha256": common.sha256_text(clean_decoded),
+                    "clean_text_nonempty_after_strip": bool(clean_decoded.strip()),
                     "generated_tokens_total": len(ids),
                     **chat_metadata,
                 }

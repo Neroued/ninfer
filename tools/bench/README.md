@@ -43,7 +43,17 @@ python3 tools/bench/decode_e2e_report.py \
 ```
 
 Decoded text is human-smoke-only. Each decoded repeat writes `repeat_<n>.raw.txt` and
-`repeat_<n>.clean.txt` sidecars. Correctness gates use token ids and report comparison.
+`repeat_<n>.clean.txt` sidecars, plus manifest metadata for clean text length, SHA256, and whether the
+clean text is nonempty after stripping whitespace. Correctness gates use token ids and report comparison;
+the nonempty check only prevents committing blank output smoke artifacts.
+
+Baseline summary classes are:
+
+```text
+smoke
+m3_output_gate
+m3_prefill_gate
+```
 
 E2E benchmark invocations for Qwen3.6 chat-template fixtures should pass both stop tokens:
 

@@ -236,6 +236,7 @@ void write_repeat(std::ostream& out, const RepeatReport& repeat, const std::stri
         << indent << "  \"prefill_output_tokens\": " << repeat.prefill_output_tokens << ",\n"
         << indent << "  \"decode_loop_tokens\": " << repeat.decode_loop_tokens << ",\n"
         << indent << "  \"generated_tokens_total\": " << repeat.generated_tokens_total() << ",\n"
+        << indent << "  \"prefill_prompt_tok_s\": " << repeat.prefill_prompt_tok_s() << ",\n"
         << indent << "  \"decode_eager_tok_s\": ";
     if (repeat.decode_eager_tok_s_valid()) {
         out << repeat.decode_eager_tok_s();
@@ -258,15 +259,18 @@ void write_repeat(std::ostream& out, const RepeatReport& repeat, const std::stri
 void write_case_summary(std::ostream& out, const CaseReport& case_report,
                         const std::string& indent) {
     std::vector<double> prefill_times;
+    std::vector<double> prefill_tok_s;
     std::vector<double> decode_times;
     std::vector<double> decode_tok_s;
     std::vector<double> e2e_tok_s;
     prefill_times.reserve(case_report.repeats.size());
+    prefill_tok_s.reserve(case_report.repeats.size());
     decode_times.reserve(case_report.repeats.size());
     decode_tok_s.reserve(case_report.repeats.size());
     e2e_tok_s.reserve(case_report.repeats.size());
     for (const RepeatReport& repeat : case_report.repeats) {
         prefill_times.push_back(repeat.prefill_time_s);
+        prefill_tok_s.push_back(repeat.prefill_prompt_tok_s());
         decode_times.push_back(repeat.decode_time_s);
         if (repeat.decode_eager_tok_s_valid()) { decode_tok_s.push_back(repeat.decode_eager_tok_s()); }
         e2e_tok_s.push_back(repeat.e2e_excluding_load_tok_s());
@@ -274,6 +278,7 @@ void write_case_summary(std::ostream& out, const CaseReport& case_report,
 
     out << indent << "{\n"
         << indent << "  \"prefill_time_s_median\": " << median(prefill_times) << ",\n"
+        << indent << "  \"prefill_prompt_tok_s_median\": " << median(prefill_tok_s) << ",\n"
         << indent << "  \"decode_time_s_median\": " << median(decode_times) << ",\n"
         << indent << "  \"decode_eager_tok_s_median\": ";
     if (decode_tok_s.empty()) {

@@ -23,6 +23,9 @@ SHA_CN_MESSAGES = "4" * 64
 SHA_LONG_MESSAGES = "5" * 64
 SHA_CN_RENDERED = "6" * 64
 SHA_LONG_RENDERED = "7" * 64
+SHA_OTHER_IDS = "8" * 64
+SHA_OTHER_MESSAGES = "9" * 64
+SHA_OTHER_RENDERED = "a" * 64
 
 
 def arena(name: str, peak: int) -> dict[str, object]:
@@ -54,6 +57,7 @@ def repeat(
         "prefill_output_tokens": 1,
         "decode_loop_tokens": decode_loop_tokens,
         "generated_tokens_total": len(tokens),
+        "prefill_prompt_tok_s": prompt_tokens / 0.02,
         "decode_eager_tok_s": tok_s if decode_loop_tokens else None,
         "decode_eager_tok_s_valid": bool(decode_loop_tokens),
         "e2e_excluding_load_tok_s": 80.0,
@@ -68,13 +72,27 @@ def case(
     tokens: list[int],
     tok_s: float = 100.0,
     workspace_peak: int = 256 * 1024 * 1024,
+    requested_max_new_tokens: int | None = None,
+    warmup_repeats: int | None = None,
+    measured_repeats: int | None = None,
 ) -> dict[str, object]:
     prompt_tokens = 2048 if name == "long_2k" else 4
-    requested_max_new_tokens = 128 if name == "cn_short" else 1
-    measured_repeats = 3 if name == "cn_short" else 1
+    if requested_max_new_tokens is None:
+        requested_max_new_tokens = 1 if name == "long_2k" else 96
+    if measured_repeats is None:
+        measured_repeats = 1 if name == "long_2k" else 3
+    if warmup_repeats is None:
+        warmup_repeats = 0 if name == "long_2k" else 1
     decode_loop_tokens_requested = max(requested_max_new_tokens - 1, 0)
     required_max_context = prompt_tokens + decode_loop_tokens_requested
     stop_reason = "max_new_tokens" if len(tokens) == requested_max_new_tokens else "eos_token"
+    ids_sha = SHA_LONG_IDS if name == "long_2k" else SHA_CN_IDS if name == "cn_short" else SHA_OTHER_IDS
+    messages_sha = (
+        SHA_LONG_MESSAGES if name == "long_2k" else SHA_CN_MESSAGES if name == "cn_short" else SHA_OTHER_MESSAGES
+    )
+    rendered_sha = (
+        SHA_LONG_RENDERED if name == "long_2k" else SHA_CN_RENDERED if name == "cn_short" else SHA_OTHER_RENDERED
+    )
     return {
         "name": name,
         "fixture_set": "m2.8-v1",
@@ -82,20 +100,20 @@ def case(
         "fixture_manifest_sha256": SHA_FIXTURE,
         "prompt_format": tokenizer_common.PROMPT_FORMAT,
         "messages_path": f"bench/fixtures/prompts/{name}.messages.json",
-        "messages_sha256": SHA_LONG_MESSAGES if name == "long_2k" else SHA_CN_MESSAGES,
-        "rendered_prompt_sha256": SHA_LONG_RENDERED if name == "long_2k" else SHA_CN_RENDERED,
+        "messages_sha256": messages_sha,
+        "rendered_prompt_sha256": rendered_sha,
         "add_generation_prompt": tokenizer_common.ADD_GENERATION_PROMPT,
         "add_special_tokens": tokenizer_common.ADD_SPECIAL_TOKENS,
         "chat_template_kwargs": dict(tokenizer_common.CHAT_TEMPLATE_KWARGS),
         "stop_token_ids": list(tokenizer_common.STOP_TOKEN_IDS),
         "prompt_ids_path": f"bench/fixtures/prompts/{name}.ids",
-        "prompt_ids_sha256": SHA_LONG_IDS if name == "long_2k" else SHA_CN_IDS,
+        "prompt_ids_sha256": ids_sha,
         "prompt_tokens": prompt_tokens,
         "requested_max_new_tokens": requested_max_new_tokens,
         "max_context": 4096,
         "decode_loop_tokens_requested": decode_loop_tokens_requested,
         "required_max_context": required_max_context,
-        "warmup_repeats": 1 if name == "cn_short" else 0,
+        "warmup_repeats": warmup_repeats,
         "measured_repeats": measured_repeats,
         "repeats": [
             repeat(
@@ -110,6 +128,7 @@ def case(
         ],
         "summary": {
             "prefill_time_s_median": 0.02,
+            "prefill_prompt_tok_s_median": prompt_tokens / 0.02,
             "decode_time_s_median": 0.01 if len(tokens) > 1 else 0.0,
             "decode_eager_tok_s_median": tok_s if len(tokens) > 1 else None,
             "e2e_excluding_load_tok_s_median": 80.0,
@@ -131,7 +150,7 @@ def report(
         "status": "ok",
         "run": {
             "binary": "qus_e2e_bench",
-            "command": "qus_e2e_bench --case cn_short:bench/fixtures/prompts/cn_short.ids:128",
+            "command": "qus_e2e_bench --case cn_short:bench/fixtures/prompts/cn_short.ids:96",
             "git_commit": "abc123",
             "worktree_dirty": False,
             "load_time_s": 1.5,
@@ -180,10 +199,47 @@ def report(
             "q5090_quant_count": 6,
             "known_exclusions": [],
         },
-        "summary": {"case_count": 2, "load_time_s": 1.5},
+        "summary": {"case_count": 5, "load_time_s": 1.5},
         "cases": [
             case("cn_short", [10, 11, 12], tok_s=tok_s, workspace_peak=workspace_peak),
+            case("en_short", [30, 31, 32], tok_s=tok_s, workspace_peak=workspace_peak),
+            case("code_short", [40, 41, 42], tok_s=tok_s, workspace_peak=workspace_peak),
+            case("math_short", [50, 51, 52], tok_s=tok_s, workspace_peak=workspace_peak),
             case("long_2k", [20], tok_s=tok_s, workspace_peak=workspace_peak),
+        ],
+    }
+
+
+def decoded_manifest(report_path: Path, root: Path, case_names: list[str] | None = None) -> dict[str, object]:
+    names = case_names or ["cn_short"]
+    return {
+        "artifact_type": "qus_decoded_text_artifacts",
+        "source_report": str(report_path),
+        "readability_gate": "human_smoke_only",
+        "tokenizer": {
+            "tokenizer_source": "local_hf",
+            "tokenizer_model_id": "Qwen/Qwen3.6-27B",
+            "tokenizer_path": "",
+            "tokenizer_json_sha256": "tok",
+            "tokenizer_config_sha256": "cfg",
+            "special_tokens_map_sha256": "special",
+            "chat_template_jinja_sha256": "chat",
+            "generation_config_sha256": "gen",
+        },
+        "artifacts": [
+            {
+                "case_index": index,
+                "case_name": name,
+                "repeat_index": 0,
+                "raw_text_path": str(root / f"{name}.raw.txt"),
+                "clean_text_path": str(root / f"{name}.clean.txt"),
+                "raw_text_chars": 6,
+                "clean_text_chars": 4,
+                "clean_text_sha256": "b" * 64,
+                "clean_text_nonempty_after_strip": True,
+                "generated_tokens_total": 3,
+            }
+            for index, name in enumerate(names)
         ],
     }
 
@@ -200,19 +256,33 @@ class ReportCommonTests(unittest.TestCase):
 
     def test_validate_report_rejects_bad_zero_decode_throughput(self) -> None:
         bad = report()
-        bad["cases"][1]["repeats"][0]["decode_eager_tok_s"] = 0.0
+        bad["cases"][-1]["repeats"][0]["decode_eager_tok_s"] = 0.0
         with self.assertRaises(common.ReportValidationError):
             common.validate_report(bad)
 
     def test_validate_report_rejects_bad_zero_decode_summary_throughput(self) -> None:
         bad = report()
-        bad["cases"][1]["summary"]["decode_eager_tok_s_median"] = 0.0
+        bad["cases"][-1]["summary"]["decode_eager_tok_s_median"] = 0.0
         with self.assertRaises(common.ReportValidationError):
             common.validate_report(bad)
 
+    def test_validate_report_requires_prefill_prompt_throughput(self) -> None:
+        bad_repeat = report()
+        del bad_repeat["cases"][0]["repeats"][0]["prefill_prompt_tok_s"]
+        with self.assertRaises(common.ReportValidationError):
+            common.validate_report(bad_repeat)
+
+        bad_summary = report()
+        del bad_summary["cases"][0]["summary"]["prefill_prompt_tok_s_median"]
+        with self.assertRaises(common.ReportValidationError):
+            common.validate_report(bad_summary)
+
     def test_case_map_and_generated_ids(self) -> None:
         cases = common.case_map(report())
-        self.assertEqual(sorted(cases), ["cn_short", "long_2k"])
+        self.assertEqual(
+            sorted(cases),
+            ["cn_short", "code_short", "en_short", "long_2k", "math_short"],
+        )
         self.assertEqual(
             common.generated_ids_by_repeat(cases["cn_short"]),
             [[10, 11, 12], [10, 11, 12], [10, 11, 12]],
@@ -405,6 +475,34 @@ class CompareReportTests(unittest.TestCase):
         )
         self.assertTrue(any(item["code"] == "throughput_drop" for item in failed.failures))
 
+    def test_prefill_throughput_warning_can_be_promoted(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        candidate = report()
+        candidate["cases"][0]["summary"]["prefill_prompt_tok_s_median"] = 150.0
+        warned = compare_e2e_reports.compare_reports(report(), candidate)
+        self.assertFalse(warned.failures)
+        self.assertTrue(
+            any(
+                item["code"] == "throughput_drop"
+                and item["metric"] == "prefill_prompt_tok_s_median"
+                for item in warned.warnings
+            )
+        )
+
+        failed = compare_e2e_reports.compare_reports(
+            report(),
+            candidate,
+            fail_on_performance_regression=True,
+        )
+        self.assertTrue(
+            any(
+                item["code"] == "throughput_drop"
+                and item["metric"] == "prefill_prompt_tok_s_median"
+                for item in failed.failures
+            )
+        )
+
     def test_phase_time_warning(self) -> None:
         from tools.bench import compare_e2e_reports
 
@@ -507,8 +605,13 @@ class BaselineSummaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             report_path = root / "report.json"
+            decoded_path = root / "decoded_manifest.json"
             report_path.write_text(json.dumps(report()), encoding="utf-8")
-            summary = make_baseline_summary.make_summary(report_path, "smoke", decoded_manifest_path=None)
+            decoded_path.write_text(
+                json.dumps(decoded_manifest(report_path, root)),
+                encoding="utf-8",
+            )
+            summary = make_baseline_summary.make_summary(report_path, "smoke", decoded_path)
             self.assertEqual(summary["artifact_type"], "qus_e2e_baseline_summary")
             self.assertEqual(summary["schema_version"], 1)
             self.assertEqual(summary["baseline_class"], "smoke")
@@ -516,7 +619,10 @@ class BaselineSummaryTests(unittest.TestCase):
             self.assertEqual(summary["q5090"]["sha256"], "weights-sha")
             self.assertEqual(summary["workspace_lifetime_policy"], "step_reset")
             self.assertFalse(summary["hidden_device_allocations"])
-            self.assertEqual([case["name"] for case in summary["cases"]], ["cn_short", "long_2k"])
+            self.assertEqual(
+                [case["name"] for case in summary["cases"]],
+                ["cn_short", "en_short", "code_short", "math_short", "long_2k"],
+            )
             self.assertEqual(summary["cases"][0]["prompt_format"], tokenizer_common.PROMPT_FORMAT)
             self.assertEqual(
                 summary["cases"][0]["messages_path"],
@@ -531,6 +637,11 @@ class BaselineSummaryTests(unittest.TestCase):
                 tokenizer_common.CHAT_TEMPLATE_KWARGS,
             )
             self.assertEqual(summary["cases"][0]["stop_token_ids"], tokenizer_common.STOP_TOKEN_IDS)
+            self.assertEqual(summary["cases"][0]["prefill_prompt_tok_s_median"], 200.0)
+            self.assertEqual(
+                summary["timing_summary"]["cases"][0]["prefill_prompt_tok_s_median"],
+                200.0,
+            )
             self.assertNotIn("eos_token_id", summary["cases"][0])
 
     def test_smoke_summary_enforces_cn_short_case_and_token_minimum(self) -> None:
@@ -538,9 +649,9 @@ class BaselineSummaryTests(unittest.TestCase):
 
         def lower_cn_short_requested_tokens(value: dict[str, object]) -> None:
             cn_short = value["cases"][0]
-            cn_short["requested_max_new_tokens"] = 7
-            cn_short["decode_loop_tokens_requested"] = 6
-            cn_short["required_max_context"] = cn_short["prompt_tokens"] + 6
+            cn_short["requested_max_new_tokens"] = 95
+            cn_short["decode_loop_tokens_requested"] = 94
+            cn_short["required_max_context"] = cn_short["prompt_tokens"] + 94
 
         mutations = {
             "missing_cn_short": lambda value: value["cases"].pop(0),
@@ -607,18 +718,18 @@ class BaselineSummaryTests(unittest.TestCase):
                             decoded_manifest_path=None,
                         )
 
-    def test_m3_gate_summary_enforces_required_cases(self) -> None:
+    def test_m3_output_gate_summary_enforces_required_cases(self) -> None:
         from tools.bench import make_baseline_summary
 
         with tempfile.TemporaryDirectory() as tmp:
             report_path = Path(tmp) / "report.json"
             bad = report()
-            bad["cases"] = [bad["cases"][0]]
+            bad["cases"] = [bad["cases"][0], bad["cases"][-1]]
             report_path.write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaises(RuntimeError):
-                make_baseline_summary.make_summary(report_path, "m3_gate", decoded_manifest_path=None)
+                make_baseline_summary.make_summary(report_path, "m3_output_gate", decoded_manifest_path=None)
 
-    def test_m3_gate_summary_rejects_missing_actual_repeat_records(self) -> None:
+    def test_m3_output_gate_summary_rejects_missing_actual_repeat_records(self) -> None:
         from tools.bench import make_baseline_summary
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -627,9 +738,9 @@ class BaselineSummaryTests(unittest.TestCase):
             bad["cases"][0]["repeats"].pop()
             report_path.write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaises(common.ReportValidationError):
-                make_baseline_summary.make_summary(report_path, "m3_gate", decoded_manifest_path=None)
+                make_baseline_summary.make_summary(report_path, "m3_output_gate", decoded_manifest_path=None)
 
-    def test_m3_gate_summary_rejects_nondeterministic_token_ids(self) -> None:
+    def test_m3_output_gate_summary_rejects_nondeterministic_token_ids(self) -> None:
         from tools.bench import make_baseline_summary
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -638,7 +749,40 @@ class BaselineSummaryTests(unittest.TestCase):
             bad["cases"][0]["summary"]["deterministic_token_ids"] = False
             report_path.write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaises(RuntimeError):
-                make_baseline_summary.make_summary(report_path, "m3_gate", decoded_manifest_path=None)
+                make_baseline_summary.make_summary(report_path, "m3_output_gate", decoded_manifest_path=None)
+
+    def test_m3_prefill_gate_summary_enforces_long_2k_only_contract(self) -> None:
+        from tools.bench import make_baseline_summary
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "report.json"
+            valid = report()
+            valid["cases"] = [valid["cases"][-1]]
+            report_path.write_text(json.dumps(valid), encoding="utf-8")
+            summary = make_baseline_summary.make_summary(
+                report_path,
+                "m3_prefill_gate",
+                decoded_manifest_path=None,
+            )
+            self.assertEqual(summary["baseline_class"], "m3_prefill_gate")
+            self.assertEqual([case["name"] for case in summary["cases"]], ["long_2k"])
+
+            bad_tokens = report()
+            bad_tokens["cases"] = [bad_tokens["cases"][-1]]
+            bad_tokens["cases"][0]["requested_max_new_tokens"] = 2
+            bad_tokens["cases"][0]["decode_loop_tokens_requested"] = 1
+            bad_tokens["cases"][0]["required_max_context"] = bad_tokens["cases"][0]["prompt_tokens"] + 1
+            bad_tokens["cases"][0]["repeats"][0]["decode_loop_tokens"] = 1
+            bad_tokens["cases"][0]["repeats"][0]["generated_token_ids"] = [20, 21]
+            bad_tokens["cases"][0]["repeats"][0]["generated_tokens_total"] = 2
+            bad_tokens["cases"][0]["repeats"][0]["decode_time_s"] = 0.01
+            bad_tokens["cases"][0]["repeats"][0]["e2e_excluding_load_time_s"] = 0.03
+            bad_tokens["cases"][0]["repeats"][0]["decode_eager_tok_s"] = 100.0
+            bad_tokens["cases"][0]["repeats"][0]["decode_eager_tok_s_valid"] = True
+            bad_tokens["cases"][0]["summary"]["decode_eager_tok_s_median"] = 100.0
+            report_path.write_text(json.dumps(bad_tokens), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                make_baseline_summary.make_summary(report_path, "m3_prefill_gate", None)
 
     def test_summary_includes_decoded_tokenizer_when_manifest_given(self) -> None:
         from tools.bench import make_baseline_summary
@@ -664,7 +808,20 @@ class BaselineSummaryTests(unittest.TestCase):
                             "chat_template_jinja_sha256": "chat",
                             "generation_config_sha256": "gen",
                         },
-                        "artifacts": [],
+                        "artifacts": [
+                            {
+                                "case_index": 0,
+                                "case_name": "cn_short",
+                                "repeat_index": 0,
+                                "raw_text_path": str(root / "repeat_0.raw.txt"),
+                                "clean_text_path": str(root / "repeat_0.clean.txt"),
+                                "raw_text_chars": 6,
+                                "clean_text_chars": 4,
+                                "clean_text_sha256": "b" * 64,
+                                "clean_text_nonempty_after_strip": True,
+                                "generated_tokens_total": 3,
+                            }
+                        ],
                     }
                 ),
                 encoding="utf-8",
@@ -674,6 +831,51 @@ class BaselineSummaryTests(unittest.TestCase):
             self.assertEqual(summary["readability_gate"], "human_smoke_only")
             self.assertEqual(summary["decoded_manifest_path"], str(decoded_path))
             self.assertEqual(summary["decoded_manifest_sha256"], common.sha256_file(decoded_path))
+
+    def test_summary_rejects_empty_clean_output_for_output_gates(self) -> None:
+        from tools.bench import make_baseline_summary
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_path = root / "report.json"
+            decoded_path = root / "decoded_manifest.json"
+            report_path.write_text(json.dumps(report()), encoding="utf-8")
+            decoded_path.write_text(
+                json.dumps(
+                    {
+                        "artifact_type": "qus_decoded_text_artifacts",
+                        "source_report": str(report_path),
+                        "readability_gate": "human_smoke_only",
+                        "tokenizer": {
+                            "tokenizer_source": "local_hf",
+                            "tokenizer_model_id": "Qwen/Qwen3.6-27B",
+                            "tokenizer_path": "",
+                            "tokenizer_json_sha256": "tok",
+                            "tokenizer_config_sha256": "cfg",
+                            "special_tokens_map_sha256": "special",
+                            "chat_template_jinja_sha256": "chat",
+                            "generation_config_sha256": "gen",
+                        },
+                        "artifacts": [
+                            {
+                                "case_index": 0,
+                                "case_name": "cn_short",
+                                "repeat_index": 0,
+                                "raw_text_path": str(root / "repeat_0.raw.txt"),
+                                "clean_text_path": str(root / "repeat_0.clean.txt"),
+                                "raw_text_chars": 2,
+                                "clean_text_chars": 0,
+                                "clean_text_sha256": "b" * 64,
+                                "clean_text_nonempty_after_strip": False,
+                                "generated_tokens_total": 3,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RuntimeError):
+                make_baseline_summary.make_summary(report_path, "smoke", decoded_path)
 
     def test_summary_rejects_unredacted_decoded_manifest(self) -> None:
         from tools.bench import make_baseline_summary
@@ -762,7 +964,12 @@ class BaselineSummaryTests(unittest.TestCase):
             root = Path(tmp)
             report_path = root / "report.json"
             output_path = root / "summary.json"
+            decoded_path = root / "decoded_manifest.json"
             report_path.write_text(json.dumps(report()), encoding="utf-8")
+            decoded_path.write_text(
+                json.dumps(decoded_manifest(report_path, root)),
+                encoding="utf-8",
+            )
             rc = make_baseline_summary.main(
                 [
                     "--report",
@@ -771,6 +978,8 @@ class BaselineSummaryTests(unittest.TestCase):
                     str(output_path),
                     "--baseline-class",
                     "smoke",
+                    "--decoded-manifest",
+                    str(decoded_path),
                 ]
             )
             self.assertEqual(rc, 0)

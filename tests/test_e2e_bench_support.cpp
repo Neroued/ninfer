@@ -294,7 +294,7 @@ int test_fixture_manifest_reader() {
                             "manifest rendered prompt sha");
     failures += expect_bool(!metadata.case_metadata.prompt_ids_sha256.empty(),
                             "manifest ids sha");
-    failures += expect_int(metadata.case_metadata.prompt_tokens, 60, "manifest prompt tokens");
+    failures += expect_int(metadata.case_metadata.prompt_tokens, 31, "manifest prompt tokens");
 
     failures += expect_throws<std::invalid_argument>(
         [&] {
@@ -594,11 +594,18 @@ int test_raw_report_json_is_valid() {
                     : fail("case stop_token_ids missing");
     failures += expect_not_contains(text, "\"eos_token_id\"", "case eos_token_id removed");
     failures += text.find("\"prefill_time_s_median\"") != std::string::npos &&
+                        text.find("\"prefill_prompt_tok_s_median\"") != std::string::npos &&
                         text.find("\"decode_eager_tok_s_median\"") != std::string::npos &&
                         text.find("\"deterministic_token_ids\"") != std::string::npos &&
                         text.find("\"max_workspace_arena_peak_used_bytes\"") != std::string::npos
                     ? 0
                     : fail("raw report summary fields missing");
+    failures += text.find("\"prefill_prompt_tok_s\": 300") != std::string::npos
+                    ? 0
+                    : fail("repeat prefill prompt throughput missing");
+    failures += text.find("\"prefill_prompt_tok_s_median\": 300") != std::string::npos
+                    ? 0
+                    : fail("summary prefill prompt throughput missing");
     failures += text.find("\"decode_eager_tok_s_valid\": true") != std::string::npos
                     ? 0
                     : fail("decode validity missing");

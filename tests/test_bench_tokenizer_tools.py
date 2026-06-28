@@ -169,6 +169,27 @@ class TokenizerCommonTests(unittest.TestCase):
 
 
 class FixtureManifestTests(unittest.TestCase):
+    def test_committed_prompt_messages_use_common_user_questions(self) -> None:
+        fixture_dir = common.repo_root() / "bench/fixtures/prompts"
+        expected_snippets = {
+            "cn_short": "为什么每天适量喝水很重要",
+            "en_short": "backing up important files",
+            "code_short": "def average(nums):",
+            "math_short": "一个杯子 12 元",
+            "long_2k": "周末旅行规划资料",
+        }
+        forbidden = ("M2.8", "benchmark", "prefill", "decode", "q5090")
+        for name, snippet in expected_snippets.items():
+            with self.subTest(name=name):
+                messages = common.read_messages(fixture_dir / f"{name}.messages.json")
+                self.assertEqual([message["role"] for message in messages], ["user"])
+                text = messages[0]["content"]
+                self.assertIn(snippet, text)
+                if name != "long_2k":
+                    self.assertNotIn("基准测试", text)
+                for term in forbidden:
+                    self.assertNotIn(term, text)
+
     def test_build_manifest_records_cases_in_required_order(self) -> None:
         from tools.bench import tokenize_prompts
 
@@ -334,7 +355,13 @@ class LongPromptGeneratorTests(unittest.TestCase):
             messages = common.read_messages(out)
             self.assertEqual(len(messages), 1)
             self.assertEqual(messages[0]["role"], "user")
-            self.assertIn("Long-context benchmark prompt for M2.8.", messages[0]["content"])
+            self.assertIn("周末旅行规划资料", messages[0]["content"])
+            self.assertIn(
+                "请根据上面的资料，给一家三口安排一个周六下午到晚上的简短行程。",
+                messages[0]["content"],
+            )
+            self.assertNotIn("M2.8", messages[0]["content"])
+            self.assertNotIn("benchmark", messages[0]["content"].lower())
 
 
 class DecodeReportTests(unittest.TestCase):
@@ -402,6 +429,13 @@ class DecodeReportTests(unittest.TestCase):
             self.assertEqual(first_clean.name, "repeat_0.clean.txt")
             self.assertEqual(first_raw.read_text(encoding="utf-8"), "A\x00BC")
             self.assertEqual(first_clean.read_text(encoding="utf-8"), "ABC")
+            self.assertEqual(manifest["artifacts"][0]["raw_text_chars"], 4)
+            self.assertEqual(manifest["artifacts"][0]["clean_text_chars"], 3)
+            self.assertEqual(
+                manifest["artifacts"][0]["clean_text_sha256"],
+                common.sha256_text("ABC"),
+            )
+            self.assertTrue(manifest["artifacts"][0]["clean_text_nonempty_after_strip"])
 
     def test_decode_report_rejects_bad_repeat_records_with_runtime_error(self) -> None:
         from tools.bench import decode_e2e_report

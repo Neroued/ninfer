@@ -65,6 +65,7 @@ REPEAT_FIELDS = (
     "prefill_output_tokens",
     "decode_loop_tokens",
     "generated_tokens_total",
+    "prefill_prompt_tok_s",
     "decode_eager_tok_s",
     "decode_eager_tok_s_valid",
     "e2e_excluding_load_tok_s",
@@ -205,6 +206,13 @@ def _validate_repeat(repeat: dict[str, Any], case_name: str) -> None:
     if generated_tokens_total != 1 + decode_loop_tokens:
         raise ReportValidationError(f"{case_name}.generated_tokens_total must equal 1 + decode_loop_tokens")
 
+    prefill_tok_s = require_number(
+        repeat["prefill_prompt_tok_s"],
+        f"{case_name}.prefill_prompt_tok_s",
+    )
+    if prefill_tok_s < 0.0:
+        raise ReportValidationError(f"{case_name}.prefill_prompt_tok_s must be nonnegative")
+
     valid = repeat["decode_eager_tok_s_valid"]
     if decode_loop_tokens == 0:
         if repeat["decode_eager_tok_s"] is not None or valid is not False:
@@ -255,6 +263,16 @@ def _validate_case(case: dict[str, Any]) -> None:
 
     if "decode_eager_tok_s_median" not in summary:
         raise ReportValidationError(f"{name}.summary missing decode_eager_tok_s_median")
+    if "prefill_prompt_tok_s_median" not in summary:
+        raise ReportValidationError(f"{name}.summary missing prefill_prompt_tok_s_median")
+    prefill_median = require_number(
+        summary["prefill_prompt_tok_s_median"],
+        f"{name}.summary.prefill_prompt_tok_s_median",
+    )
+    if prefill_median < 0.0:
+        raise ReportValidationError(
+            f"{name}.summary.prefill_prompt_tok_s_median must be nonnegative"
+        )
     has_valid_decode_throughput = any(
         repeat["decode_eager_tok_s_valid"] is True for repeat in checked_repeats
     )

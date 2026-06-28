@@ -83,10 +83,14 @@ struct LowbitGemvGroup<Q5Codec> {
         const float scale = __half2float(__ushort_as_half(sb));
         const std::uint8_t* packed =
             payload + off + 64 * 2 + static_cast<std::int64_t>(rit) * Q5Codec::kBytesPerRowPerGroup;
-        const auto* words = reinterpret_cast<const std::uint32_t*>(packed);
+        const auto* word_pairs = reinterpret_cast<const std::uint64_t*>(packed);
         std::uint32_t w[11];
 #pragma unroll
-        for (int j = 0; j < 10; ++j) { w[j] = words[j]; }
+        for (int j = 0; j < 5; ++j) {
+            const std::uint64_t pair = word_pairs[j];
+            w[j * 2]                 = static_cast<std::uint32_t>(pair);
+            w[j * 2 + 1]             = static_cast<std::uint32_t>(pair >> 32);
+        }
         w[10] = 0u;
 #pragma unroll
         for (int offset = 0; offset < Q5Codec::kGroupK; offset += 2) {

@@ -597,3 +597,100 @@ compute-sanitizer ./build/tests/qus_linear_test
 
 All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
 errors`.
+
+## Q4 Round 3 - Q4 mlp.gate/up [17408,5120]
+
+Subagent model/effort: gpt-5.5, xhigh.
+
+Target: Q4 `mlp.gate/up [17408,5120]`, launch 0 of:
+
+```bash
+./build/bench/qus_linear_bench --decode --q4
+```
+
+NCU kernel filter:
+
+```bash
+--kernel-name regex:'linear_tuned_lowbit_gemv_kernel' --launch-skip 0 --launch-count 1
+```
+
+Artifacts:
+
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/baseline_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/baseline_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/baseline_detailed.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/baseline_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/baseline_instr_sched.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/baseline_global_loads.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/baseline_stall_reasons.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/after_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/after_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/after_detailed.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/after_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/after_instr_sched.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/after_global_loads.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q4-mlp-gate-up/after_stall_reasons.ncu.{rep,csv,txt}`
+
+### Diagnosis
+
+The round-3 baseline showed the round-2 Q4 x4 path was no longer sector-inflation limited, but still
+had x4-path load-instruction and issue pressure. DRAM was 55.16%, Memory SOL and Compute SOL were
+both 82.05%, achieved occupancy was 83.14%, registers were 39/thread, and local/shared spilling was
+zero. Scheduler metrics showed 2.15 eligible warps per scheduler and 0.59 issued warp per scheduler.
+The top stall remained long scoreboard at 7.3 cycles, 42.7% of cycles between issued instructions;
+normalized stall metrics also showed not-selected at 15.12%, MIO throttle at 12.25%, and LG throttle
+at 8.84%. Global-load traffic matched round 2: 5,570,560 global-load instructions and 9,748,480
+L1TEX sectors.
+
+Single change: specialize only Q4's full-K64 x4 path so lanes 0-3 cooperatively issue the four scale
+halfword loads, one lane per group, then broadcast them with shuffles after the packed-byte and `x`
+loads are issued. This replaces four serial lane-0 byte-pair scale loads in the x4 fast path. The
+tail path, Q5/Q6 paths, public API, q5090 ABI, tests, CMake, registry routing, and externally
+workspace-free contract are unchanged.
+
+### Metrics
+
+| metric | before | after |
+| --- | ---: | ---: |
+| NCU duration | 51.90 us | 47.90 us |
+| DRAM throughput | 55.16% | 60.00% |
+| Memory SOL | 82.05% | 60.00% |
+| Compute SOL | 82.05% | 58.85% |
+| L1/TEX throughput | 89.08% | 69.00% |
+| achieved occupancy | 83.14% | 82.75% |
+| registers/thread | 39 | 36 |
+| spills/local memory | 0 | 0 |
+| long scoreboard | 7.3 cycles, 42.7% | 11.3 cycles, 66.9% |
+| top normalized stall | long scoreboard, 46.15% | long scoreboard, 68.72% |
+| second normalized stall | not selected, 15.12% | not selected, 10.66% |
+| MIO throttle | 12.25% | 1.43% |
+| LG throttle | 8.84% | 0.65% |
+| eligible warps/scheduler | 2.15 | 1.65 |
+| issued warp/scheduler | 0.59 | 0.59 |
+| global-load instructions | 5,570,560 | 3,133,440 |
+| global-load L1TEX sectors | 9,748,480 | 8,355,840 |
+| global-load requested bytes | 311.95 MB | 267.39 MB |
+| global-load data bytes | 225.61 MB | 225.61 MB |
+| total SM instructions | 37,183,488 | 32,657,408 |
+| source coalescing warning | no warning | 1,044,480 excessive sectors |
+| source branch instructions | 452,608 | 452,608 |
+
+Accepted with concern: the diagnosed x4 load-instruction pressure improved materially. Global-load
+instructions dropped by 43.75%, L1TEX sectors dropped by 14.29%, total SM instructions dropped by
+12.18%, MIO/LG throttling fell sharply, registers dropped, DRAM throughput rose by 4.84 points, and
+NCU duration improved by 7.71% with no spills or correctness regression. This does not meet the Task
+4 target (`>=70%` DRAM and near `C = 82.76%`). The concern is that the cooperative scale load creates
+a small scattered-scale access warning and shifts the remaining limiter harder onto L1TEX long
+scoreboard; eligible warps per scheduler also fell. The next round should target latency hiding or
+cache behavior rather than another pure instruction-count cleanup.
+
+### Verification
+
+```bash
+cmake --build build -j
+ctest --test-dir build -R qus_linear_test --output-on-failure
+compute-sanitizer ./build/tests/qus_linear_test
+```
+
+All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
+errors`.

@@ -221,6 +221,19 @@ __device__ __forceinline__ std::uint32_t q4_load_scale_bits(const std::uint8_t* 
     return __shfl_sync(0xffffffffu, scale_bits, 0);
 }
 
+__device__ __forceinline__ std::uint32_t q4_load_scale_bits_x4_lane(
+    const std::uint8_t* payload, std::int64_t off0, std::int32_t rit, int lane) {
+    std::uint32_t lane_scale_bits = 0u;
+    if (lane < 4) {
+        const std::int64_t scale_off =
+            off0 + static_cast<std::int64_t>(lane) * Q4Codec::kTileBytes +
+            static_cast<std::int64_t>(rit) * 2;
+        lane_scale_bits =
+            static_cast<std::uint32_t>(*reinterpret_cast<const std::uint16_t*>(payload + scale_off));
+    }
+    return lane_scale_bits;
+}
+
 __device__ __forceinline__ float q4_accumulate_lane_pair(
     const std::uint8_t* payload, const __nv_bfloat16* x, std::int32_t tile, std::int32_t rit,
     std::int32_t group, std::int32_t group_cnt, std::int32_t base_k, std::int32_t limit, int lane,
@@ -284,10 +297,8 @@ __global__ void linear_tuned_lowbit_gemv_kernel<Q4Codec>(const __nv_bfloat16* x,
         const std::int64_t off2 = off1 + Q4Codec::kTileBytes;
         const std::int64_t off3 = off2 + Q4Codec::kTileBytes;
 
-        const std::uint32_t scale_bits0 = q4_load_scale_bits(payload, off0, rit, lane);
-        const std::uint32_t scale_bits1 = q4_load_scale_bits(payload, off1, rit, lane);
-        const std::uint32_t scale_bits2 = q4_load_scale_bits(payload, off2, rit, lane);
-        const std::uint32_t scale_bits3 = q4_load_scale_bits(payload, off3, rit, lane);
+        const std::uint32_t lane_scale_bits =
+            q4_load_scale_bits_x4_lane(payload, off0, rit, lane);
 
         const std::uint8_t* packed0 = payload + off0 + 64 * 2 +
                                       static_cast<std::int64_t>(rit) *
@@ -323,6 +334,10 @@ __global__ void linear_tuned_lowbit_gemv_kernel<Q4Codec>(const __nv_bfloat16* x,
         const int s21 = static_cast<int>(((bits2 >> 4) & 0x0fu) << 28) >> 28;
         const int s30 = static_cast<int>((bits3 & 0x0fu) << 28) >> 28;
         const int s31 = static_cast<int>(((bits3 >> 4) & 0x0fu) << 28) >> 28;
+        const std::uint32_t scale_bits0 = __shfl_sync(0xffffffffu, lane_scale_bits, 0);
+        const std::uint32_t scale_bits1 = __shfl_sync(0xffffffffu, lane_scale_bits, 1);
+        const std::uint32_t scale_bits2 = __shfl_sync(0xffffffffu, lane_scale_bits, 2);
+        const std::uint32_t scale_bits3 = __shfl_sync(0xffffffffu, lane_scale_bits, 3);
         const float scale0 =
             __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits0)));
         const float scale1 =

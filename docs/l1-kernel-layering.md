@@ -17,7 +17,9 @@ document fixes **how those operators are physically organized**, not what each o
 
 **Design principles**
 - **Organize by layer, not by operator family.** No `gemm/`, `attention/`, `gdn/` … subfolders.
-  Each layer is one flat folder; an operator's files are distinguished by filename.
+  Each layer is one flat folder; an operator's files are distinguished by filename. **One documented
+  exception:** the M3 `linear` backend is large enough to own a dedicated `src/kernels/linear/`
+  subtree (see §3.1); every other operator stays flat.
 - **Four layers per operator**, top to bottom: **api → wrapper → launcher → kernel**. The folder
   order reads as the call chain.
 - **One responsibility per layer.** Validation and dispatch are host concerns (wrapper); launch
@@ -92,6 +94,29 @@ src/kernels/kernel/gqa_attention_decode.cuh
 
 The wrapper stays **one file per operator** even when there are several variants — it is the single
 place that decides which variant to launch.
+
+### 3.1 Exception: the `linear` backend subtree
+
+`linear` is the sole operator that does not use the flat `wrapper/ launcher/ kernel/` folders. The M3
+q5090 GEMV/GEMM backend (see [`m3-linear-backend-framework.md`](m3-linear-backend-framework.md)) is
+large enough — multiple formats, shape families, regimes, codecs, and tuned backends — that a flat
+layout would scatter it across the shared folders. Its whole private implementation therefore lives in
+a dedicated `src/kernels/linear/` subtree, organized by responsibility rather than by layer:
+
+```
+src/kernels/linear/
+  linear.cpp                 # wrapper (host/gcc): validate + classify + switch dispatch
+  plan/linear_plan.h         # device-free keys, registry, classify_*, constexpr table + switch
+  codec/linear_codec.cuh     # qtype/layout decode primitives (group/tile granularity)
+  reference/linear_generic_*.{h,cu,cuh}  # Generic bootstrap GEMV/GEMM (codec-driven)
+  gemv/  gemm/               # tuned plans, added per performance phase
+```
+
+The four-layer **responsibilities** are unchanged — only their physical grouping is. The host/device
+compiler boundary still holds by extension (`.cpp` = host wrapper, `.cu` = launcher, `.cuh` = device
+kernel header), the public header stays at `include/qus/kernels/linear.h`, and the recursive build
+glob (§7) picks the subtree up with no CMake edit. The public `linear` API does not change. This
+exception applies to `linear` only; do not create per-operator subfolders for other ops.
 
 ---
 

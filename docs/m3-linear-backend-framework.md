@@ -937,41 +937,47 @@ mandatory because `T > 1` is not automatically a large Tensor Core GEMM problem.
 
 ## 19. Integration with existing file layout
 
-The public file remains:
+The public file remains unchanged:
 
 ```text
 include/qus/kernels/linear.h
 ```
 
-The wrapper remains:
+`linear` is the one L1 operator that does **not** use the flat `wrapper/ launcher/ kernel/` layout.
+Because the M3 backend is large, its whole private implementation lives in a dedicated
+`src/kernels/linear/` subtree, organized by responsibility. This exception is recorded in
+`l1-kernel-layering.md` §3.1; every other operator stays flat.
 
 ```text
-src/kernels/wrapper/linear.cpp
+src/kernels/linear/
+  linear.cpp                            # wrapper (host/gcc): validate -> classify -> switch dispatch
+  plan/
+    linear_plan.h                       # device-free: LinearFormat / ShapeFamily / LinearRegime,
+                                        #   LinearPlanKey / LinearPlan, classify_*, constexpr registry + switch
+  codec/
+    linear_codec.cuh                    # WeightCodecTraits + device decode primitives (group/tile)
+  reference/
+    linear_generic.h                    # detail launch prototypes
+    linear_generic_gemv.{cu,cuh}        # Generic GEMV (T==1), codec-driven, correctness
+    linear_generic_gemm.{cu,cuh}        # Generic GEMM (T>1), codec-driven, correctness
+  gemv/                                 # tuned GEMV plans (added per performance phase)
+  gemm/                                 # tuned GEMM plans (added per performance phase)
 ```
 
-Possible private files, preserving the current flat L1 organization:
+The old flat `src/kernels/{wrapper,launcher,kernel}/linear*` files are removed (no backward
+compatibility). The build glob is recursive, so the subtree needs no CMake change; private headers
+still resolve as `kernels/linear/...`.
+
+Layer responsibilities are unchanged, only relocated:
 
 ```text
-src/kernels/launcher/linear.h
-src/kernels/launcher/linear_gemv_*.cu
-src/kernels/launcher/linear_gemm_*.cu
-src/kernels/kernel/linear_plan.cuh
-src/kernels/kernel/linear_shape.cuh
-src/kernels/kernel/linear_codec.cuh
-src/kernels/kernel/linear_gemv_*.cuh
-src/kernels/kernel/linear_gemm_*.cuh
+api      : public declaration only            (include/qus/kernels/linear.h)
+wrapper  : validation + classify + dispatch   (linear/linear.cpp, host)
+plan     : keys, registry, switch, codec seam (linear/plan, linear/codec)
+backend  : templated device compute           (linear/reference, later linear/gemv, linear/gemm)
 ```
 
 No separate public dispatcher object is required.
-
-Keep the existing layering:
-
-```text
-api      : public declaration only
-wrapper  : validation + plan dispatch
-launcher : launch configuration and explicit instantiation seam
-kernel   : templated device compute
-```
 
 ---
 

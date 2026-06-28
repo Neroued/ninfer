@@ -55,9 +55,8 @@ class FakeTokenizer:
         return [ord(ch) for ch in rendered]
 
     def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
-        if skip_special_tokens:
-            raise AssertionError("decode sidecars must preserve generated ids")
-        return "".join(chr(i) for i in ids)
+        values = [i for i in ids if not skip_special_tokens or i != 0]
+        return "".join(chr(i) for i in values)
 
 
 class TokenizerCommonTests(unittest.TestCase):
@@ -339,26 +338,39 @@ class LongPromptGeneratorTests(unittest.TestCase):
 
 
 class DecodeReportTests(unittest.TestCase):
+    def _report(self, repeats: list[object]) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "artifact_type": "qus_e2e_benchmark_report",
+            "status": "ok",
+            "cases": [
+                {
+                    "name": "cn_short",
+                    "prompt_format": common.PROMPT_FORMAT,
+                    "messages_path": "bench/fixtures/prompts/cn_short.messages.json",
+                    "messages_sha256": "1" * 64,
+                    "rendered_prompt_sha256": "2" * 64,
+                    "add_generation_prompt": common.ADD_GENERATION_PROMPT,
+                    "add_special_tokens": common.ADD_SPECIAL_TOKENS,
+                    "chat_template_kwargs": common.CHAT_TEMPLATE_KWARGS,
+                    "stop_token_ids": common.STOP_TOKEN_IDS,
+                    "repeats": repeats,
+                }
+            ],
+        }
+
     def test_decode_report_writes_sidecar_manifest_and_text(self) -> None:
         from tools.bench import decode_e2e_report
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             report_path = root / "report.json"
-            report = {
-                "schema_version": 1,
-                "artifact_type": "qus_e2e_benchmark_report",
-                "status": "ok",
-                "cases": [
-                    {
-                        "name": "cn_short",
-                        "repeats": [
-                            {"repeat_index": 0, "generated_token_ids": [65, 66, 67]},
-                            {"repeat_index": 1, "generated_token_ids": [68, 69]},
-                        ],
-                    }
-                ],
-            }
+            report = self._report(
+                [
+                    {"repeat_index": 0, "generated_token_ids": [65, 0, 66, 67]},
+                    {"repeat_index": 1, "generated_token_ids": [68, 69]},
+                ]
+            )
             report_path.write_text(json.dumps(report), encoding="utf-8")
             metadata = {
                 "tokenizer_source": "local_hf",
@@ -367,6 +379,8 @@ class DecodeReportTests(unittest.TestCase):
                 "tokenizer_json_sha256": "tok",
                 "tokenizer_config_sha256": "cfg",
                 "special_tokens_map_sha256": "special",
+                "chat_template_jinja_sha256": "chat",
+                "generation_config_sha256": "gen",
             }
             manifest = decode_e2e_report.decode_report(
                 report_path=report_path,
@@ -380,8 +394,95 @@ class DecodeReportTests(unittest.TestCase):
             self.assertEqual(len(manifest["artifacts"]), 2)
             manifest_path = root / "report.decoded" / "manifest.json"
             self.assertTrue(manifest_path.exists())
-            first = Path(manifest["artifacts"][0]["decoded_text_path"])
-            self.assertEqual(first.read_text(encoding="utf-8"), "ABC")
+            self.assertEqual(manifest["prompt_format"], common.PROMPT_FORMAT)
+            self.assertEqual(manifest["chat_template_kwargs"], common.CHAT_TEMPLATE_KWARGS)
+            first_raw = Path(manifest["artifacts"][0]["raw_text_path"])
+            first_clean = Path(manifest["artifacts"][0]["clean_text_path"])
+            self.assertEqual(first_raw.name, "repeat_0.raw.txt")
+            self.assertEqual(first_clean.name, "repeat_0.clean.txt")
+            self.assertEqual(first_raw.read_text(encoding="utf-8"), "A\x00BC")
+            self.assertEqual(first_clean.read_text(encoding="utf-8"), "ABC")
+
+    def test_decode_report_rejects_bad_repeat_records_with_runtime_error(self) -> None:
+        from tools.bench import decode_e2e_report
+
+        bad_reports = {
+            "non_dict_repeat": self._report(["not-a-repeat"]),
+            "bad_repeat_index": self._report(
+                [{"repeat_index": "not-an-int", "generated_token_ids": [65]}]
+            ),
+            "bool_repeat_index": self._report(
+                [{"repeat_index": True, "generated_token_ids": [65]}]
+            ),
+            "bool_generated_token_id": self._report(
+                [{"repeat_index": 0, "generated_token_ids": [65, True]}]
+            ),
+            "empty_generated_token_ids": self._report(
+                [{"repeat_index": 0, "generated_token_ids": []}]
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, report in bad_reports.items():
+                with self.subTest(name=name):
+                    report_path = root / f"{name}.json"
+                    report_path.write_text(json.dumps(report), encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "repeat"):
+                        decode_e2e_report.decode_report(
+                            report_path=report_path,
+                            tokenizer=FakeTokenizer(),
+                            tokenizer_metadata=common.tokenizer_metadata(
+                                Path(tmp),
+                                redact_path=True,
+                            ),
+                            output_dir=None,
+                        )
+
+    def test_decode_report_rejects_bad_case_chat_identity(self) -> None:
+        from tools.bench import decode_e2e_report
+
+        def stale_eos_token_id() -> dict[str, object]:
+            report = self._report([{"repeat_index": 0, "generated_token_ids": [65]}])
+            report["cases"][0]["eos_token_id"] = -1
+            return report
+
+        def bool_stop_token_ids() -> dict[str, object]:
+            report = self._report([{"repeat_index": 0, "generated_token_ids": [65]}])
+            report["cases"][0]["stop_token_ids"] = [True]
+            return report
+
+        def bad_prompt_format() -> dict[str, object]:
+            report = self._report([{"repeat_index": 0, "generated_token_ids": [65]}])
+            report["cases"][0]["prompt_format"] = "raw-text"
+            return report
+
+        def bad_chat_template_kwargs() -> dict[str, object]:
+            report = self._report([{"repeat_index": 0, "generated_token_ids": [65]}])
+            report["cases"][0]["chat_template_kwargs"] = {"enable_thinking": 0}
+            return report
+
+        bad_reports = {
+            "stale_eos_token_id": stale_eos_token_id(),
+            "bool_stop_token_ids": bool_stop_token_ids(),
+            "bad_prompt_format": bad_prompt_format(),
+            "bad_chat_template_kwargs": bad_chat_template_kwargs(),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, report in bad_reports.items():
+                with self.subTest(name=name):
+                    report_path = root / f"{name}.json"
+                    report_path.write_text(json.dumps(report), encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "case"):
+                        decode_e2e_report.decode_report(
+                            report_path=report_path,
+                            tokenizer=FakeTokenizer(),
+                            tokenizer_metadata=common.tokenizer_metadata(
+                                Path(tmp),
+                                redact_path=True,
+                            ),
+                            output_dir=None,
+                        )
 
     def test_decode_report_rejects_non_ok_report(self) -> None:
         from tools.bench import decode_e2e_report

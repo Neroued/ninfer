@@ -111,16 +111,23 @@ def _compare_case_identity(base_case: dict[str, Any], cand_case: dict[str, Any],
         "fixture_set",
         "fixture_manifest_path",
         "fixture_manifest_sha256",
+        "prompt_format",
+        "messages_path",
+        "messages_sha256",
+        "rendered_prompt_sha256",
+        "add_generation_prompt",
+        "add_special_tokens",
+        "chat_template_kwargs",
+        "stop_token_ids",
         "prompt_ids_path",
         "prompt_ids_sha256",
         "prompt_tokens",
         "requested_max_new_tokens",
-        "eos_token_id",
     )
     changed = {
         field: (base_case.get(field), cand_case.get(field))
         for field in fields
-        if base_case.get(field) != cand_case.get(field)
+        if not _identity_value_equal(base_case.get(field), cand_case.get(field))
     }
     if changed:
         result.add_failure(
@@ -129,6 +136,20 @@ def _compare_case_identity(base_case: dict[str, Any], cand_case: dict[str, Any],
             case=base_case["name"],
             fields=changed,
         )
+
+
+def _identity_value_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        if set(left) != set(right):
+            return False
+        return all(_identity_value_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        if len(left) != len(right):
+            return False
+        return all(_identity_value_equal(old, new) for old, new in zip(left, right))
+    return left == right
 
 
 def _compare_tokens(base_case: dict[str, Any], cand_case: dict[str, Any], result: CompareResult) -> None:

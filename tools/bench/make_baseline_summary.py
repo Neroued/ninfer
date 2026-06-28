@@ -27,11 +27,18 @@ def _case_summary(case: dict[str, Any]) -> dict[str, Any]:
         "fixture_set": case["fixture_set"],
         "fixture_manifest_path": case["fixture_manifest_path"],
         "fixture_manifest_sha256": case["fixture_manifest_sha256"],
+        "prompt_format": case["prompt_format"],
+        "messages_path": case["messages_path"],
+        "messages_sha256": case["messages_sha256"],
+        "rendered_prompt_sha256": case["rendered_prompt_sha256"],
+        "add_generation_prompt": case["add_generation_prompt"],
+        "add_special_tokens": case["add_special_tokens"],
+        "chat_template_kwargs": case["chat_template_kwargs"],
+        "stop_token_ids": case["stop_token_ids"],
         "prompt_ids_path": case["prompt_ids_path"],
         "prompt_ids_sha256": case["prompt_ids_sha256"],
         "prompt_tokens": case["prompt_tokens"],
         "requested_max_new_tokens": case["requested_max_new_tokens"],
-        "eos_token_id": case["eos_token_id"],
         "warmup_repeats": case["warmup_repeats"],
         "measured_repeats": case["measured_repeats"],
         "deterministic_token_ids": summary.get("deterministic_token_ids"),
@@ -102,6 +109,8 @@ def _decoded_manifest(decoded_manifest_path: Path | None) -> dict[str, Any]:
         "tokenizer_json_sha256",
         "tokenizer_config_sha256",
         "special_tokens_map_sha256",
+        "chat_template_jinja_sha256",
+        "generation_config_sha256",
     ):
         _require_key(tokenizer, field, "decoded manifest tokenizer")
     if tokenizer["tokenizer_path"] != "":

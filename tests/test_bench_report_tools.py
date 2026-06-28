@@ -13,6 +13,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.bench import e2e_report_common as common  # noqa: E402
+from tools.bench import tokenizer_common  # noqa: E402
+
+
+SHA_FIXTURE = "1" * 64
+SHA_CN_IDS = "2" * 64
+SHA_LONG_IDS = "3" * 64
+SHA_CN_MESSAGES = "4" * 64
+SHA_LONG_MESSAGES = "5" * 64
+SHA_CN_RENDERED = "6" * 64
+SHA_LONG_RENDERED = "7" * 64
 
 
 def arena(name: str, peak: int) -> dict[str, object]:
@@ -69,12 +79,19 @@ def case(
         "name": name,
         "fixture_set": "m2.8-v1",
         "fixture_manifest_path": "bench/fixtures/prompts/m2.8-v1.manifest.json",
-        "fixture_manifest_sha256": "fixture-sha",
+        "fixture_manifest_sha256": SHA_FIXTURE,
+        "prompt_format": tokenizer_common.PROMPT_FORMAT,
+        "messages_path": f"bench/fixtures/prompts/{name}.messages.json",
+        "messages_sha256": SHA_LONG_MESSAGES if name == "long_2k" else SHA_CN_MESSAGES,
+        "rendered_prompt_sha256": SHA_LONG_RENDERED if name == "long_2k" else SHA_CN_RENDERED,
+        "add_generation_prompt": tokenizer_common.ADD_GENERATION_PROMPT,
+        "add_special_tokens": tokenizer_common.ADD_SPECIAL_TOKENS,
+        "chat_template_kwargs": dict(tokenizer_common.CHAT_TEMPLATE_KWARGS),
+        "stop_token_ids": list(tokenizer_common.STOP_TOKEN_IDS),
         "prompt_ids_path": f"bench/fixtures/prompts/{name}.ids",
-        "prompt_ids_sha256": f"{name}-ids-sha",
+        "prompt_ids_sha256": SHA_LONG_IDS if name == "long_2k" else SHA_CN_IDS,
         "prompt_tokens": prompt_tokens,
         "requested_max_new_tokens": requested_max_new_tokens,
-        "eos_token_id": -1,
         "max_context": 4096,
         "decode_loop_tokens_requested": decode_loop_tokens_requested,
         "required_max_context": required_max_context,
@@ -207,6 +224,52 @@ class ReportCommonTests(unittest.TestCase):
         with self.assertRaises(common.ReportValidationError):
             common.validate_report(bad)
 
+    def test_validate_report_rejects_bool_generated_token_id(self) -> None:
+        bad = report()
+        bad["cases"][0]["repeats"][0]["generated_token_ids"] = [10, True, 12]
+        with self.assertRaises(common.ReportValidationError):
+            common.validate_report(bad)
+
+    def test_validate_report_rejects_bool_repeat_index(self) -> None:
+        bad = report()
+        bad["cases"][0]["repeats"][0]["repeat_index"] = True
+        with self.assertRaises(common.ReportValidationError):
+            common.validate_report(bad)
+
+    def test_validate_report_rejects_any_eos_token_id(self) -> None:
+        bad = report()
+        bad["cases"][0]["eos_token_id"] = -1
+        with self.assertRaisesRegex(
+            common.ReportValidationError,
+            "report schema uses stop_token_ids; eos_token_id is not allowed and report must be regenerated",
+        ):
+            common.validate_report(bad)
+
+    def test_validate_report_rejects_bad_chat_identity_fields(self) -> None:
+        mutations = {
+            "prompt_format": lambda value: value["cases"][0].__setitem__(
+                "prompt_format", "raw-text"
+            ),
+            "messages_sha256": lambda value: value["cases"][0].__setitem__(
+                "messages_sha256", "not-a-sha"
+            ),
+            "rendered_prompt_sha256": lambda value: value["cases"][0].__setitem__(
+                "rendered_prompt_sha256", "A" * 64
+            ),
+            "chat_template_kwargs": lambda value: value["cases"][0].__setitem__(
+                "chat_template_kwargs", {"enable_thinking": True}
+            ),
+            "chat_template_kwargs_int_bool": lambda value: value["cases"][0].__setitem__(
+                "chat_template_kwargs", {"enable_thinking": 0}
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                bad = report()
+                mutate(bad)
+                with self.assertRaises(common.ReportValidationError):
+                    common.validate_report(bad)
+
 
 class CompareReportTests(unittest.TestCase):
     def test_identical_reports_compare_cleanly(self) -> None:
@@ -228,16 +291,50 @@ class CompareReportTests(unittest.TestCase):
         from tools.bench import compare_e2e_reports
 
         candidate = report()
-        candidate["cases"][0]["prompt_ids_sha256"] = "different"
+        candidate["cases"][0]["prompt_ids_sha256"] = "8" * 64
         result = compare_e2e_reports.compare_reports(report(), candidate)
         self.assertTrue(any(item["code"] == "case_identity_changed" for item in result.failures))
 
-    def test_eos_policy_change_is_hard_failure(self) -> None:
+    def test_stop_token_ids_change_is_hard_failure(self) -> None:
         from tools.bench import compare_e2e_reports
 
         candidate = report()
-        candidate["cases"][0]["eos_token_id"] = 151645
+        candidate["cases"][0]["stop_token_ids"] = [248046]
         result = compare_e2e_reports.compare_reports(report(), candidate)
+        self.assertTrue(any(item["code"] == "case_identity_changed" for item in result.failures))
+
+    def test_chat_identity_changes_are_hard_failures(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        mutations = {
+            "prompt_format": lambda value: value["cases"][0].__setitem__(
+                "prompt_format", "raw-text"
+            ),
+            "messages_sha256": lambda value: value["cases"][0].__setitem__(
+                "messages_sha256", "8" * 64
+            ),
+            "rendered_prompt_sha256": lambda value: value["cases"][0].__setitem__(
+                "rendered_prompt_sha256", "9" * 64
+            ),
+            "chat_template_kwargs": lambda value: value["cases"][0].__setitem__(
+                "chat_template_kwargs", {"enable_thinking": True}
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                candidate = report()
+                mutate(candidate)
+                result = compare_e2e_reports.compare_reports(report(), candidate)
+                self.assertTrue(result.failures)
+
+    def test_chat_template_kwargs_int_bool_is_case_identity_change(self) -> None:
+        from tools.bench import compare_e2e_reports
+
+        baseline = report()["cases"][0]
+        candidate = report()["cases"][0]
+        candidate["chat_template_kwargs"] = {"enable_thinking": 0}
+        result = compare_e2e_reports.CompareResult()
+        compare_e2e_reports._compare_case_identity(baseline, candidate, result)
         self.assertTrue(any(item["code"] == "case_identity_changed" for item in result.failures))
 
     def test_missing_q5090_identity_is_hard_failure_by_default(self) -> None:
@@ -256,7 +353,7 @@ class CompareReportTests(unittest.TestCase):
         from tools.bench import compare_e2e_reports
 
         candidate = report()
-        candidate["cases"][0]["eos_token_id"] = 151645
+        candidate["cases"][0]["stop_token_ids"] = [248046]
         candidate["weights"]["q5090_sha256"] = "different"
         candidate["cases"][0]["repeats"][0]["generated_token_ids"] = [10, 99, 12]
         result = compare_e2e_reports.compare_reports(report(), candidate, skip_token_id_check=True)
@@ -420,7 +517,21 @@ class BaselineSummaryTests(unittest.TestCase):
             self.assertEqual(summary["workspace_lifetime_policy"], "step_reset")
             self.assertFalse(summary["hidden_device_allocations"])
             self.assertEqual([case["name"] for case in summary["cases"]], ["cn_short", "long_2k"])
-            self.assertEqual(summary["cases"][0]["eos_token_id"], -1)
+            self.assertEqual(summary["cases"][0]["prompt_format"], tokenizer_common.PROMPT_FORMAT)
+            self.assertEqual(
+                summary["cases"][0]["messages_path"],
+                "bench/fixtures/prompts/cn_short.messages.json",
+            )
+            self.assertEqual(summary["cases"][0]["messages_sha256"], SHA_CN_MESSAGES)
+            self.assertEqual(summary["cases"][0]["rendered_prompt_sha256"], SHA_CN_RENDERED)
+            self.assertTrue(summary["cases"][0]["add_generation_prompt"])
+            self.assertFalse(summary["cases"][0]["add_special_tokens"])
+            self.assertEqual(
+                summary["cases"][0]["chat_template_kwargs"],
+                tokenizer_common.CHAT_TEMPLATE_KWARGS,
+            )
+            self.assertEqual(summary["cases"][0]["stop_token_ids"], tokenizer_common.STOP_TOKEN_IDS)
+            self.assertNotIn("eos_token_id", summary["cases"][0])
 
     def test_smoke_summary_enforces_cn_short_case_and_token_minimum(self) -> None:
         from tools.bench import make_baseline_summary
@@ -550,6 +661,8 @@ class BaselineSummaryTests(unittest.TestCase):
                             "tokenizer_json_sha256": "tok",
                             "tokenizer_config_sha256": "cfg",
                             "special_tokens_map_sha256": "special",
+                            "chat_template_jinja_sha256": "chat",
+                            "generation_config_sha256": "gen",
                         },
                         "artifacts": [],
                     }
@@ -583,6 +696,8 @@ class BaselineSummaryTests(unittest.TestCase):
                             "tokenizer_json_sha256": "tok",
                             "tokenizer_config_sha256": "cfg",
                             "special_tokens_map_sha256": "special",
+                            "chat_template_jinja_sha256": "chat",
+                            "generation_config_sha256": "gen",
                         },
                         "artifacts": [],
                     }

@@ -13,12 +13,17 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from tools.bench import tokenizer_common  # noqa: E402
+
 
 class FakeTokenizer:
+    def __init__(self) -> None:
+        self.calls: list[bool] = []
+
     def decode(self, ids: list[int], skip_special_tokens: bool = False) -> str:
-        if skip_special_tokens:
-            raise AssertionError("decode sidecars must preserve generated ids")
-        return "".join(chr(i) for i in ids)
+        self.calls.append(skip_special_tokens)
+        values = [i for i in ids if not skip_special_tokens or i != 0]
+        return "".join(chr(i) for i in values)
 
 
 class DecodeE2EReportRedactionTests(unittest.TestCase):
@@ -40,8 +45,16 @@ class DecodeE2EReportRedactionTests(unittest.TestCase):
                         "cases": [
                             {
                                 "name": "cn_short",
+                                "prompt_format": tokenizer_common.PROMPT_FORMAT,
+                                "messages_path": "bench/fixtures/prompts/cn_short.messages.json",
+                                "messages_sha256": "1" * 64,
+                                "rendered_prompt_sha256": "2" * 64,
+                                "add_generation_prompt": tokenizer_common.ADD_GENERATION_PROMPT,
+                                "add_special_tokens": tokenizer_common.ADD_SPECIAL_TOKENS,
+                                "chat_template_kwargs": tokenizer_common.CHAT_TEMPLATE_KWARGS,
+                                "stop_token_ids": tokenizer_common.STOP_TOKEN_IDS,
                                 "repeats": [
-                                    {"repeat_index": 0, "generated_token_ids": [65, 66, 67]},
+                                    {"repeat_index": 0, "generated_token_ids": [65, 0, 66, 67]},
                                 ],
                             }
                         ],
@@ -59,13 +72,33 @@ class DecodeE2EReportRedactionTests(unittest.TestCase):
                 "--output-dir",
                 str(output_dir),
             ]
+            fake = FakeTokenizer()
             with mock.patch.object(sys, "argv", argv), mock.patch.object(
-                decode_e2e_report.common, "load_tokenizer", return_value=FakeTokenizer()
+                decode_e2e_report.common, "load_tokenizer", return_value=fake
             ):
                 self.assertEqual(decode_e2e_report.main(), 0)
 
             manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["tokenizer"]["tokenizer_path"], "")
+            self.assertIn("chat_template_jinja_sha256", manifest["tokenizer"])
+            self.assertIn("generation_config_sha256", manifest["tokenizer"])
+            self.assertEqual(manifest["prompt_format"], tokenizer_common.PROMPT_FORMAT)
+            self.assertEqual(
+                manifest["chat_template_kwargs"], tokenizer_common.CHAT_TEMPLATE_KWARGS
+            )
+            self.assertTrue(manifest["add_generation_prompt"])
+            self.assertFalse(manifest["add_special_tokens"])
+            self.assertEqual(manifest["stop_token_ids"], tokenizer_common.STOP_TOKEN_IDS)
+            self.assertEqual(fake.calls, [False, True])
+            artifact = manifest["artifacts"][0]
+            raw_path = Path(artifact["raw_text_path"])
+            clean_path = Path(artifact["clean_text_path"])
+            self.assertTrue(raw_path.exists())
+            self.assertTrue(clean_path.exists())
+            self.assertEqual(raw_path.name, "repeat_0.raw.txt")
+            self.assertEqual(clean_path.name, "repeat_0.clean.txt")
+            self.assertEqual(raw_path.read_text(encoding="utf-8"), "A\x00BC")
+            self.assertEqual(clean_path.read_text(encoding="utf-8"), "ABC")
 
 
 if __name__ == "__main__":

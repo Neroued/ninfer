@@ -6,8 +6,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Iterable
+
+from tools.bench import tokenizer_common
 
 
 class ReportValidationError(ValueError):
@@ -32,11 +35,18 @@ CASE_FIELDS = (
     "fixture_set",
     "fixture_manifest_path",
     "fixture_manifest_sha256",
+    "prompt_format",
+    "messages_path",
+    "messages_sha256",
+    "rendered_prompt_sha256",
+    "add_generation_prompt",
+    "add_special_tokens",
+    "chat_template_kwargs",
+    "stop_token_ids",
     "prompt_ids_path",
     "prompt_ids_sha256",
     "prompt_tokens",
     "requested_max_new_tokens",
-    "eos_token_id",
     "max_context",
     "decode_loop_tokens_requested",
     "required_max_context",
@@ -114,16 +124,74 @@ def require_int(value: Any, label: str, min_value: int | None = None) -> int:
     return value
 
 
+def _is_nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 def _require_fields(obj: dict[str, Any], fields: Iterable[str], label: str) -> None:
     for field in fields:
         if field not in obj:
             raise ReportValidationError(f"{label} missing required field: {field}")
 
 
+def _require_string(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ReportValidationError(f"{label} must be a string")
+    return value
+
+
+def _require_sha256(value: Any, label: str) -> str:
+    text = _require_string(value, label)
+    if re.fullmatch(r"[0-9a-f]{64}", text) is None:
+        raise ReportValidationError(f"{label} must be a 64-char lowercase hex sha256")
+    return text
+
+
+def _validate_chat_identity(case: dict[str, Any], name: str) -> None:
+    if case["prompt_format"] != tokenizer_common.PROMPT_FORMAT:
+        raise ReportValidationError(
+            f"{name}.prompt_format must be {tokenizer_common.PROMPT_FORMAT}"
+        )
+
+    messages_path = _require_string(case["messages_path"], f"{name}.messages_path")
+    if not messages_path or not messages_path.endswith(tokenizer_common.MESSAGE_FILE_SUFFIX):
+        raise ReportValidationError(
+            f"{name}.messages_path must be nonempty and end with "
+            f"{tokenizer_common.MESSAGE_FILE_SUFFIX}"
+        )
+
+    _require_sha256(case["messages_sha256"], f"{name}.messages_sha256")
+    _require_sha256(case["rendered_prompt_sha256"], f"{name}.rendered_prompt_sha256")
+    _require_sha256(case["prompt_ids_sha256"], f"{name}.prompt_ids_sha256")
+
+    if case["add_generation_prompt"] is not tokenizer_common.ADD_GENERATION_PROMPT:
+        raise ReportValidationError(
+            f"{name}.add_generation_prompt must be {tokenizer_common.ADD_GENERATION_PROMPT}"
+        )
+    if case["add_special_tokens"] is not tokenizer_common.ADD_SPECIAL_TOKENS:
+        raise ReportValidationError(
+            f"{name}.add_special_tokens must be {tokenizer_common.ADD_SPECIAL_TOKENS}"
+        )
+    chat_template_kwargs = case["chat_template_kwargs"]
+    if (
+        not isinstance(chat_template_kwargs, dict)
+        or set(chat_template_kwargs) != {"enable_thinking"}
+        or chat_template_kwargs["enable_thinking"] is not False
+    ):
+        raise ReportValidationError(
+            f"{name}.chat_template_kwargs must equal {tokenizer_common.CHAT_TEMPLATE_KWARGS}"
+        )
+
+    stop_token_ids = require_list(case["stop_token_ids"], f"{name}.stop_token_ids")
+    if not stop_token_ids or not all(_is_nonnegative_int(value) for value in stop_token_ids):
+        raise ReportValidationError(f"{name}.stop_token_ids must be nonempty nonnegative ints")
+
+
 def _validate_repeat(repeat: dict[str, Any], case_name: str) -> None:
     _require_fields(repeat, REPEAT_FIELDS, f"repeat in {case_name}")
+    require_int(repeat["repeat_index"], f"{case_name}.repeat_index", 0)
     ids = require_list(repeat["generated_token_ids"], f"{case_name}.generated_token_ids")
-    if not ids or not all(isinstance(value, int) and value >= 0 for value in ids):
+    if not ids or not all(_is_nonnegative_int(value) for value in ids):
         raise ReportValidationError(f"{case_name}.generated_token_ids must be nonempty nonnegative ints")
 
     decode_loop_tokens = require_int(repeat["decode_loop_tokens"], f"{case_name}.decode_loop_tokens", 0)
@@ -150,14 +218,18 @@ def _validate_repeat(repeat: dict[str, Any], case_name: str) -> None:
 
 
 def _validate_case(case: dict[str, Any]) -> None:
+    if "eos_token_id" in case:
+        raise ReportValidationError(
+            "report schema uses stop_token_ids; eos_token_id is not allowed and report must be regenerated"
+        )
     _require_fields(case, CASE_FIELDS, "case")
     name = str(case["name"])
     if not name:
         raise ReportValidationError("case name must be nonempty")
+    _validate_chat_identity(case, name)
 
     prompt_tokens = require_int(case["prompt_tokens"], f"{name}.prompt_tokens", 1)
     requested = require_int(case["requested_max_new_tokens"], f"{name}.requested_max_new_tokens", 1)
-    require_int(case["eos_token_id"], f"{name}.eos_token_id", -1)
     decode_requested = require_int(
         case["decode_loop_tokens_requested"],
         f"{name}.decode_loop_tokens_requested",

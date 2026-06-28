@@ -35,6 +35,7 @@ qus_add_test(qus_qwen_text_tokenizer_test
              SOURCES test_qwen_text_tokenizer.cpp
              NEEDS_SOURCE_DIR)
 target_include_directories(qus_qwen_text_tokenizer_test PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
+qus_add_test(qus_qwen_text_runner_test SOURCES test_qwen_text_runner.cpp)
 qus_add_test(qus_e2e_bench_support_test
              SOURCES test_e2e_bench_support.cpp
                      ${PROJECT_SOURCE_DIR}/bench/e2e_bench_support.cpp

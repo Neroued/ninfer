@@ -143,3 +143,82 @@ compute-sanitizer ./build/tests/qus_linear_test
 
 All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
 errors`.
+
+## Round 3 - Q5 mlp.down [5120,17408]
+
+Subagent model/effort: gpt-5.5, xhigh.
+
+Target: Q5 `mlp.down [5120,17408]`, launch 0 of:
+
+```bash
+./build/bench/qus_linear_bench --decode --q5
+```
+
+NCU kernel filter:
+
+```bash
+--kernel-name regex:'linear_tuned_lowbit_gemv_kernel' --launch-skip 0 --launch-count 1
+```
+
+Artifacts:
+
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/baseline_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/baseline_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/baseline_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/baseline_stalls.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/baseline_instr.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/after_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/after_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/after_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/after_stalls.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round3-q5-mlp-down/after_instr.ncu.{rep,csv,txt}`
+
+### Diagnosis
+
+The round-3 baseline showed the remaining limiter as issue eligibility under L1TEX load latency and
+unpack load pressure. DRAM was still only 21.44%, Memory SOL and Compute SOL were both 38.52%, and
+the scheduler had only 0.76 eligible warps per scheduler. There were no spills, achieved occupancy
+was already about 65.76%, and the top stalls were long scoreboard on L1TEX plus wait. The instruction
+counter pass showed 9,748,480 global-load instructions and 19,496,960 global-load L1TEX sectors.
+
+Single change: in the Q5-specialized row-group kernel, decode the two lane-owned Q5 values from one
+10-bit packed window. This removes the second per-lane Q5 funnel/load window while preserving the
+round-2 row-group schedule, one-warp-per-row ownership, public APIs, q5090 ABI, tests, CMake, and
+registry routing.
+
+### Metrics
+
+| metric | before | after |
+| --- | ---: | ---: |
+| NCU duration | 172.22 us | 169.41 us |
+| DRAM throughput | 21.44% | 22.29% |
+| Memory SOL | 38.52% | 29.04% |
+| Compute SOL | 38.52% | 29.96% |
+| L1/TEX throughput | 40.91% | 30.21% |
+| achieved occupancy | 65.76% | 64.41% |
+| registers/thread | 34 | 30 |
+| spills/local memory | 0 | 0 |
+| long scoreboard | 16.0 cycles, 76.01% | 18.4 cycles, 78.11% |
+| second stall | wait, 9.75% | wait, 9.71% |
+| LG throttle | 1.70% | 0.05% |
+| global-load instructions | 9,748,480 | 6,963,200 |
+| global-load L1TEX sectors | 19,496,960 | 13,926,400 |
+| global-load data bytes | 392.72 MB | 286.88 MB |
+| total SM instructions | 76,943,360 | 69,268,480 |
+
+Accepted with concern: the diagnosed Q5 load/unpack pressure improved materially, registers dropped,
+there were still no spills, DRAM improved by 0.85 points, and NCU duration improved by 1.63%. This
+does not meet the Task 4 target, and the top L1TEX long-scoreboard stall remains binding; its
+per-issued-instruction stall cost rose after the instruction count dropped. The next round should
+target latency hiding or `x`/payload staging rather than another local bit-extraction cleanup.
+
+### Verification
+
+```bash
+cmake --build build -j
+ctest --test-dir build -R qus_linear_test --output-on-failure
+compute-sanitizer ./build/tests/qus_linear_test
+```
+
+All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
+errors`.

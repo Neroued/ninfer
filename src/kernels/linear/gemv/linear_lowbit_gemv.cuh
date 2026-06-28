@@ -209,8 +209,13 @@ __global__ void linear_tuned_lowbit_gemv_kernel(const __nv_bfloat16* x, const st
     if (lane == 0) { out[row] = __float2bfloat16(acc); }
 }
 
-__device__ __forceinline__ std::uint32_t q5_load_row_word(const std::uint32_t* words, int word) {
-    return word < 10 ? words[word] : 0u;
+__device__ __forceinline__ std::uint32_t q5_load_lane_pair_bits(const std::uint32_t* words,
+                                                                int offset) {
+    const int bitpos = offset * Q5Codec::kBits;
+    const int wi     = bitpos >> 5;
+    const int sh     = bitpos & 31;
+    const std::uint32_t hi = wi < 9 ? words[wi + 1] : 0u;
+    return __funnelshift_r(words[wi], hi, sh);
 }
 
 template <>
@@ -259,19 +264,9 @@ __global__ void linear_tuned_lowbit_gemv_kernel<Q5Codec>(const __nv_bfloat16* x,
                                          Q5Codec::kBytesPerRowPerGroup;
         const auto* words = reinterpret_cast<const std::uint32_t*>(packed);
 
-        const int bitpos0          = offset * Q5Codec::kBits;
-        const int wi0              = bitpos0 >> 5;
-        const int sh0              = bitpos0 & 31;
-        const std::uint32_t bits0 =
-            __funnelshift_r(q5_load_row_word(words, wi0), q5_load_row_word(words, wi0 + 1), sh0);
-        const int s0 = static_cast<int>(bits0 << 27) >> 27;
-
-        const int bitpos1          = bitpos0 + Q5Codec::kBits;
-        const int wi1              = bitpos1 >> 5;
-        const int sh1              = bitpos1 & 31;
-        const std::uint32_t bits1 =
-            __funnelshift_r(q5_load_row_word(words, wi1), q5_load_row_word(words, wi1 + 1), sh1);
-        const int s1 = static_cast<int>(bits1 << 27) >> 27;
+        const std::uint32_t pair_bits = q5_load_lane_pair_bits(words, offset);
+        const int s0                  = static_cast<int>(pair_bits << 27) >> 27;
+        const int s1 = static_cast<int>((pair_bits >> Q5Codec::kBits) << 27) >> 27;
 
         if (offset + 1 < limit) {
             const float2 xv =

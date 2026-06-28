@@ -1,5 +1,6 @@
 #include "qus/kernels/linear.h"
 
+#include "kernels/linear/gemv/linear_lowbit_gemv.h"
 #include "kernels/linear/plan/linear_plan.h"
 #include "kernels/linear/reference/linear_generic.h"
 #include "qus/core/weight.h"   // as_dense
@@ -254,6 +255,9 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
         break;
     case detail::LinearPolicyId::GenericLowbitGemm:
         detail::linear_generic_lowbit_gemm_launch(x, w, out, fmt, stream);
+        break;
+    case detail::LinearPolicyId::TunedLowbitGemv:
+        detail::linear_tuned_lowbit_gemv_launch(x, w, out, fmt, stream);
         break;
     case detail::LinearPolicyId::GenericDenseGemv: {
         const Tensor dense = as_dense(w);

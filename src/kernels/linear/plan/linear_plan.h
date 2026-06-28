@@ -37,6 +37,7 @@ enum class LinearPolicyId {
     GenericLowbitGemm,
     GenericDenseGemv,
     GenericDenseGemm,
+    TunedLowbitGemv,
 };
 
 struct LinearPlanKey {

@@ -48,9 +48,10 @@ LinearPlan resolve_plan(LinearPlanKey key) {
     const bool gemv  = (key.regime == LinearRegime::T1);
     const LinearPolicyId policy =
         dense ? (gemv ? LinearPolicyId::GenericDenseGemv  : LinearPolicyId::GenericDenseGemm)
-              : (gemv ? LinearPolicyId::GenericLowbitGemv : LinearPolicyId::GenericLowbitGemm);
-    return LinearPlan{ LinearBackendKind::Reference, policy, policy_name(policy),
-                       /*uses_tensor_cores=*/false };
+              : (gemv ? LinearPolicyId::TunedLowbitGemv   : LinearPolicyId::GenericLowbitGemm);
+    const LinearBackendKind backend = (!dense && gemv) ? LinearBackendKind::Gemv
+                                                       : LinearBackendKind::Reference;
+    return LinearPlan{ backend, policy, policy_name(policy), /*uses_tensor_cores=*/false };
 }
 
 const char* format_name(LinearFormat f) {
@@ -95,6 +96,7 @@ const char* policy_name(LinearPolicyId p) {
     case LinearPolicyId::GenericLowbitGemm: return "linear.ref.lowbit.gemm.generic.v1";
     case LinearPolicyId::GenericDenseGemv:  return "linear.ref.dense.gemv.generic.v1";
     case LinearPolicyId::GenericDenseGemm:  return "linear.ref.dense.gemm.generic.v1";
+    case LinearPolicyId::TunedLowbitGemv:   return "linear.gemv.lowbit.tuned.v1";
     }
     return "linear.ref.unknown";
 }

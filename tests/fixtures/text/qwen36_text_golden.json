@@ -1,0 +1,281 @@
+{
+  "tokenizer_model_id": "Qwen/Qwen3.6-27B",
+  "text_cases": [
+    {
+      "name": "ascii",
+      "text": "Hello, world!",
+      "ids": [
+        9419,
+        11,
+        1814,
+        0
+      ],
+      "raw_decoded": "Hello, world!",
+      "clean_decoded": "Hello, world!"
+    },
+    {
+      "name": "chinese",
+      "text": "你好，世界！",
+      "ids": [
+        109266,
+        3709,
+        96748,
+        6115
+      ],
+      "raw_decoded": "你好，世界！",
+      "clean_decoded": "你好，世界！"
+    },
+    {
+      "name": "leading_space",
+      "text": " leading space",
+      "ids": [
+        6187,
+        3433
+      ],
+      "raw_decoded": " leading space",
+      "clean_decoded": " leading space"
+    },
+    {
+      "name": "trailing_space",
+      "text": "trailing space ",
+      "ids": [
+        371,
+        13868,
+        3433,
+        220
+      ],
+      "raw_decoded": "trailing space ",
+      "clean_decoded": "trailing space "
+    },
+    {
+      "name": "multi_space",
+      "text": "alpha  beta   gamma",
+      "ids": [
+        6918,
+        220,
+        13053,
+        256,
+        20956
+      ],
+      "raw_decoded": "alpha  beta   gamma",
+      "clean_decoded": "alpha  beta   gamma"
+    },
+    {
+      "name": "newline",
+      "text": "line1\nline2",
+      "ids": [
+        1021,
+        16,
+        198,
+        1021,
+        17
+      ],
+      "raw_decoded": "line1\nline2",
+      "clean_decoded": "line1\nline2"
+    },
+    {
+      "name": "emoji",
+      "text": "emoji 😀 test",
+      "ids": [
+        36280,
+        87209,
+        1228
+      ],
+      "raw_decoded": "emoji 😀 test",
+      "clean_decoded": "emoji 😀 test"
+    },
+    {
+      "name": "combining_nfc",
+      "text": "Café",
+      "ids": [
+        34,
+        2492,
+        933
+      ],
+      "raw_decoded": "Café",
+      "clean_decoded": "Café"
+    },
+    {
+      "name": "code",
+      "text": "def f(xs):\n    return xs or []\n",
+      "ids": [
+        727,
+        281,
+        51532,
+        1590,
+        198,
+        262,
+        460,
+        11604,
+        466,
+        2958,
+        198
+      ],
+      "raw_decoded": "def f(xs):\n    return xs or []\n",
+      "clean_decoded": "def f(xs):\n    return xs or []\n"
+    },
+    {
+      "name": "chat_markers",
+      "text": "<|im_start|>user\nhi<|im_end|>\n",
+      "ids": [
+        248045,
+        846,
+        198,
+        5834,
+        248046,
+        198
+      ],
+      "raw_decoded": "<|im_start|>user\nhi<|im_end|>\n",
+      "clean_decoded": "user\nhi\n"
+    },
+    {
+      "name": "thinking_markers",
+      "text": "<think>\n\n</think>\n\n",
+      "ids": [
+        248068,
+        271,
+        248069,
+        271
+      ],
+      "raw_decoded": "<think>\n\n</think>\n\n",
+      "clean_decoded": "<think>\n\n</think>\n\n"
+    }
+  ],
+  "message_cases": [
+    {
+      "name": "prompt_user_cn",
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好，简单介绍一下你自己。"
+        }
+      ],
+      "rendered": "<|im_start|>user\n你好，简单介绍一下你自己。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "ids": [
+        248045,
+        846,
+        198,
+        109266,
+        3709,
+        97561,
+        113552,
+        111522,
+        1710,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069,
+        271
+      ],
+      "raw_decoded": "<|im_start|>user\n你好，简单介绍一下你自己。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "clean_decoded": "user\n你好，简单介绍一下你自己。\nassistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "system_user",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are concise."
+        },
+        {
+          "role": "user",
+          "content": "Describe prefill briefly."
+        }
+      ],
+      "rendered": "<|im_start|>system\nYou are concise.<|im_end|>\n<|im_start|>user\nDescribe prefill briefly.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "ids": [
+        248045,
+        8678,
+        198,
+        2523,
+        513,
+        61446,
+        13,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        72240,
+        829,
+        7320,
+        25899,
+        13,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069,
+        271
+      ],
+      "raw_decoded": "<|im_start|>system\nYou are concise.<|im_end|>\n<|im_start|>user\nDescribe prefill briefly.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "clean_decoded": "system\nYou are concise.\nuser\nDescribe prefill briefly.\nassistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "assistant_history",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Say one word."
+        },
+        {
+          "role": "assistant",
+          "content": "Ready."
+        },
+        {
+          "role": "user",
+          "content": "Now say two words."
+        }
+      ],
+      "rendered": "<|im_start|>user\nSay one word.<|im_end|>\n<|im_start|>assistant\nReady.<|im_end|>\n<|im_start|>user\nNow say two words.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "ids": [
+        248045,
+        846,
+        198,
+        44240,
+        799,
+        3299,
+        13,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        18622,
+        13,
+        248046,
+        198,
+        248045,
+        846,
+        198,
+        6820,
+        1910,
+        1330,
+        4105,
+        13,
+        248046,
+        198,
+        248045,
+        74455,
+        198,
+        248068,
+        271,
+        248069,
+        271
+      ],
+      "raw_decoded": "<|im_start|>user\nSay one word.<|im_end|>\n<|im_start|>assistant\nReady.<|im_end|>\n<|im_start|>user\nNow say two words.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+      "clean_decoded": "user\nSay one word.\nassistant\nReady.\nuser\nNow say two words.\nassistant\n<think>\n\n</think>\n\n"
+    }
+  ],
+  "default_stop_token_ids": [
+    248046,
+    248044
+  ]
+}

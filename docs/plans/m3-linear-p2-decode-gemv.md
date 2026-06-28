@@ -67,17 +67,77 @@ Skill usage rules for this project:
 
 ---
 
+## Performance targets (explicit, measured)
+
+The decode low-bit GEMV streams the quantized weight set once per token, so once the unpack is fixed it
+is a **memory-bound** op; the target is sustained DRAM throughput, measured by `ncu-kernel-profile`
+(`dram__throughput.avg.pct_of_peak_sustained_elapsed`). RTX 5090 peak DRAM ≈ 1.79 TB/s.
+
+Per-kernel gates (ncu, on `qus_linear_bench` at the named shape):
+
+| Metric | Target | Must hold on |
+|---|---|---|
+| Sustained DRAM % of peak | **≥ 85%** | `mlp.down [5120,17408]` (Q5), `mlp.gate/up [17408,5120]` (Q4) |
+| Memory SOL vs Compute SOL | memory-bound (Memory SOL > Compute SOL); unpack stalls negligible | all dominant Q4/Q5/Q6 shapes |
+| Register spills | none (zero local-memory traffic) | all |
+
+- A genuinely occupancy-limited small-`N` shape (e.g. `attn k/v [1024,5120]`) may not reach 85%;
+  record the achieved DRAM %, the limiter (occupancy/tail), and why it is acceptable — do not fail the
+  phase on it. The 85% bar is mandatory only for the two dominant shapes above.
+
+End-to-end gate (nsys, full decode run vs the T1 baseline):
+
+- Total `lowbit_gemv` decode summed-duration reduced by **≥ 5×** (a floor — the baseline is ~70× off
+  the bandwidth roofline, so the real win should be larger), **and** low-bit GEMV is **no longer the
+  dominant decode cost** (its combined share falls below 50% and a non-GEMV kernel becomes the new top
+  hotspot).
+
+These numbers are the acceptance criteria for the Task 4 iteration loop. "Improvement toward the
+roofline" without a number is not acceptance.
+
+---
+
 ## Execution mode (subagent-driven)
 
 Same controller loop and the three subagent prompt templates as the Phase-1 plan
 (`docs/plans/m3-linear-p1-framework-and-generic.md`, "Execution mode" + "Subagent prompt templates")
 — reuse them verbatim, with these deltas:
+- **Model requirement (mandatory): dispatch every implementer and reviewer subagent on the strongest
+  available model at the highest reasoning-effort tier.** CUDA kernel optimization and roofline
+  reasoning are hard; do not use a fast/cheap tier for T2–T4 or their reviews. If the harness exposes a
+  model choice, pick the top reasoning model and record which model each subagent used in its report.
 - The implementer additionally runs the relevant profiling skill (`ncu-kernel-profile` and/or
   `nsys-inference-analysis`) as named in the task and pastes the key metrics into its report.
-- Tasks are sequential **T1 → T2 → T3 → T4** (T2 and T3 touch different files — codec vs new
-  `gemv/` — but T3's kernel consumes T2's unpack, so keep order).
+- Tasks are sequential **T1 → T2 → T3 → T4**, and **T4 is an iteration loop**: a sequence of
+  independently dispatched, independently committed optimization rounds (see "Optimization iteration
+  protocol" and Task 4). Optimization is not one-shot — expect several rounds per shape. T2 and T3
+  touch different files (codec vs new `gemv/`) but T3 consumes T2's unpack, so keep order.
 - Hard rules: do not modify `tests/kernels/test_linear.cpp` / the frozen test framework / tolerances;
-  keep the generic kernels as the reference backend (do not delete); one commit per task on `master`.
+  keep the generic kernels as the reference backend (do not delete); one commit per task, and one
+  commit per T4 iteration round, on `master`.
+
+## Optimization iteration protocol (Task 4 rounds)
+
+Each round is ONE dispatched subagent (strongest model) and ONE commit. Per target shape:
+
+1. **Profile** the current tuned kernel on the shape with `ncu-kernel-profile` (`--set roofline` +
+   SpeedOfLight/Occupancy/MemoryWorkloadAnalysis) on `qus_linear_bench`. Record DRAM%, Memory vs
+   Compute SOL, achieved occupancy, registers/thread, spills, and the top two stall reasons.
+2. **Diagnose** the single dominant limiter from the metrics (e.g. low DRAM% + high occupancy →
+   coalescing/access pattern; low occupancy → too few CTAs or too many registers → K-split or fewer
+   rows/CTA; spills → decode-in-chunks; long-scoreboard stalls → load latency → more in-flight
+   groups/prefetch).
+3. **One change** motivated by that limiter — exactly one variable per round so the effect is
+   attributable. Do not bundle changes.
+4. **Re-verify**: `cmake --build build -j`, `ctest -R qus_linear_test` PASS, `compute-sanitizer` clean.
+5. **Re-profile** the same shape and compare to step 1.
+6. **Accept or revert**: accept only if the limiter improved with no correctness regression; otherwise
+   revert. Record the before/after metric either way.
+7. **Commit** the accepted change with the metric delta in the message (reverted experiments are noted
+   in the round report, not committed).
+
+Rules: profile before changing (never optimize from theory); one variable per round; oracle green every
+round; stop a shape at its gate or at documented diminishing returns.
 
 ## Verification commands
 
@@ -302,37 +362,52 @@ reference. Externally workspace-free.
   the odd `[70,130]`/`[128,128]` tail shapes) + `compute-sanitizer` clean.
 - **`ncu-kernel-profile`** (`--set roofline`, SoL/Occupancy/Memory) on `linear_tuned_lowbit_gemv`
   via `qus_linear_bench` at `mlp.down [5120,17408]`, `mlp.gate/up [17408,5120]`, `[6144,5120]`: report
-  DRAM%, occupancy, stalls, and the speedup vs the T1 baseline durations. Gate: a clear improvement
-  toward the memory roofline on Q5 (now that unpack is cheap) and no regression on Q4.
+  DRAM%, occupancy, stalls, registers/thread, and the speedup vs the T1 baseline. **T3 gate is
+  correctness + a working first version, not the final target**: the tuned kernel must beat the generic
+  baseline and be on the path to memory-bound (no per-bit unpack, coalesced loads, fp32 shuffle
+  reduce). Reaching the §Performance-targets 85% DRAM is the job of the Task 4 iteration loop, not T3.
+  Record the T3 metrics as iteration **round 0** (the starting point) in `docs/bench/`.
 
 **Commit:** `perf(linear): tuned low-bit decode GEMV kernel and registry route`
 
 ---
 
-### Task 4 — Per-shape tuning + end-to-end validation (ncu sweep + nsys)
+### Task 4 — Iterative per-shape tuning to the performance target (ncu loop) + end-to-end (nsys)
 
-**Owns:** `src/kernels/linear/gemv/*` (tuning); optional `plan/linear_kernel_policy.h` (only if needed);
-commits `profiles/` artifacts + `docs/bench/m3-p2-gemv-after.md`.
+Task 4 is **not one change**; it is a loop of independently dispatched, independently committed
+optimization rounds that drive each dominant shape to the §Performance-targets gate. Optimization is
+iterative — expect several rounds per shape.
 
-**Reading list:** Task 3 output + its ncu report; framework §18 (benchmark contract), §11.2 (K-split for
-occupancy); both skill files.
+**Owns:** `src/kernels/linear/gemv/*` (tuning); optional `plan/linear_kernel_policy.h` (only if a shape
+genuinely needs its own config); `profiles/` artifacts; `docs/bench/m3-p2-gemv-after.md`.
 
-**Spec:**
-- Use **`ncu-kernel-profile`** to sweep a small set of kernel-shape knobs on the dominant shapes —
-  warps/CTA, threads, K-split factor, vector width, optional `x`-in-SMEM — especially checking whether
-  `mlp.down` (long-K, moderate-N → occupancy/K-split sensitive) and `mlp.gate/up` (large-N) want
-  different configs. Introduce a constexpr `LinearKernelPolicy` (the `GemmExtraOptions` analog) and
-  bind a per-format/per-shape winner **only if** measurement shows divergence; otherwise keep one
-  config (YAGNI — do not add the knob speculatively).
-- Use **`nsys-inference-analysis`** on the same decode run as the T1 baseline; confirm the
-  `lowbit_gemv` share of decode dropped substantially and capture the **new ranking + next hotspot**.
-  Commit a before/after summary in `docs/bench/m3-p2-gemv-after.md` (per-shape ncu DRAM%/occupancy +
-  the nsys decode delta).
+**Reading list (per round):** Task 3 output + the previous round's ncu report; this plan's
+"Optimization iteration protocol" + "Performance targets"; framework §11.2 (within-CTA K-split for
+small/long-K occupancy), §18; the `ncu-kernel-profile` skill.
 
-**DoD / verify:** `qus_linear_test` PASS + sanitizer clean; ncu roofline recorded for the dominant
-shapes; nsys shows the decode GEMV time materially reduced vs baseline; after-report committed.
+**Shape order (ROI):** (1) Q5 `mlp.down [5120,17408]`, (2) Q4 `mlp.gate/up [17408,5120]`,
+(3) the `[6144,5120]` / `[5120,6144]` Q5 cluster. Drive each to its gate before moving to the next.
 
-**Commit:** `perf(linear): tune decode GEMV per shape and verify end-to-end`
+**Per round (one subagent dispatch on the strongest model, one commit):** follow the "Optimization
+iteration protocol". Introduce the constexpr `LinearKernelPolicy` knob (tile / threads / K-split /
+vector width / `x`-staging) only when a round needs it or when two shapes' winners diverge — never
+speculatively (YAGNI).
+
+**Stop condition (per shape):** the 85% DRAM gate is met, OR two consecutive rounds each yield < 5%
+duration improvement (diminishing returns) — then stop and document the achieved metrics and the
+binding limiter.
+
+**Phase close (after every shape hits its stop condition):** run **`nsys-inference-analysis`** on the
+T1 baseline decode run; verify the §Performance-targets end-to-end gate (≥ 5× lowbit_gemv reduction,
+GEMV no longer dominant) and capture the new ranking + next hotspot. Commit
+`docs/bench/m3-p2-gemv-after.md` with per-shape before/after ncu metrics and the nsys decode delta.
+
+**DoD / verify:** `qus_linear_test` PASS + sanitizer clean after every round; each dominant shape meets
+its 85% DRAM gate (or a documented occupancy limit); the nsys end-to-end gate is met; after-report
+committed.
+
+**Commit (per round):** `perf(linear): gemv <shape> round <n> — <one-line change> (DRAM <before>→<after>%)`
+**Commit (phase close):** `perf(linear): decode GEMV end-to-end validation and after-report`
 
 ---
 
@@ -343,8 +418,12 @@ shapes; nsys shows the decode GEMV time materially reduced vs baseline; after-re
   warp-cooperative, fp32-accumulate, externally workspace-free, tail-correct.
 - `qus_linear_test` PASS + `compute-sanitizer` clean; no public API / ABI / CMake / test-framework
   changes.
-- Evidence committed: baseline (T1) and after (T4) nsys decode rankings + ncu roofline for the
-  dominant Q5/Q4 shapes, showing the GEMV decode share materially reduced.
+- **§Performance-targets met**: ncu sustained DRAM ≥ 85% on `mlp.down [5120,17408]` and
+  `mlp.gate/up [17408,5120]` (or a documented occupancy limit), kernels memory-bound with no spills;
+  nsys shows ≥ 5× lowbit_gemv decode reduction and GEMV no longer the dominant decode cost.
+- All T2–T4 subagents (and reviewers) ran on the strongest model; the model is recorded in each report.
+- Evidence committed: baseline (T1, round 0) and per-round + after (T4) nsys decode rankings + ncu
+  roofline for the dominant Q5/Q4 shapes.
 
 ## Review phase (risk-scaled per AGENTS.md)
 
@@ -365,3 +444,7 @@ the ncu/nsys evidence from the named skills.
   reused), no ABI change; derived-layout escalation explicitly deferred to a separate phase.
 - One coordination point: T3 edits `plan/*` + `linear.cpp` to add `TunedLowbitGemv`; it is the only
   task that touches the registry, so no shared-file contention.
+- Targets are explicit and measured (§Performance targets: 85% DRAM per-kernel + ≥5× end-to-end), not
+  vague. Optimization is split into independently dispatched/committed Task-4 rounds (one variable
+  each) under the iteration protocol — iterate to the gate, don't expect one-shot. Every T2–T4 subagent
+  must run on the strongest model.

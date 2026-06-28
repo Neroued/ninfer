@@ -209,6 +209,86 @@ __global__ void linear_tuned_lowbit_gemv_kernel(const __nv_bfloat16* x, const st
     if (lane == 0) { out[row] = __float2bfloat16(acc); }
 }
 
+__device__ __forceinline__ std::uint32_t q4_load_scale_bits(const std::uint8_t* payload,
+                                                            std::int64_t off, std::int32_t rit,
+                                                            int lane) {
+    std::uint32_t scale_bits = 0u;
+    if (lane == 0) {
+        scale_bits = static_cast<std::uint16_t>(payload[off + rit * 2]) |
+                     static_cast<std::uint32_t>(
+                         static_cast<std::uint16_t>(payload[off + rit * 2 + 1]) << 8);
+    }
+    return __shfl_sync(0xffffffffu, scale_bits, 0);
+}
+
+__device__ __forceinline__ float q4_accumulate_lane_pair(
+    const std::uint8_t* payload, const __nv_bfloat16* x, std::int32_t tile, std::int32_t rit,
+    std::int32_t group, std::int32_t group_cnt, std::int32_t base_k, std::int32_t limit, int lane,
+    float acc) {
+    const int offset = lane * 2;
+
+    const std::int64_t off =
+        (static_cast<std::int64_t>(tile) * group_cnt + group) * Q4Codec::kTileBytes;
+    const std::uint32_t scale_bits = q4_load_scale_bits(payload, off, rit, lane);
+    const float scale = __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
+
+    const std::uint8_t* packed =
+        payload + off + 64 * 2 + static_cast<std::int64_t>(rit) * Q4Codec::kBytesPerRowPerGroup;
+    const std::uint32_t bits = packed[lane];
+    const int s0             = static_cast<int>((bits & 0x0fu) << 28) >> 28;
+    const int s1             = static_cast<int>(((bits >> 4) & 0x0fu) << 28) >> 28;
+
+    if (offset + 1 < limit) {
+        const float2 xv =
+            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(x + base_k + offset));
+        acc = fmaf(static_cast<float>(s0) * scale, xv.x, acc);
+        acc = fmaf(static_cast<float>(s1) * scale, xv.y, acc);
+    } else if (offset < limit) {
+        acc = fmaf(static_cast<float>(s0) * scale, __bfloat162float(x[base_k + offset]), acc);
+    }
+    return acc;
+}
+
+template <>
+__global__ void linear_tuned_lowbit_gemv_kernel<Q4Codec>(const __nv_bfloat16* x,
+                                                         const std::uint8_t* payload,
+                                                         __nv_bfloat16* out, std::int32_t n,
+                                                         std::int32_t k, std::int32_t padded_k) {
+    constexpr int kWarpSize = 32;
+    static_assert(Q4Codec::kGroupK == 64);
+
+    const int lane            = threadIdx.x & (kWarpSize - 1);
+    const int warp_in_block   = threadIdx.x / kWarpSize;
+    const int warps_per_block = blockDim.x / kWarpSize;
+    const std::int32_t row =
+        static_cast<std::int32_t>(blockIdx.x * warps_per_block + warp_in_block);
+    const std::int32_t group_cnt = padded_k / Q4Codec::kGroupK;
+
+    if (row >= n) { return; }
+
+    const std::int32_t tile = row / 64;
+    const std::int32_t rit  = row - tile * 64;
+    float acc               = 0.0f;
+
+    for (std::int32_t group = 0; group < group_cnt; ++group) {
+        const std::int32_t base_k = group * Q4Codec::kGroupK;
+        if (base_k >= k) { continue; }
+
+        const std::int32_t remaining = k - base_k;
+        const std::int32_t limit =
+            remaining < Q4Codec::kGroupK ? remaining : Q4Codec::kGroupK;
+        acc = q4_accumulate_lane_pair(payload, x, tile, rit, group, group_cnt, base_k, limit, lane,
+                                      acc);
+    }
+
+#pragma unroll
+    for (int delta = kWarpSize / 2; delta > 0; delta >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, delta);
+    }
+
+    if (lane == 0) { out[row] = __float2bfloat16(acc); }
+}
+
 __device__ __forceinline__ std::uint32_t q5_load_lane_pair_bits(const std::uint32_t* words,
                                                                 int offset) {
     const int bitpos = offset * Q5Codec::kBits;

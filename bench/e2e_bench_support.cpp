@@ -1,5 +1,7 @@
 #include "e2e_bench_support.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <charconv>
 #include <cstdio>
@@ -13,6 +15,8 @@
 
 namespace qus::bench::e2e {
 namespace {
+
+using Json = nlohmann::json;
 
 int parse_nonnegative_int(std::string_view text, const char* label) {
     if (text.empty()) { throw std::invalid_argument(std::string(label) + " is empty"); }
@@ -60,6 +64,100 @@ std::string run_command_capture(const std::string& command) {
 }
 
 const char* json_bool(bool value) { return value ? "true" : "false"; }
+
+std::string path_display_string(const std::filesystem::path& path) {
+    std::filesystem::path normalized = path.lexically_normal();
+#ifdef QUS_SOURCE_DIR
+    const std::filesystem::path source_dir = std::filesystem::path(QUS_SOURCE_DIR).lexically_normal();
+    if (normalized.is_absolute()) {
+        const std::filesystem::path relative = normalized.lexically_relative(source_dir);
+        if (!relative.empty() && relative.native().find("..") != 0) { normalized = relative; }
+    }
+#endif
+    return normalized.generic_string();
+}
+
+bool paths_match_requested(const std::filesystem::path& manifest_relative,
+                           const std::filesystem::path& manifest_dir,
+                           const std::string& requested_prompt_ids_path) {
+    const std::filesystem::path requested =
+        std::filesystem::path(requested_prompt_ids_path).lexically_normal();
+    const std::filesystem::path joined = (manifest_dir / manifest_relative).lexically_normal();
+    if (requested == joined) { return true; }
+    const std::string joined_display = path_display_string(joined);
+    if (!requested.is_absolute() && requested.generic_string() == joined_display) { return true; }
+#ifdef QUS_SOURCE_DIR
+    const std::filesystem::path source_joined =
+        (std::filesystem::path(QUS_SOURCE_DIR) / joined_display).lexically_normal();
+    if (requested.is_absolute() && requested == source_joined) { return true; }
+#endif
+    return false;
+}
+
+std::string existing_read_path(const std::string& path) {
+    if (std::filesystem::exists(path)) { return path; }
+#ifdef QUS_SOURCE_DIR
+    const std::filesystem::path source_relative =
+        (std::filesystem::path(QUS_SOURCE_DIR) / std::filesystem::path(path)).lexically_normal();
+    if (std::filesystem::exists(source_relative)) { return source_relative.string(); }
+#endif
+    return path;
+}
+
+const Json& require_object_field(const Json& object, const char* key, const char* label) {
+    if (!object.is_object() || !object.contains(key)) {
+        throw std::invalid_argument(std::string(label) + " missing " + key);
+    }
+    const Json& value = object.at(key);
+    if (!value.is_object()) { throw std::invalid_argument(std::string(label) + "." + key + " must be object"); }
+    return value;
+}
+
+const Json& require_array_field(const Json& object, const char* key, const char* label) {
+    if (!object.is_object() || !object.contains(key)) {
+        throw std::invalid_argument(std::string(label) + " missing " + key);
+    }
+    const Json& value = object.at(key);
+    if (!value.is_array()) { throw std::invalid_argument(std::string(label) + "." + key + " must be array"); }
+    return value;
+}
+
+std::string require_string_field(const Json& object, const char* key, const char* label) {
+    if (!object.is_object() || !object.contains(key)) {
+        throw std::invalid_argument(std::string(label) + " missing " + key);
+    }
+    const Json& value = object.at(key);
+    if (!value.is_string()) { throw std::invalid_argument(std::string(label) + "." + key + " must be string"); }
+    return value.get<std::string>();
+}
+
+std::string require_nonempty_string_field(const Json& object, const char* key, const char* label) {
+    std::string value = require_string_field(object, key, label);
+    if (value.empty()) { throw std::invalid_argument(std::string(label) + "." + key + " is empty"); }
+    return value;
+}
+
+bool require_bool_field(const Json& object, const char* key, const char* label) {
+    if (!object.is_object() || !object.contains(key)) {
+        throw std::invalid_argument(std::string(label) + " missing " + key);
+    }
+    const Json& value = object.at(key);
+    if (!value.is_boolean()) { throw std::invalid_argument(std::string(label) + "." + key + " must be bool"); }
+    return value.get<bool>();
+}
+
+int require_nonnegative_int_field(const Json& object, const char* key, const char* label) {
+    if (!object.is_object() || !object.contains(key)) {
+        throw std::invalid_argument(std::string(label) + " missing " + key);
+    }
+    const Json& value = object.at(key);
+    if (!value.is_number_integer()) {
+        throw std::invalid_argument(std::string(label) + "." + key + " must be integer");
+    }
+    const int parsed = value.get<int>();
+    if (parsed < 0) { throw std::invalid_argument(std::string(label) + "." + key + " must be nonnegative"); }
+    return parsed;
+}
 
 std::size_t arena_slack(const ArenaMemoryStats& arena) {
     return arena.capacity_bytes > arena.used_bytes ? arena.capacity_bytes - arena.used_bytes : 0;
@@ -204,6 +302,14 @@ void write_case(std::ostream& out, const CaseReport& case_report, const std::str
         << json_escape(case_report.fixture_manifest_path) << "\",\n"
         << indent << "  \"fixture_manifest_sha256\": \""
         << json_escape(case_report.fixture_manifest_sha256) << "\",\n"
+        << indent << "  \"prompt_format\": \"" << json_escape(case_report.prompt_format)
+        << "\",\n"
+        << indent << "  \"messages_path\": \"" << json_escape(case_report.messages_path)
+        << "\",\n"
+        << indent << "  \"messages_sha256\": \"" << json_escape(case_report.messages_sha256)
+        << "\",\n"
+        << indent << "  \"rendered_prompt_sha256\": \""
+        << json_escape(case_report.rendered_prompt_sha256) << "\",\n"
         << indent << "  \"prompt_ids_path\": \""
         << json_escape(case_report.input.prompt_ids_path) << "\",\n"
         << indent << "  \"prompt_ids_sha256\": \"" << json_escape(case_report.prompt_ids_sha256)
@@ -211,7 +317,17 @@ void write_case(std::ostream& out, const CaseReport& case_report, const std::str
         << indent << "  \"prompt_tokens\": " << case_report.input.prompt_tokens() << ",\n"
         << indent << "  \"requested_max_new_tokens\": "
         << case_report.input.requested_max_new_tokens << ",\n"
-        << indent << "  \"eos_token_id\": " << case_report.input.eos_token_id << ",\n"
+        << indent << "  \"add_generation_prompt\": "
+        << json_bool(case_report.add_generation_prompt) << ",\n"
+        << indent << "  \"add_special_tokens\": "
+        << json_bool(case_report.add_special_tokens) << ",\n"
+        << indent << "  \"chat_template_kwargs\": {\n"
+        << indent << "    \"enable_thinking\": "
+        << json_bool(case_report.enable_thinking) << "\n"
+        << indent << "  },\n"
+        << indent << "  \"stop_token_ids\": ";
+    write_token_array(out, case_report.input.stop_token_ids);
+    out << ",\n"
         << indent << "  \"max_context\": " << case_report.input.max_context << ",\n"
         << indent << "  \"decode_loop_tokens_requested\": "
         << case_report.input.decode_loop_tokens_requested() << ",\n"
@@ -272,6 +388,9 @@ std::string usage_text(std::string_view program) {
     const RunOptions defaults;
     if (program.empty()) { program = "qus_e2e_bench"; }
 
+    std::ostringstream default_stop_tokens;
+    write_token_array(default_stop_tokens, defaults.stop_token_ids);
+
     std::ostringstream out;
     out << "Usage: " << program
         << " --weights <q5090-path> --output-json <report-path>"
@@ -280,6 +399,8 @@ std::string usage_text(std::string_view program) {
         << "Options:\n"
         << "  --weights <q5090-path>                         required q5090 weights path\n"
         << "  --output-json <report-path>                    required JSON report path\n"
+        << "  --fixture-manifest <path>                      fixture manifest path (default: "
+        << defaults.fixture_manifest_path << ")\n"
         << "  --case <name>:<prompt-ids-path>:<max-new-tokens>\n"
         << "                                                 benchmark case; repeat for multiple cases\n"
         << "  --warmup-repeats <n>                           warmup repeats (default: "
@@ -290,8 +411,9 @@ std::string usage_text(std::string_view program) {
         << defaults.max_ctx << ")\n"
         << "  --device <cuda-device>                         CUDA device ordinal (default: "
         << defaults.device << ")\n"
-        << "  --eos-token-id <id>                            optional EOS token id "
-        << "(default: -1, disabled)\n"
+        << "  --stop-token-id <id>                           stop token id; repeat to append "
+        << "(default: " << default_stop_tokens.str() << ")\n"
+        << "  --eos-token-id <id>                            deprecated alias for one stop token\n"
         << "  -h, --help                                     show this help\n";
     return out.str();
 }
@@ -300,6 +422,9 @@ RunOptions parse_args(int argc, char** argv) {
     RunOptions options;
     bool saw_weights = false;
     bool saw_output = false;
+    bool saw_explicit_stop_token = false;
+    bool saw_stop_token_flag = false;
+    bool saw_eos_token_alias = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         auto require_value = [&](const char* flag) -> std::string {
@@ -315,6 +440,8 @@ RunOptions parse_args(int argc, char** argv) {
         } else if (arg == "--output-json") {
             options.output_json_path = require_value("--output-json");
             saw_output = true;
+        } else if (arg == "--fixture-manifest") {
+            options.fixture_manifest_path = require_value("--fixture-manifest");
         } else if (arg == "--case") {
             options.cases.push_back(parse_case_arg(require_value("--case")));
         } else if (arg == "--warmup-repeats") {
@@ -327,9 +454,28 @@ RunOptions parse_args(int argc, char** argv) {
                 static_cast<std::uint32_t>(parse_positive_int(require_value("--max-ctx"), "max_ctx"));
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--stop-token-id") {
+            if (saw_eos_token_alias) {
+                throw std::invalid_argument(
+                    "--eos-token-id cannot be combined with --stop-token-id");
+            }
+            saw_stop_token_flag = true;
+            if (!saw_explicit_stop_token) {
+                options.stop_token_ids.clear();
+                saw_explicit_stop_token = true;
+            }
+            options.stop_token_ids.push_back(
+                parse_nonnegative_int(require_value("--stop-token-id"), "stop_token_id"));
         } else if (arg == "--eos-token-id") {
-            options.eos_token_id = parse_nonnegative_int(require_value("--eos-token-id"),
-                                                         "eos_token_id");
+            if (saw_stop_token_flag) {
+                throw std::invalid_argument(
+                    "--eos-token-id cannot be combined with --stop-token-id");
+            }
+            saw_eos_token_alias = true;
+            options.stop_token_ids.clear();
+            options.stop_token_ids.push_back(
+                parse_nonnegative_int(require_value("--eos-token-id"), "eos_token_id"));
+            saw_explicit_stop_token = true;
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
@@ -337,7 +483,136 @@ RunOptions parse_args(int argc, char** argv) {
     if (!saw_weights) { throw std::invalid_argument("--weights is required"); }
     if (!saw_output) { throw std::invalid_argument("--output-json is required"); }
     if (options.cases.empty()) { throw std::invalid_argument("at least one --case is required"); }
+    options.stop_token_ids = normalize_stop_token_ids(options.stop_token_ids);
+    if (options.stop_token_ids.empty()) { throw std::invalid_argument("stop token list is empty"); }
     return options;
+}
+
+std::vector<int> normalize_stop_token_ids(const std::vector<int>& ids) {
+    std::vector<int> normalized;
+    normalized.reserve(ids.size());
+    for (const int id : ids) {
+        if (id < 0) { throw std::invalid_argument("stop token id must be nonnegative"); }
+        if (std::find(normalized.begin(), normalized.end(), id) == normalized.end()) {
+            normalized.push_back(id);
+        }
+    }
+    return normalized;
+}
+
+bool is_stop_token(const std::vector<int>& stop_token_ids, int token) {
+    return std::find(stop_token_ids.begin(), stop_token_ids.end(), token) != stop_token_ids.end();
+}
+
+FixtureMetadata load_fixture_metadata_for_case(const std::string& manifest_path,
+                                               const std::string& case_name,
+                                               const std::string& prompt_ids_path) {
+    std::ifstream in(manifest_path);
+    if (!in) { throw std::runtime_error("failed to open fixture manifest: " + manifest_path); }
+
+    Json manifest;
+    try {
+        in >> manifest;
+    } catch (const nlohmann::json::exception& e) {
+        throw std::invalid_argument(std::string("invalid fixture manifest JSON: ") + e.what());
+    }
+
+    FixtureMetadata metadata;
+    metadata.fixture_set = require_string_field(manifest, "fixture_set", "manifest");
+    if (metadata.fixture_set != "m2.8-v1") {
+        throw std::invalid_argument("fixture_set must be m2.8-v1");
+    }
+
+    const Json& generation = require_object_field(manifest, "generation", "manifest");
+    const Json& stop_ids = require_array_field(generation, "stop_token_ids", "manifest.generation");
+    if (stop_ids.empty()) { throw std::invalid_argument("manifest generation.stop_token_ids is empty"); }
+    for (const Json& id : stop_ids) {
+        if (!id.is_number_integer()) {
+            throw std::invalid_argument("manifest generation.stop_token_ids entries must be integers");
+        }
+        const int parsed = id.get<int>();
+        if (parsed < 0) {
+            throw std::invalid_argument("manifest generation.stop_token_ids entries must be nonnegative");
+        }
+        metadata.stop_token_ids.push_back(parsed);
+    }
+    metadata.stop_token_ids = normalize_stop_token_ids(metadata.stop_token_ids);
+    if (metadata.stop_token_ids.empty()) {
+        throw std::invalid_argument("manifest generation.stop_token_ids is empty");
+    }
+
+    const Json& cases = require_array_field(manifest, "cases", "manifest");
+    const Json* selected = nullptr;
+    for (const Json& candidate : cases) {
+        if (!candidate.is_object()) { throw std::invalid_argument("manifest case must be object"); }
+        if (require_string_field(candidate, "name", "manifest case") == case_name) {
+            selected = &candidate;
+            break;
+        }
+    }
+    if (selected == nullptr) { throw std::invalid_argument("manifest case not found: " + case_name); }
+
+    const std::filesystem::path manifest_dir = std::filesystem::path(manifest_path).parent_path();
+    const std::string messages_relative = require_nonempty_string_field(*selected, "messages", "manifest case");
+    const std::string ids_relative = require_nonempty_string_field(*selected, "ids", "manifest case");
+    const std::filesystem::path ids_path(ids_relative);
+    if (!paths_match_requested(ids_path, manifest_dir, prompt_ids_path)) {
+        throw std::invalid_argument("manifest ids path does not match requested prompt ids path");
+    }
+
+    FixtureCaseMetadata case_metadata;
+    case_metadata.name = case_name;
+    case_metadata.messages_path =
+        path_display_string(manifest_dir / std::filesystem::path(messages_relative));
+    case_metadata.prompt_ids_path = path_display_string(manifest_dir / ids_path);
+    case_metadata.prompt_tokens = require_nonnegative_int_field(*selected, "prompt_tokens", "manifest case");
+    case_metadata.messages_sha256 =
+        require_nonempty_string_field(*selected, "messages_sha256", "manifest case");
+    case_metadata.rendered_prompt_sha256 =
+        require_nonempty_string_field(*selected, "rendered_prompt_sha256", "manifest case");
+    case_metadata.prompt_ids_sha256 =
+        require_nonempty_string_field(*selected, "ids_sha256", "manifest case");
+    case_metadata.prompt_format = require_string_field(*selected, "prompt_format", "manifest case");
+    if (case_metadata.prompt_format != "qwen3.6-chat-template") {
+        throw std::invalid_argument("manifest prompt_format must be qwen3.6-chat-template");
+    }
+    case_metadata.add_generation_prompt =
+        require_bool_field(*selected, "add_generation_prompt", "manifest case");
+    if (!case_metadata.add_generation_prompt) {
+        throw std::invalid_argument("manifest add_generation_prompt must be true");
+    }
+    case_metadata.add_special_tokens =
+        require_bool_field(*selected, "add_special_tokens", "manifest case");
+    if (case_metadata.add_special_tokens) {
+        throw std::invalid_argument("manifest add_special_tokens must be false");
+    }
+    const Json& kwargs = require_object_field(*selected, "chat_template_kwargs", "manifest case");
+    case_metadata.enable_thinking =
+        require_bool_field(kwargs, "enable_thinking", "manifest case.chat_template_kwargs");
+    if (case_metadata.enable_thinking) {
+        throw std::invalid_argument("manifest enable_thinking must be false");
+    }
+
+    metadata.case_metadata = std::move(case_metadata);
+    return metadata;
+}
+
+std::vector<int> load_verified_prompt_ids(const std::string& prompt_ids_path,
+                                          const FixtureCaseMetadata& case_metadata) {
+    const std::string read_path = existing_read_path(prompt_ids_path);
+    const std::string actual_sha256 = sha256_file_or_empty(read_path);
+    if (actual_sha256.empty()) {
+        throw std::runtime_error("failed to compute prompt ids sha256: " + prompt_ids_path);
+    }
+    if (actual_sha256 != case_metadata.prompt_ids_sha256) {
+        throw std::invalid_argument("prompt ids sha256 does not match fixture manifest");
+    }
+
+    std::vector<int> ids = parse_ids_file(read_path);
+    if (static_cast<int>(ids.size()) != case_metadata.prompt_tokens) {
+        throw std::invalid_argument("prompt ids token count does not match fixture manifest");
+    }
+    return ids;
 }
 
 void validate_case_context(const CaseRunInput& input) {

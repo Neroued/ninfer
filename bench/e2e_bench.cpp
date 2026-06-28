@@ -9,6 +9,7 @@
 #include <iostream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -43,8 +44,8 @@ void write_error_if_possible(const std::optional<std::string>& path, std::string
     if (path.has_value()) { qus::bench::e2e::write_error_report(*path, phase, message); }
 }
 
-std::string stop_reason_for(bool eos, int generated, int requested) {
-    if (eos) { return "eos_token"; }
+std::string stop_reason_for(bool stop_token, int generated, int requested) {
+    if (stop_token) { return "stop_token"; }
     if (generated >= requested) { return "max_new_tokens"; }
     return "unknown";
 }
@@ -81,6 +82,11 @@ void synchronize_cuda() {
 
 bool generated_ids_equal(const std::vector<int>& a, const std::vector<int>& b) { return a == b; }
 
+struct PreparedCase {
+    qus::bench::e2e::CaseRunInput input;
+    qus::bench::e2e::FixtureMetadata fixture;
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -101,21 +107,29 @@ int main(int argc, char** argv) {
     qus::EngineOptions engine_options;
     engine_options.device = options.device;
     engine_options.max_ctx = options.max_ctx;
-    engine_options.eos_token_id = options.eos_token_id;
 
-    std::vector<qus::bench::e2e::CaseRunInput> case_inputs;
+    std::vector<PreparedCase> case_inputs;
     try {
         case_inputs.reserve(options.cases.size());
         for (const qus::bench::e2e::CaseSpec& spec : options.cases) {
+            qus::bench::e2e::FixtureMetadata fixture =
+                qus::bench::e2e::load_fixture_metadata_for_case(
+                    options.fixture_manifest_path, spec.name, spec.prompt_ids_path);
+            if (options.stop_token_ids != fixture.stop_token_ids) {
+                throw std::invalid_argument(
+                    "CLI stop token list differs from fixture manifest generation.stop_token_ids");
+            }
+
             qus::bench::e2e::CaseRunInput input;
             input.name = spec.name;
-            input.prompt_ids_path = spec.prompt_ids_path;
-            input.prompt_ids = qus::bench::e2e::parse_ids_file(spec.prompt_ids_path);
+            input.prompt_ids_path = fixture.case_metadata.prompt_ids_path;
+            input.prompt_ids = qus::bench::e2e::load_verified_prompt_ids(
+                spec.prompt_ids_path, fixture.case_metadata);
             input.requested_max_new_tokens = spec.max_new_tokens;
-            input.eos_token_id = options.eos_token_id;
+            input.stop_token_ids = options.stop_token_ids;
             input.max_context = options.max_ctx;
             qus::bench::e2e::validate_case_context(input);
-            case_inputs.push_back(std::move(input));
+            case_inputs.push_back(PreparedCase{std::move(input), std::move(fixture)});
         }
     } catch (const std::exception& e) {
         qus::bench::e2e::write_error_report(options.output_json_path, "preflight", e.what());
@@ -151,13 +165,24 @@ int main(int argc, char** argv) {
         report.workspace_lifetime_policy = qus::model::kWorkspaceLifetimePolicy;
         report.post_load_memory = engine.memory_stats();
 
-        for (const qus::bench::e2e::CaseRunInput& input : case_inputs) {
+        for (const PreparedCase& prepared : case_inputs) {
+            const qus::bench::e2e::CaseRunInput& input = prepared.input;
+            const qus::bench::e2e::FixtureCaseMetadata& fixture_case =
+                prepared.fixture.case_metadata;
             qus::bench::e2e::CaseReport case_report;
             case_report.input = input;
-            case_report.prompt_ids_sha256 =
-                qus::bench::e2e::sha256_file_or_empty(input.prompt_ids_path);
+            case_report.prompt_format = fixture_case.prompt_format;
+            case_report.messages_path = fixture_case.messages_path;
+            case_report.messages_sha256 = fixture_case.messages_sha256;
+            case_report.rendered_prompt_sha256 = fixture_case.rendered_prompt_sha256;
+            case_report.prompt_ids_sha256 = fixture_case.prompt_ids_sha256;
+            case_report.add_generation_prompt = fixture_case.add_generation_prompt;
+            case_report.add_special_tokens = fixture_case.add_special_tokens;
+            case_report.enable_thinking = fixture_case.enable_thinking;
+            case_report.fixture_set = prepared.fixture.fixture_set;
+            case_report.fixture_manifest_path = options.fixture_manifest_path;
             case_report.fixture_manifest_sha256 =
-                qus::bench::e2e::sha256_file_or_empty(case_report.fixture_manifest_path);
+                qus::bench::e2e::sha256_file_or_empty(options.fixture_manifest_path);
             case_report.warmup_repeats = options.warmup_repeats;
             case_report.measured_repeats = options.repeats;
 
@@ -173,21 +198,23 @@ int main(int argc, char** argv) {
                 repeat.prefill_time_s = seconds_since(prefill_start, prefill_end);
                 repeat.generated_token_ids.push_back(token);
 
-                bool eos = options.eos_token_id >= 0 && token == options.eos_token_id;
+                bool stopped_by_stop_token =
+                    qus::bench::e2e::is_stop_token(input.stop_token_ids, token);
                 const auto decode_start = Clock::now();
-                while (!eos &&
+                while (!stopped_by_stop_token &&
                        static_cast<int>(repeat.generated_token_ids.size()) <
                            input.requested_max_new_tokens) {
                     token = engine.decode_step();
                     repeat.generated_token_ids.push_back(token);
                     ++repeat.decode_loop_tokens;
-                    eos = options.eos_token_id >= 0 && token == options.eos_token_id;
+                    stopped_by_stop_token =
+                        qus::bench::e2e::is_stop_token(input.stop_token_ids, token);
                 }
                 const auto decode_end = Clock::now();
                 repeat.decode_time_s =
                     repeat.decode_loop_tokens == 0 ? 0.0 : seconds_since(decode_start, decode_end);
                 repeat.stop_reason = stop_reason_for(
-                    eos, static_cast<int>(repeat.generated_token_ids.size()),
+                    stopped_by_stop_token, static_cast<int>(repeat.generated_token_ids.size()),
                     input.requested_max_new_tokens);
                 repeat.memory = engine.memory_stats();
 

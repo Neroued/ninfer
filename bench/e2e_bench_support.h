@@ -22,7 +22,7 @@ struct CaseRunInput {
     std::string prompt_ids_path;
     std::vector<int> prompt_ids;
     int requested_max_new_tokens = 0;
-    int eos_token_id = -1;
+    std::vector<int> stop_token_ids = {248046, 248044};
     std::uint32_t max_context = 0;
 
     [[nodiscard]] std::size_t prompt_tokens() const noexcept { return prompt_ids.size(); }
@@ -30,16 +30,37 @@ struct CaseRunInput {
     [[nodiscard]] std::size_t required_max_context() const noexcept;
 };
 
+struct FixtureCaseMetadata {
+    std::string name;
+    std::string messages_path;
+    std::string prompt_ids_path;
+    std::string messages_sha256;
+    std::string rendered_prompt_sha256;
+    std::string prompt_ids_sha256;
+    std::string prompt_format;
+    bool add_generation_prompt = false;
+    bool add_special_tokens = true;
+    bool enable_thinking = true;
+    int prompt_tokens = 0;
+};
+
+struct FixtureMetadata {
+    std::string fixture_set;
+    std::vector<int> stop_token_ids;
+    FixtureCaseMetadata case_metadata;
+};
+
 struct RunOptions {
     std::string weights_path;
     std::string output_json_path;
+    std::string fixture_manifest_path = "bench/fixtures/prompts/m2.8-v1.manifest.json";
     std::vector<CaseSpec> cases;
     bool help_requested = false;
     int warmup_repeats = 0;
     int repeats = 1;
     std::uint32_t max_ctx = qus::EngineOptions{}.max_ctx;
     int device = 0;
-    int eos_token_id = -1;
+    std::vector<int> stop_token_ids = {248046, 248044};
 };
 
 struct RepeatReport {
@@ -74,7 +95,14 @@ struct RepeatReport {
 
 struct CaseReport {
     CaseRunInput input;
+    std::string prompt_format;
+    std::string messages_path;
+    std::string messages_sha256;
+    std::string rendered_prompt_sha256;
     std::string prompt_ids_sha256;
+    bool add_generation_prompt = true;
+    bool add_special_tokens = false;
+    bool enable_thinking = false;
     std::string fixture_set = "m2.8-v1";
     std::string fixture_manifest_path = "bench/fixtures/prompts/m2.8-v1.manifest.json";
     std::string fixture_manifest_sha256;
@@ -112,6 +140,13 @@ CaseSpec parse_case_arg(const std::string& value);
 RunOptions parse_args(int argc, char** argv);
 std::string usage_text(std::string_view program);
 void validate_case_context(const CaseRunInput& input);
+std::vector<int> normalize_stop_token_ids(const std::vector<int>& ids);
+bool is_stop_token(const std::vector<int>& stop_token_ids, int token);
+FixtureMetadata load_fixture_metadata_for_case(const std::string& manifest_path,
+                                               const std::string& case_name,
+                                               const std::string& prompt_ids_path);
+std::vector<int> load_verified_prompt_ids(const std::string& prompt_ids_path,
+                                          const FixtureCaseMetadata& case_metadata);
 
 std::string json_escape(std::string_view value);
 double median(std::vector<double> values);

@@ -28,15 +28,45 @@ int expect_u64(std::uint64_t actual, std::uint64_t expected, std::string_view la
     return 1;
 }
 
+int expect_int(int actual, int expected, std::string_view label) {
+    if (actual == expected) { return 0; }
+    std::cerr << label << " expected " << expected << ", got " << actual << '\n';
+    return 1;
+}
+
 int expect_string(const std::string& actual, std::string_view expected, std::string_view label) {
     if (actual == expected) { return 0; }
     std::cerr << label << " expected `" << expected << "`, got `" << actual << "`\n";
     return 1;
 }
 
+int expect_int_vector(const std::vector<int>& actual, const std::vector<int>& expected,
+                      std::string_view label) {
+    if (actual == expected) { return 0; }
+    std::cerr << label << " expected [";
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        if (i != 0) { std::cerr << ", "; }
+        std::cerr << expected[i];
+    }
+    std::cerr << "], got [";
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        if (i != 0) { std::cerr << ", "; }
+        std::cerr << actual[i];
+    }
+    std::cerr << "]\n";
+    return 1;
+}
+
 int expect_contains(const std::string& actual, std::string_view expected, std::string_view label) {
     if (actual.find(expected) != std::string::npos) { return 0; }
     std::cerr << label << " expected to find `" << expected << "` in:\n" << actual << '\n';
+    return 1;
+}
+
+int expect_not_contains(const std::string& actual, std::string_view unexpected,
+                        std::string_view label) {
+    if (actual.find(unexpected) == std::string::npos) { return 0; }
+    std::cerr << label << " expected not to find `" << unexpected << "` in:\n" << actual << '\n';
     return 1;
 }
 
@@ -55,6 +85,14 @@ std::filesystem::path temp_file(std::string_view stem, std::string_view contents
     if (!out) { throw std::runtime_error("failed to create temp file"); }
     out << contents;
     return path;
+}
+
+std::filesystem::path repo_file(std::string_view relative) {
+#ifdef QUS_SOURCE_DIR
+    return std::filesystem::path(QUS_SOURCE_DIR) / std::string(relative);
+#else
+    return std::filesystem::path(relative);
+#endif
 }
 
 qus::bench::e2e::RunOptions parse_args_for_test(std::vector<std::string> args) {
@@ -127,6 +165,65 @@ int test_parse_args_help() {
     return failures;
 }
 
+int test_parse_args_stop_tokens() {
+    int failures = 0;
+    const std::vector<std::string> base = {"qus_e2e_bench",
+                                           "--weights",
+                                           "weights.q5090",
+                                           "--output-json",
+                                           "out.json",
+                                           "--case",
+                                           "cn_short:bench/fixtures/prompts/cn_short.ids:8"};
+
+    const qus::bench::e2e::RunOptions defaults = parse_args_for_test(base);
+    failures += expect_int_vector(defaults.stop_token_ids, {248046, 248044},
+                                  "default stop token ids");
+
+    std::vector<std::string> repeated = base;
+    repeated.insert(repeated.end(), {"--stop-token-id", "7", "--stop-token-id", "9",
+                                     "--stop-token-id", "7"});
+    const qus::bench::e2e::RunOptions parsed_repeated = parse_args_for_test(repeated);
+    failures += expect_int_vector(parsed_repeated.stop_token_ids, {7, 9},
+                                  "explicit repeated stop token ids");
+
+    std::vector<std::string> eos_alias = base;
+    eos_alias.insert(eos_alias.end(), {"--eos-token-id", "123"});
+    const qus::bench::e2e::RunOptions parsed_alias = parse_args_for_test(eos_alias);
+    failures += expect_int_vector(parsed_alias.stop_token_ids, {123},
+                                  "deprecated eos alias stop token ids");
+
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            std::vector<std::string> mixed = base;
+            mixed.insert(mixed.end(), {"--stop-token-id", "7", "--eos-token-id", "123"});
+            (void)parse_args_for_test(mixed);
+        },
+        "stop token then eos alias mixed flags");
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            std::vector<std::string> mixed = base;
+            mixed.insert(mixed.end(), {"--eos-token-id", "123", "--stop-token-id", "7"});
+            (void)parse_args_for_test(mixed);
+        },
+        "eos alias then stop token mixed flags");
+
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            std::vector<std::string> bad = base;
+            bad.insert(bad.end(), {"--stop-token-id", "-1"});
+            (void)parse_args_for_test(bad);
+        },
+        "negative stop token id");
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            std::vector<std::string> bad = base;
+            bad.insert(bad.end(), {"--stop-token-id", "abc"});
+            (void)parse_args_for_test(bad);
+        },
+        "malformed stop token id");
+    return failures;
+}
+
 int test_parse_args_errors_still_apply_without_help() {
     int failures = 0;
     failures += expect_throws<std::invalid_argument>(
@@ -158,12 +255,134 @@ int test_usage_text() {
     failures += expect_contains(usage, "--repeats", "usage repeats");
     failures += expect_contains(usage, "--max-ctx", "usage max-ctx");
     failures += expect_contains(usage, "--device", "usage device");
+    failures += expect_contains(usage, "--stop-token-id", "usage stop token");
+    failures += expect_contains(usage, "[248046, 248044]", "usage stop token default");
     failures += expect_contains(usage, "--eos-token-id", "usage eos");
+    failures += expect_contains(usage, "deprecated", "usage eos deprecated");
     failures += expect_contains(usage, "default: " + std::to_string(qus::EngineOptions{}.max_ctx),
                                 "usage max_ctx default");
     failures += expect_contains(usage, "default: 1", "usage repeats default");
     failures += expect_contains(usage, "default: 0", "usage warmup or device default");
-    failures += expect_contains(usage, "default: -1, disabled", "usage eos default");
+    return failures;
+}
+
+int test_fixture_manifest_reader() {
+    int failures = 0;
+    const auto manifest_path = repo_file("bench/fixtures/prompts/m2.8-v1.manifest.json");
+    const auto metadata = qus::bench::e2e::load_fixture_metadata_for_case(
+        manifest_path.string(), "cn_short", "bench/fixtures/prompts/cn_short.ids");
+    failures += expect_string(metadata.fixture_set, "m2.8-v1", "manifest fixture_set");
+    failures += expect_int_vector(metadata.stop_token_ids, {248046, 248044},
+                                  "manifest stop token ids");
+    failures += expect_string(metadata.case_metadata.messages_path,
+                              "bench/fixtures/prompts/cn_short.messages.json",
+                              "manifest messages path");
+    failures += expect_string(metadata.case_metadata.prompt_ids_path,
+                              "bench/fixtures/prompts/cn_short.ids",
+                              "manifest ids path");
+    failures += expect_string(metadata.case_metadata.prompt_format, "qwen3.6-chat-template",
+                              "manifest prompt format");
+    failures += expect_bool(metadata.case_metadata.add_generation_prompt,
+                            "manifest add_generation_prompt");
+    failures += expect_bool(!metadata.case_metadata.add_special_tokens,
+                            "manifest add_special_tokens false");
+    failures += expect_bool(!metadata.case_metadata.enable_thinking,
+                            "manifest enable_thinking false");
+    failures += expect_bool(!metadata.case_metadata.messages_sha256.empty(),
+                            "manifest messages sha");
+    failures += expect_bool(!metadata.case_metadata.rendered_prompt_sha256.empty(),
+                            "manifest rendered prompt sha");
+    failures += expect_bool(!metadata.case_metadata.prompt_ids_sha256.empty(),
+                            "manifest ids sha");
+    failures += expect_int(metadata.case_metadata.prompt_tokens, 60, "manifest prompt tokens");
+
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            (void)qus::bench::e2e::load_fixture_metadata_for_case(
+                manifest_path.string(), "cn_short", "/tmp/cn_short.ids");
+        },
+        "manifest rejects basename-only ids match");
+
+    const auto missing_prompt_format = temp_file(
+        "qus_e2e_manifest_missing_prompt_format.json",
+        R"json({
+  "fixture_set": "m2.8-v1",
+  "generation": {"stop_token_ids": [248046, 248044]},
+  "cases": [{
+    "name": "bad",
+    "messages": "bad.messages.json",
+    "ids": "bad.ids",
+    "prompt_tokens": 1,
+    "messages_sha256": "m",
+    "rendered_prompt_sha256": "r",
+    "ids_sha256": "i",
+    "add_generation_prompt": true,
+    "add_special_tokens": false,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }]
+})json");
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            (void)qus::bench::e2e::load_fixture_metadata_for_case(
+                missing_prompt_format.string(), "bad", "bad.ids");
+        },
+        "manifest missing prompt_format");
+
+    const auto wrong_enable_thinking = temp_file(
+        "qus_e2e_manifest_wrong_enable_thinking.json",
+        R"json({
+  "fixture_set": "m2.8-v1",
+  "generation": {"stop_token_ids": [248046, 248044]},
+  "cases": [{
+    "name": "bad",
+    "messages": "bad.messages.json",
+    "ids": "bad.ids",
+    "prompt_tokens": 1,
+    "messages_sha256": "m",
+    "rendered_prompt_sha256": "r",
+    "ids_sha256": "i",
+    "prompt_format": "qwen3.6-chat-template",
+    "add_generation_prompt": true,
+    "add_special_tokens": false,
+    "chat_template_kwargs": {"enable_thinking": true}
+  }]
+})json");
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            (void)qus::bench::e2e::load_fixture_metadata_for_case(
+                wrong_enable_thinking.string(), "bad", "bad.ids");
+        },
+        "manifest wrong enable_thinking");
+    return failures;
+}
+
+int test_prompt_ids_fixture_validation() {
+    int failures = 0;
+    const auto manifest_path = repo_file("bench/fixtures/prompts/m2.8-v1.manifest.json");
+    const auto metadata = qus::bench::e2e::load_fixture_metadata_for_case(
+        manifest_path.string(), "cn_short", "bench/fixtures/prompts/cn_short.ids");
+
+    const std::vector<int> ids = qus::bench::e2e::load_verified_prompt_ids(
+        "bench/fixtures/prompts/cn_short.ids", metadata.case_metadata);
+    failures += expect_int(static_cast<int>(ids.size()), metadata.case_metadata.prompt_tokens,
+                           "verified prompt ids size");
+
+    const auto wrong_hash = temp_file("qus_e2e_wrong_hash.ids", "1 2 3\n");
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            (void)qus::bench::e2e::load_verified_prompt_ids(wrong_hash.string(),
+                                                            metadata.case_metadata);
+        },
+        "prompt ids sha mismatch");
+
+    qus::bench::e2e::FixtureCaseMetadata wrong_count = metadata.case_metadata;
+    wrong_count.prompt_ids_sha256 = qus::bench::e2e::sha256_file_or_empty(wrong_hash.string());
+    wrong_count.prompt_tokens = 4;
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            (void)qus::bench::e2e::load_verified_prompt_ids(wrong_hash.string(), wrong_count);
+        },
+        "prompt ids token count mismatch");
     return failures;
 }
 
@@ -263,10 +482,15 @@ int test_raw_report_json_is_valid() {
 
     qus::bench::e2e::CaseReport case_report;
     case_report.input.name = "cn_short";
-    case_report.input.prompt_ids_path = "prompt.ids";
+    case_report.input.prompt_ids_path = "bench/fixtures/prompts/cn_short.ids";
     case_report.input.prompt_ids = {1, 2, 3};
     case_report.input.requested_max_new_tokens = 3;
+    case_report.input.stop_token_ids = {248046, 248044};
     case_report.input.max_context = 8;
+    case_report.prompt_format = "qwen3.6-chat-template";
+    case_report.messages_path = "bench/fixtures/prompts/cn_short.messages.json";
+    case_report.messages_sha256 = "messages-sha";
+    case_report.rendered_prompt_sha256 = "rendered-sha";
     case_report.prompt_ids_sha256 = "ids-sha";
     case_report.fixture_manifest_sha256 = "manifest-sha";
     case_report.measured_repeats = 2;
@@ -278,6 +502,11 @@ int test_raw_report_json_is_valid() {
     zero_decode_case.input.prompt_ids_path = "long_2k.ids";
     zero_decode_case.input.prompt_ids = {1, 2, 3, 4};
     zero_decode_case.input.requested_max_new_tokens = 1;
+    zero_decode_case.input.stop_token_ids = {248046, 248044};
+    zero_decode_case.prompt_format = "qwen3.6-chat-template";
+    zero_decode_case.messages_path = "bench/fixtures/prompts/long_2k.messages.json";
+    zero_decode_case.messages_sha256 = "long-messages-sha";
+    zero_decode_case.rendered_prompt_sha256 = "long-rendered-sha";
     zero_decode_case.prompt_ids_sha256 = "long-ids-sha";
     zero_decode_case.measured_repeats = 1;
     zero_decode_case.repeats.clear();
@@ -346,9 +575,24 @@ int test_raw_report_json_is_valid() {
                         text.find("\"prompt_ids_sha256\": \"ids-sha\"") != std::string::npos
                     ? 0
                     : fail("raw report fixture identity missing");
-    failures += text.find("\"eos_token_id\": -1") != std::string::npos
+    failures += text.find("\"prompt_format\": \"qwen3.6-chat-template\"") != std::string::npos &&
+                        text.find("\"messages_path\": \"bench/fixtures/prompts/cn_short.messages.json\"") !=
+                            std::string::npos &&
+                        text.find("\"messages_sha256\": \"messages-sha\"") != std::string::npos &&
+                        text.find("\"rendered_prompt_sha256\": \"rendered-sha\"") !=
+                            std::string::npos
                     ? 0
-                    : fail("case eos_token_id missing");
+                    : fail("raw report chat identity missing");
+    failures += text.find("\"add_generation_prompt\": true") != std::string::npos &&
+                        text.find("\"add_special_tokens\": false") != std::string::npos &&
+                        text.find("\"chat_template_kwargs\"") != std::string::npos &&
+                        text.find("\"enable_thinking\": false") != std::string::npos
+                    ? 0
+                    : fail("raw report chat template kwargs missing");
+    failures += text.find("\"stop_token_ids\": [248046, 248044]") != std::string::npos
+                    ? 0
+                    : fail("case stop_token_ids missing");
+    failures += expect_not_contains(text, "\"eos_token_id\"", "case eos_token_id removed");
     failures += text.find("\"prefill_time_s_median\"") != std::string::npos &&
                         text.find("\"decode_eager_tok_s_median\"") != std::string::npos &&
                         text.find("\"deterministic_token_ids\"") != std::string::npos &&
@@ -378,8 +622,11 @@ int main() {
     failures += test_parse_ids_file();
     failures += test_parse_case_arg();
     failures += test_parse_args_help();
+    failures += test_parse_args_stop_tokens();
     failures += test_parse_args_errors_still_apply_without_help();
     failures += test_usage_text();
+    failures += test_fixture_manifest_reader();
+    failures += test_prompt_ids_fixture_validation();
     failures += test_context_validation();
     failures += test_json_helpers();
     failures += test_error_report_json_is_valid();

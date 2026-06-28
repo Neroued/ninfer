@@ -1,7 +1,7 @@
 # M2.8 E2E Baseline Summaries
 
 This directory is reserved for committed, auditable summaries of official M2.8/M3-gate e2e baseline
-runs.
+runs. Summaries must be evidence for Qwen3.6 chat-template fixtures, not older pre-chat-template fixtures.
 
 Raw e2e reports remain local under `profiles/e2e/` because `profiles/` is ignored and may contain
 large profiler artifacts. Each committed summary here must include enough information to audit the
@@ -12,6 +12,9 @@ baseline without relying on chat history:
 - git commit;
 - q5090 identity and SHA256;
 - prompt fixture set and case summary;
+- `prompt_format` for each case;
+- `stop_token_ids`, including `[248046, 248044]` for Qwen3.6 chat-template baselines;
+- tokenizer chat-template and generation-config hashes;
 - timing summary;
 - memory summary;
 - hidden allocation status;

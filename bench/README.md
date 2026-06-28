@@ -41,12 +41,12 @@ bench/fixtures/prompts/
 Each case uses a committed pair:
 
 ```text
-<case>.txt
+<case>.messages.json
 <case>.ids
 ```
 
-`.txt` is UTF-8 source text for review and regeneration. `.ids` is the canonical C++ benchmark input:
-whitespace-separated decimal token ids, with no comments and no inline metadata.
+`.messages.json` is the chat-message source for review and regeneration. `.ids` is the canonical C++
+benchmark input: whitespace-separated decimal token ids, with no comments and no inline metadata.
 
 The fixture set manifest is required:
 
@@ -55,7 +55,10 @@ bench/fixtures/prompts/m2.8-v1.manifest.json
 ```
 
 The manifest records tokenizer provenance, case names, prompt token counts, and hashes for each
-`.txt`/`.ids` pair. `qus_e2e_bench` reads `.ids` only and has no tokenizer dependency.
+`.messages.json`/`.ids` pair. `qus_e2e_bench` reads `.ids` only and has no tokenizer dependency.
+Python fixture generation renders ids with
+`tokenizer.apply_chat_template(..., add_generation_prompt=True, enable_thinking=False)` from a local
+Qwen3.6 tokenizer path; tokenizer-level special tokens are not added separately.
 
 Regenerate or check fixtures with:
 
@@ -84,7 +87,8 @@ qus_e2e_bench \
   [--repeats <n>] \
   [--max-ctx <tokens>] \
   [--device <cuda-device>] \
-  [--eos-token-id <id>]
+  --stop-token-id 248046 \
+  --stop-token-id 248044
 ```
 
 Minimal local error-report smoke:
@@ -95,7 +99,9 @@ printf '1 2 3\n' > /tmp/qus_e2e_smoke.ids
   --weights /tmp/missing.qus \
   --output-json profiles/e2e/error-smoke.json \
   --case smoke:/tmp/qus_e2e_smoke.ids:1 \
-  --max-ctx 3
+  --max-ctx 3 \
+  --stop-token-id 248046 \
+  --stop-token-id 248044
 ```
 
 The command exits nonzero and writes a schema-v1 error report when the output path is writable.
@@ -125,6 +131,13 @@ Decoded text sidecars are written beside a report:
 
 ```text
 profiles/e2e/<report-stem>.decoded/
+```
+
+Each decoded repeat writes raw and cleaned text:
+
+```text
+repeat_<n>.raw.txt
+repeat_<n>.clean.txt
 ```
 
 Generate decoded sidecars with:

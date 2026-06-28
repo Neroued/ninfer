@@ -157,11 +157,20 @@ memory/timing information:
   "fixture_set": "m2.8-v1",
   "fixture_manifest_path": "bench/fixtures/prompts/m2.8-v1.manifest.json",
   "fixture_manifest_sha256": "",
+  "prompt_format": "qwen3.6-chat-template",
+  "messages_path": "bench/fixtures/prompts/cn_short.messages.json",
+  "messages_sha256": "",
+  "rendered_prompt_sha256": "",
   "prompt_ids_path": "bench/fixtures/prompts/cn_short.ids",
   "prompt_ids_sha256": "",
   "prompt_tokens": 0,
+  "add_generation_prompt": true,
+  "add_special_tokens": false,
+  "chat_template_kwargs": {
+    "enable_thinking": false
+  },
   "requested_max_new_tokens": 128,
-  "eos_token_id": -1,
+  "stop_token_ids": [248046, 248044],
   "max_context": 0,
   "decode_loop_tokens_requested": 127,
   "required_max_context": 0,
@@ -261,13 +270,16 @@ Manifest shape:
     "tokenizer_path": "",
     "tokenizer_json_sha256": "",
     "tokenizer_config_sha256": "",
-    "special_tokens_map_sha256": ""
+    "special_tokens_map_sha256": "",
+    "chat_template_jinja_sha256": "",
+    "generation_config_sha256": ""
   },
   "artifacts": [
     {
       "case_index": 0,
       "repeat_index": 0,
-      "decoded_text_path": "profiles/e2e/example.decoded/case0_repeat0.txt"
+      "raw_text_path": "profiles/e2e/example.decoded/case0/repeat_0.raw.txt",
+      "clean_text_path": "profiles/e2e/example.decoded/case0/repeat_0.clean.txt"
     }
   ]
 }
@@ -323,13 +335,16 @@ Report comparison depends on stable identity fields:
 - `artifact_type`;
 - git commit and dirty/clean state;
 - q5090 path, file size, and SHA256 for official baselines;
-- fixture set, manifest SHA256, case names, prompt ids path, prompt ids SHA256, and prompt token count;
-- generation config, including `requested_max_new_tokens` and `eos_token_id`;
+- fixture set, manifest SHA256, case names, prompt format, messages path/SHA256, prompt ids path/SHA256,
+  and prompt token count;
+- chat-template identity, including chat-template Jinja SHA256 and generation-config SHA256;
+- generation config, including `requested_max_new_tokens` and `stop_token_ids`;
 - workspace lifetime policy;
 - memory accounting scope.
 
-For fixed q5090 + fixed prompt ids + greedy generation config, generated token ids must match across
-measured repeats and across compared reports unless token comparison is explicitly disabled.
+For fixed q5090 + fixed chat-template prompt ids + fixed stop-token list + greedy generation config,
+generated token ids must match across measured repeats and across compared reports unless token comparison
+is explicitly disabled.
 
 ## Compare Result
 

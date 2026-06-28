@@ -1,6 +1,6 @@
 #include "qus/text/chat_template.h"
 
-#include "../../third_party/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 #include <cctype>
 #include <fstream>

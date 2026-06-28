@@ -1,5 +1,6 @@
 #include "qus/text/chat_template.h"
 
+#include <chrono>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -32,18 +33,37 @@ int expect_invalid(void (*fn)(), const char* label) {
     return 1;
 }
 
-std::filesystem::path write_temp_json(const std::string& name, const std::string& text) {
-    const std::filesystem::path path = std::filesystem::temp_directory_path() / name;
+struct TempDir {
+    std::filesystem::path path;
+
+    TempDir() {
+        const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (int i = 0; i < 16; ++i) {
+            path = std::filesystem::temp_directory_path() /
+                   ("qus_chat_template_" + std::to_string(stamp) + "_" + std::to_string(i));
+            if (std::filesystem::create_directory(path)) { return; }
+        }
+        throw std::runtime_error("failed to create unique chat template temp directory");
+    }
+
+    ~TempDir() { std::filesystem::remove_all(path); }
+};
+
+std::filesystem::path write_temp_json(const std::filesystem::path& dir,
+                                      const std::string& name,
+                                      const std::string& text) {
+    const std::filesystem::path path = dir / name;
     std::ofstream out(path);
     out << text;
     return path;
 }
 
 struct TempJson {
+    TempDir dir;
     std::filesystem::path path;
 
-    TempJson(const std::string& name, const std::string& text) : path(write_temp_json(name, text)) {}
-    ~TempJson() { std::filesystem::remove(path); }
+    TempJson(const std::string& name, const std::string& text)
+        : path(write_temp_json(dir.path, name, text)) {}
 };
 
 int test_prompt_renders_qwen_chat() {
@@ -55,10 +75,9 @@ int test_prompt_renders_qwen_chat() {
 }
 
 int test_json_messages_render_prefixes() {
-    const std::filesystem::path path =
-        write_temp_json("qus_chat_messages.json",
+    const TempJson json("messages.json",
                         R"([{"role":"system","content":"be direct"},{"role":"user","content":"hi"}])");
-    const std::vector<qus::text::ChatMessage> messages = qus::text::read_messages_json(path);
+    const std::vector<qus::text::ChatMessage> messages = qus::text::read_messages_json(json.path);
     const std::string rendered                         = qus::text::render_qwen_chat(messages);
 
     int failures = 0;
@@ -68,7 +87,6 @@ int test_json_messages_render_prefixes() {
                       "user prefix mismatch");
     failures += check(rendered.find("<|im_start|>assistant\n<think>") != std::string::npos,
                       "assistant generation prefix mismatch");
-    std::filesystem::remove(path);
     return failures;
 }
 

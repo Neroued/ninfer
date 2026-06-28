@@ -1,5 +1,7 @@
 #include "qus/text/tokenizer.h"
 
+#include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -11,12 +13,29 @@
 
 namespace {
 
+std::filesystem::path repo_file(std::string_view relative) {
+#ifdef QUS_SOURCE_DIR
+    return std::filesystem::path(QUS_SOURCE_DIR) / relative;
+#else
+    return std::filesystem::current_path() / relative;
+#endif
+}
+
 int fail(const char* message) {
     std::cerr << message << '\n';
     return 1;
 }
 
 int check(bool condition, const char* message) { return condition ? 0 : fail(message); }
+
+void print_ids(std::string_view label, const std::vector<int>& ids) {
+    std::cerr << label << ": [";
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        if (i != 0) { std::cerr << ", "; }
+        std::cerr << ids[i];
+    }
+    std::cerr << "]\n";
+}
 
 struct TempDir {
     std::filesystem::path path;
@@ -358,12 +377,13 @@ int test_added_token_same_position_first_loaded_wins() {
         write_tokenizer_json(
             dir.path,
             minimal_tokenizer_json(
-                R"({"!":0})",
+                R"({"x":0})",
                 R"([{"id":1,"content":"<tag>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},{"id":2,"content":"<tag>x","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}])"));
+        write_file(dir.path / "merges.txt", "#version: 0.2\n");
         const qus::text::QwenTokenizer tokenizer(dir.path);
 
         failures +=
-            check(encode_throws_logic_containing(tokenizer, "<tag>x", "ordinary BPE"),
+            check(tokenizer.encode("<tag>x") == std::vector<int>{1, 0},
                   "same-position overlapping added token did not choose first loaded token");
     }
     return failures;
@@ -454,6 +474,37 @@ int test_added_token_encode_decode() {
     return 0;
 }
 
+int test_hf_golden_text_cases() {
+    const auto tokenizer_path =
+        std::filesystem::path("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16");
+    if (!std::filesystem::exists(tokenizer_path / "tokenizer.json")) {
+        std::cout << "skipping golden text cases: local tokenizer not present\n";
+        return 0;
+    }
+    const auto fixture_path = repo_file("tests/fixtures/text/qwen36_text_golden.json");
+    std::ifstream in(fixture_path);
+    const auto fixture = nlohmann::json::parse(in);
+    const qus::text::QwenTokenizer tok(tokenizer_path);
+    for (const auto& item : fixture.at("text_cases")) {
+        const std::string name          = item.at("name").get<std::string>();
+        const std::string text          = item.at("text").get<std::string>();
+        const std::vector<int> expected = item.at("ids").get<std::vector<int>>();
+        const std::vector<int> actual   = tok.encode(text);
+        if (actual != expected) {
+            std::cerr << "golden encode mismatch for " << name << '\n';
+            print_ids("expected", expected);
+            print_ids("actual", actual);
+            return 1;
+        }
+        const std::string raw = tok.decode(expected, qus::text::DecodeOptions{false, {}});
+        if (raw != item.at("raw_decoded").get<std::string>()) {
+            std::cerr << "golden raw decode mismatch for " << name << '\n';
+            return 1;
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -473,6 +524,7 @@ int main() {
         failures += test_encode_rejects_unsupported_added_token_flags();
         failures += test_decode_rejects_sparse_invalid_id();
         failures += test_added_token_encode_decode();
+        failures += test_hf_golden_text_cases();
         return failures == 0 ? 0 : fail("qwen tokenizer metadata test failed");
     } catch (const std::exception& ex) {
         std::cerr << "qwen tokenizer metadata test failed: " << ex.what() << '\n';

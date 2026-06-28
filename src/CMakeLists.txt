@@ -18,6 +18,6 @@ target_link_libraries(qus_core PUBLIC CUDA::cudart)
 target_compile_options(qus_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 set_target_properties(qus_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-# --- Driver executable (token-ids in -> token-ids out) -----------------------
+# --- Driver executable (text in -> text out) ---------------------------------
 add_executable(qus ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 target_link_libraries(qus PRIVATE qus_core)

@@ -68,6 +68,141 @@ compute-sanitizer ./build/tests/qus_linear_test
 All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
 errors`.
 
+## Q5 Cluster Round 1 - v/z [6144,5120] and out [5120,6144]
+
+Subagent model/effort: gpt-5.5, xhigh.
+
+Target: remaining Q5 cluster shapes from:
+
+```bash
+./build/bench/qus_linear_bench --decode --q5
+```
+
+Logical launch mapping:
+
+- launch 1: Q5 `v/z [6144,5120]`
+- launch 2: Q5 `out [5120,6144]`
+- launch 3: Q5 `attn gate [6144,5120]`, same shape as launch 1
+
+NCU kernel filter:
+
+```bash
+--kernel-name regex:'linear_tuned_lowbit_gemv_kernel' --launch-count 1
+```
+
+Capture note: literal `--launch-skip 1` and `--launch-skip 2` target repeated launches inside the
+`mlp.down` bench loop, not the next logical decode shapes. Those sanity captures showed grid 1280
+and mlp.down-sized global-load traffic, so they were discarded. The committed baseline artifacts use
+the actual NCU skips that hit the intended logical shapes in this benchmark loop: skip 1700 for
+`v/z` and skip 4500 for `out`.
+
+Artifacts:
+
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch1_vz_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch1_vz_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch1_vz_detailed.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch1_vz_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch1_vz_instr_sched.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch1_vz_global_loads.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch1_vz_stalls.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch2_out_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch2_out_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch2_out_detailed.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch2_out_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch2_out_instr_sched.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch2_out_global_loads.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/launch2_out_stalls.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/rejected_tw2_launch1_vz_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/rejected_tw2_launch1_vz_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/rejected_tw2_launch1_vz_stalls.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/rejected_tw2_launch2_out_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/rejected_tw2_launch2_out_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round1-q5-cluster/rejected_tw2_launch2_out_stalls.ncu.{rep,csv,txt}`
+
+### Baseline Metrics
+
+| metric | launch 1 v/z [6144,5120] | launch 2 out [5120,6144] |
+| --- | ---: | ---: |
+| actual NCU launch skip | 1700 | 4500 |
+| grid | 1536 | 1280 |
+| waves per SM | 0.75 | 0.63 |
+| NCU duration | 27.58 us | 28.54 us |
+| DRAM throughput | 42.56% | 41.14% |
+| Memory SOL | 64.41% | 63.05% |
+| Compute SOL | 64.41% | 63.05% |
+| L1/TEX throughput | 75.98% | 77.58% |
+| achieved occupancy | 55.61% | 50.69% |
+| registers/thread | 40 | 40 |
+| spills/local memory | 0 | 0 |
+| long scoreboard | 43.38% | 48.00% |
+| LG throttle | 11.08% | 8.32% |
+| MIO throttle | 11.11% | 8.05% |
+| not selected | 12.07% | 9.64% |
+| eligible warps/scheduler | 1.28 | 1.09 |
+| issued warp/scheduler | 0.47 | 0.48 |
+| global-load instructions | 2,457,600 | 2,457,600 |
+| global-load L1TEX sectors | 4,915,200 | 4,915,200 |
+| global-load data bytes | 101.25 MB | 101.25 MB |
+| total SM instructions | 14,475,264 | 14,417,920 |
+| source branch instructions | 159,744 | 153,600 |
+
+### Diagnosis
+
+Both distinct cluster shapes do the same total Q5 work (`6144 * 5120 == 5120 * 6144`) and show the
+same global-load instruction and sector counts. The remaining limiter is short-K/short-wave
+latency hiding, not spills or a new coalescing failure: `v/z` launches only 1536 CTAs (0.75 waves/SM)
+and `out` launches only 1280 CTAs (0.63 waves/SM), with achieved occupancy at 55.61% and 50.69%.
+The kernel is balanced on Memory and Compute SOL rather than DRAM-bound, and long-scoreboard plus
+LG/MIO/not-selected stalls remain the binding issue.
+
+Single experiment tried and rejected: add a Q5-only two-warps-per-row cluster path for `k <= 6144`.
+This split each row's K64 groups across two warps in the same CTA and reduced the two partial sums in
+shared memory. It left Q4/Q6, public APIs, q5090 ABI, tests, CMake, registry routing, and the
+accepted Q5 `mlp.down [5120,17408]` path unchanged while it was under test.
+
+| metric | v/z before | v/z rejected | out before | out rejected |
+| --- | ---: | ---: | ---: | ---: |
+| grid | 1536 | 3072 | 1280 | 2560 |
+| waves per SM | 0.75 | 1.51 | 0.63 | 1.25 |
+| NCU duration | 27.58 us | 29.98 us | 28.54 us | 34.66 us |
+| DRAM throughput | 42.56% | 39.25% | 41.14% | 33.89% |
+| Memory SOL | 64.41% | 61.11% | 63.05% | 52.43% |
+| Compute SOL | 64.41% | 61.11% | 63.05% | 52.43% |
+| achieved occupancy | 55.61% | 77.18% | 50.69% | 69.26% |
+| registers/thread | 40 | 39 | 40 | 39 |
+| spills/local memory | 0 | 0 | 0 | 0 |
+| long scoreboard | 43.38% | 74.89% | 48.00% | 74.36% |
+| LG throttle | 11.08% | 3.09% | 8.32% | 2.88% |
+| MIO throttle | 11.11% | 3.38% | 8.05% | 3.28% |
+| barrier stall | 0% | 1.14% | 0% | 1.01% |
+
+Rejected: the experiment proved that simply increasing row-level K parallelism raises occupancy but
+hurts the actual limiter. Long-scoreboard stall share jumped to about 75%, DRAM throughput fell on
+both shapes, and duration regressed by 8.70% on `v/z` and 21.44% on `out`. The source change was
+reverted and no code change is accepted for this round.
+
+### Stop Condition
+
+The Q5 cluster stops here under the plan's documented occupancy/short-K limiter rule. It does not
+meet the `>=70%` DRAM target or approach `C = 82.76%`, and this is not claimed as target success.
+The best accepted kernel remains the current Q5 four-K64 one-warp path: 42.56% DRAM for
+`[6144,5120]` and 41.14% DRAM for `[5120,6144]`. The only justified Q5-specific cluster variable
+regressed despite higher occupancy, so there is no accepted code patch for the cluster.
+
+### Verification
+
+The rejected experiment was built and passed the oracle plus sanitizer before it was reverted. After
+reverting to the final no-code-change tree, the same verification was rerun:
+
+```bash
+cmake --build build -j
+ctest --test-dir build -R qus_linear_test --output-on-failure
+compute-sanitizer ./build/tests/qus_linear_test
+```
+
+All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
+errors`.
+
 ## Round 2 - Q5 mlp.down [5120,17408]
 
 Subagent model/effort: gpt-5.5, xhigh.

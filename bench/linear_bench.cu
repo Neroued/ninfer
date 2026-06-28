@@ -1,7 +1,7 @@
 // Performance bench for linear at real Qwen3.6 shapes. Dense in_a/in_b use
-// [48,5120]; Q4 decode uses mlp_gate/mlp_up [17408,5120]. The printed GB/s is
+// [48,5120]; low-bit decode uses real Qwen3.6 GEMV shapes. The printed GB/s is
 // informational only; ncu is the performance evidence.
-//   ./qus_linear_bench [--decode] [--prefill] [--bf16] [--fp32] [--q4] [--q6] [--stress]
+//   ./qus_linear_bench [--decode] [--prefill] [--bf16] [--fp32] [--q4] [--q5] [--q6] [--stress]
 #include "qus/kernels/linear.h"
 #include "qus_bench_common.h"
 
@@ -20,12 +20,15 @@ constexpr std::int32_t kDenseK       = 5120;
 constexpr std::int32_t kDenseStressN = 5120;
 constexpr std::int32_t kDenseStressK = 6144;
 constexpr std::int32_t kDenseStressT = 64;
-constexpr std::int32_t kQ4N          = 17408;
-constexpr std::int32_t kQ4K          = 5120;
 constexpr std::int32_t kQ4Tile       = 2176;
-constexpr std::int32_t kQ6N          = 248320;
-constexpr std::int32_t kQ6K          = 5120;
+constexpr std::int32_t kQ5Tile       = 2688;
 constexpr std::int32_t kQ6Tile       = 3200;
+
+struct LowbitShape {
+    const char* role;
+    std::int32_t n;
+    std::int32_t k;
+};
 
 DBuf make_f32(std::size_t n) {
     std::vector<float> h(n);
@@ -121,88 +124,109 @@ DBuf make_tile_payload(std::int32_t n, std::int32_t k, std::int32_t tilew) {
     return d;
 }
 
-DBuf make_q4_payload() { return make_tile_payload(kQ4N, kQ4K, kQ4Tile); }
+DBuf make_q5_payload(std::int32_t n, std::int32_t k) {
+    return make_tile_payload(n, k, kQ5Tile);
+}
 
-DBuf make_q6_payload() { return make_tile_payload(kQ6N, kQ6K, kQ6Tile); }
-
-Weight q4_weight(void* payload) {
+Weight lowbit_weight(void* payload, QType qtype, std::int32_t n, std::int32_t k,
+                     std::int32_t tilew) {
     Weight w{};
     w.payload           = payload;
-    w.payload_bytes     = static_cast<std::uint64_t>(kQ4N / 64) * (kQ4K / 64) * kQ4Tile;
-    w.qtype             = QType::Q4G64_F16S;
+    w.payload_bytes     = static_cast<std::uint64_t>(n / 64) * (k / 64) * tilew;
+    w.qtype             = qtype;
     w.layout            = QuantLayout::TileN64K64;
     w.q5090_scale_dtype = ScaleDType::FP16;
     w.group_size        = 64;
-    w.shape[0]          = kQ4N;
-    w.shape[1]          = kQ4K;
-    w.padded_shape[0]   = kQ4N;
-    w.padded_shape[1]   = kQ4K;
+    w.shape[0]          = n;
+    w.shape[1]          = k;
+    w.padded_shape[0]   = n;
+    w.padded_shape[1]   = k;
     w.ndim              = 2;
     w.qdata             = payload;
     w.scales            = nullptr;
-    w.n                 = kQ4N;
-    w.k                 = kQ4K;
+    w.n                 = n;
+    w.k                 = k;
     w.group             = 64;
     return w;
 }
 
-Weight q6_weight(void* payload) {
+Weight q4_weight(void* payload, std::int32_t n, std::int32_t k) {
+    return lowbit_weight(payload, QType::Q4G64_F16S, n, k, kQ4Tile);
+}
+
+Weight q5_weight(void* payload, std::int32_t n, std::int32_t k) {
+    return lowbit_weight(payload, QType::Q5G64_F16S, n, k, kQ5Tile);
+}
+
+Weight q6_weight(void* payload, std::int32_t n, std::int32_t k) {
+    return lowbit_weight(payload, QType::Q6G64_F16S, n, k, kQ6Tile);
+}
+
+const char* lowbit_name(QType qtype) {
+    switch (qtype) {
+    case QType::Q4G64_F16S: return "q4";
+    case QType::Q5G64_F16S: return "q5";
+    case QType::Q6G64_F16S: return "q6";
+    default:                return "lowbit";
+    }
+}
+
+void run_lowbit_decode(const LowbitShape& shape, QType qtype, std::int32_t tilew) {
+    constexpr std::int32_t t    = 1;
+    const std::size_t x_elems   = static_cast<std::size_t>(shape.k) * t;
+    const std::size_t out_elems = static_cast<std::size_t>(shape.n) * t;
+
+    DBuf x    = make_bf16(x_elems);
+    DBuf wbuf = qtype == QType::Q5G64_F16S ? make_q5_payload(shape.n, shape.k)
+                                           : make_tile_payload(shape.n, shape.k, tilew);
+    DBuf out  = make_zeros(out_elems * sizeof(std::uint16_t));
+
+    Tensor tx(x.p, DType::BF16, {shape.k, t});
+    Tensor tout(out.p, DType::BF16, {shape.n, t});
     Weight w{};
-    w.payload           = payload;
-    w.payload_bytes     = static_cast<std::uint64_t>(kQ6N / 64) * (kQ6K / 64) * kQ6Tile;
-    w.qtype             = QType::Q6G64_F16S;
-    w.layout            = QuantLayout::TileN64K64;
-    w.q5090_scale_dtype = ScaleDType::FP16;
-    w.group_size        = 64;
-    w.shape[0]          = kQ6N;
-    w.shape[1]          = kQ6K;
-    w.padded_shape[0]   = kQ6N;
-    w.padded_shape[1]   = kQ6K;
-    w.ndim              = 2;
-    w.qdata             = payload;
-    w.scales            = nullptr;
-    w.n                 = kQ6N;
-    w.k                 = kQ6K;
-    w.group             = 64;
-    return w;
+    switch (qtype) {
+    case QType::Q4G64_F16S: w = q4_weight(wbuf.p, shape.n, shape.k); break;
+    case QType::Q5G64_F16S: w = q5_weight(wbuf.p, shape.n, shape.k); break;
+    case QType::Q6G64_F16S: w = q6_weight(wbuf.p, shape.n, shape.k); break;
+    default:                return;
+    }
+
+    const double bytes = static_cast<double>(x_elems) * 2.0 + static_cast<double>(w.payload_bytes) +
+                         static_cast<double>(out_elems) * 2.0;
+    const Result r = bench_loop([&](cudaStream_t s) { kernels::linear(tx, w, tout, s); }, bytes);
+
+    char tag[112];
+    std::snprintf(tag, sizeof(tag), "linear %s decode %-10s [%d,%d] T=1", lowbit_name(qtype),
+                  shape.role, shape.n, shape.k);
+    print_result(tag, r);
 }
 
 void run_q4_decode() {
-    constexpr std::int32_t t    = 1;
-    const std::size_t x_elems   = static_cast<std::size_t>(kQ4K) * t;
-    const std::size_t out_elems = static_cast<std::size_t>(kQ4N) * t;
+    constexpr LowbitShape shapes[] = {
+        {"mlp.gate/up", 17408, 5120},
+        {"gdn q/k", 2048, 5120},
+        {"attn q", 6144, 5120},
+    };
+    for (const LowbitShape& shape : shapes) {
+        run_lowbit_decode(shape, QType::Q4G64_F16S, kQ4Tile);
+    }
+}
 
-    DBuf x    = make_bf16(x_elems);
-    DBuf wbuf = make_q4_payload();
-    DBuf out  = make_zeros(out_elems * sizeof(std::uint16_t));
-
-    Tensor tx(x.p, DType::BF16, {kQ4K, t});
-    Tensor tout(out.p, DType::BF16, {kQ4N, t});
-    Weight w = q4_weight(wbuf.p);
-
-    const double bytes = static_cast<double>(x_elems) * 2.0 + static_cast<double>(w.payload_bytes) +
-                         static_cast<double>(out_elems) * 2.0;
-    const Result r = bench_loop([&](cudaStream_t s) { kernels::linear(tx, w, tout, s); }, bytes);
-    print_result("linear q4 decode [17408,5120] T=1", r);
+void run_q5_decode() {
+    constexpr LowbitShape shapes[] = {
+        {"mlp.down", 5120, 17408},
+        {"v/z", 6144, 5120},
+        {"out", 5120, 6144},
+        {"attn gate", 6144, 5120},
+    };
+    for (const LowbitShape& shape : shapes) {
+        run_lowbit_decode(shape, QType::Q5G64_F16S, kQ5Tile);
+    }
 }
 
 void run_q6_decode() {
-    constexpr std::int32_t t    = 1;
-    const std::size_t x_elems   = static_cast<std::size_t>(kQ6K) * t;
-    const std::size_t out_elems = static_cast<std::size_t>(kQ6N) * t;
-
-    DBuf x    = make_bf16(x_elems);
-    DBuf wbuf = make_q6_payload();
-    DBuf out  = make_zeros(out_elems * sizeof(std::uint16_t));
-
-    Tensor tx(x.p, DType::BF16, {kQ6K, t});
-    Tensor tout(out.p, DType::BF16, {kQ6N, t});
-    Weight w = q6_weight(wbuf.p);
-
-    const double bytes = static_cast<double>(x_elems) * 2.0 + static_cast<double>(w.payload_bytes) +
-                         static_cast<double>(out_elems) * 2.0;
-    const Result r = bench_loop([&](cudaStream_t s) { kernels::linear(tx, w, tout, s); }, bytes);
-    print_result("linear q6 decode [248320,5120] T=1", r);
+    constexpr LowbitShape shape{"lm_head", 248320, 5120};
+    run_lowbit_decode(shape, QType::Q6G64_F16S, kQ6Tile);
 }
 
 } // namespace
@@ -214,7 +238,8 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    bool decode = false, prefill = false, bf16 = false, fp32 = false, q4 = false, q6 = false;
+    bool decode = false, prefill = false, bf16 = false, fp32 = false, q4 = false, q5 = false;
+    bool q6 = false;
     bool stress = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--decode"))
@@ -227,13 +252,15 @@ int main(int argc, char** argv) {
             fp32 = true;
         else if (!std::strcmp(argv[i], "--q4"))
             q4 = true;
+        else if (!std::strcmp(argv[i], "--q5"))
+            q5 = true;
         else if (!std::strcmp(argv[i], "--q6"))
             q6 = true;
         else if (!std::strcmp(argv[i], "--stress"))
             stress = true;
     }
     if (!decode && !prefill) { decode = prefill = true; }
-    if (!bf16 && !fp32 && !q4 && !q6) { bf16 = fp32 = q4 = q6 = true; }
+    if (!bf16 && !fp32 && !q4 && !q5 && !q6) { bf16 = fp32 = q4 = q5 = q6 = true; }
 
     if (stress) {
         if (bf16) run_dense_stress(QType::BF16_CTRL);
@@ -246,6 +273,7 @@ int main(int argc, char** argv) {
     if (prefill && bf16) run_dense(7, QType::BF16_CTRL, "prefill");
     if (prefill && fp32) run_dense(7, QType::FP32_CTRL, "prefill");
     if (decode && q4) run_q4_decode();
+    if (decode && q5) run_q5_decode();
     if (decode && q6) run_q6_decode();
     return 0;
 }

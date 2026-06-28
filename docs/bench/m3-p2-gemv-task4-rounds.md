@@ -504,3 +504,96 @@ compute-sanitizer ./build/tests/qus_linear_test
 
 All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
 errors`.
+
+## Q4 Round 2 - Q4 mlp.gate/up [17408,5120]
+
+Subagent model/effort: gpt-5.5, xhigh.
+
+Target: Q4 `mlp.gate/up [17408,5120]`, launch 0 of:
+
+```bash
+./build/bench/qus_linear_bench --decode --q4
+```
+
+NCU kernel filter:
+
+```bash
+--kernel-name regex:'linear_tuned_lowbit_gemv_kernel' --launch-skip 0 --launch-count 1
+```
+
+Artifacts:
+
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/baseline_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/baseline_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/baseline_detailed.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/baseline_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/baseline_instr_sched.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/baseline_global_loads.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/baseline_stall_reasons.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/after_basic.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/after_roofline.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/after_detailed.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/after_source.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/after_instr_sched.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/after_global_loads.ncu.{rep,csv,txt}`
+- `profiles/m3-p2-gemv-task4/round2-q4-mlp-gate-up/after_stall_reasons.ncu.{rep,csv,txt}`
+
+### Diagnosis
+
+The Q4 round-1 kernel no longer had the original sector-inflation problem, but the current baseline
+was still load-latency limited. DRAM throughput was 21.58%, Memory SOL was 30.98%, Compute SOL was
+35.60%, achieved occupancy was 95.88%, and local/shared spilling was zero. Scheduler metrics showed
+only 1.30 eligible warps per scheduler and 0.49 issued warps per scheduler. NCU's warp-state rule
+reported long scoreboard at 17.0 cycles, 71.5% of cycles between issued instructions; normalized
+stall metrics ranked long scoreboard first at 72.01% and wait second at 10.72%.
+
+Single change: specialize only Q4's full-K64 path to process four K64 groups per loop iteration.
+The fast path loads scale bits, packed bytes, and `x` pairs for four full groups before issuing the
+eight FMAs. The existing per-group helper remains the tail path for arbitrary `k`, so the generic
+backend, public API, q5090 ABI, tests, CMake, registry routing, and externally workspace-free
+contract are unchanged.
+
+### Metrics
+
+| metric | before | after |
+| --- | ---: | ---: |
+| NCU duration | 133.98 us | 51.30 us |
+| DRAM throughput | 21.58% | 55.22% |
+| Memory SOL | 30.98% | 82.64% |
+| Compute SOL | 35.60% | 82.64% |
+| L1/TEX throughput | 42.41% | 88.82% |
+| achieved occupancy | 95.88% | 83.20% |
+| registers/thread | 28 | 39 |
+| spills/local memory | 0 | 0 |
+| long scoreboard | 17.0 cycles, 71.5% | 7.3 cycles, 42.9% |
+| top normalized stall | long scoreboard, 72.01% | long scoreboard, 45.65% |
+| second normalized stall | wait, 10.72% | not selected, 15.16% |
+| eligible warps/scheduler | 1.30 | 2.13 |
+| issued warp/scheduler | 0.49 | 0.59 |
+| global-load instructions | 5,570,560 | 5,570,560 |
+| global-load L1TEX sectors | 9,748,480 | 9,748,480 |
+| global-load requested bytes | 311.95 MB | 311.95 MB |
+| global-load data bytes | 225.61 MB | 225.61 MB |
+| total SM instructions | 65,140,736 | 37,183,488 |
+| source branch instructions | 4,978,688 | 452,608 |
+
+Accepted with concern: the diagnosed load-latency limiter improved materially. NCU duration improved
+by 61.71%, DRAM throughput rose by 33.64 points, long-scoreboard cycles dropped from 17.0 to 7.3,
+eligible warps per scheduler rose from 1.30 to 2.13, total SM instructions fell by 42.92%, and branch
+instructions fell by 90.91%, with no spills or correctness regression. This still does not meet the
+Task 4 target (`>=70%` DRAM and near `C = 82.76%`), and the kernel is now balanced between Memory SOL
+and Compute SOL rather than clearly memory-bound. The tradeoff is higher register pressure
+(28 -> 39 regs/thread) and lower achieved occupancy (95.88% -> 83.20%). The next limiter appears to
+be mixed L1TEX/issue pressure, with long scoreboard still first and not-selected/MIO-throttle stalls
+now prominent.
+
+### Verification
+
+```bash
+cmake --build build -j
+ctest --test-dir build -R qus_linear_test --output-on-failure
+compute-sanitizer ./build/tests/qus_linear_test
+```
+
+All passed. `ctest` reported 1/1 tests passed. `compute-sanitizer` reported `ERROR SUMMARY: 0
+errors`.

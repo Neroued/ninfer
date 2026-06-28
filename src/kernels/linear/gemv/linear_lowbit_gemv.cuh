@@ -268,9 +268,81 @@ __global__ void linear_tuned_lowbit_gemv_kernel<Q4Codec>(const __nv_bfloat16* x,
 
     const std::int32_t tile = row / 64;
     const std::int32_t rit  = row - tile * 64;
+    const int offset        = lane * 2;
     float acc               = 0.0f;
 
-    for (std::int32_t group = 0; group < group_cnt; ++group) {
+    std::int32_t group = 0;
+    const std::int32_t full_group_cnt = k / Q4Codec::kGroupK;
+    for (; group + 3 < full_group_cnt; group += 4) {
+        const std::int32_t base_k0 = group * Q4Codec::kGroupK;
+        const std::int32_t base_k1 = base_k0 + Q4Codec::kGroupK;
+        const std::int32_t base_k2 = base_k1 + Q4Codec::kGroupK;
+        const std::int32_t base_k3 = base_k2 + Q4Codec::kGroupK;
+        const std::int64_t off0 =
+            (static_cast<std::int64_t>(tile) * group_cnt + group) * Q4Codec::kTileBytes;
+        const std::int64_t off1 = off0 + Q4Codec::kTileBytes;
+        const std::int64_t off2 = off1 + Q4Codec::kTileBytes;
+        const std::int64_t off3 = off2 + Q4Codec::kTileBytes;
+
+        const std::uint32_t scale_bits0 = q4_load_scale_bits(payload, off0, rit, lane);
+        const std::uint32_t scale_bits1 = q4_load_scale_bits(payload, off1, rit, lane);
+        const std::uint32_t scale_bits2 = q4_load_scale_bits(payload, off2, rit, lane);
+        const std::uint32_t scale_bits3 = q4_load_scale_bits(payload, off3, rit, lane);
+
+        const std::uint8_t* packed0 = payload + off0 + 64 * 2 +
+                                      static_cast<std::int64_t>(rit) *
+                                          Q4Codec::kBytesPerRowPerGroup;
+        const std::uint8_t* packed1 = payload + off1 + 64 * 2 +
+                                      static_cast<std::int64_t>(rit) *
+                                          Q4Codec::kBytesPerRowPerGroup;
+        const std::uint8_t* packed2 = payload + off2 + 64 * 2 +
+                                      static_cast<std::int64_t>(rit) *
+                                          Q4Codec::kBytesPerRowPerGroup;
+        const std::uint8_t* packed3 = payload + off3 + 64 * 2 +
+                                      static_cast<std::int64_t>(rit) *
+                                          Q4Codec::kBytesPerRowPerGroup;
+
+        const std::uint32_t bits0 = packed0[lane];
+        const std::uint32_t bits1 = packed1[lane];
+        const std::uint32_t bits2 = packed2[lane];
+        const std::uint32_t bits3 = packed3[lane];
+        const float2 xv0 =
+            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(x + base_k0 + offset));
+        const float2 xv1 =
+            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(x + base_k1 + offset));
+        const float2 xv2 =
+            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(x + base_k2 + offset));
+        const float2 xv3 =
+            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(x + base_k3 + offset));
+
+        const int s00 = static_cast<int>((bits0 & 0x0fu) << 28) >> 28;
+        const int s01 = static_cast<int>(((bits0 >> 4) & 0x0fu) << 28) >> 28;
+        const int s10 = static_cast<int>((bits1 & 0x0fu) << 28) >> 28;
+        const int s11 = static_cast<int>(((bits1 >> 4) & 0x0fu) << 28) >> 28;
+        const int s20 = static_cast<int>((bits2 & 0x0fu) << 28) >> 28;
+        const int s21 = static_cast<int>(((bits2 >> 4) & 0x0fu) << 28) >> 28;
+        const int s30 = static_cast<int>((bits3 & 0x0fu) << 28) >> 28;
+        const int s31 = static_cast<int>(((bits3 >> 4) & 0x0fu) << 28) >> 28;
+        const float scale0 =
+            __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits0)));
+        const float scale1 =
+            __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits1)));
+        const float scale2 =
+            __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits2)));
+        const float scale3 =
+            __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits3)));
+
+        acc = fmaf(static_cast<float>(s00) * scale0, xv0.x, acc);
+        acc = fmaf(static_cast<float>(s01) * scale0, xv0.y, acc);
+        acc = fmaf(static_cast<float>(s10) * scale1, xv1.x, acc);
+        acc = fmaf(static_cast<float>(s11) * scale1, xv1.y, acc);
+        acc = fmaf(static_cast<float>(s20) * scale2, xv2.x, acc);
+        acc = fmaf(static_cast<float>(s21) * scale2, xv2.y, acc);
+        acc = fmaf(static_cast<float>(s30) * scale3, xv3.x, acc);
+        acc = fmaf(static_cast<float>(s31) * scale3, xv3.y, acc);
+    }
+
+    for (; group < group_cnt; ++group) {
         const std::int32_t base_k = group * Q4Codec::kGroupK;
         if (base_k >= k) { continue; }
 

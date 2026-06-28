@@ -69,31 +69,44 @@ Skill usage rules for this project:
 
 ## Performance targets (explicit, measured)
 
-The decode low-bit GEMV streams the quantized weight set once per token, so once the unpack is fixed it
-is a **memory-bound** op; the target is sustained DRAM throughput, measured by `ncu-kernel-profile`
-(`dram__throughput.avg.pct_of_peak_sustained_elapsed`). RTX 5090 peak DRAM ≈ 1.79 TB/s.
+Acceptance is **fraction of the achievable peak DRAM bandwidth (the roofline)** — not a multiple over
+the generic baseline. The generic kernel is far below the roofline and is **not a yardstick**; "Nx
+faster than generic" is explicitly **not** a goal. The decode low-bit GEMV streams the quantized weight
+set once per token, so once the unpack is fixed it is a **memory-bound** op; the metric is ncu
+`dram__throughput.avg.pct_of_peak_sustained_elapsed`. (RTX 5090 theoretical peak ≈ 1.79 TB/s; the
+*achievable* ceiling is lower — calibrate it in T1.)
+
+**Calibrate the achievable ceiling first (T1).** Theoretical peak is never reached, and even simple
+streaming kernels in this project do not hit 85%. In T1, measure the DRAM% that the project's *best
+existing memory-bound kernel* reaches on this box (profile a Tier-1 streaming op such as
+`residual_add` or `silu_and_mul` at a large shape with `ncu-kernel-profile`). Call that measured number
+the **ceiling `C`**. The GEMV gate is expressed relative to `C`, so the bar self-calibrates to what the
+hardware+codebase actually deliver.
 
 Per-kernel gates (ncu, on `qus_linear_bench` at the named shape):
 
 | Metric | Target | Must hold on |
 |---|---|---|
-| Sustained DRAM % of peak | **≥ 85%** | `mlp.down [5120,17408]` (Q5), `mlp.gate/up [17408,5120]` (Q4) |
+| Sustained DRAM % of peak | **≥ 70% AND within ~5 points of the T1 ceiling `C`** | `mlp.down [5120,17408]` (Q5), `mlp.gate/up [17408,5120]` (Q4) |
 | Memory SOL vs Compute SOL | memory-bound (Memory SOL > Compute SOL); unpack stalls negligible | all dominant Q4/Q5/Q6 shapes |
 | Register spills | none (zero local-memory traffic) | all |
 
-- A genuinely occupancy-limited small-`N` shape (e.g. `attn k/v [1024,5120]`) may not reach 85%;
+- 70% is the floor; the real success criterion is "as close to the achievable ceiling `C` as the shape
+  allows, and clearly memory-bound." If `C` ≈ 78%, landing ~70–78% on the GEMV is success — do not
+  chase a number `C` itself cannot reach.
+- A genuinely occupancy-limited small-`N` shape (e.g. `attn k/v [1024,5120]`) may sit below the floor;
   record the achieved DRAM %, the limiter (occupancy/tail), and why it is acceptable — do not fail the
-  phase on it. The 85% bar is mandatory only for the two dominant shapes above.
+  phase on it. The floor is mandatory only for the two dominant shapes above.
 
-End-to-end gate (nsys, full decode run vs the T1 baseline):
+End-to-end check (nsys, full decode run):
 
-- Total `lowbit_gemv` decode summed-duration reduced by **≥ 5×** (a floor — the baseline is ~70× off
-  the bandwidth roofline, so the real win should be larger), **and** low-bit GEMV is **no longer the
-  dominant decode cost** (its combined share falls below 50% and a non-GEMV kernel becomes the new top
-  hotspot).
+- Once each dominant kernel reaches its per-kernel roofline gate, low-bit GEMV must **no longer be the
+  dominant decode cost** — its combined share falls below 50% and a non-GEMV kernel becomes the new top
+  hotspot. This is the structural outcome; it is **not** phrased as a multiple over the slow baseline.
 
-These numbers are the acceptance criteria for the Task 4 iteration loop. "Improvement toward the
-roofline" without a number is not acceptance.
+These are the acceptance criteria for the Task 4 iteration loop: a measured DRAM% relative to `C`, not
+"improvement toward the roofline" in the abstract. The generic baseline (T1) is captured only to
+characterize the bottleneck (unpack-bound) and the starting point — never as the target.
 
 ---
 
@@ -308,10 +321,15 @@ helpers + `make_tile_payload`); `bench/qus_bench_common.h`; the two skill files
   dominant Q5 shape (`mlp.down [5120,17408]`) and Q4 shape (`mlp.gate/up [17408,5120]`). Record DRAM%,
   SM/issue utilization, achieved occupancy, and top stall reasons. **Expected finding** to confirm:
   Q5 is issue/ALU-bound (low DRAM%, high integer/issue, stalls on the unpack), Q4 closer to bandwidth.
-  These numbers are the **gates** for T2–T4.
+  This baseline only characterizes the bottleneck and the starting point — it is **not** the target.
+- **Calibrate the achievable ceiling `C`**: with `ncu-kernel-profile`, measure the sustained DRAM% of
+  the project's best existing memory-bound kernel (a Tier-1 streaming op, e.g. `residual_add` or
+  `silu_and_mul` at a large shape via its bench). Record `C` — it is the realistic ceiling the GEMV
+  gate is measured against (§Performance targets), since even simple streaming kernels here are < 85%.
 
 **DoD / verify:** `qus_linear_bench` builds and runs all shapes; baseline nsys ranking + ncu roofline
-committed; `docs/bench/m3-p2-gemv-baseline.md` states the per-shape DRAM%/occupancy/bound-type.
+committed; `docs/bench/m3-p2-gemv-baseline.md` states the per-shape DRAM%/occupancy/bound-type **and
+the calibrated ceiling `C`** (the memory-bound reference kernel's DRAM%).
 
 **Commit:** `perf(linear): extend decode GEMV bench and record baseline profiles`
 
@@ -365,8 +383,9 @@ reference. Externally workspace-free.
   DRAM%, occupancy, stalls, registers/thread, and the speedup vs the T1 baseline. **T3 gate is
   correctness + a working first version, not the final target**: the tuned kernel must beat the generic
   baseline and be on the path to memory-bound (no per-bit unpack, coalesced loads, fp32 shuffle
-  reduce). Reaching the §Performance-targets 85% DRAM is the job of the Task 4 iteration loop, not T3.
-  Record the T3 metrics as iteration **round 0** (the starting point) in `docs/bench/`.
+  reduce). Reaching the §Performance-targets DRAM gate (≥70%, near ceiling `C`) is the job of the
+  Task 4 iteration loop, not T3. Record the T3 metrics as iteration **round 0** (the starting point) in
+  `docs/bench/`.
 
 **Commit:** `perf(linear): tuned low-bit decode GEMV kernel and registry route`
 
@@ -393,18 +412,18 @@ iteration protocol". Introduce the constexpr `LinearKernelPolicy` knob (tile / t
 vector width / `x`-staging) only when a round needs it or when two shapes' winners diverge — never
 speculatively (YAGNI).
 
-**Stop condition (per shape):** the 85% DRAM gate is met, OR two consecutive rounds each yield < 5%
-duration improvement (diminishing returns) — then stop and document the achieved metrics and the
-binding limiter.
+**Stop condition (per shape):** the per-kernel DRAM gate is met (≥70% AND within ~5 pts of ceiling
+`C`), OR two consecutive rounds each yield < 5% duration improvement / the kernel is already within ~5
+pts of `C` (diminishing returns) — then stop and document the achieved metrics and the binding limiter.
 
 **Phase close (after every shape hits its stop condition):** run **`nsys-inference-analysis`** on the
-T1 baseline decode run; verify the §Performance-targets end-to-end gate (≥ 5× lowbit_gemv reduction,
-GEMV no longer dominant) and capture the new ranking + next hotspot. Commit
+T1 baseline decode run; verify the §Performance-targets end-to-end check (low-bit GEMV no longer the
+dominant decode cost, share < 50%) and capture the new ranking + next hotspot. Commit
 `docs/bench/m3-p2-gemv-after.md` with per-shape before/after ncu metrics and the nsys decode delta.
 
 **DoD / verify:** `qus_linear_test` PASS + sanitizer clean after every round; each dominant shape meets
-its 85% DRAM gate (or a documented occupancy limit); the nsys end-to-end gate is met; after-report
-committed.
+its DRAM gate (≥70%, near ceiling `C`) or a documented occupancy limit; the nsys end-to-end check holds
+(GEMV no longer dominant); after-report committed.
 
 **Commit (per round):** `perf(linear): gemv <shape> round <n> — <one-line change> (DRAM <before>→<after>%)`
 **Commit (phase close):** `perf(linear): decode GEMV end-to-end validation and after-report`
@@ -418,9 +437,9 @@ committed.
   warp-cooperative, fp32-accumulate, externally workspace-free, tail-correct.
 - `qus_linear_test` PASS + `compute-sanitizer` clean; no public API / ABI / CMake / test-framework
   changes.
-- **§Performance-targets met**: ncu sustained DRAM ≥ 85% on `mlp.down [5120,17408]` and
-  `mlp.gate/up [17408,5120]` (or a documented occupancy limit), kernels memory-bound with no spills;
-  nsys shows ≥ 5× lowbit_gemv decode reduction and GEMV no longer the dominant decode cost.
+- **§Performance-targets met**: ncu sustained DRAM ≥ 70% and within ~5 pts of the T1 ceiling `C` on
+  `mlp.down [5120,17408]` and `mlp.gate/up [17408,5120]` (or a documented occupancy limit), kernels
+  memory-bound with no spills; nsys shows low-bit GEMV is no longer the dominant decode cost.
 - All T2–T4 subagents (and reviewers) ran on the strongest model; the model is recorded in each report.
 - Evidence committed: baseline (T1, round 0) and per-round + after (T4) nsys decode rankings + ncu
   roofline for the dominant Q5/Q4 shapes.
@@ -444,7 +463,9 @@ the ncu/nsys evidence from the named skills.
   reused), no ABI change; derived-layout escalation explicitly deferred to a separate phase.
 - One coordination point: T3 edits `plan/*` + `linear.cpp` to add `TunedLowbitGemv`; it is the only
   task that touches the registry, so no shared-file contention.
-- Targets are explicit and measured (§Performance targets: 85% DRAM per-kernel + ≥5× end-to-end), not
-  vague. Optimization is split into independently dispatched/committed Task-4 rounds (one variable
-  each) under the iteration protocol — iterate to the gate, don't expect one-shot. Every T2–T4 subagent
-  must run on the strongest model.
+- Targets are measured as a fraction of the **achievable** roofline (§Performance targets: ≥70% DRAM
+  and within ~5 pts of the T1-calibrated ceiling `C`; GEMV no longer dominant end-to-end) — never as a
+  multiple over the too-slow generic baseline, which is captured only to characterize the bottleneck.
+  Optimization is split into independently dispatched/committed Task-4 rounds (one variable each) under
+  the iteration protocol — iterate to the gate, don't expect one-shot. Every T2–T4 subagent must run on
+  the strongest model.

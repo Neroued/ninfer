@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(qus LANGUAGES CXX CUDA)
+project(qus LANGUAGES C CXX CUDA)
 
 # --- Global settings ---------------------------------------------------------
 set(CMAKE_CXX_STANDARD 20)

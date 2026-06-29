@@ -10,7 +10,9 @@ L1-equivalent op, and greedy decode is implemented without tokenizer dependencie
 from __future__ import annotations
 
 import argparse
+import json
 import mmap
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +27,7 @@ import torch.nn.functional as F
 
 from tools.q5090_convert import format as fmt
 from tools.q5090_convert import qtypes as qt
-from tools.q5090_convert.layouts import decode_tensor
+from tools.q5090_convert.layouts import decode_row_split_quantized, decode_tensor
 from tools.q5090_convert.packing import row_split_plane_sizes
 
 torch.set_grad_enabled(False)
@@ -69,6 +71,13 @@ def gdn_idx(layer: int) -> int:
 
 def bf16(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.bfloat16).to(torch.float32)
+
+
+def prod(xs: Iterable[int]) -> int:
+    out = 1
+    for x in xs:
+        out *= int(x)
+    return out
 
 
 def linear(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -172,15 +181,35 @@ def gdn_gating(a: torch.Tensor, b: torch.Tensor, a_log: torch.Tensor, dt_bias: t
 
 @dataclass
 class Entry:
+    block_index: int
     name: str
     qtype: int
     layout: int
+    module_kind: int
     shape: List[int]
     padded_shape: List[int]
     payload_offset: int
     payload_bytes: int
     code_plane_bytes: int
     scale_plane_bytes: int
+    source_layer: int
+    source_kind: int
+    crc32: int
+    segment_begin: int
+    segment_count: int
+    fusion_group_id: int
+    fusion_index: int
+
+
+@dataclass
+class WeightView:
+    segment_index: int
+    name: str
+    block: Entry
+    source_kind: int
+    source_layer: int
+    row_begin: int
+    row_count: int
 
 
 class Q5090File:
@@ -197,31 +226,94 @@ class Q5090File:
         )
         self._gpu: Dict[str, torch.Tensor] = {}
         hdr = fmt.unpack_header(self._mm[: fmt.HEADER_SIZE])
-        if hdr["magic"] != fmt.MAGIC:
-            raise ValueError(f"bad q5090 magic in {self.path}")
-        entries = []
+        if hdr["magic"] != fmt.MAGIC or hdr["version"] != fmt.VERSION:
+            raise ValueError(f"bad q5090 v2 header in {self.path}")
+        self.header = hdr
+        self.modules = []
+        off = hdr["module_index_offset"]
+        for _ in range(hdr["module_count"]):
+            self.modules.append(fmt.unpack_module_record(self._mm[off : off + fmt.MODULE_RECORD_SIZE]))
+            off += fmt.MODULE_RECORD_SIZE
+        raw_entries = []
         off = hdr["tensor_index_offset"]
         for _ in range(hdr["tensor_count"]):
-            entries.append(fmt.unpack_tensor_entry(self._mm[off : off + fmt.TENSOR_ENTRY_SIZE]))
+            raw_entries.append(fmt.unpack_tensor_entry(self._mm[off : off + fmt.TENSOR_ENTRY_SIZE]))
             off += fmt.TENSOR_ENTRY_SIZE
+        raw_segments = []
+        off = hdr["segment_index_offset"]
+        for _ in range(hdr["segment_count"]):
+            raw_segments.append(fmt.unpack_segment_record(self._mm[off : off + fmt.SEGMENT_RECORD_SIZE]))
+            off += fmt.SEGMENT_RECORD_SIZE
+        self.fusions = []
+        off = hdr["fusion_group_index_offset"]
+        for _ in range(hdr["fusion_group_count"]):
+            self.fusions.append(fmt.unpack_fusion_group_record(self._mm[off : off + fmt.FUSION_GROUP_RECORD_SIZE]))
+            off += fmt.FUSION_GROUP_RECORD_SIZE
         table = self._mm[hdr["string_table_offset"] : hdr["string_table_offset"] + hdr["string_table_bytes"]]
+
+        def read_name(record: dict, label: str) -> str:
+            begin = record["name_offset"]
+            end = begin + record["name_len"]
+            if begin < 0 or end > len(table) or end >= len(table) or table[end] != 0:
+                raise ValueError(f"{label}: invalid string table range")
+            name = table[begin:end].decode("utf-8")
+            if fmt.fnv1a_64(name) != record["name_hash"]:
+                raise ValueError(f"{label}: name_hash mismatch")
+            return name
+
+        for i, e in enumerate(raw_entries):
+            e["name"] = read_name(e, f"block[{i}]")
+        for i, s in enumerate(raw_segments):
+            s["name"] = read_name(s, f"segment[{i}]")
+
+        self.segments = raw_segments
+        self.blocks: List[Entry] = []
         self.entries: Dict[str, Entry] = {}
-        for e in entries:
-            name = table[e["name_offset"] : e["name_offset"] + e["name_len"]].decode("utf-8")
-            self.entries[name] = Entry(
-                name=name,
+        for i, e in enumerate(raw_entries):
+            entry = Entry(
+                block_index=i,
+                name=e["name"],
                 qtype=e["qtype"],
                 layout=e["layout"],
+                module_kind=e["module_kind"],
                 shape=e["shape"],
                 padded_shape=e["padded_shape"],
                 payload_offset=e["payload_offset"],
                 payload_bytes=e["payload_bytes"],
                 code_plane_bytes=e["code_plane_bytes"],
                 scale_plane_bytes=e["scale_plane_bytes"],
+                source_layer=e["source_layer"],
+                source_kind=e["source_kind"],
+                crc32=e["crc32"],
+                segment_begin=e["segment_begin"],
+                segment_count=e["segment_count"],
+                fusion_group_id=e["fusion_group_id"],
+                fusion_index=e["fusion_index"],
             )
+            self.blocks.append(entry)
+            self.entries[entry.name] = entry
+        self.views: Dict[str, WeightView] = {}
+        for block in self.blocks:
+            begin = block.segment_begin
+            end = begin + block.segment_count
+            if end > len(self.segments):
+                raise ValueError(f"{block.name}: segment range outside segment table")
+            for segment_index, segment in enumerate(self.segments[begin:end], begin):
+                view = WeightView(
+                    segment_index=segment_index,
+                    name=segment["name"],
+                    block=block,
+                    source_kind=segment["source_kind"],
+                    source_layer=segment["source_layer"],
+                    row_begin=segment["row_begin"],
+                    row_count=segment["row_count"],
+                )
+                if view.name in self.views:
+                    raise ValueError(f"duplicate segment name: {view.name}")
+                self.views[view.name] = view
 
-    def _resident_payload(self, name: str) -> Optional[torch.Tensor]:
-        """Return the full payload of `name` as a resident uint8 tensor, or None.
+    def _resident_payload(self, block: Entry) -> Optional[torch.Tensor]:
+        """Return the full payload of `block` as a resident uint8 tensor, or None.
 
         Populated lazily on first use. If the upload runs the device out of
         memory we transparently disable residency and stream from mmap instead,
@@ -229,18 +321,17 @@ class Q5090File:
         """
         if self._resident_device is None:
             return None
-        e = self.entries[name]
         # Only the large low-bit quant tensors are worth keeping resident and
         # decode cleanly from a raw uint8 blob. The small CONTIGUOUS control
         # tensors need uint16/f4 reinterpretation, so they keep streaming from
         # mmap (negligible cost).
-        if e.layout == qt.LAYOUT_CONTIGUOUS:
+        if block.layout == qt.LAYOUT_CONTIGUOUS:
             return None
-        cached = self._gpu.get(name)
+        cached = self._gpu.get(block.name)
         if cached is not None:
             return cached
         host = np.frombuffer(
-            self._mm[e.payload_offset : e.payload_offset + e.payload_bytes], dtype=np.uint8
+            self._mm[block.payload_offset : block.payload_offset + block.payload_bytes], dtype=np.uint8
         )
         try:
             tensor = torch.from_numpy(host.copy()).to(self._resident_device)
@@ -249,17 +340,32 @@ class Q5090File:
             self._gpu.clear()
             torch.cuda.empty_cache()
             return None
-        self._gpu[name] = tensor
+        self._gpu[block.name] = tensor
         return tensor
 
     def tensor(self, name: str, device: torch.device | str) -> torch.Tensor:
-        e = self.entries[name]
-        resident = self._resident_payload(name)
+        view = self.views[name]
+        e = view.block
+        resident = self._resident_payload(e)
         payload = (
             resident
             if resident is not None
             else self._mm[e.payload_offset : e.payload_offset + e.payload_bytes]
         )
+        if e.layout == qt.LAYOUT_ROW_SPLIT:
+            _, k = e.shape
+            _, kp = e.padded_shape
+            payload = self._row_split_slice_payload(e, resident, view.row_begin, view.row_count)
+            return decode_tensor(
+                payload,
+                e.qtype,
+                e.layout,
+                [view.row_count, k],
+                [view.row_count, kp],
+                device=device,
+            ).float()
+        if view.row_begin != 0 or view.row_count != e.shape[0]:
+            raise ValueError(f"{name}: cannot slice CONTIGUOUS segment from {e.name}")
         return decode_tensor(payload, e.qtype, e.layout, e.shape, e.padded_shape, device=device).float()
 
     def _row_split_geometry(self, e: Entry):
@@ -301,14 +407,15 @@ class Q5090File:
         return code + (b"\x00" * pad_bytes) + scale
 
     def row_split_rows(self, name: str, rows: torch.Tensor, device: torch.device | str) -> torch.Tensor:
-        e = self.entries[name]
-        n, k, kp, _, _, _ = self._row_split_geometry(e)
-        resident = self._resident_payload(name)
+        view = self.views[name]
+        e = view.block
+        _, k, kp, _, _, _ = self._row_split_geometry(e)
+        resident = self._resident_payload(e)
         out = []
         for row in rows.detach().cpu().tolist():
-            if row < 0 or row >= n:
+            if row < 0 or row >= view.row_count:
                 raise IndexError(f"{name} row out of range: {row}")
-            payload = self._row_split_slice_payload(e, resident, row, 1)
+            payload = self._row_split_slice_payload(e, resident, view.row_begin + row, 1)
             out.append(decode_tensor(payload, e.qtype, e.layout, [1, k], [1, kp], device=device))
         return torch.cat(out, dim=0).float()
 
@@ -318,13 +425,14 @@ class Q5090File:
         device: torch.device | str,
         rows_per_chunk: int = 8192,
     ):
-        e = self.entries[name]
-        n, k, kp, _, _, _ = self._row_split_geometry(e)
-        resident = self._resident_payload(name)
-        for row0 in range(0, n, rows_per_chunk):
-            row1 = min(n, row0 + rows_per_chunk)
+        view = self.views[name]
+        e = view.block
+        _, k, kp, _, _, _ = self._row_split_geometry(e)
+        resident = self._resident_payload(e)
+        for row0 in range(0, view.row_count, rows_per_chunk):
+            row1 = min(view.row_count, row0 + rows_per_chunk)
             row_count = row1 - row0
-            payload = self._row_split_slice_payload(e, resident, row0, row_count)
+            payload = self._row_split_slice_payload(e, resident, view.row_begin + row0, row_count)
             chunk = decode_tensor(
                 payload,
                 e.qtype,
@@ -334,6 +442,117 @@ class Q5090File:
                 device=device,
             ).float()
             yield row0, row1, chunk
+
+    def _raw_payload(self, e: Entry):
+        return self._mm[e.payload_offset : e.payload_offset + e.payload_bytes]
+
+    def _row_split_probes(self, e: Entry, device: torch.device | str = "cpu") -> List[dict]:
+        n, k = e.shape
+        _, kp = e.padded_shape
+        spec = qt.QUANT_SPECS[e.qtype]
+        probes = []
+        for row, col in [(0, 0), (n // 2, k // 2), (n - 1, k - 1)]:
+            payload = self._row_split_slice_payload(e, None, row, 1)
+            scale16, codes = decode_row_split_quantized(payload, [1, kp], e.qtype, device)
+            group = col // spec.group_size
+            lane = col % spec.group_size
+            q = int(codes[0, group, lane].item())
+            scale = float(scale16[0, group].float().item())
+            probes.append({"row": int(row), "col": int(col), "scale": scale, "q": q, "value": scale * q})
+        return probes
+
+    def _contiguous_probes(self, e: Entry, device: torch.device | str = "cpu") -> List[dict]:
+        t = decode_tensor(self._raw_payload(e), e.qtype, e.layout, e.shape, e.padded_shape, device)
+        flat = t.reshape(-1)
+        if flat.numel() == 0:
+            return []
+        out = []
+        for idx in [0, int(flat.numel() // 2), int(flat.numel() - 1)]:
+            if len(e.shape) == 1:
+                row, col = idx, 0
+            else:
+                cols = prod(e.shape[1:])
+                row, col = idx // cols, idx % cols
+            out.append({"row": int(row), "col": int(col), "value": float(flat[idx].item())})
+        return out
+
+    def dump(self, path: str | Path, probe_device: torch.device | str = "cpu") -> None:
+        blocks = []
+        for e in self.blocks:
+            block_segments = []
+            for j, s in enumerate(self.segments[e.segment_begin : e.segment_begin + e.segment_count]):
+                block_segments.append(
+                    {
+                        "segment_index": e.segment_begin + j,
+                        "name": s["name"],
+                        "source_kind": s["source_kind"],
+                        "source_layer": s["source_layer"],
+                        "row_begin": s["row_begin"],
+                        "row_count": s["row_count"],
+                    }
+                )
+            if qt.is_quant(e.qtype):
+                dequant_probes = self._row_split_probes(e, probe_device)
+            else:
+                dequant_probes = self._contiguous_probes(e, probe_device)
+            blocks.append(
+                {
+                    "block_index": e.block_index,
+                    "name": e.name,
+                    "source_kind": e.source_kind,
+                    "source_layer": e.source_layer,
+                    "qtype": qt.QTYPE_NAME.get(e.qtype, str(e.qtype)),
+                    "layout": qt.LAYOUT_NAME.get(e.layout, str(e.layout)),
+                    "shape": e.shape,
+                    "padded_shape": e.padded_shape,
+                    "payload_offset": e.payload_offset,
+                    "payload_bytes": e.payload_bytes,
+                    "code_plane_bytes": e.code_plane_bytes,
+                    "scale_plane_bytes": e.scale_plane_bytes,
+                    "crc32": e.crc32,
+                    "fusion_group_id": e.fusion_group_id,
+                    "fusion_index": e.fusion_index,
+                    "segments": block_segments,
+                    "dequant_probes": dequant_probes,
+                }
+            )
+
+        fusion_dump = []
+        for g in self.fusions:
+            first = g["first_block_tensor_index"]
+            count = g["block_count"]
+            fusion_dump.append(
+                {
+                    "group_id": qt.FUSION_GROUP_NAME.get(g["group_id"], str(g["group_id"])),
+                    "source_layer": g["source_layer"],
+                    "block_count": g["block_count"],
+                    "shared_input_kind": g["shared_input_kind"],
+                    "first_block_tensor_index": first,
+                    "payload_offset": g["payload_offset"],
+                    "payload_bytes": g["payload_bytes"],
+                    "total_n": g["total_n"],
+                    "shared_k": g["shared_k"],
+                    "members": [self.blocks[i].name for i in range(first, min(first + count, len(self.blocks)))],
+                }
+            )
+
+        header = {
+            k: (v.hex() if isinstance(v, bytes) else v)
+            for k, v in self.header.items()
+        }
+        out = {
+            "format": "q5090_w4g64_mixed_v2",
+            "file": str(self.path),
+            "header": header,
+            "modules": self.modules,
+            "blocks": blocks,
+            "fusion_groups": fusion_dump,
+        }
+        path = Path(path)
+        os.makedirs(path.parent or ".", exist_ok=True)
+        with path.open("w") as f:
+            json.dump(out, f, indent=2)
+            f.write("\n")
 
     def close(self) -> None:
         self._mm.close()
@@ -457,7 +676,7 @@ class RefModel:
         return bf16(out)
 
     def attn_mix(self, layer: int, x: torch.Tensor, phase: str, positions: torch.Tensor) -> torch.Tensor:
-        p = f"model.language_model.layers.{layer}."
+        p = f"layers.{layer}."
         h = rmsnorm(x, self.weight(p + "input_layernorm.weight"), unit_offset=True)
         q = linear(h, self.weight(p + "self_attn.q_proj.q")).reshape(-1, H_Q, DH)
         gate = linear(h, self.weight(p + "self_attn.q_proj.gate")).reshape(-1, H_Q, DH)
@@ -472,7 +691,7 @@ class RefModel:
         return residual_add(x, o)
 
     def gdn_mix(self, layer: int, x: torch.Tensor, phase: str) -> torch.Tensor:
-        p = f"model.language_model.layers.{layer}."
+        p = f"layers.{layer}."
         gidx = gdn_idx(layer)
         h = rmsnorm(x, self.weight(p + "input_layernorm.weight"), unit_offset=True)
         q = linear(h, self.weight(p + "linear_attn.in_proj_qkv.q"))
@@ -495,7 +714,7 @@ class RefModel:
         return residual_add(x, out)
 
     def mlp_tail(self, layer: int, x: torch.Tensor) -> torch.Tensor:
-        p = f"model.language_model.layers.{layer}."
+        p = f"layers.{layer}."
         h = rmsnorm(x, self.weight(p + "post_attention_layernorm.weight"), unit_offset=True)
         gate = linear(h, self.weight(p + "mlp.gate_proj.weight"))
         up = linear(h, self.weight(p + "mlp.up_proj.weight"))
@@ -582,9 +801,10 @@ def parse_prompt(text: str) -> List[int]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="q5090 PyTorch oracle")
     ap.add_argument("--weights", required=True)
-    ap.add_argument("--prompt", required=True, help="comma or space separated token ids")
+    ap.add_argument("--prompt", default="1", help="comma or space separated token ids")
     ap.add_argument("--decode", type=int, default=1)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dump", default=None, help="write v2 structural dump JSON")
     ap.add_argument("--no-cache-globals", action="store_true")
     ap.add_argument("--cache-globals", action="store_true")
     ap.add_argument(
@@ -601,6 +821,8 @@ def main() -> None:
         cache_globals=args.cache_globals and not args.no_cache_globals,
         resident=args.resident,
     )
+    if args.dump:
+        model.q5090.dump(args.dump)
     with torch.inference_mode():
         tokens = model.forward(parse_prompt(args.prompt), args.decode)
     print(" ".join(str(t) for t in tokens))

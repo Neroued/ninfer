@@ -510,7 +510,18 @@ int validation_checks() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool long_decode = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--long-decode") {
+            long_decode = true;
+        } else {
+            std::cerr << "unknown argument: " << arg << '\n';
+            return 2;
+        }
+    }
+
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 0;
@@ -525,6 +536,11 @@ int main() {
     f += one_decode_case(1, 11u);
     f += one_decode_case(17, 17u);
     f += one_decode_case(2048, 23u);
+    f += one_decode_case(2882, 29u);
+    f += one_decode_case(8191, 37u);
+    if (long_decode) {
+        f += one_decode_case(32768, 41u);
+    }
     f += one_decode_case(17, 31u, DecodeInputMode::Stress);
     f += validation_checks();
 

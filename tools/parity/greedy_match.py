@@ -1,139 +1,223 @@
 #!/usr/bin/env python3
-"""Real-weight greedy token parity gate for M2."""
+"""L4 greedy token parity against the approved q5090 v1 snapshot."""
 
 from __future__ import annotations
 
 import argparse
-import re
-import subprocess
+import gc
+import json
 import sys
-import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 
-import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from tools.parity.ref_model import D, RefModel, parse_prompt  # noqa: E402
+from tools.parity import hf_reference as hfref  # noqa: E402
+from tools.parity.ref_model import RefModel  # noqa: E402
+
+DEFAULT_SNAPSHOT = ROOT / "profiles/e2e/m3-output-gate.json"
+DEFAULT_FIXTURE = ROOT / "bench/fixtures/prompts/cn_short.ids"
+DEFAULT_STOP = {248046, 248044}
 
 
-def run_engine(engine_exe: Path, weights: Path, prompt: list[int], decode: int, max_context: int):
-    cmd = [
-        str(engine_exe),
-        str(weights),
-        "--max-context",
-        str(max_context),
-        "--max-new",
-        str(decode),
-        *[str(x) for x in prompt],
-    ]
-    proc = subprocess.run(cmd, cwd=ROOT, check=True, text=True, capture_output=True)
-    tokens = parse_prompt(proc.stdout.strip())
-    match = re.search(r"tok_s=([0-9.]+)", proc.stderr)
-    tok_s = float(match.group(1)) if match else float("nan")
-    return tokens, tok_s, proc.stderr.strip()
+def is_nonnegative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    af = a.astype(np.float64, copy=False).reshape(-1)
-    bf = b.astype(np.float64, copy=False).reshape(-1)
-    denom = np.linalg.norm(af) * np.linalg.norm(bf)
-    if denom == 0.0:
-        return 1.0 if np.count_nonzero(af - bf) == 0 else 0.0
-    return float(np.dot(af, bf) / denom)
+def first_divergence(a: list[int], b: list[int]) -> Optional[int]:
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    if len(a) != len(b):
+        return min(len(a), len(b))
+    return None
 
 
-def dump_first_divergent_layer(
-    dump_exe: Path,
-    weights: Path,
-    prompt: list[int],
-    mismatch_index: int,
-    model: RefModel,
-) -> None:
-    with tempfile.TemporaryDirectory(prefix="qus-layer-dump-") as tmp:
-        out_dir = Path(tmp)
-        subprocess.check_call(
-            [
-                str(dump_exe),
-                str(weights),
-                str(out_dir),
-                str(mismatch_index),
-                *[str(x) for x in prompt],
-            ],
-            cwd=ROOT,
+def load_snapshot_tokens(path: Path, case: str, repeat_index: int) -> list[int]:
+    if repeat_index < 0:
+        raise ValueError("--repeat must be nonnegative")
+    with path.open("r", encoding="utf-8") as f:
+        report = json.load(f)
+    for item in report.get("cases", []):
+        if item.get("name") != case:
+            continue
+        repeats = item.get("repeats", [])
+        if repeat_index >= len(repeats):
+            raise ValueError(f"{path}: case {case!r} has no repeat {repeat_index}")
+        tokens = repeats[repeat_index].get("generated_token_ids")
+        if (
+            not isinstance(tokens, list)
+            or not tokens
+            or not all(is_nonnegative_int(x) for x in tokens)
+        ):
+            raise ValueError(
+                f"{path}: case {case!r} repeat {repeat_index} "
+                "generated_token_ids must be nonempty nonnegative ints"
+            )
+        return list(tokens)
+    raise ValueError(f"{path}: missing case {case!r}")
+
+
+def infer_case(fixture: Path) -> str:
+    name = fixture.name
+    if name.endswith(".ids"):
+        return name[:-4]
+    return fixture.stem
+
+
+def require_selected_device(device: str) -> torch.device:
+    selected = torch.device(device)
+    if selected.type != "cuda":
+        raise RuntimeError("q5090 greedy parity requires a CUDA device")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA device requested for q5090 greedy parity, but this Python has CPU-only PyTorch. "
+            "Run with a CUDA environment such as "
+            "/home/neroued/miniconda3/envs/py311/bin/python or "
+            "/home/neroued/miniconda3/envs/vllm-bench/bin/python."
         )
-        dumps: dict[str, torch.Tensor] = {}
-        model.forward(prompt, mismatch_index + 1, dumps=dumps)
-        first_bad = None
-        for layer in range(64):
-            cpp = np.fromfile(out_dir / f"layer_{layer:02d}_mlp.f32", dtype="<f4")
-            if cpp.size % D != 0:
-                raise ValueError(f"bad dump shape for layer {layer}: {cpp.size} floats")
-            cpp = cpp.reshape(cpp.size // D, D)
-            ref = dumps[f"layer_{layer}"].numpy()
-            cos = cosine(cpp, ref)
-            print(f"layer {layer:02d} cosine={cos:.8f}")
-            if first_bad is None and cos < 0.999:
-                first_bad = (layer, cos)
-        if first_bad is not None:
-            print(f"first divergent layer: {first_bad[0]} cosine={first_bad[1]:.8f}")
+    return selected
+
+
+def unload_hf(tokenizer, model) -> None:
+    del tokenizer, model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def run_hf_report(
+    hf_dir: Path,
+    prompt: list[int],
+    max_new: int,
+    v2_tokens: list[int],
+    snapshot_tokens: Optional[list[int]],
+    gpu_mem: str,
+    cpu_mem: str,
+) -> None:
+    try:
+        t0 = time.perf_counter()
+        tok, model = hfref.load_hf_model(hf_dir, gpu_mem=gpu_mem, cpu_mem=cpu_mem)
+        hf_tokens = hfref.hf_greedy_tokens(
+            model, prompt, max_new, stop_token_ids=set(DEFAULT_STOP)
+        )
+        print(f"HF greedy_s={time.perf_counter() - t0:.1f} tokens={len(hf_tokens)}")
+        unload_hf(tok, model)
+    except Exception as exc:  # report-only path
+        print(f"HF first divergence unavailable: {exc}", file=sys.stderr)
+        return
+
+    div_v2 = first_divergence(v2_tokens[: len(hf_tokens)], hf_tokens)
+    if div_v2 is None:
+        print(f"HF first divergence vs v2: none in {len(hf_tokens)} tokens")
+    else:
+        print(
+            f"HF first divergence vs v2: index={div_v2} "
+            f"v2={v2_tokens[div_v2] if div_v2 < len(v2_tokens) else 'EOF'} "
+            f"hf={hf_tokens[div_v2] if div_v2 < len(hf_tokens) else 'EOF'}"
+        )
+
+    if snapshot_tokens is not None:
+        div_snap = first_divergence(snapshot_tokens[: len(hf_tokens)], hf_tokens)
+        if div_snap is None:
+            print(f"HF first divergence vs snapshot: none in {len(hf_tokens)} tokens")
         else:
-            print("no per-layer cosine below 0.999; mismatch is likely final norm/lm_head/argmax")
+            print(
+                f"HF first divergence vs snapshot: index={div_snap} "
+                f"snapshot={snapshot_tokens[div_snap] if div_snap < len(snapshot_tokens) else 'EOF'} "
+                f"hf={hf_tokens[div_snap] if div_snap < len(hf_tokens) else 'EOF'}"
+            )
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--weights", default=str(ROOT / "out/qwen3_6_27b.q5090_w4g64_mixed_v1.qus"))
-    ap.add_argument("--prompt", default="1 2 3 4")
-    ap.add_argument("--decode", type=int, default=16)
+    ap.add_argument("--weights", required=True)
+    ap.add_argument("--hf", default=None, help="local HF bf16 model directory for report-only divergence")
+    ap.add_argument("--fixture", default=str(DEFAULT_FIXTURE))
+    ap.add_argument("--tokens", type=int, default=128, help="requested decode budget")
+    ap.add_argument("--snapshot-report", default=str(DEFAULT_SNAPSHOT))
+    ap.add_argument("--case", default=None)
+    ap.add_argument("--repeat", type=int, default=0)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--engine-exe", default=str(ROOT / "build/src/qus"))
-    ap.add_argument("--dump-exe", default=str(ROOT / "build/tests/qus_layer_dump"))
-    ap.add_argument("--max-context", type=int, default=64)
+    ap.add_argument("--resident", default="auto", choices=["auto", "gpu", "stream"])
+    ap.add_argument("--run-hf-report", action="store_true", help="also run slow HF greedy divergence report")
+    ap.add_argument("--hf-gpu-mem", default="26GiB")
+    ap.add_argument("--hf-cpu-mem", default="80GiB")
     args = ap.parse_args()
 
     weights = Path(args.weights)
+    fixture = Path(args.fixture)
+    if not args.snapshot_report:
+        raise ValueError("--snapshot-report is required for the L4 gate")
+    snapshot_report = Path(args.snapshot_report)
+    case = args.case or infer_case(fixture)
     if not weights.exists():
-        print(f"SKIP real q5090 weights absent: {weights}")
-        return
-    engine_exe = Path(args.engine_exe)
-    dump_exe = Path(args.dump_exe)
-    if not engine_exe.exists():
-        raise FileNotFoundError(f"missing engine executable: {engine_exe}")
-    if not dump_exe.exists():
-        raise FileNotFoundError(f"missing layer dump executable: {dump_exe}")
+        raise FileNotFoundError(weights)
+    if not fixture.exists():
+        raise FileNotFoundError(fixture)
+    if args.tokens <= 0:
+        raise ValueError("--tokens must be positive")
+    device = require_selected_device(args.device)
 
-    prompt = parse_prompt(args.prompt)
-    engine_tokens, tok_s, engine_stats = run_engine(
-        engine_exe, weights, prompt, args.decode, args.max_context
+    prompt = hfref.read_ids(fixture)
+    snapshot_tokens = load_snapshot_tokens(snapshot_report, case, args.repeat)
+    compare_len = len(snapshot_tokens)
+    print(
+        f"snapshot={snapshot_report} case={case} repeat={args.repeat} "
+        f"snapshot_tokens={compare_len} requested_tokens={args.tokens}"
     )
-    print(f"engine: {' '.join(str(x) for x in engine_tokens)}")
-    print(f"engine_stats: {engine_stats}")
 
     t0 = time.perf_counter()
-    model = RefModel(weights, device=args.device, cache_globals=False)
-    with torch.inference_mode():
-        oracle_tokens = model.forward(prompt, args.decode)
-    oracle_s = time.perf_counter() - t0
-    print(f"oracle: {' '.join(str(x) for x in oracle_tokens)}")
-    print(f"oracle_elapsed_s={oracle_s:.3f}")
-    print(f"decode_tok_s={tok_s:.6g}")
+    model = RefModel(weights, device=str(device), cache_globals=False, resident=args.resident)
+    try:
+        with torch.inference_mode():
+            v2_tokens = model.forward(prompt, compare_len)
+    finally:
+        model.q5090.close()
+    print(f"v2_greedy_s={time.perf_counter() - t0:.1f} tokens={len(v2_tokens)}")
+    print(f"v2: {' '.join(str(x) for x in v2_tokens)}")
 
-    if engine_tokens != oracle_tokens:
-        mismatch = next(
-            i for i, pair in enumerate(zip(engine_tokens, oracle_tokens)) if pair[0] != pair[1]
-        )
-        print(
-            f"TOKEN MISMATCH index={mismatch} engine={engine_tokens[mismatch]} "
-            f"oracle={oracle_tokens[mismatch]}",
-            file=sys.stderr,
-        )
-        dump_first_divergent_layer(dump_exe, weights, prompt, mismatch, model)
+    failed = False
+    if snapshot_tokens is not None:
+        expected = snapshot_tokens[:compare_len]
+        got = v2_tokens[:compare_len]
+        div = first_divergence(got, expected)
+        if div is None and len(got) == len(expected):
+            print(f"PASS snapshot token match length={compare_len}")
+        else:
+            failed = True
+            print(
+                f"TOKEN MISMATCH index={div} "
+                f"v2={got[div] if div is not None and div < len(got) else 'EOF'} "
+                f"snapshot={expected[div] if div is not None and div < len(expected) else 'EOF'}",
+                file=sys.stderr,
+            )
+
+    if args.hf and args.run_hf_report:
+        hf_dir = Path(args.hf)
+        if hf_dir.exists():
+            run_hf_report(
+                hf_dir,
+                prompt,
+                compare_len,
+                v2_tokens,
+                snapshot_tokens,
+                args.hf_gpu_mem,
+                args.hf_cpu_mem,
+            )
+        else:
+            print(f"HF first divergence unavailable: missing HF dir {hf_dir}", file=sys.stderr)
+    elif args.hf:
+        print("HF first divergence skipped: snapshot gate is authoritative")
+    else:
+        print("HF first divergence unavailable: --hf not provided")
+
+    if failed:
         raise SystemExit(1)
-    print("PASS greedy token match")
 
 
 if __name__ == "__main__":

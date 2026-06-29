@@ -321,7 +321,7 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     if (ph == Phase::Prefill) {
         kernels::gqa_attention_prefill(qn, kn, v, kAttnScale, kv_, fidx, a, s);
     } else {
-        kernels::gqa_attention_decode(qn, kn, v, io_.pos, kAttnScale, kv_, fidx, a, s);
+        kernels::gqa_attention_decode(qn, kn, v, io_.pos, kAttnScale, kv_, fidx, work_, a, s);
     }
     kernels::sigmoid_gate_mul(gate, a, s);
 

@@ -47,7 +47,7 @@ int check_shape(const qus::Tensor& t, const std::int32_t (&expected)[4], const c
     return failures;
 }
 
-int fill_slot(const qus::KVSlot& slot, unsigned char k_value, unsigned char v_value) {
+int fill_slot(const qus::KVHeadSlot& slot, unsigned char k_value, unsigned char v_value) {
     CUDA_CHECK(cudaMemset(slot.k.data, k_value, slot.k.bytes()));
     CUDA_CHECK(cudaMemset(slot.v.data, v_value, slot.v.bytes()));
     return 0;
@@ -86,49 +86,80 @@ int main() {
 
     int failures = 0;
     qus::DeviceContext ctx(0);
-    qus::DeviceArena cache_arena(8192);
+    qus::DeviceArena cache_arena(65536);
     qus::KVCache cache(cache_arena, 2, 8, 4, 16, qus::DType::U8);
 
     failures += expect_size(cache.layer_count(), 2, "cache.layer_count");
     failures += expect_size(cache.pos, 0, "cache.pos initial");
+    failures += expect_size(cache.padded_context, 128, "cache.padded_context");
     failures += expect_size(cache.k.size(), 2, "cache.k.size");
     failures += expect_size(cache.v.size(), 2, "cache.v.size");
     for (std::size_t layer = 0; layer < 2; ++layer) {
-        failures += check_shape(cache.k[layer], {4, 16, 8, 1}, "cache.k");
-        failures += check_shape(cache.v[layer], {4, 16, 8, 1}, "cache.v");
+        failures += check_shape(cache.k[layer], {16, 128, 4, 1}, "cache.k");
+        failures += check_shape(cache.v[layer], {16, 128, 4, 1}, "cache.v");
         if (cache.k[layer].data == cache.v[layer].data) {
             ++failures;
             std::cerr << "K/V tensors alias for layer " << layer << '\n';
         }
     }
 
-    failures +=
-        expect_throws<std::out_of_range>([&] { (void)cache.slot(0, 0); }, "slot before advance");
+    failures += expect_throws<std::out_of_range>([&] { (void)cache.slot(0, 0, 0); },
+                                                 "slot before advance");
+    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(0, -1); },
+                                                 "negative append kv_head");
+    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(0, 4); },
+                                                 "too large append kv_head");
 
-    qus::KVSlot l0p0 = cache.append_slot(0);
-    qus::KVSlot l1p0 = cache.append_slot(1);
-    failures += check_shape(l0p0.k, {4, 16, 1, 1}, "l0p0.k");
-    failures += check_shape(l0p0.v, {4, 16, 1, 1}, "l0p0.v");
-    failures += fill_slot(l0p0, 0x11, 0x12);
-    failures += fill_slot(l1p0, 0x21, 0x22);
+    for (std::int32_t head = 0; head < 4; ++head) {
+        qus::KVHeadSlot l0p0 = cache.append_slot(0, head);
+        qus::KVHeadSlot l1p0 = cache.append_slot(1, head);
+        failures += check_shape(l0p0.k, {16, 1, 1, 1}, "l0p0.k");
+        failures += check_shape(l0p0.v, {16, 1, 1, 1}, "l0p0.v");
+        failures += fill_slot(l0p0, static_cast<unsigned char>(0x10 + head),
+                              static_cast<unsigned char>(0x20 + head));
+        failures += fill_slot(l1p0, static_cast<unsigned char>(0x30 + head),
+                              static_cast<unsigned char>(0x40 + head));
+    }
     cache.advance();
     failures += expect_size(cache.pos, 1, "cache.pos after first advance");
-    failures += expect_device_bytes(cache.slot(0, 0).k, 0x11, "layer0 pos0 K");
-    qus::Tensor l0p0_flat = cache.slot(0, 0).k.reshape({64});
-    failures += check_shape(l0p0_flat, {64, 1, 1, 1}, "l0p0_flat");
-    failures += expect_device_bytes(cache.slot(0, 0).v, 0x12, "layer0 pos0 V");
-    failures += expect_device_bytes(cache.slot(1, 0).k, 0x21, "layer1 pos0 K");
-    failures += expect_device_bytes(cache.slot(1, 0).v, 0x22, "layer1 pos0 V");
+    for (std::int32_t head = 0; head < 4; ++head) {
+        failures += expect_device_bytes(cache.slot(0, 0, head).k,
+                                        static_cast<unsigned char>(0x10 + head),
+                                        "layer0 pos0 K");
+        failures += expect_device_bytes(cache.slot(0, 0, head).v,
+                                        static_cast<unsigned char>(0x20 + head),
+                                        "layer0 pos0 V");
+        failures += expect_device_bytes(cache.slot(1, 0, head).k,
+                                        static_cast<unsigned char>(0x30 + head),
+                                        "layer1 pos0 K");
+        failures += expect_device_bytes(cache.slot(1, 0, head).v,
+                                        static_cast<unsigned char>(0x40 + head),
+                                        "layer1 pos0 V");
+    }
+    qus::Tensor l0p0_flat = cache.slot(0, 0, 0).k.reshape({16});
+    failures += check_shape(l0p0_flat, {16, 1, 1, 1}, "l0p0_flat");
 
-    qus::KVSlot l0p1 = cache.append_slot(0);
-    qus::KVSlot l1p1 = cache.append_slot(1);
-    failures += fill_slot(l0p1, 0x31, 0x32);
-    failures += fill_slot(l1p1, 0x41, 0x42);
+    for (std::int32_t head = 0; head < 4; ++head) {
+        qus::KVHeadSlot l0p1 = cache.append_slot(0, head);
+        qus::KVHeadSlot l1p1 = cache.append_slot(1, head);
+        failures += fill_slot(l0p1, static_cast<unsigned char>(0x50 + head),
+                              static_cast<unsigned char>(0x60 + head));
+        failures += fill_slot(l1p1, static_cast<unsigned char>(0x70 + head),
+                              static_cast<unsigned char>(0x80 + head));
+    }
     cache.advance();
-    failures += expect_device_bytes(cache.slot(0, 0).k, 0x11, "layer0 pos0 K after pos1");
-    failures += expect_device_bytes(cache.slot(0, 1).k, 0x31, "layer0 pos1 K");
-    failures += expect_device_bytes(cache.slot(1, 0).v, 0x22, "layer1 pos0 V after pos1");
-    failures += expect_device_bytes(cache.slot(1, 1).v, 0x42, "layer1 pos1 V");
+    for (std::int32_t head = 0; head < 4; ++head) {
+        failures += expect_device_bytes(cache.slot(0, 0, head).k,
+                                        static_cast<unsigned char>(0x10 + head),
+                                        "layer0 pos0 K after pos1");
+        failures += expect_device_bytes(cache.slot(0, 1, head).k,
+                                        static_cast<unsigned char>(0x50 + head), "layer0 pos1 K");
+        failures += expect_device_bytes(cache.slot(1, 0, head).v,
+                                        static_cast<unsigned char>(0x40 + head),
+                                        "layer1 pos0 V after pos1");
+        failures += expect_device_bytes(cache.slot(1, 1, head).v,
+                                        static_cast<unsigned char>(0x80 + head), "layer1 pos1 V");
+    }
 
     void* k0_base = cache.k[0].data;
     void* v0_base = cache.v[0].data;
@@ -157,13 +188,15 @@ int main() {
     failures += expect_throws<std::invalid_argument>(
         [&] { qus::KVCache invalid(cache_arena, 1, 8, 4, 0, qus::DType::U8); }, "zero head_dim");
 
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(2); },
+    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(2, 0); },
                                                  "invalid append layer");
+    failures += expect_throws<std::out_of_range>([&] { (void)cache.slot(0, 0, 4); },
+                                                 "invalid read kv_head");
 
     while (cache.pos < cache.max_context) { cache.advance(); }
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.slot(0, cache.pos); },
+    failures += expect_throws<std::out_of_range>([&] { (void)cache.slot(0, cache.pos, 0); },
                                                  "read at current pos");
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(0); },
+    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(0, 0); },
                                                  "append at full capacity");
     failures +=
         expect_throws<std::out_of_range>([&] { cache.advance(); }, "advance at full capacity");

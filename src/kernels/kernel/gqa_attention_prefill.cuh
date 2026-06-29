@@ -15,9 +15,12 @@ inline constexpr int kGqaPrefillQHeads    = 24;
 inline constexpr int kGqaPrefillKVHeads   = 4;
 inline constexpr int kGqaPrefillGroupSize = 6;
 
-__device__ __forceinline__ std::int64_t gqa_prefill_cache_index(int kv_head, int d, int position) {
-    return (static_cast<std::int64_t>(position) * kGqaPrefillHeadDim + d) * kGqaPrefillKVHeads +
-           kv_head;
+__device__ __forceinline__ std::int64_t gqa_prefill_cache_index(int kv_head, int d, int position,
+                                                                int padded_context) {
+    return static_cast<std::int64_t>(d) +
+           static_cast<std::int64_t>(kGqaPrefillHeadDim) *
+               (static_cast<std::int64_t>(position) +
+                static_cast<std::int64_t>(padded_context) * kv_head);
 }
 
 __device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, int token) {
@@ -64,7 +67,8 @@ __device__ __forceinline__ float gqa_prefill_block_sum_256(float value, float* s
 
 __global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* k, const __nv_bfloat16* v,
                                                   __nv_bfloat16* cache_k, __nv_bfloat16* cache_v,
-                                                  std::int32_t tokens) {
+                                                  std::int32_t tokens,
+                                                  std::int32_t padded_context) {
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t n =
         static_cast<std::int64_t>(tokens) * kGqaPrefillKVHeads * kGqaPrefillHeadDim;
@@ -75,7 +79,7 @@ __global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* k, const 
     const int kv_head = tmp % kGqaPrefillKVHeads;
     const int token   = tmp / kGqaPrefillKVHeads;
 
-    const std::int64_t cache_off = gqa_prefill_cache_index(kv_head, d, token);
+    const std::int64_t cache_off = gqa_prefill_cache_index(kv_head, d, token, padded_context);
     cache_k[cache_off]           = k[idx];
     cache_v[cache_off]           = v[idx];
 }
@@ -85,7 +89,7 @@ __global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* k, const 
 __launch_bounds__(256) __global__
     void gqa_attention_prefill_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
                                       const __nv_bfloat16* cache_v, float scale, __nv_bfloat16* out,
-                                      std::int32_t tokens) {
+                                      std::int32_t tokens, std::int32_t padded_context) {
     const int block  = static_cast<int>(blockIdx.x);
     const int q_head = block % kGqaPrefillQHeads;
     const int token  = block / kGqaPrefillQHeads;
@@ -101,13 +105,15 @@ __launch_bounds__(256) __global__
     float denom     = 0.0f;
     float acc       = 0.0f;
     for (std::int32_t j = 0; j <= token; ++j) {
-        const float k_d      = __bfloat162float(cache_k[gqa_prefill_cache_index(kv_head, d, j)]);
+        const float k_d =
+            __bfloat162float(cache_k[gqa_prefill_cache_index(kv_head, d, j, padded_context)]);
         const float dot_part = q_d * k_d;
         const float score    = gqa_prefill_block_sum_256(dot_part, scratch) * scale;
         const float next_max = fmaxf(max_score, score);
         const float old_w    = expf(max_score - next_max);
         const float new_w    = expf(score - next_max);
-        const float v_d      = __bfloat162float(cache_v[gqa_prefill_cache_index(kv_head, d, j)]);
+        const float v_d =
+            __bfloat162float(cache_v[gqa_prefill_cache_index(kv_head, d, j, padded_context)]);
         acc                  = acc * old_w + new_w * v_d;
         denom                = denom * old_w + new_w;
         max_score            = next_max;

@@ -27,6 +27,7 @@ constexpr std::int32_t kHeadDim = 256;
 constexpr std::int32_t kQHeads  = 24;
 constexpr std::int32_t kKVHeads = 4;
 constexpr float kScale          = 0.0625f;
+constexpr std::size_t kDecodeWorkspaceBytes = 16ULL * 1024ULL * 1024ULL;
 
 enum class DecodeInputMode { Random, Stress };
 
@@ -52,11 +53,21 @@ std::size_t kv_tensor_index(std::int32_t kv_head, std::int32_t d, std::int32_t t
                                              static_cast<std::size_t>(token);
 }
 
-std::size_t cache_index(std::int32_t kv_head, std::int32_t d, std::int32_t position) {
-    return (static_cast<std::size_t>(position) * static_cast<std::size_t>(kHeadDim) +
-            static_cast<std::size_t>(d)) *
-               static_cast<std::size_t>(kKVHeads) +
-           static_cast<std::size_t>(kv_head);
+std::int32_t align_up_128(std::int32_t value) {
+    return ((value + 127) / 128) * 128;
+}
+
+std::size_t cache_index(std::int32_t kv_head, std::int32_t d, std::int32_t position,
+                        std::int32_t padded_context) {
+    return static_cast<std::size_t>(d) +
+           static_cast<std::size_t>(kHeadDim) *
+               (static_cast<std::size_t>(position) +
+                static_cast<std::size_t>(padded_context) * static_cast<std::size_t>(kv_head));
+}
+
+std::size_t cache_elements(std::int32_t padded_context) {
+    return static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(padded_context) *
+           static_cast<std::size_t>(kKVHeads);
 }
 
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& h) {
@@ -89,7 +100,8 @@ int check_bits_equal(const char* tag, const std::vector<std::uint16_t>& got,
 }
 
 void cpu_gqa_decode(const std::vector<float>& q, const std::vector<float>& cache_k,
-                    const std::vector<float>& cache_v, std::int32_t pos, std::vector<double>& out) {
+                    const std::vector<float>& cache_v, std::int32_t pos,
+                    std::int32_t padded_context, std::vector<double>& out) {
     out.assign(static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads), 0.0);
     const std::size_t window = static_cast<std::size_t>(pos) + 1;
     std::vector<double> scores(window);
@@ -102,7 +114,7 @@ void cpu_gqa_decode(const std::vector<float>& q, const std::vector<float>& cache
             double dot = 0.0;
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
                 dot += static_cast<double>(q[q_index(qh, d)]) *
-                       static_cast<double>(cache_k[cache_index(kvh, d, j)]);
+                       static_cast<double>(cache_k[cache_index(kvh, d, j, padded_context)]);
             }
             const double score                  = dot * static_cast<double>(kScale);
             scores[static_cast<std::size_t>(j)] = score;
@@ -121,7 +133,7 @@ void cpu_gqa_decode(const std::vector<float>& q, const std::vector<float>& cache
             double acc = 0.0;
             for (std::int32_t j = 0; j <= pos; ++j) {
                 acc += probs[static_cast<std::size_t>(j)] *
-                       static_cast<double>(cache_v[cache_index(kvh, d, j)]);
+                       static_cast<double>(cache_v[cache_index(kvh, d, j, padded_context)]);
             }
             out[q_index(qh, d)] = acc;
         }
@@ -130,22 +142,22 @@ void cpu_gqa_decode(const std::vector<float>& q, const std::vector<float>& cache
 
 void cpu_gqa_prefill(const std::vector<float>& q, const std::vector<float>& k,
                      const std::vector<float>& v, std::int32_t tokens,
+                     std::int32_t padded_context,
                      std::vector<float>& expected_cache_k, std::vector<float>& expected_cache_v,
                      std::vector<double>& out) {
     out.assign(static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
                    static_cast<std::size_t>(tokens),
                0.0);
-    expected_cache_k.assign(static_cast<std::size_t>(kHeadDim) *
-                                static_cast<std::size_t>(kKVHeads) *
-                                static_cast<std::size_t>(tokens),
-                            0.0f);
+    expected_cache_k.assign(cache_elements(padded_context), 0.0f);
     expected_cache_v.assign(expected_cache_k.size(), 0.0f);
 
     for (std::int32_t t = 0; t < tokens; ++t) {
         for (std::int32_t h = 0; h < kKVHeads; ++h) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                expected_cache_k[cache_index(h, d, t)] = k[kv_tensor_index(h, d, t)];
-                expected_cache_v[cache_index(h, d, t)] = v[kv_tensor_index(h, d, t)];
+                expected_cache_k[cache_index(h, d, t, padded_context)] =
+                    k[kv_tensor_index(h, d, t)];
+                expected_cache_v[cache_index(h, d, t, padded_context)] =
+                    v[kv_tensor_index(h, d, t)];
             }
         }
     }
@@ -191,7 +203,8 @@ int one_decode_case(std::int32_t pos, std::uint32_t seed,
                     DecodeInputMode mode = DecodeInputMode::Random) {
     const std::size_t qn      = static_cast<std::size_t>(kHeadDim) * kQHeads;
     const std::size_t kvn     = static_cast<std::size_t>(kHeadDim) * kKVHeads;
-    const std::size_t cache_n = kvn * (static_cast<std::size_t>(pos) + 1);
+    const std::int32_t padded_context = align_up_128(pos + 1);
+    const std::size_t cache_n         = cache_elements(padded_context);
 
     std::vector<float> q(qn), k_new(kvn), v_new(kvn), cache_k(cache_n), cache_v(cache_n);
     if (mode == DecodeInputMode::Stress) {
@@ -217,19 +230,22 @@ int one_decode_case(std::int32_t pos, std::uint32_t seed,
     std::vector<float> expected_cache_v = cache_v;
     for (std::int32_t h = 0; h < kKVHeads; ++h) {
         for (std::int32_t d = 0; d < kHeadDim; ++d) {
-            expected_cache_k[cache_index(h, d, pos)] = k_new[kv_tensor_index(h, d)];
-            expected_cache_v[cache_index(h, d, pos)] = v_new[kv_tensor_index(h, d)];
+            expected_cache_k[cache_index(h, d, pos, padded_context)] =
+                k_new[kv_tensor_index(h, d)];
+            expected_cache_v[cache_index(h, d, pos, padded_context)] =
+                v_new[kv_tensor_index(h, d)];
         }
     }
 
     std::vector<double> ref;
-    cpu_gqa_decode(q, expected_cache_k, expected_cache_v, pos, ref);
+    cpu_gqa_decode(q, expected_cache_k, expected_cache_v, pos, padded_context, ref);
 
     DBuf dq   = to_device_bf16(q);
     DBuf dk   = to_device_bf16(k_new);
     DBuf dv   = to_device_bf16(v_new);
     DBuf dpos = to_device_i32(std::vector<int>{pos});
     DBuf dout(qn * sizeof(std::uint16_t));
+    WorkspaceArena ws(kDecodeWorkspaceBytes);
 
     const std::size_t layer_bytes = cache_n * sizeof(std::uint16_t);
     DeviceArena cache_arena(2 * (layer_bytes + 256) + 4096);
@@ -246,7 +262,9 @@ int one_decode_case(std::int32_t pos, std::uint32_t seed,
     Tensor tpos(dpos.p, DType::I32, {1});
     Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, 1});
 
-    kernels::gqa_attention_decode(tq, tk, tv, tpos, kScale, kv, 0, tout, nullptr);
+    kv.pos = static_cast<std::uint32_t>(pos);
+    const std::uint32_t initial_kv_pos = kv.pos;
+    kernels::gqa_attention_decode(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
     cudaDeviceSynchronize();
 
     int f             = 0;
@@ -259,7 +277,7 @@ int one_decode_case(std::int32_t pos, std::uint32_t seed,
     f +=
         check_bits_equal((label + " v append").c_str(),
                          from_device_bf16_bits(kv.v[0].data, cache_n), bf16_bits(expected_cache_v));
-    if (kv.pos != 0) {
+    if (kv.pos != initial_kv_pos) {
         std::cerr << label << ": decode op must not advance host KVCache.pos; got " << kv.pos
                   << '\n';
         ++f;
@@ -283,14 +301,16 @@ int one_prefill_case(std::int32_t tokens, std::uint32_t seed) {
 
     std::vector<float> expected_cache_k, expected_cache_v;
     std::vector<double> ref;
-    cpu_gqa_prefill(q, k, v, tokens, expected_cache_k, expected_cache_v, ref);
+    const std::int32_t padded_context = align_up_128(tokens);
+    cpu_gqa_prefill(q, k, v, tokens, padded_context, expected_cache_k, expected_cache_v, ref);
 
     DBuf dq   = to_device_bf16(q);
     DBuf dk   = to_device_bf16(k);
     DBuf dv   = to_device_bf16(v);
     DBuf dout = DBuf(qn * sizeof(std::uint16_t));
 
-    const std::size_t layer_bytes = kvn * sizeof(std::uint16_t);
+    const std::size_t cache_n     = cache_elements(padded_context);
+    const std::size_t layer_bytes = cache_n * sizeof(std::uint16_t);
     DeviceArena cache_arena(2 * (layer_bytes + 256) + 4096);
     KVCache kv(cache_arena, 1, static_cast<std::uint32_t>(tokens), kKVHeads, kHeadDim, DType::BF16);
     cudaMemset(kv.k[0].data, 0, layer_bytes);
@@ -307,9 +327,9 @@ int one_prefill_case(std::int32_t tokens, std::uint32_t seed) {
     int f             = 0;
     std::string label = "gqa prefill T=" + std::to_string(tokens);
     f += verify(label.c_str(), from_device_bf16(dout, qn), ref, Tolerance::attention_bf16());
-    f += check_bits_equal((label + " k fill").c_str(), from_device_bf16_bits(kv.k[0].data, kvn),
+    f += check_bits_equal((label + " k fill").c_str(), from_device_bf16_bits(kv.k[0].data, cache_n),
                           bf16_bits(expected_cache_k));
-    f += check_bits_equal((label + " v fill").c_str(), from_device_bf16_bits(kv.v[0].data, kvn),
+    f += check_bits_equal((label + " v fill").c_str(), from_device_bf16_bits(kv.v[0].data, cache_n),
                           bf16_bits(expected_cache_v));
     if (kv.pos != 0) {
         std::cerr << label << ": prefill op must not advance host KVCache.pos; got " << kv.pos
@@ -328,7 +348,8 @@ int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed)
         static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads);
     constexpr std::size_t kv_decode_n =
         static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kKVHeads);
-    const std::size_t cache_n = kv_decode_n * static_cast<std::size_t>(tokens + 1);
+    const std::int32_t padded_context = align_up_128(tokens + 1);
+    const std::size_t cache_n         = cache_elements(padded_context);
 
     std::vector<float> q_prefill(q_prefill_n), k_prefill(kv_prefill_n), v_prefill(kv_prefill_n);
     std::vector<float> q_decode(q_decode_n), k_decode(kv_decode_n), v_decode(kv_decode_n);
@@ -349,20 +370,24 @@ int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed)
     for (std::int32_t t = 0; t < tokens; ++t) {
         for (std::int32_t h = 0; h < kKVHeads; ++h) {
             for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                expected_cache_k[cache_index(h, d, t)] = k_prefill[kv_tensor_index(h, d, t)];
-                expected_cache_v[cache_index(h, d, t)] = v_prefill[kv_tensor_index(h, d, t)];
+                expected_cache_k[cache_index(h, d, t, padded_context)] =
+                    k_prefill[kv_tensor_index(h, d, t)];
+                expected_cache_v[cache_index(h, d, t, padded_context)] =
+                    v_prefill[kv_tensor_index(h, d, t)];
             }
         }
     }
     for (std::int32_t h = 0; h < kKVHeads; ++h) {
         for (std::int32_t d = 0; d < kHeadDim; ++d) {
-            expected_cache_k[cache_index(h, d, tokens)] = k_decode[kv_tensor_index(h, d)];
-            expected_cache_v[cache_index(h, d, tokens)] = v_decode[kv_tensor_index(h, d)];
+            expected_cache_k[cache_index(h, d, tokens, padded_context)] =
+                k_decode[kv_tensor_index(h, d)];
+            expected_cache_v[cache_index(h, d, tokens, padded_context)] =
+                v_decode[kv_tensor_index(h, d)];
         }
     }
 
     std::vector<double> ref;
-    cpu_gqa_decode(q_decode, expected_cache_k, expected_cache_v, tokens, ref);
+    cpu_gqa_decode(q_decode, expected_cache_k, expected_cache_v, tokens, padded_context, ref);
 
     DBuf dq_prefill   = to_device_bf16(q_prefill);
     DBuf dk_prefill   = to_device_bf16(k_prefill);
@@ -373,6 +398,7 @@ int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed)
     DBuf dv_decode    = to_device_bf16(v_decode);
     DBuf dpos         = to_device_i32(std::vector<int>{tokens});
     DBuf dout_decode  = DBuf(q_decode_n * sizeof(std::uint16_t));
+    WorkspaceArena ws(kDecodeWorkspaceBytes);
 
     const std::size_t layer_bytes = cache_n * sizeof(std::uint16_t);
     DeviceArena cache_arena(2 * (layer_bytes + 256) + 4096);
@@ -393,8 +419,10 @@ int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed)
 
     kernels::gqa_attention_prefill(tq_prefill, tk_prefill, tv_prefill, kScale, kv, 0, tout_prefill,
                                    nullptr);
-    kernels::gqa_attention_decode(tq_decode, tk_decode, tv_decode, tpos, kScale, kv, 0, tout_decode,
-                                  nullptr);
+    kv.pos = static_cast<std::uint32_t>(tokens);
+    const std::uint32_t initial_kv_pos = kv.pos;
+    kernels::gqa_attention_decode(tq_decode, tk_decode, tv_decode, tpos, kScale, kv, 0, ws,
+                                  tout_decode, nullptr);
     cudaDeviceSynchronize();
 
     int f             = 0;
@@ -407,7 +435,7 @@ int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed)
     f +=
         check_bits_equal((label + " v cache").c_str(), from_device_bf16_bits(kv.v[0].data, cache_n),
                          bf16_bits(expected_cache_v));
-    if (kv.pos != 0) {
+    if (kv.pos != initial_kv_pos) {
         std::cerr << label << ": attention ops must not advance host KVCache.pos; got " << kv.pos
                   << '\n';
         ++f;
@@ -433,8 +461,12 @@ int validation_checks() {
     DBuf dv(kvn * sizeof(std::uint16_t));
     DBuf dpos = to_device_i32(std::vector<int>{pos});
     DBuf dout(qn * sizeof(std::uint16_t));
-    DeviceArena cache_arena(2 * kvn * (pos + 1) * sizeof(std::uint16_t) + 4096);
+    WorkspaceArena ws(kDecodeWorkspaceBytes);
+    const std::int32_t padded_context = align_up_128(pos + 1);
+    const std::size_t layer_bytes = cache_elements(padded_context) * sizeof(std::uint16_t);
+    DeviceArena cache_arena(2 * (layer_bytes + 256) + 4096);
     KVCache kv(cache_arena, 1, pos + 1, kKVHeads, kHeadDim, DType::BF16);
+    kv.pos = static_cast<std::uint32_t>(pos);
 
     Tensor q(dq.p, DType::BF16, {kHeadDim, kQHeads, 1});
     Tensor k(dk.p, DType::BF16, {kHeadDim, kKVHeads, 1});
@@ -459,19 +491,19 @@ int validation_checks() {
     f += expect_invalid("gqa decode pos dtype", [&] {
         Tensor bad = scalar_pos;
         bad.dtype  = DType::BF16;
-        kernels::gqa_attention_decode(q, k, v, bad, kScale, kv, 0, out, nullptr);
+        kernels::gqa_attention_decode(q, k, v, bad, kScale, kv, 0, ws, out, nullptr);
     });
     f += expect_invalid("gqa decode pos shape", [&] {
         Tensor bad(dpos.p, DType::I32, {2});
-        kernels::gqa_attention_decode(q, k, v, bad, kScale, kv, 0, out, nullptr);
+        kernels::gqa_attention_decode(q, k, v, bad, kScale, kv, 0, ws, out, nullptr);
     });
     f += expect_invalid("gqa decode null pos", [&] {
         Tensor bad(nullptr, DType::I32, {1});
-        kernels::gqa_attention_decode(q, k, v, bad, kScale, kv, 0, out, nullptr);
+        kernels::gqa_attention_decode(q, k, v, bad, kScale, kv, 0, ws, out, nullptr);
     });
     f += expect_invalid("gqa decode q shape", [&] {
         Tensor bad(dq.p, DType::BF16, {kHeadDim, kQHeads, 2});
-        kernels::gqa_attention_decode(bad, k, v, scalar_pos, kScale, kv, 0, out, nullptr);
+        kernels::gqa_attention_decode(bad, k, v, scalar_pos, kScale, kv, 0, ws, out, nullptr);
     });
     return f;
 }

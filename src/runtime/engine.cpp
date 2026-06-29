@@ -28,6 +28,14 @@ std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
 
 std::size_t align_slack(std::size_t tensors) { return checked_mul(tensors, 256, "arena size"); }
 
+std::size_t align_up(std::size_t value, std::size_t alignment, const char* label) {
+    const std::size_t mask = alignment - 1;
+    if (value > std::numeric_limits<std::size_t>::max() - mask) {
+        throw std::overflow_error(label);
+    }
+    return (value + mask) & ~mask;
+}
+
 ArenaMemoryStats arena_stats(const std::optional<DeviceArena>& arena) noexcept {
     ArenaMemoryStats stats;
     if (!arena) { return stats; }
@@ -81,11 +89,11 @@ std::size_t Engine::default_weight_bytes(const std::string& path) {
 }
 
 std::size_t Engine::default_cache_bytes(std::uint32_t max_ctx) {
-    const auto max_ctx_size    = static_cast<std::size_t>(max_ctx);
+    const auto padded_ctx_size = align_up(static_cast<std::size_t>(max_ctx), 128, "cache arena size");
     const std::size_t kv_elems = checked_mul(
         checked_mul(model::kCfg.n_full(), 2, "cache arena size"),
         checked_mul(checked_mul(model::kCfg.n_kv, model::kCfg.head_dim, "cache arena size"),
-                    max_ctx_size, "cache arena size"),
+                    padded_ctx_size, "cache arena size"),
         "cache arena size");
     const std::size_t kv_bytes = checked_mul(kv_elems, dtype_size(DType::BF16), "cache arena size");
 

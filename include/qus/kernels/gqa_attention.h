@@ -13,6 +13,7 @@ void gqa_attention_prefill(const Tensor& q, const Tensor& k, const Tensor& v, fl
                            KVCache& kv, int layer, Tensor& out, cudaStream_t stream);
 
 void gqa_attention_decode(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
-                          float scale, KVCache& kv, int layer, Tensor& out, cudaStream_t stream);
+                          float scale, KVCache& kv, int layer, WorkspaceArena& ws, Tensor& out,
+                          cudaStream_t stream);
 
 } // namespace qus::kernels

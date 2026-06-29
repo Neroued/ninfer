@@ -41,7 +41,7 @@ std::int32_t ceil_div_i32(std::int32_t value, std::int32_t divisor) {
 
 std::int32_t decode_tile_n(std::uint32_t host_pos) {
     const std::uint32_t window = host_pos + 1U;
-    return (window <= 4096U) ? 16 : (window <= 16384U) ? 64 : 128;
+    return (window <= 4096U) ? 16 : 64;
 }
 
 void require_shape(const Tensor& t, std::int32_t n0, std::int32_t n1, std::int32_t n2,

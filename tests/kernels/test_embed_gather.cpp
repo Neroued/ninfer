@@ -1,6 +1,6 @@
 // Correctness + coverage for embed_gather, against the frozen op-test standard
 // (docs/l1-op-test-standard.md): fp64 golden from bf16-rounded dense inputs,
-// exact Q6 row-grouped dequant reference, composite tolerance bf16_elementwise.
+// exact Q6 ROW_SPLIT dequant reference, composite tolerance bf16_elementwise.
 #include "qus/kernels/embed_gather.h"
 #include "kernels/op_tester.h"
 
@@ -24,13 +24,16 @@ constexpr std::int32_t kD     = 128;
 constexpr std::int32_t kQwenHiddenD = 5120;
 constexpr std::int32_t kGroup = 64;
 constexpr std::int32_t kBpr   = 48;
-constexpr std::int32_t kRoww  = 2 + kBpr;
 
 static std::int32_t groups_for_d(std::int32_t d) {
     if (d <= 0 || d % kGroup != 0) {
         throw std::invalid_argument("embed_gather test d must be positive and divisible by 64");
     }
     return d / kGroup;
+}
+
+static std::size_t align_up_size(std::size_t x, std::size_t m) {
+    return ((x + m - 1) / m) * m;
 }
 
 static std::uint16_t f32_to_f16(float x) {
@@ -135,11 +138,16 @@ static int unpack_q6_code(const std::uint8_t* packed, std::int32_t c) {
     return (u & 0x20u) ? static_cast<int>(u) - 64 : static_cast<int>(u);
 }
 
-static std::vector<std::uint8_t> encode_q6_row_grouped(const std::vector<float>& src,
-                                                       std::int32_t d,
-                                                       std::vector<float>& deq) {
+static std::vector<std::uint8_t> encode_q6_row_split(const std::vector<float>& src,
+                                                     std::int32_t d,
+                                                     std::vector<float>& deq) {
     const std::int32_t kg = groups_for_d(d);
-    std::vector<std::uint8_t> payload(static_cast<std::size_t>(kVocab) * kg * kRoww);
+    const std::size_t code_plane_bytes =
+        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kBpr;
+    const std::size_t scale_plane_offset = align_up_size(code_plane_bytes, 256);
+    const std::size_t scale_plane_bytes =
+        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * 2u;
+    std::vector<std::uint8_t> payload(scale_plane_offset + scale_plane_bytes);
     deq.assign(src.size(), 0.0f);
     for (std::int32_t row = 0; row < kVocab; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
@@ -164,10 +172,12 @@ static std::vector<std::uint8_t> encode_q6_row_grouped(const std::vector<float>&
                 deq[base + i] = static_cast<float>(q) * scale;
             }
 
-            const std::size_t off = (static_cast<std::size_t>(row) * kg + g) * kRoww;
-            payload[off + 0] = static_cast<std::uint8_t>(scale_h & 0xffu);
-            payload[off + 1] = static_cast<std::uint8_t>(scale_h >> 8);
-            pack_q6_group(codes, payload.data() + off + 2);
+            const std::size_t group_index = static_cast<std::size_t>(row) * kg + g;
+            const std::size_t code_off = group_index * kBpr;
+            const std::size_t scale_off = scale_plane_offset + group_index * 2;
+            pack_q6_group(codes, payload.data() + code_off);
+            payload[scale_off + 0] = static_cast<std::uint8_t>(scale_h & 0xffu);
+            payload[scale_off + 1] = static_cast<std::uint8_t>(scale_h >> 8);
         }
     }
     return payload;
@@ -209,14 +219,22 @@ static Weight dense_weight(void* data, std::int32_t d = kD) {
 
 static Weight q6_weight(void* payload, std::int32_t d = kD) {
     const std::int32_t kg = groups_for_d(d);
+    const std::uint64_t code_plane_bytes =
+        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * kBpr;
+    const std::uint64_t scale_plane_offset =
+        ((code_plane_bytes + 255ULL) / 256ULL) * 256ULL;
+    const std::uint64_t scale_plane_bytes =
+        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * 2ULL;
     Weight w{};
     w.qtype           = QType::Q6G64_F16S;
-    w.layout          = QuantLayout::RowGroupedG64;
+    w.layout          = QuantLayout::RowSplit;
     w.q5090_scale_dtype = ScaleDType::FP16;
     w.payload         = payload;
-    w.payload_bytes   = static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * kRoww;
-    w.qdata           = payload;
-    w.scales          = nullptr;
+    w.payload_bytes   = scale_plane_offset + scale_plane_bytes;
+    if (payload != nullptr) {
+        w.qdata  = payload;
+        w.scales = static_cast<std::uint8_t*>(payload) + scale_plane_offset;
+    }
     w.group_size      = kGroup;
     w.group           = kGroup;
     w.ndim            = 2;
@@ -255,7 +273,7 @@ static int one_dense_shape(std::int32_t T, std::int32_t d) {
 static int one_q6_shape(std::int32_t T, std::int32_t d) {
     const std::vector<float> src = make_source_table(d);
     std::vector<float> deq;
-    std::vector<std::uint8_t> payload = encode_q6_row_grouped(src, d, deq);
+    std::vector<std::uint8_t> payload = encode_q6_row_split(src, d, deq);
     const std::vector<int> ids = ids_for_T(T);
 
     std::vector<double> ref;
@@ -356,7 +374,7 @@ static int validation_checks() {
 
     try {
         Weight bad_dense_layout = dense;
-        bad_dense_layout.layout = QuantLayout::RowGroupedG64;
+        bad_dense_layout.layout = QuantLayout::RowSplit;
         kernels::embed_gather(ids, bad_dense_layout, out, nullptr);
         std::cerr << "validation dense layout: expected invalid_argument\n";
         ++f;

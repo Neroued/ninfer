@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <vector>
 
 namespace qus {
 namespace {
@@ -15,17 +16,19 @@ namespace {
 constexpr std::array<std::byte, 16> kMagic = {
     std::byte{0x51}, std::byte{0x35}, std::byte{0x30}, std::byte{0x39},
     std::byte{0x30}, std::byte{0x4D}, std::byte{0x49}, std::byte{0x58},
-    std::byte{0x45}, std::byte{0x44}, std::byte{0x56}, std::byte{0x31},
+    std::byte{0x45}, std::byte{0x44}, std::byte{0x56}, std::byte{0x32},
     std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
 };
 
-constexpr std::uint32_t kVersion          = 1;
-constexpr std::uint32_t kEndianTag        = 0x01020304U;
-constexpr std::uint32_t kHeaderSize       = 4096;
-constexpr std::uint32_t kModuleRecordSize = 64;
-constexpr std::uint32_t kTensorEntrySize  = 128;
-constexpr std::uint64_t kPayloadAlign     = 256;
-constexpr std::uint64_t kRegionAlign      = 4096;
+constexpr std::uint32_t kVersion               = 2;
+constexpr std::uint32_t kEndianTag             = 0x01020304U;
+constexpr std::uint32_t kHeaderSize            = 4096;
+constexpr std::uint32_t kModuleRecordSize      = 64;
+constexpr std::uint32_t kTensorEntrySize       = 128;
+constexpr std::uint32_t kSegmentRecordSize     = 32;
+constexpr std::uint32_t kFusionGroupRecordSize = 64;
+constexpr std::uint64_t kPayloadAlign          = 256;
+constexpr std::uint64_t kRegionAlign           = 4096;
 
 struct Range {
     std::uint64_t begin = 0;
@@ -100,9 +103,9 @@ bool all_zero(std::span<const std::byte> bytes) {
 void require_zero_range(std::span<const std::byte> file, std::uint64_t offset, std::uint64_t size,
                         const char* label) {
     require_range(file, offset, size, label);
-    require(
-        all_zero(file.subspan(static_cast<std::size_t>(offset), static_cast<std::size_t>(size))),
-        label);
+    require(all_zero(file.subspan(static_cast<std::size_t>(offset),
+                                  static_cast<std::size_t>(size))),
+            label);
 }
 
 const std::array<std::uint32_t, 256>& crc32_table() {
@@ -130,72 +133,47 @@ void validate_expected(std::uint32_t actual, const std::optional<T>& expected, c
 
 QType qtype_from_tag(std::uint16_t tag) {
     switch (tag) {
-    case 0:
-        return QType::Q4G64_F16S;
-    case 1:
-        return QType::Q5G64_F16S;
-    case 2:
-        return QType::Q6G64_F16S;
-    case 3:
-        return QType::W8G128_F16S;
-    case 4:
-        return QType::BF16_CTRL;
-    case 5:
-        return QType::FP32_CTRL;
-    default:
-        parse_error("q5090 invalid qtype tag");
+    case 0: return QType::Q4G64_F16S;
+    case 1: return QType::Q5G64_F16S;
+    case 2: return QType::Q6G64_F16S;
+    case 3: return QType::W8G128_F16S;
+    case 4: return QType::BF16_CTRL;
+    case 5: return QType::FP32_CTRL;
+    default: parse_error("q5090 invalid qtype tag");
     }
 }
 
 QuantLayout layout_from_tag(std::uint16_t tag) {
     switch (tag) {
-    case 0:
-        return QuantLayout::TileN64K64;
-    case 1:
-        return QuantLayout::TileN64K128;
-    case 2:
-        return QuantLayout::RowGroupedG64;
-    case 3:
-        return QuantLayout::Contiguous;
-    default:
-        parse_error("q5090 invalid layout tag");
+    case 0: return QuantLayout::RowSplit;
+    case 1: return QuantLayout::Contiguous;
+    default: parse_error("q5090 invalid layout tag");
     }
 }
 
 ModuleKind module_from_tag(std::uint32_t tag) {
     switch (tag) {
-    case 0:
-        return ModuleKind::TextCore;
-    case 1:
-        return ModuleKind::MtpDraft;
-    case 2:
-        return ModuleKind::VisionEncoder;
-    default:
-        parse_error("q5090 invalid module tag");
+    case 0: return ModuleKind::TextCore;
+    case 1: return ModuleKind::MtpDraft;
+    case 2: return ModuleKind::VisionEncoder;
+    default: parse_error("q5090 invalid module tag");
     }
 }
 
 ScaleDType scale_from_tag(std::uint16_t tag) {
     switch (tag) {
-    case 0:
-        return ScaleDType::None;
-    case 1:
-        return ScaleDType::FP16;
-    default:
-        parse_error("q5090 invalid scale dtype tag");
+    case 0: return ScaleDType::None;
+    case 1: return ScaleDType::FP16;
+    default: parse_error("q5090 invalid scale dtype tag");
     }
 }
 
 LoadPolicy load_policy_from_tag(std::uint32_t tag) {
     switch (tag) {
-    case 0:
-        return LoadPolicy::Resident;
-    case 1:
-        return LoadPolicy::LazyGpu;
-    case 2:
-        return LoadPolicy::CpuPinnedThenGpu;
-    default:
-        parse_error("q5090 invalid load policy tag");
+    case 0: return LoadPolicy::Resident;
+    case 1: return LoadPolicy::LazyGpu;
+    case 2: return LoadPolicy::CpuPinnedThenGpu;
+    default: parse_error("q5090 invalid load policy tag");
     }
 }
 
@@ -259,29 +237,49 @@ bool valid_source_kind(std::uint32_t kind) {
     }
 }
 
-std::uint64_t element_size(QType qtype) {
+bool valid_fusion_group_id(std::uint32_t group_id) {
+    return group_id >= 1 && group_id <= 3;
+}
+
+bool is_quant_qtype(QType qtype) {
+    return qtype == QType::Q4G64_F16S || qtype == QType::Q5G64_F16S ||
+           qtype == QType::Q6G64_F16S || qtype == QType::W8G128_F16S;
+}
+
+std::uint32_t quant_group_size(QType qtype) {
     switch (qtype) {
-    case QType::BF16_CTRL:
-        return 2;
-    case QType::FP32_CTRL:
-        return 4;
+    case QType::Q4G64_F16S:
+    case QType::Q5G64_F16S:
+    case QType::Q6G64_F16S:
+        return 64;
+    case QType::W8G128_F16S:
+        return 128;
     default:
-        parse_error("q5090 qtype has no contiguous element size");
+        parse_error("q5090 qtype has no quant group size");
     }
 }
 
-std::uint64_t tile_bytes(QType qtype) {
+std::uint32_t quant_bits(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S:
-        return 2176;
-    case QType::Q5G64_F16S:
-        return 2688;
-    case QType::Q6G64_F16S:
-        return 3200;
-    case QType::W8G128_F16S:
-        return 8320;
-    default:
-        parse_error("q5090 qtype has no tile bytes");
+    case QType::Q4G64_F16S: return 4;
+    case QType::Q5G64_F16S: return 5;
+    case QType::Q6G64_F16S: return 6;
+    case QType::W8G128_F16S: return 8;
+    default: parse_error("q5090 qtype has no quant bit width");
+    }
+}
+
+std::uint64_t bytes_per_group(QType qtype) {
+    const std::uint64_t group = quant_group_size(qtype);
+    const std::uint64_t bits  = quant_bits(qtype);
+    return (group * bits + 7) / 8;
+}
+
+std::uint64_t element_size(QType qtype) {
+    switch (qtype) {
+    case QType::BF16_CTRL: return 2;
+    case QType::FP32_CTRL: return 4;
+    default: parse_error("q5090 qtype has no contiguous element size");
     }
 }
 
@@ -307,115 +305,126 @@ void validate_shapes(const ParsedQ5090Tensor& tensor) {
 std::uint64_t expected_payload_bytes(const ParsedQ5090Tensor& tensor) {
     validate_shapes(tensor);
     switch (tensor.layout) {
-    case QuantLayout::TileN64K64: {
-        require(tensor.ndim == 2, "q5090 TILE_N64_K64 tensor must be 2D");
-        require(tensor.qtype == QType::Q4G64_F16S || tensor.qtype == QType::Q5G64_F16S ||
-                    tensor.qtype == QType::Q6G64_F16S,
-                "q5090 TILE_N64_K64 qtype mismatch");
-        require(tensor.group_size == 64, "q5090 TILE_N64_K64 group mismatch");
-        require(tensor.scale_dtype == ScaleDType::FP16, "q5090 TILE_N64_K64 scale mismatch");
-        require(tensor.padded_shape[0] == align_up(tensor.shape[0], 64),
-                "q5090 TILE_N64_K64 padded N mismatch");
-        require(tensor.padded_shape[1] == align_up(tensor.shape[1], 64),
-                "q5090 TILE_N64_K64 padded K mismatch");
-        return checked_mul(checked_mul(tensor.padded_shape[0] / 64, tensor.padded_shape[1] / 64),
-                           tile_bytes(tensor.qtype));
-    }
-    case QuantLayout::TileN64K128: {
-        require(tensor.ndim == 2, "q5090 TILE_N64_K128 tensor must be 2D");
-        require(tensor.qtype == QType::W8G128_F16S, "q5090 TILE_N64_K128 qtype mismatch");
-        require(tensor.group_size == 128, "q5090 TILE_N64_K128 group mismatch");
-        require(tensor.scale_dtype == ScaleDType::FP16, "q5090 TILE_N64_K128 scale mismatch");
-        require(tensor.padded_shape[0] == align_up(tensor.shape[0], 64),
-                "q5090 TILE_N64_K128 padded N mismatch");
-        require(tensor.padded_shape[1] == align_up(tensor.shape[1], 128),
-                "q5090 TILE_N64_K128 padded K mismatch");
-        return checked_mul(checked_mul(tensor.padded_shape[0] / 64, tensor.padded_shape[1] / 128),
-                           tile_bytes(tensor.qtype));
-    }
-    case QuantLayout::RowGroupedG64:
-        require(tensor.ndim == 2, "q5090 ROW_GROUPED_G64 tensor must be 2D");
-        require(tensor.qtype == QType::Q6G64_F16S, "q5090 ROW_GROUPED_G64 qtype mismatch");
-        require(tensor.group_size == 64, "q5090 ROW_GROUPED_G64 group mismatch");
-        require(tensor.scale_dtype == ScaleDType::FP16, "q5090 ROW_GROUPED_G64 scale mismatch");
+    case QuantLayout::RowSplit: {
+        require(tensor.ndim == 2, "q5090 ROW_SPLIT tensor must be 2D");
+        require(is_quant_qtype(tensor.qtype), "q5090 ROW_SPLIT qtype mismatch");
+        const std::uint32_t group = quant_group_size(tensor.qtype);
+        require(tensor.group_size == group, "q5090 ROW_SPLIT group mismatch");
+        require(tensor.scale_dtype == ScaleDType::FP16, "q5090 ROW_SPLIT scale mismatch");
         require(tensor.padded_shape[0] == tensor.shape[0],
-                "q5090 ROW_GROUPED_G64 padded N mismatch");
-        require(tensor.padded_shape[1] == align_up(tensor.shape[1], 64),
-                "q5090 ROW_GROUPED_G64 padded K mismatch");
-        return checked_mul(checked_mul(tensor.shape[0], tensor.padded_shape[1] / 64), 50);
-    case QuantLayout::Contiguous:
+                "q5090 ROW_SPLIT padded N mismatch");
+        require(tensor.padded_shape[1] == align_up(tensor.shape[1], group),
+                "q5090 ROW_SPLIT padded K mismatch");
+        const std::uint64_t groups = tensor.padded_shape[1] / group;
+        const std::uint64_t code =
+            checked_mul(checked_mul(tensor.shape[0], groups), bytes_per_group(tensor.qtype));
+        const std::uint64_t scale = checked_mul(checked_mul(tensor.shape[0], groups), 2);
+        const std::uint64_t payload = checked_add(align_up(code, kPayloadAlign), scale);
+        require(tensor.code_plane_bytes == code, "q5090 ROW_SPLIT code plane byte mismatch");
+        require(tensor.scale_plane_bytes == scale, "q5090 ROW_SPLIT scale plane byte mismatch");
+        return payload;
+    }
+    case QuantLayout::Contiguous: {
         require(tensor.qtype == QType::BF16_CTRL || tensor.qtype == QType::FP32_CTRL,
                 "q5090 CONTIGUOUS qtype mismatch");
         require(tensor.group_size == 0, "q5090 CONTIGUOUS group mismatch");
         require(tensor.scale_dtype == ScaleDType::None, "q5090 CONTIGUOUS scale mismatch");
         require(tensor.padded_shape == tensor.shape, "q5090 CONTIGUOUS padded shape mismatch");
-        return checked_mul(numel(tensor.shape, tensor.ndim), element_size(tensor.qtype));
-    default:
-        parse_error("q5090 invalid layout");
+        const std::uint64_t raw = checked_mul(numel(tensor.shape, tensor.ndim),
+                                              element_size(tensor.qtype));
+        require(tensor.code_plane_bytes == raw, "q5090 CONTIGUOUS code byte mismatch");
+        require(tensor.scale_plane_bytes == 0, "q5090 CONTIGUOUS scale byte mismatch");
+        return raw;
     }
+    }
+    parse_error("q5090 invalid layout");
 }
 
-ParsedQ5090Header parse_header(std::span<const std::byte> file, const Q5090Expectations& expected) {
+ParsedQ5090Header parse_header(std::span<const std::byte> file,
+                               const Q5090Expectations& expected) {
     require(file.size() >= kHeaderSize, "q5090 file too small for header");
     require(std::equal(kMagic.begin(), kMagic.end(), file.begin()), "q5090 bad magic");
 
     require(read_u32(file, 16) == kVersion, "q5090 bad version");
     require(read_u32(file, 20) == kEndianTag, "q5090 endian mismatch");
     require(read_u32(file, 24) == kHeaderSize, "q5090 bad header size");
-    require(read_u32(file, 44) == 0, "q5090 reserved header field nonzero");
-    require(read_u32(file, 164) == 0, "q5090 reserved header field nonzero");
-    require(all_zero(file.subspan(200, kHeaderSize - 200)), "q5090 header padding nonzero");
 
     ParsedQ5090Header h;
-    h.tensor_count            = read_u32(file, 28);
-    h.module_count            = read_u32(file, 32);
-    h.layer_count             = read_u32(file, 36);
-    h.flags                   = read_u32(file, 40);
-    h.module_index_offset     = read_u64(file, 48);
-    h.module_index_bytes      = read_u64(file, 56);
-    h.tensor_index_offset     = read_u64(file, 64);
-    h.tensor_index_bytes      = read_u64(file, 72);
-    h.string_table_offset     = read_u64(file, 80);
-    h.string_table_bytes      = read_u64(file, 88);
-    h.payload_offset          = read_u64(file, 96);
-    h.payload_bytes           = read_u64(file, 104);
-    h.hidden_size             = read_u32(file, 112);
-    h.intermediate_size       = read_u32(file, 116);
-    h.vocab_size              = read_u32(file, 120);
-    h.num_attention_heads     = read_u32(file, 124);
-    h.num_key_value_heads     = read_u32(file, 128);
-    h.head_dim                = read_u32(file, 132);
-    h.gdn_key_heads           = read_u32(file, 136);
-    h.gdn_value_heads         = read_u32(file, 140);
-    h.gdn_key_head_dim        = read_u32(file, 144);
-    h.gdn_value_head_dim      = read_u32(file, 148);
-    h.gdn_conv_width          = read_u32(file, 152);
-    h.full_attention_interval = read_u32(file, 156);
-    h.max_position_embeddings = read_u32(file, 160);
+    h.tensor_count              = read_u32(file, 28);
+    h.module_count              = read_u32(file, 32);
+    h.layer_count               = read_u32(file, 36);
+    h.flags                     = read_u32(file, 40);
+    h.segment_count             = read_u32(file, 44);
+    h.module_index_offset       = read_u64(file, 48);
+    h.module_index_bytes        = read_u64(file, 56);
+    h.tensor_index_offset       = read_u64(file, 64);
+    h.tensor_index_bytes        = read_u64(file, 72);
+    h.string_table_offset       = read_u64(file, 80);
+    h.string_table_bytes        = read_u64(file, 88);
+    h.payload_offset            = read_u64(file, 96);
+    h.payload_bytes             = read_u64(file, 104);
+    h.hidden_size               = read_u32(file, 112);
+    h.intermediate_size         = read_u32(file, 116);
+    h.vocab_size                = read_u32(file, 120);
+    h.num_attention_heads       = read_u32(file, 124);
+    h.num_key_value_heads       = read_u32(file, 128);
+    h.head_dim                  = read_u32(file, 132);
+    h.gdn_key_heads             = read_u32(file, 136);
+    h.gdn_value_heads           = read_u32(file, 140);
+    h.gdn_key_head_dim          = read_u32(file, 144);
+    h.gdn_value_head_dim        = read_u32(file, 148);
+    h.gdn_conv_width            = read_u32(file, 152);
+    h.full_attention_interval   = read_u32(file, 156);
+    h.max_position_embeddings   = read_u32(file, 160);
+    h.fusion_group_count        = read_u32(file, 164);
     for (std::size_t i = 0; i < h.sha256_safetensors_index.size(); ++i) {
         h.sha256_safetensors_index[i] = std::to_integer<std::uint8_t>(file[168 + i]);
     }
+    h.segment_index_offset      = read_u64(file, 200);
+    h.segment_index_bytes       = read_u64(file, 208);
+    h.fusion_group_index_offset = read_u64(file, 216);
+    h.fusion_group_index_bytes  = read_u64(file, 224);
+    h.format_minor              = read_u32(file, 232);
 
     require(h.module_count >= 1 && h.module_count <= 3, "q5090 invalid module count");
     require(h.tensor_count > 0, "q5090 tensor count is zero");
+    require(h.segment_count > 0, "q5090 segment count is zero");
     require(h.layer_count == expected.layer_count.value_or(64), "q5090 layer count mismatch");
     require((h.flags & ~0x0FU) == 0, "q5090 unknown header flags");
+    require(h.format_minor == 0, "q5090 unsupported format minor");
+    require(all_zero(file.subspan(236, kHeaderSize - 236)), "q5090 header padding nonzero");
+
     require(h.module_index_offset == kHeaderSize, "q5090 bad module index offset");
     require(h.module_index_bytes == checked_mul(h.module_count, kModuleRecordSize),
             "q5090 bad module index bytes");
-    require(h.tensor_index_bytes == checked_mul(h.tensor_count, kTensorEntrySize),
-            "q5090 bad tensor index bytes");
     require(h.tensor_index_offset == checked_add(h.module_index_offset, h.module_index_bytes),
             "q5090 bad tensor index offset");
-    require(h.string_table_offset == checked_add(h.tensor_index_offset, h.tensor_index_bytes),
+    require(h.tensor_index_bytes == checked_mul(h.tensor_count, kTensorEntrySize),
+            "q5090 bad tensor index bytes");
+    require(h.segment_index_offset == checked_add(h.tensor_index_offset, h.tensor_index_bytes),
+            "q5090 bad segment index offset");
+    require(h.segment_index_bytes == checked_mul(h.segment_count, kSegmentRecordSize),
+            "q5090 bad segment index bytes");
+    require(h.fusion_group_index_offset == checked_add(h.segment_index_offset,
+                                                       h.segment_index_bytes),
+            "q5090 bad fusion group index offset");
+    require(h.fusion_group_index_bytes == checked_mul(h.fusion_group_count,
+                                                      kFusionGroupRecordSize),
+            "q5090 bad fusion group index bytes");
+    require(h.string_table_offset == checked_add(h.fusion_group_index_offset,
+                                                 h.fusion_group_index_bytes),
             "q5090 bad string table offset");
     const std::uint64_t string_end = checked_add(h.string_table_offset, h.string_table_bytes);
     require(h.payload_offset >= string_end, "q5090 payload begins before string table end");
     require(h.payload_offset % kRegionAlign == 0, "q5090 payload region is not aligned");
     require(checked_add(h.payload_offset, h.payload_bytes) == file.size(),
             "q5090 payload bytes do not match file size");
+
     require_range(file, h.module_index_offset, h.module_index_bytes, "module index");
     require_range(file, h.tensor_index_offset, h.tensor_index_bytes, "tensor index");
+    require_range(file, h.segment_index_offset, h.segment_index_bytes, "segment index");
+    require_range(file, h.fusion_group_index_offset, h.fusion_group_index_bytes,
+                  "fusion group index");
     require_range(file, h.string_table_offset, h.string_table_bytes, "string table");
     require_range(file, h.payload_offset, h.payload_bytes, "payload region");
     require(all_zero(file.subspan(static_cast<std::size_t>(string_end),
@@ -461,7 +470,7 @@ std::vector<ParsedQ5090Module> parse_modules(std::span<const std::byte> file,
         m.flags                      = read_u32(file, off + 44);
         require(all_zero(file.subspan(static_cast<std::size_t>(off + 48), 16)),
                 "q5090 module reserved bytes nonzero");
-        require(m.module_version == 1, "q5090 bad module version");
+        require(m.module_version == kVersion, "q5090 bad module version");
         require(m.tensor_index_count > 0, "q5090 empty module");
         require(m.tensor_index_begin == expected_begin,
                 "q5090 module tensor ranges are not contiguous");
@@ -513,47 +522,48 @@ std::string read_name(std::span<const std::byte> file, const ParsedQ5090Header& 
     require(checked_add(name_end, 1) <= h.string_table_bytes, "q5090 name outside string table");
     const std::uint64_t absolute = checked_add(h.string_table_offset, name_offset);
     require(file[static_cast<std::size_t>(absolute + name_len)] == std::byte{0},
-            "q5090 tensor name is not NUL-terminated");
+            "q5090 name is not NUL-terminated");
     const auto* chars = reinterpret_cast<const char*>(file.data() + absolute);
     return std::string(chars, chars + name_len);
 }
 
 std::vector<ParsedQ5090Tensor> parse_tensors(std::span<const std::byte> file,
                                              const ParsedQ5090Header& h,
-                                             const std::vector<ParsedQ5090Module>& modules,
-                                             Q5090Progress* progress) {
-    (void) progress;
+                                             const std::vector<ParsedQ5090Module>& modules) {
     std::vector<ParsedQ5090Tensor> tensors;
     tensors.reserve(h.tensor_count);
     std::vector<Range> ranges;
     ranges.reserve(h.tensor_count);
     std::set<std::string> seen_names;
-    std::set<std::tuple<std::uint16_t, std::uint32_t, std::uint32_t>> seen_sources;
     std::uint64_t previous_payload_end = h.payload_offset;
     for (std::uint32_t i = 0; i < h.tensor_count; ++i) {
         const std::uint64_t off = h.tensor_index_offset + checked_mul(i, kTensorEntrySize);
         ParsedQ5090Tensor t;
-        t.name_offset = read_u32(file, off);
-        t.name_len    = read_u32(file, off + 4);
-        t.name_hash   = read_u64(file, off + 8);
-        t.qtype       = qtype_from_tag(read_u16(file, off + 16));
-        t.layout      = layout_from_tag(read_u16(file, off + 18));
-        t.module_kind = module_from_tag(read_u16(file, off + 20));
-        t.ndim        = read_u16(file, off + 22);
+        t.name_offset      = read_u32(file, off);
+        t.name_len         = read_u32(file, off + 4);
+        t.name_hash        = read_u64(file, off + 8);
+        t.qtype            = qtype_from_tag(read_u16(file, off + 16));
+        t.layout           = layout_from_tag(read_u16(file, off + 18));
+        t.module_kind      = module_from_tag(read_u16(file, off + 20));
+        t.ndim             = read_u16(file, off + 22);
         for (int d = 0; d < 4; ++d) {
             t.shape[d]        = read_u32(file, off + 24 + d * 4);
             t.padded_shape[d] = read_u32(file, off + 40 + d * 4);
         }
-        t.group_size  = read_u32(file, off + 56);
-        t.scale_dtype = scale_from_tag(read_u16(file, off + 60));
-        require(read_u16(file, off + 62) == 0, "q5090 tensor reserved field nonzero");
-        t.payload_offset = read_u64(file, off + 64);
-        t.payload_bytes  = read_u64(file, off + 72);
-        t.source_layer   = read_u32(file, off + 80);
-        t.source_kind    = read_u32(file, off + 84);
-        t.crc32          = read_u32(file, off + 88);
-        require(read_u32(file, off + 92) == 0, "q5090 tensor reserved field nonzero");
-        require(all_zero(file.subspan(static_cast<std::size_t>(off + 96), 32)),
+        t.group_size        = read_u32(file, off + 56);
+        t.scale_dtype       = scale_from_tag(read_u16(file, off + 60));
+        t.segment_count     = read_u16(file, off + 62);
+        t.payload_offset    = read_u64(file, off + 64);
+        t.payload_bytes     = read_u64(file, off + 72);
+        t.source_layer      = read_u32(file, off + 80);
+        t.source_kind       = read_u32(file, off + 84);
+        t.crc32             = read_u32(file, off + 88);
+        t.segment_begin     = read_u32(file, off + 92);
+        t.fusion_group_id   = read_u16(file, off + 96);
+        t.fusion_index      = read_u16(file, off + 98);
+        t.code_plane_bytes  = read_u64(file, off + 100);
+        t.scale_plane_bytes = read_u64(file, off + 108);
+        require(all_zero(file.subspan(static_cast<std::size_t>(off + 116), 12)),
                 "q5090 tensor reserved bytes nonzero");
 
         const ParsedQ5090Module& module = module_for_tensor_index(modules, i);
@@ -561,6 +571,7 @@ std::vector<ParsedQ5090Tensor> parse_tensors(std::span<const std::byte> file,
                 "q5090 tensor module does not match module range");
         t.name = read_name(file, h, t.name_offset, t.name_len);
         require(q5090_fnv1a64(t.name) == t.name_hash, "q5090 tensor name hash mismatch");
+        require(t.segment_count > 0, "q5090 tensor has no segments");
         require(t.payload_bytes > 0, "q5090 tensor payload is empty");
         require(t.payload_offset % kPayloadAlign == 0, "q5090 tensor payload is not aligned");
         require(t.payload_offset >= h.payload_offset,
@@ -579,13 +590,16 @@ std::vector<ParsedQ5090Tensor> parse_tensors(std::span<const std::byte> file,
         require(t.source_layer <= 63 || t.source_layer == kQ5090NoLayer,
                 "q5090 invalid source layer");
         require(valid_source_kind(t.source_kind), "q5090 invalid source kind");
-        require(seen_names.insert(t.name).second, "q5090 duplicate tensor name");
-        if (t.source_kind != static_cast<std::uint32_t>(SourceKind::Other)) {
-            const auto source_key = std::make_tuple(static_cast<std::uint16_t>(t.module_kind),
-                                                    t.source_kind, t.source_layer);
-            require(seen_sources.insert(source_key).second, "q5090 duplicate tensor source id");
+        require(t.fusion_group_id == 0 || valid_fusion_group_id(t.fusion_group_id),
+                "q5090 invalid tensor fusion group id");
+        if (t.fusion_group_id == 0) {
+            require(t.fusion_index == 0, "q5090 standalone tensor has nonzero fusion index");
         }
+        require(seen_names.insert(t.name).second, "q5090 duplicate tensor name");
         require(expected_payload_bytes(t) == t.payload_bytes, "q5090 tensor payload byte mismatch");
+        const auto payload = file.subspan(static_cast<std::size_t>(t.payload_offset),
+                                          static_cast<std::size_t>(t.payload_bytes));
+        require(q5090_crc32(payload) == t.crc32, "q5090 tensor crc32 mismatch");
         ranges.push_back(Range{t.payload_offset, payload_end});
         tensors.push_back(std::move(t));
     }
@@ -615,6 +629,161 @@ std::vector<ParsedQ5090Tensor> parse_tensors(std::span<const std::byte> file,
     return tensors;
 }
 
+std::vector<ParsedQ5090Segment> parse_segments(std::span<const std::byte> file,
+                                               const ParsedQ5090Header& h) {
+    std::vector<ParsedQ5090Segment> segments;
+    segments.reserve(h.segment_count);
+    std::set<std::string> seen_names;
+    for (std::uint32_t i = 0; i < h.segment_count; ++i) {
+        const std::uint64_t off = h.segment_index_offset + checked_mul(i, kSegmentRecordSize);
+        ParsedQ5090Segment s;
+        s.source_kind  = read_u32(file, off);
+        s.source_layer = read_u32(file, off + 4);
+        s.row_begin    = read_u32(file, off + 8);
+        s.row_count    = read_u32(file, off + 12);
+        s.name_offset  = read_u32(file, off + 16);
+        s.name_len     = read_u32(file, off + 20);
+        s.name_hash    = read_u64(file, off + 24);
+        s.name         = read_name(file, h, s.name_offset, s.name_len);
+        require(q5090_fnv1a64(s.name) == s.name_hash, "q5090 segment name hash mismatch");
+        require(s.source_layer <= 63 || s.source_layer == kQ5090NoLayer,
+                "q5090 invalid segment source layer");
+        require(valid_source_kind(s.source_kind), "q5090 invalid segment source kind");
+        require(s.row_count > 0, "q5090 segment row_count is zero");
+        require(seen_names.insert(s.name).second, "q5090 duplicate segment name");
+        segments.push_back(std::move(s));
+    }
+    return segments;
+}
+
+void validate_tensor_segments(const std::vector<ParsedQ5090Tensor>& tensors,
+                              const std::vector<ParsedQ5090Segment>& segments) {
+    std::set<std::tuple<std::uint16_t, std::uint32_t, std::uint32_t>> seen_sources;
+    for (const ParsedQ5090Tensor& t : tensors) {
+        const std::uint64_t end = checked_add(t.segment_begin, t.segment_count);
+        require(end <= segments.size(), "q5090 tensor segment range outside table");
+        const auto module = static_cast<std::uint16_t>(t.module_kind);
+        std::uint32_t row = 0;
+        for (std::uint32_t j = 0; j < t.segment_count; ++j) {
+            const ParsedQ5090Segment& s = segments[static_cast<std::size_t>(t.segment_begin + j)];
+            if (t.layout == QuantLayout::RowSplit) {
+                require(s.row_begin == row, "q5090 ROW_SPLIT segments are not contiguous");
+                row = static_cast<std::uint32_t>(checked_add(row, s.row_count));
+                require(row <= t.shape[0], "q5090 ROW_SPLIT segment exceeds N");
+            } else {
+                require(t.segment_count == 1, "q5090 CONTIGUOUS block must have one segment");
+                require(s.row_begin == 0, "q5090 CONTIGUOUS segment row_begin must be zero");
+                require(s.row_count == t.shape[0],
+                        "q5090 CONTIGUOUS segment row_count mismatch");
+            }
+            if (t.segment_count > 1) {
+                require(s.source_layer == t.source_layer,
+                        "q5090 fused block segment source_layer mismatch");
+            }
+            if (s.source_kind != static_cast<std::uint32_t>(SourceKind::Other)) {
+                const auto key = std::make_tuple(module, s.source_kind, s.source_layer);
+                require(seen_sources.insert(key).second, "q5090 duplicate segment source id");
+            }
+        }
+        if (t.layout == QuantLayout::RowSplit) {
+            require(row == t.shape[0], "q5090 ROW_SPLIT segments do not partition N");
+        }
+
+        const ParsedQ5090Segment& first = segments[static_cast<std::size_t>(t.segment_begin)];
+        if (t.segment_count == 1) {
+            require(t.source_kind == first.source_kind && t.source_layer == first.source_layer,
+                    "q5090 single-segment source identity mismatch");
+            if (t.fusion_group_id == 0) {
+                require(t.name == first.name, "q5090 standalone segment name mismatch");
+            }
+        } else {
+            require(t.source_kind == static_cast<std::uint32_t>(SourceKind::Other),
+                    "q5090 fused block source_kind must be OTHER");
+        }
+    }
+}
+
+std::vector<ParsedQ5090FusionGroup> parse_fusion_groups(std::span<const std::byte> file,
+                                                        const ParsedQ5090Header& h) {
+    std::vector<ParsedQ5090FusionGroup> groups;
+    groups.reserve(h.fusion_group_count);
+    for (std::uint32_t i = 0; i < h.fusion_group_count; ++i) {
+        const std::uint64_t off =
+            h.fusion_group_index_offset + checked_mul(i, kFusionGroupRecordSize);
+        ParsedQ5090FusionGroup g;
+        g.group_id                 = read_u32(file, off);
+        g.source_layer             = read_u32(file, off + 4);
+        g.block_count              = read_u32(file, off + 8);
+        g.shared_input_kind        = read_u32(file, off + 12);
+        g.first_block_tensor_index = read_u64(file, off + 16);
+        g.payload_offset           = read_u64(file, off + 24);
+        g.payload_bytes            = read_u64(file, off + 32);
+        g.total_n                  = read_u32(file, off + 40);
+        g.shared_k                 = read_u32(file, off + 44);
+        require(all_zero(file.subspan(static_cast<std::size_t>(off + 48), 16)),
+                "q5090 fusion group reserved bytes nonzero");
+        require(valid_fusion_group_id(g.group_id), "q5090 invalid fusion group id");
+        require(g.source_layer <= 63, "q5090 invalid fusion group source layer");
+        require(g.block_count > 0, "q5090 empty fusion group");
+        require(valid_source_kind(g.shared_input_kind), "q5090 invalid fusion shared input kind");
+        require(checked_add(g.first_block_tensor_index, g.block_count) <= h.tensor_count,
+                "q5090 fusion group tensor range outside table");
+        require(g.payload_offset >= h.payload_offset,
+                "q5090 fusion group payload begins before payload region");
+        require(checked_add(g.payload_offset, g.payload_bytes) <=
+                    checked_add(h.payload_offset, h.payload_bytes),
+                "q5090 fusion group payload outside payload region");
+        groups.push_back(g);
+    }
+    return groups;
+}
+
+void validate_fusion_groups(const std::vector<ParsedQ5090Tensor>& tensors,
+                            const std::vector<ParsedQ5090FusionGroup>& groups) {
+    std::vector<bool> covered(tensors.size(), false);
+    std::uint64_t previous_first = 0;
+    bool have_previous           = false;
+    for (const ParsedQ5090FusionGroup& g : groups) {
+        if (have_previous) {
+            require(g.first_block_tensor_index > previous_first,
+                    "q5090 fusion groups are not ordered");
+        }
+        have_previous = true;
+        previous_first = g.first_block_tensor_index;
+
+        std::uint32_t total_n = 0;
+        const std::uint64_t first = g.first_block_tensor_index;
+        const std::uint64_t last = first + g.block_count - 1;
+        const ParsedQ5090Tensor& first_tensor = tensors[static_cast<std::size_t>(first)];
+        const ParsedQ5090Tensor& last_tensor  = tensors[static_cast<std::size_t>(last)];
+        require(g.payload_offset == first_tensor.payload_offset,
+                "q5090 fusion payload offset mismatch");
+        require(checked_add(g.payload_offset, g.payload_bytes) ==
+                    checked_add(last_tensor.payload_offset, last_tensor.payload_bytes),
+                "q5090 fusion payload span mismatch");
+
+        for (std::uint32_t j = 0; j < g.block_count; ++j) {
+            const std::size_t index = static_cast<std::size_t>(g.first_block_tensor_index + j);
+            require(!covered[index], "q5090 overlapping fusion groups");
+            covered[index] = true;
+            const ParsedQ5090Tensor& t = tensors[index];
+            require(t.layout == QuantLayout::RowSplit, "q5090 fusion member must be ROW_SPLIT");
+            require(t.fusion_group_id == g.group_id, "q5090 fusion member group id mismatch");
+            require(t.fusion_index == j, "q5090 fusion member index mismatch");
+            require(t.source_layer == g.source_layer, "q5090 fusion member layer mismatch");
+            require(t.shape[1] == g.shared_k, "q5090 fusion member K mismatch");
+            total_n = static_cast<std::uint32_t>(checked_add(total_n, t.shape[0]));
+        }
+        require(total_n == g.total_n, "q5090 fusion total_n mismatch");
+    }
+
+    for (std::size_t i = 0; i < tensors.size(); ++i) {
+        if (tensors[i].fusion_group_id != 0) {
+            require(covered[i], "q5090 tensor references missing fusion group");
+        }
+    }
+}
+
 } // namespace
 
 std::uint64_t q5090_fnv1a64(std::string_view name) {
@@ -636,14 +805,20 @@ std::uint32_t q5090_crc32(std::span<const std::byte> bytes) {
     return crc ^ 0xFFFFFFFFU;
 }
 
-ParsedQ5090File parse_q5090_file(std::span<const std::byte> file, const Q5090Expectations& expected,
+ParsedQ5090File parse_q5090_file(std::span<const std::byte> file,
+                                 const Q5090Expectations& expected,
                                  Q5090Progress* progress) {
+    (void)progress;
     ParsedQ5090File parsed;
-    parsed.header  = parse_header(file, expected);
+    parsed.header = parse_header(file, expected);
     parsed.modules = parse_modules(file, parsed.header);
     require((parsed.header.flags & 0x07U) == module_flags(parsed.modules),
             "q5090 header module flags mismatch");
-    parsed.tensors = parse_tensors(file, parsed.header, parsed.modules, progress);
+    parsed.tensors = parse_tensors(file, parsed.header, parsed.modules);
+    parsed.segments = parse_segments(file, parsed.header);
+    validate_tensor_segments(parsed.tensors, parsed.segments);
+    parsed.fusion_groups = parse_fusion_groups(file, parsed.header);
+    validate_fusion_groups(parsed.tensors, parsed.fusion_groups);
     return parsed;
 }
 

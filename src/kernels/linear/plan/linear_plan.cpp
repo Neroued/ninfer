@@ -5,11 +5,11 @@ namespace qus::kernels::detail {
 LinearFormat classify_format(const Weight& w) {
     using L = QuantLayout;
     switch (w.qtype) {
-    case QType::Q4G64_F16S: return w.layout == L::TileN64K64 ? LinearFormat::Q4G64_N64K64
+    case QType::Q4G64_F16S: return w.layout == L::RowSplit ? LinearFormat::Q4G64_RowSplit
                                                              : LinearFormat::GenericUnsupported;
-    case QType::Q5G64_F16S: return w.layout == L::TileN64K64 ? LinearFormat::Q5G64_N64K64
+    case QType::Q5G64_F16S: return w.layout == L::RowSplit ? LinearFormat::Q5G64_RowSplit
                                                              : LinearFormat::GenericUnsupported;
-    case QType::Q6G64_F16S: return w.layout == L::TileN64K64 ? LinearFormat::Q6G64_N64K64
+    case QType::Q6G64_F16S: return w.layout == L::RowSplit ? LinearFormat::Q6G64_RowSplit
                                                              : LinearFormat::GenericUnsupported;
     case QType::BF16_CTRL:  return w.layout == L::Contiguous ? LinearFormat::DenseBF16
                                                              : LinearFormat::GenericUnsupported;
@@ -48,17 +48,18 @@ LinearPlan resolve_plan(LinearPlanKey key) {
     const bool gemv  = (key.regime == LinearRegime::T1);
     const LinearPolicyId policy =
         dense ? (gemv ? LinearPolicyId::GenericDenseGemv  : LinearPolicyId::GenericDenseGemm)
-              : (gemv ? LinearPolicyId::TunedLowbitGemv   : LinearPolicyId::GenericLowbitGemm);
-    const LinearBackendKind backend = (!dense && gemv) ? LinearBackendKind::Gemv
-                                                       : LinearBackendKind::Reference;
+              : (gemv ? LinearPolicyId::GenericLowbitGemv : LinearPolicyId::GenericLowbitGemm);
+    const LinearBackendKind backend =
+        dense ? LinearBackendKind::Reference : (gemv ? LinearBackendKind::Gemv
+                                                     : LinearBackendKind::Gemm);
     return LinearPlan{ backend, policy, policy_name(policy), /*uses_tensor_cores=*/false };
 }
 
 const char* format_name(LinearFormat f) {
     switch (f) {
-    case LinearFormat::Q4G64_N64K64:     return "q4_n64k64";
-    case LinearFormat::Q5G64_N64K64:     return "q5_n64k64";
-    case LinearFormat::Q6G64_N64K64:     return "q6_n64k64";
+    case LinearFormat::Q4G64_RowSplit:   return "q4_rowsplit";
+    case LinearFormat::Q5G64_RowSplit:   return "q5_rowsplit";
+    case LinearFormat::Q6G64_RowSplit:   return "q6_rowsplit";
     case LinearFormat::DenseBF16:        return "dense_bf16";
     case LinearFormat::DenseFP32:        return "dense_fp32";
     case LinearFormat::GenericUnsupported: return "generic_unsupported";
@@ -96,7 +97,6 @@ const char* policy_name(LinearPolicyId p) {
     case LinearPolicyId::GenericLowbitGemm: return "linear.ref.lowbit.gemm.generic.v1";
     case LinearPolicyId::GenericDenseGemv:  return "linear.ref.dense.gemv.generic.v1";
     case LinearPolicyId::GenericDenseGemm:  return "linear.ref.dense.gemm.generic.v1";
-    case LinearPolicyId::TunedLowbitGemv:   return "linear.gemv.lowbit.tuned.v1";
     }
     return "linear.ref.unknown";
 }

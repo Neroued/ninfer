@@ -1,7 +1,7 @@
 #pragma once
 
-// qus::kernels - embed_gather kernels. Dense copies BF16 rows; Q6 decodes the
-// RowGroupedG64 payload format: fp16 scale followed by 48 LSB-first Q6 bytes.
+// qus::kernels - embed_gather kernels. Dense copies BF16 rows; Q6 decodes
+// ROW_SPLIT code and scale planes.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -12,7 +12,6 @@ namespace qus::kernels {
 
 inline constexpr std::int32_t kEmbedGatherQ6Group = 64;
 inline constexpr std::int32_t kEmbedGatherQ6Bpr   = 48;
-inline constexpr std::int32_t kEmbedGatherQ6Roww  = 2 + kEmbedGatherQ6Bpr;
 inline constexpr std::int32_t kEmbedGatherQ6GroupsPerBlock = 2;
 
 __device__ __forceinline__ int unpack_q6_code(const std::uint8_t* packed, int index) {
@@ -40,7 +39,8 @@ __global__ void embed_gather_dense_kernel(const std::int32_t* ids, const __nv_bf
     }
 }
 
-__global__ void embed_gather_q6_kernel(const std::int32_t* ids, const std::uint8_t* payload,
+__global__ void embed_gather_q6_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                       const std::uint8_t* scales,
                                        __nv_bfloat16* out, std::int32_t d, std::int32_t T,
                                        std::int32_t padded_d) {
     const std::int32_t kg         = padded_d / kEmbedGatherQ6Group;
@@ -55,21 +55,21 @@ __global__ void embed_gather_q6_kernel(const std::int32_t* ids, const std::uint8
         const std::int32_t row = ids[t];
         const std::int32_t g = k / kEmbedGatherQ6Group;
         const std::int32_t lane = k - g * kEmbedGatherQ6Group;
-        const std::int64_t off =
-            (static_cast<std::int64_t>(row) * kg + g) *
-            static_cast<std::int64_t>(kEmbedGatherQ6Roww);
+        const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
         const std::uint16_t scale_bits =
-            static_cast<std::uint16_t>(payload[off]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(payload[off + 1]) << 8);
+            static_cast<std::uint16_t>(scales[group_index * 2]) |
+            static_cast<std::uint16_t>(
+                static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
         const float scale = __half2float(__ushort_as_half(scale_bits));
-        const int code = unpack_q6_code(payload + off + 2, lane);
+        const int code = unpack_q6_code(codes + group_index * kEmbedGatherQ6Bpr, lane);
         out[i] = __float2bfloat16(static_cast<float>(code) * scale);
     }
 }
 
 __launch_bounds__(kEmbedGatherQ6Group * kEmbedGatherQ6GroupsPerBlock)
 __global__ void embed_gather_q6_grouped_kernel(const std::int32_t* ids,
-                                               const std::uint8_t* payload,
+                                               const std::uint8_t* codes,
+                                               const std::uint8_t* scales,
                                                __nv_bfloat16* out, std::int32_t d,
                                                std::int32_t T) {
     const std::int32_t kg = d / kEmbedGatherQ6Group;
@@ -84,18 +84,16 @@ __global__ void embed_gather_q6_grouped_kernel(const std::int32_t* ids,
     if (g >= kg) { return; }
 
     const std::int32_t row = ids[t];
-    const std::int64_t off =
-        (static_cast<std::int64_t>(row) * kg + g) *
-        static_cast<std::int64_t>(kEmbedGatherQ6Roww);
+    const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
 
     int scale_bits = 0;
     if ((lane & 31) == 0) {
-        scale_bits = static_cast<int>(payload[off]) |
-                     (static_cast<int>(payload[off + 1]) << 8);
+        scale_bits = static_cast<int>(scales[group_index * 2]) |
+                     (static_cast<int>(scales[group_index * 2 + 1]) << 8);
     }
     scale_bits = __shfl_sync(0xffffffffu, scale_bits, 0);
     const float scale = __half2float(__ushort_as_half(static_cast<std::uint16_t>(scale_bits)));
-    const int code = unpack_q6_code(payload + off + 2, lane);
+    const int code = unpack_q6_code(codes + group_index * kEmbedGatherQ6Bpr, lane);
     const std::int64_t out_idx =
         static_cast<std::int64_t>(t) * d + static_cast<std::int64_t>(g) * kEmbedGatherQ6Group +
         lane;

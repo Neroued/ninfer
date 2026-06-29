@@ -192,7 +192,7 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
     std::vector<float> source_weight(static_cast<std::size_t>(n) * k);
     fill_uniform(source_weight, seed + 2000u, -weight_abs, weight_abs);
     round_to_bf16(source_weight);
-    q5090::PackedWeight packed = q5090::pack_tile_lowbit(source_weight, n, k, qtype);
+    q5090::PackedWeight packed = q5090::pack_row_split_lowbit(source_weight, n, k, qtype);
     std::vector<float>().swap(source_weight);
 
     std::vector<float> x(static_cast<std::size_t>(k) * max_t);
@@ -366,7 +366,7 @@ int lowbit_metadata_validation(QType qtype) {
     std::vector<float> source(static_cast<std::size_t>(n) * k);
     fill_uniform(source, 123u, -0.125f, 0.125f);
     round_to_bf16(source);
-    q5090::PackedWeight packed = q5090::pack_tile_lowbit(source, n, k, qtype);
+    q5090::PackedWeight packed = q5090::pack_row_split_lowbit(source, n, k, qtype);
 
     std::vector<float> x(k, 1.0f);
     round_to_bf16(x);

@@ -70,9 +70,6 @@ constexpr std::int32_t kDenseK       = 5120;
 constexpr std::int32_t kDenseStressN = 5120;
 constexpr std::int32_t kDenseStressK = 6144;
 constexpr std::int32_t kDenseStressT = 64;
-constexpr std::int32_t kQ4Tile       = 2176;
-constexpr std::int32_t kQ5Tile       = 2688;
-constexpr std::int32_t kQ6Tile       = 3200;
 
 struct LowbitShape {
     const char* role;
@@ -149,24 +146,41 @@ void run_dense_stress(QType qtype) {
     run_dense_shape(kDenseStressN, kDenseStressK, kDenseStressT, qtype, "stress-prefill");
 }
 
-DBuf make_tile_payload(std::int32_t n, std::int32_t k, std::int32_t tilew) {
+std::int32_t bytes_per_group(QType qtype) {
+    switch (qtype) {
+    case QType::Q4G64_F16S: return 32;
+    case QType::Q5G64_F16S: return 40;
+    case QType::Q6G64_F16S: return 48;
+    default:                return 0;
+    }
+}
+
+std::uint64_t align_up_u64(std::uint64_t value, std::uint64_t align) {
+    return ((value + align - 1) / align) * align;
+}
+
+DBuf make_row_split_payload(QType qtype, std::int32_t n, std::int32_t k) {
     constexpr std::uint16_t kScaleOne = 0x3c00u;
-    const std::int32_t nt             = n / 64;
-    const std::int32_t kg             = k / 64;
-    std::vector<std::uint8_t> payload(static_cast<std::size_t>(nt) * kg * tilew);
-    for (std::int32_t tile = 0; tile < nt; ++tile) {
+    const std::int32_t kg = (k + 63) / 64;
+    const std::int32_t bpr = bytes_per_group(qtype);
+    const std::uint64_t code_bytes =
+        static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) *
+        static_cast<std::uint64_t>(bpr);
+    const std::uint64_t scale_offset = align_up_u64(code_bytes, 256);
+    const std::uint64_t scale_bytes =
+        static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) * 2ULL;
+    std::vector<std::uint8_t> payload(static_cast<std::size_t>(scale_offset + scale_bytes));
+    for (std::uint64_t i = 0; i < code_bytes; ++i) {
+        payload[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>((i * 17u + 31u) & 0xffu);
+    }
+    for (std::int32_t row = 0; row < n; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
-            const std::size_t base =
-                (static_cast<std::size_t>(tile) * kg + g) * static_cast<std::size_t>(tilew);
-            for (std::int32_t row = 0; row < 64; ++row) {
-                payload[base + static_cast<std::size_t>(row) * 2] =
-                    static_cast<std::uint8_t>(kScaleOne & 0xffu);
-                payload[base + static_cast<std::size_t>(row) * 2 + 1] =
-                    static_cast<std::uint8_t>(kScaleOne >> 8);
-            }
-            for (std::int32_t i = 64 * 2; i < tilew; ++i) {
-                payload[base + i] = static_cast<std::uint8_t>((i + tile + g) & 0xff);
-            }
+            const std::uint64_t off =
+                scale_offset + (static_cast<std::uint64_t>(row) * kg + g) * 2ULL;
+            payload[static_cast<std::size_t>(off)] =
+                static_cast<std::uint8_t>(kScaleOne & 0xffu);
+            payload[static_cast<std::size_t>(off + 1)] =
+                static_cast<std::uint8_t>(kScaleOne >> 8);
         }
     }
     DBuf d(payload.size());
@@ -174,17 +188,19 @@ DBuf make_tile_payload(std::int32_t n, std::int32_t k, std::int32_t tilew) {
     return d;
 }
 
-DBuf make_q5_payload(std::int32_t n, std::int32_t k) {
-    return make_tile_payload(n, k, kQ5Tile);
-}
-
-Weight lowbit_weight(void* payload, QType qtype, std::int32_t n, std::int32_t k,
-                     std::int32_t tilew) {
+Weight lowbit_weight(void* payload, QType qtype, std::int32_t n, std::int32_t k) {
+    const std::int32_t kg = (k + 63) / 64;
+    const std::uint64_t code_bytes =
+        static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) *
+        static_cast<std::uint64_t>(bytes_per_group(qtype));
+    const std::uint64_t scale_offset = align_up_u64(code_bytes, 256);
+    const std::uint64_t scale_bytes =
+        static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) * 2ULL;
     Weight w{};
     w.payload           = payload;
-    w.payload_bytes     = static_cast<std::uint64_t>(n / 64) * (k / 64) * tilew;
+    w.payload_bytes     = scale_offset + scale_bytes;
     w.qtype             = qtype;
-    w.layout            = QuantLayout::TileN64K64;
+    w.layout            = QuantLayout::RowSplit;
     w.q5090_scale_dtype = ScaleDType::FP16;
     w.group_size        = 64;
     w.shape[0]          = n;
@@ -193,7 +209,7 @@ Weight lowbit_weight(void* payload, QType qtype, std::int32_t n, std::int32_t k,
     w.padded_shape[1]   = k;
     w.ndim              = 2;
     w.qdata             = payload;
-    w.scales            = nullptr;
+    w.scales            = static_cast<std::uint8_t*>(payload) + scale_offset;
     w.n                 = n;
     w.k                 = k;
     w.group             = 64;
@@ -201,15 +217,15 @@ Weight lowbit_weight(void* payload, QType qtype, std::int32_t n, std::int32_t k,
 }
 
 Weight q4_weight(void* payload, std::int32_t n, std::int32_t k) {
-    return lowbit_weight(payload, QType::Q4G64_F16S, n, k, kQ4Tile);
+    return lowbit_weight(payload, QType::Q4G64_F16S, n, k);
 }
 
 Weight q5_weight(void* payload, std::int32_t n, std::int32_t k) {
-    return lowbit_weight(payload, QType::Q5G64_F16S, n, k, kQ5Tile);
+    return lowbit_weight(payload, QType::Q5G64_F16S, n, k);
 }
 
 Weight q6_weight(void* payload, std::int32_t n, std::int32_t k) {
-    return lowbit_weight(payload, QType::Q6G64_F16S, n, k, kQ6Tile);
+    return lowbit_weight(payload, QType::Q6G64_F16S, n, k);
 }
 
 const char* lowbit_name(QType qtype) {
@@ -221,14 +237,13 @@ const char* lowbit_name(QType qtype) {
     }
 }
 
-void run_lowbit_decode(const LowbitShape& shape, QType qtype, std::int32_t tilew) {
+void run_lowbit_decode(const LowbitShape& shape, QType qtype) {
     constexpr std::int32_t t    = 1;
     const std::size_t x_elems   = static_cast<std::size_t>(shape.k) * t;
     const std::size_t out_elems = static_cast<std::size_t>(shape.n) * t;
 
     DBuf x    = make_bf16(x_elems);
-    DBuf wbuf = qtype == QType::Q5G64_F16S ? make_q5_payload(shape.n, shape.k)
-                                           : make_tile_payload(shape.n, shape.k, tilew);
+    DBuf wbuf = make_row_split_payload(qtype, shape.n, shape.k);
     DBuf out  = make_zeros(out_elems * sizeof(std::uint16_t));
 
     Tensor tx(x.p, DType::BF16, {shape.k, t});
@@ -259,7 +274,7 @@ void run_q4_decode() {
         {"attn q", 6144, 5120},
     };
     for (const LowbitShape& shape : shapes) {
-        run_lowbit_decode(shape, QType::Q4G64_F16S, kQ4Tile);
+        run_lowbit_decode(shape, QType::Q4G64_F16S);
     }
 }
 
@@ -271,13 +286,13 @@ void run_q5_decode() {
         {"attn gate", 6144, 5120},
     };
     for (const LowbitShape& shape : shapes) {
-        run_lowbit_decode(shape, QType::Q5G64_F16S, kQ5Tile);
+        run_lowbit_decode(shape, QType::Q5G64_F16S);
     }
 }
 
 void run_q6_decode() {
     constexpr LowbitShape shape{"lm_head", 248320, 5120};
-    run_lowbit_decode(shape, QType::Q6G64_F16S, kQ6Tile);
+    run_lowbit_decode(shape, QType::Q6G64_F16S);
 }
 
 } // namespace

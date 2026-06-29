@@ -10,7 +10,9 @@ namespace qus::kernels::detail {
 
 template <class Codec>
 __global__ void linear_generic_lowbit_gemv_kernel(const __nv_bfloat16* x,
-                                                  const std::uint8_t* payload, __nv_bfloat16* out,
+                                                  const std::uint8_t* codes,
+                                                  const std::uint8_t* scales,
+                                                  __nv_bfloat16* out,
                                                   std::int32_t n, std::int32_t k,
                                                   std::int32_t padded_k) {
     const std::int32_t kg     = padded_k / Codec::kGroupK;
@@ -21,7 +23,7 @@ __global__ void linear_generic_lowbit_gemv_kernel(const __nv_bfloat16* x,
         float acc              = 0.0f;
         float wbuf[Codec::kGroupK];
         for (std::int32_t group = 0; group < kg; ++group) {
-            Codec::load_group(payload, row, group, kg, wbuf);
+            Codec::load_group(codes, scales, row, group, kg, wbuf);
             for (int lane = 0; lane < Codec::kGroupK; ++lane) {
                 const std::int32_t kk = group * Codec::kGroupK + lane;
                 if (kk >= k) { break; }
@@ -34,7 +36,9 @@ __global__ void linear_generic_lowbit_gemv_kernel(const __nv_bfloat16* x,
 
 template <class Codec>
 __global__ void linear_generic_lowbit_gemm_kernel(const __nv_bfloat16* x,
-                                                  const std::uint8_t* payload, __nv_bfloat16* out,
+                                                  const std::uint8_t* codes,
+                                                  const std::uint8_t* scales,
+                                                  __nv_bfloat16* out,
                                                   std::int32_t n, std::int32_t k, std::int32_t t,
                                                   std::int32_t padded_k) {
     const std::int32_t kg       = padded_k / Codec::kGroupK;
@@ -48,7 +52,7 @@ __global__ void linear_generic_lowbit_gemm_kernel(const __nv_bfloat16* x,
         float acc                  = 0.0f;
         float wbuf[Codec::kGroupK];
         for (std::int32_t group = 0; group < kg; ++group) {
-            Codec::load_group(payload, row, group, kg, wbuf);
+            Codec::load_group(codes, scales, row, group, kg, wbuf);
             for (int lane = 0; lane < Codec::kGroupK; ++lane) {
                 const std::int32_t kk = group * Codec::kGroupK + lane;
                 if (kk >= k) { break; }

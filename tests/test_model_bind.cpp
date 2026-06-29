@@ -74,6 +74,9 @@ int expect_weight(const qus::Weight* w, qus::SourceKind kind, std::uint32_t laye
     failures += w->shape[1] == k ? 0 : fail(std::string(label) + " shape[1]");
     failures += w->payload != nullptr ? 0 : fail(std::string(label) + " payload");
     failures += w->qdata != nullptr ? 0 : fail(std::string(label) + " qdata");
+    if (layout == qus::QuantLayout::RowSplit) {
+        failures += w->scales != nullptr ? 0 : fail(std::string(label) + " scales");
+    }
     return failures;
 }
 
@@ -95,11 +98,11 @@ int expect_tensor(const qus::Tensor* t, qus::DType dtype, std::initializer_list<
 int expect_mlp(const qus::model::MlpW& mlp, std::uint32_t layer, std::string_view label) {
     int failures = 0;
     failures += expect_weight(mlp.gate, qus::SourceKind::MlpGate, layer, qus::QType::Q4G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, std::string(label) + ".gate");
+                              qus::QuantLayout::RowSplit, 8, 8, std::string(label) + ".gate");
     failures += expect_weight(mlp.up, qus::SourceKind::MlpUp, layer, qus::QType::Q4G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, std::string(label) + ".up");
+                              qus::QuantLayout::RowSplit, 8, 8, std::string(label) + ".up");
     failures += expect_weight(mlp.down, qus::SourceKind::MlpDown, layer, qus::QType::Q5G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, std::string(label) + ".down");
+                              qus::QuantLayout::RowSplit, 8, 8, std::string(label) + ".down");
     return failures;
 }
 
@@ -149,24 +152,24 @@ int main() {
 
     failures +=
         expect_weight(card.embed(), qus::SourceKind::Embed, qus::kQ5090NoLayer,
-                      qus::QType::Q6G64_F16S, qus::QuantLayout::RowGroupedG64, 16, 8, "embed");
+                      qus::QType::Q6G64_F16S, qus::QuantLayout::RowSplit, 16, 8, "embed");
     failures += expect_tensor(card.final_norm(), qus::DType::BF16, {5120}, "final_norm");
     failures +=
         expect_weight(card.lm_head(), qus::SourceKind::LmHead, qus::kQ5090NoLayer,
-                      qus::QType::Q6G64_F16S, qus::QuantLayout::TileN64K64, 16, 8, "lm_head");
+                      qus::QType::Q6G64_F16S, qus::QuantLayout::RowSplit, 16, 8, "lm_head");
 
     const qus::model::FullLayerW& full = card.full_layer(0);
     failures += expect_tensor(full.input_norm, qus::DType::BF16, {5120}, "full.input_norm");
     failures += expect_weight(full.q_proj, qus::SourceKind::AttnQ, 3, qus::QType::Q4G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "full.q_proj");
+                              qus::QuantLayout::RowSplit, 8, 8, "full.q_proj");
     failures += expect_weight(full.gate_proj, qus::SourceKind::AttnGate, 3, qus::QType::Q5G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "full.gate_proj");
+                              qus::QuantLayout::RowSplit, 8, 8, "full.gate_proj");
     failures += expect_weight(full.k_proj, qus::SourceKind::AttnK, 3, qus::QType::Q4G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "full.k_proj");
+                              qus::QuantLayout::RowSplit, 8, 8, "full.k_proj");
     failures += expect_weight(full.v_proj, qus::SourceKind::AttnV, 3, qus::QType::Q5G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "full.v_proj");
+                              qus::QuantLayout::RowSplit, 8, 8, "full.v_proj");
     failures += expect_weight(full.o_proj, qus::SourceKind::AttnO, 3, qus::QType::Q5G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "full.o_proj");
+                              qus::QuantLayout::RowSplit, 8, 8, "full.o_proj");
     failures += expect_tensor(full.q_norm, qus::DType::BF16, {256}, "full.q_norm");
     failures += expect_tensor(full.k_norm, qus::DType::BF16, {256}, "full.k_norm");
     failures += expect_tensor(full.post_attn_norm, qus::DType::BF16, {5120}, "full.post_attn_norm");
@@ -175,13 +178,13 @@ int main() {
     const qus::model::GdnLayerW& gdn = card.gdn_layer(0);
     failures += expect_tensor(gdn.input_norm, qus::DType::BF16, {5120}, "gdn.input_norm");
     failures += expect_weight(gdn.in_q, qus::SourceKind::GdnInProjQ, 0, qus::QType::Q4G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "gdn.in_q");
+                              qus::QuantLayout::RowSplit, 8, 8, "gdn.in_q");
     failures += expect_weight(gdn.in_k, qus::SourceKind::GdnInProjK, 0, qus::QType::Q4G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "gdn.in_k");
+                              qus::QuantLayout::RowSplit, 8, 8, "gdn.in_k");
     failures += expect_weight(gdn.in_v, qus::SourceKind::GdnInProjV, 0, qus::QType::Q5G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "gdn.in_v");
+                              qus::QuantLayout::RowSplit, 8, 8, "gdn.in_v");
     failures += expect_weight(gdn.in_z, qus::SourceKind::GdnInProjZ, 0, qus::QType::Q5G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "gdn.in_z");
+                              qus::QuantLayout::RowSplit, 8, 8, "gdn.in_z");
     failures += expect_weight(gdn.in_a, qus::SourceKind::GdnInProjA, 0, qus::QType::BF16_CTRL,
                               qus::QuantLayout::Contiguous, 48, 8, "gdn.in_a");
     failures += expect_weight(gdn.in_b, qus::SourceKind::GdnInProjB, 0, qus::QType::BF16_CTRL,
@@ -192,7 +195,7 @@ int main() {
     failures += expect_tensor(gdn.dt_bias, qus::DType::FP32, {48}, "gdn.dt_bias");
     failures += expect_tensor(gdn.gdn_norm, qus::DType::BF16, {128}, "gdn.gdn_norm");
     failures += expect_weight(gdn.out_proj, qus::SourceKind::GdnOutProj, 0, qus::QType::Q5G64_F16S,
-                              qus::QuantLayout::TileN64K64, 8, 8, "gdn.out_proj");
+                              qus::QuantLayout::RowSplit, 8, 8, "gdn.out_proj");
     failures += expect_tensor(gdn.post_attn_norm, qus::DType::BF16, {5120}, "gdn.post_attn_norm");
     failures += expect_mlp(gdn.mlp, 0, "gdn.mlp");
 

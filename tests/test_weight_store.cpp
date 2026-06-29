@@ -103,7 +103,7 @@ int expect_device_bytes(const void* device, const std::vector<std::byte>& expect
 int expect_counts(const qus::WeightStore& store, std::uint64_t loaded_bytes) {
     int failures = 0;
     failures += store.tensor_count() == 10 ? 0 : fail("tensor_count mismatch");
-    failures += store.quant_count() == 6 ? 0 : fail("quant_count mismatch");
+    failures += store.quant_count() == 7 ? 0 : fail("quant_count mismatch");
     failures +=
         store.module_tensor_count(qus::ModuleKind::TextCore) == 6 ? 0 : fail("TEXT count mismatch");
     failures +=
@@ -125,25 +125,35 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
     failures +=
         !store.module_loaded(qus::ModuleKind::VisionEncoder) ? 0 : fail("VISION loaded by default");
 
-    const auto& text_q = find_tensor(parsed, "model.language_model.layers.0.mlp.gate_proj.weight");
-    const qus::Weight* text_weight =
-        store.qweight("model.language_model.layers.0.mlp.gate_proj.weight");
+    const auto& text_q = find_tensor(parsed, "layers.0.mlp.down_proj.weight");
+    const qus::Weight* text_weight = store.qweight("layers.0.mlp.down_proj.weight");
     failures += text_weight != nullptr ? 0 : fail("missing text quant weight");
     if (text_weight != nullptr) {
         failures += text_weight->payload != nullptr ? 0 : fail("text quant payload is null");
         failures += text_weight->payload_bytes == text_q.payload_bytes
                         ? 0
                         : fail("text payload bytes mismatch");
-        failures +=
-            text_weight->layout == qus::QuantLayout::TileN64K64 ? 0 : fail("text layout mismatch");
+        failures += text_weight->layout == qus::QuantLayout::RowSplit ? 0 : fail("text layout mismatch");
+        failures += text_weight->scales != nullptr ? 0 : fail("text scales null");
         failures +=
             expect_device_bytes(text_weight->payload, payload_bytes(file, text_q), "text qweight");
     }
 
+    const qus::Weight* gate = store.qweight("layers.0.mlp.gate_proj.weight");
+    const qus::Weight* up   = store.qweight("layers.0.mlp.up_proj.weight");
+    failures += gate != nullptr ? 0 : fail("missing fused gate segment");
+    failures += up != nullptr ? 0 : fail("missing fused up segment");
+    if (gate != nullptr && up != nullptr) {
+        failures += gate->n == 5 && gate->k == 7 ? 0 : fail("gate segment shape mismatch");
+        failures += up->n == 4 && up->k == 7 ? 0 : fail("up segment shape mismatch");
+        failures += gate->payload == up->payload ? 0 : fail("fused segments should share payload");
+        failures += gate->qdata != nullptr && gate->scales != nullptr ? 0 : fail("gate planes null");
+        failures += up->qdata != nullptr && up->scales != nullptr ? 0 : fail("up planes null");
+    }
+
     const auto& text_tensor_meta =
-        find_tensor(parsed, "model.language_model.layers.0.input_layernorm.weight");
-    const qus::Tensor* text_tensor =
-        store.tensor("model.language_model.layers.0.input_layernorm.weight");
+        find_tensor(parsed, "layers.0.input_layernorm.weight");
+    const qus::Tensor* text_tensor = store.tensor("layers.0.input_layernorm.weight");
     failures += text_tensor != nullptr ? 0 : fail("missing text tensor");
     if (text_tensor != nullptr) {
         failures += text_tensor->data != nullptr ? 0 : fail("text tensor payload is null");
@@ -152,7 +162,7 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
     }
 
     const qus::Weight* by_source = store.qweight(
-        qus::ModuleKind::TextCore, static_cast<std::uint32_t>(qus::SourceKind::MlpGate), 0);
+        qus::ModuleKind::TextCore, static_cast<std::uint32_t>(qus::SourceKind::MlpDown), 0);
     failures += by_source == text_weight ? 0 : fail("source lookup mismatch");
 
     const qus::Weight* mtp = store.qweight("mtp.fc.weight");

@@ -2,7 +2,7 @@
 
 // qus::kernels - embed_gather: out[:, t] = table[ids[t], :].
 // Precision seam op: BF16_CTRL copies dense rows through as_dense(table);
-// Q6G64_F16S dequantizes RowGroupedG64 payload rows.
+// Q6G64_F16S dequantizes ROW_SPLIT code and scale planes.
 
 #include "qus/core/tensor.h"
 

@@ -8,9 +8,9 @@
 namespace qus::kernels::detail {
 
 enum class LinearFormat {
-    Q4G64_N64K64,
-    Q5G64_N64K64,
-    Q6G64_N64K64,
+    Q4G64_RowSplit,
+    Q5G64_RowSplit,
+    Q6G64_RowSplit,
     DenseBF16,
     DenseFP32,
     GenericUnsupported,
@@ -37,7 +37,6 @@ enum class LinearPolicyId {
     GenericLowbitGemm,
     GenericDenseGemv,
     GenericDenseGemm,
-    TunedLowbitGemv,
 };
 
 struct LinearPlanKey {

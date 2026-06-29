@@ -11,18 +11,15 @@ struct Q4Codec {
     static constexpr int kBits = 4;
     static constexpr int kGroupK = 64;
     static constexpr int kBytesPerRowPerGroup = 32;            // ceil(64*4/8)
-    static constexpr int kTileBytes = 64 * 2 + 64 * kBytesPerRowPerGroup;  // 2176
-    __device__ static void load_group(const std::uint8_t* payload, std::int32_t row,
-                                      std::int32_t group, std::int32_t kg, float out[kGroupK]) {
-        const std::int32_t tile = row / 64;
-        const std::int32_t rit  = row - tile * 64;
-        const std::int64_t off  = (static_cast<std::int64_t>(tile) * kg + group) * kTileBytes;
-        const std::uint16_t sb  = static_cast<std::uint16_t>(payload[off + rit * 2]) |
+    __device__ static void load_group(const std::uint8_t* codes, const std::uint8_t* scales,
+                                      std::int32_t row, std::int32_t group, std::int32_t kg,
+                                      float out[kGroupK]) {
+        const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + group;
+        const std::uint16_t sb  = static_cast<std::uint16_t>(scales[group_index * 2]) |
                                   static_cast<std::uint16_t>(
-                                      static_cast<std::uint16_t>(payload[off + rit * 2 + 1]) << 8);
+                                      static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
         const float scale = __half2float(__ushort_as_half(sb));
-        const std::uint8_t* packed =
-            payload + off + 64 * 2 + static_cast<std::int64_t>(rit) * kBytesPerRowPerGroup;
+        const std::uint8_t* packed = codes + group_index * kBytesPerRowPerGroup;
         for (int lane = 0; lane < kGroupK; ++lane) {
             const std::uint8_t byte = packed[lane >> 1];
             const int u = (lane & 1) ? (byte >> 4) : (byte & 0x0f);
@@ -36,18 +33,15 @@ struct Q5Codec {
     static constexpr int kBits = 5;
     static constexpr int kGroupK = 64;
     static constexpr int kBytesPerRowPerGroup = 40;           // ceil(64*5/8)
-    static constexpr int kTileBytes = 64 * 2 + 64 * kBytesPerRowPerGroup;  // 2688
-    __device__ static void load_group(const std::uint8_t* payload, std::int32_t row,
-                                      std::int32_t group, std::int32_t kg, float out[kGroupK]) {
-        const std::int32_t tile = row / 64;
-        const std::int32_t rit  = row - tile * 64;
-        const std::int64_t off  = (static_cast<std::int64_t>(tile) * kg + group) * kTileBytes;
-        const std::uint16_t sb  = static_cast<std::uint16_t>(payload[off + rit * 2]) |
+    __device__ static void load_group(const std::uint8_t* codes, const std::uint8_t* scales,
+                                      std::int32_t row, std::int32_t group, std::int32_t kg,
+                                      float out[kGroupK]) {
+        const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + group;
+        const std::uint16_t sb  = static_cast<std::uint16_t>(scales[group_index * 2]) |
                                   static_cast<std::uint16_t>(
-                                      static_cast<std::uint16_t>(payload[off + rit * 2 + 1]) << 8);
+                                      static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
         const float scale = __half2float(__ushort_as_half(sb));
-        const std::uint8_t* packed =
-            payload + off + 64 * 2 + static_cast<std::int64_t>(rit) * kBytesPerRowPerGroup;
+        const std::uint8_t* packed = codes + group_index * kBytesPerRowPerGroup;
         const auto* words = reinterpret_cast<const std::uint32_t*>(packed);
         std::uint32_t w[11];
 #pragma unroll
@@ -71,18 +65,15 @@ struct Q6Codec {
     static constexpr int kBits = 6;
     static constexpr int kGroupK = 64;
     static constexpr int kBytesPerRowPerGroup = 48;           // ceil(64*6/8)
-    static constexpr int kTileBytes = 64 * 2 + 64 * kBytesPerRowPerGroup;  // 3200
-    __device__ static void load_group(const std::uint8_t* payload, std::int32_t row,
-                                      std::int32_t group, std::int32_t kg, float out[kGroupK]) {
-        const std::int32_t tile = row / 64;
-        const std::int32_t rit  = row - tile * 64;
-        const std::int64_t off  = (static_cast<std::int64_t>(tile) * kg + group) * kTileBytes;
-        const std::uint16_t sb  = static_cast<std::uint16_t>(payload[off + rit * 2]) |
+    __device__ static void load_group(const std::uint8_t* codes, const std::uint8_t* scales,
+                                      std::int32_t row, std::int32_t group, std::int32_t kg,
+                                      float out[kGroupK]) {
+        const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + group;
+        const std::uint16_t sb  = static_cast<std::uint16_t>(scales[group_index * 2]) |
                                   static_cast<std::uint16_t>(
-                                      static_cast<std::uint16_t>(payload[off + rit * 2 + 1]) << 8);
+                                      static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
         const float scale = __half2float(__ushort_as_half(sb));
-        const std::uint8_t* packed =
-            payload + off + 64 * 2 + static_cast<std::int64_t>(rit) * kBytesPerRowPerGroup;
+        const std::uint8_t* packed = codes + group_index * kBytesPerRowPerGroup;
         const auto* words = reinterpret_cast<const std::uint32_t*>(packed);
         std::uint32_t w[13];
 #pragma unroll

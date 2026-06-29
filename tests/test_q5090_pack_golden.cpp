@@ -74,7 +74,7 @@ qtype_name = sys.argv[2]
 out_path = Path(sys.argv[3])
 sys.path.insert(0, str(source_dir))
 
-from tools.q5090_convert.layouts import encode_tile_lowbit
+from tools.q5090_convert.layouts import encode_tensor
 from tools.q5090_convert import qtypes as qt
 
 N = 70
@@ -96,14 +96,14 @@ qtypes = {
     "q6": qt.QT_Q6G64,
 }
 
-payload, logical, padded, group_size, scale_dtype = encode_tile_lowbit(
-    known_matrix(), qtypes[qtype_name], torch.device("cpu")
+payload, logical, padded, group_size, scale_dtype, code_plane_bytes, scale_plane_bytes = encode_tensor(
+    known_matrix(), qtypes[qtype_name], qt.LAYOUT_ROW_SPLIT, torch.device("cpu")
 )
 
-if logical != [N, K] or padded != [128, 192] or group_size != 64 or scale_dtype != qt.SCALE_FP16:
+if logical != [N, K] or padded != [70, 192] or group_size != 64 or scale_dtype != qt.SCALE_FP16:
     raise SystemExit(
         f"unexpected encoder metadata: logical={logical} padded={padded} "
-        f"group={group_size} scale={scale_dtype}"
+        f"group={group_size} scale={scale_dtype} code={code_plane_bytes} scales={scale_plane_bytes}"
     )
 
 out_path.write_bytes(payload)
@@ -183,7 +183,7 @@ int main() {
             if (case_failures == 0) {
                 const std::vector<std::uint8_t> expected = read_bytes(payload_path);
                 const qus::test::q5090::PackedWeight actual =
-                    qus::test::q5090::pack_tile_lowbit(source, kN, kK, test_case.qtype);
+                    qus::test::q5090::pack_row_split_lowbit(source, kN, kK, test_case.qtype);
                 case_failures += compare_payload(test_case.label, actual.payload, expected);
             }
             failures += case_failures;

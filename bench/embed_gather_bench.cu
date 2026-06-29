@@ -1,4 +1,4 @@
-// Performance bench for embed_gather Q6 RowGroupedG64 at the real Qwen3.6
+// Performance bench for embed_gather Q6 ROW_SPLIT at the real Qwen3.6
 // embedding shape. The printed GB/s is informational only; the gate is ncu
 // sustained DRAM percent (see docs/l1-op-test-standard.md section 2).
 //   ./qus_embed_gather_bench [--decode] [--t64|--prefill]   (default: both)
@@ -20,8 +20,13 @@ constexpr std::int32_t kVocab = 248320;
 constexpr std::int32_t kD     = 5120;
 constexpr std::int32_t kGroup = 64;
 constexpr std::int32_t kBpr   = 48;
-constexpr std::int32_t kRoww  = 2 + kBpr;
 constexpr std::int32_t kKg    = kD / kGroup;
+constexpr std::uint64_t kCodePlaneBytes =
+    static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kKg) * kBpr;
+constexpr std::uint64_t kScalePlaneOffset = ((kCodePlaneBytes + 255ULL) / 256ULL) * 256ULL;
+constexpr std::uint64_t kScalePlaneBytes =
+    static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kKg) * 2ULL;
+constexpr std::uint64_t kPayloadBytes = kScalePlaneOffset + kScalePlaneBytes;
 
 DBuf make_ids(std::int32_t t) {
     std::vector<std::int32_t> h(static_cast<std::size_t>(t));
@@ -36,9 +41,9 @@ DBuf make_ids(std::int32_t t) {
 Weight q6_weight(void* payload) {
     Weight w{};
     w.payload            = payload;
-    w.payload_bytes      = static_cast<std::uint64_t>(kVocab) * kKg * kRoww;
+    w.payload_bytes      = kPayloadBytes;
     w.qtype              = QType::Q6G64_F16S;
-    w.layout             = QuantLayout::RowGroupedG64;
+    w.layout             = QuantLayout::RowSplit;
     w.q5090_scale_dtype  = ScaleDType::FP16;
     w.group_size         = kGroup;
     w.shape[0]           = kVocab;
@@ -47,7 +52,7 @@ Weight q6_weight(void* payload) {
     w.padded_shape[1]    = kD;
     w.ndim               = 2;
     w.qdata              = payload;
-    w.scales             = nullptr;
+    w.scales             = static_cast<std::uint8_t*>(payload) + kScalePlaneOffset;
     w.n                  = kVocab;
     w.k                  = kD;
     w.group              = kGroup;
@@ -55,17 +60,14 @@ Weight q6_weight(void* payload) {
 }
 
 void run(std::int32_t t, const char* tag) {
-    constexpr std::size_t payload_bytes =
-        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kKg) *
-        static_cast<std::size_t>(kRoww);
     const std::size_t out_elems =
         static_cast<std::size_t>(kD) * static_cast<std::size_t>(t);
 
-    DBuf payload(payload_bytes);
+    DBuf payload(kPayloadBytes);
     DBuf ids = make_ids(t);
     DBuf out = make_zeros(out_elems * sizeof(std::uint16_t));
 
-    // Deterministic nonzero RowGroupedG64 bytes. Correctness values do not
+    // Deterministic nonzero ROW_SPLIT bytes. Correctness values do not
     // matter for this bandwidth bench; tests cover signed LSB-first semantics.
     CUDA_CHECK(cudaMemset(payload.p, 0x3c, payload.bytes));
 
@@ -74,7 +76,8 @@ void run(std::int32_t t, const char* tag) {
     Tensor tout(out.p, DType::BF16, {kD, t});
 
     // Task-defined traffic: Q6 row read plus BF16 output write.
-    const double bytes = static_cast<double>(t) * static_cast<double>(kD) * 0.875 +
+    const double bytes = static_cast<double>(t) * static_cast<double>(kKg) *
+                             static_cast<double>(kBpr + 2) +
                          static_cast<double>(t) * static_cast<double>(kD) * 2.0;
     const Result r = bench_loop(
         [&](cudaStream_t s) { kernels::embed_gather(tids, table, tout, s); }, bytes);

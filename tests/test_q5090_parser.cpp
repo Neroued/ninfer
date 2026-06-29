@@ -19,6 +19,7 @@ namespace {
 
 constexpr std::uint64_t kModuleRecordSize = 64;
 constexpr std::uint64_t kTensorEntrySize  = 128;
+constexpr std::uint64_t kSegmentRecordSize = 32;
 constexpr std::uint64_t kHeaderSize       = 4096;
 
 int fail(std::string_view message) {
@@ -99,6 +100,14 @@ const qus::ParsedQ5090Tensor& find_tensor(const qus::ParsedQ5090File& parsed,
     throw std::runtime_error("tensor not found in parsed fixture");
 }
 
+const qus::ParsedQ5090Segment& find_segment(const qus::ParsedQ5090File& parsed,
+                                            std::string_view name) {
+    for (const qus::ParsedQ5090Segment& segment : parsed.segments) {
+        if (segment.name == name) { return segment; }
+    }
+    throw std::runtime_error("segment not found in parsed fixture");
+}
+
 template <typename Mutate>
 int expect_parse_throws(const std::vector<std::byte>& valid, std::string_view label,
                         Mutate mutate) {
@@ -117,9 +126,13 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
     int failures                      = 0;
     failures += parsed.header.tensor_count == 10 ? 0 : fail("tensor_count mismatch");
     failures += parsed.header.module_count == 3 ? 0 : fail("module_count mismatch");
+    failures += parsed.header.segment_count == 11 ? 0 : fail("segment_count mismatch");
+    failures += parsed.header.fusion_group_count == 1 ? 0 : fail("fusion_group_count mismatch");
     failures += parsed.header.layer_count == 64 ? 0 : fail("layer_count mismatch");
     failures += parsed.modules.size() == 3 ? 0 : fail("parsed module size mismatch");
     failures += parsed.tensors.size() == 10 ? 0 : fail("parsed tensor size mismatch");
+    failures += parsed.segments.size() == 11 ? 0 : fail("parsed segment size mismatch");
+    failures += parsed.fusion_groups.size() == 1 ? 0 : fail("parsed fusion group size mismatch");
 
     failures += parsed.modules[0].module_kind == qus::ModuleKind::TextCore
                     ? 0
@@ -140,7 +153,7 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
 
     const auto& embed = find_tensor(parsed, "model.language_model.embed_tokens.weight");
     failures += embed.qtype == qus::QType::Q6G64_F16S ? 0 : fail("embed qtype mismatch");
-    failures += embed.layout == qus::QuantLayout::RowGroupedG64 ? 0 : fail("embed layout mismatch");
+    failures += embed.layout == qus::QuantLayout::RowSplit ? 0 : fail("embed layout mismatch");
     failures += embed.module_kind == qus::ModuleKind::TextCore ? 0 : fail("embed module mismatch");
     failures +=
         embed.shape == std::array<std::uint32_t, 4>{3, 5, 1, 1} ? 0 : fail("embed shape mismatch");
@@ -149,19 +162,43 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
                     : fail("embed padded mismatch");
     failures += embed.group_size == 64 ? 0 : fail("embed group mismatch");
     failures += embed.scale_dtype == qus::ScaleDType::FP16 ? 0 : fail("embed scale dtype mismatch");
-    failures += embed.payload_bytes == 150 ? 0 : fail("embed payload bytes mismatch");
+    failures += embed.payload_bytes == 262 ? 0 : fail("embed payload bytes mismatch");
+    failures += embed.code_plane_bytes == 144 ? 0 : fail("embed code bytes mismatch");
+    failures += embed.scale_plane_bytes == 6 ? 0 : fail("embed scale bytes mismatch");
+    failures += embed.segment_count == 1 ? 0 : fail("embed segment count mismatch");
     failures += embed.name_hash == qus::q5090_fnv1a64(embed.name) ? 0 : fail("embed hash mismatch");
+    const auto& embed_segment = find_segment(parsed, "model.language_model.embed_tokens.weight");
+    failures += embed_segment.row_begin == 0 && embed_segment.row_count == 3
+                    ? 0
+                    : fail("embed segment range mismatch");
+
+    const auto& gateup = find_tensor(parsed, "layers.0.mlp.gateup");
+    failures += gateup.segment_count == 2 ? 0 : fail("gateup segment count mismatch");
+    failures += gateup.source_kind == static_cast<std::uint32_t>(qus::SourceKind::Other)
+                    ? 0
+                    : fail("gateup source kind mismatch");
+    const auto& gate = find_segment(parsed, "layers.0.mlp.gate_proj.weight");
+    const auto& up   = find_segment(parsed, "layers.0.mlp.up_proj.weight");
+    failures += gate.row_begin == 0 && gate.row_count == 5 ? 0 : fail("gate segment mismatch");
+    failures += up.row_begin == 5 && up.row_count == 4 ? 0 : fail("up segment mismatch");
+
+    const auto& fusion = parsed.fusion_groups[0];
+    failures += fusion.group_id == 3 ? 0 : fail("fusion group id mismatch");
+    failures += fusion.first_block_tensor_index == 1 ? 0 : fail("fusion first block mismatch");
+    failures += fusion.block_count == 1 ? 0 : fail("fusion block count mismatch");
+    failures += fusion.total_n == 9 ? 0 : fail("fusion total_n mismatch");
+    failures += fusion.shared_k == 7 ? 0 : fail("fusion shared_k mismatch");
 
     const auto& mtp = find_tensor(parsed, "mtp.fc.weight");
     failures += mtp.qtype == qus::QType::W8G128_F16S ? 0 : fail("mtp qtype mismatch");
-    failures += mtp.layout == qus::QuantLayout::TileN64K128 ? 0 : fail("mtp layout mismatch");
+    failures += mtp.layout == qus::QuantLayout::RowSplit ? 0 : fail("mtp layout mismatch");
     failures += mtp.module_kind == qus::ModuleKind::MtpDraft ? 0 : fail("mtp module mismatch");
-    failures += mtp.padded_shape == std::array<std::uint32_t, 4>{64, 128, 1, 1}
+    failures += mtp.padded_shape == std::array<std::uint32_t, 4>{5, 128, 1, 1}
                     ? 0
                     : fail("mtp padded mismatch");
-    failures += mtp.payload_bytes == 8320 ? 0 : fail("mtp payload bytes mismatch");
+    failures += mtp.payload_bytes == 778 ? 0 : fail("mtp payload bytes mismatch");
 
-    const auto& fp32 = find_tensor(parsed, "model.language_model.layers.0.linear_attn.A_log");
+    const auto& fp32 = find_tensor(parsed, "layers.0.linear_attn.A_log");
     failures += fp32.qtype == qus::QType::FP32_CTRL ? 0 : fail("fp32 qtype mismatch");
     failures += fp32.layout == qus::QuantLayout::Contiguous ? 0 : fail("fp32 layout mismatch");
     failures += fp32.scale_dtype == qus::ScaleDType::None ? 0 : fail("fp32 scale dtype mismatch");
@@ -181,7 +218,7 @@ int check_model_bind_conv1d_parse() {
     const std::vector<std::byte> bytes       = read_file(fixture_path);
     const qus::ParsedQ5090File parsed        = qus::parse_q5090_file(bytes, expectations());
     const auto& conv =
-        find_tensor(parsed, "model.language_model.layers.0.linear_attn.conv1d.weight");
+        find_tensor(parsed, "layers.0.linear_attn.conv1d.weight");
 
     int failures = 0;
     failures += conv.qtype == qus::QType::BF16_CTRL ? 0 : fail("conv1d qtype mismatch");
@@ -216,14 +253,18 @@ int main() {
     const std::uint64_t string_offset       = read_u64(valid, 80);
     const std::uint64_t string_bytes        = read_u64(valid, 88);
     const std::uint64_t payload_base        = read_u64(valid, 96);
+    const std::uint64_t segment_offset      = read_u64(valid, 200);
+    const std::uint64_t fusion_offset       = read_u64(valid, 216);
     const std::uint64_t first_entry         = tensor_offset;
     const std::uint64_t second_entry        = tensor_offset + kTensorEntrySize;
     const std::uint64_t first_payload       = read_u64(valid, first_entry + 64);
     const std::uint64_t first_payload_bytes = read_u64(valid, first_entry + 72);
     const std::uint64_t second_module       = module_offset + kModuleRecordSize;
+    const std::uint64_t gate_segment        = segment_offset + kSegmentRecordSize;
+    const std::uint64_t up_segment          = segment_offset + 2 * kSegmentRecordSize;
 
     failures += expect_parse_throws(valid, "bad magic", [](auto& b) { b[0] = std::byte{0x58}; });
-    failures += expect_parse_throws(valid, "bad version", [](auto& b) { write_u32(b, 16, 2); });
+    failures += expect_parse_throws(valid, "bad version", [](auto& b) { write_u32(b, 16, 1); });
     failures +=
         expect_parse_throws(valid, "bad endian", [](auto& b) { write_u32(b, 20, 0x04030201U); });
     failures +=
@@ -232,7 +273,7 @@ int main() {
         expect_parse_throws(valid, "unknown header flags", [](auto& b) { write_u32(b, 40, 0x10); });
     failures +=
         expect_parse_throws(valid, "module flags mismatch", [](auto& b) { write_u32(b, 40, 0x1); });
-    failures += expect_parse_throws(valid, "header reserved", [](auto& b) { write_u32(b, 44, 1); });
+    failures += expect_parse_throws(valid, "header reserved", [](auto& b) { write_u32(b, 236, 1); });
     failures += expect_parse_throws(valid, "tensor index non-adjacent", [module_offset](auto& b) {
         write_u64(b, 64, module_offset + kModuleRecordSize);
     });
@@ -264,9 +305,9 @@ int main() {
         write_u64(b, second_entry + 8, read_u64(b, first_entry + 8));
     });
     failures +=
-        expect_parse_throws(valid, "duplicate source", [first_entry, second_entry](auto& b) {
-            write_u32(b, second_entry + 80, read_u32(b, first_entry + 80));
-            write_u32(b, second_entry + 84, read_u32(b, first_entry + 84));
+        expect_parse_throws(valid, "duplicate source", [gate_segment, up_segment](auto& b) {
+            write_u32(b, up_segment + 0, read_u32(b, gate_segment + 0));
+            write_u32(b, up_segment + 4, read_u32(b, gate_segment + 4));
         });
     failures +=
         expect_parse_throws(valid, "bad string terminator", [first_entry, string_offset](auto& b) {
@@ -290,6 +331,15 @@ int main() {
                                     });
     failures += expect_parse_throws(valid, "shape payload mismatch", [first_entry](auto& b) {
         write_u32(b, first_entry + 40, 128);
+    });
+    failures += expect_parse_throws(valid, "code plane mismatch", [first_entry](auto& b) {
+        write_u64(b, first_entry + 100, read_u64(b, first_entry + 100) + 1);
+    });
+    failures += expect_parse_throws(valid, "segment partition mismatch", [up_segment](auto& b) {
+        write_u32(b, up_segment + 8, 6);
+    });
+    failures += expect_parse_throws(valid, "fusion total_n mismatch", [fusion_offset](auto& b) {
+        write_u32(b, fusion_offset + 40, read_u32(b, fusion_offset + 40) + 1);
     });
     try {
         qus::Q5090Expectations expected;

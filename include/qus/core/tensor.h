@@ -37,11 +37,8 @@ enum class QType : std::uint16_t {
 };
 
 enum class QuantLayout : std::uint16_t {
-    TileN64K64          = 0,
-    W4A16KernelPackedV1 = 0,
-    TileN64K128         = 1,
-    RowGroupedG64       = 2,
-    Contiguous          = 3,
+    RowSplit  = 0,
+    Contiguous = 1,
 };
 
 enum class ModuleKind : std::uint16_t {
@@ -134,7 +131,7 @@ struct Weight {
     std::int32_t n           = 0;
     std::int32_t k           = 0;
     std::int32_t group       = 0;
-    QuantLayout layout       = QuantLayout::W4A16KernelPackedV1;
+    QuantLayout layout       = QuantLayout::RowSplit;
     DType scale_dtype        = DType::FP32;
     std::int32_t scale_ne[4] = {1, 1, 1, 1};
     std::int64_t scale_nb[4] = {0, 0, 0, 0};

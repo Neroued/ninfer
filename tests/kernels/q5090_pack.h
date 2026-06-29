@@ -1,9 +1,9 @@
 #pragma once
 
-// Test-only q5090 TILE_N64_K64 packing helpers. Mirrors
+// Test-only q5090 ROW_SPLIT packing helpers. Mirrors
 // tools/q5090_convert/{quantize.py,packing.py,layouts.py} for low-bit weights:
 // fp16-round per-row/group scales, signed two's-complement LSB-first low-bit
-// codes, and tile-major payload bytes.
+// codes, a contiguous code plane, 256-byte padding, and a separate scale plane.
 
 #include "qus/core/tensor.h"
 
@@ -19,6 +19,10 @@ namespace qus::test::q5090 {
 namespace detail {
 
 inline std::int32_t align_up(std::int32_t x, std::int32_t m) { return ((x + m - 1) / m) * m; }
+
+inline std::size_t align_up_size(std::size_t x, std::size_t m) {
+    return ((x + m - 1) / m) * m;
+}
 
 inline std::uint32_t float_bits(float f) {
     std::uint32_t u = 0;
@@ -52,8 +56,6 @@ inline std::uint16_t f32_to_bf16(float f) {
 inline float bf16_to_f32(std::uint16_t h) {
     return bits_float(static_cast<std::uint32_t>(h) << 16);
 }
-
-inline float round_to_bf16(float f) { return bf16_to_f32(f32_to_bf16(f)); }
 
 inline std::uint16_t f32_to_f16(float f) {
     const std::uint32_t x    = float_bits(f);
@@ -168,52 +170,55 @@ struct PackedWeight {
     std::vector<std::uint8_t> payload;
     std::vector<float> dequant;
     Weight weight{};
+    std::uint64_t code_plane_bytes = 0;
+    std::uint64_t scale_plane_offset = 0;
+    std::uint64_t scale_plane_bytes = 0;
 
     Weight device_weight(void* device_payload) const {
         Weight w  = weight;
         w.payload = device_payload;
-        w.qdata   = device_payload;
-        w.scales  = nullptr;
+        if (device_payload != nullptr) {
+            w.qdata  = device_payload;
+            w.scales = static_cast<std::uint8_t*>(device_payload) + scale_plane_offset;
+        } else {
+            w.qdata  = nullptr;
+            w.scales = nullptr;
+        }
         return w;
     }
 };
 
-inline std::vector<float> decode_tile_lowbit(const std::vector<std::uint8_t>& payload,
-                                             std::int32_t n, std::int32_t k, std::int32_t padded_n,
-                                             std::int32_t padded_k, QType qtype) {
+inline std::vector<float> decode_row_split_lowbit(const std::vector<std::uint8_t>& payload,
+                                                  std::int32_t n, std::int32_t k,
+                                                  std::int32_t padded_k, QType qtype) {
     const detail::QuantSpec spec = detail::quant_spec(qtype);
     const int bpr                = detail::bytes_per_group(spec);
-    const int tilew              = 64 * 2 + 64 * bpr;
-    const std::int32_t nt        = padded_n / 64;
     const std::int32_t kg        = padded_k / spec.group_size;
+    const std::size_t code_bytes =
+        static_cast<std::size_t>(n) * static_cast<std::size_t>(kg) * static_cast<std::size_t>(bpr);
+    const std::size_t scale_off = detail::align_up_size(code_bytes, 256);
 
     std::vector<float> deq(static_cast<std::size_t>(n) * k);
-    for (std::int32_t tile = 0; tile < nt; ++tile) {
+    for (std::int32_t row = 0; row < n; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
-            const std::size_t base =
-                (static_cast<std::size_t>(tile) * kg + g) * static_cast<std::size_t>(tilew);
-            for (std::int32_t row_in_tile = 0; row_in_tile < 64; ++row_in_tile) {
-                const std::int32_t row = tile * 64 + row_in_tile;
-                if (row >= n) { continue; }
-                const std::uint16_t scale_h =
-                    detail::load_u16_le(payload, base + static_cast<std::size_t>(row_in_tile) * 2);
-                const float scale = detail::f16_to_f32(scale_h);
-                const std::uint8_t* packed =
-                    payload.data() + base + 64 * 2 + static_cast<std::size_t>(row_in_tile) * bpr;
-                for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {
-                    const std::int32_t kk = g * spec.group_size + lane;
-                    if (kk >= k) { continue; }
-                    const int code = detail::unpack_lowbit_code(packed, spec, lane);
-                    deq[static_cast<std::size_t>(row) * k + kk] = static_cast<float>(code) * scale;
-                }
+            const std::size_t group_index = static_cast<std::size_t>(row) * kg + g;
+            const std::uint16_t scale_h =
+                detail::load_u16_le(payload, scale_off + group_index * 2);
+            const float scale = detail::f16_to_f32(scale_h);
+            const std::uint8_t* packed = payload.data() + group_index * bpr;
+            for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {
+                const std::int32_t kk = g * spec.group_size + lane;
+                if (kk >= k) { continue; }
+                const int code = detail::unpack_lowbit_code(packed, spec, lane);
+                deq[static_cast<std::size_t>(row) * k + kk] = static_cast<float>(code) * scale;
             }
         }
     }
     return deq;
 }
 
-inline PackedWeight pack_tile_lowbit(const std::vector<float>& source, std::int32_t n,
-                                     std::int32_t k, QType qtype) {
+inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std::int32_t n,
+                                          std::int32_t k, QType qtype) {
     if (n <= 0 || k <= 0) {
         throw std::invalid_argument("q5090 test packer: shape must be positive");
     }
@@ -222,85 +227,85 @@ inline PackedWeight pack_tile_lowbit(const std::vector<float>& source, std::int3
     }
 
     const detail::QuantSpec spec = detail::quant_spec(qtype);
-    const std::int32_t padded_n  = detail::align_up(n, 64);
     const std::int32_t padded_k  = detail::align_up(k, spec.group_size);
-    const std::int32_t nt        = padded_n / 64;
     const std::int32_t kg        = padded_k / spec.group_size;
     const int bpr                = detail::bytes_per_group(spec);
-    const int tilew              = 64 * 2 + 64 * bpr;
 
     PackedWeight out;
-    out.payload.assign(static_cast<std::size_t>(nt) * kg * tilew, 0);
+    out.code_plane_bytes =
+        static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) * static_cast<std::uint64_t>(bpr);
+    out.scale_plane_offset = detail::align_up_size(static_cast<std::size_t>(out.code_plane_bytes), 256);
+    out.scale_plane_bytes =
+        static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) * 2ULL;
+    out.payload.assign(static_cast<std::size_t>(out.scale_plane_offset + out.scale_plane_bytes), 0);
 
     std::int8_t codes[64];
     float vals[64];
-    for (std::int32_t tile = 0; tile < nt; ++tile) {
+    for (std::int32_t row = 0; row < n; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
-            const std::size_t base =
-                (static_cast<std::size_t>(tile) * kg + g) * static_cast<std::size_t>(tilew);
-            for (std::int32_t row_in_tile = 0; row_in_tile < 64; ++row_in_tile) {
-                const std::int32_t row = tile * 64 + row_in_tile;
-                float maxabs           = 0.0f;
-                for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {
-                    const std::int32_t kk = g * spec.group_size + lane;
-                    const float v =
-                        (row < n && kk < k) ? source[static_cast<std::size_t>(row) * k + kk] : 0.0f;
-                    vals[lane] = v;
-                    maxabs     = std::max(maxabs, std::abs(v));
-                }
-
-                std::uint16_t scale_h = detail::f32_to_f16(maxabs / static_cast<float>(spec.qmax));
-                if (scale_h == 0 && maxabs > 0.0f) { scale_h = 0x0001u; }
-                detail::store_u16_le(out.payload, base + static_cast<std::size_t>(row_in_tile) * 2,
-                                     scale_h);
-                const float scale = detail::f16_to_f32(scale_h);
-                const float inv   = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
-                for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {
-                    const float q = std::nearbyint(vals[lane] * inv);
-                    const int qi  = std::min(spec.qmax, std::max(spec.qmin, static_cast<int>(q)));
-                    codes[lane]   = static_cast<std::int8_t>(qi);
-                }
-                detail::pack_lowbit_group(codes, spec,
-                                          out.payload.data() + base + 64 * 2 +
-                                              static_cast<std::size_t>(row_in_tile) * bpr);
+            float maxabs = 0.0f;
+            for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {
+                const std::int32_t kk = g * spec.group_size + lane;
+                const float v =
+                    (kk < k) ? source[static_cast<std::size_t>(row) * k + kk] : 0.0f;
+                vals[lane] = v;
+                maxabs     = std::max(maxabs, std::abs(v));
             }
+
+            std::uint16_t scale_h = detail::f32_to_f16(maxabs / static_cast<float>(spec.qmax));
+            if (scale_h == 0 && maxabs > 0.0f) { scale_h = 0x0001u; }
+            const float scale = detail::f16_to_f32(scale_h);
+            const float inv   = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+            for (std::int32_t lane = 0; lane < spec.group_size; ++lane) {
+                const float q = std::nearbyint(vals[lane] * inv);
+                const int qi  = std::min(spec.qmax, std::max(spec.qmin, static_cast<int>(q)));
+                codes[lane]   = static_cast<std::int8_t>(qi);
+            }
+
+            const std::size_t group_index = static_cast<std::size_t>(row) * kg + g;
+            detail::pack_lowbit_group(codes, spec, out.payload.data() + group_index * bpr);
+            detail::store_u16_le(out.payload, out.scale_plane_offset + group_index * 2, scale_h);
         }
     }
 
-    out.dequant = decode_tile_lowbit(out.payload, n, k, padded_n, padded_k, qtype);
+    out.dequant = decode_row_split_lowbit(out.payload, n, k, padded_k, qtype);
 
     out.weight.qtype             = qtype;
-    out.weight.layout            = QuantLayout::TileN64K64;
+    out.weight.layout            = QuantLayout::RowSplit;
     out.weight.q5090_scale_dtype = ScaleDType::FP16;
     out.weight.payload           = out.payload.data();
     out.weight.payload_bytes     = out.payload.size();
     out.weight.qdata             = out.payload.data();
-    out.weight.scales            = nullptr;
+    out.weight.scales            = out.payload.data() + out.scale_plane_offset;
     out.weight.group_size        = static_cast<std::uint32_t>(spec.group_size);
     out.weight.group             = spec.group_size;
     out.weight.ndim              = 2;
     out.weight.shape[0]          = n;
     out.weight.shape[1]          = k;
-    out.weight.padded_shape[0]   = padded_n;
+    out.weight.shape[2]          = 1;
+    out.weight.shape[3]          = 1;
+    out.weight.padded_shape[0]   = n;
     out.weight.padded_shape[1]   = padded_k;
+    out.weight.padded_shape[2]   = 1;
+    out.weight.padded_shape[3]   = 1;
     out.weight.n                 = n;
     out.weight.k                 = k;
     return out;
 }
 
-inline PackedWeight pack_q4_tile_n64_k64(const std::vector<float>& source, std::int32_t n,
-                                         std::int32_t k) {
-    return pack_tile_lowbit(source, n, k, QType::Q4G64_F16S);
+inline PackedWeight pack_q4_row_split(const std::vector<float>& source, std::int32_t n,
+                                      std::int32_t k) {
+    return pack_row_split_lowbit(source, n, k, QType::Q4G64_F16S);
 }
 
-inline PackedWeight pack_q5_tile_n64_k64(const std::vector<float>& source, std::int32_t n,
-                                         std::int32_t k) {
-    return pack_tile_lowbit(source, n, k, QType::Q5G64_F16S);
+inline PackedWeight pack_q5_row_split(const std::vector<float>& source, std::int32_t n,
+                                      std::int32_t k) {
+    return pack_row_split_lowbit(source, n, k, QType::Q5G64_F16S);
 }
 
-inline PackedWeight pack_q6_tile_n64_k64(const std::vector<float>& source, std::int32_t n,
-                                         std::int32_t k) {
-    return pack_tile_lowbit(source, n, k, QType::Q6G64_F16S);
+inline PackedWeight pack_q6_row_split(const std::vector<float>& source, std::int32_t n,
+                                      std::int32_t k) {
+    return pack_row_split_lowbit(source, n, k, QType::Q6G64_F16S);
 }
 
 } // namespace qus::test::q5090

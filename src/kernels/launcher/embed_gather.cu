@@ -44,17 +44,18 @@ void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,
     const std::int32_t d = out.ne[0];
     const std::int32_t T = ids.ne[0];
     const std::int64_t n = static_cast<std::int64_t>(d) * T;
-    const void* payload = table.payload != nullptr ? table.payload : table.qdata;
+    const auto* codes = static_cast<const std::uint8_t*>(table.qdata);
+    const auto* scales = static_cast<const std::uint8_t*>(table.scales);
     if (d == table.padded_shape[1] && d % kEmbedGatherQ6Group == 0) {
         embed_gather_q6_grouped_kernel<<<grid_for_q6_grouped(d, T), kQ6GroupedBlock, 0, stream>>>(
-            static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(payload),
+            static_cast<const std::int32_t*>(ids.data), codes, scales,
             static_cast<__nv_bfloat16*>(out.data), d, T);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
 
     embed_gather_q6_kernel<<<grid_for(n), kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(payload),
+        static_cast<const std::int32_t*>(ids.data), codes, scales,
         static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
     CUDA_CHECK(cudaGetLastError());
 }

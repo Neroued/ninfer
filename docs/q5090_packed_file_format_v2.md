@@ -209,6 +209,11 @@ the canonical name in `name_*`. Segments of one block partition `[0, N)` exactly
 `row_begin` order. For a standalone block the single segment's `name_*` equals the block's `name_*`;
 for a fused block each segment carries its own projection name while the block carries the group name.
 
+For a `CONTIGUOUS` block (not an `[N,K]` matrix — e.g. rank-1 norms `[5120]`/`[256]`/`[48]` or rank-3
+`conv1d [10240,4,1]`), there is exactly one segment with `row_begin = 0` and `row_count = shape[0]`
+(the leading logical dim), and `scale_plane_bytes = 0`. The `[0, N)` row-partition and output-row
+semantics in this section apply to `ROW_SPLIT` blocks only.
+
 ## 6. FusionGroupRecord (64 bytes)
 
 A fusion group binds the blocks that consume the **same input activation** (same `K`) so the runtime

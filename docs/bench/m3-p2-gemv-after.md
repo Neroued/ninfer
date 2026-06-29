@@ -2,6 +2,51 @@
 
 Date: 2026-06-29.
 
+## Phase 2.5 update — tile-centric coalescing redesign
+
+The Phase 2 warp-per-row kernel was pipe-bound on scattered loads. Phase 2.5
+replaced it with a tile-centric kernel for Q5/Q6: each CTA owns a 32-row stripe
+of one N64 tile, `KSPLIT` warps split the K groups, and per group a warp
+cooperatively loads the contiguous 32-row code block into shared memory with
+fully coalesced word loads, then `lane == row` decodes its row (branchless) and
+accumulates; partials reduce across warps in SMEM. `KSPLIT = 32` (`16` for very
+large N) maximizes warps/CTA, which was the occupancy lever. Q4 keeps its direct
+byte-per-lane kernel: its layout is already coalesced, so SMEM staging only added
+overhead (measured Q4 `mlp.gate/up` regressed ~86 ms -> ~100 ms under the tile
+kernel), so dispatch is per format.
+
+Cold-cache results (ncu `dram__throughput.avg.pct_of_peak`, L2-flushed; ceiling
+`C = 82.76%`):
+
+| shape | qtype | before | after | note |
+| --- | --- | ---: | ---: | --- |
+| `mlp.down [5120,17408]` | Q5 | 47.4% | 54.3% | occupancy 53%->66%, 70->64 us; canonical-layout occupancy ceiling |
+| `lm_head [248320,5120]` | Q6 | ~30% | ~87% | huge-N, now coalesced; at/above C |
+| `out [5120,6144]` | Q5 | ~41% | ~45% | |
+| `v/z [6144,5120]` | Q5 | ~33% | ~37% | |
+| `mlp.gate/up [17408,5120]` | Q4 | ~63% | ~63% | unchanged (direct kernel kept) |
+
+End-to-end decode GEMV summed time (same `cn_short:16` workload):
+
+| | before (Phase 2) | after (Phase 2.5) | delta |
+| --- | ---: | ---: | ---: |
+| Q5 tile GEMV | 103.3 ms | ~95 ms | -8% |
+| Q6 lm_head GEMV | 30.0 ms | ~10 ms | -67% |
+| Q4 direct GEMV | 85.6 ms | ~88 ms | ~flat |
+| total | 218.9 ms | ~191 ms | **-13%** |
+
+Verification: `qus_linear_test` (fp64 oracle) PASS and `compute-sanitizer` clean
+across all qtypes/shapes incl. non-64-multiple tails; externally workspace-free;
+public API and q5090 ABI unchanged.
+
+Remaining limit: `mlp.down` is occupancy-capped at ~66% (N=5120 -> 160 CTAs at 32
+rows/CTA; a `ROWS=16` experiment gave more CTAs but did not raise occupancy and
+wasted decode lanes, so it was reverted). Pushing `down` past ~55% on the
+canonical layout is bounded; further gain needs a derived GEMM-friendly Q5 layout
+(framework section 21.2), which is a separate ABI-revising phase.
+
+## Phase 2 history (superseded by 2.5 above)
+
 Status: blocked at the Task 4 end-to-end nsys gate. The per-shape Task 4 loop
 has documented stop conditions, but the full decode trace still shows low-bit
 GEMV as the dominant decode kernel cost.

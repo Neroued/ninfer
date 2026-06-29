@@ -15,6 +15,56 @@ using namespace qus::bench;
 
 namespace {
 
+// Cold-cache timing: per-layer weight matrices fit the RTX 5090 ~96 MB L2, so the
+// shared bench_loop (which reuses one buffer) reports L2 bandwidth, not DRAM. In
+// real decode the working set is >>L2, so every weight read is a cold DRAM read.
+// --cold flushes a >L2 buffer before each timed launch to model that. ncu remains
+// the acceptance gate; this is a fast iteration signal.
+bool g_cold              = false;
+void* g_flush_buf        = nullptr;
+constexpr std::size_t kFlushBytes = std::size_t(256) << 20; // 256 MiB > L2
+
+void flush_l2() {
+    if (g_flush_buf == nullptr) { cudaMalloc(&g_flush_buf, kFlushBytes); }
+    cudaMemsetAsync(g_flush_buf, 0, kFlushBytes, 0);
+}
+
+Result bench_loop_cold(const launch_fn& launch, double bytes_moved, int warmup = 10,
+                       int repeat = 80) {
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    for (int i = 0; i < warmup; ++i) launch(nullptr);
+    cudaStreamSynchronize(nullptr);
+
+    std::vector<double> samples;
+    samples.reserve(repeat);
+    for (int i = 0; i < repeat; ++i) {
+        flush_l2();                 // serialized before launch on the default stream
+        cudaEventRecord(a, nullptr);
+        launch(nullptr);
+        cudaEventRecord(b, nullptr);
+        cudaEventSynchronize(b);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, a, b);
+        samples.push_back(double(ms) * 1000.0);
+    }
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+
+    std::sort(samples.begin(), samples.end());
+    Result r;
+    r.n_runs      = int(samples.size());
+    r.inner_iters = 1;
+    r.median_us   = samples[samples.size() / 2];
+    r.min_us      = samples.front();
+    r.p95_us      = samples[std::min(samples.size() - 1, std::size_t(0.95 * samples.size()))];
+    r.mean_us     = r.median_us;
+    const double sec = r.median_us * 1e-6;
+    r.gbs            = (sec > 0.0) ? bytes_moved / sec / 1e9 : 0.0;
+    return r;
+}
+
 constexpr std::int32_t kDenseN       = 48;
 constexpr std::int32_t kDenseK       = 5120;
 constexpr std::int32_t kDenseStressN = 5120;
@@ -193,11 +243,12 @@ void run_lowbit_decode(const LowbitShape& shape, QType qtype, std::int32_t tilew
 
     const double bytes = static_cast<double>(x_elems) * 2.0 + static_cast<double>(w.payload_bytes) +
                          static_cast<double>(out_elems) * 2.0;
-    const Result r = bench_loop([&](cudaStream_t s) { kernels::linear(tx, w, tout, s); }, bytes);
+    const launch_fn launch = [&](cudaStream_t s) { kernels::linear(tx, w, tout, s); };
+    const Result r = g_cold ? bench_loop_cold(launch, bytes) : bench_loop(launch, bytes);
 
     char tag[112];
-    std::snprintf(tag, sizeof(tag), "linear %s decode %-10s [%d,%d] T=1", lowbit_name(qtype),
-                  shape.role, shape.n, shape.k);
+    std::snprintf(tag, sizeof(tag), "linear %s decode %-10s [%d,%d] T=1%s", lowbit_name(qtype),
+                  shape.role, shape.n, shape.k, g_cold ? " COLD" : "");
     print_result(tag, r);
 }
 
@@ -258,6 +309,8 @@ int main(int argc, char** argv) {
             q6 = true;
         else if (!std::strcmp(argv[i], "--stress"))
             stress = true;
+        else if (!std::strcmp(argv[i], "--cold"))
+            g_cold = true;
     }
     if (!decode && !prefill) { decode = prefill = true; }
     if (!bf16 && !fp32 && !q4 && !q5 && !q6) { bf16 = fp32 = q4 = q5 = q6 = true; }

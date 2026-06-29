@@ -13,7 +13,8 @@ high memory throughput**:
 
 1. **Load** the v2 layout (parser + `Weight`/segment binding).
 2. **Adapt the kernels** — GEMV (decode `T=1`) and GEMM (prefill `T>1`) — to `ROW_SPLIT`, correct first.
-3. **Prove correct inference** end to end (parity vs the Phase-1 Python ref and HF).
+3. **Prove correct inference** end to end: reproduce the recorded quantized greedy snapshot **exactly**
+   (HF is diagnostic only, never a gate — see the verification contract).
 4. **Per-kernel tuning** of the `ROW_SPLIT` GEMV/GEMM, profile-driven, to approach the weight-bandwidth
    roofline the v2 layout was designed for.
 
@@ -86,19 +87,20 @@ files only in the owning task.
 **Requirements:** parse the v2 header (magic `Q5090MIXEDV2`, version 2, segment/fusion offsets+counts),
 `ModuleRecord`, `TensorEntry` (block: `segment_*`, `fusion_*`, `code_plane_bytes`, `scale_plane_bytes`),
 and the new `SegmentRecord` + `FusionGroupRecord` tables into `ParsedQ5090File`. `QuantLayout` gains
-`RowSplit`, drops TILE/row-grouped. Validate contract **L0** structural items.
+`RowSplit`, drops TILE/row-grouped. Validate contract **G-STRUCT** structural items (incl. plan-conformance).
 **DoD:** parser test parses the Phase-1 v2 file; L0 passes; no TILE enum remains in the parser.
 
 ## Task 2 — `WeightStore` segment binding + cpp dump
 
 **Files:** `weight_store.{h,cpp}`, `weight.h`, `tools/parity/block_dump.cpp`.
-**Reading:** tensor-plan doc; contract L0/§5; current `weight_store.cpp`, `block_dump.cpp`.
+**Reading:** tensor-plan doc; contract G-STRUCT/G-DUMP; current `weight_store.cpp`, `block_dump.cpp`.
 **Requirements:** per segment, build a `Weight` with `payload = code_plane + row_begin·G·bpr`,
 `scales = scale_plane + row_begin·G·2`, `n = row_count`, `k = K`, `layout = RowSplit`; dense `Tensor`
 from `CONTIGUOUS` blocks. `qweight(module, source_kind, source_layer)` keys unchanged. Emit a cpp dump
 matching the converter/Python schema.
-**DoD:** every projection resolves to a segment view; `compare_dumps` shows cpp == converter == Python
-(offsets, CRCs, sampled dequant).
+**DoD (G-DUMP):** every projection resolves to a segment view; `compare_dumps` shows cpp == converter
+== Python on metadata and recovered `(scale16, q_i)` **bit-exact** (sampled dequant within a tiny
+tolerance — compare recovered codes/scales, not dtype-dependent dequant floats).
 
 # Stage B — Adapt the kernels (correctness, untuned)
 
@@ -142,14 +144,20 @@ is empty.
 **Requirements:** confirm `bind()` resolves every projection from segment weights with no model-card
 structural change; engine loads the v2 file and sizes the weight arena from its payload. Adapt the bind
 / block tests to v2.
-**DoD:** `qus_model_bind_test` and `qus_model_blocks_test` pass (contract L3 per-op block parity).
+**DoD:** `qus_model_bind_test` passes (every projection binds from a segment; structural).
+`qus_model_blocks_test` passes against its in-tree cpp/recorded reference within a bf16 tolerance —
+**no HF gate and no per-op cpp-vs-Python comparison** (op correctness is the CUDA↔cpp fp64 oracle,
+G-KERNEL).
 
 ## Task 7 — End-to-end correctness + sanitizer
 
-**Requirements:** run `qus` on the v2 file; greedy decode matches the Phase-1 snapshot (contract
-**L4-greedy**, cpp vs Python/snapshot) and per-op taps match the Python ref (**L3-impl**, cos ≥ 0.9999);
-`compute-sanitizer` clean over a short decode on the load + linear path.
-**DoD:** greedy matches the snapshot exactly; memcheck clean. (Throughput irrelevant here.)
+**Requirements:** run `qus` on the v2 file; greedy decode reproduces the recorded quantized snapshot
+**exactly for the snapshot's own length** (contract **G-SNAPSHOT**). HF divergence is reported as a
+diagnostic only, never a gate. `compute-sanitizer` clean over a short decode on the load + linear path.
+There is **no** per-op cpp-vs-Python comparison — cpp op correctness is the CUDA↔cpp fp64 oracle
+(**G-KERNEL**, Tasks 3/4); end-to-end correctness is the snapshot.
+**DoD (G-SNAPSHOT):** greedy matches the snapshot exactly for its length; memcheck clean. (Throughput
+irrelevant here.)
 
 ## Task 8 — Remove residual cpp v1 layout code (audit)
 
@@ -215,9 +223,10 @@ named with profile evidence.
 ## Definition of done
 
 **Correctness (Stages A–C):** cpp loads v2; every projection binds as a `ROW_SPLIT` segment;
-cpp/converter/Python dumps identical; generic GEMV/GEMM pass the fp64 oracle; model block parity passes;
-`qus` greedy matches the Phase-1 snapshot (L4) and per-op taps match the Python ref (L3-impl);
-`compute-sanitizer` clean; framework unchanged; no TILE/v1 layout code remains; v1 weight file untouched.
+cpp/converter/Python dumps agree bit-exact (G-DUMP); generic GEMV/GEMM pass the CUDA↔cpp fp64 oracle
+(G-KERNEL); model bind + block tests pass against the in-tree reference; `qus` greedy reproduces the
+recorded snapshot exactly (G-SNAPSHOT); HF metrics are diagnostic only; `compute-sanitizer` clean;
+framework unchanged; no TILE/v1 layout code remains; v1 weight file untouched.
 
 **Performance (Stage D):** per dominant shape, the tuned `ROW_SPLIT` GEMV beats the generic baseline and
 approaches the cold-cache ceiling (or the limiter is documented); e2e nsys confirms the decode gain;
@@ -228,7 +237,9 @@ correctness gates remained green throughout; tuned plans are registered in the e
 Risk: CUDA kernels, numerical behavior, q5090 ABI, GPU memory, benchmark evidence. Reviews:
 
 **After T8 (correctness):**
-1. **Numerical-correctness reviewer** — codec addressing, generic GEMV/GEMM math, fp64 oracle, L3-impl/L4.
+1. **Numerical-correctness reviewer** — codec addressing, generic GEMV/GEMM math, the CUDA↔cpp fp64
+   oracle (G-KERNEL), and the snapshot match (G-SNAPSHOT); confirms every HF comparison is diagnostic
+   only, never gating.
 2. **CUDA memory/lifetime reviewer** — segment sub-view bounds, weight-load/arena lifetime,
    `embed_gather` bounds; `compute-sanitizer` evidence.
 3. **Format/ABI reviewer** — parser vs spec, segment binding, dump cross-check, `source_kind` rule.

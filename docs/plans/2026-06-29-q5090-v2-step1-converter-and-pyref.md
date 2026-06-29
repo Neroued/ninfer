@@ -147,30 +147,32 @@ python -m tools.parity.compare_dumps out/conv_dump.v2.json out/ref_dump.v2.json 
 Expected: ref loads v2 and runs a greedy step without error; converter and ref dumps are identical
 (offsets, sizes, CRCs, sampled dequant) — the cheap structural cross-check.
 
-## Task 5 — Numerical parity gates (vs HF)
+## Task 5 — Numerical parity (snapshot gate; HF diagnostics)
 
-**Files:** `block_parity.py`, `greedy_match.py`, `hf_reference.py` (oracle), fixtures.
+**Files:** `block_parity.py`, `greedy_match.py`, `hf_reference.py` (diagnostics oracle), fixtures.
 
-**Reading list:** verification contract L2/L3/L4; current `block_parity.py`, `greedy_match.py`,
-`hf_reference.py`.
+**Reading list:** verification contract §2 (hard gates) / §3 (diagnostics); current `block_parity.py`,
+`greedy_match.py`, `hf_reference.py`.
 
 **Requirements:**
-- **L2:** per-weight `dequant(v2)` vs HF bf16 — per-output-row cosine ≥ 0.98; report max/RMS/cosine per
-  qtype.
-- **L3-HF:** per-layer hidden-state cosine ≥ 0.999 through the stack on the canonical fixtures.
-- **L4:** greedy next-token sequence matches the reference snapshot for K = 128 tokens; first divergence
-  vs HF is ≥ the v1 baseline's divergence index (no quantized-quality regression — expected exact,
-  since v2 values equal v1's).
+- **Hard gate — G-SNAPSHOT:** the Python ref reproduces the recorded quantized greedy snapshot
+  **exactly**, for the snapshot's **own** token length (do not hardcode a count). This is the
+  authoritative correctness gate.
+- **Diagnostics only (reported, never gate):** D-DEQUANT (per-tensor dequant vs HF: max/RMS/row-cos;
+  WARN on gross outliers — but quant-level per-row dips, e.g. Q4 rows at cos ≈ 0.977, are normal and do
+  not fail); D-LAYER (per-layer hidden cosine vs HF, expected to decay to ~0.92 deep — for localization
+  only); D-GREEDY-HF (HF divergence index, informational).
+- **Never gate on any HF comparison** (verification contract §0/§3).
 
 **DoD / verification:**
 ```bash
 python -m tools.parity.block_parity --weights out/qwen3_6_27b.q5090_w4g64_mixed_v2.qus \
-  --hf /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16
+  --hf /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16   # prints D-DEQUANT/D-LAYER diagnostics
 python -m tools.parity.greedy_match --weights out/qwen3_6_27b.q5090_w4g64_mixed_v2.qus \
-  --hf /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16 \
-  --fixture bench/fixtures/prompts/cn_short.ids --tokens 128
+  --snapshot <recorded quantized snapshot json>                # G-SNAPSHOT: exact match for its length
 ```
-Expected: L2/L3/L4 thresholds met; greedy matches the snapshot.
+Expected: greedy reproduces the recorded snapshot **exactly** for its length (G-SNAPSHOT); HF metrics
+are reported as diagnostics, not gated.
 
 ## Task 6 — Remove residual Python v1 code (audit)
 

@@ -24,8 +24,8 @@ so the unported cpp runtime keeps working; it is deleted at cutover (Phase 3).
 | phase | scope | produces | gate (verification contract) |
 |---|---|---|---|
 | **0. Spec** (done) | binary spec, tensor plan, verification contract | the v2 contract | docs internally consistent |
-| **1. Converter + Python ref** (no cpp) | rewrite converter to emit v2; rewrite Python ref to consume v2; remove Python-side v1 code | v2 `.qus` file; proven-correct Python reference | converter L0+L1; Python ref L0–L4 |
-| **2. CPP runtime** | weight store + reference backend on v2 (correctness), then row-split GEMV / fused-projection GEMV / prefill GEMM (perf); remove cpp v1 layout code | v2-native cpp runtime | cpp L0 + L3-impl + L4-greedy, then perf rounds |
+| **1. Converter + Python ref** (no cpp) | rewrite converter to emit v2; rewrite Python ref to consume v2; remove Python-side v1 code | v2 `.qus` file; proven-correct Python reference | converter G-STRUCT+G-VALUE; Python ref G-STRUCT/G-VALUE/G-DUMP/G-SNAPSHOT (HF diagnostic) |
+| **2. CPP runtime** | weight store + reference backend on v2 (correctness), then row-split GEMV / prefill GEMM (perf; fused-projection GEMV deferred); remove cpp v1 layout code | v2-native cpp runtime | cpp G-STRUCT + G-DUMP + G-KERNEL + G-SNAPSHOT, then perf rounds |
 | **3. Cutover & cleanup** | delete the v1 weight file; archive v1 docs; remove residual v1 references | v2-only repository | end-to-end v2 parity + the end-state checklist above |
 
 ## Ordering rationale

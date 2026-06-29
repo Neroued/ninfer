@@ -50,7 +50,7 @@ std::size_t align_overhead(std::size_t allocations) {
 
 std::int32_t decode_tile_n(std::int32_t pos_value) {
     const std::int32_t window = pos_value + 1;
-    return (window <= 4096) ? 32 : (window <= 16384) ? 64 : 128;
+    return (window <= 4096) ? 16 : (window <= 16384) ? 64 : 128;
 }
 
 std::int32_t decode_tile_count(std::int32_t pos_value) {

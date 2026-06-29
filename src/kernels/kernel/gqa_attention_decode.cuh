@@ -154,7 +154,7 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_partial_kernel(
     const std::int32_t* pos, __nv_bfloat16* cache_k, __nv_bfloat16* cache_v,
     std::int32_t padded_context, std::int32_t max_context, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
-    static_assert(TileN == 32 || TileN == 64 || TileN == 128);
+    static_assert(TileN == 16 || TileN == 32 || TileN == 64 || TileN == 128);
     static_assert(QHeadsPerCta == 6 || QHeadsPerCta == 3 || QHeadsPerCta == 2);
 
     constexpr int q_subgroups = (kGqaGroupSize + QHeadsPerCta - 1) / QHeadsPerCta;

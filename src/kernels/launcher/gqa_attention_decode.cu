@@ -36,6 +36,11 @@ void launch_tile(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor
                  cudaStream_t stream) {
     constexpr bool kWarpPerQueryHead = QHeadsPerCta == 6;
     switch (tile_n) {
+    case 16:
+        launch_partial<16, QHeadsPerCta, kWarpPerQueryHead>(
+            q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context, tile_count,
+            partial_acc, partial_m, partial_l, stream);
+        return;
     case 32:
         launch_partial<32, QHeadsPerCta, kWarpPerQueryHead>(
             q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context, tile_count,

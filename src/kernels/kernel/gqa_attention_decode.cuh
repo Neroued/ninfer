@@ -104,6 +104,25 @@ __device__ __forceinline__ bool gqa_valid_q_head(int kv_head, int q_head) {
            q_head < (kv_head + 1) * kGqaGroupSize && q_head < kGqaQHeads;
 }
 
+__device__ __forceinline__ float gqa_cached_pair_lane_value(const __nv_bfloat16* cache,
+                                                            int kv_head, int d, int token,
+                                                            int padded_context) {
+    const int pair_d = d & ~1;
+    float pair_lo    = 0.0f;
+    float pair_hi    = 0.0f;
+    if ((d & 1) == 0) {
+        const auto* pair_ptr = reinterpret_cast<const __nv_bfloat162*>(
+            cache + gqa_cache_index(kv_head, pair_d, token, padded_context));
+        const float2 pair = __bfloat1622float2(*pair_ptr);
+        pair_lo           = pair.x;
+        pair_hi           = pair.y;
+    }
+
+    constexpr unsigned mask = 0xffffffffu;
+    const float hi_from_even = __shfl_up_sync(mask, pair_hi, 1);
+    return ((d & 1) == 0) ? pair_lo : hi_from_even;
+}
+
 template <int QHeadsPerCta>
 __device__ __forceinline__ void gqa_write_neutral_partial(__nv_bfloat16* partial_acc,
                                                           float* partial_m, float* partial_l,
@@ -219,15 +238,21 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_partial_kernel(
 
             const bool current_token = token == p;
             float dot                = 0.0f;
+            if (current_token) {
 #pragma unroll
-            for (int k = 0; k < kDimsPerLane; ++k) {
-                const int d                = lane + 32 * k;
-                const std::int64_t new_off = gqa_kv_new_index(kv_head, d);
-                const float k_d = current_token
-                                      ? __bfloat162float(k_new[new_off])
-                                      : __bfloat162float(cache_k[gqa_cache_index(
-                                            kv_head, d, token, padded_context)]);
-                dot += q_d[k] * k_d;
+                for (int k = 0; k < kDimsPerLane; ++k) {
+                    const int d     = lane + 32 * k;
+                    const float k_d = __bfloat162float(k_new[gqa_kv_new_index(kv_head, d)]);
+                    dot += q_d[k] * k_d;
+                }
+            } else {
+#pragma unroll
+                for (int k = 0; k < kDimsPerLane; ++k) {
+                    const int d     = lane + 32 * k;
+                    const float k_d = gqa_cached_pair_lane_value(cache_k, kv_head, d, token,
+                                                                 padded_context);
+                    dot += q_d[k] * k_d;
+                }
             }
 
             const float score  = gqa_warp_sum_broadcast(dot) * scale;
@@ -235,15 +260,21 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_partial_kernel(
             const float old_w  = expf(m - next_m);
             const float new_w  = expf(score - next_m);
 
+            if (current_token) {
 #pragma unroll
-            for (int k = 0; k < kDimsPerLane; ++k) {
-                const int d                = lane + 32 * k;
-                const std::int64_t new_off = gqa_kv_new_index(kv_head, d);
-                const float v_d = current_token
-                                      ? __bfloat162float(v_new[new_off])
-                                      : __bfloat162float(cache_v[gqa_cache_index(
-                                            kv_head, d, token, padded_context)]);
-                acc[k] = acc[k] * old_w + new_w * v_d;
+                for (int k = 0; k < kDimsPerLane; ++k) {
+                    const int d     = lane + 32 * k;
+                    const float v_d = __bfloat162float(v_new[gqa_kv_new_index(kv_head, d)]);
+                    acc[k]          = acc[k] * old_w + new_w * v_d;
+                }
+            } else {
+#pragma unroll
+                for (int k = 0; k < kDimsPerLane; ++k) {
+                    const int d     = lane + 32 * k;
+                    const float v_d = gqa_cached_pair_lane_value(cache_v, kv_head, d, token,
+                                                                 padded_context);
+                    acc[k]          = acc[k] * old_w + new_w * v_d;
+                }
             }
             l = l * old_w + new_w;
             m = next_m;

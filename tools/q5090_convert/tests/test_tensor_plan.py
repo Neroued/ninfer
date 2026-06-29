@@ -74,7 +74,7 @@ def test_prepare_source_applies_gdn_conv1d_transform_before_encoding():
     spec = _conv1d_spec()
 
     prepared = _prepare_source(_Reader(src), spec)
-    payload, logical, padded, group, scale_dtype = encode_tensor(
+    payload, logical, padded, group, scale_dtype, code_plane_bytes, scale_plane_bytes = encode_tensor(
         prepared, spec.qtype, spec.layout, torch.device("cpu")
     )
 
@@ -82,6 +82,8 @@ def test_prepare_source_applies_gdn_conv1d_transform_before_encoding():
     assert padded == [3, 4, 1]
     assert group == 0
     assert scale_dtype == qt.SCALE_NONE
+    assert code_plane_bytes == len(payload)
+    assert scale_plane_bytes == 0
     decoded_words = torch.frombuffer(bytearray(payload), dtype=torch.int16).to(torch.int32)
     expected_words = prepared.reshape(-1).view(torch.int16).to(torch.int32)
     assert decoded_words.tolist() == expected_words.tolist()

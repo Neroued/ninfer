@@ -1,7 +1,7 @@
-"""Enums and per-qtype constants for the q5090_w4g64_mixed_v1 packed format.
+"""Enums and per-qtype constants for the q5090_w4g64_mixed_v2 packed format.
 
 Values here are the on-disk ABI; do not renumber. See
-../../docs/q5090_packed_file_format_v1.md sections 5-7.
+../../docs/q5090_packed_file_format_v2.md sections 7-9.
 """
 
 from __future__ import annotations
@@ -27,15 +27,11 @@ QTYPE_NAME = {
 }
 
 # --- layout ids (TensorEntry.layout) ---
-LAYOUT_TILE_N64_K64 = 0
-LAYOUT_TILE_N64_K128 = 1
-LAYOUT_ROW_GROUPED_G64 = 2
-LAYOUT_CONTIGUOUS = 3
+LAYOUT_ROW_SPLIT = 0
+LAYOUT_CONTIGUOUS = 1
 
 LAYOUT_NAME = {
-    LAYOUT_TILE_N64_K64: "TILE_N64_K64",
-    LAYOUT_TILE_N64_K128: "TILE_N64_K128",
-    LAYOUT_ROW_GROUPED_G64: "ROW_GROUPED_G64",
+    LAYOUT_ROW_SPLIT: "ROW_SPLIT",
     LAYOUT_CONTIGUOUS: "CONTIGUOUS",
 }
 
@@ -51,9 +47,9 @@ MODULE_NAME = {
 }
 
 MODULE_POLICY = {
-    MODULE_TEXT: "q5090_w4g64_mixed_v1",
-    MODULE_MTP: "mtp_w8g128_v1",
-    MODULE_VISION: "vision_q4mix_merger_w8g128_v1",
+    MODULE_TEXT: "q5090_w4g64_mixed_v2",
+    MODULE_MTP: "mtp_w8g128_v2",
+    MODULE_VISION: "vision_q4mix_merger_w8g128_v2",
 }
 
 # --- scale dtype ---
@@ -64,6 +60,19 @@ SCALE_FP16 = 1
 LOAD_RESIDENT = 0
 LOAD_LAZY_GPU = 1
 LOAD_CPU_PINNED_THEN_GPU = 2
+
+# --- fusion groups (TensorEntry.fusion_group_id / FusionGroupRecord.group_id) ---
+FUSION_NONE = 0
+FUSION_ATTN_IN = 1
+FUSION_GDN_IN = 2
+FUSION_MLP_GATEUP = 3
+
+FUSION_GROUP_NAME = {
+    FUSION_NONE: "NONE",
+    FUSION_ATTN_IN: "ATTN_IN",
+    FUSION_GDN_IN: "GDN_IN",
+    FUSION_MLP_GATEUP: "MLP_GATEUP",
+}
 
 # --- source_kind ids (informational) ---
 SK_OTHER = 0
@@ -147,10 +156,3 @@ QUANT_SPECS = {
 
 def is_quant(qtype: int) -> bool:
     return qtype in QUANT_SPECS
-
-
-def tile_bytes(qtype: int) -> int:
-    """Bytes for one full tile (64 rows) of a tiled quant qtype."""
-    spec = QUANT_SPECS[qtype]
-    scale_bytes = 64 * 2  # fp16 scale per row
-    return scale_bytes + 64 * spec.bytes_per_group

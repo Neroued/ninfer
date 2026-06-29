@@ -1,8 +1,7 @@
 """Declarative tensor plan: source safetensors name -> (qtype, layout, slice/reshape).
 
-Mirrors the policy tables in ../../docs/qwen3_6_27b_q5090_final_quant_format_v1.md
-sections 3, 5, 6, 10. The converter walks these specs in order (TEXT, then MTP, then
-VISION) so each module is a contiguous range of the tensor index.
+Mirrors the v2 policy tables. The converter walks these specs in order (TEXT, then
+MTP, then VISION) so each module is a contiguous range of the tensor index.
 """
 
 from __future__ import annotations
@@ -101,19 +100,19 @@ def _fp32(name, src, sk, layer, module=qt.MODULE_TEXT) -> TensorSpec:
     return TensorSpec(name, qt.QT_FP32, qt.LAYOUT_CONTIGUOUS, module, src, sk, layer)
 
 
-def _tile(name, qtype, src, sk, layer, module=qt.MODULE_TEXT, row_slice=None) -> TensorSpec:
-    return TensorSpec(name, qtype, qt.LAYOUT_TILE_N64_K64, module, src, sk, layer, row_slice)
+def _row_split(name, qtype, src, sk, layer, module=qt.MODULE_TEXT, row_slice=None) -> TensorSpec:
+    return TensorSpec(name, qtype, qt.LAYOUT_ROW_SPLIT, module, src, sk, layer, row_slice)
 
 
 def _w8(name, src, sk, layer, module) -> TensorSpec:
-    return TensorSpec(name, qt.QT_W8G128, qt.LAYOUT_TILE_N64_K128, module, src, sk, layer)
+    return TensorSpec(name, qt.QT_W8G128, qt.LAYOUT_ROW_SPLIT, module, src, sk, layer)
 
 
 def build_text_specs(layer_types: List[str]) -> List[TensorSpec]:
     s: List[TensorSpec] = []
     # globals
     s.append(TensorSpec("model.language_model.embed_tokens.weight", qt.QT_Q6G64,
-                        qt.LAYOUT_ROW_GROUPED_G64, qt.MODULE_TEXT,
+                        qt.LAYOUT_ROW_SPLIT, qt.MODULE_TEXT,
                         "model.language_model.embed_tokens.weight", qt.SK_EMBED))
     for li, lt in enumerate(layer_types):
         p = f"model.language_model.layers.{li}."
@@ -132,39 +131,39 @@ def build_text_specs(layer_types: List[str]) -> List[TensorSpec]:
                 ),
                 _bf16(p + "linear_attn.in_proj_a.weight", p + "linear_attn.in_proj_a.weight", qt.SK_GDN_IN_PROJ_A, li),
                 _bf16(p + "linear_attn.in_proj_b.weight", p + "linear_attn.in_proj_b.weight", qt.SK_GDN_IN_PROJ_B, li),
-                _tile(p + "linear_attn.in_proj_qkv.q", qt.QT_Q4G64, qkv, qt.SK_GDN_IN_PROJ_Q, li, row_slice=_GDN_Q),
-                _tile(p + "linear_attn.in_proj_qkv.k", qt.QT_Q4G64, qkv, qt.SK_GDN_IN_PROJ_K, li, row_slice=_GDN_K),
-                _tile(p + "linear_attn.in_proj_qkv.v", qt.QT_Q5G64, qkv, qt.SK_GDN_IN_PROJ_V, li, row_slice=_GDN_V),
-                _tile(p + "linear_attn.in_proj_z.weight", qt.QT_Q5G64, p + "linear_attn.in_proj_z.weight", qt.SK_GDN_IN_PROJ_Z, li),
+                _row_split(p + "linear_attn.in_proj_qkv.q", qt.QT_Q4G64, qkv, qt.SK_GDN_IN_PROJ_Q, li, row_slice=_GDN_Q),
+                _row_split(p + "linear_attn.in_proj_qkv.k", qt.QT_Q4G64, qkv, qt.SK_GDN_IN_PROJ_K, li, row_slice=_GDN_K),
+                _row_split(p + "linear_attn.in_proj_qkv.v", qt.QT_Q5G64, qkv, qt.SK_GDN_IN_PROJ_V, li, row_slice=_GDN_V),
+                _row_split(p + "linear_attn.in_proj_z.weight", qt.QT_Q5G64, p + "linear_attn.in_proj_z.weight", qt.SK_GDN_IN_PROJ_Z, li),
                 _bf16(p + "linear_attn.norm.weight", p + "linear_attn.norm.weight", qt.SK_GDN_NORM, li),
-                _tile(p + "linear_attn.out_proj.weight", qt.QT_Q5G64, p + "linear_attn.out_proj.weight", qt.SK_GDN_OUT_PROJ, li),
+                _row_split(p + "linear_attn.out_proj.weight", qt.QT_Q5G64, p + "linear_attn.out_proj.weight", qt.SK_GDN_OUT_PROJ, li),
             ]
         elif lt == "full_attention":
             qp = p + "self_attn.q_proj.weight"
             s += [
-                TensorSpec(p + "self_attn.q_proj.q", qt.QT_Q4G64, qt.LAYOUT_TILE_N64_K64,
+                TensorSpec(p + "self_attn.q_proj.q", qt.QT_Q4G64, qt.LAYOUT_ROW_SPLIT,
                            qt.MODULE_TEXT, qp, qt.SK_ATTN_Q, li,
                            transform=TRANSFORM_ATTN_QPROJ_QUERY),
-                TensorSpec(p + "self_attn.q_proj.gate", qt.QT_Q5G64, qt.LAYOUT_TILE_N64_K64,
+                TensorSpec(p + "self_attn.q_proj.gate", qt.QT_Q5G64, qt.LAYOUT_ROW_SPLIT,
                            qt.MODULE_TEXT, qp, qt.SK_ATTN_GATE, li,
                            transform=TRANSFORM_ATTN_QPROJ_GATE),
-                _tile(p + "self_attn.k_proj.weight", qt.QT_Q4G64, p + "self_attn.k_proj.weight", qt.SK_ATTN_K, li),
-                _tile(p + "self_attn.v_proj.weight", qt.QT_Q5G64, p + "self_attn.v_proj.weight", qt.SK_ATTN_V, li),
+                _row_split(p + "self_attn.k_proj.weight", qt.QT_Q4G64, p + "self_attn.k_proj.weight", qt.SK_ATTN_K, li),
+                _row_split(p + "self_attn.v_proj.weight", qt.QT_Q5G64, p + "self_attn.v_proj.weight", qt.SK_ATTN_V, li),
                 _bf16(p + "self_attn.q_norm.weight", p + "self_attn.q_norm.weight", qt.SK_ATTN_Q_NORM, li),
                 _bf16(p + "self_attn.k_norm.weight", p + "self_attn.k_norm.weight", qt.SK_ATTN_K_NORM, li),
-                _tile(p + "self_attn.o_proj.weight", qt.QT_Q5G64, p + "self_attn.o_proj.weight", qt.SK_ATTN_O, li),
+                _row_split(p + "self_attn.o_proj.weight", qt.QT_Q5G64, p + "self_attn.o_proj.weight", qt.SK_ATTN_O, li),
             ]
         else:
             raise ValueError(f"layer {li}: unknown layer_type {lt!r}")
         s += [
             _bf16(p + "post_attention_layernorm.weight", p + "post_attention_layernorm.weight", qt.SK_POST_ATTN_LAYERNORM, li),
-            _tile(p + "mlp.gate_proj.weight", qt.QT_Q4G64, p + "mlp.gate_proj.weight", qt.SK_MLP_GATE, li),
-            _tile(p + "mlp.up_proj.weight", qt.QT_Q4G64, p + "mlp.up_proj.weight", qt.SK_MLP_UP, li),
-            _tile(p + "mlp.down_proj.weight", qt.QT_Q5G64, p + "mlp.down_proj.weight", qt.SK_MLP_DOWN, li),
+            _row_split(p + "mlp.gate_proj.weight", qt.QT_Q4G64, p + "mlp.gate_proj.weight", qt.SK_MLP_GATE, li),
+            _row_split(p + "mlp.up_proj.weight", qt.QT_Q4G64, p + "mlp.up_proj.weight", qt.SK_MLP_UP, li),
+            _row_split(p + "mlp.down_proj.weight", qt.QT_Q5G64, p + "mlp.down_proj.weight", qt.SK_MLP_DOWN, li),
         ]
     # final globals
     s.append(_bf16("model.language_model.norm.weight", "model.language_model.norm.weight", qt.SK_FINAL_NORM))
-    s.append(_tile("lm_head.weight", qt.QT_Q6G64, "lm_head.weight", qt.SK_LM_HEAD, qt.NO_LAYER))
+    s.append(_row_split("lm_head.weight", qt.QT_Q6G64, "lm_head.weight", qt.SK_LM_HEAD, qt.NO_LAYER))
     return s
 
 
@@ -193,8 +192,8 @@ def build_mtp_specs() -> List[TensorSpec]:
 def build_vision_specs(depth: int) -> List[TensorSpec]:
     m = qt.MODULE_VISION
 
-    def vtile(name, qtype, sk, layer):
-        return TensorSpec("model.visual." + name, qtype, qt.LAYOUT_TILE_N64_K64, m,
+    def vrow_split(name, qtype, sk, layer):
+        return TensorSpec("model.visual." + name, qtype, qt.LAYOUT_ROW_SPLIT, m,
                           "model.visual." + name, sk, layer)
 
     def vbf16(name, sk, layer=qt.NO_LAYER):
@@ -202,7 +201,7 @@ def build_vision_specs(depth: int) -> List[TensorSpec]:
 
     s: List[TensorSpec] = []
     # patch embed: Conv3d [1152,3,2,16,16] -> [1152, 1536]
-    s.append(TensorSpec("model.visual.patch_embed.proj.weight", qt.QT_Q5G64, qt.LAYOUT_TILE_N64_K64, m,
+    s.append(TensorSpec("model.visual.patch_embed.proj.weight", qt.QT_Q5G64, qt.LAYOUT_ROW_SPLIT, m,
                         "model.visual.patch_embed.proj.weight", qt.SK_VIS_PATCH_EMBED, qt.NO_LAYER,
                         reshape=(1152, 1536)))
     s.append(vbf16("patch_embed.proj.bias", qt.SK_VIS_PATCH_EMBED_BIAS))
@@ -210,13 +209,13 @@ def build_vision_specs(depth: int) -> List[TensorSpec]:
     for b in range(depth):
         p = f"blocks.{b}."
         s += [
-            vtile(p + "attn.qkv.weight", qt.QT_Q4G64, qt.SK_VIS_BLOCK_QKV, b),
+            vrow_split(p + "attn.qkv.weight", qt.QT_Q4G64, qt.SK_VIS_BLOCK_QKV, b),
             vbf16(p + "attn.qkv.bias", qt.SK_VIS_BLOCK_QKV_BIAS, b),
-            vtile(p + "attn.proj.weight", qt.QT_Q5G64, qt.SK_VIS_BLOCK_PROJ, b),
+            vrow_split(p + "attn.proj.weight", qt.QT_Q5G64, qt.SK_VIS_BLOCK_PROJ, b),
             vbf16(p + "attn.proj.bias", qt.SK_VIS_BLOCK_PROJ_BIAS, b),
-            vtile(p + "mlp.linear_fc1.weight", qt.QT_Q4G64, qt.SK_VIS_BLOCK_FC1, b),
+            vrow_split(p + "mlp.linear_fc1.weight", qt.QT_Q4G64, qt.SK_VIS_BLOCK_FC1, b),
             vbf16(p + "mlp.linear_fc1.bias", qt.SK_VIS_BLOCK_FC1_BIAS, b),
-            vtile(p + "mlp.linear_fc2.weight", qt.QT_Q5G64, qt.SK_VIS_BLOCK_FC2, b),
+            vrow_split(p + "mlp.linear_fc2.weight", qt.QT_Q5G64, qt.SK_VIS_BLOCK_FC2, b),
             vbf16(p + "mlp.linear_fc2.bias", qt.SK_VIS_BLOCK_FC2_BIAS, b),
             vbf16(p + "norm1.weight", qt.SK_VIS_BLOCK_NORM1_W, b),
             vbf16(p + "norm1.bias", qt.SK_VIS_BLOCK_NORM1_B, b),

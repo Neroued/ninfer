@@ -1,4 +1,4 @@
-"""CLI: Qwen3.6-27B bf16 safetensors -> q5090_w4g64_mixed_v1 packed file.
+"""CLI: Qwen3.6-27B bf16 safetensors -> q5090_w4g64_mixed_v2 packed file.
 
 Usage:
   python -m tools.q5090_convert.convert --model /path/to/Qwen3.6-27B [--out FILE]
@@ -6,7 +6,7 @@ Usage:
                                         [--limit-text-layers N] [--vision-blocks M]
 
 Default output includes all three segments (TEXT_CORE + MTP_DRAFT + VISION_ENCODER).
-Binary format: ../../docs/q5090_packed_file_format_v1.md
+Binary format: ../../docs/q5090_packed_file_format_v2.md
 """
 
 from __future__ import annotations
@@ -161,7 +161,7 @@ def _fmt_bytes(n: int) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="q5090_w4g64_mixed_v1 quantizing converter")
+    ap = argparse.ArgumentParser(description="q5090_w4g64_mixed_v2 quantizing converter")
     ap.add_argument("--model", required=True, help="path to original Qwen3.6-27B safetensors dir")
     ap.add_argument("--out", default=None, help="output .qus file path")
     ap.add_argument("--no-mtp", action="store_true")
@@ -174,7 +174,7 @@ def main() -> None:
 
     model_dir = args.model.rstrip("/")
     out_path = args.out or os.path.join(
-        os.getcwd(), "out", "qwen3_6_27b.q5090_w4g64_mixed_v1.qus"
+        os.getcwd(), "out", "qwen3_6_27b.q5090_w4g64_mixed_v2.qus"
     )
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
@@ -225,6 +225,7 @@ def main() -> None:
         fmt.TensorEntry(
             name=s.name, qtype=s.qtype, layout=s.layout, module_kind=s.module_kind,
             shape=[], padded_shape=[], group_size=0, scale_dtype=qt.SCALE_NONE,
+            segment_count=1,
             source_layer=s.source_layer, source_kind=s.source_kind,
         )
         for s in specs
@@ -234,11 +235,17 @@ def main() -> None:
     string_table = fmt.build_string_table(entries)  # also assigns name_offset
     tensor_count = len(entries)
     module_count = len(module_specs)
+    segment_count = 0
+    fusion_group_count = 0
     module_index_offset = fmt.HEADER_SIZE
     module_index_bytes = module_count * fmt.MODULE_RECORD_SIZE
     tensor_index_offset = module_index_offset + module_index_bytes
     tensor_index_bytes = tensor_count * fmt.TENSOR_ENTRY_SIZE
-    string_table_offset = tensor_index_offset + tensor_index_bytes
+    segment_index_offset = tensor_index_offset + tensor_index_bytes
+    segment_index_bytes = segment_count * fmt.SEGMENT_RECORD_SIZE
+    fusion_group_index_offset = segment_index_offset + segment_index_bytes
+    fusion_group_index_bytes = fusion_group_count * fmt.FUSION_GROUP_RECORD_SIZE
+    string_table_offset = fusion_group_index_offset + fusion_group_index_bytes
     string_table_bytes = len(string_table)
     payload_region_start = fmt.align_up(string_table_offset + string_table_bytes, fmt.REGION_ALIGN)
 
@@ -256,7 +263,15 @@ def main() -> None:
                 f.write(b"\x00" * pad)
                 pos += pad
             w = _prepare_source(reader, spec)
-            payload, logical, padded, group, scale_dtype = encode_tensor(w, spec.qtype, spec.layout, device)
+            (
+                payload,
+                logical,
+                padded,
+                group,
+                scale_dtype,
+                code_plane_bytes,
+                scale_plane_bytes,
+            ) = encode_tensor(w, spec.qtype, spec.layout, device)
             f.write(payload)
             entry.shape = logical
             entry.padded_shape = padded
@@ -265,6 +280,8 @@ def main() -> None:
             entry.payload_offset = pos
             entry.payload_bytes = len(payload)
             entry.crc32 = fmt.crc32(payload)
+            entry.code_plane_bytes = code_plane_bytes
+            entry.scale_plane_bytes = scale_plane_bytes
             span = module_span.setdefault(spec.module_kind, [pos, pos + len(payload)])
             span[0] = min(span[0], pos)
             span[1] = max(span[1], pos + len(payload))
@@ -280,7 +297,7 @@ def main() -> None:
         for kind, count, policy in module_specs:
             sp = module_span.get(kind, [payload_region_start, payload_region_start])
             module_records.append(fmt.ModuleRecord(
-                module_kind=kind, module_version=1,
+                module_kind=kind, module_version=fmt.VERSION,
                 tensor_index_begin=begin, tensor_index_count=count,
                 payload_offset=sp[0], payload_bytes=sp[1] - sp[0], load_policy=policy,
             ))
@@ -293,9 +310,11 @@ def main() -> None:
             flags |= 4
         header = fmt.FileHeaderFields(
             tensor_count=tensor_count, module_count=module_count, layer_count=EXPECTED["num_hidden_layers"],
-            flags=flags,
+            flags=flags, segment_count=segment_count,
             module_index_offset=module_index_offset, module_index_bytes=module_index_bytes,
             tensor_index_offset=tensor_index_offset, tensor_index_bytes=tensor_index_bytes,
+            segment_index_offset=segment_index_offset, segment_index_bytes=segment_index_bytes,
+            fusion_group_index_offset=fusion_group_index_offset, fusion_group_index_bytes=fusion_group_index_bytes,
             string_table_offset=string_table_offset, string_table_bytes=string_table_bytes,
             payload_offset=payload_region_start, payload_bytes=file_size - payload_region_start,
             hidden_size=tc["hidden_size"], intermediate_size=tc["intermediate_size"],
@@ -304,7 +323,8 @@ def main() -> None:
             gdn_key_heads=tc["linear_num_key_heads"], gdn_value_heads=tc["linear_num_value_heads"],
             gdn_key_head_dim=tc["linear_key_head_dim"], gdn_value_head_dim=tc["linear_value_head_dim"],
             gdn_conv_width=tc["linear_conv_kernel_dim"], full_attention_interval=tc["full_attention_interval"],
-            max_position_embeddings=tc["max_position_embeddings"], sha256_index=sha,
+            max_position_embeddings=tc["max_position_embeddings"], fusion_group_count=fusion_group_count,
+            sha256_safetensors_index=sha,
         )
         meta = bytearray()
         meta += fmt.pack_header(header)
@@ -354,10 +374,10 @@ def write_manifest(out_path, cfg, module_records, entries, disabled, file_size) 
             seg["fallback"] = "vision_merger_bf16_strict"
         segments.append(seg)
     manifest = {
-        "format": "q5090_w4g64_mixed_v1_final",
-        "format_version": 1,
+        "format": "q5090_w4g64_mixed_v2",
+        "format_version": 2,
         "model": cfg.get("_name_or_path", "Qwen/Qwen3.6-27B"),
-        "binary_spec": "docs/q5090_packed_file_format_v1.md",
+        "binary_spec": "docs/q5090_packed_file_format_v2.md",
         "file_bytes": int(file_size),
         "segments": segments,
         "disabled_segments": disabled,

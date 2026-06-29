@@ -1,8 +1,8 @@
-"""Low-bit code packing/unpacking (LSB-first two's complement).
+"""Low-bit code packing/unpacking and ROW_SPLIT plane assembly.
 
 Layout: within each group of `gs` signed codes, each code is stored as a `bits`-bit
 two's-complement value; codes are concatenated LSB-first and packed into bytes with
-numpy bitorder="little". See ../../docs/q5090_packed_file_format_v1.md section 7.1.
+numpy bitorder="little". See ../../docs/q5090_packed_file_format_v2.md section 9.1.
 
 Two implementations:
   * numpy `*_groups`     -- reference, used by the unit tests
@@ -18,11 +18,53 @@ import torch
 _CHUNK_BITS_BUDGET = 256 * 1024 * 1024       # numpy temp cap
 _TORCH_CHUNK_BYTES = 4 * 1024 * 1024 * 1024  # gpu temp cap for the expanded-bit array
 _UNPACK_G64_INDEX_CACHE = {}
+ROW_SPLIT_PLANE_ALIGN = 256
 
 
 def bytes_per_group(gs: int, bits: int) -> int:
     assert (gs * bits) % 8 == 0, "group_size * bits must be byte-aligned"
     return gs * bits // 8
+
+
+def align_up(x: int, a: int) -> int:
+    return (x + a - 1) // a * a
+
+
+def row_split_plane_sizes(n: int, groups: int, code_bytes_per_group: int):
+    """Return (code bytes, scale offset, scale bytes, payload bytes) for ROW_SPLIT."""
+    code_plane_bytes = n * groups * code_bytes_per_group
+    scale_plane_off = align_up(code_plane_bytes, ROW_SPLIT_PLANE_ALIGN)
+    scale_plane_bytes = n * groups * 2
+    payload_bytes = scale_plane_off + scale_plane_bytes
+    return code_plane_bytes, scale_plane_off, scale_plane_bytes, payload_bytes
+
+
+def assemble_row_split_payload(code_plane: torch.Tensor, scale_plane: torch.Tensor):
+    """Flatten code and fp16 scale planes into the v2 ROW_SPLIT payload tensor."""
+    code = code_plane.reshape(-1).contiguous().view(torch.uint8)
+    scale = scale_plane.reshape(-1).contiguous().view(torch.uint8)
+    pad_bytes = align_up(code.numel(), ROW_SPLIT_PLANE_ALIGN) - code.numel()
+    if pad_bytes:
+        pad = torch.zeros((pad_bytes,), dtype=torch.uint8, device=code.device)
+        payload = torch.cat([code, pad, scale], dim=0)
+    else:
+        payload = torch.cat([code, scale], dim=0)
+    return payload, code.numel(), scale.numel()
+
+
+def split_row_split_payload(
+    payload: torch.Tensor,
+    code_plane_bytes: int,
+    scale_plane_bytes: int,
+):
+    """Return flattened code and scale byte views from a ROW_SPLIT payload tensor."""
+    scale_plane_off = align_up(code_plane_bytes, ROW_SPLIT_PLANE_ALIGN)
+    scale_end = scale_plane_off + scale_plane_bytes
+    if payload.numel() < scale_end:
+        raise ValueError(
+            f"ROW_SPLIT payload too short: need {scale_end} bytes, got {payload.numel()}"
+        )
+    return payload[:code_plane_bytes], payload[scale_plane_off:scale_end]
 
 
 # ----------------------------- numpy reference -----------------------------

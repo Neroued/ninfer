@@ -1,10 +1,10 @@
 # q5090_convert
 
 Offline, GPU-accelerated quantizing converter: original **Qwen3.6-27B** bf16 safetensors
--> a single self-describing packed file in the `q5090_w4g64_mixed_v1` format.
+-> a single self-describing packed file in the `q5090_w4g64_mixed_v2` format.
 
-- Quantization policy: [`docs/qwen3_6_27b_q5090_final_quant_format_v1.md`](../../docs/qwen3_6_27b_q5090_final_quant_format_v1.md)
-- Binary file contract: [`docs/q5090_packed_file_format_v1.md`](../../docs/q5090_packed_file_format_v1.md)
+- Tensor plan: [`docs/qwen3_6_27b_q5090_v2_tensor_plan.md`](../../docs/qwen3_6_27b_q5090_v2_tensor_plan.md)
+- Binary file contract: [`docs/q5090_packed_file_format_v2.md`](../../docs/q5090_packed_file_format_v2.md)
 
 The output **always contains all three segments** (TEXT_CORE + MTP_DRAFT + VISION_ENCODER) so
 it never needs regenerating; the runtime skips the segments it does not need. There are no runtime
@@ -15,10 +15,10 @@ transforms: the converter may canonicalize documented TEXT_CORE shapes into q509
 | file | role |
 |---|---|
 | `qtypes.py` | qtype/layout/module/source enums + per-qtype constants (on-disk ABI) |
-| `format.py` | header / module-record / tensor-entry (de)serialization, FNV-1a-64, crc32 |
+| `format.py` | header / module / tensor / segment / fusion record serialization, FNV-1a-64, crc32 |
 | `quantize.py` | GPU per-group symmetric quantization (fp16 scale, signed codes) |
 | `packing.py` | LSB-first two's-complement bit packing (Q4/Q5/Q6) + W8 |
-| `layouts.py` | TILE_N64_K64 / TILE_N64_K128 / ROW_GROUPED_G64 / CONTIGUOUS encoders + decoders |
+| `layouts.py` | ROW_SPLIT and CONTIGUOUS encoders + decoders |
 | `tensor_plan.py` | declarative source->qtype/layout/slice tables for all three segments |
 | `convert.py` | CLI: stream shards, assemble the packed file + `manifest.json` |
 | `verify.py` | reparse + per-tensor round-trip dequant error metrics |
@@ -38,7 +38,7 @@ conda run -n vllm-bench python -m tools.q5090_convert.convert \
 
 conda run -n vllm-bench python -m tools.q5090_convert.verify \
   --model /home/neroued/llama.cpp/models/Qwen3.6-27B \
-  --file  /home/neroued/llama.cpp/models/Qwen3.6-27B-q5090/qwen3_6_27b.q5090_w4g64_mixed_v1.qus
+  --file  /home/neroued/llama.cpp/models/Qwen3.6-27B-q5090/qwen3_6_27b.q5090_w4g64_mixed_v2.qus
 ```
 
 Useful flags: `--out FILE`, `--no-mtp`, `--no-vision`, `--device cpu`,

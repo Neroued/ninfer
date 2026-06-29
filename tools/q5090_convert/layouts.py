@@ -1,11 +1,11 @@
-"""On-disk payload encoders/decoders for each layout (Torch / GPU).
+"""On-disk payload encoders/decoders for q5090 v2 layouts.
 
-Ties quantize + packing into the exact byte layouts of
-../../docs/q5090_packed_file_format_v1.md section 7. Everything runs on the chosen
-device (CUDA) so the host only sees the final byte blob.
+Encoders return:
+  (payload_bytes, logical_shape, padded_shape, group_size, scale_dtype,
+   code_plane_bytes, scale_plane_bytes)
 
-Encoders return (payload_bytes, logical_shape, padded_shape, group_size, scale_dtype).
-Decoders return a float32 torch.Tensor on `device` (used by verify.py).
+Decoders return a float32 torch.Tensor on `device` unless explicitly decoding the
+ROW_SPLIT quantized planes.
 """
 
 from __future__ import annotations
@@ -17,19 +17,25 @@ import torch
 import torch.nn.functional as F
 
 from . import qtypes as qt
-from .packing import bytes_per_group, pack_lowbit_torch, unpack_lowbit_torch
+from .packing import (
+    assemble_row_split_payload,
+    bytes_per_group,
+    row_split_plane_sizes,
+    split_row_split_payload,
+    pack_lowbit_torch,
+    unpack_lowbit_torch,
+)
 from .quantize import quantize_core
 
-EncodeResult = Tuple[bytes, List[int], List[int], int, int]
+EncodeResult = Tuple[bytes, List[int], List[int], int, int, int, int]
 
 
-def _pad_2d(w: torch.Tensor, n_mult: int, k_mult: int):
+def _pad_row_split_2d(w: torch.Tensor, k_mult: int):
     n, k = w.shape
-    np_ = (n + n_mult - 1) // n_mult * n_mult
     kp = (k + k_mult - 1) // k_mult * k_mult
-    if np_ != n or kp != k:
-        w = F.pad(w, (0, kp - k, 0, np_ - n), value=0.0)
-    return w, n, k, np_, kp
+    if kp != k:
+        w = F.pad(w, (0, kp - k, 0, 0), value=0.0)
+    return w, n, k, kp
 
 
 def _to_bytes(t: torch.Tensor) -> bytes:
@@ -37,10 +43,6 @@ def _to_bytes(t: torch.Tensor) -> bytes:
 
 
 def _from_bytes(payload, device, dtype=np.uint8) -> torch.Tensor:
-    # Fast path: payload already a resident uint8 tensor on the target device
-    # (used by the parity oracle to avoid re-reading/re-uploading weights each
-    # forward). All low-bit decoders only ever request dtype=uint8 from here and
-    # reinterpret slices via torch .view(), so a pass-through is exact.
     if isinstance(payload, torch.Tensor):
         if dtype is not np.uint8:
             raise ValueError("resident tensor payloads must be decoded as uint8")
@@ -50,52 +52,32 @@ def _from_bytes(payload, device, dtype=np.uint8) -> torch.Tensor:
 
 # ----------------------------- encoders -----------------------------
 
-def encode_tile_lowbit(w: torch.Tensor, qtype: int, device) -> EncodeResult:
+def encode_row_split(w: torch.Tensor, qtype: int, device) -> EncodeResult:
+    if qtype not in qt.QUANT_SPECS:
+        raise ValueError(f"ROW_SPLIT qtype must be quantized, got {qtype}")
+
     spec = qt.QUANT_SPECS[qtype]
     gs, bits = spec.group_size, spec.bits
     bpr = bytes_per_group(gs, bits)
     wf = w.to(device=device, dtype=torch.float32)
-    wf, n, k, np_, kp = _pad_2d(wf, 64, gs)
+    if wf.dim() != 2:
+        raise ValueError(f"ROW_SPLIT needs 2D [N,K], got {tuple(wf.shape)}")
+    wf, n, k, kp = _pad_row_split_2d(wf, gs)
     scale16, codes = quantize_core(wf, gs, spec.qmax, spec.qmin)
     del wf
-    kg = kp // gs
-    nt = np_ // 64
-    packed = pack_lowbit_torch(codes.reshape(np_ * kg, gs), bits).reshape(np_, kg, bpr)
+
+    groups = kp // gs
+    if qtype == qt.QT_W8G128:
+        code_plane = codes.contiguous().view(torch.uint8).reshape(n, groups, bpr)
+    else:
+        code_plane = pack_lowbit_torch(codes.reshape(n * groups, gs), bits).reshape(n, groups, bpr)
     del codes
-    sb = scale16.reshape(nt, 64, kg).permute(0, 2, 1).contiguous().view(torch.uint8)   # [nt,kg,128]
-    data = packed.reshape(nt, 64, kg, bpr).permute(0, 2, 1, 3).contiguous().reshape(nt, kg, 64 * bpr)
-    tile = torch.cat([sb, data], dim=2)
-    return _to_bytes(tile), [n, k], [np_, kp], gs, qt.SCALE_FP16
 
-
-def encode_tile_w8(w: torch.Tensor, device) -> EncodeResult:
-    spec = qt.QUANT_SPECS[qt.QT_W8G128]
-    gs = spec.group_size
-    wf = w.to(device=device, dtype=torch.float32)
-    wf, n, k, np_, kp = _pad_2d(wf, 64, gs)
-    scale16, codes = quantize_core(wf, gs, spec.qmax, spec.qmin)
-    del wf
-    kg = kp // gs
-    nt = np_ // 64
-    sb = scale16.reshape(nt, 64, kg).permute(0, 2, 1).contiguous().view(torch.uint8)
-    data = codes.reshape(nt, 64, kg, gs).permute(0, 2, 1, 3).contiguous().view(torch.uint8).reshape(nt, kg, 64 * gs)
-    tile = torch.cat([sb, data], dim=2)
-    return _to_bytes(tile), [n, k], [np_, kp], gs, qt.SCALE_FP16
-
-
-def encode_row_grouped(w: torch.Tensor, qtype: int, device) -> EncodeResult:
-    spec = qt.QUANT_SPECS[qtype]
-    gs, bits = spec.group_size, spec.bits
-    bpr = bytes_per_group(gs, bits)
-    wf = w.to(device=device, dtype=torch.float32)
-    wf, n, k, np_, kp = _pad_2d(wf, 1, gs)
-    scale16, codes = quantize_core(wf, gs, spec.qmax, spec.qmin)
-    del wf
-    kg = kp // gs
-    packed = pack_lowbit_torch(codes.reshape(n * kg, gs), bits).reshape(n, kg, bpr)
-    sb = scale16.contiguous().view(torch.uint8).reshape(n, kg, 2)
-    row = torch.cat([sb, packed], dim=2)
-    return _to_bytes(row), [n, k], [np_, kp], gs, qt.SCALE_FP16
+    payload, code_plane_bytes, scale_plane_bytes = assemble_row_split_payload(code_plane, scale16)
+    exp_code, _, exp_scale, _ = row_split_plane_sizes(n, groups, bpr)
+    assert code_plane_bytes == exp_code
+    assert scale_plane_bytes == exp_scale
+    return _to_bytes(payload), [n, k], [n, kp], gs, qt.SCALE_FP16, code_plane_bytes, scale_plane_bytes
 
 
 def encode_contiguous(w: torch.Tensor, qtype: int) -> EncodeResult:
@@ -106,66 +88,44 @@ def encode_contiguous(w: torch.Tensor, qtype: int) -> EncodeResult:
     elif qtype == qt.QT_FP32:
         raw = w.to(torch.float32).contiguous().cpu().numpy().astype("<f4").tobytes()
     else:
-        raise ValueError(f"contiguous qtype must be BF16/FP32, got {qtype}")
-    return raw, shape, list(shape), 0, qt.SCALE_NONE
+        raise ValueError(f"CONTIGUOUS qtype must be BF16/FP32, got {qtype}")
+    return raw, shape, list(shape), 0, qt.SCALE_NONE, len(raw), 0
 
 
 def encode_tensor(w: torch.Tensor, qtype: int, layout: int, device) -> EncodeResult:
+    if layout == qt.LAYOUT_ROW_SPLIT:
+        return encode_row_split(w, qtype, device)
     if layout == qt.LAYOUT_CONTIGUOUS:
         return encode_contiguous(w, qtype)
-    if layout == qt.LAYOUT_TILE_N64_K64:
-        return encode_tile_lowbit(w, qtype, device)
-    if layout == qt.LAYOUT_TILE_N64_K128:
-        return encode_tile_w8(w, device)
-    if layout == qt.LAYOUT_ROW_GROUPED_G64:
-        return encode_row_grouped(w, qtype, device)
     raise ValueError(f"unknown layout {layout}")
 
 
-# ----------------------------- decoders (verify) -----------------------------
+# ----------------------------- decoders -----------------------------
 
-def decode_tile_lowbit(payload, padded, logical, qtype, device) -> torch.Tensor:
-    spec = qt.QUANT_SPECS[qtype]
-    gs, bits = spec.group_size, spec.bits
-    bpr = bytes_per_group(gs, bits)
-    np_, kp = padded
-    n, k = logical
-    nt, kg = np_ // 64, kp // gs
-    tilew = 64 * 2 + 64 * bpr
-    arr = _from_bytes(payload, device).reshape(nt, kg, tilew)
-    scale = arr[:, :, : 64 * 2].contiguous().view(torch.float16).to(torch.float32)        # [nt,kg,64]
-    data = arr[:, :, 64 * 2 :].contiguous().reshape(nt * kg * 64, bpr)
-    codes = unpack_lowbit_torch(data, bits, gs).reshape(nt, kg, 64, gs).to(torch.float32)
-    deq = (codes * scale.unsqueeze(-1)).permute(0, 2, 1, 3).reshape(np_, kp)
-    return deq[:n, :k]
-
-
-def decode_tile_w8(payload, padded, logical, device) -> torch.Tensor:
-    gs = 128
-    np_, kp = padded
-    n, k = logical
-    nt, kg = np_ // 64, kp // gs
-    tilew = 64 * 2 + 64 * gs
-    arr = _from_bytes(payload, device).reshape(nt, kg, tilew)
-    scale = arr[:, :, : 64 * 2].contiguous().view(torch.float16).to(torch.float32)
-    data = arr[:, :, 64 * 2 :].contiguous().reshape(nt, kg, 64, gs).view(torch.int8).to(torch.float32)
-    deq = (data * scale.unsqueeze(-1)).permute(0, 2, 1, 3).reshape(np_, kp)
-    return deq[:n, :k]
-
-
-def decode_row_grouped(payload, padded, logical, qtype, device) -> torch.Tensor:
+def decode_row_split_quantized(payload, padded, qtype, device="cpu"):
     spec = qt.QUANT_SPECS[qtype]
     gs, bits = spec.group_size, spec.bits
     bpr = bytes_per_group(gs, bits)
     n, kp = padded
-    _, k = logical
-    kg = kp // gs
-    roww = 2 + bpr
-    arr = _from_bytes(payload, device).reshape(n, kg, roww)
-    scale = arr[:, :, :2].contiguous().view(torch.float16).reshape(n, kg).to(torch.float32)
-    data = arr[:, :, 2:].contiguous().reshape(n * kg, bpr)
-    codes = unpack_lowbit_torch(data, bits, gs).reshape(n, kg, gs).to(torch.float32)
-    deq = (codes * scale.unsqueeze(-1)).reshape(n, kp)
+    groups = kp // gs
+    code_bytes, _, scale_bytes, _ = row_split_plane_sizes(n, groups, bpr)
+    arr = _from_bytes(payload, device)
+    code_plane, scale_plane = split_row_split_payload(arr, code_bytes, scale_bytes)
+
+    if qtype == qt.QT_W8G128:
+        codes = code_plane.reshape(n, groups, gs).view(torch.int8)
+    else:
+        packed = code_plane.reshape(n * groups, bpr)
+        codes = unpack_lowbit_torch(packed, bits, gs).reshape(n, groups, gs)
+    scale16 = scale_plane.reshape(n * groups * 2).view(torch.float16).reshape(n, groups)
+    return scale16, codes
+
+
+def decode_row_split(payload, padded, logical, qtype, device) -> torch.Tensor:
+    scale16, codes = decode_row_split_quantized(payload, padded, qtype, device)
+    n, k = logical
+    _, kp = padded
+    deq = (codes.to(torch.float32) * scale16.to(torch.float32).unsqueeze(-1)).reshape(n, kp)
     return deq[:, :k]
 
 
@@ -176,17 +136,13 @@ def decode_contiguous(payload, shape, qtype, device) -> torch.Tensor:
     elif qtype == qt.QT_FP32:
         f32 = _from_bytes(payload, device, "<f4")
     else:
-        raise ValueError(f"contiguous qtype must be BF16/FP32, got {qtype}")
+        raise ValueError(f"CONTIGUOUS qtype must be BF16/FP32, got {qtype}")
     return f32.reshape(shape)
 
 
 def decode_tensor(payload, qtype, layout, logical, padded, device="cpu") -> torch.Tensor:
+    if layout == qt.LAYOUT_ROW_SPLIT:
+        return decode_row_split(payload, padded, logical, qtype, device)
     if layout == qt.LAYOUT_CONTIGUOUS:
         return decode_contiguous(payload, logical, qtype, device)
-    if layout == qt.LAYOUT_TILE_N64_K64:
-        return decode_tile_lowbit(payload, padded, logical, qtype, device)
-    if layout == qt.LAYOUT_TILE_N64_K128:
-        return decode_tile_w8(payload, padded, logical, device)
-    if layout == qt.LAYOUT_ROW_GROUPED_G64:
-        return decode_row_grouped(payload, padded, logical, qtype, device)
     raise ValueError(f"unknown layout {layout}")

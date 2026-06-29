@@ -48,8 +48,7 @@ EXPECTED = dict(
     vision_intermediate=4304,
     vision_out_hidden=5120,
 )
-PRESERVED_V1_ARTIFACT = "qwen3_6_27b.q5090_w4g64_mixed_v1.qus"
-
+OUTPUT_FORMAT_MARKER = "mixed_v2"
 
 @dataclass(frozen=True)
 class SegmentPlan:
@@ -387,10 +386,13 @@ def _prod(xs: Sequence[int]) -> int:
     return p
 
 
-def _reject_preserved_v1_output(out_path: str) -> None:
+def _require_v2_output_path(out_path: str) -> None:
     basename = os.path.basename(os.path.normpath(out_path))
-    if basename == PRESERVED_V1_ARTIFACT or "mixed_v1" in basename:
-        raise SystemExit(f"refusing to write preserved v1 artifact path: {out_path}")
+    if OUTPUT_FORMAT_MARKER not in basename or not basename.endswith(".qus"):
+        raise SystemExit(
+            f"q5090 v2 converter output path must be a {OUTPUT_FORMAT_MARKER} .qus file: "
+            f"{out_path}"
+        )
 
 
 def _fill_segment_row_counts(
@@ -518,7 +520,7 @@ def main() -> None:
     out_path = args.out or os.path.join(
         os.getcwd(), "out", "qwen3_6_27b.q5090_w4g64_mixed_v2.qus"
     )
-    _reject_preserved_v1_output(out_path)
+    _require_v2_output_path(out_path)
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)

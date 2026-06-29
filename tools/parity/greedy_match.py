@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""L4 greedy token parity against the approved q5090 v1 snapshot."""
+"""L4 greedy token parity against the recorded quantized snapshot."""
 
 from __future__ import annotations
 

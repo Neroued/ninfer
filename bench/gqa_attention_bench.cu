@@ -21,6 +21,11 @@ constexpr std::int32_t kHeadDim = 256;
 constexpr std::int32_t kQHeads  = 24;
 constexpr std::int32_t kKVHeads = 4;
 constexpr float kScale          = 0.0625f;
+constexpr std::size_t kDecodeWorkspaceBytes = 16ULL * 1024ULL * 1024ULL;
+
+constexpr std::int32_t align_up_128(std::int32_t value) {
+    return ((value + 127) / 128) * 128;
+}
 
 DBuf make_i32(std::int32_t value) {
     DBuf d(sizeof(std::int32_t));
@@ -28,8 +33,8 @@ DBuf make_i32(std::int32_t value) {
     return d;
 }
 
-void run_decode(KVCache& kv, const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out,
-                std::int32_t pos_value) {
+void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& k, const Tensor& v,
+                Tensor& out, std::int32_t pos_value) {
     DBuf pos_buf = make_i32(pos_value);
     Tensor pos(pos_buf.p, DType::I32, {1});
 
@@ -38,9 +43,10 @@ void run_decode(KVCache& kv, const Tensor& q, const Tensor& k, const Tensor& v, 
     const double kv_elements = static_cast<double>(kHeadDim) * static_cast<double>(kKVHeads);
     const double bytes = ((4.0 * window * q_elements) + q_elements + (4.0 * kv_elements)) * 2.0;
 
-    const Result r = bench_loop(
-        [&](cudaStream_t s) { kernels::gqa_attention_decode(q, k, v, pos, kScale, kv, 0, out, s); },
-        bytes);
+    const Result r = bench_loop([&](cudaStream_t s) {
+        kv.pos = static_cast<std::uint32_t>(pos_value);
+        kernels::gqa_attention_decode(q, k, v, pos, kScale, kv, 0, ws, out, s);
+    }, bytes);
 
     char tag[96];
     std::snprintf(tag, sizeof(tag), "gqa_attention decode pos=%d", pos_value);
@@ -99,9 +105,10 @@ int main(int argc, char** argv) {
     constexpr std::int32_t max_context = 32769;
     const std::size_t layer_elements   = static_cast<std::size_t>(kKVHeads) *
                                        static_cast<std::size_t>(kHeadDim) *
-                                       static_cast<std::size_t>(max_context);
+                                       static_cast<std::size_t>(align_up_128(max_context));
     const std::size_t layer_bytes = layer_elements * sizeof(std::uint16_t);
     DeviceArena cache_arena(2 * (layer_bytes + 256) + 4096);
+    WorkspaceArena work_arena(kDecodeWorkspaceBytes);
     KVCache kv(cache_arena, 1, max_context, kKVHeads, kHeadDim, DType::BF16);
     cudaMemset(kv.k[0].data, 0x3e, layer_bytes);
     cudaMemset(kv.v[0].data, 0x3d, layer_bytes);
@@ -119,8 +126,8 @@ int main(int argc, char** argv) {
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, 1});
 
     if (decode) {
-        run_decode(kv, tq, tk, tv, tout, 2048);
-        run_decode(kv, tq, tk, tv, tout, 32768);
+        run_decode(kv, work_arena, tq, tk, tv, tout, 2048);
+        run_decode(kv, work_arena, tq, tk, tv, tout, 32768);
     }
     if (prefill) {
         run_prefill(kv, 128);

@@ -10,15 +10,16 @@
 namespace qus::kernels::detail {
 namespace {
 
-template <int TileN, int QHeadsPerCta>
+template <int TileN, int QHeadsPerCta, bool WarpPerQueryHead>
 void launch_partial(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
                     float scale, Tensor& cache_k, Tensor& cache_v, std::int32_t padded_context,
                     std::int32_t max_context, std::int32_t tile_count, Tensor& partial_acc,
                     Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-    constexpr int kBlock      = 256;
+    constexpr int kBlock      = WarpPerQueryHead ? 32 * QHeadsPerCta : 256;
     constexpr int q_subgroups = (kGqaGroupSize + QHeadsPerCta - 1) / QHeadsPerCta;
     const dim3 grid(kGqaKVHeads * q_subgroups, tile_count);
-    gqa_attention_decode_partial_kernel<TileN, QHeadsPerCta><<<grid, kBlock, 0, stream>>>(
+    gqa_attention_decode_partial_kernel<TileN, QHeadsPerCta, WarpPerQueryHead>
+        <<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
         static_cast<__nv_bfloat16*>(cache_k.data), static_cast<__nv_bfloat16*>(cache_v.data),
@@ -33,21 +34,22 @@ void launch_tile(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor
                  std::int32_t max_context, std::int32_t tile_n, std::int32_t tile_count,
                  Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                  cudaStream_t stream) {
+    constexpr bool kWarpPerQueryHead = QHeadsPerCta == 6;
     switch (tile_n) {
     case 32:
-        launch_partial<32, QHeadsPerCta>(q, k, v, pos, scale, cache_k, cache_v, padded_context,
-                                         max_context, tile_count, partial_acc, partial_m,
-                                         partial_l, stream);
+        launch_partial<32, QHeadsPerCta, kWarpPerQueryHead>(
+            q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context, tile_count,
+            partial_acc, partial_m, partial_l, stream);
         return;
     case 64:
-        launch_partial<64, QHeadsPerCta>(q, k, v, pos, scale, cache_k, cache_v, padded_context,
-                                         max_context, tile_count, partial_acc, partial_m,
-                                         partial_l, stream);
+        launch_partial<64, QHeadsPerCta, kWarpPerQueryHead>(
+            q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context, tile_count,
+            partial_acc, partial_m, partial_l, stream);
         return;
     case 128:
-        launch_partial<128, QHeadsPerCta>(q, k, v, pos, scale, cache_k, cache_v, padded_context,
-                                          max_context, tile_count, partial_acc, partial_m,
-                                          partial_l, stream);
+        launch_partial<128, QHeadsPerCta, kWarpPerQueryHead>(
+            q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context, tile_count,
+            partial_acc, partial_m, partial_l, stream);
         return;
     default:
         throw std::invalid_argument("gqa_attention_decode_launch: unsupported tile_n");

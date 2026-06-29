@@ -53,6 +53,12 @@ __device__ __forceinline__ float gqa_warp_sum(float value) {
     return value;
 }
 
+__device__ __forceinline__ float gqa_warp_sum_broadcast(float value) {
+    constexpr unsigned mask = 0xffffffffu;
+    const float sum         = gqa_warp_sum(value);
+    return __shfl_sync(mask, sum, 0);
+}
+
 template <int QHeadsPerCta>
 __device__ __forceinline__ void gqa_block_sum_256(float (&values)[QHeadsPerCta],
                                                   float (&reduced)[QHeadsPerCta],
@@ -115,7 +121,34 @@ __device__ __forceinline__ void gqa_write_neutral_partial(__nv_bfloat16* partial
     }
 }
 
-template <int TileN, int QHeadsPerCta>
+template <int QHeadsPerCta>
+__device__ __forceinline__ void gqa_write_neutral_partial_warp(__nv_bfloat16* partial_acc,
+                                                               float* partial_m,
+                                                               float* partial_l, int kv_head,
+                                                               int q_subgroup, int tile) {
+    constexpr int kDimsPerLane = kGqaHeadDim / 32;
+    static_assert(kDimsPerLane == 8);
+
+    const int local_q = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    if (local_q >= QHeadsPerCta) { return; }
+
+    const int q_head = gqa_global_q_head<QHeadsPerCta>(kv_head, q_subgroup, local_q);
+    if (!gqa_valid_q_head(kv_head, q_head)) { return; }
+
+    if (lane == 0) {
+        partial_m[gqa_partial_stat_index(q_head, tile)] = -CUDART_INF_F;
+        partial_l[gqa_partial_stat_index(q_head, tile)] = 0.0f;
+    }
+
+#pragma unroll
+    for (int k = 0; k < kDimsPerLane; ++k) {
+        const int d = lane + 32 * k;
+        partial_acc[gqa_partial_acc_index(q_head, d, tile)] = __float2bfloat16(0.0f);
+    }
+}
+
+template <int TileN, int QHeadsPerCta, bool WarpPerQueryHead = false>
 __launch_bounds__(256) __global__ void gqa_attention_decode_partial_kernel(
     const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
     const std::int32_t* pos, __nv_bfloat16* cache_k, __nv_bfloat16* cache_v,
@@ -125,7 +158,6 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_partial_kernel(
     static_assert(QHeadsPerCta == 6 || QHeadsPerCta == 3 || QHeadsPerCta == 2);
 
     constexpr int q_subgroups = (kGqaGroupSize + QHeadsPerCta - 1) / QHeadsPerCta;
-    const int d               = threadIdx.x;
     const int kv_head         = static_cast<int>(blockIdx.x) / q_subgroups;
     const int q_subgroup      = static_cast<int>(blockIdx.x) - kv_head * q_subgroups;
     const int tile            = static_cast<int>(blockIdx.y);
@@ -136,78 +168,167 @@ __launch_bounds__(256) __global__ void gqa_attention_decode_partial_kernel(
         return;
     }
     if (p < 0 || p >= max_context || tile_start > p) {
-        gqa_write_neutral_partial<QHeadsPerCta>(partial_acc, partial_m, partial_l, kv_head,
-                                                q_subgroup, tile);
+        if constexpr (WarpPerQueryHead) {
+            gqa_write_neutral_partial_warp<QHeadsPerCta>(partial_acc, partial_m, partial_l,
+                                                         kv_head, q_subgroup, tile);
+        } else {
+            gqa_write_neutral_partial<QHeadsPerCta>(partial_acc, partial_m, partial_l, kv_head,
+                                                    q_subgroup, tile);
+        }
         return;
     }
 
-    const bool tile_contains_p = p >= tile_start && p < tile_start + TileN;
-    const std::int64_t new_off = gqa_kv_new_index(kv_head, d);
-    if (q_subgroup == 0 && tile_contains_p) {
-        const std::int64_t cache_off = gqa_cache_index(kv_head, d, p, padded_context);
-        cache_k[cache_off]           = k_new[new_off];
-        cache_v[cache_off]           = v_new[new_off];
-    }
+    if constexpr (WarpPerQueryHead) {
+        constexpr int kDimsPerLane = kGqaHeadDim / 32;
+        static_assert(kDimsPerLane == 8);
 
-    float q_d[QHeadsPerCta];
-    float acc[QHeadsPerCta];
-    float m[QHeadsPerCta];
-    float l[QHeadsPerCta];
-    bool valid_q[QHeadsPerCta];
+        const int local_q = threadIdx.x >> 5;
+        const int lane    = threadIdx.x & 31;
+        if (local_q >= QHeadsPerCta) { return; }
 
-#pragma unroll
-    for (int local_q = 0; local_q < QHeadsPerCta; ++local_q) {
         const int q_head = gqa_global_q_head<QHeadsPerCta>(kv_head, q_subgroup, local_q);
-        valid_q[local_q] = gqa_valid_q_head(kv_head, q_head);
-        q_d[local_q]     = valid_q[local_q] ? __bfloat162float(q[gqa_q_index(q_head, d)]) : 0.0f;
-        acc[local_q]     = 0.0f;
-        m[local_q]       = -CUDART_INF_F;
-        l[local_q]       = 0.0f;
-    }
+        if (!gqa_valid_q_head(kv_head, q_head)) { return; }
 
-    __shared__ float reduce_scratch[QHeadsPerCta * 8];
-
-    for (int token = tile_start; token < tile_start + TileN; ++token) {
-        if (token > p) { break; }
-        if (token >= max_context) { break; }
-
-        const bool current_token = token == p;
-        const std::int64_t kv_off =
-            current_token ? new_off : gqa_cache_index(kv_head, d, token, padded_context);
-        const float k_d = __bfloat162float(current_token ? k_new[new_off] : cache_k[kv_off]);
-
-        float dot[QHeadsPerCta];
+        const bool tile_contains_p = p >= tile_start && p < tile_start + TileN;
+        if (q_subgroup == 0 && local_q == 0 && tile_contains_p) {
 #pragma unroll
-        for (int local_q = 0; local_q < QHeadsPerCta; ++local_q) {
-            dot[local_q] = valid_q[local_q] ? q_d[local_q] * k_d : 0.0f;
+            for (int k = 0; k < kDimsPerLane; ++k) {
+                const int d                   = lane + 32 * k;
+                const std::int64_t new_off    = gqa_kv_new_index(kv_head, d);
+                const std::int64_t cache_off  = gqa_cache_index(kv_head, d, p, padded_context);
+                cache_k[cache_off]            = k_new[new_off];
+                cache_v[cache_off]            = v_new[new_off];
+            }
         }
 
-        float dot_sum[QHeadsPerCta];
-        gqa_block_sum_256<QHeadsPerCta>(dot, dot_sum, reduce_scratch);
-
-        const float v_d = __bfloat162float(current_token ? v_new[new_off] : cache_v[kv_off]);
+        float q_d[kDimsPerLane];
+        float acc[kDimsPerLane];
 #pragma unroll
-        for (int local_q = 0; local_q < QHeadsPerCta; ++local_q) {
-            if (!valid_q[local_q]) { continue; }
-            const float score  = dot_sum[local_q] * scale;
-            const float next_m = fmaxf(m[local_q], score);
-            const float old_w  = expf(m[local_q] - next_m);
+        for (int k = 0; k < kDimsPerLane; ++k) {
+            const int d = lane + 32 * k;
+            q_d[k]      = __bfloat162float(q[gqa_q_index(q_head, d)]);
+            acc[k]      = 0.0f;
+        }
+
+        float m = -CUDART_INF_F;
+        float l = 0.0f;
+
+        for (int token = tile_start; token < tile_start + TileN; ++token) {
+            if (token > p) { break; }
+            if (token >= max_context) { break; }
+
+            const bool current_token = token == p;
+            float dot                = 0.0f;
+#pragma unroll
+            for (int k = 0; k < kDimsPerLane; ++k) {
+                const int d                = lane + 32 * k;
+                const std::int64_t new_off = gqa_kv_new_index(kv_head, d);
+                const float k_d = current_token
+                                      ? __bfloat162float(k_new[new_off])
+                                      : __bfloat162float(cache_k[gqa_cache_index(
+                                            kv_head, d, token, padded_context)]);
+                dot += q_d[k] * k_d;
+            }
+
+            const float score  = gqa_warp_sum_broadcast(dot) * scale;
+            const float next_m = fmaxf(m, score);
+            const float old_w  = expf(m - next_m);
             const float new_w  = expf(score - next_m);
-            acc[local_q]       = acc[local_q] * old_w + new_w * v_d;
-            l[local_q]         = l[local_q] * old_w + new_w;
-            m[local_q]         = next_m;
-        }
-    }
 
 #pragma unroll
-    for (int local_q = 0; local_q < QHeadsPerCta; ++local_q) {
-        const int q_head = gqa_global_q_head<QHeadsPerCta>(kv_head, q_subgroup, local_q);
-        if (!valid_q[local_q]) { continue; }
-        if (d == 0) {
-            partial_m[gqa_partial_stat_index(q_head, tile)] = m[local_q];
-            partial_l[gqa_partial_stat_index(q_head, tile)] = l[local_q];
+            for (int k = 0; k < kDimsPerLane; ++k) {
+                const int d                = lane + 32 * k;
+                const std::int64_t new_off = gqa_kv_new_index(kv_head, d);
+                const float v_d = current_token
+                                      ? __bfloat162float(v_new[new_off])
+                                      : __bfloat162float(cache_v[gqa_cache_index(
+                                            kv_head, d, token, padded_context)]);
+                acc[k] = acc[k] * old_w + new_w * v_d;
+            }
+            l = l * old_w + new_w;
+            m = next_m;
         }
-        partial_acc[gqa_partial_acc_index(q_head, d, tile)] = __float2bfloat16(acc[local_q]);
+
+        if (lane == 0) {
+            partial_m[gqa_partial_stat_index(q_head, tile)] = m;
+            partial_l[gqa_partial_stat_index(q_head, tile)] = l;
+        }
+#pragma unroll
+        for (int k = 0; k < kDimsPerLane; ++k) {
+            const int d = lane + 32 * k;
+            partial_acc[gqa_partial_acc_index(q_head, d, tile)] = __float2bfloat16(acc[k]);
+        }
+    } else {
+        const int d               = threadIdx.x;
+        const bool tile_contains_p = p >= tile_start && p < tile_start + TileN;
+        const std::int64_t new_off = gqa_kv_new_index(kv_head, d);
+        if (q_subgroup == 0 && tile_contains_p) {
+            const std::int64_t cache_off = gqa_cache_index(kv_head, d, p, padded_context);
+            cache_k[cache_off]           = k_new[new_off];
+            cache_v[cache_off]           = v_new[new_off];
+        }
+
+        float q_d[QHeadsPerCta];
+        float acc[QHeadsPerCta];
+        float m[QHeadsPerCta];
+        float l[QHeadsPerCta];
+        bool valid_q[QHeadsPerCta];
+
+#pragma unroll
+        for (int local_q = 0; local_q < QHeadsPerCta; ++local_q) {
+            const int q_head = gqa_global_q_head<QHeadsPerCta>(kv_head, q_subgroup, local_q);
+            valid_q[local_q] = gqa_valid_q_head(kv_head, q_head);
+            q_d[local_q] =
+                valid_q[local_q] ? __bfloat162float(q[gqa_q_index(q_head, d)]) : 0.0f;
+            acc[local_q] = 0.0f;
+            m[local_q]   = -CUDART_INF_F;
+            l[local_q]   = 0.0f;
+        }
+
+        __shared__ float reduce_scratch[QHeadsPerCta * 8];
+
+        for (int token = tile_start; token < tile_start + TileN; ++token) {
+            if (token > p) { break; }
+            if (token >= max_context) { break; }
+
+            const bool current_token = token == p;
+            const std::int64_t kv_off =
+                current_token ? new_off : gqa_cache_index(kv_head, d, token, padded_context);
+            const float k_d = __bfloat162float(current_token ? k_new[new_off] : cache_k[kv_off]);
+
+            float dot[QHeadsPerCta];
+#pragma unroll
+            for (int local_q = 0; local_q < QHeadsPerCta; ++local_q) {
+                dot[local_q] = valid_q[local_q] ? q_d[local_q] * k_d : 0.0f;
+            }
+
+            float dot_sum[QHeadsPerCta];
+            gqa_block_sum_256<QHeadsPerCta>(dot, dot_sum, reduce_scratch);
+
+            const float v_d = __bfloat162float(current_token ? v_new[new_off] : cache_v[kv_off]);
+#pragma unroll
+            for (int local_q = 0; local_q < QHeadsPerCta; ++local_q) {
+                if (!valid_q[local_q]) { continue; }
+                const float score  = dot_sum[local_q] * scale;
+                const float next_m = fmaxf(m[local_q], score);
+                const float old_w  = expf(m[local_q] - next_m);
+                const float new_w  = expf(score - next_m);
+                acc[local_q]       = acc[local_q] * old_w + new_w * v_d;
+                l[local_q]         = l[local_q] * old_w + new_w;
+                m[local_q]         = next_m;
+            }
+        }
+
+#pragma unroll
+        for (int local_q = 0; local_q < QHeadsPerCta; ++local_q) {
+            const int q_head = gqa_global_q_head<QHeadsPerCta>(kv_head, q_subgroup, local_q);
+            if (!valid_q[local_q]) { continue; }
+            if (d == 0) {
+                partial_m[gqa_partial_stat_index(q_head, tile)] = m[local_q];
+                partial_l[gqa_partial_stat_index(q_head, tile)] = l[local_q];
+            }
+            partial_acc[gqa_partial_acc_index(q_head, d, tile)] = __float2bfloat16(acc[local_q]);
+        }
     }
 }
 

@@ -19,9 +19,11 @@ constexpr int kGroups = kK / kGroupK;
 constexpr int kQ4WarpsPerRow = 4;
 constexpr int kQ4GroupsPerWarp = kGroups / kQ4WarpsPerRow;
 constexpr int kQ4BlockThreads = kQ4WarpsPerRow * 32;
+constexpr int kQ4ProjBlocks = kProjRows / kQ4WarpsPerRow;
 constexpr int kQ5WarpsPerRow = 8;
 constexpr int kQ5GroupsPerWarp = kGroups / kQ5WarpsPerRow;
 constexpr int kQ5BlockThreads = kQ5WarpsPerRow * 32;
+constexpr int kQ5ProjBlocks = kProjRows / kQ5WarpsPerRow;
 
 constexpr int kQ4BytesPerGroup = 32;
 constexpr int kQ5BytesPerGroup = 40;
@@ -80,16 +82,13 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int row = static_cast<int>(blockIdx.x);
-    if (row >= kN) { return; }
-
-    const std::uint8_t* code_row =
-        codes + static_cast<std::int64_t>(row) * kGroups * kQ4BytesPerGroup;
-    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
 
-    if (row < kProjRows) {
-        if (warp != 0) { return; }
+    if (static_cast<int>(blockIdx.x) < kQ4ProjBlocks) {
+        const int row = static_cast<int>(blockIdx.x) * kQ4WarpsPerRow + warp;
+        const std::uint8_t* code_row =
+            codes + static_cast<std::int64_t>(row) * kGroups * kQ4BytesPerGroup;
+        const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
 
         float acc = 0.0f;
 #pragma unroll 1
@@ -121,6 +120,12 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
         return;
     }
 
+    const int row = kProjRows + (static_cast<int>(blockIdx.x) - kQ4ProjBlocks);
+    if (row >= kN) { return; }
+
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(row) * kGroups * kQ4BytesPerGroup;
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
     __shared__ float partials[kQ4WarpsPerRow];
     const int group_begin = warp * kQ4GroupsPerWarp;
     float acc = 0.0f;
@@ -160,16 +165,13 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q5_kernel(
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int row = static_cast<int>(blockIdx.x);
-    if (row >= kN) { return; }
-
-    const std::uint8_t* code_row =
-        codes + static_cast<std::int64_t>(row) * kGroups * kQ5BytesPerGroup;
-    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
 
-    if (row < kProjRows) {
-        if (warp != 0) { return; }
+    if (static_cast<int>(blockIdx.x) < kQ5ProjBlocks) {
+        const int row = static_cast<int>(blockIdx.x) * kQ5WarpsPerRow + warp;
+        const std::uint8_t* code_row =
+            codes + static_cast<std::int64_t>(row) * kGroups * kQ5BytesPerGroup;
+        const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
 
         float acc = 0.0f;
         int group = 0;
@@ -241,6 +243,12 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q5_kernel(
         return;
     }
 
+    const int row = kProjRows + (static_cast<int>(blockIdx.x) - kQ5ProjBlocks);
+    if (row >= kN) { return; }
+
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(row) * kGroups * kQ5BytesPerGroup;
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
     __shared__ float partials[kQ5WarpsPerRow];
     const int group_begin = warp * kQ5GroupsPerWarp;
     const int group_end = group_begin + kQ5GroupsPerWarp;
@@ -329,7 +337,8 @@ void linear_rowsplit_gemv_attn_in_7168_q4_launch(const Tensor& x, const Weight& 
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
         throw std::invalid_argument("linear: Attention q/k Q4 fused GEMV requires 7168x5120");
     }
-    linear_rowsplit_gemv_attn_in_7168_q4_kernel<<<kN, kQ4BlockThreads, 0, stream>>>(
+    constexpr int kBlocks = kQ4ProjBlocks + (kN - kProjRows);
+    linear_rowsplit_gemv_attn_in_7168_q4_kernel<<<kBlocks, kQ4BlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
@@ -341,7 +350,8 @@ void linear_rowsplit_gemv_attn_in_7168_q5_launch(const Tensor& x, const Weight& 
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
         throw std::invalid_argument("linear: Attention gate/v Q5 fused GEMV requires 7168x5120");
     }
-    linear_rowsplit_gemv_attn_in_7168_q5_kernel<<<kN, kQ5BlockThreads, 0, stream>>>(
+    constexpr int kBlocks = kQ5ProjBlocks + (kN - kProjRows);
+    linear_rowsplit_gemv_attn_in_7168_q5_kernel<<<kBlocks, kQ5BlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());

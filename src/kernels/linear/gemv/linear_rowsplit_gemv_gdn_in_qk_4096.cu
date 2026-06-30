@@ -53,7 +53,8 @@ __global__ void linear_rowsplit_gemv_gdn_in_qk_4096_q4_kernel(
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
 
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const int group_begin = warp * kGroupsPerWarp;
     std::uint16_t lane_scale_bits = 0;
     if (lane < kGroupsPerWarp) {
@@ -61,21 +62,35 @@ __global__ void linear_rowsplit_gemv_gdn_in_qk_4096_q4_kernel(
     }
 
 #pragma unroll
-    for (int tile_group = 0; tile_group < kGroupsPerWarp; ++tile_group) {
-        const int group = group_begin + tile_group;
-        const auto scale_bits =
+    for (int tile_group = 0; tile_group < kGroupsPerWarp; tile_group += 2) {
+        const int group0 = group_begin + tile_group;
+        const auto scale_bits0 =
             static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, lane_scale_bits, tile_group));
-        const float scale = __half2float(__ushort_as_half(scale_bits));
+        const float scale0 = __half2float(__ushort_as_half(scale_bits0));
 
-        const std::uint8_t packed = code_row[group * kBytesPerGroup + lane];
-        const int q0 = sign_extend_q4(packed & 0x0f);
-        const int q1 = sign_extend_q4(packed >> 4);
-        const int k0 = group * kGroupK + lane * 2;
-        const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
-        acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
-        acc = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
+        const std::uint8_t packed0 = code_row[group0 * kBytesPerGroup + lane];
+        const int q00 = sign_extend_q4(packed0 & 0x0f);
+        const int q01 = sign_extend_q4(packed0 >> 4);
+        const int k0 = group0 * kGroupK + lane * 2;
+        const float2 xv0 = __bfloat1622float2(x2[k0 >> 1]);
+        acc0 = fmaf(static_cast<float>(q00) * scale0, xv0.x, acc0);
+        acc0 = fmaf(static_cast<float>(q01) * scale0, xv0.y, acc0);
+
+        const int group1 = group0 + 1;
+        const auto scale_bits1 =
+            static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, lane_scale_bits, tile_group + 1));
+        const float scale1 = __half2float(__ushort_as_half(scale_bits1));
+
+        const std::uint8_t packed1 = code_row[group1 * kBytesPerGroup + lane];
+        const int q10 = sign_extend_q4(packed1 & 0x0f);
+        const int q11 = sign_extend_q4(packed1 >> 4);
+        const int k1 = group1 * kGroupK + lane * 2;
+        const float2 xv1 = __bfloat1622float2(x2[k1 >> 1]);
+        acc1 = fmaf(static_cast<float>(q10) * scale1, xv1.x, acc1);
+        acc1 = fmaf(static_cast<float>(q11) * scale1, xv1.y, acc1);
     }
 
+    float acc = acc0 + acc1;
     acc = warp_reduce_sum(acc);
     if (lane == 0) { partials[warp] = acc; }
     __syncthreads();

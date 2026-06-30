@@ -91,6 +91,9 @@ struct ProgressState {
 
 int main(int argc, char** argv) {
     try {
+        std::ios::sync_with_stdio(false);
+        std::cin.tie(nullptr);
+
         const qus::text::CliOptions cli = qus::text::parse_cli(argc, argv);
         if (cli.help_requested) {
             std::cout << qus::text::usage_text(argv[0]);

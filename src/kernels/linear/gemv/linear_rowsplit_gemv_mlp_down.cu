@@ -35,21 +35,23 @@ __device__ __forceinline__ int sign_extend_q5(int v) {
     return (v & 0x10) ? (v - 32) : v;
 }
 
-__device__ __forceinline__ float accumulate_group(const __nv_bfloat162* __restrict__ x2,
-                                                  std::uint32_t lane_word,
-                                                  std::uint16_t scale_bits,
-                                                  int source_lane_base, int lane, int group,
-                                                  float acc) {
-    const float scale = __half2float(__ushort_as_half(scale_bits));
+__device__ __forceinline__ std::uint32_t load_q5_pair_bits(const std::uint8_t* __restrict__ group,
+                                                           int lane) {
+    const int bitpos      = lane * 10;
+    const int byte_offset = bitpos >> 3;
+    const int bit_shift   = bitpos & 7;
+    const std::uint8_t* p = group + byte_offset;
+    return (static_cast<std::uint32_t>(p[0]) |
+            (static_cast<std::uint32_t>(p[1]) << 8)) >>
+           bit_shift;
+}
 
-    const int bitpos = lane * 10;
-    const int wi = bitpos >> 5;
-    const int sh = bitpos & 31;
-    const std::uint32_t w0 = __shfl_sync(0xffffffffu, lane_word, source_lane_base + wi);
-    const std::uint32_t w1_next =
-        __shfl_sync(0xffffffffu, lane_word, source_lane_base + (wi < 9 ? wi + 1 : 9));
-    const std::uint32_t w1 = wi < 9 ? w1_next : 0u;
-    const std::uint32_t bits = __funnelshift_r(w0, w1, sh);
+__device__ __forceinline__ float accumulate_group(const __nv_bfloat162* __restrict__ x2,
+                                                  const std::uint8_t* __restrict__ code_group,
+                                                  std::uint16_t scale_bits,
+                                                  int lane, int group, float acc) {
+    const float scale = __half2float(__ushort_as_half(scale_bits));
+    const std::uint32_t bits = load_q5_pair_bits(code_group, lane);
 
     const int q0 = sign_extend_q5(static_cast<int>(bits & 0x1fu));
     const int q1 = sign_extend_q5(static_cast<int>((bits >> 5) & 0x1fu));
@@ -83,14 +85,6 @@ __global__ void linear_rowsplit_gemv_mlp_down_q5_kernel(
         const std::uint8_t* code_group0 = code_row + group * kBytesPerGroup;
         const std::uint8_t* code_group1 = code_group0 + kBytesPerGroup;
         const std::uint8_t* code_group2 = code_group1 + kBytesPerGroup;
-        std::uint32_t lane_word = 0;
-        if (lane < 10) {
-            lane_word = *reinterpret_cast<const std::uint32_t*>(code_group0 + lane * 4);
-        } else if (lane < 20) {
-            lane_word = *reinterpret_cast<const std::uint32_t*>(code_group1 + (lane - 10) * 4);
-        } else if (lane < 30) {
-            lane_word = *reinterpret_cast<const std::uint32_t*>(code_group2 + (lane - 20) * 4);
-        }
 
         std::uint16_t scale0_bits = 0;
         std::uint16_t scale1_bits = 0;
@@ -112,21 +106,15 @@ __global__ void linear_rowsplit_gemv_mlp_down_q5_kernel(
         scale1_bits = static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, scale1_bits, 1));
         scale2_bits = static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, scale2_bits, 2));
 
-        acc = accumulate_group(x2, lane_word, scale0_bits, 0, lane, group, acc);
-        acc = accumulate_group(x2, lane_word, scale1_bits, 10, lane, group + 1, acc);
-        acc = accumulate_group(x2, lane_word, scale2_bits, 20, lane, group + 2, acc);
+        acc = accumulate_group(x2, code_group0, scale0_bits, lane, group, acc);
+        acc = accumulate_group(x2, code_group1, scale1_bits, lane, group + 1, acc);
+        acc = accumulate_group(x2, code_group2, scale2_bits, lane, group + 2, acc);
     }
 
     if (group < group_end) {
         const bool has_group1 = group + 1 < group_end;
         const std::uint8_t* code_group0 = code_row + group * kBytesPerGroup;
         const std::uint8_t* code_group1 = code_group0 + kBytesPerGroup;
-        std::uint32_t lane_word = 0;
-        if (lane < 10) {
-            lane_word = *reinterpret_cast<const std::uint32_t*>(code_group0 + lane * 4);
-        } else if (has_group1 && lane < 20) {
-            lane_word = *reinterpret_cast<const std::uint32_t*>(code_group1 + (lane - 10) * 4);
-        }
 
         std::uint16_t scale0_bits = 0;
         std::uint16_t scale1_bits = 0;
@@ -142,9 +130,9 @@ __global__ void linear_rowsplit_gemv_mlp_down_q5_kernel(
         scale0_bits = static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, scale0_bits, 0));
         scale1_bits = static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, scale1_bits, 1));
 
-        acc = accumulate_group(x2, lane_word, scale0_bits, 0, lane, group, acc);
+        acc = accumulate_group(x2, code_group0, scale0_bits, lane, group, acc);
         if (has_group1) {
-            acc = accumulate_group(x2, lane_word, scale1_bits, 10, lane, group + 1, acc);
+            acc = accumulate_group(x2, code_group1, scale1_bits, lane, group + 1, acc);
         }
     }
 

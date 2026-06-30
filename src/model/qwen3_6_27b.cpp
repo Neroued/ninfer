@@ -6,6 +6,7 @@
 #include "qus/kernels/causal_conv1d.h"
 #include "qus/kernels/argmax.h"
 #include "qus/kernels/gated_delta_rule.h"
+#include "qus/kernels/gdn_in_ab.h"
 #include "qus/kernels/gdn_gating.h"
 #include "qus/kernels/gdn_in_vz.h"
 #include "qus/kernels/gqa_attention.h"
@@ -402,8 +403,7 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, 1});
         Tensor b = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, 1});
-        kernels::linear(h, *w.in_a, a, work_, s);
-        kernels::linear(h, *w.in_b, b, work_, s);
+        kernels::gdn_in_ab_decode(h, *w.in_a, *w.in_b, a, b, s);
 
         Tensor qkv_c       = work_.alloc(DType::BF16, {kCfg.conv_dim, 1});
         Tensor& conv_state = state_.conv.at(static_cast<std::size_t>(gidx));

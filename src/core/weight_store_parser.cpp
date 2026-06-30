@@ -108,22 +108,6 @@ void require_zero_range(std::span<const std::byte> file, std::uint64_t offset, s
             label);
 }
 
-const std::array<std::uint32_t, 256>& crc32_table() {
-    static const std::array<std::uint32_t, 256> table = [] {
-        std::array<std::uint32_t, 256> out{};
-        for (std::uint32_t i = 0; i < out.size(); ++i) {
-            std::uint32_t crc = i;
-            for (int bit = 0; bit < 8; ++bit) {
-                const std::uint32_t mask = 0U - (crc & 1U);
-                crc                      = (crc >> 1) ^ (0xEDB88320U & mask);
-            }
-            out[i] = crc;
-        }
-        return out;
-    }();
-    return table;
-}
-
 template <typename T>
 void validate_expected(std::uint32_t actual, const std::optional<T>& expected, const char* name) {
     if (expected.has_value() && actual != static_cast<std::uint32_t>(*expected)) {
@@ -597,9 +581,6 @@ std::vector<ParsedQ5090Tensor> parse_tensors(std::span<const std::byte> file,
         }
         require(seen_names.insert(t.name).second, "q5090 duplicate tensor name");
         require(expected_payload_bytes(t) == t.payload_bytes, "q5090 tensor payload byte mismatch");
-        const auto payload = file.subspan(static_cast<std::size_t>(t.payload_offset),
-                                          static_cast<std::size_t>(t.payload_bytes));
-        require(q5090_crc32(payload) == t.crc32, "q5090 tensor crc32 mismatch");
         ranges.push_back(Range{t.payload_offset, payload_end});
         tensors.push_back(std::move(t));
     }
@@ -793,16 +774,6 @@ std::uint64_t q5090_fnv1a64(std::string_view name) {
         h *= 0x100000001B3ULL;
     }
     return h;
-}
-
-std::uint32_t q5090_crc32(std::span<const std::byte> bytes) {
-    const auto& table = crc32_table();
-    std::uint32_t crc = 0xFFFFFFFFU;
-    for (std::byte byte : bytes) {
-        const auto value = static_cast<std::uint32_t>(std::to_integer<unsigned char>(byte));
-        crc              = table[(crc ^ value) & 0xFFU] ^ (crc >> 8);
-    }
-    return crc ^ 0xFFFFFFFFU;
 }
 
 ParsedQ5090File parse_q5090_file(std::span<const std::byte> file,

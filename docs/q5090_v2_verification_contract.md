@@ -40,9 +40,11 @@ value-preserving, reproducing it proves correctness. The **Python reference is a
 ## 2. Hard gates (exactness — pass/fail)
 
 - **G-STRUCT** — ABI valid + plan-conformance: header/offsets in range and ordered, payloads
-  256-aligned and non-overlapping, per-block `crc32` recomputes, segments partition `[0,N)`, fusion
-  adjacency + `source_kind` rule, plane-byte formulas; and the file matches the tensor-plan expected
-  manifest item-by-item (block/segment/fusion identities, names, shapes, row ranges).
+  256-aligned and non-overlapping, segments partition `[0,N)`, fusion adjacency + `source_kind` rule,
+  plane-byte formulas; and the file matches the tensor-plan expected manifest item-by-item
+  (block/segment/fusion identities, names, shapes, row ranges). Converter and offline verification
+  tools may recompute per-block `crc32`; the cpp runtime loader does not recompute payload CRC during
+  normal model load.
 - **G-VALUE** — recovered `(scale16, q_i)` from the file are **bit-identical** to the quantizer output.
 - **G-DUMP** — the converter dump and each engine dump (Python, cpp) agree **bit-exact** on
   block/segment/fusion metadata and on sampled `(scale16, q_i)`; sampled dequant agrees within a tiny
@@ -68,7 +70,7 @@ value-preserving, reproducing it proves correctness. The **Python reference is a
 |---|---|---|
 | **Converter** | G-STRUCT, G-VALUE | — |
 | **Python ref** (Phase 1) | G-STRUCT, G-VALUE, G-DUMP, G-SNAPSHOT | D-DEQUANT, D-LAYER, D-GREEDY-HF |
-| **cpp runtime** (Phase 2) | G-STRUCT (parse), G-DUMP, G-KERNEL, G-SNAPSHOT | D-DEQUANT, D-LAYER, D-GREEDY-HF |
+| **cpp runtime** (Phase 2) | G-STRUCT (parse, excluding payload CRC recomputation), G-DUMP, G-KERNEL, G-SNAPSHOT | D-DEQUANT, D-LAYER, D-GREEDY-HF |
 
 No phase gates on any HF comparison. The cpp runtime is validated by the **kernel oracle (CUDA↔cpp)**
 plus the **snapshot**, not by any per-op comparison to the Python reference.

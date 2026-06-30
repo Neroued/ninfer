@@ -152,7 +152,8 @@ struct DeviceContext {
 
 ### 5.2 WeightStore / Loader
 Reads the **one fixed q5090 weight file**, validates its header and tensor table against the
-`constexpr` config, checks payload CRCs, and uploads selected modules into the **Weights** region.
+`constexpr` config, and uploads selected modules into the **Weights** region. It does not recompute
+payload CRCs during normal model load; CRC remains an offline converter/auditor field.
 Exposes typed `Tensor` / `QuantWeight` views by name or by q5090 module/source id.
 ```cpp
 class WeightStore {

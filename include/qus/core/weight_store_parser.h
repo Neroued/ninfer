@@ -143,7 +143,6 @@ struct Q5090Progress {
 };
 
 std::uint64_t q5090_fnv1a64(std::string_view name);
-std::uint32_t q5090_crc32(std::span<const std::byte> bytes);
 ParsedQ5090File parse_q5090_file(std::span<const std::byte> file,
                                  const Q5090Expectations& expected = {},
                                  Q5090Progress* progress           = nullptr);

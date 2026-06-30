@@ -480,7 +480,8 @@ uniformity-over-gather-locality choice: the cost is negligible (a few extra byte
   `SegmentRecord` (projection name)
   (`h=0xcbf29ce484222325; for b: h=((h^b)*0x100000001b3) & 2^64-1`).
 - `crc32`: `zlib.crc32` over each block's whole payload (code plane + alignment pad + scale plane, or
-  the raw bytes for `CONTIGUOUS`).
+  the raw bytes for `CONTIGUOUS`). This is an offline converter/auditor integrity field; the cpp
+  runtime loader does not recompute it during normal model load.
 - `sha256_safetensors_index`: sha256 of the source `model.safetensors.index.json`.
 
 A converter or auditor MAY verify correctness by dequantizing each block and asserting bit-identical

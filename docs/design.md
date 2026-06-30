@@ -338,8 +338,9 @@ bf16 safetensors ─┐
   blobs. Spec lives in [`q5090_packed_file_format_v1.md`](q5090_packed_file_format_v1.md).
 - Python owns quantization and byte-level payload layout. It does not fold RMSNorm `+1`,
   log-decay exponentiation, or other model-semantic transforms into the stored weights.
-- The C++ loader validates q5090 metadata against the model card's `constexpr` config, checks
-  payload CRCs, uploads selected modules, and fails fast on mismatch.
+- The C++ loader validates q5090 metadata against the model card's `constexpr` config, uploads
+  selected modules, and fails fast on structural mismatches. It does not recompute payload CRCs during
+  normal model load; CRC is retained for converter and offline audit tooling.
 
 ---
 

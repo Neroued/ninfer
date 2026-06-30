@@ -4,6 +4,10 @@ This document is the **authoritative per-tensor assignment** for the v2 packed w
 input contract the converter (`tools/q5090_convert/tensor_plan.py`) implements and the unit test
 asserts.
 
+The same block/segment/fusion assignment applies to v3 unchanged; v3 changes only the on-disk
+code-plane packing. The full v3 artifact includes TEXT_CORE, MTP_DRAFT, and VISION_ENCODER:
+1167 blocks, 1311 segments, 128 fusion groups.
+
 It composes two layers:
 
 - **Quantization policy** — *which qtype each tensor gets* — is owned by
@@ -196,10 +200,10 @@ lm_head
   `…self_attn.q_proj.q`, `…mlp.gate_proj.weight`). `TensorEntry.source_kind` of a fused block is
   `OTHER` (0); segment identity is authoritative (binary spec §4 rule).
 
-## 5. MTP_DRAFT (deferred; assignment rules only)
+## 5. MTP_DRAFT (included; standalone assignment rules)
 
-MTP is introduced only after the text decode path is optimized; its detailed fusion plan is deferred.
-v2 layout rules for the 15 MTP tensors (one MTP layer + globals):
+MTP is included in the full artifact; its detailed fusion plan is deferred. v2/v3 layout rules for
+the 15 MTP tensors (one MTP layer + globals):
 
 - W8 linears (`self_attn.q/k/v/o_proj`, `mlp.gate/up/down_proj`, `mtp.fc`) → `ROW_SPLIT`,
   `group_size=128`, **standalone** (MTP fusion groups deferred).
@@ -209,9 +213,10 @@ v2 layout rules for the 15 MTP tensors (one MTP layer + globals):
 Exact per-tensor list and shapes: see `tools/q5090_convert/tensor_plan.py::build_mtp_specs` and the
 policy doc. MTP `source_layer` is its own index space.
 
-## 6. VISION_ENCODER (deferred; assignment rules only)
+## 6. VISION_ENCODER (included; standalone assignment rules)
 
-Vision is `LAZY_GPU` and not on the text decode path; fusion is deferred. v2 layout rules
+Vision is included in the full artifact as `LAZY_GPU` and is not on the text decode path; fusion is
+deferred. v2/v3 layout rules
 (depth = 27 blocks, plus patch_embed / pos_embed / merger):
 
 - block linears `attn.qkv` (Q4), `attn.proj` (Q5), `mlp.linear_fc1` (Q4), `mlp.linear_fc2` (Q5),

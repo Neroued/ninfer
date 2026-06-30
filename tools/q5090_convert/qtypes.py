@@ -1,7 +1,7 @@
-"""Enums and per-qtype constants for the q5090_w4g64_mixed_v2 packed format.
+"""Enums and per-qtype constants for the q5090_w4g64_mixed_v3 packed format.
 
 Values here are the on-disk ABI; do not renumber. See
-../../docs/q5090_packed_file_format_v2.md sections 7-9.
+../../docs/q5090_packed_file_format_v3.md sections 7-9.
 """
 
 from __future__ import annotations
@@ -47,9 +47,9 @@ MODULE_NAME = {
 }
 
 MODULE_POLICY = {
-    MODULE_TEXT: "q5090_w4g64_mixed_v2",
-    MODULE_MTP: "mtp_w8g128_v2",
-    MODULE_VISION: "vision_q4mix_merger_w8g128_v2",
+    MODULE_TEXT: "q5090_w4g64_mixed_v3",
+    MODULE_MTP: "mtp_w8g128_v3",
+    MODULE_VISION: "vision_q4mix_merger_w8g128_v3",
 }
 
 # --- scale dtype ---
@@ -144,6 +144,18 @@ class QuantSpec:
     def bytes_per_group(self) -> int:
         return (self.group_size * self.bits + 7) // 8
 
+    @property
+    def nibble_bytes_per_group(self) -> int:
+        if self.bits == 8:
+            return self.group_size
+        return self.group_size // 2
+
+    @property
+    def high_bytes_per_group(self) -> int:
+        if self.bits in (4, 8):
+            return 0
+        return self.group_size * (self.bits - 4) // 8
+
 
 # Quant parameters per qtype id (low-bit qtypes only).
 QUANT_SPECS = {
@@ -156,3 +168,11 @@ QUANT_SPECS = {
 
 def is_quant(qtype: int) -> bool:
     return qtype in QUANT_SPECS
+
+
+def nibble_plane_bytes_per_group(qtype: int) -> int:
+    return QUANT_SPECS[qtype].nibble_bytes_per_group
+
+
+def high_plane_bytes_per_group(qtype: int) -> int:
+    return QUANT_SPECS[qtype].high_bytes_per_group

@@ -1,11 +1,11 @@
-"""CLI: Qwen3.6-27B bf16 safetensors -> q5090_w4g64_mixed_v2 packed file.
+"""CLI: Qwen3.6-27B bf16 safetensors -> q5090_w4g64_mixed_v3 packed file.
 
 Usage:
   python -m tools.q5090_convert.convert --model /path/to/Qwen3.6-27B --out out/file.qus
 
 Default output includes all modules present in the HF source: TEXT_CORE plus MTP_DRAFT and
 VISION_ENCODER when their weights exist. Binary format:
-../../docs/q5090_packed_file_format_v2.md
+../../docs/q5090_packed_file_format_v3.md
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ EXPECTED = dict(
     vision_intermediate=4304,
     vision_out_hidden=5120,
 )
-OUTPUT_FORMAT_MARKER = "mixed_v2"
+OUTPUT_FORMAT_MARKER = "mixed_v3"
 
 @dataclass(frozen=True)
 class SegmentPlan:
@@ -309,30 +309,21 @@ def _append_standalone_blocks(
 
 def build_conversion_plan(
     cfg: dict,
-    include_mtp: bool,
-    include_vision: bool,
-    limit_text_layers: int = -1,
-    vision_blocks: int = -1,
 ) -> ConversionPlan:
     layer_types = _layer_types(cfg)
-    if limit_text_layers >= 0:
-        layer_types = layer_types[:limit_text_layers]
 
     blocks, segments, fusion_groups = _text_plan(layer_types)
     modules: List[ModulePlan] = [
         ModulePlan(qt.MODULE_TEXT, 0, len(blocks), qt.LOAD_RESIDENT),
     ]
 
-    if include_mtp:
-        begin = len(blocks)
-        _append_standalone_blocks(blocks, segments, tp.build_mtp_specs())
-        modules.append(ModulePlan(qt.MODULE_MTP, begin, len(blocks) - begin, qt.LOAD_RESIDENT))
+    begin = len(blocks)
+    _append_standalone_blocks(blocks, segments, tp.build_mtp_specs())
+    modules.append(ModulePlan(qt.MODULE_MTP, begin, len(blocks) - begin, qt.LOAD_RESIDENT))
 
-    if include_vision:
-        begin = len(blocks)
-        depth = EXPECTED["vision_depth"] if vision_blocks < 0 else vision_blocks
-        _append_standalone_blocks(blocks, segments, tp.build_vision_specs(depth))
-        modules.append(ModulePlan(qt.MODULE_VISION, begin, len(blocks) - begin, qt.LOAD_LAZY_GPU))
+    begin = len(blocks)
+    _append_standalone_blocks(blocks, segments, tp.build_vision_specs(EXPECTED["vision_depth"]))
+    modules.append(ModulePlan(qt.MODULE_VISION, begin, len(blocks) - begin, qt.LOAD_LAZY_GPU))
 
     return ConversionPlan(tuple(modules), tuple(blocks), tuple(segments), tuple(fusion_groups))
 
@@ -386,11 +377,11 @@ def _prod(xs: Sequence[int]) -> int:
     return p
 
 
-def _require_v2_output_path(out_path: str) -> None:
+def _require_v3_output_path(out_path: str) -> None:
     basename = os.path.basename(os.path.normpath(out_path))
     if OUTPUT_FORMAT_MARKER not in basename or not basename.endswith(".qus"):
         raise SystemExit(
-            f"q5090 v2 converter output path must be a {OUTPUT_FORMAT_MARKER} .qus file: "
+            f"q5090 v3 converter output path must be a {OUTPUT_FORMAT_MARKER} .qus file: "
             f"{out_path}"
         )
 
@@ -421,36 +412,10 @@ def _write_manifest(
     entries: Sequence[fmt.TensorEntry],
     segment_records: Sequence[fmt.SegmentRecord],
     fusion_records: Sequence[fmt.FusionGroupRecord],
-    disabled: Sequence[str],
     file_size: int,
     source_index_sha256: bytes,
 ) -> None:
     tc = cfg.get("text_config", cfg)
-    modules = []
-    for m in module_records:
-        module_entries = entries[m.tensor_index_begin: m.tensor_index_begin + m.tensor_index_count]
-        modules.append(
-            {
-                "kind": qt.MODULE_NAME[m.module_kind],
-                "policy": qt.MODULE_POLICY[m.module_kind],
-                "block_count": int(m.tensor_index_count),
-                "segment_count": int(sum(e.segment_count for e in module_entries)),
-                "fusion_group_count": int(
-                    sum(
-                        1
-                        for g in fusion_records
-                        if m.tensor_index_begin
-                        <= g.first_block_tensor_index
-                        < m.tensor_index_begin + m.tensor_index_count
-                    )
-                ),
-                "payload_offset": int(m.payload_offset),
-                "payload_bytes": int(m.payload_bytes),
-                "payload_gib": round(m.payload_bytes / (1024**3), 4),
-                "load_policy": int(m.load_policy),
-            }
-        )
-
     text_bytes = sum(e.payload_bytes for e in entries if e.module_kind == qt.MODULE_TEXT)
     text_elems = sum(_prod(e.shape) for e in entries if e.module_kind == qt.MODULE_TEXT)
     group_summary = []
@@ -460,44 +425,59 @@ def _write_manifest(
             group_summary.append(
                 {
                     "group_id": qt.FUSION_GROUP_NAME[gid],
-                    "groups": len(records),
+                    "layers": len(records),
                     "blocks_per_group": records[0].block_count,
                     "total_n": records[0].total_n,
-                    "shared_k": records[0].shared_k,
                 }
             )
+    present_modules = [qt.MODULE_NAME[m.module_kind] for m in module_records]
+    absent_modules = [
+        qt.MODULE_NAME[k]
+        for k in (qt.MODULE_TEXT, qt.MODULE_MTP, qt.MODULE_VISION)
+        if qt.MODULE_NAME[k] not in present_modules
+    ]
+    present_qtypes = [
+        name
+        for qtype, name in qt.QTYPE_NAME.items()
+        if any(e.qtype == qtype for e in entries)
+    ]
+    present_layouts = [
+        name
+        for layout, name in qt.LAYOUT_NAME.items()
+        if any(e.layout == layout for e in entries)
+    ]
 
     manifest = {
-        "format": "q5090_w4g64_mixed_v2",
-        "format_version": 2,
-        "model": cfg.get("_name_or_path", "Qwen/Qwen3.6-27B"),
-        "binary_spec": "docs/q5090_packed_file_format_v2.md",
+        "format": "q5090_w4g64_mixed_v3",
+        "format_version": 3,
+        "format_minor": fmt.FORMAT_MINOR,
+        "binary_spec": "docs/q5090_packed_file_format_v3.md",
         "tensor_plan": "docs/qwen3_6_27b_q5090_v2_tensor_plan.md",
-        "output": os.path.basename(out_path),
+        "value_source": "qwen3_6_27b_q5090_final_quant_format_v1 (policy)",
+        "weights_file": os.path.basename(out_path),
         "file_bytes": int(file_size),
-        "source_index_sha256": source_index_sha256.hex(),
-        "block_count": len(entries),
+        "sha256_safetensors_index": source_index_sha256.hex(),
+        "calibrated": False,
+        "alignment": {
+            "header": fmt.HEADER_SIZE,
+            "payload": fmt.REGION_ALIGN,
+            "block": fmt.PAYLOAD_ALIGN,
+            "k_pad": 128,
+            "group_size": 64,
+        },
+        "layouts": present_layouts,
+        "code_planes": ["nibble", "high", "scale"],
+        "qtypes": present_qtypes,
+        "modules": present_modules,
+        "absent_modules": absent_modules,
+        "module_count": len(module_records),
+        "tensor_count": len(entries),
         "segment_count": len(segment_records),
         "fusion_group_count": len(fusion_records),
-        "modules": modules,
-        "disabled_modules": list(disabled),
-        "layouts": list(qt.LAYOUT_NAME.values()),
-        "qtypes": list(qt.QTYPE_NAME.values()),
         "fusion_groups": group_summary,
-        "value_source": "qwen3_6_27b_q5090_final_quant_format_v1 (policy)",
         "effective_text_bpw": round(text_bytes * 8 / max(1, text_elems), 4),
-        "hidden_size": tc["hidden_size"],
-        "intermediate_size": tc["intermediate_size"],
-        "vocab_size": tc["vocab_size"],
-        "num_hidden_layers": tc["num_hidden_layers"],
-        "zero_point": False,
-        "alignment": {
-            "file_header": fmt.HEADER_SIZE,
-            "tensor_payload": fmt.PAYLOAD_ALIGN,
-            "payload_region": fmt.REGION_ALIGN,
-        },
     }
-    mpath = os.path.join(os.path.dirname(out_path), fmt.MANIFEST_V2_NAME)
+    mpath = out_path + fmt.MANIFEST_SUFFIX
     with open(mpath, "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
@@ -505,22 +485,18 @@ def _write_manifest(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="q5090_w4g64_mixed_v2 quantizing converter")
+    ap = argparse.ArgumentParser(description="q5090_w4g64_mixed_v3 quantizing converter")
     ap.add_argument("--model", required=True, help="path to original Qwen3.6-27B safetensors dir")
     ap.add_argument("--out", default=None, help="output .qus file path")
-    ap.add_argument("--no-mtp", action="store_true")
-    ap.add_argument("--no-vision", action="store_true")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--force", action="store_true", help="warn instead of abort on config mismatch")
-    ap.add_argument("--limit-text-layers", type=int, default=-1, help="debug: only first N text layers")
-    ap.add_argument("--vision-blocks", type=int, default=-1, help="debug: only first M vision blocks")
     args = ap.parse_args()
 
     model_dir = args.model.rstrip("/")
     out_path = args.out or os.path.join(
-        os.getcwd(), "out", "qwen3_6_27b.q5090_w4g64_mixed_v2.qus"
+        os.getcwd(), "out", "qwen3_6_27b.q5090_w4g64_mixed_v3.qus"
     )
-    _require_v2_output_path(out_path)
+    _require_v3_output_path(out_path)
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -538,21 +514,7 @@ def main() -> None:
     weight_map = json.loads(index_raw)["weight_map"]
     reader = ShardReader(model_dir, weight_map)
 
-    want_mtp = (not args.no_mtp) and reader.has("mtp.fc.weight")
-    want_vision = (not args.no_vision) and reader.has("model.visual.merger.linear_fc1.weight")
-    disabled: List[str] = []
-    if not args.no_mtp and not want_mtp:
-        disabled.append("MTP_DRAFT")
-    if not args.no_vision and not want_vision:
-        disabled.append("VISION_ENCODER")
-
-    plan = build_conversion_plan(
-        cfg,
-        include_mtp=want_mtp,
-        include_vision=want_vision,
-        limit_text_layers=args.limit_text_layers,
-        vision_blocks=args.vision_blocks,
-    )
+    plan = build_conversion_plan(cfg)
     missing = [name for name in plan_source_names(plan) if not reader.has(name)]
     if missing:
         raise SystemExit("missing source tensors:\n  " + "\n  ".join(missing))
@@ -630,7 +592,8 @@ def main() -> None:
                 padded,
                 group,
                 scale_dtype,
-                code_plane_bytes,
+                nibble_plane_bytes,
+                high_plane_bytes,
                 scale_plane_bytes,
             ) = encode_tensor(w, block.qtype, block.layout, device)
             if block.shape is not None and list(block.shape) != logical:
@@ -645,7 +608,8 @@ def main() -> None:
             entry.payload_offset = pos
             entry.payload_bytes = len(payload)
             entry.crc32 = fmt.crc32(payload)
-            entry.code_plane_bytes = code_plane_bytes
+            entry.nibble_plane_bytes = nibble_plane_bytes
+            entry.high_plane_bytes = high_plane_bytes
             entry.scale_plane_bytes = scale_plane_bytes
 
             if len(payload) >= (1 << 20) or i % 50 == 0 or i == tensor_count - 1:
@@ -696,11 +660,7 @@ def main() -> None:
                 )
             )
 
-        flags = 1
-        if want_mtp:
-            flags |= 2
-        if want_vision:
-            flags |= 4
+        flags = fmt.FLAG_TEXT_PRESENT | fmt.FLAG_MTP_PRESENT | fmt.FLAG_VISION_PRESENT
         header = fmt.FileHeaderFields(
             tensor_count=tensor_count,
             module_count=module_count,
@@ -759,7 +719,6 @@ def main() -> None:
         entries,
         segment_records,
         fusion_records,
-        disabled,
         file_size,
         sha,
     )
@@ -770,8 +729,6 @@ def main() -> None:
             f"  {qt.MODULE_NAME[m.module_kind]:14s} blocks={m.tensor_index_count:4d}  "
             f"payload={_fmt_bytes(m.payload_bytes)}  policy={qt.MODULE_POLICY[m.module_kind]}"
         )
-    if disabled:
-        print("  disabled_modules:", list(disabled))
 
 
 if __name__ == "__main__":

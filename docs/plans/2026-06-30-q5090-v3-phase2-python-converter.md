@@ -12,8 +12,9 @@ a step-by-step subtask breakdown.
 
 Move the Python converter/reference stack from v2 (concatenated-bitstream Q5/Q6) to **v3 plane-split**
 (low-nibble plane + separate high-bit plane), regenerate the weight artifact as v3, and prove — in the
-Python path — that v3 is a **value-preserving relayout** (bit-identical dequant) that the reference
-model runs normally on. v3 byte contract: the Phase-1 spec (§2/§4/§7/§9/§13/§17).
+Python path — that v3 preserves the quantizer policy values from the original source weights and that
+the reference model runs normally on the full artifact. v3 byte contract: the Phase-1 spec
+(§2/§4/§7/§9/§13/§17).
 
 ## Execution mode — single atomic task, NOT subagent-driven
 
@@ -25,7 +26,8 @@ Per AGENTS.md, a non-subagent mode requires a stated reason:
   only some are on v3 **does not import, run, or verify**. There is no meaningful verifiable subtask
   boundary, so the change must not be split.
 - Therefore: **one developer executes the entire Python change in one task**, with **no intermediate
-  commits, builds, or reviews**; it is verified **once** against the strategy below and reviewed once.
+  commits, builds, or reviews**; it is verified against the strategy below and then reviewed once in a
+  final read-only subagent review stage.
 - No git worktree / no parallelism is needed (single sequential task on `master`; the implementer may
   iterate freely in the working tree and squash to one commit when green).
 
@@ -33,7 +35,8 @@ Per AGENTS.md, a non-subagent mode requires a stated reason:
 
 - **No C++ changes.** `src/**`, `include/**`, the kernels, the C++ parser (`weight_store*`,
   `q5090_pack.h`), and C++ tests are Phase 3. This task touches Python + docs only.
-- **No value change.** v3 dequant MUST equal v2 dequant / the policy output bit-for-bit (the gate).
+- **No value change.** v3 dequant MUST equal the policy output from the original source weights
+  bit-for-bit (the gate). A v2 artifact comparison is not required.
   The quantizer (`quantize.py` max-abs) is **not** modified.
 - **No tensor-plan reassignment.** Blocks/segments/fusion groups/qtypes/shapes/source transforms are
   unchanged (v3 inherits the v2 tensor plan). Only the on-disk **code packing** changes.
@@ -52,8 +55,8 @@ Per AGENTS.md, a non-subagent mode requires a stated reason:
 | `tools/q5090_convert/convert.py` | driver: thread `nibble/high/scale` plane bytes into each `TensorEntry`; build the header with v3 `VERSION`/flags; `_write_manifest` emits the v3 schema (spec §17: `binary_spec`, `tensor_plan`, `file_bytes`, hex `sha256_safetensors_index`, `modules`/`absent_modules`, `qtypes`, `alignment`, `tensor_count`/`segment_count`/`fusion_group_count`); output path → `…_v3.qus`. |
 | `tools/q5090_convert/verify.py` | structural validation to the spec §13 (3-plane sizes via `row_split_plane_sizes`; magic/version; ROW_SPLIT vs CONTIGUOUS `padded_shape` split; plane-byte equality; `source_kind` defined-for-module; zero-fill as verifier check); keep the **dequant value-preservation** check (decoded `.qus` == source-quantized weights) on v3. |
 | `tools/q5090_convert/tensor_plan.py` | no assignment change; bump any embedded format/version string only. |
-| `tools/q5090_convert/tests/test_packing.py` | add v3 round-trip (`pack∘unpack == codes`, Q4/Q5/Q6/W8) **and** the value-preservation test (v3 dequant == v2 dequant, value-for-value, random tensors per qtype). |
-| `tools/q5090_convert/tests/test_tensor_plan.py` | bump magic/version asserts if present; counts unchanged (819/963/128). |
+| `tools/q5090_convert/tests/test_packing.py` | add v3 round-trip (`pack∘unpack == codes`, Q4/Q5/Q6/W8) **and** the value-preservation test (v3 dequant == the policy output, value-for-value, random tensors per qtype). |
+| `tools/q5090_convert/tests/test_tensor_plan.py` | bump magic/version asserts if present; TEXT_CORE plan counts remain 819/963/128, while the full v3 artifact counts are 1167/1311/128. |
 | `tools/parity/ref_model.py` | reads v3 **transparently** through the updated `format`/`layouts`/`packing`; change only if it pins magic/version. |
 | `docs/qwen3_6_27b_q5090_v2_tensor_plan.md` (optional) | add a one-line note that the assignment applies to v3 unchanged, or rename/tag a v3 copy; no assignment edits. |
 
@@ -70,9 +73,9 @@ manifest + header) → `verify.py` (v3 structural + dequant) → tests → regen
 
 ## Artifact output
 
-Regenerate `out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus` (+ its `manifest.v3.json`) from the same source
-safetensors the v2 artifact used. The v2 `.qus` is superseded (not deleted by this task; Phase 3 makes
-the runtime read v3).
+Regenerate the full all-module `out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus` (+ sidecar manifest) from
+the source safetensors, including TEXT_CORE, MTP_DRAFT, and VISION_ENCODER. The v2 `.qus` is
+superseded (not deleted by this task; Phase 3 makes the runtime read v3).
 
 ## Reading list
 
@@ -91,29 +94,39 @@ Python: `/home/neroued/miniconda3/envs/vllm-bench/bin/python` (or repo env).
 1. **Packing round-trip.** `pytest tools/q5090_convert/tests/test_packing.py` — for Q4/Q5/Q6/W8,
    `unpack(pack(codes)) == codes`; numpy reference and torch fast path agree bit-for-bit.
 2. **Value-preservation gate (the migration's reason to exist).** For random tensors per qtype **and**
-   on real model tensors: **v3 dequant == v2 dequant, value-for-value** (equivalently, both equal the
-   `quantize.py` policy output). A single mismatch fails the task. (Test in `test_packing.py` + the
-   verifier's dequant probe.)
+   on real model tensors: **v3 dequant == the `quantize.py` policy output from the source weights,
+   value-for-value**. A single mismatch fails the task. (Test in `test_packing.py` + the verifier's
+   dequant probe.)
 3. **Converter regen + structural verify.** Run the converter to emit `…_v3.qus` + manifest, then
    `python -m tools.q5090_convert.verify out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus` passes **all** spec
    §13 structural checks (magic V3/version 3, index adjacency, 3-plane sizes, ROW_SPLIT/CONTIGUOUS
    `padded_shape`, `payload_bytes`, segment partition, fusion consistency) **and** the dequant probe.
-4. **Header/manifest consistency.** `unpack_header` reports magic `Q5090MIXEDV3`, version 3, correct
-   `tensor_count`/`segment_count`/`fusion_group_count` (819/963/128) and flags; the manifest fields
-   equal the header (spec §17).
-5. **Reference-model inference is normal.** Run `tools/parity/ref_model.py` on the v3 artifact and
-   confirm it loads and produces outputs **numerically identical** to the same reference run on the v2
-   artifact (logits/hidden states match to bit/✶tolerance, since dequant is identical). This is the
-   "inference normal" check.
+4. **Header/manifest consistency.** `unpack_header` reports magic `Q5090MIXEDV3`, version 3, full
+   all-module counts (`tensor_count`/`segment_count`/`fusion_group_count` = 1167/1311/128,
+   `module_count` = 3) and TEXT/MTP/VISION flags; the manifest fields equal the header (spec §17).
+5. **Reference-model inference is normal.** Run `tools/parity/ref_model.py` on the v3 artifact using
+   the local Qwen3.6 tokenizer, the Qwen chat template, and a real short prompt; confirm it prints a
+   non-empty prompt token count, generated token ids, and decoded generated text. This is the
+   "inference normal" check; comparing against a v2 artifact is not required in this phase.
+   Command shape:
+   `python tools/parity/ref_model.py --weights out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus --model /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16 --prompt "请用三条短句说明，为什么每天适量喝水很重要？每条不超过 18 个字。" --decode 16`.
 6. **Suite green.** `pytest tools/q5090_convert/` fully green.
 
 > **Out of Phase-2 verification scope:** the C++ runtime cannot load v3 until Phase 3, so there is **no
 > C++ build / e2e / nsys check here**. Phase 2 is proven entirely on the Python path (steps 1–6); the
 > C++ e2e gate belongs to Phase 3.
 
-## Review (single pass, risk-scaled: format + numerics + weight-loading)
+## Review (final read-only subagent stage)
 
-One independent review against this checklist (no review subagents; it is one reviewer):
+Before the final commit, run two independent subagent reviews:
+
+1. **v3 design-doc fit** — compare the implementation against
+   `docs/q5090_packed_file_format_v3.md` §2/§4/§7/§9/§13/§17 and this plan.
+2. **Code implementation quality** — inspect the Python converter/verifier/reference implementation
+   for malformed partial artifacts, manifest/header consistency, weight-loading safety, and avoidable
+   complexity.
+
+The combined review checklist:
 
 - **Format/ABI** — emitted bytes match spec §2/§4/§9 (magic/version, `_ENTRY_STRUCT` size 124→128,
   three 256-aligned planes, `payload_bytes` = relative span); enums not renumbered.

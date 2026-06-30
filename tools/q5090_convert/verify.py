@@ -1,11 +1,11 @@
-"""Verify a q5090_w4g64_mixed_v2 file with L0 structure checks and L1 value checks.
+"""Verify a q5090_w4g64_mixed_v3 file with L0 structure checks and L1 value checks.
 
 Usage:
-  python -m tools.q5090_convert.verify out/qwen3_6_27b.q5090_w4g64_mixed_v2.qus
+  python -m tools.q5090_convert.verify out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus
 
 L0 validates the binary ABI and plan conformance. L1 recovers ROW_SPLIT scales/codes from the
 file and compares them bit-identically to tools.q5090_convert.quantize over the same block rows.
-The verifier writes a deterministic structural dump to out/conv_dump.v2.json by default.
+The verifier writes a deterministic structural dump to out/conv_dump.v3.json by default.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from . import format as fmt
 from . import qtypes as qt
 from .layouts import decode_row_split_quantized, decode_tensor, encode_tensor
-from .packing import bytes_per_group, row_split_plane_sizes
+from .packing import row_split_plane_sizes
 from .quantize import pick_device, quantize_core
 from .convert import ShardReader, assert_config, build_conversion_plan, load_config, materialize_block
 
@@ -35,6 +35,101 @@ def _prod(xs: Sequence[int]) -> int:
     for x in xs:
         p *= int(x)
     return p
+
+
+def _all_zero(buf: bytes) -> bool:
+    return not buf or buf == b"\x00" * len(buf)
+
+
+def _check_zero_range(f, begin: int, end: int, label: str, problems: List[str]) -> None:
+    if end <= begin:
+        return
+    f.seek(begin)
+    if not _all_zero(f.read(end - begin)):
+        problems.append(f"{label}: nonzero reserved/padding bytes")
+
+
+_TEXT_SOURCE_KINDS = {
+    qt.SK_OTHER,
+    qt.SK_EMBED,
+    qt.SK_LM_HEAD,
+    qt.SK_FINAL_NORM,
+    qt.SK_INPUT_LAYERNORM,
+    qt.SK_POST_ATTN_LAYERNORM,
+    qt.SK_GDN_A_LOG,
+    qt.SK_GDN_DT_BIAS,
+    qt.SK_GDN_CONV1D,
+    qt.SK_GDN_IN_PROJ_A,
+    qt.SK_GDN_IN_PROJ_B,
+    qt.SK_GDN_IN_PROJ_Q,
+    qt.SK_GDN_IN_PROJ_K,
+    qt.SK_GDN_IN_PROJ_V,
+    qt.SK_GDN_IN_PROJ_Z,
+    qt.SK_GDN_NORM,
+    qt.SK_GDN_OUT_PROJ,
+    qt.SK_ATTN_Q,
+    qt.SK_ATTN_GATE,
+    qt.SK_ATTN_K,
+    qt.SK_ATTN_V,
+    qt.SK_ATTN_Q_NORM,
+    qt.SK_ATTN_K_NORM,
+    qt.SK_ATTN_O,
+    qt.SK_MLP_GATE,
+    qt.SK_MLP_UP,
+    qt.SK_MLP_DOWN,
+}
+_MTP_SOURCE_KINDS = {
+    qt.SK_OTHER,
+    qt.SK_INPUT_LAYERNORM,
+    qt.SK_POST_ATTN_LAYERNORM,
+    qt.SK_ATTN_Q,
+    qt.SK_ATTN_GATE,
+    qt.SK_ATTN_K,
+    qt.SK_ATTN_V,
+    qt.SK_ATTN_Q_NORM,
+    qt.SK_ATTN_K_NORM,
+    qt.SK_ATTN_O,
+    qt.SK_MLP_GATE,
+    qt.SK_MLP_UP,
+    qt.SK_MLP_DOWN,
+    qt.SK_MTP_FC,
+    qt.SK_MTP_PRE_FC_NORM_EMB,
+    qt.SK_MTP_PRE_FC_NORM_HID,
+    qt.SK_MTP_NORM,
+}
+_VISION_SOURCE_KINDS = {
+    qt.SK_OTHER,
+    qt.SK_VIS_PATCH_EMBED,
+    qt.SK_VIS_PATCH_EMBED_BIAS,
+    qt.SK_VIS_POS_EMBED,
+    qt.SK_VIS_BLOCK_QKV,
+    qt.SK_VIS_BLOCK_QKV_BIAS,
+    qt.SK_VIS_BLOCK_PROJ,
+    qt.SK_VIS_BLOCK_PROJ_BIAS,
+    qt.SK_VIS_BLOCK_FC1,
+    qt.SK_VIS_BLOCK_FC1_BIAS,
+    qt.SK_VIS_BLOCK_FC2,
+    qt.SK_VIS_BLOCK_FC2_BIAS,
+    qt.SK_VIS_BLOCK_NORM1_W,
+    qt.SK_VIS_BLOCK_NORM1_B,
+    qt.SK_VIS_BLOCK_NORM2_W,
+    qt.SK_VIS_BLOCK_NORM2_B,
+    qt.SK_VIS_MERGER_FC1,
+    qt.SK_VIS_MERGER_FC1_BIAS,
+    qt.SK_VIS_MERGER_FC2,
+    qt.SK_VIS_MERGER_FC2_BIAS,
+    qt.SK_VIS_MERGER_NORM_W,
+    qt.SK_VIS_MERGER_NORM_B,
+}
+_SOURCE_KINDS_BY_MODULE = {
+    qt.MODULE_TEXT: _TEXT_SOURCE_KINDS,
+    qt.MODULE_MTP: _MTP_SOURCE_KINDS,
+    qt.MODULE_VISION: _VISION_SOURCE_KINDS,
+}
+
+
+def _source_kind_defined(module_kind: int, source_kind: int) -> bool:
+    return source_kind in _SOURCE_KINDS_BY_MODULE.get(module_kind, set())
 
 
 def _read_name(table: bytes, offset: int, length: int, label: str, problems: List[str]) -> str:
@@ -130,7 +225,8 @@ def _make_dump(path: str, hdr, modules, entries, segments, fusions) -> dict:
                 "padded_shape": e["padded_shape"],
                 "payload_offset": e["payload_offset"],
                 "payload_bytes": e["payload_bytes"],
-                "code_plane_bytes": e["code_plane_bytes"],
+                "nibble_plane_bytes": e["nibble_plane_bytes"],
+                "high_plane_bytes": e["high_plane_bytes"],
                 "scale_plane_bytes": e["scale_plane_bytes"],
                 "crc32": e["crc32"],
                 "fusion_group_id": e["fusion_group_id"],
@@ -164,7 +260,7 @@ def _make_dump(path: str, hdr, modules, entries, segments, fusions) -> dict:
         )
 
     return {
-        "format": "q5090_w4g64_mixed_v2",
+        "format": "q5090_w4g64_mixed_v3",
         "file": path,
         "header": _header_dump(hdr),
         "modules": modules,
@@ -194,11 +290,17 @@ def _check_entry_planes(e: dict) -> List[str]:
             problems.append(f"{name}: group_size {e['group_size']} != {spec.group_size}")
         if e["scale_dtype"] != qt.SCALE_FP16:
             problems.append(f"{name}: scale_dtype {e['scale_dtype']} != FP16")
+        want_pk = fmt.align_up(k, 128)
+        if pk != want_pk:
+            problems.append(f"{name}: padded K {pk} != align_up(K,128) {want_pk}")
         groups = pk // spec.group_size if spec.group_size else 0
-        bpr = bytes_per_group(spec.group_size, spec.bits)
-        code, _, scale, payload = row_split_plane_sizes(n, groups, bpr)
-        if e["code_plane_bytes"] != code:
-            problems.append(f"{name}: code_plane_bytes {e['code_plane_bytes']} != {code}")
+        nib = spec.nibble_bytes_per_group
+        high = spec.high_bytes_per_group
+        nibble_bytes, _, high_bytes, _, scale, payload = row_split_plane_sizes(n, groups, nib, high)
+        if e["nibble_plane_bytes"] != nibble_bytes:
+            problems.append(f"{name}: nibble_plane_bytes {e['nibble_plane_bytes']} != {nibble_bytes}")
+        if e["high_plane_bytes"] != high_bytes:
+            problems.append(f"{name}: high_plane_bytes {e['high_plane_bytes']} != {high_bytes}")
         if e["scale_plane_bytes"] != scale:
             problems.append(f"{name}: scale_plane_bytes {e['scale_plane_bytes']} != {scale}")
         if e["payload_bytes"] != payload:
@@ -214,10 +316,12 @@ def _check_entry_planes(e: dict) -> List[str]:
             problems.append(f"{name}: CONTIGUOUS group_size {e['group_size']} != 0")
         if e["scale_dtype"] != qt.SCALE_NONE:
             problems.append(f"{name}: CONTIGUOUS scale_dtype {e['scale_dtype']} != none")
+        if e["high_plane_bytes"] != 0:
+            problems.append(f"{name}: CONTIGUOUS high_plane_bytes {e['high_plane_bytes']} != 0")
         if e["scale_plane_bytes"] != 0:
             problems.append(f"{name}: CONTIGUOUS scale_plane_bytes {e['scale_plane_bytes']} != 0")
-        if e["code_plane_bytes"] != raw_bytes:
-            problems.append(f"{name}: code_plane_bytes {e['code_plane_bytes']} != raw bytes {raw_bytes}")
+        if e["nibble_plane_bytes"] != raw_bytes:
+            problems.append(f"{name}: nibble_plane_bytes {e['nibble_plane_bytes']} != raw bytes {raw_bytes}")
         if e["payload_bytes"] != raw_bytes:
             problems.append(f"{name}: payload_bytes {e['payload_bytes']} != raw bytes {raw_bytes}")
     else:
@@ -236,12 +340,40 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
         problems.append(f"bad endian {hdr['endian']:#x}")
     if hdr["header_size"] != fmt.HEADER_SIZE:
         problems.append(f"bad header_size {hdr['header_size']}")
+    if hdr["module_count"] != 3:
+        problems.append(f"module_count {hdr['module_count']} != 3")
+    if hdr["layer_count"] != 64:
+        problems.append(f"layer_count {hdr['layer_count']} != 64")
+    if hdr["format_minor"] != fmt.FORMAT_MINOR:
+        problems.append(f"format_minor {hdr['format_minor']} != {fmt.FORMAT_MINOR}")
+    if hdr["flags"] & fmt.FLAG_RESERVED_MASK:
+        problems.append(f"reserved header flags set: {hdr['flags']:#x}")
+    if hdr["flags"] != fmt.FLAG_MODULE_PRESENT_MASK:
+        problems.append(f"flags {hdr['flags']:#x} != full module flags {fmt.FLAG_MODULE_PRESENT_MASK:#x}")
+    if hdr["tensor_count"] != 1167:
+        problems.append(f"tensor_count {hdr['tensor_count']} != full artifact count 1167")
+    if hdr["segment_count"] != 1311:
+        problems.append(f"segment_count {hdr['segment_count']} != full artifact count 1311")
+    if hdr["fusion_group_count"] != 128:
+        problems.append(f"fusion_group_count {hdr['fusion_group_count']} != full artifact count 128")
     if hdr["tensor_count"] != len(entries):
         problems.append(f"tensor_count {hdr['tensor_count']} != table entries {len(entries)}")
     if hdr["segment_count"] != len(segments):
         problems.append(f"segment_count {hdr['segment_count']} != table entries {len(segments)}")
     if hdr["fusion_group_count"] != len(fusions):
         problems.append(f"fusion_group_count {hdr['fusion_group_count']} != table entries {len(fusions)}")
+    present_mask = 0
+    for m in modules:
+        if m["module_kind"] in (qt.MODULE_TEXT, qt.MODULE_MTP, qt.MODULE_VISION):
+            present_mask |= 1 << m["module_kind"]
+        else:
+            problems.append(f"unknown module_kind {m['module_kind']}")
+    if (hdr["flags"] & fmt.FLAG_MODULE_PRESENT_MASK) != present_mask:
+        problems.append(
+            f"module present flags {hdr['flags'] & fmt.FLAG_MODULE_PRESENT_MASK:#x} != module table {present_mask:#x}"
+        )
+    if not (hdr["flags"] & fmt.FLAG_TEXT_PRESENT):
+        problems.append("TEXT_PRESENT flag is not set")
 
     expected_offsets = [
         ("module_index_offset", fmt.HEADER_SIZE),
@@ -267,6 +399,21 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
         problems.append(f"payload_bytes {hdr['payload_bytes']} != file payload {file_size - hdr['payload_offset']}")
     if hdr["payload_offset"] > file_size:
         problems.append(f"payload_offset {hdr['payload_offset']} > file size {file_size}")
+
+    module_kinds = [m["module_kind"] for m in modules]
+    if module_kinds != [qt.MODULE_TEXT, qt.MODULE_MTP, qt.MODULE_VISION]:
+        problems.append(f"module kinds {module_kinds} != full artifact modules [TEXT, MTP, VISION]")
+    if module_kinds != sorted(module_kinds) or len(set(module_kinds)) != len(module_kinds):
+        problems.append(f"module kinds are not distinct TEXT->MTP->VISION ordered: {module_kinds}")
+    next_tensor = 0
+    for i, got in enumerate(modules):
+        if got["flags"] != 0:
+            problems.append(f"module[{i}]: flags {got['flags']} != 0")
+        if got["tensor_index_begin"] != next_tensor:
+            problems.append(f"module[{i}]: tensor range begins at {got['tensor_index_begin']}, expected {next_tensor}")
+        next_tensor = got["tensor_index_begin"] + got["tensor_index_count"]
+    if next_tensor != len(entries):
+        problems.append(f"module tensor ranges end at {next_tensor}, expected {len(entries)}")
 
     if len(modules) != len(plan.modules):
         problems.append(f"module_count {len(modules)} != expected {len(plan.modules)}")
@@ -314,6 +461,10 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
         ):
             if got[key] != want:
                 problems.append(f"block[{i}] {got['name']}: {key} {got[key]!r} != expected {want!r}")
+        if not _source_kind_defined(got["module_kind"], got["source_kind"]):
+            problems.append(
+                f"block[{i}] {got['name']}: source_kind {got['source_kind']} not defined for module {got['module_kind']}"
+            )
         if expected.shape is not None and got["shape"] != list(expected.shape):
             problems.append(f"block[{i}] {got['name']}: shape {got['shape']} != expected {list(expected.shape)}")
 
@@ -352,6 +503,35 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
 
     prev_end = None
     with open(path, "rb") as f:
+        _check_zero_range(f, fmt._HEADER_STRUCT.size, fmt.HEADER_SIZE, "FileHeader reserved", problems)
+        for i in range(len(modules)):
+            begin = hdr["module_index_offset"] + i * fmt.MODULE_RECORD_SIZE
+            _check_zero_range(
+                f,
+                begin + fmt._MODULE_STRUCT.size,
+                begin + fmt.MODULE_RECORD_SIZE,
+                f"ModuleRecord[{i}] reserved",
+                problems,
+            )
+        for i in range(len(entries)):
+            begin = hdr["tensor_index_offset"] + i * fmt.TENSOR_ENTRY_SIZE
+            _check_zero_range(
+                f,
+                begin + fmt._ENTRY_STRUCT.size,
+                begin + fmt.TENSOR_ENTRY_SIZE,
+                f"TensorEntry[{i}] reserved",
+                problems,
+            )
+        for i in range(len(fusions)):
+            begin = hdr["fusion_group_index_offset"] + i * fmt.FUSION_GROUP_RECORD_SIZE
+            _check_zero_range(
+                f,
+                begin + fmt._FUSION_GROUP_STRUCT.size,
+                begin + fmt.FUSION_GROUP_RECORD_SIZE,
+                f"FusionGroupRecord[{i}] reserved",
+                problems,
+            )
+        _check_zero_range(f, string_end, hdr["payload_offset"], "string-to-payload padding", problems)
         for i, e in enumerate(entries):
             problems += _check_entry_planes(e)
             off, nb = e["payload_offset"], e["payload_bytes"]
@@ -364,11 +544,44 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
                 expected_off = fmt.align_up(prev_end, fmt.PAYLOAD_ALIGN)
                 if off != expected_off:
                     problems.append(f"{e['name']}: payload_offset {off} != next aligned offset {expected_off}")
+                _check_zero_range(f, prev_end, off, f"{e['name']}: inter-block padding", problems)
             f.seek(off)
             payload = f.read(nb)
             if fmt.crc32(payload) != e["crc32"]:
                 problems.append(f"{e['name']}: crc32 mismatch")
+            if (
+                e["layout"] == qt.LAYOUT_ROW_SPLIT
+                and qt.is_quant(e["qtype"])
+                and len(e["shape"]) == 2
+                and len(e["padded_shape"]) == 2
+            ):
+                spec = qt.QUANT_SPECS[e["qtype"]]
+                n, _ = e["shape"]
+                _, pk = e["padded_shape"]
+                groups = pk // spec.group_size
+                nibble_bytes, high_off, high_bytes, scale_off, _, _ = row_split_plane_sizes(
+                    n,
+                    groups,
+                    spec.nibble_bytes_per_group,
+                    spec.high_bytes_per_group,
+                )
+                _check_zero_range(
+                    f,
+                    off + nibble_bytes,
+                    off + high_off,
+                    f"{e['name']}: nibble-to-high padding",
+                    problems,
+                )
+                _check_zero_range(
+                    f,
+                    off + high_off + high_bytes,
+                    off + scale_off,
+                    f"{e['name']}: high-to-scale padding",
+                    problems,
+                )
             prev_end = off + nb
+        if prev_end is not None and prev_end != file_size:
+            problems.append(f"last block ends at {prev_end}, file_size is {file_size}")
 
     for i, e in enumerate(entries):
         begin, count = e["segment_begin"], e["segment_count"]
@@ -385,6 +598,11 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
                 problems.append(f"{e['name']}: segment {s['name']} row_begin {s['row_begin']} != {row}")
             if s["row_count"] <= 0:
                 problems.append(f"{e['name']}: segment {s['name']} row_count {s['row_count']} <= 0")
+            if not _source_kind_defined(e["module_kind"], s["source_kind"]):
+                problems.append(
+                    f"{e['name']}: segment {s['name']} source_kind {s['source_kind']} "
+                    f"not defined for module {e['module_kind']}"
+                )
             row = s["row_begin"] + s["row_count"]
         if e["shape"] and row != e["shape"][0]:
             problems.append(f"{e['name']}: segments cover {row} rows, expected {e['shape'][0]}")
@@ -431,6 +649,67 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
             problems.append(f"fusion[{i}]: total_n {g['total_n']} != {total_n}")
         if g["shared_k"] != shared_k:
             problems.append(f"fusion[{i}]: shared_k {g['shared_k']} != {shared_k}")
+    return problems
+
+
+def _manifest_checks(path: str, hdr, modules, entries, segments, fusions) -> List[str]:
+    problems: List[str] = []
+    manifest_path = path + fmt.MANIFEST_SUFFIX
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except FileNotFoundError:
+        return [f"missing manifest sidecar {manifest_path}"]
+    except json.JSONDecodeError as exc:
+        return [f"manifest {manifest_path}: invalid JSON: {exc}"]
+
+    def expect(key: str, want) -> None:
+        got = manifest.get(key)
+        if got != want:
+            problems.append(f"manifest {key} {got!r} != {want!r}")
+
+    module_names = [qt.MODULE_NAME.get(m["module_kind"], str(m["module_kind"])) for m in modules]
+    present_qtypes = [
+        name
+        for qtype, name in qt.QTYPE_NAME.items()
+        if any(e["qtype"] == qtype for e in entries)
+    ]
+    present_layouts = [
+        name
+        for layout, name in qt.LAYOUT_NAME.items()
+        if any(e["layout"] == layout for e in entries)
+    ]
+
+    expect("format", "q5090_w4g64_mixed_v3")
+    expect("format_version", fmt.VERSION)
+    expect("format_minor", fmt.FORMAT_MINOR)
+    expect("binary_spec", "docs/q5090_packed_file_format_v3.md")
+    expect("tensor_plan", "docs/qwen3_6_27b_q5090_v2_tensor_plan.md")
+    expect("weights_file", os.path.basename(path))
+    expect("file_bytes", os.path.getsize(path))
+    expect("sha256_safetensors_index", hdr["sha256_safetensors_index"].hex())
+    expect("calibrated", bool(hdr["flags"] & fmt.FLAG_CALIBRATED))
+    expect("layouts", present_layouts)
+    expect("code_planes", ["nibble", "high", "scale"])
+    expect("qtypes", present_qtypes)
+    expect("modules", module_names)
+    expect("absent_modules", [])
+    expect("module_count", hdr["module_count"])
+    expect("tensor_count", hdr["tensor_count"])
+    expect("segment_count", hdr["segment_count"])
+    expect("fusion_group_count", hdr["fusion_group_count"])
+
+    alignment = manifest.get("alignment")
+    want_alignment = {
+        "header": fmt.HEADER_SIZE,
+        "payload": fmt.REGION_ALIGN,
+        "block": fmt.PAYLOAD_ALIGN,
+        "k_pad": 128,
+        "group_size": 64,
+    }
+    if alignment != want_alignment:
+        problems.append(f"manifest alignment {alignment!r} != {want_alignment!r}")
+
     return problems
 
 
@@ -514,7 +793,7 @@ def _l1_checks(path: str, entries, plan, reader, device, dump: dict) -> Tuple[Li
                     del got_scale, got_codes, exp_scale, exp_codes
                 else:
                     src = materialize_block(reader, block)
-                    exp_payload, logical, padded, _, _, _, _ = encode_tensor(
+                    exp_payload, logical, padded, _, _, _, _, _ = encode_tensor(
                         src, entry["qtype"], entry["layout"], device
                     )
                     if logical != entry["shape"] or padded != entry["padded_shape"]:
@@ -544,12 +823,12 @@ def _write_dump(path: str, dump: dict) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="verify q5090_w4g64_mixed_v2 packed file")
-    ap.add_argument("file", help="v2 .qus file")
+    ap = argparse.ArgumentParser(description="verify q5090_w4g64_mixed_v3 packed file")
+    ap.add_argument("file", help="v3 .qus file")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="HF bf16 source model for L1")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--quick", action="store_true", help="L0 + CRC only; skip L1")
-    ap.add_argument("--dump", default=os.path.join("out", "conv_dump.v2.json"))
+    ap.add_argument("--dump", default=os.path.join("out", "conv_dump.v3.json"))
     args = ap.parse_args()
 
     t0 = time.time()
@@ -557,12 +836,7 @@ def main() -> None:
     assert_config(cfg, force=False)
 
     hdr, modules, entries, segments, fusions, read_problems = _read_file(args.file)
-    module_kinds = {m["module_kind"] for m in modules}
-    plan = build_conversion_plan(
-        cfg,
-        include_mtp=qt.MODULE_MTP in module_kinds,
-        include_vision=qt.MODULE_VISION in module_kinds,
-    )
+    plan = build_conversion_plan(cfg)
     dump = _make_dump(args.file, hdr, modules, entries, segments, fusions)
 
     print(f"file: {args.file}")
@@ -579,7 +853,11 @@ def main() -> None:
             flush=True,
         )
 
-    l0 = read_problems + _l0_checks(args.file, hdr, modules, entries, segments, fusions, plan)
+    l0 = (
+        read_problems
+        + _l0_checks(args.file, hdr, modules, entries, segments, fusions, plan)
+        + _manifest_checks(args.file, hdr, modules, entries, segments, fusions)
+    )
     print(f"L0 structural checks done; problems={len(l0)}", flush=True)
 
     l1: List[str] = []

@@ -1,4 +1,4 @@
-"""Round-trip tests for q5090 v2 packing, layouts and binary records.
+"""Round-trip tests for q5090 v3 packing, layouts and binary records.
 
 Runs on CPU so it needs no GPU. Either:
   pytest tools/q5090_convert/tests/test_packing.py
@@ -16,12 +16,13 @@ from .. import qtypes as qt
 from .. import layouts
 from .. import packing
 from ..packing import (
-    bytes_per_group,
-    pack_lowbit_groups,
-    pack_lowbit_torch,
+    high_bytes_per_group,
+    nibble_bytes_per_group,
+    pack_plane_split_groups,
+    pack_plane_split_torch,
     pack_w8_groups,
-    unpack_lowbit_groups,
-    unpack_lowbit_torch,
+    unpack_plane_split_groups,
+    unpack_plane_split_torch,
     unpack_w8_groups,
 )
 from ..quantize import dequantize_rows, quantize_rows
@@ -31,7 +32,7 @@ DEV = torch.device("cpu")
 
 def _pad_k(w: torch.Tensor, group_size: int) -> torch.Tensor:
     n, k = w.shape
-    kp = (k + group_size - 1) // group_size * group_size
+    kp = (k + 127) // 128 * 128
     if kp == k:
         return w
     return F.pad(w, (0, kp - k, 0, 0), value=0.0)
@@ -43,24 +44,27 @@ def _ref_quantized(w: torch.Tensor, qtype: int) -> tuple[np.ndarray, np.ndarray]
     return quantize_rows(wp, spec.group_size, spec.qmax, spec.qmin, DEV)
 
 
-def test_lowbit_roundtrip():
+def test_plane_split_roundtrip_and_code_preservation():
     rng = np.random.default_rng(1)
     for bits, qmin, qmax in [(4, -8, 7), (5, -16, 15), (6, -32, 31)]:
         codes = rng.integers(qmin, qmax + 1, size=(777, 64)).astype(np.int8)
-        packed = pack_lowbit_groups(codes, bits)
-        assert packed.shape[1] == (64 * bits) // 8
-        back = unpack_lowbit_groups(packed, bits, 64)
+        codes[0] = np.resize(np.arange(qmin, qmax + 1, dtype=np.int8), 64)
+        nibble, high = pack_plane_split_groups(codes, bits)
+        assert nibble.shape == (777, nibble_bytes_per_group(64, bits))
+        assert high.shape == (777, high_bytes_per_group(64, bits))
+        back = unpack_plane_split_groups(nibble, high, bits, 64)
         assert np.array_equal(codes, back), f"bits={bits}"
 
 
-def test_torch_matches_numpy_packing():
+def test_torch_matches_numpy_plane_split_packing():
     rng = np.random.default_rng(7)
     for bits, qmin, qmax in [(4, -8, 7), (5, -16, 15), (6, -32, 31)]:
         codes = rng.integers(qmin, qmax + 1, size=(999, 64)).astype(np.int8)
-        np_packed = pack_lowbit_groups(codes, bits)
-        t_packed = pack_lowbit_torch(torch.from_numpy(codes).to(DEV), bits).cpu().numpy()
-        assert np.array_equal(np_packed, t_packed), f"pack bits={bits}"
-        t_unpacked = unpack_lowbit_torch(torch.from_numpy(np_packed).to(DEV), bits, 64).cpu().numpy()
+        np_nibble, np_high = pack_plane_split_groups(codes, bits)
+        t_nibble, t_high = pack_plane_split_torch(torch.from_numpy(codes).to(DEV), bits)
+        assert np.array_equal(np_nibble, t_nibble.cpu().numpy()), f"nibble pack bits={bits}"
+        assert np.array_equal(np_high, t_high.cpu().numpy()), f"high pack bits={bits}"
+        t_unpacked = unpack_plane_split_torch(t_nibble, t_high, bits, 64).cpu().numpy()
         assert np.array_equal(codes, t_unpacked), f"unpack bits={bits}"
 
 
@@ -69,6 +73,9 @@ def test_w8_roundtrip():
     codes = rng.integers(-127, 128, size=(123, 128)).astype(np.int8)
     back = unpack_w8_groups(pack_w8_groups(codes)).reshape(codes.shape)
     assert np.array_equal(codes, back)
+    nibble, high = pack_plane_split_groups(codes, 8)
+    assert high.shape == (123, 0)
+    assert np.array_equal(unpack_plane_split_groups(nibble, high, 8, 128), codes)
 
 
 def test_quant_range_and_dequant():
@@ -91,7 +98,7 @@ def test_row_split_encode_decode_quantized_bit_exact():
 
     for w, qtype in cases:
         wb = w.bfloat16().float()
-        payload, logical, padded, group, sd, code_bytes, scale_bytes = layouts.encode_tensor(
+        payload, logical, padded, group, sd, nibble_bytes, high_bytes, scale_bytes = layouts.encode_tensor(
             wb, qtype, qt.LAYOUT_ROW_SPLIT, DEV
         )
         scale16, codes = layouts.decode_row_split_quantized(payload, padded, qtype, DEV)
@@ -100,22 +107,32 @@ def test_row_split_encode_decode_quantized_bit_exact():
         n, kp = padded
         spec = qt.QUANT_SPECS[qtype]
         groups = kp // spec.group_size
-        bpr = bytes_per_group(spec.group_size, spec.bits)
-        exp_code, exp_scale_off, exp_scale, exp_payload = packing.row_split_plane_sizes(n, groups, bpr)
+        nib = spec.nibble_bytes_per_group
+        high = spec.high_bytes_per_group
+        exp_nib, exp_high_off, exp_high, exp_scale_off, exp_scale, exp_payload = packing.row_split_plane_sizes(
+            n, groups, nib, high
+        )
 
         assert logical == [w.shape[0], w.shape[1]]
         assert padded == [w.shape[0], kp]
         assert group == spec.group_size
         assert sd == qt.SCALE_FP16
-        assert code_bytes == exp_code
+        assert nibble_bytes == exp_nib
+        assert high_bytes == exp_high
         assert scale_bytes == exp_scale
         assert len(payload) == exp_payload
-        assert bytes(payload[code_bytes:exp_scale_off]) == b"\x00" * (exp_scale_off - code_bytes)
+        assert bytes(payload[nibble_bytes:exp_high_off]) == b"\x00" * (exp_high_off - nibble_bytes)
+        assert bytes(payload[exp_high_off + high_bytes:exp_scale_off]) == b"\x00" * (
+            exp_scale_off - exp_high_off - high_bytes
+        )
 
-        row_code_bytes = groups * bpr
-        assert row_code_bytes % 16 == 0
+        row_nibble_bytes = groups * nib
+        row_high_bytes = groups * high
+        assert row_nibble_bytes % 16 == 0
+        assert row_high_bytes % 16 == 0
         for row in range(n):
-            assert (row * row_code_bytes) % 16 == 0
+            assert (row * row_nibble_bytes) % 16 == 0
+            assert (row * row_high_bytes) % 16 == 0
 
         assert np.array_equal(codes.cpu().numpy(), ref_codes), qt.QTYPE_NAME[qtype]
         assert np.array_equal(scale16.cpu().numpy().view(np.uint16), ref_scale16.view(np.uint16))
@@ -125,10 +142,29 @@ def test_row_split_encode_decode_quantized_bit_exact():
         assert np.array_equal(got, ref), qt.QTYPE_NAME[qtype]
 
 
+def test_row_split_dequant_matches_policy_output():
+    torch.manual_seed(11)
+    cases = [
+        (torch.randn(9, 192), qt.QT_Q4G64),
+        (torch.randn(11, 192), qt.QT_Q5G64),
+        (torch.randn(13, 320), qt.QT_Q6G64),
+        (torch.randn(7, 192), qt.QT_W8G128),
+    ]
+
+    for w, qtype in cases:
+        wb = w.bfloat16().float()
+        payload, logical, padded, *_ = layouts.encode_tensor(wb, qtype, qt.LAYOUT_ROW_SPLIT, DEV)
+        got = layouts.decode_tensor(payload, qtype, qt.LAYOUT_ROW_SPLIT, logical, padded, DEV).cpu().numpy()
+
+        ref_scale16, ref_codes = _ref_quantized(wb, qtype)
+        policy_deq = dequantize_rows(ref_scale16, ref_codes)[:, : w.shape[1]]
+        assert np.array_equal(got, policy_deq), qt.QTYPE_NAME[qtype]
+
+
 def test_contiguous_exact_and_plane_metadata():
     torch.manual_seed(5)
     w = torch.randn(10, 1, 4).bfloat16()
-    payload, logical, padded, group, sd, code_bytes, scale_bytes = layouts.encode_tensor(
+    payload, logical, padded, group, sd, nibble_bytes, high_bytes, scale_bytes = layouts.encode_tensor(
         w, qt.QT_BF16, qt.LAYOUT_CONTIGUOUS, DEV
     )
     got = layouts.decode_tensor(payload, qt.QT_BF16, qt.LAYOUT_CONTIGUOUS, logical, padded, DEV).cpu().numpy()
@@ -137,20 +173,22 @@ def test_contiguous_exact_and_plane_metadata():
     assert padded == list(w.shape)
     assert group == 0
     assert sd == qt.SCALE_NONE
-    assert code_bytes == len(payload)
+    assert nibble_bytes == len(payload)
+    assert high_bytes == 0
     assert scale_bytes == 0
 
     w = torch.randn(48).bfloat16()
-    payload, logical, padded, group, sd, code_bytes, scale_bytes = layouts.encode_tensor(
+    payload, logical, padded, group, sd, nibble_bytes, high_bytes, scale_bytes = layouts.encode_tensor(
         w, qt.QT_FP32, qt.LAYOUT_CONTIGUOUS, DEV
     )
     got = layouts.decode_tensor(payload, qt.QT_FP32, qt.LAYOUT_CONTIGUOUS, logical, padded, DEV).cpu().numpy()
     assert np.array_equal(got, w.float().numpy())
-    assert code_bytes == len(payload)
+    assert nibble_bytes == len(payload)
+    assert high_bytes == 0
     assert scale_bytes == 0
 
 
-def test_v2_records_pack_unpack_and_string_table():
+def test_v3_records_pack_unpack_and_string_table():
     entry = fmt.TensorEntry(
         name="block.q4",
         qtype=qt.QT_Q4G64,
@@ -169,7 +207,8 @@ def test_v2_records_pack_unpack_and_string_table():
         segment_begin=3,
         fusion_group_id=1,
         fusion_index=1,
-        code_plane_bytes=6144,
+        nibble_plane_bytes=6144,
+        high_plane_bytes=1024,
         scale_plane_bytes=768,
     )
     segments = [
@@ -181,7 +220,7 @@ def test_v2_records_pack_unpack_and_string_table():
 
     packed_entry = fmt.pack_tensor_entry(entry)
     assert len(packed_entry) == fmt.TENSOR_ENTRY_SIZE
-    assert packed_entry[116:] == b"\x00" * 12
+    assert packed_entry[124:] == b"\x00" * 4
     parsed_entry = fmt.unpack_tensor_entry(packed_entry)
     assert parsed_entry["name_offset"] == 0
     assert parsed_entry["name_len"] == len("block.q4")
@@ -191,7 +230,8 @@ def test_v2_records_pack_unpack_and_string_table():
     assert parsed_entry["segment_begin"] == 3
     assert parsed_entry["fusion_group_id"] == 1
     assert parsed_entry["fusion_index"] == 1
-    assert parsed_entry["code_plane_bytes"] == 6144
+    assert parsed_entry["nibble_plane_bytes"] == 6144
+    assert parsed_entry["high_plane_bytes"] == 1024
     assert parsed_entry["scale_plane_bytes"] == 768
 
     packed_segment = fmt.pack_segment_record(segments[1])
@@ -224,11 +264,11 @@ def test_v2_records_pack_unpack_and_string_table():
     assert parsed_fusion["total_n"] == 384
     assert parsed_fusion["shared_k"] == 128
 
-    module = fmt.ModuleRecord(qt.MODULE_TEXT, 2, 0, 1, 8192, 9984, qt.LOAD_RESIDENT)
+    module = fmt.ModuleRecord(qt.MODULE_TEXT, 3, 0, 1, 8192, 9984, qt.LOAD_RESIDENT)
     packed_module = fmt.pack_module_record(module)
     assert len(packed_module) == fmt.MODULE_RECORD_SIZE
     parsed_module = fmt.unpack_module_record(packed_module)
-    assert parsed_module["module_version"] == 2
+    assert parsed_module["module_version"] == 3
     assert parsed_module["payload_bytes"] == 9984
 
     header = fmt.FileHeaderFields(
@@ -270,7 +310,7 @@ def test_v2_records_pack_unpack_and_string_table():
     assert packed_header[236:] == b"\x00" * (fmt.HEADER_SIZE - 236)
     parsed_header = fmt.unpack_header(packed_header)
     assert parsed_header["magic"] == fmt.MAGIC
-    assert parsed_header["version"] == 2
+    assert parsed_header["version"] == 3
     assert parsed_header["segment_count"] == 2
     assert parsed_header["fusion_group_count"] == 1
     assert parsed_header["segment_index_offset"] == 6144

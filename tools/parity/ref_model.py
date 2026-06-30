@@ -16,7 +16,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -32,6 +32,9 @@ from tools.q5090_convert.packing import row_split_plane_sizes
 
 torch.set_grad_enabled(False)
 
+DEFAULT_MODEL = "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16"
+DEFAULT_PROMPT = "请用三条短句说明，为什么每天适量喝水很重要？每条不超过 18 个字。"
+DEFAULT_STOP_TOKEN_IDS = "248046,248044"
 
 D = 5120
 L = 64
@@ -190,7 +193,8 @@ class Entry:
     padded_shape: List[int]
     payload_offset: int
     payload_bytes: int
-    code_plane_bytes: int
+    nibble_plane_bytes: int
+    high_plane_bytes: int
     scale_plane_bytes: int
     source_layer: int
     source_kind: int
@@ -227,7 +231,7 @@ class Q5090File:
         self._gpu: Dict[str, torch.Tensor] = {}
         hdr = fmt.unpack_header(self._mm[: fmt.HEADER_SIZE])
         if hdr["magic"] != fmt.MAGIC or hdr["version"] != fmt.VERSION:
-            raise ValueError(f"bad q5090 v2 header in {self.path}")
+            raise ValueError(f"bad q5090 v3 header in {self.path}")
         self.header = hdr
         self.modules = []
         off = hdr["module_index_offset"]
@@ -280,7 +284,8 @@ class Q5090File:
                 padded_shape=e["padded_shape"],
                 payload_offset=e["payload_offset"],
                 payload_bytes=e["payload_bytes"],
-                code_plane_bytes=e["code_plane_bytes"],
+                nibble_plane_bytes=e["nibble_plane_bytes"],
+                high_plane_bytes=e["high_plane_bytes"],
                 scale_plane_bytes=e["scale_plane_bytes"],
                 source_layer=e["source_layer"],
                 source_kind=e["source_kind"],
@@ -377,14 +382,32 @@ class Q5090File:
         n, k = e.shape
         _, kp = e.padded_shape
         groups = kp // spec.group_size
-        code_bytes, scale_off, scale_bytes, _ = row_split_plane_sizes(n, groups, spec.bytes_per_group)
-        if e.code_plane_bytes != code_bytes or e.scale_plane_bytes != scale_bytes:
+        nibble_bytes, high_off, high_bytes, scale_off, scale_bytes, _ = row_split_plane_sizes(
+            n,
+            groups,
+            spec.nibble_bytes_per_group,
+            spec.high_bytes_per_group,
+        )
+        if (
+            e.nibble_plane_bytes != nibble_bytes
+            or e.high_plane_bytes != high_bytes
+            or e.scale_plane_bytes != scale_bytes
+        ):
             raise ValueError(
                 f"{e.name} ROW_SPLIT plane size mismatch: "
-                f"entry=({e.code_plane_bytes},{e.scale_plane_bytes}) "
-                f"computed=({code_bytes},{scale_bytes})"
+                f"entry=({e.nibble_plane_bytes},{e.high_plane_bytes},{e.scale_plane_bytes}) "
+                f"computed=({nibble_bytes},{high_bytes},{scale_bytes})"
             )
-        return n, k, kp, groups * spec.bytes_per_group, groups * 2, scale_off
+        return (
+            n,
+            k,
+            kp,
+            groups * spec.nibble_bytes_per_group,
+            groups * spec.high_bytes_per_group,
+            groups * 2,
+            high_off,
+            scale_off,
+        )
 
     def _payload_slice(self, e: Entry, resident: Optional[torch.Tensor], rel: int, nbytes: int):
         if resident is not None:
@@ -393,23 +416,37 @@ class Q5090File:
         return self._mm[start : start + nbytes]
 
     def _row_split_slice_payload(self, e: Entry, resident: Optional[torch.Tensor], row0: int, row_count: int):
-        _, _, _, row_code_bytes, row_scale_bytes, scale_off = self._row_split_geometry(e)
-        code_nbytes = row_count * row_code_bytes
+        _, _, _, row_nibble_bytes, row_high_bytes, row_scale_bytes, high_off, scale_off = self._row_split_geometry(e)
+        nibble_nbytes = row_count * row_nibble_bytes
+        high_nbytes = row_count * row_high_bytes
         scale_nbytes = row_count * row_scale_bytes
-        code = self._payload_slice(e, resident, row0 * row_code_bytes, code_nbytes)
+        nibble = self._payload_slice(e, resident, row0 * row_nibble_bytes, nibble_nbytes)
+        high = self._payload_slice(e, resident, high_off + row0 * row_high_bytes, high_nbytes)
         scale = self._payload_slice(e, resident, scale_off + row0 * row_scale_bytes, scale_nbytes)
-        pad_bytes = fmt.align_up(code_nbytes, fmt.PAYLOAD_ALIGN) - code_nbytes
+        nibble_pad_bytes = fmt.align_up(nibble_nbytes, fmt.PAYLOAD_ALIGN) - nibble_nbytes
+        high_pad_bytes = fmt.align_up(high_nbytes, fmt.PAYLOAD_ALIGN) - high_nbytes if high_nbytes else 0
         if resident is not None:
-            if pad_bytes:
-                pad = torch.zeros((pad_bytes,), dtype=torch.uint8, device=resident.device)
-                return torch.cat([code, pad, scale], dim=0)
-            return torch.cat([code, scale], dim=0)
-        return code + (b"\x00" * pad_bytes) + scale
+            parts = [nibble]
+            if nibble_pad_bytes:
+                parts.append(torch.zeros((nibble_pad_bytes,), dtype=torch.uint8, device=resident.device))
+            if high_nbytes:
+                parts.append(high)
+                if high_pad_bytes:
+                    parts.append(torch.zeros((high_pad_bytes,), dtype=torch.uint8, device=resident.device))
+            parts.append(scale)
+            return torch.cat(parts, dim=0)
+        return (
+            nibble
+            + (b"\x00" * nibble_pad_bytes)
+            + high
+            + (b"\x00" * high_pad_bytes)
+            + scale
+        )
 
     def row_split_rows(self, name: str, rows: torch.Tensor, device: torch.device | str) -> torch.Tensor:
         view = self.views[name]
         e = view.block
-        _, k, kp, _, _, _ = self._row_split_geometry(e)
+        _, k, kp, *_ = self._row_split_geometry(e)
         resident = self._resident_payload(e)
         out = []
         for row in rows.detach().cpu().tolist():
@@ -427,7 +464,7 @@ class Q5090File:
     ):
         view = self.views[name]
         e = view.block
-        _, k, kp, _, _, _ = self._row_split_geometry(e)
+        _, k, kp, *_ = self._row_split_geometry(e)
         resident = self._resident_payload(e)
         for row0 in range(0, view.row_count, rows_per_chunk):
             row1 = min(view.row_count, row0 + rows_per_chunk)
@@ -507,7 +544,8 @@ class Q5090File:
                     "padded_shape": e.padded_shape,
                     "payload_offset": e.payload_offset,
                     "payload_bytes": e.payload_bytes,
-                    "code_plane_bytes": e.code_plane_bytes,
+                    "nibble_plane_bytes": e.nibble_plane_bytes,
+                    "high_plane_bytes": e.high_plane_bytes,
                     "scale_plane_bytes": e.scale_plane_bytes,
                     "crc32": e.crc32,
                     "fusion_group_id": e.fusion_group_id,
@@ -541,7 +579,7 @@ class Q5090File:
             for k, v in self.header.items()
         }
         out = {
-            "format": "q5090_w4g64_mixed_v2",
+            "format": "q5090_w4g64_mixed_v3",
             "file": str(self.path),
             "header": header,
             "modules": self.modules,
@@ -760,6 +798,7 @@ class RefModel:
         n_decode: int,
         *,
         dumps: Optional[Dict[str, torch.Tensor]] = None,
+        stop_token_ids: Optional[set[int]] = None,
     ) -> List[int]:
         prompt_ids = list(prompt)
         if not prompt_ids:
@@ -783,6 +822,8 @@ class RefModel:
         token = int(torch.argmax(lg).item())
         out = [token]
         self.pos = len(prompt_ids)
+        if stop_token_ids and token in stop_token_ids:
+            return out
 
         while len(out) < n_decode:
             x = self.embed([token])
@@ -791,20 +832,85 @@ class RefModel:
             token = int(torch.argmax(self.logits_last(x)).item())
             out.append(token)
             self.pos += 1
+            if stop_token_ids and token in stop_token_ids:
+                break
         return out
 
 
-def parse_prompt(text: str) -> List[int]:
+def parse_token_ids(text: str) -> List[int]:
     return [int(part) for part in text.replace(",", " ").split()]
+
+
+def parse_stop_token_ids(text: str) -> set[int]:
+    return {int(part) for part in text.replace(",", " ").split() if part.strip()}
+
+
+def load_tokenizer(model_dir: str) -> Any:
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError(
+            "transformers is required for chat-template prompts; run with the vllm-bench environment"
+        ) from exc
+    return AutoTokenizer.from_pretrained(
+        model_dir,
+        local_files_only=True,
+        trust_remote_code=True,
+        use_fast=True,
+    )
+
+
+def load_messages(path: str) -> list[dict[str, str]]:
+    with open(path, "r", encoding="utf-8") as f:
+        value = json.load(f)
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{path}: expected a non-empty JSON message list")
+    messages = []
+    for i, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"{path}[{i}]: expected object")
+        role = item.get("role")
+        content = item.get("content")
+        if not isinstance(role, str) or not isinstance(content, str):
+            raise ValueError(f"{path}[{i}]: expected string role/content")
+        messages.append({"role": role, "content": content})
+    return messages
+
+
+def chat_prompt_ids(tokenizer: Any, messages: list[dict[str, str]]) -> tuple[List[int], str]:
+    rendered = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if hasattr(ids, "keys") and "input_ids" in ids:
+        ids = ids["input_ids"]
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if not ids:
+        raise ValueError("chat template produced an empty prompt")
+    return [int(x) for x in ids], str(rendered)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="q5090 PyTorch oracle")
     ap.add_argument("--weights", required=True)
-    ap.add_argument("--prompt", default="1", help="comma or space separated token ids")
-    ap.add_argument("--decode", type=int, default=1)
+    ap.add_argument("--model", default=DEFAULT_MODEL, help="HF model/tokenizer directory")
+    ap.add_argument("--prompt", default=DEFAULT_PROMPT, help="user prompt text rendered through the Qwen chat template")
+    ap.add_argument("--messages-json", default=None, help="JSON chat messages rendered through the Qwen chat template")
+    ap.add_argument("--token-ids", default=None, help="comma or space separated token ids; bypasses tokenizer/chat template")
+    ap.add_argument("--decode", type=int, default=16)
+    ap.add_argument("--stop-token-ids", default=DEFAULT_STOP_TOKEN_IDS)
+    ap.add_argument("--show-rendered-prompt", action="store_true")
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--dump", default=None, help="write v2 structural dump JSON")
+    ap.add_argument("--dump", default=None, help="write v3 structural dump JSON")
     ap.add_argument("--no-cache-globals", action="store_true")
     ap.add_argument("--cache-globals", action="store_true")
     ap.add_argument(
@@ -823,9 +929,28 @@ def main() -> None:
     )
     if args.dump:
         model.q5090.dump(args.dump)
+    tokenizer = None
+    rendered_prompt = None
+    if args.token_ids is not None:
+        prompt_ids = parse_token_ids(args.token_ids)
+    else:
+        tokenizer = load_tokenizer(args.model)
+        messages = load_messages(args.messages_json) if args.messages_json else [
+            {"role": "user", "content": args.prompt}
+        ]
+        prompt_ids, rendered_prompt = chat_prompt_ids(tokenizer, messages)
+    stop_token_ids = parse_stop_token_ids(args.stop_token_ids)
     with torch.inference_mode():
-        tokens = model.forward(parse_prompt(args.prompt), args.decode)
-    print(" ".join(str(t) for t in tokens))
+        tokens = model.forward(prompt_ids, args.decode, stop_token_ids=stop_token_ids)
+    print(f"PROMPT_TOKENS: {len(prompt_ids)}")
+    if rendered_prompt is not None and args.show_rendered_prompt:
+        print(f"RENDERED_PROMPT: {rendered_prompt!r}")
+    print(f"GENERATED_TOKEN_IDS: {tokens}")
+    if tokenizer is not None:
+        text = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        print(f"GENERATED_TEXT: {text!r}")
+    else:
+        print(" ".join(str(t) for t in tokens))
 
 
 if __name__ == "__main__":

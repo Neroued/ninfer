@@ -1,4 +1,4 @@
-"""Declarative q5090 v2 tensor plan.
+"""Declarative q5090 tensor plan carried unchanged from v2 to v3.
 
 TEXT_CORE is expressed as stored blocks, logical segments, and fusion groups.
 Each segment carries the source TensorSpec needed to materialize its rows before

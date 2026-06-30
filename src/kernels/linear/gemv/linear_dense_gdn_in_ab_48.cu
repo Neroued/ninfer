@@ -76,6 +76,47 @@ __global__ void linear_dense_gdn_in_ab_48_kernel(const __nv_bfloat16* x,
     }
 }
 
+__device__ __forceinline__ float gdn_ab_softplus_f32(float x) {
+    return (x > 20.0f) ? x : log1pf(expf(x));
+}
+
+__device__ __forceinline__ float gdn_ab_sigmoid_f32(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+__global__ void linear_dense_gdn_in_ab_gated_48_kernel(
+    const __nv_bfloat16* x, const __nv_bfloat16* a_weight, const __nv_bfloat16* b_weight,
+    const float* A_log, const float* dt_bias, float* g, float* beta) {
+    const int global_row = static_cast<int>(blockIdx.x);
+    const bool is_b      = global_row >= kN;
+    const int row        = is_b ? global_row - kN : global_row;
+    const auto* weight   = is_b ? b_weight : a_weight;
+
+    float acc                   = 0.0f;
+    constexpr int kPairs        = kK / 2;
+    const std::int64_t row_base = static_cast<std::int64_t>(row) * kK;
+    const auto* x2              = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* w2 =
+        reinterpret_cast<const __nv_bfloat162*>(weight + static_cast<std::int64_t>(row_base));
+    for (int p = static_cast<int>(threadIdx.x); p < kPairs; p += static_cast<int>(blockDim.x)) {
+        const float2 wf = bf162_to_float2(w2[p]);
+        const float2 xf = bf162_to_float2(x2[p]);
+        acc             = fmaf(wf.x, xf.x, acc);
+        acc             = fmaf(wf.y, xf.y, acc);
+    }
+
+    acc = block_reduce_sum<kThreads>(acc);
+    if (threadIdx.x == 0) {
+        const float rounded = __bfloat162float(__float2bfloat16(acc));
+        if (is_b) {
+            beta[row] = gdn_ab_sigmoid_f32(rounded);
+        } else {
+            const float sp = gdn_ab_softplus_f32(rounded + dt_bias[row]);
+            g[row] = -expf(A_log[row]) * sp;
+        }
+    }
+}
+
 void require_shape(const Weight& w, const char* name) {
     if (w.n != kN || w.k != kK || w.shape[0] != kN || w.shape[1] != kK) {
         throw std::invalid_argument(std::string("gdn_in_ab_decode: ") + name +
@@ -95,6 +136,21 @@ void linear_dense_gdn_in_ab_48_launch(const Tensor& x, const Weight& a_weight,
         static_cast<const __nv_bfloat16*>(a_weight.qdata),
         static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<__nv_bfloat16*>(a_out.data),
         static_cast<__nv_bfloat16*>(b_out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void linear_dense_gdn_in_ab_gated_48_launch(const Tensor& x, const Weight& a_weight,
+                                            const Weight& b_weight, const Tensor& A_log,
+                                            const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                            cudaStream_t stream) {
+    require_shape(a_weight, "a_weight");
+    require_shape(b_weight, "b_weight");
+    linear_dense_gdn_in_ab_gated_48_kernel<<<2 * kN, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
+        static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
+        static_cast<float*>(beta.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

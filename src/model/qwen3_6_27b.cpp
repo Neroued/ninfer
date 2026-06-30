@@ -401,17 +401,13 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         kernels::linear(h, *w.in_qk_q4, qk_out, work_, s);
         kernels::gdn_in_vz_decode(h, *w.in_v, *w.in_z, v_out, z_flat, s);
 
-        Tensor a = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, 1});
-        Tensor b = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, 1});
-        kernels::gdn_in_ab_decode(h, *w.in_a, *w.in_b, a, b, s);
-
         Tensor qkv_c       = work_.alloc(DType::BF16, {kCfg.conv_dim, 1});
         Tensor& conv_state = state_.conv.at(static_cast<std::size_t>(gidx));
         kernels::causal_conv1d_decode(qkv, *w.conv1d, conv_state, qkv_c, s);
 
         Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, 1});
         Tensor beta = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, 1});
-        kernels::gdn_gating(a, b, *w.a_log, *w.dt_bias, g, beta, s);
+        kernels::gdn_in_ab_gated_decode(h, *w.in_a, *w.in_b, *w.a_log, *w.dt_bias, g, beta, s);
 
         Tensor qc = qkv_c.slice(0, 0, kCfg.key_dim);
         Tensor kc = qkv_c.slice(0, kCfg.key_dim, kCfg.key_dim);

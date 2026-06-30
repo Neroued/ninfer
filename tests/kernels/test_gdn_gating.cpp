@@ -3,6 +3,7 @@
 // GDN gate ranges including the softplus guard, composite tolerance
 // fp32_transcendental.
 #include "qus/kernels/gdn_gating.h"
+#include "qus/kernels/gdn_in_ab.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -31,6 +32,65 @@ static void cpu_gdn_gating(const std::vector<float>& a, const std::vector<float>
             beta[i] = 1.0 / (1.0 + std::exp(-bv));
         }
     }
+}
+
+static Weight dense_bf16_weight(void* data) {
+    Weight w{};
+    w.qtype             = QType::BF16_CTRL;
+    w.layout            = QuantLayout::Contiguous;
+    w.q5090_scale_dtype = ScaleDType::None;
+    w.payload           = data;
+    w.payload_bytes     = static_cast<std::uint64_t>(48) * 5120u * 2u;
+    w.qdata             = data;
+    w.ndim              = 2;
+    w.shape[0]          = 48;
+    w.shape[1]          = 5120;
+    w.padded_shape[0]   = 48;
+    w.padded_shape[1]   = 5120;
+    w.n                 = 48;
+    w.k                 = 5120;
+    return w;
+}
+
+static int fused_decode_matches_two_step() {
+    std::vector<float> x(5120), aw(48 * 5120), bw(48 * 5120), A_log(48), dt_bias(48);
+    fill_uniform(x, 501u, -2.f, 2.f);
+    fill_uniform(aw, 502u, -0.05f, 0.05f);
+    fill_uniform(bw, 503u, -0.05f, 0.05f);
+    fill_uniform(A_log, 504u, -2.f, 1.f);
+    fill_uniform(dt_bias, 505u, -1.f, 1.f);
+    round_to_bf16(x);
+    round_to_bf16(aw);
+    round_to_bf16(bw);
+
+    DBuf dx = to_device_bf16(x), daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
+    DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
+    DBuf da(48 * 2), db(48 * 2), dg_ref(48 * 4), dbeta_ref(48 * 4), dg(48 * 4),
+        dbeta(48 * 4);
+
+    Tensor tx(dx.p, DType::BF16, {5120, 1});
+    Tensor ta(da.p, DType::BF16, {48, 1});
+    Tensor tb(db.p, DType::BF16, {48, 1});
+    Tensor tA_log(dA_log.p, DType::FP32, {48});
+    Tensor tdt_bias(ddt_bias.p, DType::FP32, {48});
+    Tensor tg_ref(dg_ref.p, DType::FP32, {48, 1});
+    Tensor tbeta_ref(dbeta_ref.p, DType::FP32, {48, 1});
+    Tensor tg(dg.p, DType::FP32, {48, 1});
+    Tensor tbeta(dbeta.p, DType::FP32, {48, 1});
+    Weight wa = dense_bf16_weight(daw.p);
+    Weight wb = dense_bf16_weight(dbw.p);
+
+    kernels::gdn_in_ab_decode(tx, wa, wb, ta, tb, nullptr);
+    kernels::gdn_gating(ta, tb, tA_log, tdt_bias, tg_ref, tbeta_ref, nullptr);
+    kernels::gdn_in_ab_gated_decode(tx, wa, wb, tA_log, tdt_bias, tg, tbeta, nullptr);
+    cudaDeviceSynchronize();
+
+    int f = 0;
+    f += verify("gdn_in_ab_gated_decode g", from_device_f32(dg, 48), from_device_f32(dg_ref, 48),
+                Tolerance::fp32_transcendental());
+    f += verify("gdn_in_ab_gated_decode beta", from_device_f32(dbeta, 48),
+                from_device_f32(dbeta_ref, 48), Tolerance::fp32_transcendental());
+    return f;
 }
 
 static int one_shape(const char* tag, std::int32_t T, std::uint32_t seed, float a_lo, float a_hi) {
@@ -188,6 +248,7 @@ int main() {
     }
     int f = 0;
     f += validation_checks();
+    f += fused_decode_matches_two_step();
 
     for (std::uint32_t seed : {1u, 7u, 99u}) {
         f += one_shape("gdn_gating [48,1]", 1, seed, -8.f, 8.f);

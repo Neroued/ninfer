@@ -36,4 +36,18 @@ void gdn_in_ab_decode(const Tensor& x, const Weight& a_weight, const Weight& b_w
     detail::linear_dense_gdn_in_ab_48_launch(x, a_weight, b_weight, a_out, b_out, stream);
 }
 
+void gdn_in_ab_gated_decode(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
+                            const Tensor& A_log, const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                            cudaStream_t stream) {
+    require_tensor(x, DType::BF16, 5120, "x");
+    require_tensor(A_log, DType::FP32, 48, "A_log");
+    require_tensor(dt_bias, DType::FP32, 48, "dt_bias");
+    require_tensor(g, DType::FP32, 48, "g");
+    require_tensor(beta, DType::FP32, 48, "beta");
+    require_dense_bf16(a_weight, "a_weight");
+    require_dense_bf16(b_weight, "b_weight");
+    detail::linear_dense_gdn_in_ab_gated_48_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
+                                                   stream);
+}
+
 } // namespace qus::kernels

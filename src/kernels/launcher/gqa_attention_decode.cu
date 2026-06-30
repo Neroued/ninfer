@@ -44,7 +44,7 @@ void gqa_attention_decode_launch(const Tensor& q, const Tensor& k, const Tensor&
                             partial_acc, partial_m, partial_l, stream);
 
     constexpr int kReduceBlock = 256;
-    constexpr int kDChunk      = 32;
+    constexpr int kDChunk      = 64;
     const dim3 reduce_grid(kGqaQHeads, (kGqaHeadDim + kDChunk - 1) / kDChunk);
     gqa_attention_decode_reduce_output_kernel<kDChunk><<<reduce_grid, kReduceBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(partial_acc.data),

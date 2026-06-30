@@ -29,7 +29,7 @@ constexpr std::int32_t kHeadDim                  = 256;
 constexpr std::int32_t kQHeads                   = 24;
 constexpr std::int32_t kKVHeads                  = 4;
 constexpr float kScale                           = 0.0625f;
-constexpr std::int32_t kDChunk                   = 32;
+constexpr std::int32_t kDChunk                   = 64;
 constexpr std::size_t kColdCacheBytes            = std::size_t(256) << 20;
 constexpr std::int32_t kDefaultDecodePositions[] = {2048, 2882, 8192, 32768};
 
@@ -128,8 +128,58 @@ void touch_cold_cache(DBuf& buf, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
+Result bench_cold_cache_loop(const launch_fn& launch, DBuf& cold_cache, double bytes_moved,
+                             int warmup = 5, int repeat = 100) {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+
+    for (int i = 0; i < warmup; ++i) {
+        touch_cold_cache(cold_cache, stream);
+        launch(stream);
+    }
+    cudaStreamSynchronize(stream);
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(repeat));
+    for (int i = 0; i < repeat; ++i) {
+        touch_cold_cache(cold_cache, stream);
+        cudaEventRecord(a, stream);
+        launch(stream);
+        cudaEventRecord(b, stream);
+        cudaEventSynchronize(b);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, a, b);
+        samples.push_back(static_cast<double>(ms) * 1000.0);
+    }
+    cudaEventDestroy(a);
+    cudaEventDestroy(b);
+
+    std::vector<double> sorted = samples;
+    std::sort(sorted.begin(), sorted.end());
+    auto pct = [&](double q) {
+        const std::size_t idx = std::min(sorted.size() - 1, std::size_t(q * sorted.size()));
+        return sorted[idx];
+    };
+    double sum = 0.0;
+    for (double v : samples) { sum += v; }
+
+    Result r;
+    r.n_runs      = static_cast<int>(samples.size());
+    r.inner_iters = 1;
+    r.median_us   = pct(0.50);
+    r.min_us      = sorted.front();
+    r.p95_us      = pct(0.95);
+    r.mean_us     = sum / static_cast<double>(samples.size());
+    const double sec = r.median_us * 1e-6;
+    r.gbs            = (sec > 0.0) ? bytes_moved / sec / 1e9 : 0.0;
+    return r;
+}
+
 void print_decode_result(const char* tag, const Result& r, const DecodeBytes& bytes,
-                         std::int32_t pos_value, std::uint32_t round_robin_layers) {
+                         std::int32_t pos_value, std::uint32_t round_robin_layers,
+                         const char* suffix) {
     const double sec       = r.median_us * 1.0e-6;
     const double total_gbs = (sec > 0.0) ? static_cast<double>(bytes.total) / sec / 1.0e9 : 0.0;
     const double useful_kv_gbs =
@@ -142,7 +192,7 @@ void print_decode_result(const char* tag, const Result& r, const DecodeBytes& by
                 static_cast<double>(bytes.useful_kv) / kMiB,
                 static_cast<double>(bytes.scratch) / kMiB, static_cast<double>(bytes.total) / kMiB,
                 kGqaDecodeSplits, decode_kps(pos_value), round_robin_layers,
-                (round_robin_layers == 1u) ? " hot_cache_info" : "");
+                suffix);
 }
 
 void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& k, const Tensor& v,
@@ -164,7 +214,8 @@ void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& 
 
     char tag[96];
     std::snprintf(tag, sizeof(tag), "gqa_attention decode combined pos=%d", pos_value);
-    print_decode_result(tag, r, bytes, pos_value, round_robin_layers);
+    print_decode_result(tag, r, bytes, pos_value, round_robin_layers,
+                        (round_robin_layers == 1u) ? " hot_cache_info" : "");
 }
 
 void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& k,
@@ -174,7 +225,24 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
     const DecodeBytes bytes = decode_bytes(pos_value);
 
     cudaStream_t stream = nullptr;
-    if (cold_cache != nullptr) { touch_cold_cache(*cold_cache, stream); }
+    if (cold_cache != nullptr) {
+        const Result r = bench_cold_cache_loop(
+            [&](cudaStream_t s) {
+                kv.pos = static_cast<std::uint32_t>(pos_value);
+                kernels::gqa_attention_decode(q, k, v, pos, kScale, kv, 0, ws, out, s);
+            },
+            *cold_cache, static_cast<double>(bytes.total));
+
+        char tag[96];
+        std::snprintf(tag, sizeof(tag), "PROFILE_COLD gqa_attention decode pos=%d", pos_value);
+        print_decode_result(tag, r, bytes, pos_value, 1u, " cold_cache");
+        std::printf("PROFILE_COLD_METADATA pos=%d splits=%d kps=%d cold_cache_bytes=%zu "
+                    "useful_kv_bytes=%zu scratch_bytes=%zu total_modeled_bytes=%zu repeats=%d\n",
+                    pos_value, kGqaDecodeSplits, decode_kps(pos_value), cold_cache->bytes,
+                    bytes.useful_kv, bytes.scratch, bytes.total, r.n_runs);
+        return;
+    }
+
     kv.pos = static_cast<std::uint32_t>(pos_value);
     kernels::gqa_attention_decode(q, k, v, pos, kScale, kv, 0, ws, out, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));

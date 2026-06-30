@@ -13,7 +13,7 @@ namespace {
 
 constexpr int kN            = 5120;
 constexpr int kK            = 17408; // kK/1024 = 17 tiles per row.
-constexpr int kRowsPerBlock = 8;
+constexpr int kRowsPerBlock = 16;
 constexpr int kStages       = 3;
 
 } // namespace

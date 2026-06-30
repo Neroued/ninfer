@@ -110,16 +110,9 @@ void gated_delta_rule_recurrent(const Tensor& q, const Tensor& k, const Tensor& 
                                 Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
     validate_recurrent(q, k, v, g, beta, scale, ssm_state, out);
 
-    ArenaScope arena_scope(ws);
-    Tensor q_f32   = ws.alloc(DType::FP32, {q.ne[0], q.ne[1], q.ne[2]});
-    Tensor k_f32   = ws.alloc(DType::FP32, {k.ne[0], k.ne[1], k.ne[2]});
-    Tensor v_f32   = ws.alloc(DType::FP32, {v.ne[0], v.ne[1], v.ne[2]});
-    Tensor out_f32 = ws.alloc(DType::FP32, {out.ne[0], out.ne[1], out.ne[2]});
-
-    detail::gdn_cast_qkv_bf16_to_f32_launch(q, k, v, q_f32, k_f32, v_f32, stream);
-    detail::gated_delta_rule_recurrent_launch(q_f32, k_f32, v_f32, g, beta, scale, ssm_state,
-                                              out_f32, stream);
-    detail::gdn_cast_f32_to_bf16_launch(out_f32, out, stream);
+    (void)ws;
+    detail::gated_delta_rule_recurrent_bf16_launch(q, k, v, g, beta, scale, ssm_state, out,
+                                                   stream);
 }
 
 void gated_delta_rule_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,

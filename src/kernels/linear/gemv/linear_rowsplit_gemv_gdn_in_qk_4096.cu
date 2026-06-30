@@ -16,9 +16,14 @@ constexpr int kK = 5120;
 constexpr int kGroupK = 64;
 constexpr int kGroups = kK / kGroupK;
 constexpr int kBytesPerGroup = 32;
-constexpr int kWarpsPerRow = 4;
+constexpr int kVecBytes = 16;
+constexpr int kWarpsPerRow = 8;
 constexpr int kGroupsPerWarp = kGroups / kWarpsPerRow;
+constexpr int kGroupsPerWarpTile = 16;
+constexpr int kVecsPerWarpTile = kGroupsPerWarpTile * kBytesPerGroup / kVecBytes;
 constexpr int kBlockThreads = kWarpsPerRow * 32;
+static_assert(kBytesPerGroup == 2 * kVecBytes);
+static_assert(kVecsPerWarpTile == 32);
 
 __device__ __forceinline__ int sign_extend_q4(int v) {
     return (v & 0x08) ? (v - 16) : v;
@@ -42,61 +47,66 @@ __device__ __forceinline__ float warp_reduce_sum(float acc) {
 __global__ void linear_rowsplit_gemv_gdn_in_qk_4096_q4_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
+    __shared__ uint4 code_tile[kWarpsPerRow][kVecsPerWarpTile];
+    __shared__ float partials[kWarpsPerRow];
+
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int row = static_cast<int>(blockIdx.x);
     if (row >= kN) { return; }
 
-    __shared__ float partials[kWarpsPerRow];
     const std::uint8_t* code_row =
         codes + static_cast<std::int64_t>(row) * kGroups * kBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
+    float acc = 0.0f;
     const int group_begin = warp * kGroupsPerWarp;
-    std::uint16_t lane_scale_bits = 0;
-    if (lane < kGroupsPerWarp) {
-        lane_scale_bits = load_scale_bits(scale_row, group_begin + lane);
-    }
 
+    for (int tile = 0; tile < kGroupsPerWarp; tile += kGroupsPerWarpTile) {
+        const int tile_count =
+            (kGroupsPerWarp - tile) < kGroupsPerWarpTile ? (kGroupsPerWarp - tile)
+                                                         : kGroupsPerWarpTile;
+        const int tile_vecs = tile_count * kBytesPerGroup / kVecBytes;
+        const auto* global_vecs =
+            reinterpret_cast<const uint4*>(code_row + (group_begin + tile) * kBytesPerGroup);
+        if (lane < tile_vecs) { code_tile[warp][lane] = global_vecs[lane]; }
+        __syncwarp();
+
+        std::uint16_t lane_scale_bits = 0;
+        if (lane < tile_count) {
+            lane_scale_bits = load_scale_bits(scale_row, group_begin + tile + lane);
+        }
+        const auto* tile_codes = reinterpret_cast<const std::uint8_t*>(code_tile[warp]);
 #pragma unroll
-    for (int tile_group = 0; tile_group < kGroupsPerWarp; tile_group += 2) {
-        const int group0 = group_begin + tile_group;
-        const auto scale_bits0 =
-            static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, lane_scale_bits, tile_group));
-        const float scale0 = __half2float(__ushort_as_half(scale_bits0));
+        for (int tile_group = 0; tile_group < kGroupsPerWarpTile; ++tile_group) {
+            if (tile_group >= tile_count) { break; }
+            const auto scale_bits = static_cast<std::uint16_t>(
+                __shfl_sync(0xffffffffu, lane_scale_bits, tile_group));
+            const float scale = __half2float(__ushort_as_half(scale_bits));
 
-        const std::uint8_t packed0 = code_row[group0 * kBytesPerGroup + lane];
-        const int q00 = sign_extend_q4(packed0 & 0x0f);
-        const int q01 = sign_extend_q4(packed0 >> 4);
-        const int k0 = group0 * kGroupK + lane * 2;
-        const float2 xv0 = __bfloat1622float2(x2[k0 >> 1]);
-        acc0 = fmaf(static_cast<float>(q00) * scale0, xv0.x, acc0);
-        acc0 = fmaf(static_cast<float>(q01) * scale0, xv0.y, acc0);
-
-        const int group1 = group0 + 1;
-        const auto scale_bits1 =
-            static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, lane_scale_bits, tile_group + 1));
-        const float scale1 = __half2float(__ushort_as_half(scale_bits1));
-
-        const std::uint8_t packed1 = code_row[group1 * kBytesPerGroup + lane];
-        const int q10 = sign_extend_q4(packed1 & 0x0f);
-        const int q11 = sign_extend_q4(packed1 >> 4);
-        const int k1 = group1 * kGroupK + lane * 2;
-        const float2 xv1 = __bfloat1622float2(x2[k1 >> 1]);
-        acc1 = fmaf(static_cast<float>(q10) * scale1, xv1.x, acc1);
-        acc1 = fmaf(static_cast<float>(q11) * scale1, xv1.y, acc1);
+            const int packed = static_cast<int>(tile_codes[tile_group * kBytesPerGroup + lane]);
+            const int q0 = sign_extend_q4(packed & 0x0f);
+            const int q1 = sign_extend_q4(packed >> 4);
+            const int k0 = (group_begin + tile + tile_group) * kGroupK + lane * 2;
+            const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
+            acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
+            acc = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
+        }
+        __syncwarp();
     }
 
-    float acc = acc0 + acc1;
     acc = warp_reduce_sum(acc);
     if (lane == 0) { partials[warp] = acc; }
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        out[row] = __float2bfloat16(partials[0] + partials[1] + partials[2] + partials[3]);
+        float row_acc = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kWarpsPerRow; ++i) {
+            row_acc += partials[i];
+        }
+        out[row] = __float2bfloat16(row_acc);
     }
 }
 

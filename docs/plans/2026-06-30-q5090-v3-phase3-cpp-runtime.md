@@ -19,15 +19,21 @@ occupancy, vectorized loads) and swapping only the per-thread unpack to the chea
 ## Execution mode — two stages
 
 Phase 3 splits at a real boundary: a **correctness migration** (atomic) followed by a **performance
-re-tune** (parallelizable). The two have different shapes, so they use different modes.
+re-tune** (parallelizable). Both run through subagents, but differently — Stage A is **one** strongest-
+model subagent doing the whole atomic task (un-split) plus a paired review; Stage B is the
+**multi-subagent parallel** push-down loop.
 
-### Stage A — correctness migration (single atomic task, NOT subagent-driven)
+### Stage A — correctness migration (one atomic subagent + paired review; NOT split into subtasks)
 
-- **Why atomic / no subagents:** the runtime cannot load or run a v3 `.qus` until the parser, the
+- **One implementer subagent, strongest model, does the whole task.** Stage A is dispatched to a single
+  subagent on the strongest available model that performs the entire correctness migration in one pass
+  (no intermediate commits), followed by a **paired independent review subagent** (Stage A review,
+  below).
+- **Why not split into subtasks:** the runtime cannot load or run a v3 `.qus` until the parser, the
   `Weight` descriptor, and **every** Q5/Q6 consumer all speak the three-plane layout — a half-migrated
   runtime mis-reads the planes of any un-swapped kernel and produces garbage or crashes. There is no
-  intermediate state that builds-and-runs, hence no verifiable subtask boundary. One developer does the
-  whole correctness change in one task, verified once.
+  intermediate state that builds-and-runs, hence no verifiable subtask boundary; the subagent does it
+  atomically and it is verified + reviewed **once**.
 - Delivers **correct** v3 reading + Q5/Q6 plane-split unpack (kernel bodies may be untuned — Stage B
   tunes them). The v2 reader path is deleted (no dual format).
 
@@ -151,18 +157,21 @@ the explicitly deferred next round. So Phase 3's honest success criteria are: (1
 plane-split lets us drop the launch-adding split-K). The large wall-time jump is expected to land in the
 subsequent CUDA-graph round, which converts these kernel/launch gains into throughput.
 
-## Review (independent, strict — parser/ABI + numerics + GPU memory)
+## Stage A review (paired — independent review subagent, strongest model; strict)
 
-Per AGENTS.md (q5090 format, numerics, weight loading, CUDA kernels, GPU memory → strict review):
+A dedicated review subagent runs immediately after the Stage A implementer subagent (q5090 format,
+numerics, weight loading, CUDA kernels, GPU memory → strict review per AGENTS.md):
 
 - **Format/ABI** — `make_quant_descriptor` plane offsets match spec §9.2/§9.3; the `Weight.qhigh`
   contract (null for Q4/W8) is consistent; parser rejects malformed/short v3 payloads (fail loud).
 - **Numerical** — Q5/Q6 plane-split unpack reproduces the policy values (fp64 oracle); token parity vs
   v2 on the v3 artifact.
-- **CUDA memory** — three-plane + segment-row-offset reads in-bounds; any split-K scratch via
-  `ws`/`ArenaScope`; `compute-sanitizer` clean.
-- **Scope** — Q4/W8 kernels and the schedule untouched; v2 reader removed; no CUDA graphs; Stage B
-  changes only kernel bodies; history linear.
+- **CUDA memory** — three-plane + segment-row-offset reads in-bounds; `compute-sanitizer` clean.
+- **Scope** — Q4/W8 kernels and the schedule untouched; v2 reader removed; no CUDA graphs; v3 byte
+  contract unchanged.
+
+(**Stage B** carries its own review via the roofline push-down protocol's review phase — per-kernel
+cold-cache evidence, fp64 oracle, `compute-sanitizer`, and the launch-aware nsys integration check.)
 
 ## Dependencies & sequencing
 

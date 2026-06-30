@@ -7,6 +7,7 @@
 #include "qus/kernels/argmax.h"
 #include "qus/kernels/gated_delta_rule.h"
 #include "qus/kernels/gdn_gating.h"
+#include "qus/kernels/gdn_in_vz.h"
 #include "qus/kernels/gqa_attention.h"
 #include "qus/kernels/l2norm.h"
 #include "qus/kernels/linear.h"
@@ -395,8 +396,10 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor qkv    = work_.alloc(DType::BF16, {kCfg.conv_dim, 1});
         Tensor qk_out = qkv.slice(0, 0, 2 * kCfg.key_dim);
         Tensor v_out  = qkv.slice(0, 2 * kCfg.key_dim, kCfg.value_dim);
+        Tensor z      = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
+        Tensor z_flat = z.view({kCfg.value_dim, 1});
         kernels::linear(h, *w.in_qk_q4, qk_out, work_, s);
-        kernels::linear(h, *w.in_v, v_out, work_, s);
+        kernels::gdn_in_vz_decode(h, *w.in_v, *w.in_z, v_out, z_flat, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, 1});
         Tensor b = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, 1});
@@ -425,10 +428,6 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor& ssm_state = state_.ssm.at(static_cast<std::size_t>(gidx));
         kernels::gated_delta_rule_recurrent(qn, kn, vv, g, beta, kGdnScale, work_, ssm_state, o,
                                             s);
-
-        Tensor z      = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
-        Tensor z_flat = z.view({kCfg.value_dim, 1});
-        kernels::linear(h, *w.in_z, z_flat, work_, s);
 
         Tensor on = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
         kernels::rmsnorm(o, *w.gdn_norm, kCfg.rms_eps, false, &z, on, s);

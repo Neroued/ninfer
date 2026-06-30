@@ -178,6 +178,97 @@ __global__ void linear_rowsplit_gemv_q5_kernel(const __nv_bfloat16* __restrict__
     if (lane == 0) { out[row] = __float2bfloat16(acc); }
 }
 
+template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX>
+__global__ void linear_rowsplit_gemv_q5_dual_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes0,
+    const std::uint8_t* __restrict__ high_bits0, const std::uint8_t* __restrict__ scales0,
+    const std::uint8_t* __restrict__ codes1, const std::uint8_t* __restrict__ high_bits1,
+    const std::uint8_t* __restrict__ scales1, __nv_bfloat16* __restrict__ out0,
+    __nv_bfloat16* __restrict__ out1) {
+    constexpr int kGroupK              = 64;
+    constexpr int kGroups              = kK / kGroupK;
+    constexpr int kGroupsPerTile       = 16;
+    constexpr int kTiles               = kGroups / kGroupsPerTile;
+    constexpr int kNibbleBytesPerGroup = 32;
+    constexpr int kHighBytesPerGroup   = 8;
+    constexpr int kXVecs               = kK / 8;
+    constexpr int kPrefetch            = kStages - 1;
+    static_assert(kGroups % kGroupsPerTile == 0, "K must be a multiple of 16 groups (1024)");
+    static_assert(kN % kRowsPerBlock == 0, "N must be a multiple of kRowsPerBlock");
+    static_assert(kStages >= 2, "need at least double buffering");
+
+    __shared__ __align__(16) __nv_bfloat16 x_sh[kStageX ? kK : 1];
+    __shared__ uint4 s_nib[kRowsPerBlock][kStages][32];
+    __shared__ uint4 s_hi[kRowsPerBlock][kStages][8];
+    __shared__ uint4 s_sc[kRowsPerBlock][kStages][2];
+
+    if constexpr (kStageX) {
+        auto*       x_sh_v = reinterpret_cast<uint4*>(x_sh);
+        const auto* x_g    = reinterpret_cast<const uint4*>(x);
+        for (int i = static_cast<int>(threadIdx.x); i < kXVecs;
+             i += static_cast<int>(blockDim.x)) {
+            x_sh_v[i] = x_g[i];
+        }
+        __syncthreads();
+    }
+
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int warp       = static_cast<int>(threadIdx.x) >> 5;
+    const int global_row = static_cast<int>(blockIdx.x) * kRowsPerBlock + warp;
+    const bool second    = global_row >= kN;
+    const int row        = second ? global_row - kN : global_row;
+
+    const std::uint8_t* codes     = second ? codes1 : codes0;
+    const std::uint8_t* high_bits = second ? high_bits1 : high_bits0;
+    const std::uint8_t* scales    = second ? scales1 : scales0;
+    __nv_bfloat16*      out       = second ? out1 : out0;
+
+    const std::uint8_t* code_row =
+        codes + static_cast<std::int64_t>(row) * kGroups * kNibbleBytesPerGroup;
+    const std::uint8_t* high_row =
+        high_bits + static_cast<std::int64_t>(row) * kGroups * kHighBytesPerGroup;
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
+    const auto*         x2 =
+        kStageX ? reinterpret_cast<const __nv_bfloat162*>(x_sh)
+                : reinterpret_cast<const __nv_bfloat162*>(x);
+
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+        if (p < kTiles) {
+            q5_issue_tile(s_nib[warp][p], s_hi[warp][p], s_sc[warp][p], code_row, high_row,
+                          scale_row, p, lane);
+        } else {
+            __pipeline_commit();
+        }
+    }
+
+    float acc = 0.0f;
+#pragma unroll 1
+    for (int tile = 0; tile < kTiles; ++tile) {
+        const int fetch = tile + kPrefetch;
+        if (fetch < kTiles) {
+            const int buf = fetch % kStages;
+            q5_issue_tile(s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf], code_row, high_row,
+                          scale_row, fetch, lane);
+        } else {
+            __pipeline_commit();
+        }
+        __pipeline_wait_prior(kPrefetch);
+        __syncwarp();
+
+        const int buf = tile % kStages;
+        acc = q5_consume_tile(x2, s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf], tile, lane,
+                              acc);
+        __syncwarp();
+    }
+
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+    if (lane == 0) { out[row] = __float2bfloat16(acc); }
+}
+
 // One block per kRowsPerBlock rows; kRowsPerBlock warps per block.
 template <int kN, int kK, int kRowsPerBlock, int kStages = 2, bool kStageX = true>
 inline void launch_q5_rowsplit_gemv(const __nv_bfloat16* x, const std::uint8_t* codes,
@@ -187,6 +278,21 @@ inline void launch_q5_rowsplit_gemv(const __nv_bfloat16* x, const std::uint8_t* 
     const int     grid          = kN / kRowsPerBlock;
     linear_rowsplit_gemv_q5_kernel<kN, kK, kRowsPerBlock, kStages, kStageX>
         <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, out);
+}
+
+template <int kN, int kK, int kRowsPerBlock, int kStages = 2, bool kStageX = true>
+inline void launch_q5_rowsplit_gemv_dual(const __nv_bfloat16* x, const std::uint8_t* codes0,
+                                         const std::uint8_t* high_bits0,
+                                         const std::uint8_t* scales0,
+                                         const std::uint8_t* codes1,
+                                         const std::uint8_t* high_bits1,
+                                         const std::uint8_t* scales1, __nv_bfloat16* out0,
+                                         __nv_bfloat16* out1, cudaStream_t stream) {
+    constexpr int kBlockThreads = kRowsPerBlock * 32;
+    const int     grid          = (2 * kN) / kRowsPerBlock;
+    linear_rowsplit_gemv_q5_dual_kernel<kN, kK, kRowsPerBlock, kStages, kStageX>
+        <<<grid, kBlockThreads, 0, stream>>>(x, codes0, high_bits0, scales0, codes1, high_bits1,
+                                             scales1, out0, out1);
 }
 
 } // namespace qus::kernels::detail

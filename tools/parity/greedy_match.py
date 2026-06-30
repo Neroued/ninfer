@@ -172,7 +172,7 @@ def main() -> None:
     )
 
     t0 = time.perf_counter()
-    model = RefModel(weights, device=str(device), cache_globals=False, resident=args.resident)
+    model = RefModel(weights, device=str(device), resident=args.resident)
     try:
         with torch.inference_mode():
             v2_tokens = model.forward(prompt, compare_len)

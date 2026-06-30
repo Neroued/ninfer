@@ -140,12 +140,31 @@ def decode_row_split_quantized(payload, padded, qtype, device="cpu"):
     return scale16, codes
 
 
-def decode_row_split(payload, padded, logical, qtype, device) -> torch.Tensor:
+def decode_row_split(
+    payload,
+    padded,
+    logical,
+    qtype,
+    device,
+    *,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     scale16, codes = decode_row_split_quantized(payload, padded, qtype, device)
     n, k = logical
     _, kp = padded
+    if output_dtype == torch.float32:
+        deq = (codes.to(torch.float32) * scale16.to(torch.float32).unsqueeze(-1)).reshape(n, kp)
+        return deq[:, :k]
+    if output_dtype == torch.bfloat16:
+        deq = torch.empty(codes.shape, device=codes.device, dtype=torch.bfloat16)
+        torch.mul(
+            codes.to(torch.float32),
+            scale16.to(torch.float32).unsqueeze(-1),
+            out=deq,
+        )
+        return deq.reshape(n, kp)[:, :k]
     deq = (codes.to(torch.float32) * scale16.to(torch.float32).unsqueeze(-1)).reshape(n, kp)
-    return deq[:, :k]
+    return deq[:, :k].to(output_dtype)
 
 
 def decode_contiguous(payload, shape, qtype, device) -> torch.Tensor:
@@ -159,9 +178,28 @@ def decode_contiguous(payload, shape, qtype, device) -> torch.Tensor:
     return f32.reshape(shape)
 
 
-def decode_tensor(payload, qtype, layout, logical, padded, device="cpu") -> torch.Tensor:
+def decode_tensor(
+    payload,
+    qtype,
+    layout,
+    logical,
+    padded,
+    device="cpu",
+    *,
+    output_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     if layout == qt.LAYOUT_ROW_SPLIT:
-        return decode_row_split(payload, padded, logical, qtype, device)
+        return decode_row_split(
+            payload,
+            padded,
+            logical,
+            qtype,
+            device,
+            output_dtype=output_dtype,
+        )
     if layout == qt.LAYOUT_CONTIGUOUS:
-        return decode_contiguous(payload, logical, qtype, device)
+        out = decode_contiguous(payload, logical, qtype, device)
+        if qtype == qt.QT_BF16:
+            return out.to(output_dtype)
+        return out
     raise ValueError(f"unknown layout {layout}")

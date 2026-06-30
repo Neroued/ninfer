@@ -139,7 +139,7 @@ def run_l2(
     rows_per_chunk: int,
 ) -> bool:
     reader = hfref.HfShardReader(hf_dir)
-    model = RefModel(weights, device=str(device), cache_globals=False, resident="stream")
+    model = RefModel(weights, device=str(device), resident="stream")
     failed = False
     by_qtype: dict[int, Metrics] = {}
 

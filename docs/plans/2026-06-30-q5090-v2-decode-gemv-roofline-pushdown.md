@@ -164,6 +164,8 @@ the parallel kernels.
   any work in this plan.
 - Before dispatching a loop, the coordinator confirms the row is `pending`/`baselined` and its worktree
   isn't already created; never two loops on the same kernel file.
+- A6 stays one ledger row because it owns one file. Its `qtype` cell is `Q4/Q5`; metric cells that
+  differ by qtype use `Q4 / Q5` pairs in that order.
 
 ### Per-kernel tuning loop (coordinator-driven; one fresh strongest-model subagent per round)
 

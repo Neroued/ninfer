@@ -16,7 +16,7 @@ constexpr int kK = 5120;
 constexpr int kGroupK = 64;
 constexpr int kGroups = kK / kGroupK;
 constexpr int kBytesPerGroup = 32;
-constexpr int kWarpsPerBlock = 4;
+constexpr int kWarpsPerBlock = 8;
 constexpr int kBlockThreads = kWarpsPerBlock * 32;
 
 __device__ __forceinline__ int sign_extend_q4(int v) {

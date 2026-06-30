@@ -58,8 +58,8 @@ def repeat(
         "decode_loop_tokens": decode_loop_tokens,
         "generated_tokens_total": len(tokens),
         "prefill_prompt_tok_s": prompt_tokens / 0.02,
-        "decode_eager_tok_s": tok_s if decode_loop_tokens else None,
-        "decode_eager_tok_s_valid": bool(decode_loop_tokens),
+        "decode_tok_s": tok_s if decode_loop_tokens else None,
+        "decode_tok_s_valid": bool(decode_loop_tokens),
         "e2e_excluding_load_tok_s": 80.0,
         "stop_reason": stop_reason,
         "generated_token_ids": tokens,
@@ -130,7 +130,7 @@ def case(
             "prefill_time_s_median": 0.02,
             "prefill_prompt_tok_s_median": prompt_tokens / 0.02,
             "decode_time_s_median": 0.01 if len(tokens) > 1 else 0.0,
-            "decode_eager_tok_s_median": tok_s if len(tokens) > 1 else None,
+            "decode_tok_s_median": tok_s if len(tokens) > 1 else None,
             "e2e_excluding_load_tok_s_median": 80.0,
             "deterministic_token_ids": True,
             "max_weight_arena_peak_used_bytes": 1024,
@@ -164,7 +164,8 @@ def report(
         "engine": {
             "max_context": 4096,
             "workspace_lifetime_policy": "step_reset",
-            "decode_metric": "decode_eager_tok_s",
+            "decode_metric": "decode_tok_s",
+            "decode_path": "cuda_graph",
             "sampling_location": "device_argmax",
             "token_readback": "per_step_sync_d2h",
             "includes_token_readback": True,
@@ -256,15 +257,29 @@ class ReportCommonTests(unittest.TestCase):
 
     def test_validate_report_rejects_bad_zero_decode_throughput(self) -> None:
         bad = report()
-        bad["cases"][-1]["repeats"][0]["decode_eager_tok_s"] = 0.0
+        bad["cases"][-1]["repeats"][0]["decode_tok_s"] = 0.0
         with self.assertRaises(common.ReportValidationError):
             common.validate_report(bad)
 
     def test_validate_report_rejects_bad_zero_decode_summary_throughput(self) -> None:
         bad = report()
-        bad["cases"][-1]["summary"]["decode_eager_tok_s_median"] = 0.0
+        bad["cases"][-1]["summary"]["decode_tok_s_median"] = 0.0
         with self.assertRaises(common.ReportValidationError):
             common.validate_report(bad)
+
+    def test_validate_report_rejects_bad_decode_path(self) -> None:
+        bad = report()
+        bad["engine"]["decode_path"] = "unknown"
+        with self.assertRaises(common.ReportValidationError):
+            common.validate_report(bad)
+
+    def test_validate_report_rejects_missing_engine_contract_fields(self) -> None:
+        for field in ("workspace_lifetime_policy", "decode_metric", "decode_path"):
+            with self.subTest(field=field):
+                bad = report()
+                del bad["engine"][field]
+                with self.assertRaises(common.ReportValidationError):
+                    common.validate_report(bad)
 
     def test_validate_report_requires_prefill_prompt_throughput(self) -> None:
         bad_repeat = report()
@@ -531,11 +546,13 @@ class CompareReportTests(unittest.TestCase):
 
         candidate = report()
         candidate["engine"]["workspace_lifetime_policy"] = "block_scoped_mixer_mlp_rewind"
+        candidate["engine"]["decode_path"] = "eager"
         candidate["weights"]["load_strategy"] = "streaming_upload"
         candidate["memory"]["accounting_scope"] = "engine_arenas_only"
         result = compare_e2e_reports.compare_reports(report(), candidate)
         codes = {item["code"] for item in result.warnings}
         self.assertIn("workspace_lifetime_policy_changed", codes)
+        self.assertIn("decode_path_changed", codes)
         self.assertIn("load_strategy_changed", codes)
         self.assertIn("memory_accounting_scope_changed", codes)
 
@@ -613,6 +630,7 @@ class BaselineSummaryTests(unittest.TestCase):
             self.assertEqual(summary["source_report_sha256"], common.sha256_file(report_path))
             self.assertEqual(summary["q5090"]["sha256"], "weights-sha")
             self.assertEqual(summary["workspace_lifetime_policy"], "step_reset")
+            self.assertEqual(summary["decode_path"], "cuda_graph")
             self.assertFalse(summary["hidden_device_allocations"])
             self.assertEqual(
                 [case["name"] for case in summary["cases"]],
@@ -695,9 +713,6 @@ class BaselineSummaryTests(unittest.TestCase):
             "memory.hidden_device_allocations": (
                 lambda value: value["memory"].pop("hidden_device_allocations")
             ),
-            "engine.workspace_lifetime_policy": (
-                lambda value: value["engine"].pop("workspace_lifetime_policy")
-            ),
         }
         with tempfile.TemporaryDirectory() as tmp:
             for name, mutate in mutations.items():
@@ -772,9 +787,9 @@ class BaselineSummaryTests(unittest.TestCase):
             bad_tokens["cases"][0]["repeats"][0]["generated_tokens_total"] = 2
             bad_tokens["cases"][0]["repeats"][0]["decode_time_s"] = 0.01
             bad_tokens["cases"][0]["repeats"][0]["e2e_excluding_load_time_s"] = 0.03
-            bad_tokens["cases"][0]["repeats"][0]["decode_eager_tok_s"] = 100.0
-            bad_tokens["cases"][0]["repeats"][0]["decode_eager_tok_s_valid"] = True
-            bad_tokens["cases"][0]["summary"]["decode_eager_tok_s_median"] = 100.0
+            bad_tokens["cases"][0]["repeats"][0]["decode_tok_s"] = 100.0
+            bad_tokens["cases"][0]["repeats"][0]["decode_tok_s_valid"] = True
+            bad_tokens["cases"][0]["summary"]["decode_tok_s_median"] = 100.0
             report_path.write_text(json.dumps(bad_tokens), encoding="utf-8")
             with self.assertRaises(RuntimeError):
                 make_baseline_summary.make_summary(report_path, "m3_prefill_gate", None)

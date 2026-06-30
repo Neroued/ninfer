@@ -568,6 +568,7 @@ int test_raw_report_json_is_valid() {
     report.q5090_file_size_bytes = 1234;
     report.q5090_sha256 = "weights-sha";
     report.max_context = 8;
+    report.decode_path = "cuda_graph";
     report.post_load_memory = memory;
     report.cases.push_back(case_report);
     report.cases.push_back(zero_decode_case);
@@ -622,8 +623,10 @@ int test_raw_report_json_is_valid() {
     failures += expect_json_value(engine.at("workspace_lifetime_policy"),
                                   "block_scoped_mixer_mlp_rewind",
                                   "raw report workspace lifetime policy");
-    failures += expect_json_value(engine.at("decode_metric"), "decode_eager_tok_s",
+    failures += expect_json_value(engine.at("decode_metric"), "decode_tok_s",
                                   "raw report decode metric");
+    failures += expect_json_value(engine.at("decode_path"), "cuda_graph",
+                                  "raw report decode path");
     failures += expect_json_value(engine.at("sampling_location"), "device_argmax",
                                   "raw report sampling location");
     failures += expect_json_value(engine.at("token_readback"), "per_step_sync_d2h",
@@ -710,7 +713,7 @@ int test_raw_report_json_is_valid() {
                             "raw report prefill median field");
     failures += expect_double(cn_summary.at("prefill_prompt_tok_s_median").get<double>(), 300.0,
                               "raw report summary prefill prompt throughput");
-    failures += expect_double(cn_summary.at("decode_eager_tok_s_median").get<double>(), 100.0,
+    failures += expect_double(cn_summary.at("decode_tok_s_median").get<double>(), 100.0,
                               "raw report summary decode throughput");
     failures += expect_json_value(cn_summary.at("deterministic_token_ids"), true,
                                   "raw report deterministic summary");
@@ -719,18 +722,18 @@ int test_raw_report_json_is_valid() {
 
     failures += expect_double(cn_repeat.at("prefill_prompt_tok_s").get<double>(), 300.0,
                               "raw report repeat prefill prompt throughput");
-    failures += expect_json_value(cn_repeat.at("decode_eager_tok_s_valid"), true,
+    failures += expect_json_value(cn_repeat.at("decode_tok_s_valid"), true,
                                   "raw report decode validity");
-    failures += expect_double(cn_repeat.at("decode_eager_tok_s").get<double>(), 100.0,
+    failures += expect_double(cn_repeat.at("decode_tok_s").get<double>(), 100.0,
                               "raw report repeat decode throughput");
     failures += expect_json_int_vector(cn_repeat.at("generated_token_ids"), {10, 11, 12},
                                        "raw report generated ids");
 
-    failures += expect_json_null(zero_decode_repeat_json.at("decode_eager_tok_s"),
+    failures += expect_json_null(zero_decode_repeat_json.at("decode_tok_s"),
                                  "zero decode throughput null");
-    failures += expect_json_value(zero_decode_repeat_json.at("decode_eager_tok_s_valid"), false,
+    failures += expect_json_value(zero_decode_repeat_json.at("decode_tok_s_valid"), false,
                                   "zero decode throughput validity");
-    failures += expect_json_null(long_summary.at("decode_eager_tok_s_median"),
+    failures += expect_json_null(long_summary.at("decode_tok_s_median"),
                                  "zero decode summary throughput null");
     failures += expect_json_value(long_case.at("name"), "long_2k", "zero decode case name");
     return failures;

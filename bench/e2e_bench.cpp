@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
     qus::EngineOptions engine_options;
     engine_options.device = options.device;
     engine_options.max_ctx = options.max_ctx;
+    const std::string decode_path = engine_options.use_cuda_graph ? "cuda_graph" : "eager";
 
     std::vector<PreparedCase> case_inputs;
     try {
@@ -162,6 +163,7 @@ int main(int argc, char** argv) {
             message << "preflight: manifest=" << options.fixture_manifest_path
                     << " cases=" << options.cases.size() << " device=" << options.device
                     << " max_ctx=" << options.max_ctx
+                    << " decode_path=" << decode_path
                     << " warmup_repeats=" << options.warmup_repeats
                     << " repeats=" << options.repeats;
             progress.line(message.str());
@@ -242,6 +244,7 @@ int main(int argc, char** argv) {
         report.q5090_sha256 = "";
         report.max_context = options.max_ctx;
         report.workspace_lifetime_policy = qus::model::kWorkspaceLifetimePolicy;
+        report.decode_path = decode_path;
         report.post_load_memory = engine.memory_stats();
 
         for (std::size_t case_index = 0; case_index < case_inputs.size(); ++case_index) {
@@ -319,9 +322,9 @@ int main(int argc, char** argv) {
                             << " prefill_prompt_tok_s="
                             << format_rate(repeat.prefill_prompt_tok_s())
                             << " decode=" << format_seconds(repeat.decode_time_s)
-                            << " decode_eager_tok_s=";
-                    if (repeat.decode_eager_tok_s_valid()) {
-                        message << format_rate(repeat.decode_eager_tok_s());
+                            << " decode_tok_s=";
+                    if (repeat.decode_tok_s_valid()) {
+                        message << format_rate(repeat.decode_tok_s());
                     } else {
                         message << "n/a";
                     }

@@ -137,9 +137,9 @@ Review  independent strict review subagent (kernels + numerics + GPU memory + ru
   (partial `170-364`, reduce `366-432`). Neutral-partial helpers `126-168`; append `296-300` / `212-221`;
   current-token-from-`k_new` `239-256` / `325-328`.
 - **e2e report contract (Task 4):** `bench/e2e_bench.cpp:300` drives the real `Engine::decode_step()` loop;
-  the report names the decode path **eager** — `decode_eager_tok_s`(`_valid`/`_median`) in
+  the report names the decode path **eager** — `decode_tok_s`(`_valid`/`_median`) in
   `bench/e2e_bench_support.{h,cpp}` (`RepeatReport` methods + JSON writers `e2e_bench_support.cpp:240,283`)
-  and `"decode_metric": "decode_eager_tok_s"` in the engine block (`e2e_bench_support.cpp:742`, alongside
+  and `"decode_metric": "decode_tok_s"` in the engine block (`e2e_bench_support.cpp:742`, alongside
   `sampling_location`/`token_readback`/`includes_token_readback`). Consumers: `docs/bench/e2e-report-schema.md`,
   `tools/bench/e2e_report_common.py`, `tools/bench/compare_e2e_reports.py`, `tools/bench/make_baseline_summary.py`,
   `tests/test_e2e_bench_support.cpp`, `tests/test_bench_report_tools.py`, and baselines under
@@ -390,7 +390,7 @@ launch collapse + wall improvement; `ctest` green (tap path still eager); `Engin
 
 After Task 3, `EngineOptions::use_cuda_graph` defaults `true`, so `bench/e2e_bench.cpp`'s
 `engine.decode_step()` loop measures the **graph** path — but the report schema names it **eager**
-(`decode_eager_tok_s*`, `"decode_metric": "decode_eager_tok_s"`). AGENTS.md treats this report/schema as a
+(`decode_tok_s*`, `"decode_metric": "decode_tok_s"`). AGENTS.md treats this report/schema as a
 real, downstream-consumed contract, so the label must match reality. **Chosen approach: make the report
 honest about the production path** — rename the metric to a path-neutral `decode_tok_s*` and add an explicit
 `decode_path` fact. (Rejected alternative: force the e2e bench eager via `use_cuda_graph=false` — that keeps
@@ -398,18 +398,18 @@ the historical series comparable but makes the flagship metric stop reflecting p
 feature; the graph win would only live in nsys. We instead re-baseline against the production path.)
 
 **Files:**
-- Modify: `bench/e2e_bench_support.h` — rename `RepeatReport::decode_eager_tok_s{,_valid}()` →
+- Modify: `bench/e2e_bench_support.h` — rename `RepeatReport::decode_tok_s{,_valid}()` →
   `decode_tok_s{,_valid}()`; add `std::string decode_path` to `RawReport`.
-- Modify: `bench/e2e_bench_support.cpp` — JSON keys `decode_eager_tok_s`/`decode_eager_tok_s_valid`
-  (`write_repeat`) and `decode_eager_tok_s_median` (`write_case_summary`) → `decode_tok_s*`; engine block
+- Modify: `bench/e2e_bench_support.cpp` — JSON keys `decode_tok_s`/`decode_tok_s_valid`
+  (`write_repeat`) and `decode_tok_s_median` (`write_case_summary`) → `decode_tok_s*`; engine block
   `"decode_metric": "decode_tok_s"` and add `"decode_path": "<report.decode_path>"`.
 - Modify: `bench/e2e_bench.cpp` — set `report.decode_path = engine_options.use_cuda_graph ? "cuda_graph" : "eager";`
-  rename the progress-log `decode_eager_tok_s` → `decode_tok_s`; ensure capture is excluded from the timed
+  rename the progress-log `decode_tok_s` → `decode_tok_s`; ensure capture is excluded from the timed
   window (see measurement hygiene below).
 - Modify: `docs/bench/e2e-report-schema.md` — rename the field(s), document `decode_path`, update the
   `decode_metric` description.
 - Modify: `tools/bench/e2e_report_common.py`, `tools/bench/compare_e2e_reports.py`,
-  `tools/bench/make_baseline_summary.py` — rename `decode_eager_tok_s*` references; accept/emit `decode_path`.
+  `tools/bench/make_baseline_summary.py` — rename `decode_tok_s*` references; accept/emit `decode_path`.
 - Modify: `tests/test_e2e_bench_support.cpp`, `tests/test_bench_report_tools.py` — update assertions to the
   new field names + `decode_path` (this is a whitelisted real report/schema contract test).
 - Regenerate: `docs/bench/baselines/*.json` (the m3 gate baselines) with the graph-on bench — the decode
@@ -429,7 +429,7 @@ capture step is amortized, but the warmup repeat makes the metric clean regardle
 - [ ] **Step 5 — full ctest + pytest:** `ctest --test-dir build` and the bench-tool pytest. Expected: green.
 - [ ] **Step 6 — commit:** `git add bench/e2e_bench_support.h bench/e2e_bench_support.cpp bench/e2e_bench.cpp docs/bench/e2e-report-schema.md tools/bench/e2e_report_common.py tools/bench/compare_e2e_reports.py tools/bench/make_baseline_summary.py tests/test_e2e_bench_support.cpp tests/test_bench_report_tools.py docs/bench/baselines && git commit -m "feat(q5090): e2e report reflects cuda-graph decode (decode_tok_s + decode_path)"`
 
-**Task 4 DoD:** no `decode_eager_tok_s` remains (`rg` audit); the report carries `decode_tok_s*` +
+**Task 4 DoD:** no `decode_tok_s` remains (`rg` audit); the report carries `decode_tok_s*` +
 `decode_path`; C++ + python report-contract tests green; gate baselines regenerated with `decode_path:
 "cuda_graph"`; the validator/compare/summary tools accept the new schema.
 
@@ -453,7 +453,7 @@ review). Verify:
   module-warmup step; the tap path and prefill remain eager; `kv_.advance()` is host-side and outside the
   captured body while `detail::advance_pos` is inside it; `--no-cuda-graph` / `use_cuda_graph=false` forces
   the eager path and matches graph output token-for-token.
-- **Report schema (Task 4):** no `decode_eager_tok_s` remains; the report carries `decode_tok_s*` +
+- **Report schema (Task 4):** no `decode_tok_s` remains; the report carries `decode_tok_s*` +
   `decode_path`, `decode_metric` matches, and the C++/python report-contract tests + regenerated baselines
   agree; the bench excludes warmup/capture from the timed window.
 - **Evidence:** nsys shows `cudaLaunchKernel`/step ≈ 1 and a decode-wall improvement vs
@@ -479,7 +479,7 @@ review). Verify:
 - **Testing policy** — no new low-value tests; kernel correctness rides the existing fp64 oracle
   (`qus_gqa_attention_test`) + `compute-sanitizer` + greedy parity; Task 4's report-schema tests are the
   whitelisted real CLI/report-contract category ✓.
-- **No backward-compat shims** — the `tile_n`/`tile_count` decode path and the `decode_eager_tok_s` field
+- **No backward-compat shims** — the `tile_n`/`tile_count` decode path and the `decode_tok_s` field
   are **deleted/renamed**, not kept beside the new ones; `use_cuda_graph` is a live-feature capability
   switch (the eager body is the required warmup/tap path), not a legacy fallback ✓.
 - **One graph for all context lengths** — fixed `S` decouples graph count from `pos`/`max_context`; batch=1

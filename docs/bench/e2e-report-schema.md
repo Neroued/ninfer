@@ -65,7 +65,8 @@ Required fields:
   "engine": {
     "max_context": 0,
     "workspace_lifetime_policy": "block_scoped_mixer_mlp_rewind",
-    "decode_metric": "decode_eager_tok_s",
+    "decode_metric": "decode_tok_s",
+    "decode_path": "cuda_graph",
     "sampling_location": "device_argmax",
     "token_readback": "per_step_sync_d2h",
     "includes_token_readback": true,
@@ -77,6 +78,10 @@ Required fields:
 The current official/runtime workspace lifetime policy is `block_scoped_mixer_mlp_rewind`.
 Historical P6 short smoke artifacts may record `step_reset`; those are legacy smoke observations and do
 not represent the current M3 gate package policy.
+
+`decode_metric` is path-neutral and always names the repeat throughput field. `decode_path` records
+the engine execution path that produced the decode timing: `cuda_graph` for the production default, or
+`eager` when the engine is explicitly run without CUDA graph replay.
 
 ## Weights
 
@@ -208,8 +213,8 @@ At minimum, each measured repeat stores:
   "decode_loop_tokens": 0,
   "generated_tokens_total": 1,
   "prefill_prompt_tok_s": 0.0,
-  "decode_eager_tok_s": null,
-  "decode_eager_tok_s_valid": false,
+  "decode_tok_s": null,
+  "decode_tok_s_valid": false,
   "e2e_excluding_load_tok_s": 0.0,
   "stop_reason": "max_new_tokens",
   "generated_token_ids": [],
@@ -223,17 +228,21 @@ Required timing formulas:
 
 ```text
 e2e_excluding_load_time_s = prefill_time_s + decode_time_s
-decode_eager_tok_s = decode_loop_tokens / decode_time_s
+decode_tok_s = decode_loop_tokens / decode_time_s
 prefill_prompt_tok_s = prompt_tokens / prefill_time_s
 e2e_excluding_load_tok_s = generated_tokens_total / e2e_excluding_load_time_s
 ```
 
-If `decode_loop_tokens == 0`, set `decode_eager_tok_s` to `null` and
-`decode_eager_tok_s_valid` to `false`. Do not omit the field, write `NaN`, or use `0` as a fake
-throughput. If `decode_loop_tokens > 0`, `decode_eager_tok_s_valid` is `true`.
+If `decode_loop_tokens == 0`, set `decode_tok_s` to `null` and
+`decode_tok_s_valid` to `false`. Do not omit the field, write `NaN`, or use `0` as a fake
+throughput. If `decode_loop_tokens > 0`, `decode_tok_s_valid` is `true`.
 
 The prefill token counts in `generated_tokens_total` and e2e throughput. It does not count in
 decode-loop throughput.
+
+When `decode_path` is `cuda_graph`, reports intended for graph replay benchmarking should use
+`--warmup-repeats >= 1`. The warmup repeat drives the one-time decode module warmup and graph capture
+before measured repeats, so `decode_tok_s` reflects steady graph replay rather than capture overhead.
 
 ## Error Reports
 
@@ -320,6 +329,7 @@ summaries are committed under `docs/bench/baselines/` and use:
   "memory_summary": {},
   "hidden_device_allocations": false,
   "workspace_lifetime_policy": "block_scoped_mixer_mlp_rewind",
+  "decode_path": "cuda_graph",
   "tokenizer": {},
   "readability_gate": "not_run"
 }
@@ -355,6 +365,7 @@ Report comparison depends on stable identity fields:
 - chat-template identity, including chat-template Jinja SHA256 and generation-config SHA256;
 - generation config, including `requested_max_new_tokens` and `stop_token_ids`;
 - workspace lifetime policy;
+- decode path;
 - memory accounting scope.
 
 For fixed q5090 + fixed chat-template prompt ids + fixed stop-token list + greedy generation config,

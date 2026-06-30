@@ -56,6 +56,17 @@ CASE_FIELDS = (
     "summary",
 )
 
+ENGINE_FIELDS = (
+    "max_context",
+    "workspace_lifetime_policy",
+    "decode_metric",
+    "decode_path",
+    "sampling_location",
+    "token_readback",
+    "includes_token_readback",
+    "timing_boundary",
+)
+
 REPEAT_FIELDS = (
     "repeat_index",
     "prefill_time_s",
@@ -66,8 +77,8 @@ REPEAT_FIELDS = (
     "decode_loop_tokens",
     "generated_tokens_total",
     "prefill_prompt_tok_s",
-    "decode_eager_tok_s",
-    "decode_eager_tok_s_valid",
+    "decode_tok_s",
+    "decode_tok_s_valid",
     "e2e_excluding_load_tok_s",
     "stop_reason",
     "generated_token_ids",
@@ -213,14 +224,14 @@ def _validate_repeat(repeat: dict[str, Any], case_name: str) -> None:
     if prefill_tok_s < 0.0:
         raise ReportValidationError(f"{case_name}.prefill_prompt_tok_s must be nonnegative")
 
-    valid = repeat["decode_eager_tok_s_valid"]
+    valid = repeat["decode_tok_s_valid"]
     if decode_loop_tokens == 0:
-        if repeat["decode_eager_tok_s"] is not None or valid is not False:
+        if repeat["decode_tok_s"] is not None or valid is not False:
             raise ReportValidationError(f"{case_name} zero decode repeat must use null/false throughput")
     else:
         if valid is not True:
             raise ReportValidationError(f"{case_name} nonzero decode repeat must mark throughput valid")
-        require_number(repeat["decode_eager_tok_s"], f"{case_name}.decode_eager_tok_s")
+        require_number(repeat["decode_tok_s"], f"{case_name}.decode_tok_s")
 
     require_mapping(repeat["memory"], f"{case_name}.repeat.memory")
 
@@ -261,8 +272,8 @@ def _validate_case(case: dict[str, Any]) -> None:
         _validate_repeat(checked_repeat, name)
         checked_repeats.append(checked_repeat)
 
-    if "decode_eager_tok_s_median" not in summary:
-        raise ReportValidationError(f"{name}.summary missing decode_eager_tok_s_median")
+    if "decode_tok_s_median" not in summary:
+        raise ReportValidationError(f"{name}.summary missing decode_tok_s_median")
     if "prefill_prompt_tok_s_median" not in summary:
         raise ReportValidationError(f"{name}.summary missing prefill_prompt_tok_s_median")
     prefill_median = require_number(
@@ -274,15 +285,24 @@ def _validate_case(case: dict[str, Any]) -> None:
             f"{name}.summary.prefill_prompt_tok_s_median must be nonnegative"
         )
     has_valid_decode_throughput = any(
-        repeat["decode_eager_tok_s_valid"] is True for repeat in checked_repeats
+        repeat["decode_tok_s_valid"] is True for repeat in checked_repeats
     )
-    decode_median = summary["decode_eager_tok_s_median"]
+    decode_median = summary["decode_tok_s_median"]
     if has_valid_decode_throughput:
-        require_number(decode_median, f"{name}.summary.decode_eager_tok_s_median")
+        require_number(decode_median, f"{name}.summary.decode_tok_s_median")
     elif decode_median is not None:
         raise ReportValidationError(
             f"{name}.summary zero decode throughput median must be null"
         )
+
+
+def _validate_engine(engine: dict[str, Any]) -> None:
+    _require_fields(engine, ENGINE_FIELDS, "engine")
+    if engine["decode_metric"] != "decode_tok_s":
+        raise ReportValidationError("engine.decode_metric must be decode_tok_s")
+    decode_path = _require_string(engine["decode_path"], "engine.decode_path")
+    if decode_path not in ("cuda_graph", "eager"):
+        raise ReportValidationError("engine.decode_path must be cuda_graph or eager")
 
 
 def validate_report(report: dict[str, Any], require_ok: bool = True) -> None:
@@ -296,7 +316,7 @@ def validate_report(report: dict[str, Any], require_ok: bool = True) -> None:
 
     require_mapping(report["run"], "run")
     require_mapping(report["environment"], "environment")
-    require_mapping(report["engine"], "engine")
+    _validate_engine(require_mapping(report["engine"], "engine"))
     require_mapping(report["weights"], "weights")
     require_mapping(report["memory"], "memory")
     require_mapping(report["summary"], "summary")

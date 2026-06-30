@@ -45,7 +45,7 @@ def _case_summary(case: dict[str, Any]) -> dict[str, Any]:
         "prefill_time_s_median": summary.get("prefill_time_s_median"),
         "prefill_prompt_tok_s_median": summary.get("prefill_prompt_tok_s_median"),
         "decode_time_s_median": summary.get("decode_time_s_median"),
-        "decode_eager_tok_s_median": summary.get("decode_eager_tok_s_median"),
+        "decode_tok_s_median": summary.get("decode_tok_s_median"),
         "e2e_excluding_load_tok_s_median": summary.get("e2e_excluding_load_tok_s_median"),
         "max_weight_arena_peak_used_bytes": summary.get("max_weight_arena_peak_used_bytes"),
         "max_cache_arena_peak_used_bytes": summary.get("max_cache_arena_peak_used_bytes"),
@@ -64,7 +64,7 @@ def _timing_summary(report: dict[str, Any]) -> dict[str, Any]:
                     "prefill_prompt_tok_s_median"
                 ),
                 "decode_time_s_median": case["summary"].get("decode_time_s_median"),
-                "decode_eager_tok_s_median": case["summary"].get("decode_eager_tok_s_median"),
+                "decode_tok_s_median": case["summary"].get("decode_tok_s_median"),
                 "e2e_excluding_load_tok_s_median": case["summary"].get(
                     "e2e_excluding_load_tok_s_median"
                 ),
@@ -334,6 +334,7 @@ def make_summary(
         "memory_summary": _memory_summary(report),
         "hidden_device_allocations": _require_key(memory, "hidden_device_allocations", "memory"),
         "workspace_lifetime_policy": _require_key(engine, "workspace_lifetime_policy", "engine"),
+        "decode_path": _require_key(engine, "decode_path", "engine"),
         "tokenizer": decoded["tokenizer"],
         "readability_gate": decoded["readability_gate"],
         **{

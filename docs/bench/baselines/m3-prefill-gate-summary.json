@@ -43,7 +43,7 @@
       "prefill_time_s_median": 243.324,
       "prefill_prompt_tok_s_median": 32.5984,
       "decode_time_s_median": 0,
-      "decode_eager_tok_s_median": null,
+      "decode_tok_s_median": null,
       "e2e_excluding_load_tok_s_median": 0.00410974,
       "max_weight_arena_peak_used_bytes": 16378329088,
       "max_cache_arena_peak_used_bytes": 691312128,
@@ -58,7 +58,7 @@
         "prefill_time_s_median": 243.324,
         "prefill_prompt_tok_s_median": 32.5984,
         "decode_time_s_median": 0,
-        "decode_eager_tok_s_median": null,
+        "decode_tok_s_median": null,
         "e2e_excluding_load_tok_s_median": 0.00410974
       }
     ]

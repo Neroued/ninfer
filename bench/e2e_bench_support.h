@@ -81,12 +81,12 @@ struct RepeatReport {
     [[nodiscard]] double e2e_excluding_load_time_s() const noexcept {
         return prefill_time_s + decode_time_s;
     }
-    [[nodiscard]] bool decode_eager_tok_s_valid() const noexcept {
+    [[nodiscard]] bool decode_tok_s_valid() const noexcept {
         return decode_loop_tokens > 0 && decode_time_s > 0.0;
     }
-    [[nodiscard]] double decode_eager_tok_s() const noexcept {
-        return decode_eager_tok_s_valid() ? static_cast<double>(decode_loop_tokens) / decode_time_s
-                                          : 0.0;
+    [[nodiscard]] double decode_tok_s() const noexcept {
+        return decode_tok_s_valid() ? static_cast<double>(decode_loop_tokens) / decode_time_s
+                                    : 0.0;
     }
     [[nodiscard]] double prefill_prompt_tok_s() const noexcept {
         return prefill_time_s > 0.0 ? static_cast<double>(prompt_tokens) / prefill_time_s : 0.0;
@@ -135,6 +135,7 @@ struct RawReport {
     std::string q5090_sha256;
     std::uint32_t max_context = 0;
     std::string workspace_lifetime_policy = qus::model::kWorkspaceLifetimePolicy;
+    std::string decode_path;
     EngineMemoryStats post_load_memory;
     std::vector<CaseReport> cases;
 };

@@ -58,7 +58,7 @@ The required `long_2k` case was run with `max_new_tokens=1`, `warmup_repeats=0`,
 |---|---:|---:|---:|---:|---|
 | `long_2k` | 7932 | 243.324 | 32.5984 | n/a | true |
 
-`decode_eager_tok_s` is intentionally not valid for this case because `max_new_tokens=1` produces no
+`decode_tok_s` is intentionally not valid for this case because `max_new_tokens=1` produces no
 decode loop tokens after prefill.
 
 ## Memory Summary

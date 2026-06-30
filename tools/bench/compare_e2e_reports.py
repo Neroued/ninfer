@@ -66,6 +66,16 @@ def _compare_top_level(baseline: dict[str, Any], candidate: dict[str, Any], resu
             candidate=new_workspace,
         )
 
+    old_decode_path = common.nested_get(baseline, "engine.decode_path")
+    new_decode_path = common.nested_get(candidate, "engine.decode_path")
+    if old_decode_path != new_decode_path:
+        result.add_warning(
+            "decode_path_changed",
+            "decode path changed",
+            baseline=old_decode_path,
+            candidate=new_decode_path,
+        )
+
     old_load = common.nested_get(baseline, "weights.load_strategy")
     new_load = common.nested_get(candidate, "weights.load_strategy")
     if old_load != new_load:
@@ -182,7 +192,7 @@ def _compare_perf(
 ) -> None:
     for key in (
         "prefill_prompt_tok_s_median",
-        "decode_eager_tok_s_median",
+        "decode_tok_s_median",
         "e2e_excluding_load_tok_s_median",
     ):
         old = common.numeric_summary(base_case, key)

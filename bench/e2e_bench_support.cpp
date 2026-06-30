@@ -237,15 +237,15 @@ void write_repeat(std::ostream& out, const RepeatReport& repeat, const std::stri
         << indent << "  \"decode_loop_tokens\": " << repeat.decode_loop_tokens << ",\n"
         << indent << "  \"generated_tokens_total\": " << repeat.generated_tokens_total() << ",\n"
         << indent << "  \"prefill_prompt_tok_s\": " << repeat.prefill_prompt_tok_s() << ",\n"
-        << indent << "  \"decode_eager_tok_s\": ";
-    if (repeat.decode_eager_tok_s_valid()) {
-        out << repeat.decode_eager_tok_s();
+        << indent << "  \"decode_tok_s\": ";
+    if (repeat.decode_tok_s_valid()) {
+        out << repeat.decode_tok_s();
     } else {
         out << "null";
     }
     out << ",\n"
-        << indent << "  \"decode_eager_tok_s_valid\": "
-        << json_bool(repeat.decode_eager_tok_s_valid()) << ",\n"
+        << indent << "  \"decode_tok_s_valid\": "
+        << json_bool(repeat.decode_tok_s_valid()) << ",\n"
         << indent << "  \"e2e_excluding_load_tok_s\": "
         << repeat.e2e_excluding_load_tok_s() << ",\n"
         << indent << "  \"stop_reason\": \"" << json_escape(repeat.stop_reason) << "\",\n"
@@ -272,7 +272,7 @@ void write_case_summary(std::ostream& out, const CaseReport& case_report,
         prefill_times.push_back(repeat.prefill_time_s);
         prefill_tok_s.push_back(repeat.prefill_prompt_tok_s());
         decode_times.push_back(repeat.decode_time_s);
-        if (repeat.decode_eager_tok_s_valid()) { decode_tok_s.push_back(repeat.decode_eager_tok_s()); }
+        if (repeat.decode_tok_s_valid()) { decode_tok_s.push_back(repeat.decode_tok_s()); }
         e2e_tok_s.push_back(repeat.e2e_excluding_load_tok_s());
     }
 
@@ -280,7 +280,7 @@ void write_case_summary(std::ostream& out, const CaseReport& case_report,
         << indent << "  \"prefill_time_s_median\": " << median(prefill_times) << ",\n"
         << indent << "  \"prefill_prompt_tok_s_median\": " << median(prefill_tok_s) << ",\n"
         << indent << "  \"decode_time_s_median\": " << median(decode_times) << ",\n"
-        << indent << "  \"decode_eager_tok_s_median\": ";
+        << indent << "  \"decode_tok_s_median\": ";
     if (decode_tok_s.empty()) {
         out << "null";
     } else {
@@ -739,7 +739,8 @@ void write_raw_report(const std::string& path, const RawReport& report) {
         << "    \"max_context\": " << report.max_context << ",\n"
         << "    \"workspace_lifetime_policy\": \"" << json_escape(report.workspace_lifetime_policy)
         << "\",\n"
-        << "    \"decode_metric\": \"decode_eager_tok_s\",\n"
+        << "    \"decode_metric\": \"decode_tok_s\",\n"
+        << "    \"decode_path\": \"" << json_escape(report.decode_path) << "\",\n"
         << "    \"sampling_location\": \"device_argmax\",\n"
         << "    \"token_readback\": \"per_step_sync_d2h\",\n"
         << "    \"includes_token_readback\": true,\n"

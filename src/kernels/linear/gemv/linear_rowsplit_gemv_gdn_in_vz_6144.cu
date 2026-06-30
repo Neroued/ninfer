@@ -14,7 +14,7 @@ namespace {
 
 constexpr int kN            = 6144;
 constexpr int kK            = 5120;
-constexpr int kRowsPerBlock = 16;
+constexpr int kRowsPerBlock = 24;
 constexpr int kStages       = 2;
 
 void require_shape(const Weight& w, const char* name) {

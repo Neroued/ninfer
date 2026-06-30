@@ -26,6 +26,17 @@ std::string format_seconds(double seconds) {
     return out.str();
 }
 
+std::string format_tok_s(double tokens, double seconds) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2);
+    if (seconds > 0.0 && tokens > 0.0) {
+        out << (tokens / seconds) << " tok/s";
+    } else {
+        out << "n/a";
+    }
+    return out.str();
+}
+
 std::string format_bytes(std::uint64_t bytes) {
     constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
     constexpr double kMiB = 1024.0 * 1024.0;
@@ -162,16 +173,26 @@ int main(int argc, char** argv) {
             std::cerr << '\n';
         }
 
-        const double seconds = result.timings.prefill_seconds + result.timings.decode_seconds;
-        const double tok_s =
-            seconds > 0.0 ? static_cast<double>(result.generated_token_ids.size()) / seconds : 0.0;
-        print_metric("generated tokens", std::to_string(result.generated_token_ids.size()));
+        // Prefill processes the whole prompt and emits the first token; the decode
+        // loop emits the remaining (generated - 1) tokens. Report the two phases
+        // separately so prefill (prompt ingestion) and decode (generation) speeds
+        // are not blended into one number.
+        const std::size_t prompt_tokens    = result.prompt_token_ids.size();
+        const std::size_t generated_tokens = result.generated_token_ids.size();
+        const std::size_t decode_tokens    = generated_tokens > 0 ? generated_tokens - 1 : 0;
+        const double      prefill_seconds  = result.timings.prefill_seconds;
+        const double      decode_seconds   = result.timings.decode_seconds;
+        const double      seconds          = prefill_seconds + decode_seconds;
+
+        print_metric("prompt tokens", std::to_string(prompt_tokens));
+        print_metric("generated tokens", std::to_string(generated_tokens));
         print_metric("model elapsed", format_seconds(seconds));
-        {
-            std::ostringstream out;
-            out << std::fixed << std::setprecision(2) << tok_s << " tok/s";
-            print_metric("throughput", out.str());
-        }
+        print_metric("prefill speed",
+                     format_tok_s(static_cast<double>(prompt_tokens), prefill_seconds));
+        print_metric("decode speed",
+                     format_tok_s(static_cast<double>(decode_tokens), decode_seconds));
+        print_metric("throughput (overall)",
+                     format_tok_s(static_cast<double>(generated_tokens), seconds));
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';
         std::cerr << qus::text::usage_text(argv[0]);

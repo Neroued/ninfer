@@ -13,6 +13,7 @@
 #include "qus/kernels/l2norm.h"
 #include "qus/kernels/linear.h"
 #include "qus/kernels/linear_residual.h"
+#include "qus/kernels/mlp_gate_up_silu.h"
 #include "qus/kernels/embed_gather.h"
 #include "qus/kernels/residual_add.h"
 #include "qus/kernels/rmsnorm.h"
@@ -493,12 +494,8 @@ void Qwen3_6_27B::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     kernels::rmsnorm(x, *post_norm, kCfg.rms_eps, true, nullptr, h, s);
 
     if (ph == Phase::Decode) {
-        Tensor gu = work_.alloc(DType::BF16, {2 * kCfg.intermediate, 1});
-        kernels::linear(h, *m.gate_up, gu, work_, s);
-        Tensor g = gu.slice(0, 0, kCfg.intermediate);
-        Tensor u = gu.slice(0, kCfg.intermediate, kCfg.intermediate);
         Tensor a = work_.alloc(DType::BF16, {kCfg.intermediate, 1});
-        kernels::silu_and_mul(g, u, a, s);
+        kernels::mlp_gate_up_silu_decode(h, *m.gate_up, a, s);
 
         kernels::linear_residual_add(a, *m.down, x, work_, s);
         return;

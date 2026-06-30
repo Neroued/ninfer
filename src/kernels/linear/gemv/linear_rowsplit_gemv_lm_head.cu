@@ -17,11 +17,25 @@ constexpr int kGroupK = 64;
 constexpr int kGroups = kK / kGroupK;
 constexpr int kNibbleBytesPerGroup = 32;
 constexpr int kHighBytesPerGroup = 16;
+constexpr int kVecBytes = 16;
+constexpr int kGroupsPerWarpTile = 16;
+constexpr int kNibbleVecsPerWarpTile = kGroupsPerWarpTile * kNibbleBytesPerGroup / kVecBytes;
+constexpr int kHighVecsPerWarpTile = kGroupsPerWarpTile * kHighBytesPerGroup / kVecBytes;
 constexpr int kWarpsPerBlock = 4;
 constexpr int kBlockThreads = kWarpsPerBlock * 32;
+static_assert(kGroups % kGroupsPerWarpTile == 0);
+static_assert(kNibbleVecsPerWarpTile == 32);
+static_assert(kHighVecsPerWarpTile == 16);
 
 __device__ __forceinline__ int sign_extend_q6(int v) {
     return (v & 0x20) ? (v - 64) : v;
+}
+
+__device__ __forceinline__ std::uint16_t load_scale_bits(const std::uint8_t* scale_row,
+                                                         int group) {
+    const std::uint8_t* sp = scale_row + group * 2;
+    return static_cast<std::uint16_t>(sp[0]) |
+           static_cast<std::uint16_t>(static_cast<std::uint16_t>(sp[1]) << 8);
 }
 
 __device__ __forceinline__ float accumulate_group(const __nv_bfloat162* __restrict__ x2,
@@ -48,6 +62,9 @@ __global__ void linear_rowsplit_gemv_lm_head_q6_kernel(const __nv_bfloat16* __re
                                                        const std::uint8_t* __restrict__ high_bits,
                                                        const std::uint8_t* __restrict__ scales,
                                                        __nv_bfloat16* __restrict__ out) {
+    __shared__ uint4 nibble_tile[kWarpsPerBlock][kNibbleVecsPerWarpTile];
+    __shared__ uint4 high_tile[kWarpsPerBlock][kHighVecsPerWarpTile];
+
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int row = static_cast<int>(blockIdx.x) * kWarpsPerBlock + warp;
@@ -61,29 +78,32 @@ __global__ void linear_rowsplit_gemv_lm_head_q6_kernel(const __nv_bfloat16* __re
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
 
     float acc = 0.0f;
-#pragma unroll 1
-    for (int group = 0; group < kGroups; group += 2) {
-        const std::uint8_t* code_group0 = code_row + group * kNibbleBytesPerGroup;
-        const std::uint8_t* code_group1 = code_group0 + kNibbleBytesPerGroup;
-        const std::uint8_t* high_group0 = high_row + group * kHighBytesPerGroup;
-        const std::uint8_t* high_group1 = high_group0 + kHighBytesPerGroup;
+    for (int tile = 0; tile < kGroups; tile += kGroupsPerWarpTile) {
+        const auto* nibble_vecs =
+            reinterpret_cast<const uint4*>(code_row + tile * kNibbleBytesPerGroup);
+        const auto* high_vecs =
+            reinterpret_cast<const uint4*>(high_row + tile * kHighBytesPerGroup);
+        nibble_tile[warp][lane] = nibble_vecs[lane];
+        if (lane < kHighVecsPerWarpTile) { high_tile[warp][lane] = high_vecs[lane]; }
+        __syncwarp();
 
-        std::uint16_t scale0_bits = 0;
-        std::uint16_t scale1_bits = 0;
-        if (lane == 0) {
-            const std::uint8_t* sp = scale_row + group * 2;
-            scale0_bits = static_cast<std::uint16_t>(sp[0]) |
-                          static_cast<std::uint16_t>(static_cast<std::uint16_t>(sp[1]) << 8);
-        } else if (lane == 1) {
-            const std::uint8_t* sp = scale_row + (group + 1) * 2;
-            scale1_bits = static_cast<std::uint16_t>(sp[0]) |
-                          static_cast<std::uint16_t>(static_cast<std::uint16_t>(sp[1]) << 8);
+        std::uint16_t lane_scale_bits = 0;
+        if (lane < kGroupsPerWarpTile) {
+            lane_scale_bits = load_scale_bits(scale_row, tile + lane);
         }
-        scale0_bits = static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, scale0_bits, 0));
-        scale1_bits = static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, scale1_bits, 1));
+        const auto* tile_nibbles = reinterpret_cast<const std::uint8_t*>(nibble_tile[warp]);
+        const auto* tile_highs = reinterpret_cast<const std::uint8_t*>(high_tile[warp]);
 
-        acc = accumulate_group(x2, code_group0, high_group0, scale0_bits, lane, group, acc);
-        acc = accumulate_group(x2, code_group1, high_group1, scale1_bits, lane, group + 1, acc);
+#pragma unroll
+        for (int tile_group = 0; tile_group < kGroupsPerWarpTile; ++tile_group) {
+            const auto scale_bits = static_cast<std::uint16_t>(
+                __shfl_sync(0xffffffffu, lane_scale_bits, tile_group));
+            acc = accumulate_group(
+                x2, tile_nibbles + tile_group * kNibbleBytesPerGroup,
+                tile_highs + tile_group * kHighBytesPerGroup, scale_bits, lane, tile + tile_group,
+                acc);
+        }
+        __syncwarp();
     }
 
 #pragma unroll

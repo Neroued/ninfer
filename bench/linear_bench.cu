@@ -126,12 +126,13 @@ void run_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype
     Tensor tx(x.p, DType::BF16, {k, t});
     Tensor tout(out.p, DType::BF16, {n, t});
     Weight w = dense_weight(wbuf.p, qtype, n, k);
+    WorkspaceArena ws(64ULL << 20);
 
     const double weight_bytes = static_cast<double>(w_elems) *
                                 ((qtype == QType::FP32_CTRL) ? 4.0 : 2.0) * static_cast<double>(t);
     const double bytes =
         static_cast<double>(x_elems) * 2.0 + weight_bytes + static_cast<double>(out_elems) * 2.0;
-    const Result r = bench_loop([&](cudaStream_t s) { kernels::linear(tx, w, tout, s); }, bytes);
+    const Result r = bench_loop([&](cudaStream_t s) { kernels::linear(tx, w, tout, ws, s); }, bytes);
 
     char tag[96];
     std::snprintf(tag, sizeof(tag), "linear %s %s [%d,%d] T=%d", qtype_name(qtype), phase, n, k, t);
@@ -258,7 +259,8 @@ void run_lowbit_decode(const LowbitShape& shape, QType qtype) {
 
     const double bytes = static_cast<double>(x_elems) * 2.0 + static_cast<double>(w.payload_bytes) +
                          static_cast<double>(out_elems) * 2.0;
-    const launch_fn launch = [&](cudaStream_t s) { kernels::linear(tx, w, tout, s); };
+    WorkspaceArena ws(64ULL << 20);
+    const launch_fn launch = [&](cudaStream_t s) { kernels::linear(tx, w, tout, ws, s); };
     const Result r = g_cold ? bench_loop_cold(launch, bytes) : bench_loop(launch, bytes);
 
     char tag[112];

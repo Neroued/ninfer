@@ -468,9 +468,10 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     Tensor tx(x.p, DType::BF16, {shape.k, 1});
     Tensor tout(out.p, DType::BF16, {shape.n, 1});
     Weight w = make_weight(wbuf, target.qtype, shape.n, shape.k);
+    WorkspaceArena ws(64ULL << 20);
 
     const TimingStats stats = measure_cold(
-        [&](cudaStream_t s) { kernels::linear(tx, w, tout, s); }, flush, stream, opt.warmup,
+        [&](cudaStream_t s) { kernels::linear(tx, w, tout, ws, s); }, flush, stream, opt.warmup,
         opt.repeat);
 
     const std::uint64_t x_bytes        = static_cast<std::uint64_t>(shape.k) * 2ULL;

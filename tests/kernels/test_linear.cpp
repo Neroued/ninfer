@@ -128,7 +128,8 @@ int one_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype,
 
     Tensor tx(dx.p, DType::BF16, {k, t});
     Tensor tout(dout.p, DType::BF16, {n, t});
-    kernels::linear(tx, dense_weight(dw.p, qtype, n, k), tout, nullptr);
+    WorkspaceArena ws(64ULL << 20);
+    kernels::linear(tx, dense_weight(dw.p, qtype, n, k), tout, ws, nullptr);
     cudaDeviceSynchronize();
 
     const std::string suffix = case_name ? (" " + std::string(case_name)) : std::string();
@@ -166,9 +167,10 @@ int fp32_ctrl_first_column_consistency(std::int32_t n, std::int32_t k, std::int3
     Tensor tout_one(out_one.p, DType::BF16, {n, 1});
     Tensor tout_many(out_many.p, DType::BF16, {n, t});
     Weight w = dense_weight(dw.p, QType::FP32_CTRL, n, k);
+    WorkspaceArena ws(64ULL << 20);
 
-    kernels::linear(tx_one, w, tout_one, nullptr);
-    kernels::linear(tx_many, w, tout_many, nullptr);
+    kernels::linear(tx_one, w, tout_one, ws, nullptr);
+    kernels::linear(tx_many, w, tout_many, ws, nullptr);
     cudaDeviceSynchronize();
 
     const std::vector<double> got_one = from_device_bf16(out_one, n);
@@ -205,6 +207,7 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
     DBuf dx = to_device_bf16(x);
     DBuf dweight(packed.payload.size());
     cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
+    WorkspaceArena ws(64ULL << 20);
 
     int failures = 0;
     for (std::int32_t t : ts) {
@@ -212,7 +215,7 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
         Tensor tx(dx.p, DType::BF16, {k, t});
         Tensor tout(dout.p, DType::BF16, {n, t});
         try {
-            kernels::linear(tx, packed.device_weight(dweight.p), tout, nullptr);
+            kernels::linear(tx, packed.device_weight(dweight.p), tout, ws, nullptr);
             cudaDeviceSynchronize();
         } catch (const std::exception& e) {
             std::cerr << "linear " << qtype_name(qtype) << " [" << n << "," << k << "] T=" << t
@@ -245,11 +248,12 @@ int unsupported_qtype_validation() {
     DBuf dout(2 * 2u);
     Tensor tx(dx.p, DType::BF16, {4, 1});
     Tensor tout(dout.p, DType::BF16, {2, 1});
+    WorkspaceArena ws(64ULL << 20);
 
     Weight w = dense_weight(dx.p, QType::BF16_CTRL, 2, 4);
     w.qtype  = QType::W8G128_F16S;
     try {
-        kernels::linear(tx, w, tout, nullptr);
+        kernels::linear(tx, w, tout, ws, nullptr);
         std::cerr << "linear unsupported W8 qtype: expected invalid_argument\n";
         ++f;
     } catch (const std::invalid_argument&) {}
@@ -265,13 +269,14 @@ int dense_metadata_validation() {
     DBuf dout(2 * 2u);
     Tensor tx(dx.p, DType::BF16, {4, 1});
     Tensor tout(dout.p, DType::BF16, {2, 1});
+    WorkspaceArena ws(64ULL << 20);
 
     Weight w = dense_weight(dx.p, QType::BF16_CTRL, 2, 4);
 
     try {
         Weight bad            = w;
         bad.q5090_scale_dtype = ScaleDType::FP16;
-        kernels::linear(tx, bad, tout, nullptr);
+        kernels::linear(tx, bad, tout, ws, nullptr);
         std::cerr << "linear dense scale dtype: expected invalid_argument\n";
         ++f;
     } catch (const std::invalid_argument&) {}
@@ -279,7 +284,7 @@ int dense_metadata_validation() {
     try {
         Weight bad          = w;
         bad.padded_shape[0] = 64;
-        kernels::linear(tx, bad, tout, nullptr);
+        kernels::linear(tx, bad, tout, ws, nullptr);
         std::cerr << "linear dense padded N: expected invalid_argument\n";
         ++f;
     } catch (const std::invalid_argument&) {}
@@ -287,7 +292,7 @@ int dense_metadata_validation() {
     try {
         Weight bad          = w;
         bad.padded_shape[1] = 64;
-        kernels::linear(tx, bad, tout, nullptr);
+        kernels::linear(tx, bad, tout, ws, nullptr);
         std::cerr << "linear dense padded K: expected invalid_argument\n";
         ++f;
     } catch (const std::invalid_argument&) {}
@@ -295,7 +300,7 @@ int dense_metadata_validation() {
     try {
         Weight bad          = w;
         bad.padded_shape[2] = 2;
-        kernels::linear(tx, bad, tout, nullptr);
+        kernels::linear(tx, bad, tout, ws, nullptr);
         std::cerr << "linear dense padded trailing dim: expected invalid_argument\n";
         ++f;
     } catch (const std::invalid_argument&) {}
@@ -305,7 +310,7 @@ int dense_metadata_validation() {
         Tensor empty_out(nullptr, DType::BF16, {2, 1});
         empty_tx.ne[1]  = 0;
         empty_out.ne[1] = 0;
-        kernels::linear(empty_tx, w, empty_out, nullptr);
+        kernels::linear(empty_tx, w, empty_out, ws, nullptr);
     } catch (const std::exception& e) {
         std::cerr << "linear dense empty T: expected no throw, got " << e.what() << '\n';
         ++f;
@@ -331,10 +336,11 @@ int dense_alignment_validation() {
     Tensor tx(dx.p, DType::BF16, {k, 1});
     Tensor tout(dout.p, DType::BF16, {n, 1});
     Weight w = dense_weight(dw.p, QType::BF16_CTRL, n, k);
+    WorkspaceArena ws(64ULL << 20);
 
     try {
         Tensor bad_x(x_bytes + 2, DType::BF16, {k, 1});
-        kernels::linear(bad_x, w, tout, nullptr);
+        kernels::linear(bad_x, w, tout, ws, nullptr);
         cudaDeviceSynchronize();
         std::cerr << "linear dense unaligned x: expected invalid_argument\n";
         ++f;
@@ -342,7 +348,7 @@ int dense_alignment_validation() {
 
     try {
         Weight bad_w = dense_weight(w_bytes + 2, QType::BF16_CTRL, n, k);
-        kernels::linear(tx, bad_w, tout, nullptr);
+        kernels::linear(tx, bad_w, tout, ws, nullptr);
         cudaDeviceSynchronize();
         std::cerr << "linear dense unaligned weight: expected invalid_argument\n";
         ++f;
@@ -350,7 +356,7 @@ int dense_alignment_validation() {
 
     try {
         Tensor bad_out(out_bytes + 2, DType::BF16, {n, 1});
-        kernels::linear(tx, w, bad_out, nullptr);
+        kernels::linear(tx, w, bad_out, ws, nullptr);
         cudaDeviceSynchronize();
         std::cerr << "linear dense unaligned out: expected invalid_argument\n";
         ++f;
@@ -374,11 +380,12 @@ int lowbit_metadata_validation(QType qtype) {
     DBuf dout(static_cast<std::size_t>(n) * 2u);
     Tensor tx(dx.p, DType::BF16, {k, 1});
     Tensor tout(dout.p, DType::BF16, {n, 1});
+    WorkspaceArena ws(64ULL << 20);
 
     try {
         Weight bad        = packed.device_weight(dx.p);
         bad.payload_bytes = 0;
-        kernels::linear(tx, bad, tout, nullptr);
+        kernels::linear(tx, bad, tout, ws, nullptr);
         std::cerr << "linear " << qtype_name(qtype) << " payload size: expected invalid_argument\n";
         ++f;
     } catch (const std::invalid_argument&) {}
@@ -389,7 +396,7 @@ int lowbit_metadata_validation(QType qtype) {
         empty_tx.ne[1]   = 0;
         empty_out.ne[1]  = 0;
         Weight bad       = packed.device_weight(nullptr);
-        kernels::linear(empty_tx, bad, empty_out, nullptr);
+        kernels::linear(empty_tx, bad, empty_out, ws, nullptr);
         std::cerr << "linear " << qtype_name(qtype)
                   << " empty T null payload: expected invalid_argument\n";
         ++f;
@@ -402,7 +409,7 @@ int lowbit_metadata_validation(QType qtype) {
         empty_out.data   = nullptr;
         empty_tx.ne[1]   = 0;
         empty_out.ne[1]  = 0;
-        kernels::linear(empty_tx, packed.device_weight(dx.p), empty_out, nullptr);
+        kernels::linear(empty_tx, packed.device_weight(dx.p), empty_out, ws, nullptr);
     } catch (const std::exception& e) {
         std::cerr << "linear " << qtype_name(qtype) << " empty T: expected no throw, got "
                   << e.what() << '\n';

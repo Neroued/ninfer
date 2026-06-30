@@ -305,10 +305,10 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    kernels::linear(h, *w.q_proj, q_flat, s);
-    kernels::linear(h, *w.gate_proj, gate_flat, s);
-    kernels::linear(h, *w.k_proj, k_flat, s);
-    kernels::linear(h, *w.v_proj, v_flat, s);
+    kernels::linear(h, *w.q_proj, q_flat, work_, s);
+    kernels::linear(h, *w.gate_proj, gate_flat, work_, s);
+    kernels::linear(h, *w.k_proj, k_flat, work_, s);
+    kernels::linear(h, *w.v_proj, v_flat, work_, s);
 
     Tensor qn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
     Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
@@ -326,7 +326,7 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     kernels::sigmoid_gate_mul(gate, a, s);
 
     Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, T});
-    kernels::linear(a.view({kCfg.q_size, T}), *w.o_proj, o, s);
+    kernels::linear(a.view({kCfg.q_size, T}), *w.o_proj, o, work_, s);
     kernels::residual_add(o, x, s);
 }
 
@@ -340,9 +340,9 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor q = work_.alloc(DType::BF16, {kCfg.key_dim, T});
     Tensor k = work_.alloc(DType::BF16, {kCfg.key_dim, T});
     Tensor v = work_.alloc(DType::BF16, {kCfg.value_dim, T});
-    kernels::linear(h, *w.in_q, q, s);
-    kernels::linear(h, *w.in_k, k, s);
-    kernels::linear(h, *w.in_v, v, s);
+    kernels::linear(h, *w.in_q, q, work_, s);
+    kernels::linear(h, *w.in_k, k, work_, s);
+    kernels::linear(h, *w.in_v, v, work_, s);
 
     Tensor qkv = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
     copy_bf16_block(q, qkv, 0, s);
@@ -351,8 +351,8 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, T});
     Tensor b = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, T});
-    kernels::linear(h, *w.in_a, a, s);
-    kernels::linear(h, *w.in_b, b, s);
+    kernels::linear(h, *w.in_a, a, work_, s);
+    kernels::linear(h, *w.in_b, b, work_, s);
 
     Tensor qkv_c       = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
     Tensor& conv_state = state_.conv.at(static_cast<std::size_t>(gidx));
@@ -390,13 +390,13 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     Tensor z      = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor z_flat = z.view({kCfg.value_dim, T});
-    kernels::linear(h, *w.in_z, z_flat, s);
+    kernels::linear(h, *w.in_z, z_flat, work_, s);
 
     Tensor on = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     kernels::rmsnorm(o, *w.gdn_norm, kCfg.rms_eps, false, &z, on, s);
 
     Tensor out = work_.alloc(DType::BF16, {kCfg.hidden, T});
-    kernels::linear(on.view({kCfg.value_dim, T}), *w.out_proj, out, s);
+    kernels::linear(on.view({kCfg.value_dim, T}), *w.out_proj, out, work_, s);
     kernels::residual_add(out, x, s);
 }
 
@@ -410,14 +410,14 @@ void Qwen3_6_27B::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 
     Tensor g = work_.alloc(DType::BF16, {kCfg.intermediate, T});
     Tensor u = work_.alloc(DType::BF16, {kCfg.intermediate, T});
-    kernels::linear(h, *m.gate, g, s);
-    kernels::linear(h, *m.up, u, s);
+    kernels::linear(h, *m.gate, g, work_, s);
+    kernels::linear(h, *m.up, u, work_, s);
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.intermediate, T});
     kernels::silu_and_mul(g, u, a, s);
 
     Tensor d = work_.alloc(DType::BF16, {kCfg.hidden, T});
-    kernels::linear(a, *m.down, d, s);
+    kernels::linear(a, *m.down, d, work_, s);
     kernels::residual_add(d, x, s);
 }
 
@@ -482,7 +482,7 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
     kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, xf, s);
     if constexpr (Tap::enabled) { tap(TapId::AfterFinalNorm, -1, Phase::Prefill, xf, s); }
     Tensor last = xf.slice(1, T - 1, 1);
-    kernels::linear(last, *lm_head_, io_.logits, s);
+    kernels::linear(last, *lm_head_, io_.logits, work_, s);
     if constexpr (Tap::enabled) { tap(TapId::AfterLogits, -1, Phase::Prefill, io_.logits, s); }
     kernels::argmax(io_.logits, io_.token, s);
 
@@ -515,7 +515,7 @@ void Qwen3_6_27B::decode_step_impl(Tap& tap) {
     Tensor xf = work_.alloc(DType::BF16, {kCfg.hidden, 1});
     kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, xf, s);
     if constexpr (Tap::enabled) { tap(TapId::AfterFinalNorm, -1, Phase::Decode, xf, s); }
-    kernels::linear(xf, *lm_head_, io_.logits, s);
+    kernels::linear(xf, *lm_head_, io_.logits, work_, s);
     if constexpr (Tap::enabled) { tap(TapId::AfterLogits, -1, Phase::Decode, io_.logits, s); }
     kernels::argmax(io_.logits, io_.token, s);
 

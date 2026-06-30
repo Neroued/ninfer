@@ -213,7 +213,9 @@ void require_dense_alignment(const Tensor& x, const Weight& w, const Tensor& out
 
 } // namespace
 
-void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+            cudaStream_t stream) {
+    (void)ws;
     if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("linear: x/out must be BF16");
     }

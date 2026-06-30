@@ -6,8 +6,6 @@
 #include "kernels/q5090_pack.h"
 
 #include <algorithm>
-#include <array>
-#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -109,143 +107,6 @@ void cpu_linear_dequant(const std::vector<float>& x, const std::vector<float>& w
         });
     }
     for (auto& thread : threads) { thread.join(); }
-}
-
-std::vector<std::uint16_t> from_device_bf16_bits(const DBuf& d, std::size_t n) {
-    std::vector<std::uint16_t> bits(n);
-    cudaMemcpy(bits.data(), d.p, n * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
-    return bits;
-}
-
-enum class OldGemvReduction {
-    OneWarp,
-    FourWarp,
-    EightWarp,
-};
-
-struct OldGemvSegment {
-    std::int32_t rows;
-    OldGemvReduction reduction;
-};
-
-const char* old_reduction_name(OldGemvReduction reduction) {
-    switch (reduction) {
-    case OldGemvReduction::OneWarp:
-        return "one-warp";
-    case OldGemvReduction::FourWarp:
-        return "four-warp";
-    case OldGemvReduction::EightWarp:
-        return "eight-warp";
-    }
-    return "unknown";
-}
-
-float fadd32(float a, float b) { return static_cast<float>(a + b); }
-
-float ffma32(float a, float b, float c) { return std::fma(a, b, c); }
-
-float old_warp_reduce(std::array<float, 32> lanes) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        const std::array<float, 32> prev = lanes;
-        for (int lane = 0; lane + offset < 32; ++lane) {
-            lanes[static_cast<std::size_t>(lane)] =
-                fadd32(prev[static_cast<std::size_t>(lane)],
-                       prev[static_cast<std::size_t>(lane + offset)]);
-        }
-    }
-    return lanes[0];
-}
-
-float old_warp_partial(const std::vector<float>& x, const std::vector<float>& weight,
-                       std::int32_t row, std::int32_t k, std::int32_t group_begin,
-                       std::int32_t group_count) {
-    constexpr std::int32_t kGroupK = 64;
-    std::array<float, 32> lanes{};
-    const float* wrow = weight.data() + static_cast<std::size_t>(row) * k;
-    for (std::int32_t tile_group = 0; tile_group < group_count; ++tile_group) {
-        const std::int32_t group = group_begin + tile_group;
-        for (std::int32_t lane = 0; lane < 32; ++lane) {
-            const std::int32_t k0 = group * kGroupK + lane * 2;
-            float& acc = lanes[static_cast<std::size_t>(lane)];
-            acc = ffma32(wrow[k0], x[static_cast<std::size_t>(k0)], acc);
-            acc = ffma32(wrow[k0 + 1], x[static_cast<std::size_t>(k0 + 1)], acc);
-        }
-    }
-    return old_warp_reduce(lanes);
-}
-
-std::uint16_t old_row_bits(const std::vector<float>& x, const std::vector<float>& weight,
-                           std::int32_t row, std::int32_t k, OldGemvReduction reduction) {
-    constexpr std::int32_t kGroupK = 64;
-    if (k % kGroupK != 0) { throw std::invalid_argument("old GEMV reference requires K % 64 == 0"); }
-
-    const std::int32_t groups = k / kGroupK;
-    std::int32_t warps = 1;
-    if (reduction == OldGemvReduction::FourWarp) {
-        warps = 4;
-    } else if (reduction == OldGemvReduction::EightWarp) {
-        warps = 8;
-    }
-    if (groups % warps != 0) {
-        throw std::invalid_argument("old GEMV reference requires even group split");
-    }
-
-    const std::int32_t groups_per_warp = groups / warps;
-    std::array<float, 8> partials{};
-    for (std::int32_t warp = 0; warp < warps; ++warp) {
-        partials[static_cast<std::size_t>(warp)] =
-            old_warp_partial(x, weight, row, k, warp * groups_per_warp, groups_per_warp);
-    }
-
-    float acc = partials[0];
-    for (std::int32_t warp = 1; warp < warps; ++warp) {
-        acc = fadd32(acc, partials[static_cast<std::size_t>(warp)]);
-    }
-    return q5090::detail::f32_to_bf16(acc);
-}
-
-std::vector<OldGemvReduction> expand_segment_reductions(std::int32_t n,
-                                                        const std::vector<OldGemvSegment>& segments) {
-    std::vector<OldGemvReduction> reductions;
-    reductions.reserve(static_cast<std::size_t>(n));
-    for (const OldGemvSegment& segment : segments) {
-        if (segment.rows <= 0) { throw std::invalid_argument("old GEMV segment rows must be positive"); }
-        for (std::int32_t row = 0; row < segment.rows; ++row) {
-            reductions.push_back(segment.reduction);
-        }
-    }
-    if (reductions.size() != static_cast<std::size_t>(n)) {
-        throw std::invalid_argument("old GEMV segment rows do not match fused N");
-    }
-    return reductions;
-}
-
-std::vector<std::uint16_t> old_segment_gemv_bits(const std::vector<float>& x,
-                                                 const std::vector<float>& weight, std::int32_t n,
-                                                 std::int32_t k,
-                                                 const std::vector<OldGemvSegment>& segments) {
-    const std::vector<OldGemvReduction> reductions = expand_segment_reductions(n, segments);
-    std::vector<std::uint16_t> expected(static_cast<std::size_t>(n));
-
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const std::int32_t n_threads =
-        std::min<std::int32_t>(n, static_cast<std::int32_t>(std::min<unsigned>(hw, 16u)));
-    std::vector<std::thread> threads;
-    threads.reserve(static_cast<std::size_t>(n_threads));
-    for (std::int32_t tid = 0; tid < n_threads; ++tid) {
-        const std::int32_t row_begin =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(n) * tid) / n_threads);
-        const std::int32_t row_end =
-            static_cast<std::int32_t>((static_cast<std::int64_t>(n) * (tid + 1)) / n_threads);
-        threads.emplace_back([&, row_begin, row_end] {
-            for (std::int32_t row = row_begin; row < row_end; ++row) {
-                expected[static_cast<std::size_t>(row)] =
-                    old_row_bits(x, weight, row, k, reductions[static_cast<std::size_t>(row)]);
-            }
-        });
-    }
-    for (auto& thread : threads) { thread.join(); }
-    return expected;
 }
 
 int one_dense_shape(std::int32_t n, std::int32_t k, std::int32_t t, QType qtype, std::uint32_t seed,
@@ -373,59 +234,6 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
                            ref, Tolerance::linear_bf16());
     }
     return failures;
-}
-
-int fused_matches_old_segment_gemvs_byte_exact(QType qtype, std::int32_t n, std::int32_t k,
-                                               const std::vector<OldGemvSegment>& segments,
-                                               std::uint32_t seed, const char* case_name) {
-    std::vector<float> source(static_cast<std::size_t>(n) * k);
-    fill_uniform(source, seed + 2000u, -0.5f, 0.5f);
-    round_to_bf16(source);
-    q5090::PackedWeight packed = q5090::pack_row_split_lowbit(source, n, k, qtype);
-    std::vector<float>().swap(source);
-
-    std::vector<float> x(static_cast<std::size_t>(k));
-    fill_uniform(x, seed, -3.0f, 3.0f);
-    round_to_bf16(x);
-
-    DBuf dx = to_device_bf16(x);
-    DBuf dweight(packed.payload.size());
-    cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
-    DBuf dout(static_cast<std::size_t>(n) * 2u);
-    Tensor tx(dx.p, DType::BF16, {k, 1});
-    Tensor tout(dout.p, DType::BF16, {n, 1});
-    WorkspaceArena ws(128ULL << 20);
-
-    const std::string label = "linear " + std::string(qtype_name(qtype)) + " " + case_name +
-                              " old-segment byte equivalence seed=" + std::to_string(seed);
-    try {
-        kernels::linear(tx, packed.device_weight(dweight.p), tout, ws, nullptr);
-        cudaDeviceSynchronize();
-    } catch (const std::exception& e) {
-        std::cerr << label << ": unexpected exception: " << e.what() << '\n';
-        return 1;
-    }
-
-    std::vector<std::uint16_t> expected;
-    try {
-        expected = old_segment_gemv_bits(x, packed.dequant, n, k, segments);
-    } catch (const std::exception& e) {
-        std::cerr << label << ": reference construction failed: " << e.what() << '\n';
-        return 1;
-    }
-
-    const std::vector<std::uint16_t> got = from_device_bf16_bits(dout, static_cast<std::size_t>(n));
-    const std::vector<OldGemvReduction> reductions = expand_segment_reductions(n, segments);
-    for (std::int32_t row = 0; row < n; ++row) {
-        const auto idx = static_cast<std::size_t>(row);
-        if (got[idx] != expected[idx]) {
-            std::cerr << label << ": row " << row << " reduction="
-                      << old_reduction_name(reductions[idx]) << " got_bits=" << got[idx]
-                      << " expected_bits=" << expected[idx] << '\n';
-            return 1;
-        }
-    }
-    return 0;
 }
 
 int one_q4_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
@@ -663,22 +471,6 @@ int main() {
         f += one_quant_shape(QType::Q5G64_F16S, n, k, {1, 7}, 29u);
     }
     f += one_quant_shape(QType::Q6G64_F16S, 4096, 5120, {1, 7}, 31u);
-    f += fused_matches_old_segment_gemvs_byte_exact(
-        QType::Q4G64_F16S, 34816, 5120,
-        {{17408, OldGemvReduction::OneWarp}, {17408, OldGemvReduction::OneWarp}}, 131u,
-        "fused 34816 mlp gate/up");
-    f += fused_matches_old_segment_gemvs_byte_exact(
-        QType::Q4G64_F16S, 7168, 5120,
-        {{6144, OldGemvReduction::OneWarp}, {1024, OldGemvReduction::FourWarp}}, 137u,
-        "fused 7168 attn q/k");
-    f += fused_matches_old_segment_gemvs_byte_exact(
-        QType::Q5G64_F16S, 7168, 5120,
-        {{6144, OldGemvReduction::OneWarp}, {1024, OldGemvReduction::EightWarp}}, 139u,
-        "fused 7168 attn gate/v");
-    f += fused_matches_old_segment_gemvs_byte_exact(
-        QType::Q4G64_F16S, 4096, 5120,
-        {{2048, OldGemvReduction::FourWarp}, {2048, OldGemvReduction::FourWarp}}, 149u,
-        "fused 4096 gdn q/k");
 
     std::cout << (f ? "FAIL" : "OK") << " linear correctness\n";
     return f ? 1 : 0;

@@ -148,7 +148,6 @@ int main(int argc, char** argv) {
         generation_options.stop_token_ids = stop_token_ids;
         generation_options.stream_callback = [](const qus::text::TextStreamChunk& chunk) {
             std::cout << chunk.text;
-            std::cout.flush();
         };
 
         qus::text::TextGenerationRunner runner(tokenizer, engine);

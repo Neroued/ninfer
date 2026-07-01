@@ -5,6 +5,7 @@
 // every prompt token with fp32 online softmax and fp32 AV accumulation.
 
 #include <cuda_bf16.h>
+#include <math_constants.h>
 
 #include <cstdint>
 
@@ -65,6 +66,47 @@ __device__ __forceinline__ float gqa_prefill_block_sum_256(float value, float* s
     return value;
 }
 
+__device__ __forceinline__ int gqa_prefill_swz(int row, int col) {
+    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
+}
+
+__device__ __forceinline__ int gqa_prefill_swz32(int row, int col) {
+    return (((col >> 3) ^ (row & 3)) << 3) | (col & 7);
+}
+
+__device__ __forceinline__ unsigned gqa_prefill_smem_addr(const void* p) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void gqa_prefill_ldmatrix_x4(unsigned& a0, unsigned& a1, unsigned& a2,
+                                                        unsigned& a3, unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                 : "r"(addr));
+}
+
+__device__ __forceinline__ void gqa_prefill_ldmatrix_x2(unsigned& b0, unsigned& b1,
+                                                        unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b0), "=r"(b1)
+                 : "r"(addr));
+}
+
+__device__ __forceinline__ void gqa_prefill_mma_m16n8k16_bf16(
+    float& c0, float& c1, float& c2, float& c3, unsigned a0, unsigned a1, unsigned a2,
+    unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ float gqa_prefill_exp2_fast(float x) {
+    float y;
+    asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
 __global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* k, const __nv_bfloat16* v,
                                                   __nv_bfloat16* cache_k, __nv_bfloat16* cache_v,
                                                   std::int32_t tokens,
@@ -84,12 +126,11 @@ __global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* k, const 
     cache_v[cache_off]           = v[idx];
 }
 
-// PERF: Replace this correctness-first online-softmax kernel with a flash
-// prefill implementation in the Tier-3 performance milestone.
 __launch_bounds__(256) __global__
-    void gqa_attention_prefill_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
-                                      const __nv_bfloat16* cache_v, float scale, __nv_bfloat16* out,
-                                      std::int32_t tokens, std::int32_t padded_context) {
+    void gqa_attention_prefill_slow_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
+                                           const __nv_bfloat16* cache_v, float scale,
+                                           __nv_bfloat16* out, std::int32_t tokens,
+                                           std::int32_t padded_context) {
     const int block  = static_cast<int>(blockIdx.x);
     const int q_head = block % kGqaPrefillQHeads;
     const int token  = block / kGqaPrefillQHeads;
@@ -120,6 +161,234 @@ __launch_bounds__(256) __global__
     }
 
     out[gqa_prefill_q_index(q_head, d, token)] = __float2bfloat16(acc / denom);
+}
+
+__launch_bounds__(256, 2) __global__
+    void gqa_attention_prefill_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
+                                      const __nv_bfloat16* cache_v, float scale, __nv_bfloat16* out,
+                                      std::int32_t tokens, std::int32_t padded_context) {
+    constexpr int Br       = 16;
+    constexpr int Bc       = 32;
+    constexpr int D        = kGqaPrefillHeadDim;
+    constexpr int Warps    = 8;
+    constexpr int Threads  = Warps * 32;
+    constexpr float Log2E  = 1.4426950408889634074f;
+
+    static_assert(Threads == 256);
+
+    __shared__ __align__(16) __nv_bfloat16 q_s[Br * D];
+    __shared__ __align__(16) __nv_bfloat16 k_s[Bc * D];
+    __shared__ __align__(16) __nv_bfloat16 vt_s[D * Bc];
+    __shared__ __align__(16) __nv_bfloat16 p_s[Br * Bc];
+    __shared__ __align__(16) float s_s[Br * Bc];
+    __shared__ float row_m[Br];
+    __shared__ float row_l[Br];
+    __shared__ float row_alpha[Br];
+
+    const int q_block = static_cast<int>(blockIdx.x);
+    const int q_head  = static_cast<int>(blockIdx.y);
+    const int tid     = static_cast<int>(threadIdx.x);
+    const int warp    = tid >> 5;
+    const int lane    = tid & 31;
+    const int q0      = q_block * Br;
+    const int kv_head = q_head / kGqaPrefillGroupSize;
+
+    if (q_head >= kGqaPrefillQHeads || q0 >= tokens) { return; }
+
+    const int gid = lane >> 2;
+    const int lid = lane & 3;
+
+    const int a_mat    = lane >> 3;
+    const int a_rin    = lane & 7;
+    const int a_rowoff = a_rin + ((a_mat & 1) << 3);
+    const int a_coloff = (a_mat >> 1) << 3;
+    const int b_rin    = lane & 7;
+    const int b_koff   = ((lane >> 3) & 1) << 3;
+
+    if (tid < Br) {
+        row_m[tid]     = -CUDART_INF_F;
+        row_l[tid]     = 0.0f;
+        row_alpha[tid] = 0.0f;
+    }
+
+    for (int idx = tid; idx < Br * D; idx += Threads) {
+        const int row  = idx / D;
+        const int d    = idx - row * D;
+        const int qrow = q0 + row;
+        __nv_bfloat16 value = __float2bfloat16(0.0f);
+        if (qrow < tokens) { value = q[gqa_prefill_q_index(q_head, d, qrow)]; }
+        q_s[row * D + gqa_prefill_swz(row, d)] = value;
+    }
+    __syncthreads();
+
+    float acc[4][4];
+#pragma unroll
+    for (int n = 0; n < 4; ++n) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
+    }
+
+    const int max_key = min(tokens, q0 + Br);
+    for (int k0 = 0; k0 < max_key; k0 += Bc) {
+        for (int idx = tid; idx < Bc * D; idx += Threads) {
+            const int key_l = idx / D;
+            const int d     = idx - key_l * D;
+            const int key   = k0 + key_l;
+            __nv_bfloat16 kval = __float2bfloat16(0.0f);
+            __nv_bfloat16 vval = __float2bfloat16(0.0f);
+            if (key < tokens) {
+                const std::int64_t off = gqa_prefill_cache_index(kv_head, d, key, padded_context);
+                kval                   = cache_k[off];
+                vval                   = cache_v[off];
+            }
+            k_s[key_l * D + gqa_prefill_swz(key_l, d)] = kval;
+            vt_s[d * Bc + gqa_prefill_swz32(d, key_l)] = vval;
+        }
+        __syncthreads();
+
+        if (warp < 4) {
+            float score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const int n_tile = warp;
+#pragma unroll
+            for (int ks = 0; ks < D; ks += 16) {
+                unsigned af[4];
+                unsigned bf[2];
+                const int arow = a_rowoff;
+                const int acol = ks + a_coloff;
+                const int brow = n_tile * 8 + b_rin;
+                const int bcol = ks + b_koff;
+                gqa_prefill_ldmatrix_x4(af[0], af[1], af[2], af[3],
+                                        gqa_prefill_smem_addr(
+                                            &q_s[arow * D + gqa_prefill_swz(arow, acol)]));
+                gqa_prefill_ldmatrix_x2(bf[0], bf[1],
+                                        gqa_prefill_smem_addr(
+                                            &k_s[brow * D + gqa_prefill_swz(brow, bcol)]));
+                gqa_prefill_mma_m16n8k16_bf16(score[0], score[1], score[2], score[3], af[0],
+                                              af[1], af[2], af[3], bf[0], bf[1]);
+            }
+
+            const int col0 = n_tile * 8 + 2 * lid;
+            const int col1 = col0 + 1;
+            const int row0 = gid;
+            const int row1 = gid + 8;
+            const int key0 = k0 + col0;
+            const int key1 = k0 + col1;
+            const int qrow0 = q0 + row0;
+            const int qrow1 = q0 + row1;
+
+            s_s[row0 * Bc + col0] =
+                (qrow0 < tokens && key0 < tokens && key0 <= qrow0) ? score[0] * scale
+                                                                    : -CUDART_INF_F;
+            s_s[row0 * Bc + col1] =
+                (qrow0 < tokens && key1 < tokens && key1 <= qrow0) ? score[1] * scale
+                                                                    : -CUDART_INF_F;
+            s_s[row1 * Bc + col0] =
+                (qrow1 < tokens && key0 < tokens && key0 <= qrow1) ? score[2] * scale
+                                                                    : -CUDART_INF_F;
+            s_s[row1 * Bc + col1] =
+                (qrow1 < tokens && key1 < tokens && key1 <= qrow1) ? score[3] * scale
+                                                                    : -CUDART_INF_F;
+        }
+        __syncthreads();
+
+        if (tid < Br) {
+            const int row  = tid;
+            const int qrow = q0 + row;
+            float block_m  = -CUDART_INF_F;
+#pragma unroll
+            for (int c = 0; c < Bc; ++c) { block_m = fmaxf(block_m, s_s[row * Bc + c]); }
+
+            const float old_m = row_m[row];
+            const float new_m = fmaxf(old_m, block_m);
+            float alpha       = 0.0f;
+            if (old_m != -CUDART_INF_F && new_m != -CUDART_INF_F) {
+                alpha = gqa_prefill_exp2_fast((old_m - new_m) * Log2E);
+            }
+
+            float block_l = 0.0f;
+#pragma unroll
+            for (int c = 0; c < Bc; ++c) {
+                const float s = s_s[row * Bc + c];
+                float p       = 0.0f;
+                if (qrow < tokens && s != -CUDART_INF_F) {
+                    p = gqa_prefill_exp2_fast((s - new_m) * Log2E);
+                }
+                block_l += p;
+                p_s[row * Bc + gqa_prefill_swz32(row, c)] = __float2bfloat16(p);
+            }
+
+            row_m[row]     = new_m;
+            row_l[row]     = row_l[row] * alpha + block_l;
+            row_alpha[row] = alpha;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            const float a0 = row_alpha[gid];
+            const float a1 = row_alpha[gid + 8];
+            acc[n][0] *= a0;
+            acc[n][1] *= a0;
+            acc[n][2] *= a1;
+            acc[n][3] *= a1;
+        }
+
+        const int d_base = warp * 32;
+#pragma unroll
+        for (int ks = 0; ks < Bc; ks += 16) {
+            unsigned pf[4];
+            const int prow = a_rowoff;
+            const int pcol = ks + a_coloff;
+            gqa_prefill_ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+                                    gqa_prefill_smem_addr(
+                                        &p_s[prow * Bc + gqa_prefill_swz32(prow, pcol)]));
+#pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                unsigned vf[2];
+                const int vrow = d_base + n * 8 + b_rin;
+                const int vcol = ks + b_koff;
+                gqa_prefill_ldmatrix_x2(vf[0], vf[1],
+                                        gqa_prefill_smem_addr(
+                                            &vt_s[vrow * Bc + gqa_prefill_swz32(vrow, vcol)]));
+                gqa_prefill_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3],
+                                              pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
+            }
+        }
+        __syncthreads();
+    }
+
+    const int d_base = warp * 32;
+#pragma unroll
+    for (int n = 0; n < 4; ++n) {
+        const int d0 = d_base + n * 8 + 2 * lid;
+        const int d1 = d0 + 1;
+        const int row0 = gid;
+        const int row1 = gid + 8;
+        const int qrow0 = q0 + row0;
+        const int qrow1 = q0 + row1;
+        const float l0 = row_l[row0];
+        const float l1 = row_l[row1];
+        if (qrow0 < tokens) {
+            if (d0 < D) {
+                out[gqa_prefill_q_index(q_head, d0, qrow0)] =
+                    __float2bfloat16((l0 > 0.0f) ? (acc[n][0] / l0) : 0.0f);
+            }
+            if (d1 < D) {
+                out[gqa_prefill_q_index(q_head, d1, qrow0)] =
+                    __float2bfloat16((l0 > 0.0f) ? (acc[n][1] / l0) : 0.0f);
+            }
+        }
+        if (qrow1 < tokens) {
+            if (d0 < D) {
+                out[gqa_prefill_q_index(q_head, d0, qrow1)] =
+                    __float2bfloat16((l1 > 0.0f) ? (acc[n][2] / l1) : 0.0f);
+            }
+            if (d1 < D) {
+                out[gqa_prefill_q_index(q_head, d1, qrow1)] =
+                    __float2bfloat16((l1 > 0.0f) ? (acc[n][3] / l1) : 0.0f);
+            }
+        }
+    }
 }
 
 } // namespace qus::kernels

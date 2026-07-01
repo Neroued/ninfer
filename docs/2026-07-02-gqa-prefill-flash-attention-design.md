@@ -286,3 +286,30 @@ Decode (keep the existing split-KV kernel), non-causal attention, dropout, slidi
 head dims, and FP8/FP4 attention (a future `sm_120a` accuracy-gated axis). This document does not
 prescribe task breakdown, sequencing, or final tile constants — those belong to codex under the
 `ncu`-guided loop above.
+
+## 12. Achieved results (2026-07-02)
+
+Implemented. The kernel is `Wc=4`/`Br=64`/`Bc=32`, per-warp-independent with register-resident
+online softmax, `head_dim=256` output held in registers, Q cached in registers with the Q staging
+buffer aliased to the K/V tiles so two CTAs are resident per SM. Detailed evolution and `ncu`
+evidence: [`../profiles/ncu-gqa-prefill/pp4096_perwarp_2cta_delta.md`](../profiles/ncu-gqa-prefill/pp4096_perwarp_2cta_delta.md).
+
+Useful tensor-core efficiency (% of the 209.5 TFLOP/s bf16/FP32-accumulate peak), `qus_gqa_attention_bench`:
+
+| T | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---:|---:|---:|---:|---:|---:|
+| TC % | 20.0 | 39.9 | 55.1 | 70.7 | **80.9** | **84.1** |
+
+Efficiency rises with context to a **~84% asymptote** — the practical fp32-accumulate tensor-pipe
+ceiling on sm_120. The `pp4096` target lands at **70.7%** (up from the 36.5% cooperative baseline);
+it sits below the asymptote purely from finite-size overhead (per-CTA pipeline ramp + partial waves),
+not a structural flaw, and the long contexts where attention actually dominates prefill already clear
+80%. The kernel is tensor-pipe bound (ncu: "Tensor is the highest-utilized pipeline", 64.2%),
+occupancy-walled at 2 CTAs/SM by the `head_dim=256` O accumulator (128 regs) + cached Q (64 regs).
+Closing the residual `pp4096` gap within fp32 accumulate would require costly causal load-balancing;
+`fp16`-accumulate PV (~2× tensor throughput) is a separate lower-precision datapath, intentionally
+left out of scope. Correctness `rel_l2 ≤ 1.85e-3`; `compute-sanitizer` memcheck + racecheck clean.
+
+End-to-end full-model prefill (`qus_bench`) vs the scalar-attention baseline: `pp4096` **848 → 2730
+tok/s (3.2×)**, `pp2048` 1243 → 2676 (2.15×), `pp1024` 1580 → 2568 (1.63×). Attention is no longer
+the prefill bottleneck; the low-bit linear GEMM now dominates.

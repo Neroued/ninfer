@@ -9,6 +9,7 @@ namespace qus {
 
 class NvtxRange {
 public:
+    explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
     explicit NvtxRange(std::string name) : name_(std::move(name)) { nvtxRangePushA(name_.c_str()); }
     ~NvtxRange() { nvtxRangePop(); }
 

@@ -22,7 +22,7 @@
 
 namespace qus::bench {
 
-constexpr double kRooflineGBs = 1790.0;  // RTX 5090 ~1.79 TB/s (design.md §1)
+constexpr double kRooflineGBs = 1792.0;  // RTX 5090 GDDR7 bandwidth roofline.
 
 struct DBuf {
     void* p           = nullptr;

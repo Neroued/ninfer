@@ -1,27 +1,14 @@
 #include "qus/text/text_runner.h"
 
+#include "qus/core/nvtx_range.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
 
-#include <nvtx3/nvToolsExt.h>
-
 namespace qus::text {
-
-namespace {
-
-class NvtxRange {
-public:
-    explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
-    ~NvtxRange() { nvtxRangePop(); }
-
-    NvtxRange(const NvtxRange&)            = delete;
-    NvtxRange& operator=(const NvtxRange&) = delete;
-};
-
-} // namespace
 
 TextGenerationRunner::TextGenerationRunner(QwenTokenizer& tokenizer, qus::Engine& engine)
     : tokenizer_(tokenizer), engine_(engine) {}

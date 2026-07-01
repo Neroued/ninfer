@@ -1,5 +1,6 @@
 #include "qus_bench_support.h"
 
+#include "qus/core/nvtx_range.h"
 #include "qus/runtime/engine.h"
 
 #include <cuda_runtime.h>
@@ -62,6 +63,7 @@ qus::bench::RepTiming run_repetition(qus::Engine& engine, const qus::bench::Benc
     case qus::bench::TestKind::Prefill: {
         const std::vector<int> slice = qus::bench::prompt_slice(corpus, test.n_prompt);
         const auto start = Clock::now();
+        const qus::NvtxRange range("qus_bench.prefill." + test.label);
         engine.prefill(slice);
         timing.prefill_time_s = seconds_between(start, Clock::now());
         break;
@@ -70,6 +72,7 @@ qus::bench::RepTiming run_repetition(qus::Engine& engine, const qus::bench::Benc
         const std::vector<int> seed = qus::bench::prompt_slice(corpus, qus::bench::kDecodeSeedTokens);
         engine.prefill(seed); // untimed setup
         const auto start = Clock::now();
+        const qus::NvtxRange range("qus_bench.decode." + test.label);
         for (int step = 0; step < test.n_gen; ++step) { engine.decode_step(); }
         timing.decode_time_s = seconds_between(start, Clock::now());
         break;
@@ -77,9 +80,15 @@ qus::bench::RepTiming run_repetition(qus::Engine& engine, const qus::bench::Benc
     case qus::bench::TestKind::PrefillDecode: {
         const std::vector<int> slice = qus::bench::prompt_slice(corpus, test.n_prompt);
         const auto start = Clock::now();
-        engine.prefill(slice);
+        {
+            const qus::NvtxRange range("qus_bench.prefill." + test.label);
+            engine.prefill(slice);
+        }
         const auto after_prefill = Clock::now();
-        for (int step = 0; step < test.n_gen; ++step) { engine.decode_step(); }
+        {
+            const qus::NvtxRange range("qus_bench.decode." + test.label);
+            for (int step = 0; step < test.n_gen; ++step) { engine.decode_step(); }
+        }
         const auto end = Clock::now();
         timing.prefill_time_s = seconds_between(start, after_prefill);
         timing.decode_time_s = seconds_between(after_prefill, end);

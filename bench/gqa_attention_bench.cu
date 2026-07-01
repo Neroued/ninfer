@@ -1,9 +1,11 @@
 // Performance bench for gqa_attention at Qwen3.6-27B decode/prefill shapes.
-// The GB/s readout is informational; correctness is covered by
+// Prefill reports useful causal attention FLOP/s against the RTX 5090
+// bf16/FP32-accumulate dense tensor-core roofline. Correctness is covered by
 // tests/kernels/test_gqa_attention.cpp.
 //   ./qus_gqa_attention_bench --decode
 //   ./qus_gqa_attention_bench --decode --decode-pos 2882 --profile-once --cold-cache
-//   ./qus_gqa_attention_bench --prefill
+//   ./qus_gqa_attention_bench --prefill --tokens 4096
+//   ./qus_gqa_attention_bench --prefill --tokens 4096 --expect-tflops-pct-min 80
 #include "qus/core/device.h"
 #include "qus/kernels/gqa_attention.h"
 #include "qus_bench_common.h"
@@ -12,11 +14,18 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <limits>
+#include <sstream>
+#include <string>
+#include <string_view>
 #include <vector>
 
 using namespace qus;
@@ -32,6 +41,9 @@ constexpr float kScale                           = 0.0625f;
 constexpr std::int32_t kDChunk                   = 64;
 constexpr std::size_t kColdCacheBytes            = std::size_t(256) << 20;
 constexpr std::int32_t kDefaultDecodePositions[] = {2048, 2882, 8192, 32768};
+constexpr std::int32_t kDefaultPrefillTokens[]   = {512, 1024, 2048, 4096};
+constexpr double kDenseTcPeakTflops              = 209.5;
+constexpr double kDramPeakGBs                    = 1792.0;
 
 constexpr std::int32_t align_up_128(std::int32_t value) { return ((value + 127) / 128) * 128; }
 
@@ -253,7 +265,88 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
                 bytes.total);
 }
 
-void run_prefill(KVCache& kv, std::int32_t tokens) {
+double prefill_useful_flops(std::int32_t tokens) {
+    return 2.0 * static_cast<double>(kHeadDim) * static_cast<double>(kQHeads) *
+           static_cast<double>(tokens) * static_cast<double>(tokens + 1);
+}
+
+double prefill_model_floor_bytes(std::int32_t tokens) {
+    const double q_bytes =
+        static_cast<double>(tokens) * static_cast<double>(kQHeads) *
+        static_cast<double>(kHeadDim) * static_cast<double>(sizeof(std::uint16_t));
+    const double out_bytes = q_bytes;
+    const double k_bytes =
+        static_cast<double>(tokens) * static_cast<double>(kKVHeads) *
+        static_cast<double>(kHeadDim) * static_cast<double>(sizeof(std::uint16_t));
+    const double v_bytes = k_bytes;
+    return q_bytes + out_bytes + k_bytes + v_bytes;
+}
+
+struct PrefillTimingOptions {
+    int warmup      = 3;
+    int repeat      = 10;
+    int min_time_ms = 0;
+};
+
+struct PrefillMetrics {
+    std::int32_t tokens             = 0;
+    int runs                        = 0;
+    int inner_iters                 = 1;
+    double median_ms                = 0.0;
+    double min_ms                   = 0.0;
+    double p95_ms                   = 0.0;
+    double mean_ms                  = 0.0;
+    double useful_flops             = 0.0;
+    double model_floor_bytes        = 0.0;
+    double tflops                   = 0.0;
+    double tflops_pct               = 0.0;
+    double gbps_model               = 0.0;
+    double gbps_model_pct           = 0.0;
+    double roofline_tflops          = 0.0;
+    double roofline_eff_pct         = 0.0;
+    const char* bound               = "tc";
+};
+
+PrefillMetrics prefill_metrics_from_result(std::int32_t tokens, const Result& r) {
+    PrefillMetrics m;
+    m.tokens            = tokens;
+    m.runs              = r.n_runs;
+    m.inner_iters       = r.inner_iters;
+    m.median_ms         = r.median_us * 1.0e-3;
+    m.min_ms            = r.min_us * 1.0e-3;
+    m.p95_ms            = r.p95_us * 1.0e-3;
+    m.mean_ms           = r.mean_us * 1.0e-3;
+    m.useful_flops      = prefill_useful_flops(tokens);
+    m.model_floor_bytes = prefill_model_floor_bytes(tokens);
+
+    const double sec = r.median_us * 1.0e-6;
+    if (sec > 0.0) {
+        m.tflops     = m.useful_flops / sec / 1.0e12;
+        m.gbps_model = m.model_floor_bytes / sec / 1.0e9;
+    }
+    m.tflops_pct = m.tflops / kDenseTcPeakTflops * 100.0;
+    m.gbps_model_pct = m.gbps_model / kDramPeakGBs * 100.0;
+
+    const double intensity = m.model_floor_bytes > 0.0 ? m.useful_flops / m.model_floor_bytes : 0.0;
+    const double dram_roof_tflops = kDramPeakGBs * intensity / 1000.0;
+    m.roofline_tflops            = std::min(kDenseTcPeakTflops, dram_roof_tflops);
+    m.bound                      = (kDenseTcPeakTflops <= dram_roof_tflops) ? "tc" : "dram";
+    m.roofline_eff_pct =
+        (m.roofline_tflops > 0.0) ? (m.tflops / m.roofline_tflops * 100.0) : 0.0;
+    return m;
+}
+
+void print_prefill_result(const PrefillMetrics& m) {
+    std::printf("gqa_attention prefill T=%-6d median=%9.3f ms  min=%9.3f ms  p95=%9.3f ms  "
+                "useful=%9.2f TFLOP/s  tc=%6.2f%% of %.1f  model_floor=%8.1f GB/s "
+                "(%5.2f%% of %.0f)  bound=%s  roofline_eff=%6.2f%%  runs=%d inner=%d\n",
+                m.tokens, m.median_ms, m.min_ms, m.p95_ms, m.tflops, m.tflops_pct,
+                kDenseTcPeakTflops, m.gbps_model, m.gbps_model_pct, kDramPeakGBs, m.bound,
+                m.roofline_eff_pct, m.runs, m.inner_iters);
+}
+
+PrefillMetrics run_prefill(KVCache& kv, std::int32_t tokens,
+                           const PrefillTimingOptions& timing) {
     const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
                            static_cast<std::size_t>(tokens);
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
@@ -268,21 +361,117 @@ void run_prefill(KVCache& kv, std::int32_t tokens) {
     Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    const double causal_pairs = static_cast<double>(tokens) * static_cast<double>(tokens + 1) * 0.5;
-    const double q_elements   = static_cast<double>(qn);
-    const double kv_elements  = static_cast<double>(kvn);
-    const double bytes =
-        (4.0 * kv_elements + q_elements + q_elements +
-         2.0 * causal_pairs * static_cast<double>(kQHeads) * static_cast<double>(kHeadDim)) *
-        2.0;
-
     const Result r = bench_loop(
         [&](cudaStream_t s) { kernels::gqa_attention_prefill(tq, tk, tv, kScale, kv, 0, tout, s); },
-        bytes);
+        prefill_model_floor_bytes(tokens), timing.warmup, timing.repeat, timing.min_time_ms);
 
-    char tag[96];
-    std::snprintf(tag, sizeof(tag), "gqa_attention prefill T=%d", tokens);
-    print_result(tag, r);
+    PrefillMetrics metrics = prefill_metrics_from_result(tokens, r);
+    print_prefill_result(metrics);
+    return metrics;
+}
+
+void run_prefill_profile_once(KVCache& kv, std::int32_t tokens) {
+    const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
+                           static_cast<std::size_t>(tokens);
+    const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
+                            static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
+    DBuf q   = make_bf16(qn);
+    DBuf k   = make_bf16(kvn);
+    DBuf v   = make_bf16(kvn);
+    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+
+    Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+
+    cudaStream_t stream = nullptr;
+    kernels::gqa_attention_prefill(tq, tk, tv, kScale, kv, 0, tout, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::printf("PROFILE_ONCE gqa_attention prefill T=%d useful_flops=%.0f "
+                "model_floor_bytes=%.0f tc_peak_tflops=%.1f dram_peak_gbps=%.0f "
+                "ncu_kernel_regex='gqa_attention_prefill_kernel'\n",
+                tokens, prefill_useful_flops(tokens), prefill_model_floor_bytes(tokens),
+                kDenseTcPeakTflops, kDramPeakGBs);
+}
+
+std::string json_number(double value) {
+    if (!std::isfinite(value)) { return "null"; }
+    std::ostringstream out;
+    out << std::setprecision(10) << value;
+    return out.str();
+}
+
+std::string format_prefill_csv(const std::vector<PrefillMetrics>& results) {
+    std::ostringstream out;
+    out << "T,ms,tflops,tflops_pct,gbps_model,gbps_model_pct,gbps_dram,gbps_dram_pct,"
+           "gbps_pct,bound,"
+           "roofline_tflops,roofline_eff_pct,model_floor_bytes,useful_flops,"
+           "median_ms,min_ms,p95_ms,mean_ms,runs,inner_iters\n";
+    for (const PrefillMetrics& m : results) {
+        out << m.tokens << ',' << json_number(m.median_ms) << ',' << json_number(m.tflops) << ','
+            << json_number(m.tflops_pct) << ',' << json_number(m.gbps_model) << ','
+            << json_number(m.gbps_model_pct) << ",,," << json_number(m.gbps_model_pct) << ','
+            << m.bound << ',' << json_number(m.roofline_tflops) << ','
+            << json_number(m.roofline_eff_pct) << ',' << json_number(m.model_floor_bytes) << ','
+            << json_number(m.useful_flops) << ',' << json_number(m.median_ms) << ','
+            << json_number(m.min_ms) << ',' << json_number(m.p95_ms) << ','
+            << json_number(m.mean_ms) << ',' << m.runs << ',' << m.inner_iters << '\n';
+    }
+    return out.str();
+}
+
+std::string format_prefill_json(const std::vector<PrefillMetrics>& results,
+                                const PrefillTimingOptions& timing) {
+    std::ostringstream out;
+    out << "{\n"
+        << "  \"schema_version\": 1,\n"
+        << "  \"artifact_type\": \"qus_gqa_attention_prefill_bench\",\n"
+        << "  \"tc_peak_tflops\": " << json_number(kDenseTcPeakTflops) << ",\n"
+        << "  \"dram_peak_gbps\": " << json_number(kDramPeakGBs) << ",\n"
+        << "  \"flops_definition\": \"useful_causal_2*d*Hq*T*(T+1)\",\n"
+        << "  \"gbps_pct_definition\": \"model_floor_bytes_per_second / dram_peak_gbps\",\n"
+        << "  \"timing\": {\"warmup\": " << timing.warmup << ", \"repeat\": " << timing.repeat
+        << ", \"min_time_ms\": " << timing.min_time_ms << "},\n"
+        << "  \"results\": [\n";
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        const PrefillMetrics& m = results[i];
+        out << "    {\"T\": " << m.tokens << ", \"ms\": " << json_number(m.median_ms)
+            << ", \"tflops\": " << json_number(m.tflops)
+            << ", \"tflops_pct\": " << json_number(m.tflops_pct)
+            << ", \"gbps_model\": " << json_number(m.gbps_model)
+            << ", \"gbps_model_pct\": " << json_number(m.gbps_model_pct)
+            << ", \"gbps_dram\": null"
+            << ", \"gbps_dram_pct\": null"
+            << ", \"gbps_pct\": " << json_number(m.gbps_model_pct) << ", \"bound\": \"" << m.bound
+            << "\", \"roofline_tflops\": " << json_number(m.roofline_tflops)
+            << ", \"roofline_eff_pct\": " << json_number(m.roofline_eff_pct)
+            << ", \"model_floor_bytes\": " << json_number(m.model_floor_bytes)
+            << ", \"useful_flops\": " << json_number(m.useful_flops)
+            << ", \"median_ms\": " << json_number(m.median_ms)
+            << ", \"min_ms\": " << json_number(m.min_ms)
+            << ", \"p95_ms\": " << json_number(m.p95_ms)
+            << ", \"mean_ms\": " << json_number(m.mean_ms) << ", \"runs\": " << m.runs
+            << ", \"inner_iters\": " << m.inner_iters << "}" << (i + 1 < results.size() ? "," : "")
+            << "\n";
+    }
+    out << "  ]\n"
+        << "}\n";
+    return out.str();
+}
+
+void write_text_file(const std::string& path, const std::string& text) {
+    if (path.empty()) { return; }
+    const std::filesystem::path p(path);
+    if (!p.parent_path().empty()) { std::filesystem::create_directories(p.parent_path()); }
+    std::ofstream out(path);
+    if (!out) {
+        std::fprintf(stderr, "error: failed to open output file: %s\n", path.c_str());
+        std::exit(2);
+    }
+    out << text;
+    std::printf("wrote %s\n", path.c_str());
 }
 
 struct Options {
@@ -293,13 +482,21 @@ struct Options {
     bool cold_cache                  = false;
     std::int32_t decode_pos          = 0;
     std::uint32_t round_robin_layers = 1;
+    std::vector<std::int32_t> prefill_tokens;
+    PrefillTimingOptions prefill_timing;
+    double expect_tflops_pct_min = -1.0;
+    std::string csv_out;
+    std::string json_out;
 };
 
 void fail_usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: qus_gqa_attention_bench [--decode] [--prefill] [--decode-pos N] "
-                 "[--profile-once] [--cold-cache] [--round-robin-layers 16]\n",
+                 "usage: qus_gqa_attention_bench [--prefill] [--tokens T[,T...]] "
+                 "[--expect-tflops-pct-min PCT] [--csv-out path] [--json-out path]\n"
+                 "       qus_gqa_attention_bench --prefill --tokens 4096 --profile-once\n"
+                 "       qus_gqa_attention_bench --decode [--decode-pos N] [--profile-once] "
+                 "[--cold-cache] [--round-robin-layers 16]\n",
                  message);
     std::exit(2);
 }
@@ -317,6 +514,35 @@ std::int32_t parse_i32_arg(const char* text, const char* flag) {
     return static_cast<std::int32_t>(value);
 }
 
+double parse_double_arg(const char* text, const char* flag) {
+    errno             = 0;
+    char* end         = nullptr;
+    const double value = std::strtod(text, &end);
+    if (errno != 0 || end == text || *end != '\0' || !std::isfinite(value)) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "%s expects a finite number", flag);
+        fail_usage(msg);
+    }
+    return value;
+}
+
+std::vector<std::int32_t> parse_i32_list_arg(const char* text, const char* flag) {
+    std::vector<std::int32_t> out;
+    const char* start = text;
+    while (*start != '\0') {
+        const char* comma = std::strchr(start, ',');
+        std::string piece(start, comma == nullptr ? std::strlen(start)
+                                                  : static_cast<std::size_t>(comma - start));
+        const std::int32_t value = parse_i32_arg(piece.c_str(), flag);
+        if (value <= 0) { fail_usage("--tokens expects positive lengths"); }
+        out.push_back(value);
+        if (comma == nullptr) { break; }
+        start = comma + 1;
+    }
+    if (out.empty()) { fail_usage("--tokens expects at least one length"); }
+    return out;
+}
+
 Options parse_options(int argc, char** argv) {
     Options opt;
     for (int i = 1; i < argc; ++i) {
@@ -324,6 +550,11 @@ Options parse_options(int argc, char** argv) {
             opt.decode = true;
         } else if (!std::strcmp(argv[i], "--prefill")) {
             opt.prefill = true;
+        } else if (!std::strcmp(argv[i], "--tokens") ||
+                   !std::strcmp(argv[i], "--prefill-tokens")) {
+            if (++i >= argc) { fail_usage("--tokens requires a value"); }
+            opt.prefill_tokens = parse_i32_list_arg(argv[i], "--tokens");
+            opt.prefill        = true;
         } else if (!std::strcmp(argv[i], "--decode-pos")) {
             if (++i >= argc) { fail_usage("--decode-pos requires a value"); }
             opt.decode_pos     = parse_i32_arg(argv[i], "--decode-pos");
@@ -331,7 +562,6 @@ Options parse_options(int argc, char** argv) {
             opt.decode         = true;
         } else if (!std::strcmp(argv[i], "--profile-once")) {
             opt.profile_once = true;
-            opt.decode       = true;
         } else if (!std::strcmp(argv[i], "--cold-cache")) {
             opt.cold_cache = true;
         } else if (!std::strcmp(argv[i], "--round-robin-layers")) {
@@ -341,32 +571,65 @@ Options parse_options(int argc, char** argv) {
             if (opt.round_robin_layers == 0) {
                 fail_usage("--round-robin-layers expects a positive value");
             }
+        } else if (!std::strcmp(argv[i], "--warmup")) {
+            if (++i >= argc) { fail_usage("--warmup requires a value"); }
+            opt.prefill_timing.warmup = parse_i32_arg(argv[i], "--warmup");
+        } else if (!std::strcmp(argv[i], "--repeat")) {
+            if (++i >= argc) { fail_usage("--repeat requires a value"); }
+            opt.prefill_timing.repeat = parse_i32_arg(argv[i], "--repeat");
+            if (opt.prefill_timing.repeat <= 0) { fail_usage("--repeat expects a positive value"); }
+        } else if (!std::strcmp(argv[i], "--min-time-ms")) {
+            if (++i >= argc) { fail_usage("--min-time-ms requires a value"); }
+            opt.prefill_timing.min_time_ms = parse_i32_arg(argv[i], "--min-time-ms");
+        } else if (!std::strcmp(argv[i], "--expect-tflops-pct-min")) {
+            if (++i >= argc) { fail_usage("--expect-tflops-pct-min requires a value"); }
+            opt.expect_tflops_pct_min = parse_double_arg(argv[i], "--expect-tflops-pct-min");
+        } else if (!std::strcmp(argv[i], "--csv-out")) {
+            if (++i >= argc) { fail_usage("--csv-out requires a value"); }
+            opt.csv_out = argv[i];
+        } else if (!std::strcmp(argv[i], "--json-out")) {
+            if (++i >= argc) { fail_usage("--json-out requires a value"); }
+            opt.json_out = argv[i];
         } else {
             fail_usage("unknown argument");
         }
     }
 
-    if (!opt.decode && !opt.prefill) { opt.decode = true; }
-    if (opt.profile_once && !opt.decode_pos_set) {
-        fail_usage("--profile-once requires --decode-pos");
+    if (!opt.decode && !opt.prefill) { opt.prefill = true; }
+    if (opt.prefill && opt.prefill_tokens.empty()) {
+        if (opt.profile_once) {
+            opt.prefill_tokens = {4096};
+        } else {
+            opt.prefill_tokens.assign(std::begin(kDefaultPrefillTokens),
+                                      std::end(kDefaultPrefillTokens));
+        }
+    }
+    if (opt.profile_once && opt.decode && !opt.prefill && !opt.decode_pos_set) {
+        fail_usage("--decode --profile-once requires --decode-pos");
     }
     if (opt.decode_pos_set && opt.decode_pos == std::numeric_limits<std::int32_t>::max()) {
         fail_usage("--decode-pos exceeds the maximum supported decode window");
     }
-    if (opt.profile_once && opt.prefill) {
-        fail_usage("--profile-once cannot be combined with --prefill");
+    if (opt.profile_once && opt.decode && opt.prefill) {
+        fail_usage("--profile-once must target either --decode or --prefill, not both");
     }
-    if (opt.profile_once && opt.round_robin_layers != 1u) {
+    if (opt.profile_once && opt.prefill && opt.prefill_tokens.size() != 1u) {
+        fail_usage("--prefill --profile-once requires exactly one --tokens length");
+    }
+    if (opt.profile_once && opt.decode && opt.round_robin_layers != 1u) {
         fail_usage("--profile-once cannot be combined with --round-robin-layers");
     }
-    if (opt.cold_cache && !opt.profile_once) {
-        fail_usage("--cold-cache is only valid with --profile-once");
+    if (opt.cold_cache && (!opt.profile_once || !opt.decode)) {
+        fail_usage("--cold-cache is only valid with decode --profile-once");
     }
     if (opt.round_robin_layers != 1u && !opt.decode) {
         fail_usage("--round-robin-layers is only valid with --decode");
     }
     if (opt.round_robin_layers != 1u && opt.round_robin_layers != 16u) {
         fail_usage("--round-robin-layers currently supports only 16");
+    }
+    if (opt.expect_tflops_pct_min >= 0.0 && !opt.prefill) {
+        fail_usage("--expect-tflops-pct-min is only valid with --prefill");
     }
     return opt;
 }
@@ -393,6 +656,9 @@ int main(int argc, char** argv) {
     std::int32_t max_context = 2048;
     for (const std::int32_t pos : decode_positions) {
         max_context = std::max(max_context, pos + 1);
+    }
+    for (const std::int32_t tokens : opt.prefill_tokens) {
+        max_context = std::max(max_context, tokens);
     }
     const std::uint32_t cache_layers = opt.round_robin_layers;
     DeviceArena cache_arena(cache_arena_bytes(cache_layers, max_context));
@@ -428,8 +694,33 @@ int main(int argc, char** argv) {
         }
     }
     if (opt.prefill) {
-        run_prefill(kv, 128);
-        run_prefill(kv, 2048);
+        if (opt.profile_once) {
+            for (const std::int32_t tokens : opt.prefill_tokens) {
+                run_prefill_profile_once(kv, tokens);
+            }
+        } else {
+            std::vector<PrefillMetrics> prefill_results;
+            prefill_results.reserve(opt.prefill_tokens.size());
+            for (const std::int32_t tokens : opt.prefill_tokens) {
+                prefill_results.push_back(run_prefill(kv, tokens, opt.prefill_timing));
+            }
+            write_text_file(opt.csv_out, format_prefill_csv(prefill_results));
+            write_text_file(opt.json_out, format_prefill_json(prefill_results, opt.prefill_timing));
+
+            if (opt.expect_tflops_pct_min >= 0.0) {
+                int failures = 0;
+                for (const PrefillMetrics& m : prefill_results) {
+                    if (m.tflops_pct < opt.expect_tflops_pct_min) {
+                        std::fprintf(stderr,
+                                     "FAIL: prefill T=%d tflops_pct=%.3f below expected %.3f\n",
+                                     m.tokens, m.tflops_pct, opt.expect_tflops_pct_min);
+                        ++failures;
+                    }
+                }
+                if (failures != 0) { return 1; }
+                std::printf("PASS: all prefill tflops_pct >= %.3f\n", opt.expect_tflops_pct_min);
+            }
+        }
     }
     return 0;
 }

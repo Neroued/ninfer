@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <stdexcept>
@@ -125,8 +126,7 @@ std::size_t Engine::default_cache_bytes(std::uint32_t max_ctx) {
 }
 
 void Engine::load(const std::string& path) {
-    decode_graph_.reset();
-    decode_warmed_ = false;
+    reset_decode_graphs();
     card_.reset();
     state_.reset();
     kv_.reset();
@@ -158,6 +158,7 @@ void Engine::load(const std::string& path) {
         cache_arena_->alloc(DType::I32, {1}),
         cache_arena_->alloc(DType::I32, {1}),
         cache_arena_->alloc(DType::BF16, {model::kCfg.vocab, 1}),
+        cache_arena_->alloc(DType::I32, {kDecodeGraphChunk}),
     };
     card_.emplace(*ctx_, *weights_, *work_, *kv_, *state_, io_);
 }
@@ -198,6 +199,34 @@ int Engine::read_token() {
     return token;
 }
 
+std::vector<int> Engine::read_decode_tokens(int count) {
+    if (count <= 0 || count > kDecodeGraphChunk) {
+        throw std::invalid_argument("Engine::read_decode_tokens count out of range");
+    }
+    ctx_->synchronize();
+    CUDA_CHECK(cudaMemcpy(host_decode_tokens_.data(), io_.decode_tokens.data,
+                          static_cast<std::size_t>(count) * sizeof(std::int32_t),
+                          cudaMemcpyDeviceToHost));
+    return std::vector<int>(host_decode_tokens_.begin(), host_decode_tokens_.begin() + count);
+}
+
+void Engine::record_decode_token(int slot) {
+    if (slot < 0 || slot >= kDecodeGraphChunk) {
+        throw std::invalid_argument("Engine::record_decode_token slot out of range");
+    }
+    card_->decode_step_record();
+    auto* dst = static_cast<std::int32_t*>(io_.decode_tokens.data) + slot;
+    CUDA_CHECK(cudaMemcpyAsync(dst, io_.token.data, sizeof(std::int32_t),
+                               cudaMemcpyDeviceToDevice, ctx_->stream));
+}
+
+void Engine::reset_decode_graphs() noexcept {
+    for (DecodeGraph& graph : decode_graphs_) {
+        graph.reset();
+    }
+    decode_warmed_ = false;
+}
+
 bool Engine::is_stop_token(int token) const noexcept {
     return std::binary_search(options_.stop_token_ids.begin(), options_.stop_token_ids.end(),
                               token);
@@ -216,21 +245,41 @@ int Engine::prefill(std::span<const int> ids) {
 }
 
 int Engine::decode_step() {
+    std::vector<int> tokens = decode_steps(1);
+    return tokens.front();
+}
+
+std::vector<int> Engine::decode_steps(int max_steps) {
     require_loaded();
+    if (max_steps <= 0) { throw std::invalid_argument("Engine::decode_steps requires steps"); }
     if (kv_->pos >= kv_->max_context) {
-        throw std::out_of_range("Engine::decode_step exceeds max_ctx");
+        throw std::out_of_range("Engine::decode_steps exceeds max_ctx");
     }
+    int count = std::min(max_steps, kDecodeGraphChunk);
+    count = std::min(count, static_cast<int>(kv_->max_context - kv_->pos));
+
     if (options_.use_cuda_graph && decode_warmed_) {
-        if (!decode_graph_.ready()) {
-            decode_graph_.capture(ctx_->stream, [this] { card_->decode_step_record(); });
+        DecodeGraph& graph = decode_graphs_[static_cast<std::size_t>(count - 1)];
+        if (!graph.ready()) {
+            graph.capture(ctx_->stream, [this, count] {
+                for (int i = 0; i < count; ++i) {
+                    record_decode_token(i);
+                }
+            });
         }
-        decode_graph_.launch(ctx_->stream);
+        graph.launch(ctx_->stream);
+        for (int i = 0; i < count; ++i) {
+            kv_->advance();
+        }
     } else {
-        card_->decode_step_record();
+        count = 1;
+        for (int i = 0; i < count; ++i) {
+            record_decode_token(i);
+            kv_->advance();
+        }
         decode_warmed_ = true;
     }
-    kv_->advance();
-    return read_token();
+    return read_decode_tokens(count);
 }
 
 std::vector<int> Engine::generate(std::span<const int> prompt, int max_new_tokens) {
@@ -245,9 +294,13 @@ std::vector<int> Engine::generate(std::span<const int> prompt, int max_new_token
     out.push_back(token);
     if (is_stop_token(token)) { return out; }
     while (static_cast<int>(out.size()) < max_new_tokens) {
-        token = decode_step();
-        out.push_back(token);
-        if (is_stop_token(token)) { break; }
+        const int remaining = max_new_tokens - static_cast<int>(out.size());
+        std::vector<int> tokens = decode_steps(remaining);
+        for (int next : tokens) {
+            out.push_back(next);
+            if (is_stop_token(next) || static_cast<int>(out.size()) >= max_new_tokens) { break; }
+        }
+        if (is_stop_token(out.back())) { break; }
     }
     return out;
 }

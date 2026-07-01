@@ -81,9 +81,18 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
         const NvtxRange range("qus.decode");
         if (!is_stop(token)) {
             while (static_cast<int>(generated_token_ids.size()) < options.max_new_tokens) {
-                token = engine_.decode_step();
-                generated_token_ids.push_back(token);
-                emit_stream_text(token);
+                const int remaining =
+                    options.max_new_tokens - static_cast<int>(generated_token_ids.size());
+                std::vector<int> tokens = engine_.decode_steps(remaining);
+                for (int next : tokens) {
+                    token = next;
+                    generated_token_ids.push_back(token);
+                    emit_stream_text(token);
+                    if (is_stop(token) ||
+                        static_cast<int>(generated_token_ids.size()) >= options.max_new_tokens) {
+                        break;
+                    }
+                }
                 if (is_stop(token)) { break; }
             }
         }

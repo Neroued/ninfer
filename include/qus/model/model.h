@@ -62,6 +62,7 @@ struct StepState {
     Tensor token;
     Tensor pos;
     Tensor logits;
+    Tensor decode_tokens;
 };
 
 enum class Phase {

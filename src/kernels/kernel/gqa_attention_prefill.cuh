@@ -7,6 +7,8 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 
+#include "kernels/kernel/gdn_common.cuh"
+
 #include <cstdint>
 
 namespace qus::kernels {
@@ -102,6 +104,13 @@ __device__ __forceinline__ void gqa_prefill_ldmatrix_x2(unsigned& b0, unsigned& 
                  : "r"(addr));
 }
 
+__device__ __forceinline__ void gqa_prefill_ldmatrix_x2_trans(unsigned& b0, unsigned& b1,
+                                                              unsigned addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(b0), "=r"(b1)
+                 : "r"(addr));
+}
+
 __device__ __forceinline__ void gqa_prefill_mma_m16n8k16_bf16(
     float& c0, float& c1, float& c2, float& c3, unsigned a0, unsigned a1, unsigned a2,
     unsigned a3, unsigned b0, unsigned b1) {
@@ -180,6 +189,7 @@ __launch_bounds__(512, 1) __global__
     constexpr int Br       = 32;
     constexpr int Bc       = 32;
     constexpr int D        = kGqaPrefillHeadDim;
+    constexpr int Stages   = 2;
     constexpr int Warps    = 16;
     constexpr int Threads  = Warps * 32;
     constexpr float Log2E  = 1.4426950408889634074f;
@@ -187,8 +197,8 @@ __launch_bounds__(512, 1) __global__
     static_assert(Threads == 512);
 
     __shared__ __align__(16) __nv_bfloat16 q_s[Br * D];
-    __shared__ __align__(16) __nv_bfloat16 k_s[Bc * D];
-    __shared__ __align__(16) __nv_bfloat16 vt_s[D * Bc];
+    __shared__ __align__(16) __nv_bfloat16 k_s[Stages][Bc * D];
+    __shared__ __align__(16) __nv_bfloat16 v_s[Stages][Bc * D];
     __shared__ __align__(16) __nv_bfloat16 p_s[Br * Bc];
     __shared__ __align__(16) float s_s[Br * Bc];
     __shared__ float row_m[Br];
@@ -239,22 +249,43 @@ __launch_bounds__(512, 1) __global__
     }
 
     const int max_key = min(tokens, q0 + Br);
-    for (int k0 = 0; k0 < max_key; k0 += Bc) {
-        for (int idx = tid; idx < Bc * D; idx += Threads) {
-            const int key_l = idx / D;
-            const int d     = idx - key_l * D;
+    const int key_blocks = (max_key + Bc - 1) / Bc;
+
+    auto stage_load = [&](int stage, int kb) {
+        const int k0 = kb * Bc;
+#pragma unroll 1
+        for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+            const int key_l = chunk / (D / 8);
+            const int d     = (chunk - key_l * (D / 8)) * 8;
             const int key   = k0 + key_l;
-            __nv_bfloat16 kval = __float2bfloat16(0.0f);
-            __nv_bfloat16 vval = __float2bfloat16(0.0f);
+            __nv_bfloat16* k_dst = &k_s[stage][key_l * D + gqa_prefill_swz(key_l, d)];
+            __nv_bfloat16* v_dst = &v_s[stage][key_l * D + gqa_prefill_swz(key_l, d)];
             if (key < tokens) {
                 const std::int64_t off = gqa_prefill_cache_index(kv_head, d, key, padded_context);
-                kval                   = cache_k[off];
-                vval                   = cache_v[off];
+                qus::kernels::async_copy_global_to_shared<16>(k_dst, &cache_k[off]);
+                qus::kernels::async_copy_global_to_shared<16>(v_dst, &cache_v[off]);
+            } else {
+                *reinterpret_cast<int4*>(k_dst) = make_int4(0, 0, 0, 0);
+                *reinterpret_cast<int4*>(v_dst) = make_int4(0, 0, 0, 0);
             }
-            k_s[key_l * D + gqa_prefill_swz(key_l, d)] = kval;
-            vt_s[d * Bc + gqa_prefill_swz32(d, key_l)] = vval;
+        }
+    };
+
+    if (key_blocks > 0) { stage_load(0, 0); }
+    qus::kernels::async_copy_commit();
+    if (key_blocks > 1) { stage_load(1, 1); }
+    qus::kernels::async_copy_commit();
+
+    for (int kb = 0; kb < key_blocks; ++kb) {
+        if (kb + 1 < key_blocks) {
+            qus::kernels::async_copy_wait<1>();
+        } else {
+            qus::kernels::async_copy_wait<0>();
         }
         __syncthreads();
+
+        const int k0    = kb * Bc;
+        const int stage = kb & 1;
 
         if (warp < 8) {
             float score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -273,7 +304,7 @@ __launch_bounds__(512, 1) __global__
                                             &q_s[arow * D + gqa_prefill_swz(arow, acol)]));
                 gqa_prefill_ldmatrix_x2(bf[0], bf[1],
                                         gqa_prefill_smem_addr(
-                                            &k_s[brow * D + gqa_prefill_swz(brow, bcol)]));
+                                            &k_s[stage][brow * D + gqa_prefill_swz(brow, bcol)]));
                 gqa_prefill_mma_m16n8k16_bf16(score[0], score[1], score[2], score[3], af[0],
                                               af[1], af[2], af[3], bf[0], bf[1]);
             }
@@ -312,7 +343,8 @@ __launch_bounds__(512, 1) __global__
                 float block_m  = gqa_prefill_warp_max(s);
                 block_m        = __shfl_sync(FullMask, block_m, 0);
 
-                const float old_m = row_m[row];
+                float old_m = (lane == 0) ? row_m[row] : 0.0f;
+                old_m       = __shfl_sync(FullMask, old_m, 0);
                 const float new_m = fmaxf(old_m, block_m);
                 float alpha       = 0.0f;
                 if (old_m != -CUDART_INF_F && new_m != -CUDART_INF_F) {
@@ -360,16 +392,21 @@ __launch_bounds__(512, 1) __global__
 #pragma unroll
             for (int n = 0; n < 4; ++n) {
                 unsigned vf[2];
-                const int vrow = d_base + n * 8 + b_rin;
-                const int vcol = ks + b_koff;
-                gqa_prefill_ldmatrix_x2(vf[0], vf[1],
-                                        gqa_prefill_smem_addr(
-                                            &vt_s[vrow * Bc + gqa_prefill_swz32(vrow, vcol)]));
+                const int vrow = ks + b_koff + b_rin;
+                const int vcol = d_base + n * 8;
+                gqa_prefill_ldmatrix_x2_trans(
+                    vf[0], vf[1],
+                    gqa_prefill_smem_addr(
+                        &v_s[stage][vrow * D + gqa_prefill_swz(vrow, vcol)]));
                 gqa_prefill_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3],
                                               pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
         }
         __syncthreads();
+
+        const int load_kb = kb + Stages;
+        if (load_kb < key_blocks) { stage_load(stage, load_kb); }
+        qus::kernels::async_copy_commit();
     }
 
     const int row_base = (warp >> 3) * 16;

@@ -27,7 +27,7 @@
 
 namespace qus::kernels::detail {
 
-__device__ __forceinline__ int q5_sign_extend(int v) { return (v & 0x10) ? (v - 32) : v; }
+__device__ __forceinline__ int q5_sign_extend(int v) { return (v ^ 0x10) - 0x10; }
 
 // Issue the cp.async copies for one 16-group tile into a shared buffer slot, then
 // commit them as one pipeline group. Every lane commits (even lanes that issue

@@ -182,28 +182,34 @@ __launch_bounds__(256) __global__
     out[gqa_prefill_q_index(q_head, d, token)] = __float2bfloat16(acc / denom);
 }
 
-__launch_bounds__(512, 1) __global__
+// Per-warp-independent flash prefill: each warp owns 16 query rows and runs its own
+// QK -> register online softmax -> PV pipeline. The only CTA barrier is the one that
+// publishes the shared K/V tile per key block; there are no full-CTA barriers between the
+// compute phases, so the warps' phases interleave and keep the tensor pipe fed at low
+// occupancy (the head_dim=256 O accumulator is register-heavy, so occupancy is low by design
+// and latency is hidden by the per-warp pipeline, mirroring the linear tensor-core GEMM).
+__launch_bounds__(128, 1) __global__
     void gqa_attention_prefill_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
                                       const __nv_bfloat16* cache_v, float scale, __nv_bfloat16* out,
                                       std::int32_t tokens, std::int32_t padded_context) {
-    constexpr int Br       = 32;
-    constexpr int Bc       = 32;
-    constexpr int D        = kGqaPrefillHeadDim;
-    constexpr int Stages   = 2;
-    constexpr int Warps    = 16;
-    constexpr int Threads  = Warps * 32;
-    constexpr float Log2E  = 1.4426950408889634074f;
+    constexpr int Wc      = 4;
+    constexpr int Br      = Wc * 16;
+    constexpr int Bc      = 32;
+    constexpr int D       = kGqaPrefillHeadDim;
+    constexpr int Threads = Wc * 32;
+    constexpr int QKNt    = Bc / 8;  // QK score n-tiles
+    constexpr int QKKs    = D / 16;  // QK contraction steps over head_dim
+    constexpr int PVNt    = D / 8;   // PV output n-tiles
+    constexpr int PVKs    = Bc / 16; // PV contraction steps over keys
+    constexpr float Log2E = 1.4426950408889634074f;
+    constexpr unsigned FullMask = 0xffffffffu;
 
-    static_assert(Threads == 512);
+    static_assert(Threads == 128);
 
     __shared__ __align__(16) __nv_bfloat16 q_s[Br * D];
-    __shared__ __align__(16) __nv_bfloat16 k_s[Stages][Bc * D];
-    __shared__ __align__(16) __nv_bfloat16 v_s[Stages][Bc * D];
-    __shared__ __align__(16) __nv_bfloat16 p_s[Br * Bc];
-    __shared__ __align__(16) float s_s[Br * Bc];
-    __shared__ float row_m[Br];
-    __shared__ float row_l[Br];
-    __shared__ float row_alpha[Br];
+    __shared__ __align__(16) __nv_bfloat16 k_s[Bc * D];
+    __shared__ __align__(16) __nv_bfloat16 v_s[Bc * D];
+    __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -225,11 +231,8 @@ __launch_bounds__(512, 1) __global__
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
-    if (tid < Br) {
-        row_m[tid]     = -CUDART_INF_F;
-        row_l[tid]     = 0.0f;
-        row_alpha[tid] = 0.0f;
-    }
+    const int warp_row0 = warp * 16;             // CTA-tile rows owned by this warp
+    __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];  // warp-local P scratch [16 x Bc]
 
     for (int idx = tid; idx < Br * D; idx += Threads) {
         const int row  = idx / D;
@@ -241,25 +244,26 @@ __launch_bounds__(512, 1) __global__
     }
     __syncthreads();
 
-    float acc[4][4];
+    float acc[PVNt][4];
 #pragma unroll
-    for (int n = 0; n < 4; ++n) {
+    for (int n = 0; n < PVNt; ++n) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
     }
+    float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
-    const int max_key = min(tokens, q0 + Br);
+    const int max_key    = min(tokens, q0 + Br);
     const int key_blocks = (max_key + Bc - 1) / Bc;
 
-    auto stage_load = [&](int stage, int kb) {
+    for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
             const int key_l = chunk / (D / 8);
             const int d     = (chunk - key_l * (D / 8)) * 8;
             const int key   = k0 + key_l;
-            __nv_bfloat16* k_dst = &k_s[stage][key_l * D + gqa_prefill_swz(key_l, d)];
-            __nv_bfloat16* v_dst = &v_s[stage][key_l * D + gqa_prefill_swz(key_l, d)];
+            __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_prefill_swz(key_l, d)];
+            __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_prefill_swz(key_l, d)];
             if (key < tokens) {
                 const std::int64_t off = gqa_prefill_cache_index(kv_head, d, key, padded_context);
                 qus::kernels::async_copy_global_to_shared<16>(k_dst, &cache_k[off]);
@@ -269,177 +273,148 @@ __launch_bounds__(512, 1) __global__
                 *reinterpret_cast<int4*>(v_dst) = make_int4(0, 0, 0, 0);
             }
         }
-    };
-
-    if (key_blocks > 0) { stage_load(0, 0); }
-    qus::kernels::async_copy_commit();
-    if (key_blocks > 1) { stage_load(1, 1); }
-    qus::kernels::async_copy_commit();
-
-    for (int kb = 0; kb < key_blocks; ++kb) {
-        if (kb + 1 < key_blocks) {
-            qus::kernels::async_copy_wait<1>();
-        } else {
-            qus::kernels::async_copy_wait<0>();
-        }
+        qus::kernels::async_copy_commit();
+        qus::kernels::async_copy_wait<0>();
         __syncthreads();
 
-        const int k0    = kb * Bc;
-        const int stage = kb & 1;
-
-        if (warp < 8) {
-            float score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            const int row_base = (warp >> 2) * 16;
-            const int n_tile   = warp & 3;
+        // QK: this warp computes S[16 rows][Bc] entirely in registers.
+        float score[QKNt][4];
 #pragma unroll
-            for (int ks = 0; ks < D; ks += 16) {
+        for (int nt = 0; nt < QKNt; ++nt) {
+            score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+#pragma unroll
+            for (int k = 0; k < QKKs; ++k) {
                 unsigned af[4];
                 unsigned bf[2];
-                const int arow = row_base + a_rowoff;
-                const int acol = ks + a_coloff;
-                const int brow = n_tile * 8 + b_rin;
-                const int bcol = ks + b_koff;
-                gqa_prefill_ldmatrix_x4(af[0], af[1], af[2], af[3],
-                                        gqa_prefill_smem_addr(
-                                            &q_s[arow * D + gqa_prefill_swz(arow, acol)]));
-                gqa_prefill_ldmatrix_x2(bf[0], bf[1],
-                                        gqa_prefill_smem_addr(
-                                            &k_s[stage][brow * D + gqa_prefill_swz(brow, bcol)]));
-                gqa_prefill_mma_m16n8k16_bf16(score[0], score[1], score[2], score[3], af[0],
-                                              af[1], af[2], af[3], bf[0], bf[1]);
-            }
-
-            const int col0 = n_tile * 8 + 2 * lid;
-            const int col1 = col0 + 1;
-            const int row0 = row_base + gid;
-            const int row1 = row_base + gid + 8;
-            const int key0 = k0 + col0;
-            const int key1 = k0 + col1;
-            const int qrow0 = q0 + row0;
-            const int qrow1 = q0 + row1;
-
-            s_s[row0 * Bc + col0] =
-                (qrow0 < tokens && key0 < tokens && key0 <= qrow0) ? score[0] * scale
-                                                                    : -CUDART_INF_F;
-            s_s[row0 * Bc + col1] =
-                (qrow0 < tokens && key1 < tokens && key1 <= qrow0) ? score[1] * scale
-                                                                    : -CUDART_INF_F;
-            s_s[row1 * Bc + col0] =
-                (qrow1 < tokens && key0 < tokens && key0 <= qrow1) ? score[2] * scale
-                                                                    : -CUDART_INF_F;
-            s_s[row1 * Bc + col1] =
-                (qrow1 < tokens && key1 < tokens && key1 <= qrow1) ? score[3] * scale
-                                                                    : -CUDART_INF_F;
-        }
-        __syncthreads();
-
-        if (warp < 16) {
-            constexpr unsigned FullMask = 0xffffffffu;
-#pragma unroll
-            for (int row_iter = 0; row_iter < 2; ++row_iter) {
-                const int row  = warp + row_iter * 16;
-                const int qrow = q0 + row;
-                const float s  = s_s[row * Bc + lane];
-                float block_m  = gqa_prefill_warp_max(s);
-                block_m        = __shfl_sync(FullMask, block_m, 0);
-
-                float old_m = (lane == 0) ? row_m[row] : 0.0f;
-                old_m       = __shfl_sync(FullMask, old_m, 0);
-                const float new_m = fmaxf(old_m, block_m);
-                float alpha       = 0.0f;
-                if (old_m != -CUDART_INF_F && new_m != -CUDART_INF_F) {
-                    alpha = gqa_prefill_exp2_fast((old_m - new_m) * Log2E);
-                }
-
-                float p = 0.0f;
-                if (qrow < tokens && s != -CUDART_INF_F) {
-                    p = gqa_prefill_exp2_fast((s - new_m) * Log2E);
-                }
-                float block_l = gqa_prefill_warp_sum(p);
-                block_l       = __shfl_sync(FullMask, block_l, 0);
-                p_s[row * Bc + gqa_prefill_swz32(row, lane)] = __float2bfloat16(p);
-
-                if (lane == 0) {
-                    row_m[row]     = new_m;
-                    row_l[row]     = row_l[row] * alpha + block_l;
-                    row_alpha[row] = alpha;
-                }
+                const int arow = warp_row0 + a_rowoff;
+                const int acol = k * 16 + a_coloff;
+                gqa_prefill_ldmatrix_x4(
+                    af[0], af[1], af[2], af[3],
+                    gqa_prefill_smem_addr(&q_s[arow * D + gqa_prefill_swz(arow, acol)]));
+                const int brow = nt * 8 + b_rin;
+                const int bcol = k * 16 + b_koff;
+                gqa_prefill_ldmatrix_x2(
+                    bf[0], bf[1],
+                    gqa_prefill_smem_addr(&k_s[brow * D + gqa_prefill_swz(brow, bcol)]));
+                gqa_prefill_mma_m16n8k16_bf16(score[nt][0], score[nt][1], score[nt][2],
+                                              score[nt][3], af[0], af[1], af[2], af[3], bf[0],
+                                              bf[1]);
             }
         }
-        __syncthreads();
 
-#pragma unroll
-        for (int n = 0; n < 4; ++n) {
-            const int row_base = (warp >> 3) * 16;
-            const float a0 = row_alpha[row_base + gid];
-            const float a1 = row_alpha[row_base + gid + 8];
-            acc[n][0] *= a0;
-            acc[n][1] *= a0;
-            acc[n][2] *= a1;
-            acc[n][3] *= a1;
-        }
-
-        const int row_base = (warp >> 3) * 16;
-        const int d_base   = (warp & 7) * 32;
-#pragma unroll
-        for (int ks = 0; ks < Bc; ks += 16) {
-            unsigned pf[4];
-            const int prow = row_base + a_rowoff;
-            const int pcol = ks + a_coloff;
-            gqa_prefill_ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
-                                    gqa_prefill_smem_addr(
-                                        &p_s[prow * Bc + gqa_prefill_swz32(prow, pcol)]));
-#pragma unroll
-            for (int n = 0; n < 4; ++n) {
-                unsigned vf[2];
-                const int vrow = ks + b_koff + b_rin;
-                const int vcol = d_base + n * 8;
-                gqa_prefill_ldmatrix_x2_trans(
-                    vf[0], vf[1],
-                    gqa_prefill_smem_addr(
-                        &v_s[stage][vrow * D + gqa_prefill_swz(vrow, vcol)]));
-                gqa_prefill_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3],
-                                              pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
-            }
-        }
-        __syncthreads();
-
-        const int load_kb = kb + Stages;
-        if (load_kb < key_blocks) { stage_load(stage, load_kb); }
-        qus::kernels::async_copy_commit();
-    }
-
-    const int row_base = (warp >> 3) * 16;
-    const int d_base   = (warp & 7) * 32;
-#pragma unroll
-    for (int n = 0; n < 4; ++n) {
-        const int d0 = d_base + n * 8 + 2 * lid;
-        const int d1 = d0 + 1;
-        const int row0 = row_base + gid;
-        const int row1 = row_base + gid + 8;
+        const int row0  = warp_row0 + gid;
+        const int row1  = warp_row0 + gid + 8;
         const int qrow0 = q0 + row0;
         const int qrow1 = q0 + row1;
-        const float l0 = row_l[row0];
-        const float l1 = row_l[row1];
-        if (qrow0 < tokens) {
-            if (d0 < D) {
-                out[gqa_prefill_q_index(q_head, d0, qrow0)] =
-                    __float2bfloat16((l0 > 0.0f) ? (acc[n][0] / l0) : 0.0f);
-            }
-            if (d1 < D) {
-                out[gqa_prefill_q_index(q_head, d1, qrow0)] =
-                    __float2bfloat16((l0 > 0.0f) ? (acc[n][1] / l0) : 0.0f);
+
+        float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
+#pragma unroll
+        for (int nt = 0; nt < QKNt; ++nt) {
+            const int col0 = nt * 8 + 2 * lid;
+            const int col1 = col0 + 1;
+            const int key0 = k0 + col0;
+            const int key1 = k0 + col1;
+            score[nt][0] = (qrow0 < tokens && key0 < tokens && key0 <= qrow0)
+                               ? score[nt][0] * scale : -CUDART_INF_F;
+            score[nt][1] = (qrow0 < tokens && key1 < tokens && key1 <= qrow0)
+                               ? score[nt][1] * scale : -CUDART_INF_F;
+            score[nt][2] = (qrow1 < tokens && key0 < tokens && key0 <= qrow1)
+                               ? score[nt][2] * scale : -CUDART_INF_F;
+            score[nt][3] = (qrow1 < tokens && key1 < tokens && key1 <= qrow1)
+                               ? score[nt][3] * scale : -CUDART_INF_F;
+            bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+            bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+        }
+        bm0 = fmaxf(bm0, __shfl_xor_sync(FullMask, bm0, 1));
+        bm0 = fmaxf(bm0, __shfl_xor_sync(FullMask, bm0, 2));
+        bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 1));
+        bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 2));
+
+        const float nm0    = fmaxf(m0, bm0);
+        const float nm1    = fmaxf(m1, bm1);
+        const float alpha0 =
+            (m0 == -CUDART_INF_F) ? 0.0f : gqa_prefill_exp2_fast((m0 - nm0) * Log2E);
+        const float alpha1 =
+            (m1 == -CUDART_INF_F) ? 0.0f : gqa_prefill_exp2_fast((m1 - nm1) * Log2E);
+
+        float bl0 = 0.0f, bl1 = 0.0f;
+#pragma unroll
+        for (int nt = 0; nt < QKNt; ++nt) {
+            const int col0 = nt * 8 + 2 * lid;
+            const int col1 = col0 + 1;
+            const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
+                                  ? gqa_prefill_exp2_fast((score[nt][0] - nm0) * Log2E) : 0.0f;
+            const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
+                                  ? gqa_prefill_exp2_fast((score[nt][1] - nm0) * Log2E) : 0.0f;
+            const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
+                                  ? gqa_prefill_exp2_fast((score[nt][2] - nm1) * Log2E) : 0.0f;
+            const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
+                                  ? gqa_prefill_exp2_fast((score[nt][3] - nm1) * Log2E) : 0.0f;
+            bl0 += p00 + p01;
+            bl1 += p10 + p11;
+            p_sw[gid * Bc + gqa_prefill_swz32(gid, col0)]           = __float2bfloat16(p00);
+            p_sw[gid * Bc + gqa_prefill_swz32(gid, col1)]           = __float2bfloat16(p01);
+            p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col0)] = __float2bfloat16(p10);
+            p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+        }
+        bl0 += __shfl_xor_sync(FullMask, bl0, 1);
+        bl0 += __shfl_xor_sync(FullMask, bl0, 2);
+        bl1 += __shfl_xor_sync(FullMask, bl1, 1);
+        bl1 += __shfl_xor_sync(FullMask, bl1, 2);
+
+        l0 = l0 * alpha0 + bl0;
+        l1 = l1 * alpha1 + bl1;
+        m0 = nm0;
+        m1 = nm1;
+#pragma unroll
+        for (int n = 0; n < PVNt; ++n) {
+            acc[n][0] *= alpha0;
+            acc[n][1] *= alpha0;
+            acc[n][2] *= alpha1;
+            acc[n][3] *= alpha1;
+        }
+        __syncwarp();
+
+        // PV: acc += P * V, contracting over the Bc keys.
+#pragma unroll
+        for (int n = 0; n < PVNt; ++n) {
+#pragma unroll
+            for (int k = 0; k < PVKs; ++k) {
+                unsigned pf[4];
+                const int pcol = k * 16 + a_coloff;
+                gqa_prefill_ldmatrix_x4(
+                    pf[0], pf[1], pf[2], pf[3],
+                    gqa_prefill_smem_addr(&p_sw[a_rowoff * Bc + gqa_prefill_swz32(a_rowoff, pcol)]));
+                unsigned vf[2];
+                const int vrow = k * 16 + b_koff + b_rin;
+                const int vcol = n * 8;
+                gqa_prefill_ldmatrix_x2_trans(
+                    vf[0], vf[1],
+                    gqa_prefill_smem_addr(&v_s[vrow * D + gqa_prefill_swz(vrow, vcol)]));
+                gqa_prefill_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0],
+                                              pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
         }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int n = 0; n < PVNt; ++n) {
+        const int d0    = n * 8 + 2 * lid;
+        const int d1    = d0 + 1;
+        const int qrow0 = q0 + warp_row0 + gid;
+        const int qrow1 = q0 + warp_row0 + gid + 8;
+        if (qrow0 < tokens) {
+            out[gqa_prefill_q_index(q_head, d0, qrow0)] =
+                __float2bfloat16((l0 > 0.0f) ? (acc[n][0] / l0) : 0.0f);
+            out[gqa_prefill_q_index(q_head, d1, qrow0)] =
+                __float2bfloat16((l0 > 0.0f) ? (acc[n][1] / l0) : 0.0f);
+        }
         if (qrow1 < tokens) {
-            if (d0 < D) {
-                out[gqa_prefill_q_index(q_head, d0, qrow1)] =
-                    __float2bfloat16((l1 > 0.0f) ? (acc[n][2] / l1) : 0.0f);
-            }
-            if (d1 < D) {
-                out[gqa_prefill_q_index(q_head, d1, qrow1)] =
-                    __float2bfloat16((l1 > 0.0f) ? (acc[n][3] / l1) : 0.0f);
-            }
+            out[gqa_prefill_q_index(q_head, d0, qrow1)] =
+                __float2bfloat16((l1 > 0.0f) ? (acc[n][2] / l1) : 0.0f);
+            out[gqa_prefill_q_index(q_head, d1, qrow1)] =
+                __float2bfloat16((l1 > 0.0f) ? (acc[n][3] / l1) : 0.0f);
         }
     }
 }

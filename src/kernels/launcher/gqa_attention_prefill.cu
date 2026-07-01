@@ -27,8 +27,8 @@ void gqa_attention_prefill_launch(const Tensor& q, const Tensor& k, const Tensor
         tokens, padded_context);
     CUDA_CHECK(cudaGetLastError());
 
-    constexpr int kQBlock = 32;
-    constexpr int kAttentionBlock = 512;
+    constexpr int kQBlock = 64;
+    constexpr int kAttentionBlock = 128;
     const dim3 attention_grid(static_cast<unsigned>((tokens + kQBlock - 1) / kQBlock),
                               static_cast<unsigned>(kGqaPrefillQHeads), 1u);
     gqa_attention_prefill_kernel<<<attention_grid, kAttentionBlock, 0, stream>>>(

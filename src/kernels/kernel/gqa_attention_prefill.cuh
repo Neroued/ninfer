@@ -163,18 +163,18 @@ __launch_bounds__(256) __global__
     out[gqa_prefill_q_index(q_head, d, token)] = __float2bfloat16(acc / denom);
 }
 
-__launch_bounds__(256, 2) __global__
+__launch_bounds__(512, 1) __global__
     void gqa_attention_prefill_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
                                       const __nv_bfloat16* cache_v, float scale, __nv_bfloat16* out,
                                       std::int32_t tokens, std::int32_t padded_context) {
-    constexpr int Br       = 16;
+    constexpr int Br       = 32;
     constexpr int Bc       = 32;
     constexpr int D        = kGqaPrefillHeadDim;
-    constexpr int Warps    = 8;
+    constexpr int Warps    = 16;
     constexpr int Threads  = Warps * 32;
     constexpr float Log2E  = 1.4426950408889634074f;
 
-    static_assert(Threads == 256);
+    static_assert(Threads == 512);
 
     __shared__ __align__(16) __nv_bfloat16 q_s[Br * D];
     __shared__ __align__(16) __nv_bfloat16 k_s[Bc * D];
@@ -246,14 +246,15 @@ __launch_bounds__(256, 2) __global__
         }
         __syncthreads();
 
-        if (warp < 4) {
+        if (warp < 8) {
             float score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            const int n_tile = warp;
+            const int row_base = (warp >> 2) * 16;
+            const int n_tile   = warp & 3;
 #pragma unroll
             for (int ks = 0; ks < D; ks += 16) {
                 unsigned af[4];
                 unsigned bf[2];
-                const int arow = a_rowoff;
+                const int arow = row_base + a_rowoff;
                 const int acol = ks + a_coloff;
                 const int brow = n_tile * 8 + b_rin;
                 const int bcol = ks + b_koff;
@@ -269,8 +270,8 @@ __launch_bounds__(256, 2) __global__
 
             const int col0 = n_tile * 8 + 2 * lid;
             const int col1 = col0 + 1;
-            const int row0 = gid;
-            const int row1 = gid + 8;
+            const int row0 = row_base + gid;
+            const int row1 = row_base + gid + 8;
             const int key0 = k0 + col0;
             const int key1 = k0 + col1;
             const int qrow0 = q0 + row0;
@@ -325,19 +326,21 @@ __launch_bounds__(256, 2) __global__
 
 #pragma unroll
         for (int n = 0; n < 4; ++n) {
-            const float a0 = row_alpha[gid];
-            const float a1 = row_alpha[gid + 8];
+            const int row_base = (warp >> 3) * 16;
+            const float a0 = row_alpha[row_base + gid];
+            const float a1 = row_alpha[row_base + gid + 8];
             acc[n][0] *= a0;
             acc[n][1] *= a0;
             acc[n][2] *= a1;
             acc[n][3] *= a1;
         }
 
-        const int d_base = warp * 32;
+        const int row_base = (warp >> 3) * 16;
+        const int d_base   = (warp & 7) * 32;
 #pragma unroll
         for (int ks = 0; ks < Bc; ks += 16) {
             unsigned pf[4];
-            const int prow = a_rowoff;
+            const int prow = row_base + a_rowoff;
             const int pcol = ks + a_coloff;
             gqa_prefill_ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
                                     gqa_prefill_smem_addr(
@@ -357,13 +360,14 @@ __launch_bounds__(256, 2) __global__
         __syncthreads();
     }
 
-    const int d_base = warp * 32;
+    const int row_base = (warp >> 3) * 16;
+    const int d_base   = (warp & 7) * 32;
 #pragma unroll
     for (int n = 0; n < 4; ++n) {
         const int d0 = d_base + n * 8 + 2 * lid;
         const int d1 = d0 + 1;
-        const int row0 = gid;
-        const int row1 = gid + 8;
+        const int row0 = row_base + gid;
+        const int row1 = row_base + gid + 8;
         const int qrow0 = q0 + row0;
         const int qrow1 = q0 + row1;
         const float l0 = row_l[row0];

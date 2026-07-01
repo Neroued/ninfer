@@ -48,6 +48,16 @@ __device__ __forceinline__ float gqa_prefill_warp_sum(float value) {
     return value;
 }
 
+__device__ __forceinline__ float gqa_prefill_warp_max(float value) {
+    constexpr unsigned mask = 0xffffffffu;
+    value = fmaxf(value, __shfl_down_sync(mask, value, 16));
+    value = fmaxf(value, __shfl_down_sync(mask, value, 8));
+    value = fmaxf(value, __shfl_down_sync(mask, value, 4));
+    value = fmaxf(value, __shfl_down_sync(mask, value, 2));
+    value = fmaxf(value, __shfl_down_sync(mask, value, 1));
+    return value;
+}
+
 __device__ __forceinline__ float gqa_prefill_block_sum_256(float value, float* scratch) {
     const int tid  = threadIdx.x;
     const int lane = tid & 31;
@@ -292,35 +302,37 @@ __launch_bounds__(512, 1) __global__
         }
         __syncthreads();
 
-        if (tid < Br) {
-            const int row  = tid;
-            const int qrow = q0 + row;
-            float block_m  = -CUDART_INF_F;
+        if (warp < 16) {
+            constexpr unsigned FullMask = 0xffffffffu;
 #pragma unroll
-            for (int c = 0; c < Bc; ++c) { block_m = fmaxf(block_m, s_s[row * Bc + c]); }
+            for (int row_iter = 0; row_iter < 2; ++row_iter) {
+                const int row  = warp + row_iter * 16;
+                const int qrow = q0 + row;
+                const float s  = s_s[row * Bc + lane];
+                float block_m  = gqa_prefill_warp_max(s);
+                block_m        = __shfl_sync(FullMask, block_m, 0);
 
-            const float old_m = row_m[row];
-            const float new_m = fmaxf(old_m, block_m);
-            float alpha       = 0.0f;
-            if (old_m != -CUDART_INF_F && new_m != -CUDART_INF_F) {
-                alpha = gqa_prefill_exp2_fast((old_m - new_m) * Log2E);
-            }
+                const float old_m = row_m[row];
+                const float new_m = fmaxf(old_m, block_m);
+                float alpha       = 0.0f;
+                if (old_m != -CUDART_INF_F && new_m != -CUDART_INF_F) {
+                    alpha = gqa_prefill_exp2_fast((old_m - new_m) * Log2E);
+                }
 
-            float block_l = 0.0f;
-#pragma unroll
-            for (int c = 0; c < Bc; ++c) {
-                const float s = s_s[row * Bc + c];
-                float p       = 0.0f;
+                float p = 0.0f;
                 if (qrow < tokens && s != -CUDART_INF_F) {
                     p = gqa_prefill_exp2_fast((s - new_m) * Log2E);
                 }
-                block_l += p;
-                p_s[row * Bc + gqa_prefill_swz32(row, c)] = __float2bfloat16(p);
-            }
+                float block_l = gqa_prefill_warp_sum(p);
+                block_l       = __shfl_sync(FullMask, block_l, 0);
+                p_s[row * Bc + gqa_prefill_swz32(row, lane)] = __float2bfloat16(p);
 
-            row_m[row]     = new_m;
-            row_l[row]     = row_l[row] * alpha + block_l;
-            row_alpha[row] = alpha;
+                if (lane == 0) {
+                    row_m[row]     = new_m;
+                    row_l[row]     = row_l[row] * alpha + block_l;
+                    row_alpha[row] = alpha;
+                }
+            }
         }
         __syncthreads();
 

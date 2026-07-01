@@ -32,7 +32,7 @@ static_assert(kGroups % kGroupsPerWarpTile == 0);
 static_assert(kVecsPerWarpTile == 32);
 
 __device__ __forceinline__ int sign_extend_q4(int v) {
-    return (v & 0x08) ? (v - 16) : v;
+    return (v ^ 0x08) - 0x08;
 }
 
 __global__ void linear_rowsplit_gemv_mlp_gate_up_34816_q4_kernel(

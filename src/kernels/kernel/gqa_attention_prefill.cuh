@@ -188,7 +188,7 @@ __launch_bounds__(256) __global__
 // compute phases, so the warps' phases interleave and keep the tensor pipe fed at low
 // occupancy (the head_dim=256 O accumulator is register-heavy, so occupancy is low by design
 // and latency is hidden by the per-warp pipeline, mirroring the linear tensor-core GEMM).
-__launch_bounds__(128, 1) __global__
+__launch_bounds__(128, 2) __global__
     void gqa_attention_prefill_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
                                       const __nv_bfloat16* cache_v, float scale, __nv_bfloat16* out,
                                       std::int32_t tokens, std::int32_t padded_context) {
@@ -205,11 +205,15 @@ __launch_bounds__(128, 1) __global__
     constexpr unsigned FullMask = 0xffffffffu;
 
     static_assert(Threads == 128);
+    static_assert(Br * D == 2 * Bc * D, "Q-load tile must alias the K/V staging tile");
 
-    __shared__ __align__(16) __nv_bfloat16 q_s[Br * D];
-    __shared__ __align__(16) __nv_bfloat16 k_s[Bc * D];
-    __shared__ __align__(16) __nv_bfloat16 v_s[Bc * D];
+    // Q is staged here, copied into registers, then this buffer is reused for the K/V tiles
+    // (Br*D == 2*Bc*D), so the CTA needs only one 32 KB tile plus the small P scratch. That
+    // keeps shared memory low enough for two resident CTAs per SM.
+    __shared__ __align__(16) __nv_bfloat16 qkv_s[Br * D];
     __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
+    __nv_bfloat16* k_s = qkv_s;
+    __nv_bfloat16* v_s = qkv_s + Bc * D;
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -240,7 +244,20 @@ __launch_bounds__(128, 1) __global__
         const int qrow = q0 + row;
         __nv_bfloat16 value = __float2bfloat16(0.0f);
         if (qrow < tokens) { value = q[gqa_prefill_q_index(q_head, d, qrow)]; }
-        q_s[row * D + gqa_prefill_swz(row, d)] = value;
+        qkv_s[row * D + gqa_prefill_swz(row, d)] = value;
+    }
+    __syncthreads();
+
+    // Copy this warp's Q rows into registers (all QK contraction steps), then release the
+    // staging buffer so the main loop can reuse it for K/V.
+    unsigned af_q[QKKs][4];
+#pragma unroll
+    for (int k = 0; k < QKKs; ++k) {
+        const int arow = warp_row0 + a_rowoff;
+        const int acol = k * 16 + a_coloff;
+        gqa_prefill_ldmatrix_x4(
+            af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
+            gqa_prefill_smem_addr(&qkv_s[arow * D + gqa_prefill_swz(arow, acol)]));
     }
     __syncthreads();
 
@@ -284,21 +301,15 @@ __launch_bounds__(128, 1) __global__
             score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
 #pragma unroll
             for (int k = 0; k < QKKs; ++k) {
-                unsigned af[4];
                 unsigned bf[2];
-                const int arow = warp_row0 + a_rowoff;
-                const int acol = k * 16 + a_coloff;
-                gqa_prefill_ldmatrix_x4(
-                    af[0], af[1], af[2], af[3],
-                    gqa_prefill_smem_addr(&q_s[arow * D + gqa_prefill_swz(arow, acol)]));
                 const int brow = nt * 8 + b_rin;
                 const int bcol = k * 16 + b_koff;
                 gqa_prefill_ldmatrix_x2(
                     bf[0], bf[1],
                     gqa_prefill_smem_addr(&k_s[brow * D + gqa_prefill_swz(brow, bcol)]));
                 gqa_prefill_mma_m16n8k16_bf16(score[nt][0], score[nt][1], score[nt][2],
-                                              score[nt][3], af[0], af[1], af[2], af[3], bf[0],
-                                              bf[1]);
+                                              score[nt][3], af_q[k][0], af_q[k][1], af_q[k][2],
+                                              af_q[k][3], bf[0], bf[1]);
             }
         }
 

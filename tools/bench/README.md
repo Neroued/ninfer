@@ -6,20 +6,29 @@ under [`tools/parity`](../parity).
 ## Corpus baker
 
 `qus_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
-committed corpus, so the corpus must be real, in-distribution text (not random tokens) and long
-enough for the largest prefill you want to run. `make_bench_corpus.py` bakes that corpus offline
-with a local Hugging Face Qwen3.6 tokenizer.
+committed corpus, so the corpus must be real, in-distribution text (not random tokens) and at
+least as long as the largest prefill you want to run. `make_bench_corpus.py` bakes that corpus
+offline with a local Hugging Face Qwen3.6 tokenizer.
 
 Outputs (committed):
 
 ```text
-bench/fixtures/bench_corpus.ids            whitespace-separated decimal token ids
-bench/fixtures/bench_corpus.manifest.json  tokenizer id, token count, ids sha256
+bench/fixtures/bench_corpus.ids            whitespace-separated decimal token ids (exactly --tokens)
+bench/fixtures/bench_corpus.manifest.json  tokenizer id, token count, ids sha256, source
 ```
 
-The corpus is curated mixed-domain prose (Chinese / English / code / math) encoded WITHOUT the
-chat template and WITHOUT special tokens, then repeated to reach `--min-tokens`. Encoding is
-deterministic for a fixed text + tokenizer, so `--check` can verify the committed artifact.
+Content sources:
+
+- Built-in curated multi-domain prose (Chinese / English / code / math) — the default. It is
+  encoded WITHOUT the chat template or special tokens, then tiled (paragraphs rotated each cycle)
+  and truncated to exactly `--tokens`. Repetition only fills length; because prefill/decode
+  throughput is token-count / bandwidth bound, it does not bias the numbers.
+- `--source-text <file>` (repeatable) — tokenize your own long meaningful text instead, e.g. a
+  downloaded public-domain book or a concatenated document set, for genuinely diverse very long
+  content. The committed default is `~64k` tokens; raise `--tokens` and/or pass `--source-text`
+  for more.
+
+The binary slices `[0:P]`; the manifest is provenance only.
 
 ## Requirements
 
@@ -35,15 +44,20 @@ The tokenizer is loaded locally only; the tool never downloads from the network.
 ## Regenerate / check
 
 ```bash
-# Regenerate the committed corpus (default target ~9216 tokens, covers prefill up to max_ctx).
+# Regenerate the committed corpus from the built-in bank (default 65536 tokens).
 python3 tools/bench/make_bench_corpus.py \
   --tokenizer-path /path/to/local/Qwen3.6-27B/tokenizer \
-  --min-tokens 9216
+  --tokens 65536
 
-# Verify the committed .ids + manifest match a fresh bake (nonzero exit on mismatch).
+# Bake from your own downloaded/assembled text instead (kept local; not committed).
 python3 tools/bench/make_bench_corpus.py \
   --tokenizer-path /path/to/local/Qwen3.6-27B/tokenizer \
-  --min-tokens 9216 --check
+  --tokens 131072 --source-text /path/to/book.txt
+
+# Verify the committed .ids + manifest agree (hash + token count only; no tokenizer or source
+# needed, so a corpus baked from a downloaded source stays CI-verifiable).
+python3 tools/bench/make_bench_corpus.py --check
 ```
 
-To benchmark prefill lengths beyond the current corpus, re-bake with a larger `--min-tokens`.
+`--tokens` is the exact committed corpus size and the ceiling on prefill length; increase it (and
+optionally use `--source-text`) to benchmark longer prefills, memory permitting.

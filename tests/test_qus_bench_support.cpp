@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -219,10 +220,12 @@ std::vector<qb::TestResult> sample_results() {
     qb::TestResult pp;
     pp.test = qb::BenchTest{qb::TestKind::Prefill, 512, 0, "pp512"};
     pp.reps = {qb::RepTiming{0.5, 0.0}, qb::RepTiming{0.25, 0.0}};
+    pp.workspace_peak_bytes = 5368709120ULL; // 5 GiB
 
     qb::TestResult tg;
     tg.test = qb::BenchTest{qb::TestKind::Decode, 0, 128, "tg128"};
     tg.reps = {qb::RepTiming{0.0, 0.5}, qb::RepTiming{0.0, 1.0}};
+    tg.workspace_peak_bytes = 1048576ULL; // 1 MiB
     return {pp, tg};
 }
 
@@ -259,6 +262,8 @@ int test_format_json_schema() {
     failures += expect_double_near(pp.at("prefill_tok_s_mean").get<double>(), 1536.0,
                                    "json pp prefill mean");
     failures += expect_bool(pp.at("decode_tok_s_mean").is_null(), "json pp decode null");
+    failures += expect_bool(pp.at("workspace_peak_bytes").get<std::uint64_t>() == 5368709120ULL,
+                            "json pp workspace peak");
     failures += expect_bool(pp.at("reps").is_array() && pp.at("reps").size() == 2, "json pp reps");
 
     const Json& tg = tests.at(1);
@@ -279,9 +284,13 @@ int test_format_table_and_csv() {
     failures += expect_bool(table.find("pp512") != std::string::npos, "table has pp512");
     failures += expect_bool(table.find("tg128") != std::string::npos, "table has tg128");
     failures += expect_bool(table.find("prefill t/s") != std::string::npos, "table has header");
+    failures += expect_bool(table.find("work peak") != std::string::npos, "table has work peak");
+    failures += expect_bool(table.find("GiB") != std::string::npos, "table shows GiB peak");
 
     const std::string csv = qb::format_csv(results);
     failures += expect_bool(csv.find("label,kind,n_prompt") == 0, "csv header first");
+    failures += expect_bool(csv.find("workspace_peak_bytes") != std::string::npos,
+                            "csv has workspace_peak_bytes");
     std::size_t lines = 0;
     for (const char c : csv) {
         if (c == '\n') { ++lines; }

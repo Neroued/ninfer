@@ -5,8 +5,10 @@
   "tokenizer_model_id": "Qwen/Qwen3.6-27B",
   "add_special_tokens": false,
   "chat_template": false,
-  "min_tokens": 9216,
-  "token_count": 10241,
-  "ids_sha256": "a815f71e7d05ff12d46c0ebf241fbdd0abf4cc8d5741ddda5e30b74cbae43023",
-  "source": "curated mixed-domain prose (zh/en/code/math), repeated to reach min_tokens"
+  "tokens": 65536,
+  "token_count": 65536,
+  "ids_sha256": "27e4f63c17efe3f89b5cf278b3b1a42a737316ed4044d7d0d1d52437059d1002",
+  "source": "builtin_curated_bank",
+  "source_files": [],
+  "note": "meaningful tokens; tiled (rotated) and truncated to exactly `tokens`. Repetition fills length only and does not bias throughput."
 }

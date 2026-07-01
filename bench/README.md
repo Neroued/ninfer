@@ -32,7 +32,9 @@ bench/fixtures/bench_corpus.manifest.json
 ```
 
 Bake or verify the corpus with [`tools/bench/make_bench_corpus.py`](../tools/bench/README.md). The
-corpus bounds the largest prefill length; re-bake with a larger `--min-tokens` to go higher.
+committed corpus is ~64k tokens and bounds the largest prefill length; re-bake with a larger
+`--tokens`, or pass `--source-text` to tokenize a downloaded book/dataset, to go higher (memory
+permitting).
 
 ## Test model
 
@@ -60,6 +62,7 @@ qus_bench --weights <q5090-path>
           [-r, --repetitions <n>]            # default 5
           [--warmup <n>]                     # default 1, discarded
           [--max-ctx <tokens>]               # default: auto = max test requirement
+          [--work-bytes <bytes>]             # prefill workspace arena size (raise for long prefills)
           [--device <id>] [--no-cuda-graph]
           [-o, --output <table|json|csv>]    # default table
           [--output-file <path>]             # default stdout
@@ -79,8 +82,15 @@ Example:
 ## Output
 
 Default `table` prints an identity/config header followed by one row per test with prefill and
-decode t/s (`mean ± stddev`; the stddev is omitted for a single repetition). `--output json` and
-`--output csv` write machine-readable results.
+decode t/s (`mean ± stddev`; the stddev is omitted for a single repetition) and the `work peak`
+column (high-water workspace-arena usage for that test). `--output json` and `--output csv` write
+machine-readable results, including `workspace_peak_bytes` per test.
+
+Prefill workspace scales with the prompt length, so long prefills can overflow the default
+workspace arena (`std::bad_alloc`). Raise `--work-bytes` accordingly; the reported `work peak` /
+`workspace_peak_bytes` tells you how much a given prefill length actually needed, so you can size
+it. On a 32 GB card with the ~16 GB q5090 model, prefills into the tens of thousands of tokens are
+workspace- and memory-bound (e.g. `pp16384` needs roughly 5 GiB of workspace).
 
 JSON shape (`schema_version: 1`, `artifact_type: "qus_bench_report"`):
 
@@ -94,14 +104,16 @@ JSON shape (`schema_version: 1`, `artifact_type: "qus_bench_report"`):
   "worktree_dirty": false,
   "environment": {"gpu_name": "", "cuda_runtime_version": "", "cuda_driver_version": "", "device_id": 0},
   "weights": {"path": "", "file_size_bytes": 0},
-  "config": {"max_ctx": 0, "decode_path": "cuda_graph", "repetitions": 5, "warmup": 1,
-             "timing_boundary": "host_visible_phase_end", "corpus_path": "", "corpus_tokens": 0},
+  "config": {"max_ctx": 0, "work_bytes": 0, "decode_path": "cuda_graph", "repetitions": 5,
+             "warmup": 1, "timing_boundary": "host_visible_phase_end", "corpus_path": "",
+             "corpus_tokens": 0},
   "tests": [
     {
       "label": "pp2048+tg128", "kind": "pp+tg", "n_prompt": 2048, "n_gen": 128,
       "prefill_tok_s_mean": 0.0, "prefill_tok_s_stddev": 0.0,
       "decode_tok_s_mean": 0.0, "decode_tok_s_stddev": 0.0,
       "prefill_time_s_mean": 0.0, "decode_time_s_mean": 0.0,
+      "workspace_peak_bytes": 0,
       "reps": [{"prefill_time_s": 0.0, "prefill_tok_s": 0.0, "decode_time_s": 0.0, "decode_tok_s": 0.0}]
     }
   ]

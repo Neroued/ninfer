@@ -40,6 +40,18 @@ int parse_positive(std::string_view text, const char* label) {
     return value;
 }
 
+std::size_t parse_positive_u64(std::string_view text, const char* label) {
+    if (text.empty()) { throw std::invalid_argument(std::string(label) + " is empty"); }
+    unsigned long long value = 0;
+    const auto* first = text.data();
+    const auto* last = text.data() + text.size();
+    const auto result = std::from_chars(first, last, value);
+    if (result.ec != std::errc{} || result.ptr != last || value == 0) {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + std::string(text));
+    }
+    return static_cast<std::size_t>(value);
+}
+
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
     std::vector<int> out;
     std::size_t start = 0;
@@ -128,6 +140,19 @@ std::string json_number(double value) {
     return out.str();
 }
 
+std::string format_bytes(std::size_t bytes) {
+    if (bytes == 0) { return "-"; }
+    constexpr double gib = 1024.0 * 1024.0 * 1024.0;
+    constexpr double mib = 1024.0 * 1024.0;
+    std::ostringstream out;
+    if (static_cast<double>(bytes) >= gib) {
+        out << std::fixed << std::setprecision(2) << (static_cast<double>(bytes) / gib) << " GiB";
+    } else {
+        out << std::fixed << std::setprecision(1) << (static_cast<double>(bytes) / mib) << " MiB";
+    }
+    return out.str();
+}
+
 std::string rate_cell(const std::vector<double>& series) {
     if (series.empty()) { return "-"; }
     const Stats stats = compute_stats(series);
@@ -183,6 +208,7 @@ std::string usage_text(std::string_view program) {
         << "  --warmup <n>                warmup repetitions, discarded (default: " << kDefaultWarmup
         << ")\n"
         << "  --max-ctx <tokens>          override auto-sized max context\n"
+        << "  --work-bytes <bytes>        prefill workspace arena size; raise for long prefills\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             disable CUDA graph decode (decode_path=eager)\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
@@ -228,6 +254,8 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--max-ctx") {
             options.max_ctx =
                 static_cast<std::uint32_t>(parse_positive(require_value("--max-ctx"), "max-ctx"));
+        } else if (arg == "--work-bytes") {
+            options.work_bytes = parse_positive_u64(require_value("--work-bytes"), "work-bytes");
         } else if (arg == "--device") {
             options.device = parse_nonnegative(require_value("--device"), "device");
         } else if (arg == "--no-cuda-graph") {
@@ -402,26 +430,29 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
     out << "  weights:    " << env.weights_path << " (" << env.weights_file_size_bytes
         << " bytes)\n";
     out << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n";
-    out << "  config:     max_ctx=" << env.max_ctx << " decode_path=" << env.decode_path
-        << " repetitions=" << env.repetitions << " warmup=" << env.warmup << "\n\n";
+    out << "  config:     max_ctx=" << env.max_ctx << " work_bytes=" << env.work_bytes
+        << " decode_path=" << env.decode_path << " repetitions=" << env.repetitions
+        << " warmup=" << env.warmup << "\n\n";
 
-    const std::vector<std::string> headers = {"test", "n_prompt", "n_gen", "prefill t/s",
-                                              "decode t/s"};
-    std::vector<std::array<std::string, 5>> rows;
+    constexpr std::size_t kCols = 6;
+    const std::array<std::string, kCols> headers = {"test",        "n_prompt",   "n_gen",
+                                                    "prefill t/s", "decode t/s", "work peak"};
+    std::vector<std::array<std::string, kCols>> rows;
     rows.reserve(results.size());
     for (const TestResult& result : results) {
         rows.push_back({result.test.label, std::to_string(result.test.n_prompt),
                         std::to_string(result.test.n_gen), rate_cell(prefill_tok_s_series(result)),
-                        rate_cell(decode_tok_s_series(result))});
+                        rate_cell(decode_tok_s_series(result)),
+                        format_bytes(result.workspace_peak_bytes)});
     }
 
-    std::array<std::size_t, 5> width{};
+    std::array<std::size_t, kCols> width{};
     for (std::size_t c = 0; c < headers.size(); ++c) { width[c] = headers[c].size(); }
     for (const auto& row : rows) {
         for (std::size_t c = 0; c < row.size(); ++c) { width[c] = std::max(width[c], row[c].size()); }
     }
 
-    auto write_row = [&](const std::array<std::string, 5>& row) {
+    auto write_row = [&](const std::array<std::string, kCols>& row) {
         for (std::size_t c = 0; c < row.size(); ++c) {
             if (c != 0) { out << "  "; }
             if (c == 0) {
@@ -433,7 +464,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         out << "\n";
     };
 
-    write_row({headers[0], headers[1], headers[2], headers[3], headers[4]});
+    write_row(headers);
     for (const auto& row : rows) { write_row(row); }
     return out.str();
 }
@@ -460,6 +491,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  },\n"
         << "  \"config\": {\n"
         << "    \"max_ctx\": " << env.max_ctx << ",\n"
+        << "    \"work_bytes\": " << env.work_bytes << ",\n"
         << "    \"decode_path\": \"" << json_escape(env.decode_path) << "\",\n"
         << "    \"repetitions\": " << env.repetitions << ",\n"
         << "    \"warmup\": " << env.warmup << ",\n"
@@ -486,6 +518,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         append_stat_fields(out, "prefill_time_s", prefill_times, "      ");
         out << ",\n";
         append_stat_fields(out, "decode_time_s", decode_times, "      ");
+        out << ",\n      \"workspace_peak_bytes\": " << result.workspace_peak_bytes;
         out << ",\n      \"reps\": [\n";
         for (std::size_t r = 0; r < result.reps.size(); ++r) {
             const RepTiming& rep = result.reps[r];
@@ -520,7 +553,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
 std::string format_csv(const std::vector<TestResult>& results) {
     std::ostringstream out;
     out << "label,kind,n_prompt,n_gen,repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,"
-           "decode_tok_s_mean,decode_tok_s_stddev,prefill_time_s_mean,decode_time_s_mean\n";
+           "decode_tok_s_mean,decode_tok_s_stddev,prefill_time_s_mean,decode_time_s_mean,"
+           "workspace_peak_bytes\n";
     auto cell_mean = [](const std::vector<double>& series) -> std::string {
         return series.empty() ? std::string() : json_number(compute_stats(series).mean);
     };
@@ -535,7 +569,7 @@ std::string format_csv(const std::vector<TestResult>& results) {
             << cell_mean(decode_tok_s_series(result)) << ","
             << cell_stddev(decode_tok_s_series(result)) << ","
             << cell_mean(prefill_time_series(result)) << ","
-            << cell_mean(decode_time_series(result)) << "\n";
+            << cell_mean(decode_time_series(result)) << "," << result.workspace_peak_bytes << "\n";
     }
     return out.str();
 }

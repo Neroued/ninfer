@@ -57,6 +57,7 @@ struct BenchOptions {
     int repetitions = kDefaultRepetitions;
     int warmup = kDefaultWarmup;
     std::optional<std::uint32_t> max_ctx;          // --max-ctx override
+    std::optional<std::size_t> work_bytes;         // --work-bytes override (prefill workspace)
     int device = 0;
     bool use_cuda_graph = true;
     OutputFormat output = OutputFormat::Table;
@@ -73,6 +74,7 @@ struct RepTiming {
 struct TestResult {
     BenchTest test;
     std::vector<RepTiming> reps;
+    std::size_t workspace_peak_bytes = 0; // high-water workspace-arena usage during this test
 };
 
 struct Stats {
@@ -91,6 +93,7 @@ struct BenchEnvironment {
     std::string weights_path;
     std::uint64_t weights_file_size_bytes = 0;
     std::uint32_t max_ctx = 0;
+    std::size_t work_bytes = 0;
     std::string decode_path;   // "cuda_graph" or "eager"
     int repetitions = 0;
     int warmup = 0;

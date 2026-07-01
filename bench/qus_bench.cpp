@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
         engine_options.device = options.device;
         engine_options.max_ctx = max_ctx;
         engine_options.use_cuda_graph = options.use_cuda_graph;
+        if (options.work_bytes.has_value()) { engine_options.work_bytes = *options.work_bytes; }
 
         qus::bench::BenchEnvironment env;
         fill_cuda_environment(env, options.device);
@@ -135,6 +136,7 @@ int main(int argc, char** argv) {
         env.weights_path = options.weights_path;
         env.weights_file_size_bytes = qus::bench::file_size_or_zero(options.weights_path);
         env.max_ctx = max_ctx;
+        env.work_bytes = engine_options.work_bytes;
         env.decode_path = options.use_cuda_graph ? "cuda_graph" : "eager";
         env.repetitions = options.repetitions;
         env.warmup = options.warmup;
@@ -158,10 +160,12 @@ int main(int argc, char** argv) {
                       << ": warmup=" << options.warmup << " reps=" << options.repetitions << '\n';
             qus::bench::TestResult result;
             result.test = test;
+            engine.reset_memory_peaks();
             for (int w = 0; w < options.warmup; ++w) { run_repetition(engine, test, corpus); }
             for (int m = 0; m < options.repetitions; ++m) {
                 result.reps.push_back(run_repetition(engine, test, corpus));
             }
+            result.workspace_peak_bytes = engine.memory_stats().workspace.peak_used_bytes;
             results.push_back(std::move(result));
         }
 

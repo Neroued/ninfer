@@ -269,13 +269,13 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             std::uint8_t* dst  = &Sr[stage][rg * 2];
             if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                dst[0]                = scales[gi * 2];
-                dst[1]                = scales[gi * 2 + 1];
+                *reinterpret_cast<std::uint16_t*>(dst) =
+                    *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
             } else {
                 if (grow < n) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                    dst[0]                = scales[gi * 2];
-                    dst[1]                = scales[gi * 2 + 1];
+                    *reinterpret_cast<std::uint16_t*>(dst) =
+                        *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
                 } else {
                     dst[0] = 0;
                     dst[1] = 0;

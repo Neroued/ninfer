@@ -7,6 +7,12 @@
 
 namespace qus::kernels::detail {
 
+__device__ __forceinline__ float codec_load_scale_f16(const std::uint8_t* scales,
+                                                      std::int64_t group_index) {
+    const auto* p = reinterpret_cast<const std::uint16_t*>(scales + group_index * 2);
+    return __half2float(__ushort_as_half(*p));
+}
+
 struct Q4Codec {
     static constexpr int kBits = 4;
     static constexpr int kGroupK = 64;
@@ -16,10 +22,7 @@ struct Q4Codec {
                                       std::int32_t group, std::int32_t kg, float out[kGroupK]) {
         (void)high;
         const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + group;
-        const std::uint16_t sb  = static_cast<std::uint16_t>(scales[group_index * 2]) |
-                                  static_cast<std::uint16_t>(
-                                      static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
-        const float scale = __half2float(__ushort_as_half(sb));
+        const float scale = codec_load_scale_f16(scales, group_index);
         const std::uint8_t* packed = codes + group_index * kBytesPerRowPerGroup;
         for (int lane = 0; lane < kGroupK; ++lane) {
             const std::uint8_t byte = packed[lane >> 1];
@@ -35,10 +38,7 @@ struct Q4Codec {
     __device__ static void load_pair(const std::uint8_t* codes, const std::uint8_t* /*high*/,
                                      const std::uint8_t* scales, std::int64_t group_index, int lane,
                                      float& w0, float& w1) {
-        const std::uint16_t sb =
-            static_cast<std::uint16_t>(scales[group_index * 2]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
-        const float         scale = __half2float(__ushort_as_half(sb));
+        const float         scale = codec_load_scale_f16(scales, group_index);
         const std::uint8_t  byte  = codes[group_index * kBytesPerRowPerGroup + lane];
         const int           u0    = byte & 0x0f;
         const int           u1    = byte >> 4;
@@ -53,10 +53,7 @@ struct Q4Codec {
                                                                      const std::uint8_t* scales,
                                                                      std::int64_t group_index,
                                                                      int lane) {
-        const std::uint16_t sb =
-            static_cast<std::uint16_t>(scales[group_index * 2]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
-        const float        scale = __half2float(__ushort_as_half(sb));
+        const float        scale = codec_load_scale_f16(scales, group_index);
         const std::uint8_t byte  = codes[group_index * kBytesPerRowPerGroup + lane];
         const int          u0    = byte & 0x0f;
         const int          u1    = byte >> 4;
@@ -75,10 +72,7 @@ struct Q5Codec {
                                       const std::uint8_t* scales, std::int32_t row,
                                       std::int32_t group, std::int32_t kg, float out[kGroupK]) {
         const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + group;
-        const std::uint16_t sb  = static_cast<std::uint16_t>(scales[group_index * 2]) |
-                                  static_cast<std::uint16_t>(
-                                      static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
-        const float scale = __half2float(__ushort_as_half(sb));
+        const float scale = codec_load_scale_f16(scales, group_index);
         const std::uint8_t* nibble = codes + group_index * kNibbleBytesPerRowPerGroup;
         const std::uint8_t* high_bits = high + group_index * kHighBytesPerRowPerGroup;
 #pragma unroll
@@ -95,10 +89,7 @@ struct Q5Codec {
     __device__ static void load_pair(const std::uint8_t* codes, const std::uint8_t* high,
                                      const std::uint8_t* scales, std::int64_t group_index, int lane,
                                      float& w0, float& w1) {
-        const std::uint16_t sb =
-            static_cast<std::uint16_t>(scales[group_index * 2]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
-        const float          scale     = __half2float(__ushort_as_half(sb));
+        const float          scale     = codec_load_scale_f16(scales, group_index);
         const std::uint8_t   byte      = codes[group_index * kNibbleBytesPerRowPerGroup + lane];
         const std::uint8_t*  high_bits = high + group_index * kHighBytesPerRowPerGroup;
         const int            lo0       = byte & 0x0f;
@@ -120,10 +111,7 @@ struct Q5Codec {
                                                                      const std::uint8_t* scales,
                                                                      std::int64_t group_index,
                                                                      int lane) {
-        const std::uint16_t sb =
-            static_cast<std::uint16_t>(scales[group_index * 2]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
-        const float          scale     = __half2float(__ushort_as_half(sb));
+        const float          scale     = codec_load_scale_f16(scales, group_index);
         const std::uint8_t   byte      = codes[group_index * kNibbleBytesPerRowPerGroup + lane];
         const std::uint8_t*  high_bits = high + group_index * kHighBytesPerRowPerGroup;
         const int            lo0       = byte & 0x0f;
@@ -149,10 +137,7 @@ struct Q6Codec {
                                       const std::uint8_t* scales, std::int32_t row,
                                       std::int32_t group, std::int32_t kg, float out[kGroupK]) {
         const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + group;
-        const std::uint16_t sb  = static_cast<std::uint16_t>(scales[group_index * 2]) |
-                                  static_cast<std::uint16_t>(
-                                      static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
-        const float scale = __half2float(__ushort_as_half(sb));
+        const float scale = codec_load_scale_f16(scales, group_index);
         const std::uint8_t* nibble = codes + group_index * kNibbleBytesPerRowPerGroup;
         const std::uint8_t* high_bits = high + group_index * kHighBytesPerRowPerGroup;
 #pragma unroll
@@ -170,10 +155,7 @@ struct Q6Codec {
     __device__ static void load_pair(const std::uint8_t* codes, const std::uint8_t* high,
                                      const std::uint8_t* scales, std::int64_t group_index, int lane,
                                      float& w0, float& w1) {
-        const std::uint16_t sb =
-            static_cast<std::uint16_t>(scales[group_index * 2]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
-        const float          scale     = __half2float(__ushort_as_half(sb));
+        const float          scale     = codec_load_scale_f16(scales, group_index);
         const std::uint8_t   byte      = codes[group_index * kNibbleBytesPerRowPerGroup + lane];
         const std::uint8_t*  high_bits = high + group_index * kHighBytesPerRowPerGroup;
         const int            lo0       = byte & 0x0f;
@@ -195,10 +177,7 @@ struct Q6Codec {
                                                                      const std::uint8_t* scales,
                                                                      std::int64_t group_index,
                                                                      int lane) {
-        const std::uint16_t sb =
-            static_cast<std::uint16_t>(scales[group_index * 2]) |
-            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1]) << 8);
-        const float          scale     = __half2float(__ushort_as_half(sb));
+        const float          scale     = codec_load_scale_f16(scales, group_index);
         const std::uint8_t   byte      = codes[group_index * kNibbleBytesPerRowPerGroup + lane];
         const std::uint8_t*  high_bits = high + group_index * kHighBytesPerRowPerGroup;
         const int            lo0       = byte & 0x0f;

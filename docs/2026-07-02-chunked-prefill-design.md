@@ -83,7 +83,7 @@ Two unrelated "chunk" concepts must not be conflated:
    stream is **never** needed across chunks — all cross-chunk information lives in the KV cache and
    GDN state.
 3. **`chunk_size` is a power-of-two-friendly multiple of 128, startup-fixed.** Only multiples of 128
-   are supported (default **512**). This is deliberate: 128 is a multiple of the GDN kernel tile
+   are supported (default **1024**). This is deliberate: 128 is a multiple of the GDN kernel tile
    (64), so every non-final chunk is GDN-fast-path aligned; and `chunk_size ≥ 128 > τ=16` keeps
    every prefill linear in the tensor-core MMA regime (`classify_regime`,
    `src/kernels/linear/plan/linear_plan.cpp`). The **final** chunk (`T mod chunk_size`) may be
@@ -217,7 +217,7 @@ implementation (wrong parallelism, per-launch single query).
 ### Configuration threading
 
 - `EngineOptions::prefill_chunk` (`include/qus/runtime/engine.h`), validated `> 0` and a multiple of
-  128; default 512.
+  128; default 1024.
 - `--prefill-chunk N` on the CLI (`include/qus/text/cli.h`, `src/text/cli.cpp`, `src/main.cpp`) and
   on `qus_bench` (`bench/qus_bench_support.*`).
 
@@ -302,10 +302,10 @@ against kernel efficiency:
   the MMA path, larger chunks amortize weight reuse better.
 - **Launch overhead.** `⌈T/chunk_size⌉` × more launches; negligible at `chunk_size ≥ 512`.
 
-Hence the default **512**: large enough for good attention/GEMM utilization and full SM occupancy,
-small enough that the work arena is ~150 MiB. `chunk_size` is the single knob exposing this trade;
-the bench length-sweep should report tok/s and `workspace_peak_bytes` per `chunk_size` so the
-default can be confirmed against evidence.
+Hence the default **1024**: it favors attention/GEMM throughput and fewer chunk launches while
+keeping workspace bounded at O(chunk). `chunk_size` is the single knob exposing this trade; the bench
+length-sweep should report tok/s and `workspace_peak_bytes` per `chunk_size` so the default can be
+confirmed against evidence.
 
 ## 10. Benchmark & report schema (whitelisted contract)
 

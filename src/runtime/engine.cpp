@@ -106,7 +106,8 @@ Engine::Engine(EngineOptions options) : options_(options) {
         std::unique(options_.stop_token_ids.begin(), options_.stop_token_ids.end()),
         options_.stop_token_ids.end());
     if (options_.max_ctx == 0) { throw std::invalid_argument("Engine max_ctx must be nonzero"); }
-    if (options_.prefill_chunk == 0 || options_.prefill_chunk % 128 != 0) {
+    if (options_.prefill_chunk == 0 ||
+        options_.prefill_chunk % model::kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("Engine prefill_chunk must be a nonzero multiple of 128");
     }
     if (options_.prefill_chunk >
@@ -177,7 +178,7 @@ std::size_t Engine::default_cache_bytes(std::uint32_t max_ctx) {
 }
 
 std::size_t Engine::default_work_bytes(std::uint32_t prefill_chunk) {
-    if (prefill_chunk == 0 || prefill_chunk % 128 != 0) {
+    if (prefill_chunk == 0 || prefill_chunk % model::kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("Engine prefill_chunk must be a nonzero multiple of 128");
     }
     if (prefill_chunk > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {

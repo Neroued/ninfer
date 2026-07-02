@@ -196,7 +196,7 @@ private:
     KVCache& kv_;
     GdnState& state_;
     StepState& io_;
-    std::uint32_t prefill_chunk_    = 512;
+    std::uint32_t prefill_chunk_    = kDefaultPrefillChunk;
     const Tensor* active_positions_ = nullptr;
 
     const Weight* embed_      = nullptr;

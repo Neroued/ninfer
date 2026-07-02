@@ -213,7 +213,7 @@ std::string usage_text(std::string_view program) {
         << kDefaultWarmup << ")\n"
         << "  --max-ctx <tokens>          override auto-sized max context\n"
         << "  --prefill-chunk <tokens>    prefill ubatch size, multiple of 128 (default: "
-        << kDefaultPrefillChunk << ")\n"
+        << model::kDefaultPrefillChunk << ")\n"
         << "  --work-bytes <bytes>        explicit workspace arena override\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             disable CUDA graph decode (decode_path=eager)\n"
@@ -289,7 +289,7 @@ BenchOptions parse_args(int argc, char** argv) {
         }
     }
     if (!saw_weights) { throw std::invalid_argument("--weights is required"); }
-    if (options.prefill_chunk % 128 != 0) {
+    if (options.prefill_chunk % model::kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     return options;

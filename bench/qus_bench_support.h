@@ -5,6 +5,8 @@
 // statistics, and table/JSON/CSV formatting. The engine-driven measurement lives in
 // qus_bench.cpp; everything here is host-only and unit-testable without a GPU.
 
+#include "qus/model/config.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -19,12 +21,11 @@ inline constexpr std::string_view kArtifactType      = "qus_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath = "bench/fixtures/bench_corpus.ids";
 // Seed tokens prefilled (untimed) before a pure decode (tg) test so the model has a valid
 // context to decode from. Kept tiny so tg measures near-peak decode throughput.
-inline constexpr int kDecodeSeedTokens              = 1;
-inline constexpr int kDefaultNPrompt                = 512;
-inline constexpr int kDefaultNGen                   = 128;
-inline constexpr int kDefaultRepetitions            = 5;
-inline constexpr int kDefaultWarmup                 = 1;
-inline constexpr std::uint32_t kDefaultPrefillChunk = 512;
+inline constexpr int kDecodeSeedTokens   = 1;
+inline constexpr int kDefaultNPrompt     = 512;
+inline constexpr int kDefaultNGen        = 128;
+inline constexpr int kDefaultRepetitions = 5;
+inline constexpr int kDefaultWarmup      = 1;
 
 enum class TestKind { Prefill, Decode, PrefillDecode };
 
@@ -61,7 +62,7 @@ struct BenchOptions {
     int warmup      = kDefaultWarmup;
     std::optional<std::uint32_t> max_ctx;  // --max-ctx override
     std::optional<std::size_t> work_bytes; // --work-bytes override (prefill workspace)
-    std::uint32_t prefill_chunk = kDefaultPrefillChunk;
+    std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
     int device                  = 0;
     bool use_cuda_graph         = true;
     OutputFormat output         = OutputFormat::Table;
@@ -98,7 +99,7 @@ struct BenchEnvironment {
     std::uint64_t weights_file_size_bytes = 0;
     std::uint32_t max_ctx                 = 0;
     std::size_t work_bytes                = 0;
-    std::uint32_t prefill_chunk           = kDefaultPrefillChunk;
+    std::uint32_t prefill_chunk           = model::kDefaultPrefillChunk;
     std::string decode_path; // "cuda_graph" or "eager"
     int repetitions = 0;
     int warmup      = 0;

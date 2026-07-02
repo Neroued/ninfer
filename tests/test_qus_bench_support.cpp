@@ -252,7 +252,7 @@ int test_format_json_schema() {
     env.max_ctx       = 640;
     env.decode_path   = "cuda_graph";
     env.repetitions   = 2;
-    env.prefill_chunk = 512;
+    env.prefill_chunk = qus::model::kDefaultPrefillChunk;
     env.corpus_path   = "bench/fixtures/bench_corpus.ids";
     env.corpus_tokens = 10241;
     env.weights_path  = "w.qus";
@@ -268,7 +268,8 @@ int test_format_json_schema() {
     failures += expect_bool(report.at("schema_version").get<int>() == 2, "json schema version");
     failures += expect_string(report.at("artifact_type").get<std::string>(), "qus_bench_report",
                               "json artifact type");
-    failures += expect_bool(report.at("config").at("prefill_chunk").get<int>() == 512,
+    failures += expect_bool(report.at("config").at("prefill_chunk").get<int>() ==
+                                static_cast<int>(qus::model::kDefaultPrefillChunk),
                             "json config prefill_chunk");
     const Json& tests = report.at("tests");
     failures += expect_bool(tests.is_array() && tests.size() == 2, "json tests array");
@@ -299,13 +300,15 @@ int test_format_table_and_csv() {
     const std::vector<qb::TestResult> results = sample_results();
     qb::BenchEnvironment env;
     env.decode_path         = "cuda_graph";
-    env.prefill_chunk       = 512;
+    env.prefill_chunk       = qus::model::kDefaultPrefillChunk;
     const std::string table = qb::format_table(env, results);
     failures += expect_bool(table.find("pp512") != std::string::npos, "table has pp512");
     failures += expect_bool(table.find("tg128") != std::string::npos, "table has tg128");
     failures += expect_bool(table.find("prefill t/s") != std::string::npos, "table has header");
-    failures += expect_bool(table.find("prefill_chunk=512") != std::string::npos,
-                            "table has prefill_chunk config");
+    failures += expect_bool(
+        table.find("prefill_chunk=" + std::to_string(qus::model::kDefaultPrefillChunk)) !=
+            std::string::npos,
+        "table has prefill_chunk config");
     failures += expect_bool(table.find("work peak") != std::string::npos, "table has work peak");
     failures += expect_bool(table.find("GiB") != std::string::npos, "table shows GiB peak");
 

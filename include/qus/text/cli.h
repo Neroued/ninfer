@@ -1,5 +1,7 @@
 #pragma once
 
+#include "qus/model/config.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -19,7 +21,7 @@ struct CliOptions {
     std::string messages_path;
     int max_new                 = 128;
     std::uint32_t max_context   = 2048;
-    std::uint32_t prefill_chunk = 512;
+    std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
     int device                  = 0;
     OutputMode output_mode      = OutputMode::Clean;
     bool print_token_ids        = false;

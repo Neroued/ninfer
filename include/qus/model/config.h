@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace qus::model {
 
 struct ModelConfig {
@@ -49,7 +51,9 @@ struct ModelConfig {
 };
 
 inline constexpr ModelConfig kCfg{};
-inline constexpr float kAttnScale = 0.0625f;
-inline constexpr float kGdnScale  = 0.08838834764831845f;
+inline constexpr float kAttnScale                     = 0.0625f;
+inline constexpr float kGdnScale                      = 0.08838834764831845f;
+inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
 
 } // namespace qus::model

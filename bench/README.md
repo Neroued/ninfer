@@ -62,7 +62,7 @@ qus_bench --weights <q5090-path>
           [-r, --repetitions <n>]            # default 5
           [--warmup <n>]                     # default 1, discarded
           [--max-ctx <tokens>]               # default: auto = max test requirement
-          [--prefill-chunk <tokens>]         # default 512, must be a multiple of 128
+          [--prefill-chunk <tokens>]         # default 1024, must be a multiple of 128
           [--work-bytes <bytes>]             # optional workspace override
           [--device <id>] [--no-cuda-graph]
           [-o, --output <table|json|csv>]    # default table
@@ -103,7 +103,7 @@ JSON shape (`schema_version: 2`, `artifact_type: "qus_bench_report"`):
   "worktree_dirty": false,
   "environment": {"gpu_name": "", "cuda_runtime_version": "", "cuda_driver_version": "", "device_id": 0},
   "weights": {"path": "", "file_size_bytes": 0},
-  "config": {"max_ctx": 0, "prefill_chunk": 512, "work_bytes": 0,
+  "config": {"max_ctx": 0, "prefill_chunk": 1024, "work_bytes": 0,
              "decode_path": "cuda_graph", "repetitions": 5, "warmup": 1,
              "timing_boundary": "host_visible_phase_end", "corpus_path": "",
              "corpus_tokens": 0},

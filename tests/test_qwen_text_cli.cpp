@@ -1,5 +1,7 @@
 #include "qus/text/cli.h"
 
+#include "qus/model/config.h"
+
 #include <exception>
 #include <iostream>
 #include <stdexcept>
@@ -32,7 +34,8 @@ int test_prompt_mode_defaults() {
     failures += check(options.messages_path.empty(), "prompt mode: messages path not empty");
     failures += check(options.max_new == 128, "prompt mode: max-new default mismatch");
     failures += check(options.max_context == 2048, "prompt mode: max-context default mismatch");
-    failures += check(options.prefill_chunk == 512, "prompt mode: prefill-chunk default mismatch");
+    failures += check(options.prefill_chunk == qus::model::kDefaultPrefillChunk,
+                      "prompt mode: prefill-chunk default mismatch");
     failures += check(options.device == 0, "prompt mode: device default mismatch");
     failures += check(options.output_mode == qus::text::OutputMode::Clean,
                       "prompt mode: output mode default mismatch");

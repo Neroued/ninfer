@@ -43,7 +43,7 @@ struct EngineOptions {
     std::size_t weight_bytes    = 0;
     std::size_t cache_bytes     = 0;
     std::size_t work_bytes      = 0;
-    std::uint32_t prefill_chunk = 512;
+    std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
     Q5090Progress* progress     = nullptr;
     std::vector<int> stop_token_ids;
     bool use_cuda_graph = true;

@@ -257,7 +257,7 @@ Qwen3_6_27B::Qwen3_6_27B(DeviceContext& ctx, WeightStore& weights, WorkspaceAren
                          KVCache& kv, GdnState& state, StepState& io, std::uint32_t prefill_chunk)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), state_(state), io_(io),
       prefill_chunk_(prefill_chunk) {
-    if (prefill_chunk_ == 0 || prefill_chunk_ % 128 != 0 ||
+    if (prefill_chunk_ == 0 || prefill_chunk_ % kPrefillChunkAlignment != 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("Qwen3_6_27B prefill_chunk must be a nonzero multiple of 128");
     }

@@ -86,7 +86,7 @@ CliOptions parse_cli(int argc, char** argv) {
     }
     if (options.max_new <= 0) { throw std::invalid_argument("--max-new must be positive"); }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.prefill_chunk % 128 != 0) {
+    if (options.prefill_chunk % model::kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     return options;

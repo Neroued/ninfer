@@ -14,6 +14,17 @@ namespace qus::kernels::detail {
 void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
     const std::int64_t n = out.numel();
     constexpr int kBlock = 128;
+    if (!gate.is_contiguous() || !up.is_contiguous()) {
+        const int scalar_grid = static_cast<int>((n + kBlock - 1) / kBlock);
+        silu_and_mul_strided_input_kernel<<<scalar_grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(gate.data), static_cast<const __nv_bfloat16*>(up.data),
+            static_cast<__nv_bfloat16*>(out.data), n, gate.ne[0], gate.ne[1], gate.ne[2],
+            gate.nb[0], gate.nb[1], gate.nb[2], gate.nb[3], up.nb[0], up.nb[1], up.nb[2],
+            up.nb[3]);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     const auto gate_addr = reinterpret_cast<std::uintptr_t>(gate.data);
     const auto up_addr   = reinterpret_cast<std::uintptr_t>(up.data);
     const auto out_addr  = reinterpret_cast<std::uintptr_t>(out.data);

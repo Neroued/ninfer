@@ -77,6 +77,40 @@ static int unaligned_data_case() {
                   Tolerance::bf16_elementwise());
 }
 
+static int strided_gate_up_view_case() {
+    constexpr int intermediate = 17408;
+    constexpr int T            = 3;
+    constexpr int n            = intermediate * T;
+    std::vector<float> g(n), u(n), fused(static_cast<std::size_t>(2 * intermediate) * T);
+    fill_uniform(g, 5026u, -8.f, 8.f);
+    fill_uniform(u, 6026u, -8.f, 8.f);
+    round_to_bf16(g);
+    round_to_bf16(u);
+
+    for (int t = 0; t < T; ++t) {
+        for (int i = 0; i < intermediate; ++i) {
+            fused[static_cast<std::size_t>(t) * 2 * intermediate + i] =
+                g[static_cast<std::size_t>(t) * intermediate + i];
+            fused[static_cast<std::size_t>(t) * 2 * intermediate + intermediate + i] =
+                u[static_cast<std::size_t>(t) * intermediate + i];
+        }
+    }
+
+    std::vector<double> ref(n);
+    cpu_silu_and_mul(g, u, ref);
+
+    DBuf dfused = to_device_bf16(fused), dout(static_cast<std::size_t>(n) * 2);
+    Tensor tfused(dfused.p, DType::BF16, {2 * intermediate, T});
+    Tensor tg   = tfused.slice(0, 0, intermediate);
+    Tensor tu   = tfused.slice(0, intermediate, intermediate);
+    Tensor tout(dout.p, DType::BF16, {intermediate, T});
+    kernels::silu_and_mul(tg, tu, tout, nullptr);
+    cudaDeviceSynchronize();
+
+    return verify("silu strided fused gate_up view", from_device_bf16(dout, n), ref,
+                  Tolerance::bf16_elementwise());
+}
+
 static int null_validation_case() {
     try {
         Tensor gate(nullptr, DType::BF16, {1});
@@ -107,6 +141,7 @@ int main() {
     // Stress: large magnitudes break range-limited approximations of silu.
     f += one_shape("silu stress [-30,30]", 65536, 4242u, -30.f, 30.f);
     f += unaligned_data_case();
+    f += strided_gate_up_view_case();
     f += null_validation_case();
 
     std::cout << (f ? "FAIL" : "OK") << " silu_and_mul correctness\n";

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 
 namespace qus::kernels::detail {
 namespace {
@@ -56,10 +57,16 @@ void dispatch_codec(const __nv_bfloat16* xp, const std::uint8_t* codes, const st
         launch_cfg<Codec, GemmCfg<64, 128, 64, 16, 64, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "64x128x64x16") {
         launch_cfg<Codec, GemmCfg<64, 128, 64, 64, 16, 2, 2, false>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
+    } else if (tag == "64x128x64x32cg") {
+        launch_cfg<Codec, GemmCfg<64, 128, 64, 64, 32, 2, 1, false, true>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
+    } else if (tag == "64x128x64x32cgsp") {
+        launch_cfg<Codec, GemmCfg<64, 128, 64, 64, 32, 2, 1, false, true, true>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "128x64x64x32") {
         launch_cfg<Codec, GemmCfg<128, 64, 64, 64, 32, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "64x64x64x32") {
         launch_cfg<Codec, GemmCfg<64, 64, 64, 64, 32, 2, 3>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
+    } else if constexpr (std::is_same_v<Codec, Q6Codec>) {
+        launch_cfg<Codec, GemmCfg<64, 128, 64, 64, 32, 2, 1, false, true, true>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else {
         launch_cfg<Codec, GemmCfg<64, 128, 64, 64, 16, 2, 2, false>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     }

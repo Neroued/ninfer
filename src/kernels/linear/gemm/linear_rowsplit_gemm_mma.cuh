@@ -56,7 +56,7 @@ struct gemm_high_bytes<Q6Codec> {
 // K-step consumes exactly one group per row (single scale load). The block tile
 // BM x BN is partitioned into WARPS_M x WARPS_N warp tiles of WM x WN.
 template <int BM_, int BN_, int BK_, int WM_, int WN_, int STAGES_, int MIN_BLOCKS_ = 1,
-          bool FRAG_DBUF_ = true>
+          bool FRAG_DBUF_ = true, bool CG_LOAD_ = false, bool SCALE_PAIR_LOAD_ = false>
 struct GemmCfg {
     static constexpr int BM         = BM_;
     static constexpr int BN         = BN_;
@@ -72,14 +72,18 @@ struct GemmCfg {
     static constexpr int MT      = WM_ / 16; // m16 subtiles per warp
     static constexpr int NT      = WN_ / 8;  // n8 subtiles per warp
     static constexpr bool FRAG_DBUF = FRAG_DBUF_;
+    static constexpr bool CG_LOAD = CG_LOAD_;
+    static constexpr bool SCALE_PAIR_LOAD = SCALE_PAIR_LOAD_;
 
     static constexpr int GROUPS_PER_BK = BK_ / 64; // quant groups contracted per K-tile
+    static constexpr int SCALE_BYTES = SCALE_PAIR_LOAD_ ? 4 : 2;
 
     // Conservative shared estimate: single As (bf16) + STAGES x-tiles (bf16) +
-    // STAGES raw quant (codes 32B + high <=16B + scale 2B per group). Uses the
-    // Q6 high plane as the upper bound so all codecs fit the static 48KB budget.
+    // STAGES raw quant. Uses the Q6 high plane as the upper bound so all codecs
+    // fit the static 48KB budget.
     static constexpr int smem_est_bytes =
-        (BM_ * BK_) * 2 + STAGES_ * (BN_ * BK_) * 2 + STAGES_ * (BM_ * GROUPS_PER_BK * (32 + 16 + 2));
+        (BM_ * BK_) * 2 + STAGES_ * (BN_ * BK_) * 2 +
+        STAGES_ * (BM_ * GROUPS_PER_BK * (32 + 16 + SCALE_BYTES));
 
     static_assert(BK_ % 64 == 0, "GemmCfg: BK must be a multiple of the 64-wide quant group");
     static_assert(STAGES_ >= 2, "GemmCfg: the cp.async pipeline requires STAGES >= 2");
@@ -102,6 +106,21 @@ __device__ __forceinline__ void gemm_mma_m16n8k16_bf16(float& c0, float& c1, flo
 
 __device__ __forceinline__ unsigned gemm_smem_addr(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+
+template <int N_BYTES, class Cfg>
+__device__ __forceinline__ void gemm_async_copy_global_to_shared(void* dst, const void* src) {
+    if constexpr (Cfg::CG_LOAD && N_BYTES == 16) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" ::"r"(
+                         static_cast<unsigned>(__cvta_generic_to_shared(dst))),
+                     "l"(src), "n"(N_BYTES));
+#else
+        *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
+#endif
+    } else {
+        qus::kernels::async_copy_global_to_shared<N_BYTES>(dst, src);
+    }
 }
 
 // XOR swizzle for a [rows][64] bf16 tile: permute the eight 16-byte (8-bf16) column
@@ -151,15 +170,16 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
     constexpr int S    = Cfg::STAGES;        // cp.async pipeline depth (>=2)
     constexpr int HB   = gemm_high_bytes<Codec>::value;
     constexpr int HBS  = HB > 0 ? HB : 1; // avoid a zero-size shared array for Q4
+    constexpr int SB   = Cfg::SCALE_BYTES;
 
     // As holds the dequantized weight tile for the current stage; Bs/Cr/Hr/Sr are
     // S-deep so cp.async can prefetch the next K-tile's raw quant + x while the
     // current tile is dequantized and multiplied.
-    __shared__ __align__(16) __nv_bfloat16 As[BM * BK];         // dequantized W [BM][BK]
-    __shared__ __align__(16) __nv_bfloat16 Bs[S][BN * BK];      // staged x      [BN][BK]
+    __shared__ __align__(16) __nv_bfloat16 As[BM * BK];           // dequantized W [BM][BK]
+    __shared__ __align__(16) __nv_bfloat16 Bs[S][BN * BK];        // staged x      [BN][BK]
     __shared__ __align__(16) std::uint8_t  Cr[S][BM * GPB * 32];  // nibble codes
     __shared__ __align__(16) std::uint8_t  Hr[S][BM * GPB * HBS]; // high plane
-    __shared__ __align__(16) std::uint8_t  Sr[S][BM * GPB * 2];   // fp16 scales
+    __shared__ __align__(16) std::uint8_t  Sr[S][BM * GPB * SB];  // fp16 scales
 
     const int kg   = padded_k >> 6;
     const int tid  = static_cast<int>(threadIdx.x);
@@ -195,11 +215,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3; // +8 for the k8-15 half
 
-    // Prefetch K-tile `kt`'s raw quant (codes/high) + x into stage buffer `stage`
-    // with cp.async (coalesced 16B); scales are 2B/group and read scalar. No math.
-    auto stage_load = [&](int stage, int kt) {
+    auto stage_load_x = [&](int stage, int kt) {
         const int k0 = kt * BK;
-        const int g  = k0 >> 6;
 #pragma unroll 1
         for (int c = tid; c < BN * (BK / 8); c += Cfg::THREADS) {
             const int      tl  = c / (BK / 8);
@@ -209,17 +226,22 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             const int      kk  = k0 + kl;
             __nv_bfloat16* dst = &Bs[stage][tl * BK + gemm_swz64(tl, kl)];
             if constexpr (FullTiles) {
-                qus::kernels::async_copy_global_to_shared<16>(
+                gemm_async_copy_global_to_shared<16, Cfg>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
                 if (col < t && kk + 8 <= k) {
-                    qus::kernels::async_copy_global_to_shared<16>(
+                    gemm_async_copy_global_to_shared<16, Cfg>(
                         dst, &x[static_cast<std::int64_t>(col) * k + kk]);
                 } else {
                     *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
                 }
             }
         }
+    };
+
+    auto stage_load_quant = [&](int stage, int kt) {
+        const int k0 = kt * BK;
+        const int g  = k0 >> 6;
 #pragma unroll 1
         for (int c = tid; c < BM * GPB * 2; c += Cfg::THREADS) {
             const int     rg   = c >> 1;
@@ -230,11 +252,11 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             std::uint8_t* dst  = &Cr[stage][rg * 32 + half * 16];
             if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                qus::kernels::async_copy_global_to_shared<16>(dst, &codes[gi * 32 + half * 16]);
+                gemm_async_copy_global_to_shared<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
             } else {
                 if (grow < n) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                    qus::kernels::async_copy_global_to_shared<16>(dst, &codes[gi * 32 + half * 16]);
+                    gemm_async_copy_global_to_shared<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
                 } else {
                     *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
                 }
@@ -249,11 +271,11 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 std::uint8_t* dst  = &Hr[stage][rg * HB];
                 if constexpr (FullTiles) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                    qus::kernels::async_copy_global_to_shared<HB>(dst, &high[gi * HB]);
+                    gemm_async_copy_global_to_shared<HB, Cfg>(dst, &high[gi * HB]);
                 } else {
                     if (grow < n) {
                         const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                        qus::kernels::async_copy_global_to_shared<HB>(dst, &high[gi * HB]);
+                        gemm_async_copy_global_to_shared<HB, Cfg>(dst, &high[gi * HB]);
                     } else {
 #pragma unroll
                         for (int b = 0; b < HB; ++b) { dst[b] = 0; }
@@ -266,32 +288,82 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             const int     row  = rg / GPB;
             const int     gg   = rg - row * GPB;
             const int     grow = m0 + row;
-            std::uint8_t* dst  = &Sr[stage][rg * 2];
+            const int     sg   = g + gg;
+            std::uint8_t* dst = &Sr[stage][rg * SB];
             if constexpr (FullTiles) {
-                const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                *reinterpret_cast<std::uint16_t*>(dst) =
-                    *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
-            } else {
-                if (grow < n) {
-                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
+                if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                    const int          aligned_sg = sg & ~1;
+                    const std::int64_t aligned_gi =
+                        static_cast<std::int64_t>(grow) * kg + aligned_sg;
+                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + sg;
+                    if (aligned_sg + 1 < kg) {
+                        gemm_async_copy_global_to_shared<4, Cfg>(dst, &scales[aligned_gi * 2]);
+                    } else {
+                        *reinterpret_cast<std::uint16_t*>(dst) =
+                            *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
+                        *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
+                    }
+                } else {
+                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + sg;
                     *reinterpret_cast<std::uint16_t*>(dst) =
                         *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
+                }
+            } else {
+                if (grow < n) {
+                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + sg;
+                    if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                        const int          aligned_sg = sg & ~1;
+                        const std::int64_t aligned_gi =
+                            static_cast<std::int64_t>(grow) * kg + aligned_sg;
+                        if (aligned_sg + 1 < kg) {
+                            gemm_async_copy_global_to_shared<4, Cfg>(dst,
+                                                                     &scales[aligned_gi * 2]);
+                        } else {
+                            *reinterpret_cast<std::uint16_t*>(dst) =
+                                *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
+                            *reinterpret_cast<std::uint16_t*>(dst + 2) = 0;
+                        }
+                    } else {
+                        *reinterpret_cast<std::uint16_t*>(dst) =
+                            *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
+                    }
                 } else {
                     dst[0] = 0;
                     dst[1] = 0;
+                    if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                        dst[2] = 0;
+                        dst[3] = 0;
+                    }
                 }
             }
         }
     };
 
+    // Prefetch K-tile `kt`'s raw quant (codes/high/scales) + x into stage buffer
+    // `stage`. Scale-pair configs stage aligned 4B pairs so dequant can select the
+    // requested fp16 scale without another global load.
+    auto stage_load = [&](int stage, int kt) {
+        stage_load_x(stage, kt);
+        stage_load_quant(stage, kt);
+    };
+
     // Dequant staged quant of buffer `stage` into As (swizzled), warp-per-row.
-    auto dequant_to_As = [&](int stage) {
+    auto dequant_to_As = [&](int stage, int kt) {
+        const int scale_group = (kt * BK) >> 6;
         for (int row = warp; row < BM; row += Cfg::WARPS) {
             __nv_bfloat16* dst = &As[row * BK];
 #pragma unroll
             for (int gg = 0; gg < GPB; ++gg) {
-                const __nv_bfloat162 w = Codec::load_pair_bf162(Cr[stage], Hr[stage], Sr[stage],
-                                                                 row * GPB + gg, lane);
+                const int group_index = row * GPB + gg;
+                __nv_bfloat162 w;
+                if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                    const int scale_off = ((scale_group + gg) & 1) * 2;
+                    w = Codec::load_pair_bf162_scale_ptr(
+                        Cr[stage], Hr[stage], &Sr[stage][group_index * SB + scale_off],
+                        group_index, lane);
+                } else {
+                    w = Codec::load_pair_bf162(Cr[stage], Hr[stage], Sr[stage], group_index, lane);
+                }
                 const int sc = gemm_swz64(row, gg * 64 + 2 * lane);
                 *reinterpret_cast<__nv_bfloat162*>(&dst[sc]) = w;
             }
@@ -310,8 +382,10 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
         qus::kernels::async_copy_wait<S - 1>();
         __syncthreads();
 
-        dequant_to_As(stage);
+        dequant_to_As(stage, it);
         __syncthreads();
+
+        const int itp = it + S;
 
         auto load_frag_set = [&](int ks, unsigned (&af)[MT][4], unsigned (&bf)[NT][2]) {
 #pragma unroll
@@ -369,7 +443,6 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
         }
         __syncthreads();
 
-        const int itp = it + S;
         if (itp < NKT) { stage_load(stage, itp); }
         qus::kernels::async_copy_commit();
     }
@@ -391,12 +464,24 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 out[static_cast<std::int64_t>(cc1) * n + r1] = __float2bfloat16(a[3]);
             } else {
                 if (r0 < n) {
-                    if (cc0 < t) { out[static_cast<std::int64_t>(cc0) * n + r0] = __float2bfloat16(a[0]); }
-                    if (cc1 < t) { out[static_cast<std::int64_t>(cc1) * n + r0] = __float2bfloat16(a[1]); }
+                    if (cc0 < t) {
+                        out[static_cast<std::int64_t>(cc0) * n + r0] =
+                            __float2bfloat16(a[0]);
+                    }
+                    if (cc1 < t) {
+                        out[static_cast<std::int64_t>(cc1) * n + r0] =
+                            __float2bfloat16(a[1]);
+                    }
                 }
                 if (r1 < n) {
-                    if (cc0 < t) { out[static_cast<std::int64_t>(cc0) * n + r1] = __float2bfloat16(a[2]); }
-                    if (cc1 < t) { out[static_cast<std::int64_t>(cc1) * n + r1] = __float2bfloat16(a[3]); }
+                    if (cc0 < t) {
+                        out[static_cast<std::int64_t>(cc0) * n + r1] =
+                            __float2bfloat16(a[2]);
+                    }
+                    if (cc1 < t) {
+                        out[static_cast<std::int64_t>(cc1) * n + r1] =
+                            __float2bfloat16(a[3]);
+                    }
                 }
             }
         }

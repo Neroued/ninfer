@@ -53,7 +53,14 @@ struct Q4Codec {
                                                                      const std::uint8_t* scales,
                                                                      std::int64_t group_index,
                                                                      int lane) {
-        const float        scale = codec_load_scale_f16(scales, group_index);
+        return load_pair_bf162_scale_ptr(codes, high, scales + group_index * 2, group_index, lane);
+    }
+
+    static __device__ __forceinline__ __nv_bfloat162
+    load_pair_bf162_scale_ptr(const std::uint8_t* codes, const std::uint8_t* /*high*/,
+                              const std::uint8_t* scale_ptr, std::int64_t group_index, int lane) {
+        const float        scale = __half2float(__ushort_as_half(
+            *reinterpret_cast<const std::uint16_t*>(scale_ptr)));
         const std::uint8_t byte  = codes[group_index * kBytesPerRowPerGroup + lane];
         const int          u0    = byte & 0x0f;
         const int          u1    = byte >> 4;
@@ -111,7 +118,14 @@ struct Q5Codec {
                                                                      const std::uint8_t* scales,
                                                                      std::int64_t group_index,
                                                                      int lane) {
-        const float          scale     = codec_load_scale_f16(scales, group_index);
+        return load_pair_bf162_scale_ptr(codes, high, scales + group_index * 2, group_index, lane);
+    }
+
+    static __device__ __forceinline__ __nv_bfloat162
+    load_pair_bf162_scale_ptr(const std::uint8_t* codes, const std::uint8_t* high,
+                              const std::uint8_t* scale_ptr, std::int64_t group_index, int lane) {
+        const float          scale     = __half2float(__ushort_as_half(
+            *reinterpret_cast<const std::uint16_t*>(scale_ptr)));
         const std::uint8_t   byte      = codes[group_index * kNibbleBytesPerRowPerGroup + lane];
         const std::uint8_t*  high_bits = high + group_index * kHighBytesPerRowPerGroup;
         const int            lo0       = byte & 0x0f;
@@ -177,7 +191,14 @@ struct Q6Codec {
                                                                      const std::uint8_t* scales,
                                                                      std::int64_t group_index,
                                                                      int lane) {
-        const float          scale     = codec_load_scale_f16(scales, group_index);
+        return load_pair_bf162_scale_ptr(codes, high, scales + group_index * 2, group_index, lane);
+    }
+
+    static __device__ __forceinline__ __nv_bfloat162
+    load_pair_bf162_scale_ptr(const std::uint8_t* codes, const std::uint8_t* high,
+                              const std::uint8_t* scale_ptr, std::int64_t group_index, int lane) {
+        const float          scale     = __half2float(__ushort_as_half(
+            *reinterpret_cast<const std::uint16_t*>(scale_ptr)));
         const std::uint8_t   byte      = codes[group_index * kNibbleBytesPerRowPerGroup + lane];
         const std::uint8_t*  high_bits = high + group_index * kHighBytesPerRowPerGroup;
         const int            lo0       = byte & 0x0f;

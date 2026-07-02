@@ -8,6 +8,7 @@ file(GLOB_RECURSE QUS_SOURCES CONFIGURE_DEPENDS
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 
 add_library(qus_core STATIC ${QUS_SOURCES})
+set_target_properties(qus_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_include_directories(qus_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
 # Internal L1 layer headers resolve as "kernels/launcher/<op>.h" (wrapper -> launcher seam).
 target_include_directories(qus_core PRIVATE

@@ -14,6 +14,11 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+if(CMAKE_GENERATOR MATCHES "Ninja")
+  set_property(GLOBAL PROPERTY JOB_POOLS cuda_link=1)
+  set(CMAKE_JOB_POOL_LINK cuda_link)
+endif()
+
 find_package(CUDAToolkit REQUIRED)
 
 # --- Subdirectories ----------------------------------------------------------

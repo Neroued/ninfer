@@ -501,13 +501,12 @@ void Qwen3_6_27B::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
         return;
     }
 
-    Tensor g = work_.alloc(DType::BF16, {kCfg.intermediate, T});
-    Tensor u = work_.alloc(DType::BF16, {kCfg.intermediate, T});
-    kernels::linear(h, *m.gate, g, work_, s);
-    kernels::linear(h, *m.up, u, work_, s);
+    Tensor gate_up = work_.alloc(DType::BF16, {2 * kCfg.intermediate, T});
+    kernels::linear(h, *m.gate_up, gate_up, work_, s);
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.intermediate, T});
-    kernels::silu_and_mul(g, u, a, s);
+    kernels::silu_and_mul(gate_up.slice(0, 0, kCfg.intermediate),
+                          gate_up.slice(0, kCfg.intermediate, kCfg.intermediate), a, s);
 
     Tensor d = work_.alloc(DType::BF16, {kCfg.hidden, T});
     kernels::linear(a, *m.down, d, work_, s);

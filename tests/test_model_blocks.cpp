@@ -88,6 +88,52 @@ void set_positions(qus::model::StepState& io, qus::test::DBuf& pos, int T) {
     io.pos = qus::Tensor(pos.p, qus::DType::I32, {T});
 }
 
+qus::Weight invalid_dense_weight(std::int32_t n, std::int32_t k) {
+    qus::Weight w{};
+    w.qtype             = qus::QType::BF16_CTRL;
+    w.layout            = qus::QuantLayout::Contiguous;
+    w.q5090_scale_dtype = qus::ScaleDType::None;
+    w.n                 = n;
+    w.k                 = k;
+    w.ndim              = 2;
+    w.shape[0]          = n;
+    w.shape[1]          = k;
+    for (int d = 0; d < 4; ++d) { w.padded_shape[d] = w.shape[d]; }
+    w.payload_bytes = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k) * 2ULL;
+    return w;
+}
+
+int fused_prefill_uses_gate_up(qus::model::Qwen3_6_27B& card, const qus::model::FullLayerW& full,
+                               qus::WorkspaceArena& work, qus::DeviceArena& x_arena) {
+    constexpr int T = 32;
+
+    work.reset();
+    x_arena.reset();
+    qus::Tensor x = x_arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, T});
+    fill_hidden(x, T);
+
+    qus::Weight bad_gate =
+        invalid_dense_weight(qus::model::kCfg.intermediate, qus::model::kCfg.hidden);
+    qus::Weight bad_up =
+        invalid_dense_weight(qus::model::kCfg.intermediate, qus::model::kCfg.hidden);
+    qus::model::MlpW fused_mlp = full.mlp;
+    fused_mlp.gate             = &bad_gate;
+    fused_mlp.up               = &bad_up;
+
+    try {
+        card.test_mlp_tail(full.post_attn_norm, fused_mlp, x, qus::model::Phase::Prefill);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } catch (const std::exception& e) {
+        return fail(std::string("prefill T=32 fused_mlp_tail: unexpected exception: ") + e.what());
+    }
+
+    int failures = expect_finite_hidden(x, "prefill T=32 fused_mlp_tail");
+    if (work.used() == 0) {
+        failures += fail("prefill T=32 fused_mlp_tail: workspace was not used");
+    }
+    return failures;
+}
+
 int run_case(qus::model::Qwen3_6_27B& card, const qus::model::FullLayerW& full,
              const qus::model::GdnLayerW& gdn, qus::WorkspaceArena& work, qus::DeviceArena& x_arena,
              qus::KVCache& kv, qus::GdnState& state, qus::model::StepState& io,
@@ -200,5 +246,6 @@ int main() {
                          qus::model::Phase::Decode, 1, "decode T=1");
     failures += run_case(card, full, gdn, workspace, x_arena, kv, state, io,
                          qus::model::Phase::Prefill, 4, "prefill T=4");
+    failures += fused_prefill_uses_gate_up(card, full, workspace, x_arena);
     return failures == 0 ? 0 : 1;
 }

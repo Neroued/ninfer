@@ -37,20 +37,22 @@ void dispatch_codec(const __nv_bfloat16* xp, const std::uint8_t* codes, const st
     const char*            env = std::getenv("QUS_GEMM_CFG");
     const std::string_view tag = env ? std::string_view(env) : std::string_view();
 
-    // Tag = "BMxBNxWMxWN" (BK 64). All configs are cp.async double-buffered
-    // (STAGES=2); the trailing GemmCfg arg is __launch_bounds__ min blocks/SM.
+    // Tag = "BMxBNxWMxWN" (BK 64). The default favors the MLP gate_up
+    // fused-prefill shape while preserving the original configs for local sweeps.
     if (tag == "64x64x32x32") {
         launch_cfg<Codec, GemmCfg<64, 64, 64, 32, 32, 2, 3>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "128x64x32x32") {
         launch_cfg<Codec, GemmCfg<128, 64, 64, 32, 32, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "64x128x32x32") {
         launch_cfg<Codec, GemmCfg<64, 128, 64, 32, 32, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
+    } else if (tag == "64x128x16x64" || tag == "64x128x16x64m2") {
+        launch_cfg<Codec, GemmCfg<64, 128, 64, 16, 64, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "128x64x64x32") {
         launch_cfg<Codec, GemmCfg<128, 64, 64, 64, 32, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "64x64x64x32") {
         launch_cfg<Codec, GemmCfg<64, 64, 64, 64, 32, 2, 3>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else {
-        launch_cfg<Codec, GemmCfg<64, 128, 64, 32, 32, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
+        launch_cfg<Codec, GemmCfg<64, 128, 64, 16, 64, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     }
 }
 

@@ -62,6 +62,26 @@ __global__ void silu_and_mul_strided_input_kernel(
     }
 }
 
+__launch_bounds__(256) __global__ void silu_and_mul_dim0_split_kernel(
+    const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out, std::int32_t rows,
+    std::int64_t gate_col_stride, std::int64_t up_col_stride) {
+    const int col             = blockIdx.y;
+    const std::int64_t pair0 =
+        (blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x) *
+        kSiluAndMulPairsPerThread;
+    const std::int64_t row_pairs = rows / 2;
+
+    const auto* gate2 =
+        reinterpret_cast<const __nv_bfloat162*>(gate + col * gate_col_stride);
+    const auto* up2 = reinterpret_cast<const __nv_bfloat162*>(up + col * up_col_stride);
+    auto* out2      = reinterpret_cast<__nv_bfloat162*>(out + col * static_cast<std::int64_t>(rows));
+
+    for (int p = 0; p < kSiluAndMulPairsPerThread; ++p) {
+        const std::int64_t j = pair0 + p;
+        if (j < row_pairs) { out2[j] = silu_mul_pair(gate2[j], up2[j]); }
+    }
+}
+
 __launch_bounds__(256) __global__
     void silu_and_mul_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out,
                              std::int64_t n) {

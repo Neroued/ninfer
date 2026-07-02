@@ -24,7 +24,7 @@ struct Q4Codec {
         for (int lane = 0; lane < kGroupK; ++lane) {
             const std::uint8_t byte = packed[lane >> 1];
             const int u = (lane & 1) ? (byte >> 4) : (byte & 0x0f);
-            const int s = (u & 0x08) ? (u - 16) : u;          // sign-extend bit 3
+            const int s = (u ^ 0x08) - 0x08;                  // sign-extend bit 3
             out[lane] = static_cast<float>(s) * scale;
         }
     }
@@ -42,8 +42,8 @@ struct Q4Codec {
         const std::uint8_t  byte  = codes[group_index * kBytesPerRowPerGroup + lane];
         const int           u0    = byte & 0x0f;
         const int           u1    = byte >> 4;
-        const int           s0    = (u0 & 0x08) ? (u0 - 16) : u0;
-        const int           s1    = (u1 & 0x08) ? (u1 - 16) : u1;
+        const int           s0    = (u0 ^ 0x08) - 0x08;
+        const int           s1    = (u1 ^ 0x08) - 0x08;
         w0 = static_cast<float>(s0) * scale;
         w1 = static_cast<float>(s1) * scale;
     }

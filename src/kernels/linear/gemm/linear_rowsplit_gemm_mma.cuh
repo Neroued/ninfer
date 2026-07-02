@@ -55,7 +55,8 @@ struct gemm_high_bytes<Q6Codec> {
 // Compile-time tile configuration. BK is fixed to the 64-wide quant group so a
 // K-step consumes exactly one group per row (single scale load). The block tile
 // BM x BN is partitioned into WARPS_M x WARPS_N warp tiles of WM x WN.
-template <int BM_, int BN_, int BK_, int WM_, int WN_, int STAGES_, int MIN_BLOCKS_ = 1>
+template <int BM_, int BN_, int BK_, int WM_, int WN_, int STAGES_, int MIN_BLOCKS_ = 1,
+          bool FRAG_DBUF_ = true>
 struct GemmCfg {
     static constexpr int BM         = BM_;
     static constexpr int BN         = BN_;
@@ -70,6 +71,7 @@ struct GemmCfg {
     static constexpr int THREADS = WARPS * 32;
     static constexpr int MT      = WM_ / 16; // m16 subtiles per warp
     static constexpr int NT      = WN_ / 8;  // n8 subtiles per warp
+    static constexpr bool FRAG_DBUF = FRAG_DBUF_;
 
     static constexpr int GROUPS_PER_BK = BK_ / 64; // quant groups contracted per K-tile
 
@@ -131,7 +133,7 @@ __device__ __forceinline__ void gemm_ldmatrix_x2(unsigned& b0, unsigned& b1, uns
                  : "r"(addr));
 }
 
-template <class Codec, class Cfg>
+template <class Codec, class Cfg, bool FullTiles>
 __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
@@ -206,11 +208,16 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             const int      col = t0 + tl;
             const int      kk  = k0 + kl;
             __nv_bfloat16* dst = &Bs[stage][tl * BK + gemm_swz64(tl, kl)];
-            if (col < t && kk + 8 <= k) {
+            if constexpr (FullTiles) {
                 qus::kernels::async_copy_global_to_shared<16>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
-                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                if (col < t && kk + 8 <= k) {
+                    qus::kernels::async_copy_global_to_shared<16>(
+                        dst, &x[static_cast<std::int64_t>(col) * k + kk]);
+                } else {
+                    *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                }
             }
         }
 #pragma unroll 1
@@ -221,11 +228,16 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             const int     gg   = rg - row * GPB;
             const int     grow = m0 + row;
             std::uint8_t* dst  = &Cr[stage][rg * 32 + half * 16];
-            if (grow < n) {
+            if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
                 qus::kernels::async_copy_global_to_shared<16>(dst, &codes[gi * 32 + half * 16]);
             } else {
-                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                if (grow < n) {
+                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
+                    qus::kernels::async_copy_global_to_shared<16>(dst, &codes[gi * 32 + half * 16]);
+                } else {
+                    *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                }
             }
         }
         if constexpr (HB > 0) {
@@ -235,12 +247,17 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 const int     gg   = rg - row * GPB;
                 const int     grow = m0 + row;
                 std::uint8_t* dst  = &Hr[stage][rg * HB];
-                if (grow < n) {
+                if constexpr (FullTiles) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
                     qus::kernels::async_copy_global_to_shared<HB>(dst, &high[gi * HB]);
                 } else {
+                    if (grow < n) {
+                        const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
+                        qus::kernels::async_copy_global_to_shared<HB>(dst, &high[gi * HB]);
+                    } else {
 #pragma unroll
-                    for (int b = 0; b < HB; ++b) { dst[b] = 0; }
+                        for (int b = 0; b < HB; ++b) { dst[b] = 0; }
+                    }
                 }
             }
         }
@@ -250,13 +267,19 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             const int     gg   = rg - row * GPB;
             const int     grow = m0 + row;
             std::uint8_t* dst  = &Sr[stage][rg * 2];
-            if (grow < n) {
+            if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
                 dst[0]                = scales[gi * 2];
                 dst[1]                = scales[gi * 2 + 1];
             } else {
-                dst[0] = 0;
-                dst[1] = 0;
+                if (grow < n) {
+                    const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
+                    dst[0]                = scales[gi * 2];
+                    dst[1]                = scales[gi * 2 + 1];
+                } else {
+                    dst[0] = 0;
+                    dst[1] = 0;
+                }
             }
         }
     };
@@ -292,39 +315,57 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
         dequant_to_As(stage);
         __syncthreads();
 
-        unsigned af[2][MT][4];
-        unsigned bf[2][NT][2];
-        auto     load_frags = [&](int ks, int buf) {
+        auto load_frag_set = [&](int ks, unsigned (&af)[MT][4], unsigned (&bf)[NT][2]) {
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
                 const int arow = wm * WM + mi * 16 + a_rowoff;
                 const int acol = ks + a_coloff;
-                gemm_ldmatrix_x4(af[buf][mi][0], af[buf][mi][1], af[buf][mi][2], af[buf][mi][3],
+                gemm_ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
                                  gemm_smem_addr(&As[arow * BK + gemm_swz64(arow, acol)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int brow = wn * WN + ni * 8 + b_rin;
                 const int bcol = ks + b_koff;
-                gemm_ldmatrix_x2(bf[buf][ni][0], bf[buf][ni][1],
+                gemm_ldmatrix_x2(bf[ni][0], bf[ni][1],
                                  gemm_smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, bcol)]));
             }
         };
 
-        load_frags(0, 0);
+        if constexpr (Cfg::FRAG_DBUF) {
+            unsigned af[2][MT][4];
+            unsigned bf[2][NT][2];
+            load_frag_set(0, af[0], bf[0]);
 #pragma unroll
-        for (int ki = 0; ki < KSUB; ++ki) {
-            const int cur = ki & 1;
-            const int nxt = (ki + 1) & 1;
-            if (ki + 1 < KSUB) { load_frags((ki + 1) * 16, nxt); }
+            for (int ki = 0; ki < KSUB; ++ki) {
+                const int cur = ki & 1;
+                const int nxt = (ki + 1) & 1;
+                if (ki + 1 < KSUB) { load_frag_set((ki + 1) * 16, af[nxt], bf[nxt]); }
 #pragma unroll
-            for (int mi = 0; mi < MT; ++mi) {
+                for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
-                for (int ni = 0; ni < NT; ++ni) {
-                    gemm_mma_m16n8k16_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
-                                           acc[mi][ni][3], af[cur][mi][0], af[cur][mi][1],
-                                           af[cur][mi][2], af[cur][mi][3], bf[cur][ni][0],
-                                           bf[cur][ni][1]);
+                    for (int ni = 0; ni < NT; ++ni) {
+                        gemm_mma_m16n8k16_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
+                                               acc[mi][ni][3], af[cur][mi][0], af[cur][mi][1],
+                                               af[cur][mi][2], af[cur][mi][3], bf[cur][ni][0],
+                                               bf[cur][ni][1]);
+                    }
+                }
+            }
+        } else {
+            unsigned af[MT][4];
+            unsigned bf[NT][2];
+#pragma unroll
+            for (int ki = 0; ki < KSUB; ++ki) {
+                load_frag_set(ki * 16, af, bf);
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+                    for (int ni = 0; ni < NT; ++ni) {
+                        gemm_mma_m16n8k16_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
+                                               acc[mi][ni][3], af[mi][0], af[mi][1], af[mi][2],
+                                               af[mi][3], bf[ni][0], bf[ni][1]);
+                    }
                 }
             }
         }
@@ -345,13 +386,20 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             const int    cc0 = t0 + wn * WN + ni * 8 + 2 * lid;
             const int    cc1 = cc0 + 1;
             const float* a   = acc[mi][ni];
-            if (r0 < n) {
-                if (cc0 < t) { out[static_cast<std::int64_t>(cc0) * n + r0] = __float2bfloat16(a[0]); }
-                if (cc1 < t) { out[static_cast<std::int64_t>(cc1) * n + r0] = __float2bfloat16(a[1]); }
-            }
-            if (r1 < n) {
-                if (cc0 < t) { out[static_cast<std::int64_t>(cc0) * n + r1] = __float2bfloat16(a[2]); }
-                if (cc1 < t) { out[static_cast<std::int64_t>(cc1) * n + r1] = __float2bfloat16(a[3]); }
+            if constexpr (FullTiles) {
+                out[static_cast<std::int64_t>(cc0) * n + r0] = __float2bfloat16(a[0]);
+                out[static_cast<std::int64_t>(cc1) * n + r0] = __float2bfloat16(a[1]);
+                out[static_cast<std::int64_t>(cc0) * n + r1] = __float2bfloat16(a[2]);
+                out[static_cast<std::int64_t>(cc1) * n + r1] = __float2bfloat16(a[3]);
+            } else {
+                if (r0 < n) {
+                    if (cc0 < t) { out[static_cast<std::int64_t>(cc0) * n + r0] = __float2bfloat16(a[0]); }
+                    if (cc1 < t) { out[static_cast<std::int64_t>(cc1) * n + r0] = __float2bfloat16(a[1]); }
+                }
+                if (r1 < n) {
+                    if (cc0 < t) { out[static_cast<std::int64_t>(cc0) * n + r1] = __float2bfloat16(a[2]); }
+                    if (cc1 < t) { out[static_cast<std::int64_t>(cc1) * n + r1] = __float2bfloat16(a[3]); }
+                }
             }
         }
     }

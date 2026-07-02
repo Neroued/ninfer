@@ -23,8 +23,15 @@ void launch_cfg(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::u
                 std::int32_t t, std::int32_t padded_k, cudaStream_t stream) {
     const dim3 grid(static_cast<unsigned>(ceil_div(n, Cfg::BM)),
                     static_cast<unsigned>(ceil_div(t, Cfg::BN)), 1u);
-    linear_rowsplit_gemm_mma_kernel<Codec, Cfg>
-        <<<grid, Cfg::THREADS, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k);
+    const bool full_tiles =
+        (n % Cfg::BM) == 0 && (t % Cfg::BN) == 0 && k == padded_k && (k % Cfg::BK) == 0;
+    if (full_tiles) {
+        linear_rowsplit_gemm_mma_kernel<Codec, Cfg, true>
+            <<<grid, Cfg::THREADS, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k);
+    } else {
+        linear_rowsplit_gemm_mma_kernel<Codec, Cfg, false>
+            <<<grid, Cfg::THREADS, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k);
+    }
 }
 
 // QUS_GEMM_CFG selects a compiled tile config for ncu sweeps. Tag = "BMxBNxWMxWN"
@@ -47,12 +54,14 @@ void dispatch_codec(const __nv_bfloat16* xp, const std::uint8_t* codes, const st
         launch_cfg<Codec, GemmCfg<64, 128, 64, 32, 32, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "64x128x16x64" || tag == "64x128x16x64m2") {
         launch_cfg<Codec, GemmCfg<64, 128, 64, 16, 64, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
+    } else if (tag == "64x128x64x16") {
+        launch_cfg<Codec, GemmCfg<64, 128, 64, 64, 16, 2, 2, false>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "128x64x64x32") {
         launch_cfg<Codec, GemmCfg<128, 64, 64, 64, 32, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else if (tag == "64x64x64x32") {
         launch_cfg<Codec, GemmCfg<64, 64, 64, 64, 32, 2, 3>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     } else {
-        launch_cfg<Codec, GemmCfg<64, 128, 64, 16, 64, 2, 2>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
+        launch_cfg<Codec, GemmCfg<64, 128, 64, 64, 16, 2, 2, false>>(xp, codes, high, scales, outp, n, k, t, padded_k, stream);
     }
 }
 

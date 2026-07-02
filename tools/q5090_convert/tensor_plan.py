@@ -1,8 +1,9 @@
-"""Declarative q5090 tensor plan carried unchanged from v2 to v3.
+"""Declarative q5090 v3 tensor plan.
 
-TEXT_CORE is expressed as stored blocks, logical segments, and fusion groups.
-Each segment carries the source TensorSpec needed to materialize its rows before
-block-level concatenation and quantization.
+TEXT_CORE, MTP_DRAFT, and VISION_ENCODER are expressed as stored blocks,
+logical segments, and fusion groups. Each segment carries the source TensorSpec
+needed to materialize its rows before block-level concatenation and
+quantization.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ FULL_ATTENTION_INTERVAL = 4
 ATTN_Q_ROWS = _ATTN_HEADS * _ATTN_HEAD_DIM
 ATTN_KV_ROWS = 4 * _ATTN_HEAD_DIM
 ATTN_IN_BLOCK_ROWS = ATTN_Q_ROWS + ATTN_KV_ROWS
+MTP_ATTN_IN_ROWS = (2 * ATTN_Q_ROWS) + (2 * ATTN_KV_ROWS)
+MTP_MLP_GATEUP_ROWS = 2 * INTERMEDIATE_SIZE
 
 GDN_KEY_ROWS = 16 * 128
 GDN_VALUE_ROWS = 48 * 128
@@ -234,12 +237,13 @@ def _source(
     source_layer: int,
     row_slice: Optional[Tuple[int, int]] = None,
     transform: Optional[str] = None,
+    module_kind: int = qt.MODULE_TEXT,
 ) -> TensorSpec:
     return TensorSpec(
         name,
         qtype,
         layout,
-        qt.MODULE_TEXT,
+        module_kind,
         src_name,
         source_kind,
         source_layer,
@@ -259,6 +263,7 @@ def _append_block(
     segment_defs: List[Tuple[str, int, int, int, TensorSpec]],
     fusion_group_id: int = qt.FUSION_NONE,
     fusion_index: int = 0,
+    module_kind: int = qt.MODULE_TEXT,
 ) -> TensorBlockSpec:
     block_index = len(blocks)
     segment_begin = len(flat_segments)
@@ -289,7 +294,7 @@ def _append_block(
         name=name,
         qtype=qtype,
         layout=layout,
-        module_kind=qt.MODULE_TEXT,
+        module_kind=module_kind,
         shape=shape,
         source_layer=source_layer,
         source_kind=source_kind,
@@ -315,8 +320,19 @@ def _append_standalone_block(
     source_layer: int = qt.NO_LAYER,
     row_slice: Optional[Tuple[int, int]] = None,
     transform: Optional[str] = None,
+    module_kind: int = qt.MODULE_TEXT,
 ) -> TensorBlockSpec:
-    source = _source(name, qtype, layout, src_name, source_kind, source_layer, row_slice, transform)
+    source = _source(
+        name,
+        qtype,
+        layout,
+        src_name,
+        source_kind,
+        source_layer,
+        row_slice,
+        transform,
+        module_kind,
+    )
     return _append_block(
         blocks,
         flat_segments,
@@ -326,6 +342,7 @@ def _append_standalone_block(
         shape,
         source_layer,
         [(name, source_kind, 0, int(shape[0]), source)],
+        module_kind=module_kind,
     )
 
 
@@ -798,26 +815,280 @@ def build_text_specs(layer_types: List[str]) -> List[TensorBlockSpec]:
     return list(build_text_manifest(layer_types).blocks)
 
 
-def build_mtp_specs() -> List[TensorSpec]:
-    m = qt.MODULE_MTP
+def _mtp_source(
+    name: str,
+    src_name: str,
+    source_kind: int,
+    source_layer: int,
+    *,
+    qtype: int = qt.QT_W8G128,
+    layout: int = qt.LAYOUT_ROW_SPLIT,
+    transform: Optional[str] = None,
+) -> TensorSpec:
+    return TensorSpec(
+        name,
+        qtype,
+        layout,
+        qt.MODULE_MTP,
+        src_name,
+        source_kind,
+        source_layer,
+        transform=transform,
+    )
+
+
+def build_mtp_manifest() -> ExpectedManifest:
+    blocks: List[TensorBlockSpec] = []
+    segments: List[TensorSegmentSpec] = []
+    fusion_groups: List[TensorFusionGroupSpec] = []
     p = "mtp.layers.0."
-    return [
-        _w8("mtp.fc.weight", "mtp.fc.weight", qt.SK_MTP_FC, qt.NO_LAYER, m),
-        _bf16("mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_embedding.weight", qt.SK_MTP_PRE_FC_NORM_EMB, qt.NO_LAYER, m),
-        _bf16("mtp.pre_fc_norm_hidden.weight", "mtp.pre_fc_norm_hidden.weight", qt.SK_MTP_PRE_FC_NORM_HID, qt.NO_LAYER, m),
-        _bf16(p + "input_layernorm.weight", p + "input_layernorm.weight", qt.SK_INPUT_LAYERNORM, 0, m),
-        _w8(p + "self_attn.q_proj.weight", p + "self_attn.q_proj.weight", qt.SK_ATTN_Q, 0, m),
-        _w8(p + "self_attn.k_proj.weight", p + "self_attn.k_proj.weight", qt.SK_ATTN_K, 0, m),
-        _w8(p + "self_attn.v_proj.weight", p + "self_attn.v_proj.weight", qt.SK_ATTN_V, 0, m),
-        _w8(p + "self_attn.o_proj.weight", p + "self_attn.o_proj.weight", qt.SK_ATTN_O, 0, m),
-        _bf16(p + "self_attn.q_norm.weight", p + "self_attn.q_norm.weight", qt.SK_ATTN_Q_NORM, 0, m),
-        _bf16(p + "self_attn.k_norm.weight", p + "self_attn.k_norm.weight", qt.SK_ATTN_K_NORM, 0, m),
-        _bf16(p + "post_attention_layernorm.weight", p + "post_attention_layernorm.weight", qt.SK_POST_ATTN_LAYERNORM, 0, m),
-        _w8(p + "mlp.gate_proj.weight", p + "mlp.gate_proj.weight", qt.SK_MLP_GATE, 0, m),
-        _w8(p + "mlp.up_proj.weight", p + "mlp.up_proj.weight", qt.SK_MLP_UP, 0, m),
-        _w8(p + "mlp.down_proj.weight", p + "mlp.down_proj.weight", qt.SK_MLP_DOWN, 0, m),
-        _bf16("mtp.norm.weight", "mtp.norm.weight", qt.SK_MTP_NORM, qt.NO_LAYER, m),
-    ]
+    q_proj = p + "self_attn.q_proj.weight"
+
+    _append_standalone_block(
+        blocks,
+        segments,
+        "mtp.fc.weight",
+        qt.QT_W8G128,
+        qt.LAYOUT_ROW_SPLIT,
+        (HIDDEN_SIZE, 2 * HIDDEN_SIZE),
+        "mtp.fc.weight",
+        qt.SK_MTP_FC,
+        module_kind=qt.MODULE_MTP,
+    )
+    _append_standalone_block(
+        blocks,
+        segments,
+        "mtp.pre_fc_norm_embedding.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        (HIDDEN_SIZE,),
+        "mtp.pre_fc_norm_embedding.weight",
+        qt.SK_MTP_PRE_FC_NORM_EMB,
+        module_kind=qt.MODULE_MTP,
+    )
+    _append_standalone_block(
+        blocks,
+        segments,
+        "mtp.pre_fc_norm_hidden.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        (HIDDEN_SIZE,),
+        "mtp.pre_fc_norm_hidden.weight",
+        qt.SK_MTP_PRE_FC_NORM_HID,
+        module_kind=qt.MODULE_MTP,
+    )
+    _append_standalone_block(
+        blocks,
+        segments,
+        p + "input_layernorm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        (HIDDEN_SIZE,),
+        p + "input_layernorm.weight",
+        qt.SK_INPUT_LAYERNORM,
+        0,
+        module_kind=qt.MODULE_MTP,
+    )
+
+    attn_first = len(blocks)
+    _append_block(
+        blocks,
+        segments,
+        p + "attn_in.w8",
+        qt.QT_W8G128,
+        qt.LAYOUT_ROW_SPLIT,
+        (MTP_ATTN_IN_ROWS, HIDDEN_SIZE),
+        0,
+        [
+            (
+                p + "self_attn.q_proj.q",
+                qt.SK_ATTN_Q,
+                0,
+                ATTN_Q_ROWS,
+                _mtp_source(
+                    p + "self_attn.q_proj.q",
+                    q_proj,
+                    qt.SK_ATTN_Q,
+                    0,
+                    transform=TRANSFORM_ATTN_QPROJ_QUERY,
+                ),
+            ),
+            (
+                p + "self_attn.k_proj.weight",
+                qt.SK_ATTN_K,
+                ATTN_Q_ROWS,
+                ATTN_KV_ROWS,
+                _mtp_source(
+                    p + "self_attn.k_proj.weight",
+                    p + "self_attn.k_proj.weight",
+                    qt.SK_ATTN_K,
+                    0,
+                ),
+            ),
+            (
+                p + "self_attn.q_proj.gate",
+                qt.SK_ATTN_GATE,
+                ATTN_Q_ROWS + ATTN_KV_ROWS,
+                ATTN_Q_ROWS,
+                _mtp_source(
+                    p + "self_attn.q_proj.gate",
+                    q_proj,
+                    qt.SK_ATTN_GATE,
+                    0,
+                    transform=TRANSFORM_ATTN_QPROJ_GATE,
+                ),
+            ),
+            (
+                p + "self_attn.v_proj.weight",
+                qt.SK_ATTN_V,
+                (2 * ATTN_Q_ROWS) + ATTN_KV_ROWS,
+                ATTN_KV_ROWS,
+                _mtp_source(
+                    p + "self_attn.v_proj.weight",
+                    p + "self_attn.v_proj.weight",
+                    qt.SK_ATTN_V,
+                    0,
+                ),
+            ),
+        ],
+        qt.FUSION_ATTN_IN,
+        0,
+        module_kind=qt.MODULE_MTP,
+    )
+    _append_fusion_group(
+        fusion_groups,
+        blocks,
+        qt.FUSION_ATTN_IN,
+        0,
+        attn_first,
+        1,
+        MTP_ATTN_IN_ROWS,
+        HIDDEN_SIZE,
+    )
+
+    _append_standalone_block(
+        blocks,
+        segments,
+        p + "self_attn.q_norm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        (_ATTN_HEAD_DIM,),
+        p + "self_attn.q_norm.weight",
+        qt.SK_ATTN_Q_NORM,
+        0,
+        module_kind=qt.MODULE_MTP,
+    )
+    _append_standalone_block(
+        blocks,
+        segments,
+        p + "self_attn.k_norm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        (_ATTN_HEAD_DIM,),
+        p + "self_attn.k_norm.weight",
+        qt.SK_ATTN_K_NORM,
+        0,
+        module_kind=qt.MODULE_MTP,
+    )
+    _append_standalone_block(
+        blocks,
+        segments,
+        p + "self_attn.o_proj.weight",
+        qt.QT_W8G128,
+        qt.LAYOUT_ROW_SPLIT,
+        (HIDDEN_SIZE, ATTN_Q_ROWS),
+        p + "self_attn.o_proj.weight",
+        qt.SK_ATTN_O,
+        0,
+        module_kind=qt.MODULE_MTP,
+    )
+    _append_standalone_block(
+        blocks,
+        segments,
+        p + "post_attention_layernorm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        (HIDDEN_SIZE,),
+        p + "post_attention_layernorm.weight",
+        qt.SK_POST_ATTN_LAYERNORM,
+        0,
+        module_kind=qt.MODULE_MTP,
+    )
+
+    mlp_first = len(blocks)
+    _append_block(
+        blocks,
+        segments,
+        p + "mlp.gateup.w8",
+        qt.QT_W8G128,
+        qt.LAYOUT_ROW_SPLIT,
+        (MTP_MLP_GATEUP_ROWS, HIDDEN_SIZE),
+        0,
+        [
+            (
+                p + "mlp.gate_proj.weight",
+                qt.SK_MLP_GATE,
+                0,
+                INTERMEDIATE_SIZE,
+                _mtp_source(
+                    p + "mlp.gate_proj.weight",
+                    p + "mlp.gate_proj.weight",
+                    qt.SK_MLP_GATE,
+                    0,
+                ),
+            ),
+            (
+                p + "mlp.up_proj.weight",
+                qt.SK_MLP_UP,
+                INTERMEDIATE_SIZE,
+                INTERMEDIATE_SIZE,
+                _mtp_source(
+                    p + "mlp.up_proj.weight",
+                    p + "mlp.up_proj.weight",
+                    qt.SK_MLP_UP,
+                    0,
+                ),
+            ),
+        ],
+        qt.FUSION_MLP_GATEUP,
+        0,
+        module_kind=qt.MODULE_MTP,
+    )
+    _append_fusion_group(
+        fusion_groups,
+        blocks,
+        qt.FUSION_MLP_GATEUP,
+        0,
+        mlp_first,
+        1,
+        MTP_MLP_GATEUP_ROWS,
+        HIDDEN_SIZE,
+    )
+    _append_standalone_block(
+        blocks,
+        segments,
+        p + "mlp.down_proj.weight",
+        qt.QT_W8G128,
+        qt.LAYOUT_ROW_SPLIT,
+        (HIDDEN_SIZE, INTERMEDIATE_SIZE),
+        p + "mlp.down_proj.weight",
+        qt.SK_MLP_DOWN,
+        0,
+        module_kind=qt.MODULE_MTP,
+    )
+    _append_standalone_block(
+        blocks,
+        segments,
+        "mtp.norm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        (HIDDEN_SIZE,),
+        "mtp.norm.weight",
+        qt.SK_MTP_NORM,
+        module_kind=qt.MODULE_MTP,
+    )
+
+    return ExpectedManifest(tuple(blocks), tuple(segments), tuple(fusion_groups))
 
 
 def build_vision_specs(depth: int) -> List[TensorSpec]:

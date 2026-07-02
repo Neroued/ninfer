@@ -307,6 +307,58 @@ def _append_standalone_blocks(
         segments.append(seg)
 
 
+def _append_manifest(
+    blocks: List[BlockPlan],
+    segments: List[SegmentPlan],
+    fusion_groups: List[FusionPlan],
+    manifest: tp.ExpectedManifest,
+) -> None:
+    block_offset = len(blocks)
+    segment_offset = len(segments)
+    for b in manifest.blocks:
+        bsegs = []
+        for s in b.segments:
+            seg = SegmentPlan(
+                block_index=block_offset + s.block_index,
+                segment_index=segment_offset + s.segment_index,
+                name=s.name,
+                source_kind=s.source_kind,
+                source_layer=s.source_layer,
+                row_begin=s.row_begin,
+                row_count=s.row_count,
+                source=s.source,
+            )
+            bsegs.append(seg)
+            segments.append(seg)
+        blocks.append(
+            BlockPlan(
+                block_index=block_offset + b.block_index,
+                name=b.name,
+                qtype=b.qtype,
+                layout=b.layout,
+                module_kind=b.module_kind,
+                shape=b.shape,
+                source_layer=b.source_layer,
+                source_kind=b.source_kind,
+                segment_begin=segment_offset + b.segment_begin,
+                segments=tuple(bsegs),
+                fusion_group_id=b.fusion_group_id,
+                fusion_index=b.fusion_index,
+            )
+        )
+    for g in manifest.fusion_groups:
+        fusion_groups.append(
+            FusionPlan(
+                group_id=g.group_id,
+                source_layer=g.source_layer,
+                block_indices=tuple(block_offset + i for i in g.block_indices),
+                shared_input_kind=g.shared_input_kind,
+                total_n=g.total_n,
+                shared_k=g.shared_k,
+            )
+        )
+
+
 def build_conversion_plan(
     cfg: dict,
 ) -> ConversionPlan:
@@ -318,7 +370,7 @@ def build_conversion_plan(
     ]
 
     begin = len(blocks)
-    _append_standalone_blocks(blocks, segments, tp.build_mtp_specs())
+    _append_manifest(blocks, segments, fusion_groups, tp.build_mtp_manifest())
     modules.append(ModulePlan(qt.MODULE_MTP, begin, len(blocks) - begin, qt.LOAD_RESIDENT))
 
     begin = len(blocks)
@@ -419,15 +471,37 @@ def _write_manifest(
     text_bytes = sum(e.payload_bytes for e in entries if e.module_kind == qt.MODULE_TEXT)
     text_elems = sum(_prod(e.shape) for e in entries if e.module_kind == qt.MODULE_TEXT)
     group_summary = []
-    for gid in (qt.FUSION_ATTN_IN, qt.FUSION_GDN_IN, qt.FUSION_MLP_GATEUP):
-        records = [g for g in fusion_records if g.group_id == gid]
+    fusion_summary_keys = []
+    for g in fusion_records:
+        first = entries[g.first_block_tensor_index]
+        key = (
+            first.module_kind,
+            g.group_id,
+            g.block_count,
+            g.total_n,
+            g.shared_k,
+        )
+        if key not in fusion_summary_keys:
+            fusion_summary_keys.append(key)
+    for module_kind, gid, block_count, total_n, shared_k in fusion_summary_keys:
+        records = [
+            g
+            for g in fusion_records
+            if entries[g.first_block_tensor_index].module_kind == module_kind
+            and g.group_id == gid
+            and g.block_count == block_count
+            and g.total_n == total_n
+            and g.shared_k == shared_k
+        ]
         if records:
             group_summary.append(
                 {
+                    "module": qt.MODULE_NAME[module_kind],
                     "group_id": qt.FUSION_GROUP_NAME[gid],
-                    "layers": len(records),
-                    "blocks_per_group": records[0].block_count,
-                    "total_n": records[0].total_n,
+                    "group_count": len(records),
+                    "blocks_per_group": block_count,
+                    "total_n": total_n,
+                    "shared_k": shared_k,
                 }
             )
     present_modules = [qt.MODULE_NAME[m.module_kind] for m in module_records]
@@ -452,7 +526,7 @@ def _write_manifest(
         "format_version": 3,
         "format_minor": fmt.FORMAT_MINOR,
         "binary_spec": "docs/q5090_packed_file_format_v3.md",
-        "tensor_plan": "docs/qwen3_6_27b_q5090_v2_tensor_plan.md",
+        "tensor_plan": "docs/q5090_packed_file_format_v3.md",
         "value_source": "qwen3_6_27b_q5090_final_quant_format_v1 (policy)",
         "weights_file": os.path.basename(out_path),
         "file_bytes": int(file_size),

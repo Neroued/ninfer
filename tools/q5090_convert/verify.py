@@ -22,12 +22,16 @@ import torch.nn.functional as F
 
 from . import format as fmt
 from . import qtypes as qt
+from . import tensor_plan as tp
 from .layouts import decode_row_split_quantized, decode_tensor, encode_tensor
 from .packing import row_split_plane_sizes
 from .quantize import pick_device, quantize_core
 from .convert import ShardReader, assert_config, build_conversion_plan, load_config, materialize_block
 
 DEFAULT_MODEL = "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16"
+FULL_ARTIFACT_BLOCKS = 1164
+FULL_ARTIFACT_SEGMENTS = 1312
+FULL_ARTIFACT_FUSIONS = 130
 
 
 def _prod(xs: Sequence[int]) -> int:
@@ -329,6 +333,147 @@ def _check_entry_planes(e: dict) -> List[str]:
     return problems
 
 
+def _module_tensor_range(modules, module_kind: int) -> Tuple[int, int]:
+    for m in modules:
+        if m["module_kind"] == module_kind:
+            begin = m["tensor_index_begin"]
+            return begin, begin + m["tensor_index_count"]
+    return 0, 0
+
+
+def _block_segments(entry: dict, segments: List[dict]) -> List[dict]:
+    begin = entry["segment_begin"]
+    return segments[begin: begin + entry["segment_count"]]
+
+
+def _find_plan_block(plan, name: str):
+    for block in plan.blocks:
+        if block.name == name:
+            return block
+    return None
+
+
+def _mtp_layout_checks(modules, entries, segments, fusions, plan) -> List[str]:
+    problems: List[str] = []
+    mtp_begin, mtp_end = _module_tensor_range(modules, qt.MODULE_MTP)
+    if mtp_begin == mtp_end:
+        return ["MTP_DRAFT module missing"]
+    mtp_entries = entries[mtp_begin:mtp_end]
+    mtp_segment_count = sum(e["segment_count"] for e in mtp_entries)
+    if len(mtp_entries) != 12:
+        problems.append(f"MTP_DRAFT block count {len(mtp_entries)} != 12")
+    if mtp_segment_count != 16:
+        problems.append(f"MTP_DRAFT segment count {mtp_segment_count} != 16")
+
+    by_name = {e["name"]: e for e in mtp_entries}
+
+    def expect_w8(name: str, shape: List[int]) -> dict | None:
+        e = by_name.get(name)
+        if e is None:
+            problems.append(f"{name}: missing MTP block")
+            return None
+        if e["shape"] != shape:
+            problems.append(f"{name}: shape {e['shape']} != {shape}")
+        if e["qtype"] != qt.QT_W8G128:
+            problems.append(f"{name}: qtype {e['qtype']} != W8G128")
+        if e["layout"] != qt.LAYOUT_ROW_SPLIT:
+            problems.append(f"{name}: layout {e['layout']} != ROW_SPLIT")
+        if e["group_size"] != 128:
+            problems.append(f"{name}: group_size {e['group_size']} != 128")
+        if e["scale_dtype"] != qt.SCALE_FP16:
+            problems.append(f"{name}: scale_dtype {e['scale_dtype']} != FP16")
+        if e["high_plane_bytes"] != 0:
+            problems.append(f"{name}: high_plane_bytes {e['high_plane_bytes']} != 0")
+        return e
+
+    def expect_bf16(name: str, shape: List[int]) -> None:
+        e = by_name.get(name)
+        if e is None:
+            problems.append(f"{name}: missing MTP block")
+            return
+        if e["shape"] != shape:
+            problems.append(f"{name}: shape {e['shape']} != {shape}")
+        if e["qtype"] != qt.QT_BF16 or e["layout"] != qt.LAYOUT_CONTIGUOUS:
+            problems.append(f"{name}: expected BF16 CONTIGUOUS")
+
+    expect_w8("mtp.fc.weight", [5120, 10240])
+    expect_bf16("mtp.pre_fc_norm_embedding.weight", [5120])
+    expect_bf16("mtp.pre_fc_norm_hidden.weight", [5120])
+    expect_bf16("mtp.layers.0.input_layernorm.weight", [5120])
+    attn = expect_w8("mtp.layers.0.attn_in.w8", [14336, 5120])
+    expect_bf16("mtp.layers.0.self_attn.q_norm.weight", [256])
+    expect_bf16("mtp.layers.0.self_attn.k_norm.weight", [256])
+    expect_w8("mtp.layers.0.self_attn.o_proj.weight", [5120, 6144])
+    expect_bf16("mtp.layers.0.post_attention_layernorm.weight", [5120])
+    gateup = expect_w8("mtp.layers.0.mlp.gateup.w8", [34816, 5120])
+    expect_w8("mtp.layers.0.mlp.down_proj.weight", [5120, 17408])
+    expect_bf16("mtp.norm.weight", [5120])
+
+    if attn is not None:
+        if attn["source_kind"] != qt.SK_OTHER:
+            problems.append(f"{attn['name']}: fused block source_kind {attn['source_kind']} != OTHER")
+        got = [
+            (s["name"], s["source_kind"], s["row_begin"], s["row_count"])
+            for s in _block_segments(attn, segments)
+        ]
+        want = [
+            ("mtp.layers.0.self_attn.q_proj.q", qt.SK_ATTN_Q, 0, 6144),
+            ("mtp.layers.0.self_attn.k_proj.weight", qt.SK_ATTN_K, 6144, 1024),
+            ("mtp.layers.0.self_attn.q_proj.gate", qt.SK_ATTN_GATE, 7168, 6144),
+            ("mtp.layers.0.self_attn.v_proj.weight", qt.SK_ATTN_V, 13312, 1024),
+        ]
+        if got != want:
+            problems.append(f"{attn['name']}: segment layout {got!r} != {want!r}")
+        plan_block = _find_plan_block(plan, attn["name"])
+        if plan_block is None:
+            problems.append(f"{attn['name']}: missing expected plan block")
+        else:
+            sources = {s.name: s.source for s in plan_block.segments}
+            q_src = sources.get("mtp.layers.0.self_attn.q_proj.q")
+            gate_src = sources.get("mtp.layers.0.self_attn.q_proj.gate")
+            if (
+                q_src is None
+                or q_src.src_name != "mtp.layers.0.self_attn.q_proj.weight"
+                or q_src.transform != tp.TRANSFORM_ATTN_QPROJ_QUERY
+            ):
+                problems.append(f"{attn['name']}: q segment source/transform mismatch")
+            if (
+                gate_src is None
+                or gate_src.src_name != "mtp.layers.0.self_attn.q_proj.weight"
+                or gate_src.transform != tp.TRANSFORM_ATTN_QPROJ_GATE
+            ):
+                problems.append(f"{attn['name']}: gate segment source/transform mismatch")
+
+    if gateup is not None:
+        if gateup["source_kind"] != qt.SK_OTHER:
+            problems.append(f"{gateup['name']}: fused block source_kind {gateup['source_kind']} != OTHER")
+        got = [
+            (s["name"], s["source_kind"], s["row_begin"], s["row_count"])
+            for s in _block_segments(gateup, segments)
+        ]
+        want = [
+            ("mtp.layers.0.mlp.gate_proj.weight", qt.SK_MLP_GATE, 0, 17408),
+            ("mtp.layers.0.mlp.up_proj.weight", qt.SK_MLP_UP, 17408, 17408),
+        ]
+        if got != want:
+            problems.append(f"{gateup['name']}: segment layout {got!r} != {want!r}")
+
+    mtp_fusions = [
+        g
+        for g in fusions
+        if g["first_block_tensor_index"] < len(entries)
+        and entries[g["first_block_tensor_index"]]["module_kind"] == qt.MODULE_MTP
+    ]
+    got_fusion_ids = [(g["group_id"], g["block_count"], g["total_n"], g["shared_k"]) for g in mtp_fusions]
+    want_fusion_ids = [
+        (qt.FUSION_ATTN_IN, 1, 14336, 5120),
+        (qt.FUSION_MLP_GATEUP, 1, 34816, 5120),
+    ]
+    if got_fusion_ids != want_fusion_ids:
+        problems.append(f"MTP fusion groups {got_fusion_ids!r} != {want_fusion_ids!r}")
+    return problems
+
+
 def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> List[str]:
     problems: List[str] = []
     file_size = os.path.getsize(path)
@@ -350,12 +495,14 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
         problems.append(f"reserved header flags set: {hdr['flags']:#x}")
     if hdr["flags"] != fmt.FLAG_MODULE_PRESENT_MASK:
         problems.append(f"flags {hdr['flags']:#x} != full module flags {fmt.FLAG_MODULE_PRESENT_MASK:#x}")
-    if hdr["tensor_count"] != 1167:
-        problems.append(f"tensor_count {hdr['tensor_count']} != full artifact count 1167")
-    if hdr["segment_count"] != 1311:
-        problems.append(f"segment_count {hdr['segment_count']} != full artifact count 1311")
-    if hdr["fusion_group_count"] != 128:
-        problems.append(f"fusion_group_count {hdr['fusion_group_count']} != full artifact count 128")
+    if hdr["tensor_count"] != FULL_ARTIFACT_BLOCKS:
+        problems.append(f"tensor_count {hdr['tensor_count']} != full artifact count {FULL_ARTIFACT_BLOCKS}")
+    if hdr["segment_count"] != FULL_ARTIFACT_SEGMENTS:
+        problems.append(f"segment_count {hdr['segment_count']} != full artifact count {FULL_ARTIFACT_SEGMENTS}")
+    if hdr["fusion_group_count"] != FULL_ARTIFACT_FUSIONS:
+        problems.append(
+            f"fusion_group_count {hdr['fusion_group_count']} != full artifact count {FULL_ARTIFACT_FUSIONS}"
+        )
     if hdr["tensor_count"] != len(entries):
         problems.append(f"tensor_count {hdr['tensor_count']} != table entries {len(entries)}")
     if hdr["segment_count"] != len(segments):
@@ -649,6 +796,7 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
             problems.append(f"fusion[{i}]: total_n {g['total_n']} != {total_n}")
         if g["shared_k"] != shared_k:
             problems.append(f"fusion[{i}]: shared_k {g['shared_k']} != {shared_k}")
+    problems += _mtp_layout_checks(modules, entries, segments, fusions, plan)
     return problems
 
 
@@ -684,7 +832,7 @@ def _manifest_checks(path: str, hdr, modules, entries, segments, fusions) -> Lis
     expect("format_version", fmt.VERSION)
     expect("format_minor", fmt.FORMAT_MINOR)
     expect("binary_spec", "docs/q5090_packed_file_format_v3.md")
-    expect("tensor_plan", "docs/qwen3_6_27b_q5090_v2_tensor_plan.md")
+    expect("tensor_plan", "docs/q5090_packed_file_format_v3.md")
     expect("weights_file", os.path.basename(path))
     expect("file_bytes", os.path.getsize(path))
     expect("sha256_safetensors_index", hdr["sha256_safetensors_index"].hex())

@@ -210,7 +210,7 @@ int expect_manifest_fields(const Json& manifest, std::uint64_t file_size) {
     failures += expect_string_field(manifest, "binary_spec", "docs/q5090_packed_file_format_v3.md",
                                     "manifest binary_spec mismatch");
     failures += expect_string_field(manifest, "tensor_plan",
-                                    "docs/qwen3_6_27b_q5090_v2_tensor_plan.md",
+                                    "docs/q5090_packed_file_format_v3.md",
                                     "manifest tensor_plan mismatch");
     failures += expect_string_field(manifest, "weights_file",
                                     "qwen3_6_27b.q5090_w4g64_mixed_v3.qus",
@@ -234,9 +234,9 @@ int expect_manifest_fields(const Json& manifest, std::uint64_t file_size) {
         std::array<const char*, 3>{"TEXT_CORE", "MTP_DRAFT", "VISION_ENCODER"},
         "manifest modules mismatch");
     failures += expect_uint_field(manifest, "module_count", 3, "manifest module_count mismatch");
-    failures += expect_uint_field(manifest, "tensor_count", 1167, "manifest tensor_count mismatch");
-    failures += expect_uint_field(manifest, "segment_count", 1311, "manifest segment_count mismatch");
-    failures += expect_uint_field(manifest, "fusion_group_count", 128,
+    failures += expect_uint_field(manifest, "tensor_count", 1164, "manifest tensor_count mismatch");
+    failures += expect_uint_field(manifest, "segment_count", 1312, "manifest segment_count mismatch");
+    failures += expect_uint_field(manifest, "fusion_group_count", 130,
                                   "manifest fusion_group_count mismatch");
 
     const auto alignment_it = manifest.find("alignment");
@@ -259,13 +259,13 @@ int expect_manifest_fields(const Json& manifest, std::uint64_t file_size) {
 
 int expect_inventory(const qus::ParsedQ5090File& parsed, std::uint64_t file_size) {
     int failures = 0;
-    failures += parsed.header.tensor_count == 1167 ? 0 : fail("real tensor_count mismatch");
+    failures += parsed.header.tensor_count == 1164 ? 0 : fail("real tensor_count mismatch");
     failures += parsed.header.module_count == 3 ? 0 : fail("real module_count mismatch");
-    failures += parsed.header.segment_count == 1311 ? 0 : fail("real segment_count mismatch");
-    failures += parsed.header.fusion_group_count == 128 ? 0 : fail("real fusion count mismatch");
-    failures += parsed.tensors.size() == 1167 ? 0 : fail("real parsed tensor size mismatch");
-    failures += parsed.segments.size() == 1311 ? 0 : fail("real parsed segment size mismatch");
-    failures += parsed.fusion_groups.size() == 128 ? 0 : fail("real parsed fusion size mismatch");
+    failures += parsed.header.segment_count == 1312 ? 0 : fail("real segment_count mismatch");
+    failures += parsed.header.fusion_group_count == 130 ? 0 : fail("real fusion count mismatch");
+    failures += parsed.tensors.size() == 1164 ? 0 : fail("real parsed tensor size mismatch");
+    failures += parsed.segments.size() == 1312 ? 0 : fail("real parsed segment size mismatch");
+    failures += parsed.fusion_groups.size() == 130 ? 0 : fail("real parsed fusion size mismatch");
     failures += parsed.modules.size() == 3 ? 0 : fail("real parsed module size mismatch");
     failures += parsed.header.payload_offset + parsed.header.payload_bytes == file_size
                     ? 0
@@ -279,7 +279,7 @@ int expect_inventory(const qus::ParsedQ5090File& parsed, std::uint64_t file_size
     failures += parsed.modules[1].module_kind == qus::ModuleKind::MtpDraft
                     ? 0
                     : fail("real MTP module mismatch");
-    failures += parsed.modules[1].tensor_index_count == 15 ? 0 : fail("real MTP count mismatch");
+    failures += parsed.modules[1].tensor_index_count == 12 ? 0 : fail("real MTP count mismatch");
     failures +=
         parsed.modules[1].payload_bytes == 431361024ULL ? 0 : fail("real MTP payload mismatch");
     failures += parsed.modules[2].module_kind == qus::ModuleKind::VisionEncoder
@@ -391,7 +391,7 @@ int run_default_load(const std::filesystem::path& file_path, std::uint64_t text_
     failures += !store.module_loaded(qus::ModuleKind::VisionEncoder)
                     ? 0
                     : fail("real VISION loaded by default");
-    failures += store.tensor_count() == 1167 ? 0 : fail("real store tensor_count mismatch");
+    failures += store.tensor_count() == 1164 ? 0 : fail("real store tensor_count mismatch");
     failures +=
         store.loaded_payload_bytes() == text_payload_bytes ? 0 : fail("real loaded bytes mismatch");
     failures += expect_real_fused_contract(store);

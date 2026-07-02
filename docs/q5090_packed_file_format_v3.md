@@ -20,12 +20,16 @@ A conformant converter/loader implements this document **plus**:
 - **Quantization policy** —
   [qwen3_6_27b_q5090_final_quant_format_v1.md](qwen3_6_27b_q5090_final_quant_format_v1.md): *which
   `qtype` each tensor gets* and the quantizer algorithm whose output this format stores verbatim (§8).
-- **Tensor plan** —
-  [qwen3_6_27b_q5090_v2_tensor_plan.md](qwen3_6_27b_q5090_v2_tensor_plan.md): the authoritative
-  per-model block/segment/fusion assignment, canonical emission order, control-tensor shapes, and
-  source transforms. v3 changes **only the on-disk code packing** (§9.1); it does **not** change the
-  tensor inventory, qtypes, shapes, segments, or fusion groups, so that tensor plan applies to v3
-  **unchanged** (a v3-tagged tensor plan, if produced, MUST preserve the same assignment).
+- **TEXT_CORE / VISION tensor plan** —
+  [qwen3_6_27b_q5090_v2_tensor_plan.md](qwen3_6_27b_q5090_v2_tensor_plan.md): the TEXT_CORE and
+  VISION_ENCODER per-model block/segment/fusion assignment, canonical emission order, control-tensor
+  shapes, and source transforms. Its MTP_DRAFT standalone assignment is historical for v2 and is **not**
+  normative for v3.
+- **MTP_DRAFT v3 assignment** — this document (§10.1, §14, §16) owns the v3 MTP_DRAFT fused
+  block/segment/fusion assignment directly: 12 blocks, 16 segments, and two fusion groups. This changes
+  only grouping/source transforms inside the existing `q5090_w4g64_mixed_v3` container; it does not
+  change `W8G128_F16S`, the file magic, or the version number. The v2 tensor-plan document and the
+  quantization-policy document are not edited by this assignment change.
 
 ## Why this layout
 
@@ -363,8 +367,8 @@ shared `ATTN_*` / `MLP_*` / `INPUT_LAYERNORM` / `POST_ATTN_LAYERNORM` kinds abov
 
 Values `6..9`, `21..29`, `37..39`, `43..49`, `54..59`, and `81..95` are reserved (unused). A loader MUST
 reject a block whose `source_kind` is not a defined value for its `module_kind` (or `OTHER` for a fused
-block). The per-tensor MTP/VISION block/segment/shape assignment (standalone for now) is in the
-tensor-plan companion §5/§6.
+block). The TEXT_CORE assignment is in §10 and the tensor-plan companion; the v3 MTP_DRAFT assignment
+is in §10.1 / §14 / §16; the VISION_ENCODER assignment remains in the tensor-plan companion §6.
 
 ## 8. Quantization values (weight-only, symmetric, no zero point)
 
@@ -589,6 +593,22 @@ Notes:
 
 The exact per-layer block/segment/fusion counts and emission order are in the tensor-plan companion.
 
+### 10.1 Fused projection groups (MTP_DRAFT)
+
+MTP_DRAFT reuses the existing module-agnostic fusion ids. Its member blocks are distinguished from
+TEXT_CORE by `TensorEntry.module_kind = MTP_DRAFT`; no new fusion id is introduced.
+
+| group | source_layer | member blocks (`qtype`, `[N,K]`) | segments (row-ranges) | `total_n` |
+|---|---:|---|---|---:|
+| `ATTN_IN` | 0 | W8 `[14336,5120]` named `mtp.layers.0.attn_in.w8` | `ATTN_Q[0,6144)`, `ATTN_K[6144,7168)`, `ATTN_GATE[7168,13312)`, `ATTN_V[13312,14336)` | 14336 |
+| `MLP_GATEUP` | 0 | W8 `[34816,5120]` named `mtp.layers.0.mlp.gateup.w8` | `MLP_GATE[0,17408)`, `MLP_UP[17408,34816)` | 34816 |
+
+Both fused MTP blocks have block-level `source_kind = OTHER`; segment identity is authoritative. The
+MTP raw `self_attn.q_proj.weight [12288,5120]` is interleaved per head as
+`[query(256) | gate(256)] x 24`, so the `ATTN_Q` and `ATTN_GATE` segments MUST use the same
+value-defining de-interleave transforms as TEXT_CORE full-attention q_proj. A contiguous
+`[0:6144] / [6144:12288]` split is invalid.
+
 ## 11. Consumption model (normative intent)
 
 This section fixes how the format is meant to be executed so the byte layout is unambiguous. It does
@@ -688,14 +708,35 @@ from this document alone.
 | `lm_head` | Q6 | `ROW_SPLIT` | standalone |
 | `embed_tokens` | Q6 | `ROW_SPLIT` | standalone (consumed by gather; see note) |
 | norms, `A_log`, `dt_bias`, conv1d | BF16/FP32 | `CONTIGUOUS` | standalone |
-| MTP quantized linears | W8 | `ROW_SPLIT` (group 128) | per MTP fusion if applicable |
+| MTP `fc`, `o_proj`, `down_proj` | W8 | `ROW_SPLIT` (group 128) | standalone |
+| MTP `attn q/k/gate/v` | W8 | `ROW_SPLIT` (group 128) | `ATTN_IN` (one block, four segments) |
+| MTP MLP `gate`, `up` | W8 | `ROW_SPLIT` (group 128) | `MLP_GATEUP` (one block, two segments) |
 | vision quantized linears | Q4/Q5/W8 | `ROW_SPLIT` | standalone (vision biases/norms `CONTIGUOUS`) |
 
 Every quantized tensor in every module uses `ROW_SPLIT`; every dense control tensor uses `CONTIGUOUS`.
-There is no tiled layout anywhere. The class table above fixes layout/grouping; the **exact per-tensor
-`qtype`, shape, `source_kind`, `source_layer`, canonical name, and source transform** are the
-authoritative per-model assignment in the **tensor-plan companion** (Normative companions). A converter
-or verifier implements that companion to produce/validate the concrete block/segment/fusion set.
+There is no tiled layout anywhere. The class table above fixes layout/grouping. TEXT_CORE and
+VISION_ENCODER exact per-tensor assignment is in the tensor-plan companion (Normative companions);
+MTP_DRAFT exact v3 assignment is the following canonical block order:
+
+| block name | qtype/layout | shape | source kind / segments |
+|---|---|---:|---|
+| `mtp.fc.weight` | W8 row-split | `[5120,10240]` | `MTP_FC`, `NO_LAYER` |
+| `mtp.pre_fc_norm_embedding.weight` | BF16 contiguous | `[5120]` | `MTP_PRE_FC_NORM_EMB`, `NO_LAYER` |
+| `mtp.pre_fc_norm_hidden.weight` | BF16 contiguous | `[5120]` | `MTP_PRE_FC_NORM_HID`, `NO_LAYER` |
+| `mtp.layers.0.input_layernorm.weight` | BF16 contiguous | `[5120]` | `INPUT_LAYERNORM`, layer 0 |
+| `mtp.layers.0.attn_in.w8` | W8 row-split | `[14336,5120]` | block `OTHER`; segments `ATTN_Q/K/GATE/V`, layer 0 |
+| `mtp.layers.0.self_attn.q_norm.weight` | BF16 contiguous | `[256]` | `ATTN_Q_NORM`, layer 0 |
+| `mtp.layers.0.self_attn.k_norm.weight` | BF16 contiguous | `[256]` | `ATTN_K_NORM`, layer 0 |
+| `mtp.layers.0.self_attn.o_proj.weight` | W8 row-split | `[5120,6144]` | `ATTN_O`, layer 0 |
+| `mtp.layers.0.post_attention_layernorm.weight` | BF16 contiguous | `[5120]` | `POST_ATTN_LAYERNORM`, layer 0 |
+| `mtp.layers.0.mlp.gateup.w8` | W8 row-split | `[34816,5120]` | block `OTHER`; segments `MLP_GATE/MLP_UP`, layer 0 |
+| `mtp.layers.0.mlp.down_proj.weight` | W8 row-split | `[5120,17408]` | `MLP_DOWN`, layer 0 |
+| `mtp.norm.weight` | BF16 contiguous | `[5120]` | `MTP_NORM`, `NO_LAYER` |
+
+A converter or verifier implements these assignments to produce/validate the concrete
+block/segment/fusion set. A full artifact contains 1164 blocks, 1312 segments, and 130 fusion groups:
+TEXT_CORE contributes 819/963/128, MTP_DRAFT contributes 12/16/2, and VISION_ENCODER contributes
+333/333/0.
 
 `embed_tokens` is gather-driven (one row per token), not GEMV-streamed, so the row/plane split gives it
 no throughput benefit and costs a couple of extra small transactions per lookup (a row's nibble run,
@@ -740,6 +781,15 @@ linear_attn.in_proj_z.weight  -> GDN_IN_PROJ_Z [6144,5120] Q5 (standalone block;
 
 mlp.gate_proj.weight -> MLP_GATE [17408,5120] Q4 (MLP_GATEUP block segment)
 mlp.up_proj.weight   -> MLP_UP   [17408,5120] Q4 (MLP_GATEUP block segment)
+
+mtp.layers.0.self_attn.q_proj.weight [12288,5120]   # interleaved [query(256)|gate(256)] x24
+  -> ATTN_Q   [6144,5120] W8 (MTP ATTN_IN block segment)
+  -> ATTN_GATE[6144,5120] W8 (MTP ATTN_IN block segment)
+mtp.layers.0.self_attn.k_proj.weight -> ATTN_K [1024,5120] W8 (MTP ATTN_IN block segment)
+mtp.layers.0.self_attn.v_proj.weight -> ATTN_V [1024,5120] W8 (MTP ATTN_IN block segment)
+
+mtp.layers.0.mlp.gate_proj.weight -> MLP_GATE [17408,5120] W8 (MTP MLP_GATEUP block segment)
+mtp.layers.0.mlp.up_proj.weight   -> MLP_UP   [17408,5120] W8 (MTP MLP_GATEUP block segment)
 ```
 
 Each block's `name`/`name_hash` is the converter-assigned canonical name (for a standalone block, the
@@ -758,7 +808,7 @@ fields:
   "format_version": 3,
   "format_minor": 0,
   "binary_spec": "docs/q5090_packed_file_format_v3.md",
-  "tensor_plan": "docs/qwen3_6_27b_q5090_v2_tensor_plan.md",
+  "tensor_plan": "docs/q5090_packed_file_format_v3.md",
   "value_source": "qwen3_6_27b_q5090_final_quant_format_v1 (policy)",
   "weights_file": "qwen3_6_27b.q5090_w4g64_mixed_v3.qus",
   "file_bytes": 0,
@@ -767,16 +817,18 @@ fields:
   "alignment": { "header": 4096, "payload": 4096, "block": 256, "k_pad": 128, "group_size": 64 },
   "layouts": ["ROW_SPLIT", "CONTIGUOUS"],
   "code_planes": ["nibble", "high", "scale"],
-  "qtypes": ["Q4G64_F16S", "Q5G64_F16S", "Q6G64_F16S", "BF16_CTRL", "FP32_CTRL"],
-  "modules": ["TEXT_CORE"],
-  "absent_modules": ["MTP_DRAFT", "VISION_ENCODER"],
-  "tensor_count": 819,
-  "segment_count": 963,
-  "fusion_group_count": 128,
+  "qtypes": ["Q4G64_F16S", "Q5G64_F16S", "Q6G64_F16S", "W8G128_F16S", "BF16_CTRL", "FP32_CTRL"],
+  "modules": ["TEXT_CORE", "MTP_DRAFT", "VISION_ENCODER"],
+  "absent_modules": [],
+  "tensor_count": 1164,
+  "segment_count": 1312,
+  "fusion_group_count": 130,
   "fusion_groups": [
-    {"group_id": "ATTN_IN", "layers": 16, "blocks_per_group": 2, "total_n": 14336},
-    {"group_id": "GDN_IN", "layers": 48, "blocks_per_group": 2, "total_n": 10240},
-    {"group_id": "MLP_GATEUP", "layers": 64, "blocks_per_group": 1, "total_n": 34816}
+    {"module": "TEXT_CORE", "group_id": "ATTN_IN", "group_count": 16, "blocks_per_group": 2, "total_n": 14336, "shared_k": 5120},
+    {"module": "TEXT_CORE", "group_id": "GDN_IN", "group_count": 48, "blocks_per_group": 2, "total_n": 10240, "shared_k": 5120},
+    {"module": "TEXT_CORE", "group_id": "MLP_GATEUP", "group_count": 64, "blocks_per_group": 1, "total_n": 34816, "shared_k": 5120},
+    {"module": "MTP_DRAFT", "group_id": "ATTN_IN", "group_count": 1, "blocks_per_group": 1, "total_n": 14336, "shared_k": 5120},
+    {"module": "MTP_DRAFT", "group_id": "MLP_GATEUP", "group_count": 1, "blocks_per_group": 1, "total_n": 34816, "shared_k": 5120}
   ],
   "effective_text_bpw": 4.8716
 }
@@ -803,10 +855,10 @@ it.
   via SMEM-staged per-row segment loads. Because prefill is compute-bound and lower priority, this is a
   deliberate choice, not a regression; the format does not store a GEMM-optimal duplicate.
 - **No legacy layout, no fallback, no migration path.** Only `ROW_SPLIT` + `CONTIGUOUS` exist.
-- **MTP_DRAFT / VISION_ENCODER are first-class but optional.** The format, the `source_kind` enum
-  (§7), and the converter support all three modules; the current Qwen3.6-27B text-decode artifact
-  contains only TEXT_CORE. MTP/VISION per-tensor plans (standalone for now) live in the tensor-plan
-  companion §5/§6.
+- **MTP_DRAFT / VISION_ENCODER are first-class but selectively loadable.** The format, the `source_kind`
+  enum (§7), and the converter support all three modules in the full artifact. Runtime load policy may
+  keep MTP/VISION unloaded until requested, but their block metadata is still present. VISION remains
+  standalone per the tensor-plan companion; MTP_DRAFT uses the fused v3 assignment in this document.
 
 ## 19. Differences from `q5090_w4g64_mixed_v2`
 
@@ -824,7 +876,8 @@ changing v2-shared bytes.
 | K padding | to `group_size` (with an odd-`G` Q5→128 caveat) | single rule `K_pad = align_up(K,128)`; no special case |
 | Q4 / W8 packing, scales, values, bytes/token | nibble / int8; per-group fp16; policy values | **unchanged** (bit-identical dequant; same total code bytes per block) |
 | `source_kind` MTP/VISION | spec listed placeholders `50..53 MTP_*`, `60..80 VIS_*` | full enum listed in §7; **values unchanged** (match v1 + `tensor.h`/`qtypes.py`) |
-| module support | TEXT/MTP/VISION first-class | **unchanged** (all three supported; current text artifact is TEXT-only) |
+| MTP_DRAFT assignment | standalone W8 linears in the v2 tensor-plan companion | v3-owned fused assignment: 12 blocks, 16 segments, `ATTN_IN` + `MLP_GATEUP` fusion groups; no version bump inside v3 |
+| module support | TEXT/MTP/VISION first-class | **unchanged** (the full converter artifact carries all three; runtime load policy may skip optional modules) |
 | plane addressing, structural validation, flags, manifest, FP endianness | implicit | **made normative** here (§9.3, §13, §2/§3, §17, §0) |
 
 Everything not listed is identical to v2 in structure and meaning. v3 is a pure relayout of the Q5/Q6

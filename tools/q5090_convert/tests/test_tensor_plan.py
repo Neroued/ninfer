@@ -204,36 +204,128 @@ def test_globals_are_standalone_text_blocks():
     assert lm_head.shape == (248320, 5120)
 
 
-def test_segments_partition_blocks_and_source_kind_rule():
-    manifest = tp.build_text_manifest(_canonical_layer_types())
+def test_mtp_manifest_counts_order_and_fusions():
+    manifest = tp.build_mtp_manifest()
 
-    for block in manifest.blocks:
-        assert block.segment_count == len(block.segments)
-        assert manifest.segments[block.segment_begin: block.segment_begin + block.segment_count] == block.segments
-        row = 0
-        for segment in block.segments:
-            assert segment.block_index == block.block_index
-            assert segment.row_begin == row
-            row += segment.row_count
-        assert row == block.shape[0]
-        if block.segment_count == 1:
-            assert block.source_kind == block.segments[0].source_kind
-        else:
-            assert block.source_kind == qt.SK_OTHER
+    assert len(manifest.blocks) == 12
+    assert len(manifest.segments) == 16
+    assert len(manifest.fusion_groups) == 2
+    assert [b.name for b in manifest.blocks] == [
+        "mtp.fc.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.attn_in.w8",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.mlp.gateup.w8",
+        "mtp.layers.0.mlp.down_proj.weight",
+        "mtp.norm.weight",
+    ]
+
+    attn_group, mlp_group = manifest.fusion_groups
+    assert attn_group.group_id == qt.FUSION_ATTN_IN
+    assert attn_group.block_indices == (4,)
+    assert attn_group.total_n == 14336
+    assert attn_group.shared_k == 5120
+    assert mlp_group.group_id == qt.FUSION_MLP_GATEUP
+    assert mlp_group.block_indices == (9,)
+    assert mlp_group.total_n == 34816
+    assert mlp_group.shared_k == 5120
+
+
+def test_mtp_attn_and_mlp_fused_segments():
+    manifest = tp.build_mtp_manifest()
+
+    attn = _block(manifest, "mtp.layers.0.attn_in.w8")
+    assert attn.module_kind == qt.MODULE_MTP
+    assert attn.qtype == qt.QT_W8G128
+    assert attn.layout == qt.LAYOUT_ROW_SPLIT
+    assert attn.shape == (14336, 5120)
+    assert attn.source_kind == qt.SK_OTHER
+    assert attn.fusion_group_id == qt.FUSION_ATTN_IN
+    assert _segment_ranges(attn) == [
+        ("mtp.layers.0.self_attn.q_proj.q", qt.SK_ATTN_Q, 0, 6144),
+        ("mtp.layers.0.self_attn.k_proj.weight", qt.SK_ATTN_K, 6144, 7168),
+        ("mtp.layers.0.self_attn.q_proj.gate", qt.SK_ATTN_GATE, 7168, 13312),
+        ("mtp.layers.0.self_attn.v_proj.weight", qt.SK_ATTN_V, 13312, 14336),
+    ]
+    assert attn.segments[0].source.src_name == "mtp.layers.0.self_attn.q_proj.weight"
+    assert attn.segments[0].source.transform == tp.TRANSFORM_ATTN_QPROJ_QUERY
+    assert attn.segments[2].source.src_name == "mtp.layers.0.self_attn.q_proj.weight"
+    assert attn.segments[2].source.transform == tp.TRANSFORM_ATTN_QPROJ_GATE
+
+    gateup = _block(manifest, "mtp.layers.0.mlp.gateup.w8")
+    assert gateup.module_kind == qt.MODULE_MTP
+    assert gateup.qtype == qt.QT_W8G128
+    assert gateup.shape == (34816, 5120)
+    assert gateup.source_kind == qt.SK_OTHER
+    assert gateup.fusion_group_id == qt.FUSION_MLP_GATEUP
+    assert _segment_ranges(gateup) == [
+        ("mtp.layers.0.mlp.gate_proj.weight", qt.SK_MLP_GATE, 0, 17408),
+        ("mtp.layers.0.mlp.up_proj.weight", qt.SK_MLP_UP, 17408, 34816),
+    ]
+
+
+def test_mtp_standalone_blocks():
+    manifest = tp.build_mtp_manifest()
+
+    fc = _block(manifest, "mtp.fc.weight")
+    assert fc.module_kind == qt.MODULE_MTP
+    assert fc.qtype == qt.QT_W8G128
+    assert fc.shape == (5120, 10240)
+    assert fc.source_kind == qt.SK_MTP_FC
+
+    o_proj = _block(manifest, "mtp.layers.0.self_attn.o_proj.weight")
+    assert o_proj.qtype == qt.QT_W8G128
+    assert o_proj.shape == (5120, 6144)
+
+    down = _block(manifest, "mtp.layers.0.mlp.down_proj.weight")
+    assert down.qtype == qt.QT_W8G128
+    assert down.shape == (5120, 17408)
+
+    norm = _block(manifest, "mtp.norm.weight")
+    assert norm.qtype == qt.QT_BF16
+    assert norm.layout == qt.LAYOUT_CONTIGUOUS
+    assert norm.shape == (5120,)
+
+
+def test_segments_partition_blocks_and_source_kind_rule():
+    for manifest in (
+        tp.build_text_manifest(_canonical_layer_types()),
+        tp.build_mtp_manifest(),
+    ):
+        for block in manifest.blocks:
+            assert block.segment_count == len(block.segments)
+            assert manifest.segments[block.segment_begin: block.segment_begin + block.segment_count] == block.segments
+            row = 0
+            for segment in block.segments:
+                assert segment.block_index == block.block_index
+                assert segment.row_begin == row
+                row += segment.row_count
+            assert row == block.shape[0]
+            if block.segment_count == 1:
+                assert block.source_kind == block.segments[0].source_kind
+            else:
+                assert block.source_kind == qt.SK_OTHER
 
 
 def test_fusion_members_are_consecutive_with_correct_indices():
-    manifest = tp.build_text_manifest(_canonical_layer_types())
-
-    for group in manifest.fusion_groups:
-        assert group.block_indices == tuple(range(group.first_block_index, group.first_block_index + group.block_count))
-        assert group.total_n == sum(manifest.blocks[i].shape[0] for i in group.block_indices)
-        for fusion_index, block_index in enumerate(group.block_indices):
-            block = manifest.blocks[block_index]
-            assert block.fusion_group_id == group.group_id
-            assert block.fusion_index == fusion_index
-            assert block.source_layer == group.source_layer
-            assert block.shape[1] == group.shared_k
+    for manifest in (
+        tp.build_text_manifest(_canonical_layer_types()),
+        tp.build_mtp_manifest(),
+    ):
+        for group in manifest.fusion_groups:
+            assert group.block_indices == tuple(range(group.first_block_index, group.first_block_index + group.block_count))
+            assert group.total_n == sum(manifest.blocks[i].shape[0] for i in group.block_indices)
+            for fusion_index, block_index in enumerate(group.block_indices):
+                block = manifest.blocks[block_index]
+                assert block.fusion_group_id == group.group_id
+                assert block.fusion_index == fusion_index
+                assert block.source_layer == group.source_layer
+                assert block.shape[1] == group.shared_k
 
 
 def test_source_specs_carry_value_defining_transforms():

@@ -216,6 +216,18 @@ class WeightView:
     row_count: int
 
 
+@dataclass
+class SpeculativeStats:
+    draft_tokens: int = 0
+    accepted_tokens: int = 0
+
+    @property
+    def acceptance_rate(self) -> float:
+        if self.draft_tokens == 0:
+            return 0.0
+        return self.accepted_tokens / self.draft_tokens
+
+
 class Q5090File:
     def __init__(self, path: str | Path, resident_device: torch.device | str | None = None):
         self.path = Path(path)
@@ -707,6 +719,7 @@ class RefModel:
 
     def reset_state(self) -> None:
         self.kv: Dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.mtp_kv: Dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.conv: Dict[int, torch.Tensor] = {
             i: torch.zeros(GDN_CONV, 3, device=self.device, dtype=torch.float32) for i in range(48)
         }
@@ -714,6 +727,25 @@ class RefModel:
             i: torch.zeros(GDN_HV, GDN_DV, GDN_DK, device=self.device, dtype=torch.float32) for i in range(48)
         }
         self.pos = 0
+
+    def mtp_kv_len(self, layer: int = 0) -> int:
+        kv = self.mtp_kv.get(layer)
+        if kv is None:
+            return 0
+        return int(kv[0].shape[0])
+
+    def truncate_mtp_kv(self, length: int, layer: int = 0) -> None:
+        if length < 0:
+            raise ValueError("MTP KV length must be nonnegative")
+        kv = self.mtp_kv.get(layer)
+        if kv is None:
+            if length != 0:
+                raise ValueError(f"cannot truncate empty MTP KV to {length}")
+            return
+        k, v = kv
+        if length > k.shape[0]:
+            raise ValueError(f"cannot extend MTP KV from {k.shape[0]} to {length}")
+        self.mtp_kv[layer] = (k[:length].clone(), v[:length].clone())
 
     def embed(self, ids: Iterable[int]) -> torch.Tensor:
         idx = torch.tensor(list(ids), device=self.device, dtype=torch.long)
@@ -761,6 +793,43 @@ class RefModel:
             scores = torch.einsum("thd,shd->ths", q.float(), k_rep) * ATTN_SCALE
             probs = torch.softmax(scores, dim=-1)
             return bf16(torch.einsum("ths,shd->thd", probs, v_rep))
+
+    def mtp_gqa_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: int,
+        phase: str,
+    ) -> torch.Tensor:
+        T = q.shape[0]
+        if phase == "prefill":
+            self.mtp_kv[layer] = (k.clone(), v.clone())
+            k_all, v_all = self.mtp_kv[layer]
+            k_rep = k_all.repeat_interleave(H_Q // H_KV, dim=1).float()
+            v_rep = v_all.repeat_interleave(H_Q // H_KV, dim=1).float()
+            scores = torch.einsum("thd,shd->ths", q.float(), k_rep) * ATTN_SCALE
+            t_idx = torch.arange(T, device=self.device)
+            s_idx = torch.arange(k_all.shape[0], device=self.device)
+            scores = scores.masked_fill(s_idx[None, None, :] > t_idx[:, None, None], -torch.inf)
+            probs = torch.softmax(scores, dim=-1)
+            return bf16(torch.einsum("ths,shd->thd", probs, v_rep))
+        if phase != "decode":
+            raise ValueError(f"unknown MTP attention phase {phase!r}")
+        old_k, old_v = self.mtp_kv.get(
+            layer,
+            (
+                torch.empty(0, H_KV, DH, device=self.device),
+                torch.empty(0, H_KV, DH, device=self.device),
+            ),
+        )
+        self.mtp_kv[layer] = (torch.cat([old_k, k], dim=0), torch.cat([old_v, v], dim=0))
+        k_all, v_all = self.mtp_kv[layer]
+        k_rep = k_all.repeat_interleave(H_Q // H_KV, dim=1).float()
+        v_rep = v_all.repeat_interleave(H_Q // H_KV, dim=1).float()
+        scores = torch.einsum("thd,shd->ths", q.float(), k_rep) * ATTN_SCALE
+        probs = torch.softmax(scores, dim=-1)
+        return bf16(torch.einsum("ths,shd->thd", probs, v_rep))
 
     def gdn_recurrent(
         self,
@@ -855,9 +924,11 @@ class RefModel:
                 dumps[f"layer_{layer}"] = x.detach().float().cpu()
         return x
 
-    def logits_last(self, x: torch.Tensor) -> torch.Tensor:
-        xf = rmsnorm(x, self.weight("model.language_model.norm.weight"), unit_offset=True)
-        xlast = xf[-1:, :].to(torch.bfloat16)
+    def final_norm_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        return rmsnorm(x, self.weight("model.language_model.norm.weight"), unit_offset=True)
+
+    def logits_from_hidden_last(self, hidden: torch.Tensor) -> torch.Tensor:
+        xlast = hidden[-1:, :].to(torch.bfloat16)
         logits = torch.empty(V, device=self.device, dtype=torch.bfloat16)
         for row0, row1, weight in self.q5090.row_split_row_chunks(
             "lm_head.weight",
@@ -867,6 +938,191 @@ class RefModel:
             logits[row0:row1] = (xlast @ weight.to(torch.bfloat16).t())[0]
             del weight
         return logits
+
+    def logits_last(self, x: torch.Tensor) -> torch.Tensor:
+        return self.logits_from_hidden_last(self.final_norm_hidden(x))
+
+    def mtp_forward(
+        self,
+        input_ids: Iterable[int],
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        phase: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        ids = list(input_ids)
+        if not ids:
+            raise ValueError("MTP input_ids must not be empty")
+        if phase not in {"prefill", "decode"}:
+            raise ValueError(f"unknown MTP phase {phase!r}")
+        if hidden_states.shape != (len(ids), D):
+            raise ValueError(f"MTP hidden_states shape {tuple(hidden_states.shape)} != {(len(ids), D)}")
+        positions = positions.to(device=self.device, dtype=torch.int32)
+        if positions.shape != (len(ids),):
+            raise ValueError(f"MTP positions shape {tuple(positions.shape)} != {(len(ids),)}")
+
+        p = "mtp.layers.0."
+        emb = self.embed(ids)
+        e = rmsnorm(emb, self.weight("mtp.pre_fc_norm_embedding.weight"), unit_offset=True)
+        h = rmsnorm(hidden_states, self.weight("mtp.pre_fc_norm_hidden.weight"), unit_offset=True)
+        x = linear(torch.cat([e, h], dim=-1), self.weight("mtp.fc.weight"))
+
+        ah = rmsnorm(x, self.weight(p + "input_layernorm.weight"), unit_offset=True)
+        attn_in = linear(ah, self.block_weight(p + "attn_in.w8"))
+        q = attn_in[:, :Q_SIZE].reshape(-1, H_Q, DH)
+        k = attn_in[:, Q_SIZE : Q_SIZE + KV_SIZE].reshape(-1, H_KV, DH)
+        gate = attn_in[:, Q_SIZE + KV_SIZE : Q_SIZE + KV_SIZE + Q_SIZE].reshape(-1, H_Q, DH)
+        v = attn_in[:, Q_SIZE + KV_SIZE + Q_SIZE :].reshape(-1, H_KV, DH)
+
+        qn = rmsnorm(q, self.weight(p + "self_attn.q_norm.weight"), unit_offset=True)
+        kn = rmsnorm(k, self.weight(p + "self_attn.k_norm.weight"), unit_offset=True)
+        qn, kn = apply_rope(qn, kn, positions)
+        a = self.mtp_gqa_attention(qn, kn, v, 0, phase)
+        a = sigmoid_gate_mul(gate, a).reshape(-1, Q_SIZE)
+        o = linear(a, self.weight(p + "self_attn.o_proj.weight"))
+        x = residual_add(x, o)
+
+        mh = rmsnorm(x, self.weight(p + "post_attention_layernorm.weight"), unit_offset=True)
+        gate_up = linear(mh, self.block_weight(p + "mlp.gateup.w8"))
+        gate_mlp, up = gate_up.split(I, dim=-1)
+        d = linear(silu_and_mul(gate_mlp, up), self.weight(p + "mlp.down_proj.weight"))
+        x = residual_add(x, d)
+
+        mtp_hidden = rmsnorm(x, self.weight("mtp.norm.weight"), unit_offset=True)
+        logits = self.logits_from_hidden_last(mtp_hidden)
+        draft = int(torch.argmax(logits).item())
+        return mtp_hidden, logits, draft
+
+    def _target_decode_one(self, token: int, position: int) -> tuple[int, torch.Tensor]:
+        x = self.embed([token])
+        pos = torch.tensor([position], device=self.device, dtype=torch.int32)
+        x = self.run_layers(x, "decode", pos)
+        hidden = self.final_norm_hidden(x)
+        next_token = int(torch.argmax(self.logits_from_hidden_last(hidden)).item())
+        return next_token, hidden
+
+    def _mtp_make_drafts(
+        self,
+        last_hidden: torch.Tensor,
+        last_logits: torch.Tensor,
+        last_position: int,
+        draft_count: int,
+        committed_kv_len: int,
+    ) -> List[int]:
+        if draft_count < 1 or draft_count > 5:
+            raise ValueError("draft_count must be in [1,5]")
+        self.truncate_mtp_kv(committed_kv_len)
+        drafts = [int(torch.argmax(last_logits).item())]
+        hidden = last_hidden[-1:, :]
+        token = drafts[0]
+        position = last_position + 1
+        while len(drafts) < draft_count:
+            hidden, logits, token = self.mtp_forward(
+                [token],
+                hidden,
+                torch.tensor([position], device=self.device, dtype=torch.int32),
+                "decode",
+            )
+            drafts.append(token)
+            position += 1
+        return drafts
+
+    def forward_mtp_verified(
+        self,
+        prompt: Iterable[int],
+        n_decode: int,
+        *,
+        draft_count: int,
+        stop_token_ids: Optional[set[int]] = None,
+    ) -> tuple[List[int], SpeculativeStats]:
+        if draft_count < 1 or draft_count > 5:
+            raise ValueError("draft_count must be in [1,5]")
+        prompt_ids = list(prompt)
+        if not prompt_ids:
+            raise ValueError("prompt must not be empty")
+        if n_decode < 0:
+            raise ValueError("n_decode must be nonnegative")
+        self.reset_state()
+        stats = SpeculativeStats()
+        if n_decode == 0:
+            return [], stats
+
+        x = self.embed(prompt_ids)
+        positions = torch.arange(len(prompt_ids), device=self.device, dtype=torch.int32)
+        x = self.run_layers(x, "prefill", positions)
+        target_hidden = self.final_norm_hidden(x)
+        token = int(torch.argmax(self.logits_from_hidden_last(target_hidden)).item())
+        out = [token]
+        self.pos = len(prompt_ids)
+        if len(out) >= n_decode or (stop_token_ids and token in stop_token_ids):
+            return out, stats
+
+        mtp_ids = prompt_ids[1:] + [token]
+        mtp_hidden, mtp_logits, _ = self.mtp_forward(mtp_ids, target_hidden, positions, "prefill")
+        last_mtp_hidden = mtp_hidden[-1:, :]
+        last_mtp_logits = mtp_logits
+        last_mtp_position = len(prompt_ids) - 1
+        committed_mtp_len = self.mtp_kv_len()
+        drafts = self._mtp_make_drafts(
+            last_mtp_hidden,
+            last_mtp_logits,
+            last_mtp_position,
+            draft_count,
+            committed_mtp_len,
+        )
+        draft_index = 0
+
+        while len(out) < n_decode:
+            if draft_index >= len(drafts):
+                drafts = self._mtp_make_drafts(
+                    last_mtp_hidden,
+                    last_mtp_logits,
+                    last_mtp_position,
+                    draft_count,
+                    committed_mtp_len,
+                )
+                draft_index = 0
+            candidate = drafts[draft_index]
+
+            target_position = self.pos
+            target_token, target_hidden = self._target_decode_one(token, target_position)
+            self.pos += 1
+            stats.draft_tokens += 1
+            accepted = target_token == candidate
+            if accepted:
+                stats.accepted_tokens += 1
+                token = candidate
+                draft_index += 1
+            else:
+                token = target_token
+                drafts = []
+                draft_index = 0
+
+            out.append(token)
+            if stop_token_ids and token in stop_token_ids:
+                break
+
+            self.truncate_mtp_kv(committed_mtp_len)
+            last_mtp_hidden, last_mtp_logits, _ = self.mtp_forward(
+                [token],
+                target_hidden,
+                torch.tensor([target_position], device=self.device, dtype=torch.int32),
+                "decode",
+            )
+            last_mtp_hidden = last_mtp_hidden[-1:, :]
+            last_mtp_position = target_position
+            committed_mtp_len = self.mtp_kv_len()
+
+            if not accepted or draft_index >= len(drafts):
+                drafts = self._mtp_make_drafts(
+                    last_mtp_hidden,
+                    last_mtp_logits,
+                    last_mtp_position,
+                    draft_count,
+                    committed_mtp_len,
+                )
+                draft_index = 0
+
+        return out, stats
 
     def forward(
         self,
@@ -983,6 +1239,7 @@ def main() -> None:
     ap.add_argument("--messages-json", default=None, help="JSON chat messages rendered through the Qwen chat template")
     ap.add_argument("--token-ids", default=None, help="comma or space separated token ids; bypasses tokenizer/chat template")
     ap.add_argument("--decode", type=int, default=16)
+    ap.add_argument("--mtp-draft-tokens", type=int, default=0, help="0 disables MTP; 1..5 enables verified greedy MTP")
     ap.add_argument("--stop-token-ids", default=DEFAULT_STOP_TOKEN_IDS)
     ap.add_argument("--show-rendered-prompt", action="store_true")
     ap.add_argument("--device", default="cuda")
@@ -994,6 +1251,8 @@ def main() -> None:
         help="keep quantized payloads resident on device (auto/gpu) or stream from mmap",
     )
     args = ap.parse_args()
+    if args.mtp_draft_tokens < 0 or args.mtp_draft_tokens > 5:
+        raise SystemExit("--mtp-draft-tokens must be 0 or an integer in [1,5]")
 
     model = RefModel(
         args.weights,
@@ -1014,11 +1273,24 @@ def main() -> None:
         prompt_ids, rendered_prompt = chat_prompt_ids(tokenizer, messages)
     stop_token_ids = parse_stop_token_ids(args.stop_token_ids)
     with torch.inference_mode():
-        tokens = model.forward(prompt_ids, args.decode, stop_token_ids=stop_token_ids)
+        if args.mtp_draft_tokens:
+            tokens, spec_stats = model.forward_mtp_verified(
+                prompt_ids,
+                args.decode,
+                draft_count=args.mtp_draft_tokens,
+                stop_token_ids=stop_token_ids,
+            )
+        else:
+            tokens = model.forward(prompt_ids, args.decode, stop_token_ids=stop_token_ids)
+            spec_stats = None
     print(f"PROMPT_TOKENS: {len(prompt_ids)}")
     if rendered_prompt is not None and args.show_rendered_prompt:
         print(f"RENDERED_PROMPT: {rendered_prompt!r}")
     print(f"GENERATED_TOKEN_IDS: {tokens}")
+    if spec_stats is not None:
+        print(f"MTP_DRAFT_TOKENS: {spec_stats.draft_tokens}")
+        print(f"MTP_ACCEPTED_TOKENS: {spec_stats.accepted_tokens}")
+        print(f"MTP_ACCEPTANCE_RATE: {spec_stats.acceptance_rate:.6f}")
     if tokenizer is not None:
         text = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         print(f"GENERATED_TEXT: {text!r}")

@@ -290,12 +290,10 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             __nv_bfloat16* dst = &As[row * BK];
 #pragma unroll
             for (int gg = 0; gg < GPB; ++gg) {
-                float w0 = 0.0f;
-                float w1 = 0.0f;
-                Codec::load_pair(Cr[stage], Hr[stage], Sr[stage], row * GPB + gg, lane, w0, w1);
+                const __nv_bfloat162 w = Codec::load_pair_bf162(Cr[stage], Hr[stage], Sr[stage],
+                                                                 row * GPB + gg, lane);
                 const int sc = gemm_swz64(row, gg * 64 + 2 * lane);
-                dst[sc]      = __float2bfloat16(w0);
-                dst[sc + 1]  = __float2bfloat16(w1);
+                *reinterpret_cast<__nv_bfloat162*>(&dst[sc]) = w;
             }
         }
     };

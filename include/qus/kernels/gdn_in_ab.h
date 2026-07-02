@@ -13,4 +13,8 @@ void gdn_in_ab_gated_decode(const Tensor& x, const Weight& a_weight, const Weigh
                             const Tensor& A_log, const Tensor& dt_bias, Tensor& g, Tensor& beta,
                             cudaStream_t stream);
 
+void gdn_in_ab_gated_prefill(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
+                             const Tensor& A_log, const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                             cudaStream_t stream);
+
 } // namespace qus::kernels

@@ -444,18 +444,13 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     copy_bf16_block(k, qkv, kCfg.key_dim, s);
     copy_bf16_block(v, qkv, 2 * kCfg.key_dim, s);
 
-    Tensor a = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, T});
-    Tensor b = work_.alloc(DType::BF16, {kCfg.gdn_v_heads, T});
-    kernels::linear(h, *w.in_a, a, work_, s);
-    kernels::linear(h, *w.in_b, b, work_, s);
-
     Tensor qkv_c       = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
     Tensor& conv_state = state_.conv.at(static_cast<std::size_t>(gidx));
     kernels::causal_conv1d_prefill(qkv, *w.conv1d, conv_state, qkv_c, s);
 
     Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
     Tensor beta = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
-    kernels::gdn_gating(a, b, *w.a_log, *w.dt_bias, g, beta, s);
+    kernels::gdn_in_ab_gated_prefill(h, *w.in_a, *w.in_b, *w.a_log, *w.dt_bias, g, beta, s);
 
     Tensor qc = work_.alloc(DType::BF16, {kCfg.key_dim, T});
     Tensor kc = work_.alloc(DType::BF16, {kCfg.key_dim, T});

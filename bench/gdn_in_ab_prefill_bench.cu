@@ -1,11 +1,7 @@
-// Performance bench for the Qwen3.6-27B GDN in_a/in_b prefill path:
-// two dense BF16 [48,5120] projections followed by gdn_gating.
-//
-// This is the baseline target for replacing the three-launch scalar path with
-// a fused tensor-core kernel.
+// Performance bench for the Qwen3.6-27B fused GDN in_a/in_b prefill path:
+// two dense BF16 [48,5120] projections fused with gdn_gating.
 //   ./qus_gdn_in_ab_prefill_bench -p 128,256,512,1024,2048,4096,8192,16384
-#include "qus/kernels/gdn_gating.h"
-#include "qus/kernels/linear.h"
+#include "qus/kernels/gdn_in_ab.h"
 #include "qus_bench_common.h"
 
 #include <cstdint>
@@ -85,21 +81,16 @@ void run(std::int32_t T, int warmup, int repeat, int min_time_ms) {
     DBuf bw      = make_bf16(w_elems);
     DBuf A_log   = make_f32(kHeads, 0x1234abcdU);
     DBuf dt_bias = make_f32(kHeads, 0x9876fedcU);
-    DBuf a       = make_zeros(out_elems * 2u);
-    DBuf b       = make_zeros(out_elems * 2u);
     DBuf g       = make_zeros(out_elems * sizeof(float));
     DBuf beta    = make_zeros(out_elems * sizeof(float));
 
     Tensor tx(x.p, DType::BF16, {kHidden, T});
-    Tensor ta(a.p, DType::BF16, {kHeads, T});
-    Tensor tb(b.p, DType::BF16, {kHeads, T});
     Tensor tA_log(A_log.p, DType::FP32, {kHeads});
     Tensor tdt_bias(dt_bias.p, DType::FP32, {kHeads});
     Tensor tg(g.p, DType::FP32, {kHeads, T});
     Tensor tbeta(beta.p, DType::FP32, {kHeads, T});
     Weight wa = dense_bf16_weight(aw.p);
     Weight wb = dense_bf16_weight(bw.p);
-    WorkspaceArena ws(64ULL << 20);
 
     const double useful_flops =
         4.0 * static_cast<double>(kHeads) * static_cast<double>(kHidden) *
@@ -113,16 +104,14 @@ void run(std::int32_t T, int warmup, int repeat, int min_time_ms) {
 
     const Result r = bench_loop(
         [&](cudaStream_t s) {
-            kernels::linear(tx, wa, ta, ws, s);
-            kernels::linear(tx, wb, tb, ws, s);
-            kernels::gdn_gating(ta, tb, tA_log, tdt_bias, tg, tbeta, s);
+            kernels::gdn_in_ab_gated_prefill(tx, wa, wb, tA_log, tdt_bias, tg, tbeta, s);
         },
         bytes, warmup, repeat, min_time_ms);
 
     const double sec          = r.median_us * 1e-6;
     const double useful_tflop = (sec > 0.0) ? useful_flops / sec / 1e12 : 0.0;
     const double tc_pct       = useful_tflop / kTcPeakTflops * 100.0;
-    std::printf("two_step,%d,%.3f,%.3f,%.3f,%.4f,%.2f,%d,%d\n", T, r.median_us, r.min_us,
+    std::printf("fused,%d,%.3f,%.3f,%.3f,%.4f,%.2f,%d,%d\n", T, r.median_us, r.min_us,
                 r.p95_us, useful_tflop, tc_pct, r.n_runs, r.inner_iters);
 }
 

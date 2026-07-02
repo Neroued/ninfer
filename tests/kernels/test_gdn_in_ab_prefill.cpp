@@ -1,7 +1,6 @@
-// Correctness coverage for the GDN in_a/in_b prefill path at Qwen3.6-27B
-// shapes: two dense BF16 [48,5120] projections followed by gdn_gating.
-#include "qus/kernels/gdn_gating.h"
-#include "qus/kernels/linear.h"
+// Correctness coverage for the fused GDN in_a/in_b prefill path at Qwen3.6-27B
+// shapes: two dense BF16 [48,5120] projections fused with gdn_gating.
+#include "qus/kernels/gdn_in_ab.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -94,30 +93,23 @@ int one_shape(std::int32_t T, std::uint32_t seed) {
 
     DBuf dx = to_device_bf16(x), daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
     DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
-    DBuf da(static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T) * 2u);
-    DBuf db(static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T) * 2u);
     DBuf dg(static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T) * sizeof(float));
     DBuf dbeta(static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T) * sizeof(float));
 
     Tensor tx(dx.p, DType::BF16, {kHidden, T});
-    Tensor ta(da.p, DType::BF16, {kHeads, T});
-    Tensor tb(db.p, DType::BF16, {kHeads, T});
     Tensor tA_log(dA_log.p, DType::FP32, {kHeads});
     Tensor tdt_bias(ddt_bias.p, DType::FP32, {kHeads});
     Tensor tg(dg.p, DType::FP32, {kHeads, T});
     Tensor tbeta(dbeta.p, DType::FP32, {kHeads, T});
     Weight wa = dense_bf16_weight(daw.p);
     Weight wb = dense_bf16_weight(dbw.p);
-    WorkspaceArena ws(64ULL << 20);
 
-    kernels::linear(tx, wa, ta, ws, nullptr);
-    kernels::linear(tx, wb, tb, ws, nullptr);
-    kernels::gdn_gating(ta, tb, tA_log, tdt_bias, tg, tbeta, nullptr);
+    kernels::gdn_in_ab_gated_prefill(tx, wa, wb, tA_log, tdt_bias, tg, tbeta, nullptr);
     cudaDeviceSynchronize();
 
     const std::size_t n = static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T);
     const std::string label =
-        "gdn_in_ab_prefill two-step [48,5120] T=" + std::to_string(T);
+        "gdn_in_ab_prefill fused [48,5120] T=" + std::to_string(T);
     int failures = 0;
     failures +=
         verify((label + " g").c_str(), from_device_f32(dg, n), ref_g, Tolerance::gdn_output_bf16());

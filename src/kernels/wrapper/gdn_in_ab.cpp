@@ -17,10 +17,18 @@ void require_dense_bf16(const Weight& w, const char* name) {
     }
 }
 
-void require_tensor(const Tensor& t, DType dtype, std::int32_t n0, const char* name) {
+void require_decode_tensor(const Tensor& t, DType dtype, std::int32_t n0, const char* name) {
     if (t.dtype != dtype || t.ne[0] != n0 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1 ||
         !t.is_contiguous() || t.data == nullptr) {
         throw std::invalid_argument(std::string("gdn_in_ab_decode: invalid ") + name);
+    }
+}
+
+void require_prefill_tensor(const Tensor& t, DType dtype, std::int32_t n0, std::int32_t tokens,
+                            const char* name) {
+    if (t.dtype != dtype || t.ne[0] != n0 || t.ne[1] != tokens || t.ne[2] != 1 ||
+        t.ne[3] != 1 || !t.is_contiguous() || (tokens > 0 && t.data == nullptr)) {
+        throw std::invalid_argument(std::string("gdn_in_ab_prefill: invalid ") + name);
     }
 }
 
@@ -28,9 +36,9 @@ void require_tensor(const Tensor& t, DType dtype, std::int32_t n0, const char* n
 
 void gdn_in_ab_decode(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                       Tensor& a_out, Tensor& b_out, cudaStream_t stream) {
-    require_tensor(x, DType::BF16, 5120, "x");
-    require_tensor(a_out, DType::BF16, 48, "a_out");
-    require_tensor(b_out, DType::BF16, 48, "b_out");
+    require_decode_tensor(x, DType::BF16, 5120, "x");
+    require_decode_tensor(a_out, DType::BF16, 48, "a_out");
+    require_decode_tensor(b_out, DType::BF16, 48, "b_out");
     require_dense_bf16(a_weight, "a_weight");
     require_dense_bf16(b_weight, "b_weight");
     detail::linear_dense_gdn_in_ab_48_launch(x, a_weight, b_weight, a_out, b_out, stream);
@@ -39,15 +47,33 @@ void gdn_in_ab_decode(const Tensor& x, const Weight& a_weight, const Weight& b_w
 void gdn_in_ab_gated_decode(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                             const Tensor& A_log, const Tensor& dt_bias, Tensor& g, Tensor& beta,
                             cudaStream_t stream) {
-    require_tensor(x, DType::BF16, 5120, "x");
-    require_tensor(A_log, DType::FP32, 48, "A_log");
-    require_tensor(dt_bias, DType::FP32, 48, "dt_bias");
-    require_tensor(g, DType::FP32, 48, "g");
-    require_tensor(beta, DType::FP32, 48, "beta");
+    require_decode_tensor(x, DType::BF16, 5120, "x");
+    require_decode_tensor(A_log, DType::FP32, 48, "A_log");
+    require_decode_tensor(dt_bias, DType::FP32, 48, "dt_bias");
+    require_decode_tensor(g, DType::FP32, 48, "g");
+    require_decode_tensor(beta, DType::FP32, 48, "beta");
     require_dense_bf16(a_weight, "a_weight");
     require_dense_bf16(b_weight, "b_weight");
     detail::linear_dense_gdn_in_ab_gated_48_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
                                                    stream);
+}
+
+void gdn_in_ab_gated_prefill(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
+                             const Tensor& A_log, const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                             cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    if (tokens < 0) {
+        throw std::invalid_argument("gdn_in_ab_prefill: token length must be non-negative");
+    }
+    require_prefill_tensor(x, DType::BF16, 5120, tokens, "x");
+    require_decode_tensor(A_log, DType::FP32, 48, "A_log");
+    require_decode_tensor(dt_bias, DType::FP32, 48, "dt_bias");
+    require_prefill_tensor(g, DType::FP32, 48, tokens, "g");
+    require_prefill_tensor(beta, DType::FP32, 48, tokens, "beta");
+    require_dense_bf16(a_weight, "a_weight");
+    require_dense_bf16(b_weight, "b_weight");
+    detail::linear_dense_gdn_in_ab_gated_prefill_48_launch(x, a_weight, b_weight, A_log, dt_bias,
+                                                           g, beta, stream);
 }
 
 } // namespace qus::kernels

@@ -15,4 +15,9 @@ void linear_dense_gdn_in_ab_gated_48_launch(const Tensor& x, const Weight& a_wei
                                             const Tensor& dt_bias, Tensor& g, Tensor& beta,
                                             cudaStream_t stream);
 
+void linear_dense_gdn_in_ab_gated_prefill_48_launch(const Tensor& x, const Weight& a_weight,
+                                                    const Weight& b_weight, const Tensor& A_log,
+                                                    const Tensor& dt_bias, Tensor& g,
+                                                    Tensor& beta, cudaStream_t stream);
+
 } // namespace qus::kernels::detail

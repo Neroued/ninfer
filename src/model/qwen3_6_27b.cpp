@@ -593,6 +593,7 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
     }
 
     detail::set_pos(io_.pos, T, s);
+    ctx_.synchronize();
     work_.reset();
 }
 

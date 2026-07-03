@@ -25,13 +25,22 @@ std::uint32_t parse_positive_u32(const char* text, const char* label) {
     return static_cast<std::uint32_t>(value);
 }
 
+int parse_mtp_draft_tokens(const char* text) {
+    const int value = parse_nonnegative_int(text, "mtp-draft-tokens");
+    if (value > model::kMaxMtpDraftTokens) {
+        throw std::invalid_argument("--mtp-draft-tokens must be in [0,5]");
+    }
+    return value;
+}
+
 } // namespace
 
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <weights.qus> --tokenizer <dir> (--prompt <text>|--messages <messages.json>) "
            "[--max-context N] [--prefill-chunk N] [--max-new N] [--device N] [--raw-output] "
-           "[--print-token-ids] [--no-cuda-graph] [--stop-token-id N]...\n"
+           "[--print-token-ids] [--no-cuda-graph] [--mtp-draft-tokens N] "
+           "[--mtp-strict-sequential] [--mtp-round-dump-dir DIR] [--stop-token-id N]...\n"
            "       streams decoded text to stdout; writes progress and timings to stderr\n";
 }
 
@@ -65,6 +74,12 @@ CliOptions parse_cli(int argc, char** argv) {
                 parse_positive_u32(require_value("--prefill-chunk"), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+        } else if (arg == "--mtp-draft-tokens") {
+            options.mtp_draft_tokens = parse_mtp_draft_tokens(require_value("--mtp-draft-tokens"));
+        } else if (arg == "--mtp-strict-sequential") {
+            options.mtp_strict_sequential = true;
+        } else if (arg == "--mtp-round-dump-dir") {
+            options.mtp_round_dump_dir = require_value("--mtp-round-dump-dir");
         } else if (arg == "--raw-output") {
             options.output_mode = OutputMode::Raw;
         } else if (arg == "--print-token-ids") {

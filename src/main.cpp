@@ -125,6 +125,9 @@ int main(int argc, char** argv) {
         engine_options.device         = cli.device;
         engine_options.max_ctx        = cli.max_context;
         engine_options.prefill_chunk  = cli.prefill_chunk;
+        engine_options.mtp_draft_tokens = cli.mtp_draft_tokens;
+        engine_options.mtp_strict_sequential = cli.mtp_strict_sequential;
+        engine_options.mtp_round_dump_dir = cli.mtp_round_dump_dir;
         engine_options.stop_token_ids = stop_token_ids;
         engine_options.progress       = &progress;
         engine_options.use_cuda_graph = cli.use_cuda_graph;

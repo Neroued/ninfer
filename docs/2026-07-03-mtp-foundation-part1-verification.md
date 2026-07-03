@@ -8,9 +8,9 @@ This report records the local verification artifacts for
 Generated artifact:
 
 ```text
-out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus
-out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus.manifest.json
-out/conv_dump.v3.json
+out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus
+out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus.manifest.json
+out/conv_dump.v3_mtp_w8g32.json
 ```
 
 These files are under `out/` and are ignored by git.
@@ -20,7 +20,7 @@ Generation command:
 ```bash
 /home/neroued/miniconda3/envs/py311/bin/python -m tools.q5090_convert.convert \
   --model /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16 \
-  --out out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus
+  --out out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus
 ```
 
 Converter summary:
@@ -28,18 +28,18 @@ Converter summary:
 ```text
 blocks=1164 segments=1312 fusion_groups=130 modules=3
 TEXT_CORE      blocks=819 payload=16378329088
-MTP_DRAFT      blocks=12  payload=431361024
+MTP_DRAFT      blocks=12  payload=451267584
 VISION_ENCODER blocks=333 payload=293396992
-file_bytes=17103377920
+file_bytes=17123284480
 ```
 
 Verifier command:
 
 ```bash
 /home/neroued/miniconda3/envs/py311/bin/python -m tools.q5090_convert.verify \
-  out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus \
+  out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus \
   --model /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16 \
-  --dump out/conv_dump.v3.json
+  --dump out/conv_dump.v3_mtp_w8g32.json
 ```
 
 Verifier result:
@@ -47,18 +47,21 @@ Verifier result:
 ```text
 L0 structural checks done; problems=0
 L1 value checks done; problems=0
-OK: L0 + L1 passed in 240s
+OK: L0 + L1 passed in 198s
 
 Q4G64_F16S   blocks=182 scale_bad=0 code_bad=0 control_bad=0
 Q5G64_F16S   blocks=295 scale_bad=0 code_bad=0 control_bad=0
 Q6G64_F16S   blocks=2   scale_bad=0 code_bad=0 control_bad=0
-W8G128_F16S  blocks=7   scale_bad=0 code_bad=0 control_bad=0
+W8G128_F16S  blocks=2   scale_bad=0 code_bad=0 control_bad=0
 BF16_CTRL    blocks=582 scale_bad=0 code_bad=0 control_bad=0
 FP32_CTRL    blocks=96  scale_bad=0 code_bad=0 control_bad=0
+W8G32_F16S   blocks=5   scale_bad=0 code_bad=0 control_bad=0
 ```
 
 The new MTP_DRAFT layout contributes 12 blocks, 16 segments, and 2 fusion groups:
-`ATTN_IN` and `MLP_GATEUP`.
+`ATTN_IN` and `MLP_GATEUP`. The five MTP dense/fused blocks use `W8G32_F16S`; the seven
+MTP control tensors use `BF16_CTRL`. `TEXT_CORE` has no W8 tensors. The only `W8G128_F16S`
+tensors are the existing VISION merger FC weights.
 
 ## Python Ref Model Verified MTP
 
@@ -76,7 +79,7 @@ from tools.parity.ref_model import (
     parse_stop_token_ids,
 )
 
-weights = 'out/qwen3_6_27b.q5090_w4g64_mixed_v3.qus'
+weights = 'out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus'
 decode = 8
 model = RefModel(weights, device='cuda', resident='auto')
 tokenizer = load_tokenizer(DEFAULT_MODEL)
@@ -113,20 +116,7 @@ BASE [103900, 122977, 3709, 98629, 102539, 111038, 1710, 198]
 The acceptance rate is not abnormally low for this smoke prompt. The verified greedy path produced the
 same token sequence as non-MTP greedy for every requested MTP draft-token count 1..5.
 
-## Additional Loader Check
+## C++ Scope
 
-Commands:
-
-```bash
-cmake --build build --target qus_weight_store_real_file_test -j
-./build/tests/qus_weight_store_real_file_test
-```
-
-Result:
-
-```text
-passed
-```
-
-The rebuilt real-file test accepted the new manifest/header counts and loaded the TEXT default path and
-TEXT+MTP path from the regenerated v3 artifact.
+This W8G32 MTP precision update is verified in the q5090 Python converter/verifier and Python ref
+model. C++ runtime/model-card support for MTP remains outside Part 1.

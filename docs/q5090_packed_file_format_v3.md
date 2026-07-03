@@ -173,10 +173,10 @@ TEXT_CORE module; the per-module tensor plans are in the tensor-plan companion (
 
 **`flags` semantics.** bit0 `TEXT_PRESENT`, bit1 `MTP_PRESENT`, bit2 `VISION_PRESENT` — each set iff the
 corresponding `module_kind` appears in the module table; bit0 is always set, and the bits MUST agree
-with the module table (the current artifact sets only bit0). bit3 `CALIBRATED` — set iff any tensor's
-codes/scales came from a calibrated quantizer pass (§8). Bits 4..31 are reserved and MUST be zero. A
-loader MUST reject a file whose reserved flag bits are set or whose module-present bits disagree with
-the module table.
+with the module table. The Part 1 artifact sets `TEXT_PRESENT | MTP_PRESENT | VISION_PRESENT`. bit3
+`CALIBRATED` — set iff any tensor's codes/scales came from a calibrated quantizer pass (§8). Bits
+4..31 are reserved and MUST be zero. A loader MUST reject a file whose reserved flag bits are set or
+whose module-present bits disagree with the module table.
 
 ## 3. ModuleRecord (64 bytes)
 

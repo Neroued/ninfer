@@ -10,6 +10,7 @@ enum class DType : std::uint8_t {
     FP32 = 1,
     I32  = 2,
     U8   = 3,
+    I64  = 4,
 };
 
 std::size_t dtype_size(DType dtype);

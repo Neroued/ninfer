@@ -119,6 +119,11 @@ void KVCache::advance() {
     ++pos;
 }
 
+void KVCache::rewind(std::uint32_t position) {
+    if (position > pos) { throw std::out_of_range("KVCache rewind cannot move forward"); }
+    pos = position;
+}
+
 void KVCache::reset() noexcept { pos = 0; }
 
 } // namespace qus

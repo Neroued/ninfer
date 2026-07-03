@@ -14,6 +14,8 @@ std::size_t dtype_size(DType dtype) {
         return 4;
     case DType::U8:
         return 1;
+    case DType::I64:
+        return 8;
     }
     throw std::invalid_argument("invalid DType");
 }

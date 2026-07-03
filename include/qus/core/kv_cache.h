@@ -31,6 +31,7 @@ struct KVCache {
     KVHeadSlot slot(std::uint32_t layer, std::uint32_t position, std::int32_t kv_head) const;
     KVHeadSlot append_slot(std::uint32_t layer, std::int32_t kv_head) const;
     void advance();
+    void rewind(std::uint32_t position);
     void reset() noexcept;
 };
 

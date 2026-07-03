@@ -161,6 +161,37 @@ int main() {
                                         static_cast<unsigned char>(0x80 + head), "layer1 pos1 V");
     }
 
+    cache.rewind(1);
+    failures += expect_size(cache.pos, 1, "cache.pos after rewind");
+    failures += expect_throws<std::out_of_range>([&] { (void)cache.slot(0, 1, 0); },
+                                                 "read stale rewound position");
+    failures += expect_throws<std::out_of_range>([&] { cache.rewind(2); },
+                                                 "rewind forward");
+    for (std::int32_t head = 0; head < 4; ++head) {
+        qus::KVHeadSlot l0p1 = cache.append_slot(0, head);
+        qus::KVHeadSlot l1p1 = cache.append_slot(1, head);
+        failures += fill_slot(l0p1, static_cast<unsigned char>(0x90 + head),
+                              static_cast<unsigned char>(0xa0 + head));
+        failures += fill_slot(l1p1, static_cast<unsigned char>(0xb0 + head),
+                              static_cast<unsigned char>(0xc0 + head));
+    }
+    cache.advance();
+    failures += expect_size(cache.pos, 2, "cache.pos after rewrite advance");
+    for (std::int32_t head = 0; head < 4; ++head) {
+        failures += expect_device_bytes(cache.slot(0, 0, head).k,
+                                        static_cast<unsigned char>(0x10 + head),
+                                        "layer0 pos0 K after rewrite");
+        failures += expect_device_bytes(cache.slot(0, 1, head).k,
+                                        static_cast<unsigned char>(0x90 + head),
+                                        "layer0 pos1 K rewritten");
+        failures += expect_device_bytes(cache.slot(1, 0, head).v,
+                                        static_cast<unsigned char>(0x40 + head),
+                                        "layer1 pos0 V after rewrite");
+        failures += expect_device_bytes(cache.slot(1, 1, head).v,
+                                        static_cast<unsigned char>(0xc0 + head),
+                                        "layer1 pos1 V rewritten");
+    }
+
     void* k0_base = cache.k[0].data;
     void* v0_base = cache.v[0].data;
     cache.reset();

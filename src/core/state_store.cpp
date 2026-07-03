@@ -5,6 +5,7 @@
 #include <limits>
 #include <new>
 #include <stdexcept>
+#include <string>
 
 namespace qus {
 namespace {
@@ -40,35 +41,58 @@ void validate_positive(std::int32_t value, const char* name) {
     if (value <= 0) { throw std::invalid_argument(name); }
 }
 
+void validate_layer_slot(const GdnState& state, std::uint32_t layer, std::int32_t slot,
+                         const char* label) {
+    if (layer >= state.layer_count()) {
+        throw std::out_of_range(std::string(label) + " layer out of range");
+    }
+    if (slot < 0 || slot >= state.snapshot_slots) {
+        throw std::out_of_range(std::string(label) + " slot out of range");
+    }
+}
+
 } // namespace
 
 GdnState::GdnState(DeviceArena& cache_arena, std::uint32_t gdn_layers, std::int32_t conv_dim_in,
                    std::int32_t conv_width_in, std::int32_t value_heads_in,
                    std::int32_t value_head_dim_in, std::int32_t key_head_dim_in,
                    DType conv_dtype_in)
+    : GdnState(cache_arena, gdn_layers, conv_dim_in, conv_width_in, value_heads_in,
+               value_head_dim_in, key_head_dim_in, 1, conv_dtype_in) {}
+
+GdnState::GdnState(DeviceArena& cache_arena, std::uint32_t gdn_layers, std::int32_t conv_dim_in,
+                   std::int32_t conv_width_in, std::int32_t value_heads_in,
+                   std::int32_t value_head_dim_in, std::int32_t key_head_dim_in,
+                   std::int32_t snapshot_slots_in, DType conv_dtype_in)
     : conv_dim(conv_dim_in), conv_width(conv_width_in), value_heads(value_heads_in),
-      value_head_dim(value_head_dim_in), key_head_dim(key_head_dim_in), conv_dtype(conv_dtype_in) {
+      value_head_dim(value_head_dim_in), key_head_dim(key_head_dim_in),
+      snapshot_slots(snapshot_slots_in), conv_dtype(conv_dtype_in) {
     if (gdn_layers == 0) { throw std::invalid_argument("GdnState gdn_layers must be nonzero"); }
     validate_positive(conv_dim_in, "GdnState conv_dim must be positive");
     validate_positive(conv_width_in, "GdnState conv_width must be positive");
     validate_positive(value_heads_in, "GdnState value_heads must be positive");
     validate_positive(value_head_dim_in, "GdnState value_head_dim must be positive");
     validate_positive(key_head_dim_in, "GdnState key_head_dim must be positive");
+    validate_positive(snapshot_slots_in, "GdnState snapshot_slots must be positive");
     if (conv_dtype_in != DType::BF16 && conv_dtype_in != DType::FP32) {
         throw std::invalid_argument("GdnState conv_dtype must be BF16 or FP32");
     }
 
-    const Tensor conv_shape(nullptr, conv_dtype_in, {conv_dim_in, conv_width_in});
+    const Tensor conv_shape(nullptr, conv_dtype_in,
+                            {conv_dim_in, conv_width_in, snapshot_slots_in});
     const Tensor ssm_shape(nullptr, DType::FP32,
-                           {key_head_dim_in, value_head_dim_in, value_heads_in});
+                           {key_head_dim_in, value_head_dim_in, value_heads_in,
+                            snapshot_slots_in});
     preflight_state_arena(cache_arena, gdn_layers, conv_shape.bytes(), ssm_shape.bytes());
 
     conv.reserve(gdn_layers);
     ssm.reserve(gdn_layers);
     for (std::uint32_t layer = 0; layer < gdn_layers; ++layer) {
-        conv.push_back(cache_arena.alloc(conv_dtype_in, {conv_dim_in, conv_width_in}));
-        ssm.push_back(
-            cache_arena.alloc(DType::FP32, {key_head_dim_in, value_head_dim_in, value_heads_in}));
+        conv.push_back(
+            cache_arena.alloc(conv_dtype_in, {conv_dim_in, conv_width_in, snapshot_slots_in}));
+        ssm.push_back(cache_arena.alloc(
+            DType::FP32,
+            {key_head_dim_in, value_head_dim_in, value_heads_in, snapshot_slots_in}));
     }
     reset();
 }
@@ -77,12 +101,24 @@ std::uint32_t GdnState::layer_count() const noexcept {
     return static_cast<std::uint32_t>(conv.size());
 }
 
+Tensor GdnState::conv_slot(std::uint32_t layer, std::int32_t slot) const {
+    validate_layer_slot(*this, layer, slot, "GdnState conv_slot");
+    return conv.at(layer).slice(2, slot, 1).view({conv_dim, conv_width});
+}
+
+Tensor GdnState::ssm_slot(std::uint32_t layer, std::int32_t slot) const {
+    validate_layer_slot(*this, layer, slot, "GdnState ssm_slot");
+    return ssm.at(layer).slice(3, slot, 1).view({key_head_dim, value_head_dim, value_heads});
+}
+
 void GdnState::reset(cudaStream_t stream) {
-    for (const Tensor& tensor : conv) {
-        CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), stream));
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor slot0 = conv_slot(layer, 0);
+        CUDA_CHECK(cudaMemsetAsync(slot0.data, 0, slot0.bytes(), stream));
     }
-    for (const Tensor& tensor : ssm) {
-        CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), stream));
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        const Tensor slot0 = ssm_slot(layer, 0);
+        CUDA_CHECK(cudaMemsetAsync(slot0.data, 0, slot0.bytes(), stream));
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }

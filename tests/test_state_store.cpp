@@ -87,9 +87,14 @@ int main() {
     failures += expect_size(state.conv.size(), 3, "state.conv.size");
     failures += expect_size(state.ssm.size(), 3, "state.ssm.size");
     failures += expect_size(state.conv_width, 3, "state.conv_width");
+    failures += expect_size(state.snapshot_slots, 1, "state.snapshot_slots");
     for (std::size_t layer = 0; layer < state.layer_count(); ++layer) {
         failures += check_shape(state.conv[layer], {10, 3, 1, 1}, "state.conv");
         failures += check_shape(state.ssm[layer], {6, 5, 4, 1}, "state.ssm");
+        failures += check_shape(state.conv_slot(static_cast<std::uint32_t>(layer), 0),
+                                {10, 3, 1, 1}, "state.conv_slot");
+        failures += check_shape(state.ssm_slot(static_cast<std::uint32_t>(layer), 0),
+                                {6, 5, 4, 1}, "state.ssm_slot");
         if (state.conv[layer].dtype != qus::DType::BF16) {
             ++failures;
             std::cerr << "conv dtype is not BF16\n";
@@ -118,6 +123,37 @@ int main() {
     failures += expect_device_byte(state.conv[0], 0, "reset conv0");
     failures += expect_device_byte(state.ssm[1], 0, "reset ssm1");
 
+    qus::DeviceArena slotted_arena(16384);
+    qus::GdnState slotted(slotted_arena, 1, 10, 3, 4, 5, 6, 3, qus::DType::BF16);
+    failures += expect_size(slotted.snapshot_slots, 3, "slotted.snapshot_slots");
+    failures += check_shape(slotted.conv[0], {10, 3, 3, 1}, "slotted.conv");
+    failures += check_shape(slotted.ssm[0], {6, 5, 4, 3}, "slotted.ssm");
+    failures += check_shape(slotted.conv_slot(0, 2), {10, 3, 1, 1}, "slotted.conv_slot");
+    failures += check_shape(slotted.ssm_slot(0, 2), {6, 5, 4, 1}, "slotted.ssm_slot");
+    failures += expect_throws<std::out_of_range>(
+        [&] { (void)slotted.conv_slot(1, 0); }, "conv_slot invalid layer");
+    failures += expect_throws<std::out_of_range>(
+        [&] { (void)slotted.ssm_slot(0, 3); }, "ssm_slot invalid slot");
+
+    qus::Tensor conv0 = slotted.conv_slot(0, 0);
+    qus::Tensor conv1 = slotted.conv_slot(0, 1);
+    qus::Tensor ssm0  = slotted.ssm_slot(0, 0);
+    qus::Tensor ssm1  = slotted.ssm_slot(0, 1);
+    CUDA_CHECK(cudaMemset(conv0.data, 0x7a, conv0.bytes()));
+    CUDA_CHECK(cudaMemset(conv1.data, 0x6b, conv1.bytes()));
+    CUDA_CHECK(cudaMemset(ssm0.data, 0x5c, ssm0.bytes()));
+    CUDA_CHECK(cudaMemset(ssm1.data, 0x4d, ssm1.bytes()));
+    failures += expect_device_byte(conv0, 0x7a, "slotted sentinel conv slot0");
+    failures += expect_device_byte(conv1, 0x6b, "slotted sentinel conv slot1");
+    failures += expect_device_byte(ssm0, 0x5c, "slotted sentinel ssm slot0");
+    failures += expect_device_byte(ssm1, 0x4d, "slotted sentinel ssm slot1");
+    slotted.reset(ctx.stream);
+    ctx.synchronize();
+    failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "slotted reset conv slot0");
+    failures += expect_device_byte(slotted.conv_slot(0, 1), 0x6b, "slotted reset keeps conv slot1");
+    failures += expect_device_byte(slotted.ssm_slot(0, 0), 0, "slotted reset ssm slot0");
+    failures += expect_device_byte(slotted.ssm_slot(0, 1), 0x4d, "slotted reset keeps ssm slot1");
+
     failures += expect_throws<std::invalid_argument>(
         [&] { qus::GdnState invalid(cache_arena, 0, 10, 3, 4, 5, 6); }, "zero layers");
     failures += expect_throws<std::invalid_argument>(
@@ -133,6 +169,9 @@ int main() {
     failures += expect_throws<std::invalid_argument>(
         [&] { qus::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 6, qus::DType::U8); },
         "invalid conv dtype");
+    failures += expect_throws<std::invalid_argument>(
+        [&] { qus::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 6, 0); },
+        "zero snapshot slots");
 
     qus::DeviceArena small_arena(512);
     const std::size_t small_before = small_arena.used();

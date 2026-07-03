@@ -18,14 +18,21 @@ struct GdnState {
     std::int32_t value_heads    = 0;
     std::int32_t value_head_dim = 0;
     std::int32_t key_head_dim   = 0;
+    std::int32_t snapshot_slots = 1;
     DType conv_dtype            = DType::BF16;
 
     GdnState() = default;
     GdnState(DeviceArena& cache_arena, std::uint32_t gdn_layers, std::int32_t conv_dim,
              std::int32_t conv_width, std::int32_t value_heads, std::int32_t value_head_dim,
              std::int32_t key_head_dim, DType conv_dtype = DType::BF16);
+    GdnState(DeviceArena& cache_arena, std::uint32_t gdn_layers, std::int32_t conv_dim,
+             std::int32_t conv_width, std::int32_t value_heads, std::int32_t value_head_dim,
+             std::int32_t key_head_dim, std::int32_t snapshot_slots,
+             DType conv_dtype = DType::BF16);
 
     std::uint32_t layer_count() const noexcept;
+    Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
+    Tensor ssm_slot(std::uint32_t layer, std::int32_t slot) const;
     void reset(cudaStream_t stream = nullptr);
 };
 

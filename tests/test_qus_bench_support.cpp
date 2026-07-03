@@ -174,7 +174,9 @@ int test_parse_args() {
                              "128,512",   "-n",        "64",    "-pg",
                              "2048,128",  "-r",        "3",     "--warmup",
                              "2",         "--max-ctx", "4096",  "--prefill-chunk",
-                             "128",       "-o",        "json",  "--no-cuda-graph"});
+                             "128",       "--mtp-draft-tokens",
+                             "5",         "--mtp-strict-sequential",
+                             "-o",        "json",      "--no-cuda-graph"});
     failures += expect_string(parsed.weights_path, "w.qus", "weights path");
     failures += expect_size(parsed.n_prompt.size(), 2, "n_prompt list size");
     failures +=
@@ -189,6 +191,8 @@ int test_parse_args() {
     failures +=
         expect_bool(parsed.max_ctx.has_value() && *parsed.max_ctx == 4096, "max_ctx parsed");
     failures += expect_bool(parsed.prefill_chunk == 128, "prefill_chunk parsed");
+    failures += expect_bool(parsed.mtp_draft_tokens == 5, "mtp draft tokens parsed");
+    failures += expect_bool(parsed.mtp_strict_sequential, "mtp strict sequential parsed");
     failures += expect_bool(parsed.output == qb::OutputFormat::Json, "output json parsed");
     failures += expect_bool(!parsed.use_cuda_graph, "no-cuda-graph parsed");
 
@@ -215,6 +219,12 @@ int test_parse_args() {
                 {"qus_bench", "--weights", "w.qus", "--prefill-chunk", "129"});
         },
         "non-128 prefill chunk throws");
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            (void)parse_args_for_test(
+                {"qus_bench", "--weights", "w.qus", "--mtp-draft-tokens", "6"});
+        },
+        "too many mtp draft tokens throws");
     return failures;
 }
 
@@ -235,11 +245,15 @@ std::vector<qb::TestResult> sample_results() {
     qb::TestResult pp;
     pp.test                 = qb::BenchTest{qb::TestKind::Prefill, 512, 0, "pp512"};
     pp.reps                 = {qb::RepTiming{0.5, 0.0}, qb::RepTiming{0.25, 0.0}};
+    pp.reps[0].mtp          = qb::BenchMtpStats{true, 5, 10, 4, 2, 1, {2, 1, 1, 0, 0}};
+    pp.reps[1].mtp          = qb::BenchMtpStats{true, 5, 5, 2, 1, 0, {1, 1, 0, 0, 0}};
     pp.workspace_peak_bytes = 5368709120ULL; // 5 GiB
 
     qb::TestResult tg;
     tg.test                 = qb::BenchTest{qb::TestKind::Decode, 0, 128, "tg128"};
     tg.reps                 = {qb::RepTiming{0.0, 0.5}, qb::RepTiming{0.0, 1.0}};
+    tg.reps[0].mtp          = qb::BenchMtpStats{true, 5, 5, 0, 1, 1, {0, 0, 0, 0, 0}};
+    tg.reps[1].mtp          = qb::BenchMtpStats{true, 5, 0, 0, 0, 2, {0, 0, 0, 0, 0}};
     tg.workspace_peak_bytes = 1048576ULL; // 1 MiB
     return {pp, tg};
 }
@@ -253,6 +267,8 @@ int test_format_json_schema() {
     env.decode_path   = "cuda_graph";
     env.repetitions   = 2;
     env.prefill_chunk = qus::model::kDefaultPrefillChunk;
+    env.mtp_draft_tokens = 5;
+    env.mtp_strict_sequential = true;
     env.corpus_path   = "bench/fixtures/bench_corpus.ids";
     env.corpus_tokens = 10241;
     env.weights_path  = "w.qus";
@@ -265,12 +281,16 @@ int test_format_json_schema() {
     } catch (const nlohmann::json::exception& e) {
         return fail(std::string("format_json produced invalid JSON: ") + e.what());
     }
-    failures += expect_bool(report.at("schema_version").get<int>() == 2, "json schema version");
+    failures += expect_bool(report.at("schema_version").get<int>() == 3, "json schema version");
     failures += expect_string(report.at("artifact_type").get<std::string>(), "qus_bench_report",
                               "json artifact type");
     failures += expect_bool(report.at("config").at("prefill_chunk").get<int>() ==
                                 static_cast<int>(qus::model::kDefaultPrefillChunk),
                             "json config prefill_chunk");
+    failures += expect_bool(report.at("config").at("mtp_draft_tokens").get<int>() == 5,
+                            "json config mtp_draft_tokens");
+    failures += expect_bool(report.at("config").at("mtp_strict_sequential").get<bool>(),
+                            "json config mtp_strict_sequential");
     const Json& tests = report.at("tests");
     failures += expect_bool(tests.is_array() && tests.size() == 2, "json tests array");
 
@@ -284,6 +304,24 @@ int test_format_json_schema() {
     failures += expect_bool(pp.at("decode_tok_s_mean").is_null(), "json pp decode null");
     failures += expect_bool(pp.at("workspace_peak_bytes").get<std::uint64_t>() == 5368709120ULL,
                             "json pp workspace peak");
+    failures += expect_bool(pp.at("mtp").at("enabled").get<bool>(), "json pp mtp enabled");
+    failures += expect_bool(pp.at("mtp").at("k").get<int>() == 5, "json pp mtp k");
+    failures += expect_bool(pp.at("mtp").at("draft_tokens").get<int>() == 15,
+                            "json pp mtp draft tokens");
+    failures += expect_bool(pp.at("mtp").at("accepted_tokens").get<int>() == 6,
+                            "json pp mtp accepted tokens");
+    failures += expect_double_near(pp.at("mtp").at("acceptance_rate").get<double>(), 0.4,
+                                   "json pp mtp acceptance rate");
+    failures += expect_double_near(pp.at("mtp").at("acceptance_length").get<double>(), 3.0,
+                                   "json pp mtp acceptance length");
+    failures += expect_bool(pp.at("mtp").at("rounds").get<int>() == 3, "json pp mtp rounds");
+    failures += expect_bool(pp.at("mtp").at("fallback_steps").get<int>() == 1,
+                            "json pp mtp fallback steps");
+    failures += expect_bool(pp.at("mtp").at("accepted_per_pos").is_array() &&
+                                pp.at("mtp").at("accepted_per_pos").size() == 5,
+                            "json pp mtp accepted per pos");
+    failures += expect_bool(pp.at("mtp").at("accepted_per_pos").at(0).get<int>() == 3,
+                            "json pp mtp accepted per pos 0");
     failures += expect_bool(pp.at("reps").is_array() && pp.at("reps").size() == 2, "json pp reps");
 
     const Json& tg = tests.at(1);
@@ -301,6 +339,7 @@ int test_format_table_and_csv() {
     qb::BenchEnvironment env;
     env.decode_path         = "cuda_graph";
     env.prefill_chunk       = qus::model::kDefaultPrefillChunk;
+    env.mtp_draft_tokens    = 0;
     const std::string table = qb::format_table(env, results);
     failures += expect_bool(table.find("pp512") != std::string::npos, "table has pp512");
     failures += expect_bool(table.find("tg128") != std::string::npos, "table has tg128");
@@ -309,13 +348,27 @@ int test_format_table_and_csv() {
         table.find("prefill_chunk=" + std::to_string(qus::model::kDefaultPrefillChunk)) !=
             std::string::npos,
         "table has prefill_chunk config");
+    failures += expect_bool(table.find("mtp_k=0") != std::string::npos, "table has mtp config");
     failures += expect_bool(table.find("work peak") != std::string::npos, "table has work peak");
+    failures += expect_bool(table.find("mtp acc") != std::string::npos, "table has mtp acc");
     failures += expect_bool(table.find("GiB") != std::string::npos, "table shows GiB peak");
+
+    failures += expect_string(qb::decode_path_name(true, 0, false), "cuda_graph",
+                              "decode path cuda graph");
+    failures += expect_string(qb::decode_path_name(false, 0, false), "eager", "decode path eager");
+    failures += expect_string(qb::decode_path_name(true, 5, false), "mtp_eager",
+                              "decode path mtp eager");
+    failures += expect_string(qb::decode_path_name(true, 5, true), "mtp_strict",
+                              "decode path mtp strict");
 
     const std::string csv = qb::format_csv(env, results);
     failures += expect_bool(csv.find("label,kind,n_prompt") == 0, "csv header first");
     failures +=
         expect_bool(csv.find("prefill_chunk") != std::string::npos, "csv has prefill_chunk");
+    failures += expect_bool(csv.find("mtp_draft_tokens") != std::string::npos,
+                            "csv has mtp_draft_tokens");
+    failures += expect_bool(csv.find("mtp_acceptance_rate") != std::string::npos,
+                            "csv has mtp_acceptance_rate");
     failures += expect_bool(csv.find("workspace_peak_bytes") != std::string::npos,
                             "csv has workspace_peak_bytes");
     std::size_t lines = 0;

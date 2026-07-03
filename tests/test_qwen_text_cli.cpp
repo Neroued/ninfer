@@ -40,6 +40,8 @@ int test_prompt_mode_defaults() {
     failures += check(options.output_mode == qus::text::OutputMode::Clean,
                       "prompt mode: output mode default mismatch");
     failures += check(!options.print_token_ids, "prompt mode: print-token-ids default mismatch");
+    failures +=
+        check(options.mtp_round_dump_dir.empty(), "prompt mode: mtp dump dir not empty");
     failures += check(options.stop_token_ids.empty(), "prompt mode: stop token ids not empty");
     return failures;
 }
@@ -52,6 +54,11 @@ int test_messages_mode_options() {
                                                  "--max-context",   "4096",
                                                  "--prefill-chunk", "128",
                                                  "--device",        "1",
+                                                 "--mtp-draft-tokens",
+                                                 "5",
+                                                 "--mtp-strict-sequential",
+                                                 "--mtp-round-dump-dir",
+                                                 "/tmp/qus-mtp-rounds",
                                                  "--raw-output",    "--print-token-ids",
                                                  "--stop-token-id", "248046",
                                                  "--stop-token-id", "248044"});
@@ -67,6 +74,11 @@ int test_messages_mode_options() {
     failures += check(options.max_context == 4096, "messages mode: max-context mismatch");
     failures += check(options.prefill_chunk == 128, "messages mode: prefill-chunk mismatch");
     failures += check(options.device == 1, "messages mode: device mismatch");
+    failures += check(options.mtp_draft_tokens == 5, "messages mode: mtp draft tokens mismatch");
+    failures += check(options.mtp_strict_sequential,
+                      "messages mode: mtp strict sequential mismatch");
+    failures += check(options.mtp_round_dump_dir == "/tmp/qus-mtp-rounds",
+                      "messages mode: mtp dump dir mismatch");
     failures += check(options.output_mode == qus::text::OutputMode::Raw,
                       "messages mode: output mode mismatch");
     failures += check(options.print_token_ids, "messages mode: print-token-ids mismatch");
@@ -91,6 +103,12 @@ int test_usage_documents_streaming_output_boundary() {
                       "usage does not document stderr progress/timings");
     failures += check(usage.find("--prefill-chunk N") != std::string::npos,
                       "usage does not document prefill chunk");
+    failures += check(usage.find("--mtp-draft-tokens N") != std::string::npos,
+                      "usage does not document mtp draft tokens");
+    failures += check(usage.find("--mtp-strict-sequential") != std::string::npos,
+                      "usage does not document mtp strict sequential");
+    failures += check(usage.find("--mtp-round-dump-dir DIR") != std::string::npos,
+                      "usage does not document mtp round dump dir");
     return failures;
 }
 
@@ -120,6 +138,9 @@ int test_rejections() {
     failures += expect_invalid({"qwen-text", "weights.qus", "--tokenizer", "tokenizer", "--prompt",
                                 "hello", "--prefill-chunk", "127"},
                                "unaligned prefill chunk");
+    failures += expect_invalid({"qwen-text", "weights.qus", "--tokenizer", "tokenizer", "--prompt",
+                                "hello", "--mtp-draft-tokens", "6"},
+                               "too many mtp draft tokens");
     return failures;
 }
 

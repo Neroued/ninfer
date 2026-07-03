@@ -25,6 +25,8 @@ qus_add_test(qus_q5090_parser_test           SOURCES test_q5090_parser.cpp      
 qus_add_test(qus_q5090_pack_golden_test      SOURCES test_q5090_pack_golden.cpp  NEEDS_SOURCE_DIR)
 qus_add_test(qus_weight_store_real_file_test SOURCES test_weight_store_real.cpp  NEEDS_SOURCE_DIR)
 qus_add_test(qus_engine_real_file_test       SOURCES test_engine_real_file.cpp   NEEDS_SOURCE_DIR)
+qus_add_test(qus_engine_mtp_e2e_strict_test
+             SOURCES test_engine_mtp_e2e.cpp NEEDS_SOURCE_DIR)
 qus_add_test(qus_model_config_test           SOURCES test_model_config.cpp)
 qus_add_test(qus_model_bind_test             SOURCES test_model_bind.cpp        NEEDS_SOURCE_DIR)
 qus_add_test(qus_model_blocks_test           SOURCES test_model_blocks.cpp      NEEDS_SOURCE_DIR)
@@ -76,3 +78,4 @@ qus_add_test(qus_embed_gather_test SOURCES kernels/test_embed_gather.cpp)
 qus_add_test(qus_argmax_test SOURCES kernels/test_argmax.cpp)
 qus_add_test(qus_linear_test SOURCES kernels/test_linear.cpp)
 qus_add_test(qus_mtp_pack_test SOURCES kernels/test_mtp_pack.cpp)
+qus_add_test(qus_mtp_round_test SOURCES kernels/test_mtp_round.cpp)

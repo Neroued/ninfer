@@ -69,6 +69,11 @@ struct TargetSpec {
 };
 
 constexpr ShapeSpec kShapes[] = {
+    {"MtpFc5120x10240", 5120, 10240},
+    {"MtpAttnIn14336x5120", 14336, 5120},
+    {"MtpOProj5120x6144", 5120, 6144},
+    {"MtpMlpGateUp34816x5120", 34816, 5120},
+    {"MtpMlpDown5120x17408", 5120, 17408},
     {"MlpGateUp34816x5120", 34816, 5120},
     {"AttnInQKV7168x5120", 7168, 5120},
     {"GdnInQK4096x5120", 4096, 5120},
@@ -87,6 +92,11 @@ constexpr TargetSpec kTask2Targets[] = {
     {{"LmHead248320x5120", 248320, 5120}, QType::Q6G64_F16S},
     {{"Proj6144x5120", 6144, 5120}, QType::Q5G64_F16S},
     {{"Out5120x6144", 5120, 6144}, QType::Q5G64_F16S},
+    {{"MtpFc5120x10240", 5120, 10240}, QType::W8G32_F16S},
+    {{"MtpAttnIn14336x5120", 14336, 5120}, QType::W8G32_F16S},
+    {{"MtpOProj5120x6144", 5120, 6144}, QType::W8G32_F16S},
+    {{"MtpMlpGateUp34816x5120", 34816, 5120}, QType::W8G32_F16S},
+    {{"MtpMlpDown5120x17408", 5120, 17408}, QType::W8G32_F16S},
 };
 
 struct Options {
@@ -338,7 +348,7 @@ void usage(const char* argv0) {
                  "  %s --all-targets [--warmup N] [--repeat N] [--copy-repeat N]\n"
                  "  %s --shape ShapeFamily --qtype Q4|Q5|Q6|W8G32 [--repeat N]\n\n"
                  "Options:\n"
-                 "  --all-targets              Run the Task-2 target shape/qtype rows (default).\n"
+                 "  --all-targets              Run the registered target shape/qtype rows (default).\n"
                  "  --shape NAME               One ShapeFamily string, e.g. MlpGateUp34816x5120.\n"
                  "  --qtype Q4|Q5|Q6|W8G32     Low-bit ROW_SPLIT qtype for --shape.\n"
                  "  --warmup N                 Cold-cache warmup GEMV launches (default %d).\n"

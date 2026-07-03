@@ -17,6 +17,7 @@
 namespace qus::model {
 
 inline constexpr const char* kWorkspaceLifetimePolicy = "block_scoped_mixer_mlp_rewind";
+inline constexpr std::int32_t kStepStatsCounters      = 8;
 
 struct MlpW {
     const Weight* gate    = nullptr;
@@ -77,11 +78,26 @@ struct StepState {
     Tensor token;
     Tensor pos;
     Tensor logits;
+    Tensor verify_hidden;
+    Tensor prefill_hidden;
+    Tensor target_tokens;
+    Tensor drafts;
+    Tensor sampled_out;
+    Tensor num_sampled;
+    Tensor verify_ids;
+    Tensor shifted_ids;
+    Tensor positions;
+    Tensor window_base;
+    Tensor accepted;
+    Tensor ar_pos;
+    Tensor mtp_ar_hidden;
+    Tensor stats;
 };
 
 enum class Phase {
     Prefill,
     Decode,
+    Verify,
 };
 
 enum class TapId {
@@ -145,6 +161,8 @@ public:
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, Tensor& mtp_hidden, Tensor& logits,
                              Tensor& draft_token);
+
+    void target_verify(const Tensor& ids, const Tensor& positions, std::uint32_t cache_offset);
 
     void prefill(std::span<const int> ids);
 

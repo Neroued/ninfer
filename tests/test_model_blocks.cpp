@@ -10,7 +10,9 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -86,6 +88,30 @@ void set_positions(qus::model::StepState& io, qus::test::DBuf& pos, int T) {
     qus::test::fill_iota_i32(host);
     pos    = qus::test::to_device_i32(host);
     io.pos = qus::Tensor(pos.p, qus::DType::I32, {T});
+}
+
+qus::model::StepState make_step_state(qus::DeviceArena& arena, int window_cols,
+                                      int prefill_chunk) {
+    const int draft_cols = std::max(1, window_cols - 1);
+    return qus::model::StepState{
+        arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::BF16, {qus::model::kCfg.vocab, window_cols}),
+        arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, window_cols}),
+        arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, prefill_chunk}),
+        arena.alloc(qus::DType::I32, {window_cols}),
+        arena.alloc(qus::DType::I32, {draft_cols}),
+        arena.alloc(qus::DType::I32, {window_cols}),
+        arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::I32, {window_cols}),
+        arena.alloc(qus::DType::I32, {window_cols}),
+        arena.alloc(qus::DType::I32, {window_cols}),
+        arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, 1}),
+        arena.alloc(qus::DType::I64, {qus::model::kStepStatsCounters}),
+    };
 }
 
 qus::Weight invalid_dense_weight(std::int32_t n, std::int32_t k) {
@@ -193,6 +219,53 @@ int schedule_mapping_smoke() {
     return failures;
 }
 
+bool all_bytes_equal(const qus::Tensor& t, std::uint8_t value) {
+    std::vector<std::uint8_t> bytes(t.bytes());
+    CUDA_CHECK(cudaMemcpy(bytes.data(), t.data, bytes.size(), cudaMemcpyDeviceToHost));
+    return std::all_of(bytes.begin(), bytes.end(), [&](std::uint8_t got) { return got == value; });
+}
+
+int verify_gdn_snapshot_slots(qus::model::Qwen3_6_27B& card, const qus::model::GdnLayerW& gdn,
+                              qus::WorkspaceArena& work, qus::DeviceArena& x_arena,
+                              qus::KVCache& kv, qus::GdnState& state,
+                              qus::model::StepState& io) {
+    constexpr int T = 3;
+    int failures    = 0;
+    qus::test::DBuf pos(4);
+    set_positions(io, pos, T);
+
+    work.reset();
+    x_arena.reset();
+    kv.reset();
+    CUDA_CHECK(cudaMemsetAsync(state.conv[0].data, 0xA5, state.conv[0].bytes(), nullptr));
+    CUDA_CHECK(cudaMemsetAsync(state.ssm[0].data, 0xA5, state.ssm[0].bytes(), nullptr));
+    state.reset();
+
+    qus::Tensor x = x_arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, T});
+    fill_hidden(x, T);
+    try {
+        card.test_gdn_mix(gdn, x, 0, qus::model::Phase::Verify);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } catch (const std::exception& e) {
+        return fail(std::string("verify gdn snapshot slots: unexpected exception: ") + e.what());
+    }
+
+    for (int slot = 0; slot < T; ++slot) {
+        const qus::Tensor conv_slot = state.conv_slot(0, slot);
+        const qus::Tensor ssm_slot  = state.ssm_slot(0, slot);
+        failures += all_bytes_equal(conv_slot, 0xA5)
+                        ? fail("verify gdn snapshot conv slot " + std::to_string(slot) +
+                               " was not written")
+                        : 0;
+        failures += all_bytes_equal(ssm_slot, 0xA5)
+                        ? fail("verify gdn snapshot ssm slot " + std::to_string(slot) +
+                               " was not written")
+                        : 0;
+    }
+    failures += expect_finite_hidden(x, "verify gdn snapshot slots");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -221,10 +294,10 @@ int main() {
 
     const std::filesystem::path fixture_path = make_fixture();
     qus::DeviceArena fixture_weight_arena(768ULL * 1024ULL * 1024ULL);
-    qus::DeviceArena cache_arena(256ULL * 1024ULL * 1024ULL);
+    qus::DeviceArena cache_arena(768ULL * 1024ULL * 1024ULL);
     qus::WorkspaceArena workspace(128ULL * 1024ULL * 1024ULL);
     qus::DeviceArena x_arena(8ULL * 1024ULL * 1024ULL);
-    qus::DeviceArena io_arena(qus::model::kCfg.vocab * 2ULL + 1024ULL);
+    qus::DeviceArena io_arena(16ULL * 1024ULL * 1024ULL);
 
     qus::WeightStore store(expectations());
     store.load(fixture_path.c_str(), fixture_weight_arena, ctx);
@@ -233,10 +306,8 @@ int main() {
                     qus::model::kCfg.head_dim);
     qus::GdnState state(cache_arena, qus::model::kCfg.n_gdn(), qus::model::kCfg.conv_dim,
                         qus::model::kCfg.gdn_conv_state_width, qus::model::kCfg.gdn_v_heads,
-                        qus::model::kCfg.gdn_v_dim, qus::model::kCfg.gdn_k_dim);
-    qus::model::StepState io{io_arena.alloc(qus::DType::I32, {1}),
-                             io_arena.alloc(qus::DType::I32, {1}),
-                             io_arena.alloc(qus::DType::BF16, {qus::model::kCfg.vocab})};
+                        qus::model::kCfg.gdn_v_dim, qus::model::kCfg.gdn_k_dim, 3);
+    qus::model::StepState io = make_step_state(io_arena, 3, 512);
 
     qus::model::Qwen3_6_27B card(ctx, store, workspace, kv, state, io, 512);
     const qus::model::FullLayerW& full = card.full_layer(0);
@@ -246,6 +317,9 @@ int main() {
                          qus::model::Phase::Decode, 1, "decode T=1");
     failures += run_case(card, full, gdn, workspace, x_arena, kv, state, io,
                          qus::model::Phase::Prefill, 4, "prefill T=4");
+    failures += run_case(card, full, gdn, workspace, x_arena, kv, state, io,
+                         qus::model::Phase::Verify, 3, "verify T=3");
+    failures += verify_gdn_snapshot_slots(card, gdn, workspace, x_arena, kv, state, io);
     failures += fused_prefill_uses_gate_up(card, full, workspace, x_arena);
     return failures == 0 ? 0 : 1;
 }

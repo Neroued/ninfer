@@ -213,6 +213,47 @@ void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<st
     if (t.data == nullptr) { throw std::invalid_argument(std::string(label) + " data is null"); }
 }
 
+void require_tensor_window(const Tensor& t, DType dtype, std::int32_t rows, std::int32_t cols,
+                           const char* label) {
+    if (cols <= 0) { throw std::invalid_argument(std::string(label) + " cols must be positive"); }
+    if (t.dtype != dtype) { throw std::invalid_argument(std::string(label) + " dtype mismatch"); }
+    if (t.ne[0] != rows || t.ne[1] < cols || t.ne[2] != 1 || t.ne[3] != 1) {
+        throw std::invalid_argument(std::string(label) + " shape mismatch");
+    }
+    if (!t.is_contiguous()) {
+        throw std::invalid_argument(std::string(label) + " must be contiguous");
+    }
+    if (t.data == nullptr) { throw std::invalid_argument(std::string(label) + " data is null"); }
+}
+
+void require_vector_window(const Tensor& t, DType dtype, std::int32_t cols, const char* label) {
+    if (cols <= 0) { throw std::invalid_argument(std::string(label) + " cols must be positive"); }
+    if (t.dtype != dtype) { throw std::invalid_argument(std::string(label) + " dtype mismatch"); }
+    if (t.ne[0] < cols || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
+        throw std::invalid_argument(std::string(label) + " shape mismatch");
+    }
+    if (!t.is_contiguous()) {
+        throw std::invalid_argument(std::string(label) + " must be contiguous");
+    }
+    if (t.data == nullptr) { throw std::invalid_argument(std::string(label) + " data is null"); }
+}
+
+Tensor matrix_window(Tensor& t, std::int32_t cols) {
+    if (cols <= 0) { throw std::invalid_argument("matrix_window cols must be positive"); }
+    if (t.ne[1] < cols || t.ne[2] != 1 || t.ne[3] != 1) {
+        throw std::invalid_argument("matrix_window shape mismatch");
+    }
+    return t.slice(1, 0, cols);
+}
+
+Tensor vector_window(Tensor& t, std::int32_t cols) {
+    if (cols <= 0) { throw std::invalid_argument("vector_window cols must be positive"); }
+    if (t.ne[0] < cols || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
+        throw std::invalid_argument("vector_window shape mismatch");
+    }
+    return t.slice(0, 0, cols);
+}
+
 class ScopedPositions {
 public:
     ScopedPositions(const Tensor*& slot, const Tensor& positions) : slot_(slot) {
@@ -277,6 +318,13 @@ std::vector<float> tensor_to_f32(const Tensor& x, cudaStream_t stream) {
     if (x.dtype == DType::U8) {
         std::vector<std::uint8_t> values(n);
         CUDA_CHECK(cudaMemcpy(values.data(), x.data, values.size() * sizeof(std::uint8_t),
+                              cudaMemcpyDeviceToHost));
+        for (std::size_t i = 0; i < values.size(); ++i) { out[i] = static_cast<float>(values[i]); }
+        return out;
+    }
+    if (x.dtype == DType::I64) {
+        std::vector<std::int64_t> values(n);
+        CUDA_CHECK(cudaMemcpy(values.data(), x.data, values.size() * sizeof(std::int64_t),
                               cudaMemcpyDeviceToHost));
         for (std::size_t i = 0; i < values.size(); ++i) { out[i] = static_cast<float>(values[i]); }
         return out;
@@ -540,6 +588,42 @@ void Qwen3_6_27B::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     work_.rewind(logits_mark);
 }
 
+void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions,
+                                std::uint32_t cache_offset) {
+    const int T = ids.ne[0];
+    if (T <= 0) { throw std::invalid_argument("target_verify T must be positive"); }
+    require_tensor_shape(ids, DType::I32, {T}, "target_verify ids");
+    require_tensor_shape(positions, DType::I32, {T}, "target_verify positions");
+    require_tensor_window(io_.verify_hidden, DType::BF16, kCfg.hidden, T,
+                          "target_verify hidden");
+    require_tensor_window(io_.logits, DType::BF16, kCfg.vocab, T, "target_verify logits");
+    require_vector_window(io_.target_tokens, DType::I32, T, "target_verify target_tokens");
+    const auto token_count = static_cast<std::uint32_t>(T);
+    if (cache_offset > kv_.max_context || token_count > kv_.max_context - cache_offset) {
+        throw std::out_of_range("target_verify cache range exceeds max_context");
+    }
+
+    cudaStream_t s = ctx_.stream;
+    work_.reset();
+
+    {
+        Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, T});
+        kernels::embed_gather(ids, *embed_, x, s);
+        ScopedPositions scoped_positions(active_positions_, positions);
+        NullTap tap;
+        run_layers(x, Phase::Verify, tap, cache_offset);
+
+        Tensor hidden = matrix_window(io_.verify_hidden, T);
+        Tensor logits = matrix_window(io_.logits, T);
+        Tensor target = vector_window(io_.target_tokens, T);
+        kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, hidden, s);
+        kernels::linear(hidden, *lm_head_, logits, work_, s);
+        kernels::argmax(logits, target, s);
+    }
+
+    work_.reset();
+}
+
 void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph,
                            std::uint32_t cache_offset) {
     cudaStream_t s = ctx_.stream;
@@ -619,8 +703,8 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         kernels::linear(h, *w.in_qk_q4, qk_out, work_, s);
         kernels::gdn_in_vz_decode(h, *w.in_v, *w.in_z, v_out, z_flat, s);
 
-        Tensor qkv_c       = work_.alloc(DType::BF16, {kCfg.conv_dim, 1});
-        Tensor& conv_state = state_.conv.at(static_cast<std::size_t>(gidx));
+        Tensor qkv_c     = work_.alloc(DType::BF16, {kCfg.conv_dim, 1});
+        Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
         kernels::causal_conv1d_decode(qkv, *w.conv1d, conv_state, qkv_c, s);
 
         Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, 1});
@@ -636,9 +720,9 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         kernels::l2norm(qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1}), 1.0e-6f, qn, s);
         kernels::l2norm(kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1}), 1.0e-6f, kn, s);
 
-        Tensor vv         = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
-        Tensor o          = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
-        Tensor& ssm_state = state_.ssm.at(static_cast<std::size_t>(gidx));
+        Tensor vv        = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
+        Tensor o         = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
+        Tensor ssm_state = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
         kernels::gated_delta_rule_recurrent(qn, kn, vv, g, beta, kGdnScale, work_, ssm_state, o, s);
 
         Tensor on = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
@@ -660,9 +744,14 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     copy_bf16_block(k, qkv, kCfg.key_dim, s);
     copy_bf16_block(v, qkv, 2 * kCfg.key_dim, s);
 
-    Tensor qkv_c       = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
-    Tensor& conv_state = state_.conv.at(static_cast<std::size_t>(gidx));
-    kernels::causal_conv1d_prefill(qkv, *w.conv1d, conv_state, qkv_c, s);
+    Tensor qkv_c = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
+    if (ph == Phase::Verify) {
+        Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
+        kernels::causal_conv1d_sequence_snapshot(qkv, *w.conv1d, conv_states, qkv_c, s);
+    } else {
+        Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
+        kernels::causal_conv1d_prefill(qkv, *w.conv1d, conv_state, qkv_c, s);
+    }
 
     Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
     Tensor beta = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
@@ -680,10 +769,17 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     kernels::l2norm(qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T}), 1.0e-6f, qn, s);
     kernels::l2norm(kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T}), 1.0e-6f, kn, s);
 
-    Tensor vv         = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    Tensor o          = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    Tensor& ssm_state = state_.ssm.at(static_cast<std::size_t>(gidx));
-    kernels::gated_delta_rule_chunked(qn, kn, vv, g, beta, kGdnScale, 64, work_, ssm_state, o, s);
+    Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    Tensor o  = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    if (ph == Phase::Verify) {
+        Tensor& ssm_states = state_.ssm.at(static_cast<std::size_t>(gidx));
+        kernels::gated_delta_rule_recurrent_snapshot(qn, kn, vv, g, beta, kGdnScale, work_,
+                                                     ssm_states, o, s);
+    } else {
+        Tensor ssm_state = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
+        kernels::gated_delta_rule_chunked(qn, kn, vv, g, beta, kGdnScale, 64, work_, ssm_state, o,
+                                          s);
+    }
 
     Tensor z      = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor z_flat = z.view({kCfg.value_dim, T});
@@ -786,18 +882,20 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
             if constexpr (Tap::enabled) { tap(TapId::AfterEmbed, -1, Phase::Prefill, x, s); }
             run_layers(x, Phase::Prefill, tap, static_cast<std::uint32_t>(t0));
 
+            Tensor xf = io_.prefill_hidden.data != nullptr
+                            ? matrix_window(io_.prefill_hidden, len)
+                            : work_.alloc(DType::BF16, {kCfg.hidden, len});
+            kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, xf, s);
+            if constexpr (Tap::enabled) { tap(TapId::AfterFinalNorm, -1, Phase::Prefill, xf, s); }
+
             if (is_last) {
-                Tensor last_x = x.slice(1, len - 1, 1);
-                Tensor xf     = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-                kernels::rmsnorm(last_x, *final_norm_, kCfg.rms_eps, true, nullptr, xf, s);
+                Tensor last_xf = xf.slice(1, len - 1, 1);
+                Tensor logits  = matrix_window(io_.logits, 1);
+                kernels::linear(last_xf, *lm_head_, logits, work_, s);
                 if constexpr (Tap::enabled) {
-                    tap(TapId::AfterFinalNorm, -1, Phase::Prefill, xf, s);
+                    tap(TapId::AfterLogits, -1, Phase::Prefill, logits, s);
                 }
-                kernels::linear(xf, *lm_head_, io_.logits, work_, s);
-                if constexpr (Tap::enabled) {
-                    tap(TapId::AfterLogits, -1, Phase::Prefill, io_.logits, s);
-                }
-                kernels::argmax(io_.logits, io_.token, s);
+                kernels::argmax(logits, io_.token, s);
             }
         }
 
@@ -833,9 +931,10 @@ void Qwen3_6_27B::decode_step_impl(Tap& tap) {
     Tensor xf = work_.alloc(DType::BF16, {kCfg.hidden, 1});
     kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, xf, s);
     if constexpr (Tap::enabled) { tap(TapId::AfterFinalNorm, -1, Phase::Decode, xf, s); }
-    kernels::linear(xf, *lm_head_, io_.logits, work_, s);
-    if constexpr (Tap::enabled) { tap(TapId::AfterLogits, -1, Phase::Decode, io_.logits, s); }
-    kernels::argmax(io_.logits, io_.token, s);
+    Tensor logits = matrix_window(io_.logits, 1);
+    kernels::linear(xf, *lm_head_, logits, work_, s);
+    if constexpr (Tap::enabled) { tap(TapId::AfterLogits, -1, Phase::Decode, logits, s); }
+    kernels::argmax(logits, io_.token, s);
 
     detail::advance_pos(io_.pos, s);
     work_.reset();

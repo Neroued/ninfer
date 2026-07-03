@@ -15,6 +15,7 @@
 #include "qus/kernels/linear_residual.h"
 #include "qus/kernels/mlp_gate_up_silu.h"
 #include "qus/kernels/mtp_pack.h"
+#include "qus/kernels/mtp_round.h"
 #include "qus/kernels/embed_gather.h"
 #include "qus/kernels/residual_add.h"
 #include "qus/kernels/rmsnorm.h"
@@ -588,6 +589,27 @@ void Qwen3_6_27B::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     work_.rewind(logits_mark);
 }
 
+void Qwen3_6_27B::mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Tensor& row,
+                                             Tensor& out_hidden, Tensor& logits,
+                                             Tensor& draft_token) {
+    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (mtp_hidden.dtype != DType::BF16 || mtp_hidden.ne[0] != kCfg.hidden ||
+        mtp_hidden.ne[1] <= 0 || mtp_hidden.ne[2] != 1 || mtp_hidden.ne[3] != 1 ||
+        !mtp_hidden.is_contiguous() || mtp_hidden.data == nullptr) {
+        throw std::invalid_argument("MTP sample hidden shape mismatch");
+    }
+    require_tensor_shape(row, DType::I32, {1}, "MTP sample row");
+    require_tensor_shape(out_hidden, DType::BF16, {kCfg.hidden, 1}, "MTP sample hidden out");
+    require_tensor_shape(logits, DType::BF16, {kCfg.vocab, 1}, "MTP sample logits");
+    require_tensor_shape(draft_token, DType::I32, {1}, "MTP sample draft token");
+
+    const std::size_t mark = work_.mark();
+    kernels::mtp_gather_hidden_row(mtp_hidden, row, out_hidden, ctx_.stream);
+    kernels::linear(out_hidden, *lm_head_, logits, work_, ctx_.stream);
+    kernels::argmax(logits, draft_token, ctx_.stream);
+    work_.rewind(mark);
+}
+
 void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions,
                                 std::uint32_t cache_offset) {
     const int T = ids.ne[0];
@@ -621,6 +643,47 @@ void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions,
         kernels::argmax(logits, target, s);
     }
 
+    work_.reset();
+}
+
+void Qwen3_6_27B::target_decode_strict_step_capture(const Tensor& input_token,
+                                                    const Tensor& position, int output_column) {
+    if (output_column < 0) {
+        throw std::invalid_argument("target_decode_strict_step_capture column must be nonnegative");
+    }
+    require_tensor_shape(input_token, DType::I32, {1}, "strict target input token");
+    require_tensor_shape(position, DType::I32, {1}, "strict target position");
+    require_tensor_window(io_.verify_hidden, DType::BF16, kCfg.hidden, output_column + 1,
+                          "strict target hidden");
+    require_tensor_window(io_.logits, DType::BF16, kCfg.vocab, output_column + 1,
+                          "strict target logits");
+    require_vector_window(io_.target_tokens, DType::I32, output_column + 1,
+                          "strict target tokens");
+
+    cudaStream_t s = ctx_.stream;
+    work_.reset();
+    CUDA_CHECK(cudaMemcpyAsync(io_.token.data, input_token.data, input_token.bytes(),
+                               cudaMemcpyDeviceToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(io_.pos.data, position.data, position.bytes(),
+                               cudaMemcpyDeviceToDevice, s));
+
+    {
+        Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+        kernels::embed_gather(io_.token, *embed_, x, s);
+        NullTap tap;
+        run_layers(x, Phase::Decode, tap, 0);
+
+        Tensor hidden = io_.verify_hidden.slice(1, output_column, 1);
+        Tensor logits = io_.logits.slice(1, output_column, 1);
+        Tensor target = io_.target_tokens.slice(0, output_column, 1);
+        kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, hidden, s);
+        kernels::linear(hidden, *lm_head_, logits, work_, s);
+        kernels::argmax(logits, target, s);
+        CUDA_CHECK(cudaMemcpyAsync(io_.token.data, target.data, target.bytes(),
+                                   cudaMemcpyDeviceToDevice, s));
+    }
+
+    detail::advance_pos(io_.pos, s);
     work_.reset();
 }
 
@@ -896,6 +959,65 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                     tap(TapId::AfterLogits, -1, Phase::Prefill, logits, s);
                 }
                 kernels::argmax(logits, io_.token, s);
+            }
+
+            const bool can_prepare_final_mtp =
+                !mtp_enabled() || !is_last ||
+                (static_cast<std::uint64_t>(T) +
+                     static_cast<std::uint64_t>(std::max(0, io_.drafts.ne[0] - 1)) <=
+                 static_cast<std::uint64_t>(mtp_kv_->max_context));
+            if (mtp_enabled() && io_.drafts.data != nullptr && can_prepare_final_mtp) {
+                std::vector<int> mtp_ids_host(static_cast<std::size_t>(len));
+                if (is_last) {
+                    for (int j = 0; j + 1 < len; ++j) {
+                        mtp_ids_host[static_cast<std::size_t>(j)] = ids[t0 + j + 1];
+                    }
+                    int next_token = 0;
+                    CUDA_CHECK(cudaStreamSynchronize(s));
+                    CUDA_CHECK(cudaMemcpy(&next_token, io_.token.data, sizeof(next_token),
+                                          cudaMemcpyDeviceToHost));
+                    mtp_ids_host[static_cast<std::size_t>(len - 1)] = next_token;
+                } else {
+                    for (int j = 0; j < len; ++j) {
+                        mtp_ids_host[static_cast<std::size_t>(j)] = ids[t0 + j + 1];
+                    }
+                }
+
+                Tensor mtp_ids = work_.alloc(DType::I32, {len});
+                copy_i32_to_device(mtp_ids_host.data(), mtp_ids, s);
+                Tensor mtp_hidden = work_.alloc(DType::BF16, {kCfg.hidden, len});
+                if (is_last) {
+                    Tensor logits = matrix_window(io_.logits, 1);
+                    Tensor draft0 = io_.drafts.slice(0, 0, 1);
+                    mtp_forward_batch(mtp_ids, xf, positions, static_cast<std::uint32_t>(t0),
+                                      mtp_hidden, len - 1, &logits, &draft0);
+                    const auto* src = static_cast<const unsigned char*>(mtp_hidden.data) +
+                                      static_cast<std::size_t>(len - 1) *
+                                          static_cast<std::size_t>(kCfg.hidden) *
+                                          dtype_size(DType::BF16);
+                    CUDA_CHECK(cudaMemcpyAsync(io_.mtp_ar_hidden.data, src,
+                                               io_.mtp_ar_hidden.bytes(),
+                                               cudaMemcpyDeviceToDevice, s));
+
+                    detail::set_pos(io_.ar_pos, T, s);
+                    for (int i = 1; i < io_.drafts.ne[0]; ++i) {
+                        const int host_pos = T + i - 1;
+                        mtp_set_cache_position(static_cast<std::uint32_t>(host_pos));
+                        Tensor prev_token = io_.drafts.slice(0, i - 1, 1);
+                        Tensor next_token = io_.drafts.slice(0, i, 1);
+                        Tensor next_hidden = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+                        mtp_forward_ar_step(prev_token, io_.mtp_ar_hidden, io_.ar_pos,
+                                             next_hidden, logits, next_token);
+                        CUDA_CHECK(cudaMemcpyAsync(io_.mtp_ar_hidden.data, next_hidden.data,
+                                                   io_.mtp_ar_hidden.bytes(),
+                                                   cudaMemcpyDeviceToDevice, s));
+                        kernels::mtp_increment_i32(io_.ar_pos, s);
+                        mtp_set_cache_position(static_cast<std::uint32_t>(host_pos + 1));
+                    }
+                } else {
+                    mtp_forward_batch(mtp_ids, xf, positions, static_cast<std::uint32_t>(t0),
+                                      mtp_hidden, -1, nullptr, nullptr);
+                }
             }
         }
 

@@ -8,6 +8,7 @@
 #include "qus/model/model.h"
 #include "qus/runtime/decode_graph.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -37,6 +38,16 @@ struct EngineMemoryStats {
     std::size_t q5090_quant_count          = 0;
 };
 
+struct EngineMtpStats {
+    bool enabled = false;
+    int k = 0;
+    std::int64_t draft_tokens = 0;
+    std::int64_t accepted_tokens = 0;
+    std::int64_t rounds = 0;
+    std::int64_t fallback_steps = 0;
+    std::array<std::int64_t, model::kMaxMtpDraftTokens> accepted_per_pos{};
+};
+
 struct EngineOptions {
     int device                  = 0;
     std::uint32_t max_ctx       = 2048;
@@ -45,6 +56,8 @@ struct EngineOptions {
     std::size_t work_bytes      = 0;
     std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
     int mtp_draft_tokens        = 0;
+    bool mtp_strict_sequential  = false;
+    std::string mtp_round_dump_dir;
     Q5090Progress* progress     = nullptr;
     std::vector<int> stop_token_ids;
     bool use_cuda_graph = true;
@@ -66,8 +79,10 @@ public:
     [[nodiscard]] std::uint32_t max_context() const noexcept { return options_.max_ctx; }
 
     [[nodiscard]] EngineMemoryStats memory_stats() const noexcept;
+    [[nodiscard]] EngineMtpStats mtp_stats() const;
 
     void reset_memory_peaks() noexcept;
+    void reset_mtp_stats();
 
     [[nodiscard]] static std::size_t default_work_bytes(std::uint32_t prefill_chunk);
 
@@ -78,7 +93,16 @@ private:
 
     void require_loaded() const;
     [[nodiscard]] int read_token();
+    [[nodiscard]] int read_i32_scalar(const Tensor model::StepState::*field);
+    [[nodiscard]] int read_i32_element(const Tensor& tensor, int index);
+    [[nodiscard]] std::vector<int> read_sampled_tokens();
     [[nodiscard]] bool is_stop_token(int token) const noexcept;
+    [[nodiscard]] int decode_step_one();
+    [[nodiscard]] std::vector<int> decode_round();
+    [[nodiscard]] std::vector<int> decode_round_strict();
+    void commit_gdn_snapshots();
+    void propose_mtp_after_accept(std::uint32_t host_window_base, int host_length, int k);
+    void dump_mtp_round_state(int host_length);
 
     EngineOptions options_;
     std::optional<DeviceContext> ctx_;
@@ -93,6 +117,8 @@ private:
     std::optional<model::Qwen3_6_27B> card_;
     DecodeGraph decode_graph_;
     bool decode_warmed_ = false;
+    std::vector<int> pending_sampled_;
+    std::uint64_t mtp_round_dump_index_ = 0;
 };
 
 } // namespace qus

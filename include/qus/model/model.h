@@ -17,7 +17,7 @@
 namespace qus::model {
 
 inline constexpr const char* kWorkspaceLifetimePolicy = "block_scoped_mixer_mlp_rewind";
-inline constexpr std::int32_t kStepStatsCounters      = 8;
+inline constexpr std::int32_t kStepStatsCounters      = 9;
 
 struct MlpW {
     const Weight* gate    = nullptr;
@@ -162,7 +162,13 @@ public:
                              const Tensor& position, Tensor& mtp_hidden, Tensor& logits,
                              Tensor& draft_token);
 
+    void mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Tensor& row, Tensor& out_hidden,
+                                    Tensor& logits, Tensor& draft_token);
+
     void target_verify(const Tensor& ids, const Tensor& positions, std::uint32_t cache_offset);
+
+    void target_decode_strict_step_capture(const Tensor& input_token, const Tensor& position,
+                                           int output_column);
 
     void prefill(std::span<const int> ids);
 

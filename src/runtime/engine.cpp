@@ -1,6 +1,9 @@
 #include "qus/runtime/engine.h"
 
+#include "qus/kernels/gdn_commit.h"
+#include "qus/kernels/mtp_round.h"
 #include "qus/model/config.h"
+#include "qus/runtime/round_dump.h"
 
 #include <cuda_runtime.h>
 
@@ -440,6 +443,8 @@ std::size_t Engine::default_work_bytes(std::uint32_t prefill_chunk) {
 void Engine::load(const std::string& path) {
     decode_graph_.reset();
     decode_warmed_ = false;
+    pending_sampled_.clear();
+    mtp_round_dump_index_ = 0;
     card_.reset();
     state_.reset();
     kv_.reset();
@@ -536,10 +541,33 @@ EngineMemoryStats Engine::memory_stats() const noexcept {
     return stats;
 }
 
+EngineMtpStats Engine::mtp_stats() const {
+    EngineMtpStats out;
+    out.enabled = options_.mtp_draft_tokens > 0;
+    out.k       = options_.mtp_draft_tokens;
+    if (!loaded() || io_.stats.data == nullptr) { return out; }
+
+    ctx_->synchronize();
+    std::int64_t raw[model::kStepStatsCounters] = {};
+    CUDA_CHECK(cudaMemcpy(raw, io_.stats.data, sizeof(raw), cudaMemcpyDeviceToHost));
+    out.draft_tokens    = raw[0];
+    out.accepted_tokens = raw[1];
+    out.rounds          = raw[2];
+    out.fallback_steps  = raw[3];
+    for (int i = 0; i < model::kMaxMtpDraftTokens; ++i) { out.accepted_per_pos[i] = raw[4 + i]; }
+    return out;
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (weight_arena_) { weight_arena_->reset_peak(); }
     if (cache_arena_) { cache_arena_->reset_peak(); }
     if (work_) { work_->reset_peak(); }
+}
+
+void Engine::reset_mtp_stats() {
+    require_loaded();
+    CUDA_CHECK(cudaMemsetAsync(io_.stats.data, 0, io_.stats.bytes(), ctx_->stream));
+    ctx_->synchronize();
 }
 
 int Engine::read_token() {
@@ -547,6 +575,41 @@ int Engine::read_token() {
     ctx_->synchronize();
     CUDA_CHECK(cudaMemcpy(&token, io_.token.data, sizeof(token), cudaMemcpyDeviceToHost));
     return token;
+}
+
+int Engine::read_i32_scalar(const Tensor model::StepState::*field) {
+    int value = 0;
+    ctx_->synchronize();
+    const model::StepState& io = io_;
+    CUDA_CHECK(cudaMemcpy(&value, (io.*field).data, sizeof(value), cudaMemcpyDeviceToHost));
+    return value;
+}
+
+int Engine::read_i32_element(const Tensor& tensor, int index) {
+    if (tensor.dtype != DType::I32 || index < 0 || index >= tensor.numel()) {
+        throw std::invalid_argument("Engine read_i32_element invalid tensor/index");
+    }
+    int value = 0;
+    ctx_->synchronize();
+    const auto* bytes = static_cast<const unsigned char*>(tensor.data);
+    CUDA_CHECK(cudaMemcpy(&value, bytes + static_cast<std::size_t>(index) * sizeof(value),
+                          sizeof(value), cudaMemcpyDeviceToHost));
+    return value;
+}
+
+std::vector<int> Engine::read_sampled_tokens() {
+    const int n = read_i32_scalar(&model::StepState::num_sampled);
+    if (n <= 0 || n > io_.sampled_out.ne[0]) {
+        throw std::runtime_error("Engine MTP sampled token count is invalid");
+    }
+    std::vector<int> out(static_cast<std::size_t>(n));
+    CUDA_CHECK(cudaMemcpy(out.data(), io_.sampled_out.data, out.size() * sizeof(int),
+                          cudaMemcpyDeviceToHost));
+    const auto stop = std::find_if(out.begin(), out.end(), [&](int token) {
+        return is_stop_token(token);
+    });
+    if (stop != out.end()) { out.erase(stop + 1, out.end()); }
+    return out;
 }
 
 bool Engine::is_stop_token(int token) const noexcept {
@@ -562,17 +625,18 @@ int Engine::prefill(std::span<const int> ids) {
     }
     kv_->reset();
     if (mtp_kv_) { mtp_kv_->reset(); }
+    pending_sampled_.clear();
     state_->reset(ctx_->stream);
     card_->prefill(ids);
     return read_token();
 }
 
-int Engine::decode_step() {
-    require_loaded();
+int Engine::decode_step_one() {
     if (kv_->pos >= kv_->max_context) {
         throw std::out_of_range("Engine::decode_step exceeds max_ctx");
     }
-    if (options_.use_cuda_graph && decode_warmed_) {
+    const bool use_graph = options_.use_cuda_graph && options_.mtp_draft_tokens == 0;
+    if (use_graph && decode_warmed_) {
         if (!decode_graph_.ready()) {
             decode_graph_.capture(ctx_->stream, [this] { card_->decode_step_record(); });
         }
@@ -582,7 +646,131 @@ int Engine::decode_step() {
         decode_warmed_ = true;
     }
     kv_->advance();
+    if (options_.mtp_draft_tokens > 0) {
+        kernels::mtp_count_fallback_step(io_.stats, ctx_->stream);
+    }
     return read_token();
+}
+
+void Engine::commit_gdn_snapshots() {
+    for (std::size_t i = 0; i < state_->conv.size(); ++i) {
+        kernels::gdn_commit(state_->conv[i], state_->ssm[i], io_.accepted, ctx_->stream);
+    }
+}
+
+void Engine::propose_mtp_after_accept(std::uint32_t host_window_base, int host_length, int k) {
+    const int T = k + 1;
+    kernels::mtp_prepare_shifted_ids(io_.verify_ids, io_.token, io_.accepted, io_.shifted_ids,
+                                     ctx_->stream);
+    Tensor mtp_hidden = io_.prefill_hidden.slice(1, 0, T);
+    card_->mtp_forward_batch(io_.shifted_ids, io_.verify_hidden, io_.positions, host_window_base,
+                             mtp_hidden, -1, nullptr, nullptr);
+    card_->mtp_set_cache_position(static_cast<std::uint32_t>(host_length));
+
+    Tensor logits = io_.logits.slice(1, 0, 1);
+    Tensor draft0 = io_.drafts.slice(0, 0, 1);
+    card_->mtp_sample_from_hidden_row(mtp_hidden, io_.accepted, io_.mtp_ar_hidden, logits, draft0);
+
+    for (int i = 1; i < k; ++i) {
+        const int host_pos = host_length + i - 1;
+        card_->mtp_set_cache_position(static_cast<std::uint32_t>(host_pos));
+        Tensor prev_token  = io_.drafts.slice(0, i - 1, 1);
+        Tensor next_token  = io_.drafts.slice(0, i, 1);
+        Tensor next_hidden = io_.prefill_hidden.slice(1, i, 1);
+        card_->mtp_forward_ar_step(prev_token, io_.mtp_ar_hidden, io_.ar_pos, next_hidden, logits,
+                                   next_token);
+        CUDA_CHECK(cudaMemcpyAsync(io_.mtp_ar_hidden.data, next_hidden.data,
+                                   io_.mtp_ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                                   ctx_->stream));
+        kernels::mtp_increment_i32(io_.ar_pos, ctx_->stream);
+        card_->mtp_set_cache_position(static_cast<std::uint32_t>(host_pos + 1));
+    }
+}
+
+void Engine::dump_mtp_round_state(int host_length) {
+    if (options_.mtp_round_dump_dir.empty()) { return; }
+    if (!mtp_kv_) { return; }
+    write_mtp_round_state_dump(options_.mtp_round_dump_dir, mtp_round_dump_index_++,
+                               static_cast<std::uint32_t>(host_length), *state_, *mtp_kv_,
+                               ctx_->stream);
+}
+
+std::vector<int> Engine::decode_round_strict() {
+    const int k = options_.mtp_draft_tokens;
+    const auto host_window_base = kv_->pos;
+    const int T = k + 1;
+    kernels::mtp_prepare_verify_inputs(io_.token, io_.drafts, io_.pos, io_.window_base,
+                                       io_.verify_ids, io_.positions, ctx_->stream);
+
+    int accepted = 0;
+    for (int column = 0; column < T; ++column) {
+        Tensor input = io_.verify_ids.slice(0, column, 1);
+        Tensor pos   = io_.positions.slice(0, column, 1);
+        card_->target_decode_strict_step_capture(input, pos, column);
+        kv_->pos = host_window_base + static_cast<std::uint32_t>(column) + 1U;
+
+        const int target = read_i32_element(io_.target_tokens, column);
+        if (column == k) { break; }
+        const int draft = read_i32_element(io_.drafts, column);
+        if (target != draft) { break; }
+        ++accepted;
+    }
+
+    const int base = static_cast<int>(host_window_base);
+    CUDA_CHECK(cudaMemcpyAsync(io_.pos.data, &base, sizeof(base), cudaMemcpyHostToDevice,
+                               ctx_->stream));
+    kernels::mtp_accept_tokens(io_.target_tokens, io_.drafts, io_.pos, io_.token,
+                               io_.sampled_out, io_.num_sampled, io_.accepted, io_.ar_pos,
+                               io_.stats, ctx_->stream);
+    const int host_length = read_i32_scalar(&model::StepState::pos);
+    kv_->pos             = static_cast<std::uint32_t>(host_length);
+    mtp_kv_->pos         = static_cast<std::uint32_t>(host_length);
+    (void)accepted;
+    propose_mtp_after_accept(host_window_base, host_length, k);
+    dump_mtp_round_state(host_length);
+    return read_sampled_tokens();
+}
+
+std::vector<int> Engine::decode_round() {
+    const int k = options_.mtp_draft_tokens;
+    if (k <= 0 || !mtp_kv_ || !card_->mtp_enabled()) { return {decode_step_one()}; }
+    if (kv_->pos + static_cast<std::uint32_t>(2 * k) > kv_->max_context) {
+        return {decode_step_one()};
+    }
+    if (options_.mtp_strict_sequential) { return decode_round_strict(); }
+
+    const auto host_window_base = kv_->pos;
+    const int T = k + 1;
+    kernels::mtp_prepare_verify_inputs(io_.token, io_.drafts, io_.pos, io_.window_base,
+                                       io_.verify_ids, io_.positions, ctx_->stream);
+    card_->target_verify(io_.verify_ids, io_.positions, host_window_base);
+    kernels::mtp_accept_tokens(io_.target_tokens, io_.drafts, io_.pos, io_.token,
+                               io_.sampled_out, io_.num_sampled, io_.accepted, io_.ar_pos,
+                               io_.stats, ctx_->stream);
+
+    const int host_length = read_i32_scalar(&model::StepState::pos);
+    kv_->pos             = static_cast<std::uint32_t>(host_length);
+    mtp_kv_->pos         = static_cast<std::uint32_t>(host_length);
+    commit_gdn_snapshots();
+
+    propose_mtp_after_accept(host_window_base, host_length, k);
+    dump_mtp_round_state(host_length);
+    return read_sampled_tokens();
+}
+
+int Engine::decode_step() {
+    require_loaded();
+    if (!pending_sampled_.empty()) {
+        const int token = pending_sampled_.front();
+        pending_sampled_.erase(pending_sampled_.begin());
+        return token;
+    }
+
+    std::vector<int> tokens = decode_round();
+    if (tokens.empty()) { throw std::runtime_error("Engine MTP round produced no tokens"); }
+    const int first = tokens.front();
+    pending_sampled_.assign(tokens.begin() + 1, tokens.end());
+    return first;
 }
 
 std::vector<int> Engine::generate(std::span<const int> prompt, int max_new_tokens) {
@@ -590,6 +778,7 @@ std::vector<int> Engine::generate(std::span<const int> prompt, int max_new_token
     if (max_new_tokens < 0) {
         throw std::invalid_argument("Engine::generate max_new_tokens must be nonnegative");
     }
+    pending_sampled_.clear();
     std::vector<int> out;
     if (max_new_tokens == 0) { return out; }
     out.reserve(static_cast<std::size_t>(max_new_tokens));
@@ -601,6 +790,7 @@ std::vector<int> Engine::generate(std::span<const int> prompt, int max_new_token
         out.push_back(token);
         if (is_stop_token(token)) { break; }
     }
+    pending_sampled_.clear();
     return out;
 }
 

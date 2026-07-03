@@ -64,5 +64,6 @@ inline constexpr float kAttnScale                     = 0.0625f;
 inline constexpr float kGdnScale                      = 0.08838834764831845f;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
 inline constexpr std::uint32_t kDefaultPrefillChunk   = 1024;
+inline constexpr int kMaxMtpDraftTokens               = 5;
 
 } // namespace qus::model

@@ -66,6 +66,13 @@ int expect_peak_reset(const qus::ArenaMemoryStats& stats, std::string_view label
                : fail(std::string(label) + " peak was not reset to used");
 }
 
+std::size_t gdn_single_ssm_bytes() {
+    return static_cast<std::size_t>(qus::model::kCfg.n_gdn()) *
+           static_cast<std::size_t>(qus::model::kCfg.gdn_k_dim) *
+           static_cast<std::size_t>(qus::model::kCfg.gdn_v_dim) *
+           static_cast<std::size_t>(qus::model::kCfg.gdn_v_heads) * sizeof(float);
+}
+
 std::filesystem::path make_fixture() {
     const auto path = std::filesystem::temp_directory_path() / "qus_engine_memory_stats_fixture.qus";
     const std::filesystem::path script =
@@ -109,6 +116,13 @@ int test_unloaded_stats_do_not_need_cuda() {
         qus::Engine bad_engine(bad_options);
         (void)bad_engine;
         failures += fail("negative mtp_draft_tokens did not throw");
+    } catch (const std::invalid_argument&) {}
+    try {
+        qus::EngineOptions bad_options;
+        bad_options.mtp_draft_tokens = qus::model::kMaxMtpDraftTokens + 1;
+        qus::Engine bad_engine(bad_options);
+        (void)bad_engine;
+        failures += fail("too large mtp_draft_tokens did not throw");
     } catch (const std::invalid_argument&) {}
     return failures;
 }
@@ -189,6 +203,34 @@ int test_loaded_stats_with_cuda() {
     failures += mtp_stats.workspace.capacity_bytes > stats.workspace.capacity_bytes
                     ? 0
                     : fail("MTP load did not increase workspace capacity");
+
+    auto load_stats = [&](std::uint32_t max_ctx, int draft_tokens) {
+        qus::EngineOptions opts;
+        opts.device           = 0;
+        opts.max_ctx          = max_ctx;
+        opts.prefill_chunk    = 128;
+        opts.mtp_draft_tokens = draft_tokens;
+        qus::Engine scoped(opts);
+        scoped.load(fixture.string());
+        return scoped.memory_stats();
+    };
+
+    const qus::EngineMemoryStats k0_8192 = load_stats(8192, 0);
+    const qus::EngineMemoryStats k5_8192 = load_stats(8192, 5);
+    const std::size_t expected_snapshot_increment = 5ULL * gdn_single_ssm_bytes();
+    failures += expected_snapshot_increment == 720ULL * kMiB
+                    ? 0
+                    : fail("k=5 snapshot increment constant is not 720 MiB");
+    failures +=
+        k5_8192.cache.capacity_bytes >= k0_8192.cache.capacity_bytes + expected_snapshot_increment
+            ? 0
+            : fail("k=5 cache budget does not include the 720 MiB SSM snapshot increment");
+    failures += k5_8192.cache.used_bytes > k0_8192.cache.used_bytes + expected_snapshot_increment
+                    ? 0
+                    : fail("k=5 cache allocation did not materialize snapshot slots");
+    failures += k5_8192.workspace.capacity_bytes >= k0_8192.workspace.capacity_bytes
+                    ? 0
+                    : fail("k=5 workspace capacity regressed below k=0");
     return failures;
 }
 

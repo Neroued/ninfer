@@ -134,14 +134,15 @@ void require_dense_metadata(const Weight& w) {
 }
 
 void require_row_split_lowbit_metadata(const Weight& w, const char* label,
+                                       std::int32_t group_size,
                                        std::uint64_t nibble_bytes_per_group,
                                        std::uint64_t high_bytes_per_group) {
     if (w.layout != QuantLayout::RowSplit) {
         throw std::invalid_argument(std::string("linear: ") + label + " weight must be RowSplit");
     }
     require_weight_2d(w, label);
-    if (w.group != 64 || w.group_size != 64) {
-        throw std::invalid_argument(std::string("linear: ") + label + " weight group must be 64");
+    if (w.group != group_size || w.group_size != static_cast<std::uint32_t>(group_size)) {
+        throw std::invalid_argument(std::string("linear: ") + label + " weight group is invalid");
     }
     if (w.q5090_scale_dtype != ScaleDType::FP16) {
         throw std::invalid_argument(std::string("linear: ") + label +
@@ -151,7 +152,7 @@ void require_row_split_lowbit_metadata(const Weight& w, const char* label,
         w.padded_shape[1] != align_up_checked(w.shape[1], 128, label)) {
         throw std::invalid_argument(std::string("linear: ") + label + " padded shape is invalid");
     }
-    const std::uint64_t kg = static_cast<std::uint64_t>(w.padded_shape[1] / 64);
+    const std::uint64_t kg = static_cast<std::uint64_t>(w.padded_shape[1] / group_size);
     const std::uint64_t nibble_plane_bytes =
         checked_mul_u64(checked_mul_u64(static_cast<std::uint64_t>(w.n), kg),
                         nibble_bytes_per_group);
@@ -258,21 +259,28 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
         require_dense_alignment(x, w, out);
         break;
     case QType::Q4G64_F16S:
-        require_row_split_lowbit_metadata(w, "Q4G64_F16S", 32u, 0u);
+        require_row_split_lowbit_metadata(w, "Q4G64_F16S", 64, 32u, 0u);
         require_matrix_shapes(x, w, out);
         require_tensor_strides(x, out);
         if (is_empty_T(x, out)) { return; }
         require_tensor_data(x, out);
         break;
     case QType::Q5G64_F16S:
-        require_row_split_lowbit_metadata(w, "Q5G64_F16S", 32u, 8u);
+        require_row_split_lowbit_metadata(w, "Q5G64_F16S", 64, 32u, 8u);
         require_matrix_shapes(x, w, out);
         require_tensor_strides(x, out);
         if (is_empty_T(x, out)) { return; }
         require_tensor_data(x, out);
         break;
     case QType::Q6G64_F16S:
-        require_row_split_lowbit_metadata(w, "Q6G64_F16S", 32u, 16u);
+        require_row_split_lowbit_metadata(w, "Q6G64_F16S", 64, 32u, 16u);
+        require_matrix_shapes(x, w, out);
+        require_tensor_strides(x, out);
+        if (is_empty_T(x, out)) { return; }
+        require_tensor_data(x, out);
+        break;
+    case QType::W8G32_F16S:
+        require_row_split_lowbit_metadata(w, "W8G32_F16S", 32, 32u, 0u);
         require_matrix_shapes(x, w, out);
         require_tensor_strides(x, out);
         if (is_empty_T(x, out)) { return; }
@@ -291,7 +299,11 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
     // 16-byte aligned and the last k%8 elements would be dropped). Every Qwen3.6
     // shape has k a multiple of 128; for any other k, fall back to the multi-step
     // GEMV, which is correct for all k.
-    if (regime == detail::LinearRegime::LargeT && (w.k % 8) != 0) {
+    const bool mma_routed_format =
+        fmt == detail::LinearFormat::Q4G64_RowSplit ||
+        fmt == detail::LinearFormat::Q5G64_RowSplit ||
+        fmt == detail::LinearFormat::Q6G64_RowSplit;
+    if (mma_routed_format && regime == detail::LinearRegime::LargeT && (w.k % 8) != 0) {
         regime = detail::LinearRegime::SmallT;
     }
     const detail::LinearPlan plan = detail::resolve_plan(detail::LinearPlanKey{fmt, shape, regime});

@@ -6,7 +6,7 @@
 // layout the decode GEMV uses (single VRAM copy; the layout is not changed or
 // duplicated for prefill), and adapts on-chip:
 //   - Each warp owns one output row; blockIdx.y selects a tile of kTt activation
-//     columns. A lane owns the group values (2*lane, 2*lane+1).
+//     columns. Active lanes own codec-dependent group pairs (2*lane, 2*lane+1).
 //   - For every K-group the row's weights are dequantized ONCE (Codec::load_pair)
 //     and reused across all kTt columns, so weight dequant is amortized over the
 //     column tile instead of re-dequantized per token (the naive reference cost).
@@ -33,8 +33,8 @@ __global__ void linear_rowsplit_gemm_multistep_kernel(const __nv_bfloat16* __res
                                                       __nv_bfloat16* __restrict__ out,
                                                       std::int32_t n, std::int32_t k,
                                                       std::int32_t t, std::int32_t padded_k) {
-    constexpr int kGroupK  = Codec::kGroupK; // 64
-    constexpr int kPairsPG = kGroupK / 2;    // 32 lanes each own one value pair
+    constexpr int kGroupK  = Codec::kGroupK;
+    constexpr int kPairsPG = kGroupK / 2;
     const int     kg       = padded_k / kGroupK;
 
     const int lane            = static_cast<int>(threadIdx.x) & 31;
@@ -46,12 +46,14 @@ __global__ void linear_rowsplit_gemm_multistep_kernel(const __nv_bfloat16* __res
 
     const auto*        x2 = reinterpret_cast<const __nv_bfloat162*>(x);
     const std::int64_t k2 = static_cast<std::int64_t>(k) >> 1; // bf162 pairs per column
+    const bool         even_k = (k & 1) == 0;
 
     float acc[kTt];
 #pragma unroll
     for (int i = 0; i < kTt; ++i) { acc[i] = 0.0f; }
 
     for (int group = 0; group < kg; ++group) {
+        if (lane >= kPairsPG) { continue; }
         const int kk = group * kGroupK + lane * 2;
         if (kk >= k) { continue; }
         const std::int64_t gi = static_cast<std::int64_t>(row) * kg + group;
@@ -63,10 +65,18 @@ __global__ void linear_rowsplit_gemm_multistep_kernel(const __nv_bfloat16* __res
         for (int tt = 0; tt < kTt; ++tt) {
             const int col = col0 + tt;
             if (col < t) {
-                const float2 xv =
-                    __bfloat1622float2(x2[static_cast<std::int64_t>(col) * k2 + xi]);
-                acc[tt] = fmaf(w0, xv.x, acc[tt]);
-                acc[tt] = fmaf(w1, xv.y, acc[tt]);
+                if (even_k) {
+                    const float2 xv =
+                        __bfloat1622float2(x2[static_cast<std::int64_t>(col) * k2 + xi]);
+                    acc[tt] = fmaf(w0, xv.x, acc[tt]);
+                    acc[tt] = fmaf(w1, xv.y, acc[tt]);
+                } else {
+                    const std::int64_t base = static_cast<std::int64_t>(col) * k + kk;
+                    acc[tt] = fmaf(w0, __bfloat162float(x[base]), acc[tt]);
+                    if (kk + 1 < k) {
+                        acc[tt] = fmaf(w1, __bfloat162float(x[base + 1]), acc[tt]);
+                    }
+                }
             }
         }
     }

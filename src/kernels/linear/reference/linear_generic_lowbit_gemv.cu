@@ -49,6 +49,11 @@ void linear_generic_lowbit_gemv_launch(const Tensor& x, const Weight& w, Tensor&
             static_cast<const __nv_bfloat16*>(x.data), codes, high, scales,
             static_cast<__nv_bfloat16*>(out.data), n, k, padded_k);
         break;
+    case LinearFormat::W8G32_RowSplit:
+        linear_generic_lowbit_gemv_kernel<W8G32Codec><<<grid_for(n), kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), codes, nullptr, scales,
+            static_cast<__nv_bfloat16*>(out.data), n, k, padded_k);
+        break;
     default: break;
     }
     CUDA_CHECK(cudaGetLastError());

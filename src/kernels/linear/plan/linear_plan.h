@@ -11,6 +11,7 @@ enum class LinearFormat {
     Q4G64_RowSplit,
     Q5G64_RowSplit,
     Q6G64_RowSplit,
+    W8G32_RowSplit,
     DenseBF16,
     DenseFP32,
     GenericUnsupported,
@@ -18,6 +19,8 @@ enum class LinearFormat {
 
 enum class ShapeFamily {
     DenseCtrl48x5120,
+    MtpFc5120x10240,
+    MtpAttnIn14336x5120,
     AttnInQKV7168x5120,
     GdnInQK4096x5120,
     Proj6144x5120,

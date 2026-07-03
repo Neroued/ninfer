@@ -11,6 +11,8 @@ LinearFormat classify_format(const Weight& w) {
                                                              : LinearFormat::GenericUnsupported;
     case QType::Q6G64_F16S: return w.layout == L::RowSplit ? LinearFormat::Q6G64_RowSplit
                                                              : LinearFormat::GenericUnsupported;
+    case QType::W8G32_F16S: return w.layout == L::RowSplit ? LinearFormat::W8G32_RowSplit
+                                                             : LinearFormat::GenericUnsupported;
     case QType::BF16_CTRL:  return w.layout == L::Contiguous ? LinearFormat::DenseBF16
                                                              : LinearFormat::GenericUnsupported;
     case QType::FP32_CTRL:  return w.layout == L::Contiguous ? LinearFormat::DenseFP32
@@ -23,6 +25,8 @@ ShapeFamily classify_shape(std::int32_t n, std::int32_t k) {
     struct Entry { std::int32_t n, k; ShapeFamily fam; };
     static constexpr Entry kTable[] = {
         {    48,  5120, ShapeFamily::DenseCtrl48x5120     },
+        {  5120, 10240, ShapeFamily::MtpFc5120x10240      },
+        { 14336,  5120, ShapeFamily::MtpAttnIn14336x5120  },
         {  7168,  5120, ShapeFamily::AttnInQKV7168x5120   },
         {  4096,  5120, ShapeFamily::GdnInQK4096x5120     },
         {  6144,  5120, ShapeFamily::Proj6144x5120        },
@@ -107,15 +111,26 @@ LinearPlan resolve_plan(LinearPlanKey key) {
                           policy_name(LinearPolicyId::Out6144Q5RowsplitGemv),
                           /*uses_tensor_cores=*/false};
     }
-    // Dense keeps its reference GEMV/GEMM. Low-bit routes by regime: T1 -> generic GEMV
-    // (decode); SmallT -> multi-step GEMV (memory-bound, CUDA cores); LargeT -> bf16
-    // tensor-core mma GEMM (compute-bound). Registered families with no T1-only plan land
-    // here too (their T>1 goes to multi-step / mma).
+    // Dense keeps its reference GEMV/GEMM. Q4/Q5/Q6 low-bit routes by regime:
+    // T1 -> generic GEMV (decode); SmallT -> multi-step GEMV (memory-bound, CUDA
+    // cores); LargeT -> bf16 tensor-core mma GEMM (compute-bound). W8G32 is the
+    // M1 correctness-first exception below: it uses generic GEMV for T1 and the
+    // multi-step GEMM for every T>1 regime until a W8-specific MMA path exists.
     if (key.format == LinearFormat::DenseBF16 || key.format == LinearFormat::DenseFP32) {
         const bool           gemv   = (key.regime == LinearRegime::T1);
         const LinearPolicyId policy =
             gemv ? LinearPolicyId::GenericDenseGemv : LinearPolicyId::GenericDenseGemm;
         return LinearPlan{LinearBackendKind::Reference, policy, policy_name(policy),
+                          /*uses_tensor_cores=*/false};
+    }
+    if (key.format == LinearFormat::W8G32_RowSplit) {
+        if (key.regime == LinearRegime::T1) {
+            return LinearPlan{LinearBackendKind::Gemv, LinearPolicyId::GenericLowbitGemv,
+                              policy_name(LinearPolicyId::GenericLowbitGemv),
+                              /*uses_tensor_cores=*/false};
+        }
+        return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmMultistep,
+                          policy_name(LinearPolicyId::RowsplitLowbitGemmMultistep),
                           /*uses_tensor_cores=*/false};
     }
     if (key.regime == LinearRegime::T1) {
@@ -138,6 +153,7 @@ const char* format_name(LinearFormat f) {
     case LinearFormat::Q4G64_RowSplit:   return "q4_rowsplit";
     case LinearFormat::Q5G64_RowSplit:   return "q5_rowsplit";
     case LinearFormat::Q6G64_RowSplit:   return "q6_rowsplit";
+    case LinearFormat::W8G32_RowSplit:   return "w8g32_rowsplit";
     case LinearFormat::DenseBF16:        return "dense_bf16";
     case LinearFormat::DenseFP32:        return "dense_fp32";
     case LinearFormat::GenericUnsupported: return "generic_unsupported";
@@ -148,6 +164,8 @@ const char* format_name(LinearFormat f) {
 const char* shape_name(ShapeFamily s) {
     switch (s) {
     case ShapeFamily::DenseCtrl48x5120:    return "dense_ctrl_48x5120";
+    case ShapeFamily::MtpFc5120x10240:     return "mtp_fc_5120x10240";
+    case ShapeFamily::MtpAttnIn14336x5120: return "mtp_attn_in_14336x5120";
     case ShapeFamily::AttnInQKV7168x5120:  return "attn_in_qkv_7168x5120";
     case ShapeFamily::GdnInQK4096x5120:    return "gdn_in_qk_4096x5120";
     case ShapeFamily::Proj6144x5120:       return "proj_6144x5120";

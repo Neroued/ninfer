@@ -48,8 +48,14 @@ void linear_rowsplit_gemm_multistep_launch(const Tensor& x, const Weight& w, Ten
         linear_rowsplit_gemm_multistep_kernel<Q6Codec, kTt>
             <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k);
         break;
+    case LinearFormat::W8G32_RowSplit:
+        linear_rowsplit_gemm_multistep_kernel<W8G32Codec, kTt>
+            <<<grid, kBlockThreads, 0, stream>>>(xp, codes, nullptr, scales, outp, n, k, t,
+                                                 padded_k);
+        break;
     default:
-        throw std::invalid_argument("linear: multistep GEMM requires a Q4/Q5/Q6 row-split format");
+        throw std::invalid_argument(
+            "linear: multistep GEMM requires a Q4/Q5/Q6/W8G32 row-split format");
     }
     CUDA_CHECK(cudaGetLastError());
 }

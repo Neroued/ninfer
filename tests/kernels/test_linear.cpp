@@ -255,13 +255,15 @@ int unsupported_qtype_validation() {
     Tensor tout(dout.p, DType::BF16, {2, 1});
     WorkspaceArena ws(64ULL << 20);
 
-    Weight w = dense_weight(dx.p, QType::BF16_CTRL, 2, 4);
-    w.qtype  = QType::W8G128_F16S;
-    try {
-        kernels::linear(tx, w, tout, ws, nullptr);
-        std::cerr << "linear unsupported W8 qtype: expected invalid_argument\n";
-        ++f;
-    } catch (const std::invalid_argument&) {}
+    for (QType qtype : {QType::W8G128_F16S, QType::W8G32_F16S}) {
+        Weight w = dense_weight(dx.p, QType::BF16_CTRL, 2, 4);
+        w.qtype  = qtype;
+        try {
+            kernels::linear(tx, w, tout, ws, nullptr);
+            std::cerr << "linear unsupported W8 qtype: expected invalid_argument\n";
+            ++f;
+        } catch (const std::invalid_argument&) {}
+    }
 
     return f;
 }

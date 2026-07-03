@@ -82,6 +82,7 @@ inline const char* qtype_name(QType qtype) {
     case QType::W8G128_F16S: return "W8G128_F16S";
     case QType::BF16_CTRL: return "BF16_CTRL";
     case QType::FP32_CTRL: return "FP32_CTRL";
+    case QType::W8G32_F16S: return "W8G32_F16S";
     }
     return "unknown";
 }
@@ -165,6 +166,7 @@ inline float f16_to_f32(std::uint16_t h) {
 inline std::uint32_t group_size(QType qtype) {
     switch (qtype) {
     case QType::W8G128_F16S: return 128;
+    case QType::W8G32_F16S: return 32;
     case QType::Q4G64_F16S:
     case QType::Q5G64_F16S:
     case QType::Q6G64_F16S: return 64;
@@ -178,6 +180,7 @@ inline std::uint32_t bit_width(QType qtype) {
     case QType::Q5G64_F16S: return 5;
     case QType::Q6G64_F16S: return 6;
     case QType::W8G128_F16S: return 8;
+    case QType::W8G32_F16S: return 8;
     default: throw std::runtime_error("qtype is not ROW_SPLIT quantized");
     }
 }
@@ -186,7 +189,8 @@ inline std::uint32_t nibble_bytes_per_group(QType qtype) {
     switch (qtype) {
     case QType::Q4G64_F16S:
     case QType::Q5G64_F16S:
-    case QType::Q6G64_F16S: return 32;
+    case QType::Q6G64_F16S:
+    case QType::W8G32_F16S: return 32;
     case QType::W8G128_F16S: return 128;
     default: throw std::runtime_error("qtype is not ROW_SPLIT quantized");
     }
@@ -195,7 +199,8 @@ inline std::uint32_t nibble_bytes_per_group(QType qtype) {
 inline std::uint32_t high_bytes_per_group(QType qtype) {
     switch (qtype) {
     case QType::Q4G64_F16S:
-    case QType::W8G128_F16S: return 0;
+    case QType::W8G128_F16S:
+    case QType::W8G32_F16S: return 0;
     case QType::Q5G64_F16S: return 8;
     case QType::Q6G64_F16S: return 16;
     default: throw std::runtime_error("qtype is not ROW_SPLIT quantized");
@@ -227,7 +232,8 @@ inline int unpack_code(const std::byte* nibble, const std::byte* high, QType qty
 
 inline bool is_quantized(QType qtype) {
     return qtype == QType::Q4G64_F16S || qtype == QType::Q5G64_F16S ||
-           qtype == QType::Q6G64_F16S || qtype == QType::W8G128_F16S;
+           qtype == QType::Q6G64_F16S || qtype == QType::W8G128_F16S ||
+           qtype == QType::W8G32_F16S;
 }
 
 inline Json row_split_probes(const std::vector<std::byte>& file, const ParsedQ5090Tensor& tensor) {

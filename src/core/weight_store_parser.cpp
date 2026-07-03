@@ -123,6 +123,7 @@ QType qtype_from_tag(std::uint16_t tag) {
     case 3: return QType::W8G128_F16S;
     case 4: return QType::BF16_CTRL;
     case 5: return QType::FP32_CTRL;
+    case 6: return QType::W8G32_F16S;
     default: parse_error("q5090 invalid qtype tag");
     }
 }
@@ -242,7 +243,8 @@ bool valid_fusion_group_id(std::uint32_t group_id) {
 
 bool is_quant_qtype(QType qtype) {
     return qtype == QType::Q4G64_F16S || qtype == QType::Q5G64_F16S ||
-           qtype == QType::Q6G64_F16S || qtype == QType::W8G128_F16S;
+           qtype == QType::Q6G64_F16S || qtype == QType::W8G128_F16S ||
+           qtype == QType::W8G32_F16S;
 }
 
 std::uint32_t quant_group_size(QType qtype) {
@@ -253,6 +255,8 @@ std::uint32_t quant_group_size(QType qtype) {
         return 64;
     case QType::W8G128_F16S:
         return 128;
+    case QType::W8G32_F16S:
+        return 32;
     default:
         parse_error("q5090 qtype has no quant group size");
     }
@@ -266,6 +270,8 @@ std::uint64_t nibble_bytes_per_group(QType qtype) {
         return 32;
     case QType::W8G128_F16S:
         return 128;
+    case QType::W8G32_F16S:
+        return 32;
     default:
         parse_error("q5090 qtype has no nibble plane bytes per group");
     }
@@ -275,6 +281,7 @@ std::uint64_t high_bytes_per_group(QType qtype) {
     switch (qtype) {
     case QType::Q4G64_F16S:
     case QType::W8G128_F16S:
+    case QType::W8G32_F16S:
         return 0;
     case QType::Q5G64_F16S:
         return 8;

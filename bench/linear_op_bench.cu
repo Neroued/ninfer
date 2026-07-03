@@ -230,7 +230,18 @@ const char* qtype_name(QType qtype) {
     case QType::Q4G64_F16S: return "Q4";
     case QType::Q5G64_F16S: return "Q5";
     case QType::Q6G64_F16S: return "Q6";
+    case QType::W8G32_F16S: return "W8G32";
     default:                return "unsupported";
+    }
+}
+
+std::int32_t group_size(QType qtype) {
+    switch (qtype) {
+    case QType::Q4G64_F16S:
+    case QType::Q5G64_F16S:
+    case QType::Q6G64_F16S: return 64;
+    case QType::W8G32_F16S: return 32;
+    default:                throw std::invalid_argument("unsupported qtype for ROW_SPLIT bench");
     }
 }
 
@@ -239,6 +250,7 @@ std::int32_t nibble_bytes_per_group(QType qtype) {
     case QType::Q4G64_F16S: return 32;
     case QType::Q5G64_F16S: return 32;
     case QType::Q6G64_F16S: return 32;
+    case QType::W8G32_F16S: return 32;
     default:                throw std::invalid_argument("unsupported qtype for ROW_SPLIT bench");
     }
 }
@@ -246,6 +258,7 @@ std::int32_t nibble_bytes_per_group(QType qtype) {
 std::int32_t high_bytes_per_group(QType qtype) {
     switch (qtype) {
     case QType::Q4G64_F16S: return 0;
+    case QType::W8G32_F16S: return 0;
     case QType::Q5G64_F16S: return 8;
     case QType::Q6G64_F16S: return 16;
     default:                throw std::invalid_argument("unsupported qtype for ROW_SPLIT bench");
@@ -257,6 +270,7 @@ QType parse_qtype(std::string_view raw) {
     if (q == "q4" || q == "q4g64_f16s") { return QType::Q4G64_F16S; }
     if (q == "q5" || q == "q5g64_f16s") { return QType::Q5G64_F16S; }
     if (q == "q6" || q == "q6g64_f16s") { return QType::Q6G64_F16S; }
+    if (q == "w8g32" || q == "w8g32_f16s") { return QType::W8G32_F16S; }
     throw std::invalid_argument("unknown qtype: " + std::string(raw));
 }
 
@@ -322,11 +336,11 @@ void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage:\n"
                  "  %s --all-targets [--warmup N] [--repeat N] [--copy-repeat N]\n"
-                 "  %s --shape ShapeFamily --qtype Q4|Q5|Q6 [--repeat N]\n\n"
+                 "  %s --shape ShapeFamily --qtype Q4|Q5|Q6|W8G32 [--repeat N]\n\n"
                  "Options:\n"
                  "  --all-targets              Run the Task-2 target shape/qtype rows (default).\n"
                  "  --shape NAME               One ShapeFamily string, e.g. MlpGateUp34816x5120.\n"
-                 "  --qtype Q4|Q5|Q6           Low-bit ROW_SPLIT qtype for --shape.\n"
+                 "  --qtype Q4|Q5|Q6|W8G32     Low-bit ROW_SPLIT qtype for --shape.\n"
                  "  --warmup N                 Cold-cache warmup GEMV launches (default %d).\n"
                  "  --repeat N                 Cold-cache measured GEMV launches (default %d).\n"
                  "  --copy-repeat N            Cold-cache copy-ceiling samples (default %d).\n"
@@ -564,7 +578,8 @@ DeviceBuffer make_bf16_device(std::uint64_t n) {
 RowSplitPayload make_row_split_payload(QType qtype, std::int32_t n, std::int32_t k,
                                        cudaStream_t stream) {
     const std::int32_t padded_k = static_cast<std::int32_t>(align_up_u64(k, 128));
-    const std::int32_t kg       = padded_k / 64;
+    const std::int32_t group    = group_size(qtype);
+    const std::int32_t kg       = padded_k / group;
     const std::uint64_t groups =
         static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg);
     const std::uint64_t nibble_bytes =
@@ -595,6 +610,7 @@ RowSplitPayload make_row_split_payload(QType qtype, std::int32_t n, std::int32_t
 
 Weight make_weight(const RowSplitPayload& payload, QType qtype, std::int32_t n, std::int32_t k) {
     const std::int32_t padded_k = static_cast<std::int32_t>(align_up_u64(k, 128));
+    const std::int32_t group    = group_size(qtype);
     Weight             w{};
     w.payload             = payload.data.p;
     w.payload_bytes       = payload.payload_bytes();
@@ -602,7 +618,7 @@ Weight make_weight(const RowSplitPayload& payload, QType qtype, std::int32_t n, 
     w.qtype               = qtype;
     w.layout              = QuantLayout::RowSplit;
     w.q5090_scale_dtype   = ScaleDType::FP16;
-    w.group_size          = 64;
+    w.group_size          = static_cast<std::uint32_t>(group);
     w.shape[0]            = n;
     w.shape[1]            = k;
     w.padded_shape[0]     = n;
@@ -616,7 +632,7 @@ Weight make_weight(const RowSplitPayload& payload, QType qtype, std::int32_t n, 
     w.scales              = static_cast<const std::uint8_t*>(payload.data.p) + payload.scale_offset;
     w.n                   = n;
     w.k                   = k;
-    w.group               = 64;
+    w.group               = group;
     return w;
 }
 

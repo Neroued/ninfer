@@ -303,6 +303,144 @@ def sampled_dense(
     return seg(name, source_kind, source_layer, shape, random_seed=seed if random_sample else None)
 
 
+def add_compact_mtp(blocks: list[BlockSpec], fusions: list[FusionSpec]) -> None:
+    no_layer = qt.NO_LAYER
+    hidden = 8
+    fc_in = 16
+    q_rows = 8
+    kv_rows = 4
+    intermediate = 10
+    head_dim = 4
+    p = "mtp.layers.0."
+
+    block(
+        blocks,
+        "mtp.fc.weight",
+        qt.QT_W8G32,
+        qt.LAYOUT_ROW_SPLIT,
+        qt.MODULE_MTP,
+        no_layer,
+        [seg("mtp.fc.weight", qt.SK_MTP_FC, no_layer, (hidden, fc_in))],
+    )
+    block(
+        blocks,
+        "mtp.pre_fc_norm_embedding.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        qt.MODULE_MTP,
+        no_layer,
+        [seg("mtp.pre_fc_norm_embedding.weight", qt.SK_MTP_PRE_FC_NORM_EMB, no_layer, (hidden,))],
+    )
+    block(
+        blocks,
+        "mtp.pre_fc_norm_hidden.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        qt.MODULE_MTP,
+        no_layer,
+        [seg("mtp.pre_fc_norm_hidden.weight", qt.SK_MTP_PRE_FC_NORM_HID, no_layer, (hidden,))],
+    )
+    block(
+        blocks,
+        p + "input_layernorm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        qt.MODULE_MTP,
+        0,
+        [seg(p + "input_layernorm.weight", qt.SK_INPUT_LAYERNORM, 0, (hidden,))],
+    )
+
+    attn_first = len(blocks)
+    block(
+        blocks,
+        p + "attn_in.w8",
+        qt.QT_W8G32,
+        qt.LAYOUT_ROW_SPLIT,
+        qt.MODULE_MTP,
+        0,
+        [
+            seg(p + "self_attn.q_proj.q", qt.SK_ATTN_Q, 0, (q_rows, hidden)),
+            seg(p + "self_attn.k_proj.weight", qt.SK_ATTN_K, 0, (kv_rows, hidden)),
+            seg(p + "self_attn.q_proj.gate", qt.SK_ATTN_GATE, 0, (q_rows, hidden)),
+            seg(p + "self_attn.v_proj.weight", qt.SK_ATTN_V, 0, (kv_rows, hidden)),
+        ],
+        qt.FUSION_ATTN_IN,
+        0,
+    )
+    fusions.append(FusionSpec(qt.FUSION_ATTN_IN, 0, attn_first, 1, 2 * q_rows + 2 * kv_rows, hidden))
+    block(
+        blocks,
+        p + "self_attn.q_norm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        qt.MODULE_MTP,
+        0,
+        [seg(p + "self_attn.q_norm.weight", qt.SK_ATTN_Q_NORM, 0, (head_dim,))],
+    )
+    block(
+        blocks,
+        p + "self_attn.k_norm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        qt.MODULE_MTP,
+        0,
+        [seg(p + "self_attn.k_norm.weight", qt.SK_ATTN_K_NORM, 0, (head_dim,))],
+    )
+    block(
+        blocks,
+        p + "self_attn.o_proj.weight",
+        qt.QT_W8G32,
+        qt.LAYOUT_ROW_SPLIT,
+        qt.MODULE_MTP,
+        0,
+        [seg(p + "self_attn.o_proj.weight", qt.SK_ATTN_O, 0, (hidden, q_rows))],
+    )
+    block(
+        blocks,
+        p + "post_attention_layernorm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        qt.MODULE_MTP,
+        0,
+        [seg(p + "post_attention_layernorm.weight", qt.SK_POST_ATTN_LAYERNORM, 0, (hidden,))],
+    )
+
+    mlp_first = len(blocks)
+    block(
+        blocks,
+        p + "mlp.gateup.w8",
+        qt.QT_W8G32,
+        qt.LAYOUT_ROW_SPLIT,
+        qt.MODULE_MTP,
+        0,
+        [
+            seg(p + "mlp.gate_proj.weight", qt.SK_MLP_GATE, 0, (intermediate, hidden)),
+            seg(p + "mlp.up_proj.weight", qt.SK_MLP_UP, 0, (intermediate, hidden)),
+        ],
+        qt.FUSION_MLP_GATEUP,
+        0,
+    )
+    fusions.append(FusionSpec(qt.FUSION_MLP_GATEUP, 0, mlp_first, 1, 2 * intermediate, hidden))
+    block(
+        blocks,
+        p + "mlp.down_proj.weight",
+        qt.QT_W8G32,
+        qt.LAYOUT_ROW_SPLIT,
+        qt.MODULE_MTP,
+        0,
+        [seg(p + "mlp.down_proj.weight", qt.SK_MLP_DOWN, 0, (hidden, intermediate))],
+    )
+    block(
+        blocks,
+        "mtp.norm.weight",
+        qt.QT_BF16,
+        qt.LAYOUT_CONTIGUOUS,
+        qt.MODULE_MTP,
+        no_layer,
+        [seg("mtp.norm.weight", qt.SK_MTP_NORM, no_layer, (hidden,))],
+    )
+
+
 def build_default() -> tuple[list[BlockSpec], list[FusionSpec]]:
     blocks: list[BlockSpec] = []
     no_layer = qt.NO_LAYER
@@ -366,24 +504,8 @@ def build_default() -> tuple[list[BlockSpec], list[FusionSpec]]:
         0,
         [seg(lname(0, "linear_attn.A_log"), qt.SK_GDN_A_LOG, 0, (3,), make_values((3,), 7.0))],
     )
-    block(
-        blocks,
-        "mtp.fc.weight",
-        qt.QT_W8G128,
-        qt.LAYOUT_ROW_SPLIT,
-        qt.MODULE_MTP,
-        no_layer,
-        [seg("mtp.fc.weight", qt.SK_MTP_FC, no_layer, (5, 9), make_values((5, 9), 8.0))],
-    )
-    block(
-        blocks,
-        "mtp.norm.weight",
-        qt.QT_BF16,
-        qt.LAYOUT_CONTIGUOUS,
-        qt.MODULE_MTP,
-        no_layer,
-        [seg("mtp.norm.weight", qt.SK_MTP_NORM, no_layer, (4,), make_values((4,), 9.0))],
-    )
+    fusions = [FusionSpec(qt.FUSION_MLP_GATEUP, 0, mlp_first, 1, 9, 7)]
+    add_compact_mtp(blocks, fusions)
     block(
         blocks,
         "model.visual.patch_embed.proj.weight",
@@ -402,7 +524,6 @@ def build_default() -> tuple[list[BlockSpec], list[FusionSpec]]:
         no_layer,
         [seg("model.visual.patch_embed.proj.bias", qt.SK_VIS_PATCH_EMBED_BIAS, no_layer, (7,), make_values((7,), 11.0))],
     )
-    fusions = [FusionSpec(qt.FUSION_MLP_GATEUP, 0, mlp_first, 1, 9, 7)]
     return blocks, fusions
 
 
@@ -663,6 +784,7 @@ def build_model_bind(real_sample_blocks: bool, random_sample_blocks: bool) -> tu
         no_layer,
         [seg("lm_head.weight", qt.SK_LM_HEAD, no_layer, (16, 8))],
     )
+    add_compact_mtp(blocks, fusions)
     return blocks, fusions
 
 

@@ -124,15 +124,15 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
     qus::Q5090Expectations expected = expectations();
     const qus::ParsedQ5090File parsed = qus::parse_q5090_file(bytes, expected);
     int failures                      = 0;
-    failures += parsed.header.tensor_count == 10 ? 0 : fail("tensor_count mismatch");
+    failures += parsed.header.tensor_count == 20 ? 0 : fail("tensor_count mismatch");
     failures += parsed.header.module_count == 3 ? 0 : fail("module_count mismatch");
-    failures += parsed.header.segment_count == 11 ? 0 : fail("segment_count mismatch");
-    failures += parsed.header.fusion_group_count == 1 ? 0 : fail("fusion_group_count mismatch");
+    failures += parsed.header.segment_count == 25 ? 0 : fail("segment_count mismatch");
+    failures += parsed.header.fusion_group_count == 3 ? 0 : fail("fusion_group_count mismatch");
     failures += parsed.header.layer_count == 64 ? 0 : fail("layer_count mismatch");
     failures += parsed.modules.size() == 3 ? 0 : fail("parsed module size mismatch");
-    failures += parsed.tensors.size() == 10 ? 0 : fail("parsed tensor size mismatch");
-    failures += parsed.segments.size() == 11 ? 0 : fail("parsed segment size mismatch");
-    failures += parsed.fusion_groups.size() == 1 ? 0 : fail("parsed fusion group size mismatch");
+    failures += parsed.tensors.size() == 20 ? 0 : fail("parsed tensor size mismatch");
+    failures += parsed.segments.size() == 25 ? 0 : fail("parsed segment size mismatch");
+    failures += parsed.fusion_groups.size() == 3 ? 0 : fail("parsed fusion group size mismatch");
 
     failures += parsed.modules[0].module_kind == qus::ModuleKind::TextCore
                     ? 0
@@ -144,6 +144,7 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
     failures += parsed.modules[1].module_kind == qus::ModuleKind::MtpDraft
                     ? 0
                     : fail("MTP module mismatch");
+    failures += parsed.modules[1].tensor_index_count == 12 ? 0 : fail("MTP module range mismatch");
     failures += parsed.modules[2].module_kind == qus::ModuleKind::VisionEncoder
                     ? 0
                     : fail("VISION module mismatch");
@@ -189,15 +190,53 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
     failures += fusion.block_count == 1 ? 0 : fail("fusion block count mismatch");
     failures += fusion.total_n == 9 ? 0 : fail("fusion total_n mismatch");
     failures += fusion.shared_k == 7 ? 0 : fail("fusion shared_k mismatch");
+    const auto& mtp_attn_fusion = parsed.fusion_groups[1];
+    failures += mtp_attn_fusion.group_id == 1 ? 0 : fail("mtp attn fusion id mismatch");
+    failures += mtp_attn_fusion.first_block_tensor_index == 10
+                    ? 0
+                    : fail("mtp attn fusion first block mismatch");
+    failures += mtp_attn_fusion.block_count == 1 ? 0 : fail("mtp attn fusion block count mismatch");
+    failures += mtp_attn_fusion.total_n == 24 ? 0 : fail("mtp attn fusion total_n mismatch");
+    failures += mtp_attn_fusion.shared_k == 8 ? 0 : fail("mtp attn fusion shared_k mismatch");
+    const auto& mtp_mlp_fusion = parsed.fusion_groups[2];
+    failures += mtp_mlp_fusion.group_id == 3 ? 0 : fail("mtp mlp fusion id mismatch");
+    failures += mtp_mlp_fusion.first_block_tensor_index == 15
+                    ? 0
+                    : fail("mtp mlp fusion first block mismatch");
+    failures += mtp_mlp_fusion.block_count == 1 ? 0 : fail("mtp mlp fusion block count mismatch");
+    failures += mtp_mlp_fusion.total_n == 20 ? 0 : fail("mtp mlp fusion total_n mismatch");
+    failures += mtp_mlp_fusion.shared_k == 8 ? 0 : fail("mtp mlp fusion shared_k mismatch");
 
     const auto& mtp = find_tensor(parsed, "mtp.fc.weight");
-    failures += mtp.qtype == qus::QType::W8G128_F16S ? 0 : fail("mtp qtype mismatch");
+    failures += mtp.qtype == qus::QType::W8G32_F16S ? 0 : fail("mtp qtype mismatch");
     failures += mtp.layout == qus::QuantLayout::RowSplit ? 0 : fail("mtp layout mismatch");
     failures += mtp.module_kind == qus::ModuleKind::MtpDraft ? 0 : fail("mtp module mismatch");
-    failures += mtp.padded_shape == std::array<std::uint32_t, 4>{5, 128, 1, 1}
+    failures += mtp.shape == std::array<std::uint32_t, 4>{8, 16, 1, 1}
+                    ? 0
+                    : fail("mtp shape mismatch");
+    failures += mtp.padded_shape == std::array<std::uint32_t, 4>{8, 128, 1, 1}
                     ? 0
                     : fail("mtp padded mismatch");
-    failures += mtp.payload_bytes == 778 ? 0 : fail("mtp payload bytes mismatch");
+    failures += mtp.group_size == 32 ? 0 : fail("mtp group mismatch");
+    failures += mtp.payload_bytes == 1088 ? 0 : fail("mtp payload bytes mismatch");
+    failures += mtp.nibble_plane_bytes == 1024 ? 0 : fail("mtp nibble bytes mismatch");
+    failures += mtp.high_plane_bytes == 0 ? 0 : fail("mtp high bytes mismatch");
+    failures += mtp.scale_plane_bytes == 64 ? 0 : fail("mtp scale bytes mismatch");
+
+    const auto& mtp_attn = find_tensor(parsed, "mtp.layers.0.attn_in.w8");
+    failures += mtp_attn.qtype == qus::QType::W8G32_F16S ? 0 : fail("mtp attn qtype mismatch");
+    failures += mtp_attn.segment_count == 4 ? 0 : fail("mtp attn segment count mismatch");
+    failures += mtp_attn.source_kind == static_cast<std::uint32_t>(qus::SourceKind::Other)
+                    ? 0
+                    : fail("mtp attn source kind mismatch");
+    const auto& mtp_attn_gate = find_segment(parsed, "mtp.layers.0.self_attn.q_proj.gate");
+    failures += mtp_attn_gate.row_begin == 12 && mtp_attn_gate.row_count == 8
+                    ? 0
+                    : fail("mtp attn gate segment mismatch");
+
+    const auto& mtp_mlp = find_tensor(parsed, "mtp.layers.0.mlp.gateup.w8");
+    failures += mtp_mlp.qtype == qus::QType::W8G32_F16S ? 0 : fail("mtp mlp qtype mismatch");
+    failures += mtp_mlp.segment_count == 2 ? 0 : fail("mtp mlp segment count mismatch");
 
     const auto& fp32 = find_tensor(parsed, "layers.0.linear_attn.A_log");
     failures += fp32.qtype == qus::QType::FP32_CTRL ? 0 : fail("fp32 qtype mismatch");
@@ -258,6 +297,7 @@ int main() {
     const std::uint64_t fusion_offset       = read_u64(valid, 216);
     const std::uint64_t first_entry         = tensor_offset;
     const std::uint64_t second_entry        = tensor_offset + kTensorEntrySize;
+    const std::uint64_t mtp_entry           = tensor_offset + 6 * kTensorEntrySize;
     const std::uint64_t first_payload       = read_u64(valid, first_entry + 64);
     const std::uint64_t first_payload_bytes = read_u64(valid, first_entry + 72);
     const std::uint64_t second_module       = module_offset + kModuleRecordSize;
@@ -341,6 +381,15 @@ int main() {
     });
     failures += expect_parse_throws(valid, "scale plane mismatch", [first_entry](auto& b) {
         write_u64(b, first_entry + 116, read_u64(b, first_entry + 116) + 1);
+    });
+    failures += expect_parse_throws(valid, "W8G32 bad group", [mtp_entry](auto& b) {
+        write_u32(b, mtp_entry + 56, 64);
+    });
+    failures += expect_parse_throws(valid, "W8G32 nonzero high plane", [mtp_entry](auto& b) {
+        write_u64(b, mtp_entry + 108, 32);
+    });
+    failures += expect_parse_throws(valid, "W8G32 bad scale plane", [mtp_entry](auto& b) {
+        write_u64(b, mtp_entry + 116, read_u64(b, mtp_entry + 116) + 2);
     });
     failures += expect_parse_throws(valid, "segment partition mismatch", [up_segment](auto& b) {
         write_u32(b, up_segment + 8, 6);

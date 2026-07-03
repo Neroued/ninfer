@@ -94,13 +94,15 @@ qtypes = {
     "q4": qt.QT_Q4G64,
     "q5": qt.QT_Q5G64,
     "q6": qt.QT_Q6G64,
+    "w8g32": qt.QT_W8G32,
 }
 
 payload, logical, padded, group_size, scale_dtype, nibble_plane_bytes, high_plane_bytes, scale_plane_bytes = encode_tensor(
     known_matrix(), qtypes[qtype_name], qt.LAYOUT_ROW_SPLIT, torch.device("cpu")
 )
 
-if logical != [N, K] or padded != [70, 256] or group_size != 64 or scale_dtype != qt.SCALE_FP16:
+expected_group = 32 if qtype_name == "w8g32" else 64
+if logical != [N, K] or padded != [70, 256] or group_size != expected_group or scale_dtype != qt.SCALE_FP16:
     raise SystemExit(
         f"unexpected encoder metadata: logical={logical} padded={padded} "
         f"group={group_size} scale={scale_dtype} nibble={nibble_plane_bytes} "
@@ -177,7 +179,9 @@ int main() {
         int failures = 0;
         for (const Case& test_case : {Case{qus::QType::Q4G64_F16S, "q4", "Q4G64_F16S"},
                                       Case{qus::QType::Q5G64_F16S, "q5", "Q5G64_F16S"},
-                                      Case{qus::QType::Q6G64_F16S, "q6", "Q6G64_F16S"}}) {
+                                      Case{qus::QType::Q6G64_F16S, "q6", "Q6G64_F16S"},
+                                      Case{qus::QType::W8G32_F16S, "w8g32",
+                                           "W8G32_F16S"}}) {
             const std::filesystem::path payload_path = unique_temp_path(
                 "qus_q5090_pack_golden_" + std::string(test_case.python_name) + "_", ".bin");
             int case_failures = run_converter(script_path, test_case.python_name, payload_path);

@@ -131,6 +131,8 @@ inline QuantSpec quant_spec(QType qtype) {
         return {5, 64, 15, -16};
     case QType::Q6G64_F16S:
         return {6, 64, 31, -32};
+    case QType::W8G32_F16S:
+        return {8, 32, 127, -127};
     default:
         throw std::invalid_argument("q5090 test packer: unsupported qtype");
     }
@@ -141,6 +143,7 @@ inline int nibble_bytes_per_group(const QuantSpec& spec) {
 }
 
 inline int high_bytes_per_group(const QuantSpec& spec) {
+    if (spec.bits == 8) { return 0; }
     return spec.bits <= 4 ? 0 : spec.group_size * (spec.bits - 4) / 8;
 }
 
@@ -150,6 +153,12 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
     const int high = high_bytes_per_group(spec);
     std::fill(nibble_out, nibble_out + nib, static_cast<std::uint8_t>(0));
     if (high != 0) { std::fill(high_out, high_out + high, static_cast<std::uint8_t>(0)); }
+    if (spec.bits == 8) {
+        for (int i = 0; i < spec.group_size; ++i) {
+            nibble_out[i] = static_cast<std::uint8_t>(codes[i]);
+        }
+        return;
+    }
     const std::uint32_t mask = (1u << spec.bits) - 1u;
     for (int i = 0; i < spec.group_size; ++i) {
         const std::uint32_t u = static_cast<std::uint32_t>(codes[i]) & mask;
@@ -174,6 +183,7 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
 
 inline int unpack_lowbit_code(const std::uint8_t* nibble, const std::uint8_t* high,
                               const QuantSpec& spec, int index) {
+    if (spec.bits == 8) { return static_cast<std::int8_t>(nibble[index]); }
     const std::uint8_t low_byte = nibble[index >> 1];
     const std::uint32_t low = (index & 1) ? (low_byte >> 4) : (low_byte & 0x0fu);
     std::uint32_t hi = 0;
@@ -361,6 +371,11 @@ inline PackedWeight pack_q5_row_split(const std::vector<float>& source, std::int
 inline PackedWeight pack_q6_row_split(const std::vector<float>& source, std::int32_t n,
                                       std::int32_t k) {
     return pack_row_split_lowbit(source, n, k, QType::Q6G64_F16S);
+}
+
+inline PackedWeight pack_w8g32_row_split(const std::vector<float>& source, std::int32_t n,
+                                         std::int32_t k) {
+    return pack_row_split_lowbit(source, n, k, QType::W8G32_F16S);
 }
 
 } // namespace qus::test::q5090

@@ -102,17 +102,19 @@ amount of latency hiding available.
 | 45 | Group two rows per direct split4 block to recover some within-block x reuse while retaining four K-slice warps per row. | Attn: 27.71 us / 66.48% SOL, memory 49.45%, regs 44, static smem 128 B, waves/SM 4.22, achieved occupancy 74.58%. | Rejected. The larger 256-thread block did not improve L1TEX behavior enough to beat the one-row split4 body. |
 | 46 | Stage the four T-column x vectors once per chunk for a two-row direct split4 block, so both rows reuse shared x instead of issuing duplicate global x loads. | Attn: 62.14 us / 78.57% SOL, memory 78.57%, DRAM 22.01%, SM 32.13%, regs 44, static smem 8.32 KiB, waves/SM 4.22. | Rejected. The primary SOL number rose, but shared-memory traffic and two slab barriers per iteration more than doubled duration. |
 | 47 | In direct split4, reduce high-bit global load instructions by having one lane per four load a 32-bit high word and broadcast it with `__shfl_sync`. | Attn: 28.06 us / 67.79% SOL, memory 48.77%, regs 44, static smem 64 B, waves/SM 4.22, achieved occupancy 74.05%. | Rejected. Fewer high-bit loads did not offset the shuffle/shift overhead and duration regressed versus final10. |
+| 48 | Specialize direct split4 for the exact short-K shapes: template the full slab count and K stride, then fully unroll the 5- or 6-slab loop. | Final11: Attn 25.98 us / 68.75% SOL, memory 52.71%, regs 48; Proj 22.91 us / 66.51%, memory 51.22%; Out 22.85 us / 64.56%, memory 51.46%; MlpDown unchanged direct path 62.05 us / 60.22%. | Accepted. Exact shape constants improve instruction scheduling and memory throughput for all short-K durations without materially regressing MlpDown. |
 
 ## Final Candidate
 
 Code change: keep the generic 8-row small-T kernel for Q5 generally, but route
 the three full-aligned short-K Q5 T=4 shapes (`7168x5120`, `6144x5120`, and
-`5120x6144`) to
-`linear_rowsplit_gemm_smallt_kernel_direct_split4_q5_t4<Q5Smallt>`. The split4
-kernel uses four warps/block for one output row: each warp loads one 256-K slice
-of each 1024-value slab directly from global memory, accumulates the four T
-columns in fp32, then the block performs a single final four-part row reduction.
-The old staged chunk4 path was removed because it is no longer routed.
+`5120x6144`) to exact-shape instantiations of
+`linear_rowsplit_gemm_smallt_kernel_direct_split4_q5_t4<Q5Smallt,kFullSlabs,kStride>`.
+The split4 kernel uses four warps/block for one output row: each warp loads one
+256-K slice of each 1024-value slab directly from global memory, accumulates the
+four T columns in fp32, then the block performs a single final four-part row
+reduction. The old staged chunk4 path was removed because it is no longer
+routed.
 
 MlpDown (`5120x17408`) now routes to
 `linear_rowsplit_gemm_smallt_kernel_direct_q5_t4<Q5Smallt,8>`. That exact-shape
@@ -124,17 +126,17 @@ full-slab Q5 T=4 MlpDown shape.
 
 Profiles:
 
-- `profiles/q5-smallt/final10/AttnInQKV7168x5120.ncu-rep`
-- `profiles/q5-smallt/final10/MlpDown5120x17408.ncu-rep`
-- `profiles/q5-smallt/final10/Proj6144x5120.ncu-rep`
-- `profiles/q5-smallt/final10/Out5120x6144.ncu-rep`
+- `profiles/q5-smallt/final11/AttnInQKV7168x5120.ncu-rep`
+- `profiles/q5-smallt/final11/MlpDown5120x17408.ncu-rep`
+- `profiles/q5-smallt/final11/Proj6144x5120.ncu-rep`
+- `profiles/q5-smallt/final11/Out5120x6144.ncu-rep`
 
 | shape | kernel | duration us | SOL % | SM % | memory % | regs | static smem KiB | waves/SM | achieved occ % |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| AttnInQKV7168x5120 | `direct_split4_q5_t4<Q5Smallt>` | 27.23 | 67.24 | 67.24 | 50.30 | 44 | 0.06 | 4.22 | 74.05 |
-| MlpDown5120x17408 | `direct_q5_t4<Q5Smallt,8>` | 62.40 | 60.72 | 60.72 | 53.28 | 54 | 0.00 | 0.94 | 62.17 |
-| Proj6144x5120 | `direct_split4_q5_t4<Q5Smallt>` | 24.35 | 65.37 | 65.37 | 48.22 | 44 | 0.06 | 3.61 | 73.36 |
-| Out5120x6144 | `direct_split4_q5_t4<Q5Smallt>` | 23.58 | 64.82 | 64.82 | 49.84 | 44 | 0.06 | 3.01 | 72.53 |
+| AttnInQKV7168x5120 | `direct_split4_q5_t4<Q5Smallt,5,5120>` | 25.98 | 68.75 | 68.75 | 52.71 | 48 | 0.06 | 4.22 | 74.21 |
+| MlpDown5120x17408 | `direct_q5_t4<Q5Smallt,8>` | 62.05 | 60.22 | 60.22 | 53.60 | 54 | 0.00 | 0.94 | 62.17 |
+| Proj6144x5120 | `direct_split4_q5_t4<Q5Smallt,5,5120>` | 22.91 | 66.51 | 66.51 | 51.22 | 48 | 0.06 | 3.61 | 73.10 |
+| Out5120x6144 | `direct_split4_q5_t4<Q5Smallt,6,6144>` | 22.85 | 64.56 | 64.56 | 51.46 | 48 | 0.06 | 3.01 | 72.65 |
 
 Correctness:
 
@@ -154,21 +156,21 @@ The correctness suite now includes Q5 T=4 checks for the representative
 The final candidate replaces the staged one-row chunk4 short-K path with a
 direct global-load split4 body, while retaining the direct one-warp MlpDown
 body. Versus final9, the three short-K durations improve materially: Attn
-31.49 -> 27.23 us, Proj 27.14 -> 24.35 us, and Out 27.33 -> 23.58 us. MlpDown
-uses the same direct path as final9; the final10 sample is 62.40 us versus the
+31.49 -> 25.98 us, Proj 27.14 -> 22.91 us, and Out 27.33 -> 22.85 us. MlpDown
+uses the same direct path as final9; the final11 sample is 62.05 us versus the
 final9 rerun at 62.11 us, within observed NCU run-to-run spread. Numerical
 correctness is unchanged under the existing linear correctness suite and
 `compute-sanitizer` reports no errors.
 
 The primary 85% SOL target was not reached. The best final representative SOL is
-67.24% on Attn. The direct split4 path proves that, for the short-K shapes,
+68.75% on Attn. The direct split4 path proves that, for the short-K shapes,
 per-slab shared staging and block barriers were more expensive than direct Q5
 global loads, even though the resulting kernel is still L1TEX-scoreboard
 limited. The direct MlpDown path proves that long-K staged cp.async overhead can
 dominate even when wave count remains low, but split4 MlpDown regresses duration
 despite higher SOL. The failed tensor-core, split-by-slab, staged chunk,
 pipeline-cleanup, read-only-load, deeper-pipeline, launch-bounds, x-preload
-MlpDown, and rows/block experiments indicate that reaching 85% SOL likely
-requires a larger architecture change, such as a better-balanced split-K or
-tensor-core path that can feed all warps without duplicating dequant/staging
-work.
+MlpDown, rows/block, shared x-staging, and grouped high-bit load experiments
+indicate that reaching 85% SOL likely requires a larger architecture change,
+such as a better-balanced split-K or tensor-core path that can feed all warps
+without duplicating dequant/staging work.

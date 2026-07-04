@@ -343,13 +343,16 @@ __global__ void linear_rowsplit_gemm_smallt_kernel_direct_q5_t4(
     }
 }
 
-template <class SC>
+template <class SC, int kFullSlabs, int kStride>
 __launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_direct_split4_q5_t4(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k, std::int32_t t,
     std::int32_t padded_k, std::int32_t full_slabs) {
     static_assert(std::is_same_v<SC, Q5Smallt>, "direct split4 small-T kernel is Q5-only");
+    static_assert(kFullSlabs > 0 && kStride > 0, "direct split4 requires exact positive shape");
+    (void)full_slabs;
+    (void)k;
     (void)t;
 
     __shared__ float s_part[4][4];
@@ -369,8 +372,8 @@ __launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_di
 #pragma unroll
     for (int i = 0; i < 4; ++i) { acc[i] = 0.0f; }
 
-#pragma unroll 1
-    for (int s = 0; s < full_slabs; ++s) {
+#pragma unroll
+    for (int s = 0; s < kFullSlabs; ++s) {
         const std::uint8_t* code_phase =
             code_row + static_cast<std::int64_t>(s) * 512 + chunk * 128 + lane * 4;
         const std::uint8_t* high_phase =
@@ -401,11 +404,11 @@ __launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_di
         const std::int64_t xoff =
             static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
         const uint4 xv0 = *reinterpret_cast<const uint4*>(x + xoff);
-        const uint4 xv1 = *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(k) + xoff);
+        const uint4 xv1 = *reinterpret_cast<const uint4*>(x + kStride + xoff);
         const uint4 xv2 =
-            *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(2) * k + xoff);
+            *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(2) * kStride + xoff);
         const uint4 xv3 =
-            *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(3) * k + xoff);
+            *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(3) * kStride + xoff);
 
         const float2 f00 =
             __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv0.x));

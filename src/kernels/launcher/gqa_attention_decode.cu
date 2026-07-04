@@ -11,6 +11,36 @@
 namespace qus::kernels::detail {
 namespace {
 
+std::int32_t ceil_div_i32(std::int32_t x, std::int32_t y) {
+    return (x + y - 1) / y;
+}
+
+std::int32_t gqa_small_t_split_upper_bound(std::int32_t max_context, std::int32_t tokens) {
+    if (tokens <= 1) { return kGqaDecodeSplits; }
+    if (max_context <= 0) { return kGqaDecodeSplits; }
+
+    constexpr std::int32_t kMinSplits = 4;
+    std::int32_t splits               = kMinSplits;
+    if (tokens <= 5) {
+        constexpr std::int32_t kSmallWindowLimit     = 4096;
+        constexpr std::int32_t kSmallTargetKeysSplit = 32;
+        const std::int32_t small_window =
+            (max_context < kSmallWindowLimit) ? max_context : kSmallWindowLimit;
+        const std::int32_t small_splits = ceil_div_i32(small_window, kSmallTargetKeysSplit);
+        splits                          = (splits > small_splits) ? splits : small_splits;
+        if (max_context > kSmallWindowLimit) {
+            constexpr std::int32_t kLargeTargetKeysSplit = 480;
+            const std::int32_t large_splits = ceil_div_i32(max_context, kLargeTargetKeysSplit);
+            splits                          = (splits > large_splits) ? splits : large_splits;
+        }
+    } else {
+        constexpr std::int32_t kTargetKeysSplit = 512;
+        splits = ceil_div_i32(max_context, kTargetKeysSplit);
+        splits = (splits > kMinSplits) ? splits : kMinSplits;
+    }
+    return (splits < kGqaDecodeSplits) ? splits : kGqaDecodeSplits;
+}
+
 template <int TokenTile, int WarpsPerCta>
 void launch_tc_partial(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
                        float scale, Tensor& cache_k, Tensor& cache_v, std::int32_t padded_context,
@@ -18,7 +48,8 @@ void launch_tc_partial(const Tensor& q, const Tensor& k, const Tensor& v, const 
                        Tensor& partial_l, cudaStream_t stream) {
     constexpr int kBlock = 32 * WarpsPerCta;
     const int tokens     = q.ne[2];
-    const dim3 grid(kGqaKVHeads, kGqaDecodeSplits, 1);
+    const int splits     = gqa_small_t_split_upper_bound(max_context, tokens);
+    const dim3 grid(kGqaKVHeads, splits, 1);
     gqa_attention_small_t_tc_partial_kernel<TokenTile, WarpsPerCta><<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
@@ -73,11 +104,12 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;
+    const int partial_splits   = gqa_small_t_split_upper_bound(max_context, q.ne[2]);
     const dim3 reduce_grid(kGqaQHeads, (kGqaHeadDim + kDChunk - 1) / kDChunk, q.ne[2]);
     gqa_attention_small_t_reduce_output_kernel<kDChunk><<<reduce_grid, kReduceBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(partial_acc.data),
         static_cast<const float*>(partial_m.data), static_cast<const float*>(partial_l.data),
-        static_cast<const std::int32_t*>(pos.data), q.ne[2], kGqaDecodeSplits,
+        static_cast<const std::int32_t*>(pos.data), q.ne[2], partial_splits,
         static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());
 }

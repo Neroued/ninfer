@@ -1,5 +1,10 @@
 # MTP 支持预先准备工作第二部分：底层算子支持
 
+> GQA API note (2026-07-04): the public `gqa_attention_prefill` /
+> `gqa_attention_decode` split described in older sections has been superseded by the unified
+> `gqa_attention(..., positions, ...)` contract. Keep the old names below as historical analysis of
+> the pre-refactor implementation, not as live API.
+
 本文承接 [Part 1](2026-07-02-mtp-foundation-part1-design.md) 的 q5090 v3
 MTP_DRAFT layout，只讨论为了执行 MTP head 和后续 speculative target
 verification 需要补齐的 L1/operator 能力。

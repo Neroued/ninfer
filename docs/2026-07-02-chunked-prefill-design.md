@@ -176,6 +176,9 @@ signature/logic change.
 
 ### (C) GQA prefill attention — the one real kernel change
 
+> Superseded API note (2026-07-04): the public GQA surface is now the unified
+> `gqa_attention(..., positions, ...)`; the host `cache_offset` path below is historical context.
+
 `gqa_attention_prefill` (kernel `src/kernels/kernel/gqa_attention_prefill.cuh`, launcher
 `.../launcher/gqa_attention_prefill.cu`, wrapper `.../wrapper/gqa_attention.cpp`) today assumes the
 chunk *is* the whole prompt: its fill writes cache slots `[0, T)` and its causal mask compares

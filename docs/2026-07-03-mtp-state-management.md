@@ -34,9 +34,8 @@
 
 - `KVCache` 增加回退能力：把 `pos` 设为不大于当前值的目标值（语义上仅移动游标；
   现有 `slot()` 的 `position >= pos` 守卫自动使 stale 区间不可读）。
-- verify/propose 的 attention 算子从 **device 标量** 取窗口基址（现有
-  `gqa_attention_decode` 已从 device 读 `pos`，prefill 版本用 host `cache_offset`
-  —— graph 化需要 device 标量变体，见 §5.3）。
+- verify/propose 的 attention 算子从 **device positions** 取窗口基址；统一的
+  `gqa_attention` 不从 host 读取 `cache_offset`，见 §5.3。
 - host 侧 `kv_.pos` 只作为每轮回读后的镜像，用于容量守卫与断言。
 
 ## 3. MTP KV：独立命名空间
@@ -159,20 +158,19 @@ gated_delta_rule_recurrent_snapshot(
 不变（slot 0 就地读写），供 prefill 与 MTP-disabled decode 使用。MTP-enabled
 fallback T=1 decode 使用上述快照契约，读取 selector 指向的槽位并写 slot 0。
 
-### 5.3 attention 追加/单查询（device 标量窗口）
+### 5.3 attention 追加/单查询（device positions）
 
 ```text
-gqa_attention_append(q [256,24,T], k [256,4,T], v [256,4,T],
-                     base: device I32 标量（窗口基址）,
-                     cache: caller-owned KVCache 层切片,
-                     out [256,24,T])
-语义: 先写 K/V @ base..base+T-1（fill-then-attend）, 行 j attend 0..base+j;
+gqa_attention(q [256,24,T], k [256,4,T], v [256,4,T],
+              positions [T] I32 device,
+              cache: caller-owned KVCache 层切片,
+              out [256,24,T])
+语义: 先写 K/V @ positions[j]（fill-then-attend）, 行 j attend 0..positions[j];
       不推进 KVCache::pos。target verify 与 MTP shifted pass 共用（传各自 cache）。
 ```
 
-现有 `gqa_attention_prefill(cache_offset)` 是其 host-offset 正确性实现，可先用于
-eager 阶段；graph 化需要 device 标量变体。`gqa_attention_decode` 已满足 MTP AR
-step 的需求（device `pos`）。small-T 性能形态维持 Part 2 §8 的分类结论。
+`T>1` 调用负责提供连续 positions；wrapper 只验证 shape/dtype/容量，不回读
+positions。small-T 性能形态维持 Part 2 §8 的分类结论。
 
 ### 5.4 GDN selector 标量
 

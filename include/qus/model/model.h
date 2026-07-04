@@ -229,11 +229,11 @@ public:
 
 private:
     void bind();
-    void attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph, std::uint32_t cache_offset);
+    void attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph);
     void gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph);
     void mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                          Phase ph, std::uint32_t cache_offset, Tensor& mtp_hidden);
+                          Tensor& mtp_hidden);
     void prefill_erased(std::span<const int> ids, void* tap, TapCallback callback);
     void decode_step_erased(void* tap, TapCallback callback);
     template <class Tap>
@@ -241,7 +241,7 @@ private:
     template <class Tap>
     void decode_step_impl(Tap& tap);
     template <class Tap>
-    void run_layers(Tensor& x, Phase ph, Tap& tap, std::uint32_t cache_offset);
+    void run_layers(Tensor& x, Phase ph, Tap& tap);
     void run_layers(Tensor& x, Phase ph);
 
     DeviceContext& ctx_;

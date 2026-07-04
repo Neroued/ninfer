@@ -155,19 +155,19 @@ void rope(const Tensor& positions, int rotary_dim, float theta,
 - **In place** on `q`/`k`. Rotates the first `rotary_dim=64` of `head_dim=256` (NeoX split), passes the rest through. `positions` `i32 [T]` (decode: the single device `pos`). `theta = 1e7`.
 - **Notes:** v1 = plain 1-D partial RoPE; the MRoPE `[11,11,10]` 3-axis split is added (as an optional param) only when vision lands. Replaces arch §10 `rope_partial_mrope`. Applied **after** q/k-norm.
 
-### 3.6 `gqa_attention` — full attention (phase-split)
+### 3.6 `gqa_attention` — full attention with folded KV append
 
 ```cpp
 // include/qus/kernels/gqa_attention.h
-void gqa_attention_prefill(const Tensor& q, const Tensor& k, const Tensor& v, float scale,
-                           KVCache& kv, int layer, Tensor& out, cudaStream_t stream);
-void gqa_attention_decode (const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
-                           float scale, KVCache& kv, int layer, Tensor& out, cudaStream_t stream);
+void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                   const Tensor& positions, float scale,
+                   KVCache& kv, int layer, WorkspaceArena& ws,
+                   Tensor& out, cudaStream_t stream);
 ```
 
-- **Shapes:** `q [256,24,T]`, `k/v [256,4,T]` (GQA 24 query / 4 kv heads), `out [256,24,T]`, `scale = 1/√256`.
-- **`prefill`:** writes `k,v` for all `T` into `kv[layer]`; causal (flash-style) attention.
-- **`decode`:** appends `k,v` at `pos` into `kv[layer]`; attends the `[0..pos]` window. `pos` is the device scalar (graph-safe).
+- **Shapes:** `q [256,24,T]`, `k/v [256,4,T]`, `positions i32 [T]`, `out [256,24,T]`, `scale = 1/√256`.
+- **Semantics:** for token `i`, append `k/v[:,:,i]` at `positions[i]`, then row `i` attends cache positions `0..positions[i]`. For `T>1`, callers provide contiguous positions.
+- **Graph contract:** `positions` is device-owned; the wrapper validates host-known shape/capacity only and does not read or advance `KVCache::pos`.
 - **Notes:** the **KV append is folded into attention** (no separate `kv_cache_append` op); `kv` is in-out. Replaces arch §10 `flash_attn_causal_gqa` / `attn_decode_gqa`.
 
 ### 3.7 GDN linear attention (Gated DeltaNet)
@@ -222,7 +222,7 @@ Confirms the catalog is complete for `l2-model-card-design.md` §4. (`P`=prefill
 | q/k/v/gate/o, gate/up/down, in_*, out_proj, lm_head | `linear` | P,D |
 | q-norm / k-norm | `rmsnorm(unit_offset=true)` (head view) | P,D |
 | RoPE | `rope` | P,D |
-| full attention (+KV) | `gqa_attention_prefill` / `gqa_attention_decode` | P / D |
+| full attention (+KV) | `gqa_attention` | P,D |
 | attn output gate | `sigmoid_gate_mul` | P,D |
 | residual adds | `residual_add` | P,D |
 | SwiGLU MLP | `silu_and_mul` (+ `linear`) | P,D |

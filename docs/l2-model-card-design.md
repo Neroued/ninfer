@@ -198,8 +198,7 @@ void attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
   rmsnorm(k, *w.k_norm, eps, true, nullptr, kn, s);
   rope(io_.pos, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);                   // partial NeoX, in place
   Tensor a = scratch({256,24,T});
-  if (ph == Phase::Prefill) gqa_attention_prefill(qn, kn, v, kAttnScale, kv_, fidx, a, s);
-  else                      gqa_attention_decode (qn, kn, v, io_.pos, kAttnScale, kv_, fidx, a, s);
+  gqa_attention(qn, kn, v, io_.pos, kAttnScale, kv_, fidx, work_, a, s);
   sigmoid_gate_mul(gate, a, s);                                                 // a *= σ(gate)
   Tensor o = scratch({5120, T});
   linear(a, *w.o_proj, o, s);

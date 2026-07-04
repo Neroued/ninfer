@@ -1,6 +1,9 @@
 # GQA Prefill Flash Attention — methodology / design (goal)
 
 > Status: design goal (not yet implemented). Date: 2026-07-02.
+> API note (2026-07-04): the old public `gqa_attention_prefill(...)` entry point has been
+> superseded by `gqa_attention(..., positions, ...)`; this document's prefill name refers to the
+> internal prompt-scale kernel/policy and historical benchmark context.
 > Scope: the **target design** for a tensor-core flash-attention kernel that replaces the
 > correctness-first `gqa_attention_prefill_kernel`. This document fixes the architecture, the
 > hardware envelope, the roofline it must reach (explicit target: **≥80% tensor-core efficiency at

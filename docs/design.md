@@ -253,7 +253,7 @@ the decode step. Full conventions: [`l1-kernel-layering.md`](l1-kernel-layering.
 embed gather
 for layer in 0..63:
     h = rmsnorm(x)
-    if full_attn(layer):  attn = gqa_attention_prefill(h)   # fills KV
+    if full_attn(layer):  attn = gqa_attention(h, positions) # fills KV
     else:                 attn = gdn_linear_attn_chunked(h)  # folds prompt into state
     x = x + attn_output_gate(attn)
     h = rmsnorm(x)
@@ -268,7 +268,7 @@ first_token = argmax(logits)
 embed gather (1 token)
 for layer in 0..63:
     h = rmsnorm(x)
-    if full_attn(layer):  attn = gqa_attention_decode(h)     # append 1 KV slot, attend window
+    if full_attn(layer):  attn = gqa_attention(h, pos)        # append 1 KV slot, attend window
     else:                 attn = gdn_linear_attn_recurrent(h)# in-place state update
     x = x + attn_output_gate(attn)
     h = rmsnorm(x)

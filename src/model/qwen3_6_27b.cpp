@@ -200,9 +200,7 @@ void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<st
     if (t.dtype != dtype) { throw std::invalid_argument(std::string(label) + " dtype mismatch"); }
     int i = 0;
     for (const std::int32_t dim : shape) {
-        if (t.ne[i] != dim) {
-            throw std::invalid_argument(std::string(label) + " shape mismatch");
-        }
+        if (t.ne[i] != dim) { throw std::invalid_argument(std::string(label) + " shape mismatch"); }
         ++i;
     }
     for (; i < 4; ++i) {
@@ -373,8 +371,8 @@ void FileTap::operator()(TapId id, int layer, Phase phase, const Tensor& x, cuda
 }
 
 Qwen3_6_27B::Qwen3_6_27B(DeviceContext& ctx, WeightStore& weights, WorkspaceArena& work,
-                         KVCache& kv, GdnState& state, StepState& io,
-                         std::uint32_t prefill_chunk, KVCache* mtp_kv)
+                         KVCache& kv, GdnState& state, StepState& io, std::uint32_t prefill_chunk,
+                         KVCache* mtp_kv)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
       prefill_chunk_(prefill_chunk) {
     if (prefill_chunk_ == 0 || prefill_chunk_ % kPrefillChunkAlignment != 0 ||
@@ -462,9 +460,8 @@ void Qwen3_6_27B::mtp_set_cache_position(std::uint32_t position) {
     mtp_kv_->pos = position;
 }
 
-void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden,
-                                   const Tensor& positions, Phase ph,
-                                   std::uint32_t cache_offset, Tensor& mtp_hidden) {
+void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
+                                   Tensor& mtp_hidden) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     cudaStream_t s = ctx_.stream;
     const int T    = ids.ne[0];
@@ -504,11 +501,7 @@ void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden,
     kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
-    if (ph == Phase::Decode) {
-        kernels::gqa_attention_decode(qn, kn, v, positions, kAttnScale, *mtp_kv_, 0, work_, a, s);
-    } else {
-        kernels::gqa_attention_prefill(qn, kn, v, kAttnScale, *mtp_kv_, 0, cache_offset, a, s);
-    }
+    kernels::gqa_attention(qn, kn, v, positions, kAttnScale, *mtp_kv_, 0, work_, a, s);
     kernels::sigmoid_gate_mul(gate, a, s);
 
     Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, T});
@@ -559,12 +552,12 @@ void Qwen3_6_27B::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP draft token");
     }
 
-    mtp_forward_core(ids, hidden, positions, Phase::Prefill, cache_offset, mtp_hidden);
+    mtp_forward_core(ids, hidden, positions, mtp_hidden);
     mtp_kv_->pos = cache_offset + token_count;
 
     if (logits_column >= 0) {
         const std::size_t logits_mark = work_.mark();
-        Tensor col = mtp_hidden.slice(1, logits_column, 1);
+        Tensor col                    = mtp_hidden.slice(1, logits_column, 1);
         kernels::linear(col, *lm_head_, *logits, work_, ctx_.stream);
         kernels::argmax(*logits, *draft_token, ctx_.stream);
         work_.rewind(logits_mark);
@@ -582,7 +575,7 @@ void Qwen3_6_27B::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, 1}, "MTP AR logits");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
 
-    mtp_forward_core(token, previous_hidden, position, Phase::Decode, 0, mtp_hidden);
+    mtp_forward_core(token, previous_hidden, position, mtp_hidden);
     const std::size_t logits_mark = work_.mark();
     kernels::linear(mtp_hidden, *lm_head_, logits, work_, ctx_.stream);
     kernels::argmax(logits, draft_token, ctx_.stream);
@@ -616,8 +609,7 @@ void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions,
     if (T <= 0) { throw std::invalid_argument("target_verify T must be positive"); }
     require_tensor_shape(ids, DType::I32, {T}, "target_verify ids");
     require_tensor_shape(positions, DType::I32, {T}, "target_verify positions");
-    require_tensor_window(io_.verify_hidden, DType::BF16, kCfg.hidden, T,
-                          "target_verify hidden");
+    require_tensor_window(io_.verify_hidden, DType::BF16, kCfg.hidden, T, "target_verify hidden");
     require_tensor_window(io_.logits, DType::BF16, kCfg.vocab, T, "target_verify logits");
     require_vector_window(io_.target_tokens, DType::I32, T, "target_verify target_tokens");
     const auto token_count = static_cast<std::uint32_t>(T);
@@ -633,7 +625,7 @@ void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions,
         kernels::embed_gather(ids, *embed_, x, s);
         ScopedPositions scoped_positions(active_positions_, positions);
         NullTap tap;
-        run_layers(x, Phase::Verify, tap, cache_offset);
+        run_layers(x, Phase::Verify, tap);
 
         Tensor hidden = matrix_window(io_.verify_hidden, T);
         Tensor logits = matrix_window(io_.logits, T);
@@ -646,8 +638,7 @@ void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions,
     work_.reset();
 }
 
-void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph,
-                           std::uint32_t cache_offset) {
+void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
@@ -673,7 +664,7 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph,
         kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        kernels::gqa_attention_decode(qn, kn, v, io_.pos, kAttnScale, kv_, fidx, work_, a, s);
+        kernels::gqa_attention(qn, kn, v, positions, kAttnScale, kv_, fidx, work_, a, s);
         kernels::sigmoid_gate_mul(gate, a, s);
 
         kernels::linear_residual_add(a.view({kCfg.q_size, 1}), *w.o_proj, x, work_, s);
@@ -701,7 +692,7 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph,
     kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
-    kernels::gqa_attention_prefill(qn, kn, v, kAttnScale, kv_, fidx, cache_offset, a, s);
+    kernels::gqa_attention(qn, kn, v, positions, kAttnScale, kv_, fidx, work_, a, s);
     kernels::sigmoid_gate_mul(gate, a, s);
 
     Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, T});
@@ -725,7 +716,7 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         kernels::linear(h, *w.in_qk_q4, qk_out, work_, s);
         kernels::gdn_in_vz_decode(h, *w.in_v, *w.in_z, v_out, z_flat, s);
 
-        Tensor qkv_c     = work_.alloc(DType::BF16, {kCfg.conv_dim, 1});
+        Tensor qkv_c = work_.alloc(DType::BF16, {kCfg.conv_dim, 1});
         if (mtp_enabled()) {
             Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
             kernels::causal_conv1d_sequence_snapshot(qkv, *w.conv1d, conv_states,
@@ -748,16 +739,16 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         kernels::l2norm(qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1}), 1.0e-6f, qn, s);
         kernels::l2norm(kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, 1}), 1.0e-6f, kn, s);
 
-        Tensor vv        = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
-        Tensor o         = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
+        Tensor vv = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
+        Tensor o  = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
         if (mtp_enabled()) {
             Tensor& ssm_states = state_.ssm.at(static_cast<std::size_t>(gidx));
             kernels::gated_delta_rule_recurrent_snapshot(qn, kn, vv, g, beta, kGdnScale, work_,
                                                          ssm_states, io_.gdn_initial_slot, o, s);
         } else {
             Tensor ssm_state = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
-            kernels::gated_delta_rule_recurrent(qn, kn, vv, g, beta, kGdnScale, work_, ssm_state,
-                                                o, s);
+            kernels::gated_delta_rule_recurrent(qn, kn, vv, g, beta, kGdnScale, work_, ssm_state, o,
+                                                s);
         }
 
         Tensor on = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
@@ -782,8 +773,8 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor qkv_c = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
     if (ph == Phase::Verify) {
         Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
-        kernels::causal_conv1d_sequence_snapshot(qkv, *w.conv1d, conv_states,
-                                                 io_.gdn_initial_slot, qkv_c, s);
+        kernels::causal_conv1d_sequence_snapshot(qkv, *w.conv1d, conv_states, io_.gdn_initial_slot,
+                                                 qkv_c, s);
     } else {
         Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
         kernels::causal_conv1d_prefill(qkv, *w.conv1d, conv_state, qkv_c, s);
@@ -857,13 +848,13 @@ void Qwen3_6_27B::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 }
 
 template <class Tap>
-void Qwen3_6_27B::run_layers(Tensor& x, Phase ph, Tap& tap, std::uint32_t cache_offset) {
+void Qwen3_6_27B::run_layers(Tensor& x, Phase ph, Tap& tap) {
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx               = ModelConfig::full_idx(layer);
             const FullLayerW& full       = full_.at(static_cast<std::size_t>(fidx));
             const std::size_t mixer_mark = work_.mark();
-            attn_mix(full, x, fidx, ph, cache_offset);
+            attn_mix(full, x, fidx, ph);
             if constexpr (Tap::enabled) { tap(TapId::AfterMixer, layer, ph, x, ctx_.stream); }
             work_.rewind(mixer_mark);
             const std::size_t mlp_mark = work_.mark();
@@ -887,7 +878,7 @@ void Qwen3_6_27B::run_layers(Tensor& x, Phase ph, Tap& tap, std::uint32_t cache_
 
 void Qwen3_6_27B::run_layers(Tensor& x, Phase ph) {
     NullTap tap;
-    run_layers(x, ph, tap, 0);
+    run_layers(x, ph, tap);
 }
 
 template <class Tap>
@@ -916,7 +907,7 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
             Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, len});
             kernels::embed_gather(ids_device, *embed_, x, s);
             if constexpr (Tap::enabled) { tap(TapId::AfterEmbed, -1, Phase::Prefill, x, s); }
-            run_layers(x, Phase::Prefill, tap, static_cast<std::uint32_t>(t0));
+            run_layers(x, Phase::Prefill, tap);
 
             Tensor xf = io_.prefill_hidden.data != nullptr
                             ? matrix_window(io_.prefill_hidden, len)
@@ -969,18 +960,18 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                                           static_cast<std::size_t>(kCfg.hidden) *
                                           dtype_size(DType::BF16);
                     CUDA_CHECK(cudaMemcpyAsync(io_.mtp_ar_hidden.data, src,
-                                               io_.mtp_ar_hidden.bytes(),
-                                               cudaMemcpyDeviceToDevice, s));
+                                               io_.mtp_ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                                               s));
 
                     detail::set_pos(io_.ar_pos, T, s);
                     for (int i = 1; i < io_.drafts.ne[0]; ++i) {
                         const int host_pos = T + i - 1;
                         mtp_set_cache_position(static_cast<std::uint32_t>(host_pos));
-                        Tensor prev_token = io_.drafts.slice(0, i - 1, 1);
-                        Tensor next_token = io_.drafts.slice(0, i, 1);
+                        Tensor prev_token  = io_.drafts.slice(0, i - 1, 1);
+                        Tensor next_token  = io_.drafts.slice(0, i, 1);
                         Tensor next_hidden = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-                        mtp_forward_ar_step(prev_token, io_.mtp_ar_hidden, io_.ar_pos,
-                                             next_hidden, logits, next_token);
+                        mtp_forward_ar_step(prev_token, io_.mtp_ar_hidden, io_.ar_pos, next_hidden,
+                                            logits, next_token);
                         CUDA_CHECK(cudaMemcpyAsync(io_.mtp_ar_hidden.data, next_hidden.data,
                                                    io_.mtp_ar_hidden.bytes(),
                                                    cudaMemcpyDeviceToDevice, s));
@@ -1021,7 +1012,7 @@ void Qwen3_6_27B::decode_step_impl(Tap& tap) {
     Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, 1});
     kernels::embed_gather(io_.token, *embed_, x, s);
     if constexpr (Tap::enabled) { tap(TapId::AfterEmbed, -1, Phase::Decode, x, s); }
-    run_layers(x, Phase::Decode, tap, 0);
+    run_layers(x, Phase::Decode, tap);
 
     Tensor xf = work_.alloc(DType::BF16, {kCfg.hidden, 1});
     kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, xf, s);

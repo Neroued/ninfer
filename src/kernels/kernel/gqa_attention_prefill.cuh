@@ -1,8 +1,8 @@
 #pragma once
 
-// qus::kernels - gqa_attention prefill kernels. The op writes the prompt chunk
-// k/v into absolute KVCache positions [cache_offset..cache_offset+T-1], then
-// computes causal GQA attention for every chunk token over all cached history.
+// qus::kernels - gqa_attention prompt-scale kernels. The op writes k/v into
+// absolute KVCache positions from the device positions vector, then computes
+// causal GQA attention for every chunk token over all cached history.
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -126,30 +126,32 @@ __device__ __forceinline__ float gqa_prefill_exp2_fast(float x) {
 }
 
 __global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* k, const __nv_bfloat16* v,
+                                                  const std::int32_t* positions,
                                                   __nv_bfloat16* cache_k, __nv_bfloat16* cache_v,
-                                                  std::int32_t tokens, std::int32_t cache_offset,
+                                                  std::int32_t tokens,
                                                   std::int32_t padded_context) {
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t n =
         static_cast<std::int64_t>(tokens) * kGqaPrefillKVHeads * kGqaPrefillHeadDim;
     if (idx >= n) { return; }
 
-    const int d       = static_cast<int>(idx % kGqaPrefillHeadDim);
-    const int tmp     = static_cast<int>(idx / kGqaPrefillHeadDim);
-    const int kv_head = tmp % kGqaPrefillKVHeads;
-    const int token   = tmp / kGqaPrefillKVHeads;
+    const int d        = static_cast<int>(idx % kGqaPrefillHeadDim);
+    const int tmp      = static_cast<int>(idx / kGqaPrefillHeadDim);
+    const int kv_head  = tmp % kGqaPrefillKVHeads;
+    const int token    = tmp / kGqaPrefillKVHeads;
+    const int position = positions[token];
 
-    const std::int64_t cache_off =
-        gqa_prefill_cache_index(kv_head, d, cache_offset + token, padded_context);
-    cache_k[cache_off] = k[idx];
-    cache_v[cache_off] = v[idx];
+    const std::int64_t cache_off = gqa_prefill_cache_index(kv_head, d, position, padded_context);
+    cache_k[cache_off]           = k[idx];
+    cache_v[cache_off]           = v[idx];
 }
 
 __launch_bounds__(256) __global__
     void gqa_attention_prefill_slow_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
-                                           const __nv_bfloat16* cache_v, float scale,
+                                           const __nv_bfloat16* cache_v,
+                                           const std::int32_t* positions, float scale,
                                            __nv_bfloat16* out, std::int32_t tokens,
-                                           std::int32_t cache_offset, std::int32_t padded_context) {
+                                           std::int32_t padded_context) {
     const int block  = static_cast<int>(blockIdx.x);
     const int q_head = block % kGqaPrefillQHeads;
     const int token  = block / kGqaPrefillQHeads;
@@ -164,7 +166,7 @@ __launch_bounds__(256) __global__
     float max_score              = -3.4028234663852886e38f;
     float denom                  = 0.0f;
     float acc                    = 0.0f;
-    const std::int32_t query_abs = cache_offset + token;
+    const std::int32_t query_abs = positions[token];
     for (std::int32_t j = 0; j <= query_abs; ++j) {
         const float k_d =
             __bfloat162float(cache_k[gqa_prefill_cache_index(kv_head, d, j, padded_context)]);
@@ -191,8 +193,8 @@ __launch_bounds__(256) __global__
 // and latency is hidden by the per-warp pipeline, mirroring the linear tensor-core GEMM).
 __launch_bounds__(128, 2) __global__
     void gqa_attention_prefill_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
-                                      const __nv_bfloat16* cache_v, float scale, __nv_bfloat16* out,
-                                      std::int32_t tokens, std::int32_t cache_offset,
+                                      const __nv_bfloat16* cache_v, const std::int32_t* positions,
+                                      float scale, __nv_bfloat16* out, std::int32_t tokens,
                                       std::int32_t padded_context) {
     constexpr int Wc            = 4;
     constexpr int Br            = Wc * 16;
@@ -271,9 +273,10 @@ __launch_bounds__(128, 2) __global__
     }
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
 
-    const int cache_end  = cache_offset + tokens;
-    const int max_key    = min(cache_end, cache_offset + q0 + Br);
-    const int key_blocks = (max_key + Bc - 1) / Bc;
+    const int tile_rows     = min(Br, tokens - q0);
+    const int last_qrow     = q0 + tile_rows - 1;
+    const int max_query_abs = (tile_rows > 0) ? positions[last_qrow] : -1;
+    const int key_blocks    = (max_query_abs + Bc) / Bc;
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
@@ -284,7 +287,7 @@ __launch_bounds__(128, 2) __global__
             const int key        = k0 + key_l;
             __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_prefill_swz(key_l, d)];
             __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_prefill_swz(key_l, d)];
-            if (key < cache_end) {
+            if (key <= max_query_abs) {
                 const std::int64_t off = gqa_prefill_cache_index(kv_head, d, key, padded_context);
                 qus::kernels::async_copy_global_to_shared<16>(k_dst, &cache_k[off]);
                 qus::kernels::async_copy_global_to_shared<16>(v_dst, &cache_v[off]);
@@ -320,8 +323,8 @@ __launch_bounds__(128, 2) __global__
         const int row1  = warp_row0 + gid + 8;
         const int qrow0 = q0 + row0;
         const int qrow1 = q0 + row1;
-        const int qabs0 = cache_offset + qrow0;
-        const int qabs1 = cache_offset + qrow1;
+        const int qabs0 = (qrow0 < tokens) ? positions[qrow0] : -1;
+        const int qabs1 = (qrow1 < tokens) ? positions[qrow1] : -1;
 
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
@@ -330,16 +333,16 @@ __launch_bounds__(128, 2) __global__
             const int col1 = col0 + 1;
             const int key0 = k0 + col0;
             const int key1 = k0 + col1;
-            score[nt][0]   = (qrow0 < tokens && key0 < cache_end && key0 <= qabs0)
+            score[nt][0]   = (qrow0 < tokens && key0 <= max_query_abs && key0 <= qabs0)
                                  ? score[nt][0] * scale
                                  : -CUDART_INF_F;
-            score[nt][1]   = (qrow0 < tokens && key1 < cache_end && key1 <= qabs0)
+            score[nt][1]   = (qrow0 < tokens && key1 <= max_query_abs && key1 <= qabs0)
                                  ? score[nt][1] * scale
                                  : -CUDART_INF_F;
-            score[nt][2]   = (qrow1 < tokens && key0 < cache_end && key0 <= qabs1)
+            score[nt][2]   = (qrow1 < tokens && key0 <= max_query_abs && key0 <= qabs1)
                                  ? score[nt][2] * scale
                                  : -CUDART_INF_F;
-            score[nt][3]   = (qrow1 < tokens && key1 < cache_end && key1 <= qabs1)
+            score[nt][3]   = (qrow1 < tokens && key1 <= max_query_abs && key1 <= qabs1)
                                  ? score[nt][3] * scale
                                  : -CUDART_INF_F;
             bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

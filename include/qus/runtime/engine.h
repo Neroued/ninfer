@@ -96,7 +96,6 @@ private:
     [[nodiscard]] bool is_stop_token(int token) const noexcept;
     [[nodiscard]] int decode_step_one();
     [[nodiscard]] std::vector<int> decode_round();
-    void commit_gdn_snapshots();
     void propose_mtp_after_accept(std::uint32_t host_window_base, int host_length, int k);
 
     EngineOptions options_;

@@ -97,7 +97,7 @@ token 未经 target 验证不进入 committed 上下文。
   verify:   target forward [t0, d1..dk] @ 位置 L..L+k
             → hidden[5120, k+1], logits[vocab, k+1], target_tokens[k+1] (per-column argmax)
   accept:   a = 最长匹配前缀; t* = target_tokens[a]; 输出 d1..da, t*
-  commit:   L += a+1; target KV pos := L; GDN commit-copy(slot a); MTP KV pos 同步
+  commit:   L += a+1; target KV pos := L; GDN initial_slot := a; MTP KV pos 同步
   propose:  mtp shifted pass(固定 T=k+1, 有效长 a+1, 末位补 t*) → d1'
             mtp AR steps × (k-1) → d2'..dk'
   host:     回读本轮 sampled tokens (a+1 个), 检查 stop/上限
@@ -143,30 +143,31 @@ attention 读取窗口由 `pos`/长度约束，stale 条目永远不可见。这
 （`num_computed_tokens += query_len - num_rejected`，slot 由位置推导，下一步覆盖）。
 `KVCache` 需要新增回退能力（设置 `pos` 到指定值），语义上只是移动游标。
 
-### C3 — GDN 状态：per-token snapshot + commit-copy（deferred commit）
+### C3 — GDN 状态：per-token snapshot + accepted-slot 间接读取
 
 48 个 GDN 层的 conv/ssm 状态没有位置轴，一旦折入 token 无法逻辑回退。约定采用
-vLLM 的 deferred-commit 思想、按 batch=1 简化：
+vLLM 的 deferred-state-selection 思想、按 batch=1 简化：
 
 ```text
-每 GDN 层的状态缓冲扩展为 slot[0..k]（ssm 每槽 [128,128,48] fp32，conv 每槽 [10240,3] bf16）
-slot[0] 就是 committed 状态；prefill/普通 decode 路径只读写 slot[0]，行为不变
-verify 阶段的 conv/recurrent 算子: 以 slot[0] 为初始状态，
+每 GDN 层物理持有一个 conv 大 tensor 和一个 ssm 大 tensor，逻辑 slot[0..k]
+engine 持有 device I32 标量 gdn_initial_slot，表示当前 committed GDN 状态所在槽位
+verify 阶段的 conv/recurrent 算子: 以 slot[gdn_initial_slot] 为初始状态，
     逐 token 处理 [t0, d1..dk]，处理完第 j 个 token 后把状态快照写入 slot[j]
-commit: 由 device 标量 a 驱动一次 gather-copy: slot[a] → slot[0]（a==0 时为 no-op）
+accept: 由 device 标量 a 直接写 gdn_initial_slot := a
 ```
 
 要点：
 - token 0（`t0`）永远属于 committed 序列，所以用 after-t0 快照覆盖 slot[0] 是
-  安全的（初始状态先读入寄存器再写，无冒险）；round 之间 slot[0] 恒等于
-  committed 状态。
+  安全的（初始状态先读入寄存器再写，无冒险）。round 之间 committed GDN 状态由
+  `gdn_initial_slot` 选择，不再要求 slot 0 是唯一 committed 槽。
 - 不做「快照-回滚-重放」：重放需要重跑整轮 forward 或按层缓存中间量并二次发射
   kernel，数据依赖使 kernel 序列不固定，无法进 CUDA graph。snapshot 方案的
   kernel DAG 与 `a` 无关（见 C5）。
-- 与 vLLM 的差异只在 commit 形态：vLLM 用 `num_accepted_tokens` 在下一步做
-  indirect read（省一次拷贝），qus v1 用显式 commit-copy 换取「round 之间
-  committed 状态唯一且可 dump」的强不变量；indirect-read 作为性能后续项。
-- chunked prefill 与普通 decode 路径不变，仍就地读写 slot[0]。
+- MTP-enabled fallback T=1 decode 同样从 `gdn_initial_slot` 读初始 conv/ssm 状态，
+  把 after-token 状态写入 slot 0，然后把 selector 重置为 0，避免 fallback 在
+  上一轮 `a>0` 后读到旧 slot 0。
+- chunked prefill 与 MTP-disabled 普通 decode 路径仍就地读写 slot 0；prefill reset
+  同时清 slot 0 并把 `gdn_initial_slot` 置 0。
 
 ### C4 — MTP KV 独立命名空间 + 固定形状 propose（junk 覆盖）
 
@@ -211,15 +212,15 @@ uniform batch」设计在 batch=1 下的直接翻译。v1 允许先 eager 跑通
 | 状态 | owner | 形状/精度 | 生命周期与提交语义 |
 |---|---|---|---|
 | target full-attn KV ×16 | Engine（现有 `KVCache`） | `[256, padded_ctx, 4]` bf16 ×2 | 物理 append @ L..L+k；commit 时 `pos := L+a+1`；stale 覆盖 |
-| target GDN conv ×48 | Engine（`GdnState` 扩展） | slot[0..k] × `[10240,3]` bf16 | verify 逐 token 快照；commit-copy slot[a]→slot[0] |
-| target GDN ssm ×48 | Engine（`GdnState` 扩展） | slot[0..k] × `[128,128,48]` fp32 | 同上 |
+| target GDN conv ×48 | Engine（`GdnState` 扩展） | `[10240,3,k+1]` bf16 | verify 从 `gdn_initial_slot` 读，快照写 `0..k` |
+| target GDN ssm ×48 | Engine（`GdnState` 扩展） | `[128,128,48,k+1]` fp32 | 与 conv 共用同一个 selector |
 | target hidden (verify 窗口) | Engine 新缓冲 | `[5120, k+1]` bf16 | 每轮覆盖；MTP shifted pass 的 hidden 输入 |
 | target hidden (prefill chunk) | Engine 新缓冲 | `[5120, prefill_chunk]` bf16 | 每 chunk 覆盖；chunk 级 MTP shifted pass 输入 |
 | MTP full-attn KV ×1 | Engine 新增第二个 `KVCache` 实例 | `[256, padded_ctx, 4]` bf16 ×2 | 与 target KV 同样的逻辑回退/物理覆盖 |
 | MTP AR hidden | Engine 新缓冲 | `[5120, 1]` bf16 | AR step 之间传递上一 MTP hidden |
 | draft tokens | Engine device 缓冲 | `[k]` i32 | propose 写，下一轮 verify 读 |
 | verify logits | Engine（`StepState` 扩展） | `[248320, k+1]` bf16 | 每轮覆盖 |
-| 位置/接受标量 | Engine device 标量 | `L, a, t0` 等 | C5 所列 |
+| 位置/接受标量 | Engine device 标量 | `L, a, t0, gdn_initial_slot` 等 | C5 所列 |
 
 MTP 不使用任何 GDN 状态（MTP 层是纯 full attention）；MTP 不写 target KV；
 target 不读 MTP KV。
@@ -322,7 +323,7 @@ kernel/launch 开销，否则端到端加速模型会被 verify 成本主导。
 | verify 窗口 `[t0, d1..dk]`、k+1 个 logits | ✓ | 同 | 对齐 |
 | greedy 接受 = argmax 相等，t* = 拒绝位 argmax / bonus | ✓ | 同 | 对齐 |
 | KV 逻辑回退 + 物理覆盖 | ✓ | 同 | 对齐 |
-| GDN per-token 状态快照、按 accepted 选择 | ✓（k+1 slot + 下一步 indirect read） | 同思想；slot[0] 即 committed + 显式 commit-copy | 简化 |
+| GDN per-token 状态快照、按 accepted 选择 | ✓（k+1 slot + 下一步 indirect read） | 同；`gdn_initial_slot` 选择当前 committed 状态 | 对齐 |
 | conv 状态 | 加宽窗口 `w-1+k` + offset 读 | 与 ssm 同构的 per-token snapshot 槽 | 简化（等价语义） |
 | MTP shifted pass：ids 左移、positions 照抄、末位补 last_sampled/next_prefill | ✓ | 同 | 对齐 |
 | propose 固定形状、junk 行覆盖 | ✓（padded drafter batch） | 同（batch=1 版本） | 对齐 |

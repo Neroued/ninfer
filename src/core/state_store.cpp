@@ -101,6 +101,15 @@ std::uint32_t GdnState::layer_count() const noexcept {
     return static_cast<std::uint32_t>(conv.size());
 }
 
+std::int64_t GdnState::conv_slot_stride_elements() const noexcept {
+    return static_cast<std::int64_t>(conv_dim) * static_cast<std::int64_t>(conv_width);
+}
+
+std::int64_t GdnState::ssm_slot_stride_elements() const noexcept {
+    return static_cast<std::int64_t>(key_head_dim) * static_cast<std::int64_t>(value_head_dim) *
+           static_cast<std::int64_t>(value_heads);
+}
+
 Tensor GdnState::conv_slot(std::uint32_t layer, std::int32_t slot) const {
     validate_layer_slot(*this, layer, slot, "GdnState conv_slot");
     return conv.at(layer).slice(2, slot, 1).view({conv_dim, conv_width});

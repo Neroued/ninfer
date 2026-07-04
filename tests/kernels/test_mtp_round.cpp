@@ -279,6 +279,26 @@ int fallback_count_case() {
                      {5, 7, 3, 5, 100, 200, 300, 400, 500});
 }
 
+int gdn_initial_slot_case() {
+    auto d_accepted = to_device_i32({0});
+    auto d_slot = to_device_i32({-1});
+    Tensor accepted(d_accepted.p, DType::I32, {1});
+    Tensor slot(d_slot.p, DType::I32, {1});
+
+    int failures = 0;
+    for (int value = 0; value <= 5; ++value) {
+        cudaMemcpy(d_accepted.p, &value, sizeof(value), cudaMemcpyHostToDevice);
+        kernels::mtp_set_gdn_initial_slot_from_accepted(accepted, slot, nullptr);
+        cudaDeviceSynchronize();
+        failures += expect_eq("gdn initial slot set", from_device_i32(d_slot, 1), {value});
+    }
+
+    kernels::mtp_reset_gdn_initial_slot(slot, nullptr);
+    cudaDeviceSynchronize();
+    failures += expect_eq("gdn initial slot reset", from_device_i32(d_slot, 1), {0});
+    return failures;
+}
+
 int validation_case() {
     try {
         DBuf d(4);
@@ -310,6 +330,7 @@ int main() {
     failures += gather_case();
     failures += increment_case();
     failures += fallback_count_case();
+    failures += gdn_initial_slot_case();
     failures += validation_case();
     std::cout << (failures ? "FAIL" : "OK") << " mtp_round correctness\n";
     return failures ? 1 : 0;

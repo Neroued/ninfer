@@ -109,6 +109,7 @@ qus::model::StepState make_step_state(qus::DeviceArena& arena, int window_cols,
         arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, 1}),
         arena.alloc(qus::DType::I64, {qus::model::kStepStatsCounters}),
     };
@@ -173,6 +174,8 @@ int run_case(qus::model::Qwen3_6_27B& card, const qus::model::FullLayerW& full,
         x_arena.reset();
         kv.reset();
         state.reset();
+        CUDA_CHECK(cudaMemsetAsync(io.gdn_initial_slot.data, 0, io.gdn_initial_slot.bytes(),
+                                   nullptr));
         qus::Tensor x = x_arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, T});
         fill_hidden(x, T);
         try {
@@ -240,6 +243,7 @@ int verify_gdn_snapshot_slots(qus::model::Qwen3_6_27B& card, const qus::model::G
     CUDA_CHECK(cudaMemsetAsync(state.conv[0].data, 0xA5, state.conv[0].bytes(), nullptr));
     CUDA_CHECK(cudaMemsetAsync(state.ssm[0].data, 0xA5, state.ssm[0].bytes(), nullptr));
     state.reset();
+    CUDA_CHECK(cudaMemsetAsync(io.gdn_initial_slot.data, 0, io.gdn_initial_slot.bytes(), nullptr));
 
     qus::Tensor x = x_arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, T});
     fill_hidden(x, T);

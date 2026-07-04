@@ -104,6 +104,7 @@ qus::model::StepState make_step_state(qus::DeviceArena& arena, int window_cols,
         arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, 1}),
         arena.alloc(qus::DType::I64, {qus::model::kStepStatsCounters}),
     };
@@ -185,12 +186,14 @@ int main(int argc, char** argv) {
             workspace.reset();
             copy_i32_scalar(1, io.token, ctx.stream);
             copy_i32_scalar(0, io.pos, ctx.stream);
+            copy_i32_scalar(0, io.gdn_initial_slot, ctx.stream);
             ctx.synchronize();
         };
         auto reset_verify_state = [&] {
             kv.reset();
             state.reset(ctx.stream);
             workspace.reset();
+            copy_i32_scalar(0, io.gdn_initial_slot, ctx.stream);
             ctx.synchronize();
         };
         auto time_decode = [&] {

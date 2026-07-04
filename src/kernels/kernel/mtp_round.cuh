@@ -74,4 +74,13 @@ __global__ void mtp_increment_i32_kernel(std::int32_t* scalar) { *scalar += 1; }
 
 __global__ void mtp_count_fallback_step_kernel(std::int64_t* stats) { stats[3] += 1; }
 
+__global__ void mtp_reset_gdn_initial_slot_kernel(std::int32_t* gdn_initial_slot) {
+    *gdn_initial_slot = 0;
+}
+
+__global__ void mtp_set_gdn_initial_slot_from_accepted_kernel(const std::int32_t* accepted,
+                                                              std::int32_t* gdn_initial_slot) {
+    *gdn_initial_slot = *accepted;
+}
+
 } // namespace qus::kernels

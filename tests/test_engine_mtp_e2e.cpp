@@ -107,6 +107,25 @@ int scenario_capacity_fallback(const std::filesystem::path& weights) {
     return failures;
 }
 
+int scenario_fallback_after_accept(const std::filesystem::path& weights) {
+    const std::vector<int> prompt = foundation_prompt_ids();
+    qus::EngineOptions options;
+    options.max_ctx          = static_cast<std::uint32_t>(prompt.size() + 10);
+    options.mtp_draft_tokens = 5;
+    const Run mtp = generate(weights, options, prompt, 8);
+
+    int failures = 0;
+    failures += mtp.tokens.size() == 8 ? 0 : fail("fallback-after-accept token count mismatch");
+    failures += mtp.mtp.rounds == 1 ? 0 : fail("fallback-after-accept did not run exactly one MTP round");
+    failures += mtp.mtp.accepted_tokens > 0
+                    ? 0
+                    : fail("fallback-after-accept first round accepted no draft tokens");
+    failures += mtp.mtp.fallback_steps > 0
+                    ? 0
+                    : fail("fallback-after-accept did not record fallback");
+    return failures;
+}
+
 int scenario_stop_truncation(const std::filesystem::path& weights) {
     qus::EngineOptions probe_options;
     probe_options.max_ctx          = 32;
@@ -133,7 +152,8 @@ int scenario_stop_truncation(const std::filesystem::path& weights) {
 
 int main(int argc, char** argv) {
     if (argc > 2) {
-        std::cerr << "usage: qus_engine_mtp_e2e_test <batched|capacity_fallback|stop_truncation>\n";
+        std::cerr << "usage: qus_engine_mtp_e2e_test "
+                     "<batched|capacity_fallback|fallback_after_accept|stop_truncation>\n";
         return 2;
     }
     const std::filesystem::path weights = real_weights_path();
@@ -164,6 +184,8 @@ int main(int argc, char** argv) {
         failures = scenario_batched(weights);
     } else if (scenario == "capacity_fallback") {
         failures = scenario_capacity_fallback(weights);
+    } else if (scenario == "fallback_after_accept") {
+        failures = scenario_fallback_after_accept(weights);
     } else if (scenario == "stop_truncation") {
         failures = scenario_stop_truncation(weights);
     } else {

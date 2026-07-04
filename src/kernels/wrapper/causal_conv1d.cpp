@@ -67,6 +67,13 @@ void require_out_shape(const Tensor& x, const Tensor& out) {
     }
 }
 
+void require_initial_slot_shape(const Tensor& initial_slot) {
+    if (initial_slot.ne[0] != 1 || initial_slot.ne[1] != 1 || initial_slot.ne[2] != 1 ||
+        initial_slot.ne[3] != 1) {
+        throw std::invalid_argument("causal_conv1d: initial_slot must have shape [1]");
+    }
+}
+
 std::int64_t validate_common(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
                              const Tensor& out) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
@@ -98,6 +105,15 @@ void require_non_empty_accessible(const Tensor& x, const Tensor& weight, const T
     }
 }
 
+void require_initial_slot_accessible(const Tensor& initial_slot) {
+    if (!initial_slot.is_contiguous()) {
+        throw std::invalid_argument("causal_conv1d: initial_slot must be contiguous");
+    }
+    if (initial_slot.data == nullptr) {
+        throw std::invalid_argument("causal_conv1d: initial_slot data pointer must be non-null");
+    }
+}
+
 } // namespace
 
 void causal_conv1d_prefill(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
@@ -120,26 +136,34 @@ void causal_conv1d_decode(const Tensor& x, const Tensor& weight, Tensor& conv_st
 }
 
 void causal_conv1d_sequence_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                     Tensor& out, cudaStream_t stream) {
+                                     const Tensor& initial_slot, Tensor& out,
+                                     cudaStream_t stream) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
         conv_states.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("causal_conv1d: x/weight/conv_states/out must be BF16");
+    }
+    if (initial_slot.dtype != DType::I32) {
+        throw std::invalid_argument("causal_conv1d: initial_slot must be I32");
     }
 
     const std::int64_t n = numel_allow_zero(x, "x");
     (void) numel_allow_zero(weight, "weight");
     (void) numel_allow_zero(conv_states, "conv_states");
+    (void) numel_allow_zero(initial_slot, "initial_slot");
     (void) numel_allow_zero(out, "out");
 
     require_x_shape(x);
     if (x.ne[1] <= 0) { throw std::invalid_argument("causal_conv1d: snapshot T must be positive"); }
     require_weight_shape(weight, x.ne[0]);
     require_snapshot_state_shape(conv_states, x.ne[0], x.ne[1]);
+    require_initial_slot_shape(initial_slot);
     require_out_shape(x, out);
     if (n == 0) { return; }
 
     require_non_empty_accessible(x, weight, conv_states, out);
-    detail::causal_conv1d_sequence_snapshot_launch(x, weight, conv_states, out, stream);
+    require_initial_slot_accessible(initial_slot);
+    detail::causal_conv1d_sequence_snapshot_launch(x, weight, conv_states, initial_slot, out,
+                                                   stream);
 }
 
 } // namespace qus::kernels

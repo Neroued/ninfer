@@ -14,6 +14,7 @@ void causal_conv1d_prefill(const Tensor& x, const Tensor& weight, Tensor& conv_s
 void causal_conv1d_decode(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
                           cudaStream_t stream);
 void causal_conv1d_sequence_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                     Tensor& out, cudaStream_t stream);
+                                     const Tensor& initial_slot, Tensor& out,
+                                     cudaStream_t stream);
 
 } // namespace qus::kernels

@@ -60,14 +60,15 @@ prefill 结束时的全局状态：
 
 ```text
 L = P;  t0 = argmax(target logits);  drafts = d1..dk
-target KV/GDN 覆盖 0..P-1;  MTP KV 覆盖 0..P-1（另有 AR step 写入的 P..P+k-2 draft 条目）
+target KV/GDN 覆盖 0..P-1；`gdn_initial_slot=0`；MTP KV 覆盖 0..P-1
+（另有 AR step 写入的 P..P+k-2 draft 条目）
 ```
 
 ---
 
 ## 2. Decode round
 
-每轮四个阶段严格按序：verify → accept/commit → propose(shifted) → propose(AR)。
+每轮四个阶段严格按序：verify → accept/selector-update → propose(shifted) → propose(AR)。
 所有 kernel 形状只依赖 `k`；`a` 只以 device 标量形式参与索引。
 
 ### 2.1 verify
@@ -86,7 +87,7 @@ target forward，`T = T_v = k+1`：
   物理写 target KV @ `L..L+k`，行 `j` 的注意力窗口为 `0..L+j`（fill-then-attend +
   窗口内因果 mask）。
 - 48 个 GDN 层：conv sequence + gated delta recurrent 的 **snapshot 变体**：
-  `state_in = slot[0]`（committed），逐 token 处理并把 after-token-j 状态写入
+  `state_in = slot[gdn_initial_slot]`，逐 token 处理并把 after-token-j 状态写入
   `slot[j]`（详见 state-management §4/§5）。数学与现有逐 token decode 完全一致
   （同一 recurrent kernel 的串行 token 循环）。
 - MLP/norm 与 prefill 同构，T 维放宽到 `k+1`。
@@ -94,7 +95,7 @@ target forward，`T = T_v = k+1`：
   hidden 缓冲），lm_head → `logits[248320,k+1]`，逐列 argmax →
   `target_tokens[k+1]`，其中 `target_tokens[i] = g_i`。
 
-### 2.2 accept + commit
+### 2.2 accept + selector update
 
 单个小 kernel（"accept kernel"）完成判定与标量更新：
 
@@ -122,14 +123,14 @@ propose 读到已更新的值，约定两个 device 标量：`window_base`（ver
 1. **target KV**：逻辑回退 `pos := L+a+1`。物理数据不动；下一轮窗口
    `L'..L'+k` 覆盖 stale 条目。attention 算子的窗口边界一律由 device 位置标量
    推导，host 侧 `kv_.pos` 仅在每轮回读后同步，用于容量检查。
-2. **GDN**：commit-copy kernel，48 层 `ssm slot[a] → slot[0]`、
-   `conv slot[a] → slot[0]`（`a==0` 时退化为自拷贝或跳过）。
+2. **GDN**：device 小 kernel 写 `gdn_initial_slot := a`。下一次 verify 或
+   MTP-enabled fallback decode 由 conv/ssm kernel 自行按 selector 读取初始槽位。
 3. **MTP KV**：逻辑回退到 `L+a+1`（与 target KV 同语义；物理覆盖由下一轮
    shifted pass 保证，见 §2.3 与总领 C4）。
 4. 统计计数器累加（§4）。
 
-顺序约束：commit-copy 必须在本轮 GDN snapshot 写全部完成后、下一轮 verify 的
-GDN 读之前执行；放在 accept kernel 之后、propose 之前即可（propose 不触碰 GDN）。
+顺序约束：selector update 必须在本轮 GDN snapshot 写全部完成后、下一次 GDN 读之前
+执行；放在 accept kernel 之后、propose 之前即可（propose 不触碰 GDN）。
 
 ### 2.3 propose — shifted pass（固定 T = k+1）
 
@@ -193,7 +194,8 @@ drafts[i] = argmax(lm_head(m));  ar_hidden = m;  ar_pos += 1
 
 1. **容量守卫**：仅当 `L + 2k ≤ max_ctx` 时运行 MTP round（轮内最远触及位置
    `max(L+k, L+a+k-1) ≤ L+2k-1`，再留下一轮窗口余量由下轮自身判断）。否则回退
-   到现有 T=1 decode 步直至结束。
+   到 T=1 decode 步直至结束。若 MTP 已启用，回退 decode 的 GDN conv/ssm 从
+   `gdn_initial_slot` 读取初始状态，写 after-token 状态到 slot 0，然后重置 selector。
 2. **禁止事项**：round 循环内不得调用 `Engine::prefill`（它会 reset KV/GDN）；
    不得在轮中途以 host 分支改变 kernel 序列形状（违反总领 C5）。
 
@@ -240,7 +242,7 @@ implementation-requirements §7）。
 | §2.1 全窗口 logits | `logits_indices` = 每请求窗口末 `num_logits` 行 |
 | §2.2 accept | rejection kernel `temp==0` 分支 + `_insert_resampled`（bonus/replacement） |
 | §2.2 KV 逻辑回退 | `num_computed_tokens += query_len - num_rejected` |
-| §2.2 GDN commit | 下一步 kernel 按 `num_accepted_tokens` 选 slot（qus 改为显式 copy） |
+| §2.2 GDN selector | 下一步 kernel 按 `num_accepted_tokens` 选 slot |
 | §2.3 shifted pass | `prepare_prefill_inputs`（shift-left、last_sampled、positions 照抄、junk padding） |
 | §2.4 AR steps | `prepare_decode_inputs` / `update_draft_inputs` / `_multi_step_decode` |
 | §1.2 chunk 级 shifted pass | chunked prefill 时 drafter 用 `next_prefill_tokens` 收尾 |

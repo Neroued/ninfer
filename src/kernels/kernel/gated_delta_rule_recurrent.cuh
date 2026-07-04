@@ -136,20 +136,22 @@ __device__ __forceinline__ void gdn_load_qk_lane_bf16(float (&reg)[DQK_PER_LANE]
     }
 }
 
-template <int S>
+template <int HeadDim, bool Spec>
 __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
     gated_delta_rule_recurrent_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const __nv_bfloat16* __restrict__ k,
                                            const __nv_bfloat16* __restrict__ v,
                                            const float* __restrict__ g,
                                            const float* __restrict__ beta,
-                                           float* __restrict__ ssm_state,
+                                           float* __restrict__ ssm_state_or_states,
+                                           const std::int32_t* __restrict__ initial_slot,
                                            __nv_bfloat16* __restrict__ out, std::int64_t T,
-                                           head_map heads, float scale) {
-    constexpr int active_lanes  = (S < WARP_SIZE) ? S : WARP_SIZE;
-    constexpr int d_qk_per_lane = S / active_lanes;
-    static_assert(S % active_lanes == 0, "S must be a multiple of active_lanes");
-    static_assert(S % kGdnBlockDv == 0, "S must be a multiple of kGdnBlockDv");
+                                           head_map heads, float scale,
+                                           std::int64_t state_slot_stride, std::int32_t slots) {
+    constexpr int active_lanes  = (HeadDim < WARP_SIZE) ? HeadDim : WARP_SIZE;
+    constexpr int d_qk_per_lane = HeadDim / active_lanes;
+    static_assert(HeadDim % active_lanes == 0, "HeadDim must be a multiple of active_lanes");
+    static_assert(HeadDim % kGdnBlockDv == 0, "HeadDim must be a multiple of kGdnBlockDv");
 
     const int lane           = threadIdx.x;
     const int warp_id        = threadIdx.y;
@@ -160,21 +162,28 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
         static_cast<std::uint32_t>(blockIdx.z * kGdnBlockDv + warp_id * kGdnDvPerWarp);
     const std::uint32_t dqk_base = static_cast<std::uint32_t>(lane * d_qk_per_lane);
 
-    float* state_h = ssm_state + static_cast<std::int64_t>(h_v) * S * S;
+    float* state_base = ssm_state_or_states;
+    if constexpr (Spec) {
+        const std::int32_t slot = *initial_slot;
+        const std::int32_t safe_slot = (slot >= 0 && slot < slots) ? slot : 0;
+        state_base = ssm_state_or_states + static_cast<std::int64_t>(safe_slot) * state_slot_stride;
+    }
+    float* state_h = state_base + static_cast<std::int64_t>(h_v) * HeadDim * HeadDim;
 
     __align__(16) float s_tile[kGdnDvPerWarp][d_qk_per_lane];
 #pragma unroll
     for (int r = 0; r < kGdnDvPerWarp; ++r) {
-        gdn_load_qk_lane<S, d_qk_per_lane, active_lanes>(
-            s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * S, lane, dqk_base);
+        gdn_load_qk_lane<HeadDim, d_qk_per_lane, active_lanes>(
+            s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * HeadDim, lane,
+            dqk_base);
     }
 
     __align__(16) float k_reg[d_qk_per_lane];
-    gdn_load_qk_lane_bf16<S, d_qk_per_lane, active_lanes>(
-        k_reg, k + static_cast<std::int64_t>(h_qk) * S, lane, dqk_base);
+    gdn_load_qk_lane_bf16<HeadDim, d_qk_per_lane, active_lanes>(
+        k_reg, k + static_cast<std::int64_t>(h_qk) * HeadDim, lane, dqk_base);
 
     for (std::int64_t t = 0; t < T; ++t) {
-        const __nv_bfloat16* v_t = v + (t * heads.H_v + h_v) * S;
+        const __nv_bfloat16* v_t = v + (t * heads.H_v + h_v) * HeadDim;
         const std::int64_t gb_off = t * heads.H_v + h_v;
         const float beta_val      = beta[gb_off];
         const float alpha         = expf(g[gb_off]);
@@ -199,13 +208,13 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
         }
 
         if (t + 1 < T) {
-            gdn_load_qk_lane_bf16<S, d_qk_per_lane, active_lanes>(
-                k_reg, k + ((t + 1) * heads.H_qk + h_qk) * S, lane, dqk_base);
+            gdn_load_qk_lane_bf16<HeadDim, d_qk_per_lane, active_lanes>(
+                k_reg, k + ((t + 1) * heads.H_qk + h_qk) * HeadDim, lane, dqk_base);
         }
 
         __align__(16) float q_reg[d_qk_per_lane];
-        gdn_load_qk_lane_bf16<S, d_qk_per_lane, active_lanes>(
-            q_reg, q + (t * heads.H_qk + h_qk) * S, lane, dqk_base);
+        gdn_load_qk_lane_bf16<HeadDim, d_qk_per_lane, active_lanes>(
+            q_reg, q + (t * heads.H_qk + h_qk) * HeadDim, lane, dqk_base);
 
         float attn_val = 0.0f;
 #pragma unroll
@@ -218,114 +227,27 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
         }
 
         if (lane < kGdnDvPerWarp) {
-            out[(t * heads.H_v + h_v) * S + dv_base + lane] =
+            out[(t * heads.H_v + h_v) * HeadDim + dv_base + lane] =
                 __float2bfloat16(attn_val * scale);
         }
-    }
 
+        if constexpr (Spec) {
+            float* snapshot_h = ssm_state_or_states + t * state_slot_stride +
+                                static_cast<std::int64_t>(h_v) * HeadDim * HeadDim;
 #pragma unroll
-    for (int r = 0; r < kGdnDvPerWarp; ++r) {
-        gdn_store_qk_lane<S, d_qk_per_lane, active_lanes>(
-            s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * S, lane, dqk_base);
-    }
-}
-
-template <int S>
-__global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
-    gated_delta_rule_recurrent_snapshot_bf16_kernel(const __nv_bfloat16* __restrict__ q,
-                                                    const __nv_bfloat16* __restrict__ k,
-                                                    const __nv_bfloat16* __restrict__ v,
-                                                    const float* __restrict__ g,
-                                                    const float* __restrict__ beta,
-                                                    float* __restrict__ ssm_states,
-                                                    __nv_bfloat16* __restrict__ out,
-                                                    std::int64_t T, head_map heads,
-                                                    float scale) {
-    constexpr int active_lanes  = (S < WARP_SIZE) ? S : WARP_SIZE;
-    constexpr int d_qk_per_lane = S / active_lanes;
-    static_assert(S % active_lanes == 0, "S must be a multiple of active_lanes");
-    static_assert(S % kGdnBlockDv == 0, "S must be a multiple of kGdnBlockDv");
-
-    const int lane           = threadIdx.x;
-    const int warp_id        = threadIdx.y;
-    const std::uint32_t h_v  = static_cast<std::uint32_t>(heads.cta_h_v(blockIdx.x));
-    const std::uint32_t h_qk = static_cast<std::uint32_t>(heads.qk_head(static_cast<int>(h_v)));
-
-    const std::uint32_t dv_base =
-        static_cast<std::uint32_t>(blockIdx.z * kGdnBlockDv + warp_id * kGdnDvPerWarp);
-    const std::uint32_t dqk_base = static_cast<std::uint32_t>(lane * d_qk_per_lane);
-    const std::int64_t state_slot_stride =
-        static_cast<std::int64_t>(heads.H_v) * static_cast<std::int64_t>(S) *
-        static_cast<std::int64_t>(S);
-
-    float* state_h = ssm_states + static_cast<std::int64_t>(h_v) * S * S;
-
-    __align__(16) float s_tile[kGdnDvPerWarp][d_qk_per_lane];
-#pragma unroll
-    for (int r = 0; r < kGdnDvPerWarp; ++r) {
-        gdn_load_qk_lane<S, d_qk_per_lane, active_lanes>(
-            s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * S, lane, dqk_base);
-    }
-
-    __align__(16) float k_reg[d_qk_per_lane];
-    gdn_load_qk_lane_bf16<S, d_qk_per_lane, active_lanes>(
-        k_reg, k + static_cast<std::int64_t>(h_qk) * S, lane, dqk_base);
-
-    for (std::int64_t t = 0; t < T; ++t) {
-        const __nv_bfloat16* v_t = v + (t * heads.H_v + h_v) * S;
-        const std::int64_t gb_off = t * heads.H_v + h_v;
-        const float beta_val      = beta[gb_off];
-        const float alpha         = expf(g[gb_off]);
-
-        float v_local = 0.0f;
-        if (lane < kGdnDvPerWarp) { v_local = __bfloat162float(v_t[dv_base + lane]); }
-
-#pragma unroll
-        for (int r = 0; r < kGdnDvPerWarp; ++r) {
-            float partial = 0.0f;
-#pragma unroll
-            for (int c = 0; c < d_qk_per_lane; ++c) { partial += s_tile[r][c] * k_reg[c]; }
-            partial = warp_reduce_sum<WARP_SIZE>(partial);
-
-            const float v_r   = __shfl_sync(0xffffffff, v_local, r, WARP_SIZE);
-            const float delta = beta_val * (v_r - alpha * partial);
-
-#pragma unroll
-            for (int c = 0; c < d_qk_per_lane; ++c) {
-                s_tile[r][c] = alpha * s_tile[r][c] + delta * k_reg[c];
+            for (int r = 0; r < kGdnDvPerWarp; ++r) {
+                gdn_store_qk_lane<HeadDim, d_qk_per_lane, active_lanes>(
+                    s_tile[r], snapshot_h + static_cast<std::int64_t>(dv_base + r) * HeadDim,
+                    lane, dqk_base);
             }
         }
+    }
 
-        if (t + 1 < T) {
-            gdn_load_qk_lane_bf16<S, d_qk_per_lane, active_lanes>(
-                k_reg, k + ((t + 1) * heads.H_qk + h_qk) * S, lane, dqk_base);
-        }
-
-        __align__(16) float q_reg[d_qk_per_lane];
-        gdn_load_qk_lane_bf16<S, d_qk_per_lane, active_lanes>(
-            q_reg, q + (t * heads.H_qk + h_qk) * S, lane, dqk_base);
-
-        float attn_val = 0.0f;
+    if constexpr (!Spec) {
 #pragma unroll
         for (int r = 0; r < kGdnDvPerWarp; ++r) {
-            float partial = 0.0f;
-#pragma unroll
-            for (int c = 0; c < d_qk_per_lane; ++c) { partial += s_tile[r][c] * q_reg[c]; }
-            partial = warp_reduce_sum<WARP_SIZE>(partial);
-            if (lane == r) { attn_val = partial; }
-        }
-
-        if (lane < kGdnDvPerWarp) {
-            out[(t * heads.H_v + h_v) * S + dv_base + lane] =
-                __float2bfloat16(attn_val * scale);
-        }
-
-        float* snapshot_h = ssm_states + t * state_slot_stride +
-                            static_cast<std::int64_t>(h_v) * S * S;
-#pragma unroll
-        for (int r = 0; r < kGdnDvPerWarp; ++r) {
-            gdn_store_qk_lane<S, d_qk_per_lane, active_lanes>(
-                s_tile[r], snapshot_h + static_cast<std::int64_t>(dv_base + r) * S, lane,
+            gdn_store_qk_lane<HeadDim, d_qk_per_lane, active_lanes>(
+                s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * HeadDim, lane,
                 dqk_base);
         }
     }

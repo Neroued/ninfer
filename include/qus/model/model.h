@@ -89,6 +89,7 @@ struct StepState {
     Tensor positions;
     Tensor window_base;
     Tensor accepted;
+    Tensor gdn_initial_slot;
     Tensor ar_pos;
     Tensor mtp_ar_hidden;
     Tensor stats;

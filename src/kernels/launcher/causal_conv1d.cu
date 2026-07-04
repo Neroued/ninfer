@@ -81,17 +81,21 @@ void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, Tensor& 
 }
 
 void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weight,
-                                            Tensor& conv_states, Tensor& out,
-                                            cudaStream_t stream) {
+                                            Tensor& conv_states, const Tensor& initial_slot,
+                                            Tensor& out, cudaStream_t stream) {
     constexpr int kBlock = 256;
     const std::int32_t C = x.ne[0];
     const std::int32_t T = x.ne[1];
+    const std::int32_t slots = conv_states.ne[2];
+    const std::int64_t slot_stride =
+        static_cast<std::int64_t>(conv_states.ne[0]) * static_cast<std::int64_t>(conv_states.ne[1]);
 
     causal_conv1d_sequence_snapshot_kernel<<<grid_for(C, kBlock, "sequence snapshot"), kBlock, 0,
                                              stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-        static_cast<__nv_bfloat16*>(conv_states.data), static_cast<__nv_bfloat16*>(out.data), C,
-        T);
+        static_cast<__nv_bfloat16*>(conv_states.data),
+        static_cast<const std::int32_t*>(initial_slot.data), static_cast<__nv_bfloat16*>(out.data),
+        C, T, slots, slot_stride);
     CUDA_CHECK(cudaGetLastError());
 }
 

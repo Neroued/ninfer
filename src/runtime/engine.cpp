@@ -1,6 +1,5 @@
 #include "qus/runtime/engine.h"
 
-#include "qus/kernels/gdn_commit.h"
 #include "qus/kernels/mtp_round.h"
 #include "qus/model/config.h"
 
@@ -178,6 +177,8 @@ std::size_t default_cache_bytes_for(std::uint32_t max_ctx, int draft_tokens,
                            "cache arena size");
     io_bytes = checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"),
                            "cache arena size");
+    io_bytes = checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"),
+                           "cache arena size");
     io_bytes = checked_add(io_bytes, token_matrix_bytes(model::kCfg.hidden, 1, DType::BF16,
                                                         "cache arena size"),
                            "cache arena size");
@@ -190,7 +191,7 @@ std::size_t default_cache_bytes_for(std::uint32_t max_ctx, int draft_tokens,
     total             = checked_add(total, conv_bytes, "cache arena size");
     total             = checked_add(total, ssm_bytes, "cache arena size");
     total             = checked_add(total, io_bytes, "cache arena size");
-    total = checked_add(total, align_slack(kv_layers * 2 + model::kCfg.n_gdn() * 2 + 17),
+    total = checked_add(total, align_slack(kv_layers * 2 + model::kCfg.n_gdn() * 2 + 18),
                         "cache arena size");
     return checked_add(total, 64ULL * kMiB, "cache arena size");
 }
@@ -504,12 +505,15 @@ void Engine::load(const std::string& path) {
         cache_arena_->alloc(DType::I32, {1}),
         cache_arena_->alloc(DType::I32, {1}),
         cache_arena_->alloc(DType::I32, {1}),
+        cache_arena_->alloc(DType::I32, {1}),
         cache_arena_->alloc(DType::BF16, {model::kCfg.hidden, 1}),
         cache_arena_->alloc(DType::I64, {model::kStepStatsCounters}),
     };
     CUDA_CHECK(cudaMemsetAsync(io_.num_sampled.data, 0, io_.num_sampled.bytes(), ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.window_base.data, 0, io_.window_base.bytes(), ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.accepted.data, 0, io_.accepted.bytes(), ctx_->stream));
+    CUDA_CHECK(cudaMemsetAsync(io_.gdn_initial_slot.data, 0, io_.gdn_initial_slot.bytes(),
+                               ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.ar_pos.data, 0, io_.ar_pos.bytes(), ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.stats.data, 0, io_.stats.bytes(), ctx_->stream));
     card_.emplace(*ctx_, *weights_, *work_, *kv_, *state_, io_, options_.prefill_chunk,
@@ -613,6 +617,7 @@ int Engine::prefill(std::span<const int> ids) {
     if (mtp_kv_) { mtp_kv_->reset(); }
     pending_sampled_.clear();
     state_->reset(ctx_->stream);
+    kernels::mtp_reset_gdn_initial_slot(io_.gdn_initial_slot, ctx_->stream);
     card_->prefill(ids);
     return read_token();
 }
@@ -634,14 +639,9 @@ int Engine::decode_step_one() {
     kv_->advance();
     if (options_.mtp_draft_tokens > 0) {
         kernels::mtp_count_fallback_step(io_.stats, ctx_->stream);
+        kernels::mtp_reset_gdn_initial_slot(io_.gdn_initial_slot, ctx_->stream);
     }
     return read_token();
-}
-
-void Engine::commit_gdn_snapshots() {
-    for (std::size_t i = 0; i < state_->conv.size(); ++i) {
-        kernels::gdn_commit(state_->conv[i], state_->ssm[i], io_.accepted, ctx_->stream);
-    }
 }
 
 void Engine::propose_mtp_after_accept(std::uint32_t host_window_base, int host_length, int k) {
@@ -688,11 +688,12 @@ std::vector<int> Engine::decode_round() {
     kernels::mtp_accept_tokens(io_.target_tokens, io_.drafts, io_.pos, io_.token,
                                io_.sampled_out, io_.num_sampled, io_.accepted, io_.ar_pos,
                                io_.stats, ctx_->stream);
+    kernels::mtp_set_gdn_initial_slot_from_accepted(io_.accepted, io_.gdn_initial_slot,
+                                                    ctx_->stream);
 
     const int host_length = read_i32_scalar(&model::StepState::pos);
     kv_->pos             = static_cast<std::uint32_t>(host_length);
     mtp_kv_->pos         = static_cast<std::uint32_t>(host_length);
-    commit_gdn_snapshots();
 
     propose_mtp_after_accept(host_window_base, host_length, k);
     return read_sampled_tokens();

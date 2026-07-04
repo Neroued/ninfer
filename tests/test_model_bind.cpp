@@ -162,9 +162,13 @@ int main() {
                         qus::model::kCfg.gdn_v_dim, qus::model::kCfg.gdn_k_dim);
     qus::KVCache mtp_kv(cache_arena, qus::model::kCfg.mtp_layers, 1, qus::model::kCfg.n_kv,
                         qus::model::kCfg.head_dim);
-    qus::model::StepState io{io_arena.alloc(qus::DType::I32, {1}),
-                             io_arena.alloc(qus::DType::I32, {1}),
-                             io_arena.alloc(qus::DType::BF16, {qus::model::kCfg.vocab})};
+    qus::model::StepState io{};
+    io.token            = io_arena.alloc(qus::DType::I32, {1});
+    io.pos              = io_arena.alloc(qus::DType::I32, {1});
+    io.logits           = io_arena.alloc(qus::DType::BF16, {qus::model::kCfg.vocab});
+    io.gdn_initial_slot = io_arena.alloc(qus::DType::I32, {1});
+    CUDA_CHECK(cudaMemsetAsync(io.gdn_initial_slot.data, 0, io.gdn_initial_slot.bytes(),
+                               ctx.stream));
     qus::model::Qwen3_6_27B card(ctx, store, workspace, kv, state, io, 512, &mtp_kv);
 
     failures += expect_weight(card.embed(), qus::SourceKind::Embed, qus::kQ5090NoLayer,

@@ -31,6 +31,8 @@ struct GdnState {
              DType conv_dtype = DType::BF16);
 
     std::uint32_t layer_count() const noexcept;
+    std::int64_t conv_slot_stride_elements() const noexcept;
+    std::int64_t ssm_slot_stride_elements() const noexcept;
     Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
     Tensor ssm_slot(std::uint32_t layer, std::int32_t slot) const;
     void reset(cudaStream_t stream = nullptr);

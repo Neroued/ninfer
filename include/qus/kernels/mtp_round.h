@@ -26,4 +26,9 @@ void mtp_increment_i32(Tensor& scalar, cudaStream_t stream);
 
 void mtp_count_fallback_step(Tensor& stats, cudaStream_t stream);
 
+void mtp_reset_gdn_initial_slot(Tensor& gdn_initial_slot, cudaStream_t stream);
+
+void mtp_set_gdn_initial_slot_from_accepted(const Tensor& accepted, Tensor& gdn_initial_slot,
+                                            cudaStream_t stream);
+
 } // namespace qus::kernels

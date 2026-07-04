@@ -726,8 +726,14 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         kernels::gdn_in_vz_decode(h, *w.in_v, *w.in_z, v_out, z_flat, s);
 
         Tensor qkv_c     = work_.alloc(DType::BF16, {kCfg.conv_dim, 1});
-        Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
-        kernels::causal_conv1d_decode(qkv, *w.conv1d, conv_state, qkv_c, s);
+        if (mtp_enabled()) {
+            Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
+            kernels::causal_conv1d_sequence_snapshot(qkv, *w.conv1d, conv_states,
+                                                     io_.gdn_initial_slot, qkv_c, s);
+        } else {
+            Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
+            kernels::causal_conv1d_decode(qkv, *w.conv1d, conv_state, qkv_c, s);
+        }
 
         Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, 1});
         Tensor beta = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, 1});
@@ -744,8 +750,15 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
         Tensor vv        = vc.view({kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
         Tensor o         = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
-        Tensor ssm_state = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
-        kernels::gated_delta_rule_recurrent(qn, kn, vv, g, beta, kGdnScale, work_, ssm_state, o, s);
+        if (mtp_enabled()) {
+            Tensor& ssm_states = state_.ssm.at(static_cast<std::size_t>(gidx));
+            kernels::gated_delta_rule_recurrent_snapshot(qn, kn, vv, g, beta, kGdnScale, work_,
+                                                         ssm_states, io_.gdn_initial_slot, o, s);
+        } else {
+            Tensor ssm_state = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
+            kernels::gated_delta_rule_recurrent(qn, kn, vv, g, beta, kGdnScale, work_, ssm_state,
+                                                o, s);
+        }
 
         Tensor on = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, 1});
         kernels::rmsnorm(o, *w.gdn_norm, kCfg.rms_eps, false, &z, on, s);
@@ -769,7 +782,8 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor qkv_c = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
     if (ph == Phase::Verify) {
         Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
-        kernels::causal_conv1d_sequence_snapshot(qkv, *w.conv1d, conv_states, qkv_c, s);
+        kernels::causal_conv1d_sequence_snapshot(qkv, *w.conv1d, conv_states,
+                                                 io_.gdn_initial_slot, qkv_c, s);
     } else {
         Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
         kernels::causal_conv1d_prefill(qkv, *w.conv1d, conv_state, qkv_c, s);
@@ -796,7 +810,7 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     if (ph == Phase::Verify) {
         Tensor& ssm_states = state_.ssm.at(static_cast<std::size_t>(gidx));
         kernels::gated_delta_rule_recurrent_snapshot(qn, kn, vv, g, beta, kGdnScale, work_,
-                                                     ssm_states, o, s);
+                                                     ssm_states, io_.gdn_initial_slot, o, s);
     } else {
         Tensor ssm_state = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
         kernels::gated_delta_rule_chunked(qn, kn, vv, g, beta, kGdnScale, 64, work_, ssm_state, o,

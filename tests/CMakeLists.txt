@@ -27,6 +27,12 @@ qus_add_test(qus_weight_store_real_file_test SOURCES test_weight_store_real.cpp 
 qus_add_test(qus_engine_real_file_test       SOURCES test_engine_real_file.cpp   NEEDS_SOURCE_DIR)
 qus_add_test(qus_engine_mtp_e2e_test
              SOURCES test_engine_mtp_e2e.cpp NEEDS_SOURCE_DIR)
+add_test(NAME qus_engine_mtp_e2e_test_capacity_fallback
+         COMMAND qus_engine_mtp_e2e_test capacity_fallback)
+add_test(NAME qus_engine_mtp_e2e_test_fallback_after_accept
+         COMMAND qus_engine_mtp_e2e_test fallback_after_accept)
+add_test(NAME qus_engine_mtp_e2e_test_stop_truncation
+         COMMAND qus_engine_mtp_e2e_test stop_truncation)
 qus_add_test(qus_model_config_test           SOURCES test_model_config.cpp)
 qus_add_test(qus_model_bind_test             SOURCES test_model_bind.cpp        NEEDS_SOURCE_DIR)
 qus_add_test(qus_model_blocks_test           SOURCES test_model_blocks.cpp      NEEDS_SOURCE_DIR)
@@ -71,7 +77,6 @@ qus_add_test(qus_gdn_gating_test SOURCES kernels/test_gdn_gating.cpp)
 qus_add_test(qus_gdn_in_ab_prefill_test SOURCES kernels/test_gdn_in_ab_prefill.cpp)
 qus_add_test(qus_gated_delta_rule_test SOURCES kernels/test_gated_delta_rule.cpp)
 qus_add_test(qus_causal_conv1d_test SOURCES kernels/test_causal_conv1d.cpp)
-qus_add_test(qus_gdn_commit_test SOURCES kernels/test_gdn_commit.cpp)
 qus_add_test(qus_rope_test SOURCES kernels/test_rope.cpp)
 qus_add_test(qus_gqa_attention_test SOURCES kernels/test_gqa_attention.cpp)
 qus_add_test(qus_embed_gather_test SOURCES kernels/test_embed_gather.cpp)

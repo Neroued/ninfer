@@ -144,18 +144,23 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
 __global__ void causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x,
                                                        const __nv_bfloat16* weight,
                                                        __nv_bfloat16* conv_states,
+                                                       const std::int32_t* initial_slot,
                                                        __nv_bfloat16* out, std::int32_t C,
-                                                       std::int32_t T) {
+                                                       std::int32_t T, std::int32_t slots,
+                                                       std::int64_t slot_stride) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);
-    const std::int64_t slot_stride = C64 * 3;
+    const std::int32_t slot = *initial_slot;
+    const std::int32_t safe_slot = (slot >= 0 && slot < slots) ? slot : 0;
+    const __nv_bfloat16* init =
+        conv_states + static_cast<std::int64_t>(safe_slot) * slot_stride;
 
     for (std::int64_t c64 = start; c64 < C64; c64 += stride) {
         const std::int32_t c = static_cast<std::int32_t>(c64);
-        __nv_bfloat16 s0     = conv_states[c64];
-        __nv_bfloat16 s1     = conv_states[C64 + c64];
-        __nv_bfloat16 s2     = conv_states[2 * C64 + c64];
+        __nv_bfloat16 s0     = init[c64];
+        __nv_bfloat16 s1     = init[C64 + c64];
+        __nv_bfloat16 s2     = init[2 * C64 + c64];
 
         for (std::int32_t t = 0; t < T; ++t) {
             const std::int64_t out_idx = static_cast<std::int64_t>(t) * C64 + c64;

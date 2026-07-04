@@ -224,13 +224,15 @@ static int snapshot_chain_equivalence(std::uint32_t seed, std::int32_t T, float 
     std::copy(state.begin(), state.end(), snapshot_state.begin());
 
     DBuf dx_snapshot = to_device_bf16(x), dw_snapshot = to_device_bf16(weight),
-         dstates_snapshot = to_device_bf16(snapshot_state), dout_snapshot(n * 2);
+         dstates_snapshot = to_device_bf16(snapshot_state), dout_snapshot(n * 2),
+         dinitial_slot = to_device_i32({0});
     Tensor tx_snapshot(dx_snapshot.p, DType::BF16, {C, T});
     Tensor tw_snapshot(dw_snapshot.p, DType::BF16, {C, 4});
     Tensor ts_snapshot(dstates_snapshot.p, DType::BF16, {C, 3, T});
+    Tensor tinitial_slot(dinitial_slot.p, DType::I32, {1});
     Tensor tout_snapshot(dout_snapshot.p, DType::BF16, {C, T});
-    kernels::causal_conv1d_sequence_snapshot(tx_snapshot, tw_snapshot, ts_snapshot, tout_snapshot,
-                                             nullptr);
+    kernels::causal_conv1d_sequence_snapshot(tx_snapshot, tw_snapshot, ts_snapshot, tinitial_slot,
+                                             tout_snapshot, nullptr);
     cudaDeviceSynchronize();
 
     DBuf dx_decode = to_device_bf16(x), dw_decode = to_device_bf16(weight),
@@ -260,6 +262,76 @@ static int snapshot_chain_equivalence(std::uint32_t seed, std::int32_t T, float 
                           from_device_u16(dout_decode.p, n));
     f += verify_u16_equal((tag + " state slot bits").c_str(),
                           from_device_u16(dstates_snapshot.p, state_n * static_cast<std::size_t>(T)),
+                          expected_slots);
+    return f;
+}
+
+static int selected_slot_snapshot_equivalence(std::uint32_t seed, std::int32_t T,
+                                              std::int32_t initial_slot) {
+    constexpr std::int32_t C     = 10240;
+    constexpr std::int32_t Slots = 6;
+    const std::size_t n          = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
+    const std::size_t state_n    = static_cast<std::size_t>(C) * 3u;
+    const std::size_t weight_n   = static_cast<std::size_t>(C) * 4u;
+
+    std::vector<float> x(n), weight(weight_n), state(state_n);
+    fill_uniform(x, seed, -8.f, 8.f);
+    fill_uniform(weight, seed + 1000u, -8.f, 8.f);
+    fill_uniform(state, seed + 2000u, -8.f, 8.f);
+    round_to_bf16(x);
+    round_to_bf16(weight);
+    round_to_bf16(state);
+
+    std::vector<float> snapshot_state(state_n * Slots, 17.0f);
+    for (std::size_t i = 0; i < snapshot_state.size(); ++i) {
+        snapshot_state[i] = bf16_to_f32(f32_to_bf16(snapshot_state[i]));
+    }
+    std::copy(state.begin(), state.end(),
+              snapshot_state.begin() + static_cast<std::size_t>(initial_slot) * state_n);
+
+    DBuf dx_snapshot = to_device_bf16(x), dw_snapshot = to_device_bf16(weight),
+         dstates_snapshot = to_device_bf16(snapshot_state), dout_snapshot(n * 2),
+         dinitial_slot = to_device_i32({initial_slot});
+    Tensor tx_snapshot(dx_snapshot.p, DType::BF16, {C, T});
+    Tensor tw_snapshot(dw_snapshot.p, DType::BF16, {C, 4});
+    Tensor ts_snapshot(dstates_snapshot.p, DType::BF16, {C, 3, Slots});
+    Tensor tinitial_slot(dinitial_slot.p, DType::I32, {1});
+    Tensor tout_snapshot(dout_snapshot.p, DType::BF16, {C, T});
+    kernels::causal_conv1d_sequence_snapshot(tx_snapshot, tw_snapshot, ts_snapshot, tinitial_slot,
+                                             tout_snapshot, nullptr);
+    cudaDeviceSynchronize();
+
+    DBuf dx_decode = to_device_bf16(x), dw_decode = to_device_bf16(weight),
+         dstate_decode = to_device_bf16(state), dout_decode(n * 2);
+    Tensor tw_decode(dw_decode.p, DType::BF16, {C, 4});
+    Tensor ts_decode(dstate_decode.p, DType::BF16, {C, 3});
+
+    std::vector<std::uint16_t> expected_slots(snapshot_state.size());
+    for (std::size_t i = 0; i < snapshot_state.size(); ++i) {
+        expected_slots[i] = f32_to_bf16(snapshot_state[i]);
+    }
+    for (std::int32_t t = 0; t < T; ++t) {
+        auto* x_step = static_cast<unsigned char*>(dx_decode.p) +
+                       static_cast<std::size_t>(t) * static_cast<std::size_t>(C) * 2u;
+        Tensor tx_step(x_step, DType::BF16, {C, 1});
+        auto* out_step = static_cast<unsigned char*>(dout_decode.p) +
+                         static_cast<std::size_t>(t) * static_cast<std::size_t>(C) * 2u;
+        Tensor tout_step(out_step, DType::BF16, {C, 1});
+        kernels::causal_conv1d_decode(tx_step, tw_decode, ts_decode, tout_step, nullptr);
+        cudaDeviceSynchronize();
+        const auto state_bits = from_device_u16(dstate_decode.p, state_n);
+        std::memcpy(expected_slots.data() + static_cast<std::size_t>(t) * state_n,
+                    state_bits.data(), state_n * sizeof(std::uint16_t));
+    }
+    cudaDeviceSynchronize();
+
+    const std::string tag = "causal_conv1d selected snapshot slot=" +
+                            std::to_string(initial_slot) + " T=" + std::to_string(T);
+    int f = 0;
+    f += verify_u16_equal((tag + " out bits").c_str(), from_device_u16(dout_snapshot.p, n),
+                          from_device_u16(dout_decode.p, n));
+    f += verify_u16_equal((tag + " slots").c_str(),
+                          from_device_u16(dstates_snapshot.p, expected_slots.size()),
                           expected_slots);
     return f;
 }
@@ -405,7 +477,16 @@ static int validation_checks() {
                         [&] { kernels::causal_conv1d_decode(x, weight, state, out, nullptr); });
     f += expect_invalid("causal_conv1d validation snapshot T exceeds slots", [&] {
         Tensor bad_state(dstate.p, DType::BF16, {C, 3, T - 1});
-        kernels::causal_conv1d_sequence_snapshot(x, weight, bad_state, out, nullptr);
+        DBuf d_initial_slot = to_device_i32({0});
+        Tensor initial_slot(d_initial_slot.p, DType::I32, {1});
+        kernels::causal_conv1d_sequence_snapshot(x, weight, bad_state, initial_slot, out, nullptr);
+    });
+    f += expect_invalid("causal_conv1d validation snapshot initial_slot dtype", [&] {
+        Tensor snapshot_state(dstate.p, DType::BF16, {C, 3, T});
+        DBuf d_initial_slot(sizeof(std::int32_t));
+        Tensor initial_slot(d_initial_slot.p, DType::FP32, {1});
+        kernels::causal_conv1d_sequence_snapshot(x, weight, snapshot_state, initial_slot, out,
+                                                 nullptr);
     });
     f += expect_invalid("causal_conv1d validation contiguous", [&] {
         Tensor bad = out;
@@ -483,6 +564,9 @@ int main() {
         for (std::int32_t T : {1, 2, 3, 4, 5, 6}) {
             f += snapshot_chain_equivalence(seed + 6000u + static_cast<std::uint32_t>(T), T);
         }
+        f += selected_slot_snapshot_equivalence(seed + 7000u, 4, 0);
+        f += selected_slot_snapshot_equivalence(seed + 7100u, 4, 2);
+        f += selected_slot_snapshot_equivalence(seed + 7200u, 5, 5);
     }
     f += prefill_state_carry_equivalence(6061u, 10240, 257, 129);
     f += prefill_state_carry_equivalence(6067u, 10241, 257, 2);

@@ -13,7 +13,7 @@ void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight, Tensor&
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, Tensor& conv_state,
                                  Tensor& out, cudaStream_t stream);
 void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weight,
-                                            Tensor& conv_states, Tensor& out,
-                                            cudaStream_t stream);
+                                            Tensor& conv_states, const Tensor& initial_slot,
+                                            Tensor& out, cudaStream_t stream);
 
 } // namespace qus::kernels::detail

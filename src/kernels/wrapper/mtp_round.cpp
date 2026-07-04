@@ -114,4 +114,18 @@ void mtp_count_fallback_step(Tensor& stats, cudaStream_t stream) {
     detail::mtp_count_fallback_step_launch(stats, stream);
 }
 
+void mtp_reset_gdn_initial_slot(Tensor& gdn_initial_slot, cudaStream_t stream) {
+    constexpr const char* op = "mtp_reset_gdn_initial_slot";
+    require_scalar(gdn_initial_slot, DType::I32, op, "gdn_initial_slot");
+    detail::mtp_reset_gdn_initial_slot_launch(gdn_initial_slot, stream);
+}
+
+void mtp_set_gdn_initial_slot_from_accepted(const Tensor& accepted, Tensor& gdn_initial_slot,
+                                            cudaStream_t stream) {
+    constexpr const char* op = "mtp_set_gdn_initial_slot_from_accepted";
+    require_scalar(accepted, DType::I32, op, "accepted");
+    require_scalar(gdn_initial_slot, DType::I32, op, "gdn_initial_slot");
+    detail::mtp_set_gdn_initial_slot_from_accepted_launch(accepted, gdn_initial_slot, stream);
+}
+
 } // namespace qus::kernels

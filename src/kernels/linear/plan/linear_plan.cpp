@@ -112,10 +112,10 @@ LinearPlan resolve_plan(LinearPlanKey key) {
                           /*uses_tensor_cores=*/false};
     }
     // Dense keeps its reference GEMV/GEMM. Q4/Q5/Q6 low-bit routes by regime:
-    // T1 -> generic GEMV (decode); SmallT -> multi-step GEMV (memory-bound, CUDA
-    // cores); LargeT -> bf16 tensor-core mma GEMM (compute-bound). W8G32 is the
-    // M1 correctness-first exception below: it uses generic GEMV for T1 and the
-    // multi-step GEMM for every T>1 regime until a W8-specific MMA path exists.
+    // registered-shape T1 -> tuned GEMV above; generic T1 and SmallT -> the
+    // small-T streaming GEMM (memory-bound, CUDA cores, weights streamed once
+    // per column tile); LargeT -> bf16 tensor-core mma GEMM (compute-bound).
+    // W8G32 has no MMA path yet, so it uses the small-T GEMM for every regime.
     if (key.format == LinearFormat::DenseBF16 || key.format == LinearFormat::DenseFP32) {
         const bool           gemv   = (key.regime == LinearRegime::T1);
         const LinearPolicyId policy =
@@ -123,29 +123,14 @@ LinearPlan resolve_plan(LinearPlanKey key) {
         return LinearPlan{LinearBackendKind::Reference, policy, policy_name(policy),
                           /*uses_tensor_cores=*/false};
     }
-    if (key.format == LinearFormat::W8G32_RowSplit) {
-        if (key.regime == LinearRegime::T1) {
-            return LinearPlan{LinearBackendKind::Gemv, LinearPolicyId::GenericLowbitGemv,
-                              policy_name(LinearPolicyId::GenericLowbitGemv),
-                              /*uses_tensor_cores=*/false};
-        }
-        return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmMultistep,
-                          policy_name(LinearPolicyId::RowsplitLowbitGemmMultistep),
-                          /*uses_tensor_cores=*/false};
+    if (key.format != LinearFormat::W8G32_RowSplit && key.regime == LinearRegime::LargeT) {
+        return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmMma,
+                          policy_name(LinearPolicyId::RowsplitLowbitGemmMma),
+                          /*uses_tensor_cores=*/true};
     }
-    if (key.regime == LinearRegime::T1) {
-        return LinearPlan{LinearBackendKind::Gemv, LinearPolicyId::GenericLowbitGemv,
-                          policy_name(LinearPolicyId::GenericLowbitGemv),
-                          /*uses_tensor_cores=*/false};
-    }
-    if (key.regime == LinearRegime::SmallT) {
-        return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmMultistep,
-                          policy_name(LinearPolicyId::RowsplitLowbitGemmMultistep),
-                          /*uses_tensor_cores=*/false};
-    }
-    return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmMma,
-                      policy_name(LinearPolicyId::RowsplitLowbitGemmMma),
-                      /*uses_tensor_cores=*/true};
+    return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmSmallt,
+                      policy_name(LinearPolicyId::RowsplitLowbitGemmSmallt),
+                      /*uses_tensor_cores=*/false};
 }
 
 const char* format_name(LinearFormat f) {
@@ -189,9 +174,8 @@ const char* regime_name(LinearRegime r) {
 
 const char* policy_name(LinearPolicyId p) {
     switch (p) {
-    case LinearPolicyId::GenericLowbitGemv: return "linear.ref.lowbit.gemv.generic.v1";
-    case LinearPolicyId::RowsplitLowbitGemmMultistep:
-        return "linear.rowsplit.gemm.multistep.v1";
+    case LinearPolicyId::RowsplitLowbitGemmSmallt:
+        return "linear.rowsplit.gemm.smallt.v1";
     case LinearPolicyId::RowsplitLowbitGemmMma:
         return "linear.rowsplit.gemm.mma.bf16.v1";
     case LinearPolicyId::GenericDenseGemv:  return "linear.ref.dense.gemv.generic.v1";

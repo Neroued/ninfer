@@ -7,13 +7,11 @@
 
 namespace qus::kernels::detail {
 
-// Low-bit (Q4/Q5/Q6): launcher selects the codec by fmt. w carries payload/qdata/qhigh + padded_shape.
-// GEMV is the T==1 (decode) generic path; the multi-step GEMM is the T>1 (prefill)
-// path shared by every low-bit shape (dequant once per K-group, reuse across T).
-void linear_generic_lowbit_gemv_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                       LinearFormat fmt, cudaStream_t stream);
-void linear_rowsplit_gemm_multistep_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                           LinearFormat fmt, cudaStream_t stream);
+// Low-bit (Q4/Q5/Q6/W8G32): launcher selects the codec by fmt. w carries
+// payload/qdata/qhigh + padded_shape. The small-T streaming GEMM is the universal
+// low-bit path outside the tuned T==1 GEMVs and the LargeT tensor-core GEMM.
+void linear_rowsplit_gemm_smallt_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                        LinearFormat fmt, cudaStream_t stream);
 // LargeT (T > tau) tensor-core path: bf16 mma.sync with on-chip low-bit dequant.
 void linear_rowsplit_gemm_mma_launch(const Tensor& x, const Weight& w, Tensor& out,
                                      LinearFormat fmt, cudaStream_t stream);

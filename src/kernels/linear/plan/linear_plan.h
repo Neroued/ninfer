@@ -36,8 +36,7 @@ enum class LinearRegime { T1, SmallT, LargeT };
 enum class LinearBackendKind { Gemv, Gemm, Reference };
 
 enum class LinearPolicyId {
-    GenericLowbitGemv,
-    RowsplitLowbitGemmMultistep,
+    RowsplitLowbitGemmSmallt,
     RowsplitLowbitGemmMma,
     GenericDenseGemv,
     GenericDenseGemm,

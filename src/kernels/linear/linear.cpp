@@ -297,8 +297,8 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
     // The LargeT bf16 tensor-core mma GEMM streams x with 16B cp.async (8 bf16 per
     // token row), which requires k % 8 == 0 (else the per-token base k*col is not
     // 16-byte aligned and the last k%8 elements would be dropped). Every Qwen3.6
-    // shape has k a multiple of 128; for any other k, fall back to the multi-step
-    // GEMV, which is correct for all k.
+    // shape has k a multiple of 128; for any other k, fall back to the small-T
+    // GEMM, which is correct for all k.
     const bool mma_routed_format =
         fmt == detail::LinearFormat::Q4G64_RowSplit ||
         fmt == detail::LinearFormat::Q5G64_RowSplit ||
@@ -309,11 +309,8 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
     const detail::LinearPlan plan = detail::resolve_plan(detail::LinearPlanKey{fmt, shape, regime});
 
     switch (plan.policy) {
-    case detail::LinearPolicyId::GenericLowbitGemv:
-        detail::linear_generic_lowbit_gemv_launch(x, w, out, fmt, stream);
-        break;
-    case detail::LinearPolicyId::RowsplitLowbitGemmMultistep:
-        detail::linear_rowsplit_gemm_multistep_launch(x, w, out, fmt, stream);
+    case detail::LinearPolicyId::RowsplitLowbitGemmSmallt:
+        detail::linear_rowsplit_gemm_smallt_launch(x, w, out, fmt, stream);
         break;
     case detail::LinearPolicyId::RowsplitLowbitGemmMma:
         detail::linear_rowsplit_gemm_mma_launch(x, w, out, fmt, stream);

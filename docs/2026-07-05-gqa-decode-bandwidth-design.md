@@ -221,36 +221,41 @@ Per `docs/l1-op-test-standard.md` and `AGENTS.md` testing policy (no low-value t
   and after (model runner or a targeted harness), confirming the op-level speedup shows up in the hot
   path.
 
-## 6. Execution mode (subagent-driven, per AGENTS.md)
+## 6. Execution mode (direct, sequential)
 
-A coordinator dispatches bounded tasks to fresh subagents (each assigned the strongest available
-model) and integrates/verifies. File ownership and integration points below; shared files
-(`gqa_attention_decode.cuh`, `gqa_attention_decode.cu`, `gqa_attention_bench.cu`, the evidence doc)
-are explicit coordination points and must not be edited by two tasks in parallel.
+Execution is direct and sequential: a single author works the tasks below in order, in one session,
+verifying each before moving on. (`AGENTS.md` requires naming the mode when a plan opts out of its
+subagent default; the reason here is that the work is one coherent CUDA kernel effort on a few
+tightly-coupled files with a strict profile->change->re-profile loop, best held in one author's
+context.)
 
-- **T0 - spike (Phase 1).** Owns: `gqa_attention_decode.cu` (launcher), `gqa_attention_decode.cuh`
+The tasks below are ordered work units, done one at a time and verified before moving on. The shared
+files (`gqa_attention_decode.cuh`, `gqa_attention_decode.cu`, `gqa_attention_bench.cu`, the evidence
+doc) are edited sequentially, never concurrently.
+
+- **T0 - spike (Phase 1).** Touches: `gqa_attention_decode.cu` (launcher), `gqa_attention_decode.cuh`
   (guard), `docs/bench/...`. DoD: T=1 tensor-core ceiling recorded over the ctx sweep; test + memcheck
   pass; spike reverted. Reading list: this spec S3; launcher; tensor-core kernel guards.
-- **T1 - copy-kernel ceiling.** Owns: `gqa_attention_bench.cu`. Adds an `out=in` streaming baseline for
-  the 128 MiB K+V volume and prints `C_copy`. DoD: `C_copy` recorded (hot and cold). Reading list:
+- **T1 - copy-kernel ceiling.** Touches: `gqa_attention_bench.cu`. Adds an `out=in` streaming baseline
+  for the 128 MiB K+V volume and prints `C_copy`. DoD: `C_copy` recorded (hot and cold). Reading list:
   bench byte model, l1-op-test-standard 2.3.
-- **T2 - stream kernel.** Owns: `gqa_attention_decode.cuh` (new kernel), `gqa_attention_decode.cu`
+- **T2 - stream kernel.** Touches: `gqa_attention_decode.cuh` (new kernel), `gqa_attention_decode.cu`
   (dispatch T=1..6 to the stream kernel; tensor-core kept temporarily). DoD: correctness test +
   memcheck + racecheck clean; bench shows T=1 ctx=32768 >= 1150 GB/s. Reading list: this spec S4;
   current scalar + tensor-core kernels; `gdn_common.cuh` async helpers.
-- **T3 - tune.** Owns: kernel tunable constants (`Bc`, `S`, q_d-in-smem) + bench/evidence doc.
+- **T3 - tune.** Touches: kernel tunable constants (`Bc`, `S`, q_d-in-smem) + bench/evidence doc.
   `ncu`-driven per S2.4 loop (profile -> one change -> re-profile). DoD: gate met (S2.2) or limiter
   documented with `.ncu-rep`. Reading list: l1-op-test-standard 2.2-2.4.
-- **T4 - route + retire.** Owns: `gqa_attention_decode.cu` (route), `gqa_attention_decode.cuh`
+- **T4 - route + retire.** Touches: `gqa_attention_decode.cu` (route), `gqa_attention_decode.cuh`
   (delete tensor-core kernel if dominated), `docs/bench/...` (route table + evidence). DoD: per-`T`
   route backed by (T x ctx) `ncu` evidence; no-regression bars met.
-- **T5 - end-to-end + review.** Owns: e2e wall-clock harness/report. DoD: hot-path speedup confirmed.
-  Then an independent strict review (CUDA kernel, numerics, GPU memory lifetime, route table) per
-  `AGENTS.md` risk scaling.
+- **T5 - end-to-end + review.** Touches: e2e wall-clock harness/report. DoD: hot-path speedup
+  confirmed, then a strict review (CUDA kernel, numerics, GPU memory lifetime, route table) per
+  `AGENTS.md` risk scaling, using the oracle test, `compute-sanitizer`, and `ncu` evidence as the
+  review inputs.
 
-Sequencing: T0 and T1 are independent and parallel. T2 depends on T1 (needs `C_copy` target context)
-but can start against the primary target in parallel. T3 depends on T2. T4 depends on T3. T5 depends
-on T4.
+Sequencing: T0 -> T1 -> T2 -> T3 -> T4 -> T5, done in order. T0 and T1 are mutually independent (either
+first), but neither is worked concurrently with the others.
 
 ## 7. Risks
 

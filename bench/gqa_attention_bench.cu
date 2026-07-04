@@ -5,6 +5,7 @@
 //   ./qus_gqa_attention_bench --decode
 //   ./qus_gqa_attention_bench --decode --decode-pos 2882 --profile-once --cold-cache
 //   ./qus_gqa_attention_bench --append-small-t --tokens 6 --context 32768
+//   ./qus_gqa_attention_bench --copy-ceiling --tokens 1 --context 32768
 //   ./qus_gqa_attention_bench --prefill --tokens 4096
 //   ./qus_gqa_attention_bench --prefill --tokens 4096 --expect-tflops-pct-min 80
 #include "qus/core/device.h"
@@ -187,6 +188,12 @@ __global__ void bench_cold_cache_touch_kernel(std::uint32_t* data, std::size_t w
     for (std::size_t i = start; i < words; i += step) { data[i] = data[i] + 1u; }
 }
 
+__global__ void bench_stream_copy_kernel(const uint4* src, uint4* dst, std::size_t words) {
+    const std::size_t start = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    const std::size_t step  = blockDim.x * static_cast<std::size_t>(gridDim.x);
+    for (std::size_t i = start; i < words; i += step) { dst[i] = src[i]; }
+}
+
 void touch_cold_cache(DBuf& buf, cudaStream_t stream) {
     constexpr int kBlock    = 256;
     const std::size_t words = buf.bytes / sizeof(std::uint32_t);
@@ -244,6 +251,21 @@ Result bench_cold_cache_loop(const launch_fn& launch, DBuf& cold_cache, double b
     const double sec = r.median_us * 1e-6;
     r.gbs            = (sec > 0.0) ? bytes_moved / sec / 1e9 : 0.0;
     return r;
+}
+
+void print_copy_ceiling_result(const char* tag, const Result& r, std::size_t payload_bytes,
+                               std::int32_t tokens, std::int32_t context) {
+    const double sec         = r.median_us * 1.0e-6;
+    const double payload_gbs = (sec > 0.0) ? static_cast<double>(payload_bytes) / sec / 1.0e9 : 0.0;
+    const double copy_gbs =
+        (sec > 0.0) ? static_cast<double>(payload_bytes * 2u) / sec / 1.0e9 : 0.0;
+    constexpr double kMiB = 1024.0 * 1024.0;
+    std::printf("%-38s median=%8.2f us  min=%8.2f us  p95=%8.2f us  C_copy=%8.1f GB/s  "
+                "payload_rate=%8.1f GB/s  bytes payload=%.2f MiB copy_total=%.2f MiB  "
+                "T=%d context=%d\n",
+                tag, r.median_us, r.min_us, r.p95_us, copy_gbs, payload_gbs,
+                static_cast<double>(payload_bytes) / kMiB,
+                static_cast<double>(payload_bytes * 2u) / kMiB, tokens, context);
 }
 
 void print_decode_result(const char* tag, const Result& r, const DecodeBytes& bytes,
@@ -414,7 +436,7 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
         std::printf("PROFILE_COLD_METADATA mode=append-small-t T=%d context=%d splits=%d "
                     "cold_cache_bytes=%zu useful_kv_bytes=%zu scratch_bytes=%zu "
                     "total_modeled_bytes=%zu redundancy=%.6f repeats=%d "
-                    "ncu_kernel_regex='gqa_attention_small_t_(tc_)?partial_kernel'\n",
+                    "ncu_kernel_regex='gqa_attention_small_t_(stream_|tc_)?partial_kernel'\n",
                     tokens, context, small_t_active_splits(tokens, context), cold_cache->bytes,
                     bytes.useful_kv, bytes.scratch, bytes.total,
                     bytes.useful_kv > 0
@@ -428,12 +450,38 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::printf("PROFILE_ONCE gqa_attention append-small-T T=%d context=%d splits=%d "
                 "useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu redundancy=%.6f "
-                "ncu_kernel_regex='gqa_attention_small_t_(tc_)?partial_kernel'\n",
+                "ncu_kernel_regex='gqa_attention_small_t_(stream_|tc_)?partial_kernel'\n",
                 tokens, context, small_t_active_splits(tokens, context), bytes.useful_kv,
                 bytes.scratch, bytes.total,
                 bytes.useful_kv > 0
                     ? static_cast<double>(bytes.total) / static_cast<double>(bytes.useful_kv)
                     : 0.0);
+}
+
+void run_copy_ceiling(std::int32_t tokens, std::int32_t context) {
+    const DecodeBytes bytes = append_small_t_bytes(tokens, context);
+    DBuf src                = make_zeros(bytes.useful_kv);
+    DBuf dst                = make_zeros(bytes.useful_kv);
+    DBuf cold_cache         = make_zeros(kColdCacheBytes);
+
+    const std::size_t words = bytes.useful_kv / sizeof(uint4);
+    constexpr int kBlock    = 256;
+    const int grid = static_cast<int>(std::min<std::size_t>(4096u, ceil_div_size(words, kBlock)));
+
+    auto launch = [&](cudaStream_t s) {
+        bench_stream_copy_kernel<<<grid, kBlock, 0, s>>>(static_cast<const uint4*>(src.p),
+                                                         static_cast<uint4*>(dst.p), words);
+        CUDA_CHECK(cudaGetLastError());
+    };
+
+    const Result hot = bench_loop(launch, static_cast<double>(bytes.useful_kv * 2u));
+    print_copy_ceiling_result("gqa_attention copy ceiling hot", hot, bytes.useful_kv, tokens,
+                              context);
+
+    const Result cold =
+        bench_cold_cache_loop(launch, cold_cache, static_cast<double>(bytes.useful_kv * 2u));
+    print_copy_ceiling_result("gqa_attention copy ceiling cold", cold, bytes.useful_kv, tokens,
+                              context);
 }
 
 void run_append_prompt_baseline(KVCache& kv, std::int32_t tokens, std::int32_t context) {
@@ -682,6 +730,7 @@ struct Options {
     bool prefill                     = false;
     bool append_small_t              = false;
     bool append_prompt_baseline      = false;
+    bool copy_ceiling                = false;
     bool decode_pos_set              = false;
     bool context_set                 = false;
     bool profile_once                = false;
@@ -705,6 +754,7 @@ void fail_usage(const char* message) {
                  "       qus_gqa_attention_bench --append-small-t --tokens T --context N "
                  "[--profile-once] [--cold-cache]\n"
                  "       qus_gqa_attention_bench --append-prompt-baseline --tokens T --context N\n"
+                 "       qus_gqa_attention_bench --copy-ceiling --tokens T --context N\n"
                  "       qus_gqa_attention_bench --decode [--decode-pos N] [--profile-once] "
                  "[--cold-cache] [--round-robin-layers 16]\n",
                  message);
@@ -764,6 +814,8 @@ Options parse_options(int argc, char** argv) {
             opt.append_small_t = true;
         } else if (!std::strcmp(argv[i], "--append-prompt-baseline")) {
             opt.append_prompt_baseline = true;
+        } else if (!std::strcmp(argv[i], "--copy-ceiling")) {
+            opt.copy_ceiling = true;
         } else if (!std::strcmp(argv[i], "--tokens") || !std::strcmp(argv[i], "--prefill-tokens")) {
             if (++i >= argc) { fail_usage("--tokens requires a value"); }
             opt.tokens = parse_i32_list_arg(argv[i], "--tokens");
@@ -811,7 +863,8 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
-    if (!opt.decode && !opt.prefill && !opt.append_small_t && !opt.append_prompt_baseline) {
+    if (!opt.decode && !opt.prefill && !opt.append_small_t && !opt.append_prompt_baseline &&
+        !opt.copy_ceiling) {
         opt.prefill = true;
     }
     if (opt.prefill && opt.tokens.empty()) {
@@ -823,8 +876,12 @@ Options parse_options(int argc, char** argv) {
     }
     if (opt.append_small_t && opt.tokens.empty()) { opt.tokens = {1}; }
     if (opt.append_prompt_baseline && opt.tokens.empty()) { opt.tokens = {6}; }
+    if (opt.copy_ceiling && opt.tokens.empty()) { opt.tokens = {1}; }
     if ((opt.append_small_t || opt.append_prompt_baseline) && opt.tokens.size() != 1u) {
         fail_usage("append modes require exactly one --tokens value");
+    }
+    if (opt.copy_ceiling && opt.tokens.size() != 1u) {
+        fail_usage("--copy-ceiling requires exactly one --tokens value");
     }
     if (opt.append_small_t && (opt.tokens[0] <= 0 || opt.tokens[0] > 6)) {
         fail_usage("--append-small-t currently supports T in [1,6]");
@@ -832,11 +889,16 @@ Options parse_options(int argc, char** argv) {
     if (opt.append_prompt_baseline && (opt.tokens[0] <= 0 || opt.tokens[0] > 6)) {
         fail_usage("--append-prompt-baseline currently supports T in [1,6]");
     }
-    if ((opt.append_small_t || opt.append_prompt_baseline) && !opt.context_set) {
-        fail_usage("append modes require --context");
+    if (opt.copy_ceiling && (opt.tokens[0] <= 0 || opt.tokens[0] > 6)) {
+        fail_usage("--copy-ceiling currently supports T in [1,6]");
+    }
+    if ((opt.append_small_t || opt.append_prompt_baseline || opt.copy_ceiling) &&
+        !opt.context_set) {
+        fail_usage("append/copy modes require --context");
     }
     if (static_cast<int>(opt.decode) + static_cast<int>(opt.prefill) +
-            static_cast<int>(opt.append_small_t) + static_cast<int>(opt.append_prompt_baseline) >
+            static_cast<int>(opt.append_small_t) + static_cast<int>(opt.append_prompt_baseline) +
+            static_cast<int>(opt.copy_ceiling) >
         1) {
         fail_usage("select exactly one benchmark mode");
     }
@@ -860,6 +922,9 @@ Options parse_options(int argc, char** argv) {
     }
     if (opt.cold_cache && (!opt.profile_once || (!opt.decode && !opt.append_small_t))) {
         fail_usage("--cold-cache is only valid with decode or append-small-t --profile-once");
+    }
+    if (opt.profile_once && opt.copy_ceiling) {
+        fail_usage("--copy-ceiling does not support --profile-once");
     }
     if (opt.profile_once && opt.append_prompt_baseline) {
         fail_usage("--append-prompt-baseline does not support --profile-once");
@@ -904,6 +969,7 @@ int main(int argc, char** argv) {
     if (opt.append_prompt_baseline) {
         max_context = std::max(max_context, opt.context + opt.tokens[0]);
     }
+    if (opt.copy_ceiling) { max_context = std::max(max_context, opt.context + opt.tokens[0]); }
     const std::uint32_t cache_layers = opt.round_robin_layers;
     DeviceArena cache_arena(cache_arena_bytes(cache_layers, max_context));
     WorkspaceArena work_arena(decode_workspace_bytes(decode_positions));
@@ -949,6 +1015,9 @@ int main(int argc, char** argv) {
     }
     if (opt.append_prompt_baseline) {
         run_append_prompt_baseline(kv, opt.tokens[0], opt.context);
+    }
+    if (opt.copy_ceiling) {
+        run_copy_ceiling(opt.tokens[0], opt.context);
     }
     if (opt.prefill) {
         if (opt.profile_once) {

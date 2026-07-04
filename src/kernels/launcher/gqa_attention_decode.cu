@@ -11,25 +11,6 @@
 namespace qus::kernels::detail {
 namespace {
 
-template <int QHeadsPerCta, int TokenTile>
-void launch_partial(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
-                    float scale, Tensor& cache_k, Tensor& cache_v, std::int32_t padded_context,
-                    std::int32_t max_context, Tensor& partial_acc, Tensor& partial_m,
-                    Tensor& partial_l, cudaStream_t stream) {
-    constexpr int kBlock      = 32 * QHeadsPerCta;
-    constexpr int q_subgroups = (kGqaGroupSize + QHeadsPerCta - 1) / QHeadsPerCta;
-    const int tokens          = q.ne[2];
-    const dim3 grid(kGqaKVHeads * q_subgroups, kGqaDecodeSplits,
-                    (tokens + TokenTile - 1) / TokenTile);
-    gqa_attention_small_t_partial_kernel<QHeadsPerCta, TokenTile><<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
-        static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
-        static_cast<__nv_bfloat16*>(cache_k.data), static_cast<__nv_bfloat16*>(cache_v.data),
-        tokens, padded_context, max_context, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
-    CUDA_CHECK(cudaGetLastError());
-}
-
 template <int TokenTile, int WarpsPerCta>
 void launch_tc_partial(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
                        float scale, Tensor& cache_k, Tensor& cache_v, std::int32_t padded_context,
@@ -63,8 +44,8 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
 
     switch (q.ne[2]) {
     case 1:
-        launch_partial<6, 1>(q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context,
-                             partial_acc, partial_m, partial_l, stream);
+        launch_tc_partial<1, 2>(q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context,
+                                partial_acc, partial_m, partial_l, stream);
         break;
     case 2:
         launch_tc_partial<2, 4>(q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context,

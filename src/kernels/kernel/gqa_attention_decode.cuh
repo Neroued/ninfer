@@ -53,65 +53,10 @@ __device__ __forceinline__ std::int64_t gqa_partial_stat_index(int q_head, int t
                (static_cast<std::int64_t>(token) + static_cast<std::int64_t>(tokens) * split);
 }
 
-__device__ __forceinline__ float gqa_warp_sum(float value) {
-    constexpr unsigned mask = 0xffffffffu;
-    value += __shfl_down_sync(mask, value, 16);
-    value += __shfl_down_sync(mask, value, 8);
-    value += __shfl_down_sync(mask, value, 4);
-    value += __shfl_down_sync(mask, value, 2);
-    value += __shfl_down_sync(mask, value, 1);
-    return value;
-}
-
-__device__ __forceinline__ float gqa_warp_sum_broadcast(float value) {
-    constexpr unsigned mask = 0xffffffffu;
-    const float sum         = gqa_warp_sum(value);
-    return __shfl_sync(mask, sum, 0);
-}
-
 __device__ __forceinline__ float gqa_exp2_fast(float x) {
     float y;
     asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
-}
-
-template <int QHeadsPerCta>
-__device__ __forceinline__ void gqa_block_sum_256(float (&values)[QHeadsPerCta],
-                                                  float (&reduced)[QHeadsPerCta], float* scratch) {
-    static_assert(QHeadsPerCta > 0 && QHeadsPerCta <= kGqaGroupSize);
-    constexpr int kWarps = kGqaHeadDim / 32;
-    const int tid        = threadIdx.x;
-    const int lane       = tid & 31;
-    const int warp       = tid >> 5;
-
-#pragma unroll
-    for (int q = 0; q < QHeadsPerCta; ++q) {
-        const float sum = gqa_warp_sum(values[q]);
-        if (lane == 0) { scratch[q * kWarps + warp] = sum; }
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (int q = 0; q < QHeadsPerCta; ++q) {
-        float sum = (tid < kWarps) ? scratch[q * kWarps + lane] : 0.0f;
-        if (warp == 0) { sum = gqa_warp_sum(sum); }
-        if (lane == 0 && warp == 0) { scratch[q * kWarps] = sum; }
-    }
-    __syncthreads();
-
-#pragma unroll
-    for (int q = 0; q < QHeadsPerCta; ++q) { reduced[q] = scratch[q * kWarps]; }
-    __syncthreads();
-}
-
-template <int QHeadsPerCta>
-__device__ __forceinline__ int gqa_q_subgroups() {
-    return (kGqaGroupSize + QHeadsPerCta - 1) / QHeadsPerCta;
-}
-
-template <int QHeadsPerCta>
-__device__ __forceinline__ int gqa_global_q_head(int kv_head, int q_subgroup, int local_q) {
-    return kv_head * kGqaGroupSize + q_subgroup * QHeadsPerCta + local_q;
 }
 
 __device__ __forceinline__ bool gqa_valid_q_head(int kv_head, int q_head) {
@@ -127,24 +72,6 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int max_spl
     int splits = (window + target_keys_per_split - 1) / target_keys_per_split;
     splits     = max(kMinSplits, splits);
     return min(max_splits, splits);
-}
-
-__device__ __forceinline__ float gqa_cached_pair_lane_value(const __nv_bfloat16* cache, int kv_head,
-                                                            int d, int token, int padded_context) {
-    const int pair_d = d & ~1;
-    float pair_lo    = 0.0f;
-    float pair_hi    = 0.0f;
-    if ((d & 1) == 0) {
-        const auto* pair_ptr = reinterpret_cast<const __nv_bfloat162*>(
-            cache + gqa_cache_index(kv_head, pair_d, token, padded_context));
-        const float2 pair = __bfloat1622float2(*pair_ptr);
-        pair_lo           = pair.x;
-        pair_hi           = pair.y;
-    }
-
-    constexpr unsigned mask  = 0xffffffffu;
-    const float hi_from_even = __shfl_up_sync(mask, pair_hi, 1);
-    return ((d & 1) == 0) ? pair_lo : hi_from_even;
 }
 
 __device__ __forceinline__ int gqa_small_t_tc_swz(int row, int col) {
@@ -198,223 +125,6 @@ gqa_small_t_tc_row_to_qt(int row, int tokens, int kv_head, int& q_head, int& tok
     q_head            = kv_head * kGqaGroupSize + local_q;
 }
 
-template <int QHeadsPerCta>
-__device__ __forceinline__ void
-gqa_write_neutral_partial(__nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
-                          int kv_head, int q_subgroup, int token, int split, int tokens) {
-    const int d = threadIdx.x;
-#pragma unroll
-    for (int local_q = 0; local_q < QHeadsPerCta; ++local_q) {
-        const int q_head = gqa_global_q_head<QHeadsPerCta>(kv_head, q_subgroup, local_q);
-        if (!gqa_valid_q_head(kv_head, q_head)) { continue; }
-        if (d == 0) {
-            partial_m[gqa_partial_stat_index(q_head, token, split, tokens)] = -CUDART_INF_F;
-            partial_l[gqa_partial_stat_index(q_head, token, split, tokens)] = 0.0f;
-        }
-        partial_acc[gqa_partial_acc_index(q_head, d, token, split, tokens)] =
-            __float2bfloat16(0.0f);
-    }
-}
-
-template <int QHeadsPerCta>
-__device__ __forceinline__ void
-gqa_write_neutral_partial_warp(__nv_bfloat16* partial_acc, float* partial_m, float* partial_l,
-                               int kv_head, int q_subgroup, int token, int split, int tokens) {
-    constexpr int kDimsPerLane = kGqaHeadDim / 32;
-    static_assert(kDimsPerLane == 8);
-
-    const int local_q = threadIdx.x >> 5;
-    const int lane    = threadIdx.x & 31;
-    if (local_q >= QHeadsPerCta) { return; }
-
-    const int q_head = gqa_global_q_head<QHeadsPerCta>(kv_head, q_subgroup, local_q);
-    if (!gqa_valid_q_head(kv_head, q_head)) { return; }
-
-    if (lane == 0) {
-        partial_m[gqa_partial_stat_index(q_head, token, split, tokens)] = -CUDART_INF_F;
-        partial_l[gqa_partial_stat_index(q_head, token, split, tokens)] = 0.0f;
-    }
-
-#pragma unroll
-    for (int k = 0; k < kDimsPerLane; ++k) {
-        const int d = lane + 32 * k;
-        partial_acc[gqa_partial_acc_index(q_head, d, token, split, tokens)] =
-            __float2bfloat16(0.0f);
-    }
-}
-
-template <int QHeadsPerCta, int TokenTile>
-__launch_bounds__(256) __global__
-    void gqa_attention_small_t_partial_kernel(const __nv_bfloat16* q, const __nv_bfloat16* k_new,
-                                              const __nv_bfloat16* v_new, const std::int32_t* pos,
-                                              __nv_bfloat16* cache_k, __nv_bfloat16* cache_v,
-                                              std::int32_t tokens, std::int32_t padded_context,
-                                              std::int32_t max_context, float scale,
-                                              __nv_bfloat16* partial_acc, float* partial_m,
-                                              float* partial_l) {
-    static_assert(QHeadsPerCta == 6);
-    static_assert(TokenTile >= 1 && TokenTile <= 6);
-
-    constexpr int q_subgroups = (kGqaGroupSize + QHeadsPerCta - 1) / QHeadsPerCta;
-    const int kv_head         = static_cast<int>(blockIdx.x) / q_subgroups;
-    const int q_subgroup      = static_cast<int>(blockIdx.x) - kv_head * q_subgroups;
-    const int split           = static_cast<int>(blockIdx.y);
-    const int split_count     = static_cast<int>(gridDim.y);
-    const int tile_start      = static_cast<int>(blockIdx.z) * TokenTile;
-    const int tile_limit      = min(tile_start + TokenTile, static_cast<int>(tokens));
-    const int tile_tokens     = tile_limit - tile_start;
-
-    if (kv_head < 0 || kv_head >= kGqaKVHeads || q_subgroup < 0 || q_subgroup >= q_subgroups) {
-        return;
-    }
-    if (tile_tokens <= 0 || split_count <= 0) { return; }
-
-    const std::int32_t first_pos = pos[0];
-    const std::int32_t last_pos  = pos[tile_limit - 1];
-    if (first_pos < 0 || last_pos < 0 || last_pos >= max_context) {
-#pragma unroll
-        for (int tt = 0; tt < TokenTile; ++tt) {
-            const int token = tile_start + tt;
-            if (token < tile_limit) {
-                gqa_write_neutral_partial_warp<QHeadsPerCta>(
-                    partial_acc, partial_m, partial_l, kv_head, q_subgroup, token, split, tokens);
-            }
-        }
-        return;
-    }
-
-    const int window             = last_pos + 1;
-    const int active_split_count = gqa_small_t_active_splits(window, split_count, tokens);
-    if (split >= active_split_count) { return; }
-
-    const int kps         = (window + active_split_count - 1) / active_split_count;
-    const int split_start = split * kps;
-    const int split_limit = split_start + kps;
-    const int split_end   = (split_limit < window) ? split_limit : window;
-
-    if (split_start >= window) {
-#pragma unroll
-        for (int tt = 0; tt < TokenTile; ++tt) {
-            const int token = tile_start + tt;
-            if (token < tile_limit) {
-                gqa_write_neutral_partial_warp<QHeadsPerCta>(
-                    partial_acc, partial_m, partial_l, kv_head, q_subgroup, token, split, tokens);
-            }
-        }
-        return;
-    }
-
-    constexpr int kDimsPerLane = kGqaHeadDim / 32;
-    static_assert(kDimsPerLane == 8);
-
-    const int local_q = threadIdx.x >> 5;
-    const int lane    = threadIdx.x & 31;
-    if (local_q >= QHeadsPerCta) { return; }
-
-    const int q_head = gqa_global_q_head<QHeadsPerCta>(kv_head, q_subgroup, local_q);
-    if (!gqa_valid_q_head(kv_head, q_head)) { return; }
-
-    if (q_subgroup == 0 && local_q == 0) {
-#pragma unroll
-        for (int tt = 0; tt < TokenTile; ++tt) {
-            const int token = tile_start + tt;
-            if (token >= tile_limit) { continue; }
-            const std::int32_t p_tok = pos[token];
-            if (split_start > p_tok || p_tok >= split_end || p_tok < 0 || p_tok >= max_context) {
-                continue;
-            }
-#pragma unroll
-            for (int k = 0; k < kDimsPerLane; ++k) {
-                const int d                  = lane + 32 * k;
-                const std::int64_t new_off   = gqa_kv_new_index(kv_head, d, token);
-                const std::int64_t cache_off = gqa_cache_index(kv_head, d, p_tok, padded_context);
-                cache_k[cache_off]           = k_new[new_off];
-                cache_v[cache_off]           = v_new[new_off];
-            }
-        }
-    }
-
-    float q_d[TokenTile][kDimsPerLane];
-    float acc[TokenTile][kDimsPerLane];
-    float m[TokenTile];
-    float l[TokenTile];
-#pragma unroll
-    for (int tt = 0; tt < TokenTile; ++tt) {
-        const int token = tile_start + tt;
-#pragma unroll
-        for (int k = 0; k < kDimsPerLane; ++k) {
-            const int d = lane + 32 * k;
-            q_d[tt][k] =
-                (token < tile_limit) ? __bfloat162float(q[gqa_q_index(q_head, d, token)]) : 0.0f;
-            acc[tt][k] = 0.0f;
-        }
-        m[tt] = -CUDART_INF_F;
-        l[tt] = 0.0f;
-    }
-
-    for (int token = split_start; token < split_end; ++token) {
-        const int new_token = token - first_pos;
-        const bool from_new =
-            new_token >= 0 && new_token < static_cast<int>(tokens) && token >= first_pos;
-        float k_d[kDimsPerLane];
-        float v_d[kDimsPerLane];
-#pragma unroll
-        for (int k = 0; k < kDimsPerLane; ++k) {
-            const int d = lane + 32 * k;
-            if (from_new) {
-                k_d[k] = __bfloat162float(k_new[gqa_kv_new_index(kv_head, d, new_token)]);
-                v_d[k] = __bfloat162float(v_new[gqa_kv_new_index(kv_head, d, new_token)]);
-            } else {
-                k_d[k] = gqa_cached_pair_lane_value(cache_k, kv_head, d, token, padded_context);
-                v_d[k] = gqa_cached_pair_lane_value(cache_v, kv_head, d, token, padded_context);
-            }
-        }
-
-#pragma unroll
-        for (int tt = 0; tt < TokenTile; ++tt) {
-            const int query_token = tile_start + tt;
-            if (query_token >= tile_limit) { continue; }
-            const std::int32_t query_pos = pos[query_token];
-            if (query_pos < 0 || query_pos >= max_context || token > query_pos ||
-                (from_new && new_token > query_token)) {
-                continue;
-            }
-
-            float dot = 0.0f;
-#pragma unroll
-            for (int k = 0; k < kDimsPerLane; ++k) { dot += q_d[tt][k] * k_d[k]; }
-
-            const float score  = gqa_warp_sum_broadcast(dot) * scale;
-            const float next_m = fmaxf(m[tt], score);
-            const float old_w  = expf(m[tt] - next_m);
-            const float new_w  = expf(score - next_m);
-
-#pragma unroll
-            for (int k = 0; k < kDimsPerLane; ++k) {
-                acc[tt][k] = acc[tt][k] * old_w + new_w * v_d[k];
-            }
-            l[tt] = l[tt] * old_w + new_w;
-            m[tt] = next_m;
-        }
-    }
-
-#pragma unroll
-    for (int tt = 0; tt < TokenTile; ++tt) {
-        const int token = tile_start + tt;
-        if (token >= tile_limit) { continue; }
-        if (lane == 0) {
-            partial_m[gqa_partial_stat_index(q_head, token, split, tokens)] = m[tt];
-            partial_l[gqa_partial_stat_index(q_head, token, split, tokens)] = l[tt];
-        }
-#pragma unroll
-        for (int k = 0; k < kDimsPerLane; ++k) {
-            const int d = lane + 32 * k;
-            partial_acc[gqa_partial_acc_index(q_head, d, token, split, tokens)] =
-                __float2bfloat16(acc[tt][k]);
-        }
-    }
-}
-
 template <int TokenTile, int WarpsPerCta>
 __launch_bounds__(128, 2) __global__
     void gqa_attention_small_t_tc_partial_kernel(const __nv_bfloat16* q,
@@ -427,8 +137,8 @@ __launch_bounds__(128, 2) __global__
                                                  std::int32_t max_context, float scale,
                                                  __nv_bfloat16* partial_acc, float* partial_m,
                                                  float* partial_l) {
-    static_assert(TokenTile >= 2 && TokenTile <= 6);
-    static_assert(WarpsPerCta == 4);
+    static_assert(TokenTile >= 1 && TokenTile <= 6);
+    static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
     constexpr int Wc            = WarpsPerCta;
     constexpr int Br            = Wc * 16;
@@ -481,7 +191,7 @@ __launch_bounds__(128, 2) __global__
         }
     };
 
-    if (kv_head < 0 || kv_head >= kGqaKVHeads || tokens < 2 || tokens > TokenTile ||
+    if (kv_head < 0 || kv_head >= kGqaKVHeads || tokens < 1 || tokens > TokenTile ||
         row_count > Br || split_count <= 0) {
         return;
     }

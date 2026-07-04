@@ -81,6 +81,13 @@ amount of latency hiding available.
 | 24 | Remove chunk4 row-tail predicates for the exact even-N routed shapes. | Attn: 32.32 us / 65.28% SOL; Proj: 28.00 us / 64.36%; Out: 29.38 us / 59.51%. | Rejected. Branch removal did not reduce registers and regressed Attn/Out. |
 | 25 | Direct one-row chunk4 body with one row of shared memory and no row-local indexing. | Final7: Attn 32.35 us / 64.46% SOL; Proj 29.73 us / 60.63%; Out 30.24 us / 57.41%; regs 44, static smem 1.41 KiB. | Rejected. Lower register count hurt scheduling/codegen and lost the cont11 speedup. |
 | 26 | One-row chunk4 launch: 4 warps/block, one output row per block, normal block barriers over only the cooperating row-warps, retaining the measured-fast parameterized body shape. | Final8: Attn 31.36 us / 68.45% SOL; Proj 27.26 us / 67.39%; Out 27.42 us / 64.27%; all chunk4 shapes use regs 48 and static smem 1.41 KiB. | Accepted. This halves chunk4 shared memory and barrier participants while preserving occupancy and improving all chunk4-routed representative shapes versus final6. |
+| 27 | Current-state detailed diagnosis after final8. | MlpDown original detailed: 73.79 us / 56.81% SOL, memory 45.08%, regs 58, static smem 10.75 KiB, waves/SM 0.94, achieved occupancy 61.25%, branch efficiency 74.03%. Attn chunk4 detailed: 31.23 us / 67.27% SOL, memory 43.86%, regs 48, static smem 1.41 KiB, waves/SM 4.22, achieved occupancy 75.91%, branch efficiency 91.38%. Attn SchedulerStats: issued warp/scheduler 0.75, no eligible 25.26%, eligible warps/scheduler 3.42. | Diagnostic. MlpDown remains the worse low-wave path; chunk4 is already much healthier, and attempts that only raise occupancy need to preserve the 48-register ILP schedule. |
+| 28 | Route MlpDown to the current one-row chunk4 kernel. | MlpDown: 78.05 us / 61.87% SOL, memory 47.34%, regs 48, static smem 1.41 KiB, waves/SM 3.01, achieved occupancy 75.65%. | Rejected. More waves and higher SOL did not offset the synchronization/reduction cost over 17 slabs, so duration materially regressed versus the original path. |
+| 29 | Route MlpDown through the original kernel with `kTt=2`, keeping 8 row-warps/block. | MlpDown: 105.89 us / 56.15% SOL, memory 31.40%, regs 48, static smem 10.75 KiB, waves/SM 1.51. | Rejected. Halving per-warp accumulator state raised occupancy but streamed the Q5 weights twice and lost too much bandwidth. |
+| 30 | Add chunk4-only `__launch_bounds__(128, 12)` to force 12 resident 128-thread blocks/SM. | Attn: 34.11 us / 62.31% SOL, memory 41.85%, regs 40, theoretical occupancy 100%, achieved occupancy 89.85%, waves/SM 3.51. | Rejected. The register cap improved occupancy but removed the ILP needed by this body. |
+| 31 | Add chunk4-only `__launch_bounds__(128, 11)` as a less aggressive occupancy cap. | Attn: 34.59 us / 62.56% SOL, memory 41.62%, regs 40, theoretical occupancy 100%, achieved occupancy 89.70%, waves/SM 3.51. | Rejected. Ptxas still capped to 40 registers and reproduced the launch-bounds regression. |
+| 32 | Route MlpDown through the original kernel with one cp.async stage and 8 row-warps/block. | Repeat sample: 69.15 us / 56.87% SOL, memory 48.09%, regs 58, static smem 5.38 KiB, waves/SM 0.94. | Rejected. Duration improved versus recent two-stage samples, but the primary SOL metric moved down and the change did not address the low-wave limiter. |
+| 33 | Route MlpDown through the original kernel with one cp.async stage and 4 row-warps/block. | MlpDown: 69.34 us / 56.11% SOL, memory 47.93%, regs 58, static smem 2.69 KiB, waves/SM 0.94. | Rejected. Smaller blocks did not increase wave count and further reduced SOL. |
 
 ## Final Candidate
 
@@ -134,6 +141,7 @@ under-parallelized for several small-T shapes, but MlpDown remains limited by th
 original low-wave, issue-eligibility behavior and the chunk-split variants raise
 occupancy at too much per-slab synchronization cost. The failed tensor-core,
 split-by-slab, chunk2, pipeline-cleanup, read-only-load, and deeper-pipeline
-experiments indicate that reaching 85% SOL likely requires a larger architecture
-change, such as a better-balanced split-K or tensor-core path that can feed all
-warps without duplicating dequant/staging work.
+experiments, plus the later launch-bounds and one-stage pipeline probes, indicate
+that reaching 85% SOL likely requires a larger architecture change, such as a
+better-balanced split-K or tensor-core path that can feed all warps without
+duplicating dequant/staging work.

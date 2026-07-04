@@ -100,6 +100,8 @@ amount of latency hiding available.
 | 43 | Route MlpDown to the direct split4 body. | MlpDown: 74.62 us / 65.41% SOL, memory 65.41%, regs 44, static smem 64 B, waves/SM 3.01, achieved occupancy 75.62%. | Rejected. This raises the primary SOL metric but materially regresses duration, violating the representative-shape guardrail. |
 | 44 | Launch the one-warp MlpDown direct body with 4 rows/block instead of 8. | MlpDown: 62.88 us / 59.36% SOL, memory 52.86%, regs 54, waves/SM 0.84. | Rejected. Smaller blocks reduced wave count and regressed both duration and SOL. |
 | 45 | Group two rows per direct split4 block to recover some within-block x reuse while retaining four K-slice warps per row. | Attn: 27.71 us / 66.48% SOL, memory 49.45%, regs 44, static smem 128 B, waves/SM 4.22, achieved occupancy 74.58%. | Rejected. The larger 256-thread block did not improve L1TEX behavior enough to beat the one-row split4 body. |
+| 46 | Stage the four T-column x vectors once per chunk for a two-row direct split4 block, so both rows reuse shared x instead of issuing duplicate global x loads. | Attn: 62.14 us / 78.57% SOL, memory 78.57%, DRAM 22.01%, SM 32.13%, regs 44, static smem 8.32 KiB, waves/SM 4.22. | Rejected. The primary SOL number rose, but shared-memory traffic and two slab barriers per iteration more than doubled duration. |
+| 47 | In direct split4, reduce high-bit global load instructions by having one lane per four load a 32-bit high word and broadcast it with `__shfl_sync`. | Attn: 28.06 us / 67.79% SOL, memory 48.77%, regs 44, static smem 64 B, waves/SM 4.22, achieved occupancy 74.05%. | Rejected. Fewer high-bit loads did not offset the shuffle/shift overhead and duration regressed versus final10. |
 
 ## Final Candidate
 

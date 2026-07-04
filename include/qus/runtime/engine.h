@@ -56,8 +56,6 @@ struct EngineOptions {
     std::size_t work_bytes      = 0;
     std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
     int mtp_draft_tokens        = 0;
-    bool mtp_strict_sequential  = false;
-    std::string mtp_round_dump_dir;
     Q5090Progress* progress     = nullptr;
     std::vector<int> stop_token_ids;
     bool use_cuda_graph = true;
@@ -94,15 +92,12 @@ private:
     void require_loaded() const;
     [[nodiscard]] int read_token();
     [[nodiscard]] int read_i32_scalar(const Tensor model::StepState::*field);
-    [[nodiscard]] int read_i32_element(const Tensor& tensor, int index);
     [[nodiscard]] std::vector<int> read_sampled_tokens();
     [[nodiscard]] bool is_stop_token(int token) const noexcept;
     [[nodiscard]] int decode_step_one();
     [[nodiscard]] std::vector<int> decode_round();
-    [[nodiscard]] std::vector<int> decode_round_strict();
     void commit_gdn_snapshots();
     void propose_mtp_after_accept(std::uint32_t host_window_base, int host_length, int k);
-    void dump_mtp_round_state(int host_length);
 
     EngineOptions options_;
     std::optional<DeviceContext> ctx_;
@@ -118,7 +113,6 @@ private:
     DecodeGraph decode_graph_;
     bool decode_warmed_ = false;
     std::vector<int> pending_sampled_;
-    std::uint64_t mtp_round_dump_index_ = 0;
 };
 
 } // namespace qus

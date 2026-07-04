@@ -14,9 +14,9 @@ import json
 import mmap
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -214,43 +214,6 @@ class WeightView:
     source_layer: int
     row_begin: int
     row_count: int
-
-
-@dataclass
-class SpeculativeStats:
-    draft_batches: int = 0
-    draft_tokens: int = 0
-    accepted_tokens: int = 0
-    draft_tokens_per_pos: List[int] = field(default_factory=list)
-    accepted_tokens_per_pos: List[int] = field(default_factory=list)
-
-    @property
-    def acceptance_rate(self) -> float:
-        if self.draft_tokens == 0:
-            return 0.0
-        return self.accepted_tokens / self.draft_tokens
-
-    @property
-    def acceptance_length(self) -> float:
-        if self.draft_batches == 0:
-            return 0.0
-        return 1.0 + self.accepted_tokens / self.draft_batches
-
-    def observe_draft(self, draft_count: int, accepted_count: int) -> None:
-        if draft_count < 0:
-            raise ValueError("draft_count must be nonnegative")
-        if accepted_count < 0 or accepted_count > draft_count:
-            raise ValueError("accepted_count must be in [0,draft_count]")
-        self.draft_batches += 1
-        self.draft_tokens += draft_count
-        self.accepted_tokens += accepted_count
-        while len(self.draft_tokens_per_pos) < draft_count:
-            self.draft_tokens_per_pos.append(0)
-            self.accepted_tokens_per_pos.append(0)
-        for i in range(draft_count):
-            self.draft_tokens_per_pos[i] += 1
-        for i in range(accepted_count):
-            self.accepted_tokens_per_pos[i] += 1
 
 
 class Q5090File:
@@ -744,7 +707,6 @@ class RefModel:
 
     def reset_state(self) -> None:
         self.kv: Dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.mtp_kv: Dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.conv: Dict[int, torch.Tensor] = {
             i: torch.zeros(GDN_CONV, 3, device=self.device, dtype=torch.float32) for i in range(48)
         }
@@ -752,25 +714,6 @@ class RefModel:
             i: torch.zeros(GDN_HV, GDN_DV, GDN_DK, device=self.device, dtype=torch.float32) for i in range(48)
         }
         self.pos = 0
-
-    def mtp_kv_len(self, layer: int = 0) -> int:
-        kv = self.mtp_kv.get(layer)
-        if kv is None:
-            return 0
-        return int(kv[0].shape[0])
-
-    def truncate_mtp_kv(self, length: int, layer: int = 0) -> None:
-        if length < 0:
-            raise ValueError("MTP KV length must be nonnegative")
-        kv = self.mtp_kv.get(layer)
-        if kv is None:
-            if length != 0:
-                raise ValueError(f"cannot truncate empty MTP KV to {length}")
-            return
-        k, v = kv
-        if length > k.shape[0]:
-            raise ValueError(f"cannot extend MTP KV from {k.shape[0]} to {length}")
-        self.mtp_kv[layer] = (k[:length].clone(), v[:length].clone())
 
     def embed(self, ids: Iterable[int]) -> torch.Tensor:
         idx = torch.tensor(list(ids), device=self.device, dtype=torch.long)
@@ -811,58 +754,13 @@ class RefModel:
                     torch.empty(0, H_KV, DH, device=self.device),
                 ),
             )
-            old_len = old_k.shape[0]
             self.kv[fidx] = (torch.cat([old_k, k], dim=0), torch.cat([old_v, v], dim=0))
             k_all, v_all = self.kv[fidx]
             k_rep = k_all.repeat_interleave(H_Q // H_KV, dim=1).float()
             v_rep = v_all.repeat_interleave(H_Q // H_KV, dim=1).float()
             scores = torch.einsum("thd,shd->ths", q.float(), k_rep) * ATTN_SCALE
-            t_idx = old_len + torch.arange(T, device=self.device)
-            s_idx = torch.arange(k_all.shape[0], device=self.device)
-            scores = scores.masked_fill(s_idx[None, None, :] > t_idx[:, None, None], -torch.inf)
             probs = torch.softmax(scores, dim=-1)
             return bf16(torch.einsum("ths,shd->thd", probs, v_rep))
-
-    def mtp_gqa_attention(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        layer: int,
-        phase: str,
-    ) -> torch.Tensor:
-        T = q.shape[0]
-        if phase == "prefill":
-            self.mtp_kv[layer] = (k.clone(), v.clone())
-            k_all, v_all = self.mtp_kv[layer]
-            k_rep = k_all.repeat_interleave(H_Q // H_KV, dim=1).float()
-            v_rep = v_all.repeat_interleave(H_Q // H_KV, dim=1).float()
-            scores = torch.einsum("thd,shd->ths", q.float(), k_rep) * ATTN_SCALE
-            t_idx = torch.arange(T, device=self.device)
-            s_idx = torch.arange(k_all.shape[0], device=self.device)
-            scores = scores.masked_fill(s_idx[None, None, :] > t_idx[:, None, None], -torch.inf)
-            probs = torch.softmax(scores, dim=-1)
-            return bf16(torch.einsum("ths,shd->thd", probs, v_rep))
-        if phase != "decode":
-            raise ValueError(f"unknown MTP attention phase {phase!r}")
-        old_k, old_v = self.mtp_kv.get(
-            layer,
-            (
-                torch.empty(0, H_KV, DH, device=self.device),
-                torch.empty(0, H_KV, DH, device=self.device),
-            ),
-        )
-        old_len = old_k.shape[0]
-        self.mtp_kv[layer] = (torch.cat([old_k, k], dim=0), torch.cat([old_v, v], dim=0))
-        k_all, v_all = self.mtp_kv[layer]
-        k_rep = k_all.repeat_interleave(H_Q // H_KV, dim=1).float()
-        v_rep = v_all.repeat_interleave(H_Q // H_KV, dim=1).float()
-        scores = torch.einsum("thd,shd->ths", q.float(), k_rep) * ATTN_SCALE
-        t_idx = old_len + torch.arange(T, device=self.device)
-        s_idx = torch.arange(k_all.shape[0], device=self.device)
-        scores = scores.masked_fill(s_idx[None, None, :] > t_idx[:, None, None], -torch.inf)
-        probs = torch.softmax(scores, dim=-1)
-        return bf16(torch.einsum("ths,shd->thd", probs, v_rep))
 
     def gdn_recurrent(
         self,
@@ -957,11 +855,9 @@ class RefModel:
                 dumps[f"layer_{layer}"] = x.detach().float().cpu()
         return x
 
-    def final_norm_hidden(self, x: torch.Tensor) -> torch.Tensor:
-        return rmsnorm(x, self.weight("model.language_model.norm.weight"), unit_offset=True)
-
-    def logits_from_hidden_last(self, hidden: torch.Tensor) -> torch.Tensor:
-        xlast = hidden[-1:, :].to(torch.bfloat16)
+    def logits_last(self, x: torch.Tensor) -> torch.Tensor:
+        xf = rmsnorm(x, self.weight("model.language_model.norm.weight"), unit_offset=True)
+        xlast = xf[-1:, :].to(torch.bfloat16)
         logits = torch.empty(V, device=self.device, dtype=torch.bfloat16)
         for row0, row1, weight in self.q5090.row_split_row_chunks(
             "lm_head.weight",
@@ -972,264 +868,6 @@ class RefModel:
             del weight
         return logits
 
-    def logits_last(self, x: torch.Tensor) -> torch.Tensor:
-        return self.logits_from_hidden_last(self.final_norm_hidden(x))
-
-    def greedy_tokens_from_hidden(self, hidden: torch.Tensor) -> List[int]:
-        if hidden.ndim != 2 or hidden.shape[1] != D:
-            raise ValueError(f"hidden shape {tuple(hidden.shape)} must be [T,{D}]")
-        if hidden.shape[0] == 0:
-            return []
-        h = hidden.to(torch.bfloat16)
-        best_vals = torch.full((h.shape[0],), -torch.inf, device=self.device, dtype=torch.float32)
-        best_ids = torch.zeros((h.shape[0],), device=self.device, dtype=torch.long)
-        for row0, row1, weight in self.q5090.row_split_row_chunks(
-            "lm_head.weight",
-            self.device,
-            output_dtype=torch.bfloat16,
-        ):
-            logits = h @ weight.to(torch.bfloat16).t()
-            vals, idx = torch.max(logits.float(), dim=-1)
-            take = vals > best_vals
-            best_vals[take] = vals[take]
-            best_ids[take] = idx[take].to(torch.long) + row0
-            del weight, logits
-        return [int(x) for x in best_ids.tolist()]
-
-    def target_decode_hidden(self, input_ids: Iterable[int], start_position: int) -> torch.Tensor:
-        ids = list(input_ids)
-        if not ids:
-            raise ValueError("target decode input_ids must not be empty")
-        x = self.embed(ids)
-        positions = torch.arange(
-            start_position,
-            start_position + len(ids),
-            device=self.device,
-            dtype=torch.int32,
-        )
-        x = self.run_layers(x, "decode", positions)
-        return self.final_norm_hidden(x)
-
-    def mtp_forward(
-        self,
-        input_ids: Iterable[int],
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        phase: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        ids = list(input_ids)
-        if not ids:
-            raise ValueError("MTP input_ids must not be empty")
-        if phase not in {"prefill", "decode"}:
-            raise ValueError(f"unknown MTP phase {phase!r}")
-        if hidden_states.shape != (len(ids), D):
-            raise ValueError(f"MTP hidden_states shape {tuple(hidden_states.shape)} != {(len(ids), D)}")
-        positions = positions.to(device=self.device, dtype=torch.int32)
-        if positions.shape != (len(ids),):
-            raise ValueError(f"MTP positions shape {tuple(positions.shape)} != {(len(ids),)}")
-
-        p = "mtp.layers.0."
-        emb = self.embed(ids)
-        e = rmsnorm(emb, self.weight("mtp.pre_fc_norm_embedding.weight"), unit_offset=True)
-        h = rmsnorm(hidden_states, self.weight("mtp.pre_fc_norm_hidden.weight"), unit_offset=True)
-        x = linear(torch.cat([e, h], dim=-1), self.weight("mtp.fc.weight"))
-
-        ah = rmsnorm(x, self.weight(p + "input_layernorm.weight"), unit_offset=True)
-        attn_in = linear(ah, self.block_weight(p + "attn_in.w8"))
-        q = attn_in[:, :Q_SIZE].reshape(-1, H_Q, DH)
-        k = attn_in[:, Q_SIZE : Q_SIZE + KV_SIZE].reshape(-1, H_KV, DH)
-        gate = attn_in[:, Q_SIZE + KV_SIZE : Q_SIZE + KV_SIZE + Q_SIZE].reshape(-1, H_Q, DH)
-        v = attn_in[:, Q_SIZE + KV_SIZE + Q_SIZE :].reshape(-1, H_KV, DH)
-
-        qn = rmsnorm(q, self.weight(p + "self_attn.q_norm.weight"), unit_offset=True)
-        kn = rmsnorm(k, self.weight(p + "self_attn.k_norm.weight"), unit_offset=True)
-        qn, kn = apply_rope(qn, kn, positions)
-        a = self.mtp_gqa_attention(qn, kn, v, 0, phase)
-        a = sigmoid_gate_mul(gate, a).reshape(-1, Q_SIZE)
-        o = linear(a, self.weight(p + "self_attn.o_proj.weight"))
-        x = residual_add(x, o)
-
-        mh = rmsnorm(x, self.weight(p + "post_attention_layernorm.weight"), unit_offset=True)
-        gate_up = linear(mh, self.block_weight(p + "mlp.gateup.w8"))
-        gate_mlp, up = gate_up.split(I, dim=-1)
-        d = linear(silu_and_mul(gate_mlp, up), self.weight(p + "mlp.down_proj.weight"))
-        x = residual_add(x, d)
-
-        mtp_hidden = rmsnorm(x, self.weight("mtp.norm.weight"), unit_offset=True)
-        logits = self.logits_from_hidden_last(mtp_hidden)
-        draft = int(torch.argmax(logits).item())
-        return mtp_hidden, logits, draft
-
-    def _target_decode_one(self, token: int, position: int) -> tuple[int, torch.Tensor]:
-        hidden = self.target_decode_hidden([token], position)
-        next_token = self.greedy_tokens_from_hidden(hidden)[0]
-        return next_token, hidden
-
-    def _target_verify_drafts(
-        self,
-        token: int,
-        drafts: list[int],
-        target_position: int,
-    ) -> tuple[int, int, list[int], torch.Tensor]:
-        target_tokens: list[int] = []
-        valid_inputs: list[int] = []
-        valid_hidden: list[torch.Tensor] = []
-        accepted_count = 0
-
-        for i in range(len(drafts) + 1):
-            input_token = token if i == 0 else drafts[i - 1]
-            hidden = self.target_decode_hidden([input_token], target_position + i)
-            next_token = self.greedy_tokens_from_hidden(hidden)[0]
-            target_tokens.append(next_token)
-            valid_inputs.append(input_token)
-            valid_hidden.append(hidden)
-
-            if i == len(drafts):
-                break
-            if next_token != drafts[i]:
-                break
-            accepted_count += 1
-
-        return (
-            accepted_count,
-            target_tokens[accepted_count],
-            valid_inputs,
-            torch.cat(valid_hidden, dim=0),
-        )
-
-    def _mtp_make_drafts(
-        self,
-        last_hidden: torch.Tensor,
-        last_logits: torch.Tensor,
-        last_position: int,
-        draft_count: int,
-        committed_kv_len: int,
-    ) -> List[int]:
-        if draft_count < 1 or draft_count > 5:
-            raise ValueError("draft_count must be in [1,5]")
-        self.truncate_mtp_kv(committed_kv_len)
-        drafts = [int(torch.argmax(last_logits).item())]
-        hidden = last_hidden[-1:, :]
-        token = drafts[0]
-        position = last_position + 1
-        while len(drafts) < draft_count:
-            hidden, logits, token = self.mtp_forward(
-                [token],
-                hidden,
-                torch.tensor([position], device=self.device, dtype=torch.int32),
-                "decode",
-            )
-            drafts.append(token)
-            position += 1
-        return drafts
-
-    def forward_mtp_verified(
-        self,
-        prompt: Iterable[int],
-        n_decode: int,
-        *,
-        draft_count: int,
-        stop_token_ids: Optional[set[int]] = None,
-        progress: Optional[Callable[[str], None]] = None,
-    ) -> tuple[List[int], SpeculativeStats]:
-        if draft_count < 1 or draft_count > 5:
-            raise ValueError("draft_count must be in [1,5]")
-        prompt_ids = list(prompt)
-        if not prompt_ids:
-            raise ValueError("prompt must not be empty")
-        if n_decode < 0:
-            raise ValueError("n_decode must be nonnegative")
-        self.reset_state()
-        stats = SpeculativeStats()
-        if n_decode == 0:
-            return [], stats
-
-        x = self.embed(prompt_ids)
-        positions = torch.arange(len(prompt_ids), device=self.device, dtype=torch.int32)
-        x = self.run_layers(x, "prefill", positions)
-        target_hidden = self.final_norm_hidden(x)
-        token = int(torch.argmax(self.logits_from_hidden_last(target_hidden)).item())
-        out = [token]
-        self.pos = len(prompt_ids)
-        if progress is not None:
-            progress(f"mtp out={len(out)}/{n_decode} prefill token={token}")
-        if len(out) >= n_decode or (stop_token_ids and token in stop_token_ids):
-            return out, stats
-
-        mtp_ids = prompt_ids[1:] + [token]
-        mtp_hidden, mtp_logits, _ = self.mtp_forward(mtp_ids, target_hidden, positions, "prefill")
-        last_mtp_hidden = mtp_hidden[-1:, :]
-        last_mtp_logits = mtp_logits
-        last_mtp_position = len(prompt_ids) - 1
-        committed_mtp_len = self.mtp_kv_len()
-
-        while len(out) < n_decode:
-            remaining = n_decode - len(out)
-            if remaining <= 1:
-                target_token, _ = self._target_decode_one(token, self.pos)
-                self.pos += 1
-                token = target_token
-                out.append(token)
-                if progress is not None:
-                    progress(f"mtp out={len(out)}/{n_decode} final-target token={token}")
-                break
-            k = min(draft_count, remaining - 1)
-            drafts = self._mtp_make_drafts(
-                last_mtp_hidden,
-                last_mtp_logits,
-                last_mtp_position,
-                k,
-                committed_mtp_len,
-            )
-
-            target_position = self.pos
-            accepted_count, target_token, valid_target_inputs, valid_target_hidden = self._target_verify_drafts(
-                token,
-                drafts,
-                target_position,
-            )
-            stats.observe_draft(k, accepted_count)
-
-            committed_tokens = drafts[:accepted_count] + [target_token]
-
-            self.pos = target_position + len(valid_target_inputs)
-            stop_hit = False
-            for committed_token in committed_tokens:
-                token = committed_token
-                out.append(token)
-                if stop_token_ids and token in stop_token_ids:
-                    stop_hit = True
-                    break
-            if progress is not None:
-                stop_note = " stop" if stop_hit else ""
-                progress(
-                    f"mtp out={len(out)}/{n_decode} batch={stats.draft_batches} "
-                    f"accepted={accepted_count}/{k} drafted={stats.draft_tokens} "
-                    f"accepted_total={stats.accepted_tokens}{stop_note}"
-                )
-            if stop_hit or len(out) >= n_decode:
-                break
-
-            self.truncate_mtp_kv(committed_mtp_len)
-            mtp_ids = valid_target_inputs[1:] + [token]
-            mtp_positions = torch.arange(
-                target_position,
-                target_position + len(valid_target_inputs),
-                device=self.device,
-                dtype=torch.int32,
-            )
-            last_mtp_hidden, last_mtp_logits, _ = self.mtp_forward(
-                mtp_ids,
-                valid_target_hidden,
-                mtp_positions,
-                "decode",
-            )
-            last_mtp_hidden = last_mtp_hidden[-1:, :]
-            last_mtp_position = target_position + len(valid_target_inputs) - 1
-            committed_mtp_len = self.mtp_kv_len()
-
-        return out, stats
-
     def forward(
         self,
         prompt: Iterable[int],
@@ -1237,7 +875,6 @@ class RefModel:
         *,
         dumps: Optional[Dict[str, torch.Tensor]] = None,
         stop_token_ids: Optional[set[int]] = None,
-        progress: Optional[Callable[[str], None]] = None,
     ) -> List[int]:
         prompt_ids = list(prompt)
         if not prompt_ids:
@@ -1261,8 +898,6 @@ class RefModel:
         token = int(torch.argmax(lg).item())
         out = [token]
         self.pos = len(prompt_ids)
-        if progress is not None:
-            progress(f"greedy out={len(out)}/{n_decode} prefill token={token}")
         if stop_token_ids and token in stop_token_ids:
             return out
 
@@ -1273,9 +908,6 @@ class RefModel:
             token = int(torch.argmax(self.logits_last(x)).item())
             out.append(token)
             self.pos += 1
-            if progress is not None:
-                stop_note = " stop" if stop_token_ids and token in stop_token_ids else ""
-                progress(f"greedy out={len(out)}/{n_decode} token={token}{stop_note}")
             if stop_token_ids and token in stop_token_ids:
                 break
         return out
@@ -1351,10 +983,8 @@ def main() -> None:
     ap.add_argument("--messages-json", default=None, help="JSON chat messages rendered through the Qwen chat template")
     ap.add_argument("--token-ids", default=None, help="comma or space separated token ids; bypasses tokenizer/chat template")
     ap.add_argument("--decode", type=int, default=16)
-    ap.add_argument("--mtp-draft-tokens", type=int, default=0, help="0 disables MTP; 1..5 enables verified greedy MTP")
     ap.add_argument("--stop-token-ids", default=DEFAULT_STOP_TOKEN_IDS)
     ap.add_argument("--show-rendered-prompt", action="store_true")
-    ap.add_argument("--progress", action="store_true", help="print decode progress to stderr")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dump", default=None, help="write v3 structural dump JSON")
     ap.add_argument(
@@ -1364,8 +994,6 @@ def main() -> None:
         help="keep quantized payloads resident on device (auto/gpu) or stream from mmap",
     )
     args = ap.parse_args()
-    if args.mtp_draft_tokens < 0 or args.mtp_draft_tokens > 5:
-        raise SystemExit("--mtp-draft-tokens must be 0 or an integer in [1,5]")
 
     model = RefModel(
         args.weights,
@@ -1385,38 +1013,12 @@ def main() -> None:
         ]
         prompt_ids, rendered_prompt = chat_prompt_ids(tokenizer, messages)
     stop_token_ids = parse_stop_token_ids(args.stop_token_ids)
-    progress = None
-    if args.progress:
-        progress = lambda msg: print(f"PROGRESS: {msg}", file=sys.stderr, flush=True)
     with torch.inference_mode():
-        if args.mtp_draft_tokens:
-            tokens, spec_stats = model.forward_mtp_verified(
-                prompt_ids,
-                args.decode,
-                draft_count=args.mtp_draft_tokens,
-                stop_token_ids=stop_token_ids,
-                progress=progress,
-            )
-        else:
-            tokens = model.forward(
-                prompt_ids,
-                args.decode,
-                stop_token_ids=stop_token_ids,
-                progress=progress,
-            )
-            spec_stats = None
+        tokens = model.forward(prompt_ids, args.decode, stop_token_ids=stop_token_ids)
     print(f"PROMPT_TOKENS: {len(prompt_ids)}")
     if rendered_prompt is not None and args.show_rendered_prompt:
         print(f"RENDERED_PROMPT: {rendered_prompt!r}")
     print(f"GENERATED_TOKEN_IDS: {tokens}")
-    if spec_stats is not None:
-        print(f"MTP_DRAFT_BATCHES: {spec_stats.draft_batches}")
-        print(f"MTP_DRAFT_TOKENS: {spec_stats.draft_tokens}")
-        print(f"MTP_ACCEPTED_TOKENS: {spec_stats.accepted_tokens}")
-        print(f"MTP_ACCEPTANCE_RATE: {spec_stats.acceptance_rate:.6f}")
-        print(f"MTP_ACCEPTANCE_LENGTH: {spec_stats.acceptance_length:.6f}")
-        print(f"MTP_DRAFT_TOKENS_PER_POS: {spec_stats.draft_tokens_per_pos}")
-        print(f"MTP_ACCEPTED_TOKENS_PER_POS: {spec_stats.accepted_tokens_per_pos}")
     if tokenizer is not None:
         text = tokenizer.decode(tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
         print(f"GENERATED_TEXT: {text!r}")

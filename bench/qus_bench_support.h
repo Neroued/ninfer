@@ -65,7 +65,6 @@ struct BenchOptions {
     std::optional<std::size_t> work_bytes; // --work-bytes override (prefill workspace)
     std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
     int mtp_draft_tokens        = 0;
-    bool mtp_strict_sequential  = false;
     int device                  = 0;
     bool use_cuda_graph         = true;
     OutputFormat output         = OutputFormat::Table;
@@ -115,8 +114,7 @@ struct BenchEnvironment {
     std::size_t work_bytes                = 0;
     std::uint32_t prefill_chunk           = model::kDefaultPrefillChunk;
     int mtp_draft_tokens                  = 0;
-    bool mtp_strict_sequential            = false;
-    std::string decode_path; // "cuda_graph", "eager", "mtp_eager", or "mtp_strict"
+    std::string decode_path; // "cuda_graph", "eager", or "mtp_eager"
     int repetitions = 0;
     int warmup      = 0;
     std::string corpus_path;
@@ -139,8 +137,7 @@ void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t co
 // Corpus ------------------------------------------------------------------------------------
 std::vector<int> load_corpus_ids(const std::string& path);
 std::vector<int> prompt_slice(const std::vector<int>& corpus, int n_prompt);
-std::string decode_path_name(bool use_cuda_graph, int mtp_draft_tokens,
-                             bool mtp_strict_sequential);
+std::string decode_path_name(bool use_cuda_graph, int mtp_draft_tokens);
 
 // Statistics --------------------------------------------------------------------------------
 Stats compute_stats(const std::vector<double>& values);

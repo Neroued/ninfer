@@ -40,7 +40,7 @@ std::string usage_text(const char* argv0) {
            " <weights.qus> --tokenizer <dir> (--prompt <text>|--messages <messages.json>) "
            "[--max-context N] [--prefill-chunk N] [--max-new N] [--device N] [--raw-output] "
            "[--print-token-ids] [--no-cuda-graph] [--mtp-draft-tokens N] "
-           "[--mtp-strict-sequential] [--mtp-round-dump-dir DIR] [--stop-token-id N]...\n"
+           "[--stop-token-id N]...\n"
            "       streams decoded text to stdout; writes progress and timings to stderr\n";
 }
 
@@ -76,10 +76,6 @@ CliOptions parse_cli(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--mtp-draft-tokens") {
             options.mtp_draft_tokens = parse_mtp_draft_tokens(require_value("--mtp-draft-tokens"));
-        } else if (arg == "--mtp-strict-sequential") {
-            options.mtp_strict_sequential = true;
-        } else if (arg == "--mtp-round-dump-dir") {
-            options.mtp_round_dump_dir = require_value("--mtp-round-dump-dir");
         } else if (arg == "--raw-output") {
             options.output_mode = OutputMode::Raw;
         } else if (arg == "--print-token-ids") {

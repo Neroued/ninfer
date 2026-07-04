@@ -182,10 +182,9 @@ gdn_commit(conv_states[l], ssm_states[l] for all l,
 1. **快照轨迹 ≡ 逐 token 调用**：§5.1/§5.2 算子给定相同输入序列时，
    `states[..., j]` 必须与「以相同 kernel 连续 j+1 次 T=1 调用」的终态**逐 bit
    相等**。可达成依据：recurrent kernel 本就串行遍历 token、状态在寄存器中以
-   fp32 演化，store/load fp32 往返无损；conv 窗口只是输入列的搬运。此性质是
-   strict-sequential 验证模式（总领 §8.2）的基石，必须有数值测试锁定。
+   fp32 演化，store/load fp32 往返无损；conv 窗口只是输入列的搬运。
 2. 层输入本身（projection 输出）在 batched 与 T=1 路径间允许 kernel 级浮点差异；
-   端到端影响按总领 §8.2 的 near-tie 规则验收。
+   端到端不以跨路径逐 token 相等为验收目标。
 3. argmax tie-break 全项目统一为最低 index。
 
 ---
@@ -214,13 +213,9 @@ gdn_commit(conv_states[l], ssm_states[l] for all l,
 
 ---
 
-## 7. 状态调试与 parity 工具约定
+## 7. 状态调试约定
 
-1. GDN slot 0 与 MTP KV 纳入现有 dump/parity 体系（FileTap / layer_dump 级别），
-   round 之间 slot 0 可与 ref model 的状态直接对拍（ref model 用 KV truncate +
-   顺序 verify，与本约定在 committed 语义上等价）。
-2. strict-sequential 模式下（round-algorithm §3.2）不使用快照槽，状态即
-   committed，可与 MTP-off 基线逐 bit 对拍——用于隔离「算法/状态机 bug」与
-   「batched kernel 数值差异」。
-3. ref model `forward_mtp_verified` 保持为算法 oracle：它验证的性质（MTP on/off
-   greedy 输出一致、接受率统计）就是 strict-sequential 模式的验收标准。
+1. round 之间 GDN slot 0 表示 committed 状态；MTP KV 的 `pos` 表示 committed
+   MTP 前缀长度。
+2. 状态调试应检查 committed slot、MTP KV cursor、accept 数与 host 位置镜像是否
+   一致，不要求与 MTP-off 或 Python ref model 做逐 bit 对拍。

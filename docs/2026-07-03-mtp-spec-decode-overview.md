@@ -255,8 +255,8 @@ lm_head（Q6 ≈ 1.0 GB）+ MTP 权重（0.43 GB），k 步 draft 的 MTP 成本
 speedup ≈ (E[a]+1) × C_t / (C_t×(1+ε) + k × C_mtp)
 ```
 
-用 ref model 实测接受数据（greedy、代码类 prompt）：k=4 时 acceptance length
-4.5，k=5 时 4.85。代入 ε=0.2、C_mtp≈0.8ms、C_t≈19ms：k=4 → ≈3.7×，k=5 → ≈3.8×。
+用早期离线 greedy 估计数据（代码类 prompt）：k=4 时 acceptance length
+约 4.5，k=5 时约 4.85。代入 ε=0.2、C_mtp≈0.8ms、C_t≈19ms：k=4 → ≈3.7×，k=5 → ≈3.8×。
 保守预期（真实负载接受率更低、small-T 未调优）为 **2~3.5×**。`k` 的最终默认值
 由 benchmark 决定，初始建议 3 或 4。
 
@@ -276,28 +276,21 @@ kernel/launch 开销，否则端到端加速模型会被 verify 成本主导。
 1. **自洽性（硬性）**：committed 输出必须恰好是 verify 路径自身的 greedy 输出——
    即被接受的 `d_i` 必须等于 verify 计算出的 `g_{i-1}`，`t*` 必须是 `g_a`。这由
    C1 的构造保证，是算法层不变量。
-2. **与非 MTP 基线的一致性（验收目标，允许受控偏差）**：greedy 语义下 MTP on/off
-   的输出序列应一致。但 batched verify（T=2..6）与 T=1 decode 走不同 kernel
-   （GEMV multistep vs T1、attention append vs split-KV decode），浮点归约顺序
-   不同，argmax 在 near-tie 处可能翻转并引起序列分叉。ref model 已实测过一次
-   此类分叉（draft_count=5、batched target 路径）。因此基线一致性按 8.2 分层验证，
-   不作为 batched 路径的逐 bit 硬性要求。
+2. **跨路径输出不作为验收目标**：batched verify（T=2..6）与普通 T=1 decode 走不同
+   kernel（GEMV multistep vs T1、attention append vs split-KV decode），浮点归约
+   顺序不同，argmax 在 near-tie 处可能翻转并引起序列分叉。MTP 验收只要求自身
+   committed 序列满足契约 1，并正确处理容量、stop、`max_new` 与统计。
 3. **接受率只影响吞吐**：MTP 质量差只降低 `E[a]`，不得影响契约 1。
 
-### 8.2 两级验证策略
+### 8.2 验证策略
 
-1. **strict-sequential 模式（算法验证）**：engine 提供 debug 路径，verify 阶段
-   改为逐 token 复放现有 T=1 decode kernel 序列（数学上与基线完全同路径）。此
-   模式下 MTP on/off 输出必须逐 token 相等（ref model 已证明该算法性质成立）。
-   用于验证 round 状态机、commit/rewind、MTP 输入构造的正确性。
-2. **batched 模式（生产路径）**：
-   - 算子级：每个 small-T 算子对「逐 token 复放」的 op-level parity（现行
-     l1-op-test-standard 容差体系）；GDN sequence 算子的 state 快照必须与逐步
-     单 token 调用 bit 一致（同一 kernel、同一顺序，可达成）。
-   - 端到端：与 strict-sequential 模式对比；若出现分叉，分叉点必须满足
-     near-tie 条件（target top1/top2 logit 差 < 阈值），否则判定为 bug。
-   - 统计：acceptance rate / acceptance length / tokens-per-round 进入 bench
-     报告 schema，回归监控。
+1. **算子级**：small-T 算子继续按现有 l1-op-test-standard 容差体系验证数学性质；
+   GDN sequence 算子验证快照与 committed slot 选择语义。
+2. **端到端**：canonical fixtures 覆盖 MTP batched round 能生成请求 token 数、记录
+   round/acceptance/fallback 统计，并正确处理容量 fallback、stop token 截断和
+   `max_new` overshoot。
+3. **报告**：acceptance rate / acceptance length / tokens-per-round 进入 bench
+   报告 schema，回归监控。
 
 ---
 

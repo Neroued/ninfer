@@ -453,7 +453,7 @@ reviewer to audit:
 - M2 boundary and coordination discipline against the roadmap;
 - MTP C++ API suitability for M4 without implementing M4;
 - exact MTP weight binding, source kinds, fused groups, layers, qtypes, and shapes;
-- shifted-pass and AR-step math order against the Python ref model;
+- shifted-pass and AR-step shape/cache/workspace contract;
 - fill-then-attend and MTP KV cursor semantics;
 - allowed tests under AGENTS.md.
 

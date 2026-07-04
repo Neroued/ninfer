@@ -3,7 +3,6 @@
 #include "qus/kernels/gdn_commit.h"
 #include "qus/kernels/mtp_round.h"
 #include "qus/model/config.h"
-#include "qus/runtime/round_dump.h"
 
 #include <cuda_runtime.h>
 
@@ -444,7 +443,6 @@ void Engine::load(const std::string& path) {
     decode_graph_.reset();
     decode_warmed_ = false;
     pending_sampled_.clear();
-    mtp_round_dump_index_ = 0;
     card_.reset();
     state_.reset();
     kv_.reset();
@@ -585,18 +583,6 @@ int Engine::read_i32_scalar(const Tensor model::StepState::*field) {
     return value;
 }
 
-int Engine::read_i32_element(const Tensor& tensor, int index) {
-    if (tensor.dtype != DType::I32 || index < 0 || index >= tensor.numel()) {
-        throw std::invalid_argument("Engine read_i32_element invalid tensor/index");
-    }
-    int value = 0;
-    ctx_->synchronize();
-    const auto* bytes = static_cast<const unsigned char*>(tensor.data);
-    CUDA_CHECK(cudaMemcpy(&value, bytes + static_cast<std::size_t>(index) * sizeof(value),
-                          sizeof(value), cudaMemcpyDeviceToHost));
-    return value;
-}
-
 std::vector<int> Engine::read_sampled_tokens() {
     const int n = read_i32_scalar(&model::StepState::num_sampled);
     if (n <= 0 || n > io_.sampled_out.ne[0]) {
@@ -687,57 +673,12 @@ void Engine::propose_mtp_after_accept(std::uint32_t host_window_base, int host_l
     }
 }
 
-void Engine::dump_mtp_round_state(int host_length) {
-    if (options_.mtp_round_dump_dir.empty()) { return; }
-    if (!mtp_kv_) { return; }
-    write_mtp_round_state_dump(options_.mtp_round_dump_dir, mtp_round_dump_index_++,
-                               static_cast<std::uint32_t>(host_length), *state_, *mtp_kv_,
-                               ctx_->stream);
-}
-
-std::vector<int> Engine::decode_round_strict() {
-    const int k = options_.mtp_draft_tokens;
-    const auto host_window_base = kv_->pos;
-    const int T = k + 1;
-    kernels::mtp_prepare_verify_inputs(io_.token, io_.drafts, io_.pos, io_.window_base,
-                                       io_.verify_ids, io_.positions, ctx_->stream);
-
-    int accepted = 0;
-    for (int column = 0; column < T; ++column) {
-        Tensor input = io_.verify_ids.slice(0, column, 1);
-        Tensor pos   = io_.positions.slice(0, column, 1);
-        card_->target_decode_strict_step_capture(input, pos, column);
-        kv_->pos = host_window_base + static_cast<std::uint32_t>(column) + 1U;
-
-        const int target = read_i32_element(io_.target_tokens, column);
-        if (column == k) { break; }
-        const int draft = read_i32_element(io_.drafts, column);
-        if (target != draft) { break; }
-        ++accepted;
-    }
-
-    const int base = static_cast<int>(host_window_base);
-    CUDA_CHECK(cudaMemcpyAsync(io_.pos.data, &base, sizeof(base), cudaMemcpyHostToDevice,
-                               ctx_->stream));
-    kernels::mtp_accept_tokens(io_.target_tokens, io_.drafts, io_.pos, io_.token,
-                               io_.sampled_out, io_.num_sampled, io_.accepted, io_.ar_pos,
-                               io_.stats, ctx_->stream);
-    const int host_length = read_i32_scalar(&model::StepState::pos);
-    kv_->pos             = static_cast<std::uint32_t>(host_length);
-    mtp_kv_->pos         = static_cast<std::uint32_t>(host_length);
-    (void)accepted;
-    propose_mtp_after_accept(host_window_base, host_length, k);
-    dump_mtp_round_state(host_length);
-    return read_sampled_tokens();
-}
-
 std::vector<int> Engine::decode_round() {
     const int k = options_.mtp_draft_tokens;
     if (k <= 0 || !mtp_kv_ || !card_->mtp_enabled()) { return {decode_step_one()}; }
     if (kv_->pos + static_cast<std::uint32_t>(2 * k) > kv_->max_context) {
         return {decode_step_one()};
     }
-    if (options_.mtp_strict_sequential) { return decode_round_strict(); }
 
     const auto host_window_base = kv_->pos;
     const int T = k + 1;
@@ -754,7 +695,6 @@ std::vector<int> Engine::decode_round() {
     commit_gdn_snapshots();
 
     propose_mtp_after_accept(host_window_base, host_length, k);
-    dump_mtp_round_state(host_length);
     return read_sampled_tokens();
 }
 

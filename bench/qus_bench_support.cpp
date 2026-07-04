@@ -226,7 +226,6 @@ std::string usage_text(std::string_view program) {
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             disable CUDA graph decode (non-MTP decode_path=eager)\n"
         << "  --mtp-draft-tokens <0..5>   enable eager MTP draft rounds (default: 0)\n"
-        << "  --mtp-strict-sequential     run MTP strict-sequential debug mode\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
         << "  --output-file <path>        write output to a file instead of stdout\n"
         << "  -h, --help                  show this help\n"
@@ -281,8 +280,6 @@ BenchOptions parse_args(int argc, char** argv) {
             options.device = parse_nonnegative(require_value("--device"), "device");
         } else if (arg == "--mtp-draft-tokens") {
             options.mtp_draft_tokens = parse_mtp_draft_tokens(require_value("--mtp-draft-tokens"));
-        } else if (arg == "--mtp-strict-sequential") {
-            options.mtp_strict_sequential = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "-o" || arg == "--output") {
@@ -397,9 +394,8 @@ std::vector<int> prompt_slice(const std::vector<int>& corpus, int n_prompt) {
     return std::vector<int>(corpus.begin(), corpus.begin() + n_prompt);
 }
 
-std::string decode_path_name(bool use_cuda_graph, int mtp_draft_tokens,
-                             bool mtp_strict_sequential) {
-    if (mtp_draft_tokens > 0) { return mtp_strict_sequential ? "mtp_strict" : "mtp_eager"; }
+std::string decode_path_name(bool use_cuda_graph, int mtp_draft_tokens) {
+    if (mtp_draft_tokens > 0) { return "mtp_eager"; }
     return use_cuda_graph ? "cuda_graph" : "eager";
 }
 
@@ -467,10 +463,9 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " bytes)\n";
     out << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n";
     out << "  config:     max_ctx=" << env.max_ctx << " prefill_chunk=" << env.prefill_chunk
-        << " mtp_k=" << env.mtp_draft_tokens
-        << " mtp_strict=" << (env.mtp_strict_sequential ? "true" : "false")
-        << " work_bytes=" << env.work_bytes << " decode_path=" << env.decode_path
-        << " repetitions=" << env.repetitions << " warmup=" << env.warmup << "\n\n";
+        << " mtp_k=" << env.mtp_draft_tokens << " work_bytes=" << env.work_bytes
+        << " decode_path=" << env.decode_path << " repetitions=" << env.repetitions
+        << " warmup=" << env.warmup << "\n\n";
 
     constexpr std::size_t kCols                  = 7;
     const std::array<std::string, kCols> headers = {"test",        "n_prompt",   "n_gen",
@@ -593,8 +588,6 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"max_ctx\": " << env.max_ctx << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"mtp_draft_tokens\": " << env.mtp_draft_tokens << ",\n"
-        << "    \"mtp_strict_sequential\": "
-        << (env.mtp_strict_sequential ? "true" : "false") << ",\n"
         << "    \"work_bytes\": " << env.work_bytes << ",\n"
         << "    \"decode_path\": \"" << json_escape(env.decode_path) << "\",\n"
         << "    \"repetitions\": " << env.repetitions << ",\n"

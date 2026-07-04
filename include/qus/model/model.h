@@ -167,9 +167,6 @@ public:
 
     void target_verify(const Tensor& ids, const Tensor& positions, std::uint32_t cache_offset);
 
-    void target_decode_strict_step_capture(const Tensor& input_token, const Tensor& position,
-                                           int output_column);
-
     void prefill(std::span<const int> ids);
 
     template <class Tap>

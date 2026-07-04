@@ -10,10 +10,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <numeric>
@@ -32,12 +30,11 @@ struct Options {
     int device          = 0;
     int warmup          = 1;
     int reps            = 3;
-    bool parity         = false;
 };
 
 void usage(const char* argv0) {
     std::cout << "usage: " << argv0 << " [--weights <path>] [--device <id>] [--warmup <n>]"
-              << " [--reps <n>] [--parity]\n";
+              << " [--reps <n>]\n";
 }
 
 Options parse_args(int argc, char** argv) {
@@ -56,8 +53,6 @@ Options parse_args(int argc, char** argv) {
             out.warmup = std::stoi(need_value("--warmup"));
         } else if (arg == "--reps") {
             out.reps = std::stoi(need_value("--reps"));
-        } else if (arg == "--parity") {
-            out.parity = true;
         } else if (arg == "-h" || arg == "--help") {
             usage(argc > 0 ? argv[0] : "qus_target_verify_bench");
             std::exit(0);
@@ -123,78 +118,9 @@ void copy_i32_vector(const std::vector<int>& value, qus::Tensor& dst, cudaStream
                                cudaMemcpyHostToDevice, stream));
 }
 
-void copy_bf16_column(const qus::Tensor& src, qus::Tensor& dst, int dst_col,
-                      cudaStream_t stream) {
-    const auto bytes = static_cast<std::size_t>(src.ne[0]) * sizeof(std::uint16_t);
-    auto* dst_ptr    = static_cast<unsigned char*>(dst.data) +
-                    static_cast<std::size_t>(dst_col) * bytes;
-    CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src.data, bytes, cudaMemcpyDeviceToDevice, stream));
-}
-
-void copy_i32_column(const qus::Tensor& src, qus::Tensor& dst, int dst_col,
-                     cudaStream_t stream) {
-    auto* dst_ptr = static_cast<unsigned char*>(dst.data) +
-                    static_cast<std::size_t>(dst_col) * sizeof(std::int32_t);
-    CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src.data, sizeof(std::int32_t), cudaMemcpyDeviceToDevice,
-                               stream));
-}
-
-void copy_device_tensor(const qus::Tensor& src, const qus::Tensor& dst, cudaStream_t stream) {
-    if (src.bytes() != dst.bytes()) { throw std::runtime_error("device copy size mismatch"); }
-    CUDA_CHECK(cudaMemcpyAsync(dst.data, src.data, src.bytes(), cudaMemcpyDeviceToDevice, stream));
-}
-
-float bf16_to_f32(std::uint16_t bits) {
-    const std::uint32_t u = static_cast<std::uint32_t>(bits) << 16;
-    float out             = 0.0f;
-    std::memcpy(&out, &u, sizeof(out));
-    return out;
-}
-
-std::vector<std::uint16_t> copy_bf16_to_host(const qus::Tensor& t) {
-    std::vector<std::uint16_t> out(static_cast<std::size_t>(t.numel()));
-    CUDA_CHECK(cudaMemcpy(out.data(), t.data, out.size() * sizeof(std::uint16_t),
-                          cudaMemcpyDeviceToHost));
-    return out;
-}
-
-std::vector<std::int32_t> copy_i32_to_host(const qus::Tensor& t) {
-    std::vector<std::int32_t> out(static_cast<std::size_t>(t.numel()));
-    CUDA_CHECK(cudaMemcpy(out.data(), t.data, out.size() * sizeof(std::int32_t),
-                          cudaMemcpyDeviceToHost));
-    return out;
-}
-
-double max_abs_bf16_diff(const qus::Tensor& a, const qus::Tensor& b) {
-    const std::vector<std::uint16_t> ah = copy_bf16_to_host(a);
-    const std::vector<std::uint16_t> bh = copy_bf16_to_host(b);
-    if (ah.size() != bh.size()) { throw std::runtime_error("parity tensor size mismatch"); }
-    double max_abs = 0.0;
-    for (std::size_t i = 0; i < ah.size(); ++i) {
-        const double diff =
-            std::abs(static_cast<double>(bf16_to_f32(ah[i])) - static_cast<double>(bf16_to_f32(bh[i])));
-        max_abs = std::max(max_abs, diff);
-    }
-    return max_abs;
-}
-
 double mean_ms(const std::vector<float>& ms) {
     return std::accumulate(ms.begin(), ms.end(), 0.0) / static_cast<double>(ms.size());
 }
-
-struct HiddenCaptureTap {
-    static constexpr bool enabled = true;
-
-    qus::Tensor* hidden = nullptr;
-    int col             = 0;
-
-    void operator()(qus::model::TapId id, int layer, qus::model::Phase, const qus::Tensor& x,
-                    cudaStream_t stream) {
-        if (id == qus::model::TapId::AfterFinalNorm && layer == -1) {
-            copy_bf16_column(x, *hidden, col, stream);
-        }
-    }
-};
 
 } // namespace
 
@@ -249,16 +175,6 @@ int main(int argc, char** argv) {
 
         qus::Tensor ids       = cache_arena.alloc(qus::DType::I32, {kMaxVerifyT});
         qus::Tensor positions = cache_arena.alloc(qus::DType::I32, {kMaxVerifyT});
-        qus::Tensor seq_hidden =
-            cache_arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, kMaxVerifyT});
-        qus::Tensor seq_logits =
-            cache_arena.alloc(qus::DType::BF16, {qus::model::kCfg.vocab, kMaxVerifyT});
-        qus::Tensor seq_tokens = cache_arena.alloc(qus::DType::I32, {kMaxVerifyT});
-        qus::Tensor verify_hidden_copy =
-            cache_arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, kMaxVerifyT});
-        qus::Tensor verify_logits_copy =
-            cache_arena.alloc(qus::DType::BF16, {qus::model::kCfg.vocab, kMaxVerifyT});
-        qus::Tensor verify_tokens_copy = cache_arena.alloc(qus::DType::I32, {kMaxVerifyT});
         copy_i32_vector({1, 2, 3, 4, 5, 6}, ids, ctx.stream);
         copy_i32_vector({0, 1, 2, 3, 4, 5}, positions, ctx.stream);
         ctx.synchronize();
@@ -277,21 +193,6 @@ int main(int argc, char** argv) {
             workspace.reset();
             ctx.synchronize();
         };
-        auto reset_to_prefix = [&](int prefix) {
-            kv.reset();
-            state.reset(ctx.stream);
-            workspace.reset();
-            if (prefix > 0) {
-                std::vector<int> prefix_ids(static_cast<std::size_t>(prefix));
-                for (int i = 0; i < prefix; ++i) { prefix_ids[static_cast<std::size_t>(i)] = 11 + i; }
-                card.prefill(prefix_ids);
-            } else {
-                copy_i32_scalar(1, io.token, ctx.stream);
-                copy_i32_scalar(0, io.pos, ctx.stream);
-                ctx.synchronize();
-            }
-        };
-
         auto time_decode = [&] {
             reset_decode_state();
             qus::CudaEventTimer timer(ctx);
@@ -335,64 +236,6 @@ int main(int argc, char** argv) {
             std::cout << T << ',' << verify_mean << ',' << ratio << ',' << (ratio - 1.0) << '\n';
         }
 
-        if (options.parity) {
-            std::cout << "parity\n";
-            std::cout << "prefix,T,hidden_max_abs,logits_max_abs,argmax_mismatches\n";
-            for (const int prefix : {0, 4}) {
-                std::vector<int> absolute_positions(kMaxVerifyT);
-                for (int i = 0; i < kMaxVerifyT; ++i) {
-                    absolute_positions[static_cast<std::size_t>(i)] = prefix + i;
-                }
-                copy_i32_vector(absolute_positions, positions, ctx.stream);
-                ctx.synchronize();
-
-                for (int T = 1; T <= kMaxVerifyT; ++T) {
-                    reset_to_prefix(prefix);
-                    qus::Tensor ids_t       = ids.slice(0, 0, T);
-                    qus::Tensor positions_t = positions.slice(0, 0, T);
-                    card.target_verify(ids_t, positions_t, static_cast<std::uint32_t>(prefix));
-                    copy_device_tensor(io.verify_hidden.slice(1, 0, T),
-                                       verify_hidden_copy.slice(1, 0, T), ctx.stream);
-                    copy_device_tensor(io.logits.slice(1, 0, T),
-                                       verify_logits_copy.slice(1, 0, T), ctx.stream);
-                    copy_device_tensor(io.target_tokens.slice(0, 0, T),
-                                       verify_tokens_copy.slice(0, 0, T), ctx.stream);
-                    ctx.synchronize();
-
-                    reset_to_prefix(prefix);
-                    for (int col = 0; col < T; ++col) {
-                        copy_i32_scalar(col + 1, io.token, ctx.stream);
-                        copy_i32_scalar(prefix + col, io.pos, ctx.stream);
-                        ctx.synchronize();
-                        HiddenCaptureTap tap{&seq_hidden, col};
-                        card.decode_step(tap);
-                        copy_bf16_column(io.logits, seq_logits, col, ctx.stream);
-                        copy_i32_column(io.token, seq_tokens, col, ctx.stream);
-                        ctx.synchronize();
-                    }
-
-                    const qus::Tensor verify_hidden = verify_hidden_copy.slice(1, 0, T);
-                    const qus::Tensor verify_logits = verify_logits_copy.slice(1, 0, T);
-                    const qus::Tensor replay_hidden = seq_hidden.slice(1, 0, T);
-                    const qus::Tensor replay_logits = seq_logits.slice(1, 0, T);
-                    const double hidden_diff = max_abs_bf16_diff(verify_hidden, replay_hidden);
-                    const double logits_diff = max_abs_bf16_diff(verify_logits, replay_logits);
-                    const std::vector<std::int32_t> verify_tokens =
-                        copy_i32_to_host(verify_tokens_copy.slice(0, 0, T));
-                    const std::vector<std::int32_t> replay_tokens =
-                        copy_i32_to_host(seq_tokens.slice(0, 0, T));
-                    int mismatches = 0;
-                    for (int i = 0; i < T; ++i) {
-                        if (verify_tokens[static_cast<std::size_t>(i)] !=
-                            replay_tokens[static_cast<std::size_t>(i)]) {
-                            ++mismatches;
-                        }
-                    }
-                    std::cout << prefix << ',' << T << ',' << hidden_diff << ',' << logits_diff
-                              << ',' << mismatches << '\n';
-                }
-            }
-        }
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "target_verify_bench: " << e.what() << '\n';

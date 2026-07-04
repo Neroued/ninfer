@@ -158,7 +158,6 @@ int main(int argc, char** argv) {
         engine_options.max_ctx        = max_ctx;
         engine_options.prefill_chunk  = options.prefill_chunk;
         engine_options.mtp_draft_tokens = options.mtp_draft_tokens;
-        engine_options.mtp_strict_sequential = options.mtp_strict_sequential;
         engine_options.use_cuda_graph = options.use_cuda_graph;
         if (options.work_bytes.has_value()) { engine_options.work_bytes = *options.work_bytes; }
 
@@ -171,9 +170,8 @@ int main(int argc, char** argv) {
         env.max_ctx                 = max_ctx;
         env.prefill_chunk           = options.prefill_chunk;
         env.mtp_draft_tokens        = options.mtp_draft_tokens;
-        env.mtp_strict_sequential   = options.mtp_strict_sequential;
-        env.decode_path             = qus::bench::decode_path_name(
-            options.use_cuda_graph, options.mtp_draft_tokens, options.mtp_strict_sequential);
+        env.decode_path             =
+            qus::bench::decode_path_name(options.use_cuda_graph, options.mtp_draft_tokens);
         env.repetitions             = options.repetitions;
         env.warmup                  = options.warmup;
         env.corpus_path             = options.corpus_path;

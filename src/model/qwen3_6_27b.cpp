@@ -646,47 +646,6 @@ void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions,
     work_.reset();
 }
 
-void Qwen3_6_27B::target_decode_strict_step_capture(const Tensor& input_token,
-                                                    const Tensor& position, int output_column) {
-    if (output_column < 0) {
-        throw std::invalid_argument("target_decode_strict_step_capture column must be nonnegative");
-    }
-    require_tensor_shape(input_token, DType::I32, {1}, "strict target input token");
-    require_tensor_shape(position, DType::I32, {1}, "strict target position");
-    require_tensor_window(io_.verify_hidden, DType::BF16, kCfg.hidden, output_column + 1,
-                          "strict target hidden");
-    require_tensor_window(io_.logits, DType::BF16, kCfg.vocab, output_column + 1,
-                          "strict target logits");
-    require_vector_window(io_.target_tokens, DType::I32, output_column + 1,
-                          "strict target tokens");
-
-    cudaStream_t s = ctx_.stream;
-    work_.reset();
-    CUDA_CHECK(cudaMemcpyAsync(io_.token.data, input_token.data, input_token.bytes(),
-                               cudaMemcpyDeviceToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(io_.pos.data, position.data, position.bytes(),
-                               cudaMemcpyDeviceToDevice, s));
-
-    {
-        Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-        kernels::embed_gather(io_.token, *embed_, x, s);
-        NullTap tap;
-        run_layers(x, Phase::Decode, tap, 0);
-
-        Tensor hidden = io_.verify_hidden.slice(1, output_column, 1);
-        Tensor logits = io_.logits.slice(1, output_column, 1);
-        Tensor target = io_.target_tokens.slice(0, output_column, 1);
-        kernels::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, nullptr, hidden, s);
-        kernels::linear(hidden, *lm_head_, logits, work_, s);
-        kernels::argmax(logits, target, s);
-        CUDA_CHECK(cudaMemcpyAsync(io_.token.data, target.data, target.bytes(),
-                                   cudaMemcpyDeviceToDevice, s));
-    }
-
-    detail::advance_pos(io_.pos, s);
-    work_.reset();
-}
-
 void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph,
                            std::uint32_t cache_offset) {
     cudaStream_t s = ctx_.stream;

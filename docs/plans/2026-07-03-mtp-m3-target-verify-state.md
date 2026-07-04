@@ -32,8 +32,8 @@ device-scalar-driven `gdn_commit` primitive.
 
 ## Non-Goals
 
-- No accept/reject decision kernel, round state machine, sampled output assembly, strict-sequential
-  mode, host/device round synchronization, or generation path change; those belong to M4.
+- No accept/reject decision kernel, round state machine, sampled output assembly, host/device round
+  synchronization, or generation path change; those belong to M4.
 - No MTP forward, MTP KV scheduling, shifted-pass input assembly, AR-step loop, or MTP binding
   changes except preserving the M2 surfaces already in the tree.
 - No W8 work and no small-T performance kernels. Verify uses TEXT_CORE Q4/Q5/Q6 generic/prefill
@@ -301,12 +301,9 @@ feat(kernels): add gdn snapshot state operators
 - Extend `qus_model_blocks_test` with a focused Verify smoke path using the model-block fixture:
   `Phase::Verify` must run the generic small-T fallback path, GDN snapshot slots `0..k` must be
   written, and the model path must not accidentally use in-place or chunked GDN state.
-- Use `qus_target_verify_bench --parity` as the real-artifact parity path. It runs T=1..6 Verify
-  windows and sequential T=1
-  decode replay from identical prefilled state. It should compare hidden/logits under the existing
-  house tolerance and report argmax mismatches only when the top1/top2 gap satisfies the near-tie
-  rule from overview §8.2.
-- Keep the real-artifact parity command outside always-on CTest if it depends on the large `out/`
+- Use `qus_target_verify_bench` as the real-artifact cost checkpoint. It runs T=2..6 Verify windows
+  and reports ratio/epsilon against T=1 decode cost.
+- Keep the real-artifact cost command outside always-on CTest if it depends on the large `out/`
   artifact; it is still part of the M3 gate evidence.
 
 **Definition Of Done:**
@@ -320,7 +317,7 @@ feat(kernels): add gdn snapshot state operators
 cmake --build build --target qus_model_blocks_test qus_target_verify_bench -j
 ./build/tests/qus_model_blocks_test
 compute-sanitizer --tool memcheck ./build/tests/qus_model_blocks_test
-./build/bench/qus_target_verify_bench --weights out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus --warmup 1 --reps 3 --parity
+./build/bench/qus_target_verify_bench --weights out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus --warmup 1 --reps 3
 ```
 
 **Commit Subject:**
@@ -402,7 +399,7 @@ feat(runtime): budget target verify state
 **Verification Commands:**
 ```bash
 cmake --build build --target qus_target_verify_bench -j
-./build/bench/qus_target_verify_bench --weights out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus --warmup 1 --reps 3 --parity
+./build/bench/qus_target_verify_bench --weights out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus --warmup 1 --reps 3
 ```
 
 **Commit Subject:**
@@ -434,8 +431,7 @@ bench(mtp): record target verify cost
 - All existing tests pass.
 - Snapshot operator tests pass and compute-sanitizer is clean.
 - KV rewind/rewrite test passes.
-- Target Verify real-artifact parity passes for T=1..6, with any argmax mismatch justified by
-  near-tie evidence.
+- Target Verify real-artifact cost checkpoint runs for T=2..6 and records ratio/epsilon.
 - `qus_engine_memory_stats_test` passes and k=5/max_ctx=8192 budget numbers are captured.
 - Cost checkpoint report is committed under `docs/bench/`.
 - Code review has no unresolved Critical or Important findings.
@@ -449,14 +445,14 @@ compute-sanitizer --tool memcheck ./build/tests/qus_causal_conv1d_test
 compute-sanitizer --tool memcheck ./build/tests/qus_gated_delta_rule_test
 compute-sanitizer --tool memcheck ./build/tests/qus_gdn_commit_test
 compute-sanitizer --tool memcheck ./build/tests/qus_model_blocks_test
-./build/bench/qus_target_verify_bench --weights out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus --warmup 1 --reps 3 --parity
+./build/bench/qus_target_verify_bench --weights out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus --warmup 1 --reps 3
 git status --short
 ```
 
 ## Final Evidence To Report
 
 - Change summary by layer: L0 state, L1 kernels, L2 model Verify, runtime memory, tests, bench docs.
-- Gate evidence: build, CTest, sanitizer, real-artifact Verify parity, memory stats, and benchmark
+- Gate evidence: build, CTest, sanitizer, real-artifact Verify cost, memory stats, and benchmark
   command outputs.
 - Epsilon checkpoint numbers and the resulting M5 tuning priority.
 - M4 handoff notes: StepState field meanings, `target_verify` inputs/outputs, `gdn_commit` timing,

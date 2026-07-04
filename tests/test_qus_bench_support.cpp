@@ -175,8 +175,7 @@ int test_parse_args() {
                              "2048,128",  "-r",        "3",     "--warmup",
                              "2",         "--max-ctx", "4096",  "--prefill-chunk",
                              "128",       "--mtp-draft-tokens",
-                             "5",         "--mtp-strict-sequential",
-                             "-o",        "json",      "--no-cuda-graph"});
+                             "5",         "-o",        "json",   "--no-cuda-graph"});
     failures += expect_string(parsed.weights_path, "w.qus", "weights path");
     failures += expect_size(parsed.n_prompt.size(), 2, "n_prompt list size");
     failures +=
@@ -192,7 +191,6 @@ int test_parse_args() {
         expect_bool(parsed.max_ctx.has_value() && *parsed.max_ctx == 4096, "max_ctx parsed");
     failures += expect_bool(parsed.prefill_chunk == 128, "prefill_chunk parsed");
     failures += expect_bool(parsed.mtp_draft_tokens == 5, "mtp draft tokens parsed");
-    failures += expect_bool(parsed.mtp_strict_sequential, "mtp strict sequential parsed");
     failures += expect_bool(parsed.output == qb::OutputFormat::Json, "output json parsed");
     failures += expect_bool(!parsed.use_cuda_graph, "no-cuda-graph parsed");
 
@@ -268,7 +266,6 @@ int test_format_json_schema() {
     env.repetitions   = 2;
     env.prefill_chunk = qus::model::kDefaultPrefillChunk;
     env.mtp_draft_tokens = 5;
-    env.mtp_strict_sequential = true;
     env.corpus_path   = "bench/fixtures/bench_corpus.ids";
     env.corpus_tokens = 10241;
     env.weights_path  = "w.qus";
@@ -289,8 +286,6 @@ int test_format_json_schema() {
                             "json config prefill_chunk");
     failures += expect_bool(report.at("config").at("mtp_draft_tokens").get<int>() == 5,
                             "json config mtp_draft_tokens");
-    failures += expect_bool(report.at("config").at("mtp_strict_sequential").get<bool>(),
-                            "json config mtp_strict_sequential");
     const Json& tests = report.at("tests");
     failures += expect_bool(tests.is_array() && tests.size() == 2, "json tests array");
 
@@ -353,13 +348,11 @@ int test_format_table_and_csv() {
     failures += expect_bool(table.find("mtp acc") != std::string::npos, "table has mtp acc");
     failures += expect_bool(table.find("GiB") != std::string::npos, "table shows GiB peak");
 
-    failures += expect_string(qb::decode_path_name(true, 0, false), "cuda_graph",
-                              "decode path cuda graph");
-    failures += expect_string(qb::decode_path_name(false, 0, false), "eager", "decode path eager");
-    failures += expect_string(qb::decode_path_name(true, 5, false), "mtp_eager",
+    failures +=
+        expect_string(qb::decode_path_name(true, 0), "cuda_graph", "decode path cuda graph");
+    failures += expect_string(qb::decode_path_name(false, 0), "eager", "decode path eager");
+    failures += expect_string(qb::decode_path_name(true, 5), "mtp_eager",
                               "decode path mtp eager");
-    failures += expect_string(qb::decode_path_name(true, 5, true), "mtp_strict",
-                              "decode path mtp strict");
 
     const std::string csv = qb::format_csv(env, results);
     failures += expect_bool(csv.find("label,kind,n_prompt") == 0, "csv header first");

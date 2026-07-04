@@ -24,8 +24,6 @@ struct CliOptions {
     std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
     int device                  = 0;
     int mtp_draft_tokens        = 0;
-    bool mtp_strict_sequential  = false;
-    std::string mtp_round_dump_dir;
     OutputMode output_mode      = OutputMode::Clean;
     bool print_token_ids        = false;
     bool use_cuda_graph         = true;

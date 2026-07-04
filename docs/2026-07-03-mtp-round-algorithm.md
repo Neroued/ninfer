@@ -194,19 +194,14 @@ drafts[i] = argmax(lm_head(m));  ar_hidden = m;  ar_pos += 1
 1. **容量守卫**：仅当 `L + 2k ≤ max_ctx` 时运行 MTP round（轮内最远触及位置
    `max(L+k, L+a+k-1) ≤ L+2k-1`，再留下一轮窗口余量由下轮自身判断）。否则回退
    到现有 T=1 decode 步直至结束。
-2. **strict-sequential 调试模式**（总领 §8.2）：verify 阶段替换为 k+1 次现有
-   T=1 decode kernel 序列（含 GDN 就地更新），逐 token 与 drafts 比较，在第一个
-   不匹配处停止；后续 token 不 forward。此模式下 GDN 无需 snapshot（拒绝点即
-   停止点，状态恰好等于 committed），输出必须与 MTP-off 基线逐 token 相等。
-   该模式仅用于验证与排障，不是性能路径。
-3. **禁止事项**：round 循环内不得调用 `Engine::prefill`（它会 reset KV/GDN）；
+2. **禁止事项**：round 循环内不得调用 `Engine::prefill`（它会 reset KV/GDN）；
    不得在轮中途以 host 分支改变 kernel 序列形状（违反总领 C5）。
 
 ---
 
 ## 4. 统计口径
 
-与 ref model `SpeculativeStats` 及 vLLM spec-decode metrics 对齐：
+与 spec-decode 常见吞吐指标对齐：
 
 | 指标 | 定义 |
 |---|---|
@@ -230,8 +225,8 @@ implementation-requirements §7）。
 2. **状态一致**：C2/C3/C4 保证三类状态在每轮结束时都精确对应 committed 前缀
    `0..L'-1`：KV 靠位置轴 + 覆盖，GDN 靠 snapshot 选择，MTP KV 靠位置轴 + 覆盖。
 3. **kernel 路径差异**：batched verify 与 T=1 decode 的浮点归约顺序不同，
-   near-tie 处 argmax 可能与基线分叉（总领 §8.1-2）。分叉后的序列仍满足本文
-   不变量 1/2（自洽），验收按总领 §8.2 分层执行。
+   near-tie 处 argmax 可能与普通 decode 分叉。分叉后的序列仍满足本文不变量
+   1/2（自洽）；MTP 验收不以跨实现 token 序列相等为目标。
 4. **MTP 质量无关性**：drafts 只出现在接受判定的右侧与 MTP 自身输入中，任何
    draft 错误只减小 `a`，不进入 committed 状态。
 
@@ -264,7 +259,7 @@ qus 的简化：非最后 chunk 跳过 MTP logits 与 AR steps（vLLM 因 batchi
 3. `attn_in.w8` 输出行区间 `q[0,6144) k[6144,7168) gate[7168,13312) v[13312,14336)`；
    `T>1` 时需 compact split（Part 2 §7 Option A/B）。
 4. argmax tie-break：全项目统一"最低 index 获胜"（现有 `kernels::argmax` 行为），
-   verify 与 draft 两侧一致，保证 strict-sequential 模式可逐 bit 复现。
+   verify 与 draft 两侧一致。
 5. lm_head/embedding 为 target 与 MTP 共享张量（checkpoint 无独立 MTP 副本）。
 
 ---

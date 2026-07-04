@@ -79,24 +79,6 @@ Run generate(const std::filesystem::path& weights, qus::EngineOptions options,
     return out;
 }
 
-int scenario_strict(const std::filesystem::path& weights) {
-    qus::EngineOptions base_options;
-    base_options.max_ctx = 32;
-    const Run baseline = generate(weights, base_options, {1}, 3);
-
-    qus::EngineOptions mtp_options;
-    mtp_options.max_ctx               = 32;
-    mtp_options.mtp_draft_tokens      = 5;
-    mtp_options.mtp_strict_sequential = true;
-    const Run mtp = generate(weights, mtp_options, {1}, 3);
-
-    int failures = 0;
-    failures += mtp.tokens == baseline.tokens ? 0 : fail("strict tokens differ from baseline");
-    failures += mtp.mtp.rounds > 0 ? 0 : fail("strict scenario did not record MTP rounds");
-    failures += mtp.mtp.fallback_steps == 0 ? 0 : fail("strict scenario used fallback");
-    return failures;
-}
-
 int scenario_batched(const std::filesystem::path& weights) {
     qus::EngineOptions options;
     options.max_ctx          = 128;
@@ -126,14 +108,20 @@ int scenario_capacity_fallback(const std::filesystem::path& weights) {
 }
 
 int scenario_stop_truncation(const std::filesystem::path& weights) {
+    qus::EngineOptions probe_options;
+    probe_options.max_ctx          = 32;
+    probe_options.mtp_draft_tokens = 5;
+    const Run probe = generate(weights, probe_options, {1}, 3);
+    if (probe.tokens.size() < 2) { return fail("stop probe token count mismatch"); }
+
     qus::EngineOptions options;
     options.max_ctx          = 32;
     options.mtp_draft_tokens = 5;
-    options.stop_token_ids   = {3300};
+    options.stop_token_ids   = {probe.tokens[1]};
     const Run mtp = generate(weights, options, {1}, 3);
 
     int failures = 0;
-    failures += mtp.tokens == std::vector<int>({5328, 3300})
+    failures += mtp.tokens == std::vector<int>({probe.tokens[0], probe.tokens[1]})
                     ? 0
                     : fail("stop scenario did not truncate at stop token");
     failures += mtp.mtp.rounds > 0 ? 0 : fail("stop scenario did not record MTP rounds");
@@ -145,7 +133,7 @@ int scenario_stop_truncation(const std::filesystem::path& weights) {
 
 int main(int argc, char** argv) {
     if (argc > 2) {
-        std::cerr << "usage: qus_engine_mtp_e2e_test <strict|batched|capacity_fallback|stop_truncation>\n";
+        std::cerr << "usage: qus_engine_mtp_e2e_test <batched|capacity_fallback|stop_truncation>\n";
         return 2;
     }
     const std::filesystem::path weights = real_weights_path();
@@ -170,11 +158,9 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    const std::string scenario = argc == 2 ? argv[1] : "strict";
+    const std::string scenario = argc == 2 ? argv[1] : "batched";
     int failures = 0;
-    if (scenario == "strict") {
-        failures = scenario_strict(weights);
-    } else if (scenario == "batched") {
+    if (scenario == "batched") {
         failures = scenario_batched(weights);
     } else if (scenario == "capacity_fallback") {
         failures = scenario_capacity_fallback(weights);

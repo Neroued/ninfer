@@ -208,7 +208,7 @@ implementation (wrong parallelism, per-launch single query).
 
 `embed_gather`, `rmsnorm` (input / q-k / post-attn / final / GDN-gated), `linear`
 (GEMV/multistep/MMA), `l2norm`, `silu_and_mul`, `sigmoid_gate_mul`, `residual_add`,
-`gdn_in_ab_gated_prefill`, and the host pack/split memcpy helpers. Each operates on the chunk's
+`gdn_in_ab_gated`, and the host pack/split memcpy helpers. Each operates on the chunk's
 `[·, len]` slice with no cross-token coupling.
 
 ### Orchestration / lifecycle

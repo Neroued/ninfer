@@ -4,6 +4,7 @@
 // fp32_transcendental.
 #include "qus/kernels/gdn_gating.h"
 #include "qus/kernels/gdn_in_ab.h"
+#include "qus/core/arena.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -63,33 +64,43 @@ static int fused_decode_matches_two_step() {
     round_to_bf16(aw);
     round_to_bf16(bw);
 
+    std::vector<float> a(48), b(48);
+    for (std::int32_t h = 0; h < 48; ++h) {
+        const float* aw_row = aw.data() + static_cast<std::size_t>(h) * 5120u;
+        const float* bw_row = bw.data() + static_cast<std::size_t>(h) * 5120u;
+        float acc_a         = 0.0f;
+        float acc_b         = 0.0f;
+        for (std::int32_t k = 0; k < 5120; ++k) {
+            acc_a = std::fma(aw_row[k], x[k], acc_a);
+            acc_b = std::fma(bw_row[k], x[k], acc_b);
+        }
+        a[h] = bf16_to_f32(f32_to_bf16(acc_a));
+        b[h] = bf16_to_f32(f32_to_bf16(acc_b));
+    }
+    std::vector<double> ref_g(48), ref_beta(48);
+    cpu_gdn_gating(a, b, A_log, dt_bias, 1, ref_g, ref_beta);
+
     DBuf dx = to_device_bf16(x), daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
     DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
-    DBuf da(48 * 2), db(48 * 2), dg_ref(48 * 4), dbeta_ref(48 * 4), dg(48 * 4),
-        dbeta(48 * 4);
+    DBuf dg(48 * 4), dbeta(48 * 4);
 
     Tensor tx(dx.p, DType::BF16, {5120, 1});
-    Tensor ta(da.p, DType::BF16, {48, 1});
-    Tensor tb(db.p, DType::BF16, {48, 1});
     Tensor tA_log(dA_log.p, DType::FP32, {48});
     Tensor tdt_bias(ddt_bias.p, DType::FP32, {48});
-    Tensor tg_ref(dg_ref.p, DType::FP32, {48, 1});
-    Tensor tbeta_ref(dbeta_ref.p, DType::FP32, {48, 1});
     Tensor tg(dg.p, DType::FP32, {48, 1});
     Tensor tbeta(dbeta.p, DType::FP32, {48, 1});
     Weight wa = dense_bf16_weight(daw.p);
     Weight wb = dense_bf16_weight(dbw.p);
+    WorkspaceArena ws(4u * 1024u * 1024u);
 
-    kernels::gdn_in_ab_decode(tx, wa, wb, ta, tb, nullptr);
-    kernels::gdn_gating(ta, tb, tA_log, tdt_bias, tg_ref, tbeta_ref, nullptr);
-    kernels::gdn_in_ab_gated_decode(tx, wa, wb, tA_log, tdt_bias, tg, tbeta, nullptr);
+    kernels::gdn_in_ab_gated(tx, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, nullptr);
     cudaDeviceSynchronize();
 
     int f = 0;
-    f += verify("gdn_in_ab_gated_decode g", from_device_f32(dg, 48), from_device_f32(dg_ref, 48),
+    f += verify("gdn_in_ab_gated T=1 g", from_device_f32(dg, 48), ref_g,
                 Tolerance::fp32_transcendental());
-    f += verify("gdn_in_ab_gated_decode beta", from_device_f32(dbeta, 48),
-                from_device_f32(dbeta_ref, 48), Tolerance::fp32_transcendental());
+    f += verify("gdn_in_ab_gated T=1 beta", from_device_f32(dbeta, 48), ref_beta,
+                Tolerance::fp32_transcendental());
     return f;
 }
 

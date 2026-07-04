@@ -285,7 +285,7 @@ feat(kernels): add gdn snapshot state operators
   and `cache_offset + T <= kv_.max_context`, then writes all final outputs to StepState buffers.
 - Update `attn_mix` so `Phase::Verify` uses generic T>1 projections and
   `gqa_attention_prefill(..., cache_offset, ...)`.
-- Update `gdn_mix` so `Phase::Verify` uses generic linears for Q/K/V/Z, `gdn_in_ab_gated_prefill`
+- Update `gdn_mix` so `Phase::Verify` uses generic linears for Q/K/V/Z, `gdn_in_ab_gated`
   for G/Beta, `causal_conv1d_sequence_snapshot`, `gated_delta_rule_recurrent_snapshot`, generic
   out projection, and `residual_add`. `Phase::Verify` must never call `gated_delta_rule_chunked`.
 - Update `mlp_tail` so `Phase::Verify` uses generic `linear`, `silu_and_mul`, generic down

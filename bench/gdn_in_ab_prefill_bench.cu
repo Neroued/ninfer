@@ -18,7 +18,8 @@ namespace {
 
 constexpr std::int32_t kHidden = 5120;
 constexpr std::int32_t kHeads  = 48;
-constexpr double kTcPeakTflops = 220.0;
+constexpr std::int32_t kSmallTMax    = 8;
+constexpr std::int32_t kSmallTSplits = 10;
 
 DBuf make_f32(std::size_t n, std::uint32_t seed) {
     std::vector<float> h(n);
@@ -83,6 +84,7 @@ void run(std::int32_t T, int warmup, int repeat, int min_time_ms) {
     DBuf dt_bias = make_f32(kHeads, 0x9876fedcU);
     DBuf g       = make_zeros(out_elems * sizeof(float));
     DBuf beta    = make_zeros(out_elems * sizeof(float));
+    WorkspaceArena ws(64u * 1024u * 1024u);
 
     Tensor tx(x.p, DType::BF16, {kHidden, T});
     Tensor tA_log(A_log.p, DType::FP32, {kHeads});
@@ -92,27 +94,33 @@ void run(std::int32_t T, int warmup, int repeat, int min_time_ms) {
     Weight wa = dense_bf16_weight(aw.p);
     Weight wb = dense_bf16_weight(bw.p);
 
-    const double useful_flops =
-        4.0 * static_cast<double>(kHeads) * static_cast<double>(kHidden) *
-        static_cast<double>(T);
-    const double bytes =
-        2.0 * static_cast<double>(x_elems) * 2.0 +
-        2.0 * static_cast<double>(w_elems) * 2.0 * static_cast<double>(T) +
-        2.0 * static_cast<double>(out_elems) * 2.0 +
-        2.0 * static_cast<double>(out_elems) * 2.0 +
-        2.0 * static_cast<double>(out_elems) * 4.0;
+    const char* route = (T == 1) ? "decode-row"
+                       : (T <= kSmallTMax) ? "smallt-splitk"
+                                           : "wmma-prefill";
+    const double weight_bytes = 2.0 * static_cast<double>(w_elems) * sizeof(std::uint16_t);
+    const double x_bytes      = static_cast<double>(x_elems) * sizeof(std::uint16_t);
+    const double out_bytes    = 2.0 * static_cast<double>(out_elems) * sizeof(float);
+    const double scratch_bytes =
+        (T >= 2 && T <= kSmallTMax)
+            ? 2.0 * static_cast<double>(kSmallTSplits) * static_cast<double>(T) *
+                  static_cast<double>(2 * kHeads) * sizeof(float)
+            : 0.0;
+    const double useful_bytes = weight_bytes + x_bytes + out_bytes;
+    const double bench_bytes  = useful_bytes + scratch_bytes;
 
     const Result r = bench_loop(
         [&](cudaStream_t s) {
-            kernels::gdn_in_ab_gated_prefill(tx, wa, wb, tA_log, tdt_bias, tg, tbeta, s);
+            kernels::gdn_in_ab_gated(tx, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, s);
         },
-        bytes, warmup, repeat, min_time_ms);
+        bench_bytes, warmup, repeat, min_time_ms);
 
     const double sec          = r.median_us * 1e-6;
-    const double useful_tflop = (sec > 0.0) ? useful_flops / sec / 1e12 : 0.0;
-    const double tc_pct       = useful_tflop / kTcPeakTflops * 100.0;
-    std::printf("fused,%d,%.3f,%.3f,%.3f,%.4f,%.2f,%d,%d\n", T, r.median_us, r.min_us,
-                r.p95_us, useful_tflop, tc_pct, r.n_runs, r.inner_iters);
+    const double useful_gbs   = (sec > 0.0) ? useful_bytes / sec / 1e9 : 0.0;
+    const double bench_gbs    = (sec > 0.0) ? bench_bytes / sec / 1e9 : 0.0;
+    const double roof_pct     = useful_gbs / kRooflineGBs * 100.0;
+    std::printf("fused,%d,%s,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.0f,%d,%d\n", T, route,
+                r.median_us, r.min_us, r.p95_us, useful_gbs, bench_gbs, roof_pct,
+                scratch_bytes, r.n_runs, r.inner_iters);
 }
 
 } // namespace
@@ -146,7 +154,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("mode,T,median_us,min_us,p95_us,useful_tflops,tc_peak_pct,n_runs,inner_iters\n");
+    std::printf("mode,T,route,median_us,min_us,p95_us,useful_gbps,bench_gbps,roof_pct,"
+                "scratch_bytes,n_runs,inner_iters\n");
     for (std::int32_t T : tokens) { run(T, warmup, repeat, min_time_ms); }
     return 0;
 }

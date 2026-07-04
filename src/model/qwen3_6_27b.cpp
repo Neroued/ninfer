@@ -728,7 +728,7 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
         Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, 1});
         Tensor beta = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, 1});
-        kernels::gdn_in_ab_gated_decode(h, *w.in_a, *w.in_b, *w.a_log, *w.dt_bias, g, beta, s);
+        kernels::gdn_in_ab_gated(h, *w.in_a, *w.in_b, *w.a_log, *w.dt_bias, work_, g, beta, s);
 
         Tensor qc = qkv_c.slice(0, 0, kCfg.key_dim);
         Tensor kc = qkv_c.slice(0, kCfg.key_dim, kCfg.key_dim);
@@ -782,7 +782,7 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
 
     Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
     Tensor beta = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
-    kernels::gdn_in_ab_gated_prefill(h, *w.in_a, *w.in_b, *w.a_log, *w.dt_bias, g, beta, s);
+    kernels::gdn_in_ab_gated(h, *w.in_a, *w.in_b, *w.a_log, *w.dt_bias, work_, g, beta, s);
 
     Tensor qc = work_.alloc(DType::BF16, {kCfg.key_dim, T});
     Tensor kc = work_.alloc(DType::BF16, {kCfg.key_dim, T});

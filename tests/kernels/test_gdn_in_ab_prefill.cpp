@@ -1,6 +1,7 @@
 // Correctness coverage for the fused GDN in_a/in_b prefill path at Qwen3.6-27B
 // shapes: two dense BF16 [48,5120] projections fused with gdn_gating.
 #include "qus/kernels/gdn_in_ab.h"
+#include "qus/core/arena.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -103,8 +104,9 @@ int one_shape(std::int32_t T, std::uint32_t seed) {
     Tensor tbeta(dbeta.p, DType::FP32, {kHeads, T});
     Weight wa = dense_bf16_weight(daw.p);
     Weight wb = dense_bf16_weight(dbw.p);
+    WorkspaceArena ws(64u * 1024u * 1024u);
 
-    kernels::gdn_in_ab_gated_prefill(tx, wa, wb, tA_log, tdt_bias, tg, tbeta, nullptr);
+    kernels::gdn_in_ab_gated(tx, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, nullptr);
     cudaDeviceSynchronize();
 
     const std::size_t n = static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(T);
@@ -128,7 +130,10 @@ int main() {
 
     int failures = 0;
     failures += one_shape(1, 0x101u);
+    failures += one_shape(2, 0x151u);
+    failures += one_shape(6, 0x181u);
     failures += one_shape(7, 0x202u);
+    failures += one_shape(8, 0x252u);
     failures += one_shape(128, 0x303u);
 
     std::cout << (failures ? "FAIL" : "OK") << " gdn_in_ab_prefill correctness\n";

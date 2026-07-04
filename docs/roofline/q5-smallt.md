@@ -103,6 +103,13 @@ amount of latency hiding available.
 | 46 | Stage the four T-column x vectors once per chunk for a two-row direct split4 block, so both rows reuse shared x instead of issuing duplicate global x loads. | Attn: 62.14 us / 78.57% SOL, memory 78.57%, DRAM 22.01%, SM 32.13%, regs 44, static smem 8.32 KiB, waves/SM 4.22. | Rejected. The primary SOL number rose, but shared-memory traffic and two slab barriers per iteration more than doubled duration. |
 | 47 | In direct split4, reduce high-bit global load instructions by having one lane per four load a 32-bit high word and broadcast it with `__shfl_sync`. | Attn: 28.06 us / 67.79% SOL, memory 48.77%, regs 44, static smem 64 B, waves/SM 4.22, achieved occupancy 74.05%. | Rejected. Fewer high-bit loads did not offset the shuffle/shift overhead and duration regressed versus final10. |
 | 48 | Specialize direct split4 for the exact short-K shapes: template the full slab count and K stride, then fully unroll the 5- or 6-slab loop. | Final11: Attn 25.98 us / 68.75% SOL, memory 52.71%, regs 48; Proj 22.91 us / 66.51%, memory 51.22%; Out 22.85 us / 64.56%, memory 51.46%; MlpDown unchanged direct path 62.05 us / 60.22%. | Accepted. Exact shape constants improve instruction scheduling and memory throughput for all short-K durations without materially regressing MlpDown. |
+| 49 | Detailed final11 diagnosis for exact direct split4 Attn. | Attn detailed: 25.28 us / 69.15% SOL, memory 54.26%, L1/TEX 48.92%, L2 34.16%, regs 48, waves/SM 4.22, achieved occupancy 73.66%. SchedulerStats: issued warp/scheduler 0.75, no eligible 25.37%, eligible warps/scheduler 3.13. WarpStateStats: L1TEX scoreboard 3.9 cycles, 32.68% of the issue interval. InstructionStats: 4,587,520 fused and 1,748,992 non-fused FP32 instructions. PM sampling did not produce source attribution because the kernel is too short for the minimum sampling interval. | Diagnostic. The current short-K split4 limiter is still L1TEX scoreboard latency plus FP32 instruction issue; sparse output stores are visible in the memory tables but are small byte volume. |
+| 50 | Accumulate each 8-value lane chunk as unscaled dot products for the four T columns, then apply the Q5 scale once per T accumulator to reduce non-fused FP32 scale multiplies. | Attn: 26.21 us / 67.48% SOL, memory 52.27%, regs 48, static smem 64 B, waves/SM 4.22, achieved occupancy 74.74%. | Rejected. The rewrite did not reduce register allocation and regressed both duration and SOL versus final11. |
+| 51 | Stage the exact shape's 16 Q5 scale halfwords per slab into shared memory once per block, replacing sparse per-warp scale global loads and `__shfl_sync` broadcasts. | Attn: 25.44 us / 65.64% SOL, memory 53.84%, regs 48, static smem 224 B, waves/SM 4.22, achieved occupancy 74.13%. | Rejected. Duration improved slightly, but the primary SOL metric regressed materially versus final11, so the change moves away from the utilization target. |
+| 52 | Detailed final11 diagnosis for MlpDown's one-warp direct path. | MlpDown detailed: 62.78 us / 59.60% SOL, memory 53.00%, L1/TEX 36.20%, L2 33.50%, regs 54, waves/SM 0.94, achieved occupancy 62.84%. SchedulerStats: issued warp/scheduler 0.62, no eligible 37.80%, eligible warps/scheduler 1.73. WarpStateStats: L1TEX scoreboard 6.8 cycles, 56.20% of the issue interval. | Diagnostic. One warp per row leaves too few independent row-warps for the 5120-row long-K shape, so L1TEX latency dominates even though split4 had already shown too much row-split overhead. |
+| 53 | Route MlpDown to a direct split2 exact-shape body: two warps per row, each warp covers two 256-K chunks per slab, then a two-part row reduction writes the four T outputs. | Final12: MlpDown 59.04 us / 65.88% SOL, memory 58.71%, regs 64, static smem 32 B, waves/SM 1.88, achieved occupancy 58.70%. Short-K final12 samples stayed within run-to-run spread: Attn 25.31 us / 69.11%, Proj 22.91 us / 65.17%, Out 23.20 us / 64.79%. | Accepted. Split2 gives MlpDown enough independent work to cut L1TEX latency impact without the duration regression seen in split4. |
+| 54 | Force the MlpDown split2 body to 24 resident 64-thread blocks/SM with `__launch_bounds__(64,24)`. | MlpDown: 77.63 us / 58.45% SOL, memory 58.45%, regs 40, waves/SM 1.25, achieved occupancy 82.37%. | Rejected. Higher occupancy and lower register count destroyed the ILP schedule and materially regressed both duration and SOL. |
+| 55 | Route Attn to the split2 geometry to reduce tail-wave count versus split4. | Attn: 24.77 us / 66.34% SOL, memory 55.33%, regs 64, static smem 32 B, waves/SM 2.64, achieved occupancy 56.89%. | Rejected. Duration improved, but SOL regressed versus split4, so the change moves away from the utilization target. |
 
 ## Final Candidate
 
@@ -117,26 +124,25 @@ reduction. The old staged chunk4 path was removed because it is no longer
 routed.
 
 MlpDown (`5120x17408`) now routes to
-`linear_rowsplit_gemm_smallt_kernel_direct_q5_t4<Q5Smallt,8>`. That exact-shape
-body keeps one warp per output row and the same fp32 accumulation order as the
-original small-T path, but loads Q5 codes/high bits/scales directly from global
-memory and broadcasts one scale per 64-value group instead of staging each
-1024-value slab through shared memory. The direct path is only used for the
-full-slab Q5 T=4 MlpDown shape.
+`linear_rowsplit_gemm_smallt_kernel_direct_split2_q5_t4<Q5Smallt,17,17408>`.
+That exact-shape body uses two warps for one output row: each warp loads half of
+each 1024-value slab directly from global memory, accumulates the four T columns
+in fp32, then the block performs a final two-part row reduction. The old
+one-warp direct MlpDown path was removed because it is no longer routed.
 
 Profiles:
 
-- `profiles/q5-smallt/final11/AttnInQKV7168x5120.ncu-rep`
-- `profiles/q5-smallt/final11/MlpDown5120x17408.ncu-rep`
-- `profiles/q5-smallt/final11/Proj6144x5120.ncu-rep`
-- `profiles/q5-smallt/final11/Out5120x6144.ncu-rep`
+- `profiles/q5-smallt/final12/AttnInQKV7168x5120.ncu-rep`
+- `profiles/q5-smallt/final12/MlpDown5120x17408.ncu-rep`
+- `profiles/q5-smallt/final12/Proj6144x5120.ncu-rep`
+- `profiles/q5-smallt/final12/Out5120x6144.ncu-rep`
 
 | shape | kernel | duration us | SOL % | SM % | memory % | regs | static smem KiB | waves/SM | achieved occ % |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| AttnInQKV7168x5120 | `direct_split4_q5_t4<Q5Smallt,5,5120>` | 25.98 | 68.75 | 68.75 | 52.71 | 48 | 0.06 | 4.22 | 74.21 |
-| MlpDown5120x17408 | `direct_q5_t4<Q5Smallt,8>` | 62.05 | 60.22 | 60.22 | 53.60 | 54 | 0.00 | 0.94 | 62.17 |
-| Proj6144x5120 | `direct_split4_q5_t4<Q5Smallt,5,5120>` | 22.91 | 66.51 | 66.51 | 51.22 | 48 | 0.06 | 3.61 | 73.10 |
-| Out5120x6144 | `direct_split4_q5_t4<Q5Smallt,6,6144>` | 22.85 | 64.56 | 64.56 | 51.46 | 48 | 0.06 | 3.01 | 72.65 |
+| AttnInQKV7168x5120 | `direct_split4_q5_t4<Q5Smallt,5,5120>` | 25.31 | 69.11 | 69.11 | 54.18 | 48 | 0.06 | 4.22 | 74.17 |
+| MlpDown5120x17408 | `direct_split2_q5_t4<Q5Smallt,17,17408>` | 59.04 | 65.88 | 65.88 | 58.71 | 64 | 0.03 | 1.88 | 58.70 |
+| Proj6144x5120 | `direct_split4_q5_t4<Q5Smallt,5,5120>` | 22.91 | 65.17 | 65.17 | 51.32 | 48 | 0.06 | 3.61 | 73.34 |
+| Out5120x6144 | `direct_split4_q5_t4<Q5Smallt,6,6144>` | 23.20 | 64.79 | 64.79 | 50.74 | 48 | 0.06 | 3.01 | 73.50 |
 
 Correctness:
 
@@ -154,23 +160,24 @@ The correctness suite now includes Q5 T=4 checks for the representative
 ## Conclusion
 
 The final candidate replaces the staged one-row chunk4 short-K path with a
-direct global-load split4 body, while retaining the direct one-warp MlpDown
-body. Versus final9, the three short-K durations improve materially: Attn
-31.49 -> 25.98 us, Proj 27.14 -> 22.91 us, and Out 27.33 -> 22.85 us. MlpDown
-uses the same direct path as final9; the final11 sample is 62.05 us versus the
-final9 rerun at 62.11 us, within observed NCU run-to-run spread. Numerical
+direct global-load split4 body, and replaces the one-warp direct MlpDown path
+with a direct split2 body. Versus final9, the three short-K durations improve
+materially: Attn 31.49 -> 25.31 us, Proj 27.14 -> 22.91 us, and Out 27.33 ->
+23.20 us. MlpDown improves from the final11 one-warp direct sample at 62.05 us
+to 59.04 us while raising SOL from 60.22% to 65.88%. Numerical
 correctness is unchanged under the existing linear correctness suite and
 `compute-sanitizer` reports no errors.
 
 The primary 85% SOL target was not reached. The best final representative SOL is
-68.75% on Attn. The direct split4 path proves that, for the short-K shapes,
+69.11% on Attn. The direct split4 path proves that, for the short-K shapes,
 per-slab shared staging and block barriers were more expensive than direct Q5
 global loads, even though the resulting kernel is still L1TEX-scoreboard
-limited. The direct MlpDown path proves that long-K staged cp.async overhead can
-dominate even when wave count remains low, but split4 MlpDown regresses duration
-despite higher SOL. The failed tensor-core, split-by-slab, staged chunk,
-pipeline-cleanup, read-only-load, deeper-pipeline, launch-bounds, x-preload
-MlpDown, rows/block, shared x-staging, and grouped high-bit load experiments
-indicate that reaching 85% SOL likely requires a larger architecture change,
-such as a better-balanced split-K or tensor-core path that can feed all warps
-without duplicating dequant/staging work.
+limited. The split2 MlpDown path proves that the long-K shape benefits from more
+row-local K parallelism than one warp can provide, but split4 MlpDown still
+regresses duration and aggressive register caps remove too much ILP. The failed
+tensor-core, split-by-slab, staged chunk, pipeline-cleanup, read-only-load,
+deeper-pipeline, launch-bounds, x-preload MlpDown, rows/block, shared x-staging,
+grouped high-bit load, shared-scale, and split2 short-K experiments indicate
+that reaching 85% SOL likely requires a larger architecture change, such as a
+better-balanced split-K or tensor-core path that can feed all warps without
+duplicating dequant/staging work.

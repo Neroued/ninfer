@@ -32,13 +32,15 @@ void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::ui
                                              full_slabs);
 }
 
-void launch_q5_t4_direct(const __nv_bfloat16* xp, const std::uint8_t* codes,
-                         const std::uint8_t* high, const std::uint8_t* scales,
-                         __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
-                         std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
-    constexpr int kBlockThreads = kRowsPerBlockDefault * 32;
-    const dim3    grid(static_cast<unsigned>(ceil_div(n, kRowsPerBlockDefault)), 1u, 1u);
-    linear_rowsplit_gemm_smallt_kernel_direct_q5_t4<Q5Smallt, kRowsPerBlockDefault>
+template <int kFullSlabs, int kStride>
+void launch_q5_t4_direct_split2(const __nv_bfloat16* xp, const std::uint8_t* codes,
+                                const std::uint8_t* high, const std::uint8_t* scales,
+                                __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
+                                std::int32_t t, std::int32_t padded_k,
+                                std::int32_t full_slabs, cudaStream_t stream) {
+    constexpr int kBlockThreads = 2 * 32;
+    const dim3    grid(static_cast<unsigned>(n), 1u, 1u);
+    linear_rowsplit_gemm_smallt_kernel_direct_split2_q5_t4<Q5Smallt, kFullSlabs, kStride>
         <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
                                              full_slabs);
 }
@@ -79,8 +81,8 @@ void launch_codec(const __nv_bfloat16* xp, const std::uint8_t* codes, const std:
                 return;
             }
             if (n == 5120 && k == 17408) {
-                launch_q5_t4_direct(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
-                                    stream);
+                launch_q5_t4_direct_split2<17, 17408>(xp, codes, high, scales, outp, n, k, t,
+                                                      padded_k, full_slabs, stream);
                 return;
             }
         }

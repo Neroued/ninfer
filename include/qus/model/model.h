@@ -205,7 +205,7 @@ public:
     };
 
     void test_attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
-        attn_mix(w, x, fidx, ph, 0);
+        attn_mix(w, x, fidx, ph);
     }
 
     void test_gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {

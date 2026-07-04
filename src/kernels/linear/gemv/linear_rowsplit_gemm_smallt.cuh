@@ -362,6 +362,96 @@ smallt_q5_t4_chunk4_body(const __nv_bfloat16* __restrict__ x,
     }
 }
 
+template <class SC, int kRowsPerBlock>
+__global__ void linear_rowsplit_gemm_smallt_kernel_direct_q5_t4(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k, std::int32_t t,
+    std::int32_t padded_k, std::int32_t full_slabs) {
+    static_assert(std::is_same_v<SC, Q5Smallt>, "direct small-T kernel is Q5-only");
+    (void)t;
+
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int row  = static_cast<int>(blockIdx.x) * kRowsPerBlock + warp;
+    if (row >= n) { return; }
+
+    const int           kg_padded = padded_k / Q5Codec::kGroupK;
+    const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
+    const std::uint8_t* high_row =
+        high + static_cast<std::int64_t>(row) * kg_padded * Q5Smallt::kHighBytesPerGroup;
+    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg_padded * 2;
+
+    float acc[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { acc[i] = 0.0f; }
+
+#pragma unroll 1
+    for (int s = 0; s < full_slabs; ++s) {
+        const std::int64_t slab_k = static_cast<std::int64_t>(s) * 1024;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const std::uint8_t* code_phase = code_row + static_cast<std::int64_t>(s) * 512 +
+                                             c * 128 + lane * 4;
+            const std::uint8_t* high_phase =
+                high_row + static_cast<std::int64_t>(s) * 128 + c * 32 + lane;
+            const int group_in_slab = c * 4 + (lane >> 3);
+            std::uint32_t scale_bits = 0;
+            if ((lane & 7) == 0) {
+                scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                    scale_row + (static_cast<std::int64_t>(s) * 16 + group_in_slab) * 2);
+            }
+            scale_bits = __shfl_sync(0xffffffffu, scale_bits, lane & ~7);
+
+            const std::uint32_t word  = *reinterpret_cast<const std::uint32_t*>(code_phase);
+            const std::uint32_t hc    = static_cast<std::uint32_t>(*high_phase) ^ 0xffu;
+            const float         scale = __half2float(__ushort_as_half(scale_bits));
+            const __half2       bias  = __half2half2(__ushort_as_half(0x6410)); // 1040.0
+            float               w[8];
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
+                bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
+                const __half2 h = __hsub2(*reinterpret_cast<const __half2*>(&bits), bias);
+                const float2  f = __half22float2(h);
+                w[p]            = f.x * scale;
+                w[p + 4]        = f.y * scale;
+            }
+
+            const std::int64_t xoff = slab_k + c * 256 + lane * 8;
+#pragma unroll
+            for (int tt = 0; tt < 4; ++tt) {
+                const uint4 xv =
+                    *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(tt) * k + xoff);
+                const float2 f0 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+                const float2 f1 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+                const float2 f2 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.z));
+                const float2 f3 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.w));
+                acc[tt] = fmaf(w[0], f0.x, acc[tt]);
+                acc[tt] = fmaf(w[1], f0.y, acc[tt]);
+                acc[tt] = fmaf(w[2], f1.x, acc[tt]);
+                acc[tt] = fmaf(w[3], f1.y, acc[tt]);
+                acc[tt] = fmaf(w[4], f2.x, acc[tt]);
+                acc[tt] = fmaf(w[5], f2.y, acc[tt]);
+                acc[tt] = fmaf(w[6], f3.x, acc[tt]);
+                acc[tt] = fmaf(w[7], f3.y, acc[tt]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int tt = 0; tt < 4; ++tt) {
+        float a = acc[tt];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) { a += __shfl_down_sync(0xffffffffu, a, off); }
+        if (lane == 0) { out[static_cast<std::int64_t>(tt) * n + row] = __float2bfloat16(a); }
+    }
+}
+
 // full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte
 // aligned, else 0 (everything runs through the scalar tail).
 template <class SC, int kTt, int kRowsPerBlock, int kStages>

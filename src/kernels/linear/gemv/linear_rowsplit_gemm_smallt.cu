@@ -45,6 +45,17 @@ void launch_q5_t4_chunk4(const __nv_bfloat16* xp, const std::uint8_t* codes,
                                              full_slabs);
 }
 
+void launch_q5_t4_direct(const __nv_bfloat16* xp, const std::uint8_t* codes,
+                         const std::uint8_t* high, const std::uint8_t* scales,
+                         __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
+                         std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
+    constexpr int kBlockThreads = kRowsPerBlockDefault * 32;
+    const dim3    grid(static_cast<unsigned>(ceil_div(n, kRowsPerBlockDefault)), 1u, 1u);
+    linear_rowsplit_gemm_smallt_kernel_direct_q5_t4<Q5Smallt, kRowsPerBlockDefault>
+        <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                             full_slabs);
+}
+
 // kTt is the column-tile width: T <= kTt streams the weights exactly once. Only
 // 4 and 8 exist: wider tiles blow the register budget and end up latency-bound
 // (see the kernel header). T > 8 re-streams the weights per 8-column tile until
@@ -61,6 +72,11 @@ void launch_codec(const __nv_bfloat16* xp, const std::uint8_t* codes, const std:
                 (n == 5120 && k == 6144)) {
                 launch_q5_t4_chunk4(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
                                      stream);
+                return;
+            }
+            if (n == 5120 && k == 17408) {
+                launch_q5_t4_direct(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
+                                    stream);
                 return;
             }
         }

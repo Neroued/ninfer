@@ -88,6 +88,7 @@ amount of latency hiding available.
 | 31 | Add chunk4-only `__launch_bounds__(128, 11)` as a less aggressive occupancy cap. | Attn: 34.59 us / 62.56% SOL, memory 41.62%, regs 40, theoretical occupancy 100%, achieved occupancy 89.70%, waves/SM 3.51. | Rejected. Ptxas still capped to 40 registers and reproduced the launch-bounds regression. |
 | 32 | Route MlpDown through the original kernel with one cp.async stage and 8 row-warps/block. | Repeat sample: 69.15 us / 56.87% SOL, memory 48.09%, regs 58, static smem 5.38 KiB, waves/SM 0.94. | Rejected. Duration improved versus recent two-stage samples, but the primary SOL metric moved down and the change did not address the low-wave limiter. |
 | 33 | Route MlpDown through the original kernel with one cp.async stage and 4 row-warps/block. | MlpDown: 69.34 us / 56.11% SOL, memory 47.93%, regs 58, static smem 2.69 KiB, waves/SM 0.94. | Rejected. Smaller blocks did not increase wave count and further reduced SOL. |
+| 34 | Replace MlpDown's staged cp.async small-T path with an exact-shape direct global-load Q5 T=4 body. One warp still owns one row and keeps the same fp32 FMA order, but codes/high/scales are loaded directly from global memory with per-group scale broadcast. | Final9 rerun: MlpDown 62.11 us / 59.97% SOL, memory 53.55%, regs 54, static smem 0 B, waves/SM 0.94, achieved occupancy 62.16%. | Accepted. For the long-K MlpDown shape, removing shared staging and warp sync cuts duration materially while preserving/slightly improving SOL versus final8's original path. |
 
 ## Final Candidate
 
@@ -97,23 +98,29 @@ the three full-aligned Q5 T=4 shapes that benefit from chunk parallelism
 `linear_rowsplit_gemm_smallt_kernel_chunk4<Q5Smallt,4,4,2>`. The chunk kernel
 uses 4 warps/block as four cooperative warps for one output row: one warp stages
 the Q5 slab, four warps consume the four 256-wide chunks in parallel, and the
-block reduces four fp32 partials before storing bf16 output. MlpDown stays on
-the original `<Q5Smallt,4,8,2>` kernel because the chunk-split and launch-shape
-variants regressed its duration.
+block reduces four fp32 partials before storing bf16 output.
+
+MlpDown (`5120x17408`) now routes to
+`linear_rowsplit_gemm_smallt_kernel_direct_q5_t4<Q5Smallt,8>`. That exact-shape
+body keeps one warp per output row and the same fp32 accumulation order as the
+original small-T path, but loads Q5 codes/high bits/scales directly from global
+memory and broadcasts one scale per 64-value group instead of staging each
+1024-value slab through shared memory. The direct path is only used for the
+full-slab Q5 T=4 MlpDown shape.
 
 Profiles:
 
-- `profiles/q5-smallt/final8/AttnInQKV7168x5120.ncu-rep`
-- `profiles/q5-smallt/final8/MlpDown5120x17408.ncu-rep`
-- `profiles/q5-smallt/final8/Proj6144x5120.ncu-rep`
-- `profiles/q5-smallt/final8/Out5120x6144.ncu-rep`
+- `profiles/q5-smallt/final9/AttnInQKV7168x5120.ncu-rep`
+- `profiles/q5-smallt/final9/MlpDown5120x17408-rerun.ncu-rep`
+- `profiles/q5-smallt/final9/Proj6144x5120.ncu-rep`
+- `profiles/q5-smallt/final9/Out5120x6144.ncu-rep`
 
 | shape | kernel | duration us | SOL % | SM % | memory % | regs | static smem KiB | waves/SM | achieved occ % |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| AttnInQKV7168x5120 | `kernel_chunk4<Q5Smallt,4,4,2>` | 31.36 | 68.45 | 68.45 | 43.88 | 48 | 1.41 | 4.22 | 75.49 |
-| MlpDown5120x17408 | `<Q5Smallt,4,8,2>` | 71.36 | 58.94 | 58.94 | 46.60 | 58 | 10.75 | 0.94 | 61.92 |
-| Proj6144x5120 | `kernel_chunk4<Q5Smallt,4,4,2>` | 27.26 | 67.39 | 67.39 | 43.21 | 48 | 1.41 | 3.61 | 74.65 |
-| Out5120x6144 | `kernel_chunk4<Q5Smallt,4,4,2>` | 27.42 | 64.27 | 64.27 | 42.84 | 48 | 1.41 | 3.01 | 74.41 |
+| AttnInQKV7168x5120 | `kernel_chunk4<Q5Smallt,4,4,2>` | 31.49 | 68.63 | 68.63 | 44.00 | 48 | 1.41 | 4.22 | 75.53 |
+| MlpDown5120x17408 | `direct_q5_t4<Q5Smallt,8>` | 62.11 | 59.97 | 59.97 | 53.55 | 54 | 0.00 | 0.94 | 62.16 |
+| Proj6144x5120 | `kernel_chunk4<Q5Smallt,4,4,2>` | 27.14 | 66.59 | 66.59 | 43.27 | 48 | 1.41 | 3.61 | 74.85 |
+| Out5120x6144 | `kernel_chunk4<Q5Smallt,4,4,2>` | 27.33 | 64.86 | 64.86 | 43.02 | 48 | 1.41 | 3.01 | 74.10 |
 
 Correctness:
 
@@ -121,6 +128,8 @@ Correctness:
 cmake --build build --target qus_linear_op_bench qus_linear_test -j
 ./build/tests/qus_linear_test
 # OK linear correctness
+compute-sanitizer ./build/tests/qus_linear_test
+# ERROR SUMMARY: 0 errors
 ```
 
 The correctness suite now includes Q5 T=4 checks for the representative
@@ -128,20 +137,19 @@ The correctness suite now includes Q5 T=4 checks for the representative
 
 ## Conclusion
 
-The final candidate preserves the original 8-row kernel for MlpDown, where
-chunk splitting did not hold up, and uses the one-row cooperative chunk split
-for the K=5120 shapes plus Out5120x6144. Versus final6, the one-row chunk route
-raises Attn SOL from 67.15% to 68.45%, Proj from 63.70% to 67.39%, and Out from
-61.24% to 64.27%, with lower static shared memory per chunk4 block. Numerical
-correctness is unchanged under the existing linear correctness suite.
+The final candidate uses the one-row cooperative chunk split for the K=5120
+shapes plus Out5120x6144, and uses a direct global-load exact-shape body for
+MlpDown. Versus final8, MlpDown duration drops from 71.36 us to 62.11 us while
+SOL rises from 58.94% to 59.97%; the chunk4-routed shapes remain in the same
+performance band. Numerical correctness is unchanged under the existing linear
+correctness suite and `compute-sanitizer` reports no errors.
 
 The primary 85% SOL target was not reached. The best final representative SOL is
-68.45% on Attn. The chunk split proves that the original warp-per-row body was
-under-parallelized for several small-T shapes, but MlpDown remains limited by the
-original low-wave, issue-eligibility behavior and the chunk-split variants raise
-occupancy at too much per-slab synchronization cost. The failed tensor-core,
-split-by-slab, chunk2, pipeline-cleanup, read-only-load, and deeper-pipeline
-experiments, plus the later launch-bounds and one-stage pipeline probes, indicate
-that reaching 85% SOL likely requires a larger architecture change, such as a
-better-balanced split-K or tensor-core path that can feed all warps without
-duplicating dequant/staging work.
+68.63% on Attn. The chunk split proves that the original warp-per-row body was
+under-parallelized for several small-T shapes, and the direct MlpDown path proves
+that long-K staged cp.async overhead can dominate even when wave count remains
+low. The failed tensor-core, split-by-slab, chunk2, pipeline-cleanup,
+read-only-load, deeper-pipeline, launch-bounds, and one-stage pipeline
+experiments indicate that reaching 85% SOL likely requires a larger architecture
+change, such as a better-balanced split-K or tensor-core path that can feed all
+warps without duplicating dequant/staging work.

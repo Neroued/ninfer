@@ -15,7 +15,7 @@ namespace qus::kernels::detail {
 namespace {
 
 constexpr int kRowsPerBlockDefault = 8;
-constexpr int kRowsPerBlockQ5Chunk = 2;
+constexpr int kRowsPerBlockQ5Chunk = 1;
 constexpr int kStages              = 2;
 
 int ceil_div(int a, int b) { return (a + b - 1) / b; }
@@ -37,7 +37,7 @@ void launch_q5_t4_chunk4(const __nv_bfloat16* xp, const std::uint8_t* codes,
                          const std::uint8_t* high, const std::uint8_t* scales,
                          __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
                          std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
-    constexpr int kWarpTilesPerBlock = kRowsPerBlockDefault;
+    constexpr int kWarpTilesPerBlock = 4;
     constexpr int kBlockThreads      = kWarpTilesPerBlock * 32;
     const dim3    grid(static_cast<unsigned>(ceil_div(n, kRowsPerBlockQ5Chunk)), 1u, 1u);
     linear_rowsplit_gemm_smallt_kernel_chunk4<Q5Smallt, 4, kWarpTilesPerBlock, kStages>

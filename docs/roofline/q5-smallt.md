@@ -73,32 +73,40 @@ amount of latency hiding available.
 | 16 | Two-warp cooperative chunk split: 2 warps per row, 4 rows/block, one warp stages the slab and each warp consumes 512 K-values. | MlpDown: 98.27 us / 56.59% SOL, regs 56, static smem 5.50 KiB, waves/SM 1.88; Out: 35.58 us / 45.42% SOL. | Rejected. The half split added synchronization and register pressure without enough parallelism to beat either the original or chunk4 paths. |
 | 17 | Keep chunk4 but have only the staging warp issue `cp.async` commit/wait groups; non-staging warps rely on the following block barrier. | Attn: 31.71 us / 65.37% SOL; Proj: 28.61 us / 63.16% SOL; Out: 28.58 us / 60.50% SOL. | Rejected. The Out gain was marginal and Proj slowed, so the original chunk4 pipeline structure was restored. |
 | 18 | Route Out5120x6144 to chunk4, keep MlpDown on the original 8-row kernel, and leave chunk4 internals unchanged. | Final6: Out 28.74 us / 61.24% SOL; Attn 31.39 us / 67.15% SOL; MlpDown 70.59 us / 59.14% SOL; Proj 28.29 us / 63.70% SOL. | Accepted. Out is no longer low-wave limited on the original path, while MlpDown avoids the chunk-split duration regression. |
+| 19 | Detailed MlpDown diagnosis with SchedulerStats/WarpStateStats. | Detailed basic: 72.35 us / 57.42% SOL, grid 640, waves/SM 0.94. Warp stats: issued warp/scheduler 0.61, no eligible 38.83%, L1TEX scoreboard 6.1 cycles, 49.3% of issue interval. | Diagnostic. The remaining original path is both low-wave and L1TEX-scoreboard limited; previous x-staging/chunk-split variants raised occupancy at too much synchronization cost. |
+| 20 | Replace chunk4 full-block barriers with row-local named `bar.sync` barriers. | Attn: 33.89 us / 66.69% SOL, regs 51, barrier-limited to 8 blocks; Proj: 30.05 us / 65.09%; Out: 29.73 us / 62.53%. | Rejected. Narrower barrier scope increased register pressure and made barriers the occupancy limiter. |
+| 21 | Route only MlpDown to the original kernel with 16 row-warps/block. | MlpDown: 74.53 us / 55.80% SOL, static smem 21.50 KiB, waves/SM 0.94. | Rejected. Same wave count, higher shared memory, and slower than the 8-row path. |
+| 22 | Route only MlpDown to the original kernel with three cp.async stages. | MlpDown: 91.07 us / 46.16% SOL, regs 62, static smem 16.13 KiB. | Rejected. Deeper prefetching increased live state/shared memory and did not hide the scoreboard stalls. |
+| 23 | Load aligned x vectors with `__ldg`. | MlpDown: 82.11 us / 50.61% SOL, regs 60; Attn: 31.62 us / 66.86%; Proj: 28.67 us / 63.83%; Out: 28.67 us / 61.66%. | Rejected. The read-only load path materially regressed MlpDown and did not consistently improve chunk4 shapes. |
+| 24 | Remove chunk4 row-tail predicates for the exact even-N routed shapes. | Attn: 32.32 us / 65.28% SOL; Proj: 28.00 us / 64.36%; Out: 29.38 us / 59.51%. | Rejected. Branch removal did not reduce registers and regressed Attn/Out. |
+| 25 | Direct one-row chunk4 body with one row of shared memory and no row-local indexing. | Final7: Attn 32.35 us / 64.46% SOL; Proj 29.73 us / 60.63%; Out 30.24 us / 57.41%; regs 44, static smem 1.41 KiB. | Rejected. Lower register count hurt scheduling/codegen and lost the cont11 speedup. |
+| 26 | One-row chunk4 launch: 4 warps/block, one output row per block, normal block barriers over only the cooperating row-warps, retaining the measured-fast parameterized body shape. | Final8: Attn 31.36 us / 68.45% SOL; Proj 27.26 us / 67.39%; Out 27.42 us / 64.27%; all chunk4 shapes use regs 48 and static smem 1.41 KiB. | Accepted. This halves chunk4 shared memory and barrier participants while preserving occupancy and improving all chunk4-routed representative shapes versus final6. |
 
 ## Final Candidate
 
 Code change: keep the original 8-row small-T kernel for Q5 generally, but route
 the three full-aligned Q5 T=4 shapes that benefit from chunk parallelism
 (`7168x5120`, `6144x5120`, and `5120x6144`) to
-`linear_rowsplit_gemm_smallt_kernel_chunk4<Q5Smallt,4,8,2>`. The chunk kernel
-uses 8 warps/block as four cooperative warps per output row: one warp stages the
-Q5 slab, four warps consume the four 256-wide chunks in parallel, and the block
-reduces four fp32 partials before storing bf16 output. MlpDown stays on the
-original `<Q5Smallt,4,8,2>` kernel because both the chunk4 and chunk2 variants
-regressed its duration.
+`linear_rowsplit_gemm_smallt_kernel_chunk4<Q5Smallt,4,4,2>`. The chunk kernel
+uses 4 warps/block as four cooperative warps for one output row: one warp stages
+the Q5 slab, four warps consume the four 256-wide chunks in parallel, and the
+block reduces four fp32 partials before storing bf16 output. MlpDown stays on
+the original `<Q5Smallt,4,8,2>` kernel because the chunk-split and launch-shape
+variants regressed its duration.
 
 Profiles:
 
-- `profiles/q5-smallt/final6/AttnInQKV7168x5120.ncu-rep`
-- `profiles/q5-smallt/final6/MlpDown5120x17408.ncu-rep`
-- `profiles/q5-smallt/final6/Proj6144x5120.ncu-rep`
-- `profiles/q5-smallt/final6/Out5120x6144.ncu-rep`
+- `profiles/q5-smallt/final8/AttnInQKV7168x5120.ncu-rep`
+- `profiles/q5-smallt/final8/MlpDown5120x17408.ncu-rep`
+- `profiles/q5-smallt/final8/Proj6144x5120.ncu-rep`
+- `profiles/q5-smallt/final8/Out5120x6144.ncu-rep`
 
 | shape | kernel | duration us | SOL % | SM % | memory % | regs | static smem KiB | waves/SM | achieved occ % |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| AttnInQKV7168x5120 | `kernel_chunk4<Q5Smallt,4,8,2>` | 31.39 | 67.15 | 67.15 | 43.05 | 48 | 2.82 | 4.22 | 75.89 |
-| MlpDown5120x17408 | `<Q5Smallt,4,8,2>` | 70.59 | 59.14 | 59.14 | 46.81 | 58 | 10.75 | 0.94 | 61.85 |
-| Proj6144x5120 | `kernel_chunk4<Q5Smallt,4,8,2>` | 28.29 | 63.70 | 63.70 | 41.71 | 48 | 2.82 | 3.61 | 75.08 |
-| Out5120x6144 | `kernel_chunk4<Q5Smallt,4,8,2>` | 28.74 | 61.24 | 61.24 | 41.09 | 48 | 2.82 | 3.01 | 74.92 |
+| AttnInQKV7168x5120 | `kernel_chunk4<Q5Smallt,4,4,2>` | 31.36 | 68.45 | 68.45 | 43.88 | 48 | 1.41 | 4.22 | 75.49 |
+| MlpDown5120x17408 | `<Q5Smallt,4,8,2>` | 71.36 | 58.94 | 58.94 | 46.60 | 58 | 10.75 | 0.94 | 61.92 |
+| Proj6144x5120 | `kernel_chunk4<Q5Smallt,4,4,2>` | 27.26 | 67.39 | 67.39 | 43.21 | 48 | 1.41 | 3.61 | 74.65 |
+| Out5120x6144 | `kernel_chunk4<Q5Smallt,4,4,2>` | 27.42 | 64.27 | 64.27 | 42.84 | 48 | 1.41 | 3.01 | 74.41 |
 
 Correctness:
 
@@ -114,18 +122,18 @@ The correctness suite now includes Q5 T=4 checks for the representative
 ## Conclusion
 
 The final candidate preserves the original 8-row kernel for MlpDown, where
-chunk splitting did not hold up, and uses the cooperative chunk split for the
-K=5120 shapes plus Out5120x6144. The Out route raises its measured SOL from
-50.60% to 61.24% and cuts duration from 29.63 us to 28.74 us versus the
-previous final sample. Numerical correctness is unchanged under the existing
-linear correctness suite.
+chunk splitting did not hold up, and uses the one-row cooperative chunk split
+for the K=5120 shapes plus Out5120x6144. Versus final6, the one-row chunk route
+raises Attn SOL from 67.15% to 68.45%, Proj from 63.70% to 67.39%, and Out from
+61.24% to 64.27%, with lower static shared memory per chunk4 block. Numerical
+correctness is unchanged under the existing linear correctness suite.
 
 The primary 85% SOL target was not reached. The best final representative SOL is
-67.15% on Attn. The chunk split proves that the original warp-per-row body was
+68.45% on Attn. The chunk split proves that the original warp-per-row body was
 under-parallelized for several small-T shapes, but MlpDown remains limited by the
 original low-wave, issue-eligibility behavior and the chunk-split variants raise
 occupancy at too much per-slab synchronization cost. The failed tensor-core,
-split-by-slab, chunk2, and pipeline-cleanup experiments indicate that reaching
-85% SOL likely requires a larger architecture change, such as a better-balanced
-split-K or tensor-core path that can feed all warps without duplicating
-dequant/staging work.
+split-by-slab, chunk2, pipeline-cleanup, read-only-load, and deeper-pipeline
+experiments indicate that reaching 85% SOL likely requires a larger architecture
+change, such as a better-balanced split-K or tensor-core path that can feed all
+warps without duplicating dequant/staging work.

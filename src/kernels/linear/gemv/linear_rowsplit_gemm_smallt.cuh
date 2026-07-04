@@ -253,7 +253,7 @@ smallt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, st
     }
 }
 
-template <int kStages>
+template <int kStages, int kOutputRowsPerBlock>
 __device__ __forceinline__ void
 smallt_q5_t4_chunk4_body(const __nv_bfloat16* __restrict__ x,
                          const std::uint8_t* __restrict__ codes,
@@ -262,19 +262,18 @@ smallt_q5_t4_chunk4_body(const __nv_bfloat16* __restrict__ x,
                          __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k,
                          std::int32_t padded_k, std::int32_t full_slabs) {
     constexpr int kWarpsPerRow = 4;
-    constexpr int kRowsPerBlock = 2;
     constexpr int kPrefetch = kStages - 1;
 
-    __shared__ __align__(16) uint4         s_nib[kRowsPerBlock][kStages][Q5Smallt::kNibU4];
-    __shared__ __align__(16) uint4         s_hi[kRowsPerBlock][kStages][Q5Smallt::kHighU4];
-    __shared__ __align__(16) std::uint32_t s_sc[kRowsPerBlock][kStages][Q5Smallt::kScaleU32];
-    __shared__ float                      s_part[kRowsPerBlock][kWarpsPerRow][4];
+    __shared__ __align__(16) uint4         s_nib[kOutputRowsPerBlock][kStages][Q5Smallt::kNibU4];
+    __shared__ __align__(16) uint4         s_hi[kOutputRowsPerBlock][kStages][Q5Smallt::kHighU4];
+    __shared__ __align__(16) std::uint32_t s_sc[kOutputRowsPerBlock][kStages][Q5Smallt::kScaleU32];
+    __shared__ float                      s_part[kOutputRowsPerBlock][kWarpsPerRow][4];
 
     const int lane      = static_cast<int>(threadIdx.x) & 31;
     const int warp      = static_cast<int>(threadIdx.x) >> 5;
     const int row_local = warp / kWarpsPerRow;
     const int chunk     = warp - row_local * kWarpsPerRow;
-    const int row       = static_cast<int>(blockIdx.x) * kRowsPerBlock + row_local;
+    const int row       = static_cast<int>(blockIdx.x) * kOutputRowsPerBlock + row_local;
     const int safe_row  = row < n ? row : 0;
 
     const int kg_padded = padded_k / Q5Codec::kGroupK;
@@ -467,9 +466,10 @@ __global__ void linear_rowsplit_gemm_smallt_kernel_chunk4(
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k, std::int32_t t,
     std::int32_t padded_k, std::int32_t full_slabs) {
-    static_assert(std::is_same_v<SC, Q5Smallt> && kTt == 4 && kRowsPerBlock == 8 && kStages == 2,
-                  "chunk4 kernel is only tuned for Q5 T=4 with eight row-warps");
-    smallt_q5_t4_chunk4_body<kStages>(x, codes, high, scales, out, n, k, padded_k, full_slabs);
+    static_assert(std::is_same_v<SC, Q5Smallt> && kTt == 4 && kRowsPerBlock == 4 && kStages == 2,
+                  "chunk4 kernel is only tuned for Q5 T=4 with four row-warps");
+    smallt_q5_t4_chunk4_body<kStages, 1>(x, codes, high, scales, out, n, k, padded_k,
+                                         full_slabs);
 }
 
 } // namespace qus::kernels::detail

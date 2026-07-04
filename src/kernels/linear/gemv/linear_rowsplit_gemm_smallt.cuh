@@ -46,6 +46,7 @@
 #include <cuda_pipeline.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace qus::kernels::detail {
 
@@ -252,6 +253,116 @@ smallt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, st
     }
 }
 
+template <int kStages>
+__device__ __forceinline__ void
+smallt_q5_t4_chunk4_body(const __nv_bfloat16* __restrict__ x,
+                         const std::uint8_t* __restrict__ codes,
+                         const std::uint8_t* __restrict__ high,
+                         const std::uint8_t* __restrict__ scales,
+                         __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k,
+                         std::int32_t padded_k, std::int32_t full_slabs) {
+    constexpr int kWarpsPerRow = 4;
+    constexpr int kRowsPerBlock = 2;
+    constexpr int kPrefetch = kStages - 1;
+
+    __shared__ __align__(16) uint4         s_nib[kRowsPerBlock][kStages][Q5Smallt::kNibU4];
+    __shared__ __align__(16) uint4         s_hi[kRowsPerBlock][kStages][Q5Smallt::kHighU4];
+    __shared__ __align__(16) std::uint32_t s_sc[kRowsPerBlock][kStages][Q5Smallt::kScaleU32];
+    __shared__ float                      s_part[kRowsPerBlock][kWarpsPerRow][4];
+
+    const int lane      = static_cast<int>(threadIdx.x) & 31;
+    const int warp      = static_cast<int>(threadIdx.x) >> 5;
+    const int row_local = warp / kWarpsPerRow;
+    const int chunk     = warp - row_local * kWarpsPerRow;
+    const int row       = static_cast<int>(blockIdx.x) * kRowsPerBlock + row_local;
+    const int safe_row  = row < n ? row : 0;
+
+    const int kg_padded = padded_k / Q5Codec::kGroupK;
+    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(safe_row) * kg_padded * 32;
+    const std::uint8_t* high_row =
+        high + static_cast<std::int64_t>(safe_row) * kg_padded * Q5Smallt::kHighBytesPerGroup;
+    const std::uint8_t* scale_row =
+        scales + static_cast<std::int64_t>(safe_row) * kg_padded * 2;
+
+    float acc[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) { acc[i] = 0.0f; }
+
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+        if (p < full_slabs && chunk == 0) {
+            smallt_issue_slab<Q5Smallt>(s_nib[row_local][p], s_hi[row_local][p],
+                                        s_sc[row_local][p], code_row, high_row, scale_row, p,
+                                        lane);
+        } else {
+            __pipeline_commit();
+        }
+    }
+
+#pragma unroll 1
+    for (int s = 0; s < full_slabs; ++s) {
+        const int fetch = s + kPrefetch;
+        if (fetch < full_slabs && chunk == 0) {
+            const int buf = fetch % kStages;
+            smallt_issue_slab<Q5Smallt>(s_nib[row_local][buf], s_hi[row_local][buf],
+                                        s_sc[row_local][buf], code_row, high_row, scale_row,
+                                        fetch, lane);
+        } else {
+            __pipeline_commit();
+        }
+        __pipeline_wait_prior(kPrefetch);
+        __syncthreads();
+
+        const int buf = s % kStages;
+        float     w[8];
+        Q5Smallt::dequant_chunk(s_nib[row_local][buf], s_hi[row_local][buf],
+                                s_sc[row_local][buf], chunk, lane, w);
+        const std::int64_t xoff =
+            static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
+#pragma unroll
+        for (int tt = 0; tt < 4; ++tt) {
+            const uint4 xv =
+                *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(tt) * k + xoff);
+            const float2 f0 =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+            const float2 f1 =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+            const float2 f2 =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.z));
+            const float2 f3 =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.w));
+            acc[tt] = fmaf(w[0], f0.x, acc[tt]);
+            acc[tt] = fmaf(w[1], f0.y, acc[tt]);
+            acc[tt] = fmaf(w[2], f1.x, acc[tt]);
+            acc[tt] = fmaf(w[3], f1.y, acc[tt]);
+            acc[tt] = fmaf(w[4], f2.x, acc[tt]);
+            acc[tt] = fmaf(w[5], f2.y, acc[tt]);
+            acc[tt] = fmaf(w[6], f3.x, acc[tt]);
+            acc[tt] = fmaf(w[7], f3.y, acc[tt]);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int tt = 0; tt < 4; ++tt) {
+        float a = acc[tt];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) { a += __shfl_down_sync(0xffffffffu, a, off); }
+        if (lane == 0) { s_part[row_local][chunk][tt] = row < n ? a : 0.0f; }
+    }
+
+    __syncthreads();
+
+    if (chunk == 0 && lane < 4) {
+        if (row < n) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int p = 0; p < kWarpsPerRow; ++p) { sum += s_part[row_local][p][lane]; }
+            out[static_cast<std::int64_t>(lane) * n + row] = __float2bfloat16(sum);
+        }
+    }
+}
+
 // full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte
 // aligned, else 0 (everything runs through the scalar tail).
 template <class SC, int kTt, int kRowsPerBlock, int kStages>
@@ -348,6 +459,17 @@ __global__ void linear_rowsplit_gemm_smallt_kernel(
             out[static_cast<std::int64_t>(col0 + tt) * n + row] = __float2bfloat16(a);
         }
     }
+}
+
+template <class SC, int kTt, int kRowsPerBlock, int kStages>
+__global__ void linear_rowsplit_gemm_smallt_kernel_chunk4(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k, std::int32_t t,
+    std::int32_t padded_k, std::int32_t full_slabs) {
+    static_assert(std::is_same_v<SC, Q5Smallt> && kTt == 4 && kRowsPerBlock == 8 && kStages == 2,
+                  "chunk4 kernel is only tuned for Q5 T=4 with eight row-warps");
+    smallt_q5_t4_chunk4_body<kStages>(x, codes, high, scales, out, n, k, padded_k, full_slabs);
 }
 
 } // namespace qus::kernels::detail

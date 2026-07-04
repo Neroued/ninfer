@@ -15,7 +15,7 @@ namespace qus::kernels::detail {
 namespace {
 
 constexpr int kRowsPerBlockDefault = 8;
-constexpr int kRowsPerBlockWide    = 16;
+constexpr int kRowsPerBlockQ5Chunk = 2;
 constexpr int kStages              = 2;
 
 int ceil_div(int a, int b) { return (a + b - 1) / b; }
@@ -33,6 +33,18 @@ void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::ui
                                              full_slabs);
 }
 
+void launch_q5_t4_chunk4(const __nv_bfloat16* xp, const std::uint8_t* codes,
+                         const std::uint8_t* high, const std::uint8_t* scales,
+                         __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
+                         std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
+    constexpr int kWarpTilesPerBlock = kRowsPerBlockDefault;
+    constexpr int kBlockThreads      = kWarpTilesPerBlock * 32;
+    const dim3    grid(static_cast<unsigned>(ceil_div(n, kRowsPerBlockQ5Chunk)), 1u, 1u);
+    linear_rowsplit_gemm_smallt_kernel_chunk4<Q5Smallt, 4, kWarpTilesPerBlock, kStages>
+        <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                             full_slabs);
+}
+
 // kTt is the column-tile width: T <= kTt streams the weights exactly once. Only
 // 4 and 8 exist: wider tiles blow the register budget and end up latency-bound
 // (see the kernel header). T > 8 re-streams the weights per 8-column tile until
@@ -44,9 +56,10 @@ void launch_codec(const __nv_bfloat16* xp, const std::uint8_t* codes, const std:
                   std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
                   cudaStream_t stream) {
     if constexpr (std::is_same_v<SC, Q5Smallt>) {
-        if (t == 4 && n == 7168 && k == 5120) {
-            launch_tt<SC, 4, kRowsPerBlockWide>(xp, codes, high, scales, outp, n, k, t,
-                                                padded_k, full_slabs, stream);
+        if (t == 4 && full_slabs * 1024 == k && padded_k == k &&
+            ((n == 7168 && k == 5120) || (n == 6144 && k == 5120))) {
+            launch_q5_t4_chunk4(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
+                                 stream);
             return;
         }
     }

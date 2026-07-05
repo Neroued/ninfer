@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
             qus::Tensor positions_t = positions.slice(0, 0, T);
             qus::CudaEventTimer timer(ctx);
             timer.start();
-            card.target_verify(ids_t, positions_t, 0);
+            card.target_verify(ids_t, positions_t);
             return timer.stop_ms();
         };
 

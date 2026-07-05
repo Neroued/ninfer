@@ -224,8 +224,8 @@ std::string usage_text(std::string_view program) {
         << model::kDefaultPrefillChunk << ")\n"
         << "  --work-bytes <bytes>        explicit workspace arena override\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
-        << "  --no-cuda-graph             disable CUDA graph decode (non-MTP decode_path=eager)\n"
-        << "  --mtp-draft-tokens <0..5>   enable eager MTP draft rounds (default: 0)\n"
+        << "  --no-cuda-graph             disable CUDA graph decode (decode_path=eager or mtp_eager)\n"
+        << "  --mtp-draft-tokens <0..5>   enable MTP draft rounds (default: 0)\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
         << "  --output-file <path>        write output to a file instead of stdout\n"
         << "  -h, --help                  show this help\n"
@@ -395,7 +395,7 @@ std::vector<int> prompt_slice(const std::vector<int>& corpus, int n_prompt) {
 }
 
 std::string decode_path_name(bool use_cuda_graph, int mtp_draft_tokens) {
-    if (mtp_draft_tokens > 0) { return "mtp_eager"; }
+    if (mtp_draft_tokens > 0) { return use_cuda_graph ? "mtp_cuda_graph" : "mtp_eager"; }
     return use_cuda_graph ? "cuda_graph" : "eager";
 }
 

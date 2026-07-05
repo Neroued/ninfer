@@ -91,12 +91,12 @@ private:
 
     void require_loaded() const;
     [[nodiscard]] int read_token();
-    [[nodiscard]] int read_i32_scalar(const Tensor model::StepState::*field);
-    [[nodiscard]] std::vector<int> read_sampled_tokens();
     [[nodiscard]] bool is_stop_token(int token) const noexcept;
     [[nodiscard]] int decode_step_one();
     [[nodiscard]] std::vector<int> decode_round();
-    void propose_mtp_after_accept(std::uint32_t host_window_base, int host_length, int k);
+    void record_decode_round();
+    void record_propose(int k);
+    [[nodiscard]] std::vector<int> read_round_output();
 
     EngineOptions options_;
     std::optional<DeviceContext> ctx_;
@@ -110,7 +110,9 @@ private:
     model::StepState io_{};
     std::optional<model::Qwen3_6_27B> card_;
     DecodeGraph decode_graph_;
+    DecodeGraph round_graph_;
     bool decode_warmed_ = false;
+    bool round_warmed_  = false;
     std::vector<int> pending_sampled_;
 };
 

@@ -69,8 +69,7 @@ struct Run {
 
 Run generate(const std::filesystem::path& weights, qus::EngineOptions options,
              const std::vector<int>& prompt, int max_new_tokens) {
-    options.device         = 0;
-    options.use_cuda_graph = false;
+    options.device = 0;
     qus::Engine engine(options);
     engine.load(weights.string());
     Run out;
@@ -83,6 +82,7 @@ int scenario_batched(const std::filesystem::path& weights) {
     qus::EngineOptions options;
     options.max_ctx          = 128;
     options.mtp_draft_tokens = 5;
+    options.use_cuda_graph   = false;
     const Run mtp = generate(weights, options, foundation_prompt_ids(), 8);
 
     int failures = 0;
@@ -98,6 +98,7 @@ int scenario_capacity_fallback(const std::filesystem::path& weights) {
     qus::EngineOptions options;
     options.max_ctx          = 8;
     options.mtp_draft_tokens = 5;
+    options.use_cuda_graph   = false;
     const Run mtp = generate(weights, options, {1, 2, 3, 4, 5, 6, 7}, 2);
 
     int failures = 0;
@@ -112,6 +113,7 @@ int scenario_fallback_after_accept(const std::filesystem::path& weights) {
     qus::EngineOptions options;
     options.max_ctx          = static_cast<std::uint32_t>(prompt.size() + 10);
     options.mtp_draft_tokens = 5;
+    options.use_cuda_graph   = false;
     const Run mtp = generate(weights, options, prompt, 8);
 
     int failures = 0;
@@ -130,12 +132,14 @@ int scenario_stop_truncation(const std::filesystem::path& weights) {
     qus::EngineOptions probe_options;
     probe_options.max_ctx          = 32;
     probe_options.mtp_draft_tokens = 5;
+    probe_options.use_cuda_graph   = false;
     const Run probe = generate(weights, probe_options, {1}, 3);
     if (probe.tokens.size() < 2) { return fail("stop probe token count mismatch"); }
 
     qus::EngineOptions options;
     options.max_ctx          = 32;
     options.mtp_draft_tokens = 5;
+    options.use_cuda_graph   = false;
     options.stop_token_ids   = {probe.tokens[1]};
     const Run mtp = generate(weights, options, {1}, 3);
 
@@ -148,12 +152,46 @@ int scenario_stop_truncation(const std::filesystem::path& weights) {
     return failures;
 }
 
+int scenario_graph_parity(const std::filesystem::path& weights) {
+    const std::vector<int> prompt = foundation_prompt_ids();
+
+    qus::EngineOptions eager;
+    eager.max_ctx          = 256;
+    eager.mtp_draft_tokens = 5;
+    eager.use_cuda_graph   = false;
+    const Run a = generate(weights, eager, prompt, 24);
+
+    qus::EngineOptions graph;
+    graph.max_ctx          = 256;
+    graph.mtp_draft_tokens = 5;
+    graph.use_cuda_graph   = true;
+    const Run b = generate(weights, graph, prompt, 24);
+
+    int failures = 0;
+    failures += a.tokens == b.tokens ? 0 : fail("graph/eager MTP token streams differ");
+    failures += a.mtp.accepted_tokens == b.mtp.accepted_tokens
+                    ? 0
+                    : fail("graph/eager accepted-token counts differ");
+    return failures;
+}
+
+int run_scenario(std::string_view scenario, const std::filesystem::path& weights) {
+    if (scenario == "batched") { return scenario_batched(weights); }
+    if (scenario == "capacity_fallback") { return scenario_capacity_fallback(weights); }
+    if (scenario == "fallback_after_accept") { return scenario_fallback_after_accept(weights); }
+    if (scenario == "stop_truncation") { return scenario_stop_truncation(weights); }
+    if (scenario == "graph_parity") { return scenario_graph_parity(weights); }
+    std::cerr << "unknown scenario: " << scenario << '\n';
+    return 2;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc > 2) {
         std::cerr << "usage: qus_engine_mtp_e2e_test "
-                     "<batched|capacity_fallback|fallback_after_accept|stop_truncation>\n";
+                     "<batched|capacity_fallback|fallback_after_accept|stop_truncation|"
+                     "graph_parity>\n";
         return 2;
     }
     const std::filesystem::path weights = real_weights_path();
@@ -178,21 +216,21 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    const std::string scenario = argc == 2 ? argv[1] : "batched";
     int failures = 0;
-    if (scenario == "batched") {
-        failures = scenario_batched(weights);
-    } else if (scenario == "capacity_fallback") {
-        failures = scenario_capacity_fallback(weights);
-    } else if (scenario == "fallback_after_accept") {
-        failures = scenario_fallback_after_accept(weights);
-    } else if (scenario == "stop_truncation") {
-        failures = scenario_stop_truncation(weights);
+    if (argc == 2) {
+        failures = run_scenario(argv[1], weights);
+        if (failures == 2) { return 2; }
+        if (failures != 0) { return fail("MTP E2E scenario failed"); }
+        std::cout << "OK MTP E2E scenario " << argv[1] << '\n';
     } else {
-        std::cerr << "unknown scenario: " << scenario << '\n';
-        return 2;
+        for (std::string_view scenario :
+             {"batched", "capacity_fallback", "fallback_after_accept", "stop_truncation",
+              "graph_parity"}) {
+            const int scenario_failures = run_scenario(scenario, weights);
+            if (scenario_failures != 0) { failures += scenario_failures; }
+        }
+        if (failures != 0) { return fail("MTP E2E scenarios failed"); }
+        std::cout << "OK MTP E2E scenarios\n";
     }
-    if (failures != 0) { return fail("MTP E2E scenario failed"); }
-    std::cout << "OK MTP E2E scenario " << scenario << '\n';
     return 0;
 }

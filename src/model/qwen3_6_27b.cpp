@@ -452,14 +452,6 @@ const MtpW& Qwen3_6_27B::mtp_weights() const {
     return mtp_;
 }
 
-void Qwen3_6_27B::mtp_set_cache_position(std::uint32_t position) {
-    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP KV cache is not enabled"); }
-    if (position > mtp_kv_->max_context) {
-        throw std::out_of_range("MTP KV cache position exceeds max_context");
-    }
-    mtp_kv_->pos = position;
-}
-
 void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                                    Tensor& mtp_hidden) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
@@ -527,9 +519,8 @@ void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
 }
 
 void Qwen3_6_27B::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
-                                    const Tensor& positions, std::uint32_t cache_offset,
-                                    Tensor& mtp_hidden, int logits_column, Tensor* logits,
-                                    Tensor* draft_token) {
+                                    const Tensor& positions, Tensor& mtp_hidden,
+                                    int logits_column, Tensor* logits, Tensor* draft_token) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
@@ -539,10 +530,6 @@ void Qwen3_6_27B::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     require_tensor_shape(positions, DType::I32, {T}, "MTP positions");
     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "MTP hidden");
     require_tensor_shape(mtp_hidden, DType::BF16, {kCfg.hidden, T}, "MTP output hidden");
-    const auto token_count = static_cast<std::uint32_t>(T);
-    if (cache_offset > mtp_kv_->max_context || token_count > mtp_kv_->max_context - cache_offset) {
-        throw std::out_of_range("MTP batch cache range exceeds max_context");
-    }
     if (logits_column >= T) { throw std::invalid_argument("MTP logits column out of range"); }
     if (logits_column >= 0) {
         if (logits == nullptr || draft_token == nullptr) {
@@ -553,7 +540,6 @@ void Qwen3_6_27B::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     }
 
     mtp_forward_core(ids, hidden, positions, mtp_hidden);
-    mtp_kv_->pos = cache_offset + token_count;
 
     if (logits_column >= 0) {
         const std::size_t logits_mark = work_.mark();
@@ -603,8 +589,7 @@ void Qwen3_6_27B::mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Ten
     work_.rewind(mark);
 }
 
-void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions,
-                                std::uint32_t cache_offset) {
+void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions) {
     const int T = ids.ne[0];
     if (T <= 0) { throw std::invalid_argument("target_verify T must be positive"); }
     require_tensor_shape(ids, DType::I32, {T}, "target_verify ids");
@@ -612,10 +597,6 @@ void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions,
     require_tensor_window(io_.verify_hidden, DType::BF16, kCfg.hidden, T, "target_verify hidden");
     require_tensor_window(io_.logits, DType::BF16, kCfg.vocab, T, "target_verify logits");
     require_vector_window(io_.target_tokens, DType::I32, T, "target_verify target_tokens");
-    const auto token_count = static_cast<std::uint32_t>(T);
-    if (cache_offset > kv_.max_context || token_count > kv_.max_context - cache_offset) {
-        throw std::out_of_range("target_verify cache range exceeds max_context");
-    }
 
     cudaStream_t s = ctx_.stream;
     work_.reset();
@@ -953,8 +934,8 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                 if (is_last) {
                     Tensor logits = matrix_window(io_.logits, 1);
                     Tensor draft0 = io_.drafts.slice(0, 0, 1);
-                    mtp_forward_batch(mtp_ids, xf, positions, static_cast<std::uint32_t>(t0),
-                                      mtp_hidden, len - 1, &logits, &draft0);
+                    mtp_forward_batch(mtp_ids, xf, positions, mtp_hidden, len - 1, &logits,
+                                      &draft0);
                     const auto* src = static_cast<const unsigned char*>(mtp_hidden.data) +
                                       static_cast<std::size_t>(len - 1) *
                                           static_cast<std::size_t>(kCfg.hidden) *
@@ -965,8 +946,6 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
 
                     detail::set_pos(io_.ar_pos, T, s);
                     for (int i = 1; i < io_.drafts.ne[0]; ++i) {
-                        const int host_pos = T + i - 1;
-                        mtp_set_cache_position(static_cast<std::uint32_t>(host_pos));
                         Tensor prev_token  = io_.drafts.slice(0, i - 1, 1);
                         Tensor next_token  = io_.drafts.slice(0, i, 1);
                         Tensor next_hidden = work_.alloc(DType::BF16, {kCfg.hidden, 1});
@@ -976,11 +955,9 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                                                    io_.mtp_ar_hidden.bytes(),
                                                    cudaMemcpyDeviceToDevice, s));
                         kernels::mtp_increment_i32(io_.ar_pos, s);
-                        mtp_set_cache_position(static_cast<std::uint32_t>(host_pos + 1));
                     }
                 } else {
-                    mtp_forward_batch(mtp_ids, xf, positions, static_cast<std::uint32_t>(t0),
-                                      mtp_hidden, -1, nullptr, nullptr);
+                    mtp_forward_batch(mtp_ids, xf, positions, mtp_hidden, -1, nullptr, nullptr);
                 }
             }
         }

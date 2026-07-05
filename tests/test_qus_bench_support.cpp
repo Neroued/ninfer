@@ -351,7 +351,9 @@ int test_format_table_and_csv() {
     failures +=
         expect_string(qb::decode_path_name(true, 0), "cuda_graph", "decode path cuda graph");
     failures += expect_string(qb::decode_path_name(false, 0), "eager", "decode path eager");
-    failures += expect_string(qb::decode_path_name(true, 5), "mtp_eager",
+    failures += expect_string(qb::decode_path_name(true, 5), "mtp_cuda_graph",
+                              "decode path mtp cuda graph");
+    failures += expect_string(qb::decode_path_name(false, 5), "mtp_eager",
                               "decode path mtp eager");
 
     const std::string csv = qb::format_csv(env, results);

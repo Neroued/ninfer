@@ -442,7 +442,9 @@ std::size_t Engine::default_work_bytes(std::uint32_t prefill_chunk) {
 
 void Engine::load(const std::string& path) {
     decode_graph_.reset();
+    round_graph_.reset();
     decode_warmed_ = false;
+    round_warmed_  = false;
     pending_sampled_.clear();
     card_.reset();
     state_.reset();
@@ -579,25 +581,19 @@ int Engine::read_token() {
     return token;
 }
 
-int Engine::read_i32_scalar(const Tensor model::StepState::*field) {
-    int value = 0;
+std::vector<int> Engine::read_round_output() {
     ctx_->synchronize();
-    const model::StepState& io = io_;
-    CUDA_CHECK(cudaMemcpy(&value, (io.*field).data, sizeof(value), cudaMemcpyDeviceToHost));
-    return value;
-}
-
-std::vector<int> Engine::read_sampled_tokens() {
-    const int n = read_i32_scalar(&model::StepState::num_sampled);
+    int n = 0;
+    CUDA_CHECK(cudaMemcpy(&n, io_.num_sampled.data, sizeof(n), cudaMemcpyDeviceToHost));
     if (n <= 0 || n > io_.sampled_out.ne[0]) {
         throw std::runtime_error("Engine MTP sampled token count is invalid");
     }
     std::vector<int> out(static_cast<std::size_t>(n));
     CUDA_CHECK(cudaMemcpy(out.data(), io_.sampled_out.data, out.size() * sizeof(int),
                           cudaMemcpyDeviceToHost));
-    const auto stop = std::find_if(out.begin(), out.end(), [&](int token) {
-        return is_stop_token(token);
-    });
+    kv_->pos += static_cast<std::uint32_t>(n);
+    const auto stop = std::find_if(out.begin(), out.end(),
+                                   [&](int token) { return is_stop_token(token); });
     if (stop != out.end()) { out.erase(stop + 1, out.end()); }
     return out;
 }
@@ -626,7 +622,7 @@ int Engine::decode_step_one() {
     if (kv_->pos >= kv_->max_context) {
         throw std::out_of_range("Engine::decode_step exceeds max_ctx");
     }
-    const bool use_graph = options_.use_cuda_graph && options_.mtp_draft_tokens == 0;
+    const bool use_graph = options_.use_cuda_graph;
     if (use_graph && decode_warmed_) {
         if (!decode_graph_.ready()) {
             decode_graph_.capture(ctx_->stream, [this] { card_->decode_step_record(); });
@@ -644,22 +640,19 @@ int Engine::decode_step_one() {
     return read_token();
 }
 
-void Engine::propose_mtp_after_accept(std::uint32_t host_window_base, int host_length, int k) {
+void Engine::record_propose(int k) {
     const int T = k + 1;
     kernels::mtp_prepare_shifted_ids(io_.verify_ids, io_.token, io_.accepted, io_.shifted_ids,
                                      ctx_->stream);
     Tensor mtp_hidden = io_.prefill_hidden.slice(1, 0, T);
-    card_->mtp_forward_batch(io_.shifted_ids, io_.verify_hidden, io_.positions, host_window_base,
-                             mtp_hidden, -1, nullptr, nullptr);
-    card_->mtp_set_cache_position(static_cast<std::uint32_t>(host_length));
+    card_->mtp_forward_batch(io_.shifted_ids, io_.verify_hidden, io_.positions, mtp_hidden, -1,
+                             nullptr, nullptr);
 
     Tensor logits = io_.logits.slice(1, 0, 1);
     Tensor draft0 = io_.drafts.slice(0, 0, 1);
     card_->mtp_sample_from_hidden_row(mtp_hidden, io_.accepted, io_.mtp_ar_hidden, logits, draft0);
 
     for (int i = 1; i < k; ++i) {
-        const int host_pos = host_length + i - 1;
-        card_->mtp_set_cache_position(static_cast<std::uint32_t>(host_pos));
         Tensor prev_token  = io_.drafts.slice(0, i - 1, 1);
         Tensor next_token  = io_.drafts.slice(0, i, 1);
         Tensor next_hidden = io_.prefill_hidden.slice(1, i, 1);
@@ -669,8 +662,19 @@ void Engine::propose_mtp_after_accept(std::uint32_t host_window_base, int host_l
                                    io_.mtp_ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
                                    ctx_->stream));
         kernels::mtp_increment_i32(io_.ar_pos, ctx_->stream);
-        card_->mtp_set_cache_position(static_cast<std::uint32_t>(host_pos + 1));
     }
+}
+
+void Engine::record_decode_round() {
+    const int k = options_.mtp_draft_tokens;
+    kernels::mtp_prepare_verify_inputs(io_.token, io_.drafts, io_.pos, io_.window_base,
+                                       io_.verify_ids, io_.positions, ctx_->stream);
+    card_->target_verify(io_.verify_ids, io_.positions);
+    kernels::mtp_accept_tokens(io_.target_tokens, io_.drafts, io_.pos, io_.token, io_.sampled_out,
+                               io_.num_sampled, io_.accepted, io_.ar_pos, io_.stats, ctx_->stream);
+    kernels::mtp_set_gdn_initial_slot_from_accepted(io_.accepted, io_.gdn_initial_slot,
+                                                    ctx_->stream);
+    record_propose(k);
 }
 
 std::vector<int> Engine::decode_round() {
@@ -680,23 +684,18 @@ std::vector<int> Engine::decode_round() {
         return {decode_step_one()};
     }
 
-    const auto host_window_base = kv_->pos;
-    const int T = k + 1;
-    kernels::mtp_prepare_verify_inputs(io_.token, io_.drafts, io_.pos, io_.window_base,
-                                       io_.verify_ids, io_.positions, ctx_->stream);
-    card_->target_verify(io_.verify_ids, io_.positions, host_window_base);
-    kernels::mtp_accept_tokens(io_.target_tokens, io_.drafts, io_.pos, io_.token,
-                               io_.sampled_out, io_.num_sampled, io_.accepted, io_.ar_pos,
-                               io_.stats, ctx_->stream);
-    kernels::mtp_set_gdn_initial_slot_from_accepted(io_.accepted, io_.gdn_initial_slot,
-                                                    ctx_->stream);
+    const bool use_graph = options_.use_cuda_graph;
+    if (use_graph && round_warmed_) {
+        if (!round_graph_.ready()) {
+            round_graph_.capture(ctx_->stream, [this] { record_decode_round(); });
+        }
+        round_graph_.launch(ctx_->stream);
+    } else {
+        record_decode_round();
+        round_warmed_ = true;
+    }
 
-    const int host_length = read_i32_scalar(&model::StepState::pos);
-    kv_->pos             = static_cast<std::uint32_t>(host_length);
-    mtp_kv_->pos         = static_cast<std::uint32_t>(host_length);
-
-    propose_mtp_after_accept(host_window_base, host_length, k);
-    return read_sampled_tokens();
+    return read_round_output();
 }
 
 int Engine::decode_step() {

@@ -114,7 +114,7 @@ struct BenchEnvironment {
     std::size_t work_bytes                = 0;
     std::uint32_t prefill_chunk           = model::kDefaultPrefillChunk;
     int mtp_draft_tokens                  = 0;
-    std::string decode_path; // "cuda_graph", "eager", or "mtp_eager"
+    std::string decode_path; // "cuda_graph", "eager", "mtp_cuda_graph", or "mtp_eager"
     int repetitions = 0;
     int warmup      = 0;
     std::string corpus_path;

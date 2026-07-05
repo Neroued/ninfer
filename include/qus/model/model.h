@@ -153,11 +153,9 @@ public:
 
     [[nodiscard]] const MtpW& mtp_weights() const;
 
-    void mtp_set_cache_position(std::uint32_t position);
-
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                           std::uint32_t cache_offset, Tensor& mtp_hidden, int logits_column,
-                           Tensor* logits, Tensor* draft_token);
+                           Tensor& mtp_hidden, int logits_column, Tensor* logits,
+                           Tensor* draft_token);
 
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, Tensor& mtp_hidden, Tensor& logits,
@@ -166,7 +164,7 @@ public:
     void mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Tensor& row, Tensor& out_hidden,
                                     Tensor& logits, Tensor& draft_token);
 
-    void target_verify(const Tensor& ids, const Tensor& positions, std::uint32_t cache_offset);
+    void target_verify(const Tensor& ids, const Tensor& positions);
 
     void prefill(std::span<const int> ids);
 

@@ -24,12 +24,12 @@ double seconds_between(Clock::time_point start, Clock::time_point end) {
 
 qus::bench::BenchMtpStats to_bench_mtp_stats(const qus::EngineMtpStats& stats) {
     qus::bench::BenchMtpStats out;
-    out.enabled = stats.enabled;
-    out.k = stats.k;
-    out.draft_tokens = stats.draft_tokens;
+    out.enabled         = stats.enabled;
+    out.k               = stats.k;
+    out.draft_tokens    = stats.draft_tokens;
     out.accepted_tokens = stats.accepted_tokens;
-    out.rounds = stats.rounds;
-    out.fallback_steps = stats.fallback_steps;
+    out.rounds          = stats.rounds;
+    out.fallback_steps  = stats.fallback_steps;
     for (std::size_t i = 0; i < out.accepted_per_pos.size(); ++i) {
         out.accepted_per_pos[i] = stats.accepted_per_pos[i];
     }
@@ -68,6 +68,25 @@ void fill_cuda_environment(qus::bench::BenchEnvironment& env, int device) {
     }
 }
 
+bool has_decode_tests(const std::vector<qus::bench::BenchTest>& tests) {
+    for (const qus::bench::BenchTest& test : tests) {
+        if (test.has_decode()) { return true; }
+    }
+    return false;
+}
+
+void prime_decode_graphs(qus::Engine& engine, qus::bench::BenchEnvironment& env,
+                         const std::vector<int>& corpus) {
+    if (!env.decode_graph_requested) { return; }
+    const std::vector<int> seed = qus::bench::prompt_slice(corpus, qus::bench::kDecodeSeedTokens);
+    engine.prefill(seed);
+    const int steps = qus::bench::decode_graph_prime_steps(env.mtp_draft_tokens);
+    for (int step = 0; step < steps; ++step) { engine.decode_step(); }
+    engine.reset_mtp_stats();
+    env.decode_graph_primed      = true;
+    env.decode_graph_prime_steps = steps;
+}
+
 // Run one repetition of a test, returning its timing. Prefill resets KV/state, so repetitions
 // are independent. Decode always runs exactly n_gen steps (decode_step ignores stop tokens).
 qus::bench::RepTiming run_repetition(qus::Engine& engine, const qus::bench::BenchTest& test,
@@ -77,11 +96,11 @@ qus::bench::RepTiming run_repetition(qus::Engine& engine, const qus::bench::Benc
     case qus::bench::TestKind::Prefill: {
         const std::vector<int> slice = qus::bench::prompt_slice(corpus, test.n_prompt);
         engine.reset_mtp_stats();
-        const auto start             = Clock::now();
+        const auto start = Clock::now();
         const qus::NvtxRange range("qus_bench.prefill." + test.label);
         engine.prefill(slice);
         timing.prefill_time_s = seconds_between(start, Clock::now());
-        timing.mtp = to_bench_mtp_stats(engine.mtp_stats());
+        timing.mtp            = to_bench_mtp_stats(engine.mtp_stats());
         break;
     }
     case qus::bench::TestKind::Decode: {
@@ -93,13 +112,13 @@ qus::bench::RepTiming run_repetition(qus::Engine& engine, const qus::bench::Benc
         const qus::NvtxRange range("qus_bench.decode." + test.label);
         for (int step = 0; step < test.n_gen; ++step) { engine.decode_step(); }
         timing.decode_time_s = seconds_between(start, Clock::now());
-        timing.mtp = to_bench_mtp_stats(engine.mtp_stats());
+        timing.mtp           = to_bench_mtp_stats(engine.mtp_stats());
         break;
     }
     case qus::bench::TestKind::PrefillDecode: {
         const std::vector<int> slice = qus::bench::prompt_slice(corpus, test.n_prompt);
         engine.reset_mtp_stats();
-        const auto start             = Clock::now();
+        const auto start = Clock::now();
         {
             const qus::NvtxRange range("qus_bench.prefill." + test.label);
             engine.prefill(slice);
@@ -112,7 +131,7 @@ qus::bench::RepTiming run_repetition(qus::Engine& engine, const qus::bench::Benc
         const auto end        = Clock::now();
         timing.prefill_time_s = seconds_between(start, after_prefill);
         timing.decode_time_s  = seconds_between(after_prefill, end);
-        timing.mtp = to_bench_mtp_stats(engine.mtp_stats());
+        timing.mtp            = to_bench_mtp_stats(engine.mtp_stats());
         break;
     }
     }
@@ -151,14 +170,16 @@ int main(int argc, char** argv) {
         const std::vector<int> corpus = qus::bench::load_corpus_ids(options.corpus_path);
         const std::vector<qus::bench::BenchTest> tests = qus::bench::expand_tests(options);
         qus::bench::validate_prompt_lengths(tests, corpus.size());
-        const std::uint32_t max_ctx = qus::bench::resolve_max_ctx(tests, options.max_ctx);
+        const bool needs_decode     = has_decode_tests(tests);
+        const std::uint32_t max_ctx = qus::bench::resolve_max_ctx(
+            tests, options.max_ctx, options.mtp_draft_tokens, options.use_cuda_graph);
 
         qus::EngineOptions engine_options;
-        engine_options.device         = options.device;
-        engine_options.max_ctx        = max_ctx;
-        engine_options.prefill_chunk  = options.prefill_chunk;
+        engine_options.device           = options.device;
+        engine_options.max_ctx          = max_ctx;
+        engine_options.prefill_chunk    = options.prefill_chunk;
         engine_options.mtp_draft_tokens = options.mtp_draft_tokens;
-        engine_options.use_cuda_graph = options.use_cuda_graph;
+        engine_options.use_cuda_graph   = options.use_cuda_graph;
         if (options.work_bytes.has_value()) { engine_options.work_bytes = *options.work_bytes; }
 
         qus::bench::BenchEnvironment env;
@@ -170,12 +191,13 @@ int main(int argc, char** argv) {
         env.max_ctx                 = max_ctx;
         env.prefill_chunk           = options.prefill_chunk;
         env.mtp_draft_tokens        = options.mtp_draft_tokens;
-        env.decode_path             =
+        env.decode_path =
             qus::bench::decode_path_name(options.use_cuda_graph, options.mtp_draft_tokens);
-        env.repetitions             = options.repetitions;
-        env.warmup                  = options.warmup;
-        env.corpus_path             = options.corpus_path;
-        env.corpus_tokens           = corpus.size();
+        env.decode_graph_requested = options.use_cuda_graph && needs_decode;
+        env.repetitions            = options.repetitions;
+        env.warmup                 = options.warmup;
+        env.corpus_path            = options.corpus_path;
+        env.corpus_tokens          = corpus.size();
 
         std::cerr << "[qus_bench] loading weights " << options.weights_path
                   << " (max_ctx=" << max_ctx << ")\n";
@@ -186,6 +208,7 @@ int main(int argc, char** argv) {
                                      cudaGetErrorString(status));
         }
         env.work_bytes = engine.memory_stats().workspace.capacity_bytes;
+        prime_decode_graphs(engine, env, corpus);
 
         std::vector<qus::bench::TestResult> results;
         results.reserve(tests.size());

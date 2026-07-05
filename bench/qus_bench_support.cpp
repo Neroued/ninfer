@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -150,6 +151,13 @@ std::string json_number(double value) {
     return out.str();
 }
 
+std::uint32_t checked_context_u32(std::uint64_t value, const char* label) {
+    if (value > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+        throw std::overflow_error(std::string(label) + " exceeds uint32");
+    }
+    return static_cast<std::uint32_t>(value);
+}
+
 std::string format_bytes(std::size_t bytes) {
     if (bytes == 0) { return "-"; }
     constexpr double gib = 1024.0 * 1024.0 * 1024.0;
@@ -188,14 +196,23 @@ void append_stat_fields(std::ostringstream& out, const std::string& prefix,
 
 } // namespace
 
-std::uint32_t BenchTest::required_context() const noexcept {
+std::uint32_t BenchTest::required_context(int mtp_draft_tokens) const {
+    const int k = std::max(0, mtp_draft_tokens);
     switch (kind) {
     case TestKind::Prefill:
-        return static_cast<std::uint32_t>(n_prompt);
+        return checked_context_u32(static_cast<std::uint64_t>(n_prompt) +
+                                       static_cast<std::uint64_t>(k > 0 ? k - 1 : 0),
+                                   "prefill context requirement");
     case TestKind::Decode:
-        return static_cast<std::uint32_t>(kDecodeSeedTokens + n_gen);
+        return checked_context_u32(static_cast<std::uint64_t>(kDecodeSeedTokens) +
+                                       static_cast<std::uint64_t>(n_gen) +
+                                       static_cast<std::uint64_t>(k > 0 ? 2 * k : 0),
+                                   "decode context requirement");
     case TestKind::PrefillDecode:
-        return static_cast<std::uint32_t>(n_prompt + n_gen);
+        return checked_context_u32(static_cast<std::uint64_t>(n_prompt) +
+                                       static_cast<std::uint64_t>(n_gen) +
+                                       static_cast<std::uint64_t>(k > 0 ? 2 * k : 0),
+                                   "prefill-decode context requirement");
     }
     return 0;
 }
@@ -224,7 +241,8 @@ std::string usage_text(std::string_view program) {
         << model::kDefaultPrefillChunk << ")\n"
         << "  --work-bytes <bytes>        explicit workspace arena override\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
-        << "  --no-cuda-graph             disable CUDA graph decode (decode_path=eager or mtp_eager)\n"
+        << "  --no-cuda-graph             disable CUDA graph decode (decode_path=eager or "
+           "mtp_eager)\n"
         << "  --mtp-draft-tokens <0..5>   enable MTP draft rounds (default: 0)\n"
         << "  -o, --output <table|json|csv>  output format (default: table)\n"
         << "  --output-file <path>        write output to a file instead of stdout\n"
@@ -332,22 +350,36 @@ std::vector<BenchTest> expand_tests(const BenchOptions& options) {
 }
 
 std::uint32_t resolve_max_ctx(const std::vector<BenchTest>& tests,
-                              std::optional<std::uint32_t> override_max_ctx) {
-    std::uint32_t required  = 0;
-    const BenchTest* driver = nullptr;
+                              std::optional<std::uint32_t> override_max_ctx, int mtp_draft_tokens,
+                              bool use_cuda_graph) {
+    if (mtp_draft_tokens < 0 || mtp_draft_tokens > model::kMaxMtpDraftTokens) {
+        throw std::invalid_argument("mtp-draft-tokens must be in [0,5]");
+    }
+    std::uint32_t required = 0;
+    std::string driver;
+    bool has_decode = false;
     for (const BenchTest& test : tests) {
-        const std::uint32_t need = test.required_context();
+        const std::uint32_t need = test.required_context(mtp_draft_tokens);
         if (need > required) {
             required = need;
-            driver   = &test;
+            driver   = test.label;
+        }
+        has_decode = has_decode || test.has_decode();
+    }
+    if (use_cuda_graph && has_decode) {
+        const std::uint32_t prime_need = decode_graph_prime_required_context(mtp_draft_tokens);
+        if (prime_need > required) {
+            required = prime_need;
+            driver   = "decode graph prime";
         }
     }
     if (required == 0) { throw std::invalid_argument("no tests to size max_ctx for"); }
     if (override_max_ctx.has_value()) {
         if (*override_max_ctx < required) {
-            throw std::invalid_argument(
-                "--max-ctx " + std::to_string(*override_max_ctx) + " is too small; test " +
-                (driver ? driver->label : std::string("?")) + " needs " + std::to_string(required));
+            throw std::invalid_argument("--max-ctx " + std::to_string(*override_max_ctx) +
+                                        " is too small; test " +
+                                        (driver.empty() ? std::string("?") : driver) + " needs " +
+                                        std::to_string(required));
         }
         return *override_max_ctx;
     }
@@ -399,6 +431,26 @@ std::string decode_path_name(bool use_cuda_graph, int mtp_draft_tokens) {
     return use_cuda_graph ? "cuda_graph" : "eager";
 }
 
+int decode_graph_prime_steps(int mtp_draft_tokens) {
+    if (mtp_draft_tokens < 0 || mtp_draft_tokens > model::kMaxMtpDraftTokens) {
+        throw std::invalid_argument("mtp-draft-tokens must be in [0,5]");
+    }
+    return mtp_draft_tokens > 0 ? mtp_draft_tokens + 2 : 2;
+}
+
+std::uint32_t decode_graph_prime_required_context(int mtp_draft_tokens) {
+    if (mtp_draft_tokens < 0 || mtp_draft_tokens > model::kMaxMtpDraftTokens) {
+        throw std::invalid_argument("mtp-draft-tokens must be in [0,5]");
+    }
+    if (mtp_draft_tokens <= 0) {
+        return checked_context_u32(static_cast<std::uint64_t>(kDecodeSeedTokens) + 2ULL,
+                                   "decode graph prime context requirement");
+    }
+    const auto k = static_cast<std::uint64_t>(mtp_draft_tokens);
+    return checked_context_u32(static_cast<std::uint64_t>(kDecodeSeedTokens) + 3ULL * k + 1ULL,
+                               "MTP decode graph prime context requirement");
+}
+
 Stats compute_stats(const std::vector<double>& values) {
     Stats stats;
     stats.count = static_cast<int>(values.size());
@@ -425,12 +477,35 @@ std::vector<double> prefill_tok_s_series(const TestResult& result) {
     return out;
 }
 
-std::vector<double> decode_tok_s_series(const TestResult& result) {
+std::int64_t decode_output_tokens(const TestResult& result) {
+    return result.test.has_decode() ? static_cast<std::int64_t>(result.test.n_gen) : 0;
+}
+
+std::int64_t decode_engine_tokens(const TestResult& result, const RepTiming& rep) {
+    if (!result.test.has_decode()) { return 0; }
+    if (!rep.mtp.enabled || rep.mtp.k <= 0) { return static_cast<std::int64_t>(result.test.n_gen); }
+    return rep.mtp.rounds + rep.mtp.accepted_tokens + rep.mtp.fallback_steps;
+}
+
+std::vector<double> decode_output_tok_s_series(const TestResult& result) {
+    std::vector<double> out;
+    if (!result.test.has_decode()) { return out; }
+    const std::int64_t tokens = decode_output_tokens(result);
+    for (const RepTiming& rep : result.reps) {
+        if (rep.decode_time_s > 0.0) {
+            out.push_back(static_cast<double>(tokens) / rep.decode_time_s);
+        }
+    }
+    return out;
+}
+
+std::vector<double> decode_engine_tok_s_series(const TestResult& result) {
     std::vector<double> out;
     if (!result.test.has_decode()) { return out; }
     for (const RepTiming& rep : result.reps) {
+        const std::int64_t tokens = decode_engine_tokens(result, rep);
         if (rep.decode_time_s > 0.0) {
-            out.push_back(static_cast<double>(result.test.n_gen) / rep.decode_time_s);
+            out.push_back(static_cast<double>(tokens) / rep.decode_time_s);
         }
     }
     return out;
@@ -465,24 +540,35 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
     out << "  config:     max_ctx=" << env.max_ctx << " prefill_chunk=" << env.prefill_chunk
         << " mtp_k=" << env.mtp_draft_tokens << " work_bytes=" << env.work_bytes
         << " decode_path=" << env.decode_path << " repetitions=" << env.repetitions
-        << " warmup=" << env.warmup << "\n\n";
+        << " warmup=" << env.warmup;
+    if (env.decode_graph_requested) {
+        out << " graph_prime="
+            << (env.decode_graph_primed ? std::to_string(env.decode_graph_prime_steps)
+                                        : std::string("not_run"));
+    } else {
+        out << " graph_prime=n/a";
+    }
+    out << "\n\n";
 
-    constexpr std::size_t kCols                  = 7;
-    const std::array<std::string, kCols> headers = {"test",        "n_prompt",   "n_gen",
-                                                    "prefill t/s", "decode t/s", "mtp acc",
-                                                    "work peak"};
+    constexpr std::size_t kCols                  = 9;
+    const std::array<std::string, kCols> headers = {
+        "test",           "n_prompt", "n_gen",        "prefill t/s", "decode out t/s",
+        "decode eng t/s", "mtp acc",  "mtp round/fb", "work peak"};
     std::vector<std::array<std::string, kCols>> rows;
     rows.reserve(results.size());
     for (const TestResult& result : results) {
-        const BenchMtpStats mtp = aggregate_mtp(env, result);
-        const std::string mtp_rate =
-            mtp.draft_tokens > 0
-                ? json_number(static_cast<double>(mtp.accepted_tokens) /
-                              static_cast<double>(mtp.draft_tokens))
-                : std::string("n/a");
+        const BenchMtpStats mtp    = aggregate_mtp(env, result);
+        const std::string mtp_rate = mtp.draft_tokens > 0
+                                         ? json_number(static_cast<double>(mtp.accepted_tokens) /
+                                                       static_cast<double>(mtp.draft_tokens))
+                                         : std::string("n/a");
+        const std::string mtp_rounds =
+            mtp.enabled ? std::to_string(mtp.rounds) + "/" + std::to_string(mtp.fallback_steps)
+                        : std::string("n/a");
         rows.push_back({result.test.label, std::to_string(result.test.n_prompt),
                         std::to_string(result.test.n_gen), rate_cell(prefill_tok_s_series(result)),
-                        rate_cell(decode_tok_s_series(result)), mtp_rate,
+                        rate_cell(decode_output_tok_s_series(result)),
+                        rate_cell(decode_engine_tok_s_series(result)), mtp_rate, mtp_rounds,
                         format_bytes(result.workspace_peak_bytes)});
     }
 
@@ -511,8 +597,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
     return out.str();
 }
 
-void append_mtp_json(std::ostringstream& out, const BenchEnvironment& env,
-                     const BenchMtpStats& mtp, const std::string& indent) {
+void append_mtp_json(std::ostringstream& out, const BenchEnvironment& env, const BenchMtpStats& mtp,
+                     const std::string& indent) {
     out << indent << "\"mtp\": {\n";
     out << indent << "  \"enabled\": " << (mtp.enabled ? "true" : "false") << ",\n";
     out << indent << "  \"k\": " << mtp.k << ",\n";
@@ -590,6 +676,11 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"mtp_draft_tokens\": " << env.mtp_draft_tokens << ",\n"
         << "    \"work_bytes\": " << env.work_bytes << ",\n"
         << "    \"decode_path\": \"" << json_escape(env.decode_path) << "\",\n"
+        << "    \"decode_graph_prime\": {\n"
+        << "      \"requested\": " << (env.decode_graph_requested ? "true" : "false") << ",\n"
+        << "      \"primed\": " << (env.decode_graph_primed ? "true" : "false") << ",\n"
+        << "      \"decode_steps\": " << env.decode_graph_prime_steps << "\n"
+        << "    },\n"
         << "    \"repetitions\": " << env.repetitions << ",\n"
         << "    \"warmup\": " << env.warmup << ",\n"
         << "    \"timing_boundary\": \"host_visible_phase_end\",\n"
@@ -598,11 +689,12 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  },\n"
         << "  \"tests\": [\n";
     for (std::size_t i = 0; i < results.size(); ++i) {
-        const TestResult& result                = results[i];
-        const std::vector<double> prefill_rates = prefill_tok_s_series(result);
-        const std::vector<double> decode_rates  = decode_tok_s_series(result);
-        const std::vector<double> prefill_times = prefill_time_series(result);
-        const std::vector<double> decode_times  = decode_time_series(result);
+        const TestResult& result                      = results[i];
+        const std::vector<double> prefill_rates       = prefill_tok_s_series(result);
+        const std::vector<double> decode_output_rates = decode_output_tok_s_series(result);
+        const std::vector<double> decode_engine_rates = decode_engine_tok_s_series(result);
+        const std::vector<double> prefill_times       = prefill_time_series(result);
+        const std::vector<double> decode_times        = decode_time_series(result);
         out << "    {\n"
             << "      \"label\": \"" << json_escape(result.test.label) << "\",\n"
             << "      \"kind\": \"" << kind_string(result.test.kind) << "\",\n"
@@ -610,7 +702,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
             << "      \"n_gen\": " << result.test.n_gen << ",\n";
         append_stat_fields(out, "prefill_tok_s", prefill_rates, "      ");
         out << ",\n";
-        append_stat_fields(out, "decode_tok_s", decode_rates, "      ");
+        append_stat_fields(out, "decode_output_tok_s", decode_output_rates, "      ");
+        out << ",\n";
+        append_stat_fields(out, "decode_engine_tok_s", decode_engine_rates, "      ");
         out << ",\n";
         append_stat_fields(out, "prefill_time_s", prefill_times, "      ");
         out << ",\n";
@@ -634,10 +728,27 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
             out << "\"decode_time_s\": "
                 << (result.test.has_decode() ? json_number(rep.decode_time_s) : std::string("null"))
                 << ", ";
-            out << "\"decode_tok_s\": "
+            out << "\"decode_output_tokens\": "
+                << (result.test.has_decode() ? std::to_string(decode_output_tokens(result))
+                                             : std::string("null"))
+                << ", ";
+            out << "\"decode_engine_tokens\": "
+                << (result.test.has_decode() ? std::to_string(decode_engine_tokens(result, rep))
+                                             : std::string("null"))
+                << ", ";
+            out << "\"decode_output_tok_s\": "
                 << (result.test.has_decode() && rep.decode_time_s > 0.0
-                        ? json_number(static_cast<double>(result.test.n_gen) / rep.decode_time_s)
+                        ? json_number(static_cast<double>(decode_output_tokens(result)) /
+                                      rep.decode_time_s)
+                        : std::string("null"))
+                << ", ";
+            out << "\"decode_engine_tok_s\": "
+                << (result.test.has_decode() && rep.decode_time_s > 0.0
+                        ? json_number(static_cast<double>(decode_engine_tokens(result, rep)) /
+                                      rep.decode_time_s)
                         : std::string("null"));
+            out << ", ";
+            append_mtp_json(out, env, rep.mtp, "");
             out << "}" << (r + 1 < result.reps.size() ? "," : "") << "\n";
         }
         out << "      ]\n";
@@ -650,10 +761,11 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
 
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
-    out << "label,kind,n_prompt,n_gen,prefill_chunk,mtp_draft_tokens,mtp_acceptance_rate,"
-           "repetitions,prefill_tok_s_mean,prefill_tok_s_"
-           "stddev,"
-           "decode_tok_s_mean,decode_tok_s_stddev,prefill_time_s_mean,decode_time_s_mean,"
+    out << "label,kind,n_prompt,n_gen,prefill_chunk,mtp_draft_tokens,decode_path,"
+           "decode_graph_primed,decode_graph_prime_steps,mtp_rounds,mtp_fallback_steps,"
+           "mtp_acceptance_rate,repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,"
+           "decode_output_tok_s_mean,decode_output_tok_s_stddev,decode_engine_tok_s_mean,"
+           "decode_engine_tok_s_stddev,prefill_time_s_mean,decode_time_s_mean,"
            "workspace_peak_bytes\n";
     auto cell_mean = [](const std::vector<double>& series) -> std::string {
         return series.empty() ? std::string() : json_number(compute_stats(series).mean);
@@ -662,19 +774,22 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
         return series.empty() ? std::string() : json_number(compute_stats(series).stddev);
     };
     for (const TestResult& result : results) {
-        const BenchMtpStats mtp = aggregate_mtp(env, result);
-        const std::string mtp_rate =
-            mtp.draft_tokens > 0
-                ? json_number(static_cast<double>(mtp.accepted_tokens) /
-                              static_cast<double>(mtp.draft_tokens))
-                : std::string();
+        const BenchMtpStats mtp    = aggregate_mtp(env, result);
+        const std::string mtp_rate = mtp.draft_tokens > 0
+                                         ? json_number(static_cast<double>(mtp.accepted_tokens) /
+                                                       static_cast<double>(mtp.draft_tokens))
+                                         : std::string();
         out << result.test.label << "," << kind_string(result.test.kind) << ","
             << result.test.n_prompt << "," << result.test.n_gen << "," << env.prefill_chunk << ","
-            << env.mtp_draft_tokens << "," << mtp_rate << ","
+            << env.mtp_draft_tokens << "," << env.decode_path << ","
+            << (env.decode_graph_primed ? "true" : "false") << "," << env.decode_graph_prime_steps
+            << "," << mtp.rounds << "," << mtp.fallback_steps << "," << mtp_rate << ","
             << result.reps.size() << "," << cell_mean(prefill_tok_s_series(result)) << ","
             << cell_stddev(prefill_tok_s_series(result)) << ","
-            << cell_mean(decode_tok_s_series(result)) << ","
-            << cell_stddev(decode_tok_s_series(result)) << ","
+            << cell_mean(decode_output_tok_s_series(result)) << ","
+            << cell_stddev(decode_output_tok_s_series(result)) << ","
+            << cell_mean(decode_engine_tok_s_series(result)) << ","
+            << cell_stddev(decode_engine_tok_s_series(result)) << ","
             << cell_mean(prefill_time_series(result)) << ","
             << cell_mean(decode_time_series(result)) << "," << result.workspace_peak_bytes << "\n";
     }

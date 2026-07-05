@@ -17,7 +17,7 @@
 
 namespace qus::bench {
 
-inline constexpr int kSchemaVersion                  = 3;
+inline constexpr int kSchemaVersion                  = 4;
 inline constexpr std::string_view kArtifactType      = "qus_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath = "bench/fixtures/bench_corpus.ids";
 // Seed tokens prefilled (untimed) before a pure decode (tg) test so the model has a valid
@@ -45,10 +45,10 @@ struct BenchTest {
         return kind == TestKind::Decode || kind == TestKind::PrefillDecode;
     }
 
-    // Minimum EngineOptions.max_ctx that lets this test run without tripping the engine
-    // prefill/decode context guards. Derivation: prefill(P) leaves pos=P; each decode_step
-    // requires pos < max_ctx then advances.
-    [[nodiscard]] std::uint32_t required_context() const noexcept;
+    // Minimum EngineOptions.max_ctx that lets this test run without tripping the engine guards.
+    // MTP sizing includes room for prefill draft preparation and full decode rounds, not only
+    // caller-visible output tokens.
+    [[nodiscard]] std::uint32_t required_context(int mtp_draft_tokens) const;
 };
 
 enum class OutputFormat { Table, Json, Csv };
@@ -76,13 +76,14 @@ struct BenchOptions {
 struct RepTiming {
     double prefill_time_s = 0.0;
     double decode_time_s  = 0.0;
+
     struct BenchMtpStats {
-        bool enabled = false;
-        int k = 0;
-        std::int64_t draft_tokens = 0;
+        bool enabled                 = false;
+        int k                        = 0;
+        std::int64_t draft_tokens    = 0;
         std::int64_t accepted_tokens = 0;
-        std::int64_t rounds = 0;
-        std::int64_t fallback_steps = 0;
+        std::int64_t rounds          = 0;
+        std::int64_t fallback_steps  = 0;
         std::array<std::int64_t, model::kMaxMtpDraftTokens> accepted_per_pos{};
     } mtp;
 };
@@ -115,8 +116,11 @@ struct BenchEnvironment {
     std::uint32_t prefill_chunk           = model::kDefaultPrefillChunk;
     int mtp_draft_tokens                  = 0;
     std::string decode_path; // "cuda_graph", "eager", "mtp_cuda_graph", or "mtp_eager"
-    int repetitions = 0;
-    int warmup      = 0;
+    bool decode_graph_requested  = false;
+    bool decode_graph_primed     = false;
+    int decode_graph_prime_steps = 0;
+    int repetitions              = 0;
+    int warmup                   = 0;
     std::string corpus_path;
     std::size_t corpus_tokens = 0;
 };
@@ -130,7 +134,8 @@ std::string usage_text(std::string_view program);
 std::vector<BenchTest> expand_tests(const BenchOptions& options);
 // Auto-size max_ctx to the largest test requirement, or validate the --max-ctx override.
 std::uint32_t resolve_max_ctx(const std::vector<BenchTest>& tests,
-                              std::optional<std::uint32_t> override_max_ctx);
+                              std::optional<std::uint32_t> override_max_ctx, int mtp_draft_tokens,
+                              bool use_cuda_graph);
 // Reject prefill lengths that exceed the meaningful corpus (can't slice beyond it).
 void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t corpus_tokens);
 
@@ -138,12 +143,15 @@ void validate_prompt_lengths(const std::vector<BenchTest>& tests, std::size_t co
 std::vector<int> load_corpus_ids(const std::string& path);
 std::vector<int> prompt_slice(const std::vector<int>& corpus, int n_prompt);
 std::string decode_path_name(bool use_cuda_graph, int mtp_draft_tokens);
+int decode_graph_prime_steps(int mtp_draft_tokens);
+std::uint32_t decode_graph_prime_required_context(int mtp_draft_tokens);
 
 // Statistics --------------------------------------------------------------------------------
 Stats compute_stats(const std::vector<double>& values);
 // Per-rep throughput series for a result (empty if the test lacks that phase).
 std::vector<double> prefill_tok_s_series(const TestResult& result);
-std::vector<double> decode_tok_s_series(const TestResult& result);
+std::vector<double> decode_output_tok_s_series(const TestResult& result);
+std::vector<double> decode_engine_tok_s_series(const TestResult& result);
 std::vector<double> prefill_time_series(const TestResult& result);
 std::vector<double> decode_time_series(const TestResult& result);
 

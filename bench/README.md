@@ -39,17 +39,27 @@ permitting).
 ## Test model
 
 Three test kinds, each measured independently over `repetitions` timed runs (plus discarded
-`warmup` runs). A warmup run is required for honest decode numbers because the first `decode_step`
-captures the CUDA graph; measured runs then reflect steady graph replay.
+`warmup` runs). When CUDA graph decode is enabled and the matrix contains decode work, `qus_bench`
+also primes the decode graph once before timed repetitions so small `tg` cases do not include graph
+capture in their measured time.
 
 - `pp{P}` — prefill `P` meaningful tokens. `prefill t/s = P / prefill_time`.
-- `tg{G}` — prefill a 1-token seed (untimed), then time exactly `G` decode steps. `decode t/s = G / decode_time`. Decode ignores stop tokens, so the length is exact.
-- `pp{P}+tg{G}` — prefill `P`, then decode `G` in one sequence; reports both rates (decode runs at context offset `P`).
+- `tg{G}` — prefill a 1-token seed (untimed), then time exactly `G` `decode_step()` calls. Decode
+  ignores stop tokens, so the requested output length is exact.
+- `pp{P}+tg{G}` — prefill `P`, then decode `G` in one sequence; reports both rates (decode runs at
+  context offset `P`).
+
+Decode reports two token/s views:
+
+- `decode_output_tok_s` — caller-visible requested output tokens divided by decode time (`G / time`).
+- `decode_engine_tok_s` — engine-produced tokens divided by decode time. This equals output tokens
+  for non-MTP and can exceed output tokens for MTP when the final round produces pending tokens.
 
 Timing boundary is `host_visible_phase_end`: `prefill()` and each `decode_step()` synchronize and
-read back their token before the timer stops, so decode t/s includes per-step device-to-host
-readback. `max_ctx` is auto-sized to the largest test requirement (`pp`→P, `tg`→G+1, `pp+tg`→P+G)
-unless `--max-ctx` overrides it; a `--max-ctx` smaller than a test needs is rejected.
+read back their token before the timer stops, so decode rates include per-step device-to-host
+readback. `max_ctx` is auto-sized to the largest test requirement. With MTP enabled, the auto size
+also leaves capacity for prefill draft preparation and full MTP decode rounds; with CUDA graph decode
+it also leaves capacity for graph priming. A `--max-ctx` smaller than a test needs is rejected.
 
 ## CLI
 
@@ -65,6 +75,7 @@ qus_bench --weights <q5090-path>
           [--prefill-chunk <tokens>]         # default 1024, must be a multiple of 128
           [--work-bytes <bytes>]             # optional workspace override
           [--device <id>] [--no-cuda-graph]
+          [--mtp-draft-tokens <0..5>]
           [-o, --output <table|json|csv>]    # default table
           [--output-file <path>]             # default stdout
 ```
@@ -82,20 +93,21 @@ Example:
 
 ## Output
 
-Default `table` prints an identity/config header followed by one row per test with prefill and
-decode t/s (`mean ± stddev`; the stddev is omitted for a single repetition) and the `work peak`
-column (high-water workspace-arena usage for that test). `--output json` and `--output csv` write
-machine-readable results, including `config.prefill_chunk` and `workspace_peak_bytes` per test.
+Default `table` prints an identity/config header followed by one row per test with prefill t/s,
+decode output t/s, decode engine t/s (`mean ± stddev`; the stddev is omitted for a single
+repetition), MTP acceptance, MTP round/fallback counts, and `work peak` (high-water workspace-arena
+usage for that test). `--output json` and `--output csv` write machine-readable results, including
+`config.prefill_chunk`, MTP stats, graph-prime metadata, and `workspace_peak_bytes` per test.
 
 The default workspace arena is derived from `--prefill-chunk`, not prompt length. `work peak` /
 `workspace_peak_bytes` should stay flat as prompt length grows at a fixed prefill chunk. Use
 `--work-bytes` only as an explicit experiment override.
 
-JSON shape (`schema_version: 2`, `artifact_type: "qus_bench_report"`):
+JSON shape (`schema_version: 4`, `artifact_type: "qus_bench_report"`):
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "artifact_type": "qus_bench_report",
   "tool": "qus_bench",
   "command": "",
@@ -103,18 +115,31 @@ JSON shape (`schema_version: 2`, `artifact_type: "qus_bench_report"`):
   "worktree_dirty": false,
   "environment": {"gpu_name": "", "cuda_runtime_version": "", "cuda_driver_version": "", "device_id": 0},
   "weights": {"path": "", "file_size_bytes": 0},
-  "config": {"max_ctx": 0, "prefill_chunk": 1024, "work_bytes": 0,
-             "decode_path": "cuda_graph", "repetitions": 5, "warmup": 1,
+  "config": {"max_ctx": 0, "prefill_chunk": 1024, "mtp_draft_tokens": 0, "work_bytes": 0,
+             "decode_path": "cuda_graph",
+             "decode_graph_prime": {"requested": true, "primed": true, "decode_steps": 2},
+             "repetitions": 5, "warmup": 1,
              "timing_boundary": "host_visible_phase_end", "corpus_path": "",
              "corpus_tokens": 0},
   "tests": [
     {
       "label": "pp2048+tg128", "kind": "pp+tg", "n_prompt": 2048, "n_gen": 128,
       "prefill_tok_s_mean": 0.0, "prefill_tok_s_stddev": 0.0,
-      "decode_tok_s_mean": 0.0, "decode_tok_s_stddev": 0.0,
+      "decode_output_tok_s_mean": 0.0, "decode_output_tok_s_stddev": 0.0,
+      "decode_engine_tok_s_mean": 0.0, "decode_engine_tok_s_stddev": 0.0,
       "prefill_time_s_mean": 0.0, "decode_time_s_mean": 0.0,
       "workspace_peak_bytes": 0,
-      "reps": [{"prefill_time_s": 0.0, "prefill_tok_s": 0.0, "decode_time_s": 0.0, "decode_tok_s": 0.0}]
+      "mtp": {"enabled": false, "k": 0, "draft_tokens": 0, "accepted_tokens": 0,
+              "acceptance_rate": null, "acceptance_length": null,
+              "rounds": 0, "fallback_steps": 0, "accepted_per_pos": []},
+      "reps": [{"prefill_time_s": 0.0, "prefill_tok_s": 0.0,
+                "decode_time_s": 0.0, "decode_output_tokens": 128,
+                "decode_engine_tokens": 128,
+                "decode_output_tok_s": 0.0, "decode_engine_tok_s": 0.0,
+                "mtp": {"enabled": false, "k": 0, "draft_tokens": 0,
+                        "accepted_tokens": 0, "acceptance_rate": null,
+                        "acceptance_length": null, "rounds": 0,
+                        "fallback_steps": 0, "accepted_per_pos": []}}]
     }
   ]
 }
@@ -122,8 +147,8 @@ JSON shape (`schema_version: 2`, `artifact_type: "qus_bench_report"`):
 
 `kind` is `pp`, `tg`, or `pp+tg`. Phase fields that do not apply to a test kind are `null`
 (a `pp` test has null decode fields; a `tg` test has null prefill fields). CSV columns are
-`label,kind,n_prompt,n_gen,prefill_chunk,repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_tok_s_mean,decode_tok_s_stddev,prefill_time_s_mean,decode_time_s_mean,workspace_peak_bytes`,
-with empty cells for inapplicable phases.
+`label,kind,n_prompt,n_gen,prefill_chunk,mtp_draft_tokens,decode_path,decode_graph_primed,decode_graph_prime_steps,mtp_rounds,mtp_fallback_steps,mtp_acceptance_rate,repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,prefill_time_s_mean,decode_time_s_mean,workspace_peak_bytes`,
+with empty cells for inapplicable phase rates.
 
 ## Artifacts
 

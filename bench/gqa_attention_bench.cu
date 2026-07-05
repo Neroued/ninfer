@@ -68,17 +68,17 @@ std::int32_t decode_kps(std::int32_t pos_value) {
 std::int32_t small_t_active_splits(std::int32_t tokens, std::int32_t context) {
     if (tokens <= 1) { return kGqaDecodeSplits; }
     const std::int32_t window = context + tokens;
-    if (tokens <= 5 && window <= 4096) {
-        constexpr std::int32_t kTargetKeysPerSplit = 32;
-        constexpr std::int32_t kMinSplits          = 4;
-        std::int32_t splits                        = ceil_div_i32(window, kTargetKeysPerSplit);
-        splits                                     = std::max(kMinSplits, splits);
-        return std::min(kGqaDecodeSplits, splits);
+    std::int32_t target_keys_per_split = 480;
+    if (window <= 4096) {
+        target_keys_per_split = 64;
+    } else if (window <= 8198) {
+        target_keys_per_split = 128;
+    } else if (window <= 16390) {
+        target_keys_per_split = 256;
     }
-    const std::int32_t target_keys_per_split = (tokens <= 5) ? 480 : 512;
-    constexpr std::int32_t kMinSplits        = 4;
-    std::int32_t splits                      = ceil_div_i32(window, target_keys_per_split);
-    splits                                   = std::max(kMinSplits, splits);
+    constexpr std::int32_t kMinSplits = 4;
+    std::int32_t splits               = ceil_div_i32(window, target_keys_per_split);
+    splits                            = std::max(kMinSplits, splits);
     return std::min(kGqaDecodeSplits, splits);
 }
 

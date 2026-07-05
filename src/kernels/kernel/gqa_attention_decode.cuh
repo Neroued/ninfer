@@ -67,15 +67,15 @@ __device__ __forceinline__ bool gqa_valid_q_head(int kv_head, int q_head) {
 __device__ __forceinline__ int gqa_small_t_active_splits(int window, int max_splits, int tokens) {
     if (tokens <= 1) { return max_splits; }
     if (window <= 0) { return max_splits; }
-    if (tokens <= 5 && window <= 4096) {
-        constexpr int kTargetKeysPerSplit = 32;
-        constexpr int kMinSplits          = 4;
-        int splits = (window + kTargetKeysPerSplit - 1) / kTargetKeysPerSplit;
-        splits     = max(kMinSplits, splits);
-        return min(max_splits, splits);
+    int target_keys_per_split = 480;
+    if (window <= 4096) {
+        target_keys_per_split = 64;
+    } else if (window <= 8198) {
+        target_keys_per_split = 128;
+    } else if (window <= 16390) {
+        target_keys_per_split = 256;
     }
-    const int target_keys_per_split = (tokens <= 5) ? 480 : 512;
-    constexpr int kMinSplits        = 4;
+    constexpr int kMinSplits = 4;
     int splits = (window + target_keys_per_split - 1) / target_keys_per_split;
     splits     = max(kMinSplits, splits);
     return min(max_splits, splits);

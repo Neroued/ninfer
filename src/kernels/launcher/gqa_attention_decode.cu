@@ -21,23 +21,21 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t max_context, std::int32_
 
     constexpr std::int32_t kMinSplits = 4;
     std::int32_t splits               = kMinSplits;
-    if (tokens <= 5) {
-        constexpr std::int32_t kSmallWindowLimit     = 4096;
-        constexpr std::int32_t kSmallTargetKeysSplit = 32;
-        const std::int32_t small_window =
-            (max_context < kSmallWindowLimit) ? max_context : kSmallWindowLimit;
-        const std::int32_t small_splits = ceil_div_i32(small_window, kSmallTargetKeysSplit);
-        splits                          = (splits > small_splits) ? splits : small_splits;
-        if (max_context > kSmallWindowLimit) {
-            constexpr std::int32_t kLargeTargetKeysSplit = 480;
-            const std::int32_t large_splits = ceil_div_i32(max_context, kLargeTargetKeysSplit);
-            splits                          = (splits > large_splits) ? splits : large_splits;
+
+    const auto include_tier = [&](std::int32_t window_limit, std::int32_t target_keys_per_split) {
+        const std::int32_t tier_window =
+            (max_context < window_limit) ? max_context : window_limit;
+        if (tier_window > 0) {
+            const std::int32_t tier_splits = ceil_div_i32(tier_window, target_keys_per_split);
+            splits                         = (splits > tier_splits) ? splits : tier_splits;
         }
-    } else {
-        constexpr std::int32_t kTargetKeysSplit = 512;
-        splits = ceil_div_i32(max_context, kTargetKeysSplit);
-        splits = (splits > kMinSplits) ? splits : kMinSplits;
-    }
+    };
+
+    include_tier(4096, 64);
+    if (max_context > 4096) { include_tier(8198, 128); }
+    if (max_context > 8198) { include_tier(16390, 256); }
+    if (max_context > 16390) { include_tier(max_context, 480); }
+
     return (splits < kGqaDecodeSplits) ? splits : kGqaDecodeSplits;
 }
 

@@ -32,59 +32,103 @@ void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::ui
                                              full_slabs);
 }
 
-template <int kFullSlabs, int kStride>
-void launch_q5_t4_direct_split2(const __nv_bfloat16* xp, const std::uint8_t* codes,
-                                const std::uint8_t* high, const std::uint8_t* scales,
-                                __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
-                                std::int32_t t, std::int32_t padded_k,
-                                std::int32_t full_slabs, cudaStream_t stream) {
+template <int kTt, int kFullSlabs, int kStride>
+void launch_q5_direct_split2(const __nv_bfloat16* xp, const std::uint8_t* codes,
+                             const std::uint8_t* high, const std::uint8_t* scales,
+                             __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
+                             std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
+                             cudaStream_t stream) {
     constexpr int kBlockThreads = 2 * 32;
     const dim3    grid(static_cast<unsigned>(n), 1u, 1u);
-    linear_rowsplit_gemm_smallt_kernel_direct_split2_q5_t4<Q5Smallt, kFullSlabs, kStride>
+    linear_rowsplit_gemm_smallt_kernel_direct_split2_q5<Q5Smallt, kTt, kFullSlabs, kStride>
         <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
                                              full_slabs);
 }
 
-template <int kFullSlabs, int kStride>
-void launch_q5_t4_direct_split4(const __nv_bfloat16* xp, const std::uint8_t* codes,
-                                const std::uint8_t* high, const std::uint8_t* scales,
-                                __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
-                                std::int32_t t, std::int32_t padded_k,
-                                std::int32_t full_slabs, cudaStream_t stream) {
+template <int kTt, int kFullSlabs, int kStride>
+void launch_q5_direct_split4(const __nv_bfloat16* xp, const std::uint8_t* codes,
+                             const std::uint8_t* high, const std::uint8_t* scales,
+                             __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
+                             std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
+                             cudaStream_t stream) {
     constexpr int kBlockThreads = 4 * 32;
     const dim3    grid(static_cast<unsigned>(n), 1u, 1u);
-    linear_rowsplit_gemm_smallt_kernel_direct_split4_q5_t4<Q5Smallt, kFullSlabs, kStride>
+    linear_rowsplit_gemm_smallt_kernel_direct_split4_q5<Q5Smallt, kTt, kFullSlabs, kStride>
         <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
                                              full_slabs);
 }
 
-// kTt is the column-tile width: T <= kTt streams the weights exactly once. Only
-// 4 and 8 exist: wider tiles blow the register budget and end up latency-bound
-// (see the kernel header). T > 8 re-streams the weights per 8-column tile until
-// the LargeT tensor-core GEMM takes over. Unused columns are skipped by uniform
-// predicates, so kTt only has to cover T, not match it.
+template <int kTt>
+bool try_launch_q5_direct(const __nv_bfloat16* xp, const std::uint8_t* codes,
+                          const std::uint8_t* high, const std::uint8_t* scales,
+                          __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
+                          std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
+                          cudaStream_t stream) {
+    if (full_slabs * 1024 != k || padded_k != k) { return false; }
+    if (n == 7168 && k == 5120) {
+        launch_q5_direct_split2<kTt, 5, 5120>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                              full_slabs, stream);
+        return true;
+    }
+    if (n == 6144 && k == 5120) {
+        launch_q5_direct_split4<kTt, 5, 5120>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                              full_slabs, stream);
+        return true;
+    }
+    if (n == 5120 && k == 6144) {
+        launch_q5_direct_split2<kTt, 6, 6144>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                              full_slabs, stream);
+        return true;
+    }
+    if (n == 5120 && k == 17408) {
+        launch_q5_direct_split2<kTt, 17, 17408>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                                full_slabs, stream);
+        return true;
+    }
+    return false;
+}
+
+bool try_launch_q5_direct(const __nv_bfloat16* xp, const std::uint8_t* codes,
+                          const std::uint8_t* high, const std::uint8_t* scales,
+                          __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
+                          std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
+                          cudaStream_t stream) {
+    switch (t) {
+    case 2:
+        return try_launch_q5_direct<2>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                       full_slabs, stream);
+    case 3:
+        return try_launch_q5_direct<3>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                       full_slabs, stream);
+    case 4:
+        return try_launch_q5_direct<4>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                       full_slabs, stream);
+    case 5:
+        return try_launch_q5_direct<5>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                       full_slabs, stream);
+    case 6:
+        return try_launch_q5_direct<6>(xp, codes, high, scales, outp, n, k, t, padded_k,
+                                       full_slabs, stream);
+    default:
+        return false;
+    }
+}
+
+// Fallback kTt is the column-tile width: T <= kTt streams the weights exactly
+// once. Only 4 and 8 exist for the generic fallback: wider tiles blow the
+// register budget and end up latency-bound (see the kernel header). T > 8
+// re-streams the weights per 8-column tile until the LargeT tensor-core GEMM
+// takes over. Unused columns are skipped by uniform predicates, so kTt only has
+// to cover T, not match it.
 template <class SC>
 void launch_codec(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::uint8_t* high,
                   const std::uint8_t* scales, __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
                   std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
                   cudaStream_t stream) {
     if constexpr (std::is_same_v<SC, Q5Smallt>) {
-        if (t == 4 && full_slabs * 1024 == k && padded_k == k) {
-            if ((n == 7168 && k == 5120) || (n == 6144 && k == 5120)) {
-                launch_q5_t4_direct_split4<5, 5120>(xp, codes, high, scales, outp, n, k, t,
-                                                    padded_k, full_slabs, stream);
-                return;
-            }
-            if (n == 5120 && k == 6144) {
-                launch_q5_t4_direct_split4<6, 6144>(xp, codes, high, scales, outp, n, k, t,
-                                                    padded_k, full_slabs, stream);
-                return;
-            }
-            if (n == 5120 && k == 17408) {
-                launch_q5_t4_direct_split2<17, 17408>(xp, codes, high, scales, outp, n, k, t,
-                                                      padded_k, full_slabs, stream);
-                return;
-            }
+        if (try_launch_q5_direct(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
+                                 stream)) {
+            return;
         }
     }
     if (t <= 4) {

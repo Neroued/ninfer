@@ -506,7 +506,7 @@ int main() {
                         std::pair<std::int32_t, std::int32_t>{7168, 5120},
                         std::pair<std::int32_t, std::int32_t>{5120, 6144},
                         std::pair<std::int32_t, std::int32_t>{5120, 17408}}) {
-        f += one_quant_shape(QType::Q5G64_F16S, n, k, {1, 4, 7}, 29u);
+        f += one_quant_shape(QType::Q5G64_F16S, n, k, {1, 2, 3, 4, 5, 6, 7}, 29u);
     }
     f += one_quant_shape(QType::Q6G64_F16S, 4096, 5120, {1, 7}, 31u);
 

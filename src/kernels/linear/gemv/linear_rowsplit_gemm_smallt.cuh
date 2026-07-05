@@ -253,19 +253,20 @@ smallt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, st
     }
 }
 
-template <class SC, int kFullSlabs, int kStride>
-__launch_bounds__(64, 16) __global__ void linear_rowsplit_gemm_smallt_kernel_direct_split2_q5_t4(
+template <class SC, int kTt, int kFullSlabs, int kStride>
+__launch_bounds__(64, 16) __global__ void linear_rowsplit_gemm_smallt_kernel_direct_split2_q5(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k, std::int32_t t,
     std::int32_t padded_k, std::int32_t full_slabs) {
     static_assert(std::is_same_v<SC, Q5Smallt>, "direct split2 small-T kernel is Q5-only");
+    static_assert(kTt > 0, "direct split2 requires a positive column tile");
     static_assert(kFullSlabs > 0 && kStride > 0, "direct split2 requires exact positive shape");
     (void)full_slabs;
     (void)k;
     (void)t;
 
-    __shared__ float s_part[2][4];
+    __shared__ float s_part[2][kTt];
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int part = static_cast<int>(threadIdx.x) >> 5;
@@ -278,9 +279,9 @@ __launch_bounds__(64, 16) __global__ void linear_rowsplit_gemm_smallt_kernel_dir
         high + static_cast<std::int64_t>(row) * kg_padded * Q5Smallt::kHighBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg_padded * 2;
 
-    float acc[4];
+    float acc[kTt];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) { acc[i] = 0.0f; }
+    for (int i = 0; i < kTt; ++i) { acc[i] = 0.0f; }
 
 #pragma unroll
     for (int s = 0; s < kFullSlabs; ++s) {
@@ -316,83 +317,32 @@ __launch_bounds__(64, 16) __global__ void linear_rowsplit_gemm_smallt_kernel_dir
 
             const std::int64_t xoff =
                 static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
-            const uint4 xv0 = *reinterpret_cast<const uint4*>(x + xoff);
-            const uint4 xv1 = *reinterpret_cast<const uint4*>(x + kStride + xoff);
-            const uint4 xv2 = *reinterpret_cast<const uint4*>(
-                x + static_cast<std::int64_t>(2) * kStride + xoff);
-            const uint4 xv3 = *reinterpret_cast<const uint4*>(
-                x + static_cast<std::int64_t>(3) * kStride + xoff);
-
-            const float2 f00 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv0.x));
-            const float2 f01 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv0.y));
-            const float2 f02 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv0.z));
-            const float2 f03 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv0.w));
-            const float2 f10 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv1.x));
-            const float2 f11 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv1.y));
-            const float2 f12 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv1.z));
-            const float2 f13 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv1.w));
-            const float2 f20 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv2.x));
-            const float2 f21 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv2.y));
-            const float2 f22 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv2.z));
-            const float2 f23 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv2.w));
-            const float2 f30 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv3.x));
-            const float2 f31 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv3.y));
-            const float2 f32 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv3.z));
-            const float2 f33 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv3.w));
-
-            acc[0] = fmaf(w[0], f00.x, acc[0]);
-            acc[0] = fmaf(w[1], f00.y, acc[0]);
-            acc[0] = fmaf(w[2], f01.x, acc[0]);
-            acc[0] = fmaf(w[3], f01.y, acc[0]);
-            acc[0] = fmaf(w[4], f02.x, acc[0]);
-            acc[0] = fmaf(w[5], f02.y, acc[0]);
-            acc[0] = fmaf(w[6], f03.x, acc[0]);
-            acc[0] = fmaf(w[7], f03.y, acc[0]);
-            acc[1] = fmaf(w[0], f10.x, acc[1]);
-            acc[1] = fmaf(w[1], f10.y, acc[1]);
-            acc[1] = fmaf(w[2], f11.x, acc[1]);
-            acc[1] = fmaf(w[3], f11.y, acc[1]);
-            acc[1] = fmaf(w[4], f12.x, acc[1]);
-            acc[1] = fmaf(w[5], f12.y, acc[1]);
-            acc[1] = fmaf(w[6], f13.x, acc[1]);
-            acc[1] = fmaf(w[7], f13.y, acc[1]);
-            acc[2] = fmaf(w[0], f20.x, acc[2]);
-            acc[2] = fmaf(w[1], f20.y, acc[2]);
-            acc[2] = fmaf(w[2], f21.x, acc[2]);
-            acc[2] = fmaf(w[3], f21.y, acc[2]);
-            acc[2] = fmaf(w[4], f22.x, acc[2]);
-            acc[2] = fmaf(w[5], f22.y, acc[2]);
-            acc[2] = fmaf(w[6], f23.x, acc[2]);
-            acc[2] = fmaf(w[7], f23.y, acc[2]);
-            acc[3] = fmaf(w[0], f30.x, acc[3]);
-            acc[3] = fmaf(w[1], f30.y, acc[3]);
-            acc[3] = fmaf(w[2], f31.x, acc[3]);
-            acc[3] = fmaf(w[3], f31.y, acc[3]);
-            acc[3] = fmaf(w[4], f32.x, acc[3]);
-            acc[3] = fmaf(w[5], f32.y, acc[3]);
-            acc[3] = fmaf(w[6], f33.x, acc[3]);
-            acc[3] = fmaf(w[7], f33.y, acc[3]);
+#pragma unroll
+            for (int tt = 0; tt < kTt; ++tt) {
+                const uint4 xv = *reinterpret_cast<const uint4*>(
+                    x + static_cast<std::int64_t>(tt) * kStride + xoff);
+                const float2 f0 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+                const float2 f1 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+                const float2 f2 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.z));
+                const float2 f3 =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.w));
+                acc[tt] = fmaf(w[0], f0.x, acc[tt]);
+                acc[tt] = fmaf(w[1], f0.y, acc[tt]);
+                acc[tt] = fmaf(w[2], f1.x, acc[tt]);
+                acc[tt] = fmaf(w[3], f1.y, acc[tt]);
+                acc[tt] = fmaf(w[4], f2.x, acc[tt]);
+                acc[tt] = fmaf(w[5], f2.y, acc[tt]);
+                acc[tt] = fmaf(w[6], f3.x, acc[tt]);
+                acc[tt] = fmaf(w[7], f3.y, acc[tt]);
+            }
         }
     }
 
 #pragma unroll
-    for (int tt = 0; tt < 4; ++tt) {
+    for (int tt = 0; tt < kTt; ++tt) {
         float a = acc[tt];
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) { a += __shfl_down_sync(0xffffffffu, a, off); }
@@ -401,25 +351,26 @@ __launch_bounds__(64, 16) __global__ void linear_rowsplit_gemm_smallt_kernel_dir
 
     __syncthreads();
 
-    if (part == 0 && lane < 4) {
+    if (part == 0 && lane < kTt) {
         const float sum = s_part[0][lane] + s_part[1][lane];
         out[static_cast<std::int64_t>(lane) * n + row] = __float2bfloat16(sum);
     }
 }
 
-template <class SC, int kFullSlabs, int kStride>
-__launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_direct_split4_q5_t4(
+template <class SC, int kTt, int kFullSlabs, int kStride>
+__launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_direct_split4_q5(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k, std::int32_t t,
     std::int32_t padded_k, std::int32_t full_slabs) {
     static_assert(std::is_same_v<SC, Q5Smallt>, "direct split4 small-T kernel is Q5-only");
+    static_assert(kTt > 0, "direct split4 requires a positive column tile");
     static_assert(kFullSlabs > 0 && kStride > 0, "direct split4 requires exact positive shape");
     (void)full_slabs;
     (void)k;
     (void)t;
 
-    __shared__ float s_part[4][4];
+    __shared__ float s_part[4][kTt];
 
     const int lane  = static_cast<int>(threadIdx.x) & 31;
     const int chunk = static_cast<int>(threadIdx.x) >> 5;
@@ -432,9 +383,9 @@ __launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_di
         high + static_cast<std::int64_t>(row) * kg_padded * Q5Smallt::kHighBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg_padded * 2;
 
-    float acc[4];
+    float acc[kTt];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) { acc[i] = 0.0f; }
+    for (int i = 0; i < kTt; ++i) { acc[i] = 0.0f; }
 
 #pragma unroll
     for (int s = 0; s < kFullSlabs; ++s) {
@@ -467,82 +418,31 @@ __launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_di
 
         const std::int64_t xoff =
             static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
-        const uint4 xv0 = *reinterpret_cast<const uint4*>(x + xoff);
-        const uint4 xv1 = *reinterpret_cast<const uint4*>(x + kStride + xoff);
-        const uint4 xv2 =
-            *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(2) * kStride + xoff);
-        const uint4 xv3 =
-            *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(3) * kStride + xoff);
-
-        const float2 f00 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv0.x));
-        const float2 f01 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv0.y));
-        const float2 f02 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv0.z));
-        const float2 f03 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv0.w));
-        const float2 f10 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv1.x));
-        const float2 f11 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv1.y));
-        const float2 f12 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv1.z));
-        const float2 f13 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv1.w));
-        const float2 f20 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv2.x));
-        const float2 f21 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv2.y));
-        const float2 f22 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv2.z));
-        const float2 f23 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv2.w));
-        const float2 f30 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv3.x));
-        const float2 f31 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv3.y));
-        const float2 f32 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv3.z));
-        const float2 f33 =
-            __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv3.w));
-
-        acc[0] = fmaf(w[0], f00.x, acc[0]);
-        acc[0] = fmaf(w[1], f00.y, acc[0]);
-        acc[0] = fmaf(w[2], f01.x, acc[0]);
-        acc[0] = fmaf(w[3], f01.y, acc[0]);
-        acc[0] = fmaf(w[4], f02.x, acc[0]);
-        acc[0] = fmaf(w[5], f02.y, acc[0]);
-        acc[0] = fmaf(w[6], f03.x, acc[0]);
-        acc[0] = fmaf(w[7], f03.y, acc[0]);
-        acc[1] = fmaf(w[0], f10.x, acc[1]);
-        acc[1] = fmaf(w[1], f10.y, acc[1]);
-        acc[1] = fmaf(w[2], f11.x, acc[1]);
-        acc[1] = fmaf(w[3], f11.y, acc[1]);
-        acc[1] = fmaf(w[4], f12.x, acc[1]);
-        acc[1] = fmaf(w[5], f12.y, acc[1]);
-        acc[1] = fmaf(w[6], f13.x, acc[1]);
-        acc[1] = fmaf(w[7], f13.y, acc[1]);
-        acc[2] = fmaf(w[0], f20.x, acc[2]);
-        acc[2] = fmaf(w[1], f20.y, acc[2]);
-        acc[2] = fmaf(w[2], f21.x, acc[2]);
-        acc[2] = fmaf(w[3], f21.y, acc[2]);
-        acc[2] = fmaf(w[4], f22.x, acc[2]);
-        acc[2] = fmaf(w[5], f22.y, acc[2]);
-        acc[2] = fmaf(w[6], f23.x, acc[2]);
-        acc[2] = fmaf(w[7], f23.y, acc[2]);
-        acc[3] = fmaf(w[0], f30.x, acc[3]);
-        acc[3] = fmaf(w[1], f30.y, acc[3]);
-        acc[3] = fmaf(w[2], f31.x, acc[3]);
-        acc[3] = fmaf(w[3], f31.y, acc[3]);
-        acc[3] = fmaf(w[4], f32.x, acc[3]);
-        acc[3] = fmaf(w[5], f32.y, acc[3]);
-        acc[3] = fmaf(w[6], f33.x, acc[3]);
-        acc[3] = fmaf(w[7], f33.y, acc[3]);
+#pragma unroll
+        for (int tt = 0; tt < kTt; ++tt) {
+            const uint4 xv = *reinterpret_cast<const uint4*>(
+                x + static_cast<std::int64_t>(tt) * kStride + xoff);
+            const float2 f0 =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+            const float2 f1 =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+            const float2 f2 =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.z));
+            const float2 f3 =
+                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.w));
+            acc[tt] = fmaf(w[0], f0.x, acc[tt]);
+            acc[tt] = fmaf(w[1], f0.y, acc[tt]);
+            acc[tt] = fmaf(w[2], f1.x, acc[tt]);
+            acc[tt] = fmaf(w[3], f1.y, acc[tt]);
+            acc[tt] = fmaf(w[4], f2.x, acc[tt]);
+            acc[tt] = fmaf(w[5], f2.y, acc[tt]);
+            acc[tt] = fmaf(w[6], f3.x, acc[tt]);
+            acc[tt] = fmaf(w[7], f3.y, acc[tt]);
+        }
     }
 
 #pragma unroll
-    for (int tt = 0; tt < 4; ++tt) {
+    for (int tt = 0; tt < kTt; ++tt) {
         float a = acc[tt];
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) { a += __shfl_down_sync(0xffffffffu, a, off); }
@@ -551,7 +451,7 @@ __launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_di
 
     __syncthreads();
 
-    if (chunk == 0 && lane < 4) {
+    if (chunk == 0 && lane < kTt) {
         float sum = 0.0f;
 #pragma unroll
         for (int p = 0; p < 4; ++p) { sum += s_part[p][lane]; }

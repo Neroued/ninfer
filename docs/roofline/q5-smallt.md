@@ -184,3 +184,138 @@ grouped high-bit load, shared-scale, and split2 short-K experiments indicate
 that reaching 85% SOL likely requires a larger architecture change, such as a
 better-balanced split-K or tensor-core path that can feed all warps without
 duplicating dequant/staging work.
+
+## Generalized Direct Split T=2..6
+
+Date: 2026-07-05
+
+Goal: generalize the accepted Q5 direct split bodies from T=4-only to the MTP
+decode set T in {2,3,4,5,6}. The old `_t4` direct kernels were replaced by
+templated exact-T direct kernels. Q4/Q6/W8 remain on the generic SmallT path:
+there is no measured exercised Qwen3.6 call site in this task that justifies
+extra instantiations.
+
+Bench command:
+
+```bash
+./build/bench/qus_linear_op_bench --shape <shape> --qtype Q5 --t-sweep 2,3,4,5,6 \
+  --warmup 1 --repeat 200 --flush-mib 256 --stream-ceiling-gbs 1792
+```
+
+NCU command shape:
+
+```bash
+ncu --force-overwrite --target-processes all --kernel-name-base demangled \
+  --set basic --launch-skip 1 --launch-count 1 \
+  --kernel-name 'regex:linear_rowsplit_gemm_smallt.*Q5Smallt' \
+  -o profiles/q5-smallt/<attempt>/<shape>_T<t> \
+  ./build/bench/qus_linear_op_bench --shape <shape> --qtype Q5 --t-sweep <t> \
+  --warmup 1 --repeat 1 --flush-mib 1 --stream-ceiling-gbs 1792
+```
+
+Profile sets:
+
+- Generic measurement-only bypass: `profiles/q5-smallt/generic-sweep/*.ncu-rep`
+- Final generalized route: `profiles/q5-smallt/generalized-final/*.ncu-rep`
+- Extracted CSV summaries: `profiles/q5-smallt/generic-sweep/summary.csv`,
+  `profiles/q5-smallt/generalized-final/summary.csv`
+
+Fresh current T=4 gap before generalization, using a measurement-only local
+bypass for the generic T=4 path:
+
+| shape | direct T=4 us | generic T=4 us | direct speedup |
+| --- | ---: | ---: | ---: |
+| AttnInQKV7168x5120 | 25.856 | 38.144 | 1.48x |
+| MlpDown5120x17408 | 52.512 | 67.616 | 1.29x |
+| Proj6144x5120 | 21.792 | 34.080 | 1.56x |
+| Out5120x6144 | 23.520 | 31.904 | 1.36x |
+
+Generic path headroom from the same pre-change sweep:
+
+| shape | T=2 us | T=3 us | T=4 generic us | T=5 us | T=6 us |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AttnInQKV7168x5120 | 36.096 | 36.832 | 38.144 | 60.672 | 62.752 |
+| MlpDown5120x17408 | 64.768 | 66.816 | 67.616 | 152.832 | 161.056 |
+| Proj6144x5120 | 32.000 | 33.888 | 34.080 | 52.512 | 56.064 |
+| Out5120x6144 | 29.952 | 30.464 | 31.904 | 56.928 | 62.752 |
+
+Split-factor probes:
+
+| probe | result | decision |
+| --- | --- | --- |
+| Short-K split2 instead of split4 | Attn improved for T=3..6 and tied T=2. Out improved most at T=5/6. Proj tied at T=2/3/6 but split4 stayed faster at T=4/5. | Route Attn and Out to split2; keep Proj on split4. |
+| MlpDown split4 instead of split2 | Slower at every measured T: 46.368/54.304/57.472/66.624/72.800 us for T=2..6. | Keep MlpDown on split2. |
+
+Final route:
+
+- AttnInQKV7168x5120: `direct_split2_q5<Q5Smallt,kTt,5,5120>`
+- MlpDown5120x17408: `direct_split2_q5<Q5Smallt,kTt,17,17408>`
+- Proj6144x5120: `direct_split4_q5<Q5Smallt,kTt,5,5120>`
+- Out5120x6144: `direct_split2_q5<Q5Smallt,kTt,6,6144>`
+
+Final benchmark results versus the generic headroom:
+
+| shape | T | generic us | final us | speedup | final kernel | NCU SOL % | regs | smem B | waves/SM | occ % |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| AttnInQKV7168x5120 | 2 | 36.096 | 21.760 | 1.66x | split2 | 62.87 | 64 | 16 | 2.64 | 57.84 |
+| AttnInQKV7168x5120 | 3 | 36.832 | 22.912 | 1.61x | split2 | 58.03 | 64 | 24 | 2.64 | 57.54 |
+| AttnInQKV7168x5120 | 4 | 38.144 | 25.792 | 1.48x | split2 | 65.93 | 64 | 32 | 2.64 | 57.10 |
+| AttnInQKV7168x5120 | 5 | 60.672 | 29.952 | 2.03x | split2 | 65.65 | 64 | 40 | 2.64 | 56.34 |
+| AttnInQKV7168x5120 | 6 | 62.752 | 31.680 | 1.98x | split2 | 67.71 | 64 | 48 | 2.64 | 57.06 |
+| MlpDown5120x17408 | 2 | 64.768 | 44.320 | 1.46x | split2 | 69.62 | 64 | 16 | 1.88 | 60.47 |
+| MlpDown5120x17408 | 3 | 66.816 | 46.336 | 1.44x | split2 | 67.15 | 64 | 24 | 1.88 | 60.10 |
+| MlpDown5120x17408 | 4 | 67.616 | 55.328 | 1.22x | split2 | 64.98 | 64 | 32 | 1.88 | 57.60 |
+| MlpDown5120x17408 | 5 | 152.832 | 62.720 | 2.44x | split2 | 62.61 | 64 | 40 | 1.88 | 58.33 |
+| MlpDown5120x17408 | 6 | 161.056 | 67.584 | 2.38x | split2 | 66.14 | 64 | 48 | 1.88 | 57.18 |
+| Proj6144x5120 | 2 | 32.000 | 19.712 | 1.62x | split4 | 58.49 | 48 | 32 | 3.61 | 74.29 |
+| Proj6144x5120 | 3 | 33.888 | 21.728 | 1.56x | split4 | 54.65 | 48 | 48 | 3.61 | 73.53 |
+| Proj6144x5120 | 4 | 34.080 | 23.712 | 1.44x | split4 | 59.77 | 48 | 64 | 3.61 | 73.31 |
+| Proj6144x5120 | 5 | 52.512 | 27.552 | 1.91x | split4 | 63.35 | 48 | 80 | 3.61 | 73.76 |
+| Proj6144x5120 | 6 | 56.064 | 29.824 | 1.88x | split4 | 63.93 | 48 | 96 | 3.61 | 74.16 |
+| Out5120x6144 | 2 | 29.952 | 19.616 | 1.53x | split2 | 60.25 | 64 | 16 | 1.88 | 59.11 |
+| Out5120x6144 | 3 | 30.464 | 19.744 | 1.54x | split2 | 55.63 | 64 | 24 | 1.88 | 58.24 |
+| Out5120x6144 | 4 | 31.904 | 23.040 | 1.38x | split2 | 58.47 | 64 | 32 | 1.88 | 55.72 |
+| Out5120x6144 | 5 | 56.928 | 25.888 | 2.20x | split2 | 60.58 | 64 | 40 | 1.88 | 54.16 |
+| Out5120x6144 | 6 | 62.752 | 27.936 | 2.25x | split2 | 63.66 | 64 | 48 | 1.88 | 53.73 |
+
+Generic NCU reference:
+
+| shape | T | generic kernel | NCU duration us | SOL % | regs | waves/SM | occ % |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| AttnInQKV7168x5120 | 2 | `<Q5Smallt,4,8,2>` | 37.47 | 46.74 | 58 | 1.32 | 58.06 |
+| AttnInQKV7168x5120 | 3 | `<Q5Smallt,4,8,2>` | 35.01 | 50.57 | 58 | 1.32 | 57.28 |
+| AttnInQKV7168x5120 | 4 | `<Q5Smallt,4,8,2>` | 39.97 | 44.93 | 58 | 1.32 | 57.03 |
+| AttnInQKV7168x5120 | 5 | `<Q5Smallt,8,8,2>` | 72.45 | 67.08 | 71 | 1.76 | 42.73 |
+| AttnInQKV7168x5120 | 6 | `<Q5Smallt,8,8,2>` | 75.42 | 64.45 | 71 | 1.76 | 42.97 |
+| MlpDown5120x17408 | 2 | `<Q5Smallt,4,8,2>` | 67.23 | 61.46 | 58 | 0.94 | 62.09 |
+| MlpDown5120x17408 | 3 | `<Q5Smallt,4,8,2>` | 69.60 | 60.50 | 58 | 0.94 | 62.15 |
+| MlpDown5120x17408 | 4 | `<Q5Smallt,4,8,2>` | 72.83 | 57.38 | 58 | 0.94 | 61.73 |
+| MlpDown5120x17408 | 5 | `<Q5Smallt,8,8,2>` | 189.89 | 61.75 | 71 | 1.25 | 41.77 |
+| MlpDown5120x17408 | 6 | `<Q5Smallt,8,8,2>` | 193.41 | 61.16 | 71 | 1.25 | 42.22 |
+| Proj6144x5120 | 2 | `<Q5Smallt,4,8,2>` | 32.64 | 46.36 | 58 | 1.13 | 60.97 |
+| Proj6144x5120 | 3 | `<Q5Smallt,4,8,2>` | 33.18 | 45.85 | 58 | 1.13 | 60.55 |
+| Proj6144x5120 | 4 | `<Q5Smallt,4,8,2>` | 35.39 | 43.28 | 58 | 1.13 | 59.94 |
+| Proj6144x5120 | 5 | `<Q5Smallt,8,8,2>` | 60.83 | 68.56 | 71 | 1.51 | 41.27 |
+| Proj6144x5120 | 6 | `<Q5Smallt,8,8,2>` | 62.11 | 67.10 | 71 | 1.51 | 41.00 |
+| Out5120x6144 | 2 | `<Q5Smallt,4,8,2>` | 28.90 | 50.99 | 58 | 0.94 | 61.54 |
+| Out5120x6144 | 3 | `<Q5Smallt,4,8,2>` | 28.93 | 52.22 | 58 | 0.94 | 61.81 |
+| Out5120x6144 | 4 | `<Q5Smallt,4,8,2>` | 28.99 | 51.84 | 58 | 0.94 | 61.56 |
+| Out5120x6144 | 5 | `<Q5Smallt,8,8,2>` | 70.82 | 59.50 | 71 | 1.25 | 40.82 |
+| Out5120x6144 | 6 | `<Q5Smallt,8,8,2>` | 63.84 | 65.00 | 71 | 1.25 | 41.21 |
+
+Correctness and memory verification:
+
+```bash
+cmake --build build --target qus_linear_op_bench qus_linear_test -j
+./build/tests/qus_linear_test
+# OK linear correctness
+compute-sanitizer ./build/tests/qus_linear_test
+# ERROR SUMMARY: 0 errors
+```
+
+Conclusion: every measured non-T=4 decode size now uses a direct Q5 split
+kernel on the registered shapes and improves over the generic path. The biggest
+remaining tradeoff is T=4 code shape: the generalized looped body preserves the
+direct-path advantage over generic T=4, but it does not keep every old
+hand-unrolled T=4 microbenchmark result. The split-factor retune keeps the best
+measured route per representative shape under the new exact-T implementation.

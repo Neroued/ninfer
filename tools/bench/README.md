@@ -61,3 +61,39 @@ python3 tools/bench/make_bench_corpus.py --check
 
 `--tokens` is the exact committed corpus size and the ceiling on prefill length; increase it (and
 optionally use `--source-text`) to benchmark longer prefills, memory permitting.
+
+## Current-state performance matrix
+
+`run_qus_bench_matrix.py` runs the layered current-state `qus_bench` matrix and stores all raw
+reports under ignored `profiles/bench/`. The matrix treats `--mtp-draft-tokens 3` as the primary
+MTP hypothesis, keeps `k=0` and `k=5` as controls, and sweeps `k=0..5` on representative
+context-decode cases.
+
+```bash
+# Inspect commands without running the model.
+python3 tools/bench/run_qus_bench_matrix.py --preset core --dry-run
+
+# Main current-state run. Builds qus_bench first, writes JSON reports and summary.csv.
+python3 tools/bench/run_qus_bench_matrix.py --preset core
+
+# Longer run that adds 32k/64k prompt and context-decode points.
+python3 tools/bench/run_qus_bench_matrix.py --preset full
+
+# Run only the MTP draft-window sweep.
+python3 tools/bench/run_qus_bench_matrix.py --preset full --suite mtp_sweep
+```
+
+Default outputs:
+
+```text
+profiles/bench/current-state-<preset>-<timestamp>/
+  commands.sh
+  manifest.json
+  json/<suite>/<case>.json
+  logs/<suite>.<case>.stderr.txt
+  summary.csv
+  summary.json
+```
+
+Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and `--preset smoke`
+for a minimal script/runner check.

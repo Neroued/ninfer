@@ -57,11 +57,11 @@ using SamplingFinalizeBlockSort =
 using SamplingGroupBlockSort =
     cub::BlockRadixSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread, int>;
 using SamplingPartialMergeSort =
-    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread, int>;
+    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread>;
 using SamplingFusedPartialMergeSort =
-    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerFusedItemsPerThread, int>;
+    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerFusedItemsPerThread>;
 using SamplingGroupMergeSort =
-    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread, int>;
+    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread>;
 
 struct SamplingFusedGroupShared {
     typename SamplingGroupMergeSort::TempStorage sort_storage;
@@ -128,6 +128,11 @@ __device__ __forceinline__ float sampling_key_float(unsigned long long key) {
     const unsigned int ordered = static_cast<unsigned int>(key >> 32);
     const unsigned int bits = (ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered;
     return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ int sampling_key_index(unsigned long long key) {
+    if (key == 0ull) { return INT_MAX; }
+    return static_cast<int>(0xffffffffu - static_cast<unsigned int>(key));
 }
 
 __device__ __forceinline__ int sampling_candidate_cap(const SamplingConfig& cfg,

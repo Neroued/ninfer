@@ -94,7 +94,6 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_partial_topk_kernel(
 
     __shared__ typename SamplingPartialMergeSort::TempStorage sort_storage;
     unsigned long long keys[kSamplerItemsPerThread];
-    int items[kSamplerItemsPerThread];
 
     const bool greedy = !(cfg.temperature > 0.0f);
     const int cap = greedy ? 1 : sampling_candidate_cap(cfg, vocab);
@@ -107,13 +106,11 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_partial_topk_kernel(
             const float raw = __bfloat162float(logits[base + v]);
             const float x = greedy ? raw : sampling_adjusted_logit(raw, v, cfg);
             keys[item] = sampling_sort_key(x, v);
-            items[item] = v;
         } else {
             keys[item] = 0ull;
-            items[item] = INT_MAX;
         }
     }
-    SamplingPartialMergeSort(sort_storage).Sort(keys, items, SamplingKeyGreater{});
+    SamplingPartialMergeSort(sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
@@ -121,7 +118,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_partial_topk_kernel(
         if (rank < cap) {
             const int off = sampling_partial_offset(col, partial, rank);
             sampling_partial_val[off] = sampling_key_float(keys[item]);
-            sampling_partial_idx[off] = items[item];
+            sampling_partial_idx[off] = sampling_key_index(keys[item]);
         }
     }
 }
@@ -141,7 +138,6 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
 
     __shared__ SamplingFusedShared fused_shared;
     unsigned long long partial_keys[kSamplerFusedItemsPerThread];
-    int partial_items[kSamplerFusedItemsPerThread];
 
     const bool greedy = !(cfg.temperature > 0.0f);
     const int cap = greedy ? 1 : sampling_candidate_cap(cfg, vocab);
@@ -154,14 +150,12 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
             const float raw = __bfloat162float(logits[base + v]);
             const float x = greedy ? raw : sampling_adjusted_logit(raw, v, cfg);
             partial_keys[item] = sampling_sort_key(x, v);
-            partial_items[item] = v;
         } else {
             partial_keys[item] = 0ull;
-            partial_items[item] = INT_MAX;
         }
     }
     SamplingFusedPartialMergeSort(fused_shared.partial_sort_storage)
-        .Sort(partial_keys, partial_items, SamplingKeyGreater{});
+        .Sort(partial_keys, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerFusedItemsPerThread; ++item) {
@@ -169,7 +163,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
         if (rank < cap) {
             const int off = sampling_partial_offset(col, partial, rank);
             sampling_partial_val[off] = sampling_key_float(partial_keys[item]);
-            sampling_partial_idx[off] = partial_items[item];
+            sampling_partial_idx[off] = sampling_key_index(partial_keys[item]);
         }
     }
     __syncthreads();
@@ -186,7 +180,6 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
 
     SamplingFusedGroupShared& group_shared = fused_shared.group;
     unsigned long long keys[kSamplerGroupItemsPerThread];
-    int items[kSamplerGroupItemsPerThread];
 
     const int group = partial;
     const int group_begin = group * kSamplerPartialsPerGroup;
@@ -204,13 +197,11 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
             const int idx = sampling_partial_idx[off];
             const float v = sampling_partial_val[off];
             keys[item] = sampling_sort_key(v, idx);
-            items[item] = idx;
         } else {
             keys[item] = 0ull;
-            items[item] = INT_MAX;
         }
     }
-    SamplingGroupMergeSort(group_shared.sort_storage).Sort(keys, items, SamplingKeyGreater{});
+    SamplingGroupMergeSort(group_shared.sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
@@ -218,7 +209,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
         if (rank < cap) {
             const int out_off = sampling_partial_offset(col, partial_blocks + group, rank);
             sampling_partial_val[out_off] = sampling_key_float(keys[item]);
-            sampling_partial_idx[out_off] = items[item];
+            sampling_partial_idx[out_off] = sampling_key_index(keys[item]);
         }
     }
     __syncthreads();
@@ -242,20 +233,18 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
             const int idx = sampling_partial_idx[off];
             const float v = sampling_partial_val[off];
             keys[item] = sampling_sort_key(v, idx);
-            items[item] = idx;
         } else {
             keys[item] = 0ull;
-            items[item] = INT_MAX;
         }
     }
-    SamplingGroupMergeSort(group_shared.sort_storage).Sort(keys, items, SamplingKeyGreater{});
+    SamplingGroupMergeSort(group_shared.sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
         const int rank = tid * kSamplerGroupItemsPerThread + item;
         if (rank < cap) {
             group_shared.cand_val[rank] = sampling_key_float(keys[item]);
-            group_shared.cand_idx[rank] = items[item];
+            group_shared.cand_idx[rank] = sampling_key_index(keys[item]);
         }
     }
     __syncthreads();
@@ -354,7 +343,6 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_group_finalize_sample_
     __shared__ int n_support;
     __shared__ int is_last;
     unsigned long long keys[kSamplerGroupItemsPerThread];
-    int items[kSamplerGroupItemsPerThread];
 
     const bool greedy = !(cfg.temperature > 0.0f);
     const int cap = greedy ? 1 : sampling_candidate_cap(cfg, vocab);
@@ -378,13 +366,11 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_group_finalize_sample_
             const int idx = sampling_partial_idx[off];
             const float v = sampling_partial_val[off];
             keys[item] = sampling_sort_key(v, idx);
-            items[item] = idx;
         } else {
             keys[item] = 0ull;
-            items[item] = INT_MAX;
         }
     }
-    SamplingGroupMergeSort(sort_storage).Sort(keys, items, SamplingKeyGreater{});
+    SamplingGroupMergeSort(sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
@@ -392,7 +378,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_group_finalize_sample_
         if (rank < cap) {
             const int out_off = sampling_partial_offset(col, partial_blocks + group, rank);
             sampling_partial_val[out_off] = sampling_key_float(keys[item]);
-            sampling_partial_idx[out_off] = items[item];
+            sampling_partial_idx[out_off] = sampling_key_index(keys[item]);
         }
     }
     __syncthreads();
@@ -416,20 +402,18 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_group_finalize_sample_
             const int idx = sampling_partial_idx[off];
             const float v = sampling_partial_val[off];
             keys[item] = sampling_sort_key(v, idx);
-            items[item] = idx;
         } else {
             keys[item] = 0ull;
-            items[item] = INT_MAX;
         }
     }
-    SamplingGroupMergeSort(sort_storage).Sort(keys, items, SamplingKeyGreater{});
+    SamplingGroupMergeSort(sort_storage).Sort(keys, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
         const int rank = tid * kSamplerGroupItemsPerThread + item;
         if (rank < cap) {
             cand_val[rank] = sampling_key_float(keys[item]);
-            cand_idx[rank] = items[item];
+            cand_idx[rank] = sampling_key_index(keys[item]);
         }
     }
     __syncthreads();

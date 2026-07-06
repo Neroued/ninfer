@@ -29,6 +29,10 @@ venv/
 out/
 *.log
 
+# Measurement corpora & frequency stats (large; produced by offline tooling).
+# The small reusable counts are preserved locally under out/freq_stats/.
+tools/freq_corpus/fixtures/
+
 # Editor / OS
 .vscode/
 .idea/

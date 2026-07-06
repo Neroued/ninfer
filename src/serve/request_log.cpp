@@ -15,6 +15,20 @@ const char* finish_reason_name(qus::text::FinishReason reason) {
     return "unknown";
 }
 
+std::string tool_choice_name(const ToolChoice& choice) {
+    switch (choice.mode) {
+        case ToolChoiceMode::Auto:
+            return "auto";
+        case ToolChoiceMode::None:
+            return "none";
+        case ToolChoiceMode::Required:
+            return "required";
+        case ToolChoiceMode::Named:
+            return choice.name.empty() ? "named" : choice.name;
+    }
+    return "unknown";
+}
+
 // tokens/second with fixed precision, or "n/a" when the interval is degenerate.
 std::string rate(double tokens, double seconds) {
     std::ostringstream out;
@@ -54,11 +68,16 @@ std::string mtp_str(const GenerationMetrics& m) {
 } // namespace
 
 std::string format_request_start(std::uint64_t id, bool stream, std::size_t n_messages,
-                                 int max_tokens, bool client_set) {
+                                 int max_tokens, bool client_set, std::size_t n_tools,
+                                 const ToolChoice& tool_choice, bool has_tool_history) {
     std::ostringstream out;
     out << "[req " << id << "] chat " << (stream ? "stream" : "non-stream")
         << " msgs=" << n_messages << " max_tokens=" << max_tokens << ' '
-        << (client_set ? "(client)" : "(server default)") << " \xE2\x86\x92 running";
+        << (client_set ? "(client)" : "(server default)")
+        << " tools=" << n_tools
+        << " tool_choice=" << tool_choice_name(tool_choice)
+        << " tool_history=" << (has_tool_history ? "yes" : "no")
+        << " \xE2\x86\x92 running";
     return out.str();
 }
 
@@ -71,8 +90,10 @@ std::string format_request_done(std::uint64_t id, const GenerationOutcome& outco
                                      : 0.0;
 
     std::ostringstream out;
-    out << "[req " << id << "] done finish=" << finish_reason_name(outcome.finish_reason)
-        << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
+    out << "[req " << id << "] done finish="
+        << (outcome.tool_calls.empty() ? finish_reason_name(outcome.finish_reason) : "tool_calls");
+    if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
+    out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
         << " ttft=" << std::fixed << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(static_cast<double>(outcome.prompt_tokens), m.prefill_seconds)
         << " decode=" << rate(decode_tokens, m.decode_seconds)

@@ -220,7 +220,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     const std::uint64_t req_id = ++request_seq_;
     log_line(format_request_start(req_id, request.stream, request.messages.size(),
-                                  prepared.options.max_new_tokens, request.max_tokens_set));
+                                  prepared.options.max_new_tokens, request.max_tokens_set,
+                                  request.tools.size(), request.tool_choice,
+                                  request.has_tool_history()));
 
     if (!request.stream) {
         try {

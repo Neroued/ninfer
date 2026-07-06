@@ -16,7 +16,8 @@ namespace qus::serve {
 // Logged right after a request is validated: what it asked for. `client_set`
 // distinguishes a client-provided max_tokens from the server default.
 std::string format_request_start(std::uint64_t id, bool stream, std::size_t n_messages,
-                                 int max_tokens, bool client_set);
+                                 int max_tokens, bool client_set, std::size_t n_tools,
+                                 const ToolChoice& tool_choice, bool has_tool_history);
 
 // Logged when generation finishes (or is cancelled): tokens, TTFT, prefill/decode
 // throughput, wall time, and speculative-decoding acceptance.

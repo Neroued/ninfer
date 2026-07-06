@@ -74,6 +74,38 @@ std::vector<int> sample_many(const std::vector<float>& base, int cols,
     return from_device_i32(dout, static_cast<std::size_t>(cols));
 }
 
+std::vector<int> sample_many_batched(const std::vector<float>& base, int total, int cols,
+                                     kernels::SamplingConfig cfg, std::int32_t purpose,
+                                     int pos_start, bool counts_active) {
+    const int vocab = static_cast<int>(base.size());
+    std::vector<float> logits_h = broadcast_columns(base, cols);
+    DBuf dlogits = to_device_bf16(logits_h);
+    DBuf dout = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
+    DBuf dpos = device_pos(pos_start);
+    DBuf dcollect(static_cast<std::size_t>(total) * sizeof(std::int32_t));
+    DBuf dcounts(static_cast<std::size_t>(vocab) * sizeof(std::int32_t));
+    cudaMemset(dcounts.p, 0, dcounts.bytes);
+    if (counts_active) { cfg.token_counts = static_cast<std::int32_t*>(dcounts.p); }
+    DeviceConfig dcfg(cfg);
+    Tensor tlogits(dlogits.p, DType::BF16, {vocab, cols});
+    Tensor tout(dout.p, DType::I32, {cols});
+
+    int produced = 0;
+    while (produced < total) {
+        const int batch = std::min(cols, total - produced);
+        const int pos = pos_start + produced;
+        cudaMemcpy(dpos.p, &pos, sizeof(pos), cudaMemcpyHostToDevice);
+        kernels::sample_column(tlogits, tout, dcfg.ptr(), static_cast<const std::int32_t*>(dpos.p),
+                               purpose, nullptr);
+        cudaMemcpyAsync(static_cast<std::int32_t*>(dcollect.p) + produced, dout.p,
+                        static_cast<std::size_t>(batch) * sizeof(std::int32_t),
+                        cudaMemcpyDeviceToDevice, nullptr);
+        produced += batch;
+    }
+    cudaDeviceSynchronize();
+    return from_device_i32(dcollect, static_cast<std::size_t>(total));
+}
+
 // --- greedy == argmax --------------------------------------------------------
 int greedy_matches_argmax(const char* tag, int vocab, int cols, std::uint32_t seed) {
     const auto n = static_cast<std::size_t>(vocab) * cols;
@@ -289,6 +321,92 @@ int distribution_match() {
     return 0;
 }
 
+int real_shape_distribution_match() {
+    const int vocab = 248320;
+    std::vector<float> base(vocab, -20.0f);
+    const int ids[] = {17, 7919, 65537, 200003};
+    const float vals[] = {3.0f, 2.0f, 1.0f, 0.0f};
+    for (int i = 0; i < 4; ++i) { base[ids[i]] = vals[i]; }
+    round_to_bf16(base);
+
+    std::vector<float> support(vals, vals + 4);
+    const std::vector<double> p = softmax(support);
+
+    kernels::SamplingConfig cfg;
+    cfg.temperature = 1.0f;
+    cfg.top_k = 4;
+    cfg.seed = 20260706u;
+    const int N = 4096;
+    std::vector<int> got =
+        sample_many_batched(base, N, 8, cfg, kernels::kSamplePurposeDecode, 1000, false);
+
+    std::vector<double> freq(4, 0.0);
+    for (int tok : got) {
+        int slot = -1;
+        for (int i = 0; i < 4; ++i) {
+            if (tok == ids[i]) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            std::cerr << "real_shape_distribution: token out of support " << tok << '\n';
+            return 1;
+        }
+        freq[slot] += 1.0;
+    }
+    for (double& f : freq) { f /= static_cast<double>(N); }
+
+    double max_abs = 0.0;
+    for (int i = 0; i < 4; ++i) { max_abs = std::max(max_abs, std::abs(freq[i] - p[i])); }
+    if (max_abs > 0.04) {
+        std::cerr << "real_shape_distribution: empirical/target gap " << max_abs
+                  << " too large\n";
+        for (int i = 0; i < 4; ++i) {
+            std::cerr << "      token=" << ids[i] << " freq=" << freq[i] << " p=" << p[i]
+                      << '\n';
+        }
+        return 1;
+    }
+    std::cout << "    real-shape distribution match ok (max abs diff " << max_abs << ")\n";
+    return 0;
+}
+
+int real_shape_reproducible_counts_active() {
+    const int vocab = 248320;
+    std::vector<float> base(vocab, -18.0f);
+    for (int i = 0; i < 20; ++i) {
+        base[(17 + i * 7919) % vocab] = 4.0f - 0.08f * static_cast<float>(i);
+    }
+    round_to_bf16(base);
+
+    kernels::SamplingConfig cfg;
+    cfg.temperature = 0.6f;
+    cfg.top_k = 20;
+    cfg.top_p = 0.95f;
+    cfg.presence_penalty = 1.0f;
+    cfg.seed = 123456u;
+    const int N = 1024;
+    std::vector<int> a =
+        sample_many_batched(base, N, 8, cfg, kernels::kSamplePurposeDecode, 2000, true);
+    std::vector<int> b =
+        sample_many_batched(base, N, 8, cfg, kernels::kSamplePurposeDecode, 2000, true);
+    if (a != b) {
+        std::cerr << "real_shape_reproducible: identical seed/count path diverged\n";
+        return 1;
+    }
+    kernels::SamplingConfig cfg2 = cfg;
+    cfg2.seed = 123457u;
+    std::vector<int> c =
+        sample_many_batched(base, N, 8, cfg2, kernels::kSamplePurposeDecode, 2000, true);
+    if (a == c) {
+        std::cerr << "real_shape_reproducible: different seed produced identical stream\n";
+        return 1;
+    }
+    std::cout << "    real-shape reproducibility with counts ok\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -308,6 +426,8 @@ int main() {
     f += min_p_subset();
     f += reproducible();
     f += distribution_match();
+    f += real_shape_distribution_match();
+    f += real_shape_reproducible_counts_active();
 
     std::cout << (f ? "FAIL" : "OK") << " sample_column correctness\n";
     return f ? 1 : 0;

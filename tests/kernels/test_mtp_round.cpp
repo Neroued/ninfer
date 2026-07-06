@@ -477,6 +477,190 @@ int reject_sampling_reproducible_case() {
     return 0;
 }
 
+int reject_sampling_real_shape_distribution_case() {
+    constexpr int k = 1;
+    constexpr int vocab = 248320;
+    const int ids[] = {17, 7919, 65537, 200003};
+    const float vals[] = {3.0f, 2.0f, 1.0f, 0.0f};
+    std::vector<float> logits_h(static_cast<std::size_t>(vocab) * (k + 1), -20.0f);
+    for (int col = 0; col <= k; ++col) {
+        for (int i = 0; i < 4; ++i) { logits_h[static_cast<std::size_t>(col) * vocab + ids[i]] = vals[i]; }
+    }
+    round_to_bf16(logits_h);
+    DBuf d_logits = to_device_bf16(logits_h);
+
+    std::vector<double> p0(4);
+    double mmax = vals[0];
+    double sum = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        p0[i] = std::exp(static_cast<double>(vals[i]) - mmax);
+        sum += p0[i];
+    }
+    for (double& x : p0) { x /= sum; }
+
+    kernels::SamplingConfig cfg;
+    cfg.temperature = 1.0f;
+    cfg.top_k = 4;
+    cfg.seed = 7001u;
+    DBuf d_cfg = to_device_config(cfg);
+
+    const int N = 2048;
+    std::vector<int> lengths(static_cast<std::size_t>(N));
+    for (int i = 0; i < N; ++i) { lengths[static_cast<std::size_t>(i)] = i + 100; }
+    DBuf d_lengths = to_device_i32(lengths);
+    DBuf d_scratch(sizeof(std::int32_t));
+    DBuf d_collect(static_cast<std::size_t>(N) * sizeof(std::int32_t));
+
+    auto d_targets = to_device_i32({0, 0});
+    auto d_drafts = to_device_i32({ids[1]});
+    auto d_token = to_device_i32({-1});
+    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
+    DBuf d_num(sizeof(std::int32_t));
+    DBuf d_accepted(sizeof(std::int32_t));
+    DBuf d_ar_pos(sizeof(std::int32_t));
+    auto d_stats = to_device_i64(std::vector<std::int64_t>(model::kStepStatsCounters, 0));
+
+    Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
+    Tensor drafts(d_drafts.p, DType::I32, {k});
+    Tensor length(d_scratch.p, DType::I32, {1});
+    Tensor token(d_token.p, DType::I32, {1});
+    Tensor sampled(d_sampled.p, DType::I32, {k + 1});
+    Tensor num(d_num.p, DType::I32, {1});
+    Tensor accepted(d_accepted.p, DType::I32, {1});
+    Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
+    Tensor stats(d_stats.p, DType::I64, {model::kStepStatsCounters});
+
+    for (int r = 0; r < N; ++r) {
+        cudaMemcpyAsync(d_scratch.p, static_cast<const std::int32_t*>(d_lengths.p) + r,
+                        sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
+        kernels::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
+                                   ar_pos, stats, config_ptr(d_cfg), nullptr);
+        cudaMemcpyAsync(static_cast<std::int32_t*>(d_collect.p) + r, d_sampled.p,
+                        sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
+    }
+    cudaDeviceSynchronize();
+
+    std::vector<int> results = from_device_i32(d_collect, static_cast<std::size_t>(N));
+    std::vector<double> freq(4, 0.0);
+    for (int tok : results) {
+        int slot = -1;
+        for (int i = 0; i < 4; ++i) {
+            if (tok == ids[i]) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            std::cerr << "real-shape reject distribution: token out of support " << tok << '\n';
+            return 1;
+        }
+        freq[slot] += 1.0;
+    }
+    for (double& f : freq) { f /= static_cast<double>(N); }
+    double max_abs = 0.0;
+    for (int i = 0; i < 4; ++i) { max_abs = std::max(max_abs, std::abs(freq[i] - p0[i])); }
+    if (max_abs > 0.05) {
+        std::cerr << "real-shape reject distribution: committed/target gap " << max_abs
+                  << " too large\n";
+        for (int i = 0; i < 4; ++i) {
+            std::cerr << "    token=" << ids[i] << " freq=" << freq[i] << " p0=" << p0[i]
+                      << '\n';
+        }
+        return 1;
+    }
+    std::cout << "    real-shape reject distribution ok (max abs diff " << max_abs << ")\n";
+    return 0;
+}
+
+std::vector<int> run_real_shape_mtp_sequence(const std::vector<float>& logits_h,
+                                             const std::vector<int>& drafts_h,
+                                             kernels::SamplingConfig cfg, int rounds) {
+    constexpr int vocab = 248320;
+    const int k = static_cast<int>(drafts_h.size());
+    DBuf d_logits = to_device_bf16(logits_h);
+    DBuf d_counts(static_cast<std::size_t>(vocab) * sizeof(std::int32_t));
+    cudaMemset(d_counts.p, 0, d_counts.bytes);
+    cfg.token_counts = static_cast<std::int32_t*>(d_counts.p);
+    DBuf d_cfg = to_device_config(cfg);
+
+    auto d_targets = to_device_i32(std::vector<int>(static_cast<std::size_t>(k + 1), 0));
+    auto d_drafts = to_device_i32(drafts_h);
+    auto d_token = to_device_i32({-1});
+    DBuf d_length(sizeof(std::int32_t));
+    DBuf d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    DBuf d_num(sizeof(std::int32_t));
+    DBuf d_accepted(sizeof(std::int32_t));
+    DBuf d_ar_pos(sizeof(std::int32_t));
+    auto d_stats = to_device_i64(std::vector<std::int64_t>(model::kStepStatsCounters, 0));
+    DBuf d_collect(static_cast<std::size_t>(rounds) * (k + 2) * sizeof(std::int32_t));
+
+    Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
+    Tensor drafts(d_drafts.p, DType::I32, {k});
+    Tensor length(d_length.p, DType::I32, {1});
+    Tensor token(d_token.p, DType::I32, {1});
+    Tensor sampled(d_sampled.p, DType::I32, {k + 1});
+    Tensor num(d_num.p, DType::I32, {1});
+    Tensor accepted(d_accepted.p, DType::I32, {1});
+    Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
+    Tensor stats(d_stats.p, DType::I64, {model::kStepStatsCounters});
+
+    for (int r = 0; r < rounds; ++r) {
+        const int len = 1000 + r;
+        cudaMemcpy(d_length.p, &len, sizeof(len), cudaMemcpyHostToDevice);
+        kernels::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
+                                   ar_pos, stats, config_ptr(d_cfg), nullptr);
+        std::int32_t* out = static_cast<std::int32_t*>(d_collect.p) + r * (k + 2);
+        cudaMemcpyAsync(out, d_sampled.p, static_cast<std::size_t>(k + 1) * sizeof(std::int32_t),
+                        cudaMemcpyDeviceToDevice, nullptr);
+        cudaMemcpyAsync(out + k + 1, d_num.p, sizeof(std::int32_t), cudaMemcpyDeviceToDevice,
+                        nullptr);
+    }
+    cudaDeviceSynchronize();
+    return from_device_i32(d_collect, static_cast<std::size_t>(rounds) * (k + 2));
+}
+
+int reject_sampling_real_shape_reproducible_case() {
+    constexpr int k = 3;
+    constexpr int vocab = 248320;
+    std::vector<float> logits_h(static_cast<std::size_t>(vocab) * (k + 1), -18.0f);
+    std::vector<int> drafts;
+    for (int col = 0; col <= k; ++col) {
+        for (int i = 0; i < 20; ++i) {
+            const int id = (17 + i * 7919 + col * 101) % vocab;
+            logits_h[static_cast<std::size_t>(col) * vocab + id] =
+                4.0f - 0.08f * static_cast<float>(i);
+            if (col == 0 && i < k) { drafts.push_back(id); }
+        }
+    }
+    round_to_bf16(logits_h);
+
+    kernels::SamplingConfig cfg;
+    cfg.temperature = 0.6f;
+    cfg.top_k = 20;
+    cfg.top_p = 0.95f;
+    cfg.presence_penalty = 1.0f;
+    cfg.seed = 9001u;
+
+    const int rounds = 64;
+    std::vector<int> a = run_real_shape_mtp_sequence(logits_h, drafts, cfg, rounds);
+    std::vector<int> b = run_real_shape_mtp_sequence(logits_h, drafts, cfg, rounds);
+    if (a != b) {
+        std::cerr << "real-shape reject reproducible: identical seed/count path diverged\n";
+        return 1;
+    }
+    kernels::SamplingConfig cfg2 = cfg;
+    cfg2.seed = 9002u;
+    std::vector<int> c = run_real_shape_mtp_sequence(logits_h, drafts, cfg2, rounds);
+    if (a == c) {
+        std::cerr << "real-shape reject reproducible: different seed produced identical stream\n";
+        return 1;
+    }
+    std::cout << "    real-shape reject reproducibility with counts ok\n";
+    return 0;
+}
+
 int validation_case() {
     try {
         DBuf d(4);
@@ -505,6 +689,8 @@ int main() {
     failures += accept_all_case();
     failures += reject_sampling_distribution_case();
     failures += reject_sampling_reproducible_case();
+    failures += reject_sampling_real_shape_distribution_case();
+    failures += reject_sampling_real_shape_reproducible_case();
     failures += shifted_case();
     failures += shifted_all_accept_case();
     failures += gather_case();

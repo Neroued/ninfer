@@ -51,14 +51,16 @@ void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
     mtp_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data), config, vocab);
     CUDA_CHECK(cudaGetLastError());
-    mtp_sampling_finalize_distribution_kernel<<<static_cast<unsigned int>(cols), kSamplerBlock, 0,
-                                                stream>>>(
+    const std::int32_t groups =
+        (partial_blocks + kSamplerPartialsPerGroup - 1) / kSamplerPartialsPerGroup;
+    const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(cols));
+    mtp_sampling_group_finalize_kernel<<<group_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(target_tokens.data),
         static_cast<const std::int32_t*>(drafts.data), static_cast<std::int32_t*>(length.data),
         static_cast<std::int32_t*>(token.data), static_cast<std::int32_t*>(sampled_out.data),
         static_cast<std::int32_t*>(num_sampled.data), static_cast<std::int32_t*>(accepted.data),
         static_cast<std::int32_t*>(ar_pos.data), static_cast<std::int64_t*>(stats.data), config,
-        vocab, cols, partial_blocks);
+        vocab, cols, partial_blocks, groups);
     CUDA_CHECK(cudaGetLastError());
 }
 

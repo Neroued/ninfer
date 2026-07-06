@@ -345,6 +345,210 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_finalize_distribut
     }
 }
 
+__launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_kernel(
+    const std::int32_t* target_tokens, const std::int32_t* drafts, std::int32_t* length,
+    std::int32_t* token, std::int32_t* sampled_out, std::int32_t* num_sampled,
+    std::int32_t* accepted, std::int32_t* ar_pos, std::int64_t* stats,
+    const SamplingConfig* cfg_ptr, std::int32_t vocab, std::int32_t cols,
+    std::int32_t partial_blocks, std::int32_t group_count) {
+    const int group          = static_cast<int>(blockIdx.x);
+    const int col            = static_cast<int>(blockIdx.y);
+    const int tid            = threadIdx.x;
+    const SamplingConfig cfg = *cfg_ptr;
+    if (vocab <= kSamplerTileItems || cols > kSamplerScratchColumns ||
+        partial_blocks > kSamplerScratchPartialBlocks ||
+        partial_blocks + group_count > kSamplerScratchPartialBlocks) {
+        return;
+    }
+
+    if (!(cfg.temperature > 0.0f)) {
+        if (tid == 0 && col == 0 && group == 0) {
+            const int k = cols - 1;
+            int a = 0;
+            while (a < k && target_tokens[a] == drafts[a]) { ++a; }
+            const int t_star = target_tokens[a];
+            for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
+            for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
+            sampled_out[a] = t_star;
+            const int produced = a + 1;
+            *num_sampled       = produced;
+            *accepted          = a;
+            *token             = t_star;
+            *length += produced;
+            *ar_pos = *length;
+            stats[0] += k;
+            stats[1] += a;
+            stats[2] += 1;
+            for (int i = 0; i < a && i < kMtpRoundAcceptedPerPosLimit; ++i) {
+                stats[kMtpRoundAcceptedPerPosOffset + i] += 1;
+            }
+        }
+        return;
+    }
+
+    __shared__ typename SamplingGroupBlockSort::TempStorage sort_storage;
+    __shared__ float cand_val[kSamplerMaxCandidates];
+    __shared__ int cand_idx[kSamplerMaxCandidates];
+    __shared__ float prob[kSamplerMaxCandidates];
+    __shared__ int n_support;
+    __shared__ int is_last_group;
+    unsigned long long keys[kSamplerGroupItemsPerThread];
+    int items[kSamplerGroupItemsPerThread];
+
+    const int cap = sampling_candidate_cap(cfg, vocab);
+    if (tid == 0 && atomicCAS(&sampling_group_init[col], 0, 1) == 0) {
+        sampling_group_done[col] = 0;
+        __threadfence();
+    }
+    if (tid == 0 && atomicCAS(&sampling_mtp_finalize_init, 0, 2) == 0) {
+        sampling_mtp_finalize_count = 0;
+        __threadfence();
+        atomicExch(&sampling_mtp_finalize_init, 1);
+    }
+
+    const int group_begin = group * kSamplerPartialsPerGroup;
+    int group_partials = partial_blocks - group_begin;
+    if (group_partials < 0) { group_partials = 0; }
+    if (group_partials > kSamplerPartialsPerGroup) { group_partials = kSamplerPartialsPerGroup; }
+    const int group_n = group_partials * cap;
+#pragma unroll
+    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
+        const int p = item * blockDim.x + tid;
+        if (p < group_n) {
+            const int partial = group_begin + p / cap;
+            const int j = p - (p / cap) * cap;
+            const int off = sampling_partial_offset(col, partial, j);
+            const int idx = sampling_partial_idx[off];
+            const float v = sampling_partial_val[off];
+            keys[item] = sampling_sort_key(v, idx);
+            items[item] = idx;
+        } else {
+            keys[item] = 0ull;
+            items[item] = INT_MAX;
+        }
+    }
+    SamplingGroupBlockSort(sort_storage).SortDescending(keys, items);
+
+#pragma unroll
+    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
+        const int rank = tid * kSamplerGroupItemsPerThread + item;
+        if (rank < cap) {
+            const int out_off = sampling_partial_offset(col, partial_blocks + group, rank);
+            sampling_partial_val[out_off] = sampling_key_float(keys[item]);
+            sampling_partial_idx[out_off] = items[item];
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        __threadfence();
+        const int done = atomicAdd(&sampling_group_done[col], 1) + 1;
+        is_last_group = (done == group_count) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!is_last_group) { return; }
+
+    const int final_n = group_count * cap;
+#pragma unroll
+    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
+        const int p = item * blockDim.x + tid;
+        if (p < final_n) {
+            const int partial = partial_blocks + p / cap;
+            const int j = p - (p / cap) * cap;
+            const int off = sampling_partial_offset(col, partial, j);
+            const int idx = sampling_partial_idx[off];
+            const float v = sampling_partial_val[off];
+            keys[item] = sampling_sort_key(v, idx);
+            items[item] = idx;
+        } else {
+            keys[item] = 0ull;
+            items[item] = INT_MAX;
+        }
+    }
+    SamplingGroupBlockSort(sort_storage).SortDescending(keys, items);
+
+#pragma unroll
+    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
+        const int rank = tid * kSamplerGroupItemsPerThread + item;
+        if (rank < cap) {
+            cand_val[rank] = sampling_key_float(keys[item]);
+            cand_idx[rank] = items[item];
+        }
+    }
+    __syncthreads();
+
+    sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
+
+    if (tid == 0) {
+        while (atomicAdd(&sampling_mtp_finalize_init, 0) != 1) {}
+        sampling_dist_support[col] = n_support;
+        for (int j = 0; j < n_support; ++j) {
+            const int off = sampling_dist_offset(col, j);
+            sampling_dist_idx[off] = cand_idx[j];
+            sampling_dist_prob[off] = prob[j];
+        }
+        sampling_group_done[col] = 0;
+        atomicExch(&sampling_group_init[col], 0);
+        __threadfence();
+        const int done_cols = atomicAdd(&sampling_mtp_finalize_count, 1) + 1;
+        if (done_cols == cols) {
+            const int k = cols - 1;
+            const int L = *length;
+            int a       = 0;
+            int tstar   = 0;
+            for (int i = 0; i <= k; ++i) {
+                const int n = sampling_dist_support[i];
+                const int* dist_idx = sampling_dist_idx + sampling_dist_offset(i, 0);
+                const float* dist_prob = sampling_dist_prob + sampling_dist_offset(i, 0);
+                if (i < k) {
+                    const int d = drafts[i];
+                    float pd    = 0.0f;
+                    for (int j = 0; j < n; ++j) {
+                        if (dist_idx[j] == d) {
+                            pd = dist_prob[j];
+                            break;
+                        }
+                    }
+                    const float u =
+                        sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeMtpAccept, 0u);
+                    if (u < pd) {
+                        a = i + 1;
+                        continue;
+                    }
+                    const float ur =
+                        sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeMtpResample, 0u);
+                    tstar = sampling_pick_from_support(dist_idx, dist_prob, n, d, ur);
+                    break;
+                }
+                const float u = sampling_uniform(cfg.seed, L + k + 1, kSamplePurposeMtpBonus, 0u);
+                tstar = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
+            }
+            for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
+            for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
+            sampled_out[a] = tstar;
+            const int produced = a + 1;
+            *num_sampled       = produced;
+            *accepted          = a;
+            *token             = tstar;
+            *length            = L + produced;
+            *ar_pos            = *length;
+            stats[0] += k;
+            stats[1] += a;
+            stats[2] += 1;
+            for (int i = 0; i < a && i < kMtpRoundAcceptedPerPosLimit; ++i) {
+                stats[kMtpRoundAcceptedPerPosOffset + i] += 1;
+            }
+            if (cfg.token_counts != nullptr) {
+                for (int i = 0; i < produced; ++i) {
+                    atomicAdd(&cfg.token_counts[sampled_out[i]], 1);
+                }
+            }
+            sampling_mtp_finalize_count = 0;
+            atomicExch(&sampling_mtp_finalize_init, 0);
+        }
+    }
+}
+
 __global__ void mtp_prepare_shifted_ids_kernel(const std::int32_t* verify_ids,
                                                const std::int32_t* token,
                                                const std::int32_t* accepted,

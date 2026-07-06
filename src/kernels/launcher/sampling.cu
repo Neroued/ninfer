@@ -21,16 +21,25 @@ void sample_column_launch(const Tensor& logits, Tensor& out, const SamplingConfi
     }
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols));
-    const std::int32_t groups =
-        (partial_blocks + kSamplerPartialsPerGroup - 1) / kSamplerPartialsPerGroup;
     if (cols == 1) {
-        sampling_fused_sample_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
-            config, pos_base, purpose, vocab, partial_blocks, groups);
-        return;
+        const std::int32_t fused_partial_blocks =
+            (vocab + kSamplerFusedPartialTileItems - 1) / kSamplerFusedPartialTileItems;
+        if (fused_partial_blocks <= kSamplerScratchPartialBlocks) {
+            const std::int32_t fused_groups =
+                (fused_partial_blocks + kSamplerPartialsPerGroup - 1) / kSamplerPartialsPerGroup;
+            const dim3 fused_grid(static_cast<unsigned int>(fused_partial_blocks),
+                                  static_cast<unsigned int>(cols));
+            sampling_fused_sample_kernel<<<fused_grid, kSamplerBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(logits.data),
+                static_cast<std::int32_t*>(out.data), config, pos_base, purpose, vocab,
+                fused_partial_blocks, fused_groups);
+            return;
+        }
     }
     sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data), config, vocab);
+    const std::int32_t groups =
+        (partial_blocks + kSamplerPartialsPerGroup - 1) / kSamplerPartialsPerGroup;
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(cols));
     sampling_group_finalize_sample_kernel<<<group_grid, kSamplerBlock, 0, stream>>>(
         static_cast<std::int32_t*>(out.data), config, pos_base, purpose, vocab, partial_blocks,

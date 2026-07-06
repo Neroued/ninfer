@@ -140,15 +140,15 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
     }
 
     __shared__ SamplingFusedShared fused_shared;
-    unsigned long long partial_keys[kSamplerItemsPerThread];
-    int partial_items[kSamplerItemsPerThread];
+    unsigned long long partial_keys[kSamplerFusedItemsPerThread];
+    int partial_items[kSamplerFusedItemsPerThread];
 
     const bool greedy = !(cfg.temperature > 0.0f);
     const int cap = greedy ? 1 : sampling_candidate_cap(cfg, vocab);
     const std::int64_t base = static_cast<std::int64_t>(col) * vocab;
-    const int tile_start = partial * kSamplerPartialTileItems;
+    const int tile_start = partial * kSamplerFusedPartialTileItems;
 #pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+    for (int item = 0; item < kSamplerFusedItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + tid;
         if (v < vocab) {
             const float raw = __bfloat162float(logits[base + v]);
@@ -160,12 +160,12 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
             partial_items[item] = INT_MAX;
         }
     }
-    SamplingPartialMergeSort(fused_shared.partial_sort_storage)
+    SamplingFusedPartialMergeSort(fused_shared.partial_sort_storage)
         .Sort(partial_keys, partial_items, SamplingKeyGreater{});
 
 #pragma unroll
-    for (int item = 0; item < kSamplerItemsPerThread; ++item) {
-        const int rank = tid * kSamplerItemsPerThread + item;
+    for (int item = 0; item < kSamplerFusedItemsPerThread; ++item) {
+        const int rank = tid * kSamplerFusedItemsPerThread + item;
         if (rank < cap) {
             const int off = sampling_partial_offset(col, partial, rank);
             sampling_partial_val[off] = sampling_key_float(partial_keys[item]);

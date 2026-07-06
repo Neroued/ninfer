@@ -23,6 +23,9 @@ inline constexpr int kSamplerMaxCandidates = 256;
 inline constexpr int kSamplerTileItems     = 256;
 inline constexpr int kSamplerItemsPerThread = 3;
 inline constexpr int kSamplerPartialTileItems = kSamplerBlock * kSamplerItemsPerThread;
+inline constexpr int kSamplerFusedItemsPerThread = 2;
+inline constexpr int kSamplerFusedPartialTileItems =
+    kSamplerBlock * kSamplerFusedItemsPerThread;
 inline constexpr int kSamplerFinalizeItemsPerThread = 10;
 inline constexpr int kSamplerFinalizeTileItems = kSamplerBlock * kSamplerFinalizeItemsPerThread;
 inline constexpr int kSamplerGroupItemsPerThread = 2;
@@ -55,6 +58,8 @@ using SamplingGroupBlockSort =
     cub::BlockRadixSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread, int>;
 using SamplingPartialMergeSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread, int>;
+using SamplingFusedPartialMergeSort =
+    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerFusedItemsPerThread, int>;
 using SamplingGroupMergeSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread, int>;
 
@@ -68,7 +73,7 @@ struct SamplingFusedGroupShared {
 };
 
 union SamplingFusedShared {
-    typename SamplingPartialMergeSort::TempStorage partial_sort_storage;
+    typename SamplingFusedPartialMergeSort::TempStorage partial_sort_storage;
     SamplingFusedGroupShared group;
 };
 

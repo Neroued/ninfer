@@ -113,7 +113,11 @@ std::string render_qwen_chat(const std::vector<ChatMessage>& messages,
 
     if (options.add_generation_prompt) {
         rendered += "<|im_start|>assistant\n";
-        if (!options.enable_thinking) { rendered += "<think>\n\n</think>\n\n"; }
+        if (options.enable_thinking) {
+            rendered += "<think>\n";
+        } else {
+            rendered += "<think>\n\n</think>\n\n";
+        }
     }
     return rendered;
 }

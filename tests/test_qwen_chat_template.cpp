@@ -74,6 +74,15 @@ int test_prompt_renders_qwen_chat() {
                  "prompt render mismatch");
 }
 
+int test_prompt_renders_thinking_prefix() {
+    const std::vector<qus::text::ChatMessage> messages = qus::text::messages_from_prompt("你好");
+    const std::string rendered = qus::text::render_qwen_chat(
+        messages, qus::text::ChatRenderOptions{.enable_thinking = true});
+    return check(rendered == "<|im_start|>user\n你好<|im_end|>\n"
+                             "<|im_start|>assistant\n<think>\n",
+                 "thinking prompt render mismatch");
+}
+
 int test_json_messages_render_prefixes() {
     const TempJson json("messages.json",
                         R"([{"role":"system","content":"be direct"},{"role":"user","content":"hi"}])");
@@ -121,6 +130,7 @@ int test_rejections() {
 int main() {
     int failures = 0;
     failures += test_prompt_renders_qwen_chat();
+    failures += test_prompt_renders_thinking_prefix();
     failures += test_json_messages_render_prefixes();
     failures += test_rejections();
     return failures == 0 ? 0 : fail("qwen chat template test failed");

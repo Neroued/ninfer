@@ -279,6 +279,56 @@ int check_model_bind_conv1d_parse() {
     return failures;
 }
 
+int check_draft_head_parse() {
+    int failures = 0;
+
+    // Positive: a v4 file carrying the optional Q4 draft head + I32 id-map parses,
+    // sets DRAFT_HEAD_PRESENT, and both draft blocks report the expected schema.
+    const std::filesystem::path good_path = make_fixture("draft-head");
+    const std::vector<std::byte> good     = read_file(good_path);
+    const qus::ParsedQ5090File parsed     = qus::parse_q5090_file(good, expectations());
+
+    failures += (parsed.header.flags & (1U << 4)) != 0
+                    ? 0
+                    : fail("draft-head DRAFT_HEAD_PRESENT flag not set");
+
+    const auto& weights = find_tensor(parsed, "lm_head_draft");
+    failures += weights.qtype == qus::QType::Q4G64_F16S ? 0 : fail("draft weights qtype mismatch");
+    failures +=
+        weights.layout == qus::QuantLayout::RowSplit ? 0 : fail("draft weights layout mismatch");
+    failures += weights.module_kind == qus::ModuleKind::TextCore
+                    ? 0
+                    : fail("draft weights module mismatch");
+    failures += weights.source_kind == static_cast<std::uint32_t>(qus::SourceKind::LmHeadDraft)
+                    ? 0
+                    : fail("draft weights source kind mismatch");
+    failures += weights.shape[0] == 6 ? 0 : fail("draft weights row count mismatch");
+
+    const auto& idmap = find_tensor(parsed, "lm_head_draft.idmap");
+    failures += idmap.qtype == qus::QType::I32_CTRL ? 0 : fail("draft idmap qtype mismatch");
+    failures +=
+        idmap.layout == qus::QuantLayout::Contiguous ? 0 : fail("draft idmap layout mismatch");
+    failures += idmap.ndim == 1 ? 0 : fail("draft idmap ndim mismatch");
+    failures += idmap.source_kind == static_cast<std::uint32_t>(qus::SourceKind::LmHeadDraftIdmap)
+                    ? 0
+                    : fail("draft idmap source kind mismatch");
+    failures += idmap.shape[0] == 6 ? 0 : fail("draft idmap length mismatch");
+    failures += idmap.payload_bytes == 6ULL * 4ULL ? 0 : fail("draft idmap payload bytes mismatch");
+
+    // Negative: clearing DRAFT_HEAD_PRESENT while the draft blocks remain must be
+    // rejected (flag/block coupling).
+    failures += expect_parse_throws(good, "draft flag cleared", [](auto& b) {
+        write_u32(b, 40, read_u32(b, 40) & ~(1U << 4));
+    });
+
+    // Negative: an id-map whose length disagrees with the draft weight row count is
+    // valid per-block but must be rejected (guards against OOB token remap).
+    const std::vector<std::byte> bad_n = read_file(make_fixture("draft-head-bad-n"));
+    failures += expect_parse_throws(bad_n, "draft idmap length mismatch", [](auto&) {});
+
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -287,6 +337,7 @@ int main() {
     const std::vector<std::byte> valid       = read_file(fixture_path);
     failures += check_valid_parse(valid);
     failures += check_model_bind_conv1d_parse();
+    failures += check_draft_head_parse();
 
     const std::uint64_t module_offset       = read_u64(valid, 48);
     const std::uint64_t tensor_offset       = read_u64(valid, 64);

@@ -510,6 +510,15 @@ int main() {
     }
     f += one_quant_shape(QType::Q6G64_F16S, 4096, 5120, {1, 7}, 31u);
 
+    // --- lm_head vocab-projection family (T1 warp-per-row GEMV) ------------------
+    // n>=65536, k=5120 routes to LmHeadVocabx5120. The Q6 kernel takes N at runtime
+    // (full head 248320 and any draft N), and the Q4 kernel serves the embedded Q4
+    // draft head. Cover the exact production N plus a smaller N to guard the
+    // runtime-N grid parameterization.
+    f += one_quant_shape(QType::Q6G64_F16S, 248320, 5120, {1}, 211u); // full lm_head
+    f += one_quant_shape(QType::Q6G64_F16S, 65536, 5120, {1}, 227u);  // runtime-N Q6
+    f += one_quant_shape(QType::Q4G64_F16S, 131072, 5120, {1}, 223u); // Q4 draft head
+
     // --- prefill (T>1) coverage of the multi-step GEMM path ---------------------
     // The fp64 CPU golden is O(N*K*T), so large families run at small/medium T and
     // the long-T (512, 2048) + tile-boundary cases run on small shapes.

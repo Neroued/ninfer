@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit compact q5090 v3 fixtures through the real converter format helpers."""
+"""Emit compact q5090 v4 fixtures through the real converter format helpers."""
 
 from __future__ import annotations
 
@@ -136,10 +136,10 @@ def encode_zero_tensor(shape: tuple[int, ...], qtype: int, layout: int):
     if layout == qt.LAYOUT_CONTIGUOUS:
         if qtype == qt.QT_BF16:
             elem_size = 2
-        elif qtype == qt.QT_FP32:
+        elif qtype == qt.QT_FP32 or qtype == qt.QT_I32:
             elem_size = 4
         else:
-            raise ValueError(f"zero CONTIGUOUS qtype must be BF16/FP32, got {qtype}")
+            raise ValueError(f"zero CONTIGUOUS qtype must be BF16/FP32/I32, got {qtype}")
         count = 1
         for dim in shape:
             count *= dim
@@ -441,7 +441,39 @@ def add_compact_mtp(blocks: list[BlockSpec], fusions: list[FusionSpec]) -> None:
     )
 
 
-def build_default() -> tuple[list[BlockSpec], list[FusionSpec]]:
+def add_draft_head(blocks: list[BlockSpec], weights_n: int = 6, idmap_n: int | None = None) -> None:
+    """Append the optional Q4 draft lm_head and its I32 id-map (TEXT module).
+
+    ``idmap_n`` defaults to ``weights_n``; passing a different value produces a
+    structurally valid file whose draft weights/id-map row counts disagree, which
+    must be rejected by the parser's draft-head coupling check.
+    """
+    no_layer = qt.NO_LAYER
+    if idmap_n is None:
+        idmap_n = weights_n
+    block(
+        blocks,
+        "lm_head_draft",
+        qt.QT_Q4G64,
+        qt.LAYOUT_ROW_SPLIT,
+        qt.MODULE_TEXT,
+        no_layer,
+        [seg("lm_head_draft", qt.SK_LM_HEAD_DRAFT, no_layer, (weights_n, 8))],
+    )
+    block(
+        blocks,
+        "lm_head_draft.idmap",
+        qt.QT_I32,
+        qt.LAYOUT_CONTIGUOUS,
+        qt.MODULE_TEXT,
+        no_layer,
+        [seg("lm_head_draft.idmap", qt.SK_LM_HEAD_DRAFT_IDMAP, no_layer, (idmap_n,))],
+    )
+
+
+def build_default(
+    with_draft: bool = False, draft_idmap_n: int | None = None
+) -> tuple[list[BlockSpec], list[FusionSpec]]:
     blocks: list[BlockSpec] = []
     no_layer = qt.NO_LAYER
     block(
@@ -505,6 +537,8 @@ def build_default() -> tuple[list[BlockSpec], list[FusionSpec]]:
         [seg(lname(0, "linear_attn.A_log"), qt.SK_GDN_A_LOG, 0, (3,), make_values((3,), 7.0))],
     )
     fusions = [FusionSpec(qt.FUSION_MLP_GATEUP, 0, mlp_first, 1, 9, 7)]
+    if with_draft:
+        add_draft_head(blocks, idmap_n=draft_idmap_n)
     add_compact_mtp(blocks, fusions)
     block(
         blocks,
@@ -808,6 +842,10 @@ def build_file(out_path: Path, profile: str) -> None:
         blocks, fusion_specs = build_model_bind(True, False)
     elif profile == "model-blocks-random":
         blocks, fusion_specs = build_model_bind(True, True)
+    elif profile == "draft-head":
+        blocks, fusion_specs = build_default(with_draft=True)
+    elif profile == "draft-head-bad-n":
+        blocks, fusion_specs = build_default(with_draft=True, draft_idmap_n=5)
     else:
         blocks, fusion_specs = build_default()
 
@@ -936,6 +974,8 @@ def build_file(out_path: Path, profile: str) -> None:
     header_flags = 0
     for kind, _, _ in modules:
         header_flags |= 1 << kind
+    if any(b.source_kind == qt.SK_LM_HEAD_DRAFT for b in blocks):
+        header_flags |= fmt.FLAG_DRAFT_HEAD_PRESENT
 
     header = fmt.FileHeaderFields(
         tensor_count=len(entries),
@@ -995,7 +1035,14 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument(
         "--profile",
-        choices=("default", "model-bind", "model-blocks", "model-blocks-random"),
+        choices=(
+            "default",
+            "model-bind",
+            "model-blocks",
+            "model-blocks-random",
+            "draft-head",
+            "draft-head-bad-n",
+        ),
         default="default",
     )
     args = parser.parse_args()

@@ -8,6 +8,7 @@
 
 #include "qus/kernels/sampling.h"
 
+#include <cub/block/block_merge_sort.cuh>
 #include <cub/block/block_radix_sort.cuh>
 
 #include <cuda_bf16.h>
@@ -51,6 +52,16 @@ using SamplingFinalizeBlockSort =
     cub::BlockRadixSort<unsigned long long, kSamplerBlock, kSamplerFinalizeItemsPerThread, int>;
 using SamplingGroupBlockSort =
     cub::BlockRadixSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread, int>;
+using SamplingPartialMergeSort =
+    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread, int>;
+using SamplingGroupMergeSort =
+    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread, int>;
+
+struct SamplingKeyGreater {
+    __device__ __forceinline__ bool operator()(unsigned long long a, unsigned long long b) const {
+        return a > b;
+    }
+};
 
 __device__ __forceinline__ unsigned long long sampling_splitmix64(unsigned long long x) {
     x += 0x9E3779B97F4A7C15ull;

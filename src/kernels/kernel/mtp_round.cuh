@@ -180,7 +180,7 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_partial_topk_kerne
         return;
     }
 
-    __shared__ typename SamplingPartialBlockSort::TempStorage sort_storage;
+    __shared__ typename SamplingPartialMergeSort::TempStorage sort_storage;
     unsigned long long keys[kSamplerItemsPerThread];
     int items[kSamplerItemsPerThread];
 
@@ -199,7 +199,7 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_partial_topk_kerne
             items[item] = INT_MAX;
         }
     }
-    SamplingPartialBlockSort(sort_storage).SortDescending(keys, items);
+    SamplingPartialMergeSort(sort_storage).Sort(keys, items, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
@@ -386,7 +386,7 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
         return;
     }
 
-    __shared__ typename SamplingGroupBlockSort::TempStorage sort_storage;
+    __shared__ typename SamplingGroupMergeSort::TempStorage sort_storage;
     __shared__ float cand_val[kSamplerMaxCandidates];
     __shared__ int cand_idx[kSamplerMaxCandidates];
     __shared__ float prob[kSamplerMaxCandidates];
@@ -427,7 +427,7 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
             items[item] = INT_MAX;
         }
     }
-    SamplingGroupBlockSort(sort_storage).SortDescending(keys, items);
+    SamplingGroupMergeSort(sort_storage).Sort(keys, items, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
@@ -465,7 +465,7 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
             items[item] = INT_MAX;
         }
     }
-    SamplingGroupBlockSort(sort_storage).SortDescending(keys, items);
+    SamplingGroupMergeSort(sort_storage).Sort(keys, items, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {

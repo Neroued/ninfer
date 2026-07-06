@@ -311,7 +311,7 @@ int main() {
     failures +=
         expect_parse_throws(valid, "bad header size", [](auto& b) { write_u32(b, 24, 2048); });
     failures +=
-        expect_parse_throws(valid, "unknown header flags", [](auto& b) { write_u32(b, 40, 0x10); });
+        expect_parse_throws(valid, "unknown header flags", [](auto& b) { write_u32(b, 40, 0x20); });
     failures +=
         expect_parse_throws(valid, "module flags mismatch", [](auto& b) { write_u32(b, 40, 0x1); });
     failures += expect_parse_throws(valid, "header reserved", [](auto& b) { write_u32(b, 236, 1); });

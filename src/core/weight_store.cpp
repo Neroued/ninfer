@@ -86,6 +86,8 @@ DType dtype_for_contiguous(QType qtype) {
         return DType::BF16;
     case QType::FP32_CTRL:
         return DType::FP32;
+    case QType::I32_CTRL:
+        return DType::I32;
     default:
         throw std::runtime_error("q5090 contiguous tensor has non-control qtype");
     }

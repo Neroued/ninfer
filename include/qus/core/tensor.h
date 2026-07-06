@@ -35,6 +35,7 @@ enum class QType : std::uint16_t {
     BF16_CTRL   = 4,
     FP32_CTRL   = 5,
     W8G32_F16S  = 6,
+    I32_CTRL    = 7,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -66,6 +67,8 @@ enum class SourceKind : std::uint32_t {
     FinalNorm         = 3,
     InputLayernorm    = 4,
     PostAttnLayernorm = 5,
+    LmHeadDraft       = 6,
+    LmHeadDraftIdmap  = 7,
     GdnALog           = 10,
     GdnDtBias         = 11,
     GdnConv1d         = 12,

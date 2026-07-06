@@ -16,11 +16,11 @@ namespace {
 constexpr std::array<std::byte, 16> kMagic = {
     std::byte{0x51}, std::byte{0x35}, std::byte{0x30}, std::byte{0x39},
     std::byte{0x30}, std::byte{0x4D}, std::byte{0x49}, std::byte{0x58},
-    std::byte{0x45}, std::byte{0x44}, std::byte{0x56}, std::byte{0x33},
+    std::byte{0x45}, std::byte{0x44}, std::byte{0x56}, std::byte{0x34},
     std::byte{0x00}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
 };
 
-constexpr std::uint32_t kVersion               = 3;
+constexpr std::uint32_t kVersion               = 4;
 constexpr std::uint32_t kEndianTag             = 0x01020304U;
 constexpr std::uint32_t kHeaderSize            = 4096;
 constexpr std::uint32_t kModuleRecordSize      = 64;
@@ -29,6 +29,7 @@ constexpr std::uint32_t kSegmentRecordSize     = 32;
 constexpr std::uint32_t kFusionGroupRecordSize = 64;
 constexpr std::uint64_t kPayloadAlign          = 256;
 constexpr std::uint64_t kRegionAlign           = 4096;
+constexpr std::uint32_t kDraftHeadPresentFlag  = 1U << 4;
 
 struct Range {
     std::uint64_t begin = 0;
@@ -124,6 +125,7 @@ QType qtype_from_tag(std::uint16_t tag) {
     case 4: return QType::BF16_CTRL;
     case 5: return QType::FP32_CTRL;
     case 6: return QType::W8G32_F16S;
+    case 7: return QType::I32_CTRL;
     default: parse_error("q5090 invalid qtype tag");
     }
 }
@@ -170,6 +172,8 @@ bool valid_source_kind(std::uint32_t kind) {
     case 3:
     case 4:
     case 5:
+    case 6:
+    case 7:
     case 10:
     case 11:
     case 12:
@@ -226,7 +230,7 @@ bool valid_source_kind(ModuleKind module, std::uint32_t kind) {
     if (kind == static_cast<std::uint32_t>(SourceKind::Other)) { return true; }
     switch (module) {
     case ModuleKind::TextCore:
-        return (kind >= 1 && kind <= 5) || (kind >= 10 && kind <= 20) ||
+        return (kind >= 1 && kind <= 7) || (kind >= 10 && kind <= 20) ||
                (kind >= 30 && kind <= 36) || (kind >= 40 && kind <= 42);
     case ModuleKind::MtpDraft:
         return (kind >= 50 && kind <= 53) || kind == 4 || kind == 5 ||
@@ -296,6 +300,7 @@ std::uint64_t element_size(QType qtype) {
     switch (qtype) {
     case QType::BF16_CTRL: return 2;
     case QType::FP32_CTRL: return 4;
+    case QType::I32_CTRL: return 4;
     default: parse_error("q5090 qtype has no contiguous element size");
     }
 }
@@ -350,7 +355,8 @@ std::uint64_t expected_payload_bytes(const ParsedQ5090Tensor& tensor) {
         return payload;
     }
     case QuantLayout::Contiguous: {
-        require(tensor.qtype == QType::BF16_CTRL || tensor.qtype == QType::FP32_CTRL,
+        require(tensor.qtype == QType::BF16_CTRL || tensor.qtype == QType::FP32_CTRL ||
+                    tensor.qtype == QType::I32_CTRL,
                 "q5090 CONTIGUOUS qtype mismatch");
         require(tensor.group_size == 0, "q5090 CONTIGUOUS group mismatch");
         require(tensor.scale_dtype == ScaleDType::None, "q5090 CONTIGUOUS scale mismatch");
@@ -416,7 +422,7 @@ ParsedQ5090Header parse_header(std::span<const std::byte> file,
     require(h.tensor_count > 0, "q5090 tensor count is zero");
     require(h.segment_count > 0, "q5090 segment count is zero");
     require(h.layer_count == expected.layer_count.value_or(64), "q5090 layer count mismatch");
-    require((h.flags & ~0x0FU) == 0, "q5090 unknown header flags");
+    require((h.flags & ~0x1FU) == 0, "q5090 unknown header flags");
     require(h.format_minor == 0, "q5090 unsupported format minor");
     require(all_zero(file.subspan(236, kHeaderSize - 236)), "q5090 header padding nonzero");
 
@@ -811,6 +817,38 @@ void validate_fusion_groups(const std::vector<ParsedQ5090Tensor>& tensors,
     }
 }
 
+void validate_draft_head(const ParsedQ5090Header& header,
+                         const std::vector<ParsedQ5090Tensor>& tensors) {
+    const ParsedQ5090Tensor* weights = nullptr;
+    const ParsedQ5090Tensor* idmap   = nullptr;
+    for (const ParsedQ5090Tensor& t : tensors) {
+        if (t.module_kind != ModuleKind::TextCore) { continue; }
+        if (t.source_kind == static_cast<std::uint32_t>(SourceKind::LmHeadDraft)) {
+            require(weights == nullptr, "q5090 duplicate LM_HEAD_DRAFT block");
+            weights = &t;
+        } else if (t.source_kind == static_cast<std::uint32_t>(SourceKind::LmHeadDraftIdmap)) {
+            require(idmap == nullptr, "q5090 duplicate LM_HEAD_DRAFT_IDMAP block");
+            idmap = &t;
+        }
+    }
+    const bool flag_present = (header.flags & kDraftHeadPresentFlag) != 0;
+    const bool draft_present = weights != nullptr;
+    require(flag_present == draft_present,
+            "q5090 DRAFT_HEAD_PRESENT flag inconsistent with LM_HEAD_DRAFT block");
+    require((idmap != nullptr) == draft_present,
+            "q5090 LM_HEAD_DRAFT and LM_HEAD_DRAFT_IDMAP must both be present or absent");
+    if (!draft_present) { return; }
+    require(weights->qtype == QType::Q4G64_F16S && weights->layout == QuantLayout::RowSplit,
+            "q5090 LM_HEAD_DRAFT must be Q4G64 ROW_SPLIT");
+    require(idmap->qtype == QType::I32_CTRL && idmap->layout == QuantLayout::Contiguous &&
+                idmap->ndim == 1,
+            "q5090 LM_HEAD_DRAFT_IDMAP must be I32_CTRL CONTIGUOUS 1D");
+    require(weights->source_layer == kQ5090NoLayer && idmap->source_layer == kQ5090NoLayer,
+            "q5090 draft-head blocks must have no source layer");
+    require(idmap->shape[0] == weights->shape[0],
+            "q5090 LM_HEAD_DRAFT_IDMAP length must match draft-head row count");
+}
+
 } // namespace
 
 std::uint64_t q5090_fnv1a64(std::string_view name) {
@@ -836,6 +874,7 @@ ParsedQ5090File parse_q5090_file(std::span<const std::byte> file,
     validate_tensor_segments(parsed.tensors, parsed.segments);
     parsed.fusion_groups = parse_fusion_groups(file, parsed.header);
     validate_fusion_groups(parsed.tensors, parsed.fusion_groups);
+    validate_draft_head(parsed.header, parsed.tensors);
     return parsed;
 }
 

@@ -227,11 +227,18 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             const GenerationOutcome outcome = service_.run(prepared, nullptr);
             log_line(format_request_done(req_id, outcome));
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
-            res.set_content(make_chat_completion_response(id, model, created, outcome.text,
-                                                          outcome.reasoning,
-                                                          finish_reason_wire(outcome.finish_reason),
-                                                          usage),
-                            "application/json");
+            if (!outcome.tool_calls.empty()) {
+                res.set_content(make_chat_completion_tool_response(id, model, created, outcome.text,
+                                                                   outcome.reasoning,
+                                                                   outcome.tool_calls, usage),
+                                "application/json");
+            } else {
+                res.set_content(make_chat_completion_response(id, model, created, outcome.text,
+                                                              outcome.reasoning,
+                                                              finish_reason_wire(outcome.finish_reason),
+                                                              usage),
+                                "application/json");
+            }
         } catch (const std::exception& e) {
             log_line(format_request_error(req_id, e.what()));
             throw;
@@ -244,9 +251,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     auto worker    = std::make_shared<JoiningThread>();
     auto prepared_ptr = std::make_shared<PreparedRequest>(std::move(prepared));
     const bool include_usage = prepared_ptr->include_usage;
+    const bool tool_capable  = prepared_ptr->tool_capable;
 
     worker->thread = std::thread([this, queue, cancelled, prepared_ptr, id, created, model,
-                                  include_usage, req_id]() {
+                                  include_usage, tool_capable, req_id]() {
         try {
             queue->push(make_chat_chunk_role(id, model, created, include_usage));
             StreamSink sink;
@@ -260,9 +268,23 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
             const GenerationOutcome outcome = service_.run(*prepared_ptr, &sink);
             log_line(format_request_done(req_id, outcome));
-            queue->push(make_chat_chunk_final(id, model, created,
-                                              finish_reason_wire(outcome.finish_reason),
-                                              include_usage));
+            if (!outcome.tool_calls.empty()) {
+                if (!outcome.text.empty()) {
+                    queue->push(make_chat_chunk_content(id, model, created, outcome.text,
+                                                        include_usage));
+                }
+                queue->push(make_chat_chunk_tool_calls(id, model, created, outcome.tool_calls,
+                                                       include_usage));
+                queue->push(make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
+            } else {
+                if (tool_capable && !outcome.text.empty()) {
+                    queue->push(make_chat_chunk_content(id, model, created, outcome.text,
+                                                        include_usage));
+                }
+                queue->push(make_chat_chunk_final(id, model, created,
+                                                  finish_reason_wire(outcome.finish_reason),
+                                                  include_usage));
+            }
             if (include_usage) {
                 const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
                 queue->push(make_chat_chunk_usage(id, model, created, usage));

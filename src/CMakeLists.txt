@@ -31,6 +31,7 @@ target_link_libraries(qus PRIVATE qus_core)
 # it can be linked by both the qus-serve executable and the schema unit test.
 add_library(qus_serve STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/serve/openai_schema.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/serve/tool_call_parser.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/serve/translate.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/serve/generation_service.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/serve/request_log.cpp

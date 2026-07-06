@@ -33,9 +33,37 @@ struct ContentPart {
     std::string type_raw;  // original OpenAI "type" string (diagnostics / future use)
 };
 
+struct ToolDefinition {
+    std::string name;
+    std::string description;
+    std::string parameters_json;
+    std::string definition_json;  // normalized OpenAI function-tool object for Qwen prompt rendering
+    bool strict = false;
+};
+
+struct ToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments_json;
+};
+
+enum class ToolChoiceMode {
+    Auto,
+    None,
+    Required,
+    Named,
+};
+
+struct ToolChoice {
+    ToolChoiceMode mode = ToolChoiceMode::Auto;
+    std::string name;
+};
+
 struct ChatTurn {
-    std::string role;                  // system | user | assistant (validated in translate)
-    std::vector<ContentPart> content;  // one or more parts
+    std::string role;                  // system | user | assistant | tool (validated in translate)
+    std::vector<ContentPart> content;  // one or more parts; assistant content may be empty with tool_calls
+    std::vector<ToolCall> tool_calls;
+    std::string tool_call_id;          // populated for role=tool
 };
 
 // The complete OpenAI sampling surface. Parsed now, honored when the sampler
@@ -54,6 +82,8 @@ struct SamplingParams {
 struct GenerationRequest {
     std::string model;
     std::vector<ChatTurn> messages;
+    std::vector<ToolDefinition> tools;
+    ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
     int max_tokens        = 0;  // 0 => use server default
     bool max_tokens_set   = false;
@@ -61,6 +91,17 @@ struct GenerationRequest {
     bool include_usage    = false;
     std::optional<bool> enable_thinking;  // non-standard extension; falls back to server default
     SamplingParams sampling;
+
+    [[nodiscard]] bool uses_tools() const noexcept {
+        return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
+    }
+
+    [[nodiscard]] bool has_tool_history() const noexcept {
+        for (const ChatTurn& message : messages) {
+            if (!message.tool_calls.empty() || message.role == "tool") { return true; }
+        }
+        return false;
+    }
 };
 
 } // namespace qus::serve

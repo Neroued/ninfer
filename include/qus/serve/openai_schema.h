@@ -57,6 +57,11 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
                                           std::int64_t created, const std::string& content,
                                           const std::string& reasoning,
                                           const char* finish_reason, const CompletionUsage& usage);
+std::string make_chat_completion_tool_response(const std::string& id, const std::string& model,
+                                                std::int64_t created, const std::string& content,
+                                                const std::string& reasoning,
+                                                const std::vector<ToolCall>& tool_calls,
+                                                const CompletionUsage& usage);
 
 // Streaming SSE event strings ("data: {...}\n\n"). The first chunk carries the
 // assistant role; reasoning chunks carry `reasoning_content` deltas (the <think>
@@ -73,6 +78,10 @@ std::string make_chat_chunk_reasoning(const std::string& id, const std::string& 
 std::string make_chat_chunk_content(const std::string& id, const std::string& model,
                                      std::int64_t created, const std::string& delta_text,
                                      bool include_usage);
+std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,
+                                       std::int64_t created,
+                                       const std::vector<ToolCall>& tool_calls,
+                                       bool include_usage);
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                    std::int64_t created, const char* finish_reason,
                                    bool include_usage);

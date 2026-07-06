@@ -99,15 +99,84 @@ int test_json_messages_render_prefixes() {
     return failures;
 }
 
+int test_tool_system_block_merges_system_content() {
+    std::vector<qus::text::ChatMessage> messages;
+    messages.push_back(qus::text::ChatMessage{"system", "be direct"});
+    messages.push_back(qus::text::ChatMessage{"user", "weather?"});
+
+    qus::text::ChatRenderOptions options;
+    options.tool_jsons.push_back(
+        R"({"function":{"description":"Fetch weather","name":"get_weather","parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false},"type":"function"})");
+    const std::string rendered = qus::text::render_qwen_chat(messages, options);
+
+    int failures = 0;
+    failures += check(rendered.find("<|im_start|>system\n# Tools\n\n"
+                                    "You have access to the following functions:\n\n<tools>\n") == 0,
+                      "tool system block prefix mismatch");
+    failures += check(rendered.find("\"name\":\"get_weather\"") != std::string::npos,
+                      "tool json missing");
+    failures += check(rendered.find("</tools>\n\nIf you choose to call a function") !=
+                          std::string::npos,
+                      "tool instructions missing");
+    failures += check(rendered.find("\n\nbe direct<|im_end|>\n") != std::string::npos,
+                      "system content not merged into tool block");
+    failures += check(rendered.find("<|im_start|>user\nweather?<|im_end|>\n") !=
+                          std::string::npos,
+                      "user message missing after tool block");
+    return failures;
+}
+
+int test_assistant_tool_call_history_renders_qwen_xml() {
+    std::vector<qus::text::ChatMessage> messages;
+    messages.push_back(qus::text::ChatMessage{"user", "weather?"});
+    qus::text::ChatMessage assistant;
+    assistant.role    = "assistant";
+    assistant.content = "";
+    assistant.tool_calls.push_back(
+        qus::text::ToolCall{"call_1", "get_weather", R"({"city":"Paris","days":2})"});
+    messages.push_back(std::move(assistant));
+
+    const std::string rendered = qus::text::render_qwen_chat(messages);
+    int failures = 0;
+    failures += check(rendered.find("<|im_start|>assistant\n<tool_call>\n"
+                                    "<function=get_weather>\n") != std::string::npos,
+                      "assistant tool call prefix missing");
+    failures += check(rendered.find("<parameter=city>\nParis\n</parameter>\n") !=
+                          std::string::npos,
+                      "string parameter rendering mismatch");
+    failures += check(rendered.find("<parameter=days>\n2\n</parameter>\n") != std::string::npos,
+                      "number parameter rendering mismatch");
+    failures += check(rendered.find("</function>\n</tool_call><|im_end|>\n") !=
+                          std::string::npos,
+                      "assistant tool call suffix missing");
+    return failures;
+}
+
+int test_tool_role_renders_tool_response() {
+    std::vector<qus::text::ChatMessage> messages;
+    messages.push_back(qus::text::ChatMessage{"user", "weather?"});
+    qus::text::ChatMessage assistant;
+    assistant.role = "assistant";
+    assistant.tool_calls.push_back(
+        qus::text::ToolCall{"call_1", "get_weather", R"({"city":"Paris"})"});
+    messages.push_back(std::move(assistant));
+    qus::text::ChatMessage tool;
+    tool.role         = "tool";
+    tool.tool_call_id = "call_1";
+    tool.content      = R"({"temp":20})";
+    messages.push_back(std::move(tool));
+
+    const std::string rendered = qus::text::render_qwen_chat(messages);
+    return check(rendered.find("<|im_start|>user\n<tool_response>\n"
+                               R"({"temp":20})"
+                               "\n</tool_response><|im_end|>\n") != std::string::npos,
+                 "tool response render mismatch");
+}
+
 int test_rejections() {
     int failures = 0;
     failures += expect_invalid(
         []() { (void)qus::text::render_qwen_chat({}); }, "empty render messages");
-    failures += expect_invalid(
-        []() {
-            (void)qus::text::render_qwen_chat({qus::text::ChatMessage{"tool", "result"}});
-        },
-        "tool role");
     failures += expect_invalid(
         []() {
             const TempJson json("qus_chat_multimodal.json",
@@ -132,6 +201,9 @@ int main() {
     failures += test_prompt_renders_qwen_chat();
     failures += test_prompt_renders_thinking_prefix();
     failures += test_json_messages_render_prefixes();
+    failures += test_tool_system_block_merges_system_content();
+    failures += test_assistant_tool_call_history_renders_qwen_xml();
+    failures += test_tool_role_renders_tool_response();
     failures += test_rejections();
     return failures == 0 ? 0 : fail("qwen chat template test failed");
 }

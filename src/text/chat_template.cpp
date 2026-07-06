@@ -5,6 +5,7 @@
 #include <cctype>
 #include <fstream>
 #include <stdexcept>
+#include <string_view>
 
 namespace qus::text {
 namespace {
@@ -12,6 +13,10 @@ namespace {
 using Json = nlohmann::json;
 
 bool is_allowed_role(const std::string& role) {
+    return role == "system" || role == "user" || role == "assistant" || role == "tool";
+}
+
+bool is_allowed_file_role(const std::string& role) {
     return role == "system" || role == "user" || role == "assistant";
 }
 
@@ -27,6 +32,73 @@ std::string trim_ascii_whitespace(const std::string& text) {
         --end;
     }
     return text.substr(begin, end - begin);
+}
+
+constexpr std::string_view kToolInstructions =
+    "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+    "<tool_call>\n"
+    "<function=example_function_name>\n"
+    "<parameter=example_parameter_1>\n"
+    "value_1\n"
+    "</parameter>\n"
+    "<parameter=example_parameter_2>\n"
+    "This is the value for the second parameter\n"
+    "that can span\n"
+    "multiple lines\n"
+    "</parameter>\n"
+    "</function>\n"
+    "</tool_call>\n\n"
+    "<IMPORTANT>\n"
+    "Reminder:\n"
+    "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+    "- Required parameters MUST be specified\n"
+    "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+    "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+    "</IMPORTANT>";
+
+std::string parameter_text(const Json& value) {
+    if (value.is_string()) { return value.get<std::string>(); }
+    return value.dump();
+}
+
+std::string render_tool_call(const ToolCall& call) {
+    Json args = Json::parse(call.arguments_json);
+    if (!args.is_object()) {
+        throw std::invalid_argument("tool call arguments must be a JSON object");
+    }
+
+    std::string rendered;
+    rendered += "<tool_call>\n<function=";
+    rendered += call.name;
+    rendered += ">\n";
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        rendered += "<parameter=";
+        rendered += it.key();
+        rendered += ">\n";
+        rendered += parameter_text(it.value());
+        rendered += "\n</parameter>\n";
+    }
+    rendered += "</function>\n</tool_call>";
+    return rendered;
+}
+
+std::string render_tools_system_block(const std::vector<std::string>& tool_jsons,
+                                      const std::string& merged_system) {
+    std::string rendered;
+    rendered += "<|im_start|>system\n";
+    rendered += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+    for (const std::string& tool : tool_jsons) {
+        rendered += "\n";
+        rendered += tool;
+    }
+    rendered += "\n</tools>";
+    rendered += std::string(kToolInstructions);
+    if (!merged_system.empty()) {
+        rendered += "\n\n";
+        rendered += merged_system;
+    }
+    rendered += "<|im_end|>\n";
+    return rendered;
 }
 
 ChatMessage parse_message(const Json& item, std::size_t index) {
@@ -51,7 +123,7 @@ ChatMessage parse_message(const Json& item, std::size_t index) {
         throw std::invalid_argument("message " + std::to_string(index) + " role must be string");
     }
     const std::string role = item.at("role").get<std::string>();
-    if (!is_allowed_role(role)) {
+    if (!is_allowed_file_role(role)) {
         throw std::invalid_argument("unsupported chat role: " + role);
     }
     if (!item.at("content").is_string()) {
@@ -100,14 +172,56 @@ std::string render_qwen_chat(const std::vector<ChatMessage>& messages,
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
 
     std::string rendered;
-    for (const ChatMessage& message : messages) {
+    const bool has_tools = !options.tool_jsons.empty();
+    std::size_t skip_system = 0;
+    if (has_tools && (messages[0].role == "system")) {
+        std::string merged_system = trim_ascii_whitespace(messages[0].content);
+        skip_system               = 1;
+        if (messages.size() > 1 && messages[1].role == "system") {
+            const std::string second = trim_ascii_whitespace(messages[1].content);
+            if (!second.empty()) {
+                if (!merged_system.empty()) { merged_system += '\n'; }
+                merged_system += second;
+            }
+            skip_system = 2;
+        }
+        rendered += render_tools_system_block(options.tool_jsons, merged_system);
+    } else if (has_tools) {
+        rendered += render_tools_system_block(options.tool_jsons, "");
+    }
+
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        const ChatMessage& message = messages[i];
+        if (has_tools && i < skip_system) { continue; }
+        if (has_tools && message.role == "system") { continue; }
         if (!is_allowed_role(message.role)) {
             throw std::invalid_argument("unsupported chat role: " + message.role);
+        }
+        if (message.role == "tool") {
+            const bool opens_group = i == 0 || messages[i - 1].role != "tool";
+            const bool closes_group = i + 1 == messages.size() || messages[i + 1].role != "tool";
+            if (opens_group) { rendered += "<|im_start|>user"; }
+            rendered += "\n<tool_response>\n";
+            rendered += trim_ascii_whitespace(message.content);
+            rendered += "\n</tool_response>";
+            if (closes_group) { rendered += "<|im_end|>\n"; }
+            continue;
         }
         rendered += "<|im_start|>";
         rendered += message.role;
         rendered += '\n';
-        rendered += trim_ascii_whitespace(message.content);
+        const std::string content = trim_ascii_whitespace(message.content);
+        rendered += content;
+        if (!message.tool_calls.empty()) {
+            for (std::size_t call_index = 0; call_index < message.tool_calls.size(); ++call_index) {
+                if (call_index == 0) {
+                    if (!content.empty()) { rendered += "\n\n"; }
+                } else {
+                    rendered += "\n";
+                }
+                rendered += render_tool_call(message.tool_calls[call_index]);
+            }
+        }
         rendered += "<|im_end|>\n";
     }
 

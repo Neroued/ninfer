@@ -86,6 +86,9 @@ cmake --build build -j
 `bench/qus_bench` is the real-weight throughput tool (llama-bench-style prefill/decode rates); see
 [`bench/README.md`](bench/README.md).
 
+The OpenAI-compatible server includes best-effort function tool calling; see
+[`docs/non-strict-tool-calling.md`](docs/non-strict-tool-calling.md).
+
 ## Toolchain target
 
 NVIDIA RTX 5090 (Blackwell, sm_120, 32 GB) · CUDA 13.1 · gcc 13.3 · CMake 3.28 · Linux/WSL2.

@@ -36,6 +36,7 @@ struct GenerationMetrics {
 struct GenerationOutcome {
     std::string text;       // answer text (non-streaming); empty when streamed via a sink
     std::string reasoning;  // thinking text split out of the <think> block (non-streaming)
+    std::vector<ToolCall> tool_calls;
     int prompt_tokens                     = 0;
     int completion_tokens                 = 0;
     qus::text::FinishReason finish_reason = qus::text::FinishReason::Length;
@@ -58,6 +59,7 @@ struct PreparedRequest {
     std::vector<std::string> stop_strings;
     int prompt_tokens  = 0;
     bool include_usage = false;
+    bool tool_capable  = false;
 };
 
 // Which optional generation features the engine currently honors. Sampling is

@@ -6,14 +6,23 @@
 
 namespace qus::text {
 
+struct ToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments_json;
+};
+
 struct ChatMessage {
     std::string role;
     std::string content;
+    std::vector<ToolCall> tool_calls;
+    std::string tool_call_id;
 };
 
 struct ChatRenderOptions {
     bool add_generation_prompt = true;
     bool enable_thinking       = false;
+    std::vector<std::string> tool_jsons;
 };
 
 std::vector<ChatMessage> messages_from_prompt(std::string prompt);

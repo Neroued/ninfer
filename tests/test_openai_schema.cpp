@@ -122,10 +122,27 @@ int test_reject_unsupported() {
     failures += check(throws_api([&] { (void)parse_chat_completion_request(n2, default_limits()); }),
                       "n>1 rejected");
 
-    Json tools = base;
-    tools["tools"] = Json::array({Json::object()});
-    failures += check(throws_api([&] { (void)parse_chat_completion_request(tools, default_limits()); }),
-                      "tools rejected");
+    Json custom_tool = base;
+    custom_tool["tools"] = Json::array({Json{{"type", "custom"},
+                                             {"custom", Json{{"name", "search"}}}}});
+    failures += check(throws_api([&] {
+                          (void)parse_chat_completion_request(custom_tool, default_limits());
+                      }),
+                      "custom tools rejected");
+
+    Json functions = base;
+    functions["functions"] = Json::array({Json::object()});
+    failures += check(throws_api([&] {
+                          (void)parse_chat_completion_request(functions, default_limits());
+                      }),
+                      "deprecated functions rejected");
+
+    Json function_call = base;
+    function_call["function_call"] = "auto";
+    failures += check(throws_api([&] {
+                          (void)parse_chat_completion_request(function_call, default_limits());
+                      }),
+                      "deprecated function_call rejected");
 
     Json rf     = base;
     rf["response_format"] = Json{{"type", "json_object"}};
@@ -146,10 +163,107 @@ int test_reject_unsupported() {
     failures += check(throws_api([&] { (void)parse_chat_completion_request(no_model, default_limits()); }),
                       "missing model rejected");
 
-    Json tool_role = {{"model", "m"},
-                      {"messages", Json::array({Json{{"role", "tool"}, {"content", "x"}}})}};
-    failures += check(throws_api([&] { (void)parse_chat_completion_request(tool_role, default_limits()); }),
-                      "tool role rejected");
+    Json function_role = {{"model", "m"},
+                          {"messages", Json::array({Json{{"role", "function"}, {"content", "x"}}})}};
+    failures += check(throws_api([&] {
+                          (void)parse_chat_completion_request(function_role, default_limits());
+                      }),
+                      "function role rejected");
+    return failures;
+}
+
+int test_parse_function_tools_and_choices() {
+    int failures = 0;
+    const Json tool = Json{{"type", "function"},
+                           {"function",
+                            Json{{"name", "get_weather"},
+                                 {"description", "Fetch weather"},
+                                 {"parameters",
+                                  Json{{"type", "object"},
+                                       {"properties",
+                                        Json{{"city", Json{{"type", "string"}}}}},
+                                       {"required", Json::array({"city"})}}},
+                                 {"strict", true}}}};
+    const Json base = {{"model", "m"},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                       {"tools", Json::array({tool})}};
+
+    GenerationRequest req = parse_chat_completion_request(base, default_limits());
+    failures += check(req.tools.size() == 1, "one tool parsed");
+    failures += check(req.tools[0].name == "get_weather", "tool name parsed");
+    failures += check(req.tools[0].description == "Fetch weather", "tool description parsed");
+    failures += check(req.tools[0].strict, "tool strict metadata parsed");
+    failures += check(Json::parse(req.tools[0].parameters_json).at("required").at(0) == "city",
+                      "tool parameters carried");
+    failures += check(Json::parse(req.tools[0].definition_json).at("type") == "function",
+                      "tool definition json carried");
+    failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "default tool choice is auto");
+    failures += check(req.uses_tools(), "tools enabled by default");
+
+    Json none = base;
+    none["tool_choice"] = "none";
+    req = parse_chat_completion_request(none, default_limits());
+    failures += check(req.tool_choice.mode == ToolChoiceMode::None, "tool_choice none parsed");
+    failures += check(!req.uses_tools(), "tool_choice none disables tools");
+
+    Json required = base;
+    required["tool_choice"] = "required";
+    req = parse_chat_completion_request(required, default_limits());
+    failures += check(req.tool_choice.mode == ToolChoiceMode::Required, "tool_choice required parsed");
+
+    Json named = base;
+    named["tool_choice"] =
+        Json{{"type", "function"}, {"function", Json{{"name", "get_weather"}}}};
+    req = parse_chat_completion_request(named, default_limits());
+    failures += check(req.tool_choice.mode == ToolChoiceMode::Named, "named tool_choice parsed");
+    failures += check(req.tool_choice.name == "get_weather", "named tool_choice name parsed");
+
+    Json unknown = base;
+    unknown["tool_choice"] =
+        Json{{"type", "function"}, {"function", Json{{"name", "missing"}}}};
+    failures += check(throws_api([&] {
+                          (void)parse_chat_completion_request(unknown, default_limits());
+                      }),
+                      "unknown named tool_choice rejected");
+    return failures;
+}
+
+int test_parse_tool_history_messages() {
+    int failures = 0;
+    const Json body = {
+        {"model", "m"},
+        {"messages",
+         Json::array({Json{{"role", "user"}, {"content", "weather?"}},
+                     Json{{"role", "assistant"},
+                          {"content", nullptr},
+                          {"tool_calls",
+                           Json::array({Json{{"id", "call_1"},
+                                             {"type", "function"},
+                                             {"function",
+                                              Json{{"name", "get_weather"},
+                                                   {"arguments", R"({"city":"Paris"})"}}}}})}},
+                     Json{{"role", "tool"},
+                          {"tool_call_id", "call_1"},
+                          {"content", R"({"temp":20})"}}})}};
+    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+    failures += check(req.messages.size() == 3, "tool history message count");
+    failures += check(req.messages[1].tool_calls.size() == 1, "assistant tool call parsed");
+    failures += check(req.messages[1].tool_calls[0].id == "call_1", "tool call id parsed");
+    failures += check(req.messages[1].tool_calls[0].name == "get_weather",
+                      "tool call name parsed");
+    failures += check(req.messages[1].tool_calls[0].arguments_json == R"({"city":"Paris"})",
+                      "tool call arguments parsed");
+    failures += check(req.messages[2].role == "tool", "tool role parsed");
+    failures += check(req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
+    failures += check(req.messages[2].content.at(0).text == R"({"temp":20})",
+                      "tool content parsed");
+
+    Json bad_args = body;
+    bad_args["messages"][1]["tool_calls"][0]["function"]["arguments"] = R"(["Paris"])";
+    failures += check(throws_api([&] {
+                          (void)parse_chat_completion_request(bad_args, default_limits());
+                      }),
+                      "non-object tool call arguments rejected");
     return failures;
 }
 
@@ -219,6 +333,37 @@ int test_response_serialization() {
     return failures;
 }
 
+int test_tool_response_serialization() {
+    int failures = 0;
+    const CompletionUsage usage{12, 6};
+    const std::vector<ToolCall> calls = {
+        ToolCall{"call_abc", "get_weather", R"({"city":"Paris"})"}};
+    const Json j = Json::parse(make_chat_completion_tool_response(
+        "id-tool", "m", 222, "", "need weather", calls, usage));
+
+    failures += check(j.at("object") == "chat.completion", "tool response object");
+    const Json& choice = j.at("choices").at(0);
+    failures += check(choice.at("finish_reason") == "tool_calls", "tool finish reason");
+    const Json& message = choice.at("message");
+    failures += check(message.at("role") == "assistant", "tool message role");
+    failures += check(message.at("content").is_null(), "empty tool content is null");
+    failures += check(message.at("reasoning_content") == "need weather", "tool reasoning carried");
+    const Json& call = message.at("tool_calls").at(0);
+    failures += check(call.at("id") == "call_abc", "tool call id");
+    failures += check(call.at("type") == "function", "tool call type");
+    failures += check(call.at("function").at("name") == "get_weather", "tool function name");
+    failures += check(call.at("function").at("arguments") == R"({"city":"Paris"})",
+                      "tool function arguments");
+    failures += check(j.at("usage").at("total_tokens") == 18, "tool usage total");
+
+    const Json with_content = Json::parse(make_chat_completion_tool_response(
+        "id-tool-2", "m", 223, "Calling weather.", "", calls, usage));
+    failures += check(with_content.at("choices").at(0).at("message").at("content") ==
+                          "Calling weather.",
+                      "tool content prefix carried");
+    return failures;
+}
+
 int test_chunk_serialization() {
     int failures = 0;
     const Json role = parse_sse(make_chat_chunk_role("id", "m", 1, false));
@@ -268,6 +413,29 @@ int test_chunk_serialization() {
     return failures;
 }
 
+int test_tool_chunk_serialization() {
+    int failures = 0;
+    const std::vector<ToolCall> calls = {
+        ToolCall{"call_abc", "get_weather", R"({"city":"Paris"})"}};
+    const Json chunk = parse_sse(make_chat_chunk_tool_calls("id", "m", 1, calls, true));
+    failures += check(chunk.at("object") == "chat.completion.chunk", "tool chunk object");
+    const Json& delta = chunk.at("choices").at(0).at("delta");
+    const Json& call  = delta.at("tool_calls").at(0);
+    failures += check(call.at("index") == 0, "tool chunk index");
+    failures += check(call.at("id") == "call_abc", "tool chunk id");
+    failures += check(call.at("type") == "function", "tool chunk type");
+    failures += check(call.at("function").at("name") == "get_weather", "tool chunk name");
+    failures += check(call.at("function").at("arguments") == R"({"city":"Paris"})",
+                      "tool chunk arguments");
+    failures += check(chunk.contains("usage") && chunk.at("usage").is_null(),
+                      "tool chunk usage null");
+
+    const Json final_chunk = parse_sse(make_chat_chunk_final("id", "m", 1, "tool_calls", true));
+    failures += check(final_chunk.at("choices").at(0).at("finish_reason") == "tool_calls",
+                      "tool final finish reason");
+    return failures;
+}
+
 int test_models_and_error() {
     int failures = 0;
     const Json list = Json::parse(make_models_list("qwen3.6-27b", 1));
@@ -311,10 +479,14 @@ int main() {
     failures += test_developer_role_mapped();
     failures += test_reject_image_in_translate();
     failures += test_reject_unsupported();
+    failures += test_parse_function_tools_and_choices();
+    failures += test_parse_tool_history_messages();
     failures += test_parse_stop_and_max_tokens();
     failures += test_parse_sampling_carried();
     failures += test_response_serialization();
+    failures += test_tool_response_serialization();
     failures += test_chunk_serialization();
+    failures += test_tool_chunk_serialization();
     failures += test_models_and_error();
     failures += test_finish_reason_wire();
     if (failures == 0) { std::cout << "ok\n"; }

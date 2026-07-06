@@ -44,6 +44,8 @@ struct TextGenerationOptions {
     int max_new_tokens = 128;
     bool raw_output = false;
     bool enable_thinking = false;
+    bool preserve_special_tokens = false;
+    ChatRenderOptions render_options;
     std::vector<int> stop_token_ids;
     TextStreamCallback stream_callback;
     // Checked before each decode step; return true to stop early. Used by the

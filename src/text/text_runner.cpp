@@ -113,8 +113,9 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
     const auto render_start = Clock::now();
     const std::vector<int> stop_token_ids =
         resolve_stop_token_ids(tokenizer_, options.stop_token_ids);
-    const std::string prompt              = render_qwen_chat(
-        messages, ChatRenderOptions{.enable_thinking = options.enable_thinking});
+    ChatRenderOptions render_options = options.render_options;
+    render_options.enable_thinking   = options.enable_thinking;
+    const std::string prompt         = render_qwen_chat(messages, render_options);
     std::vector<int> prompt_token_ids     = tokenizer_.encode(prompt);
     const std::size_t required_context =
         prompt_token_ids.size() + static_cast<std::size_t>(options.max_new_tokens - 1);
@@ -128,8 +129,9 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
 
     const std::vector<int> decode_stop_token_ids = options.raw_output ? std::vector<int>{}
                                                                       : stop_token_ids;
+    const bool skip_special_tokens = !options.raw_output && !options.preserve_special_tokens;
     TokenStreamDecoder stream_decoder(
-        tokenizer_, DecodeOptions{.skip_special_tokens = !options.raw_output,
+        tokenizer_, DecodeOptions{.skip_special_tokens = skip_special_tokens,
                                   .stop_token_ids = decode_stop_token_ids});
 
     // Thinking output opens inside a <think> block that the prompt injected; split
@@ -210,7 +212,7 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
     // independent of whether the caller streamed).
     const std::string decoded = tokenizer_.decode(
         generated_token_ids,
-        DecodeOptions{.skip_special_tokens = !options.raw_output,
+        DecodeOptions{.skip_special_tokens = skip_special_tokens,
                       .stop_token_ids = decode_stop_token_ids});
     ThinkSplitter result_splitter(split_thinking);
     ThinkSplitter::Result head = result_splitter.push(decoded);

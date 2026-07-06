@@ -1,6 +1,7 @@
 #include "qus/serve/generation_service.h"
 
 #include "qus/serve/openai_schema.h"
+#include "qus/serve/tool_call_parser.h"
 #include "qus/serve/translate.h"
 
 #include <algorithm>
@@ -104,10 +105,11 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
     prepared.options       = to_generation_options(req, options_.enable_thinking);
     prepared.stop_strings  = req.stop_strings;
     prepared.include_usage = req.include_usage;
+    prepared.tool_capable  = req.uses_tools() || req.has_tool_history();
 
-    const std::string prompt = qus::text::render_qwen_chat(
-        prepared.messages,
-        qus::text::ChatRenderOptions{.enable_thinking = prepared.options.enable_thinking});
+    qus::text::ChatRenderOptions render_options = prepared.options.render_options;
+    render_options.enable_thinking              = prepared.options.enable_thinking;
+    const std::string prompt = qus::text::render_qwen_chat(prepared.messages, render_options);
     const std::vector<int> ids = tokenizer_->encode(prompt);
     prepared.prompt_tokens     = static_cast<int>(ids.size());
 
@@ -137,6 +139,7 @@ GenerationOutcome GenerationService::run(const PreparedRequest& prepared, const 
     // delta with its channel; stop strings apply to the answer channel only.
     StopSequences matcher(prepared.stop_strings);
     bool stop_matched = false;
+    std::string streamed_answer;
 
     if (sink != nullptr) {
         opt.stream_callback = [&](const qus::text::TextStreamChunk& chunk) {
@@ -146,7 +149,13 @@ GenerationOutcome GenerationService::run(const PreparedRequest& prepared, const 
             }
             if (stop_matched) { return; }
             const StopSequences::Result r = matcher.push(chunk.text);
-            if (!r.emit.empty() && sink->on_content) { sink->on_content(r.emit); }
+            if (!r.emit.empty()) {
+                if (prepared.tool_capable) {
+                    streamed_answer += r.emit;
+                } else if (sink->on_content) {
+                    sink->on_content(r.emit);
+                }
+            }
             if (r.stopped) { stop_matched = true; }
         };
         opt.should_cancel = [&]() {
@@ -175,15 +184,32 @@ GenerationOutcome GenerationService::run(const PreparedRequest& prepared, const 
     if (sink != nullptr) {
         if (!stop_matched) {
             const std::string rest = matcher.flush();
-            if (!rest.empty() && sink->on_content) { sink->on_content(rest); }
+            if (!rest.empty()) {
+                if (prepared.tool_capable) {
+                    streamed_answer += rest;
+                } else if (sink->on_content) {
+                    sink->on_content(rest);
+                }
+            }
         }
         outcome.finish_reason = stop_matched ? qus::text::FinishReason::Stop : result.finish_reason;
+        if (prepared.tool_capable) {
+            ParsedToolCallOutput parsed = parse_qwen_tool_call_output(streamed_answer);
+            outcome.text                = std::move(parsed.content);
+            if (parsed.is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+        }
     } else {
         outcome.reasoning             = result.reasoning;
         const StopSequences::Result r = matcher.push(result.text);
         std::string answer            = r.emit;
         if (!r.stopped) { answer += matcher.flush(); }
-        outcome.text          = std::move(answer);
+        if (prepared.tool_capable) {
+            ParsedToolCallOutput parsed = parse_qwen_tool_call_output(answer);
+            outcome.text                = std::move(parsed.content);
+            if (parsed.is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+        } else {
+            outcome.text = std::move(answer);
+        }
         outcome.finish_reason = r.stopped ? qus::text::FinishReason::Stop : result.finish_reason;
     }
     return outcome;

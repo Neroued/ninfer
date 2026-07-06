@@ -1,0 +1,683 @@
+{
+  "artifact_type": "freq_measure_ranking",
+  "corpus": "tools/freq_corpus/fixtures/corpus/train.jsonl",
+  "counts_file": "ranking.train.counts.i64",
+  "counts_layout": "int64 LE; row 0 = total[vocab]; rows 1..5 = strata[vocab] in strata_order",
+  "counts_rows": 6,
+  "mode": "teacher_forced_argmax",
+  "schema_version": 1,
+  "serving_form": "chat-template conversation blocks; count model argmax over emitted assistant tokens (content + <|im_end|>); teacher-forced on ground-truth content",
+  "split": "train",
+  "status": "complete",
+  "strata_emit_counts": {
+    "code": 3123596,
+    "en_chat": 21247931,
+    "math": 1106855,
+    "other_chat": 7482254,
+    "zh_chat": 18131419
+  },
+  "strata_order": [
+    "en_chat",
+    "zh_chat",
+    "other_chat",
+    "code",
+    "math"
+  ],
+  "tokenizer_dir": "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16",
+  "top_tokens": [
+    {
+      "count": 1520733,
+      "id": 13,
+      "token": "."
+    },
+    {
+      "count": 1390351,
+      "id": 11,
+      "token": ","
+    },
+    {
+      "count": 1009971,
+      "id": 198,
+      "token": "\n"
+    },
+    {
+      "count": 1005076,
+      "id": 3709,
+      "token": "，"
+    },
+    {
+      "count": 982458,
+      "id": 271,
+      "token": "\n\n"
+    },
+    {
+      "count": 876746,
+      "id": 279,
+      "token": " the"
+    },
+    {
+      "count": 778156,
+      "id": 220,
+      "token": " "
+    },
+    {
+      "count": 626347,
+      "id": 1710,
+      "token": "。"
+    },
+    {
+      "count": 574642,
+      "id": 321,
+      "token": " and"
+    },
+    {
+      "count": 465883,
+      "id": 16,
+      "token": "1"
+    },
+    {
+      "count": 461401,
+      "id": 310,
+      "token": " to"
+    },
+    {
+      "count": 434242,
+      "id": 264,
+      "token": " a"
+    },
+    {
+      "count": 426387,
+      "id": 15,
+      "token": "0"
+    },
+    {
+      "count": 402796,
+      "id": 314,
+      "token": " of"
+    },
+    {
+      "count": 374825,
+      "id": 17,
+      "token": "2"
+    },
+    {
+      "count": 352150,
+      "id": 25,
+      "token": ":"
+    },
+    {
+      "count": 312635,
+      "id": 248046,
+      "token": "<|im_end|>"
+    },
+    {
+      "count": 252640,
+      "id": 5205,
+      "token": "、"
+    },
+    {
+      "count": 238629,
+      "id": 303,
+      "token": " in"
+    },
+    {
+      "count": 211518,
+      "id": 18,
+      "token": "3"
+    },
+    {
+      "count": 202102,
+      "id": 8,
+      "token": ")"
+    },
+    {
+      "count": 193655,
+      "id": 4960,
+      "token": "："
+    },
+    {
+      "count": 190879,
+      "id": 283,
+      "token": " ="
+    },
+    {
+      "count": 188036,
+      "id": 369,
+      "token": " is"
+    },
+    {
+      "count": 182032,
+      "id": 262,
+      "token": "   "
+    },
+    {
+      "count": 170318,
+      "id": 20,
+      "token": "5"
+    },
+    {
+      "count": 167046,
+      "id": 19,
+      "token": "4"
+    },
+    {
+      "count": 162128,
+      "id": 364,
+      "token": " for"
+    },
+    {
+      "count": 152985,
+      "id": 12,
+      "token": "-"
+    },
+    {
+      "count": 151409,
+      "id": 421,
+      "token": " that"
+    },
+    {
+      "count": 147485,
+      "id": 95793,
+      "token": "和"
+    },
+    {
+      "count": 147031,
+      "id": 318,
+      "token": " ("
+    },
+    {
+      "count": 140102,
+      "id": 328,
+      "token": " \""
+    },
+    {
+      "count": 122331,
+      "id": 440,
+      "token": " with"
+    },
+    {
+      "count": 119452,
+      "id": 579,
+      "token": "'s"
+    },
+    {
+      "count": 115562,
+      "id": 488,
+      "token": " you"
+    },
+    {
+      "count": 110229,
+      "id": 21,
+      "token": "6"
+    },
+    {
+      "count": 108981,
+      "id": 285,
+      "token": "       "
+    },
+    {
+      "count": 102171,
+      "id": 353,
+      "token": " I"
+    },
+    {
+      "count": 101736,
+      "id": 63,
+      "token": "`"
+    },
+    {
+      "count": 99060,
+      "id": 471,
+      "token": " -"
+    },
+    {
+      "count": 97996,
+      "id": 628,
+      "token": " can"
+    },
+    {
+      "count": 96586,
+      "id": 383,
+      "token": " on"
+    },
+    {
+      "count": 95349,
+      "id": 430,
+      "token": " as"
+    },
+    {
+      "count": 94784,
+      "id": 95726,
+      "token": "的"
+    },
+    {
+      "count": 91633,
+      "id": 23,
+      "token": "8"
+    },
+    {
+      "count": 91023,
+      "id": 24,
+      "token": "9"
+    },
+    {
+      "count": 87347,
+      "id": 26,
+      "token": ";"
+    },
+    {
+      "count": 86704,
+      "id": 71093,
+      "token": "```"
+    },
+    {
+      "count": 85616,
+      "id": 1,
+      "token": "\""
+    },
+    {
+      "count": 84876,
+      "id": 561,
+      "token": " The"
+    },
+    {
+      "count": 84482,
+      "id": 424,
+      "token": " it"
+    },
+    {
+      "count": 83758,
+      "id": 22,
+      "token": "7"
+    },
+    {
+      "count": 82702,
+      "id": 466,
+      "token": " or"
+    },
+    {
+      "count": 82596,
+      "id": 7347,
+      "token": " и"
+    },
+    {
+      "count": 81206,
+      "id": 401,
+      "token": " de"
+    },
+    {
+      "count": 79393,
+      "id": 381,
+      "token": " be"
+    },
+    {
+      "count": 77016,
+      "id": 513,
+      "token": " are"
+    },
+    {
+      "count": 75675,
+      "id": 95772,
+      "token": "在"
+    },
+    {
+      "count": 72860,
+      "id": 313,
+      "token": " {"
+    },
+    {
+      "count": 72598,
+      "id": 1510,
+      "token": " `"
+    },
+    {
+      "count": 68308,
+      "id": 95789,
+      "token": "中"
+    },
+    {
+      "count": 65637,
+      "id": 836,
+      "token": " their"
+    },
+    {
+      "count": 65185,
+      "id": 678,
+      "token": " your"
+    },
+    {
+      "count": 55527,
+      "id": 599,
+      "token": " have"
+    },
+    {
+      "count": 55310,
+      "id": 539,
+      "token": " by"
+    },
+    {
+      "count": 55147,
+      "id": 411,
+      "token": " this"
+    },
+    {
+      "count": 54944,
+      "id": 96402,
+      "token": "使用"
+    },
+    {
+      "count": 53949,
+      "id": 96024,
+      "token": "等"
+    },
+    {
+      "count": 53944,
+      "id": 557,
+      "token": " was"
+    },
+    {
+      "count": 53637,
+      "id": 1024,
+      "token": " her"
+    },
+    {
+      "count": 53288,
+      "id": 494,
+      "token": " from"
+    },
+    {
+      "count": 49934,
+      "id": 780,
+      "token": " his"
+    },
+    {
+      "count": 49018,
+      "id": 760,
+      "token": "The"
+    },
+    {
+      "count": 46662,
+      "id": 29,
+      "token": ">"
+    },
+    {
+      "count": 45451,
+      "id": 449,
+      "token": " an"
+    },
+    {
+      "count": 45338,
+      "id": 9616,
+      "token": "（"
+    },
+    {
+      "count": 45233,
+      "id": 309,
+      "token": "           "
+    },
+    {
+      "count": 45171,
+      "id": 1174,
+      "token": ");"
+    },
+    {
+      "count": 44429,
+      "id": 5624,
+      "token": " в"
+    },
+    {
+      "count": 41887,
+      "id": 7,
+      "token": "("
+    },
+    {
+      "count": 41609,
+      "id": 524,
+      "token": " not"
+    },
+    {
+      "count": 40907,
+      "id": 781,
+      "token": " they"
+    },
+    {
+      "count": 40178,
+      "id": 96442,
+      "token": "需要"
+    },
+    {
+      "count": 39995,
+      "id": 735,
+      "token": " |"
+    },
+    {
+      "count": 39388,
+      "id": 333,
+      "token": " }"
+    },
+    {
+      "count": 38905,
+      "id": 413,
+      "token": " if"
+    },
+    {
+      "count": 38890,
+      "id": 96348,
+      "token": "或"
+    },
+    {
+      "count": 38294,
+      "id": 567,
+      "token": " we"
+    },
+    {
+      "count": 37623,
+      "id": 1147,
+      "token": " la"
+    },
+    {
+      "count": 37268,
+      "id": 14,
+      "token": "/"
+    },
+    {
+      "count": 36448,
+      "id": 60,
+      "token": "]"
+    },
+    {
+      "count": 36121,
+      "id": 6,
+      "token": "'"
+    },
+    {
+      "count": 35728,
+      "id": 478,
+      "token": " +"
+    },
+    {
+      "count": 35329,
+      "id": 359,
+      "token": " '"
+    },
+    {
+      "count": 35091,
+      "id": 0,
+      "token": "!"
+    },
+    {
+      "count": 35058,
+      "id": 30,
+      "token": "?"
+    },
+    {
+      "count": 34898,
+      "id": 363,
+      "token": "()"
+    },
+    {
+      "count": 34653,
+      "id": 694,
+      "token": " but"
+    },
+    {
+      "count": 32983,
+      "id": 95814,
+      "token": "为"
+    },
+    {
+      "count": 32676,
+      "id": 551,
+      "token": " he"
+    },
+    {
+      "count": 32439,
+      "id": 491,
+      "token": " new"
+    },
+    {
+      "count": 32334,
+      "id": 96335,
+      "token": "进行"
+    },
+    {
+      "count": 32091,
+      "id": 96123,
+      "token": "将"
+    },
+    {
+      "count": 31954,
+      "id": 777,
+      "token": " more"
+    },
+    {
+      "count": 31840,
+      "id": 95761,
+      "token": "是"
+    },
+    {
+      "count": 31756,
+      "id": 256,
+      "token": "  "
+    },
+    {
+      "count": 31373,
+      "id": 2005,
+      "token": "“"
+    },
+    {
+      "count": 30993,
+      "id": 361,
+      "token": " <"
+    },
+    {
+      "count": 30671,
+      "id": 357,
+      "token": " A"
+    },
+    {
+      "count": 30461,
+      "id": 96902,
+      "token": "数据"
+    },
+    {
+      "count": 30254,
+      "id": 96172,
+      "token": "并"
+    },
+    {
+      "count": 30187,
+      "id": 92,
+      "token": "}"
+    },
+    {
+      "count": 29968,
+      "id": 95865,
+      "token": "时"
+    },
+    {
+      "count": 29552,
+      "id": 506,
+      "token": " at"
+    },
+    {
+      "count": 29550,
+      "id": 668,
+      "token": " will"
+    },
+    {
+      "count": 29256,
+      "id": 821,
+      "token": " my"
+    },
+    {
+      "count": 29184,
+      "id": 374,
+      "token": " y"
+    },
+    {
+      "count": 28887,
+      "id": 96050,
+      "token": "可以"
+    },
+    {
+      "count": 28749,
+      "id": 7313,
+      "token": "）"
+    },
+    {
+      "count": 28436,
+      "id": 348,
+      "token": " *"
+    },
+    {
+      "count": 28103,
+      "id": 682,
+      "token": " has"
+    },
+    {
+      "count": 27860,
+      "id": 975,
+      "token": " other"
+    },
+    {
+      "count": 27535,
+      "id": 958,
+      "token": " use"
+    },
+    {
+      "count": 27509,
+      "id": 434,
+      "token": " //"
+    },
+    {
+      "count": 27273,
+      "id": 96580,
+      "token": "通过"
+    },
+    {
+      "count": 27260,
+      "id": 795,
+      "token": " data"
+    },
+    {
+      "count": 26957,
+      "id": 1061,
+      "token": " This"
+    }
+  ],
+  "total_convs": 72464,
+  "totals": {
+    "assistant_turns": 200226,
+    "convs_seen": 72464,
+    "convs_skipped": 0,
+    "convs_truncated": 9,
+    "convs_used": 72464,
+    "distinct_emitted_tokens": 204824,
+    "emit_positions": 51092055,
+    "seconds": 31312.634484975,
+    "tokens_forwarded": 70865184
+  },
+  "vocab": 248320,
+  "weights": "out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus"
+}

@@ -14,7 +14,7 @@ namespace {
 
 constexpr std::size_t kMiB = 1024ULL * 1024ULL;
 constexpr std::size_t kGiB = 1024ULL * 1024ULL * 1024ULL;
-constexpr std::size_t kTextPayloadBytes = 16378329088ULL;
+constexpr std::size_t kTextPayloadBytes = 16735369216ULL;
 constexpr std::size_t kMtpPayloadBytes = 451267584ULL;
 constexpr std::size_t kDefaultArenaSlackBytes = 256ULL * kMiB;
 
@@ -83,7 +83,7 @@ int expect_stats(const qus::EngineMemoryStats& stats, std::size_t expected_loade
     failures += stats.q5090_loaded_payload_bytes == expected_loaded_payload
                     ? 0
                     : fail(std::string(label) + " loaded payload mismatch");
-    failures += stats.q5090_tensor_count == 1164
+    failures += stats.q5090_tensor_count == 1166
                     ? 0
                     : fail(std::string(label) + " tensor count mismatch");
     failures += stats.q5090_quant_count > 0 ? 0 : fail(std::string(label) + " quant count zero");
@@ -259,7 +259,7 @@ int expect_generate_discards_pending_overshoot(const std::filesystem::path& weig
 int main() {
     const std::filesystem::path root(QUS_SOURCE_DIR);
     const std::filesystem::path weights_path =
-        root / "out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus";
+        root / "out/qwen3_6_27b.q5090_w4g64_mixed_v4.qus";
     if (!std::filesystem::exists(weights_path)) {
         std::cout << "SKIP: real q5090 file not present\n";
         return 0;

@@ -44,7 +44,7 @@ bool enough_free_memory(std::size_t bytes) {
 
 std::filesystem::path real_weights_path() {
     const std::filesystem::path root(QUS_SOURCE_DIR);
-    return root / "out/qwen3_6_27b.q5090_w4g64_mixed_v3_mtp_w8g32.qus";
+    return root / "out/qwen3_6_27b.q5090_w4g64_mixed_v4.qus";
 }
 
 std::vector<int> foundation_prompt_ids() {

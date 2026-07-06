@@ -8,7 +8,10 @@ std::vector<qus::text::ChatMessage> to_chat_messages(const GenerationRequest& re
     std::vector<qus::text::ChatMessage> out;
     out.reserve(req.messages.size());
     for (const ChatTurn& turn : req.messages) {
-        if (turn.role != "system" && turn.role != "user" && turn.role != "assistant") {
+        // OpenAI's newer schema uses `developer` for instruction messages; the Qwen
+        // template has no such role, so fold it into `system`.
+        std::string role = turn.role == "developer" ? "system" : turn.role;
+        if (role != "system" && role != "user" && role != "assistant") {
             ApiError error;
             error.message = "unsupported role: " + turn.role;
             error.param   = "messages";
@@ -27,7 +30,7 @@ std::vector<qus::text::ChatMessage> to_chat_messages(const GenerationRequest& re
             if (!text.empty() && !part.text.empty()) { text += '\n'; }
             text += part.text;
         }
-        out.push_back(qus::text::ChatMessage{turn.role, std::move(text)});
+        out.push_back(qus::text::ChatMessage{std::move(role), std::move(text)});
     }
     return out;
 }

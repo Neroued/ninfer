@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -22,6 +23,8 @@ namespace {
 // worker) never blocks; the consumer (httplib content provider) waits for items.
 class SseQueue {
 public:
+    enum class PopStatus { Item, Timeout, Done };
+
     void push(std::string item) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -30,15 +33,20 @@ public:
         cv_.notify_one();
     }
 
-    // Blocks until an item is available or the producer is done. Returns false
-    // when the queue is drained and no more items will arrive.
-    bool pop(std::string& out) {
+    // Waits up to `timeout` for an item. Returns Item when one is dequeued, Done
+    // when the producer finished and the queue is drained, or Timeout otherwise.
+    // The timeout lets the consumer poll for client disconnect while the worker
+    // is still in a long prefill (or blocked on the engine mutex) and thus not
+    // yet producing chunks.
+    PopStatus pop(std::string& out, std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] { return !items_.empty() || producer_done_; });
-        if (items_.empty()) { return false; }
+        if (!cv_.wait_for(lock, timeout, [&] { return !items_.empty() || producer_done_; })) {
+            return PopStatus::Timeout;
+        }
+        if (items_.empty()) { return PopStatus::Done; }
         out = std::move(items_.front());
         items_.pop_front();
-        return true;
+        return PopStatus::Item;
     }
 
     void mark_producer_done() {
@@ -91,9 +99,20 @@ HttpServer::HttpServer(GenerationService& service, ServeOptions options)
 }
 
 void HttpServer::register_routes() {
+    if (options_.enable_cors) {
+        server_.set_default_headers({{"Access-Control-Allow-Origin", "*"},
+                                     {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
+                                     {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"}});
+        // CORS preflight: browsers send OPTIONS with no credentials before the real
+        // request; answer it without auth so the actual GET/POST can carry the key.
+        server_.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
+            res.status = 204;
+        });
+    }
+
     server_.set_pre_routing_handler(
         [this](const httplib::Request& req, httplib::Response& res) {
-            if (options_.api_key.empty() || req.path == "/health") {
+            if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
             if (req.get_header_value("Authorization") != ("Bearer " + options_.api_key)) {
@@ -174,7 +193,15 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         limits.default_max_tokens = options_.default_max_tokens;
         limits.max_context        = options_.max_context;
         request                   = parse_chat_completion_request(body, limits);
-        prepared                  = service_.prepare(request);
+        if (request.model != options_.model_id) {
+            ApiError error;
+            error.status  = 404;
+            error.type    = "invalid_request_error";
+            error.code    = "model_not_found";
+            error.message = "model '" + request.model + "' not found";
+            throw ApiException(std::move(error));
+        }
+        prepared = service_.prepare(request);
     } catch (const ApiException& e) {
         write_error(res, e.error());
         return;
@@ -203,18 +230,21 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     worker->thread = std::thread([this, queue, cancelled, prepared_ptr, id, created, model,
                                   include_usage]() {
         try {
-            queue->push(make_chat_chunk_role(id, model, created));
+            queue->push(make_chat_chunk_role(id, model, created, include_usage));
             StreamSink sink;
             sink.on_delta = [&](const std::string& text) {
-                queue->push(make_chat_chunk_content(id, model, created, text));
+                queue->push(make_chat_chunk_content(id, model, created, text, include_usage));
             };
             sink.is_cancelled = [&]() { return cancelled->load(); };
 
             const GenerationOutcome outcome = service_.run(*prepared_ptr, &sink);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
             queue->push(make_chat_chunk_final(id, model, created,
                                               finish_reason_wire(outcome.finish_reason),
-                                              include_usage ? &usage : nullptr));
+                                              include_usage));
+            if (include_usage) {
+                const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+                queue->push(make_chat_chunk_usage(id, model, created, usage));
+            }
             queue->push(sse_done());
         } catch (const ApiException& e) {
             queue->push(sse_error_event(e.error()));
@@ -228,19 +258,37 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         queue->mark_producer_done();
     });
 
+    // SSE hints: disable client/proxy caching and reverse-proxy response buffering
+    // so tokens flush immediately. Content-Type is set by the chunked provider.
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("X-Accel-Buffering", "no");
+
     res.set_chunked_content_provider(
         "text/event-stream",
         [queue, cancelled](std::size_t, httplib::DataSink& sink) -> bool {
-            std::string item;
-            if (!queue->pop(item)) {
-                sink.done();
+            using namespace std::chrono_literals;
+            for (;;) {
+                std::string item;
+                const SseQueue::PopStatus status = queue->pop(item, 200ms);
+                if (status == SseQueue::PopStatus::Done) {
+                    sink.done();
+                    return true;
+                }
+                if (status == SseQueue::PopStatus::Timeout) {
+                    // No chunk yet (prefill/mutex wait). Detect a vanished client
+                    // promptly so generation can be cancelled mid-prefill.
+                    if (sink.is_writable && !sink.is_writable()) {
+                        cancelled->store(true);
+                        return false;
+                    }
+                    continue;
+                }
+                if (!sink.write(item.data(), item.size())) {
+                    cancelled->store(true);
+                    return false;
+                }
                 return true;
             }
-            if (!sink.write(item.data(), item.size())) {
-                cancelled->store(true);
-                return false;
-            }
-            return true;
         },
         [worker, cancelled](bool) {
             // Streaming ended (completed or client gone): ensure the worker stops

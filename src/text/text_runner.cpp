@@ -56,18 +56,24 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
 
     FinishReason finish_reason = FinishReason::Length;
 
+    // If the caller already cancelled (e.g. the streaming client disconnected while
+    // this request waited on the engine mutex), skip the expensive prefill entirely.
+    const bool cancel_before_prefill = options.should_cancel && options.should_cancel();
+
     const auto prefill_start = Clock::now();
     int token = 0;
-    {
+    if (!cancel_before_prefill) {
         const NvtxRange range("qus.prefill");
         token = engine_.prefill(prompt_token_ids);
     }
     const auto prefill_end = Clock::now();
-    generated_token_ids.push_back(token);
-    emit_stream_text(token);
 
     const auto decode_start = Clock::now();
-    {
+    if (cancel_before_prefill) {
+        finish_reason = FinishReason::Cancelled;
+    } else {
+        generated_token_ids.push_back(token);
+        emit_stream_text(token);
         const NvtxRange range("qus.decode");
         if (is_stop(token)) {
             finish_reason = FinishReason::Stop;

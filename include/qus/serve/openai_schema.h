@@ -57,14 +57,22 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
 
 // Streaming SSE event strings ("data: {...}\n\n"). The first chunk carries the
 // assistant role; content chunks carry text deltas; the final chunk carries the
-// finish_reason (and usage when requested).
+// finish_reason with an empty delta. Per the OpenAI stream_options contract, when
+// usage reporting is enabled every content-bearing chunk carries `usage: null`
+// and a single dedicated usage chunk (empty choices) is emitted before [DONE];
+// pass include_usage accordingly.
 std::string make_chat_chunk_role(const std::string& id, const std::string& model,
-                                 std::int64_t created);
+                                 std::int64_t created, bool include_usage);
 std::string make_chat_chunk_content(const std::string& id, const std::string& model,
-                                     std::int64_t created, const std::string& delta_text);
+                                     std::int64_t created, const std::string& delta_text,
+                                     bool include_usage);
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                    std::int64_t created, const char* finish_reason,
-                                   const CompletionUsage* usage);
+                                   bool include_usage);
+// Dedicated usage chunk: `choices: []` with the request's token usage. Emitted
+// only when stream_options.include_usage is true.
+std::string make_chat_chunk_usage(const std::string& id, const std::string& model,
+                                  std::int64_t created, const CompletionUsage& usage);
 std::string sse_done();
 
 // /v1/models payloads.

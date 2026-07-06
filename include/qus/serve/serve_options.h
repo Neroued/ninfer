@@ -23,6 +23,7 @@ struct ServeOptions {
     bool use_lm_head_draft    = false;
     bool enable_thinking      = false;  // default thinking mode for the generation prompt
     int default_max_tokens    = 512;    // used when a request omits max_tokens
+    bool enable_cors          = false;  // send permissive CORS headers for browser UIs
 };
 
 ServeOptions parse_serve_options(int argc, char** argv);

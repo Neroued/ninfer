@@ -99,6 +99,19 @@ int test_reject_image_in_translate() {
                  "image content rejected by translate");
 }
 
+int test_developer_role_mapped() {
+    const Json body = {
+        {"model", "m"},
+        {"messages", Json::array({Json{{"role", "developer"}, {"content", "be terse"}},
+                                  Json{{"role", "user"}, {"content", "hi"}}})}};
+    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+    const auto messages         = to_chat_messages(req);
+    int failures                = 0;
+    failures += check(messages.size() == 2, "developer + user parsed");
+    failures += check(messages[0].role == "system", "developer role mapped to system");
+    return failures;
+}
+
 int test_reject_unsupported() {
     int failures = 0;
     const Json base = {{"model", "m"},
@@ -197,22 +210,40 @@ int test_response_serialization() {
 
 int test_chunk_serialization() {
     int failures = 0;
-    const Json role = parse_sse(make_chat_chunk_role("id", "m", 1));
+    const Json role = parse_sse(make_chat_chunk_role("id", "m", 1, false));
     failures += check(role.at("object") == "chat.completion.chunk", "chunk object");
     failures += check(role.at("choices").at(0).at("delta").at("role") == "assistant", "role delta");
+    failures += check(!role.contains("usage"), "no usage key when include_usage=false");
 
-    const Json content = parse_sse(make_chat_chunk_content("id", "m", 1, "tok"));
+    const Json content = parse_sse(make_chat_chunk_content("id", "m", 1, "tok", false));
     failures += check(content.at("choices").at(0).at("delta").at("content") == "tok", "content delta");
 
-    const CompletionUsage usage{2, 5};
-    const Json final_chunk = parse_sse(make_chat_chunk_final("id", "m", 1, "length", &usage));
+    // When usage reporting is on, content-bearing chunks carry usage: null.
+    const Json role_usage = parse_sse(make_chat_chunk_role("id", "m", 1, true));
+    failures += check(role_usage.contains("usage") && role_usage.at("usage").is_null(),
+                      "role usage null when include_usage=true");
+    const Json content_usage = parse_sse(make_chat_chunk_content("id", "m", 1, "x", true));
+    failures += check(content_usage.contains("usage") && content_usage.at("usage").is_null(),
+                      "content usage null when include_usage=true");
+
+    // Final chunk carries finish_reason with an empty delta and no usage stats.
+    const Json final_chunk = parse_sse(make_chat_chunk_final("id", "m", 1, "length", true));
     failures += check(final_chunk.at("choices").at(0).at("finish_reason") == "length",
                       "final finish_reason");
-    failures += check(final_chunk.contains("usage"), "final usage present when requested");
-    failures += check(final_chunk.at("usage").at("total_tokens") == 7, "final usage total");
+    failures += check(final_chunk.at("choices").at(0).at("delta").empty(), "final delta empty");
+    failures += check(final_chunk.contains("usage") && final_chunk.at("usage").is_null(),
+                      "final usage null (stats live on dedicated chunk)");
 
-    const Json final_no_usage = parse_sse(make_chat_chunk_final("id", "m", 1, "stop", nullptr));
-    failures += check(!final_no_usage.contains("usage"), "no usage when not requested");
+    const Json final_no_usage = parse_sse(make_chat_chunk_final("id", "m", 1, "stop", false));
+    failures += check(!final_no_usage.contains("usage"), "no usage key when include_usage=false");
+
+    // Dedicated usage chunk: empty choices, populated usage.
+    const CompletionUsage usage{2, 5};
+    const Json usage_chunk = parse_sse(make_chat_chunk_usage("id", "m", 1, usage));
+    failures += check(usage_chunk.at("choices").is_array() && usage_chunk.at("choices").empty(),
+                      "usage chunk has empty choices");
+    failures += check(usage_chunk.at("usage").at("prompt_tokens") == 2, "usage chunk prompt_tokens");
+    failures += check(usage_chunk.at("usage").at("total_tokens") == 7, "usage chunk total");
 
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
     return failures;
@@ -258,6 +289,7 @@ int main() {
     int failures = 0;
     failures += test_parse_string_content();
     failures += test_parse_parts_and_flatten();
+    failures += test_developer_role_mapped();
     failures += test_reject_image_in_translate();
     failures += test_reject_unsupported();
     failures += test_parse_stop_and_max_tokens();

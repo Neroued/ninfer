@@ -49,9 +49,17 @@ public:
             buffer_.clear();
             return result;
         }
-        const std::size_t hold     = std::min(buffer_.size(), max_len_ - 1);
-        const std::size_t emit_len = buffer_.size() - hold;
-        result.emit                = buffer_.substr(0, emit_len);
+        const std::size_t hold = std::min(buffer_.size(), max_len_ - 1);
+        std::size_t emit_len   = buffer_.size() - hold;
+        // Never cut in the middle of a multibyte UTF-8 sequence: back the emit
+        // boundary up to the start of a code point so nlohmann never has to
+        // serialize invalid UTF-8 into a delta. The held bytes complete on the
+        // next push (or in flush()).
+        while (emit_len > 0 && emit_len < buffer_.size() &&
+               (static_cast<unsigned char>(buffer_[emit_len]) & 0xC0) == 0x80) {
+            --emit_len;
+        }
+        result.emit = buffer_.substr(0, emit_len);
         buffer_.erase(0, emit_len);
         return result;
     }

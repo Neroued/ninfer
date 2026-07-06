@@ -270,34 +270,43 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
 }
 
 std::string make_chat_chunk_role(const std::string& id, const std::string& model,
-                                 std::int64_t created) {
+                                 std::int64_t created, bool include_usage) {
     Json payload            = base_chunk(id, model, created);
     payload["choices"]      = Json::array({Json{{"index", 0},
                                                 {"delta", Json{{"role", "assistant"}, {"content", ""}}},
                                                 {"finish_reason", nullptr}}});
+    if (include_usage) { payload["usage"] = nullptr; }
     return sse_event(payload);
 }
 
 std::string make_chat_chunk_content(const std::string& id, const std::string& model,
-                                     std::int64_t created, const std::string& delta_text) {
+                                     std::int64_t created, const std::string& delta_text,
+                                     bool include_usage) {
     Json payload       = base_chunk(id, model, created);
     payload["choices"] = Json::array({Json{{"index", 0},
                                            {"delta", Json{{"content", delta_text}}},
                                            {"finish_reason", nullptr}}});
+    if (include_usage) { payload["usage"] = nullptr; }
     return sse_event(payload);
 }
 
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
                                    std::int64_t created, const char* finish_reason,
-                                   const CompletionUsage* usage) {
+                                   bool include_usage) {
     Json payload       = base_chunk(id, model, created);
     payload["choices"] = Json::array(
         {Json{{"index", 0}, {"delta", Json::object()}, {"finish_reason", finish_reason}}});
-    if (usage != nullptr) {
-        payload["usage"] = Json{{"prompt_tokens", usage->prompt_tokens},
-                                {"completion_tokens", usage->completion_tokens},
-                                {"total_tokens", usage->prompt_tokens + usage->completion_tokens}};
-    }
+    if (include_usage) { payload["usage"] = nullptr; }
+    return sse_event(payload);
+}
+
+std::string make_chat_chunk_usage(const std::string& id, const std::string& model,
+                                  std::int64_t created, const CompletionUsage& usage) {
+    Json payload       = base_chunk(id, model, created);
+    payload["choices"] = Json::array();
+    payload["usage"]   = Json{{"prompt_tokens", usage.prompt_tokens},
+                              {"completion_tokens", usage.completion_tokens},
+                              {"total_tokens", usage.prompt_tokens + usage.completion_tokens}};
     return sse_event(payload);
 }
 

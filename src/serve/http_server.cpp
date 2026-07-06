@@ -1,0 +1,257 @@
+#include "qus/serve/http_server.h"
+
+#include "qus/serve/openai_schema.h"
+#include "qus/serve/translate.h"
+
+#include <nlohmann/json.hpp>
+
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <utility>
+
+namespace qus::serve {
+namespace {
+
+// Unbounded, non-blocking-producer SSE event queue. The producer (generation
+// worker) never blocks; the consumer (httplib content provider) waits for items.
+class SseQueue {
+public:
+    void push(std::string item) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            items_.push_back(std::move(item));
+        }
+        cv_.notify_one();
+    }
+
+    // Blocks until an item is available or the producer is done. Returns false
+    // when the queue is drained and no more items will arrive.
+    bool pop(std::string& out) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return !items_.empty() || producer_done_; });
+        if (items_.empty()) { return false; }
+        out = std::move(items_.front());
+        items_.pop_front();
+        return true;
+    }
+
+    void mark_producer_done() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            producer_done_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::string> items_;
+    bool producer_done_ = false;
+};
+
+// RAII wrapper that guarantees the generation worker is joined on every response
+// termination path (normal completion or client disconnect), since httplib
+// destroys the captured content-provider/releaser closures when the stream ends.
+struct JoiningThread {
+    std::thread thread;
+    ~JoiningThread() {
+        if (thread.joinable()) { thread.join(); }
+    }
+};
+
+void write_error(httplib::Response& res, const ApiError& error) {
+    res.status = error.status;
+    res.set_content(make_error_body(error), "application/json");
+}
+
+void write_exception(httplib::Response& res, const std::exception& ex) {
+    ApiError error;
+    error.status  = 500;
+    error.type    = "internal_error";
+    error.message = ex.what();
+    write_error(res, error);
+}
+
+std::string sse_error_event(const ApiError& error) {
+    return "data: " + make_error_body(error) + "\n\n";
+}
+
+} // namespace
+
+HttpServer::HttpServer(GenerationService& service, ServeOptions options)
+    : service_(service), options_(std::move(options)) {
+    register_routes();
+}
+
+void HttpServer::register_routes() {
+    server_.set_pre_routing_handler(
+        [this](const httplib::Request& req, httplib::Response& res) {
+            if (options_.api_key.empty() || req.path == "/health") {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            if (req.get_header_value("Authorization") != ("Bearer " + options_.api_key)) {
+                ApiError error;
+                error.status  = 401;
+                error.type    = "invalid_request_error";
+                error.code    = "invalid_api_key";
+                error.message = "missing or invalid API key";
+                write_error(res, error);
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+
+    server_.set_exception_handler(
+        [](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
+            try {
+                std::rethrow_exception(ep);
+            } catch (const ApiException& e) {
+                write_error(res, e.error());
+            } catch (const std::exception& e) {
+                write_exception(res, e);
+            } catch (...) {
+                ApiError error;
+                error.status  = 500;
+                error.type    = "internal_error";
+                error.message = "unknown error";
+                write_error(res, error);
+            }
+        });
+
+    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    });
+    server_.Get("/v1/models",
+                [this](const httplib::Request& req, httplib::Response& res) { handle_models(req, res); });
+    server_.Get(R"(/v1/models/(.+))",
+                [this](const httplib::Request& req, httplib::Response& res) { handle_model(req, res); });
+    server_.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_chat_completions(req, res);
+    });
+}
+
+void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(make_models_list(options_.model_id, unix_time_now()), "application/json");
+}
+
+void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
+    const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    if (id != options_.model_id) {
+        ApiError error;
+        error.status  = 404;
+        error.type    = "invalid_request_error";
+        error.code    = "model_not_found";
+        error.message = "model '" + id + "' not found";
+        write_error(res, error);
+        return;
+    }
+    res.set_content(make_model_object(options_.model_id, unix_time_now()), "application/json");
+}
+
+void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(req.body);
+    } catch (const std::exception&) {
+        ApiError error;
+        error.status  = 400;
+        error.message = "request body is not valid JSON";
+        write_error(res, error);
+        return;
+    }
+
+    GenerationRequest request;
+    PreparedRequest prepared;
+    try {
+        RequestLimits limits;
+        limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_context        = options_.max_context;
+        request                   = parse_chat_completion_request(body, limits);
+        prepared                  = service_.prepare(request);
+    } catch (const ApiException& e) {
+        write_error(res, e.error());
+        return;
+    }
+
+    const std::string id       = new_chat_completion_id();
+    const std::int64_t created = unix_time_now();
+    const std::string model    = request.model;
+
+    if (!request.stream) {
+        const GenerationOutcome outcome = service_.run(prepared, nullptr);
+        const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+        res.set_content(make_chat_completion_response(id, model, created, outcome.text,
+                                                      finish_reason_wire(outcome.finish_reason),
+                                                      usage),
+                        "application/json");
+        return;
+    }
+
+    auto queue     = std::make_shared<SseQueue>();
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    auto worker    = std::make_shared<JoiningThread>();
+    auto prepared_ptr = std::make_shared<PreparedRequest>(std::move(prepared));
+    const bool include_usage = prepared_ptr->include_usage;
+
+    worker->thread = std::thread([this, queue, cancelled, prepared_ptr, id, created, model,
+                                  include_usage]() {
+        try {
+            queue->push(make_chat_chunk_role(id, model, created));
+            StreamSink sink;
+            sink.on_delta = [&](const std::string& text) {
+                queue->push(make_chat_chunk_content(id, model, created, text));
+            };
+            sink.is_cancelled = [&]() { return cancelled->load(); };
+
+            const GenerationOutcome outcome = service_.run(*prepared_ptr, &sink);
+            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            queue->push(make_chat_chunk_final(id, model, created,
+                                              finish_reason_wire(outcome.finish_reason),
+                                              include_usage ? &usage : nullptr));
+            queue->push(sse_done());
+        } catch (const ApiException& e) {
+            queue->push(sse_error_event(e.error()));
+        } catch (const std::exception& e) {
+            ApiError error;
+            error.status  = 500;
+            error.type    = "internal_error";
+            error.message = e.what();
+            queue->push(sse_error_event(error));
+        }
+        queue->mark_producer_done();
+    });
+
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [queue, cancelled](std::size_t, httplib::DataSink& sink) -> bool {
+            std::string item;
+            if (!queue->pop(item)) {
+                sink.done();
+                return true;
+            }
+            if (!sink.write(item.data(), item.size())) {
+                cancelled->store(true);
+                return false;
+            }
+            return true;
+        },
+        [worker, cancelled](bool) {
+            // Streaming ended (completed or client gone): ensure the worker stops
+            // and is joined. The JoiningThread destructor joins when these
+            // captured shared_ptrs are released by httplib.
+            cancelled->store(true);
+        });
+}
+
+bool HttpServer::listen() { return server_.listen(options_.host, options_.port); }
+
+void HttpServer::stop() { server_.stop(); }
+
+} // namespace qus::serve

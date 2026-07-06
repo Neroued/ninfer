@@ -20,6 +20,7 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
 endif()
 
 find_package(CUDAToolkit REQUIRED)
+find_package(Threads REQUIRED)
 
 # --- Subdirectories ----------------------------------------------------------
 enable_testing()

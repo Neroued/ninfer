@@ -54,6 +54,8 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
                stop_token_ids.end();
     };
 
+    FinishReason finish_reason = FinishReason::Length;
+
     const auto prefill_start = Clock::now();
     int token = 0;
     {
@@ -67,12 +69,21 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
     const auto decode_start = Clock::now();
     {
         const NvtxRange range("qus.decode");
-        if (!is_stop(token)) {
+        if (is_stop(token)) {
+            finish_reason = FinishReason::Stop;
+        } else {
             while (static_cast<int>(generated_token_ids.size()) < options.max_new_tokens) {
+                if (options.should_cancel && options.should_cancel()) {
+                    finish_reason = FinishReason::Cancelled;
+                    break;
+                }
                 token = engine_.decode_step();
                 generated_token_ids.push_back(token);
                 emit_stream_text(token);
-                if (is_stop(token)) { break; }
+                if (is_stop(token)) {
+                    finish_reason = FinishReason::Stop;
+                    break;
+                }
             }
         }
     }
@@ -103,7 +114,8 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
     return TextGenerationResult{.prompt_token_ids = std::move(prompt_token_ids),
                                 .generated_token_ids = std::move(generated_token_ids),
                                 .text = std::move(text),
-                                .timings = timings};
+                                .timings = timings,
+                                .finish_reason = finish_reason};
 }
 
 std::vector<int> resolve_stop_token_ids(const QwenTokenizer& tokenizer,

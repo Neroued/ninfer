@@ -24,12 +24,23 @@ struct TextGenerationTimings {
     double total_seconds = 0.0;
 };
 
+// Why generation stopped. Cancelled means an external caller (e.g. a disconnected
+// streaming client) asked to stop early via should_cancel; it is not an error.
+enum class FinishReason {
+    Stop,
+    Length,
+    Cancelled,
+};
+
 struct TextGenerationOptions {
     int max_new_tokens = 128;
     bool raw_output = false;
     bool enable_thinking = false;
     std::vector<int> stop_token_ids;
     TextStreamCallback stream_callback;
+    // Checked before each decode step; return true to stop early. Used by the
+    // serving layer to abort generation when the HTTP client disconnects.
+    std::function<bool()> should_cancel;
 };
 
 struct TextGenerationResult {
@@ -37,6 +48,7 @@ struct TextGenerationResult {
     std::vector<int> generated_token_ids;
     std::string text;
     TextGenerationTimings timings;
+    FinishReason finish_reason = FinishReason::Length;
 };
 
 class TextGenerationRunner {

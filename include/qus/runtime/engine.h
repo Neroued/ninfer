@@ -5,6 +5,7 @@
 #include "qus/core/kv_cache.h"
 #include "qus/core/state_store.h"
 #include "qus/core/weight_store.h"
+#include "qus/kernels/sampling.h"
 #include "qus/model/model.h"
 #include "qus/runtime/decode_graph.h"
 
@@ -71,6 +72,15 @@ public:
     explicit Engine(EngineOptions options = {});
 
     void load(const std::string& path);
+
+    // Install decode/prefill sampling. temperature <= 0 in `config` is exact
+    // greedy argmax (the default when this is never called), so parity runs stay
+    // deterministic. `config.token_counts` is ignored/overwritten: the engine owns
+    // the per-token count buffer used by the presence/frequency penalties. Safe to
+    // call between requests; it only refreshes a device-resident config buffer, so
+    // captured CUDA graphs remain valid.
+    void set_sampling(const kernels::SamplingConfig& config);
+
     int prefill(std::span<const int> ids);
     int decode_step();
     std::vector<int> generate(std::span<const int> prompt, int max_new_tokens);
@@ -113,6 +123,12 @@ private:
     std::optional<KVCache> mtp_kv_;
     std::optional<GdnState> state_;
     model::StepState io_{};
+    // Device-resident sampling state, owned by the engine and read by the sampler
+    // kernels. `sampling_config_dev_` holds one SamplingConfig; `token_counts_` is
+    // the [vocab] i32 occurrence buffer for the penalties, reset each prefill.
+    Tensor sampling_config_dev_{};
+    Tensor token_counts_{};
+    kernels::SamplingConfig sampling_host_{};
     std::optional<model::Qwen3_6_27B> card_;
     DecodeGraph decode_graph_;
     DecodeGraph round_graph_;

@@ -84,6 +84,7 @@ private:
 } // namespace
 
 GenerationService::GenerationService(ServeOptions options) : options_(std::move(options)) {
+    caps_.sampling = true;  // the engine now honors SamplingParams (temperature 0 == greedy)
     tokenizer_ = std::make_unique<qus::text::QwenTokenizer>(options_.tokenizer_path);
 
     qus::EngineOptions engine_options;
@@ -102,7 +103,7 @@ GenerationService::GenerationService(ServeOptions options) : options_(std::move(
 PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
     PreparedRequest prepared;
     prepared.messages      = to_chat_messages(req);
-    prepared.options       = to_generation_options(req, options_.enable_thinking);
+    prepared.options       = to_generation_options(req, options_);
     prepared.stop_strings  = req.stop_strings;
     prepared.include_usage = req.include_usage;
     prepared.tool_capable  = req.uses_tools() || req.has_tool_history();

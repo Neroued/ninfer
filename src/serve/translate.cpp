@@ -2,8 +2,44 @@
 
 #include "qus/serve/openai_schema.h"
 
+#include <random>
+
 namespace qus::serve {
 namespace {
+
+// A fresh 64-bit seed for requests that omit `seed` and where the operator did
+// not pin one with --seed, so successive regenerations of the same prompt differ.
+std::uint64_t random_seed() {
+    static thread_local std::mt19937_64 rng(std::random_device{}());
+    return rng();
+}
+
+// Resolve the effective sampler: request fields override server defaults; omitted
+// fields fall back to the Qwen3 thinking defaults the server was configured with.
+// --greedy forces exact argmax (temperature 0) regardless of the request. The
+// engine fills token_counts for the penalty path itself, so it stays null here.
+qus::kernels::SamplingConfig resolve_sampling(const SamplingParams& req,
+                                              const ServeOptions& server) {
+    qus::kernels::SamplingConfig cfg;  // default is greedy (temperature 0)
+    if (server.greedy) { return cfg; }
+    cfg.temperature =
+        static_cast<float>(req.temperature.value_or(server.sampling_temperature));
+    cfg.top_p = static_cast<float>(req.top_p.value_or(server.sampling_top_p));
+    cfg.top_k = req.top_k.value_or(server.sampling_top_k);
+    cfg.min_p = 0.0f;
+    cfg.presence_penalty =
+        static_cast<float>(req.presence_penalty.value_or(server.sampling_presence_penalty));
+    cfg.frequency_penalty =
+        static_cast<float>(req.frequency_penalty.value_or(server.sampling_frequency_penalty));
+    if (req.seed.has_value()) {
+        cfg.seed = *req.seed;
+    } else if (server.sampling_seed.has_value()) {
+        cfg.seed = *server.sampling_seed;
+    } else {
+        cfg.seed = random_seed();
+    }
+    return cfg;
+}
 
 std::vector<std::string> effective_tool_jsons(const GenerationRequest& req) {
     std::vector<std::string> out;
@@ -65,15 +101,16 @@ std::vector<qus::text::ChatMessage> to_chat_messages(const GenerationRequest& re
 }
 
 qus::text::TextGenerationOptions to_generation_options(const GenerationRequest& req,
-                                                       bool default_enable_thinking) {
+                                                       const ServeOptions& server) {
     qus::text::TextGenerationOptions options;
     options.max_new_tokens  = req.max_tokens;
     options.raw_output      = false;
-    options.enable_thinking = req.enable_thinking.value_or(default_enable_thinking);
+    options.enable_thinking = req.enable_thinking.value_or(server.enable_thinking);
     options.preserve_special_tokens = req.uses_tools() || req.has_tool_history();
     options.render_options.tool_jsons = effective_tool_jsons(req);
     options.render_options.enable_thinking = options.enable_thinking;
     options.stop_token_ids.clear();  // runner resolves tokenizer default stop ids
+    options.sampling = resolve_sampling(req.sampling, server);
     return options;
 }
 

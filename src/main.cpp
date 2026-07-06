@@ -1,3 +1,4 @@
+#include "qus/kernels/sampling.h"
 #include "qus/runtime/engine.h"
 #include "qus/text/chat_template.h"
 #include "qus/text/cli.h"
@@ -112,6 +113,16 @@ void print_metric(std::string_view label, std::string_view value) {
     std::cerr << std::left << std::setw(10) << "summary" << std::setw(24) << label << value << '\n';
 }
 
+std::string format_sampling(const qus::kernels::SamplingConfig& cfg) {
+    if (cfg.temperature <= 0.0f) { return "greedy (temperature 0)"; }
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2) << "temp=" << cfg.temperature
+        << " top_p=" << cfg.top_p << " top_k=" << cfg.top_k
+        << " presence=" << cfg.presence_penalty << " freq=" << cfg.frequency_penalty
+        << " seed=" << cfg.seed;
+    return out.str();
+}
+
 struct ProgressState {
     Clock::time_point start;
     std::uint64_t last_done  = std::numeric_limits<std::uint64_t>::max();
@@ -178,6 +189,19 @@ int main(int argc, char** argv) {
         generation_options.raw_output      = cli.output_mode == qus::text::OutputMode::Raw;
         generation_options.enable_thinking = cli.enable_thinking;
         generation_options.stop_token_ids  = stop_token_ids;
+        // Default to Qwen3 thinking sampling so the CLI matches real usage and
+        // does not fall into greedy repetition; --greedy leaves the config at
+        // temperature 0 (exact argmax) for deterministic parity runs.
+        qus::kernels::SamplingConfig sampling;  // default is greedy (temperature 0)
+        if (!cli.greedy) {
+            sampling.temperature       = cli.temperature;
+            sampling.top_p             = cli.top_p;
+            sampling.top_k             = cli.top_k;
+            sampling.presence_penalty  = cli.presence_penalty;
+            sampling.frequency_penalty = cli.frequency_penalty;
+            sampling.seed              = cli.seed;
+        }
+        generation_options.sampling = sampling;
         // Answer content streams to stdout; the <think> reasoning streams to stderr
         // so `qus ... > out.txt` captures only the answer, matching how the CLI
         // already routes diagnostics.
@@ -224,6 +248,7 @@ int main(int argc, char** argv) {
         const double decode_seconds        = result.timings.decode_seconds;
         const double seconds               = prefill_seconds + decode_seconds;
 
+        print_metric("sampling", format_sampling(generation_options.sampling));
         print_metric("prompt tokens", std::to_string(prompt_tokens));
         print_metric("generated tokens", std::to_string(generated_tokens));
         print_metric("model elapsed", format_seconds(seconds));

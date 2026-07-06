@@ -24,17 +24,19 @@ void mtp_prepare_verify_inputs_launch(const Tensor& token, const Tensor& drafts,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& drafts, Tensor& length,
-                              Tensor& token, Tensor& sampled_out, Tensor& num_sampled,
-                              Tensor& accepted, Tensor& ar_pos, Tensor& stats,
+void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
+                              const Tensor& drafts, Tensor& length, Tensor& token,
+                              Tensor& sampled_out, Tensor& num_sampled, Tensor& accepted,
+                              Tensor& ar_pos, Tensor& stats, const SamplingConfig* config,
                               cudaStream_t stream) {
-    mtp_accept_tokens_kernel<<<1, 1, 0, stream>>>(
+    mtp_accept_tokens_kernel<<<1, kSamplerBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(target_tokens.data),
+        static_cast<const __nv_bfloat16*>(logits.data),
         static_cast<const std::int32_t*>(drafts.data), static_cast<std::int32_t*>(length.data),
         static_cast<std::int32_t*>(token.data), static_cast<std::int32_t*>(sampled_out.data),
         static_cast<std::int32_t*>(num_sampled.data), static_cast<std::int32_t*>(accepted.data),
-        static_cast<std::int32_t*>(ar_pos.data), static_cast<std::int64_t*>(stats.data),
-        drafts.ne[0]);
+        static_cast<std::int32_t*>(ar_pos.data), static_cast<std::int64_t*>(stats.data), config,
+        logits.ne[0], drafts.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 

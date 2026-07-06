@@ -20,6 +20,7 @@
 #include "qus/kernels/residual_add.h"
 #include "qus/kernels/rmsnorm.h"
 #include "qus/kernels/rope.h"
+#include "qus/kernels/sampling.h"
 #include "qus/kernels/sigmoid_gate_mul.h"
 #include "qus/kernels/silu_and_mul.h"
 
@@ -925,7 +926,17 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                 if constexpr (Tap::enabled) {
                     tap(TapId::AfterLogits, -1, Phase::Prefill, logits, s);
                 }
-                kernels::argmax(logits, io_.token, s);
+                // Set io_.pos to T before picking so the sampler RNG is keyed by the
+                // bonus token's absolute position (prefill purpose keeps it distinct
+                // from the first decode step, which reuses io_.pos == T).
+                detail::set_pos(io_.pos, T, s);
+                if (sampling_config_ != nullptr) {
+                    kernels::sample_column(logits, io_.token, sampling_config_,
+                                           static_cast<const std::int32_t*>(io_.pos.data),
+                                           kernels::kSamplePurposePrefill, s);
+                } else {
+                    kernels::argmax(logits, io_.token, s);
+                }
             }
 
             const bool can_prepare_final_mtp =
@@ -987,7 +998,6 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
         kv_.pos = static_cast<std::uint32_t>(t0 + len);
     }
 
-    detail::set_pos(io_.pos, T, s);
     ctx_.synchronize();
     work_.reset();
 }
@@ -1019,7 +1029,15 @@ void Qwen3_6_27B::decode_step_impl(Tap& tap) {
     Tensor logits = matrix_window(io_.logits, 1);
     kernels::linear(xf, *lm_head_, logits, work_, s);
     if constexpr (Tap::enabled) { tap(TapId::AfterLogits, -1, Phase::Decode, logits, s); }
-    kernels::argmax(logits, io_.token, s);
+    // io_.pos holds the input token's absolute position here; the decode purpose
+    // keeps this draw distinct from the prefill bonus token that shares io_.pos.
+    if (sampling_config_ != nullptr) {
+        kernels::sample_column(logits, io_.token, sampling_config_,
+                               static_cast<const std::int32_t*>(io_.pos.data),
+                               kernels::kSamplePurposeDecode, s);
+    } else {
+        kernels::argmax(logits, io_.token, s);
+    }
 
     detail::advance_pos(io_.pos, s);
     work_.reset();

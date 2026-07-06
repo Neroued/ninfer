@@ -6,6 +6,7 @@
 // adding images later means extending only this layer (and the template).
 
 #include "qus/serve/request.h"
+#include "qus/serve/serve_options.h"
 #include "qus/text/chat_template.h"
 #include "qus/text/text_runner.h"
 
@@ -17,10 +18,11 @@ namespace qus::serve {
 // unsupported roles or non-text content.
 std::vector<qus::text::ChatMessage> to_chat_messages(const GenerationRequest& req);
 
-// Build runner options (max_new_tokens, thinking, clean output). Sampling params
-// are intentionally not wired in yet (greedy engine); see ServerCapabilities.
+// Build runner options (max_new_tokens, thinking, clean output, sampler). The
+// sampler is resolved from the request's SamplingParams over the server defaults;
+// --greedy on the server forces exact argmax regardless of the request.
 qus::text::TextGenerationOptions to_generation_options(const GenerationRequest& req,
-                                                       bool default_enable_thinking);
+                                                       const ServeOptions& server);
 
 // Map an internal finish reason onto the OpenAI wire value. Cancelled maps to
 // "stop" (a disconnected client is not an error state on the wire).

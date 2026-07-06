@@ -30,6 +30,16 @@ struct CliOptions {
     bool enable_thinking        = false;
     bool use_lm_head_draft      = false;
     std::vector<int> stop_token_ids;
+    // Sampler defaults match the Qwen3 thinking recommendation so the CLI decodes
+    // like real usage; --greedy forces exact argmax (temperature 0) for parity.
+    // The default seed is fixed so demo runs are reproducible unless overridden.
+    float temperature           = 0.6f;
+    float top_p                 = 0.95f;
+    int top_k                   = 20;
+    float presence_penalty      = 1.0f;
+    float frequency_penalty     = 0.0f;
+    std::uint64_t seed          = 0;
+    bool greedy                 = false;
 };
 
 CliOptions parse_cli(int argc, char** argv);

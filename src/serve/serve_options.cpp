@@ -20,6 +20,24 @@ int parse_nonnegative_int(const char* text, const char* label) {
     return static_cast<int>(value);
 }
 
+float parse_float_in(const char* text, const char* label, float lo, float hi) {
+    char* end         = nullptr;
+    const double value = std::strtod(text, &end);
+    if (end == text || *end != '\0' || !(value >= lo) || !(value <= hi)) {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
+    }
+    return static_cast<float>(value);
+}
+
+std::uint64_t parse_u64(const char* text, const char* label) {
+    char* end                     = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0') {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
+    }
+    return static_cast<std::uint64_t>(value);
+}
+
 } // namespace
 
 int derive_default_max_tokens(std::uint32_t max_context) {
@@ -34,10 +52,16 @@ std::string serve_usage_text(const char* argv0) {
            " <weights.qus> --tokenizer <dir> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
            "[--mtp-draft-tokens N] [--default-max-tokens N] [--no-cuda-graph] "
-           "[--lm-head-draft] [--thinking] [--cors]\n"
+           "[--lm-head-draft] [--thinking] [--cors] "
+           "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
+           "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves an OpenAI-compatible Chat Completions endpoint\n"
            "       --default-max-tokens defaults to min(max_context/2, "
-           + std::to_string(kDefaultMaxTokensCeiling) + ") when omitted\n";
+           + std::to_string(kDefaultMaxTokensCeiling) +
+           ") when omitted\n"
+           "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
+           "top-k 20, presence-penalty 1.0); a request may override any field.\n"
+           "       --greedy forces temperature 0 (exact argmax) for determinism/parity.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -88,6 +112,23 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
+        } else if (arg == "--temperature") {
+            options.sampling_temperature =
+                parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
+        } else if (arg == "--top-p") {
+            options.sampling_top_p = parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
+        } else if (arg == "--top-k") {
+            options.sampling_top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
+        } else if (arg == "--presence-penalty") {
+            options.sampling_presence_penalty =
+                parse_float_in(require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
+        } else if (arg == "--frequency-penalty") {
+            options.sampling_frequency_penalty = parse_float_in(
+                require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
+        } else if (arg == "--seed") {
+            options.sampling_seed = parse_u64(require_value("--seed"), "seed");
+        } else if (arg == "--greedy") {
+            options.greedy = true;
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }

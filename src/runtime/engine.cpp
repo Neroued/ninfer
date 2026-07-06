@@ -518,8 +518,22 @@ void Engine::load(const std::string& path) {
                                ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.ar_pos.data, 0, io_.ar_pos.bytes(), ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.stats.data, 0, io_.stats.bytes(), ctx_->stream));
+
+    // Device-resident sampler state. The config buffer defaults to greedy so a
+    // freshly loaded engine (no set_sampling call) reproduces argmax exactly.
+    token_counts_        = cache_arena_->alloc(DType::I32, {model::kCfg.vocab});
+    const auto cfg_words = static_cast<std::int32_t>(
+        (sizeof(kernels::SamplingConfig) + sizeof(std::int32_t) - 1) / sizeof(std::int32_t));
+    sampling_config_dev_ = cache_arena_->alloc(DType::I32, {cfg_words});
+    CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
+    sampling_host_              = kernels::SamplingConfig{};  // temperature 0 => greedy
+    sampling_host_.token_counts = nullptr;
+    CUDA_CHECK(cudaMemcpyAsync(sampling_config_dev_.data, &sampling_host_, sizeof(sampling_host_),
+                               cudaMemcpyHostToDevice, ctx_->stream));
+
     card_.emplace(*ctx_, *weights_, *work_, *kv_, *state_, io_, options_.prefill_chunk,
                   mtp_kv_ ? &*mtp_kv_ : nullptr);
+    card_->set_sampling(static_cast<const kernels::SamplingConfig*>(sampling_config_dev_.data));
 
     // bind() auto-binds the embedded draft head when present. Enforce the two-mode
     // toggle here: keep it only when explicitly enabled, and fail loudly if enabled
@@ -586,6 +600,20 @@ void Engine::reset_mtp_stats() {
     ctx_->synchronize();
 }
 
+void Engine::set_sampling(const kernels::SamplingConfig& config) {
+    require_loaded();
+    sampling_host_ = config;
+    // The engine owns the count buffer; only attach it when a penalty needs it so
+    // the sampler skips the count reads/increment otherwise.
+    const bool penalties =
+        (config.presence_penalty != 0.0f) || (config.frequency_penalty != 0.0f);
+    sampling_host_.token_counts =
+        penalties ? static_cast<std::int32_t*>(token_counts_.data) : nullptr;
+    CUDA_CHECK(cudaMemcpyAsync(sampling_config_dev_.data, &sampling_host_, sizeof(sampling_host_),
+                               cudaMemcpyHostToDevice, ctx_->stream));
+    ctx_->synchronize();
+}
+
 int Engine::read_token() {
     int token = 0;
     ctx_->synchronize();
@@ -626,6 +654,8 @@ int Engine::prefill(std::span<const int> ids) {
     pending_sampled_.clear();
     state_->reset(ctx_->stream);
     kernels::mtp_reset_gdn_initial_slot(io_.gdn_initial_slot, ctx_->stream);
+    // Penalty counts are per-request: clear them before this prompt's first pick.
+    CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
     card_->prefill(ids);
     return read_token();
 }
@@ -682,8 +712,10 @@ void Engine::record_decode_round() {
     kernels::mtp_prepare_verify_inputs(io_.token, io_.drafts, io_.pos, io_.window_base,
                                        io_.verify_ids, io_.positions, ctx_->stream);
     card_->target_verify(io_.verify_ids, io_.positions);
-    kernels::mtp_accept_tokens(io_.target_tokens, io_.drafts, io_.pos, io_.token, io_.sampled_out,
-                               io_.num_sampled, io_.accepted, io_.ar_pos, io_.stats, ctx_->stream);
+    kernels::mtp_accept_tokens(
+        io_.target_tokens, io_.logits, io_.drafts, io_.pos, io_.token, io_.sampled_out,
+        io_.num_sampled, io_.accepted, io_.ar_pos, io_.stats,
+        static_cast<const kernels::SamplingConfig*>(sampling_config_dev_.data), ctx_->stream);
     kernels::mtp_set_gdn_initial_slot_from_accepted(io_.accepted, io_.gdn_initial_slot,
                                                     ctx_->stream);
     record_propose(k);

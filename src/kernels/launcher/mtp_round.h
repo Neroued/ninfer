@@ -1,6 +1,7 @@
 #pragma once
 
 #include "qus/core/tensor.h"
+#include "qus/kernels/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -11,9 +12,10 @@ void mtp_prepare_verify_inputs_launch(const Tensor& token, const Tensor& drafts,
                                       Tensor& verify_ids, Tensor& positions,
                                       cudaStream_t stream);
 
-void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& drafts, Tensor& length,
-                              Tensor& token, Tensor& sampled_out, Tensor& num_sampled,
-                              Tensor& accepted, Tensor& ar_pos, Tensor& stats,
+void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
+                              const Tensor& drafts, Tensor& length, Tensor& token,
+                              Tensor& sampled_out, Tensor& num_sampled, Tensor& accepted,
+                              Tensor& ar_pos, Tensor& stats, const SamplingConfig* config,
                               cudaStream_t stream);
 
 void mtp_prepare_shifted_ids_launch(const Tensor& verify_ids, const Tensor& token,

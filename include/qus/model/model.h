@@ -7,6 +7,7 @@
 #include "qus/core/tensor.h"
 #include "qus/core/weight.h"
 #include "qus/core/weight_store.h"
+#include "qus/kernels/sampling.h"
 #include "qus/model/config.h"
 
 #include <array>
@@ -156,6 +157,17 @@ public:
         lm_head_draft_n_   = n;
     }
 
+    // Device-resident sampling config for the argmax/sample sites. When null the
+    // decode/prefill token pick stays exact greedy argmax; when set, sample_column
+    // reads it (temperature == 0 in the config is still exact greedy). The pointer
+    // is stable across requests so a captured CUDA graph stays valid; only the
+    // buffer contents change between requests.
+    void set_sampling(const kernels::SamplingConfig* config) noexcept { sampling_config_ = config; }
+
+    [[nodiscard]] const kernels::SamplingConfig* sampling_config() const noexcept {
+        return sampling_config_;
+    }
+
     [[nodiscard]] const Weight* lm_head_draft() const noexcept { return lm_head_draft_; }
 
     [[nodiscard]] const std::int32_t* lm_head_draft_ids() const noexcept {
@@ -283,6 +295,7 @@ private:
     const Weight* lm_head_draft_            = nullptr;
     const std::int32_t* lm_head_draft_ids_ = nullptr;
     int lm_head_draft_n_                   = 0;
+    const kernels::SamplingConfig* sampling_config_ = nullptr;
     MtpW mtp_{};
     std::array<FullLayerW, ModelConfig::n_full()> full_{};
     std::array<GdnLayerW, ModelConfig::n_gdn()> gdn_{};

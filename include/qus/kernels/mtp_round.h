@@ -3,6 +3,7 @@
 // qus::kernels - fixed-shape MTP round state helpers.
 
 #include "qus/core/tensor.h"
+#include "qus/kernels/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -12,9 +13,14 @@ void mtp_prepare_verify_inputs(const Tensor& token, const Tensor& drafts, const 
                                Tensor& window_base, Tensor& verify_ids, Tensor& positions,
                                cudaStream_t stream);
 
-void mtp_accept_tokens(const Tensor& target_tokens, const Tensor& drafts, Tensor& length,
-                       Tensor& token, Tensor& sampled_out, Tensor& num_sampled, Tensor& accepted,
-                       Tensor& ar_pos, Tensor& stats, cudaStream_t stream);
+// Commits one MTP round. `logits` is the [vocab, k+1] verify-column logits and
+// `config` is the device-resident sampler config: temperature <= 0 keeps the
+// exact greedy argmax accept (using `target_tokens`), temperature > 0 runs
+// distribution-correct rejection sampling over `logits`.
+void mtp_accept_tokens(const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+                       Tensor& length, Tensor& token, Tensor& sampled_out, Tensor& num_sampled,
+                       Tensor& accepted, Tensor& ar_pos, Tensor& stats,
+                       const SamplingConfig* config, cudaStream_t stream);
 
 void mtp_prepare_shifted_ids(const Tensor& verify_ids, const Tensor& token,
                              const Tensor& accepted, Tensor& shifted_ids, cudaStream_t stream);

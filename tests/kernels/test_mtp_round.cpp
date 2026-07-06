@@ -1,9 +1,12 @@
 #include "qus/kernels/mtp_round.h"
+#include "qus/kernels/sampling.h"
 #include "qus/model/model.h"
 #include "kernels/op_tester.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -19,6 +22,22 @@ DBuf to_device_i64(const std::vector<std::int64_t>& h) {
     DBuf d(h.size() * sizeof(std::int64_t));
     cudaMemcpy(d.p, h.data(), h.size() * sizeof(std::int64_t), cudaMemcpyHostToDevice);
     return d;
+}
+
+DBuf to_device_config(const kernels::SamplingConfig& cfg) {
+    DBuf d(sizeof(kernels::SamplingConfig));
+    cudaMemcpy(d.p, &cfg, sizeof(cfg), cudaMemcpyHostToDevice);
+    return d;
+}
+
+const kernels::SamplingConfig* config_ptr(const DBuf& d) {
+    return static_cast<const kernels::SamplingConfig*>(d.p);
+}
+
+// Zero logits buffer [vocab, cols]; unused by the greedy accept branch but
+// required by the wrapper's shape validation.
+DBuf zero_logits(int vocab, int cols) {
+    return to_device_bf16(std::vector<float>(static_cast<std::size_t>(vocab) * cols, 0.0f));
 }
 
 DBuf to_device_u16(const std::vector<std::uint16_t>& h) {
@@ -98,7 +117,10 @@ int accept_partial_case() {
     DBuf d_ar_pos(sizeof(std::int32_t));
     auto d_stats = to_device_i64({5, 7, 3, 4, 100, 200, 300, 400, 500});
 
+    DBuf d_logits = zero_logits(16, k + 1);
+    DBuf d_cfg    = to_device_config(kernels::SamplingConfig{});  // greedy
     Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits(d_logits.p, DType::BF16, {16, k + 1});
     Tensor drafts(d_drafts.p, DType::I32, {k});
     Tensor length(d_length.p, DType::I32, {1});
     Tensor token(d_token.p, DType::I32, {1});
@@ -107,8 +129,8 @@ int accept_partial_case() {
     Tensor accepted(d_accepted.p, DType::I32, {1});
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {model::kStepStatsCounters});
-    kernels::mtp_accept_tokens(targets, drafts, length, token, sampled, num, accepted, ar_pos,
-                               stats, nullptr);
+    kernels::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
+                               ar_pos, stats, config_ptr(d_cfg), nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -136,7 +158,10 @@ int accept_all_reject_case() {
     DBuf d_ar_pos(sizeof(std::int32_t));
     auto d_stats = to_device_i64(std::vector<std::int64_t>(model::kStepStatsCounters, 0));
 
+    DBuf d_logits = zero_logits(16, k + 1);
+    DBuf d_cfg    = to_device_config(kernels::SamplingConfig{});  // greedy
     Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits(d_logits.p, DType::BF16, {16, k + 1});
     Tensor drafts(d_drafts.p, DType::I32, {k});
     Tensor length(d_length.p, DType::I32, {1});
     Tensor token(d_token.p, DType::I32, {1});
@@ -145,8 +170,8 @@ int accept_all_reject_case() {
     Tensor accepted(d_accepted.p, DType::I32, {1});
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {model::kStepStatsCounters});
-    kernels::mtp_accept_tokens(targets, drafts, length, token, sampled, num, accepted, ar_pos,
-                               stats, nullptr);
+    kernels::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
+                               ar_pos, stats, config_ptr(d_cfg), nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -175,7 +200,10 @@ int accept_all_case() {
     DBuf d_ar_pos(sizeof(std::int32_t));
     auto d_stats = to_device_i64(std::vector<std::int64_t>(model::kStepStatsCounters, 0));
 
+    DBuf d_logits = zero_logits(16, k + 1);
+    DBuf d_cfg    = to_device_config(kernels::SamplingConfig{});  // greedy
     Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits(d_logits.p, DType::BF16, {16, k + 1});
     Tensor drafts(d_drafts.p, DType::I32, {k});
     Tensor length(d_length.p, DType::I32, {1});
     Tensor token(d_token.p, DType::I32, {1});
@@ -184,8 +212,8 @@ int accept_all_case() {
     Tensor accepted(d_accepted.p, DType::I32, {1});
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {model::kStepStatsCounters});
-    kernels::mtp_accept_tokens(targets, drafts, length, token, sampled, num, accepted, ar_pos,
-                               stats, nullptr);
+    kernels::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
+                               ar_pos, stats, config_ptr(d_cfg), nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -299,6 +327,156 @@ int gdn_initial_slot_case() {
     return failures;
 }
 
+// With a one-hot (greedy) draft, speculative rejection sampling must make the
+// committed token at the first decision position distributed exactly as the
+// target column-0 distribution p0 -- independent of the draft value and of
+// whether that draft is accepted or rejected. Aggregate sampled_out[0] over many
+// rounds (each a distinct position => distinct RNG) and compare to p0.
+int reject_sampling_distribution_case() {
+    constexpr int k     = 1;
+    constexpr int vocab = 16;
+    std::vector<float> base(vocab);
+    fill_uniform(base, 4242u, -2.5f, 2.5f);
+    round_to_bf16(base);
+
+    std::vector<float> logits_h(static_cast<std::size_t>(vocab) * (k + 1), 0.0f);
+    for (int v = 0; v < vocab; ++v) {
+        logits_h[v]             = base[v];  // column 0 -> p0
+        logits_h[vocab + v]     = base[v];  // column 1 (bonus, not checked here)
+    }
+    DBuf d_logits = to_device_bf16(logits_h);
+
+    double mmax = base[0];
+    for (float x : base) { mmax = std::max(mmax, static_cast<double>(x)); }
+    std::vector<double> p0(vocab);
+    double sum = 0.0;
+    for (int v = 0; v < vocab; ++v) {
+        p0[v] = std::exp(static_cast<double>(base[v]) - mmax);
+        sum += p0[v];
+    }
+    for (double& x : p0) { x /= sum; }
+
+    const int d0 = 5;  // a mid-probability draft exercises accept and reject
+    kernels::SamplingConfig cfg;
+    cfg.temperature = 1.0f;
+    cfg.seed        = 99u;
+    DBuf d_cfg      = to_device_config(cfg);
+
+    const int N = 40000;
+    std::vector<int> lengths(static_cast<std::size_t>(N));
+    for (int i = 0; i < N; ++i) { lengths[static_cast<std::size_t>(i)] = i; }
+    DBuf d_lengths = to_device_i32(lengths);
+    DBuf d_scratch(sizeof(std::int32_t));
+    DBuf d_collect(static_cast<std::size_t>(N) * sizeof(std::int32_t));
+
+    auto d_targets = to_device_i32({0, 0});
+    auto d_drafts  = to_device_i32({d0});
+    auto d_token   = to_device_i32({-1});
+    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
+    DBuf d_num(sizeof(std::int32_t));
+    DBuf d_accepted(sizeof(std::int32_t));
+    DBuf d_ar_pos(sizeof(std::int32_t));
+    auto d_stats = to_device_i64(std::vector<std::int64_t>(model::kStepStatsCounters, 0));
+
+    Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
+    Tensor drafts(d_drafts.p, DType::I32, {k});
+    Tensor length(d_scratch.p, DType::I32, {1});
+    Tensor token(d_token.p, DType::I32, {1});
+    Tensor sampled(d_sampled.p, DType::I32, {k + 1});
+    Tensor num(d_num.p, DType::I32, {1});
+    Tensor accepted(d_accepted.p, DType::I32, {1});
+    Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
+    Tensor stats(d_stats.p, DType::I64, {model::kStepStatsCounters});
+
+    for (int r = 0; r < N; ++r) {
+        cudaMemcpyAsync(d_scratch.p, static_cast<const std::int32_t*>(d_lengths.p) + r,
+                        sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
+        kernels::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
+                                   ar_pos, stats, config_ptr(d_cfg), nullptr);
+        cudaMemcpyAsync(static_cast<std::int32_t*>(d_collect.p) + r, d_sampled.p,
+                        sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
+    }
+    cudaDeviceSynchronize();
+
+    std::vector<int> results = from_device_i32(d_collect, static_cast<std::size_t>(N));
+    std::vector<double> freq(vocab, 0.0);
+    for (int tok : results) {
+        if (tok < 0 || tok >= vocab) {
+            std::cerr << "reject distribution: token out of range " << tok << '\n';
+            return 1;
+        }
+        freq[tok] += 1.0;
+    }
+    for (double& f : freq) { f /= static_cast<double>(N); }
+
+    double max_abs = 0.0;
+    for (int v = 0; v < vocab; ++v) { max_abs = std::max(max_abs, std::abs(freq[v] - p0[v])); }
+    if (max_abs > 0.015) {
+        std::cerr << "reject distribution: committed/target gap " << max_abs << " too large\n";
+        for (int v = 0; v < vocab; ++v) {
+            std::cerr << "    v=" << v << " freq=" << freq[v] << " p0=" << p0[v] << '\n';
+        }
+        return 1;
+    }
+    std::cout << "    reject sampling distribution ok (max abs diff " << max_abs << ")\n";
+    return 0;
+}
+
+int reject_sampling_reproducible_case() {
+    constexpr int k     = 3;
+    constexpr int vocab = 32;
+    std::vector<float> logits_h(static_cast<std::size_t>(vocab) * (k + 1));
+    fill_uniform(logits_h, 7u, -3.0f, 3.0f);
+    round_to_bf16(logits_h);
+    DBuf d_logits = to_device_bf16(logits_h);
+
+    kernels::SamplingConfig cfg;
+    cfg.temperature = 0.8f;
+    cfg.top_p       = 0.95f;
+    cfg.seed        = 2026u;
+    DBuf d_cfg      = to_device_config(cfg);
+
+    auto d_targets = to_device_i32({0, 0, 0, 0});
+    auto d_drafts  = to_device_i32({3, 9, 17});
+    auto d_token   = to_device_i32({-1});
+    DBuf d_sampled((k + 1) * sizeof(std::int32_t));
+    DBuf d_num(sizeof(std::int32_t));
+    DBuf d_accepted(sizeof(std::int32_t));
+    DBuf d_ar_pos(sizeof(std::int32_t));
+    auto d_stats = to_device_i64(std::vector<std::int64_t>(model::kStepStatsCounters, 0));
+
+    Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
+    Tensor drafts(d_drafts.p, DType::I32, {k});
+    Tensor token(d_token.p, DType::I32, {1});
+    Tensor sampled(d_sampled.p, DType::I32, {k + 1});
+    Tensor num(d_num.p, DType::I32, {1});
+    Tensor accepted(d_accepted.p, DType::I32, {1});
+    Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
+    Tensor stats(d_stats.p, DType::I64, {model::kStepStatsCounters});
+
+    auto run_once = [&]() {
+        auto d_length = to_device_i32({10});
+        Tensor length(d_length.p, DType::I32, {1});
+        kernels::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
+                                   ar_pos, stats, config_ptr(d_cfg), nullptr);
+        cudaDeviceSynchronize();
+        std::vector<int> out = from_device_i32(d_sampled, k + 1);
+        out.push_back(from_device_i32(d_num, 1)[0]);
+        return out;
+    };
+
+    std::vector<int> a = run_once();
+    std::vector<int> b = run_once();
+    if (a != b) {
+        std::cerr << "reject reproducible: identical seed/length produced different output\n";
+        return 1;
+    }
+    std::cout << "    reject sampling reproducibility ok\n";
+    return 0;
+}
+
 int validation_case() {
     try {
         DBuf d(4);
@@ -325,6 +503,8 @@ int main() {
     failures += accept_partial_case();
     failures += accept_all_reject_case();
     failures += accept_all_case();
+    failures += reject_sampling_distribution_case();
+    failures += reject_sampling_reproducible_case();
     failures += shifted_case();
     failures += shifted_all_accept_case();
     failures += gather_case();

@@ -33,6 +33,24 @@ int parse_mtp_draft_tokens(const char* text) {
     return value;
 }
 
+float parse_float_in(const char* text, const char* label, float lo, float hi) {
+    char* end          = nullptr;
+    const double value = std::strtod(text, &end);
+    if (end == text || *end != '\0' || !(value >= lo) || !(value <= hi)) {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
+    }
+    return static_cast<float>(value);
+}
+
+std::uint64_t parse_u64(const char* text, const char* label) {
+    char* end                      = nullptr;
+    const unsigned long long value = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0') {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
+    }
+    return static_cast<std::uint64_t>(value);
+}
+
 } // namespace
 
 std::string usage_text(const char* argv0) {
@@ -40,8 +58,12 @@ std::string usage_text(const char* argv0) {
            " <weights.qus> --tokenizer <dir> (--prompt <text>|--messages <messages.json>) "
            "[--max-context N] [--prefill-chunk N] [--max-new N] [--device N] [--raw-output] "
            "[--print-token-ids] [--no-cuda-graph] [--lm-head-draft] [--thinking] "
-           "[--mtp-draft-tokens N] [--stop-token-id N]...\n"
-           "       streams decoded text to stdout; writes progress and timings to stderr\n";
+           "[--mtp-draft-tokens N] [--stop-token-id N]... "
+           "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
+           "[--frequency-penalty F] [--seed N] [--greedy]\n"
+           "       streams decoded text to stdout; writes progress and timings to stderr\n"
+           "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
+           "top-k 20, presence-penalty 1.0); --greedy forces temperature 0 (exact argmax)\n";
 }
 
 CliOptions parse_cli(int argc, char** argv) {
@@ -89,6 +111,23 @@ CliOptions parse_cli(int argc, char** argv) {
         } else if (arg == "--stop-token-id") {
             options.stop_token_ids.push_back(
                 parse_nonnegative_int(require_value("--stop-token-id"), "stop-token-id"));
+        } else if (arg == "--temperature") {
+            options.temperature =
+                parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
+        } else if (arg == "--top-p") {
+            options.top_p = parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
+        } else if (arg == "--top-k") {
+            options.top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
+        } else if (arg == "--presence-penalty") {
+            options.presence_penalty =
+                parse_float_in(require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
+        } else if (arg == "--frequency-penalty") {
+            options.frequency_penalty = parse_float_in(
+                require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
+        } else if (arg == "--seed") {
+            options.seed = parse_u64(require_value("--seed"), "seed");
+        } else if (arg == "--greedy") {
+            options.greedy = true;
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }

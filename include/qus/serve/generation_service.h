@@ -63,10 +63,10 @@ struct PreparedRequest {
 };
 
 // Which optional generation features the engine currently honors. Sampling is
-// off (greedy) today; flipping this is the single seam the future sampler wires
-// into, leaving the protocol/translation layers untouched.
+// wired through translate.cpp -> TextGenerationOptions -> Engine::set_sampling;
+// temperature 0 (or --greedy) selects the exact-argmax path.
 struct ServerCapabilities {
-    bool sampling = false;
+    bool sampling = true;
 };
 
 class GenerationService {

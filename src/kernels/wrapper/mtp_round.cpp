@@ -57,12 +57,17 @@ void mtp_prepare_verify_inputs(const Tensor& token, const Tensor& drafts, const 
                                              positions, stream);
 }
 
-void mtp_accept_tokens(const Tensor& target_tokens, const Tensor& drafts, Tensor& length,
-                       Tensor& token, Tensor& sampled_out, Tensor& num_sampled, Tensor& accepted,
-                       Tensor& ar_pos, Tensor& stats, cudaStream_t stream) {
+void mtp_accept_tokens(const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+                       Tensor& length, Tensor& token, Tensor& sampled_out, Tensor& num_sampled,
+                       Tensor& accepted, Tensor& ar_pos, Tensor& stats,
+                       const SamplingConfig* config, cudaStream_t stream) {
     constexpr const char* op = "mtp_accept_tokens";
     const std::int32_t k     = drafts.ne[0];
     require_vector(target_tokens, DType::I32, k + 1, op, "target_tokens");
+    require_dtype(logits, DType::BF16, op, "logits");
+    if (logits.ne[0] <= 0 || logits.ne[1] < k + 1 || logits.ne[2] != 1 || logits.ne[3] != 1) {
+        throw std::invalid_argument("mtp_accept_tokens: logits must be [vocab, >=k+1]");
+    }
     require_vector(drafts, DType::I32, k, op, "drafts");
     require_scalar(length, DType::I32, op, "length");
     require_scalar(token, DType::I32, op, "token");
@@ -71,8 +76,11 @@ void mtp_accept_tokens(const Tensor& target_tokens, const Tensor& drafts, Tensor
     require_scalar(accepted, DType::I32, op, "accepted");
     require_scalar(ar_pos, DType::I32, op, "ar_pos");
     require_vector(stats, DType::I64, model::kStepStatsCounters, op, "stats");
-    detail::mtp_accept_tokens_launch(target_tokens, drafts, length, token, sampled_out, num_sampled,
-                                     accepted, ar_pos, stats, stream);
+    if (config == nullptr) {
+        throw std::invalid_argument("mtp_accept_tokens: config must be non-null");
+    }
+    detail::mtp_accept_tokens_launch(target_tokens, logits, drafts, length, token, sampled_out,
+                                     num_sampled, accepted, ar_pos, stats, config, stream);
 }
 
 void mtp_prepare_shifted_ids(const Tensor& verify_ids, const Tensor& token,

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "kernels/kernel/sampling_device.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -22,32 +24,134 @@ __global__ void mtp_prepare_verify_inputs_kernel(const std::int32_t* token,
     positions[i]  = *length + i;
 }
 
-__global__ void mtp_accept_tokens_kernel(const std::int32_t* target_tokens,
-                                         const std::int32_t* drafts, std::int32_t* length,
-                                         std::int32_t* token, std::int32_t* sampled_out,
-                                         std::int32_t* num_sampled, std::int32_t* accepted,
-                                         std::int32_t* ar_pos, std::int64_t* stats,
-                                         std::int32_t k) {
-    int a = 0;
-    while (a < k && target_tokens[a] == drafts[a]) { ++a; }
-    const int t_star = target_tokens[a];
+// Commits the round's accepted tokens plus one correction/bonus token, then
+// advances the length/ar_pos scalars and the acceptance stats. The greedy branch
+// (config temperature <= 0) is bit-identical to the original argmax accept: keep
+// the longest draft prefix whose target argmax matches, then take the target
+// argmax at the divergence column. The sampling branch (temperature > 0) runs
+// distribution-correct speculative rejection sampling over the verify logits with
+// a one-hot (greedy) draft: accept drafts[i] with probability p_i(drafts[i]) under
+// the truncated target distribution, resample from the masked residual on the
+// first rejection, and draw a bonus from the last column when every draft accepts.
+// The draft-proposal path stays greedy, so q is one-hot and the accept test
+// collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
+// threads; only thread 0 performs the sequential accept/commit while the whole
+// block cooperates on the per-column truncated-distribution build.
+__launch_bounds__(kSamplerBlock) __global__ void mtp_accept_tokens_kernel(
+    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
+    std::int32_t* length, std::int32_t* token, std::int32_t* sampled_out,
+    std::int32_t* num_sampled, std::int32_t* accepted, std::int32_t* ar_pos, std::int64_t* stats,
+    const SamplingConfig* cfg_ptr, std::int32_t vocab, std::int32_t k) {
+    const int tid            = threadIdx.x;
+    const SamplingConfig cfg = *cfg_ptr;
 
-    for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
-    for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
-    sampled_out[a] = t_star;
+    if (!(cfg.temperature > 0.0f)) {
+        if (tid == 0) {
+            int a = 0;
+            while (a < k && target_tokens[a] == drafts[a]) { ++a; }
+            const int t_star = target_tokens[a];
 
-    const int produced = a + 1;
-    *num_sampled      = produced;
-    *accepted         = a;
-    *token            = t_star;
-    *length += produced;
-    *ar_pos = *length;
+            for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
+            for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
+            sampled_out[a] = t_star;
 
-    stats[0] += k;
-    stats[1] += a;
-    stats[2] += 1;
-    for (int i = 0; i < a && i < kMtpRoundAcceptedPerPosLimit; ++i) {
-        stats[kMtpRoundAcceptedPerPosOffset + i] += 1;
+            const int produced = a + 1;
+            *num_sampled       = produced;
+            *accepted          = a;
+            *token             = t_star;
+            *length += produced;
+            *ar_pos = *length;
+
+            stats[0] += k;
+            stats[1] += a;
+            stats[2] += 1;
+            for (int i = 0; i < a && i < kMtpRoundAcceptedPerPosLimit; ++i) {
+                stats[kMtpRoundAcceptedPerPosOffset + i] += 1;
+            }
+        }
+        return;
+    }
+
+    __shared__ float red_val[kSamplerBlock];
+    __shared__ int red_idx[kSamplerBlock];
+    __shared__ float cand_val[kSamplerMaxCandidates];
+    __shared__ int cand_idx[kSamplerMaxCandidates];
+    __shared__ float prob[kSamplerMaxCandidates];
+    __shared__ int n_support;
+    __shared__ int a_sh;
+    __shared__ int done_sh;
+    __shared__ int tstar_sh;
+    __shared__ int L_sh;
+
+    if (tid == 0) {
+        a_sh    = 0;
+        done_sh = 0;
+        tstar_sh = 0;
+        L_sh    = *length;
+    }
+    __syncthreads();
+
+    for (int i = 0; i <= k; ++i) {
+        sampling_build_truncated(logits, static_cast<std::int64_t>(i) * vocab, vocab, cfg, red_val,
+                                 red_idx, cand_val, cand_idx, prob, &n_support);
+        if (tid == 0 && done_sh == 0) {
+            const int L = L_sh;
+            if (i < k) {
+                const int d = drafts[i];
+                float pd    = 0.0f;
+                for (int j = 0; j < n_support; ++j) {
+                    if (cand_idx[j] == d) {
+                        pd = prob[j];
+                        break;
+                    }
+                }
+                const float u =
+                    sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeMtpAccept, 0u);
+                if (u < pd) {
+                    a_sh = i + 1;  // accept drafts[i], keep verifying
+                } else {
+                    const float ur =
+                        sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeMtpResample, 0u);
+                    tstar_sh = sampling_pick_from_support(cand_idx, prob, n_support, d, ur);
+                    done_sh  = 1;
+                }
+            } else {
+                // Every draft accepted: bonus token from the last verify column.
+                const float u =
+                    sampling_uniform(cfg.seed, L + k + 1, kSamplePurposeMtpBonus, 0u);
+                tstar_sh = sampling_pick_from_support(cand_idx, prob, n_support, -1, u);
+                done_sh  = 1;
+            }
+        }
+        __syncthreads();
+        if (done_sh) { break; }
+    }
+
+    if (tid == 0) {
+        const int a     = a_sh;
+        const int tstar = tstar_sh;
+        const int L     = L_sh;
+
+        for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
+        for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
+        sampled_out[a] = tstar;
+
+        const int produced = a + 1;
+        *num_sampled       = produced;
+        *accepted          = a;
+        *token             = tstar;
+        *length            = L + produced;
+        *ar_pos            = *length;
+
+        stats[0] += k;
+        stats[1] += a;
+        stats[2] += 1;
+        for (int i = 0; i < a && i < kMtpRoundAcceptedPerPosLimit; ++i) {
+            stats[kMtpRoundAcceptedPerPosOffset + i] += 1;
+        }
+        if (cfg.token_counts != nullptr) {
+            for (int i = 0; i < produced; ++i) { atomicAdd(&cfg.token_counts[sampled_out[i]], 1); }
+        }
     }
 }
 

@@ -170,6 +170,11 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
     const auto prefill_start = Clock::now();
     int token = 0;
     if (!cancel_before_prefill) {
+        // Apply this request's sampler before prefill so the config is resident in
+        // device memory when the (graph-captured) decode kernels replay. Every
+        // request sets it explicitly, so config never leaks between requests on a
+        // shared engine; the default is greedy (temperature 0 == exact argmax).
+        engine_.set_sampling(options.sampling);
         const NvtxRange range("qus.prefill");
         token = engine_.prefill(prompt_token_ids);
     }

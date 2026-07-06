@@ -51,6 +51,10 @@ struct TextGenerationOptions {
     // Checked before each decode step; return true to stop early. Used by the
     // serving layer to abort generation when the HTTP client disconnects.
     std::function<bool()> should_cancel;
+    // Sampler config applied to the engine before prefill. Default is greedy
+    // (temperature 0 => exact argmax), so callers that leave it untouched decode
+    // deterministically; front-ends opt in to sampling by populating it.
+    qus::kernels::SamplingConfig sampling;
 };
 
 struct TextGenerationResult {

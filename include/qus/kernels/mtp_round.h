@@ -22,6 +22,12 @@ void mtp_prepare_shifted_ids(const Tensor& verify_ids, const Tensor& token,
 void mtp_gather_hidden_row(const Tensor& hidden, const Tensor& accepted, Tensor& out,
                            cudaStream_t stream);
 
+// Remap an in-place draft token id: draft_token holds a shortlist index in
+// [0,n) produced by argmax over the draft head; replace it with the real vocab
+// id via the device id_map. Out-of-range indices are left unchanged.
+void mtp_remap_draft_token(Tensor& draft_token, const std::int32_t* id_map, std::int32_t n,
+                           cudaStream_t stream);
+
 void mtp_increment_i32(Tensor& scalar, cudaStream_t stream);
 
 void mtp_count_fallback_step(Tensor& stats, cudaStream_t stream);

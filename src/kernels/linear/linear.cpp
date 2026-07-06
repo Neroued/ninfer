@@ -343,6 +343,9 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
     case detail::LinearPolicyId::LmHeadQ6RowsplitGemv:
         detail::linear_rowsplit_gemv_lm_head_q6_launch(x, w, out, ws, stream);
         break;
+    case detail::LinearPolicyId::LmHeadQ4RowsplitGemv:
+        detail::linear_rowsplit_gemv_lm_head_q4_launch(x, w, out, ws, stream);
+        break;
     case detail::LinearPolicyId::Proj6144Q5RowsplitGemv:
         detail::linear_rowsplit_gemv_proj_6144_q5_launch(x, w, out, ws, stream);
         break;

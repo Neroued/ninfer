@@ -33,11 +33,14 @@ ShapeFamily classify_shape(std::int32_t n, std::int32_t k) {
         {  5120,  6144, ShapeFamily::Out5120x6144         },
         { 34816,  5120, ShapeFamily::MlpGateUp34816x5120  },
         {  5120, 17408, ShapeFamily::MlpDown5120x17408    },
-        {248320,  5120, ShapeFamily::LmHead248320x5120    },
     };
     for (const auto& e : kTable) {
         if (e.n == n && e.k == k) { return e.fam; }
     }
+    // Vocab-projection family: the full lm_head (n=248320) and any separately
+    // loaded draft head (n=65536/98304/131072) all share k=5120 and the tuned Q6
+    // warp-per-row GEMV. No other registered shape reaches n>=65536 at k=5120.
+    if (k == 5120 && n >= 65536) { return ShapeFamily::LmHeadVocabx5120; }
     return ShapeFamily::Generic;
 }
 
@@ -91,10 +94,17 @@ LinearPlan resolve_plan(LinearPlanKey key) {
                           /*uses_tensor_cores=*/false};
     }
     if (key.format == LinearFormat::Q6G64_RowSplit &&
-        key.shape == ShapeFamily::LmHead248320x5120 &&
+        key.shape == ShapeFamily::LmHeadVocabx5120 &&
         key.regime == LinearRegime::T1) {
         return LinearPlan{LinearBackendKind::Gemv, LinearPolicyId::LmHeadQ6RowsplitGemv,
                           policy_name(LinearPolicyId::LmHeadQ6RowsplitGemv),
+                          /*uses_tensor_cores=*/false};
+    }
+    if (key.format == LinearFormat::Q4G64_RowSplit &&
+        key.shape == ShapeFamily::LmHeadVocabx5120 &&
+        key.regime == LinearRegime::T1) {
+        return LinearPlan{LinearBackendKind::Gemv, LinearPolicyId::LmHeadQ4RowsplitGemv,
+                          policy_name(LinearPolicyId::LmHeadQ4RowsplitGemv),
                           /*uses_tensor_cores=*/false};
     }
     if (key.format == LinearFormat::Q5G64_RowSplit &&
@@ -157,7 +167,7 @@ const char* shape_name(ShapeFamily s) {
     case ShapeFamily::Out5120x6144:        return "out_5120x6144";
     case ShapeFamily::MlpGateUp34816x5120: return "mlp_gate_up_34816x5120";
     case ShapeFamily::MlpDown5120x17408:   return "mlp_down_5120x17408";
-    case ShapeFamily::LmHead248320x5120:   return "lm_head_248320x5120";
+    case ShapeFamily::LmHeadVocabx5120:    return "lm_head_vocab_x5120";
     case ShapeFamily::Generic:             return "generic";
     }
     return "unknown";
@@ -192,6 +202,8 @@ const char* policy_name(LinearPolicyId p) {
         return "linear.rowsplit.gemv.mlp_down.q5.warp_row.v1";
     case LinearPolicyId::LmHeadQ6RowsplitGemv:
         return "linear.rowsplit.gemv.lm_head.q6.warp_row.v1";
+    case LinearPolicyId::LmHeadQ4RowsplitGemv:
+        return "linear.rowsplit.gemv.lm_head.q4.warp_row.v1";
     case LinearPolicyId::Proj6144Q5RowsplitGemv:
         return "linear.rowsplit.gemv.proj_6144.q5.warp_row.v1";
     case LinearPolicyId::Out6144Q5RowsplitGemv:

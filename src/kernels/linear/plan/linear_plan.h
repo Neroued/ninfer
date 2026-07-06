@@ -27,7 +27,7 @@ enum class ShapeFamily {
     Out5120x6144,
     MlpGateUp34816x5120,
     MlpDown5120x17408,
-    LmHead248320x5120,
+    LmHeadVocabx5120,
     Generic,
 };
 
@@ -46,6 +46,7 @@ enum class LinearPolicyId {
     GdnInQK4096Q4RowsplitGemv,
     MlpDownQ5RowsplitGemv,
     LmHeadQ6RowsplitGemv,
+    LmHeadQ4RowsplitGemv,
     Proj6144Q5RowsplitGemv,
     Out6144Q5RowsplitGemv,
 };

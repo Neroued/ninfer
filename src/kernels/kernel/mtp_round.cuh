@@ -70,6 +70,12 @@ __global__ void mtp_gather_hidden_row_kernel(const __nv_bfloat16* hidden,
     out[row] = hidden[static_cast<std::int64_t>(col) * rows + row];
 }
 
+__global__ void mtp_remap_draft_token_kernel(std::int32_t* draft_token,
+                                             const std::int32_t* id_map, std::int32_t n) {
+    const int idx = *draft_token;
+    if (idx >= 0 && idx < n) { *draft_token = id_map[idx]; }
+}
+
 __global__ void mtp_increment_i32_kernel(std::int32_t* scalar) { *scalar += 1; }
 
 __global__ void mtp_count_fallback_step_kernel(std::int64_t* stats) { stats[3] += 1; }

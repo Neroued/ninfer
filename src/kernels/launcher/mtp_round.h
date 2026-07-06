@@ -23,6 +23,9 @@ void mtp_prepare_shifted_ids_launch(const Tensor& verify_ids, const Tensor& toke
 void mtp_gather_hidden_row_launch(const Tensor& hidden, const Tensor& accepted, Tensor& out,
                                   cudaStream_t stream);
 
+void mtp_remap_draft_token_launch(Tensor& draft_token, const std::int32_t* id_map, std::int32_t n,
+                                  cudaStream_t stream);
+
 void mtp_increment_i32_launch(Tensor& scalar, cudaStream_t stream);
 
 void mtp_count_fallback_step_launch(Tensor& stats, cudaStream_t stream);

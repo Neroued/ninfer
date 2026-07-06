@@ -61,6 +61,13 @@ void mtp_gather_hidden_row_launch(const Tensor& hidden, const Tensor& accepted, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+void mtp_remap_draft_token_launch(Tensor& draft_token, const std::int32_t* id_map, std::int32_t n,
+                                  cudaStream_t stream) {
+    mtp_remap_draft_token_kernel<<<1, 1, 0, stream>>>(
+        static_cast<std::int32_t*>(draft_token.data), id_map, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void mtp_increment_i32_launch(Tensor& scalar, cudaStream_t stream) {
     mtp_increment_i32_kernel<<<1, 1, 0, stream>>>(static_cast<std::int32_t*>(scalar.data));
     CUDA_CHECK(cudaGetLastError());

@@ -102,6 +102,16 @@ void mtp_gather_hidden_row(const Tensor& hidden, const Tensor& accepted, Tensor&
     detail::mtp_gather_hidden_row_launch(hidden, accepted, out, stream);
 }
 
+void mtp_remap_draft_token(Tensor& draft_token, const std::int32_t* id_map, std::int32_t n,
+                           cudaStream_t stream) {
+    constexpr const char* op = "mtp_remap_draft_token";
+    require_scalar(draft_token, DType::I32, op, "draft_token");
+    if (id_map == nullptr || n <= 0) {
+        throw std::invalid_argument("mtp_remap_draft_token: id_map must be non-null and n>0");
+    }
+    detail::mtp_remap_draft_token_launch(draft_token, id_map, n, stream);
+}
+
 void mtp_increment_i32(Tensor& scalar, cudaStream_t stream) {
     constexpr const char* op = "mtp_increment_i32";
     require_scalar(scalar, DType::I32, op, "scalar");

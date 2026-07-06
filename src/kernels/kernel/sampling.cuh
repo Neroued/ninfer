@@ -139,7 +139,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
         return;
     }
 
-    __shared__ typename SamplingPartialMergeSort::TempStorage partial_sort_storage;
+    __shared__ SamplingFusedShared fused_shared;
     unsigned long long partial_keys[kSamplerItemsPerThread];
     int partial_items[kSamplerItemsPerThread];
 
@@ -160,7 +160,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
             partial_items[item] = INT_MAX;
         }
     }
-    SamplingPartialMergeSort(partial_sort_storage)
+    SamplingPartialMergeSort(fused_shared.partial_sort_storage)
         .Sort(partial_keys, partial_items, SamplingKeyGreater{});
 
 #pragma unroll
@@ -184,12 +184,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
     }
     __syncthreads();
 
-    __shared__ typename SamplingGroupMergeSort::TempStorage group_sort_storage;
-    __shared__ float cand_val[kSamplerMaxCandidates];
-    __shared__ int cand_idx[kSamplerMaxCandidates];
-    __shared__ float prob[kSamplerMaxCandidates];
-    __shared__ int n_support;
-    __shared__ int is_last;
+    SamplingFusedGroupShared& group_shared = fused_shared.group;
     unsigned long long keys[kSamplerGroupItemsPerThread];
     int items[kSamplerGroupItemsPerThread];
 
@@ -215,7 +210,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
             items[item] = INT_MAX;
         }
     }
-    SamplingGroupMergeSort(group_sort_storage).Sort(keys, items, SamplingKeyGreater{});
+    SamplingGroupMergeSort(group_shared.sort_storage).Sort(keys, items, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
@@ -231,10 +226,10 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
     if (tid == 0) {
         __threadfence();
         const int done = atomicAdd(&sampling_group_done[col], 1) + 1;
-        is_last = (done == group_count) ? 1 : 0;
+        group_shared.is_last = (done == group_count) ? 1 : 0;
     }
     __syncthreads();
-    if (!is_last) { return; }
+    if (!group_shared.is_last) { return; }
 
     const int final_n = group_count * cap;
 #pragma unroll
@@ -253,37 +248,38 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
             items[item] = INT_MAX;
         }
     }
-    SamplingGroupMergeSort(group_sort_storage).Sort(keys, items, SamplingKeyGreater{});
+    SamplingGroupMergeSort(group_shared.sort_storage).Sort(keys, items, SamplingKeyGreater{});
 
 #pragma unroll
     for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
         const int rank = tid * kSamplerGroupItemsPerThread + item;
         if (rank < cap) {
-            cand_val[rank] = sampling_key_float(keys[item]);
-            cand_idx[rank] = items[item];
+            group_shared.cand_val[rank] = sampling_key_float(keys[item]);
+            group_shared.cand_idx[rank] = items[item];
         }
     }
     __syncthreads();
 
     if (greedy) {
         if (tid == 0) {
-            out[col] = cand_idx[0];
+            out[col] = group_shared.cand_idx[0];
             sampling_group_done[col] = 0;
             sampling_partial_done[col] = 0;
         }
         return;
     }
 
-    sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
+    sampling_normalize_support(cfg, group_shared.cand_val, group_shared.cand_idx, group_shared.prob,
+                               &group_shared.n_support, cap);
     if (tid == 0) {
-        const int support = n_support;
+        const int support = group_shared.n_support;
         const float u = sampling_uniform(cfg.seed, *pos_base + col, purpose, 0u);
         float acc = 0.0f;
-        int picked = cand_idx[support - 1];
+        int picked = group_shared.cand_idx[support - 1];
         for (int j = 0; j < support; ++j) {
-            acc += prob[j];
+            acc += group_shared.prob[j];
             if (u < acc) {
-                picked = cand_idx[j];
+                picked = group_shared.cand_idx[j];
                 break;
             }
         }

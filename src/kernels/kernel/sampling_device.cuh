@@ -58,6 +58,20 @@ using SamplingPartialMergeSort =
 using SamplingGroupMergeSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread, int>;
 
+struct SamplingFusedGroupShared {
+    typename SamplingGroupMergeSort::TempStorage sort_storage;
+    float cand_val[kSamplerMaxCandidates];
+    int cand_idx[kSamplerMaxCandidates];
+    float prob[kSamplerMaxCandidates];
+    int n_support;
+    int is_last;
+};
+
+union SamplingFusedShared {
+    typename SamplingPartialMergeSort::TempStorage partial_sort_storage;
+    SamplingFusedGroupShared group;
+};
+
 struct SamplingKeyGreater {
     __device__ __forceinline__ bool operator()(unsigned long long a, unsigned long long b) const {
         return a > b;

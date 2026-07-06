@@ -11,6 +11,7 @@
 #include "qus/text/text_runner.h"
 #include "qus/text/tokenizer.h"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -19,12 +20,26 @@
 
 namespace qus::serve {
 
+// Per-request timing and speculative-decoding counters for console observability.
+// Raw values only; the log layer derives tok/s, TTFT and acceptance rates.
+struct GenerationMetrics {
+    double render_tokenize_seconds = 0.0;
+    double prefill_seconds         = 0.0;
+    double decode_seconds          = 0.0;
+    double total_seconds           = 0.0;
+    bool mtp_enabled               = false;
+    std::int64_t mtp_rounds          = 0;
+    std::int64_t mtp_draft_tokens    = 0;
+    std::int64_t mtp_accepted_tokens = 0;
+};
+
 struct GenerationOutcome {
     std::string text;       // answer text (non-streaming); empty when streamed via a sink
     std::string reasoning;  // thinking text split out of the <think> block (non-streaming)
     int prompt_tokens                     = 0;
     int completion_tokens                 = 0;
     qus::text::FinishReason finish_reason = qus::text::FinishReason::Length;
+    GenerationMetrics metrics;
 };
 
 // Streaming hooks supplied by the transport layer. Reasoning (the <think> block)

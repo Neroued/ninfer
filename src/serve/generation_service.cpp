@@ -154,11 +154,23 @@ GenerationOutcome GenerationService::run(const PreparedRequest& prepared, const 
         };
     }
 
+    // Reset speculative-decoding counters so mtp_stats() reflects only this request;
+    // reset + read happen under the same engine lock, so the numbers are per-request.
+    engine_->reset_mtp_stats();
     const qus::text::TextGenerationResult result = runner.generate(prepared.messages, opt);
+    const qus::EngineMtpStats mtp = engine_->mtp_stats();
 
     GenerationOutcome outcome;
     outcome.prompt_tokens     = static_cast<int>(result.prompt_token_ids.size());
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
+    outcome.metrics.render_tokenize_seconds = result.timings.render_tokenize_seconds;
+    outcome.metrics.prefill_seconds         = result.timings.prefill_seconds;
+    outcome.metrics.decode_seconds          = result.timings.decode_seconds;
+    outcome.metrics.total_seconds           = result.timings.total_seconds;
+    outcome.metrics.mtp_enabled             = mtp.enabled;
+    outcome.metrics.mtp_rounds              = mtp.rounds;
+    outcome.metrics.mtp_draft_tokens        = mtp.draft_tokens;
+    outcome.metrics.mtp_accepted_tokens     = mtp.accepted_tokens;
 
     if (sink != nullptr) {
         if (!stop_matched) {

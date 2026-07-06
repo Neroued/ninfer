@@ -1,6 +1,7 @@
 #include "qus/serve/http_server.h"
 
 #include "qus/serve/openai_schema.h"
+#include "qus/serve/request_log.h"
 #include "qus/serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -10,6 +11,7 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -96,6 +98,11 @@ std::string sse_error_event(const ApiError& error) {
 HttpServer::HttpServer(GenerationService& service, ServeOptions options)
     : service_(service), options_(std::move(options)) {
     register_routes();
+}
+
+void HttpServer::log_line(const std::string& line) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    std::cerr << "qus-serve: " << line << '\n';
 }
 
 void HttpServer::register_routes() {
@@ -211,14 +218,24 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const std::int64_t created = unix_time_now();
     const std::string model    = request.model;
 
+    const std::uint64_t req_id = ++request_seq_;
+    log_line(format_request_start(req_id, request.stream, request.messages.size(),
+                                  prepared.options.max_new_tokens, request.max_tokens_set));
+
     if (!request.stream) {
-        const GenerationOutcome outcome = service_.run(prepared, nullptr);
-        const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
-        res.set_content(make_chat_completion_response(id, model, created, outcome.text,
-                                                      outcome.reasoning,
-                                                      finish_reason_wire(outcome.finish_reason),
-                                                      usage),
-                        "application/json");
+        try {
+            const GenerationOutcome outcome = service_.run(prepared, nullptr);
+            log_line(format_request_done(req_id, outcome));
+            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            res.set_content(make_chat_completion_response(id, model, created, outcome.text,
+                                                          outcome.reasoning,
+                                                          finish_reason_wire(outcome.finish_reason),
+                                                          usage),
+                            "application/json");
+        } catch (const std::exception& e) {
+            log_line(format_request_error(req_id, e.what()));
+            throw;
+        }
         return;
     }
 
@@ -229,7 +246,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const bool include_usage = prepared_ptr->include_usage;
 
     worker->thread = std::thread([this, queue, cancelled, prepared_ptr, id, created, model,
-                                  include_usage]() {
+                                  include_usage, req_id]() {
         try {
             queue->push(make_chat_chunk_role(id, model, created, include_usage));
             StreamSink sink;
@@ -242,6 +259,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             sink.is_cancelled = [&]() { return cancelled->load(); };
 
             const GenerationOutcome outcome = service_.run(*prepared_ptr, &sink);
+            log_line(format_request_done(req_id, outcome));
             queue->push(make_chat_chunk_final(id, model, created,
                                               finish_reason_wire(outcome.finish_reason),
                                               include_usage));
@@ -251,8 +269,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             }
             queue->push(sse_done());
         } catch (const ApiException& e) {
+            log_line(format_request_error(req_id, e.error().message));
             queue->push(sse_error_event(e.error()));
         } catch (const std::exception& e) {
+            log_line(format_request_error(req_id, e.what()));
             ApiError error;
             error.status  = 500;
             error.type    = "internal_error";

@@ -33,6 +33,7 @@ add_library(qus_serve STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/serve/openai_schema.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/serve/translate.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/serve/generation_service.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/serve/request_log.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/serve/http_server.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/serve/serve_options.cpp)
 target_include_directories(qus_serve PUBLIC

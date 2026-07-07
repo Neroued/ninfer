@@ -281,6 +281,7 @@ __launch_bounds__(128, 2) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = kb * Bc;
+        const bool full_kv_tile = (k0 + Bc - 1) <= max_query_abs;
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
             const int key_l      = chunk / (D / 8);
@@ -288,7 +289,7 @@ __launch_bounds__(128, 2) __global__
             const int key        = k0 + key_l;
             __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_prefill_swz(key_l, d)];
             __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_prefill_swz(key_l, d)];
-            if (key <= max_query_abs) {
+            if (full_kv_tile || key <= max_query_abs) {
                 const std::int64_t off = gqa_prefill_cache_index(kv_head, d, key, padded_context);
                 qus::kernels::async_copy_global_to_shared<16>(k_dst, &cache_k[off]);
                 qus::kernels::async_copy_global_to_shared<16>(v_dst, &cache_v[off]);
@@ -332,28 +333,41 @@ __launch_bounds__(128, 2) __global__
         const int qrow1 = q0 + row1;
         const int qabs0 = (qrow0 < tokens) ? base_pos + qrow0 : -1;
         const int qabs1 = (qrow1 < tokens) ? base_pos + qrow1 : -1;
+        const bool full_score_tile = (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0));
 
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
+        if (full_score_tile) {
 #pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0 = nt * 8 + 2 * lid;
-            const int col1 = col0 + 1;
-            const int key0 = k0 + col0;
-            const int key1 = k0 + col1;
-            score[nt][0]   = (qrow0 < tokens && key0 <= max_query_abs && key0 <= qabs0)
-                                 ? score[nt][0] * scale
-                                 : -CUDART_INF_F;
-            score[nt][1]   = (qrow0 < tokens && key1 <= max_query_abs && key1 <= qabs0)
-                                 ? score[nt][1] * scale
-                                 : -CUDART_INF_F;
-            score[nt][2]   = (qrow1 < tokens && key0 <= max_query_abs && key0 <= qabs1)
-                                 ? score[nt][2] * scale
-                                 : -CUDART_INF_F;
-            score[nt][3]   = (qrow1 < tokens && key1 <= max_query_abs && key1 <= qabs1)
-                                 ? score[nt][3] * scale
-                                 : -CUDART_INF_F;
-            bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-            bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+            for (int nt = 0; nt < QKNt; ++nt) {
+                score[nt][0] *= scale;
+                score[nt][1] *= scale;
+                score[nt][2] *= scale;
+                score[nt][3] *= scale;
+                bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+                bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+            }
+        } else {
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                const int col0 = nt * 8 + 2 * lid;
+                const int col1 = col0 + 1;
+                const int key0 = k0 + col0;
+                const int key1 = k0 + col1;
+                score[nt][0]   = (qrow0 < tokens && key0 <= max_query_abs && key0 <= qabs0)
+                                     ? score[nt][0] * scale
+                                     : -CUDART_INF_F;
+                score[nt][1]   = (qrow0 < tokens && key1 <= max_query_abs && key1 <= qabs0)
+                                     ? score[nt][1] * scale
+                                     : -CUDART_INF_F;
+                score[nt][2]   = (qrow1 < tokens && key0 <= max_query_abs && key0 <= qabs1)
+                                     ? score[nt][2] * scale
+                                     : -CUDART_INF_F;
+                score[nt][3]   = (qrow1 < tokens && key1 <= max_query_abs && key1 <= qabs1)
+                                     ? score[nt][3] * scale
+                                     : -CUDART_INF_F;
+                bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+                bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+            }
         }
         bm0 = fmaxf(bm0, __shfl_xor_sync(FullMask, bm0, 1));
         bm0 = fmaxf(bm0, __shfl_xor_sync(FullMask, bm0, 2));
@@ -368,28 +382,46 @@ __launch_bounds__(128, 2) __global__
             (m1 == -CUDART_INF_F) ? 0.0f : gqa_prefill_exp2_fast((m1 - nm1) * Log2E);
 
         float bl0 = 0.0f, bl1 = 0.0f;
+        if (full_score_tile) {
 #pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0  = nt * 8 + 2 * lid;
-            const int col1  = col0 + 1;
-            const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
-                                  ? gqa_prefill_exp2_fast((score[nt][0] - nm0) * Log2E)
-                                  : 0.0f;
-            const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
-                                  ? gqa_prefill_exp2_fast((score[nt][1] - nm0) * Log2E)
-                                  : 0.0f;
-            const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
-                                  ? gqa_prefill_exp2_fast((score[nt][2] - nm1) * Log2E)
-                                  : 0.0f;
-            const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
-                                  ? gqa_prefill_exp2_fast((score[nt][3] - nm1) * Log2E)
-                                  : 0.0f;
-            bl0 += p00 + p01;
-            bl1 += p10 + p11;
-            p_sw[gid * Bc + gqa_prefill_swz32(gid, col0)]           = __float2bfloat16(p00);
-            p_sw[gid * Bc + gqa_prefill_swz32(gid, col1)]           = __float2bfloat16(p01);
-            p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col0)] = __float2bfloat16(p10);
-            p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+            for (int nt = 0; nt < QKNt; ++nt) {
+                const int col0  = nt * 8 + 2 * lid;
+                const int col1  = col0 + 1;
+                const float p00 = gqa_prefill_exp2_fast((score[nt][0] - nm0) * Log2E);
+                const float p01 = gqa_prefill_exp2_fast((score[nt][1] - nm0) * Log2E);
+                const float p10 = gqa_prefill_exp2_fast((score[nt][2] - nm1) * Log2E);
+                const float p11 = gqa_prefill_exp2_fast((score[nt][3] - nm1) * Log2E);
+                bl0 += p00 + p01;
+                bl1 += p10 + p11;
+                p_sw[gid * Bc + gqa_prefill_swz32(gid, col0)]           = __float2bfloat16(p00);
+                p_sw[gid * Bc + gqa_prefill_swz32(gid, col1)]           = __float2bfloat16(p01);
+                p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col0)] = __float2bfloat16(p10);
+                p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+            }
+        } else {
+#pragma unroll
+            for (int nt = 0; nt < QKNt; ++nt) {
+                const int col0  = nt * 8 + 2 * lid;
+                const int col1  = col0 + 1;
+                const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
+                                      ? gqa_prefill_exp2_fast((score[nt][0] - nm0) * Log2E)
+                                      : 0.0f;
+                const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
+                                      ? gqa_prefill_exp2_fast((score[nt][1] - nm0) * Log2E)
+                                      : 0.0f;
+                const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
+                                      ? gqa_prefill_exp2_fast((score[nt][2] - nm1) * Log2E)
+                                      : 0.0f;
+                const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
+                                      ? gqa_prefill_exp2_fast((score[nt][3] - nm1) * Log2E)
+                                      : 0.0f;
+                bl0 += p00 + p01;
+                bl1 += p10 + p11;
+                p_sw[gid * Bc + gqa_prefill_swz32(gid, col0)]           = __float2bfloat16(p00);
+                p_sw[gid * Bc + gqa_prefill_swz32(gid, col1)]           = __float2bfloat16(p01);
+                p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col0)] = __float2bfloat16(p10);
+                p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+            }
         }
         bl0 += __shfl_xor_sync(FullMask, bl0, 1);
         bl0 += __shfl_xor_sync(FullMask, bl0, 2);

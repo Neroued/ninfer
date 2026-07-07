@@ -6,6 +6,7 @@
 //   ./qus_gqa_attention_bench --decode --decode-pos 2882 --profile-once --cold-cache
 //   ./qus_gqa_attention_bench --append-small-t --tokens 6 --context 32768
 //   ./qus_gqa_attention_bench --copy-ceiling --tokens 1 --context 32768
+//   ./qus_gqa_attention_bench --append-prompt-baseline --tokens 1024 --context 0,8192,32768
 //   ./qus_gqa_attention_bench --prefill --tokens 4096
 //   ./qus_gqa_attention_bench --prefill --tokens 4096 --expect-tflops-pct-min 80
 #include "qus/core/device.h"
@@ -47,10 +48,16 @@ constexpr std::int32_t kDefaultDecodePositions[] = {2048, 2882, 8192, 32768};
 constexpr std::int32_t kDefaultPrefillTokens[]   = {512, 1024, 2048, 4096};
 constexpr double kDenseTcPeakTflops              = 209.5;
 constexpr double kDramPeakGBs                    = 1792.0;
+constexpr std::int32_t kPromptQBlock             = 64;
+constexpr std::int32_t kPromptKBlock             = 32;
 
 constexpr std::int32_t align_up_128(std::int32_t value) { return ((value + 127) / 128) * 128; }
 
 std::int32_t ceil_div_i32(std::int32_t value, std::int32_t divisor) {
+    return (value + divisor - 1) / divisor;
+}
+
+std::int64_t ceil_div_i64(std::int64_t value, std::int64_t divisor) {
     return (value + divisor - 1) / divisor;
 }
 
@@ -67,7 +74,7 @@ std::int32_t decode_kps(std::int32_t pos_value) {
 
 std::int32_t small_t_active_splits(std::int32_t tokens, std::int32_t context) {
     if (tokens <= 1) { return kGqaDecodeSplits; }
-    const std::int32_t window = context + tokens;
+    const std::int32_t window          = context + tokens;
     std::int32_t target_keys_per_split = 480;
     if (window <= 4096) {
         target_keys_per_split = 64;
@@ -134,6 +141,65 @@ DecodeBytes append_small_t_bytes(std::int32_t tokens, std::int32_t context) {
     bytes.scratch   = partial_acc_writes_reads + partial_ml_writes + partial_ml_reads;
     bytes.total     = bytes.useful_kv + new_kv_writes + q_reads + output_writes + bytes.scratch;
     return bytes;
+}
+
+std::int32_t append_prompt_q_blocks(std::int32_t tokens) {
+    return ceil_div_i32(tokens, kPromptQBlock);
+}
+
+double append_prompt_key_sum(std::int32_t tokens, std::int32_t context) {
+    const double t = static_cast<double>(tokens);
+    const double c = static_cast<double>(context);
+    return t * c + t * static_cast<double>(tokens + 1) * 0.5;
+}
+
+double append_prompt_qblock_key_rows(std::int32_t tokens, std::int32_t context) {
+    double rows = 0.0;
+    for (std::int32_t q0 = 0; q0 < tokens; q0 += kPromptQBlock) {
+        const std::int32_t tile_rows = std::min(kPromptQBlock, tokens - q0);
+        rows += static_cast<double>(context + q0 + tile_rows);
+    }
+    return rows;
+}
+
+std::int64_t append_prompt_key_tiles_per_head(std::int32_t tokens, std::int32_t context) {
+    std::int64_t tiles = 0;
+    for (std::int32_t q0 = 0; q0 < tokens; q0 += kPromptQBlock) {
+        const std::int32_t tile_rows = std::min(kPromptQBlock, tokens - q0);
+        const std::int64_t key_count =
+            static_cast<std::int64_t>(context) + static_cast<std::int64_t>(q0) + tile_rows;
+        tiles += ceil_div_i64(key_count, kPromptKBlock);
+    }
+    return tiles;
+}
+
+double append_prompt_useful_flops(std::int32_t tokens, std::int32_t context) {
+    return 4.0 * static_cast<double>(kHeadDim) * static_cast<double>(kQHeads) *
+           append_prompt_key_sum(tokens, context);
+}
+
+double append_prompt_logical_kv_bytes(std::int32_t tokens, std::int32_t context) {
+    return append_prompt_key_sum(tokens, context) * static_cast<double>(kKVHeads) *
+           static_cast<double>(kHeadDim) * static_cast<double>(sizeof(std::uint16_t)) * 2.0;
+}
+
+double append_prompt_tile_kv_read_bytes(std::int32_t tokens, std::int32_t context) {
+    return append_prompt_qblock_key_rows(tokens, context) * static_cast<double>(kQHeads) *
+           static_cast<double>(kHeadDim) * static_cast<double>(sizeof(std::uint16_t)) * 2.0;
+}
+
+double append_prompt_global_floor_bytes(std::int32_t tokens, std::int32_t context) {
+    const double token_count = static_cast<double>(tokens);
+    const double q_bytes     = token_count * static_cast<double>(kQHeads) *
+                           static_cast<double>(kHeadDim) *
+                           static_cast<double>(sizeof(std::uint16_t));
+    const double out_bytes      = q_bytes;
+    const double kv_input_bytes = token_count * static_cast<double>(kKVHeads) *
+                                  static_cast<double>(kHeadDim) *
+                                  static_cast<double>(sizeof(std::uint16_t)) * 2.0;
+    const double kv_cache_write_bytes = kv_input_bytes;
+    return q_bytes + out_bytes + kv_input_bytes + kv_cache_write_bytes +
+           append_prompt_tile_kv_read_bytes(tokens, context);
 }
 
 std::size_t decode_workspace_bytes_for_pos(std::int32_t) {
@@ -311,16 +377,103 @@ void print_append_small_t_result(const char* tag, const Result& r, const DecodeB
                 tokens, context, small_t_active_splits(tokens, context), suffix);
 }
 
-void print_append_prompt_baseline_result(const Result& r, const DecodeBytes& bytes,
-                                         std::int32_t tokens, std::int32_t context) {
+struct AppendPromptMetrics {
+    std::int32_t tokens          = 0;
+    std::int32_t context         = 0;
+    std::int32_t end_context     = 0;
+    std::int32_t q_blocks        = 0;
+    std::int64_t attention_ctas  = 0;
+    std::int64_t key_tiles       = 0;
+    int runs                     = 0;
+    int inner_iters              = 1;
+    double median_ms             = 0.0;
+    double min_ms                = 0.0;
+    double p95_ms                = 0.0;
+    double mean_ms               = 0.0;
+    double key_sum               = 0.0;
+    double avg_keys_per_query    = 0.0;
+    double qblock_key_rows       = 0.0;
+    double tile_reuse_queries    = 0.0;
+    double useful_flops          = 0.0;
+    double logical_kv_bytes      = 0.0;
+    double tile_kv_read_bytes    = 0.0;
+    double global_floor_bytes    = 0.0;
+    double tflops                = 0.0;
+    double tflops_pct            = 0.0;
+    double logical_kv_gbps       = 0.0;
+    double tile_kv_read_gbps     = 0.0;
+    double global_floor_gbps     = 0.0;
+    double global_floor_gbps_pct = 0.0;
+    double ns_per_key_query      = 0.0;
+    double us_per_token          = 0.0;
+    double roofline_tflops       = 0.0;
+    double roofline_eff_pct      = 0.0;
+    const char* bound            = "tc";
+};
+
+struct PrefillTimingOptions {
+    int warmup      = 3;
+    int repeat      = 10;
+    int min_time_ms = 0;
+};
+
+AppendPromptMetrics append_prompt_metrics_from_result(std::int32_t tokens, std::int32_t context,
+                                                      const Result& r) {
+    AppendPromptMetrics m;
+    m.tokens             = tokens;
+    m.context            = context;
+    m.end_context        = context + tokens;
+    m.q_blocks           = append_prompt_q_blocks(tokens);
+    m.attention_ctas     = static_cast<std::int64_t>(m.q_blocks) * kQHeads;
+    m.key_tiles          = append_prompt_key_tiles_per_head(tokens, context) * kQHeads;
+    m.runs               = r.n_runs;
+    m.inner_iters        = r.inner_iters;
+    m.median_ms          = r.median_us * 1.0e-3;
+    m.min_ms             = r.min_us * 1.0e-3;
+    m.p95_ms             = r.p95_us * 1.0e-3;
+    m.mean_ms            = r.mean_us * 1.0e-3;
+    m.key_sum            = append_prompt_key_sum(tokens, context);
+    m.avg_keys_per_query = m.key_sum / static_cast<double>(tokens);
+    m.qblock_key_rows    = append_prompt_qblock_key_rows(tokens, context);
+    m.tile_reuse_queries = (m.qblock_key_rows > 0.0) ? m.key_sum / m.qblock_key_rows : 0.0;
+    m.useful_flops       = append_prompt_useful_flops(tokens, context);
+    m.logical_kv_bytes   = append_prompt_logical_kv_bytes(tokens, context);
+    m.tile_kv_read_bytes = append_prompt_tile_kv_read_bytes(tokens, context);
+    m.global_floor_bytes = append_prompt_global_floor_bytes(tokens, context);
+
     const double sec = r.median_us * 1.0e-6;
-    const double useful_kv_gbs =
-        (sec > 0.0) ? static_cast<double>(bytes.useful_kv) / sec / 1.0e9 : 0.0;
+    if (sec > 0.0) {
+        m.tflops            = m.useful_flops / sec / 1.0e12;
+        m.logical_kv_gbps   = m.logical_kv_bytes / sec / 1.0e9;
+        m.tile_kv_read_gbps = m.tile_kv_read_bytes / sec / 1.0e9;
+        m.global_floor_gbps = m.global_floor_bytes / sec / 1.0e9;
+        m.ns_per_key_query  = r.median_us * 1000.0 / m.key_sum;
+    }
+    m.us_per_token          = r.median_us / static_cast<double>(tokens);
+    m.tflops_pct            = m.tflops / kDenseTcPeakTflops * 100.0;
+    m.global_floor_gbps_pct = m.global_floor_gbps / kDramPeakGBs * 100.0;
+
+    const double intensity =
+        m.global_floor_bytes > 0.0 ? m.useful_flops / m.global_floor_bytes : 0.0;
+    const double dram_roof_tflops = kDramPeakGBs * intensity / 1000.0;
+    m.roofline_tflops             = std::min(kDenseTcPeakTflops, dram_roof_tflops);
+    m.bound                       = (kDenseTcPeakTflops <= dram_roof_tflops) ? "tc" : "tile";
+    m.roofline_eff_pct = (m.roofline_tflops > 0.0) ? (m.tflops / m.roofline_tflops * 100.0) : 0.0;
+    return m;
+}
+
+void print_append_prompt_baseline_result(const AppendPromptMetrics& m) {
     constexpr double kMiB = 1024.0 * 1024.0;
-    std::printf("%-38s median=%8.2f us  min=%8.2f us  p95=%8.2f us  "
-                "ideal_useful_kv=%8.1f GB/s  bytes useful_kv=%.2f MiB  T=%d context=%d\n",
-                "gqa_attention append prompt baseline", r.median_us, r.min_us, r.p95_us,
-                useful_kv_gbs, static_cast<double>(bytes.useful_kv) / kMiB, tokens, context);
+    std::printf("gqa_attention append-prompt T=%-6d C=%-7d median=%9.3f ms  min=%9.3f ms  "
+                "p95=%9.3f ms  useful=%9.2f TFLOP/s  tc=%6.2f%% of %.1f  "
+                "tile_floor=%8.1f GB/s (%5.2f%% of %.0f)  logical_kv=%8.1f GB/s  "
+                "ns/key=%6.3f  q_blocks=%d key_tiles=%lld tile_kv=%.2f MiB  "
+                "bound=%s roofline_eff=%6.2f%% runs=%d inner=%d\n",
+                m.tokens, m.context, m.median_ms, m.min_ms, m.p95_ms, m.tflops, m.tflops_pct,
+                kDenseTcPeakTflops, m.global_floor_gbps, m.global_floor_gbps_pct, kDramPeakGBs,
+                m.logical_kv_gbps, m.ns_per_key_query, m.q_blocks,
+                static_cast<long long>(m.key_tiles), m.tile_kv_read_bytes / kMiB, m.bound,
+                m.roofline_eff_pct, m.runs, m.inner_iters);
 }
 
 void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& k, const Tensor& v,
@@ -491,7 +644,9 @@ void run_copy_ceiling(std::int32_t tokens, std::int32_t context) {
                               context);
 }
 
-void run_append_prompt_baseline(KVCache& kv, std::int32_t tokens, std::int32_t context) {
+AppendPromptMetrics run_append_prompt_baseline(KVCache& kv, std::int32_t tokens,
+                                               std::int32_t context,
+                                               const PrefillTimingOptions& timing) {
     const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
                            static_cast<std::size_t>(tokens);
     const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
@@ -508,14 +663,16 @@ void run_append_prompt_baseline(KVCache& kv, std::int32_t tokens, std::int32_t c
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    const DecodeBytes bytes = append_small_t_bytes(tokens, context);
-    const Result r          = bench_loop(
+    const double bytes = append_prompt_global_floor_bytes(tokens, context);
+    const Result r     = bench_loop(
         [&](cudaStream_t s) {
             kernels::detail::gqa_attention_prompt_launch(tq, tk, tv, tpos, kScale, kv, 0, tout, s);
         },
-        static_cast<double>(bytes.useful_kv));
+        bytes, timing.warmup, timing.repeat, timing.min_time_ms);
 
-    print_append_prompt_baseline_result(r, bytes, tokens, context);
+    AppendPromptMetrics metrics = append_prompt_metrics_from_result(tokens, context, r);
+    print_append_prompt_baseline_result(metrics);
+    return metrics;
 }
 
 double prefill_useful_flops(std::int32_t tokens) {
@@ -534,12 +691,6 @@ double prefill_model_floor_bytes(std::int32_t tokens) {
     const double v_bytes = k_bytes;
     return q_bytes + out_bytes + k_bytes + v_bytes;
 }
-
-struct PrefillTimingOptions {
-    int warmup      = 3;
-    int repeat      = 10;
-    int min_time_ms = 0;
-};
 
 struct PrefillMetrics {
     std::int32_t tokens      = 0;
@@ -719,6 +870,91 @@ std::string format_prefill_json(const std::vector<PrefillMetrics>& results,
     return out.str();
 }
 
+std::string format_append_prompt_csv(const std::vector<AppendPromptMetrics>& results) {
+    std::ostringstream out;
+    out << "T,context,end_context,ms,tflops,tflops_pct,global_floor_gbps,"
+           "global_floor_gbps_pct,tile_kv_read_gbps,logical_kv_gbps,avg_keys_per_query,"
+           "ns_per_key_query,us_per_token,q_blocks,attention_ctas,key_tiles,tile_reuse_queries,"
+           "bound,roofline_tflops,roofline_eff_pct,global_floor_bytes,tile_kv_read_bytes,"
+           "logical_kv_bytes,useful_flops,key_sum,qblock_key_rows,median_ms,min_ms,p95_ms,"
+           "mean_ms,runs,inner_iters\n";
+    for (const AppendPromptMetrics& m : results) {
+        out << m.tokens << ',' << m.context << ',' << m.end_context << ','
+            << json_number(m.median_ms) << ',' << json_number(m.tflops) << ','
+            << json_number(m.tflops_pct) << ',' << json_number(m.global_floor_gbps) << ','
+            << json_number(m.global_floor_gbps_pct) << ',' << json_number(m.tile_kv_read_gbps)
+            << ',' << json_number(m.logical_kv_gbps) << ',' << json_number(m.avg_keys_per_query)
+            << ',' << json_number(m.ns_per_key_query) << ',' << json_number(m.us_per_token) << ','
+            << m.q_blocks << ',' << m.attention_ctas << ',' << m.key_tiles << ','
+            << json_number(m.tile_reuse_queries) << ',' << m.bound << ','
+            << json_number(m.roofline_tflops) << ',' << json_number(m.roofline_eff_pct) << ','
+            << json_number(m.global_floor_bytes) << ',' << json_number(m.tile_kv_read_bytes) << ','
+            << json_number(m.logical_kv_bytes) << ',' << json_number(m.useful_flops) << ','
+            << json_number(m.key_sum) << ',' << json_number(m.qblock_key_rows) << ','
+            << json_number(m.median_ms) << ',' << json_number(m.min_ms) << ','
+            << json_number(m.p95_ms) << ',' << json_number(m.mean_ms) << ',' << m.runs << ','
+            << m.inner_iters << '\n';
+    }
+    return out.str();
+}
+
+std::string format_append_prompt_json(const std::vector<AppendPromptMetrics>& results,
+                                      const PrefillTimingOptions& timing) {
+    std::ostringstream out;
+    out << "{\n"
+        << "  \"schema_version\": 1,\n"
+        << "  \"artifact_type\": \"qus_gqa_attention_append_prompt_bench\",\n"
+        << "  \"tc_peak_tflops\": " << json_number(kDenseTcPeakTflops) << ",\n"
+        << "  \"dram_peak_gbps\": " << json_number(kDramPeakGBs) << ",\n"
+        << "  \"q_block\": " << kPromptQBlock << ",\n"
+        << "  \"k_block\": " << kPromptKBlock << ",\n"
+        << "  \"flops_definition\": \"useful_causal_4*d*Hq*sum_{i=0}^{T-1}(context+i+1)\",\n"
+        << "  \"logical_kv_bytes_definition\": \"per-query unique GQA K/V references, no "
+           "query-block reuse\",\n"
+        << "  \"global_floor_bytes_definition\": \"Q read + output write + input K/V read + "
+           "cache K/V write + current prompt-kernel per-q_head K/V tile reads\",\n"
+        << "  \"tile_reuse_queries_definition\": \"logical token-key pairs divided by loaded "
+           "q-block key rows before q_head multiplication\",\n"
+        << "  \"timing\": {\"warmup\": " << timing.warmup << ", \"repeat\": " << timing.repeat
+        << ", \"min_time_ms\": " << timing.min_time_ms << "},\n"
+        << "  \"results\": [\n";
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        const AppendPromptMetrics& m = results[i];
+        out << "    {\"T\": " << m.tokens << ", \"context\": " << m.context
+            << ", \"end_context\": " << m.end_context << ", \"ms\": " << json_number(m.median_ms)
+            << ", \"tflops\": " << json_number(m.tflops)
+            << ", \"tflops_pct\": " << json_number(m.tflops_pct)
+            << ", \"global_floor_gbps\": " << json_number(m.global_floor_gbps)
+            << ", \"global_floor_gbps_pct\": " << json_number(m.global_floor_gbps_pct)
+            << ", \"tile_kv_read_gbps\": " << json_number(m.tile_kv_read_gbps)
+            << ", \"logical_kv_gbps\": " << json_number(m.logical_kv_gbps)
+            << ", \"avg_keys_per_query\": " << json_number(m.avg_keys_per_query)
+            << ", \"ns_per_key_query\": " << json_number(m.ns_per_key_query)
+            << ", \"us_per_token\": " << json_number(m.us_per_token)
+            << ", \"q_blocks\": " << m.q_blocks << ", \"attention_ctas\": " << m.attention_ctas
+            << ", \"key_tiles\": " << m.key_tiles
+            << ", \"tile_reuse_queries\": " << json_number(m.tile_reuse_queries)
+            << ", \"bound\": \"" << m.bound
+            << "\", \"roofline_tflops\": " << json_number(m.roofline_tflops)
+            << ", \"roofline_eff_pct\": " << json_number(m.roofline_eff_pct)
+            << ", \"global_floor_bytes\": " << json_number(m.global_floor_bytes)
+            << ", \"tile_kv_read_bytes\": " << json_number(m.tile_kv_read_bytes)
+            << ", \"logical_kv_bytes\": " << json_number(m.logical_kv_bytes)
+            << ", \"useful_flops\": " << json_number(m.useful_flops)
+            << ", \"key_sum\": " << json_number(m.key_sum)
+            << ", \"qblock_key_rows\": " << json_number(m.qblock_key_rows)
+            << ", \"median_ms\": " << json_number(m.median_ms)
+            << ", \"min_ms\": " << json_number(m.min_ms)
+            << ", \"p95_ms\": " << json_number(m.p95_ms)
+            << ", \"mean_ms\": " << json_number(m.mean_ms) << ", \"runs\": " << m.runs
+            << ", \"inner_iters\": " << m.inner_iters << "}" << (i + 1 < results.size() ? "," : "")
+            << "\n";
+    }
+    out << "  ]\n"
+        << "}\n";
+    return out.str();
+}
+
 void write_text_file(const std::string& path, const std::string& text) {
     if (path.empty()) { return; }
     const std::filesystem::path p(path);
@@ -746,6 +982,7 @@ struct Options {
     std::int32_t context             = 0;
     std::uint32_t round_robin_layers = 1;
     std::vector<std::int32_t> tokens;
+    std::vector<std::int32_t> contexts;
     PrefillTimingOptions prefill_timing;
     double expect_tflops_pct_min = -1.0;
     std::string csv_out;
@@ -760,7 +997,8 @@ void fail_usage(const char* message) {
                  "       qus_gqa_attention_bench --prefill --tokens 4096 --profile-once\n"
                  "       qus_gqa_attention_bench --append-small-t --tokens T --context N "
                  "[--profile-once] [--cold-cache]\n"
-                 "       qus_gqa_attention_bench --append-prompt-baseline --tokens T --context N\n"
+                 "       qus_gqa_attention_bench --append-prompt-baseline --tokens T[,T...] "
+                 "--context N[,N...] [--csv-out path] [--json-out path]\n"
                  "       qus_gqa_attention_bench --copy-ceiling --tokens T --context N\n"
                  "       qus_gqa_attention_bench --decode [--decode-pos N] [--profile-once] "
                  "[--cold-cache] [--round-robin-layers 16]\n",
@@ -793,7 +1031,7 @@ double parse_double_arg(const char* text, const char* flag) {
     return value;
 }
 
-std::vector<std::int32_t> parse_i32_list_arg(const char* text, const char* flag) {
+std::vector<std::int32_t> parse_i32_list_arg(const char* text, const char* flag, bool allow_zero) {
     std::vector<std::int32_t> out;
     const char* start = text;
     while (*start != '\0') {
@@ -801,12 +1039,20 @@ std::vector<std::int32_t> parse_i32_list_arg(const char* text, const char* flag)
         std::string piece(start, comma == nullptr ? std::strlen(start)
                                                   : static_cast<std::size_t>(comma - start));
         const std::int32_t value = parse_i32_arg(piece.c_str(), flag);
-        if (value <= 0) { fail_usage("--tokens expects positive lengths"); }
+        if (!allow_zero && value <= 0) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "%s expects positive values", flag);
+            fail_usage(msg);
+        }
         out.push_back(value);
         if (comma == nullptr) { break; }
         start = comma + 1;
     }
-    if (out.empty()) { fail_usage("--tokens expects at least one length"); }
+    if (out.empty()) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "%s expects at least one value", flag);
+        fail_usage(msg);
+    }
     return out;
 }
 
@@ -825,7 +1071,7 @@ Options parse_options(int argc, char** argv) {
             opt.copy_ceiling = true;
         } else if (!std::strcmp(argv[i], "--tokens") || !std::strcmp(argv[i], "--prefill-tokens")) {
             if (++i >= argc) { fail_usage("--tokens requires a value"); }
-            opt.tokens = parse_i32_list_arg(argv[i], "--tokens");
+            opt.tokens = parse_i32_list_arg(argv[i], "--tokens", false);
         } else if (!std::strcmp(argv[i], "--decode-pos")) {
             if (++i >= argc) { fail_usage("--decode-pos requires a value"); }
             opt.decode_pos     = parse_i32_arg(argv[i], "--decode-pos");
@@ -833,7 +1079,8 @@ Options parse_options(int argc, char** argv) {
             opt.decode         = true;
         } else if (!std::strcmp(argv[i], "--context")) {
             if (++i >= argc) { fail_usage("--context requires a value"); }
-            opt.context     = parse_i32_arg(argv[i], "--context");
+            opt.contexts    = parse_i32_list_arg(argv[i], "--context", true);
+            opt.context     = opt.contexts[0];
             opt.context_set = true;
         } else if (!std::strcmp(argv[i], "--profile-once")) {
             opt.profile_once = true;
@@ -882,10 +1129,10 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (opt.append_small_t && opt.tokens.empty()) { opt.tokens = {1}; }
-    if (opt.append_prompt_baseline && opt.tokens.empty()) { opt.tokens = {6}; }
+    if (opt.append_prompt_baseline && opt.tokens.empty()) { opt.tokens = {1024}; }
     if (opt.copy_ceiling && opt.tokens.empty()) { opt.tokens = {1}; }
-    if ((opt.append_small_t || opt.append_prompt_baseline) && opt.tokens.size() != 1u) {
-        fail_usage("append modes require exactly one --tokens value");
+    if (opt.append_small_t && opt.tokens.size() != 1u) {
+        fail_usage("--append-small-t requires exactly one --tokens value");
     }
     if (opt.copy_ceiling && opt.tokens.size() != 1u) {
         fail_usage("--copy-ceiling requires exactly one --tokens value");
@@ -893,15 +1140,27 @@ Options parse_options(int argc, char** argv) {
     if (opt.append_small_t && (opt.tokens[0] <= 0 || opt.tokens[0] > 6)) {
         fail_usage("--append-small-t currently supports T in [1,6]");
     }
-    if (opt.append_prompt_baseline && (opt.tokens[0] <= 0 || opt.tokens[0] > 6)) {
-        fail_usage("--append-prompt-baseline currently supports T in [1,6]");
-    }
     if (opt.copy_ceiling && (opt.tokens[0] <= 0 || opt.tokens[0] > 6)) {
         fail_usage("--copy-ceiling currently supports T in [1,6]");
     }
     if ((opt.append_small_t || opt.append_prompt_baseline || opt.copy_ceiling) &&
         !opt.context_set) {
         fail_usage("append/copy modes require --context");
+    }
+    if ((opt.append_small_t || opt.copy_ceiling) && opt.contexts.size() != 1u) {
+        fail_usage("--append-small-t and --copy-ceiling require exactly one --context value");
+    }
+    if (opt.append_prompt_baseline && opt.contexts.empty()) {
+        fail_usage("--append-prompt-baseline requires --context");
+    }
+    if (opt.append_small_t || opt.copy_ceiling || opt.append_prompt_baseline) {
+        for (const std::int32_t tokens : opt.tokens) {
+            for (const std::int32_t context : opt.contexts) {
+                if (context > std::numeric_limits<std::int32_t>::max() - tokens) {
+                    fail_usage("--context + --tokens exceeds the maximum supported window");
+                }
+            }
+        }
     }
     if (static_cast<int>(opt.decode) + static_cast<int>(opt.prefill) +
             static_cast<int>(opt.append_small_t) + static_cast<int>(opt.append_prompt_baseline) +
@@ -972,11 +1231,13 @@ int main(int argc, char** argv) {
         max_context = std::max(max_context, pos + 1);
     }
     for (const std::int32_t tokens : opt.tokens) { max_context = std::max(max_context, tokens); }
-    if (opt.append_small_t) { max_context = std::max(max_context, opt.context + opt.tokens[0]); }
-    if (opt.append_prompt_baseline) {
-        max_context = std::max(max_context, opt.context + opt.tokens[0]);
+    if (opt.append_small_t || opt.append_prompt_baseline || opt.copy_ceiling) {
+        for (const std::int32_t tokens : opt.tokens) {
+            for (const std::int32_t context : opt.contexts) {
+                max_context = std::max(max_context, context + tokens);
+            }
+        }
     }
-    if (opt.copy_ceiling) { max_context = std::max(max_context, opt.context + opt.tokens[0]); }
     const std::uint32_t cache_layers = opt.round_robin_layers;
     DeviceArena cache_arena(cache_arena_bytes(cache_layers, max_context));
     WorkspaceArena work_arena(decode_workspace_bytes(decode_positions));
@@ -1021,11 +1282,19 @@ int main(int argc, char** argv) {
         }
     }
     if (opt.append_prompt_baseline) {
-        run_append_prompt_baseline(kv, opt.tokens[0], opt.context);
+        std::vector<AppendPromptMetrics> append_results;
+        append_results.reserve(opt.tokens.size() * opt.contexts.size());
+        for (const std::int32_t tokens : opt.tokens) {
+            for (const std::int32_t context : opt.contexts) {
+                append_results.push_back(
+                    run_append_prompt_baseline(kv, tokens, context, opt.prefill_timing));
+            }
+        }
+        write_text_file(opt.csv_out, format_append_prompt_csv(append_results));
+        write_text_file(opt.json_out,
+                        format_append_prompt_json(append_results, opt.prefill_timing));
     }
-    if (opt.copy_ceiling) {
-        run_copy_ceiling(opt.tokens[0], opt.context);
-    }
+    if (opt.copy_ceiling) { run_copy_ceiling(opt.tokens[0], opt.context); }
     if (opt.prefill) {
         if (opt.profile_once) {
             for (const std::int32_t tokens : opt.tokens) { run_prefill_profile_once(kv, tokens); }

@@ -462,16 +462,16 @@ AppendPromptMetrics append_prompt_metrics_from_result(std::int32_t tokens, std::
     return m;
 }
 
-void print_append_prompt_baseline_result(const AppendPromptMetrics& m) {
+void print_append_prompt_result(const char* tag, const AppendPromptMetrics& m) {
     constexpr double kMiB = 1024.0 * 1024.0;
-    std::printf("gqa_attention append-prompt T=%-6d C=%-7d median=%9.3f ms  min=%9.3f ms  "
+    std::printf("%-38s T=%-6d C=%-7d median=%9.3f ms  min=%9.3f ms  "
                 "p95=%9.3f ms  useful=%9.2f TFLOP/s  tc=%6.2f%% of %.1f  "
                 "tile_floor=%8.1f GB/s (%5.2f%% of %.0f)  logical_kv=%8.1f GB/s  "
                 "ns/key=%6.3f  q_blocks=%d key_tiles=%lld tile_kv=%.2f MiB  "
                 "bound=%s roofline_eff=%6.2f%% runs=%d inner=%d\n",
-                m.tokens, m.context, m.median_ms, m.min_ms, m.p95_ms, m.tflops, m.tflops_pct,
-                kDenseTcPeakTflops, m.global_floor_gbps, m.global_floor_gbps_pct, kDramPeakGBs,
-                m.logical_kv_gbps, m.ns_per_key_query, m.q_blocks,
+                tag, m.tokens, m.context, m.median_ms, m.min_ms, m.p95_ms, m.tflops,
+                m.tflops_pct, kDenseTcPeakTflops, m.global_floor_gbps, m.global_floor_gbps_pct,
+                kDramPeakGBs, m.logical_kv_gbps, m.ns_per_key_query, m.q_blocks,
                 static_cast<long long>(m.key_tiles), m.tile_kv_read_bytes / kMiB, m.bound,
                 m.roofline_eff_pct, m.runs, m.inner_iters);
 }
@@ -671,7 +671,42 @@ AppendPromptMetrics run_append_prompt_baseline(KVCache& kv, std::int32_t tokens,
         bytes, timing.warmup, timing.repeat, timing.min_time_ms);
 
     AppendPromptMetrics metrics = append_prompt_metrics_from_result(tokens, context, r);
-    print_append_prompt_baseline_result(metrics);
+    print_append_prompt_result("gqa_attention append-prompt", metrics);
+    return metrics;
+}
+
+AppendPromptMetrics run_append_prompt_attention_only(KVCache& kv, std::int32_t tokens,
+                                                     std::int32_t context,
+                                                     const PrefillTimingOptions& timing) {
+    const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
+                           static_cast<std::size_t>(tokens);
+    const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
+                            static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
+    DBuf q   = make_bf16(qn);
+    DBuf k   = make_bf16(kvn);
+    DBuf v   = make_bf16(kvn);
+    DBuf pos = make_i32_sequence(context, tokens);
+    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+
+    Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tpos(pos.p, DType::I32, {tokens});
+    Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+
+    cudaStream_t stream = nullptr;
+    kernels::detail::gqa_attention_prompt_launch(tq, tk, tv, tpos, kScale, kv, 0, tout, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const double bytes = append_prompt_global_floor_bytes(tokens, context);
+    const Result r     = bench_loop(
+        [&](cudaStream_t s) {
+            kernels::detail::gqa_attention_prompt_attention_launch(tq, tpos, kScale, kv, 0, tout, s);
+        },
+        bytes, timing.warmup, timing.repeat, timing.min_time_ms);
+
+    AppendPromptMetrics metrics = append_prompt_metrics_from_result(tokens, context, r);
+    print_append_prompt_result("gqa_attention append-attn-only", metrics);
     return metrics;
 }
 
@@ -973,6 +1008,7 @@ struct Options {
     bool prefill                     = false;
     bool append_small_t              = false;
     bool append_prompt_baseline      = false;
+    bool append_prompt_attention     = false;
     bool copy_ceiling                = false;
     bool decode_pos_set              = false;
     bool context_set                 = false;
@@ -999,6 +1035,8 @@ void fail_usage(const char* message) {
                  "[--profile-once] [--cold-cache]\n"
                  "       qus_gqa_attention_bench --append-prompt-baseline --tokens T[,T...] "
                  "--context N[,N...] [--csv-out path] [--json-out path]\n"
+                 "       qus_gqa_attention_bench --append-prompt-attention-only --tokens T[,T...] "
+                 "--context N[,N...]\n"
                  "       qus_gqa_attention_bench --copy-ceiling --tokens T --context N\n"
                  "       qus_gqa_attention_bench --decode [--decode-pos N] [--profile-once] "
                  "[--cold-cache] [--round-robin-layers 16]\n",
@@ -1067,6 +1105,8 @@ Options parse_options(int argc, char** argv) {
             opt.append_small_t = true;
         } else if (!std::strcmp(argv[i], "--append-prompt-baseline")) {
             opt.append_prompt_baseline = true;
+        } else if (!std::strcmp(argv[i], "--append-prompt-attention-only")) {
+            opt.append_prompt_attention = true;
         } else if (!std::strcmp(argv[i], "--copy-ceiling")) {
             opt.copy_ceiling = true;
         } else if (!std::strcmp(argv[i], "--tokens") || !std::strcmp(argv[i], "--prefill-tokens")) {
@@ -1118,7 +1158,7 @@ Options parse_options(int argc, char** argv) {
     }
 
     if (!opt.decode && !opt.prefill && !opt.append_small_t && !opt.append_prompt_baseline &&
-        !opt.copy_ceiling) {
+        !opt.append_prompt_attention && !opt.copy_ceiling) {
         opt.prefill = true;
     }
     if (opt.prefill && opt.tokens.empty()) {
@@ -1129,7 +1169,9 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (opt.append_small_t && opt.tokens.empty()) { opt.tokens = {1}; }
-    if (opt.append_prompt_baseline && opt.tokens.empty()) { opt.tokens = {1024}; }
+    if ((opt.append_prompt_baseline || opt.append_prompt_attention) && opt.tokens.empty()) {
+        opt.tokens = {1024};
+    }
     if (opt.copy_ceiling && opt.tokens.empty()) { opt.tokens = {1}; }
     if (opt.append_small_t && opt.tokens.size() != 1u) {
         fail_usage("--append-small-t requires exactly one --tokens value");
@@ -1143,17 +1185,19 @@ Options parse_options(int argc, char** argv) {
     if (opt.copy_ceiling && (opt.tokens[0] <= 0 || opt.tokens[0] > 6)) {
         fail_usage("--copy-ceiling currently supports T in [1,6]");
     }
-    if ((opt.append_small_t || opt.append_prompt_baseline || opt.copy_ceiling) &&
+    if ((opt.append_small_t || opt.append_prompt_baseline || opt.append_prompt_attention ||
+         opt.copy_ceiling) &&
         !opt.context_set) {
         fail_usage("append/copy modes require --context");
     }
     if ((opt.append_small_t || opt.copy_ceiling) && opt.contexts.size() != 1u) {
         fail_usage("--append-small-t and --copy-ceiling require exactly one --context value");
     }
-    if (opt.append_prompt_baseline && opt.contexts.empty()) {
-        fail_usage("--append-prompt-baseline requires --context");
+    if ((opt.append_prompt_baseline || opt.append_prompt_attention) && opt.contexts.empty()) {
+        fail_usage("--append-prompt modes require --context");
     }
-    if (opt.append_small_t || opt.copy_ceiling || opt.append_prompt_baseline) {
+    if (opt.append_small_t || opt.copy_ceiling || opt.append_prompt_baseline ||
+        opt.append_prompt_attention) {
         for (const std::int32_t tokens : opt.tokens) {
             for (const std::int32_t context : opt.contexts) {
                 if (context > std::numeric_limits<std::int32_t>::max() - tokens) {
@@ -1164,7 +1208,7 @@ Options parse_options(int argc, char** argv) {
     }
     if (static_cast<int>(opt.decode) + static_cast<int>(opt.prefill) +
             static_cast<int>(opt.append_small_t) + static_cast<int>(opt.append_prompt_baseline) +
-            static_cast<int>(opt.copy_ceiling) >
+            static_cast<int>(opt.append_prompt_attention) + static_cast<int>(opt.copy_ceiling) >
         1) {
         fail_usage("select exactly one benchmark mode");
     }
@@ -1176,7 +1220,8 @@ Options parse_options(int argc, char** argv) {
     }
     if (opt.profile_once && static_cast<int>(opt.decode) + static_cast<int>(opt.prefill) +
                                     static_cast<int>(opt.append_small_t) +
-                                    static_cast<int>(opt.append_prompt_baseline) >
+                                    static_cast<int>(opt.append_prompt_baseline) +
+                                    static_cast<int>(opt.append_prompt_attention) >
                                 1) {
         fail_usage("--profile-once must target one mode");
     }
@@ -1192,8 +1237,8 @@ Options parse_options(int argc, char** argv) {
     if (opt.profile_once && opt.copy_ceiling) {
         fail_usage("--copy-ceiling does not support --profile-once");
     }
-    if (opt.profile_once && opt.append_prompt_baseline) {
-        fail_usage("--append-prompt-baseline does not support --profile-once");
+    if (opt.profile_once && (opt.append_prompt_baseline || opt.append_prompt_attention)) {
+        fail_usage("--append-prompt modes do not support --profile-once");
     }
     if (opt.round_robin_layers != 1u && !opt.decode) {
         fail_usage("--round-robin-layers is only valid with --decode");
@@ -1231,7 +1276,8 @@ int main(int argc, char** argv) {
         max_context = std::max(max_context, pos + 1);
     }
     for (const std::int32_t tokens : opt.tokens) { max_context = std::max(max_context, tokens); }
-    if (opt.append_small_t || opt.append_prompt_baseline || opt.copy_ceiling) {
+    if (opt.append_small_t || opt.append_prompt_baseline || opt.append_prompt_attention ||
+        opt.copy_ceiling) {
         for (const std::int32_t tokens : opt.tokens) {
             for (const std::int32_t context : opt.contexts) {
                 max_context = std::max(max_context, context + tokens);
@@ -1288,6 +1334,19 @@ int main(int argc, char** argv) {
             for (const std::int32_t context : opt.contexts) {
                 append_results.push_back(
                     run_append_prompt_baseline(kv, tokens, context, opt.prefill_timing));
+            }
+        }
+        write_text_file(opt.csv_out, format_append_prompt_csv(append_results));
+        write_text_file(opt.json_out,
+                        format_append_prompt_json(append_results, opt.prefill_timing));
+    }
+    if (opt.append_prompt_attention) {
+        std::vector<AppendPromptMetrics> append_results;
+        append_results.reserve(opt.tokens.size() * opt.contexts.size());
+        for (const std::int32_t tokens : opt.tokens) {
+            for (const std::int32_t context : opt.contexts) {
+                append_results.push_back(
+                    run_append_prompt_attention_only(kv, tokens, context, opt.prefill_timing));
             }
         }
         write_text_file(opt.csv_out, format_append_prompt_csv(append_results));

@@ -60,15 +60,23 @@ __device__ __forceinline__ int gqa_prefill_swz(int row, int col) {
 }
 
 __device__ __forceinline__ unsigned gqa_prefill_pack_bf16(float lo, float hi) {
-    const __nv_bfloat16 lo_b = __float2bfloat16(lo);
-    const __nv_bfloat16 hi_b = __float2bfloat16(hi);
-    const unsigned lo_bits   = static_cast<__nv_bfloat16_raw>(lo_b).x;
-    const unsigned hi_bits   = static_cast<__nv_bfloat16_raw>(hi_b).x;
-    return lo_bits | (hi_bits << 16);
+    unsigned out;
+    const unsigned lo_bits = __float_as_uint(lo);
+    const unsigned hi_bits = __float_as_uint(hi);
+    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n"
+                 : "=r"(out)
+                 : "r"(hi_bits), "r"(lo_bits));
+    return out;
 }
 
 __device__ __forceinline__ unsigned gqa_prefill_smem_addr(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void gqa_prefill_cp_async_cg_16(void* smem_dst, const void* gmem_src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(
+                     static_cast<unsigned>(__cvta_generic_to_shared(smem_dst))),
+                 "l"(gmem_src));
 }
 
 // Shared-memory byte address of a swizzled element from per-lane precomputed
@@ -113,25 +121,32 @@ __device__ __forceinline__ float gqa_prefill_exp2_fast(float x) {
     return y;
 }
 
-__global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* k, const __nv_bfloat16* v,
-                                                  const std::int32_t* positions,
-                                                  __nv_bfloat16* cache_k, __nv_bfloat16* cache_v,
+__global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* __restrict__ k,
+                                                  const __nv_bfloat16* __restrict__ v,
+                                                  const std::int32_t* __restrict__ positions,
+                                                  __nv_bfloat16* __restrict__ cache_k,
+                                                  __nv_bfloat16* __restrict__ cache_v,
                                                   std::int32_t tokens,
                                                   std::int32_t padded_context) {
+    constexpr int VecElems = 8; // 8 bf16 == 16 B, matching the cache row alignment.
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t n =
-        static_cast<std::int64_t>(tokens) * kGqaPrefillKVHeads * kGqaPrefillHeadDim;
+        static_cast<std::int64_t>(tokens) * kGqaPrefillKVHeads * (kGqaPrefillHeadDim / VecElems);
     if (idx >= n) { return; }
 
-    const int d        = static_cast<int>(idx % kGqaPrefillHeadDim);
-    const int tmp      = static_cast<int>(idx / kGqaPrefillHeadDim);
+    const int vec      = static_cast<int>(idx % (kGqaPrefillHeadDim / VecElems));
+    const int tmp      = static_cast<int>(idx / (kGqaPrefillHeadDim / VecElems));
     const int kv_head  = tmp % kGqaPrefillKVHeads;
     const int token    = tmp / kGqaPrefillKVHeads;
+    const int d        = vec * VecElems;
     const int position = positions[0] + token;
 
+    const std::int64_t src_off =
+        static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaPrefillHeadDim) *
+                                          (kv_head + kGqaPrefillKVHeads * token);
     const std::int64_t cache_off = gqa_prefill_cache_index(kv_head, d, position, padded_context);
-    cache_k[cache_off]           = k[idx];
-    cache_v[cache_off]           = v[idx];
+    *reinterpret_cast<int4*>(&cache_k[cache_off]) = *reinterpret_cast<const int4*>(&k[src_off]);
+    *reinterpret_cast<int4*>(&cache_v[cache_off]) = *reinterpret_cast<const int4*>(&v[src_off]);
 }
 
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the
@@ -149,15 +164,25 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
     // Block base pointer computed once (int64); per-element offsets stay 32-bit.
     const __nv_bfloat16* cache_block =
         cache + gqa_prefill_cache_index(kv_head, 0, k0, padded_context);
-#pragma unroll 1
-    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
-        const int key_l  = chunk >> 5;        // / VecPerRow (32)
-        const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
-        __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
-        if (full_tile || (k0 + key_l) <= max_query_abs) {
-            qus::kernels::async_copy_global_to_shared<16>(p, &cache_block[key_l * D + d]);
-        } else {
-            *reinterpret_cast<int4*>(p) = make_int4(0, 0, 0, 0);
+    if (full_tile) {
+#pragma unroll
+        for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+            const int key_l  = chunk >> 5;        // / VecPerRow (32)
+            const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
+            __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
+            gqa_prefill_cp_async_cg_16(p, &cache_block[key_l * D + d]);
+        }
+    } else {
+#pragma unroll
+        for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+            const int key_l  = chunk >> 5;        // / VecPerRow (32)
+            const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
+            __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
+            if ((k0 + key_l) <= max_query_abs) {
+                gqa_prefill_cp_async_cg_16(p, &cache_block[key_l * D + d]);
+            } else {
+                *reinterpret_cast<int4*>(p) = make_int4(0, 0, 0, 0);
+            }
         }
     }
 }
@@ -166,9 +191,11 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
 __launch_bounds__(kGqaPrefillThreads, 1) __global__
-    void gqa_attention_prefill_kernel(const __nv_bfloat16* q, const __nv_bfloat16* cache_k,
-                                      const __nv_bfloat16* cache_v, const std::int32_t* positions,
-                                      float scale, __nv_bfloat16* out, std::int32_t tokens,
+    void gqa_attention_prefill_kernel(const __nv_bfloat16* __restrict__ q,
+                                      const __nv_bfloat16* __restrict__ cache_k,
+                                      const __nv_bfloat16* __restrict__ cache_v,
+                                      const std::int32_t* __restrict__ positions,
+                                      float scale, __nv_bfloat16* __restrict__ out, std::int32_t tokens,
                                       std::int32_t padded_context) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
@@ -205,7 +232,6 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     const int a_mat     = lane >> 3;
     const int a_rin     = lane & 7;
     const int a_rowoff  = a_rin + ((a_mat & 1) << 3);
-    const int a_coloff  = (a_mat >> 1) << 3;
     const int b_rin     = lane & 7;
     const int b_koff    = ((lane >> 3) & 1) << 3;
     const int warp_row0 = warp * 16; // this warp owns rows [warp_row0, warp_row0+16)
@@ -238,14 +264,25 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         constexpr int VecPerRow  = D / 8;
         constexpr int QRowStride = D * kGqaPrefillQHeads; // global stride between tokens
         const __nv_bfloat16* q_block = q + gqa_prefill_q_index(q_head, 0, q0);
-        for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
-            const int row    = chunk >> 5;
-            const int d      = (chunk & 31) << 3;
-            __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
-            if (q0 + row < tokens) {
-                qus::kernels::async_copy_global_to_shared<16>(p, &q_block[row * QRowStride + d]);
-            } else {
-                *reinterpret_cast<int4*>(p) = make_int4(0, 0, 0, 0);
+        if (q0 + Br <= tokens) {
+#pragma unroll
+            for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
+                const int row    = chunk >> 5;
+                const int d      = (chunk & 31) << 3;
+                __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
+                gqa_prefill_cp_async_cg_16(p, &q_block[row * QRowStride + d]);
+            }
+        } else {
+#pragma unroll
+            for (int chunk = tid; chunk < Br * VecPerRow; chunk += Threads) {
+                const int row    = chunk >> 5;
+                const int d      = (chunk & 31) << 3;
+                __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
+                if (q0 + row < tokens) {
+                    gqa_prefill_cp_async_cg_16(p, &q_block[row * QRowStride + d]);
+                } else {
+                    *reinterpret_cast<int4*>(p) = make_int4(0, 0, 0, 0);
+                }
             }
         }
     }
@@ -364,21 +401,26 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
         const float nm0 = fmaxf(m0, bm0);
         const float nm1 = fmaxf(m1, bm1);
-        const float alpha0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : gqa_prefill_exp2_fast((m0 - nm0) * scale_l2);
-        const float alpha1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : gqa_prefill_exp2_fast((m1 - nm1) * scale_l2);
+        const float nm0_scaled = nm0 * scale_l2;
+        const float nm1_scaled = nm1 * scale_l2;
+        const float alpha0 = gqa_prefill_exp2_fast(__fmaf_rn(m0, scale_l2, -nm0_scaled));
+        const float alpha1 = gqa_prefill_exp2_fast(__fmaf_rn(m1, scale_l2, -nm1_scaled));
 
-        // P = exp2(S - m), repacked into the PV A-fragment layout, plus block row-sum.
+        // P = exp2(S - m), repacked into the PV A-fragment layout, plus local block row-sum.
+        // The row-sum allreduce is deferred to the epilogue; only row max must be reduced per tile.
         float bl0 = 0.0f, bl1 = 0.0f;
         unsigned p_frag[PVKs][4];
         if (full_score_tile) {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const float p00 = gqa_prefill_exp2_fast((score[nt][0] - nm0) * scale_l2);
-                const float p01 = gqa_prefill_exp2_fast((score[nt][1] - nm0) * scale_l2);
-                const float p10 = gqa_prefill_exp2_fast((score[nt][2] - nm1) * scale_l2);
-                const float p11 = gqa_prefill_exp2_fast((score[nt][3] - nm1) * scale_l2);
+                const float p00 =
+                    gqa_prefill_exp2_fast(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled));
+                const float p01 =
+                    gqa_prefill_exp2_fast(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled));
+                const float p10 =
+                    gqa_prefill_exp2_fast(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled));
+                const float p11 =
+                    gqa_prefill_exp2_fast(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled));
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
@@ -394,16 +436,20 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const float p00 = (score[nt][0] > -CUDART_INF_F)
-                                      ? gqa_prefill_exp2_fast((score[nt][0] - nm0) * scale_l2)
+                                      ? gqa_prefill_exp2_fast(
+                                            __fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
                                       : 0.0f;
                 const float p01 = (score[nt][1] > -CUDART_INF_F)
-                                      ? gqa_prefill_exp2_fast((score[nt][1] - nm0) * scale_l2)
+                                      ? gqa_prefill_exp2_fast(
+                                            __fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
                                       : 0.0f;
                 const float p10 = (score[nt][2] > -CUDART_INF_F)
-                                      ? gqa_prefill_exp2_fast((score[nt][2] - nm1) * scale_l2)
+                                      ? gqa_prefill_exp2_fast(
+                                            __fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
                                       : 0.0f;
                 const float p11 = (score[nt][3] > -CUDART_INF_F)
-                                      ? gqa_prefill_exp2_fast((score[nt][3] - nm1) * scale_l2)
+                                      ? gqa_prefill_exp2_fast(
+                                            __fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
                                       : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
@@ -417,13 +463,9 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
                 }
             }
         }
-        bl0 += __shfl_xor_sync(FullMask, bl0, 1);
-        bl0 += __shfl_xor_sync(FullMask, bl0, 2);
-        bl1 += __shfl_xor_sync(FullMask, bl1, 1);
-        bl1 += __shfl_xor_sync(FullMask, bl1, 2);
 
-        l0 = l0 * alpha0 + bl0;
-        l1 = l1 * alpha1 + bl1;
+        l0 = __fmaf_rn(l0, alpha0, bl0);
+        l1 = __fmaf_rn(l1, alpha1, bl1);
         m0 = nm0;
         m1 = nm1;
 #pragma unroll
@@ -481,22 +523,26 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         }
     }
 
+    l0 += __shfl_xor_sync(FullMask, l0, 1);
+    l0 += __shfl_xor_sync(FullMask, l0, 2);
+    l1 += __shfl_xor_sync(FullMask, l1, 1);
+    l1 += __shfl_xor_sync(FullMask, l1, 2);
+
     // Normalize once per row via reciprocal-multiply instead of 128 IEEE divides.
     const float inv_l0 = (l0 > 0.0f) ? __frcp_rn(l0) : 0.0f;
     const float inv_l1 = (l1 > 0.0f) ? __frcp_rn(l1) : 0.0f;
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
         const int d0    = n * 8 + 2 * lid;
-        const int d1    = d0 + 1;
         const int qrow0 = q0 + warp_row0 + gid;
         const int qrow1 = q0 + warp_row0 + gid + 8;
         if (qrow0 < tokens) {
-            out[gqa_prefill_q_index(q_head, d0, qrow0)] = __float2bfloat16(acc[n][0] * inv_l0);
-            out[gqa_prefill_q_index(q_head, d1, qrow0)] = __float2bfloat16(acc[n][1] * inv_l0);
+            *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index(q_head, d0, qrow0)]) =
+                gqa_prefill_pack_bf16(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
         }
         if (qrow1 < tokens) {
-            out[gqa_prefill_q_index(q_head, d0, qrow1)] = __float2bfloat16(acc[n][2] * inv_l1);
-            out[gqa_prefill_q_index(q_head, d1, qrow1)] = __float2bfloat16(acc[n][3] * inv_l1);
+            *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index(q_head, d0, qrow1)]) =
+                gqa_prefill_pack_bf16(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
 }

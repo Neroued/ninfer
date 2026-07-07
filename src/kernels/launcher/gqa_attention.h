@@ -22,6 +22,10 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
                                  const Tensor& positions, float scale, KVCache& kv, int layer,
                                  Tensor& out, cudaStream_t stream);
 
+void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
+                                           KVCache& kv, int layer, Tensor& out,
+                                           cudaStream_t stream);
+
 void gqa_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                           const Tensor& positions, float scale, KVCache& kv, int layer,
                           Tensor* partial_acc, Tensor* partial_m, Tensor* partial_l, Tensor& out,

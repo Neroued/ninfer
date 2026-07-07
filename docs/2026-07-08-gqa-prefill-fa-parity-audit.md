@@ -6,6 +6,9 @@ Kernel under audit: `qus::kernels::gqa_attention_prefill_kernel`
 Reference: FlashAttention-2 forward (`flash-attn` 2.8.3.post1), the
 `Flash_fwd_kernel_traits<256, 64, 64, 4, false, false, bf16>` instantiation.
 
+Update note: sections 1-9 preserve the original audit baseline. Section 10 records
+the implementation pass made from this audit and the new measured state.
+
 ## 0. Ground rule for this document
 
 Every performance statement carries one of two evidence tags:
@@ -310,3 +313,122 @@ ncu --import profiles/fa_prefill_T1024_C4096.ncu-rep  --page raw --csv > profile
 # Static SASS mix (ours)
 cuobjdump -sass ./build/bench/qus_gqa_attention_bench
 ```
+
+## 10. Implementation update from this audit [MEASURED]
+
+Current code:
+
+- `src/kernels/kernel/gqa_attention_prefill.cuh`
+- `src/kernels/launcher/gqa_attention.h`
+- `src/kernels/launcher/gqa_attention_prefill.cu`
+- `bench/gqa_attention_bench.cu`
+
+Accepted changes:
+
+1. Packed output bf16 conversion now uses `cvt.rn.bf16x2.f32` and 32-bit stores
+   instead of two scalar bf16 conversions and stores.
+2. The softmax exp2 argument is emitted in FFMA form by pre-scaling the current
+   block max and using `__fmaf_rn(score, scale_l2, -max_scaled)`.
+3. The alpha rescale path removed the first-tile `-inf` guard; valid rows
+   naturally produce `exp2(-inf) == 0`.
+4. The running row sum update uses FFMA form, and the row-sum allreduce is
+   deferred to the epilogue instead of running four shuffles every key tile.
+5. K/V staging now splits full and partial tiles before the staging loop and
+   unrolls the fixed 16-iteration cp.async loop.
+6. Q/K/V staging uses a local `cp.async.cg.shared.global` helper, matching FA's
+   cache-global staging choice instead of the old `.ca` helper. This removed
+   the measured cp.async shared-bank conflicts.
+7. Q staging splits full query tiles from partial tiles, so the common
+   T=1024/context=4096 path avoids one per-copy bounds branch in the prologue.
+8. Prefill/fill kernel pointer arguments are marked `__restrict__`.
+9. The K/V fill kernel copies 16 B (`int4`) chunks and the launcher sizes the
+   fill grid at that vector granularity.
+10. The benchmark has an `--append-prompt-attention-only` mode that fills the
+   cache once, then times only `gqa_attention_prefill_kernel`, matching FA's
+   `--attention-only` comparator.
+
+Standalone timing after this implementation pass:
+
+```bash
+for i in 1 2 3; do \
+  ./build/bench/qus_gqa_attention_bench \
+    --append-prompt-baseline --tokens 1024 --context 4096 \
+    --warmup 20 --repeat 100 --min-time-ms 500; \
+done
+# -> median 0.766 ms, useful 151.36-151.41 TFLOP/s,
+#    tc=72.25-72.27%, ns/key=0.162
+
+for i in 1 2 3; do \
+  ./build/bench/qus_gqa_attention_bench \
+    --append-prompt-attention-only --tokens 1024 --context 4096 \
+    --warmup 20 --repeat 100 --min-time-ms 500; \
+done
+# -> median 0.759-0.760 ms, useful 152.69-152.85 TFLOP/s,
+#    tc=72.88-72.96%, ns/key=0.161
+
+for i in 1 2 3; do \
+  conda run -n vllm-bench python tools/bench/flash_attn_gqa_bench.py \
+    --tokens 1024 --context 4096 --attention-only \
+    --warmup 20 --repeat 100 --min-time-ms 500; \
+done
+# -> FA attention-only median 0.761-0.763 ms, useful 152.06-152.41 TFLOP/s
+
+for i in 1 2 3; do \
+  conda run -n vllm-bench python tools/bench/flash_attn_gqa_bench.py \
+    --tokens 1024 --context 4096 --include-fill \
+    --warmup 20 --repeat 100 --min-time-ms 500; \
+done
+# -> FA with-fill median 0.795-0.796 ms, useful 145.62-145.91 TFLOP/s
+```
+
+The original audit compared our full append-prompt wrapper against FA
+attention-only, which is a useful upper-bound comparison but not an
+apples-to-apples API comparison. With the matching with-fill operation, current
+ours is about **1.04x faster** than FA (0.766 ms vs 0.795-0.796 ms). Against the
+FA attention-only upper bound, current attention-only timing is also a small
+stable win (0.759-0.760 ms vs 0.761-0.763 ms).
+
+NCU spot check after this implementation pass:
+
+| metric | original ours | current ours | FA comparison |
+|--------|---------------|--------------|---------------|
+| full append/wrapper median | 0.950 ms | 0.766 ms | n/a |
+| attention-only median | n/a | 0.759-0.760 ms | 0.761-0.763 ms |
+| with-fill median | n/a | 0.766 ms | 0.795-0.796 ms |
+| useful TFLOP/s, full/with-fill | 122.10 | 151.36-151.41 | 145.62-145.91 |
+| useful TFLOP/s, attention-only | n/a | 152.69-152.85 | 152.06-152.41 |
+| `smsp__inst_executed.sum` | 185,801,472 | 124,551,168 | 88,628,736 |
+| tensor active % | 64.70 | 82.17 | 88.52 |
+| shared bank conflicts, total | 6,344,186 | 0 | 0 |
+| cp.async bank conflicts | 6,396,868 | 0 | 0 |
+| main register / thread | 246 | 249 | 235 |
+| fill register / thread | 16 | 20 | n/a |
+
+This closes the measured cp.async conflict issue completely and cuts main-kernel
+dynamic instructions by 33.0% from the original kernel. Wall-clock now meets the
+audit target: current ours is faster than FA in both the matching with-fill path
+and the stricter attention-only comparator.
+
+Measured candidates that were reverted:
+
+- Page-style cp.async staging intended to mimic FA's 8-thread/64-column store
+  map passed correctness but was slower on this kernel.
+- Smem-staged vectorized output stores passed correctness but added shared
+  memory traffic, barriers, and conflicts without improving wall time.
+- A templated mask-free steady loop reduced source-level branching but increased
+  dynamic instruction count in NCU.
+- Row-major non-XOR shared layout made runtime much worse; the original XOR
+  layout remains the best measured local layout.
+- Q staging unroll, compile-time scale specialization, `cp.async` `L2::128B`
+  hinting, and approximate reciprocal specialization either pushed register
+  pressure to 255 registers/thread or did not improve sustained long-run timing.
+
+Remaining gap:
+
+The local fixes above moved the full append-prompt path from roughly 0.950 ms to
+0.766 ms, which beats FA's matching with-fill operation and its attention-only
+kernel on this audit shape. The remaining structural gap is still main-kernel
+dynamic instruction count: 124.6M vs FA's 88.6M. That gap no longer prevents
+wall-clock parity on RTX 5090 for T=1024/context=4096, but closing it further
+would require the larger FA-style reverse mainloop/address schedule rewrite
+identified above, not additional launch-side changes.

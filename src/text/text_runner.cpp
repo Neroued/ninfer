@@ -105,24 +105,39 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
                                                      const TextGenerationOptions& options) {
     using Clock = std::chrono::steady_clock;
 
+    const auto render_start          = Clock::now();
+    ChatRenderOptions render_options = options.render_options;
+    render_options.enable_thinking   = options.enable_thinking;
+    const std::string prompt         = render_qwen_chat(messages, render_options);
+    std::vector<int> prompt_token_ids = tokenizer_.encode(prompt);
+    const double render_tokenize_seconds =
+        std::chrono::duration<double>(Clock::now() - render_start).count();
+    return run_tokens(std::move(prompt_token_ids), options, render_tokenize_seconds);
+}
+
+TextGenerationResult TextGenerationRunner::generate(std::span<const int> prompt_token_ids,
+                                                     const TextGenerationOptions& options) {
+    return run_tokens(std::vector<int>(prompt_token_ids.begin(), prompt_token_ids.end()), options,
+                      0.0);
+}
+
+TextGenerationResult TextGenerationRunner::run_tokens(std::vector<int> prompt_token_ids,
+                                                       const TextGenerationOptions& options,
+                                                       double render_tokenize_seconds) {
+    using Clock = std::chrono::steady_clock;
+
     if (options.max_new_tokens <= 0) {
         throw std::invalid_argument("max_new_tokens must be positive");
     }
 
     const auto total_start = Clock::now();
-    const auto render_start = Clock::now();
     const std::vector<int> stop_token_ids =
         resolve_stop_token_ids(tokenizer_, options.stop_token_ids);
-    ChatRenderOptions render_options = options.render_options;
-    render_options.enable_thinking   = options.enable_thinking;
-    const std::string prompt         = render_qwen_chat(messages, render_options);
-    std::vector<int> prompt_token_ids     = tokenizer_.encode(prompt);
     const std::size_t required_context =
         prompt_token_ids.size() + static_cast<std::size_t>(options.max_new_tokens - 1);
     if (required_context > engine_.max_context()) {
         throw std::invalid_argument("prompt exceeds engine max_context");
     }
-    const auto render_end = Clock::now();
 
     std::vector<int> generated_token_ids;
     generated_token_ids.reserve(static_cast<std::size_t>(options.max_new_tokens));
@@ -230,10 +245,11 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
     const auto total_end       = Clock::now();
 
     TextGenerationTimings timings;
-    timings.render_tokenize_seconds = std::chrono::duration<double>(render_end - render_start).count();
+    timings.render_tokenize_seconds = render_tokenize_seconds;
     timings.prefill_seconds         = std::chrono::duration<double>(prefill_end - prefill_start).count();
     timings.decode_seconds          = std::chrono::duration<double>(decode_end - decode_start).count();
-    timings.total_seconds           = std::chrono::duration<double>(total_end - total_start).count();
+    timings.total_seconds =
+        render_tokenize_seconds + std::chrono::duration<double>(total_end - total_start).count();
 
     return TextGenerationResult{.prompt_token_ids = std::move(prompt_token_ids),
                                 .generated_token_ids = std::move(generated_token_ids),

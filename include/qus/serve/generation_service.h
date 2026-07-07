@@ -54,11 +54,15 @@ struct StreamSink {
     std::function<bool()> is_cancelled;
 };
 
-// A validated, tokenized request ready to execute.
+// A validated, tokenized request ready to execute. The prompt is rendered and
+// tokenized once here in prepare(); run() reuses prompt_token_ids so a served
+// request renders the chat template exactly once.
 struct PreparedRequest {
     std::vector<qus::text::ChatMessage> messages;
     qus::text::TextGenerationOptions options;
     std::vector<std::string> stop_strings;
+    std::vector<int> prompt_token_ids;
+    double render_tokenize_seconds = 0.0;
     int prompt_tokens  = 0;
     bool include_usage = false;
     bool tool_capable  = false;

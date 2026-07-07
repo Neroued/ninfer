@@ -27,7 +27,7 @@ struct ServeOptions {
     int mtp_draft_tokens      = 0;
     bool use_cuda_graph       = true;
     bool use_lm_head_draft    = false;
-    bool enable_thinking      = false;  // default thinking mode for the generation prompt
+    bool enable_thinking      = true;  // default thinking mode for the generation prompt (--no-thinking opts out)
     // Used when a request omits max_tokens. 0 => derive from max_context in
     // parse_serve_options; --default-max-tokens overrides with an explicit value.
     int default_max_tokens    = 0;

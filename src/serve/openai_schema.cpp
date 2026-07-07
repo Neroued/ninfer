@@ -208,6 +208,14 @@ void parse_messages(const Json& body, GenerationRequest& out) {
                 bad_request("assistant message " + std::to_string(i) + " must have content or tool_calls",
                             "messages");
             }
+            if (item.contains("reasoning_content") && !item.at("reasoning_content").is_null()) {
+                if (!item.at("reasoning_content").is_string()) {
+                    bad_request("assistant message " + std::to_string(i) +
+                                    " reasoning_content must be a string",
+                                "messages");
+                }
+                turn.reasoning_content = item.at("reasoning_content").get<std::string>();
+            }
             out.messages.push_back(std::move(turn));
             continue;
         }

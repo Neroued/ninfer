@@ -64,6 +64,7 @@ struct ChatTurn {
     std::vector<ContentPart> content;  // one or more parts; assistant content may be empty with tool_calls
     std::vector<ToolCall> tool_calls;
     std::string tool_call_id;          // populated for role=tool
+    std::string reasoning_content;     // assistant thinking carried across turns (round-tripped to the template)
 };
 
 // The complete OpenAI sampling surface. Parsed now, honored when the sampler

@@ -5,6 +5,7 @@
 #include "qus/text/tokenizer.h"
 
 #include <functional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -43,7 +44,8 @@ enum class FinishReason {
 struct TextGenerationOptions {
     int max_new_tokens = 128;
     bool raw_output = false;
-    bool enable_thinking = false;
+    // Default thinking-ON, matching the Qwen3.6 template's default generation prompt.
+    bool enable_thinking = true;
     bool preserve_special_tokens = false;
     ChatRenderOptions render_options;
     std::vector<int> stop_token_ids;
@@ -70,10 +72,23 @@ class TextGenerationRunner {
 public:
     TextGenerationRunner(QwenTokenizer& tokenizer, qus::Engine& engine);
 
+    // Renders the chat template, tokenizes, then prefills/decodes. Used by the CLI.
     TextGenerationResult generate(const std::vector<ChatMessage>& messages,
                                   const TextGenerationOptions& options);
 
+    // Prefills/decodes an already-tokenized prompt, skipping render+encode. The
+    // serving layer renders once in GenerationService::prepare() and reuses the
+    // token ids here so a served request renders exactly once.
+    TextGenerationResult generate(std::span<const int> prompt_token_ids,
+                                  const TextGenerationOptions& options);
+
 private:
+    // Shared prefill/decode body. render_tokenize_seconds is folded into the
+    // total time so the metric stays meaningful regardless of the entry point.
+    TextGenerationResult run_tokens(std::vector<int> prompt_token_ids,
+                                    const TextGenerationOptions& options,
+                                    double render_tokenize_seconds);
+
     QwenTokenizer& tokenizer_;
     qus::Engine& engine_;
 };

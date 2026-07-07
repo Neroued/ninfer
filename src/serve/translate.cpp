@@ -87,9 +87,10 @@ std::vector<qus::text::ChatMessage> to_chat_messages(const GenerationRequest& re
             text += part.text;
         }
         qus::text::ChatMessage message;
-        message.role         = std::move(role);
-        message.content      = std::move(text);
-        message.tool_call_id = turn.tool_call_id;
+        message.role              = std::move(role);
+        message.content           = std::move(text);
+        message.reasoning_content = turn.reasoning_content;
+        message.tool_call_id      = turn.tool_call_id;
         message.tool_calls.reserve(turn.tool_calls.size());
         for (const ToolCall& call : turn.tool_calls) {
             message.tool_calls.push_back(

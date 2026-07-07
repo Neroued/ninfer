@@ -52,7 +52,7 @@ std::string serve_usage_text(const char* argv0) {
            " <weights.qus> --tokenizer <dir> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
            "[--mtp-draft-tokens N] [--default-max-tokens N] [--no-cuda-graph] "
-           "[--lm-head-draft] [--thinking] [--cors] "
+           "[--lm-head-draft] [--no-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves an OpenAI-compatible Chat Completions endpoint\n"
@@ -108,8 +108,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--lm-head-draft") {
             options.use_lm_head_draft = true;
-        } else if (arg == "--thinking") {
-            options.enable_thinking = true;
+        } else if (arg == "--no-thinking") {
+            options.enable_thinking = false;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {

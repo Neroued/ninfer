@@ -41,7 +41,8 @@ qus_add_test(qus_model_blocks_test           SOURCES test_model_blocks.cpp      
 target_compile_definitions(qus_model_blocks_test PRIVATE QUS_MODEL_TESTING=1)
 qus_add_test(qus_engine_memory_stats_test    SOURCES test_engine_memory_stats.cpp NEEDS_SOURCE_DIR)
 qus_add_test(qus_qwen_text_cli_test          SOURCES test_qwen_text_cli.cpp)
-qus_add_test(qus_qwen_chat_template_test     SOURCES test_qwen_chat_template.cpp)
+qus_add_test(qus_qwen_chat_template_test     SOURCES test_qwen_chat_template.cpp NEEDS_SOURCE_DIR)
+target_include_directories(qus_qwen_chat_template_test PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 qus_add_test(qus_qwen_text_tokenizer_test
              SOURCES test_qwen_text_tokenizer.cpp
              NEEDS_SOURCE_DIR)

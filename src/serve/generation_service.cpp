@@ -5,8 +5,10 @@
 #include "qus/serve/translate.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <iostream>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -110,9 +112,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
 
     qus::text::ChatRenderOptions render_options = prepared.options.render_options;
     render_options.enable_thinking              = prepared.options.enable_thinking;
+    const auto render_start = std::chrono::steady_clock::now();
     const std::string prompt = qus::text::render_qwen_chat(prepared.messages, render_options);
-    const std::vector<int> ids = tokenizer_->encode(prompt);
-    prepared.prompt_tokens     = static_cast<int>(ids.size());
+    std::vector<int> ids = tokenizer_->encode(prompt);
+    prepared.render_tokenize_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - render_start).count();
+    prepared.prompt_tokens = static_cast<int>(ids.size());
 
     const std::size_t required =
         ids.size() + static_cast<std::size_t>(std::max(0, prepared.options.max_new_tokens - 1));
@@ -127,6 +132,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
                         std::to_string(engine_->max_context()) + ")";
         throw ApiException(std::move(error));
     }
+    prepared.prompt_token_ids = std::move(ids);
     return prepared;
 }
 
@@ -167,13 +173,16 @@ GenerationOutcome GenerationService::run(const PreparedRequest& prepared, const 
     // Reset speculative-decoding counters so mtp_stats() reflects only this request;
     // reset + read happen under the same engine lock, so the numbers are per-request.
     engine_->reset_mtp_stats();
-    const qus::text::TextGenerationResult result = runner.generate(prepared.messages, opt);
+    // The prompt was already rendered + tokenized in prepare(); reuse those ids so
+    // the chat template renders exactly once per request.
+    const qus::text::TextGenerationResult result =
+        runner.generate(std::span<const int>(prepared.prompt_token_ids), opt);
     const qus::EngineMtpStats mtp = engine_->mtp_stats();
 
     GenerationOutcome outcome;
     outcome.prompt_tokens     = static_cast<int>(result.prompt_token_ids.size());
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
-    outcome.metrics.render_tokenize_seconds = result.timings.render_tokenize_seconds;
+    outcome.metrics.render_tokenize_seconds = prepared.render_tokenize_seconds;
     outcome.metrics.prefill_seconds         = result.timings.prefill_seconds;
     outcome.metrics.decode_seconds          = result.timings.decode_seconds;
     outcome.metrics.total_seconds           = result.timings.total_seconds;

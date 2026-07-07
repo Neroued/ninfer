@@ -27,7 +27,8 @@ struct CliOptions {
     OutputMode output_mode      = OutputMode::Clean;
     bool print_token_ids        = false;
     bool use_cuda_graph         = true;
-    bool enable_thinking        = false;
+    // Default thinking-ON, matching the Qwen3.6 template (--no-thinking opts out).
+    bool enable_thinking        = true;
     bool use_lm_head_draft      = false;
     std::vector<int> stop_token_ids;
     // Sampler defaults match the Qwen3 thinking recommendation so the CLI decodes

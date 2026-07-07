@@ -34,6 +34,57 @@ std::string trim_ascii_whitespace(const std::string& text) {
     return text.substr(begin, end - begin);
 }
 
+bool starts_with(const std::string& text, std::string_view prefix) {
+    return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool ends_with(const std::string& text, std::string_view suffix) {
+    return text.size() >= suffix.size() &&
+           text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string lstrip_newlines(std::string text) {
+    std::size_t begin = 0;
+    while (begin < text.size() && text[begin] == '\n') { ++begin; }
+    return text.substr(begin);
+}
+
+std::string rstrip_newlines(std::string text) {
+    std::size_t end = text.size();
+    while (end > 0 && text[end - 1] == '\n') { --end; }
+    return text.substr(0, end);
+}
+
+// Split an assistant turn into (reasoning, content) exactly as the Qwen3.6 jinja
+// does when reasoning_content is not provided: reasoning is the text between the
+// last <think> and the first </think>; content is everything after the last
+// </think>. When there is no </think> the whole thing is content and reasoning is
+// empty.
+struct ThinkParts {
+    std::string reasoning;
+    std::string content;
+};
+
+ThinkParts derive_think_parts(const std::string& content) {
+    ThinkParts parts;
+    const std::size_t first_close = content.find("</think>");
+    if (first_close == std::string::npos) {
+        parts.content = content;
+        return parts;
+    }
+    // reasoning = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n')
+    std::string before = rstrip_newlines(content.substr(0, first_close));
+    const std::size_t last_open = before.rfind("<think>");
+    std::string reasoning =
+        (last_open == std::string::npos) ? before
+                                         : before.substr(last_open + std::string("<think>").size());
+    parts.reasoning = lstrip_newlines(std::move(reasoning));
+    // content = content.split('</think>')[-1].lstrip('\n')
+    const std::size_t last_close = content.rfind("</think>");
+    parts.content = lstrip_newlines(content.substr(last_close + std::string("</think>").size()));
+    return parts;
+}
+
 constexpr std::string_view kToolInstructions =
     "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
     "<tool_call>\n"
@@ -108,16 +159,18 @@ ChatMessage parse_message(const Json& item, std::size_t index) {
     if (item.contains("tool_calls")) {
         throw std::invalid_argument("message " + std::to_string(index) + " contains tool_calls");
     }
-    if (item.contains("reasoning_content")) {
-        throw std::invalid_argument("message " + std::to_string(index) +
-                                    " contains reasoning_content");
-    }
     if (item.contains("name")) {
         throw std::invalid_argument("message " + std::to_string(index) + " contains name");
     }
-    if (item.size() != 2 || !item.contains("role") || !item.contains("content")) {
+    for (auto it = item.begin(); it != item.end(); ++it) {
+        if (it.key() != "role" && it.key() != "content" && it.key() != "reasoning_content") {
+            throw std::invalid_argument("message " + std::to_string(index) +
+                                        " contains unsupported field: " + it.key());
+        }
+    }
+    if (!item.contains("role") || !item.contains("content")) {
         throw std::invalid_argument("message " + std::to_string(index) +
-                                    " must contain exactly role and content");
+                                    " must contain role and content");
     }
     if (!item.at("role").is_string()) {
         throw std::invalid_argument("message " + std::to_string(index) + " role must be string");
@@ -135,7 +188,15 @@ ChatMessage parse_message(const Json& item, std::size_t index) {
         throw std::invalid_argument("message " + std::to_string(index) +
                                     " content must be a non-empty string");
     }
-    return ChatMessage{role, content};
+    ChatMessage message{role, content};
+    if (item.contains("reasoning_content")) {
+        if (!item.at("reasoning_content").is_string()) {
+            throw std::invalid_argument("message " + std::to_string(index) +
+                                        " reasoning_content must be a string");
+        }
+        message.reasoning_content = item.at("reasoning_content").get<std::string>();
+    }
+    return message;
 }
 
 } // namespace
@@ -171,51 +232,103 @@ std::string render_qwen_chat(const std::vector<ChatMessage>& messages,
                              ChatRenderOptions options) {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
 
+    const auto is_system_role = [](const std::string& role) {
+        return role == "system" || role == "developer";
+    };
+
+    // Merge up to the first two leading system/developer messages; any later ones
+    // are dropped. developer folds into system. (jinja lines 45-57)
+    std::size_t num_sys = 0;
+    std::string merged_system;
+    if (is_system_role(messages[0].role)) {
+        const std::string first = trim_ascii_whitespace(messages[0].content);
+        if (messages.size() > 1 && is_system_role(messages[1].role)) {
+            const std::string second = trim_ascii_whitespace(messages[1].content);
+            merged_system = first + "\n" + second;
+            num_sys       = 2;
+        } else {
+            merged_system = first;
+            num_sys       = 1;
+        }
+    }
+
     std::string rendered;
     const bool has_tools = !options.tool_jsons.empty();
-    std::size_t skip_system = 0;
-    if (has_tools && (messages[0].role == "system")) {
-        std::string merged_system = trim_ascii_whitespace(messages[0].content);
-        skip_system               = 1;
-        if (messages.size() > 1 && messages[1].role == "system") {
-            const std::string second = trim_ascii_whitespace(messages[1].content);
-            if (!second.empty()) {
-                if (!merged_system.empty()) { merged_system += '\n'; }
-                merged_system += second;
-            }
-            skip_system = 2;
-        }
+    if (has_tools) {
         rendered += render_tools_system_block(options.tool_jsons, merged_system);
-    } else if (has_tools) {
-        rendered += render_tools_system_block(options.tool_jsons, "");
+    } else if (!merged_system.empty()) {
+        rendered += "<|im_start|>system\n";
+        rendered += merged_system;
+        rendered += "<|im_end|>\n";
+    }
+
+    // last_query_index = index of the last user message whose (trimmed) content is
+    // not a bare <tool_response>...</tool_response> wrapper. (jinja lines 76-86)
+    long last_query_index = static_cast<long>(messages.size()) - 1;
+    bool multi_step_tool  = true;
+    for (long i = static_cast<long>(messages.size()) - 1; i >= 0; --i) {
+        if (!multi_step_tool) { break; }
+        const ChatMessage& message = messages[static_cast<std::size_t>(i)];
+        if (message.role == "user") {
+            const std::string content = trim_ascii_whitespace(message.content);
+            if (!(starts_with(content, "<tool_response>") && ends_with(content, "</tool_response>"))) {
+                multi_step_tool  = false;
+                last_query_index = i;
+            }
+        }
     }
 
     for (std::size_t i = 0; i < messages.size(); ++i) {
         const ChatMessage& message = messages[i];
-        if (has_tools && i < skip_system) { continue; }
-        if (has_tools && message.role == "system") { continue; }
+        if (i < num_sys) { continue; }
+        if (is_system_role(message.role)) { continue; }
         if (!is_allowed_role(message.role)) {
             throw std::invalid_argument("unsupported chat role: " + message.role);
         }
+        const std::string content = trim_ascii_whitespace(message.content);
+        if (message.role == "user") {
+            rendered += "<|im_start|>user\n";
+            rendered += content;
+            rendered += "<|im_end|>\n";
+            continue;
+        }
         if (message.role == "tool") {
-            const bool opens_group = i == 0 || messages[i - 1].role != "tool";
+            const bool opens_group  = i > 0 && messages[i - 1].role != "tool";
             const bool closes_group = i + 1 == messages.size() || messages[i + 1].role != "tool";
             if (opens_group) { rendered += "<|im_start|>user"; }
             rendered += "\n<tool_response>\n";
-            rendered += trim_ascii_whitespace(message.content);
+            rendered += content;
             rendered += "\n</tool_response>";
             if (closes_group) { rendered += "<|im_end|>\n"; }
             continue;
         }
-        rendered += "<|im_start|>";
-        rendered += message.role;
-        rendered += '\n';
-        const std::string content = trim_ascii_whitespace(message.content);
-        rendered += content;
+
+        // assistant
+        std::string reasoning;
+        std::string body = content;
+        if (!message.reasoning_content.empty()) {
+            reasoning = message.reasoning_content;
+        } else {
+            ThinkParts parts = derive_think_parts(content);
+            reasoning        = std::move(parts.reasoning);
+            body             = std::move(parts.content);
+        }
+        reasoning = trim_ascii_whitespace(reasoning);
+
+        const bool keep_thinking =
+            options.preserve_thinking || (static_cast<long>(i) > last_query_index);
+        rendered += "<|im_start|>assistant\n";
+        if (keep_thinking) {
+            rendered += "<think>\n";
+            rendered += reasoning;
+            rendered += "\n</think>\n\n";
+        }
+        rendered += body;
         if (!message.tool_calls.empty()) {
+            const bool body_has_text = !trim_ascii_whitespace(body).empty();
             for (std::size_t call_index = 0; call_index < message.tool_calls.size(); ++call_index) {
                 if (call_index == 0) {
-                    if (!content.empty()) { rendered += "\n\n"; }
+                    if (body_has_text) { rendered += "\n\n"; }
                 } else {
                     rendered += "\n";
                 }

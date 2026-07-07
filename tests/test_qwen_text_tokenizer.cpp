@@ -658,10 +658,26 @@ int test_hf_golden_message_cases() {
     for (const auto& item : fixture.at("message_cases")) {
         std::vector<qus::text::ChatMessage> messages;
         for (const auto& msg : item.at("messages")) {
-            messages.push_back(
-                {msg.at("role").get<std::string>(), msg.at("content").get<std::string>()});
+            qus::text::ChatMessage cm;
+            cm.role    = msg.at("role").get<std::string>();
+            cm.content = msg.at("content").get<std::string>();
+            if (msg.contains("reasoning_content")) {
+                cm.reasoning_content = msg.at("reasoning_content").get<std::string>();
+            }
+            if (msg.contains("tool_calls")) {
+                for (const auto& tc : msg.at("tool_calls")) {
+                    cm.tool_calls.push_back(qus::text::ToolCall{
+                        "", tc.at("name").get<std::string>(),
+                        tc.at("arguments_json").get<std::string>()});
+                }
+            }
+            messages.push_back(std::move(cm));
         }
-        const std::string rendered = qus::text::render_qwen_chat(messages);
+        qus::text::ChatRenderOptions options;
+        options.enable_thinking   = item.at("enable_thinking").get<bool>();
+        options.preserve_thinking = item.at("preserve_thinking").get<bool>();
+        options.tool_jsons        = item.at("tool_jsons").get<std::vector<std::string>>();
+        const std::string rendered = qus::text::render_qwen_chat(messages, options);
         if (rendered != item.at("rendered").get<std::string>()) {
             std::cerr << "rendered prompt mismatch for " << item.at("name").get<std::string>()
                       << '\n';

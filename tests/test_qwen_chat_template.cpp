@@ -1,5 +1,7 @@
 #include "qus/text/chat_template.h"
 
+#include <nlohmann/json.hpp>
+
 #include <chrono>
 #include <exception>
 #include <filesystem>
@@ -7,9 +9,18 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
+
+std::filesystem::path repo_file(std::string_view relative) {
+#ifdef QUS_SOURCE_DIR
+    return std::filesystem::path(QUS_SOURCE_DIR) / relative;
+#else
+    return std::filesystem::current_path() / relative;
+#endif
+}
 
 int fail(const char* message) {
     std::cerr << message << '\n';
@@ -67,20 +78,21 @@ struct TempJson {
 };
 
 int test_prompt_renders_qwen_chat() {
+    // Default is thinking-ON, matching the Qwen3.6 template's default prompt.
     const std::vector<qus::text::ChatMessage> messages = qus::text::messages_from_prompt("你好");
     const std::string rendered                         = qus::text::render_qwen_chat(messages);
     return check(rendered == "<|im_start|>user\n你好<|im_end|>\n"
-                             "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                             "<|im_start|>assistant\n<think>\n",
                  "prompt render mismatch");
 }
 
-int test_prompt_renders_thinking_prefix() {
+int test_prompt_renders_no_thinking_prefix() {
     const std::vector<qus::text::ChatMessage> messages = qus::text::messages_from_prompt("你好");
     const std::string rendered = qus::text::render_qwen_chat(
-        messages, qus::text::ChatRenderOptions{.enable_thinking = true});
+        messages, qus::text::ChatRenderOptions{.enable_thinking = false});
     return check(rendered == "<|im_start|>user\n你好<|im_end|>\n"
-                             "<|im_start|>assistant\n<think>\n",
-                 "thinking prompt render mismatch");
+                             "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                 "no-thinking prompt render mismatch");
 }
 
 int test_json_messages_render_prefixes() {
@@ -138,7 +150,9 @@ int test_assistant_tool_call_history_renders_qwen_xml() {
 
     const std::string rendered = qus::text::render_qwen_chat(messages);
     int failures = 0;
-    failures += check(rendered.find("<|im_start|>assistant\n<tool_call>\n"
+    // The tool-call turn is after the last user query, so the (empty) think block
+    // is kept ahead of the <tool_call> XML, matching the official template.
+    failures += check(rendered.find("<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n"
                                     "<function=get_weather>\n") != std::string::npos,
                       "assistant tool call prefix missing");
     failures += check(rendered.find("<parameter=city>\nParis\n</parameter>\n") !=
@@ -194,16 +208,64 @@ int test_rejections() {
     return failures;
 }
 
+// Byte-for-byte parity against the HF-generated golden fixture. This is the
+// authoritative correctness gate for the faithful render_qwen_chat port; it needs
+// only the committed fixture (no tokenizer/model), so it runs anywhere.
+int test_hf_golden_render_parity() {
+    const auto fixture_path = repo_file("tests/fixtures/text/qwen36_text_golden.json");
+    std::ifstream in(fixture_path);
+    if (!in) {
+        std::cerr << "golden render parity: cannot open fixture " << fixture_path << '\n';
+        return 1;
+    }
+    const nlohmann::json fixture = nlohmann::json::parse(in);
+    int failures                 = 0;
+    for (const auto& item : fixture.at("message_cases")) {
+        const std::string name = item.at("name").get<std::string>();
+        std::vector<qus::text::ChatMessage> messages;
+        for (const auto& msg : item.at("messages")) {
+            qus::text::ChatMessage cm;
+            cm.role    = msg.at("role").get<std::string>();
+            cm.content = msg.at("content").get<std::string>();
+            if (msg.contains("reasoning_content")) {
+                cm.reasoning_content = msg.at("reasoning_content").get<std::string>();
+            }
+            if (msg.contains("tool_calls")) {
+                for (const auto& tc : msg.at("tool_calls")) {
+                    cm.tool_calls.push_back(qus::text::ToolCall{
+                        "", tc.at("name").get<std::string>(),
+                        tc.at("arguments_json").get<std::string>()});
+                }
+            }
+            messages.push_back(std::move(cm));
+        }
+        qus::text::ChatRenderOptions options;
+        options.enable_thinking   = item.at("enable_thinking").get<bool>();
+        options.preserve_thinking = item.at("preserve_thinking").get<bool>();
+        options.tool_jsons        = item.at("tool_jsons").get<std::vector<std::string>>();
+
+        const std::string actual   = qus::text::render_qwen_chat(messages, options);
+        const std::string expected = item.at("rendered").get<std::string>();
+        if (actual != expected) {
+            std::cerr << "golden render parity mismatch for " << name << "\nexpected: " << expected
+                      << "\nactual:   " << actual << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
     failures += test_prompt_renders_qwen_chat();
-    failures += test_prompt_renders_thinking_prefix();
+    failures += test_prompt_renders_no_thinking_prefix();
     failures += test_json_messages_render_prefixes();
     failures += test_tool_system_block_merges_system_content();
     failures += test_assistant_tool_call_history_renders_qwen_xml();
     failures += test_tool_role_renders_tool_response();
     failures += test_rejections();
+    failures += test_hf_golden_render_parity();
     return failures == 0 ? 0 : fail("qwen chat template test failed");
 }

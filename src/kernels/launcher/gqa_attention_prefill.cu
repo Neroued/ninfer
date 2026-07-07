@@ -28,11 +28,18 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
         static_cast<__nv_bfloat16*>(cache_v.data), tokens, padded_context);
     CUDA_CHECK(cudaGetLastError());
 
-    constexpr int kQBlock         = 64;
-    constexpr int kAttentionBlock = 128;
+    constexpr int kQBlock         = kGqaPrefillBr;
+    constexpr int kAttentionBlock = kGqaPrefillThreads;
+    constexpr int kSmemBytes      = kGqaPrefillSmemBytes;  // 96 KiB dynamic smem (Q + K + V)
+
+    // The FA-style tile needs > 48 KiB of shared memory, so opt in once.
+    static const cudaError_t attr_rc = cudaFuncSetAttribute(
+        gqa_attention_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+    CUDA_CHECK(attr_rc);
+
     const dim3 attention_grid(static_cast<unsigned>((tokens + kQBlock - 1) / kQBlock),
                               static_cast<unsigned>(kGqaPrefillQHeads), 1u);
-    gqa_attention_prefill_kernel<<<attention_grid, kAttentionBlock, 0, stream>>>(
+    gqa_attention_prefill_kernel<<<attention_grid, kAttentionBlock, kSmemBytes, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(cache_k.data),
         static_cast<const __nv_bfloat16*>(cache_v.data),
         static_cast<const std::int32_t*>(positions.data), scale,

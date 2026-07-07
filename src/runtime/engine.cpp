@@ -446,6 +446,7 @@ void Engine::load(const std::string& path) {
     decode_warmed_ = false;
     round_warmed_  = false;
     pending_sampled_.clear();
+    logical_tokens_.clear();
     card_.reset();
     state_.reset();
     kv_.reset();
@@ -631,10 +632,23 @@ std::vector<int> Engine::read_round_output() {
     std::vector<int> out(static_cast<std::size_t>(n));
     CUDA_CHECK(cudaMemcpy(out.data(), io_.sampled_out.data, out.size() * sizeof(int),
                           cudaMemcpyDeviceToHost));
-    kv_->pos += static_cast<std::uint32_t>(n);
+    const std::uint32_t base = kv_->pos;
+    kv_->pos = base + static_cast<std::uint32_t>(n);
     const auto stop = std::find_if(out.begin(), out.end(),
                                    [&](int token) { return is_stop_token(token); });
-    if (stop != out.end()) { out.erase(stop + 1, out.end()); }
+    if (stop != out.end()) {
+        const int m = static_cast<int>(stop - out.begin()) + 1;
+        out.erase(stop + 1, out.end());
+        // sampled_out holds [d0..d_{a-1}, t_star]: index i<a commits at absolute position base+1+i,
+        // and the trailing t_star (index a == n-1) is the uncommitted next-round bonus. When the
+        // stop is a committed draft (m < n), rewind the KV overshoot so the resident prefix ends at
+        // the stop token, and point gdn_initial_slot at that token's per-token GDN snapshot slot so
+        // the committed KV and recurrent state stay consistent and reusable next turn.
+        if (m < n) {
+            kv_->pos = base + static_cast<std::uint32_t>(m) + 1;
+            set_gdn_initial_slot(m);
+        }
+    }
     return out;
 }
 
@@ -657,7 +671,55 @@ int Engine::prefill(std::span<const int> ids) {
     // Penalty counts are per-request: clear them before this prompt's first pick.
     CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
     card_->prefill(ids);
-    return read_token();
+    logical_tokens_.assign(ids.begin(), ids.end());
+    const int tok = read_token();
+    logical_tokens_.push_back(tok);
+    return tok;
+}
+
+int Engine::prefill_append(std::span<const int> ids) {
+    require_loaded();
+    if (ids.empty()) { throw std::invalid_argument("Engine::prefill_append requires tokens"); }
+    if (kv_->pos == 0) {
+        throw std::runtime_error("Engine::prefill_append has no resident cache to extend");
+    }
+    if (static_cast<std::uint64_t>(kv_->pos) + ids.size() > options_.max_ctx) {
+        throw std::invalid_argument("Engine::prefill_append exceeds max_ctx");
+    }
+    // Append path: do NOT reset kv_/mtp_kv_/state_/gdn_initial_slot. The model card continues from
+    // the current kv_->pos (absolute positions) and reads the committed GDN state from the slot in
+    // gdn_initial_slot for the first chunk, writing the running state back to slot 0.
+    pending_sampled_.clear();
+    // Penalty counts are per-turn: clear them before this turn's first pick.
+    CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
+    // Drop any emitted-but-uncommitted tail; keep only the reusable resident prefix.
+    logical_tokens_.resize(kv_->pos);
+    card_->prefill(ids);
+    logical_tokens_.insert(logical_tokens_.end(), ids.begin(), ids.end());
+    const int tok = read_token();
+    logical_tokens_.push_back(tok);
+    return tok;
+}
+
+int Engine::prefill_cached(std::span<const int> ids) {
+    require_loaded();
+    if (ids.empty()) { throw std::invalid_argument("Engine::prefill_cached requires tokens"); }
+    const std::size_t resident = kv_->pos;
+    // Reuse only when the ENTIRE resident cache is an exact prefix of the new request and there is
+    // a non-empty suffix to append. The mirror must cover the resident prefix (a max-token cutoff
+    // can leave committed-but-unmirrored tokens, in which case we conservatively full-prefill).
+    if (resident > 0 && resident <= logical_tokens_.size() && ids.size() > resident) {
+        std::size_t match = 0;
+        while (match < resident && logical_tokens_[match] == ids[match]) { ++match; }
+        if (match == resident) { return prefill_append(ids.subspan(resident)); }
+    }
+    return prefill(ids);
+}
+
+void Engine::set_gdn_initial_slot(int slot) {
+    const std::int32_t value = static_cast<std::int32_t>(slot);
+    CUDA_CHECK(cudaMemcpy(io_.gdn_initial_slot.data, &value, sizeof(value),
+                          cudaMemcpyHostToDevice));
 }
 
 int Engine::decode_step_one() {
@@ -747,6 +809,7 @@ int Engine::decode_step() {
     if (!pending_sampled_.empty()) {
         const int token = pending_sampled_.front();
         pending_sampled_.erase(pending_sampled_.begin());
+        logical_tokens_.push_back(token);
         return token;
     }
 
@@ -754,6 +817,7 @@ int Engine::decode_step() {
     if (tokens.empty()) { throw std::runtime_error("Engine MTP round produced no tokens"); }
     const int first = tokens.front();
     pending_sampled_.assign(tokens.begin() + 1, tokens.end());
+    logical_tokens_.push_back(first);
     return first;
 }
 

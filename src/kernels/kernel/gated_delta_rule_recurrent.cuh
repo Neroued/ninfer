@@ -136,6 +136,13 @@ __device__ __forceinline__ void gdn_load_qk_lane_bf16(float (&reg)[DQK_PER_LANE]
     }
 }
 
+// state_read / state_write are the read and write bases (fp32).
+//   Spec (snapshot):    read from state_read[safe(*initial_slot)] slot, write per-token snapshots
+//                       into state_write slots 0..T-1.
+//   non-spec:           read from state_read (caller-resolved view), write the final running state
+//                       into state_write (slot-0 view). Passing state_read == state_write is the
+//                       in-place form; distinct views let prefix-append prefill read a committed
+//                       snapshot slot and publish the running state to slot 0.
 template <int HeadDim, bool Spec>
 __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
     gated_delta_rule_recurrent_bf16_kernel(const __nv_bfloat16* __restrict__ q,
@@ -143,7 +150,8 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
                                            const __nv_bfloat16* __restrict__ v,
                                            const float* __restrict__ g,
                                            const float* __restrict__ beta,
-                                           float* __restrict__ ssm_state_or_states,
+                                           float* __restrict__ state_read,
+                                           float* __restrict__ state_write,
                                            const std::int32_t* __restrict__ initial_slot,
                                            __nv_bfloat16* __restrict__ out, std::int64_t T,
                                            head_map heads, float scale,
@@ -162,19 +170,19 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
         static_cast<std::uint32_t>(blockIdx.z * kGdnBlockDv + warp_id * kGdnDvPerWarp);
     const std::uint32_t dqk_base = static_cast<std::uint32_t>(lane * d_qk_per_lane);
 
-    float* state_base = ssm_state_or_states;
+    float* read_base = state_read;
     if constexpr (Spec) {
         const std::int32_t slot = *initial_slot;
         const std::int32_t safe_slot = (slot >= 0 && slot < slots) ? slot : 0;
-        state_base = ssm_state_or_states + static_cast<std::int64_t>(safe_slot) * state_slot_stride;
+        read_base = state_read + static_cast<std::int64_t>(safe_slot) * state_slot_stride;
     }
-    float* state_h = state_base + static_cast<std::int64_t>(h_v) * HeadDim * HeadDim;
+    float* read_h = read_base + static_cast<std::int64_t>(h_v) * HeadDim * HeadDim;
 
     __align__(16) float s_tile[kGdnDvPerWarp][d_qk_per_lane];
 #pragma unroll
     for (int r = 0; r < kGdnDvPerWarp; ++r) {
         gdn_load_qk_lane<HeadDim, d_qk_per_lane, active_lanes>(
-            s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * HeadDim, lane,
+            s_tile[r], read_h + static_cast<std::int64_t>(dv_base + r) * HeadDim, lane,
             dqk_base);
     }
 
@@ -232,7 +240,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
         }
 
         if constexpr (Spec) {
-            float* snapshot_h = ssm_state_or_states + t * state_slot_stride +
+            float* snapshot_h = state_write + t * state_slot_stride +
                                 static_cast<std::int64_t>(h_v) * HeadDim * HeadDim;
 #pragma unroll
             for (int r = 0; r < kGdnDvPerWarp; ++r) {
@@ -244,10 +252,11 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
     }
 
     if constexpr (!Spec) {
+        float* write_h = state_write + static_cast<std::int64_t>(h_v) * HeadDim * HeadDim;
 #pragma unroll
         for (int r = 0; r < kGdnDvPerWarp; ++r) {
             gdn_store_qk_lane<HeadDim, d_qk_per_lane, active_lanes>(
-                s_tile[r], state_h + static_cast<std::int64_t>(dv_base + r) * HeadDim, lane,
+                s_tile[r], write_h + static_cast<std::int64_t>(dv_base + r) * HeadDim, lane,
                 dqk_base);
         }
     }

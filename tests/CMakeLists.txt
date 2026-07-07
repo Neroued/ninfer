@@ -33,6 +33,8 @@ add_test(NAME qus_engine_mtp_e2e_test_fallback_after_accept
          COMMAND qus_engine_mtp_e2e_test fallback_after_accept)
 add_test(NAME qus_engine_mtp_e2e_test_stop_truncation
          COMMAND qus_engine_mtp_e2e_test stop_truncation)
+add_test(NAME qus_engine_mtp_e2e_test_multiturn_prefix_cache
+         COMMAND qus_engine_mtp_e2e_test multiturn_prefix_cache)
 qus_add_test(qus_model_config_test           SOURCES test_model_config.cpp)
 qus_add_test(qus_model_bind_test             SOURCES test_model_bind.cpp        NEEDS_SOURCE_DIR)
 qus_add_test(qus_model_blocks_test           SOURCES test_model_blocks.cpp      NEEDS_SOURCE_DIR)

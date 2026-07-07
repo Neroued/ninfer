@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
 #include <iostream>
@@ -152,6 +153,79 @@ int scenario_stop_truncation(const std::filesystem::path& weights) {
     return failures;
 }
 
+// Drives one conversation turn to completion with greedy decode, honoring stop tokens the same way
+// the text runner does. When use_cache is true it goes through the engine-level prefix cache.
+std::vector<int> drive_turn(qus::Engine& engine, const std::vector<int>& prompt, int max_new,
+                            const std::vector<int>& stop_ids, bool use_cache) {
+    std::vector<int> out;
+    if (max_new <= 0) { return out; }
+    const auto is_stop = [&](int token) {
+        return std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end();
+    };
+    int token = use_cache ? engine.prefill_cached(prompt) : engine.prefill(prompt);
+    out.push_back(token);
+    if (is_stop(token)) { return out; }
+    while (static_cast<int>(out.size()) < max_new) {
+        token = engine.decode_step();
+        out.push_back(token);
+        if (is_stop(token)) { break; }
+    }
+    return out;
+}
+
+// Core correctness gate for engine-level prefix caching (plan whitelist 4). A two-turn greedy
+// conversation must produce identical token ids whether the second turn re-prefills the whole
+// prompt (cache OFF) or reuses the resident KV + GDN state and prefills only the new suffix
+// (cache ON). Covers MTP-off and MTP-on. Turn 1 ends on a committed stop token (the reusable
+// case) so turn 2 actually takes the append path.
+int scenario_multiturn_prefix_cache(const std::filesystem::path& weights) {
+    const std::vector<int> p1 = foundation_prompt_ids();
+    const std::vector<int> user_suffix = {198, 248045, 74455, 198, 248068, 271};
+    constexpr int kTurnNew = 8;
+    int failures = 0;
+    for (int mtp : {0, 3}) {
+        const std::string tag = mtp > 0 ? "mtp-on" : "mtp-off";
+
+        // Probe the natural greedy continuation to pick a real token as the stop id, so turn 1
+        // ends on a committed stop rather than a mid-round max-token cut.
+        qus::EngineOptions probe_opt;
+        probe_opt.max_ctx          = 256;
+        probe_opt.mtp_draft_tokens = mtp;
+        probe_opt.use_cuda_graph   = false;
+        const Run probe = generate(weights, probe_opt, p1, kTurnNew);
+        if (probe.tokens.size() < 4) {
+            failures += fail("multiturn probe too short (" + tag + ")");
+            continue;
+        }
+
+        qus::EngineOptions options = probe_opt;
+        options.stop_token_ids     = {probe.tokens[3]};
+
+        // Baseline: full re-prefill each turn (cache OFF).
+        qus::Engine base(options);
+        base.load(weights.string());
+        const std::vector<int> g1 = drive_turn(base, p1, kTurnNew, options.stop_token_ids, false);
+        std::vector<int> p2 = p1;
+        p2.insert(p2.end(), g1.begin(), g1.end());
+        p2.insert(p2.end(), user_suffix.begin(), user_suffix.end());
+        const std::vector<int> g2 = drive_turn(base, p2, kTurnNew, options.stop_token_ids, false);
+
+        // Cached: one resident engine reuses the prefix across turns (cache ON).
+        qus::Engine cached(options);
+        cached.load(weights.string());
+        const std::vector<int> c1 = drive_turn(cached, p1, kTurnNew, options.stop_token_ids, true);
+        std::vector<int> p2c = p1;
+        p2c.insert(p2c.end(), c1.begin(), c1.end());
+        p2c.insert(p2c.end(), user_suffix.begin(), user_suffix.end());
+        const std::vector<int> c2 =
+            drive_turn(cached, p2c, kTurnNew, options.stop_token_ids, true);
+
+        failures += (c1 == g1) ? 0 : fail("multiturn prefix cache turn 1 differs (" + tag + ")");
+        failures += (c2 == g2) ? 0 : fail("multiturn prefix cache turn 2 differs (" + tag + ")");
+    }
+    return failures;
+}
+
 int scenario_graph_parity(const std::filesystem::path& weights) {
     const std::vector<int> prompt = foundation_prompt_ids();
 
@@ -180,6 +254,9 @@ int run_scenario(std::string_view scenario, const std::filesystem::path& weights
     if (scenario == "capacity_fallback") { return scenario_capacity_fallback(weights); }
     if (scenario == "fallback_after_accept") { return scenario_fallback_after_accept(weights); }
     if (scenario == "stop_truncation") { return scenario_stop_truncation(weights); }
+    if (scenario == "multiturn_prefix_cache") {
+        return scenario_multiturn_prefix_cache(weights);
+    }
     if (scenario == "graph_parity") { return scenario_graph_parity(weights); }
     std::cerr << "unknown scenario: " << scenario << '\n';
     return 2;
@@ -191,7 +268,7 @@ int main(int argc, char** argv) {
     if (argc > 2) {
         std::cerr << "usage: qus_engine_mtp_e2e_test "
                      "<batched|capacity_fallback|fallback_after_accept|stop_truncation|"
-                     "graph_parity>\n";
+                     "multiturn_prefix_cache|graph_parity>\n";
         return 2;
     }
     const std::filesystem::path weights = real_weights_path();
@@ -225,7 +302,7 @@ int main(int argc, char** argv) {
     } else {
         for (std::string_view scenario :
              {"batched", "capacity_fallback", "fallback_after_accept", "stop_truncation",
-              "graph_parity"}) {
+              "multiturn_prefix_cache", "graph_parity"}) {
             const int scenario_failures = run_scenario(scenario, weights);
             if (scenario_failures != 0) { failures += scenario_failures; }
         }

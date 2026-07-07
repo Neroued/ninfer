@@ -176,7 +176,10 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
         // shared engine; the default is greedy (temperature 0 == exact argmax).
         engine_.set_sampling(options.sampling);
         const NvtxRange range("qus.prefill");
-        token = engine_.prefill(prompt_token_ids);
+        // Engine-level prefix caching: reuse the resident KV + GDN state when this request extends
+        // the previous turn's token sequence, prefilling only the new suffix. Falls back to a full
+        // reset prefill on any divergence, so single-shot callers (empty resident) are unchanged.
+        token = engine_.prefill_cached(prompt_token_ids);
     }
     const auto prefill_end = Clock::now();
 

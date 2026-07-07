@@ -84,8 +84,16 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
         __floats2bfloat162_rn(causal_conv1d_silu_f32(acc0), causal_conv1d_silu_f32(acc1));
 }
 
+// Writes the trailing width-3 conv window after consuming the T input columns.
+// The initial window is read from `conv_state_in` and the new window is written
+// to `conv_state_out`; passing the same pointer for both is the in-place form.
+// Separating them lets prefix-append prefill read the committed state from a
+// selected GDN snapshot slot while always publishing the running state to slot 0.
+// The initial values are loaded into registers before any store, so overlapping
+// in/out (in == out) has no read/write hazard.
 __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
-                                                   __nv_bfloat16* conv_state, std::int32_t C,
+                                                   const __nv_bfloat16* conv_state_in,
+                                                   __nv_bfloat16* conv_state_out, std::int32_t C,
                                                    std::int32_t T) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
@@ -93,9 +101,9 @@ __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
 
     for (std::int64_t c64 = start; c64 < C64; c64 += stride) {
         const std::int32_t c     = static_cast<std::int32_t>(c64);
-        const __nv_bfloat16 old0 = conv_state[c];
-        const __nv_bfloat16 old1 = conv_state[C64 + c];
-        const __nv_bfloat16 old2 = conv_state[2 * C64 + c];
+        const __nv_bfloat16 old0 = conv_state_in[c];
+        const __nv_bfloat16 old1 = conv_state_in[C64 + c];
+        const __nv_bfloat16 old2 = conv_state_in[2 * C64 + c];
 
         for (std::int32_t s = 0; s < 3; ++s) {
             const std::int32_t seq_pos = T + s;
@@ -109,7 +117,7 @@ __global__ void causal_conv1d_prefill_state_kernel(const __nv_bfloat16* x,
             } else {
                 v = x[static_cast<std::int64_t>(seq_pos - 3) * C64 + c];
             }
-            conv_state[static_cast<std::int64_t>(s) * C64 + c] = v;
+            conv_state_out[static_cast<std::int64_t>(s) * C64 + c] = v;
         }
     }
 }

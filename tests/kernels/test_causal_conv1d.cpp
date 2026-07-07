@@ -385,6 +385,64 @@ static int prefill_state_carry_equivalence(std::uint32_t seed, std::int32_t C, s
     return f;
 }
 
+// Prefix-append parity: reading the initial width-3 window from a selected slot and
+// writing the running window to slot 0 must match the in-place run seeded with the
+// same initial window. Same math -> bit-exact. read_slot == 0 exercises the in-place
+// equivalence; T < 3 exercises reading the initial window from the selected slot.
+static int prefill_from_slot_equivalence(std::uint32_t seed, std::int32_t C, std::int32_t T,
+                                         std::int32_t slots, std::int32_t read_slot) {
+    const std::size_t n       = static_cast<std::size_t>(C) * T;
+    const std::size_t state_n = static_cast<std::size_t>(C) * 3u;
+    const std::size_t weight_n = static_cast<std::size_t>(C) * 4u;
+
+    std::vector<float> x(n), weight(weight_n), state(state_n);
+    fill_uniform(x, seed, -8.f, 8.f);
+    fill_uniform(weight, seed + 1000u, -8.f, 8.f);
+    fill_uniform(state, seed + 2000u, -8.f, 8.f);
+    round_to_bf16(x);
+    round_to_bf16(weight);
+    round_to_bf16(state);
+
+    DBuf rx = to_device_bf16(x), rw = to_device_bf16(weight), rstate = to_device_bf16(state),
+         rout(n * 2);
+    Tensor tx(rx.p, DType::BF16, {C, T});
+    Tensor tw(rw.p, DType::BF16, {C, 4});
+    Tensor ts(rstate.p, DType::BF16, {C, 3});
+    Tensor tout(rout.p, DType::BF16, {C, T});
+    kernels::causal_conv1d_prefill(tx, tw, ts, tout, nullptr);
+    cudaDeviceSynchronize();
+
+    DBuf fx = to_device_bf16(x), fw = to_device_bf16(weight), fout(n * 2);
+    DBuf fstates(state_n * static_cast<std::size_t>(slots) * 2u);
+    cudaMemset(fstates.p, 0, fstates.bytes);
+    std::vector<std::uint16_t> state_bits(state_n);
+    for (std::size_t i = 0; i < state_n; ++i) { state_bits[i] = f32_to_bf16(state[i]); }
+    cudaMemcpy(static_cast<unsigned char*>(fstates.p) +
+                   static_cast<std::size_t>(read_slot) * state_n * 2u,
+               state_bits.data(), state_n * 2u, cudaMemcpyHostToDevice);
+
+    Tensor fx_t(fx.p, DType::BF16, {C, T});
+    Tensor fw_t(fw.p, DType::BF16, {C, 4});
+    Tensor fin(static_cast<unsigned char*>(fstates.p) +
+                   static_cast<std::size_t>(read_slot) * state_n * 2u,
+               DType::BF16, {C, 3});
+    Tensor fout_state(fstates.p, DType::BF16, {C, 3});
+    Tensor fout_t(fout.p, DType::BF16, {C, T});
+    kernels::causal_conv1d_prefill(fx_t, fw_t, fin, fout_state, fout_t, nullptr);
+    cudaDeviceSynchronize();
+
+    const std::string tag = "causal_conv1d from-slot C=" + std::to_string(C) +
+                            " T=" + std::to_string(T) + " slots=" + std::to_string(slots) +
+                            " read_slot=" + std::to_string(read_slot);
+    int f = 0;
+    f += verify_u16_equal((tag + " out bits").c_str(), from_device_u16(fout.p, n),
+                          from_device_u16(rout.p, n));
+    f += verify_u16_equal((tag + " slot0 state bits").c_str(),
+                          from_device_u16(fstates.p, state_n),
+                          from_device_u16(rstate.p, state_n));
+    return f;
+}
+
 template <typename Fn>
 static int expect_invalid(const char* label, const Fn& fn) {
     try {
@@ -570,6 +628,11 @@ int main() {
     }
     f += prefill_state_carry_equivalence(6061u, 10240, 257, 129);
     f += prefill_state_carry_equivalence(6067u, 10241, 257, 2);
+    f += prefill_from_slot_equivalence(6071u, 10240, 7, 8, 0);
+    f += prefill_from_slot_equivalence(6073u, 10240, 7, 8, 3);
+    f += prefill_from_slot_equivalence(6075u, 10240, 64, 8, 5);
+    f += prefill_from_slot_equivalence(6077u, 10240, 2, 8, 4);
+    f += prefill_from_slot_equivalence(6079u, 10241, 7, 8, 3);
     f += one_prefill_shape("causal_conv1d stress prefill [10241,64] [-32,32]", 10241, 64, 4242u,
                            -32.f, 32.f);
     f += one_decode_shape("causal_conv1d stress decode [10240,1] [-32,32]", 10240, 4343u, -32.f,

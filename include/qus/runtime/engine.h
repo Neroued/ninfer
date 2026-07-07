@@ -82,6 +82,10 @@ public:
     void set_sampling(const kernels::SamplingConfig& config);
 
     int prefill(std::span<const int> ids);
+    // Single-user multi-turn prefix caching. When the resident cache is an exact prefix of `ids`,
+    // prefill only the new suffix (reusing KV + GDN state); otherwise fall back to a full reset
+    // prefill. Correct under MTP speculative decode. Returns the first generated token.
+    int prefill_cached(std::span<const int> ids);
     int decode_step();
     std::vector<int> generate(std::span<const int> prompt, int max_new_tokens);
 
@@ -105,6 +109,13 @@ private:
     [[nodiscard]] static std::size_t default_cache_bytes(std::uint32_t max_ctx);
 
     void require_loaded() const;
+    // Append-only prefill continuation: extends the resident cache with `ids` without resetting
+    // kv_/mtp_kv_/state_/gdn_initial_slot. Resolves the GDN read slot from gdn_initial_slot inside
+    // the model card, writes the running state to slot 0. Returns the first generated token.
+    int prefill_append(std::span<const int> ids);
+    // Writes the host-side GDN snapshot slot into the device gdn_initial_slot scalar so the next
+    // MTP round / append prefill reads the committed recurrent state from that slot.
+    void set_gdn_initial_slot(int slot);
     [[nodiscard]] int read_token();
     [[nodiscard]] bool is_stop_token(int token) const noexcept;
     [[nodiscard]] int decode_step_one();
@@ -135,6 +146,10 @@ private:
     bool decode_warmed_ = false;
     bool round_warmed_  = false;
     std::vector<int> pending_sampled_;
+    // Host mirror of the resident logical token sequence: prompt tokens followed by every token
+    // returned by prefill/decode. The reusable prefix is logical_tokens_[0 : kv_.pos]; the tail
+    // beyond kv_.pos (if any) holds the last emitted-but-uncommitted bonus token.
+    std::vector<int> logical_tokens_;
 };
 
 } // namespace qus

@@ -374,7 +374,8 @@ BenchRow run_prefill_kernel_only(const Options& opt, int T) {
     row.result = bench_loop(
         [&](cudaStream_t s) {
             kernels::detail::gated_delta_rule_chunked_launch(tq, tk, tv, tg, tbeta, kScale, tstate,
-                                                             tout, workspace.p, workspace.bytes, s);
+                                                             tstate, tout, workspace.p,
+                                                             workspace.bytes, s);
         },
         estimate_user_bytes(T, sizeof(std::uint16_t)), opt.warmup, opt.repeat, opt.min_time_ms);
     return row;

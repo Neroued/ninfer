@@ -25,8 +25,9 @@ std::size_t gdn_chunked_workspace_bytes(std::int64_t T) {
 
 void gated_delta_rule_chunked_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                      const Tensor& g, const Tensor& beta, float scale,
-                                     Tensor& ssm_state, Tensor& out, void* workspace,
-                                     std::size_t workspace_bytes, cudaStream_t stream) {
+                                     const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
+                                     void* workspace, std::size_t workspace_bytes,
+                                     cudaStream_t stream) {
     const auto layout =
         gdn_chunked::compute_workspace_layout(q.ne[0], q.ne[1], v.ne[1], q.ne[2], kB);
     if (workspace == nullptr || workspace_bytes < static_cast<std::size_t>(layout.total_bytes)) {
@@ -66,10 +67,10 @@ void gated_delta_rule_chunked_launch(const Tensor& q, const Tensor& k, const Ten
     state.U         = U;
     state.k         = static_cast<const __nv_bfloat16*>(k.data);
     state.g_cumsum  = g_cumsum;
-    state.state_in  = static_cast<const float*>(ssm_state.data);
+    state.state_in  = static_cast<const float*>(ssm_state_in.data);
     state.v_new     = v_new;
     state.h_chunk   = h_chunk;
-    state.state_out = static_cast<float*>(ssm_state.data);
+    state.state_out = static_cast<float*>(ssm_state_out.data);
     state.stream    = stream;
     CUDA_CHECK(gdn_state_passing::launch_state_passing(state));
 

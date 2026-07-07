@@ -118,9 +118,14 @@ void validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor&
 }
 
 void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, int chunk_size, const Tensor& ssm_state,
-                      const Tensor& out) {
-    validate_recurrent(q, k, v, g, beta, scale, ssm_state, out);
+                      const Tensor& beta, float scale, int chunk_size, const Tensor& ssm_state_in,
+                      const Tensor& ssm_state_out, const Tensor& out) {
+    // ssm_state_out carries the running-state contract validated by validate_recurrent;
+    // ssm_state_in is an equally-shaped read view (may alias ssm_state_out for in-place).
+    validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, out);
+    require_dtype(ssm_state_in, DType::FP32, "ssm_state_in must be FP32");
+    require_shape(ssm_state_in, kS, kS, kHv, 1, "ssm_state_in");
+    require_contiguous_nonnull(ssm_state_in, "ssm_state_in");
     if (chunk_size != 64) {
         throw std::invalid_argument("gated_delta_rule_chunked: chunk_size must be 64");
     }
@@ -172,8 +177,9 @@ void gated_delta_rule_recurrent_snapshot(const Tensor& q, const Tensor& k, const
 
 void gated_delta_rule_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                               const Tensor& beta, float scale, int chunk_size, WorkspaceArena& ws,
-                              Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
-    validate_chunked(q, k, v, g, beta, scale, chunk_size, ssm_state, out);
+                              const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
+                              cudaStream_t stream) {
+    validate_chunked(q, k, v, g, beta, scale, chunk_size, ssm_state_in, ssm_state_out, out);
 
     ArenaScope arena_scope(ws);
     const std::int32_t T      = q.ne[2];
@@ -189,8 +195,9 @@ void gated_delta_rule_chunked(const Tensor& q, const Tensor& k, const Tensor& v,
         Tensor beta_full = beta.slice(1, 0, T_full);
         Tensor out_full  = out.slice(2, 0, T_full);
         detail::gated_delta_rule_chunked_launch(q_full, k_full, v_full, g_full, beta_full, scale,
-                                                ssm_state, out_full, stage_workspace.data,
-                                                stage_workspace.bytes(), stream);
+                                                ssm_state_in, ssm_state_out, out_full,
+                                                stage_workspace.data, stage_workspace.bytes(),
+                                                stream);
     }
 
     const std::int32_t tail = T - T_full;
@@ -201,9 +208,21 @@ void gated_delta_rule_chunked(const Tensor& q, const Tensor& k, const Tensor& v,
         Tensor g_tail    = g.slice(1, T_full, tail);
         Tensor beta_tail = beta.slice(1, T_full, tail);
         Tensor out_tail  = out.slice(2, T_full, tail);
-        detail::gated_delta_rule_recurrent_bf16_launch(q_tail, k_tail, v_tail, g_tail, beta_tail,
-                                                       scale, ssm_state, out_tail, stream);
+        // After full chunks the running state lives in ssm_state_out; a tail-only run (no full
+        // chunks) reads the caller-provided ssm_state_in. Either way the tail publishes to
+        // ssm_state_out.
+        const Tensor& tail_in = (T_full > 0) ? ssm_state_out : ssm_state_in;
+        detail::gated_delta_rule_recurrent_inout_bf16_launch(q_tail, k_tail, v_tail, g_tail,
+                                                             beta_tail, scale, tail_in,
+                                                             ssm_state_out, out_tail, stream);
     }
+}
+
+void gated_delta_rule_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                              const Tensor& beta, float scale, int chunk_size, WorkspaceArena& ws,
+                              Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
+    gated_delta_rule_chunked(q, k, v, g, beta, scale, chunk_size, ws, ssm_state, ssm_state, out,
+                             stream);
 }
 
 } // namespace qus::kernels

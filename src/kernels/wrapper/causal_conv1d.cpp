@@ -116,13 +116,37 @@ void require_initial_slot_accessible(const Tensor& initial_slot) {
 
 } // namespace
 
-void causal_conv1d_prefill(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
-                           cudaStream_t stream) {
-    const std::int64_t n = validate_common(x, weight, conv_state, out);
+void causal_conv1d_prefill(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                           Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
+        conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16 ||
+        out.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_conv1d: x/weight/conv_state/out must be BF16");
+    }
+
+    const std::int64_t n = numel_allow_zero(x, "x");
+    (void) numel_allow_zero(weight, "weight");
+    (void) numel_allow_zero(conv_state_in, "conv_state_in");
+    (void) numel_allow_zero(conv_state_out, "conv_state_out");
+    (void) numel_allow_zero(out, "out");
+
+    require_x_shape(x);
+    require_weight_shape(weight, x.ne[0]);
+    require_state_shape(conv_state_in, x.ne[0]);
+    require_state_shape(conv_state_out, x.ne[0]);
+    require_out_shape(x, out);
     if (n == 0) { return; }
 
-    require_non_empty_accessible(x, weight, conv_state, out);
-    detail::causal_conv1d_prefill_launch(x, weight, conv_state, out, stream);
+    require_non_empty_accessible(x, weight, conv_state_in, out);
+    if (!conv_state_out.is_contiguous() || conv_state_out.data == nullptr) {
+        throw std::invalid_argument("causal_conv1d: conv_state_out must be contiguous and non-null");
+    }
+    detail::causal_conv1d_prefill_launch(x, weight, conv_state_in, conv_state_out, out, stream);
+}
+
+void causal_conv1d_prefill(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
+                           cudaStream_t stream) {
+    causal_conv1d_prefill(x, weight, conv_state, conv_state, out, stream);
 }
 
 void causal_conv1d_decode(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,

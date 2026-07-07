@@ -8,8 +8,9 @@
 
 namespace qus::kernels::detail {
 
-void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight, Tensor& conv_state,
-                                  Tensor& out, cudaStream_t stream);
+void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
+                                  const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
+                                  cudaStream_t stream);
 void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, Tensor& conv_state,
                                  Tensor& out, cudaStream_t stream);
 void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weight,

@@ -288,6 +288,10 @@ private:
     StepState& io_;
     std::uint32_t prefill_chunk_    = kDefaultPrefillChunk;
     const Tensor* active_positions_ = nullptr;
+    // GDN snapshot slot the current prefill chunk reads its initial recurrent/conv state from.
+    // Slot 0 for the reset path and for every chunk after the first; the committed snapshot slot
+    // for chunk 0 of a prefix-append prefill (MTP). The running state is always written to slot 0.
+    std::int32_t gdn_prefill_read_slot_ = 0;
 
     const Weight* embed_      = nullptr;
     const Tensor* final_norm_ = nullptr;

@@ -780,8 +780,11 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         kernels::causal_conv1d_sequence_snapshot(qkv, *w.conv1d, conv_states, io_.gdn_initial_slot,
                                                  qkv_c, s);
     } else {
-        Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
-        kernels::causal_conv1d_prefill(qkv, *w.conv1d, conv_state, qkv_c, s);
+        // Prefill reads the committed conv window from gdn_prefill_read_slot_ and writes the
+        // running window to slot 0 (in-place when the read slot is 0).
+        Tensor conv_in  = state_.conv_slot(static_cast<std::uint32_t>(gidx), gdn_prefill_read_slot_);
+        Tensor conv_out = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
+        kernels::causal_conv1d_prefill(qkv, *w.conv1d, conv_in, conv_out, qkv_c, s);
     }
 
     Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
@@ -807,9 +810,12 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         kernels::gated_delta_rule_recurrent_snapshot(qn, kn, vv, g, beta, kGdnScale, work_,
                                                      ssm_states, io_.gdn_initial_slot, o, s);
     } else {
-        Tensor ssm_state = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
-        kernels::gated_delta_rule_chunked(qn, kn, vv, g, beta, kGdnScale, 64, work_, ssm_state, o,
-                                          s);
+        // Prefill reads the committed recurrent state from gdn_prefill_read_slot_ and writes the
+        // running state to slot 0 (in-place when the read slot is 0).
+        Tensor ssm_in  = state_.ssm_slot(static_cast<std::uint32_t>(gidx), gdn_prefill_read_slot_);
+        Tensor ssm_out = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
+        kernels::gated_delta_rule_chunked(qn, kn, vv, g, beta, kGdnScale, 64, work_, ssm_in, ssm_out,
+                                          o, s);
     }
 
     Tensor z      = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
@@ -895,17 +901,39 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
     const int T     = static_cast<int>(ids.size());
     const int chunk = static_cast<int>(prefill_chunk_);
 
+    // Prefix-append prefill continues an existing cache: positions are absolute (start at the
+    // resident length) and KV/GDN state is not reset. For a reset prefill base == 0.
+    const std::uint32_t base = kv_.pos;
+    if (static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) >
+        static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("Qwen3_6_27B::prefill absolute position exceeds int32");
+    }
+    const int base_i = static_cast<int>(base);
+
+    // The committed GDN state for the resident prefix lives in snapshot slot gdn_initial_slot
+    // (slot 0 for a reset). Chunk 0 reads from it; every later chunk reads slot 0 (the running
+    // state chunk 0 produced). Resolved on the host because prefill is eager.
+    std::int32_t gdn_read_slot0 = 0;
+    if (mtp_enabled()) {
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        CUDA_CHECK(cudaMemcpy(&gdn_read_slot0, io_.gdn_initial_slot.data, sizeof(gdn_read_slot0),
+                              cudaMemcpyDeviceToHost));
+        if (gdn_read_slot0 < 0 || gdn_read_slot0 >= state_.snapshot_slots) { gdn_read_slot0 = 0; }
+    }
+
     for (int t0 = 0; t0 < T; t0 += chunk) {
         const int len      = std::min(chunk, T - t0);
         const bool is_last = (t0 + len == T);
         work_.reset();
+
+        gdn_prefill_read_slot_ = (t0 == 0) ? gdn_read_slot0 : 0;
 
         {
             Tensor ids_device = work_.alloc(DType::I32, {len});
             copy_i32_to_device(ids.data() + t0, ids_device, s);
 
             Tensor positions = work_.alloc(DType::I32, {len});
-            detail::fill_positions(positions, t0, s);
+            detail::fill_positions(positions, base_i + t0, s);
             ScopedPositions scoped_positions(active_positions_, positions);
 
             Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, len});
@@ -926,10 +954,10 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                 if constexpr (Tap::enabled) {
                     tap(TapId::AfterLogits, -1, Phase::Prefill, logits, s);
                 }
-                // Set io_.pos to T before picking so the sampler RNG is keyed by the
-                // bonus token's absolute position (prefill purpose keeps it distinct
-                // from the first decode step, which reuses io_.pos == T).
-                detail::set_pos(io_.pos, T, s);
+                // Set io_.pos to the bonus token's absolute position (base + T) before picking so
+                // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
+                // decode step, which reuses the same io_.pos).
+                detail::set_pos(io_.pos, base_i + T, s);
                 if (sampling_config_ != nullptr) {
                     kernels::sample_column(logits, io_.token, sampling_config_,
                                            static_cast<const std::int32_t*>(io_.pos.data),
@@ -977,7 +1005,7 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                                                io_.mtp_ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
                                                s));
 
-                    detail::set_pos(io_.ar_pos, T, s);
+                    detail::set_pos(io_.ar_pos, base_i + T, s);
                     for (int i = 1; i < io_.drafts.ne[0]; ++i) {
                         Tensor prev_token  = io_.drafts.slice(0, i - 1, 1);
                         Tensor next_token  = io_.drafts.slice(0, i, 1);
@@ -995,8 +1023,11 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
             }
         }
 
-        kv_.pos = static_cast<std::uint32_t>(t0 + len);
+        kv_.pos = base + static_cast<std::uint32_t>(t0 + len);
     }
+
+    // Prefill wrote the running GDN state to slot 0; the first decode round must read slot 0.
+    if (mtp_enabled()) { kernels::mtp_reset_gdn_initial_slot(io_.gdn_initial_slot, s); }
 
     ctx_.synchronize();
     work_.reset();

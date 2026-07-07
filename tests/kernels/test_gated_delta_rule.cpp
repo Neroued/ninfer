@@ -567,6 +567,76 @@ int chunked_state_carry_equivalence_case(int T, int split, std::uint32_t seed) {
     return failures;
 }
 
+// Prefix-append parity: reading the initial recurrent state from a selected slot
+// and writing the running state to slot 0 must match the in-place run seeded with
+// the same initial state. Same math/chunk boundaries -> bit-exact. read_slot == 0
+// exercises the in-place equivalence; read_slot > 0 with T < BT exercises the
+// tail-only recurrent-inout path.
+int chunked_from_slot_equivalence_case(int T, int slots, int read_slot, std::uint32_t seed) {
+    const auto in                 = make_inputs(T, seed, false);
+    const float scale             = 1.0f / std::sqrt(float(S));
+    const std::size_t slot_floats = in.state.size();
+
+    DBuf rq = to_device_bf16(in.q), rk = to_device_bf16(in.k), rv = to_device_bf16(in.v);
+    DBuf rg = to_device_f32(in.g), rbeta = to_device_f32(in.beta), rstate = to_device_f32(in.state);
+    DBuf rout(in.v.size() * 2);
+    WorkspaceArena ws(chunked_arena_bytes(static_cast<int>(in.T)));
+
+    int failures = 0;
+    try {
+        {
+            Tensor tq(rq.p, DType::BF16, {S, H_qk, static_cast<int>(in.T)});
+            Tensor tk(rk.p, DType::BF16, {S, H_qk, static_cast<int>(in.T)});
+            Tensor tv(rv.p, DType::BF16, {S, H_v, static_cast<int>(in.T)});
+            Tensor tg(rg.p, DType::FP32, {H_v, static_cast<int>(in.T)});
+            Tensor tbeta(rbeta.p, DType::FP32, {H_v, static_cast<int>(in.T)});
+            Tensor tstate(rstate.p, DType::FP32, {S, S, H_v});
+            Tensor tout(rout.p, DType::BF16, {S, H_v, static_cast<int>(in.T)});
+            kernels::gated_delta_rule_chunked(tq, tk, tv, tg, tbeta, scale, BT, ws, tstate, tout,
+                                              nullptr);
+        }
+        cudaDeviceSynchronize();
+
+        DBuf fq = to_device_bf16(in.q), fk = to_device_bf16(in.k), fv = to_device_bf16(in.v);
+        DBuf fg = to_device_f32(in.g), fbeta = to_device_f32(in.beta);
+        DBuf fstates(slot_floats * static_cast<std::size_t>(slots) * 4);
+        cudaMemset(fstates.p, 0, fstates.bytes);
+        cudaMemcpy(static_cast<float*>(fstates.p) + static_cast<std::size_t>(read_slot) * slot_floats,
+                   in.state.data(), slot_floats * 4, cudaMemcpyHostToDevice);
+        DBuf fout(in.v.size() * 2);
+        {
+            Tensor tq(fq.p, DType::BF16, {S, H_qk, static_cast<int>(in.T)});
+            Tensor tk(fk.p, DType::BF16, {S, H_qk, static_cast<int>(in.T)});
+            Tensor tv(fv.p, DType::BF16, {S, H_v, static_cast<int>(in.T)});
+            Tensor tg(fg.p, DType::FP32, {H_v, static_cast<int>(in.T)});
+            Tensor tbeta(fbeta.p, DType::FP32, {H_v, static_cast<int>(in.T)});
+            Tensor tin(static_cast<float*>(fstates.p) +
+                           static_cast<std::size_t>(read_slot) * slot_floats,
+                       DType::FP32, {S, S, H_v});
+            Tensor tout_state(fstates.p, DType::FP32, {S, S, H_v});
+            Tensor tout(fout.p, DType::BF16, {S, H_v, static_cast<int>(in.T)});
+            kernels::gated_delta_rule_chunked(tq, tk, tv, tg, tbeta, scale, BT, ws, tin, tout_state,
+                                              tout, nullptr);
+        }
+        cudaDeviceSynchronize();
+
+        const std::string tag = std::string("gdn chunked from-slot T=") + std::to_string(T) +
+                                " slots=" + std::to_string(slots) +
+                                " read_slot=" + std::to_string(read_slot);
+        failures += verify_bits_equal((tag + " out bits").c_str(),
+                                      from_device_u16(fout.p, in.v.size()),
+                                      from_device_u16(rout.p, in.v.size()));
+        failures += verify_bits_equal((tag + " slot0 state bits").c_str(),
+                                      from_device_u32(fstates.p, slot_floats),
+                                      from_device_u32(rstate.p, slot_floats));
+    } catch (const std::exception& e) {
+        std::cerr << "gdn chunked from-slot T=" << T << " read_slot=" << read_slot
+                  << ": unexpected exception: " << e.what() << '\n';
+        return 1;
+    }
+    return failures;
+}
+
 int validation_case() {
     try {
         Tensor q(nullptr, DType::BF16, {S, H_qk, 1});
@@ -699,6 +769,11 @@ int main() {
     failures += chunked_case(4096, 9122u, false, false, true);
     failures += chunked_state_carry_equivalence_case(200, 96, 9822u);
     failures += chunked_state_carry_equivalence_case(512, 128, 9922u);
+    failures += chunked_from_slot_equivalence_case(7, 8, 0, 11028u);
+    failures += chunked_from_slot_equivalence_case(7, 8, 3, 11038u);
+    failures += chunked_from_slot_equivalence_case(64, 8, 5, 11048u);
+    failures += chunked_from_slot_equivalence_case(128, 8, 3, 11058u);
+    failures += chunked_from_slot_equivalence_case(200, 8, 7, 11068u);
     failures += chunked_validation_case();
 
     std::cout << (failures ? "FAIL" : "OK") << " gated_delta_rule correctness\n";

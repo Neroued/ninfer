@@ -85,6 +85,14 @@ __device__ __forceinline__ int gqa_prefill_swz32(int row, int col) {
     return (((col >> 3) ^ (row & 3)) << 3) | (col & 7);
 }
 
+__device__ __forceinline__ unsigned gqa_prefill_pack_bf16(float lo, float hi) {
+    const __nv_bfloat16 lo_b = __float2bfloat16(lo);
+    const __nv_bfloat16 hi_b = __float2bfloat16(hi);
+    const unsigned lo_bits   = static_cast<__nv_bfloat16_raw>(lo_b).x;
+    const unsigned hi_bits   = static_cast<__nv_bfloat16_raw>(hi_b).x;
+    return lo_bits | (hi_bits << 16);
+}
+
 __device__ __forceinline__ unsigned gqa_prefill_smem_addr(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
 }
@@ -212,10 +220,8 @@ __launch_bounds__(128, 2) __global__
     static_assert(Br * D == 2 * Bc * D, "Q-load tile must alias the K/V staging tile");
 
     // Q is staged here, copied into registers, then this buffer is reused for the K/V tiles
-    // (Br*D == 2*Bc*D), so the CTA needs only one 32 KB tile plus the small P scratch. That
-    // keeps shared memory low enough for two resident CTAs per SM.
+    // (Br*D == 2*Bc*D). P stays in registers and feeds the PV MMA directly.
     __shared__ __align__(16) __nv_bfloat16 qkv_s[Br * D];
-    __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
     __nv_bfloat16* k_s = qkv_s;
     __nv_bfloat16* v_s = qkv_s + Bc * D;
 
@@ -241,7 +247,6 @@ __launch_bounds__(128, 2) __global__
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
     const int warp_row0 = warp * 16;            // CTA-tile rows owned by this warp
-    __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc]; // warp-local P scratch [16 x Bc]
 
     for (int idx = tid; idx < Br * D; idx += Threads) {
         const int row       = idx / D;
@@ -382,27 +387,28 @@ __launch_bounds__(128, 2) __global__
             (m1 == -CUDART_INF_F) ? 0.0f : gqa_prefill_exp2_fast((m1 - nm1) * Log2E);
 
         float bl0 = 0.0f, bl1 = 0.0f;
+        unsigned p_frag[PVKs][4];
         if (full_score_tile) {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const int col0  = nt * 8 + 2 * lid;
-                const int col1  = col0 + 1;
                 const float p00 = gqa_prefill_exp2_fast((score[nt][0] - nm0) * Log2E);
                 const float p01 = gqa_prefill_exp2_fast((score[nt][1] - nm0) * Log2E);
                 const float p10 = gqa_prefill_exp2_fast((score[nt][2] - nm1) * Log2E);
                 const float p11 = gqa_prefill_exp2_fast((score[nt][3] - nm1) * Log2E);
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
-                p_sw[gid * Bc + gqa_prefill_swz32(gid, col0)]           = __float2bfloat16(p00);
-                p_sw[gid * Bc + gqa_prefill_swz32(gid, col1)]           = __float2bfloat16(p01);
-                p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col0)] = __float2bfloat16(p10);
-                p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+                const int pk = nt >> 1;
+                if ((nt & 1) == 0) {
+                    p_frag[pk][0] = gqa_prefill_pack_bf16(p00, p01);
+                    p_frag[pk][1] = gqa_prefill_pack_bf16(p10, p11);
+                } else {
+                    p_frag[pk][2] = gqa_prefill_pack_bf16(p00, p01);
+                    p_frag[pk][3] = gqa_prefill_pack_bf16(p10, p11);
+                }
             }
         } else {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const int col0  = nt * 8 + 2 * lid;
-                const int col1  = col0 + 1;
                 const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
                                       ? gqa_prefill_exp2_fast((score[nt][0] - nm0) * Log2E)
                                       : 0.0f;
@@ -417,10 +423,14 @@ __launch_bounds__(128, 2) __global__
                                       : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
-                p_sw[gid * Bc + gqa_prefill_swz32(gid, col0)]           = __float2bfloat16(p00);
-                p_sw[gid * Bc + gqa_prefill_swz32(gid, col1)]           = __float2bfloat16(p01);
-                p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col0)] = __float2bfloat16(p10);
-                p_sw[(gid + 8) * Bc + gqa_prefill_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+                const int pk = nt >> 1;
+                if ((nt & 1) == 0) {
+                    p_frag[pk][0] = gqa_prefill_pack_bf16(p00, p01);
+                    p_frag[pk][1] = gqa_prefill_pack_bf16(p10, p11);
+                } else {
+                    p_frag[pk][2] = gqa_prefill_pack_bf16(p00, p01);
+                    p_frag[pk][3] = gqa_prefill_pack_bf16(p10, p11);
+                }
             }
         }
         bl0 += __shfl_xor_sync(FullMask, bl0, 1);
@@ -439,16 +449,11 @@ __launch_bounds__(128, 2) __global__
             acc[n][2] *= alpha1;
             acc[n][3] *= alpha1;
         }
-        __syncwarp();
 
-        // PV: acc += P * V, contracting over the Bc keys.
+        // PV: acc += P * V, contracting over the Bc keys. P is already in the
+        // row-major A fragment layout that ldmatrix.x4 would have loaded from shared memory.
 #pragma unroll
         for (int k = 0; k < PVKs; ++k) {
-            unsigned pf[4];
-            const int pcol = k * 16 + a_coloff;
-            gqa_prefill_ldmatrix_x4(
-                pf[0], pf[1], pf[2], pf[3],
-                gqa_prefill_smem_addr(&p_sw[a_rowoff * Bc + gqa_prefill_swz32(a_rowoff, pcol)]));
 #pragma unroll
             for (int n = 0; n < PVNt; ++n) {
                 unsigned vf[2];
@@ -457,8 +462,9 @@ __launch_bounds__(128, 2) __global__
                 gqa_prefill_ldmatrix_x2_trans(
                     vf[0], vf[1],
                     gqa_prefill_smem_addr(&v_s[vrow * D + gqa_prefill_swz(vrow, vcol)]));
-                gqa_prefill_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0],
-                                              pf[1], pf[2], pf[3], vf[0], vf[1]);
+                gqa_prefill_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3],
+                                              p_frag[k][0], p_frag[k][1], p_frag[k][2],
+                                              p_frag[k][3], vf[0], vf[1]);
             }
         }
         __syncthreads();

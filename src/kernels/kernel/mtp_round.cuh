@@ -99,14 +99,16 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_accept_tokens_kernel(
     __syncthreads();
 
     for (int i = 0; i <= k; ++i) {
+        // Column i is only reached when drafts[0..i-1] were all accepted, so the
+        // round-local penalty overlay for this column is exactly those i drafts.
         if (vocab <= kSamplerTileItems) {
             sampling_build_truncated_small(logits, static_cast<std::int64_t>(i) * vocab, vocab,
                                            cfg, red_val, red_idx, cand_val, cand_idx, prob,
-                                           &n_support);
+                                           &n_support, drafts, i);
         } else {
             sampling_build_truncated_block_fast(logits, static_cast<std::int64_t>(i) * vocab,
                                                 vocab, cfg, merge_val, merge_idx, cand_val,
-                                                cand_idx, prob, &n_support);
+                                                cand_idx, prob, &n_support, drafts, i);
         }
         if (tid == 0 && done_sh == 0) {
             const int L = L_sh;
@@ -170,7 +172,8 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_accept_tokens_kernel(
 }
 
 __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_partial_topk_kernel(
-    const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr, std::int32_t vocab) {
+    const __nv_bfloat16* logits, const std::int32_t* drafts, const SamplingConfig* cfg_ptr,
+    std::int32_t vocab) {
     const int col            = static_cast<int>(blockIdx.y);
     const int partial        = static_cast<int>(blockIdx.x);
     const SamplingConfig cfg = *cfg_ptr;
@@ -186,11 +189,15 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_partial_topk_kerne
     const int cap = sampling_candidate_cap(cfg, vocab);
     const std::int64_t base = static_cast<std::int64_t>(col) * vocab;
     const int tile_start = partial * kSamplerPartialTileItems;
+    // Column col's penalty overlay is the first `col` drafts (see accept loop);
+    // applying it before top-k selection lets it change the candidate set, not
+    // just the post-truncation probabilities.
 #pragma unroll
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < vocab) {
-            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
+            const float x =
+                sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, drafts, col);
             keys[item] = sampling_sort_key(x, v);
         } else {
             keys[item] = 0ull;

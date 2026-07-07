@@ -145,11 +145,24 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
     return col * kSamplerCandidateCap + j;
 }
 
+// Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
+// carry a round-local count overlay: tokens already committed earlier in the
+// current MTP round but not yet flushed to the global `token_counts`. For MTP
+// verify column `col` the overlay is exactly drafts[0..col-1] (statically known,
+// since column `col` is only consumed when every earlier draft was accepted), so
+// the penalty at each column sees the same prefix a per-token sampler would.
+// Non-MTP callers pass no overlay. The scan is bounded by k (a few tokens) and
+// only runs when penalties are active, so it is free on the no-penalty path.
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v,
-                                                         const SamplingConfig& c) {
+                                                         const SamplingConfig& c,
+                                                         const std::int32_t* overlay = nullptr,
+                                                         int overlay_len = 0) {
     float x = raw;
     if (c.token_counts != nullptr) {
-        const int cnt = c.token_counts[v];
+        int cnt = c.token_counts[v];
+        for (int j = 0; j < overlay_len; ++j) {
+            if (overlay[j] == v) { ++cnt; }
+        }
         if (cnt > 0) { x -= c.presence_penalty; }
         if (c.frequency_penalty != 0.0f) {
             x -= c.frequency_penalty * static_cast<float>(cnt);
@@ -242,12 +255,15 @@ __device__ inline void sampling_build_truncated_small(const __nv_bfloat16* logit
                                                       const SamplingConfig& cfg, float* tile_val,
                                                       int* tile_idx, float* cand_val,
                                                       int* cand_idx, float* prob,
-                                                      int* n_support) {
+                                                      int* n_support,
+                                                      const std::int32_t* overlay = nullptr,
+                                                      int overlay_len = 0) {
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab);
     if (tid < kSamplerTileItems) {
         if (tid < vocab) {
-            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + tid]), tid, cfg);
+            const float x = sampling_adjusted_logit(__bfloat162float(logits[base + tid]), tid, cfg,
+                                                    overlay, overlay_len);
             tile_val[tid] = x;
             tile_idx[tid] = tid;
         } else {
@@ -274,7 +290,9 @@ __device__ inline void sampling_build_truncated_block_fast(const __nv_bfloat16* 
                                                            const SamplingConfig& cfg,
                                                            float* merge_val, int* merge_idx,
                                                            float* cand_val, int* cand_idx,
-                                                           float* prob, int* n_support) {
+                                                           float* prob, int* n_support,
+                                                           const std::int32_t* overlay = nullptr,
+                                                           int overlay_len = 0) {
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab);  // always <= kSamplerFastCandidates
 
@@ -288,7 +306,8 @@ __device__ inline void sampling_build_truncated_block_fast(const __nv_bfloat16* 
 
     const int fast_cap = cap;
     for (int v = tid; v < vocab; v += blockDim.x) {
-        const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
+        const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
+                                                overlay, overlay_len);
         sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);
     }
 

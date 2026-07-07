@@ -51,7 +51,8 @@ void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols));
     mtp_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), config, vocab);
+        static_cast<const __nv_bfloat16*>(logits.data),
+        static_cast<const std::int32_t*>(drafts.data), config, vocab);
     CUDA_CHECK(cudaGetLastError());
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(cols));
     mtp_sampling_group_finalize_kernel<<<group_grid, kSamplerBlock, 0, stream>>>(

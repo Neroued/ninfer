@@ -673,6 +673,193 @@ int validation_case() {
     return 1;
 }
 
+// Runs a single MTP accept round on dense [vocab, k+1] logits with a zeroed
+// (empty round-start) penalty count buffer, so the only counts the penalty can
+// see come from the round-local overlay. Returns {sampled_out[0..k], num,
+// accepted}.
+std::vector<int> run_one_mtp_round(const std::vector<float>& logits_h, int vocab, int k,
+                                   const std::vector<int>& drafts_h, kernels::SamplingConfig cfg,
+                                   int length) {
+    DBuf d_logits = to_device_bf16(logits_h);
+    DBuf d_counts(static_cast<std::size_t>(vocab) * sizeof(std::int32_t));
+    cudaMemset(d_counts.p, 0, d_counts.bytes);
+    cfg.token_counts = static_cast<std::int32_t*>(d_counts.p);
+    DBuf d_cfg = to_device_config(cfg);
+
+    auto d_targets  = to_device_i32(std::vector<int>(static_cast<std::size_t>(k + 1), 0));
+    auto d_drafts   = to_device_i32(drafts_h);
+    auto d_token    = to_device_i32({-1});
+    auto d_length   = to_device_i32({length});
+    DBuf d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
+    DBuf d_num(sizeof(std::int32_t));
+    DBuf d_accepted(sizeof(std::int32_t));
+    DBuf d_ar_pos(sizeof(std::int32_t));
+    auto d_stats = to_device_i64(std::vector<std::int64_t>(model::kStepStatsCounters, 0));
+
+    Tensor targets(d_targets.p, DType::I32, {k + 1});
+    Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
+    Tensor drafts(d_drafts.p, DType::I32, {k});
+    Tensor length_t(d_length.p, DType::I32, {1});
+    Tensor token(d_token.p, DType::I32, {1});
+    Tensor sampled(d_sampled.p, DType::I32, {k + 1});
+    Tensor num(d_num.p, DType::I32, {1});
+    Tensor accepted(d_accepted.p, DType::I32, {1});
+    Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
+    Tensor stats(d_stats.p, DType::I64, {model::kStepStatsCounters});
+
+    kernels::mtp_accept_tokens(targets, logits, drafts, length_t, token, sampled, num, accepted,
+                               ar_pos, stats, config_ptr(d_cfg), nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<int> out = from_device_i32(d_sampled, k + 1);
+    out.push_back(from_device_i32(d_num, 1)[0]);
+    out.push_back(from_device_i32(d_accepted, 1)[0]);
+    return out;
+}
+
+// Intra-round overlay, frequency penalty, small vocab (single-block path).
+//
+// drafts = [A, A, A]. Logits are shaped so the committed prefix count of A must
+// be visible to later columns:
+//   col0: A dominates -> accept        (round-local count(A) becomes 1)
+//   col1: A dominates after freq*1     -> accept (count(A) becomes 2)
+//   col2: freq*2 pushes A out of top-k -> reject, correction = token 2
+// With the overlay bug (columns scored from round-start counts only), A would
+// dominate col2 as well, be accepted, and the round would emit a col3 bonus.
+// Margins are large enough that the accept/reject/correction sequence is exact
+// and seed/position independent, so it is a hard oracle rather than a histogram.
+int overlay_frequency_repeat_case() {
+    constexpr int vocab = 8;
+    constexpr int k     = 3;  // 4 verify columns
+    constexpr int A     = 1;
+    std::vector<float> logits(static_cast<std::size_t>(vocab) * (k + 1), -20.0f);
+    auto set = [&](int col, int id, float v) {
+        logits[static_cast<std::size_t>(col) * vocab + id] = v;
+    };
+    set(0, A, 100.0f);
+    set(1, A, 100.0f);
+    set(2, A, 100.0f);   // A_raw=100; A_adj at count 2 == 100 - 2*30 == 40 < 42
+    set(2, 2, 60.0f);    // dominates the residual -> deterministic correction
+    set(2, 3, 42.0f);
+    set(2, 4, 42.0f);
+    set(2, 5, 42.0f);
+    set(3, 6, 100.0f);   // bonus marker: only the buggy all-accept path reaches it
+    round_to_bf16(logits);
+
+    kernels::SamplingConfig cfg;
+    cfg.temperature       = 1.0f;
+    cfg.top_k             = 4;
+    cfg.frequency_penalty = 30.0f;
+    const std::vector<int> drafts = {A, A, A};
+    // sampled_out = [A, A, 2, 0], num = 3, accepted = 2.
+    const std::vector<int> expected = {A, A, 2, 0, 3, 2};
+
+    int failures = 0;
+    for (std::uint64_t seed : {1ull, 7ull, 4242ull, 99991ull}) {
+        for (int L : {0, 5, 1000, 65536}) {
+            cfg.seed = seed;
+            std::vector<int> got = run_one_mtp_round(logits, vocab, k, drafts, cfg, L);
+            failures += expect_eq("overlay frequency repeat (seed=" + std::to_string(seed) +
+                                      " L=" + std::to_string(L) + ")",
+                                  got, expected);
+        }
+    }
+    if (failures == 0) { std::cout << "    overlay frequency-penalty (count reaches 2) ok\n"; }
+    return failures;
+}
+
+// Intra-round overlay, presence penalty, small vocab (single-block path).
+//
+// drafts = [A, A]. Round-start counts are empty, so presence can only trigger on
+// A at col1 if the accepted col0 A is visible via the overlay:
+//   col0: A dominates -> accept (round-local count(A) becomes 1)
+//   col1: presence drops A out of top-k -> reject, correction = token 2
+// With the overlay bug, col1 sees count(A)==0, presence never fires, A is
+// accepted, and the round emits a col2 bonus instead.
+int overlay_presence_case() {
+    constexpr int vocab = 8;
+    constexpr int k     = 2;  // 3 verify columns
+    constexpr int A     = 1;
+    std::vector<float> logits(static_cast<std::size_t>(vocab) * (k + 1), -20.0f);
+    auto set = [&](int col, int id, float v) {
+        logits[static_cast<std::size_t>(col) * vocab + id] = v;
+    };
+    set(0, A, 100.0f);
+    set(1, A, 100.0f);   // A_adj with presence == 100 - 70 == 30 < 42 -> excluded
+    set(1, 2, 60.0f);
+    set(1, 3, 42.0f);
+    set(1, 4, 42.0f);
+    set(1, 5, 42.0f);
+    set(2, 6, 100.0f);   // bonus marker for the buggy accept path
+    round_to_bf16(logits);
+
+    kernels::SamplingConfig cfg;
+    cfg.temperature      = 1.0f;
+    cfg.top_k            = 4;
+    cfg.presence_penalty = 70.0f;
+    const std::vector<int> drafts = {A, A};
+    // sampled_out = [A, 2, 0], num = 2, accepted = 1.
+    const std::vector<int> expected = {A, 2, 0, 2, 1};
+
+    int failures = 0;
+    for (std::uint64_t seed : {2ull, 13ull, 555ull, 271828ull}) {
+        for (int L : {0, 9, 4096, 100000}) {
+            cfg.seed = seed;
+            std::vector<int> got = run_one_mtp_round(logits, vocab, k, drafts, cfg, L);
+            failures += expect_eq("overlay presence (seed=" + std::to_string(seed) +
+                                      " L=" + std::to_string(L) + ")",
+                                  got, expected);
+        }
+    }
+    if (failures == 0) { std::cout << "    overlay presence-penalty ok\n"; }
+    return failures;
+}
+
+// Same frequency-penalty overlay contract on the real-vocab multi-block path,
+// where per-column distributions are built in parallel by the partial/group
+// kernels. Exercises the overlay applied inside mtp_sampling_partial_topk_kernel.
+int overlay_frequency_repeat_real_shape_case() {
+    constexpr int vocab = 248320;
+    constexpr int k     = 3;
+    constexpr int A     = 17;
+    constexpr int B     = 7919;
+    std::vector<float> logits(static_cast<std::size_t>(vocab) * (k + 1), -20.0f);
+    auto set = [&](int col, int id, float v) {
+        logits[static_cast<std::size_t>(col) * vocab + id] = v;
+    };
+    set(0, A, 100.0f);
+    set(1, A, 100.0f);
+    set(2, A, 100.0f);   // A_adj at count 2 == 40 < 42 -> out of top-k
+    set(2, B, 60.0f);    // dominates the residual
+    set(2, 65537, 42.0f);
+    set(2, 131072, 42.0f);
+    set(2, 200003, 42.0f);
+    set(3, 100000, 100.0f);
+    round_to_bf16(logits);
+
+    kernels::SamplingConfig cfg;
+    cfg.temperature       = 1.0f;
+    cfg.top_k             = 4;
+    cfg.frequency_penalty = 30.0f;
+    const std::vector<int> drafts = {A, A, A};
+    const std::vector<int> expected = {A, A, B, 0, 3, 2};
+
+    int failures = 0;
+    for (std::uint64_t seed : {3ull, 88ull, 123457ull}) {
+        for (int L : {0, 1000, 250000}) {
+            cfg.seed = seed;
+            std::vector<int> got = run_one_mtp_round(logits, vocab, k, drafts, cfg, L);
+            failures += expect_eq("overlay frequency real-shape (seed=" + std::to_string(seed) +
+                                      " L=" + std::to_string(L) + ")",
+                                  got, expected);
+        }
+    }
+    if (failures == 0) {
+        std::cout << "    overlay frequency-penalty real-shape (multi-block) ok\n";
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -691,6 +878,9 @@ int main() {
     failures += reject_sampling_reproducible_case();
     failures += reject_sampling_real_shape_distribution_case();
     failures += reject_sampling_real_shape_reproducible_case();
+    failures += overlay_frequency_repeat_case();
+    failures += overlay_presence_case();
+    failures += overlay_frequency_repeat_real_shape_case();
     failures += shifted_case();
     failures += shifted_all_accept_case();
     failures += gather_case();

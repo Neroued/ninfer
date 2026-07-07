@@ -74,7 +74,12 @@ per-token cost:
   draft `d_i` when `u_i < p_i(d_i)`; on rejection, resample from the residual
   distribution; when all drafts are accepted, draw the bonus token from `p_k`.
   With a greedy draft, `p_i` is the exact target distribution, so this is
-  distribution-correct speculative sampling (see
+  distribution-correct speculative sampling. When `presence_penalty` or
+  `frequency_penalty` is active, each verify column `i` is scored with the
+  global counts **plus a round-local overlay** of the drafts already accepted in
+  this round (`drafts[0..i-1]`, statically known because column `i` is only
+  consumed when every earlier draft accepted), so a token repeated within a
+  round is penalized exactly as the per-token decode path would penalize it (see
   [`docs/2026-07-03-mtp-round-algorithm.md`](2026-07-03-mtp-round-algorithm.md) §8
   and [`docs/2026-07-03-mtp-vllm-reference.md`](2026-07-03-mtp-vllm-reference.md)
   §4). It is the same count of O(vocab) passes as the argmax verify it replaces.

@@ -407,6 +407,126 @@ int real_shape_reproducible_counts_active() {
     return 0;
 }
 
+// cols==1 stochastic decode path at real vocab. This is the single-column path
+// (formerly the fused kernel, now the shared two-launch partial+group merge) that
+// no earlier test exercised, which is how F1 slipped through.
+int real_shape_col1_distribution_match() {
+    const int vocab = 248320;
+    std::vector<float> base(vocab, -20.0f);
+    const int ids[]    = {17, 7919, 65537, 200003};
+    const float vals[] = {3.0f, 2.0f, 1.0f, 0.0f};
+    for (int i = 0; i < 4; ++i) { base[ids[i]] = vals[i]; }
+    round_to_bf16(base);
+
+    std::vector<float> support(vals, vals + 4);
+    const std::vector<double> p = softmax(support);
+
+    kernels::SamplingConfig cfg;
+    cfg.temperature = 1.0f;
+    cfg.top_k       = 20;
+    cfg.seed        = 20260707u;
+    const int N     = 4096;
+    std::vector<int> got =
+        sample_many_batched(base, N, 1, cfg, kernels::kSamplePurposeDecode, 1000, false);
+
+    std::vector<double> freq(4, 0.0);
+    for (int tok : got) {
+        int slot = -1;
+        for (int i = 0; i < 4; ++i) {
+            if (tok == ids[i]) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            std::cerr << "real_shape_col1_distribution: token out of support " << tok << '\n';
+            return 1;
+        }
+        freq[slot] += 1.0;
+    }
+    for (double& f : freq) { f /= static_cast<double>(N); }
+
+    double max_abs = 0.0;
+    for (int i = 0; i < 4; ++i) { max_abs = std::max(max_abs, std::abs(freq[i] - p[i])); }
+    if (max_abs > 0.04) {
+        std::cerr << "real_shape_col1_distribution: empirical/target gap " << max_abs
+                  << " too large\n";
+        for (int i = 0; i < 4; ++i) {
+            std::cerr << "      token=" << ids[i] << " freq=" << freq[i] << " p=" << p[i] << '\n';
+        }
+        return 1;
+    }
+    std::cout << "    real-shape cols=1 distribution match ok (max abs diff " << max_abs << ")\n";
+    return 0;
+}
+
+// F1 regression: top_k above the internal cap (or <= 0) must clamp to 20 and
+// yield the identical, correct distribution rather than collapsing onto one
+// token. Before the fix, top_k=64/0 overflowed the merge tile at real vocab and
+// the cols==1 path collapsed entirely onto id 17.
+int topk_clamp_equivalence() {
+    const int vocab = 248320;
+    std::vector<float> base(vocab, -20.0f);
+    const int ids[]    = {17, 7919, 65537, 200003};
+    const float vals[] = {3.0f, 2.0f, 1.0f, 0.0f};
+    for (int i = 0; i < 4; ++i) { base[ids[i]] = vals[i]; }
+    round_to_bf16(base);
+
+    std::vector<float> support(vals, vals + 4);
+    const std::vector<double> p = softmax(support);
+
+    const int N        = 4096;
+    const int topks[]  = {20, 64, 0};
+    std::vector<std::vector<int>> streams;
+    for (int topk : topks) {
+        kernels::SamplingConfig cfg;
+        cfg.temperature = 1.0f;
+        cfg.top_k       = topk;
+        cfg.seed        = 424242u;
+        streams.push_back(
+            sample_many_batched(base, N, 1, cfg, kernels::kSamplePurposeDecode, 500, false));
+    }
+
+    for (std::size_t s = 1; s < streams.size(); ++s) {
+        if (streams[s] != streams[0]) {
+            std::cerr << "topk_clamp_equivalence: top_k=" << topks[s]
+                      << " stream differs from top_k=20 (clamp not applied)\n";
+            return 1;
+        }
+    }
+
+    std::vector<double> freq(4, 0.0);
+    for (int tok : streams[0]) {
+        int slot = -1;
+        for (int i = 0; i < 4; ++i) {
+            if (tok == ids[i]) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            std::cerr << "topk_clamp_equivalence: token out of support " << tok << '\n';
+            return 1;
+        }
+        freq[slot] += 1.0;
+    }
+    for (double& f : freq) { f /= static_cast<double>(N); }
+
+    if (freq[0] > 0.95) {
+        std::cerr << "topk_clamp_equivalence: distribution collapsed onto token " << ids[0]
+                  << " (freq=" << freq[0] << ")\n";
+        return 1;
+    }
+    double max_abs = 0.0;
+    for (int i = 0; i < 4; ++i) { max_abs = std::max(max_abs, std::abs(freq[i] - p[i])); }
+    if (max_abs > 0.04) {
+        std::cerr << "topk_clamp_equivalence: empirical/target gap " << max_abs << " too large\n";
+        return 1;
+    }
+    std::cout << "    top_k clamp equivalence ok (max abs diff " << max_abs << ")\n";
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -427,6 +547,8 @@ int main() {
     f += reproducible();
     f += distribution_match();
     f += real_shape_distribution_match();
+    f += real_shape_col1_distribution_match();
+    f += topk_clamp_equivalence();
     f += real_shape_reproducible_counts_active();
 
     std::cout << (f ? "FAIL" : "OK") << " sample_column correctness\n";

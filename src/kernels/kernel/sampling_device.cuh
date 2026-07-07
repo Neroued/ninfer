@@ -9,7 +9,6 @@
 #include "qus/kernels/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>
-#include <cub/block/block_radix_sort.cuh>
 
 #include <cuda_bf16.h>
 #include <climits>
@@ -19,60 +18,56 @@
 namespace qus::kernels {
 
 inline constexpr int kSamplerBlock         = 256;
-inline constexpr int kSamplerMaxCandidates = 256;
 inline constexpr int kSamplerTileItems     = 256;
 inline constexpr int kSamplerItemsPerThread = 3;
 inline constexpr int kSamplerPartialTileItems = kSamplerBlock * kSamplerItemsPerThread;
-inline constexpr int kSamplerFusedItemsPerThread = 2;
-inline constexpr int kSamplerFusedPartialTileItems =
-    kSamplerBlock * kSamplerFusedItemsPerThread;
-inline constexpr int kSamplerFinalizeItemsPerThread = 10;
-inline constexpr int kSamplerFinalizeTileItems = kSamplerBlock * kSamplerFinalizeItemsPerThread;
 inline constexpr int kSamplerGroupItemsPerThread = 2;
 inline constexpr int kSamplerGroupTileItems = kSamplerBlock * kSamplerGroupItemsPerThread;
 inline constexpr int kSamplerPartialsPerGroup = 20;
 inline constexpr int kSamplerFastCandidates = 20;
+// Effective per-column candidate cap. The multi-block partial/group merge tiles
+// are sized for this cap, so the sampler clamps top_k to it: top_k <= 0 or a
+// larger top_k both collapse to this cap.
+inline constexpr int kSamplerCandidateCap = kSamplerFastCandidates;
 inline constexpr int kSamplerScratchColumns = 8;
 inline constexpr int kSamplerScratchPartialBlocks = 1024;
 
+// One group merge sorts a single kSamplerGroupTileItems-wide tile. It must hold
+// one group's inputs (kSamplerPartialsPerGroup * cap); the final stage's
+// group_count * cap is enforced per launch by sampler_multiblock_ok().
+static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTileItems,
+              "group merge tile must hold one group's candidates");
+
+// Number of group blocks needed to merge `partial_blocks` partials.
+__host__ __device__ inline int sampler_group_count(int partial_blocks) {
+    return (partial_blocks + kSamplerPartialsPerGroup - 1) / kSamplerPartialsPerGroup;
+}
+
+// True when the fixed sampler scratch and merge tiles can represent this launch.
+// The launcher and the single-block kernels share this predicate so the
+// single-block fallback and the scratch path never both claim the same shape.
+__host__ __device__ inline bool sampler_multiblock_ok(int vocab, int cols, int partial_blocks,
+                                                      int group_count) {
+    return vocab > kSamplerTileItems && cols <= kSamplerScratchColumns &&
+           partial_blocks <= kSamplerScratchPartialBlocks &&
+           (partial_blocks + group_count) <= kSamplerScratchPartialBlocks &&
+           (group_count * kSamplerCandidateCap) <= kSamplerGroupTileItems;
+}
+
 static __device__ unsigned long long sampling_partial_key[kSamplerScratchColumns *
                                                           kSamplerScratchPartialBlocks *
-                                                          kSamplerMaxCandidates];
-static __device__ int sampling_dist_idx[kSamplerScratchColumns * kSamplerMaxCandidates];
-static __device__ float sampling_dist_prob[kSamplerScratchColumns * kSamplerMaxCandidates];
+                                                          kSamplerCandidateCap];
+static __device__ int sampling_dist_idx[kSamplerScratchColumns * kSamplerCandidateCap];
+static __device__ float sampling_dist_prob[kSamplerScratchColumns * kSamplerCandidateCap];
 static __device__ int sampling_dist_support[kSamplerScratchColumns];
 static __device__ int sampling_mtp_finalize_init;
 static __device__ int sampling_mtp_finalize_count;
-static __device__ int sampling_partial_done[kSamplerScratchColumns];
-static __device__ int sampling_group_init[kSamplerScratchColumns];
 static __device__ int sampling_group_done[kSamplerScratchColumns];
 
-using SamplingPartialBlockSort =
-    cub::BlockRadixSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread, int>;
-using SamplingFinalizeBlockSort =
-    cub::BlockRadixSort<unsigned long long, kSamplerBlock, kSamplerFinalizeItemsPerThread>;
-using SamplingGroupBlockSort =
-    cub::BlockRadixSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread, int>;
 using SamplingPartialMergeSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread>;
-using SamplingFusedPartialMergeSort =
-    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerFusedItemsPerThread>;
 using SamplingGroupMergeSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread>;
-
-struct SamplingFusedGroupShared {
-    typename SamplingGroupMergeSort::TempStorage sort_storage;
-    float cand_val[kSamplerMaxCandidates];
-    int cand_idx[kSamplerMaxCandidates];
-    float prob[kSamplerMaxCandidates];
-    int n_support;
-    int is_last;
-};
-
-union SamplingFusedShared {
-    typename SamplingFusedPartialMergeSort::TempStorage partial_sort_storage;
-    SamplingFusedGroupShared group;
-};
 
 struct SamplingKeyGreater {
     __device__ __forceinline__ bool operator()(unsigned long long a, unsigned long long b) const {
@@ -134,18 +129,20 @@ __device__ __forceinline__ int sampling_key_index(unsigned long long key) {
 
 __device__ __forceinline__ int sampling_candidate_cap(const SamplingConfig& cfg,
                                                       std::int32_t vocab) {
-    int cap = kSamplerMaxCandidates;
+    // top_k is clamped to the pipeline cap: top_k <= 0 (no explicit limit) or a
+    // top_k larger than the cap both select the full kSamplerCandidateCap set.
+    int cap = kSamplerCandidateCap;
     if (cfg.top_k > 0 && cfg.top_k < cap) { cap = cfg.top_k; }
     if (vocab < cap) { cap = vocab; }
     return cap;
 }
 
 __device__ __forceinline__ int sampling_partial_offset(int col, int partial, int j) {
-    return ((col * kSamplerScratchPartialBlocks + partial) * kSamplerMaxCandidates) + j;
+    return ((col * kSamplerScratchPartialBlocks + partial) * kSamplerCandidateCap) + j;
 }
 
 __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
-    return col * kSamplerMaxCandidates + j;
+    return col * kSamplerCandidateCap + j;
 }
 
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v,
@@ -279,23 +276,7 @@ __device__ inline void sampling_build_truncated_block_fast(const __nv_bfloat16* 
                                                            float* cand_val, int* cand_idx,
                                                            float* prob, int* n_support) {
     const int tid = threadIdx.x;
-    const int cap = sampling_candidate_cap(cfg, vocab);
-    if (cap > kSamplerFastCandidates) {
-        if (tid == 0) {
-            for (int j = 0; j < cap; ++j) {
-                cand_val[j] = -CUDART_INF_F;
-                cand_idx[j] = INT_MAX;
-            }
-            for (int v = 0; v < vocab; ++v) {
-                const float x =
-                    sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
-                sampling_insert_candidate(cand_val, cand_idx, cap, x, v);
-            }
-        }
-        __syncthreads();
-        sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
-        return;
-    }
+    const int cap = sampling_candidate_cap(cfg, vocab);  // always <= kSamplerFastCandidates
 
     float local_val[kSamplerFastCandidates];
     int local_idx[kSamplerFastCandidates];
@@ -305,7 +286,7 @@ __device__ inline void sampling_build_truncated_block_fast(const __nv_bfloat16* 
         local_idx[j] = INT_MAX;
     }
 
-    const int fast_cap = cap <= kSamplerFastCandidates ? cap : kSamplerFastCandidates;
+    const int fast_cap = cap;
     for (int v = tid; v < vocab; v += blockDim.x) {
         const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
         sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);
@@ -332,137 +313,6 @@ __device__ inline void sampling_build_truncated_block_fast(const __nv_bfloat16* 
     }
     __syncthreads();
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, fast_cap);
-}
-
-__device__ inline void sampling_merge_partials_to_support(
-    int col, int partial_blocks, const SamplingConfig& cfg,
-    typename SamplingFinalizeBlockSort::TempStorage& sort_storage, float* merge_val,
-    int* merge_idx, float* cand_val, int* cand_idx, float* prob, int* n_support,
-    std::int32_t vocab, int cap, bool normalize) {
-    const int tid = threadIdx.x;
-    const int n = partial_blocks * cap;
-    if (n <= kSamplerFinalizeTileItems) {
-        unsigned long long keys[kSamplerFinalizeItemsPerThread];
-#pragma unroll
-        for (int item = 0; item < kSamplerFinalizeItemsPerThread; ++item) {
-            const int p = item * blockDim.x + tid;
-            if (p < n) {
-                const int partial = p / cap;
-                const int j = p - partial * cap;
-                const int off = sampling_partial_offset(col, partial, j);
-                keys[item] = sampling_partial_key[off];
-            } else {
-                keys[item] = 0ull;
-            }
-        }
-        SamplingFinalizeBlockSort(sort_storage).SortDescending(keys);
-#pragma unroll
-        for (int item = 0; item < kSamplerFinalizeItemsPerThread; ++item) {
-            const int rank = tid * kSamplerFinalizeItemsPerThread + item;
-            if (rank < cap) {
-                cand_val[rank] = sampling_key_float(keys[item]);
-                cand_idx[rank] = sampling_key_index(keys[item]);
-            }
-        }
-        __syncthreads();
-        if (normalize) {
-            sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
-        } else {
-            if (tid == 0) { *n_support = cap; }
-            __syncthreads();
-        }
-        return;
-    }
-
-    if (cap <= kSamplerFastCandidates) {
-        const int lane = tid & 31;
-        const int warp = tid >> 5;
-        constexpr unsigned int kMask = 0xffffffffu;
-        float pivot_val = 0.0f;
-        int pivot_idx = -1;
-        for (int rank = 0; rank < kSamplerFastCandidates; ++rank) {
-            float best_val = -CUDART_INF_F;
-            int best_idx = INT_MAX;
-            if (rank < cap) {
-                for (int p = tid; p < n; p += blockDim.x) {
-                    const int partial = p / cap;
-                    const int j = p - partial * cap;
-                    const int off = sampling_partial_offset(col, partial, j);
-                    const unsigned long long key = sampling_partial_key[off];
-                    const int idx = sampling_key_index(key);
-                    const float v = sampling_key_float(key);
-                    if (idx != INT_MAX &&
-                        (rank == 0 || sampling_worse_than(v, idx, pivot_val, pivot_idx)) &&
-                        sampling_better(v, idx, best_val, best_idx)) {
-                        best_val = v;
-                        best_idx = idx;
-                    }
-                }
-            }
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                const float other_val = __shfl_down_sync(kMask, best_val, offset);
-                const int other_idx = __shfl_down_sync(kMask, best_idx, offset);
-                if (sampling_better(other_val, other_idx, best_val, best_idx)) {
-                    best_val = other_val;
-                    best_idx = other_idx;
-                }
-            }
-            best_val = __shfl_sync(kMask, best_val, 0);
-            best_idx = __shfl_sync(kMask, best_idx, 0);
-            if (lane == 0) {
-                const int off = warp * kSamplerFastCandidates + rank;
-                merge_val[off] = best_val;
-                merge_idx[off] = best_idx;
-            }
-            pivot_val = best_val;
-            pivot_idx = best_idx;
-        }
-        __syncthreads();
-        if (tid == 0) {
-            for (int j = 0; j < cap; ++j) {
-                cand_val[j] = -CUDART_INF_F;
-                cand_idx[j] = INT_MAX;
-            }
-            const int merge_n = (kSamplerBlock / 32) * kSamplerFastCandidates;
-            for (int p = 0; p < merge_n; ++p) {
-                const int idx = merge_idx[p];
-                if (idx == INT_MAX) { continue; }
-                sampling_insert_candidate(cand_val, cand_idx, cap, merge_val[p], idx);
-            }
-        }
-        __syncthreads();
-        if (normalize) {
-            sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
-        } else {
-            if (tid == 0) { *n_support = cap; }
-            __syncthreads();
-        }
-        return;
-    }
-
-    if (tid == 0) {
-        for (int j = 0; j < cap; ++j) {
-            cand_val[j] = -CUDART_INF_F;
-            cand_idx[j] = INT_MAX;
-        }
-        const int n = partial_blocks * cap;
-        for (int p = 0; p < n; ++p) {
-            const int partial = p / cap;
-            const int j = p - partial * cap;
-            const int off = sampling_partial_offset(col, partial, j);
-            const unsigned long long key = sampling_partial_key[off];
-            const int idx = sampling_key_index(key);
-            if (idx == INT_MAX) { continue; }
-            sampling_insert_candidate(cand_val, cand_idx, cap, sampling_key_float(key), idx);
-        }
-    }
-    __syncthreads();
-    if (normalize) {
-        sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
-    } else {
-        if (tid == 0) { *n_support = cap; }
-        __syncthreads();
-    }
 }
 
 // thread-0 helper: inverse-CDF pick over a normalized `prob[0..n-1]` support,

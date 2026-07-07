@@ -47,13 +47,15 @@ __launch_bounds__(kSamplerBlock) __global__ void sample_column_kernel(
     }
 
     const int partial_blocks = (vocab + kSamplerPartialTileItems - 1) / kSamplerPartialTileItems;
-    const bool scratch_capable =
-        (gridDim.x <= kSamplerScratchColumns) && (partial_blocks <= kSamplerScratchPartialBlocks);
-    if (vocab > kSamplerTileItems && scratch_capable) { return; }
+    const int group_count    = sampler_group_count(partial_blocks);
+    // No-op when the scratch/group path owns this shape (see sample_column_launch).
+    if (sampler_multiblock_ok(vocab, static_cast<int>(gridDim.x), partial_blocks, group_count)) {
+        return;
+    }
 
-    __shared__ float cand_val[kSamplerMaxCandidates];
-    __shared__ int cand_idx[kSamplerMaxCandidates];
-    __shared__ float prob[kSamplerMaxCandidates];
+    __shared__ float cand_val[kSamplerCandidateCap];
+    __shared__ int cand_idx[kSamplerCandidateCap];
+    __shared__ float prob[kSamplerCandidateCap];
     __shared__ int n_support;
     __shared__ float merge_val[kSamplerBlock * kSamplerFastCandidates];
     __shared__ int merge_idx[kSamplerBlock * kSamplerFastCandidates];
@@ -122,200 +124,6 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_partial_topk_kernel(
     }
 }
 
-__launch_bounds__(kSamplerBlock) __global__ void sampling_fused_sample_kernel(
-    const __nv_bfloat16* logits, std::int32_t* out, const SamplingConfig* cfg_ptr,
-    const std::int32_t* pos_base, std::int32_t purpose, std::int32_t vocab,
-    std::int32_t partial_blocks, std::int32_t group_count) {
-    const int col            = static_cast<int>(blockIdx.y);
-    const int partial        = static_cast<int>(blockIdx.x);
-    const int tid            = threadIdx.x;
-    const SamplingConfig cfg = *cfg_ptr;
-    if (col >= kSamplerScratchColumns || partial_blocks > kSamplerScratchPartialBlocks ||
-        partial_blocks + group_count > kSamplerScratchPartialBlocks) {
-        return;
-    }
-
-    __shared__ SamplingFusedShared fused_shared;
-    unsigned long long partial_keys[kSamplerFusedItemsPerThread];
-
-    const bool greedy = !(cfg.temperature > 0.0f);
-    const int cap = greedy ? 1 : sampling_candidate_cap(cfg, vocab);
-    const std::int64_t base = static_cast<std::int64_t>(col) * vocab;
-    const int tile_start = partial * kSamplerFusedPartialTileItems;
-#pragma unroll
-    for (int item = 0; item < kSamplerFusedItemsPerThread; ++item) {
-        const int v = tile_start + item * blockDim.x + tid;
-        if (v < vocab) {
-            const float raw = __bfloat162float(logits[base + v]);
-            const float x = greedy ? raw : sampling_adjusted_logit(raw, v, cfg);
-            partial_keys[item] = sampling_sort_key(x, v);
-        } else {
-            partial_keys[item] = 0ull;
-        }
-    }
-    SamplingFusedPartialMergeSort(fused_shared.partial_sort_storage)
-        .Sort(partial_keys, SamplingKeyGreater{});
-
-#pragma unroll
-    for (int item = 0; item < kSamplerFusedItemsPerThread; ++item) {
-        const int rank = tid * kSamplerFusedItemsPerThread + item;
-        if (rank < cap) {
-            const int off = sampling_partial_offset(col, partial, rank);
-            sampling_partial_key[off] = partial_keys[item];
-        }
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        __threadfence();
-        atomicAdd(&sampling_partial_done[col], 1);
-    }
-    if (partial >= group_count) { return; }
-    if (tid == 0) {
-        while (atomicAdd(&sampling_partial_done[col], 0) < partial_blocks) {}
-    }
-    __syncthreads();
-
-    SamplingFusedGroupShared& group_shared = fused_shared.group;
-    unsigned long long keys[kSamplerGroupItemsPerThread];
-
-    const int group = partial;
-    const int group_begin = group * kSamplerPartialsPerGroup;
-    int group_partials = partial_blocks - group_begin;
-    if (group_partials < 0) { group_partials = 0; }
-    if (group_partials > kSamplerPartialsPerGroup) { group_partials = kSamplerPartialsPerGroup; }
-    const int group_n = group_partials * cap;
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int p = item * blockDim.x + tid;
-        if (p < group_n) {
-            const int src_partial = group_begin + p / cap;
-            const int j = p - (p / cap) * cap;
-            const int off = sampling_partial_offset(col, src_partial, j);
-            keys[item] = sampling_partial_key[off];
-        } else {
-            keys[item] = 0ull;
-        }
-    }
-    SamplingGroupMergeSort(group_shared.sort_storage).Sort(keys, SamplingKeyGreater{});
-
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int rank = tid * kSamplerGroupItemsPerThread + item;
-        if (rank < cap) {
-            const int out_off = sampling_partial_offset(col, partial_blocks + group, rank);
-            sampling_partial_key[out_off] = keys[item];
-        }
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-        __threadfence();
-        const int done = atomicAdd(&sampling_group_done[col], 1) + 1;
-        group_shared.is_last = (done == group_count) ? 1 : 0;
-    }
-    __syncthreads();
-    if (!group_shared.is_last) { return; }
-
-    const int final_n = group_count * cap;
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int p = item * blockDim.x + tid;
-        if (p < final_n) {
-            const int src_partial = partial_blocks + p / cap;
-            const int j = p - (p / cap) * cap;
-            const int off = sampling_partial_offset(col, src_partial, j);
-            keys[item] = sampling_partial_key[off];
-        } else {
-            keys[item] = 0ull;
-        }
-    }
-    SamplingGroupMergeSort(group_shared.sort_storage).Sort(keys, SamplingKeyGreater{});
-
-#pragma unroll
-    for (int item = 0; item < kSamplerGroupItemsPerThread; ++item) {
-        const int rank = tid * kSamplerGroupItemsPerThread + item;
-        if (rank < cap) {
-            group_shared.cand_val[rank] = sampling_key_float(keys[item]);
-            group_shared.cand_idx[rank] = sampling_key_index(keys[item]);
-        }
-    }
-    __syncthreads();
-
-    if (greedy) {
-        if (tid == 0) {
-            out[col] = group_shared.cand_idx[0];
-            sampling_group_done[col] = 0;
-            sampling_partial_done[col] = 0;
-        }
-        return;
-    }
-
-    sampling_normalize_support(cfg, group_shared.cand_val, group_shared.cand_idx, group_shared.prob,
-                               &group_shared.n_support, cap);
-    if (tid == 0) {
-        const int support = group_shared.n_support;
-        const float u = sampling_uniform(cfg.seed, *pos_base + col, purpose, 0u);
-        float acc = 0.0f;
-        int picked = group_shared.cand_idx[support - 1];
-        for (int j = 0; j < support; ++j) {
-            acc += group_shared.prob[j];
-            if (u < acc) {
-                picked = group_shared.cand_idx[j];
-                break;
-            }
-        }
-        out[col] = picked;
-        if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
-        sampling_group_done[col] = 0;
-        sampling_partial_done[col] = 0;
-    }
-}
-
-__launch_bounds__(kSamplerBlock) __global__ void sampling_finalize_sample_kernel(
-    std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* pos_base,
-    std::int32_t purpose, std::int32_t vocab, std::int32_t partial_blocks) {
-    const int col            = static_cast<int>(blockIdx.x);
-    const int tid            = threadIdx.x;
-    const SamplingConfig cfg = *cfg_ptr;
-    if (gridDim.x > kSamplerScratchColumns || partial_blocks > kSamplerScratchPartialBlocks) {
-        return;
-    }
-
-    __shared__ float merge_val[(kSamplerBlock / 32) * kSamplerFastCandidates];
-    __shared__ int merge_idx[(kSamplerBlock / 32) * kSamplerFastCandidates];
-    __shared__ typename SamplingFinalizeBlockSort::TempStorage sort_storage;
-    __shared__ float cand_val[kSamplerMaxCandidates];
-    __shared__ int cand_idx[kSamplerMaxCandidates];
-    __shared__ float prob[kSamplerMaxCandidates];
-    __shared__ int n_support;
-
-    const bool greedy = !(cfg.temperature > 0.0f);
-    const int cap = greedy ? 1 : sampling_candidate_cap(cfg, vocab);
-    sampling_merge_partials_to_support(col, partial_blocks, cfg, sort_storage, merge_val,
-                                       merge_idx, cand_val, cand_idx, prob, &n_support, vocab,
-                                       cap, !greedy);
-
-    if (tid != 0) { return; }
-    if (greedy) {
-        out[col] = cand_idx[0];
-        return;
-    }
-    const int support = n_support;
-    const float u     = sampling_uniform(cfg.seed, *pos_base + col, purpose, 0u);
-    float acc         = 0.0f;
-    int picked        = cand_idx[support - 1];
-    for (int j = 0; j < support; ++j) {
-        acc += prob[j];
-        if (u < acc) {
-            picked = cand_idx[j];
-            break;
-        }
-    }
-    out[col] = picked;
-    if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
-}
-
 __launch_bounds__(kSamplerBlock) __global__ void sampling_group_finalize_sample_kernel(
     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* pos_base,
     std::int32_t purpose, std::int32_t vocab, std::int32_t partial_blocks,
@@ -330,19 +138,19 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_group_finalize_sample_
     }
 
     __shared__ typename SamplingGroupMergeSort::TempStorage sort_storage;
-    __shared__ float cand_val[kSamplerMaxCandidates];
-    __shared__ int cand_idx[kSamplerMaxCandidates];
-    __shared__ float prob[kSamplerMaxCandidates];
+    __shared__ float cand_val[kSamplerCandidateCap];
+    __shared__ int cand_idx[kSamplerCandidateCap];
+    __shared__ float prob[kSamplerCandidateCap];
     __shared__ int n_support;
     __shared__ int is_last;
     unsigned long long keys[kSamplerGroupItemsPerThread];
 
     const bool greedy = !(cfg.temperature > 0.0f);
     const int cap = greedy ? 1 : sampling_candidate_cap(cfg, vocab);
-    if (tid == 0 && atomicCAS(&sampling_group_init[col], 0, 1) == 0) {
-        sampling_group_done[col] = 0;
-        __threadfence();
-    }
+    // sampling_group_done[col] is 0 at entry: it is zero-initialized and the
+    // terminating (last) group block resets it before returning, and consecutive
+    // launches are ordered on the same stream. No per-entry re-init is needed
+    // (the old atomicCAS re-init raced with the counting atomicAdds).
 
     const int group_begin = group * kSamplerPartialsPerGroup;
     int group_partials = partial_blocks - group_begin;
@@ -410,7 +218,6 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_group_finalize_sample_
         if (tid == 0) {
             out[col] = cand_idx[0];
             sampling_group_done[col] = 0;
-            atomicExch(&sampling_group_init[col], 0);
         }
         return;
     }
@@ -431,7 +238,6 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_group_finalize_sample_
         out[col] = picked;
         if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
         sampling_group_done[col] = 0;
-        atomicExch(&sampling_group_init[col], 0);
     }
 }
 

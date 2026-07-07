@@ -24,6 +24,15 @@ recommendation:
 falls back to the server default above. `top_k` and `min_p` are Qwen/vLLM
 extensions, not part of the OpenAI schema.
 
+### `top_k` is clamped to 20
+
+The sampler builds its truncated distribution from at most **20 candidates** (the
+Qwen3.6 thinking default). A request `top_k` in `[1, 20]` is honored exactly; a
+`top_k <= 0` (no explicit limit) or a `top_k > 20` both select the top 20 logits.
+`top_p` and `min_p` then operate **within that top-20 set**. This is a deliberate
+scope choice for the specialized engine, not a bug: larger `top_k` semantics are
+not supported.
+
 ## Greedy / parity (`--greedy`, `temperature 0`)
 
 `temperature <= 0` is an **exact greedy bypass**: the sampler kernels run the same

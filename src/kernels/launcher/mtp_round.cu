@@ -33,8 +33,10 @@ void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
     const std::int32_t cols = drafts.ne[0] + 1;
     const std::int32_t partial_blocks =
         (vocab + kSamplerPartialTileItems - 1) / kSamplerPartialTileItems;
-    if (vocab <= kSamplerTileItems || cols > kSamplerScratchColumns ||
-        partial_blocks > kSamplerScratchPartialBlocks) {
+    const std::int32_t groups = sampler_group_count(partial_blocks);
+    // Same shared predicate the accept kernel self-guards on, so exactly one of
+    // the single-block and multi-block paths runs for any shape.
+    if (!sampler_multiblock_ok(vocab, cols, partial_blocks, groups)) {
         mtp_accept_tokens_kernel<<<1, kSamplerBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
             static_cast<const __nv_bfloat16*>(logits.data),
@@ -51,8 +53,6 @@ void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
     mtp_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data), config, vocab);
     CUDA_CHECK(cudaGetLastError());
-    const std::int32_t groups =
-        (partial_blocks + kSamplerPartialsPerGroup - 1) / kSamplerPartialsPerGroup;
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(cols));
     mtp_sampling_group_finalize_kernel<<<group_grid, kSamplerBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(target_tokens.data),

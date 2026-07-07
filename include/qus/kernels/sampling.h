@@ -10,6 +10,11 @@
 // a token with a counter-based RNG keyed by (seed, position, purpose) so the
 // output is reproducible and independent of any speculative-decode path.
 //
+// top-k is clamped to an internal candidate cap of 20 (the Qwen3.6 thinking
+// default): a top_k <= 0 or a top_k > 20 both select the top 20 logits, and
+// top-p / min-p then operate within that top-20 set. This matches the specialized
+// engine scope; larger top-k semantics are intentionally not supported.
+//
 // The config is read from device memory (not passed by value) so a CUDA-graph
 // capture stays valid across requests: only the buffer contents change.
 
@@ -38,7 +43,7 @@ enum SamplePurpose : std::int32_t {
 // plain scalars. temperature <= 0 selects exact greedy argmax.
 struct SamplingConfig {
     float temperature       = 0.0f;  // <= 0 => greedy argmax (bit-identical to argmax())
-    std::int32_t top_k      = 0;     // <= 0 => no explicit top-k limit (internal cap only)
+    std::int32_t top_k      = 0;     // clamped to 20: top_k <= 0 or top_k > 20 => 20
     float top_p             = 1.0f;  // >= 1 => disabled
     float min_p             = 0.0f;  // <= 0 => disabled
     float presence_penalty  = 0.0f;

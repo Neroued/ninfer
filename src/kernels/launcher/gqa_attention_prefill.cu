@@ -61,16 +61,25 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
 void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                  const Tensor& positions, float scale, KVCache& kv, int layer,
                                  Tensor& out, cudaStream_t stream) {
-    const auto tokens = static_cast<std::int32_t>(q.ne[2]);
+    const auto tokens         = static_cast<std::int32_t>(q.ne[2]);
+    const auto padded_context = static_cast<std::int32_t>(kv.padded_context);
+    Tensor& cache_k           = kv.k[static_cast<std::uint32_t>(layer)];
+    Tensor& cache_v           = kv.v[static_cast<std::uint32_t>(layer)];
     if (kv.dtype == DType::I8) {
-        gqa_attention_kv_quantize_append_launch(k, v, positions, kv, layer, true, stream);
+        Tensor& cache_k_scale = kv.k_scale[static_cast<std::uint32_t>(layer)];
+        Tensor& cache_v_scale = kv.v_scale[static_cast<std::uint32_t>(layer)];
+        const dim3 fill_grid(static_cast<unsigned>(kGqaKvQuantGroups),
+                             static_cast<unsigned>(kGqaPrefillKVHeads),
+                             static_cast<unsigned>(tokens));
+        gqa_attention_prefill_fill_i8_kernel<<<fill_grid, kGqaKvQuantGroup, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(positions.data),
+            static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
+            static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
+            tokens, padded_context);
+        CUDA_CHECK(cudaGetLastError());
     } else {
-        Tensor& cache_k = kv.k[static_cast<std::uint32_t>(layer)];
-        Tensor& cache_v = kv.v[static_cast<std::uint32_t>(layer)];
-
-        constexpr int kBlock      = 256;
-        const auto padded_context = static_cast<std::int32_t>(kv.padded_context);
-
+        constexpr int kBlock           = 256;
         constexpr int kFillVecElems    = 8;
         const std::int64_t kv_elements = static_cast<std::int64_t>(tokens) * kGqaPrefillKVHeads *
                                          (kGqaPrefillHeadDim / kFillVecElems);

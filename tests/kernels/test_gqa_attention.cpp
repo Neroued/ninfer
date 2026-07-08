@@ -382,72 +382,6 @@ void cache_to_kv_tokens(const std::vector<float>& cache, std::int32_t tokens,
     }
 }
 
-int one_int8_quantize_append_case(std::int32_t tokens, std::int32_t max_context,
-                                  std::vector<int> positions, bool positions_are_base,
-                                  std::uint32_t seed, const char* tag) {
-    const std::size_t kvn =
-        static_cast<std::size_t>(kHeadDim) * kKVHeads * static_cast<std::size_t>(tokens);
-    const std::int32_t padded_context = align_up_128(max_context);
-    const std::size_t code_n          = cache_elements(padded_context);
-    const std::size_t scale_n         = scale_elements(padded_context);
-
-    std::vector<float> k(kvn), v(kvn);
-    fill_uniform(k, seed, -0.5f, 0.5f);
-    fill_uniform(v, seed + 1000u, -2.0f, 2.0f);
-
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        for (std::int32_t head = 0; head < kKVHeads; ++head) {
-            for (std::int32_t d = 0; d < kKvQuantGroup; ++d) {
-                k[kv_tensor_index(head, d, token)] = 0.0f;
-            }
-            k[kv_tensor_index(head, kKvQuantGroup, token)]         = 12.0f;
-            k[kv_tensor_index(head, kKvQuantGroup + 1, token)]     = -0.125f;
-            v[kv_tensor_index(head, 2 * kKvQuantGroup, token)]     = -9.0f;
-            v[kv_tensor_index(head, 2 * kKvQuantGroup + 7, token)] = 0.25f;
-        }
-    }
-    round_to_bf16(k);
-    round_to_bf16(v);
-
-    std::vector<std::int8_t> expected_k(code_n, static_cast<std::int8_t>(0x5a));
-    std::vector<std::int8_t> expected_v(code_n, static_cast<std::int8_t>(0x5b));
-    std::vector<std::uint16_t> expected_k_scale(scale_n, 0x6a6au);
-    std::vector<std::uint16_t> expected_v_scale(scale_n, 0x6b6bu);
-    cpu_quantize_append(k, v, positions, positions_are_base, tokens, padded_context, expected_k,
-                        expected_v, expected_k_scale, expected_v_scale);
-
-    DBuf dk   = to_device_bf16(k);
-    DBuf dv   = to_device_bf16(v);
-    DBuf dpos = to_device_i32(positions);
-    const std::size_t arena_bytes =
-        2 * (code_n + 256) + 2 * (scale_n * sizeof(std::uint16_t) + 256) + 4096;
-    DeviceArena cache_arena(arena_bytes);
-    KVCache kv(cache_arena, 1, static_cast<std::uint32_t>(max_context), kKVHeads, kHeadDim,
-               DType::I8);
-    cudaMemset(kv.k[0].data, 0x5a, kv.k[0].bytes());
-    cudaMemset(kv.v[0].data, 0x5b, kv.v[0].bytes());
-    cudaMemset(kv.k_scale[0].data, 0x6a, kv.k_scale[0].bytes());
-    cudaMemset(kv.v_scale[0].data, 0x6b, kv.v_scale[0].bytes());
-
-    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
-    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
-    Tensor tpos(dpos.p, DType::I32, {tokens});
-    kernels::detail::gqa_attention_kv_quantize_append_launch(tk, tv, tpos, kv, 0,
-                                                             positions_are_base, nullptr);
-    cudaDeviceSynchronize();
-
-    int f = 0;
-    f += check_i8_equal((std::string(tag) + " k code").c_str(),
-                        from_device_i8(kv.k[0].data, code_n), expected_k);
-    f += check_i8_equal((std::string(tag) + " v code").c_str(),
-                        from_device_i8(kv.v[0].data, code_n), expected_v);
-    f += check_bits_equal((std::string(tag) + " k scale").c_str(),
-                          from_device_u16(kv.k_scale[0].data, scale_n), expected_k_scale);
-    f += check_bits_equal((std::string(tag) + " v scale").c_str(),
-                          from_device_u16(kv.v_scale[0].data, scale_n), expected_v_scale);
-    return f;
-}
-
 int one_int8_prefill_case(std::int32_t tokens, std::uint32_t seed) {
     const std::size_t qn =
         static_cast<std::size_t>(kHeadDim) * kQHeads * static_cast<std::size_t>(tokens);
@@ -524,15 +458,25 @@ int one_int8_prefill_case(std::int32_t tokens, std::uint32_t seed) {
     return f;
 }
 
-int one_int8_decode_case(std::int32_t pos, std::uint32_t seed) {
-    const std::size_t qn              = static_cast<std::size_t>(kHeadDim) * kQHeads;
-    const std::size_t kvn             = static_cast<std::size_t>(kHeadDim) * kKVHeads;
-    const std::int32_t padded_context = align_up_128(pos + 1);
+// Fused int8 decode/verify: `base` quantized history tokens already in the cache,
+// then `tokens` (1..6) new tokens at [base, base+tokens). The kernel quantizes the
+// new tokens into the cache (fused append, no separate kernel) AND reads them back
+// for the current step from k_new/v_new at full precision (from_new). The reference
+// therefore uses dequantized history but the raw bf16 new tokens for the diagonal.
+int one_int8_decode_case(std::int32_t base, std::int32_t tokens, std::uint32_t seed) {
+    const std::size_t qn =
+        static_cast<std::size_t>(kHeadDim) * kQHeads * static_cast<std::size_t>(tokens);
+    const std::size_t kvn =
+        static_cast<std::size_t>(kHeadDim) * kKVHeads * static_cast<std::size_t>(tokens);
+    const std::int32_t total          = base + tokens;
+    const std::int32_t padded_context = align_up_128(total);
     const std::size_t code_n          = cache_elements(padded_context);
     const std::size_t scale_n         = scale_elements(padded_context);
 
-    std::vector<float> history_k(kvn * static_cast<std::size_t>(pos));
-    std::vector<float> history_v(kvn * static_cast<std::size_t>(pos));
+    std::vector<float> history_k(static_cast<std::size_t>(kHeadDim) * kKVHeads *
+                                static_cast<std::size_t>(base));
+    std::vector<float> history_v(static_cast<std::size_t>(kHeadDim) * kKVHeads *
+                                static_cast<std::size_t>(base));
     std::vector<float> q(qn), k_new(kvn), v_new(kvn);
     fill_uniform(history_k, seed, -0.25f, 0.25f);
     fill_uniform(history_v, seed + 1000u, -1.0f, 1.0f);
@@ -547,36 +491,48 @@ int one_int8_decode_case(std::int32_t pos, std::uint32_t seed) {
 
     std::vector<std::int8_t> initial_k(code_n, 0), initial_v(code_n, 0);
     std::vector<std::uint16_t> initial_k_scale(scale_n, 0), initial_v_scale(scale_n, 0);
-    std::vector<int> history_positions(static_cast<std::size_t>(pos));
-    for (std::int32_t t = 0; t < pos; ++t) { history_positions[static_cast<std::size_t>(t)] = t; }
-    cpu_quantize_append(history_k, history_v, history_positions, false, pos, padded_context,
-                        initial_k, initial_v, initial_k_scale, initial_v_scale);
+    if (base > 0) {
+        std::vector<int> history_positions(static_cast<std::size_t>(base));
+        for (std::int32_t t = 0; t < base; ++t) {
+            history_positions[static_cast<std::size_t>(t)] = t;
+        }
+        cpu_quantize_append(history_k, history_v, history_positions, false, base, padded_context,
+                            initial_k, initial_v, initial_k_scale, initial_v_scale);
+    }
 
     std::vector<std::int8_t> expected_k         = initial_k;
     std::vector<std::int8_t> expected_v         = initial_v;
     std::vector<std::uint16_t> expected_k_scale = initial_k_scale;
     std::vector<std::uint16_t> expected_v_scale = initial_v_scale;
-    cpu_quantize_append(k_new, v_new, std::vector<int>{pos}, false, 1, padded_context, expected_k,
+    std::vector<int> new_positions(static_cast<std::size_t>(tokens));
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        new_positions[static_cast<std::size_t>(t)] = base + t;
+    }
+    cpu_quantize_append(k_new, v_new, new_positions, false, tokens, padded_context, expected_k,
                         expected_v, expected_k_scale, expected_v_scale);
 
-    const std::vector<float> ref_cache_k =
-        dequantize_cache_bf16(expected_k, expected_k_scale, padded_context);
-    const std::vector<float> ref_cache_v =
-        dequantize_cache_bf16(expected_v, expected_v_scale, padded_context);
+    // History is read from the quantized cache; the new tokens are placed at full
+    // precision by cpu_gqa_prefill (which overwrites cache[base+t] with k_new[t]).
+    std::vector<float> ref_cache_k =
+        dequantize_cache_bf16(initial_k, initial_k_scale, padded_context);
+    std::vector<float> ref_cache_v =
+        dequantize_cache_bf16(initial_v, initial_v_scale, padded_context);
+    std::vector<float> ignored_k, ignored_v;
     std::vector<double> ref;
-    cpu_gqa_decode(q, ref_cache_k, ref_cache_v, pos, padded_context, ref);
+    cpu_gqa_prefill(q, k_new, v_new, ref_cache_k, ref_cache_v, tokens, base, padded_context,
+                    ignored_k, ignored_v, ref);
 
     DBuf dq   = to_device_bf16(q);
     DBuf dk   = to_device_bf16(k_new);
     DBuf dv   = to_device_bf16(v_new);
-    DBuf dpos = to_device_i32(std::vector<int>{pos});
+    DBuf dpos = to_device_i32(new_positions);
     DBuf dout(qn * sizeof(std::uint16_t));
     WorkspaceArena ws(kGqaWorkspaceBytes);
 
     const std::size_t arena_bytes =
         2 * (code_n + 256) + 2 * (scale_n * sizeof(std::uint16_t) + 256) + 4096;
     DeviceArena cache_arena(arena_bytes);
-    KVCache kv(cache_arena, 1, static_cast<std::uint32_t>(pos + 1), kKVHeads, kHeadDim, DType::I8);
+    KVCache kv(cache_arena, 1, static_cast<std::uint32_t>(total), kKVHeads, kHeadDim, DType::I8);
     cudaMemcpy(kv.k[0].data, initial_k.data(), code_n * sizeof(std::int8_t),
                cudaMemcpyHostToDevice);
     cudaMemcpy(kv.v[0].data, initial_v.data(), code_n * sizeof(std::int8_t),
@@ -586,19 +542,20 @@ int one_int8_decode_case(std::int32_t pos, std::uint32_t seed) {
     cudaMemcpy(kv.v_scale[0].data, initial_v_scale.data(), scale_n * sizeof(std::uint16_t),
                cudaMemcpyHostToDevice);
 
-    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, 1});
-    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKVHeads, 1});
-    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKVHeads, 1});
-    Tensor tpos(dpos.p, DType::I32, {1});
-    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, 1});
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tpos(dpos.p, DType::I32, {tokens});
+    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    kv.pos                             = static_cast<std::uint32_t>(pos);
+    kv.pos                             = static_cast<std::uint32_t>(base);
     const std::uint32_t initial_kv_pos = kv.pos;
     kernels::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
     cudaDeviceSynchronize();
 
-    int f                   = 0;
-    const std::string label = "gqa int8 decode pos=" + std::to_string(pos);
+    int f = 0;
+    const std::string label =
+        "gqa int8 decode base=" + std::to_string(base) + " T=" + std::to_string(tokens);
     f += verify(label.c_str(), from_device_bf16(dout, qn), ref, Tolerance::attention_bf16());
     f += check_i8_equal((label + " k code").c_str(), from_device_i8(kv.k[0].data, code_n),
                         expected_k);
@@ -1153,14 +1110,18 @@ int main(int argc, char** argv) {
     }
 
     int f = 0;
-    f += one_int8_quantize_append_case(3, 16, std::vector<int>{5, 6, 7}, true, 901u,
-                                       "gqa int8 quant append prefill");
-    f += one_int8_quantize_append_case(4, 32, std::vector<int>{2, 5, 9, 10}, false, 902u,
-                                       "gqa int8 quant append decode");
-    f += one_int8_prefill_case(6, 903u);
+    // T<=6 routes to the small-t decode kernel (fused append + full-precision
+    // from_new diagonal); T>6 exercises the prefill kernel (reads all from the
+    // quantized cache). Cover both with their route-correct references.
+    f += one_int8_decode_case(0, 6, 903u);
     f += one_int8_prefill_case(65, 904u);
-    f += one_int8_decode_case(17, 905u);
-    f += one_int8_decode_case(2882, 906u);
+    f += one_int8_prefill_case(192, 911u);
+    f += one_int8_decode_case(17, 1, 905u);
+    f += one_int8_decode_case(2882, 1, 906u);
+    f += one_int8_decode_case(100, 2, 907u);
+    f += one_int8_decode_case(100, 3, 908u);
+    f += one_int8_decode_case(100, 4, 909u);
+    f += one_int8_decode_case(2048, 4, 910u);
     for (std::int32_t tokens = 1; tokens <= 6; ++tokens) {
         f += one_prefill_case(tokens, 100u + static_cast<std::uint32_t>(tokens), 0);
         f += one_prefill_case(tokens, 200u + static_cast<std::uint32_t>(tokens), 1);

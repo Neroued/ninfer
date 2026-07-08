@@ -1,6 +1,11 @@
 #pragma once
 
-// qus::kernels - signed int8, per-token group-wise KV cache append.
+// qus::kernels - signed int8, per-token group-wise KV cache codec (shared device
+// helpers). Quantization (append) and dequantization (stage) are FUSED into the
+// GQA attention kernels themselves (decode partial kernel, prefill fill/attention);
+// this header only provides the index math, the vectorized dequant, and the scalar
+// quantize helper they share. There is deliberately no standalone quant/dequant
+// kernel: that would defeat the halved-bandwidth goal.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -9,11 +14,10 @@
 
 namespace qus::kernels {
 
-inline constexpr int kGqaKvQuantHeadDim   = 256;
-inline constexpr int kGqaKvQuantKVHeads   = 4;
-inline constexpr int kGqaKvQuantGroup     = 64;
-inline constexpr int kGqaKvQuantGroups    = kGqaKvQuantHeadDim / kGqaKvQuantGroup;
-inline constexpr int kGqaKvQuantBlockSize = kGqaKvQuantGroup;
+inline constexpr int kGqaKvQuantHeadDim = 256;
+inline constexpr int kGqaKvQuantKVHeads = 4;
+inline constexpr int kGqaKvQuantGroup   = 64;
+inline constexpr int kGqaKvQuantGroups  = kGqaKvQuantHeadDim / kGqaKvQuantGroup;
 
 __device__ __forceinline__ std::int64_t gqa_kv_quant_code_index(int kv_head, int d, int position,
                                                                 int padded_context) {
@@ -37,6 +41,9 @@ __device__ __forceinline__ std::int64_t gqa_kv_quant_src_index(int kv_head, int 
                 static_cast<std::int64_t>(kGqaKvQuantKVHeads) * token);
 }
 
+// Quantize one bf16 value with a precomputed 1/scale (scale is the FP16-rounded
+// per-group absmax/127). Round-to-nearest-even + symmetric clamp to keep codes
+// bit-identical to the CPU oracle and to bf16 parity.
 __device__ __forceinline__ std::int8_t gqa_kv_quant_code(float x, float inv_scale) {
     if (inv_scale == 0.0f) { return static_cast<std::int8_t>(0); }
     int q = __float2int_rn(x * inv_scale);
@@ -52,88 +59,28 @@ __device__ __forceinline__ unsigned gqa_kv_quant_pack_bf16(float lo, float hi) {
     return out;
 }
 
+// Dequantize 8 consecutive int8 codes (dims [d, d+8), aligned to a multiple of 8
+// so they lie inside one 64-group) into 8 bf16 packed as an int4. The 8 codes are
+// read with ONE 64-bit (int2) coalesced load instead of 8 scalar byte loads, so
+// the global traffic is exactly half of the bf16 path and stays fully coalesced.
 __device__ __forceinline__ int4 gqa_kv_dequant_i8x8(const std::int8_t* __restrict__ cache,
                                                     const __half* __restrict__ scale, int kv_head,
                                                     int d, int position, int padded_context) {
-    const int group            = d / kGqaKvQuantGroup;
+    const int group            = d >> 6; // d / 64
     const std::int64_t scale_i = gqa_kv_quant_scale_index(kv_head, group, position, padded_context);
     const float s              = __half2float(scale[scale_i]);
+    const std::int64_t code_off = gqa_kv_quant_code_index(kv_head, d, position, padded_context);
+    const int2 raw              = *reinterpret_cast<const int2*>(&cache[code_off]);
+    const std::int8_t* c        = reinterpret_cast<const std::int8_t*>(&raw);
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const int d0 = d + 2 * i;
-        const int d1 = d0 + 1;
-        const float x0 =
-            static_cast<float>(
-                cache[gqa_kv_quant_code_index(kv_head, d0, position, padded_context)]) *
-            s;
-        const float x1 =
-            static_cast<float>(
-                cache[gqa_kv_quant_code_index(kv_head, d1, position, padded_context)]) *
-            s;
-        packed[i] = gqa_kv_quant_pack_bf16(x0, x1);
+        const float x0 = static_cast<float>(c[2 * i]) * s;
+        const float x1 = static_cast<float>(c[2 * i + 1]) * s;
+        packed[i]      = gqa_kv_quant_pack_bf16(x0, x1);
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
-}
-
-static __global__ void gqa_attention_kv_quantize_append_kernel(
-    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    const std::int32_t* __restrict__ positions, std::int8_t* __restrict__ cache_k,
-    std::int8_t* __restrict__ cache_v, __half* __restrict__ scale_k, __half* __restrict__ scale_v,
-    std::int32_t tokens, std::int32_t padded_context, std::int32_t max_context,
-    std::int32_t positions_are_base) {
-    __shared__ float k_abs[kGqaKvQuantGroup];
-    __shared__ float v_abs[kGqaKvQuantGroup];
-    __shared__ float k_inv_scale;
-    __shared__ float v_inv_scale;
-
-    const int group   = static_cast<int>(blockIdx.x);
-    const int kv_head = static_cast<int>(blockIdx.y);
-    const int token   = static_cast<int>(blockIdx.z);
-    const int lane    = static_cast<int>(threadIdx.x);
-
-    if (group >= kGqaKvQuantGroups || kv_head >= kGqaKvQuantKVHeads || token >= tokens ||
-        lane >= kGqaKvQuantGroup) {
-        return;
-    }
-
-    const int position = positions_are_base ? positions[0] + token : positions[token];
-    if (position < 0 || position >= max_context) { return; }
-
-    const int d                = group * kGqaKvQuantGroup + lane;
-    const std::int64_t src_off = gqa_kv_quant_src_index(kv_head, d, token);
-    const float k_value        = __bfloat162float(k[src_off]);
-    const float v_value        = __bfloat162float(v[src_off]);
-    k_abs[lane]                = fabsf(k_value);
-    v_abs[lane]                = fabsf(v_value);
-    __syncthreads();
-
-    for (int stride = kGqaKvQuantGroup / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) {
-            k_abs[lane] = fmaxf(k_abs[lane], k_abs[lane + stride]);
-            v_abs[lane] = fmaxf(v_abs[lane], v_abs[lane + stride]);
-        }
-        __syncthreads();
-    }
-
-    if (lane == 0) {
-        const std::int64_t scale_off =
-            gqa_kv_quant_scale_index(kv_head, group, position, padded_context);
-        const __half k_scale  = __float2half_rn(k_abs[0] > 0.0f ? k_abs[0] / 127.0f : 0.0f);
-        const __half v_scale  = __float2half_rn(v_abs[0] > 0.0f ? v_abs[0] / 127.0f : 0.0f);
-        scale_k[scale_off]    = k_scale;
-        scale_v[scale_off]    = v_scale;
-        const float k_scale_f = __half2float(k_scale);
-        const float v_scale_f = __half2float(v_scale);
-        k_inv_scale           = k_scale_f > 0.0f ? 1.0f / k_scale_f : 0.0f;
-        v_inv_scale           = v_scale_f > 0.0f ? 1.0f / v_scale_f : 0.0f;
-    }
-    __syncthreads();
-
-    const std::int64_t cache_off = gqa_kv_quant_code_index(kv_head, d, position, padded_context);
-    cache_k[cache_off]           = gqa_kv_quant_code(k_value, k_inv_scale);
-    cache_v[cache_off]           = gqa_kv_quant_code(v_value, v_inv_scale);
 }
 
 } // namespace qus::kernels

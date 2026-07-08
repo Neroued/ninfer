@@ -59,10 +59,10 @@ void launch_tc_partial(const Tensor& q, const Tensor& k, const Tensor& v, const 
             static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
             Quantized ? nullptr : static_cast<__nv_bfloat16*>(cache_k.data),
             Quantized ? nullptr : static_cast<__nv_bfloat16*>(cache_v.data),
-            Quantized ? static_cast<const std::int8_t*>(cache_k.data) : nullptr,
-            Quantized ? static_cast<const std::int8_t*>(cache_v.data) : nullptr,
-            Quantized ? static_cast<const __half*>(cache_k_scale->data) : nullptr,
-            Quantized ? static_cast<const __half*>(cache_v_scale->data) : nullptr, tokens,
+            Quantized ? static_cast<std::int8_t*>(cache_k.data) : nullptr,
+            Quantized ? static_cast<std::int8_t*>(cache_v.data) : nullptr,
+            Quantized ? static_cast<__half*>(cache_k_scale->data) : nullptr,
+            Quantized ? static_cast<__half*>(cache_v_scale->data) : nullptr, tokens,
             padded_context, max_context, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
             static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
@@ -83,9 +83,6 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
     // inside a large allocation is not over-split. The kernel still receives the
     // real max_context for cache-bounds checks.
     const auto window = static_cast<std::int32_t>(kv.pos) + q.ne[2];
-    if (kv.dtype == DType::I8) {
-        gqa_attention_kv_quantize_append_launch(k, v, pos, kv, layer, false, stream);
-    }
 
     switch (q.ne[2]) {
     case 1:

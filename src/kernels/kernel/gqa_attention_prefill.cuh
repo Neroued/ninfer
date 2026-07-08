@@ -145,6 +145,61 @@ __global__ void gqa_attention_prefill_fill_kernel(
     *reinterpret_cast<int4*>(&cache_v[cache_off]) = *reinterpret_cast<const int4*>(&v[src_off]);
 }
 
+// int8 counterpart of the prefill fill: quantize the new chunk's K/V into the
+// int8 cache (per 64-group absmax -> int8 code + fp16 scale). One CTA per
+// (group, kv_head, token); the 64 threads own one 64-group and reduce its absmax
+// in shared memory. This is the prefill fill for the quantized cache, not a
+// standalone quant pass: the attention kernel below reads it straight back.
+__global__ void gqa_attention_prefill_fill_i8_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, std::int8_t* __restrict__ cache_k,
+    std::int8_t* __restrict__ cache_v, __half* __restrict__ scale_k, __half* __restrict__ scale_v,
+    std::int32_t tokens, std::int32_t padded_context) {
+    __shared__ float k_abs[kGqaKvQuantGroup];
+    __shared__ float v_abs[kGqaKvQuantGroup];
+
+    const int group   = static_cast<int>(blockIdx.x);
+    const int kv_head = static_cast<int>(blockIdx.y);
+    const int token   = static_cast<int>(blockIdx.z);
+    const int lane    = static_cast<int>(threadIdx.x);
+    if (group >= kGqaKvQuantGroups || kv_head >= kGqaPrefillKVHeads || token >= tokens ||
+        lane >= kGqaKvQuantGroup) {
+        return;
+    }
+
+    const int position         = positions[0] + token;
+    const int d                = group * kGqaKvQuantGroup + lane;
+    const std::int64_t src_off = gqa_kv_quant_src_index(kv_head, d, token);
+    const float k_value        = __bfloat162float(k[src_off]);
+    const float v_value        = __bfloat162float(v[src_off]);
+    k_abs[lane]                = fabsf(k_value);
+    v_abs[lane]                = fabsf(v_value);
+    __syncthreads();
+    for (int stride = kGqaKvQuantGroup / 2; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            k_abs[lane] = fmaxf(k_abs[lane], k_abs[lane + stride]);
+            v_abs[lane] = fmaxf(v_abs[lane], v_abs[lane + stride]);
+        }
+        __syncthreads();
+    }
+
+    const __half ksh   = __float2half_rn(k_abs[0] > 0.0f ? k_abs[0] / 127.0f : 0.0f);
+    const __half vsh   = __float2half_rn(v_abs[0] > 0.0f ? v_abs[0] / 127.0f : 0.0f);
+    const float k_scl  = __half2float(ksh);
+    const float v_scl  = __half2float(vsh);
+    const float k_inv  = k_scl > 0.0f ? 1.0f / k_scl : 0.0f;
+    const float v_inv  = v_scl > 0.0f ? 1.0f / v_scl : 0.0f;
+    const std::int64_t code_off = gqa_kv_quant_code_index(kv_head, d, position, padded_context);
+    cache_k[code_off]           = gqa_kv_quant_code(k_value, k_inv);
+    cache_v[code_off]           = gqa_kv_quant_code(v_value, v_inv);
+    if (lane == 0) {
+        const std::int64_t scale_off =
+            gqa_kv_quant_scale_index(kv_head, group, position, padded_context);
+        scale_k[scale_off] = ksh;
+        scale_v[scale_off] = vsh;
+    }
+}
+
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the
 // swizzled smem buffer. Keys beyond max_query_abs (which the causal mask always
 // drops) are zeroed so the padded/uninitialized cache tail never feeds NaNs into

@@ -100,6 +100,46 @@ int test_parse_system_array_and_blocks() {
     return failures;
 }
 
+// Regression: Claude Code (v2.1.x) injects "system reminders" as system-role
+// messages inside the messages array (in addition to the top-level `system`
+// field). Earlier we rejected those with 400 "message role must be 'user' or
+// 'assistant'". They must instead fold into the single leading system turn so the
+// Qwen template (which drops non-leading system turns) keeps the content.
+int test_system_role_in_messages_folds() {
+    int failures = 0;
+    const Json body = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"system", "top-level system"},
+        {"messages", Json::array({
+                         Json{{"role", "user"}, {"content", "hello"}},
+                         Json{{"role", "system"}, {"content", "reminder from messages"}},
+                     })}};
+    const GenerationRequest req = parse_messages_request(body, default_limits());
+    // Exactly one leading system turn (top-level + in-array folded), then the user.
+    failures += check(req.messages.size() == 2, "system folded, user kept");
+    failures += check(req.messages[0].role == "system", "single leading system turn");
+    failures += check(req.messages[0].content[0].text == "top-level system\nreminder from messages",
+                      "top-level + in-array system merged in order");
+    failures += check(req.messages[1].role == "user" && req.messages[1].content[0].text == "hello",
+                      "user turn preserved");
+
+    // Also works with array-of-text-blocks content and no top-level system.
+    const Json blocks_body = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"messages", Json::array({
+                         Json{{"role", "user"}, {"content", "hi"}},
+                         Json{{"role", "system"},
+                              {"content", Json::array({Json{{"type", "text"}, {"text", "r"}}})}},
+                     })}};
+    const GenerationRequest breq = parse_messages_request(blocks_body, default_limits());
+    failures += check(breq.messages.size() == 2 && breq.messages[0].role == "system" &&
+                          breq.messages[0].content[0].text == "r",
+                      "in-array system text block folded without top-level system");
+    return failures;
+}
+
 int test_missing_and_bad_fields() {
     int failures = 0;
     const Json no_model = {{"max_tokens", 8},
@@ -109,9 +149,9 @@ int test_missing_and_bad_fields() {
 
     const Json bad_role = {{"model", "m"},
                            {"max_tokens", 8},
-                           {"messages", Json::array({Json{{"role", "system"}, {"content", "hi"}}})}};
+                           {"messages", Json::array({Json{{"role", "developer"}, {"content", "hi"}}})}};
     failures += check(throws_api([&] { (void)parse_messages_request(bad_role, default_limits()); }),
-                      "system role in messages rejected");
+                      "unknown message role rejected");
 
     const Json empty_msgs = {{"model", "m"}, {"max_tokens", 8}, {"messages", Json::array()}};
     failures += check(throws_api([&] { (void)parse_messages_request(empty_msgs, default_limits()); }),
@@ -261,6 +301,13 @@ int test_thinking_and_sampling() {
     disabled["thinking"] = Json{{"type", "disabled"}};
     const GenerationRequest dreq = parse_messages_request(disabled, default_limits());
     failures += check(dreq.enable_thinking.has_value() && !*dreq.enable_thinking, "thinking disabled");
+
+    // Claude Code sends thinking.type == "adaptive" (extended thinking); any
+    // non-"disabled" mode must map to thinking-on, not a 400.
+    Json adaptive = body;
+    adaptive["thinking"] = Json{{"type", "adaptive"}};
+    const GenerationRequest areq = parse_messages_request(adaptive, default_limits());
+    failures += check(areq.enable_thinking.has_value() && *areq.enable_thinking, "adaptive -> thinking on");
     return failures;
 }
 
@@ -403,6 +450,7 @@ int main() {
     int failures = 0;
     failures += test_parse_basic_and_system();
     failures += test_parse_system_array_and_blocks();
+    failures += test_system_role_in_messages_folds();
     failures += test_missing_and_bad_fields();
     failures += test_reject_image();
     failures += test_tools_and_choice();

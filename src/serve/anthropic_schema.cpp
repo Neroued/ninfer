@@ -162,27 +162,29 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
     }
 }
 
-void parse_system(const Json& body, GenerationRequest& out) {
-    if (!body.contains("system") || body.at("system").is_null()) { return; }
-    const Json& system = body.at("system");
+// Flatten a system value (string or array of text blocks) into plain text. Used
+// for both the top-level `system` field and any system-role turn Claude Code
+// injects into the messages array.
+std::string flatten_system_value(const Json& value, const char* param) {
     std::string text;
-    if (system.is_string()) {
-        text = system.get<std::string>();
-    } else if (system.is_array()) {
-        for (const Json& block : system) {
-            if (require_block_type(block, "system") != "text") {
-                bad_request("only text system blocks are supported", "system");
+    if (value.is_string()) {
+        text = value.get<std::string>();
+    } else if (value.is_array()) {
+        for (const Json& block : value) {
+            if (require_block_type(block, param) != "text") {
+                bad_request("only text system blocks are supported", param);
             }
             append_text(text, require_string_field(block, "text", "system text block"));
         }
     } else {
-        bad_request("system must be a string or an array of text blocks", "system");
+        bad_request("system content must be a string or an array of text blocks", param);
     }
-    if (text.empty()) { return; }
-    ChatTurn turn;
-    turn.role = "system";
-    turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
-    out.messages.push_back(std::move(turn));
+    return text;
+}
+
+void parse_system(const Json& body, std::string& system_text) {
+    if (!body.contains("system") || body.at("system").is_null()) { return; }
+    append_text(system_text, flatten_system_value(body.at("system"), "system"));
 }
 
 ToolCall parse_tool_use(const Json& block) {
@@ -284,7 +286,7 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
     }
 }
 
-void parse_messages(const Json& body, GenerationRequest& out) {
+void parse_messages(const Json& body, GenerationRequest& out, std::string& system_text) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -299,13 +301,21 @@ void parse_messages(const Json& body, GenerationRequest& out) {
             bad_request("message " + std::to_string(i) + " must have a string role", "messages");
         }
         const std::string role = item.at("role").get<std::string>();
-        if (role != "user" && role != "assistant") {
-            bad_request("message role must be 'user' or 'assistant'", "messages", "unsupported_role");
+        if (role != "user" && role != "assistant" && role != "system") {
+            bad_request("message role must be 'user', 'assistant', or 'system'", "messages",
+                        "unsupported_role");
         }
         if (!item.contains("content") || item.at("content").is_null()) {
             bad_request("message " + std::to_string(i) + " must have content", "messages");
         }
         const Json& content = item.at("content");
+        if (role == "system") {
+            // Claude Code injects system reminders as system-role messages inside
+            // the messages array. Fold them into the leading system block: the Qwen
+            // chat template only honors leading system turns and drops the rest.
+            append_text(system_text, flatten_system_value(content, "messages"));
+            continue;
+        }
         if (content.is_string()) {
             ChatTurn turn;
             turn.role = role;
@@ -349,14 +359,13 @@ void parse_thinking(const Json& body, GenerationRequest& out) {
     if (!thinking.is_object() || !thinking.contains("type") || !thinking.at("type").is_string()) {
         bad_request("thinking must be an object with a string type", "thinking");
     }
+    // Anthropic thinking modes: "disabled" turns reasoning off; "enabled" and
+    // "adaptive" (Claude Code's default extended-thinking mode) turn it on. The
+    // Qwen template only exposes an on/off toggle, so any non-"disabled" mode maps
+    // to thinking-on. Unknown future modes default to on rather than 400 so the
+    // adapter tolerates Claude Code's evolving thinking vocabulary.
     const std::string type = thinking.at("type").get<std::string>();
-    if (type == "enabled") {
-        out.enable_thinking = true;
-    } else if (type == "disabled") {
-        out.enable_thinking = false;
-    } else {
-        bad_request("thinking type must be 'enabled' or 'disabled'", "thinking");
-    }
+    out.enable_thinking    = (type != "disabled");
 }
 
 const char* anthropic_error_type(int status) {
@@ -394,8 +403,17 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
 
     parse_tools(body, out);
     parse_tool_choice(body, out);
-    parse_system(body, out);
-    parse_messages(body, out);
+    std::string system_text;
+    parse_system(body, system_text);
+    parse_messages(body, out, system_text);
+    // The leading system turn combines the top-level `system` field with any
+    // system-role reminders folded out of the messages array.
+    if (!system_text.empty()) {
+        ChatTurn turn;
+        turn.role = "system";
+        turn.content.push_back(ContentPart{ContentKind::Text, std::move(system_text), "text"});
+        out.messages.insert(out.messages.begin(), std::move(turn));
+    }
     parse_stop_sequences(body, out);
     parse_sampling(body, out);
     parse_thinking(body, out);

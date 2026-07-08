@@ -97,6 +97,7 @@ qus_add_test(qus_gated_delta_rule_test SOURCES kernels/test_gated_delta_rule.cpp
 qus_add_test(qus_causal_conv1d_test SOURCES kernels/test_causal_conv1d.cpp)
 qus_add_test(qus_rope_test SOURCES kernels/test_rope.cpp)
 qus_add_test(qus_gqa_attention_test SOURCES kernels/test_gqa_attention.cpp)
+target_include_directories(qus_gqa_attention_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 qus_add_test(qus_embed_gather_test SOURCES kernels/test_embed_gather.cpp)
 qus_add_test(qus_argmax_test SOURCES kernels/test_argmax.cpp)
 qus_add_test(qus_sampling_test SOURCES kernels/test_sampling.cpp)

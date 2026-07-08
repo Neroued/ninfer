@@ -14,8 +14,8 @@
 namespace qus {
 namespace {
 
-constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
-constexpr std::size_t kArenaAlign = 256ULL;
+constexpr std::size_t kMiB                   = 1024ULL * 1024ULL;
+constexpr std::size_t kArenaAlign            = 256ULL;
 constexpr std::size_t kMtpPayloadBudgetBytes = 451267584ULL;
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
@@ -96,96 +96,127 @@ void validate_mtp_draft_tokens(int draft_tokens) {
     }
 }
 
+int runtime_kv_quant_group(DType dtype, int quant_group) {
+    if (dtype == DType::BF16) { return 0; }
+    if (dtype != DType::I8) { throw std::invalid_argument("Engine kv_dtype must be BF16 or I8"); }
+    if (quant_group != kKvQuantGroup) {
+        throw std::invalid_argument("Engine int8 KV requires kv_quant_group 64");
+    }
+    return quant_group;
+}
+
+std::size_t kv_cache_payload_bytes(std::size_t layers, std::size_t padded_ctx, DType kv_dtype,
+                                   int quant_group) {
+    const std::size_t vectors = checked_mul(
+        checked_mul(layers, 2, "cache arena size"),
+        checked_mul(model::kCfg.n_kv, padded_ctx, "cache arena size"), "cache arena size");
+    std::size_t bytes = tensor_bytes(checked_mul(vectors, model::kCfg.head_dim, "cache arena size"),
+                                     kv_dtype, "cache arena size");
+    if (kv_dtype == DType::I8) {
+        const std::size_t groups = static_cast<std::size_t>(model::kCfg.head_dim / quant_group);
+        bytes                    = checked_add(bytes,
+                                               tensor_bytes(checked_mul(vectors, groups, "cache arena size"),
+                                                            DType::FP16, "cache arena size"),
+                                               "cache arena size");
+    }
+    return bytes;
+}
+
+std::size_t kv_cache_payload_bytes(const KVCache& kv) {
+    std::size_t bytes     = 0;
+    const auto add_tensor = [&](const Tensor& tensor) {
+        bytes = checked_add(bytes, tensor.bytes(), "KV cache payload stats");
+    };
+    for (const Tensor& tensor : kv.k) { add_tensor(tensor); }
+    for (const Tensor& tensor : kv.v) { add_tensor(tensor); }
+    for (const Tensor& tensor : kv.k_scale) { add_tensor(tensor); }
+    for (const Tensor& tensor : kv.v_scale) { add_tensor(tensor); }
+    return bytes;
+}
+
 std::size_t default_cache_bytes_for(std::uint32_t max_ctx, int draft_tokens,
-                                    std::uint32_t prefill_chunk) {
+                                    std::uint32_t prefill_chunk, DType kv_dtype,
+                                    int kv_quant_group) {
     validate_mtp_draft_tokens(draft_tokens);
-    const bool include_mtp_kv      = draft_tokens > 0;
-    const std::size_t window_cols  = static_cast<std::size_t>(draft_tokens) + 1ULL;
+    const int runtime_group       = runtime_kv_quant_group(kv_dtype, kv_quant_group);
+    const bool include_mtp_kv     = draft_tokens > 0;
+    const std::size_t window_cols = static_cast<std::size_t>(draft_tokens) + 1ULL;
     // One extra GDN snapshot slot beyond the MTP window holds the turn-boundary recurrent state
     // used for partial prefix reuse across turns (decode/MTP only cycle slots 0..draft_tokens).
     const std::size_t gdn_snapshot_slots = window_cols + 1ULL;
-    const std::size_t draft_cols   = std::max<std::size_t>(1, static_cast<std::size_t>(draft_tokens));
+    const std::size_t draft_cols = std::max<std::size_t>(1, static_cast<std::size_t>(draft_tokens));
     const auto padded_ctx_size =
         align_up(static_cast<std::size_t>(max_ctx), 128, "cache arena size");
-    const std::size_t kv_layers =
-        checked_add(model::kCfg.n_full(), include_mtp_kv ? model::kCfg.mtp_layers : 0,
-                    "cache arena size");
-    const std::size_t kv_elems =
-        checked_mul(checked_mul(kv_layers, 2, "cache arena size"),
-                    checked_mul(checked_mul(model::kCfg.n_kv, model::kCfg.head_dim,
-                                            "cache arena size"),
-                                padded_ctx_size, "cache arena size"),
-                    "cache arena size");
-    const std::size_t kv_bytes = checked_mul(kv_elems, dtype_size(DType::BF16), "cache arena size");
+    const std::size_t kv_layers = checked_add(
+        model::kCfg.n_full(), include_mtp_kv ? model::kCfg.mtp_layers : 0, "cache arena size");
+    const std::size_t kv_bytes =
+        kv_cache_payload_bytes(kv_layers, padded_ctx_size, kv_dtype, runtime_group);
 
-    const std::size_t conv_elems =
-        checked_mul(checked_mul(model::kCfg.n_gdn(), model::kCfg.conv_dim, "cache arena size"),
-                    checked_mul(model::kCfg.gdn_conv_state_width, gdn_snapshot_slots,
-                                "cache arena size"),
-                    "cache arena size");
+    const std::size_t conv_elems = checked_mul(
+        checked_mul(model::kCfg.n_gdn(), model::kCfg.conv_dim, "cache arena size"),
+        checked_mul(model::kCfg.gdn_conv_state_width, gdn_snapshot_slots, "cache arena size"),
+        "cache arena size");
     const std::size_t conv_bytes =
         checked_mul(conv_elems, dtype_size(DType::BF16), "cache arena size");
 
-    const std::size_t ssm_elems =
-        checked_mul(checked_mul(model::kCfg.n_gdn(), model::kCfg.gdn_k_dim, "cache arena size"),
-                    checked_mul(
-                        checked_mul(model::kCfg.gdn_v_dim, model::kCfg.gdn_v_heads,
-                                    "cache arena size"),
-                        gdn_snapshot_slots, "cache arena size"),
-                    "cache arena size");
+    const std::size_t ssm_elems = checked_mul(
+        checked_mul(model::kCfg.n_gdn(), model::kCfg.gdn_k_dim, "cache arena size"),
+        checked_mul(checked_mul(model::kCfg.gdn_v_dim, model::kCfg.gdn_v_heads, "cache arena size"),
+                    gdn_snapshot_slots, "cache arena size"),
+        "cache arena size");
     const std::size_t ssm_bytes =
         checked_mul(ssm_elems, dtype_size(DType::FP32), "cache arena size");
 
     std::size_t io_bytes = 0;
-    io_bytes = checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"),
-                           "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
+    io_bytes = checked_add(
+        io_bytes,
+        token_matrix_bytes(model::kCfg.vocab, window_cols, DType::BF16, "cache arena size"),
+        "cache arena size");
+    io_bytes = checked_add(
+        io_bytes,
+        token_matrix_bytes(model::kCfg.hidden, window_cols, DType::BF16, "cache arena size"),
+        "cache arena size");
+    io_bytes = checked_add(
+        io_bytes,
+        token_matrix_bytes(model::kCfg.hidden, prefill_chunk, DType::BF16, "cache arena size"),
+        "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32, "cache arena size"),
+                    "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, token_matrix_bytes(1, draft_cols, DType::I32, "cache arena size"),
+                    "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32, "cache arena size"),
+                    "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32, "cache arena size"),
+                    "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32, "cache arena size"),
+                    "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32, "cache arena size"),
+                    "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
+    io_bytes = checked_add(
+        io_bytes, token_matrix_bytes(model::kCfg.hidden, 1, DType::BF16, "cache arena size"),
+        "cache arena size");
     io_bytes = checked_add(io_bytes,
-                           token_matrix_bytes(model::kCfg.vocab, window_cols, DType::BF16,
-                                              "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes,
-                           token_matrix_bytes(model::kCfg.hidden, window_cols, DType::BF16,
-                                              "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes,
-                           token_matrix_bytes(model::kCfg.hidden, prefill_chunk, DType::BF16,
-                                              "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32,
-                                                        "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes,
-                           token_matrix_bytes(1, draft_cols, DType::I32, "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32,
-                                                        "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32,
-                                                        "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32,
-                                                        "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, token_matrix_bytes(1, window_cols, DType::I32,
-                                                        "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, token_matrix_bytes(model::kCfg.hidden, 1, DType::BF16,
-                                                        "cache arena size"),
-                           "cache arena size");
-    io_bytes = checked_add(io_bytes, tensor_bytes(model::kStepStatsCounters, DType::I64,
-                                                  "cache arena size"),
+                           tensor_bytes(model::kStepStatsCounters, DType::I64, "cache arena size"),
                            "cache arena size");
 
     std::size_t total = 0;
@@ -193,7 +224,9 @@ std::size_t default_cache_bytes_for(std::uint32_t max_ctx, int draft_tokens,
     total             = checked_add(total, conv_bytes, "cache arena size");
     total             = checked_add(total, ssm_bytes, "cache arena size");
     total             = checked_add(total, io_bytes, "cache arena size");
-    total = checked_add(total, align_slack(kv_layers * 2 + model::kCfg.n_gdn() * 2 + 18),
+    const std::size_t kv_tensors =
+        checked_mul(kv_layers, kv_dtype == DType::I8 ? 4ULL : 2ULL, "cache arena size");
+    total = checked_add(total, align_slack(kv_tensors + model::kCfg.n_gdn() * 2 + 18),
                         "cache arena size");
     return checked_add(total, 64ULL * kMiB, "cache arena size");
 }
@@ -220,6 +253,7 @@ Engine::Engine(EngineOptions options) : options_(options) {
         options_.stop_token_ids.end());
     if (options_.max_ctx == 0) { throw std::invalid_argument("Engine max_ctx must be nonzero"); }
     validate_mtp_draft_tokens(options_.mtp_draft_tokens);
+    (void)runtime_kv_quant_group(options_.kv_dtype, options_.kv_quant_group);
     if (options_.prefill_chunk == 0 ||
         options_.prefill_chunk % model::kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("Engine prefill_chunk must be a nonzero multiple of 128");
@@ -251,13 +285,14 @@ Q5090Expectations Engine::expectations() {
 
 std::size_t Engine::default_weight_bytes(const std::string& path) {
     const auto file_size = std::filesystem::file_size(path);
-    std::size_t total = checked_add(static_cast<std::size_t>(file_size), 256ULL * kMiB,
-                                    "weight arena size");
+    std::size_t total =
+        checked_add(static_cast<std::size_t>(file_size), 256ULL * kMiB, "weight arena size");
     return checked_add(total, kMtpPayloadBudgetBytes, "weight arena size");
 }
 
 std::size_t Engine::default_cache_bytes(std::uint32_t max_ctx) {
-    return default_cache_bytes_for(max_ctx, 0, model::kDefaultPrefillChunk);
+    return default_cache_bytes_for(max_ctx, 0, model::kDefaultPrefillChunk, DType::BF16,
+                                   kKvQuantGroup);
 }
 
 std::size_t default_work_bytes_for(std::uint32_t prefill_chunk, int draft_tokens) {
@@ -349,58 +384,55 @@ std::size_t default_work_bytes_for(std::uint32_t prefill_chunk, int draft_tokens
     const auto vfp32 = [&](std::size_t rows) {
         return token_matrix_bytes(rows, verify_tokens, DType::FP32, "work arena size");
     };
-    const std::size_t verify_base = arena_sequence_bytes(
-        0, {vbf16(model::kCfg.hidden)}, "work arena size");
-    const std::size_t verify_attention =
-        arena_sequence_bytes(verify_base,
-                             {
-                                 vbf16(model::kCfg.hidden),
-                                 vbf16(model::kCfg.q_size),
-                                 vbf16(model::kCfg.q_size),
-                                 vbf16(model::kCfg.kv_size),
-                                 vbf16(model::kCfg.kv_size),
-                                 vbf16(model::kCfg.q_size),
-                                 vbf16(model::kCfg.kv_size),
-                                 vbf16(model::kCfg.q_size),
-                                 vbf16(model::kCfg.hidden),
-                             },
-                             "work arena size");
-    const std::size_t verify_gdn =
-        arena_sequence_bytes(verify_base,
-                             {
-                                 vbf16(model::kCfg.hidden),
-                                 vbf16(model::kCfg.key_dim),
-                                 vbf16(model::kCfg.key_dim),
-                                 vbf16(model::kCfg.value_dim),
-                                 vbf16(model::kCfg.conv_dim),
-                                 vbf16(model::kCfg.conv_dim),
-                                 vfp32(model::kCfg.gdn_v_heads),
-                                 vfp32(model::kCfg.gdn_v_heads),
-                                 vbf16(model::kCfg.key_dim),
-                                 vbf16(model::kCfg.key_dim),
-                                 vbf16(model::kCfg.value_dim),
-                                 vbf16(model::kCfg.key_dim),
-                                 vbf16(model::kCfg.key_dim),
-                                 vbf16(model::kCfg.value_dim),
-                                 vbf16(model::kCfg.value_dim),
-                                 vbf16(model::kCfg.value_dim),
-                                 vbf16(model::kCfg.hidden),
-                             },
-                             "work arena size");
-    const std::size_t verify_mlp =
-        arena_sequence_bytes(verify_base,
-                             {
-                                 vbf16(model::kCfg.hidden),
-                                 vbf16(2ULL * model::kCfg.intermediate),
-                                 vbf16(model::kCfg.intermediate),
-                                 vbf16(model::kCfg.hidden),
-                             },
-                             "work arena size");
+    const std::size_t verify_base =
+        arena_sequence_bytes(0, {vbf16(model::kCfg.hidden)}, "work arena size");
+    const std::size_t verify_attention = arena_sequence_bytes(verify_base,
+                                                              {
+                                                                  vbf16(model::kCfg.hidden),
+                                                                  vbf16(model::kCfg.q_size),
+                                                                  vbf16(model::kCfg.q_size),
+                                                                  vbf16(model::kCfg.kv_size),
+                                                                  vbf16(model::kCfg.kv_size),
+                                                                  vbf16(model::kCfg.q_size),
+                                                                  vbf16(model::kCfg.kv_size),
+                                                                  vbf16(model::kCfg.q_size),
+                                                                  vbf16(model::kCfg.hidden),
+                                                              },
+                                                              "work arena size");
+    const std::size_t verify_gdn       = arena_sequence_bytes(verify_base,
+                                                              {
+                                                            vbf16(model::kCfg.hidden),
+                                                            vbf16(model::kCfg.key_dim),
+                                                            vbf16(model::kCfg.key_dim),
+                                                            vbf16(model::kCfg.value_dim),
+                                                            vbf16(model::kCfg.conv_dim),
+                                                            vbf16(model::kCfg.conv_dim),
+                                                            vfp32(model::kCfg.gdn_v_heads),
+                                                            vfp32(model::kCfg.gdn_v_heads),
+                                                            vbf16(model::kCfg.key_dim),
+                                                            vbf16(model::kCfg.key_dim),
+                                                            vbf16(model::kCfg.value_dim),
+                                                            vbf16(model::kCfg.key_dim),
+                                                            vbf16(model::kCfg.key_dim),
+                                                            vbf16(model::kCfg.value_dim),
+                                                            vbf16(model::kCfg.value_dim),
+                                                            vbf16(model::kCfg.value_dim),
+                                                            vbf16(model::kCfg.hidden),
+                                                        },
+                                                              "work arena size");
+    const std::size_t verify_mlp       = arena_sequence_bytes(verify_base,
+                                                              {
+                                                            vbf16(model::kCfg.hidden),
+                                                            vbf16(2ULL * model::kCfg.intermediate),
+                                                            vbf16(model::kCfg.intermediate),
+                                                            vbf16(model::kCfg.hidden),
+                                                        },
+                                                              "work arena size");
     const std::size_t verify_final =
         arena_sequence_bytes(verify_base, {vbf16(model::kCfg.hidden)}, "work arena size");
 
     const bool include_mtp_work = draft_tokens > 0;
-    std::size_t mtp = 0;
+    std::size_t mtp             = 0;
     if (include_mtp_work) {
         mtp = arena_sequence_bytes(
             persistent,
@@ -429,11 +461,10 @@ std::size_t default_work_bytes_for(std::uint32_t prefill_chunk, int draft_tokens
             "work arena size");
     }
 
-    const std::size_t verify =
-        std::max({verify_attention, verify_gdn, verify_mlp, verify_final});
-    const std::size_t formula_peak =
-        include_mtp_work ? std::max({attention, gdn, mlp, final_head, verify, mtp})
-                         : std::max({attention, gdn, mlp, final_head, verify});
+    const std::size_t verify = std::max({verify_attention, verify_gdn, verify_mlp, verify_final});
+    const std::size_t formula_peak = include_mtp_work
+                                         ? std::max({attention, gdn, mlp, final_head, verify, mtp})
+                                         : std::max({attention, gdn, mlp, final_head, verify});
     const std::size_t with_margin  = checked_add(formula_peak, 64ULL * kMiB, "work arena size");
     return align_up(with_margin, 16ULL * kMiB, "work arena size");
 }
@@ -476,15 +507,17 @@ void Engine::load(const std::string& path) {
     if (load_options.load_mtp) { weights_->require_mtp_module_expectations(); }
 
     cache_arena_.emplace(options_.cache_bytes == 0
-                             ? default_cache_bytes_for(options_.max_ctx,
-                                                       options_.mtp_draft_tokens,
-                                                       options_.prefill_chunk)
+                             ? default_cache_bytes_for(options_.max_ctx, options_.mtp_draft_tokens,
+                                                       options_.prefill_chunk, options_.kv_dtype,
+                                                       options_.kv_quant_group)
                              : options_.cache_bytes);
+    const int cache_quant_group =
+        runtime_kv_quant_group(options_.kv_dtype, options_.kv_quant_group);
     kv_.emplace(*cache_arena_, model::kCfg.n_full(), options_.max_ctx, model::kCfg.n_kv,
-                model::kCfg.head_dim);
+                model::kCfg.head_dim, options_.kv_dtype, cache_quant_group);
     if (enable_mtp) {
         mtp_kv_.emplace(*cache_arena_, model::kCfg.mtp_layers, options_.max_ctx, model::kCfg.n_kv,
-                        model::kCfg.head_dim);
+                        model::kCfg.head_dim, options_.kv_dtype, cache_quant_group);
     }
     const auto window_cols =
         static_cast<std::int32_t>(options_.mtp_draft_tokens) + static_cast<std::int32_t>(1);
@@ -494,15 +527,15 @@ void Engine::load(const std::string& path) {
     const auto draft_cols =
         std::max<std::int32_t>(1, static_cast<std::int32_t>(options_.mtp_draft_tokens));
     state_.emplace(*cache_arena_, model::kCfg.n_gdn(), model::kCfg.conv_dim,
-                   model::kCfg.gdn_conv_state_width, model::kCfg.gdn_v_heads,
-                   model::kCfg.gdn_v_dim, model::kCfg.gdn_k_dim, gdn_snapshot_slots);
+                   model::kCfg.gdn_conv_state_width, model::kCfg.gdn_v_heads, model::kCfg.gdn_v_dim,
+                   model::kCfg.gdn_k_dim, gdn_snapshot_slots);
     io_ = model::StepState{
         cache_arena_->alloc(DType::I32, {1}),
         cache_arena_->alloc(DType::I32, {1}),
         cache_arena_->alloc(DType::BF16, {model::kCfg.vocab, window_cols}),
         cache_arena_->alloc(DType::BF16, {model::kCfg.hidden, window_cols}),
-        cache_arena_->alloc(DType::BF16, {model::kCfg.hidden,
-                                          static_cast<std::int32_t>(options_.prefill_chunk)}),
+        cache_arena_->alloc(
+            DType::BF16, {model::kCfg.hidden, static_cast<std::int32_t>(options_.prefill_chunk)}),
         cache_arena_->alloc(DType::I32, {window_cols}),
         cache_arena_->alloc(DType::I32, {draft_cols}),
         cache_arena_->alloc(DType::I32, {window_cols}),
@@ -520,8 +553,8 @@ void Engine::load(const std::string& path) {
     CUDA_CHECK(cudaMemsetAsync(io_.num_sampled.data, 0, io_.num_sampled.bytes(), ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.window_base.data, 0, io_.window_base.bytes(), ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.accepted.data, 0, io_.accepted.bytes(), ctx_->stream));
-    CUDA_CHECK(cudaMemsetAsync(io_.gdn_initial_slot.data, 0, io_.gdn_initial_slot.bytes(),
-                               ctx_->stream));
+    CUDA_CHECK(
+        cudaMemsetAsync(io_.gdn_initial_slot.data, 0, io_.gdn_initial_slot.bytes(), ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.ar_pos.data, 0, io_.ar_pos.bytes(), ctx_->stream));
     CUDA_CHECK(cudaMemsetAsync(io_.stats.data, 0, io_.stats.bytes(), ctx_->stream));
 
@@ -532,7 +565,7 @@ void Engine::load(const std::string& path) {
         (sizeof(kernels::SamplingConfig) + sizeof(std::int32_t) - 1) / sizeof(std::int32_t));
     sampling_config_dev_ = cache_arena_->alloc(DType::I32, {cfg_words});
     CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
-    sampling_host_              = kernels::SamplingConfig{};  // temperature 0 => greedy
+    sampling_host_              = kernels::SamplingConfig{}; // temperature 0 => greedy
     sampling_host_.token_counts = nullptr;
     CUDA_CHECK(cudaMemcpyAsync(sampling_config_dev_.data, &sampling_host_, sizeof(sampling_host_),
                                cudaMemcpyHostToDevice, ctx_->stream));
@@ -562,13 +595,23 @@ std::uint32_t Engine::position() const noexcept { return kv_ ? kv_->pos : 0; }
 
 EngineMemoryStats Engine::memory_stats() const noexcept {
     EngineMemoryStats stats;
-    stats.loaded      = loaded();
-    stats.device      = options_.device;
-    stats.max_context = options_.max_ctx;
-    stats.position    = position();
-    stats.weights     = arena_stats(weight_arena_);
-    stats.cache       = arena_stats(cache_arena_);
-    stats.workspace   = arena_stats(work_);
+    stats.loaded         = loaded();
+    stats.device         = options_.device;
+    stats.max_context    = options_.max_ctx;
+    stats.position       = position();
+    stats.weights        = arena_stats(weight_arena_);
+    stats.cache          = arena_stats(cache_arena_);
+    stats.workspace      = arena_stats(work_);
+    stats.kv_dtype       = options_.kv_dtype;
+    stats.kv_quant_group = options_.kv_dtype == DType::I8 ? options_.kv_quant_group : 0;
+    if (kv_) {
+        stats.kv_cache_payload_bytes = kv_cache_payload_bytes(*kv_);
+        if (mtp_kv_) {
+            stats.kv_cache_payload_bytes =
+                checked_add(stats.kv_cache_payload_bytes, kv_cache_payload_bytes(*mtp_kv_),
+                            "KV cache payload stats");
+        }
+    }
     if (weights_) {
         stats.q5090_loaded_payload_bytes = weights_->loaded_payload_bytes();
         stats.q5090_tensor_count         = weights_->tensor_count();
@@ -611,8 +654,7 @@ void Engine::set_sampling(const kernels::SamplingConfig& config) {
     sampling_host_ = config;
     // The engine owns the count buffer; only attach it when a penalty needs it so
     // the sampler skips the count reads/increment otherwise.
-    const bool penalties =
-        (config.presence_penalty != 0.0f) || (config.frequency_penalty != 0.0f);
+    const bool penalties = (config.presence_penalty != 0.0f) || (config.frequency_penalty != 0.0f);
     sampling_host_.token_counts =
         penalties ? static_cast<std::int32_t*>(token_counts_.data) : nullptr;
     CUDA_CHECK(cudaMemcpyAsync(sampling_config_dev_.data, &sampling_host_, sizeof(sampling_host_),
@@ -638,9 +680,9 @@ std::vector<int> Engine::read_round_output() {
     CUDA_CHECK(cudaMemcpy(out.data(), io_.sampled_out.data, out.size() * sizeof(int),
                           cudaMemcpyDeviceToHost));
     const std::uint32_t base = kv_->pos;
-    kv_->pos = base + static_cast<std::uint32_t>(n);
-    const auto stop = std::find_if(out.begin(), out.end(),
-                                   [&](int token) { return is_stop_token(token); });
+    kv_->pos                 = base + static_cast<std::uint32_t>(n);
+    const auto stop =
+        std::find_if(out.begin(), out.end(), [&](int token) { return is_stop_token(token); });
     if (stop != out.end()) {
         const int m = static_cast<int>(stop - out.begin()) + 1;
         out.erase(stop + 1, out.end());
@@ -717,10 +759,10 @@ int Engine::prefill_cached(std::span<const int> ids, std::uint32_t content_bound
         throw std::invalid_argument("Engine::prefill_cached exceeds max_ctx");
     }
 
-    // Snapshot the GDN recurrent state at THIS turn's assistant-content boundary regardless of which
-    // reuse branch runs, so the next turn can continue from it. The card no-ops the snapshot when the
-    // boundary falls outside the prefilled range; commit_boundary() below mirrors that check so
-    // content_boundary_prev_ only advertises a boundary that was actually snapshotted.
+    // Snapshot the GDN recurrent state at THIS turn's assistant-content boundary regardless of
+    // which reuse branch runs, so the next turn can continue from it. The card no-ops the snapshot
+    // when the boundary falls outside the prefilled range; commit_boundary() below mirrors that
+    // check so content_boundary_prev_ only advertises a boundary that was actually snapshotted.
     card_->set_prefill_snapshot_boundary(static_cast<std::int64_t>(content_boundary));
 
     const std::size_t E         = kv_->pos;               // committed resident end
@@ -733,11 +775,10 @@ int Engine::prefill_cached(std::span<const int> ids, std::uint32_t content_bound
     // boundary must be strictly inside (reuse_start, L]. reuse_start is the branch base (E, B_prev,
     // or 0); L == ids.size() == base + T in every branch.
     const auto commit_boundary = [&](std::size_t reuse_start) {
-        content_boundary_prev_ =
-            (static_cast<std::size_t>(content_boundary) > reuse_start &&
-             static_cast<std::size_t>(content_boundary) <= ids.size())
-                ? content_boundary
-                : kNoBoundary;
+        content_boundary_prev_ = (static_cast<std::size_t>(content_boundary) > reuse_start &&
+                                  static_cast<std::size_t>(content_boundary) <= ids.size())
+                                     ? content_boundary
+                                     : kNoBoundary;
     };
 
     // Branch 1: the whole committed prefix E is a prefix of ids -> append the new suffix from E.
@@ -776,8 +817,8 @@ int Engine::prefill_cached(std::span<const int> ids, std::uint32_t content_bound
 
 void Engine::set_gdn_initial_slot(int slot) {
     const std::int32_t value = static_cast<std::int32_t>(slot);
-    CUDA_CHECK(cudaMemcpy(io_.gdn_initial_slot.data, &value, sizeof(value),
-                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(
+        cudaMemcpy(io_.gdn_initial_slot.data, &value, sizeof(value), cudaMemcpyHostToDevice));
 }
 
 int Engine::decode_step_one() {

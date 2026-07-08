@@ -34,18 +34,21 @@ struct EngineMemoryStats {
     ArenaMemoryStats weights;
     ArenaMemoryStats cache;
     ArenaMemoryStats workspace;
+    DType kv_dtype                         = DType::BF16;
+    int kv_quant_group                     = 0;
+    std::size_t kv_cache_payload_bytes     = 0;
     std::size_t q5090_loaded_payload_bytes = 0;
     std::size_t q5090_tensor_count         = 0;
     std::size_t q5090_quant_count          = 0;
 };
 
 struct EngineMtpStats {
-    bool enabled = false;
-    int k = 0;
-    std::int64_t draft_tokens = 0;
+    bool enabled                 = false;
+    int k                        = 0;
+    std::int64_t draft_tokens    = 0;
     std::int64_t accepted_tokens = 0;
-    std::int64_t rounds = 0;
-    std::int64_t fallback_steps = 0;
+    std::int64_t rounds          = 0;
+    std::int64_t fallback_steps  = 0;
     std::array<std::int64_t, model::kMaxMtpDraftTokens> accepted_per_pos{};
 };
 
@@ -57,6 +60,8 @@ struct EngineOptions {
     std::size_t work_bytes      = 0;
     std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
     int mtp_draft_tokens        = 0;
+    DType kv_dtype              = DType::BF16;
+    int kv_quant_group          = kKvQuantGroup;
     Q5090Progress* progress     = nullptr;
     std::vector<int> stop_token_ids;
     bool use_cuda_graph = true;
@@ -89,10 +94,10 @@ public:
     // state there so a later turn can continue the recurrence from it even after the thinking-
     // stripped re-render diverges right after the assistant header.
     //
-    // Reuse decision (most to least reuse): (1) append when the whole committed prefix E is a prefix
-    // of `ids`; (2) rewind to the previous turn's boundary B_prev (KV rewind + GDN snapshot restore)
-    // when `ids` matches through B_prev; (3) otherwise a full reset prefill. Correct under MTP
-    // speculative decode. Returns the first generated token.
+    // Reuse decision (most to least reuse): (1) append when the whole committed prefix E is a
+    // prefix of `ids`; (2) rewind to the previous turn's boundary B_prev (KV rewind + GDN snapshot
+    // restore) when `ids` matches through B_prev; (3) otherwise a full reset prefill. Correct under
+    // MTP speculative decode. Returns the first generated token.
     int prefill_cached(std::span<const int> ids, std::uint32_t content_boundary);
     int decode_step();
     std::vector<int> generate(std::span<const int> prompt, int max_new_tokens);
@@ -164,9 +169,9 @@ private:
     std::uint32_t last_prefix_hit_tokens_ = 0;
     // Sentinel: no reusable turn-boundary GDN snapshot is available.
     static constexpr std::uint32_t kNoBoundary = 0xFFFFFFFFu;
-    // Absolute position of the assistant-content boundary at which the resident GDN boundary slot was
-    // snapshotted (kNoBoundary when none). Reuse-B is valid only when the incoming request matches
-    // logical_tokens_ through this position AND the snapshot was actually taken here.
+    // Absolute position of the assistant-content boundary at which the resident GDN boundary slot
+    // was snapshotted (kNoBoundary when none). Reuse-B is valid only when the incoming request
+    // matches logical_tokens_ through this position AND the snapshot was actually taken here.
     std::uint32_t content_boundary_prev_ = kNoBoundary;
     // Host mirror of the resident logical token sequence: prompt tokens followed by every token
     // returned by prefill/decode. The reusable prefix is logical_tokens_[0 : kv_.pos]; the tail

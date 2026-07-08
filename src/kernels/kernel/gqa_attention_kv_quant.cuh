@@ -44,7 +44,40 @@ __device__ __forceinline__ std::int8_t gqa_kv_quant_code(float x, float inv_scal
     return static_cast<std::int8_t>(q);
 }
 
-__global__ void gqa_attention_kv_quantize_append_kernel(
+__device__ __forceinline__ unsigned gqa_kv_quant_pack_bf16(float lo, float hi) {
+    unsigned out;
+    const unsigned lo_bits = __float_as_uint(lo);
+    const unsigned hi_bits = __float_as_uint(hi);
+    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
+    return out;
+}
+
+__device__ __forceinline__ int4 gqa_kv_dequant_i8x8(const std::int8_t* __restrict__ cache,
+                                                    const __half* __restrict__ scale, int kv_head,
+                                                    int d, int position, int padded_context) {
+    const int group            = d / kGqaKvQuantGroup;
+    const std::int64_t scale_i = gqa_kv_quant_scale_index(kv_head, group, position, padded_context);
+    const float s              = __half2float(scale[scale_i]);
+    unsigned packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int d0 = d + 2 * i;
+        const int d1 = d0 + 1;
+        const float x0 =
+            static_cast<float>(
+                cache[gqa_kv_quant_code_index(kv_head, d0, position, padded_context)]) *
+            s;
+        const float x1 =
+            static_cast<float>(
+                cache[gqa_kv_quant_code_index(kv_head, d1, position, padded_context)]) *
+            s;
+        packed[i] = gqa_kv_quant_pack_bf16(x0, x1);
+    }
+    return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
+                     static_cast<int>(packed[2]), static_cast<int>(packed[3]));
+}
+
+static __global__ void gqa_attention_kv_quantize_append_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, std::int8_t* __restrict__ cache_k,
     std::int8_t* __restrict__ cache_v, __half* __restrict__ scale_k, __half* __restrict__ scale_v,

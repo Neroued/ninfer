@@ -8,6 +8,7 @@
 #include <math_constants.h>
 
 #include "kernels/kernel/gdn_common.cuh"
+#include "kernels/kernel/gqa_attention_kv_quant.cuh"
 
 #include <cstdint>
 
@@ -75,8 +76,8 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int max_spl
         target_keys_per_split = 256;
     }
     constexpr int kMinSplits = 4;
-    int splits = (window + target_keys_per_split - 1) / target_keys_per_split;
-    splits     = max(kMinSplits, splits);
+    int splits               = (window + target_keys_per_split - 1) / target_keys_per_split;
+    splits                   = max(kMinSplits, splits);
     return min(max_splits, splits);
 }
 
@@ -92,9 +93,8 @@ __device__ __forceinline__ unsigned gqa_small_t_tc_smem_addr(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
 }
 
-__device__ __forceinline__ void gqa_small_t_tc_ldmatrix_x4(unsigned& a0, unsigned& a1,
-                                                           unsigned& a2, unsigned& a3,
-                                                           unsigned addr) {
+__device__ __forceinline__ void gqa_small_t_tc_ldmatrix_x4(unsigned& a0, unsigned& a1, unsigned& a2,
+                                                           unsigned& a3, unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
                  : "r"(addr));
@@ -116,33 +116,28 @@ __device__ __forceinline__ void gqa_small_t_tc_ldmatrix_x2_trans(unsigned& b0, u
 
 __device__ __forceinline__ void
 gqa_small_t_tc_mma_m16n8k16_bf16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
-                                 unsigned a1, unsigned a2, unsigned a3, unsigned b0,
-                                 unsigned b1) {
+                                 unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void
-gqa_small_t_tc_row_to_qt(int row, int tokens, int kv_head, int& q_head, int& token) {
+__device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, int kv_head,
+                                                         int& q_head, int& token) {
     token             = row / kGqaGroupSize;
     const int local_q = row - token * kGqaGroupSize;
     q_head            = kv_head * kGqaGroupSize + local_q;
 }
 
-template <int TokenTile, int WarpsPerCta>
-__launch_bounds__(128, 2) __global__
-    void gqa_attention_small_t_tc_partial_kernel(const __nv_bfloat16* q,
-                                                 const __nv_bfloat16* k_new,
-                                                 const __nv_bfloat16* v_new,
-                                                 const std::int32_t* pos,
-                                                 __nv_bfloat16* cache_k,
-                                                 __nv_bfloat16* cache_v, std::int32_t tokens,
-                                                 std::int32_t padded_context,
-                                                 std::int32_t max_context, float scale,
-                                                 __nv_bfloat16* partial_acc, float* partial_m,
-                                                 float* partial_l) {
+template <int TokenTile, int WarpsPerCta, bool Quantized>
+__launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_kernel(
+    const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
+    const std::int32_t* pos, __nv_bfloat16* cache_k, __nv_bfloat16* cache_v,
+    const std::int8_t* cache_k_i8, const std::int8_t* cache_v_i8, const __half* cache_k_scale,
+    const __half* cache_v_scale, std::int32_t tokens, std::int32_t padded_context,
+    std::int32_t max_context, float scale, __nv_bfloat16* partial_acc, float* partial_m,
+    float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -222,17 +217,19 @@ __launch_bounds__(128, 2) __global__
         return;
     }
 
-    for (int chunk = tid; chunk < tokens * (D / 8); chunk += Threads) {
-        const int token = chunk / (D / 8);
-        const int d     = (chunk - token * (D / 8)) * 8;
-        const int p_tok = pos[token];
-        if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 && p_tok < max_context) {
-            const std::int64_t new_off   = gqa_kv_new_index(kv_head, d, token);
-            const std::int64_t cache_off = gqa_cache_index(kv_head, d, p_tok, padded_context);
-            *reinterpret_cast<int4*>(&cache_k[cache_off]) =
-                *reinterpret_cast<const int4*>(&k_new[new_off]);
-            *reinterpret_cast<int4*>(&cache_v[cache_off]) =
-                *reinterpret_cast<const int4*>(&v_new[new_off]);
+    if constexpr (!Quantized) {
+        for (int chunk = tid; chunk < tokens * (D / 8); chunk += Threads) {
+            const int token = chunk / (D / 8);
+            const int d     = (chunk - token * (D / 8)) * 8;
+            const int p_tok = pos[token];
+            if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 && p_tok < max_context) {
+                const std::int64_t new_off   = gqa_kv_new_index(kv_head, d, token);
+                const std::int64_t cache_off = gqa_cache_index(kv_head, d, p_tok, padded_context);
+                *reinterpret_cast<int4*>(&cache_k[cache_off]) =
+                    *reinterpret_cast<const int4*>(&k_new[new_off]);
+                *reinterpret_cast<int4*>(&cache_v[cache_off]) =
+                    *reinterpret_cast<const int4*>(&v_new[new_off]);
+            }
         }
     }
     __syncthreads();
@@ -294,15 +291,22 @@ __launch_bounds__(128, 2) __global__
             __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
             __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
             if (key < split_end) {
-                const int new_token = key - first_pos;
-                if (new_token >= 0 && new_token < tokens && key >= first_pos) {
-                    const std::int64_t off = gqa_kv_new_index(kv_head, d, new_token);
-                    qus::kernels::async_copy_global_to_shared<16>(k_dst, &k_new[off]);
-                    qus::kernels::async_copy_global_to_shared<16>(v_dst, &v_new[off]);
+                if constexpr (Quantized) {
+                    *reinterpret_cast<int4*>(k_dst) = gqa_kv_dequant_i8x8(
+                        cache_k_i8, cache_k_scale, kv_head, d, key, padded_context);
+                    *reinterpret_cast<int4*>(v_dst) = gqa_kv_dequant_i8x8(
+                        cache_v_i8, cache_v_scale, kv_head, d, key, padded_context);
                 } else {
-                    const std::int64_t off = gqa_cache_index(kv_head, d, key, padded_context);
-                    qus::kernels::async_copy_global_to_shared<16>(k_dst, &cache_k[off]);
-                    qus::kernels::async_copy_global_to_shared<16>(v_dst, &cache_v[off]);
+                    const int new_token = key - first_pos;
+                    if (new_token >= 0 && new_token < tokens && key >= first_pos) {
+                        const std::int64_t off = gqa_kv_new_index(kv_head, d, new_token);
+                        qus::kernels::async_copy_global_to_shared<16>(k_dst, &k_new[off]);
+                        qus::kernels::async_copy_global_to_shared<16>(v_dst, &v_new[off]);
+                    } else {
+                        const std::int64_t off = gqa_cache_index(kv_head, d, key, padded_context);
+                        qus::kernels::async_copy_global_to_shared<16>(k_dst, &cache_k[off]);
+                        qus::kernels::async_copy_global_to_shared<16>(v_dst, &cache_v[off]);
+                    }
                 }
             } else {
                 *reinterpret_cast<int4*>(k_dst) = make_int4(0, 0, 0, 0);
@@ -326,8 +330,8 @@ __launch_bounds__(128, 2) __global__
                     bf[0], bf[1],
                     gqa_small_t_tc_smem_addr(&k_s[brow * D + gqa_small_t_tc_swz(brow, bcol)]));
                 gqa_small_t_tc_mma_m16n8k16_bf16(score[nt][0], score[nt][1], score[nt][2],
-                                                 score[nt][3], af_q[k][0], af_q[k][1],
-                                                 af_q[k][2], af_q[k][3], bf[0], bf[1]);
+                                                 score[nt][3], af_q[k][0], af_q[k][1], af_q[k][2],
+                                                 af_q[k][3], bf[0], bf[1]);
             }
         }
 
@@ -342,34 +346,45 @@ __launch_bounds__(128, 2) __global__
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0       = nt * 8 + 2 * lid;
-            const int col1       = col0 + 1;
-            const int key0       = k0 + col0;
-            const int key1       = col1 + k0;
-            const int new_token0 = key0 - first_pos;
-            const int new_token1 = key1 - first_pos;
-            const bool from_new0 = new_token0 >= 0 && new_token0 < tokens && key0 >= first_pos;
-            const bool from_new1 = new_token1 >= 0 && new_token1 < tokens && key1 >= first_pos;
-            score[nt][0] =
-                (row0 < row_count && key0 < split_end && key0 <= qabs0 &&
-                 !(from_new0 && new_token0 > token0))
-                    ? score[nt][0] * scale
-                    : -CUDART_INF_F;
-            score[nt][1] =
-                (row0 < row_count && key1 < split_end && key1 <= qabs0 &&
-                 !(from_new1 && new_token1 > token0))
-                    ? score[nt][1] * scale
-                    : -CUDART_INF_F;
-            score[nt][2] =
-                (row1 < row_count && key0 < split_end && key0 <= qabs1 &&
-                 !(from_new0 && new_token0 > token1))
-                    ? score[nt][2] * scale
-                    : -CUDART_INF_F;
-            score[nt][3] =
-                (row1 < row_count && key1 < split_end && key1 <= qabs1 &&
-                 !(from_new1 && new_token1 > token1))
-                    ? score[nt][3] * scale
-                    : -CUDART_INF_F;
+            const int col0 = nt * 8 + 2 * lid;
+            const int col1 = col0 + 1;
+            const int key0 = k0 + col0;
+            const int key1 = col1 + k0;
+            if constexpr (Quantized) {
+                score[nt][0] = (row0 < row_count && key0 < split_end && key0 <= qabs0)
+                                   ? score[nt][0] * scale
+                                   : -CUDART_INF_F;
+                score[nt][1] = (row0 < row_count && key1 < split_end && key1 <= qabs0)
+                                   ? score[nt][1] * scale
+                                   : -CUDART_INF_F;
+                score[nt][2] = (row1 < row_count && key0 < split_end && key0 <= qabs1)
+                                   ? score[nt][2] * scale
+                                   : -CUDART_INF_F;
+                score[nt][3] = (row1 < row_count && key1 < split_end && key1 <= qabs1)
+                                   ? score[nt][3] * scale
+                                   : -CUDART_INF_F;
+            } else {
+                const int new_token0 = key0 - first_pos;
+                const int new_token1 = key1 - first_pos;
+                const bool from_new0 = new_token0 >= 0 && new_token0 < tokens && key0 >= first_pos;
+                const bool from_new1 = new_token1 >= 0 && new_token1 < tokens && key1 >= first_pos;
+                score[nt][0]         = (row0 < row_count && key0 < split_end && key0 <= qabs0 &&
+                                !(from_new0 && new_token0 > token0))
+                                           ? score[nt][0] * scale
+                                           : -CUDART_INF_F;
+                score[nt][1]         = (row0 < row_count && key1 < split_end && key1 <= qabs0 &&
+                                !(from_new1 && new_token1 > token0))
+                                           ? score[nt][1] * scale
+                                           : -CUDART_INF_F;
+                score[nt][2]         = (row1 < row_count && key0 < split_end && key0 <= qabs1 &&
+                                !(from_new0 && new_token0 > token1))
+                                           ? score[nt][2] * scale
+                                           : -CUDART_INF_F;
+                score[nt][3]         = (row1 < row_count && key1 < split_end && key1 <= qabs1 &&
+                                !(from_new1 && new_token1 > token1))
+                                           ? score[nt][3] * scale
+                                           : -CUDART_INF_F;
+            }
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
             bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
         }
@@ -378,12 +393,10 @@ __launch_bounds__(128, 2) __global__
         bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 1));
         bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 2));
 
-        const float nm0 = fmaxf(m0, bm0);
-        const float nm1 = fmaxf(m1, bm1);
-        const float alpha0 =
-            (m0 == -CUDART_INF_F) ? 0.0f : gqa_exp2_fast((m0 - nm0) * Log2E);
-        const float alpha1 =
-            (m1 == -CUDART_INF_F) ? 0.0f : gqa_exp2_fast((m1 - nm1) * Log2E);
+        const float nm0    = fmaxf(m0, bm0);
+        const float nm1    = fmaxf(m1, bm1);
+        const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : gqa_exp2_fast((m0 - nm0) * Log2E);
+        const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : gqa_exp2_fast((m1 - nm1) * Log2E);
 
         float bl0 = 0.0f, bl1 = 0.0f;
 #pragma unroll
@@ -443,8 +456,8 @@ __launch_bounds__(128, 2) __global__
                 gqa_small_t_tc_ldmatrix_x2_trans(
                     vf[0], vf[1],
                     gqa_small_t_tc_smem_addr(&v_s[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
-                gqa_small_t_tc_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3],
-                                                 pf[0], pf[1], pf[2], pf[3], vf[0], vf[1]);
+                gqa_small_t_tc_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0],
+                                                 pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
         }
         __syncthreads();

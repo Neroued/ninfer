@@ -20,6 +20,7 @@
 #include <math_constants.h>
 
 #include "kernels/kernel/gdn_common.cuh"
+#include "kernels/kernel/gqa_attention_kv_quant.cuh"
 
 #include <cstdint>
 
@@ -63,9 +64,7 @@ __device__ __forceinline__ unsigned gqa_prefill_pack_bf16(float lo, float hi) {
     unsigned out;
     const unsigned lo_bits = __float_as_uint(lo);
     const unsigned hi_bits = __float_as_uint(hi);
-    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n"
-                 : "=r"(out)
-                 : "r"(hi_bits), "r"(lo_bits));
+    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
     return out;
 }
 
@@ -121,13 +120,10 @@ __device__ __forceinline__ float gqa_prefill_exp2_fast(float x) {
     return y;
 }
 
-__global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* __restrict__ k,
-                                                  const __nv_bfloat16* __restrict__ v,
-                                                  const std::int32_t* __restrict__ positions,
-                                                  __nv_bfloat16* __restrict__ cache_k,
-                                                  __nv_bfloat16* __restrict__ cache_v,
-                                                  std::int32_t tokens,
-                                                  std::int32_t padded_context) {
+__global__ void gqa_attention_prefill_fill_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, __nv_bfloat16* __restrict__ cache_k,
+    __nv_bfloat16* __restrict__ cache_v, std::int32_t tokens, std::int32_t padded_context) {
     constexpr int VecElems = 8; // 8 bf16 == 16 B, matching the cache row alignment.
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t n =
@@ -142,8 +138,8 @@ __global__ void gqa_attention_prefill_fill_kernel(const __nv_bfloat16* __restric
     const int position = positions[0] + token;
 
     const std::int64_t src_off =
-        static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaPrefillHeadDim) *
-                                          (kv_head + kGqaPrefillKVHeads * token);
+        static_cast<std::int64_t>(d) +
+        static_cast<std::int64_t>(kGqaPrefillHeadDim) * (kv_head + kGqaPrefillKVHeads * token);
     const std::int64_t cache_off = gqa_prefill_cache_index(kv_head, d, position, padded_context);
     *reinterpret_cast<int4*>(&cache_k[cache_off]) = *reinterpret_cast<const int4*>(&k[src_off]);
     *reinterpret_cast<int4*>(&cache_v[cache_off]) = *reinterpret_cast<const int4*>(&v[src_off]);
@@ -187,16 +183,38 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
     }
 }
 
+__device__ __forceinline__ void
+gqa_prefill_stage_kv_i8(__nv_bfloat16* dst, const std::int8_t* cache, const __half* scale,
+                        int kv_head, int k0, int max_query_abs, int padded_context, int tid) {
+    constexpr int D         = kGqaPrefillHeadDim;
+    constexpr int Bc        = kGqaPrefillBc;
+    constexpr int Threads   = kGqaPrefillThreads;
+    constexpr int VecPerRow = D / 8;
+#pragma unroll
+    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
+        const int key_l  = chunk >> 5;
+        const int d      = (chunk & 31) << 3;
+        __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
+        if ((k0 + key_l) <= max_query_abs) {
+            *reinterpret_cast<int4*>(p) =
+                gqa_kv_dequant_i8x8(cache, scale, kv_head, d, k0 + key_l, padded_context);
+        } else {
+            *reinterpret_cast<int4*>(p) = make_int4(0, 0, 0, 0);
+        }
+    }
+}
+
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-__launch_bounds__(kGqaPrefillThreads, 1) __global__
-    void gqa_attention_prefill_kernel(const __nv_bfloat16* __restrict__ q,
-                                      const __nv_bfloat16* __restrict__ cache_k,
-                                      const __nv_bfloat16* __restrict__ cache_v,
-                                      const std::int32_t* __restrict__ positions,
-                                      float scale, __nv_bfloat16* __restrict__ out, std::int32_t tokens,
-                                      std::int32_t padded_context) {
+template <bool Quantized>
+__launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ cache_k,
+    const __nv_bfloat16* __restrict__ cache_v, const std::int8_t* __restrict__ cache_k_i8,
+    const std::int8_t* __restrict__ cache_v_i8, const __half* __restrict__ cache_k_scale,
+    const __half* __restrict__ cache_v_scale, const std::int32_t* __restrict__ positions,
+    float scale, __nv_bfloat16* __restrict__ out, std::int32_t tokens,
+    std::int32_t padded_context) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
     constexpr int Bc            = kGqaPrefillBc;      // 64 key cols
@@ -261,8 +279,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
     // below); it stays resident for the whole key loop. Global Q rows are 256 bf16
     // contiguous, with a token stride of 256*QHeads.
     {
-        constexpr int VecPerRow  = D / 8;
-        constexpr int QRowStride = D * kGqaPrefillQHeads; // global stride between tokens
+        constexpr int VecPerRow      = D / 8;
+        constexpr int QRowStride     = D * kGqaPrefillQHeads; // global stride between tokens
         const __nv_bfloat16* q_block = q + gqa_prefill_q_index(q_head, 0, q0);
         if (q0 + Br <= tokens) {
 #pragma unroll
@@ -305,7 +323,12 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     qus::kernels::async_copy_commit();
-    gqa_prefill_stage_kv(k_s, cache_k, kv_head, 0, max_query_abs, padded_context, tid);
+    if constexpr (Quantized) {
+        gqa_prefill_stage_kv_i8(k_s, cache_k_i8, cache_k_scale, kv_head, 0, max_query_abs,
+                                padded_context, tid);
+    } else {
+        gqa_prefill_stage_kv(k_s, cache_k, kv_head, 0, max_query_abs, padded_context, tid);
+    }
     qus::kernels::async_copy_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
@@ -315,7 +338,12 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
-        gqa_prefill_stage_kv(v_s, cache_v, kv_head, k0, max_query_abs, padded_context, tid);
+        if constexpr (Quantized) {
+            gqa_prefill_stage_kv_i8(v_s, cache_v_i8, cache_v_scale, kv_head, k0, max_query_abs,
+                                    padded_context, tid);
+        } else {
+            gqa_prefill_stage_kv(v_s, cache_v, kv_head, k0, max_query_abs, padded_context, tid);
+        }
         qus::kernels::async_copy_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
@@ -399,12 +427,12 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 1));
         bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 2));
 
-        const float nm0 = fmaxf(m0, bm0);
-        const float nm1 = fmaxf(m1, bm1);
+        const float nm0        = fmaxf(m0, bm0);
+        const float nm1        = fmaxf(m1, bm1);
         const float nm0_scaled = nm0 * scale_l2;
         const float nm1_scaled = nm1 * scale_l2;
-        const float alpha0 = gqa_prefill_exp2_fast(__fmaf_rn(m0, scale_l2, -nm0_scaled));
-        const float alpha1 = gqa_prefill_exp2_fast(__fmaf_rn(m1, scale_l2, -nm1_scaled));
+        const float alpha0     = gqa_prefill_exp2_fast(__fmaf_rn(m0, scale_l2, -nm0_scaled));
+        const float alpha1     = gqa_prefill_exp2_fast(__fmaf_rn(m1, scale_l2, -nm1_scaled));
 
         // P = exp2(S - m), repacked into the PV A-fragment layout, plus local block row-sum.
         // The row-sum allreduce is deferred to the epilogue; only row max must be reduced per tile.
@@ -435,22 +463,22 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         } else {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const float p00 = (score[nt][0] > -CUDART_INF_F)
-                                      ? gqa_prefill_exp2_fast(
-                                            __fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
-                                      : 0.0f;
-                const float p01 = (score[nt][1] > -CUDART_INF_F)
-                                      ? gqa_prefill_exp2_fast(
-                                            __fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
-                                      : 0.0f;
-                const float p10 = (score[nt][2] > -CUDART_INF_F)
-                                      ? gqa_prefill_exp2_fast(
-                                            __fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
-                                      : 0.0f;
-                const float p11 = (score[nt][3] > -CUDART_INF_F)
-                                      ? gqa_prefill_exp2_fast(
-                                            __fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
-                                      : 0.0f;
+                const float p00 =
+                    (score[nt][0] > -CUDART_INF_F)
+                        ? gqa_prefill_exp2_fast(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
+                        : 0.0f;
+                const float p01 =
+                    (score[nt][1] > -CUDART_INF_F)
+                        ? gqa_prefill_exp2_fast(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
+                        : 0.0f;
+                const float p10 =
+                    (score[nt][2] > -CUDART_INF_F)
+                        ? gqa_prefill_exp2_fast(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
+                        : 0.0f;
+                const float p11 =
+                    (score[nt][3] > -CUDART_INF_F)
+                        ? gqa_prefill_exp2_fast(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
+                        : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
@@ -481,8 +509,13 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
-            gqa_prefill_stage_kv(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                                 padded_context, tid);
+            if constexpr (Quantized) {
+                gqa_prefill_stage_kv_i8(k_s, cache_k_i8, cache_k_scale, kv_head, (kb + 1) * Bc,
+                                        max_query_abs, padded_context, tid);
+            } else {
+                gqa_prefill_stage_kv(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
+                                     padded_context, tid);
+            }
             qus::kernels::async_copy_commit();
         }
 
@@ -491,8 +524,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__
         // V fragment is issued while the current MMA runs.
         // Each x4.trans load covers 2 output n-tiles (16 dims); pipeline the next
         // load against the current pair of MMAs.
-        constexpr int PVHalf  = PVNt / 2;   // 16 n-tile pairs
-        constexpr int PVLoads = PVKs * PVHalf;  // 64 x4.trans loads
+        constexpr int PVHalf  = PVNt / 2;      // 16 n-tile pairs
+        constexpr int PVLoads = PVKs * PVHalf; // 64 x4.trans loads
         // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
         unsigned vf[2][4];
         {

@@ -348,6 +348,40 @@ void cpu_quantize_append(const std::vector<float>& k, const std::vector<float>& 
     }
 }
 
+std::vector<float> dequantize_cache_bf16(const std::vector<std::int8_t>& code,
+                                         const std::vector<std::uint16_t>& scale,
+                                         std::int32_t padded_context) {
+    std::vector<float> out(code.size(), 0.0f);
+    for (std::int32_t kv_head = 0; kv_head < kKVHeads; ++kv_head) {
+        for (std::int32_t position = 0; position < padded_context; ++position) {
+            for (std::int32_t group = 0; group < kKvQuantGroups; ++group) {
+                const float s =
+                    f16_bits_to_f32(scale[scale_index(kv_head, group, position, padded_context)]);
+                for (std::int32_t i = 0; i < kKvQuantGroup; ++i) {
+                    const std::int32_t d  = group * kKvQuantGroup + i;
+                    const std::size_t idx = cache_index(kv_head, d, position, padded_context);
+                    out[idx] = bf16_to_f32(f32_to_bf16(static_cast<float>(code[idx]) * s));
+                }
+            }
+        }
+    }
+    return out;
+}
+
+void cache_to_kv_tokens(const std::vector<float>& cache, std::int32_t tokens,
+                        std::int32_t padded_context, std::vector<float>& kv) {
+    kv.assign(static_cast<std::size_t>(kHeadDim) * kKVHeads * static_cast<std::size_t>(tokens),
+              0.0f);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t head = 0; head < kKVHeads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                kv[kv_tensor_index(head, d, token)] =
+                    cache[cache_index(head, d, token, padded_context)];
+            }
+        }
+    }
+}
+
 int one_int8_quantize_append_case(std::int32_t tokens, std::int32_t max_context,
                                   std::vector<int> positions, bool positions_are_base,
                                   std::uint32_t seed, const char* tag) {
@@ -411,6 +445,174 @@ int one_int8_quantize_append_case(std::int32_t tokens, std::int32_t max_context,
                           from_device_u16(kv.k_scale[0].data, scale_n), expected_k_scale);
     f += check_bits_equal((std::string(tag) + " v scale").c_str(),
                           from_device_u16(kv.v_scale[0].data, scale_n), expected_v_scale);
+    return f;
+}
+
+int one_int8_prefill_case(std::int32_t tokens, std::uint32_t seed) {
+    const std::size_t qn =
+        static_cast<std::size_t>(kHeadDim) * kQHeads * static_cast<std::size_t>(tokens);
+    const std::size_t kvn =
+        static_cast<std::size_t>(kHeadDim) * kKVHeads * static_cast<std::size_t>(tokens);
+    const std::int32_t padded_context = align_up_128(tokens);
+    const std::size_t code_n          = cache_elements(padded_context);
+    const std::size_t scale_n         = scale_elements(padded_context);
+
+    std::vector<float> q(qn), k(kvn), v(kvn);
+    fill_uniform(q, seed, -0.25f, 0.25f);
+    fill_uniform(k, seed + 1000u, -0.25f, 0.25f);
+    fill_uniform(v, seed + 2000u, -1.0f, 1.0f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    round_to_bf16(v);
+
+    std::vector<int> positions(static_cast<std::size_t>(tokens));
+    for (std::int32_t t = 0; t < tokens; ++t) { positions[static_cast<std::size_t>(t)] = t; }
+    std::vector<std::int8_t> expected_k(code_n, 0), expected_v(code_n, 0);
+    std::vector<std::uint16_t> expected_k_scale(scale_n, 0), expected_v_scale(scale_n, 0);
+    cpu_quantize_append(k, v, positions, true, tokens, padded_context, expected_k, expected_v,
+                        expected_k_scale, expected_v_scale);
+    const std::vector<float> cache_k =
+        dequantize_cache_bf16(expected_k, expected_k_scale, padded_context);
+    const std::vector<float> cache_v =
+        dequantize_cache_bf16(expected_v, expected_v_scale, padded_context);
+    std::vector<float> k_roundtrip, v_roundtrip;
+    cache_to_kv_tokens(cache_k, tokens, padded_context, k_roundtrip);
+    cache_to_kv_tokens(cache_v, tokens, padded_context, v_roundtrip);
+
+    std::vector<float> zero_cache_k(code_n, 0.0f), zero_cache_v(code_n, 0.0f);
+    std::vector<float> ignored_k, ignored_v;
+    std::vector<double> ref;
+    cpu_gqa_prefill(q, k_roundtrip, v_roundtrip, zero_cache_k, zero_cache_v, tokens, 0,
+                    padded_context, ignored_k, ignored_v, ref);
+
+    DBuf dq   = to_device_bf16(q);
+    DBuf dk   = to_device_bf16(k);
+    DBuf dv   = to_device_bf16(v);
+    DBuf dpos = to_device_i32(positions);
+    DBuf dout(qn * sizeof(std::uint16_t));
+    WorkspaceArena ws(kGqaWorkspaceBytes);
+
+    const std::size_t arena_bytes =
+        2 * (code_n + 256) + 2 * (scale_n * sizeof(std::uint16_t) + 256) + 4096;
+    DeviceArena cache_arena(arena_bytes);
+    KVCache kv(cache_arena, 1, static_cast<std::uint32_t>(tokens), kKVHeads, kHeadDim, DType::I8);
+    cudaMemset(kv.k[0].data, 0, kv.k[0].bytes());
+    cudaMemset(kv.v[0].data, 0, kv.v[0].bytes());
+    cudaMemset(kv.k_scale[0].data, 0, kv.k_scale[0].bytes());
+    cudaMemset(kv.v_scale[0].data, 0, kv.v_scale[0].bytes());
+
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tpos(dpos.p, DType::I32, {tokens});
+    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+
+    kernels::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
+    cudaDeviceSynchronize();
+
+    int f                   = 0;
+    const std::string label = "gqa int8 prefill T=" + std::to_string(tokens);
+    f += verify(label.c_str(), from_device_bf16(dout, qn), ref, Tolerance::attention_bf16());
+    f += check_i8_equal((label + " k code").c_str(), from_device_i8(kv.k[0].data, code_n),
+                        expected_k);
+    f += check_i8_equal((label + " v code").c_str(), from_device_i8(kv.v[0].data, code_n),
+                        expected_v);
+    f += check_bits_equal((label + " k scale").c_str(),
+                          from_device_u16(kv.k_scale[0].data, scale_n), expected_k_scale);
+    f += check_bits_equal((label + " v scale").c_str(),
+                          from_device_u16(kv.v_scale[0].data, scale_n), expected_v_scale);
+    return f;
+}
+
+int one_int8_decode_case(std::int32_t pos, std::uint32_t seed) {
+    const std::size_t qn              = static_cast<std::size_t>(kHeadDim) * kQHeads;
+    const std::size_t kvn             = static_cast<std::size_t>(kHeadDim) * kKVHeads;
+    const std::int32_t padded_context = align_up_128(pos + 1);
+    const std::size_t code_n          = cache_elements(padded_context);
+    const std::size_t scale_n         = scale_elements(padded_context);
+
+    std::vector<float> history_k(kvn * static_cast<std::size_t>(pos));
+    std::vector<float> history_v(kvn * static_cast<std::size_t>(pos));
+    std::vector<float> q(qn), k_new(kvn), v_new(kvn);
+    fill_uniform(history_k, seed, -0.25f, 0.25f);
+    fill_uniform(history_v, seed + 1000u, -1.0f, 1.0f);
+    fill_uniform(q, seed + 2000u, -0.25f, 0.25f);
+    fill_uniform(k_new, seed + 3000u, -0.25f, 0.25f);
+    fill_uniform(v_new, seed + 4000u, -1.0f, 1.0f);
+    round_to_bf16(history_k);
+    round_to_bf16(history_v);
+    round_to_bf16(q);
+    round_to_bf16(k_new);
+    round_to_bf16(v_new);
+
+    std::vector<std::int8_t> initial_k(code_n, 0), initial_v(code_n, 0);
+    std::vector<std::uint16_t> initial_k_scale(scale_n, 0), initial_v_scale(scale_n, 0);
+    std::vector<int> history_positions(static_cast<std::size_t>(pos));
+    for (std::int32_t t = 0; t < pos; ++t) { history_positions[static_cast<std::size_t>(t)] = t; }
+    cpu_quantize_append(history_k, history_v, history_positions, false, pos, padded_context,
+                        initial_k, initial_v, initial_k_scale, initial_v_scale);
+
+    std::vector<std::int8_t> expected_k         = initial_k;
+    std::vector<std::int8_t> expected_v         = initial_v;
+    std::vector<std::uint16_t> expected_k_scale = initial_k_scale;
+    std::vector<std::uint16_t> expected_v_scale = initial_v_scale;
+    cpu_quantize_append(k_new, v_new, std::vector<int>{pos}, false, 1, padded_context, expected_k,
+                        expected_v, expected_k_scale, expected_v_scale);
+
+    const std::vector<float> ref_cache_k =
+        dequantize_cache_bf16(expected_k, expected_k_scale, padded_context);
+    const std::vector<float> ref_cache_v =
+        dequantize_cache_bf16(expected_v, expected_v_scale, padded_context);
+    std::vector<double> ref;
+    cpu_gqa_decode(q, ref_cache_k, ref_cache_v, pos, padded_context, ref);
+
+    DBuf dq   = to_device_bf16(q);
+    DBuf dk   = to_device_bf16(k_new);
+    DBuf dv   = to_device_bf16(v_new);
+    DBuf dpos = to_device_i32(std::vector<int>{pos});
+    DBuf dout(qn * sizeof(std::uint16_t));
+    WorkspaceArena ws(kGqaWorkspaceBytes);
+
+    const std::size_t arena_bytes =
+        2 * (code_n + 256) + 2 * (scale_n * sizeof(std::uint16_t) + 256) + 4096;
+    DeviceArena cache_arena(arena_bytes);
+    KVCache kv(cache_arena, 1, static_cast<std::uint32_t>(pos + 1), kKVHeads, kHeadDim, DType::I8);
+    cudaMemcpy(kv.k[0].data, initial_k.data(), code_n * sizeof(std::int8_t),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(kv.v[0].data, initial_v.data(), code_n * sizeof(std::int8_t),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(kv.k_scale[0].data, initial_k_scale.data(), scale_n * sizeof(std::uint16_t),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(kv.v_scale[0].data, initial_v_scale.data(), scale_n * sizeof(std::uint16_t),
+               cudaMemcpyHostToDevice);
+
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, 1});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKVHeads, 1});
+    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKVHeads, 1});
+    Tensor tpos(dpos.p, DType::I32, {1});
+    Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, 1});
+
+    kv.pos                             = static_cast<std::uint32_t>(pos);
+    const std::uint32_t initial_kv_pos = kv.pos;
+    kernels::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
+    cudaDeviceSynchronize();
+
+    int f                   = 0;
+    const std::string label = "gqa int8 decode pos=" + std::to_string(pos);
+    f += verify(label.c_str(), from_device_bf16(dout, qn), ref, Tolerance::attention_bf16());
+    f += check_i8_equal((label + " k code").c_str(), from_device_i8(kv.k[0].data, code_n),
+                        expected_k);
+    f += check_i8_equal((label + " v code").c_str(), from_device_i8(kv.v[0].data, code_n),
+                        expected_v);
+    f += check_bits_equal((label + " k scale").c_str(),
+                          from_device_u16(kv.k_scale[0].data, scale_n), expected_k_scale);
+    f += check_bits_equal((label + " v scale").c_str(),
+                          from_device_u16(kv.v_scale[0].data, scale_n), expected_v_scale);
+    if (kv.pos != initial_kv_pos) {
+        std::cerr << label << ": decode op must not advance host KVCache.pos; got " << kv.pos
+                  << '\n';
+        ++f;
+    }
     return f;
 }
 
@@ -955,6 +1157,10 @@ int main(int argc, char** argv) {
                                        "gqa int8 quant append prefill");
     f += one_int8_quantize_append_case(4, 32, std::vector<int>{2, 5, 9, 10}, false, 902u,
                                        "gqa int8 quant append decode");
+    f += one_int8_prefill_case(6, 903u);
+    f += one_int8_prefill_case(65, 904u);
+    f += one_int8_decode_case(17, 905u);
+    f += one_int8_decode_case(2882, 906u);
     for (std::int32_t tokens = 1; tokens <= 6; ++tokens) {
         f += one_prefill_case(tokens, 100u + static_cast<std::uint32_t>(tokens), 0);
         f += one_prefill_case(tokens, 200u + static_cast<std::uint32_t>(tokens), 1);

@@ -56,9 +56,16 @@ void validate_cache(KVCache& kv, int layer, const char* op) {
     if (layer < 0 || static_cast<std::uint32_t>(layer) >= kv.layer_count()) {
         throw std::invalid_argument(std::string(op) + ": layer out of range");
     }
-    if (kv.dtype != DType::BF16 || kv.num_kv_heads != kKVHeads || kv.head_dim != kHeadDim) {
+    if ((kv.dtype != DType::BF16 && kv.dtype != DType::I8) || kv.num_kv_heads != kKVHeads ||
+        kv.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) +
-                                    ": KVCache must be BF16 [256,padded_context,4]");
+                                    ": KVCache must be BF16 or I8 [256,padded_context,4]");
+    }
+    if (kv.dtype == DType::BF16 && kv.quant_group != 0) {
+        throw std::invalid_argument(std::string(op) + ": BF16 KVCache must not have quant_group");
+    }
+    if (kv.dtype == DType::I8 && kv.quant_group != kKvQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": I8 KVCache must use quant_group 64");
     }
     if (kv.padded_context < kv.max_context) {
         throw std::invalid_argument(std::string(op) + ": KVCache padded_context is too small");
@@ -67,10 +74,11 @@ void validate_cache(KVCache& kv, int layer, const char* op) {
         throw std::invalid_argument(std::string(op) + ": invalid KVCache layer vectors");
     }
 
-    const Tensor& cache_k = kv.k[static_cast<std::uint32_t>(layer)];
-    const Tensor& cache_v = kv.v[static_cast<std::uint32_t>(layer)];
-    if (cache_k.dtype != DType::BF16 || cache_v.dtype != DType::BF16) {
-        throw std::invalid_argument(std::string(op) + ": KVCache tensors must be BF16");
+    const Tensor& cache_k            = kv.k[static_cast<std::uint32_t>(layer)];
+    const Tensor& cache_v            = kv.v[static_cast<std::uint32_t>(layer)];
+    const DType expected_cache_dtype = kv.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    if (cache_k.dtype != expected_cache_dtype || cache_v.dtype != expected_cache_dtype) {
+        throw std::invalid_argument(std::string(op) + ": invalid KVCache code tensor dtype");
     }
     const std::int32_t padded_context = checked_i32(kv.padded_context, op, "padded_context");
     if (cache_k.ne[0] != kHeadDim || cache_k.ne[1] != padded_context || cache_k.ne[2] != kKVHeads ||
@@ -80,6 +88,29 @@ void validate_cache(KVCache& kv, int layer, const char* op) {
     }
     require_contiguous_nonnull(cache_k, op, "cache k");
     require_contiguous_nonnull(cache_v, op, "cache v");
+
+    if (kv.dtype == DType::BF16) {
+        if (!kv.k_scale.empty() || !kv.v_scale.empty()) {
+            throw std::invalid_argument(std::string(op) + ": BF16 KVCache must not have scales");
+        }
+        return;
+    }
+
+    if (kv.k_scale.size() != kv.layer_count() || kv.v_scale.size() != kv.layer_count()) {
+        throw std::invalid_argument(std::string(op) + ": invalid KVCache scale vectors");
+    }
+    const Tensor& cache_k_scale         = kv.k_scale[static_cast<std::uint32_t>(layer)];
+    const Tensor& cache_v_scale         = kv.v_scale[static_cast<std::uint32_t>(layer)];
+    constexpr std::int32_t kScaleGroups = kHeadDim / kKvQuantGroup;
+    if (cache_k_scale.dtype != DType::FP16 || cache_v_scale.dtype != DType::FP16 ||
+        cache_k_scale.ne[0] != kScaleGroups || cache_k_scale.ne[1] != padded_context ||
+        cache_k_scale.ne[2] != kKVHeads || cache_k_scale.ne[3] != 1 ||
+        cache_v_scale.ne[0] != kScaleGroups || cache_v_scale.ne[1] != padded_context ||
+        cache_v_scale.ne[2] != kKVHeads || cache_v_scale.ne[3] != 1) {
+        throw std::invalid_argument(std::string(op) + ": invalid KVCache scale tensor shape");
+    }
+    require_contiguous_nonnull(cache_k_scale, op, "cache k scale");
+    require_contiguous_nonnull(cache_v_scale, op, "cache v scale");
 }
 
 } // namespace

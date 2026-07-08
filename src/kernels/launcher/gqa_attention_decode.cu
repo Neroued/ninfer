@@ -11,9 +11,7 @@
 namespace qus::kernels::detail {
 namespace {
 
-std::int32_t ceil_div_i32(std::int32_t x, std::int32_t y) {
-    return (x + y - 1) / y;
-}
+std::int32_t ceil_div_i32(std::int32_t x, std::int32_t y) { return (x + y - 1) / y; }
 
 // Split-KV grid sizing keyed on the actual attention window (kv.pos + tokens),
 // not the allocation ceiling. Over-splitting inflates the partial scratch that
@@ -42,21 +40,31 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
     return (splits < kGqaDecodeSplits) ? splits : kGqaDecodeSplits;
 }
 
-template <int TokenTile, int WarpsPerCta>
+template <int TokenTile, int WarpsPerCta, bool Quantized>
 void launch_tc_partial(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
-                       float scale, Tensor& cache_k, Tensor& cache_v, std::int32_t padded_context,
+                       float scale, KVCache& kv, int layer, std::int32_t padded_context,
                        std::int32_t max_context, std::int32_t window, Tensor& partial_acc,
                        Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     constexpr int kBlock = 32 * WarpsPerCta;
     const int tokens     = q.ne[2];
     const int splits     = gqa_small_t_split_upper_bound(window);
     const dim3 grid(kGqaKVHeads, splits, 1);
-    gqa_attention_small_t_tc_partial_kernel<TokenTile, WarpsPerCta><<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
-        static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
-        static_cast<__nv_bfloat16*>(cache_k.data), static_cast<__nv_bfloat16*>(cache_v.data),
-        tokens, padded_context, max_context, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+    Tensor& cache_k       = kv.k[static_cast<std::uint32_t>(layer)];
+    Tensor& cache_v       = kv.v[static_cast<std::uint32_t>(layer)];
+    Tensor* cache_k_scale = Quantized ? &kv.k_scale[static_cast<std::uint32_t>(layer)] : nullptr;
+    Tensor* cache_v_scale = Quantized ? &kv.v_scale[static_cast<std::uint32_t>(layer)] : nullptr;
+    gqa_attention_small_t_tc_partial_kernel<TokenTile, WarpsPerCta, Quantized>
+        <<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
+            Quantized ? nullptr : static_cast<__nv_bfloat16*>(cache_k.data),
+            Quantized ? nullptr : static_cast<__nv_bfloat16*>(cache_v.data),
+            Quantized ? static_cast<const std::int8_t*>(cache_k.data) : nullptr,
+            Quantized ? static_cast<const std::int8_t*>(cache_v.data) : nullptr,
+            Quantized ? static_cast<const __half*>(cache_k_scale->data) : nullptr,
+            Quantized ? static_cast<const __half*>(cache_v_scale->data) : nullptr, tokens,
+            padded_context, max_context, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -68,9 +76,6 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
                                   const Tensor& pos, float scale, KVCache& kv, int layer,
                                   Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                   Tensor& out, cudaStream_t stream) {
-    Tensor& cache_k = kv.k[static_cast<std::uint32_t>(layer)];
-    Tensor& cache_v = kv.v[static_cast<std::uint32_t>(layer)];
-
     const auto padded_context = static_cast<std::int32_t>(kv.padded_context);
     const auto max_context    = static_cast<std::int32_t>(kv.max_context);
     // Split count tracks the live attention window (kv.pos is the pre-round base
@@ -78,31 +83,76 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
     // inside a large allocation is not over-split. The kernel still receives the
     // real max_context for cache-bounds checks.
     const auto window = static_cast<std::int32_t>(kv.pos) + q.ne[2];
+    if (kv.dtype == DType::I8) {
+        gqa_attention_kv_quantize_append_launch(k, v, pos, kv, layer, false, stream);
+    }
 
     switch (q.ne[2]) {
     case 1:
-        launch_tc_partial<1, 2>(q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context,
-                                window, partial_acc, partial_m, partial_l, stream);
+        if (kv.dtype == DType::I8) {
+            launch_tc_partial<1, 2, true>(q, k, v, pos, scale, kv, layer, padded_context,
+                                          max_context, window, partial_acc, partial_m, partial_l,
+                                          stream);
+        } else {
+            launch_tc_partial<1, 2, false>(q, k, v, pos, scale, kv, layer, padded_context,
+                                           max_context, window, partial_acc, partial_m, partial_l,
+                                           stream);
+        }
         break;
     case 2:
-        launch_tc_partial<2, 4>(q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context,
-                                window, partial_acc, partial_m, partial_l, stream);
+        if (kv.dtype == DType::I8) {
+            launch_tc_partial<2, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
+                                          max_context, window, partial_acc, partial_m, partial_l,
+                                          stream);
+        } else {
+            launch_tc_partial<2, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
+                                           max_context, window, partial_acc, partial_m, partial_l,
+                                           stream);
+        }
         break;
     case 3:
-        launch_tc_partial<3, 4>(q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context,
-                                window, partial_acc, partial_m, partial_l, stream);
+        if (kv.dtype == DType::I8) {
+            launch_tc_partial<3, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
+                                          max_context, window, partial_acc, partial_m, partial_l,
+                                          stream);
+        } else {
+            launch_tc_partial<3, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
+                                           max_context, window, partial_acc, partial_m, partial_l,
+                                           stream);
+        }
         break;
     case 4:
-        launch_tc_partial<4, 4>(q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context,
-                                window, partial_acc, partial_m, partial_l, stream);
+        if (kv.dtype == DType::I8) {
+            launch_tc_partial<4, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
+                                          max_context, window, partial_acc, partial_m, partial_l,
+                                          stream);
+        } else {
+            launch_tc_partial<4, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
+                                           max_context, window, partial_acc, partial_m, partial_l,
+                                           stream);
+        }
         break;
     case 5:
-        launch_tc_partial<5, 4>(q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context,
-                                window, partial_acc, partial_m, partial_l, stream);
+        if (kv.dtype == DType::I8) {
+            launch_tc_partial<5, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
+                                          max_context, window, partial_acc, partial_m, partial_l,
+                                          stream);
+        } else {
+            launch_tc_partial<5, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
+                                           max_context, window, partial_acc, partial_m, partial_l,
+                                           stream);
+        }
         break;
     case 6:
-        launch_tc_partial<6, 4>(q, k, v, pos, scale, cache_k, cache_v, padded_context, max_context,
-                                window, partial_acc, partial_m, partial_l, stream);
+        if (kv.dtype == DType::I8) {
+            launch_tc_partial<6, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
+                                          max_context, window, partial_acc, partial_m, partial_l,
+                                          stream);
+        } else {
+            launch_tc_partial<6, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
+                                           max_context, window, partial_acc, partial_m, partial_l,
+                                           stream);
+        }
         break;
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");

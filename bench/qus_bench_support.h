@@ -5,6 +5,7 @@
 // statistics, and table/JSON/CSV formatting. The engine-driven measurement lives in
 // qus_bench.cpp; everything here is host-only and unit-testable without a GPU.
 
+#include "qus/core/dtype.h"
 #include "qus/model/config.h"
 
 #include <array>
@@ -17,7 +18,7 @@
 
 namespace qus::bench {
 
-inline constexpr int kSchemaVersion                  = 4;
+inline constexpr int kSchemaVersion                  = 5;
 inline constexpr std::string_view kArtifactType      = "qus_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath = "bench/fixtures/bench_corpus.ids";
 // Seed tokens prefilled (untimed) before a pure decode (tg) test so the model has a valid
@@ -64,6 +65,7 @@ struct BenchOptions {
     std::optional<std::uint32_t> max_ctx;  // --max-ctx override
     std::optional<std::size_t> work_bytes; // --work-bytes override (prefill workspace)
     std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
+    DType kv_dtype              = DType::BF16;
     int mtp_draft_tokens        = 0;
     int device                  = 0;
     bool use_cuda_graph         = true;
@@ -113,6 +115,9 @@ struct BenchEnvironment {
     std::uint64_t weights_file_size_bytes = 0;
     std::uint32_t max_ctx                 = 0;
     std::size_t work_bytes                = 0;
+    std::string kv_dtype                  = "bf16";
+    int kv_quant_group                    = 0;
+    std::size_t kv_cache_payload_bytes    = 0;
     std::uint32_t prefill_chunk           = model::kDefaultPrefillChunk;
     int mtp_draft_tokens                  = 0;
     std::string decode_path; // "cuda_graph", "eager", "mtp_cuda_graph", or "mtp_eager"
@@ -163,6 +168,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
 
 // Small shared helpers (also used by qus_bench.cpp for the report header).
 std::string json_escape(std::string_view value);
+std::string kv_dtype_name(DType dtype);
 std::string current_git_commit_or_empty();
 bool current_git_worktree_dirty();
 std::uint64_t file_size_or_zero(const std::string& path);

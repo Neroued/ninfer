@@ -178,6 +178,7 @@ int main(int argc, char** argv) {
         engine_options.device           = options.device;
         engine_options.max_ctx          = max_ctx;
         engine_options.prefill_chunk    = options.prefill_chunk;
+        engine_options.kv_dtype         = options.kv_dtype;
         engine_options.mtp_draft_tokens = options.mtp_draft_tokens;
         engine_options.use_cuda_graph   = options.use_cuda_graph;
         if (options.work_bytes.has_value()) { engine_options.work_bytes = *options.work_bytes; }
@@ -190,6 +191,8 @@ int main(int argc, char** argv) {
         env.weights_file_size_bytes = qus::bench::file_size_or_zero(options.weights_path);
         env.max_ctx                 = max_ctx;
         env.prefill_chunk           = options.prefill_chunk;
+        env.kv_dtype                = qus::bench::kv_dtype_name(options.kv_dtype);
+        env.kv_quant_group          = options.kv_dtype == qus::DType::I8 ? qus::kKvQuantGroup : 0;
         env.mtp_draft_tokens        = options.mtp_draft_tokens;
         env.decode_path =
             qus::bench::decode_path_name(options.use_cuda_graph, options.mtp_draft_tokens);
@@ -200,14 +203,19 @@ int main(int argc, char** argv) {
         env.corpus_tokens          = corpus.size();
 
         std::cerr << "[qus_bench] loading weights " << options.weights_path
-                  << " (max_ctx=" << max_ctx << ")\n";
+                  << " (max_ctx=" << max_ctx
+                  << ", kv_dtype=" << qus::bench::kv_dtype_name(options.kv_dtype) << ")\n";
         qus::Engine engine(engine_options);
         engine.load(options.weights_path);
         if (const cudaError_t status = cudaDeviceSynchronize(); status != cudaSuccess) {
             throw std::runtime_error(std::string("cuda sync after load: ") +
                                      cudaGetErrorString(status));
         }
-        env.work_bytes = engine.memory_stats().workspace.capacity_bytes;
+        const qus::EngineMemoryStats memory = engine.memory_stats();
+        env.work_bytes                      = memory.workspace.capacity_bytes;
+        env.kv_dtype                        = qus::bench::kv_dtype_name(memory.kv_dtype);
+        env.kv_quant_group                  = memory.kv_quant_group;
+        env.kv_cache_payload_bytes          = memory.kv_cache_payload_bytes;
         prime_decode_graphs(engine, env, corpus);
 
         std::vector<qus::bench::TestResult> results;

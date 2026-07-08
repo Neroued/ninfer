@@ -61,6 +61,12 @@ int parse_mtp_draft_tokens(std::string_view text) {
     return value;
 }
 
+DType parse_kv_dtype(std::string_view text) {
+    if (text == "bf16") { return DType::BF16; }
+    if (text == "int8") { return DType::I8; }
+    throw std::invalid_argument("--kv-dtype must be bf16 or int8");
+}
+
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
     std::vector<int> out;
     std::size_t start = 0;
@@ -239,6 +245,7 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized max context\n"
         << "  --prefill-chunk <tokens>    prefill ubatch size, multiple of 128 (default: "
         << model::kDefaultPrefillChunk << ")\n"
+        << "  --kv-dtype <bf16|int8>      KV cache storage dtype (default: bf16)\n"
         << "  --work-bytes <bytes>        explicit workspace arena override\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             disable CUDA graph decode (decode_path=eager or "
@@ -292,6 +299,8 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_positive(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--kv-dtype") {
+            options.kv_dtype = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--work-bytes") {
             options.work_bytes = parse_positive_u64(require_value("--work-bytes"), "work-bytes");
         } else if (arg == "--device") {
@@ -538,6 +547,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " bytes)\n";
     out << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n";
     out << "  config:     max_ctx=" << env.max_ctx << " prefill_chunk=" << env.prefill_chunk
+        << " kv_dtype=" << env.kv_dtype << " kv_quant_group=" << env.kv_quant_group
+        << " kv_payload=" << format_bytes(env.kv_cache_payload_bytes)
         << " mtp_k=" << env.mtp_draft_tokens << " work_bytes=" << env.work_bytes
         << " decode_path=" << env.decode_path << " repetitions=" << env.repetitions
         << " warmup=" << env.warmup;
@@ -673,6 +684,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"config\": {\n"
         << "    \"max_ctx\": " << env.max_ctx << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
+        << "    \"kv_dtype\": \"" << json_escape(env.kv_dtype) << "\",\n"
+        << "    \"kv_quant_group\": " << env.kv_quant_group << ",\n"
+        << "    \"kv_cache_payload_bytes\": " << env.kv_cache_payload_bytes << ",\n"
         << "    \"mtp_draft_tokens\": " << env.mtp_draft_tokens << ",\n"
         << "    \"work_bytes\": " << env.work_bytes << ",\n"
         << "    \"decode_path\": \"" << json_escape(env.decode_path) << "\",\n"
@@ -762,7 +776,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
     out << "label,kind,n_prompt,n_gen,prefill_chunk,mtp_draft_tokens,decode_path,"
-           "decode_graph_primed,decode_graph_prime_steps,mtp_rounds,mtp_fallback_steps,"
+           "kv_dtype,kv_quant_group,kv_cache_payload_bytes,decode_graph_primed,"
+           "decode_graph_prime_steps,mtp_rounds,mtp_fallback_steps,"
            "mtp_acceptance_rate,repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,"
            "decode_output_tok_s_mean,decode_output_tok_s_stddev,decode_engine_tok_s_mean,"
            "decode_engine_tok_s_stddev,prefill_time_s_mean,decode_time_s_mean,"
@@ -781,7 +796,8 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
                                          : std::string();
         out << result.test.label << "," << kind_string(result.test.kind) << ","
             << result.test.n_prompt << "," << result.test.n_gen << "," << env.prefill_chunk << ","
-            << env.mtp_draft_tokens << "," << env.decode_path << ","
+            << env.mtp_draft_tokens << "," << env.decode_path << "," << env.kv_dtype << ","
+            << env.kv_quant_group << "," << env.kv_cache_payload_bytes << ","
             << (env.decode_graph_primed ? "true" : "false") << "," << env.decode_graph_prime_steps
             << "," << mtp.rounds << "," << mtp.fallback_steps << "," << mtp_rate << ","
             << result.reps.size() << "," << cell_mean(prefill_tok_s_series(result)) << ","
@@ -830,6 +846,17 @@ std::string json_escape(std::string_view value) {
         }
     }
     return out;
+}
+
+std::string kv_dtype_name(DType dtype) {
+    switch (dtype) {
+    case DType::BF16:
+        return "bf16";
+    case DType::I8:
+        return "int8";
+    default:
+        return "unknown";
+    }
 }
 
 std::string current_git_commit_or_empty() {

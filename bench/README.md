@@ -73,6 +73,7 @@ qus_bench --weights <q5090-path>
           [--warmup <n>]                     # default 1, discarded
           [--max-ctx <tokens>]               # default: auto = max test requirement
           [--prefill-chunk <tokens>]         # default 1024, must be a multiple of 128
+          [--kv-dtype <bf16|int8>]           # default bf16
           [--work-bytes <bytes>]             # optional workspace override
           [--device <id>] [--no-cuda-graph]
           [--mtp-draft-tokens <0..5>]
@@ -97,17 +98,18 @@ Default `table` prints an identity/config header followed by one row per test wi
 decode output t/s, decode engine t/s (`mean ± stddev`; the stddev is omitted for a single
 repetition), MTP acceptance, MTP round/fallback counts, and `work peak` (high-water workspace-arena
 usage for that test). `--output json` and `--output csv` write machine-readable results, including
-`config.prefill_chunk`, MTP stats, graph-prime metadata, and `workspace_peak_bytes` per test.
+`config.prefill_chunk`, KV cache dtype/payload, MTP stats, graph-prime metadata, and
+`workspace_peak_bytes` per test.
 
 The default workspace arena is derived from `--prefill-chunk`, not prompt length. `work peak` /
 `workspace_peak_bytes` should stay flat as prompt length grows at a fixed prefill chunk. Use
 `--work-bytes` only as an explicit experiment override.
 
-JSON shape (`schema_version: 4`, `artifact_type: "qus_bench_report"`):
+JSON shape (`schema_version: 5`, `artifact_type: "qus_bench_report"`):
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "artifact_type": "qus_bench_report",
   "tool": "qus_bench",
   "command": "",
@@ -115,7 +117,9 @@ JSON shape (`schema_version: 4`, `artifact_type: "qus_bench_report"`):
   "worktree_dirty": false,
   "environment": {"gpu_name": "", "cuda_runtime_version": "", "cuda_driver_version": "", "device_id": 0},
   "weights": {"path": "", "file_size_bytes": 0},
-  "config": {"max_ctx": 0, "prefill_chunk": 1024, "mtp_draft_tokens": 0, "work_bytes": 0,
+  "config": {"max_ctx": 0, "prefill_chunk": 1024, "kv_dtype": "bf16",
+             "kv_quant_group": 0, "kv_cache_payload_bytes": 0,
+             "mtp_draft_tokens": 0, "work_bytes": 0,
              "decode_path": "cuda_graph",
              "decode_graph_prime": {"requested": true, "primed": true, "decode_steps": 2},
              "repetitions": 5, "warmup": 1,
@@ -147,7 +151,7 @@ JSON shape (`schema_version: 4`, `artifact_type: "qus_bench_report"`):
 
 `kind` is `pp`, `tg`, or `pp+tg`. Phase fields that do not apply to a test kind are `null`
 (a `pp` test has null decode fields; a `tg` test has null prefill fields). CSV columns are
-`label,kind,n_prompt,n_gen,prefill_chunk,mtp_draft_tokens,decode_path,decode_graph_primed,decode_graph_prime_steps,mtp_rounds,mtp_fallback_steps,mtp_acceptance_rate,repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,prefill_time_s_mean,decode_time_s_mean,workspace_peak_bytes`,
+`label,kind,n_prompt,n_gen,prefill_chunk,mtp_draft_tokens,decode_path,kv_dtype,kv_quant_group,kv_cache_payload_bytes,decode_graph_primed,decode_graph_prime_steps,mtp_rounds,mtp_fallback_steps,mtp_acceptance_rate,repetitions,prefill_tok_s_mean,prefill_tok_s_stddev,decode_output_tok_s_mean,decode_output_tok_s_stddev,decode_engine_tok_s_mean,decode_engine_tok_s_stddev,prefill_time_s_mean,decode_time_s_mean,workspace_peak_bytes`,
 with empty cells for inapplicable phase rates.
 
 ## Artifacts

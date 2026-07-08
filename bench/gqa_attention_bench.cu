@@ -88,19 +88,46 @@ std::int32_t small_t_active_splits(std::int32_t tokens, std::int32_t context) {
     return std::min(kGqaDecodeSplits, splits);
 }
 
+const char* kv_dtype_name(DType dtype) {
+    switch (dtype) {
+    case DType::BF16:
+        return "bf16";
+    case DType::I8:
+        return "int8";
+    default:
+        return "unknown";
+    }
+}
+
+double kv_cache_vector_bytes(DType dtype) {
+    if (dtype == DType::I8) {
+        return static_cast<double>(kHeadDim) + static_cast<double>(kHeadDim / kKvQuantGroup) *
+                                                   static_cast<double>(dtype_size(DType::FP16));
+    }
+    return static_cast<double>(kHeadDim) * static_cast<double>(dtype_size(DType::BF16));
+}
+
+double kv_cache_pair_bytes_per_head(DType dtype) { return 2.0 * kv_cache_vector_bytes(dtype); }
+
+double kv_input_pair_bytes_per_head() {
+    return 2.0 * static_cast<double>(kHeadDim) * static_cast<double>(dtype_size(DType::BF16));
+}
+
 struct DecodeBytes {
     std::size_t useful_kv = 0;
     std::size_t scratch   = 0;
     std::size_t total     = 0;
 };
 
-DecodeBytes decode_bytes(std::int32_t pos_value) {
+DecodeBytes decode_bytes(std::int32_t pos_value, DType kv_dtype) {
     const auto window          = static_cast<std::size_t>(pos_value) + 1u;
     constexpr auto split_count = static_cast<std::size_t>(kGqaDecodeSplits);
 
-    const std::size_t k_cache_reads = window * kKVHeads * kHeadDim * sizeof(std::uint16_t);
-    const std::size_t v_cache_reads = window * kKVHeads * kHeadDim * sizeof(std::uint16_t);
-    const std::size_t new_kv_writes = kKVHeads * kHeadDim * sizeof(std::uint16_t) * 2u;
+    const std::size_t k_cache_reads = static_cast<std::size_t>(
+        static_cast<double>(window * kKVHeads) * kv_cache_vector_bytes(kv_dtype));
+    const std::size_t v_cache_reads = k_cache_reads;
+    const std::size_t new_kv_writes = static_cast<std::size_t>(
+        static_cast<double>(kKVHeads) * kv_cache_pair_bytes_per_head(kv_dtype));
     const std::size_t q_reads       = kQHeads * kHeadDim * sizeof(std::uint16_t);
     const std::size_t output_writes = kQHeads * kHeadDim * sizeof(std::uint16_t);
 
@@ -117,15 +144,16 @@ DecodeBytes decode_bytes(std::int32_t pos_value) {
     return bytes;
 }
 
-DecodeBytes append_small_t_bytes(std::int32_t tokens, std::int32_t context) {
+DecodeBytes append_small_t_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
     const auto window      = static_cast<std::size_t>(context + tokens);
     const auto token_count = static_cast<std::size_t>(tokens);
     const auto split_count = static_cast<std::size_t>(small_t_active_splits(tokens, context));
 
-    const std::size_t k_cache_reads = window * kKVHeads * kHeadDim * sizeof(std::uint16_t);
-    const std::size_t v_cache_reads = window * kKVHeads * kHeadDim * sizeof(std::uint16_t);
-    const std::size_t new_kv_writes =
-        token_count * kKVHeads * kHeadDim * sizeof(std::uint16_t) * 2u;
+    const std::size_t k_cache_reads = static_cast<std::size_t>(
+        static_cast<double>(window * kKVHeads) * kv_cache_vector_bytes(kv_dtype));
+    const std::size_t v_cache_reads = k_cache_reads;
+    const std::size_t new_kv_writes = static_cast<std::size_t>(
+        static_cast<double>(token_count * kKVHeads) * kv_cache_pair_bytes_per_head(kv_dtype));
     const std::size_t q_reads       = token_count * kQHeads * kHeadDim * sizeof(std::uint16_t);
     const std::size_t output_writes = q_reads;
 
@@ -177,28 +205,28 @@ double append_prompt_useful_flops(std::int32_t tokens, std::int32_t context) {
            append_prompt_key_sum(tokens, context);
 }
 
-double append_prompt_logical_kv_bytes(std::int32_t tokens, std::int32_t context) {
+double append_prompt_logical_kv_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
     return append_prompt_key_sum(tokens, context) * static_cast<double>(kKVHeads) *
-           static_cast<double>(kHeadDim) * static_cast<double>(sizeof(std::uint16_t)) * 2.0;
+           kv_cache_pair_bytes_per_head(kv_dtype);
 }
 
-double append_prompt_tile_kv_read_bytes(std::int32_t tokens, std::int32_t context) {
+double append_prompt_tile_kv_read_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
     return append_prompt_qblock_key_rows(tokens, context) * static_cast<double>(kQHeads) *
-           static_cast<double>(kHeadDim) * static_cast<double>(sizeof(std::uint16_t)) * 2.0;
+           kv_cache_pair_bytes_per_head(kv_dtype);
 }
 
-double append_prompt_global_floor_bytes(std::int32_t tokens, std::int32_t context) {
+double append_prompt_global_floor_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
     const double token_count = static_cast<double>(tokens);
     const double q_bytes     = token_count * static_cast<double>(kQHeads) *
                            static_cast<double>(kHeadDim) *
                            static_cast<double>(sizeof(std::uint16_t));
-    const double out_bytes      = q_bytes;
-    const double kv_input_bytes = token_count * static_cast<double>(kKVHeads) *
-                                  static_cast<double>(kHeadDim) *
-                                  static_cast<double>(sizeof(std::uint16_t)) * 2.0;
-    const double kv_cache_write_bytes = kv_input_bytes;
+    const double out_bytes = q_bytes;
+    const double kv_input_bytes =
+        token_count * static_cast<double>(kKVHeads) * kv_input_pair_bytes_per_head();
+    const double kv_cache_write_bytes =
+        token_count * static_cast<double>(kKVHeads) * kv_cache_pair_bytes_per_head(kv_dtype);
     return q_bytes + out_bytes + kv_input_bytes + kv_cache_write_bytes +
-           append_prompt_tile_kv_read_bytes(tokens, context);
+           append_prompt_tile_kv_read_bytes(tokens, context, kv_dtype);
 }
 
 std::size_t decode_workspace_bytes_for_pos(std::int32_t) {
@@ -232,11 +260,21 @@ std::size_t decode_workspace_bytes(const std::vector<std::int32_t>& positions) {
     return bytes;
 }
 
-std::size_t cache_arena_bytes(std::uint32_t layers, std::int32_t max_context) {
+std::size_t cache_arena_bytes(std::uint32_t layers, std::int32_t max_context, DType kv_dtype) {
     const auto padded_context = static_cast<std::size_t>(align_up_128(max_context));
     const std::size_t layer_elements =
         static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(kHeadDim) * padded_context;
-    const std::size_t layer_bytes = layer_elements * sizeof(std::uint16_t);
+    if (kv_dtype == DType::I8) {
+        const std::size_t code_bytes     = layer_elements * dtype_size(DType::I8);
+        const std::size_t scale_elements = static_cast<std::size_t>(kKVHeads) *
+                                           static_cast<std::size_t>(kHeadDim / kKvQuantGroup) *
+                                           padded_context;
+        const std::size_t scale_bytes = scale_elements * dtype_size(DType::FP16);
+        return static_cast<std::size_t>(layers) *
+                   (2u * (code_bytes + 255u) + 2u * (scale_bytes + 255u)) +
+               4096u;
+    }
+    const std::size_t layer_bytes = layer_elements * dtype_size(DType::BF16);
     return static_cast<std::size_t>(layers) * 2u * (layer_bytes + 255u) + 4096u;
 }
 
@@ -380,6 +418,7 @@ struct AppendPromptMetrics {
     std::int32_t tokens          = 0;
     std::int32_t context         = 0;
     std::int32_t end_context     = 0;
+    DType kv_dtype               = DType::BF16;
     std::int32_t q_blocks        = 0;
     std::int64_t attention_ctas  = 0;
     std::int64_t key_tiles       = 0;
@@ -417,11 +456,12 @@ struct PrefillTimingOptions {
 };
 
 AppendPromptMetrics append_prompt_metrics_from_result(std::int32_t tokens, std::int32_t context,
-                                                      const Result& r) {
+                                                      DType kv_dtype, const Result& r) {
     AppendPromptMetrics m;
     m.tokens             = tokens;
     m.context            = context;
     m.end_context        = context + tokens;
+    m.kv_dtype           = kv_dtype;
     m.q_blocks           = append_prompt_q_blocks(tokens);
     m.attention_ctas     = static_cast<std::int64_t>(m.q_blocks) * kQHeads;
     m.key_tiles          = append_prompt_key_tiles_per_head(tokens, context) * kQHeads;
@@ -436,9 +476,9 @@ AppendPromptMetrics append_prompt_metrics_from_result(std::int32_t tokens, std::
     m.qblock_key_rows    = append_prompt_qblock_key_rows(tokens, context);
     m.tile_reuse_queries = (m.qblock_key_rows > 0.0) ? m.key_sum / m.qblock_key_rows : 0.0;
     m.useful_flops       = append_prompt_useful_flops(tokens, context);
-    m.logical_kv_bytes   = append_prompt_logical_kv_bytes(tokens, context);
-    m.tile_kv_read_bytes = append_prompt_tile_kv_read_bytes(tokens, context);
-    m.global_floor_bytes = append_prompt_global_floor_bytes(tokens, context);
+    m.logical_kv_bytes   = append_prompt_logical_kv_bytes(tokens, context, kv_dtype);
+    m.tile_kv_read_bytes = append_prompt_tile_kv_read_bytes(tokens, context, kv_dtype);
+    m.global_floor_bytes = append_prompt_global_floor_bytes(tokens, context, kv_dtype);
 
     const double sec = r.median_us * 1.0e-6;
     if (sec > 0.0) {
@@ -463,16 +503,16 @@ AppendPromptMetrics append_prompt_metrics_from_result(std::int32_t tokens, std::
 
 void print_append_prompt_result(const char* tag, const AppendPromptMetrics& m) {
     constexpr double kMiB = 1024.0 * 1024.0;
-    std::printf("%-38s T=%-6d C=%-7d median=%9.3f ms  min=%9.3f ms  "
+    std::printf("%-38s T=%-6d C=%-7d kv=%s median=%9.3f ms  min=%9.3f ms  "
                 "p95=%9.3f ms  useful=%9.2f TFLOP/s  tc=%6.2f%% of %.1f  "
                 "tile_floor=%8.1f GB/s (%5.2f%% of %.0f)  logical_kv=%8.1f GB/s  "
                 "ns/key=%6.3f  q_blocks=%d key_tiles=%lld tile_kv=%.2f MiB  "
                 "bound=%s roofline_eff=%6.2f%% runs=%d inner=%d\n",
-                tag, m.tokens, m.context, m.median_ms, m.min_ms, m.p95_ms, m.tflops,
-                m.tflops_pct, kDenseTcPeakTflops, m.global_floor_gbps, m.global_floor_gbps_pct,
-                kDramPeakGBs, m.logical_kv_gbps, m.ns_per_key_query, m.q_blocks,
-                static_cast<long long>(m.key_tiles), m.tile_kv_read_bytes / kMiB, m.bound,
-                m.roofline_eff_pct, m.runs, m.inner_iters);
+                tag, m.tokens, m.context, kv_dtype_name(m.kv_dtype), m.median_ms, m.min_ms,
+                m.p95_ms, m.tflops, m.tflops_pct, kDenseTcPeakTflops, m.global_floor_gbps,
+                m.global_floor_gbps_pct, kDramPeakGBs, m.logical_kv_gbps, m.ns_per_key_query,
+                m.q_blocks, static_cast<long long>(m.key_tiles), m.tile_kv_read_bytes / kMiB,
+                m.bound, m.roofline_eff_pct, m.runs, m.inner_iters);
 }
 
 void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& k, const Tensor& v,
@@ -480,7 +520,7 @@ void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& 
     DBuf pos_buf = make_i32(pos_value);
     Tensor pos(pos_buf.p, DType::I32, {1});
 
-    const DecodeBytes bytes  = decode_bytes(pos_value);
+    const DecodeBytes bytes  = decode_bytes(pos_value, kv.dtype);
     std::uint32_t next_layer = 0;
 
     const Result r = bench_loop(
@@ -493,7 +533,8 @@ void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& 
         static_cast<double>(bytes.total));
 
     char tag[96];
-    std::snprintf(tag, sizeof(tag), "gqa_attention decode combined pos=%d", pos_value);
+    std::snprintf(tag, sizeof(tag), "gqa_attention decode combined pos=%d kv=%s", pos_value,
+                  kv_dtype_name(kv.dtype));
     print_decode_result(tag, r, bytes, pos_value, round_robin_layers,
                         (round_robin_layers == 1u) ? " hot_cache_info" : "");
 }
@@ -502,7 +543,7 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
                       const Tensor& v, Tensor& out, std::int32_t pos_value, DBuf* cold_cache) {
     DBuf pos_buf = make_i32(pos_value);
     Tensor pos(pos_buf.p, DType::I32, {1});
-    const DecodeBytes bytes = decode_bytes(pos_value);
+    const DecodeBytes bytes = decode_bytes(pos_value, kv.dtype);
 
     cudaStream_t stream = nullptr;
     if (cold_cache != nullptr) {
@@ -516,10 +557,11 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
         char tag[96];
         std::snprintf(tag, sizeof(tag), "PROFILE_COLD gqa_attention decode pos=%d", pos_value);
         print_decode_result(tag, r, bytes, pos_value, 1u, " cold_cache");
-        std::printf("PROFILE_COLD_METADATA pos=%d splits=%d kps=%d cold_cache_bytes=%zu "
+        std::printf("PROFILE_COLD_METADATA pos=%d kv_dtype=%s splits=%d kps=%d "
+                    "cold_cache_bytes=%zu "
                     "useful_kv_bytes=%zu scratch_bytes=%zu total_modeled_bytes=%zu repeats=%d\n",
-                    pos_value, kGqaDecodeSplits, decode_kps(pos_value), cold_cache->bytes,
-                    bytes.useful_kv, bytes.scratch, bytes.total, r.n_runs);
+                    pos_value, kv_dtype_name(kv.dtype), kGqaDecodeSplits, decode_kps(pos_value),
+                    cold_cache->bytes, bytes.useful_kv, bytes.scratch, bytes.total, r.n_runs);
         return;
     }
 
@@ -527,10 +569,10 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
     kernels::gqa_attention(q, k, v, pos, kScale, kv, 0, ws, out, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::printf("PROFILE_ONCE gqa_attention decode combined pos=%d splits=%d kps=%d "
+    std::printf("PROFILE_ONCE gqa_attention decode combined pos=%d kv_dtype=%s splits=%d kps=%d "
                 "useful_kv_bytes=%zu scratch_bytes=%zu total_modeled_bytes=%zu\n",
-                pos_value, kGqaDecodeSplits, decode_kps(pos_value), bytes.useful_kv, bytes.scratch,
-                bytes.total);
+                pos_value, kv_dtype_name(kv.dtype), kGqaDecodeSplits, decode_kps(pos_value),
+                bytes.useful_kv, bytes.scratch, bytes.total);
 }
 
 void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) {
@@ -551,8 +593,8 @@ void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    kv.pos = static_cast<std::uint32_t>(context);
-    const DecodeBytes bytes = append_small_t_bytes(tokens, context);
+    kv.pos                  = static_cast<std::uint32_t>(context);
+    const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv.dtype);
     const Result r          = bench_loop(
         [&](cudaStream_t s) {
             kernels::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s);
@@ -560,7 +602,7 @@ void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
         static_cast<double>(bytes.total));
 
     char tag[96];
-    std::snprintf(tag, sizeof(tag), "gqa_attention append-small-T");
+    std::snprintf(tag, sizeof(tag), "gqa_attention append-small-T kv=%s", kv_dtype_name(kv.dtype));
     print_append_small_t_result(tag, r, bytes, tokens, context, "");
 }
 
@@ -583,8 +625,8 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    kv.pos = static_cast<std::uint32_t>(context);
-    const DecodeBytes bytes = append_small_t_bytes(tokens, context);
+    kv.pos                  = static_cast<std::uint32_t>(context);
+    const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv.dtype);
     cudaStream_t stream     = nullptr;
     if (cold_cache != nullptr) {
         const Result r = bench_cold_cache_loop(
@@ -592,14 +634,18 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
                 kernels::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s);
             },
             *cold_cache, static_cast<double>(bytes.total));
-        print_append_small_t_result("PROFILE_COLD gqa_attention append-small-T", r, bytes, tokens,
-                                    context, " cold_cache");
-        std::printf("PROFILE_COLD_METADATA mode=append-small-t T=%d context=%d splits=%d "
+        char tag[96];
+        std::snprintf(tag, sizeof(tag), "PROFILE_COLD gqa_attention append-small-T kv=%s",
+                      kv_dtype_name(kv.dtype));
+        print_append_small_t_result(tag, r, bytes, tokens, context, " cold_cache");
+        std::printf("PROFILE_COLD_METADATA mode=append-small-t T=%d context=%d kv_dtype=%s "
+                    "splits=%d "
                     "cold_cache_bytes=%zu useful_kv_bytes=%zu scratch_bytes=%zu "
                     "total_modeled_bytes=%zu redundancy=%.6f repeats=%d "
                     "ncu_kernel_regex='gqa_attention_small_t_(stream_|tc_)?partial_kernel'\n",
-                    tokens, context, small_t_active_splits(tokens, context), cold_cache->bytes,
-                    bytes.useful_kv, bytes.scratch, bytes.total,
+                    tokens, context, kv_dtype_name(kv.dtype),
+                    small_t_active_splits(tokens, context), cold_cache->bytes, bytes.useful_kv,
+                    bytes.scratch, bytes.total,
                     bytes.useful_kv > 0
                         ? static_cast<double>(bytes.total) / static_cast<double>(bytes.useful_kv)
                         : 0.0,
@@ -609,18 +655,18 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
 
     kernels::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::printf("PROFILE_ONCE gqa_attention append-small-T T=%d context=%d splits=%d "
+    std::printf("PROFILE_ONCE gqa_attention append-small-T T=%d context=%d kv_dtype=%s splits=%d "
                 "useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu redundancy=%.6f "
                 "ncu_kernel_regex='gqa_attention_small_t_(stream_|tc_)?partial_kernel'\n",
-                tokens, context, small_t_active_splits(tokens, context), bytes.useful_kv,
-                bytes.scratch, bytes.total,
+                tokens, context, kv_dtype_name(kv.dtype), small_t_active_splits(tokens, context),
+                bytes.useful_kv, bytes.scratch, bytes.total,
                 bytes.useful_kv > 0
                     ? static_cast<double>(bytes.total) / static_cast<double>(bytes.useful_kv)
                     : 0.0);
 }
 
-void run_copy_ceiling(std::int32_t tokens, std::int32_t context) {
-    const DecodeBytes bytes = append_small_t_bytes(tokens, context);
+void run_copy_ceiling(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
+    const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv_dtype);
     DBuf src                = make_zeros(bytes.useful_kv);
     DBuf dst                = make_zeros(bytes.useful_kv);
     DBuf cold_cache         = make_zeros(kColdCacheBytes);
@@ -635,14 +681,18 @@ void run_copy_ceiling(std::int32_t tokens, std::int32_t context) {
         CUDA_CHECK(cudaGetLastError());
     };
 
+    char hot_tag[96];
+    std::snprintf(hot_tag, sizeof(hot_tag), "gqa_attention copy ceiling hot kv=%s",
+                  kv_dtype_name(kv_dtype));
     const Result hot = bench_loop(launch, static_cast<double>(bytes.useful_kv * 2u));
-    print_copy_ceiling_result("gqa_attention copy ceiling hot", hot, bytes.useful_kv, tokens,
-                              context);
+    print_copy_ceiling_result(hot_tag, hot, bytes.useful_kv, tokens, context);
 
     const Result cold =
         bench_cold_cache_loop(launch, cold_cache, static_cast<double>(bytes.useful_kv * 2u));
-    print_copy_ceiling_result("gqa_attention copy ceiling cold", cold, bytes.useful_kv, tokens,
-                              context);
+    char cold_tag[96];
+    std::snprintf(cold_tag, sizeof(cold_tag), "gqa_attention copy ceiling cold kv=%s",
+                  kv_dtype_name(kv_dtype));
+    print_copy_ceiling_result(cold_tag, cold, bytes.useful_kv, tokens, context);
 }
 
 AppendPromptMetrics run_append_prompt_baseline(KVCache& kv, std::int32_t tokens,
@@ -664,14 +714,14 @@ AppendPromptMetrics run_append_prompt_baseline(KVCache& kv, std::int32_t tokens,
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    const double bytes = append_prompt_global_floor_bytes(tokens, context);
+    const double bytes = append_prompt_global_floor_bytes(tokens, context, kv.dtype);
     const Result r     = bench_loop(
         [&](cudaStream_t s) {
             kernels::detail::gqa_attention_prompt_launch(tq, tk, tv, tpos, kScale, kv, 0, tout, s);
         },
         bytes, timing.warmup, timing.repeat, timing.min_time_ms);
 
-    AppendPromptMetrics metrics = append_prompt_metrics_from_result(tokens, context, r);
+    AppendPromptMetrics metrics = append_prompt_metrics_from_result(tokens, context, kv.dtype, r);
     print_append_prompt_result("gqa_attention append-prompt", metrics);
     return metrics;
 }
@@ -699,14 +749,15 @@ AppendPromptMetrics run_append_prompt_attention_only(KVCache& kv, std::int32_t t
     kernels::detail::gqa_attention_prompt_launch(tq, tk, tv, tpos, kScale, kv, 0, tout, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const double bytes = append_prompt_global_floor_bytes(tokens, context);
+    const double bytes = append_prompt_global_floor_bytes(tokens, context, kv.dtype);
     const Result r     = bench_loop(
         [&](cudaStream_t s) {
-            kernels::detail::gqa_attention_prompt_attention_launch(tq, tpos, kScale, kv, 0, tout, s);
+            kernels::detail::gqa_attention_prompt_attention_launch(tq, tpos, kScale, kv, 0, tout,
+                                                                       s);
         },
         bytes, timing.warmup, timing.repeat, timing.min_time_ms);
 
-    AppendPromptMetrics metrics = append_prompt_metrics_from_result(tokens, context, r);
+    AppendPromptMetrics metrics = append_prompt_metrics_from_result(tokens, context, kv.dtype, r);
     print_append_prompt_result("gqa_attention append-attn-only", metrics);
     return metrics;
 }
@@ -716,20 +767,22 @@ double prefill_useful_flops(std::int32_t tokens) {
            static_cast<double>(tokens) * static_cast<double>(tokens + 1);
 }
 
-double prefill_model_floor_bytes(std::int32_t tokens) {
+double prefill_model_floor_bytes(std::int32_t tokens, DType kv_dtype) {
     const double q_bytes = static_cast<double>(tokens) * static_cast<double>(kQHeads) *
                            static_cast<double>(kHeadDim) *
                            static_cast<double>(sizeof(std::uint16_t));
-    const double out_bytes = q_bytes;
-    const double k_bytes   = static_cast<double>(tokens) * static_cast<double>(kKVHeads) *
-                           static_cast<double>(kHeadDim) *
-                           static_cast<double>(sizeof(std::uint16_t));
-    const double v_bytes = k_bytes;
-    return q_bytes + out_bytes + k_bytes + v_bytes;
+    const double out_bytes      = q_bytes;
+    const double kv_input_bytes = static_cast<double>(tokens) * static_cast<double>(kKVHeads) *
+                                  kv_input_pair_bytes_per_head();
+    const double kv_cache_write_bytes = static_cast<double>(tokens) *
+                                        static_cast<double>(kKVHeads) *
+                                        kv_cache_pair_bytes_per_head(kv_dtype);
+    return q_bytes + out_bytes + kv_input_bytes + kv_cache_write_bytes;
 }
 
 struct PrefillMetrics {
     std::int32_t tokens      = 0;
+    DType kv_dtype           = DType::BF16;
     int runs                 = 0;
     int inner_iters          = 1;
     double median_ms         = 0.0;
@@ -747,9 +800,10 @@ struct PrefillMetrics {
     const char* bound        = "tc";
 };
 
-PrefillMetrics prefill_metrics_from_result(std::int32_t tokens, const Result& r) {
+PrefillMetrics prefill_metrics_from_result(std::int32_t tokens, DType kv_dtype, const Result& r) {
     PrefillMetrics m;
     m.tokens            = tokens;
+    m.kv_dtype          = kv_dtype;
     m.runs              = r.n_runs;
     m.inner_iters       = r.inner_iters;
     m.median_ms         = r.median_us * 1.0e-3;
@@ -757,7 +811,7 @@ PrefillMetrics prefill_metrics_from_result(std::int32_t tokens, const Result& r)
     m.p95_ms            = r.p95_us * 1.0e-3;
     m.mean_ms           = r.mean_us * 1.0e-3;
     m.useful_flops      = prefill_useful_flops(tokens);
-    m.model_floor_bytes = prefill_model_floor_bytes(tokens);
+    m.model_floor_bytes = prefill_model_floor_bytes(tokens, kv_dtype);
 
     const double sec = r.median_us * 1.0e-6;
     if (sec > 0.0) {
@@ -776,12 +830,12 @@ PrefillMetrics prefill_metrics_from_result(std::int32_t tokens, const Result& r)
 }
 
 void print_prefill_result(const PrefillMetrics& m) {
-    std::printf("gqa_attention prefill T=%-6d median=%9.3f ms  min=%9.3f ms  p95=%9.3f ms  "
+    std::printf("gqa_attention prefill T=%-6d kv=%s median=%9.3f ms  min=%9.3f ms  p95=%9.3f ms  "
                 "useful=%9.2f TFLOP/s  tc=%6.2f%% of %.1f  model_floor=%8.1f GB/s "
                 "(%5.2f%% of %.0f)  bound=%s  roofline_eff=%6.2f%%  runs=%d inner=%d\n",
-                m.tokens, m.median_ms, m.min_ms, m.p95_ms, m.tflops, m.tflops_pct,
-                kDenseTcPeakTflops, m.gbps_model, m.gbps_model_pct, kDramPeakGBs, m.bound,
-                m.roofline_eff_pct, m.runs, m.inner_iters);
+                m.tokens, kv_dtype_name(m.kv_dtype), m.median_ms, m.min_ms, m.p95_ms, m.tflops,
+                m.tflops_pct, kDenseTcPeakTflops, m.gbps_model, m.gbps_model_pct, kDramPeakGBs,
+                m.bound, m.roofline_eff_pct, m.runs, m.inner_iters);
 }
 
 PrefillMetrics run_prefill(KVCache& kv, std::int32_t tokens, const PrefillTimingOptions& timing) {
@@ -806,9 +860,10 @@ PrefillMetrics run_prefill(KVCache& kv, std::int32_t tokens, const PrefillTiming
         [&](cudaStream_t s) {
             kernels::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s);
         },
-        prefill_model_floor_bytes(tokens), timing.warmup, timing.repeat, timing.min_time_ms);
+        prefill_model_floor_bytes(tokens, kv.dtype), timing.warmup, timing.repeat,
+        timing.min_time_ms);
 
-    PrefillMetrics metrics = prefill_metrics_from_result(tokens, r);
+    PrefillMetrics metrics = prefill_metrics_from_result(tokens, kv.dtype, r);
     print_prefill_result(metrics);
     return metrics;
 }
@@ -835,11 +890,11 @@ void run_prefill_profile_once(KVCache& kv, std::int32_t tokens) {
     kernels::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::printf("PROFILE_ONCE gqa_attention prefill T=%d useful_flops=%.0f "
+    std::printf("PROFILE_ONCE gqa_attention prefill T=%d kv_dtype=%s useful_flops=%.0f "
                 "model_floor_bytes=%.0f tc_peak_tflops=%.1f dram_peak_gbps=%.0f "
                 "ncu_kernel_regex='gqa_attention_prefill_kernel'\n",
-                tokens, prefill_useful_flops(tokens), prefill_model_floor_bytes(tokens),
-                kDenseTcPeakTflops, kDramPeakGBs);
+                tokens, kv_dtype_name(kv.dtype), prefill_useful_flops(tokens),
+                prefill_model_floor_bytes(tokens, kv.dtype), kDenseTcPeakTflops, kDramPeakGBs);
 }
 
 std::string json_number(double value) {
@@ -851,19 +906,20 @@ std::string json_number(double value) {
 
 std::string format_prefill_csv(const std::vector<PrefillMetrics>& results) {
     std::ostringstream out;
-    out << "T,ms,tflops,tflops_pct,gbps_model,gbps_model_pct,gbps_dram,gbps_dram_pct,"
+    out << "T,kv_dtype,ms,tflops,tflops_pct,gbps_model,gbps_model_pct,gbps_dram,gbps_dram_pct,"
            "gbps_pct,bound,"
            "roofline_tflops,roofline_eff_pct,model_floor_bytes,useful_flops,"
            "median_ms,min_ms,p95_ms,mean_ms,runs,inner_iters\n";
     for (const PrefillMetrics& m : results) {
-        out << m.tokens << ',' << json_number(m.median_ms) << ',' << json_number(m.tflops) << ','
-            << json_number(m.tflops_pct) << ',' << json_number(m.gbps_model) << ','
-            << json_number(m.gbps_model_pct) << ",,," << json_number(m.gbps_model_pct) << ','
-            << m.bound << ',' << json_number(m.roofline_tflops) << ','
-            << json_number(m.roofline_eff_pct) << ',' << json_number(m.model_floor_bytes) << ','
-            << json_number(m.useful_flops) << ',' << json_number(m.median_ms) << ','
-            << json_number(m.min_ms) << ',' << json_number(m.p95_ms) << ','
-            << json_number(m.mean_ms) << ',' << m.runs << ',' << m.inner_iters << '\n';
+        out << m.tokens << ',' << kv_dtype_name(m.kv_dtype) << ',' << json_number(m.median_ms)
+            << ',' << json_number(m.tflops) << ',' << json_number(m.tflops_pct) << ','
+            << json_number(m.gbps_model) << ',' << json_number(m.gbps_model_pct) << ",,,"
+            << json_number(m.gbps_model_pct) << ',' << m.bound << ','
+            << json_number(m.roofline_tflops) << ',' << json_number(m.roofline_eff_pct) << ','
+            << json_number(m.model_floor_bytes) << ',' << json_number(m.useful_flops) << ','
+            << json_number(m.median_ms) << ',' << json_number(m.min_ms) << ','
+            << json_number(m.p95_ms) << ',' << json_number(m.mean_ms) << ',' << m.runs << ','
+            << m.inner_iters << '\n';
     }
     return out.str();
 }
@@ -884,6 +940,7 @@ std::string format_prefill_json(const std::vector<PrefillMetrics>& results,
     for (std::size_t i = 0; i < results.size(); ++i) {
         const PrefillMetrics& m = results[i];
         out << "    {\"T\": " << m.tokens << ", \"ms\": " << json_number(m.median_ms)
+            << ", \"kv_dtype\": \"" << kv_dtype_name(m.kv_dtype) << "\""
             << ", \"tflops\": " << json_number(m.tflops)
             << ", \"tflops_pct\": " << json_number(m.tflops_pct)
             << ", \"gbps_model\": " << json_number(m.gbps_model)
@@ -908,7 +965,7 @@ std::string format_prefill_json(const std::vector<PrefillMetrics>& results,
 
 std::string format_append_prompt_csv(const std::vector<AppendPromptMetrics>& results) {
     std::ostringstream out;
-    out << "T,context,end_context,ms,tflops,tflops_pct,global_floor_gbps,"
+    out << "T,context,end_context,kv_dtype,ms,tflops,tflops_pct,global_floor_gbps,"
            "global_floor_gbps_pct,tile_kv_read_gbps,logical_kv_gbps,avg_keys_per_query,"
            "ns_per_key_query,us_per_token,q_blocks,attention_ctas,key_tiles,tile_reuse_queries,"
            "bound,roofline_tflops,roofline_eff_pct,global_floor_bytes,tile_kv_read_bytes,"
@@ -916,16 +973,16 @@ std::string format_append_prompt_csv(const std::vector<AppendPromptMetrics>& res
            "mean_ms,runs,inner_iters\n";
     for (const AppendPromptMetrics& m : results) {
         out << m.tokens << ',' << m.context << ',' << m.end_context << ','
-            << json_number(m.median_ms) << ',' << json_number(m.tflops) << ','
-            << json_number(m.tflops_pct) << ',' << json_number(m.global_floor_gbps) << ','
-            << json_number(m.global_floor_gbps_pct) << ',' << json_number(m.tile_kv_read_gbps)
-            << ',' << json_number(m.logical_kv_gbps) << ',' << json_number(m.avg_keys_per_query)
-            << ',' << json_number(m.ns_per_key_query) << ',' << json_number(m.us_per_token) << ','
-            << m.q_blocks << ',' << m.attention_ctas << ',' << m.key_tiles << ','
-            << json_number(m.tile_reuse_queries) << ',' << m.bound << ','
-            << json_number(m.roofline_tflops) << ',' << json_number(m.roofline_eff_pct) << ','
-            << json_number(m.global_floor_bytes) << ',' << json_number(m.tile_kv_read_bytes) << ','
-            << json_number(m.logical_kv_bytes) << ',' << json_number(m.useful_flops) << ','
+            << kv_dtype_name(m.kv_dtype) << ',' << json_number(m.median_ms) << ','
+            << json_number(m.tflops) << ',' << json_number(m.tflops_pct) << ','
+            << json_number(m.global_floor_gbps) << ',' << json_number(m.global_floor_gbps_pct)
+            << ',' << json_number(m.tile_kv_read_gbps) << ',' << json_number(m.logical_kv_gbps)
+            << ',' << json_number(m.avg_keys_per_query) << ',' << json_number(m.ns_per_key_query)
+            << ',' << json_number(m.us_per_token) << ',' << m.q_blocks << ',' << m.attention_ctas
+            << ',' << m.key_tiles << ',' << json_number(m.tile_reuse_queries) << ',' << m.bound
+            << ',' << json_number(m.roofline_tflops) << ',' << json_number(m.roofline_eff_pct)
+            << ',' << json_number(m.global_floor_bytes) << ',' << json_number(m.tile_kv_read_bytes)
+            << ',' << json_number(m.logical_kv_bytes) << ',' << json_number(m.useful_flops) << ','
             << json_number(m.key_sum) << ',' << json_number(m.qblock_key_rows) << ','
             << json_number(m.median_ms) << ',' << json_number(m.min_ms) << ','
             << json_number(m.p95_ms) << ',' << json_number(m.mean_ms) << ',' << m.runs << ','
@@ -958,6 +1015,7 @@ std::string format_append_prompt_json(const std::vector<AppendPromptMetrics>& re
         const AppendPromptMetrics& m = results[i];
         out << "    {\"T\": " << m.tokens << ", \"context\": " << m.context
             << ", \"end_context\": " << m.end_context << ", \"ms\": " << json_number(m.median_ms)
+            << ", \"kv_dtype\": \"" << kv_dtype_name(m.kv_dtype) << "\""
             << ", \"tflops\": " << json_number(m.tflops)
             << ", \"tflops_pct\": " << json_number(m.tflops_pct)
             << ", \"global_floor_gbps\": " << json_number(m.global_floor_gbps)
@@ -1018,6 +1076,7 @@ struct Options {
     std::int32_t decode_pos          = 0;
     std::int32_t context             = 0;
     std::uint32_t round_robin_layers = 1;
+    DType kv_dtype                   = DType::BF16;
     std::vector<std::int32_t> tokens;
     std::vector<std::int32_t> contexts;
     PrefillTimingOptions prefill_timing;
@@ -1030,17 +1089,19 @@ void fail_usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: qus_gqa_attention_bench [--prefill] [--tokens T[,T...]] "
+                 "[--kv-dtype bf16|int8] "
                  "[--expect-tflops-pct-min PCT] [--csv-out path] [--json-out path]\n"
                  "       qus_gqa_attention_bench --prefill --tokens 4096 --profile-once\n"
                  "       qus_gqa_attention_bench --append-small-t --tokens T --context N "
-                 "[--profile-once] [--cold-cache]\n"
+                 "[--kv-dtype bf16|int8] [--profile-once] [--cold-cache]\n"
                  "       qus_gqa_attention_bench --append-prompt-baseline --tokens T[,T...] "
-                 "--context N[,N...] [--csv-out path] [--json-out path]\n"
+                 "--context N[,N...] [--kv-dtype bf16|int8] [--csv-out path] [--json-out path]\n"
                  "       qus_gqa_attention_bench --append-prompt-attention-only --tokens T[,T...] "
-                 "--context N[,N...]\n"
-                 "       qus_gqa_attention_bench --copy-ceiling --tokens T --context N\n"
+                 "--context N[,N...] [--kv-dtype bf16|int8]\n"
+                 "       qus_gqa_attention_bench --copy-ceiling --tokens T --context N "
+                 "[--kv-dtype bf16|int8]\n"
                  "       qus_gqa_attention_bench --decode [--decode-pos N] [--profile-once] "
-                 "[--cold-cache] [--round-robin-layers 16]\n",
+                 "[--cold-cache] [--round-robin-layers 16] [--kv-dtype bf16|int8]\n",
                  message);
     std::exit(2);
 }
@@ -1068,6 +1129,15 @@ double parse_double_arg(const char* text, const char* flag) {
         fail_usage(msg);
     }
     return value;
+}
+
+DType parse_kv_dtype_arg(const char* text, const char* flag) {
+    if (!std::strcmp(text, "bf16")) { return DType::BF16; }
+    if (!std::strcmp(text, "int8")) { return DType::I8; }
+    char msg[128];
+    std::snprintf(msg, sizeof(msg), "%s expects bf16 or int8", flag);
+    fail_usage(msg);
+    return DType::BF16;
 }
 
 std::vector<std::int32_t> parse_i32_list_arg(const char* text, const char* flag, bool allow_zero) {
@@ -1134,6 +1204,9 @@ Options parse_options(int argc, char** argv) {
             if (opt.round_robin_layers == 0) {
                 fail_usage("--round-robin-layers expects a positive value");
             }
+        } else if (!std::strcmp(argv[i], "--kv-dtype")) {
+            if (++i >= argc) { fail_usage("--kv-dtype requires a value"); }
+            opt.kv_dtype = parse_kv_dtype_arg(argv[i], "--kv-dtype");
         } else if (!std::strcmp(argv[i], "--warmup")) {
             if (++i >= argc) { fail_usage("--warmup requires a value"); }
             opt.prefill_timing.warmup = parse_i32_arg(argv[i], "--warmup");
@@ -1286,13 +1359,20 @@ int main(int argc, char** argv) {
         }
     }
     const std::uint32_t cache_layers = opt.round_robin_layers;
-    DeviceArena cache_arena(cache_arena_bytes(cache_layers, max_context));
+    DeviceArena cache_arena(cache_arena_bytes(cache_layers, max_context, opt.kv_dtype));
     WorkspaceArena work_arena(decode_workspace_bytes(decode_positions));
     KVCache kv(cache_arena, cache_layers, static_cast<std::uint32_t>(max_context), kKVHeads,
-               kHeadDim, DType::BF16);
+               kHeadDim, opt.kv_dtype, opt.kv_dtype == DType::I8 ? kKvQuantGroup : 0);
     for (std::uint32_t layer = 0; layer < kv.layer_count(); ++layer) {
-        CUDA_CHECK(cudaMemset(kv.k[layer].data, 0x3e, kv.k[layer].bytes()));
-        CUDA_CHECK(cudaMemset(kv.v[layer].data, 0x3d, kv.v[layer].bytes()));
+        if (kv.dtype == DType::I8) {
+            CUDA_CHECK(cudaMemset(kv.k[layer].data, 0, kv.k[layer].bytes()));
+            CUDA_CHECK(cudaMemset(kv.v[layer].data, 0, kv.v[layer].bytes()));
+            CUDA_CHECK(cudaMemset(kv.k_scale[layer].data, 0, kv.k_scale[layer].bytes()));
+            CUDA_CHECK(cudaMemset(kv.v_scale[layer].data, 0, kv.v_scale[layer].bytes()));
+        } else {
+            CUDA_CHECK(cudaMemset(kv.k[layer].data, 0x3e, kv.k[layer].bytes()));
+            CUDA_CHECK(cudaMemset(kv.v[layer].data, 0x3d, kv.v[layer].bytes()));
+        }
     }
 
     constexpr std::size_t qn  = static_cast<std::size_t>(kHeadDim) * kQHeads;
@@ -1354,7 +1434,7 @@ int main(int argc, char** argv) {
         write_text_file(opt.json_out,
                         format_append_prompt_json(append_results, opt.prefill_timing));
     }
-    if (opt.copy_ceiling) { run_copy_ceiling(opt.tokens[0], opt.context); }
+    if (opt.copy_ceiling) { run_copy_ceiling(opt.tokens[0], opt.context, opt.kv_dtype); }
     if (opt.prefill) {
         if (opt.profile_once) {
             for (const std::int32_t tokens : opt.tokens) { run_prefill_profile_once(kv, tokens); }

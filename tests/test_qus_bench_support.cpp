@@ -1,5 +1,7 @@
 #include "qus_bench_support.h"
 
+#include "qus/core/kv_cache.h"
+
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -183,18 +185,14 @@ int test_validate_prompt_lengths() {
 }
 
 int test_parse_args() {
-    int failures                  = 0;
-    const qb::BenchOptions parsed = parse_args_for_test({"qus_bench", "--weights",
-                                                         "w.qus",     "-p",
-                                                         "128,512",   "-n",
-                                                         "64",        "-pg",
-                                                         "2048,128",  "-r",
-                                                         "3",         "--warmup",
-                                                         "2",         "--max-ctx",
-                                                         "4096",      "--prefill-chunk",
-                                                         "128",       "--mtp-draft-tokens",
-                                                         "5",         "-o",
-                                                         "json",      "--no-cuda-graph"});
+    int failures = 0;
+    const qb::BenchOptions parsed =
+        parse_args_for_test({"qus_bench", "--weights",  "w.qus", "-p",
+                             "128,512",   "-n",         "64",    "-pg",
+                             "2048,128",  "-r",         "3",     "--warmup",
+                             "2",         "--max-ctx",  "4096",  "--prefill-chunk",
+                             "128",       "--kv-dtype", "int8",  "--mtp-draft-tokens",
+                             "5",         "-o",         "json",  "--no-cuda-graph"});
     failures += expect_string(parsed.weights_path, "w.qus", "weights path");
     failures += expect_size(parsed.n_prompt.size(), 2, "n_prompt list size");
     failures +=
@@ -209,6 +207,7 @@ int test_parse_args() {
     failures +=
         expect_bool(parsed.max_ctx.has_value() && *parsed.max_ctx == 4096, "max_ctx parsed");
     failures += expect_bool(parsed.prefill_chunk == 128, "prefill_chunk parsed");
+    failures += expect_bool(parsed.kv_dtype == qus::DType::I8, "kv_dtype parsed");
     failures += expect_bool(parsed.mtp_draft_tokens == 5, "mtp draft tokens parsed");
     failures += expect_bool(parsed.output == qb::OutputFormat::Json, "output json parsed");
     failures += expect_bool(!parsed.use_cuda_graph, "no-cuda-graph parsed");
@@ -242,6 +241,11 @@ int test_parse_args() {
                 {"qus_bench", "--weights", "w.qus", "--mtp-draft-tokens", "6"});
         },
         "too many mtp draft tokens throws");
+    failures += expect_throws<std::invalid_argument>(
+        [&] {
+            (void)parse_args_for_test({"qus_bench", "--weights", "w.qus", "--kv-dtype", "fp8"});
+        },
+        "bad kv dtype throws");
     return failures;
 }
 
@@ -284,6 +288,9 @@ int test_format_json_schema() {
     env.decode_path              = "cuda_graph";
     env.repetitions              = 2;
     env.prefill_chunk            = qus::model::kDefaultPrefillChunk;
+    env.kv_dtype                 = "int8";
+    env.kv_quant_group           = qus::kKvQuantGroup;
+    env.kv_cache_payload_bytes   = 123456;
     env.mtp_draft_tokens         = 5;
     env.decode_graph_requested   = true;
     env.decode_graph_primed      = true;
@@ -300,12 +307,20 @@ int test_format_json_schema() {
     } catch (const nlohmann::json::exception& e) {
         return fail(std::string("format_json produced invalid JSON: ") + e.what());
     }
-    failures += expect_bool(report.at("schema_version").get<int>() == 4, "json schema version");
+    failures += expect_bool(report.at("schema_version").get<int>() == 5, "json schema version");
     failures += expect_string(report.at("artifact_type").get<std::string>(), "qus_bench_report",
                               "json artifact type");
     failures += expect_bool(report.at("config").at("prefill_chunk").get<int>() ==
                                 static_cast<int>(qus::model::kDefaultPrefillChunk),
                             "json config prefill_chunk");
+    failures += expect_string(report.at("config").at("kv_dtype").get<std::string>(), "int8",
+                              "json config kv_dtype");
+    failures +=
+        expect_bool(report.at("config").at("kv_quant_group").get<int>() == qus::kKvQuantGroup,
+                    "json config kv_quant_group");
+    failures += expect_bool(report.at("config").at("kv_cache_payload_bytes").get<std::uint64_t>() ==
+                                123456ULL,
+                            "json config kv payload");
     failures += expect_bool(report.at("config").at("mtp_draft_tokens").get<int>() == 5,
                             "json config mtp_draft_tokens");
     failures +=
@@ -380,10 +395,13 @@ int test_format_table_and_csv() {
     int failures                              = 0;
     const std::vector<qb::TestResult> results = sample_results();
     qb::BenchEnvironment env;
-    env.decode_path         = "cuda_graph";
-    env.prefill_chunk       = qus::model::kDefaultPrefillChunk;
-    env.mtp_draft_tokens    = 0;
-    const std::string table = qb::format_table(env, results);
+    env.decode_path            = "cuda_graph";
+    env.prefill_chunk          = qus::model::kDefaultPrefillChunk;
+    env.kv_dtype               = "int8";
+    env.kv_quant_group         = qus::kKvQuantGroup;
+    env.kv_cache_payload_bytes = 123456;
+    env.mtp_draft_tokens       = 0;
+    const std::string table    = qb::format_table(env, results);
     failures += expect_bool(table.find("pp512") != std::string::npos, "table has pp512");
     failures += expect_bool(table.find("tg3") != std::string::npos, "table has tg3");
     failures += expect_bool(table.find("prefill t/s") != std::string::npos, "table has header");
@@ -396,6 +414,8 @@ int test_format_table_and_csv() {
             std::string::npos,
         "table has prefill_chunk config");
     failures += expect_bool(table.find("mtp_k=0") != std::string::npos, "table has mtp config");
+    failures += expect_bool(table.find("kv_dtype=int8") != std::string::npos, "table has kv dtype");
+    failures += expect_bool(table.find("kv_payload=") != std::string::npos, "table has kv payload");
     failures += expect_bool(table.find("graph_prime=n/a") != std::string::npos,
                             "table has graph prime config");
     failures += expect_bool(table.find("work peak") != std::string::npos, "table has work peak");
@@ -413,6 +433,9 @@ int test_format_table_and_csv() {
     failures += expect_bool(csv.find("label,kind,n_prompt") == 0, "csv header first");
     failures +=
         expect_bool(csv.find("prefill_chunk") != std::string::npos, "csv has prefill_chunk");
+    failures += expect_bool(csv.find("kv_dtype") != std::string::npos, "csv has kv_dtype");
+    failures += expect_bool(csv.find("kv_cache_payload_bytes") != std::string::npos,
+                            "csv has kv cache payload");
     failures +=
         expect_bool(csv.find("mtp_draft_tokens") != std::string::npos, "csv has mtp_draft_tokens");
     failures += expect_bool(csv.find("decode_graph_primed") != std::string::npos,

@@ -642,7 +642,7 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
                     "splits=%d "
                     "cold_cache_bytes=%zu useful_kv_bytes=%zu scratch_bytes=%zu "
                     "total_modeled_bytes=%zu redundancy=%.6f repeats=%d "
-                    "ncu_kernel_regex='gqa_attention_small_t_(stream_|tc_)?partial_kernel'\n",
+                    "ncu_kernel_regex='gqa_attention_small_t_tc_partial_(bf16|i8)_kernel'\n",
                     tokens, context, kv_dtype_name(kv.dtype),
                     small_t_active_splits(tokens, context), cold_cache->bytes, bytes.useful_kv,
                     bytes.scratch, bytes.total,
@@ -657,7 +657,7 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::printf("PROFILE_ONCE gqa_attention append-small-T T=%d context=%d kv_dtype=%s splits=%d "
                 "useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu redundancy=%.6f "
-                "ncu_kernel_regex='gqa_attention_small_t_(stream_|tc_)?partial_kernel'\n",
+                "ncu_kernel_regex='gqa_attention_small_t_tc_partial_(bf16|i8)_kernel'\n",
                 tokens, context, kv_dtype_name(kv.dtype), small_t_active_splits(tokens, context),
                 bytes.useful_kv, bytes.scratch, bytes.total,
                 bytes.useful_kv > 0

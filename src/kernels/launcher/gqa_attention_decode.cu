@@ -2,6 +2,8 @@
 #include "kernels/launcher/gqa_attention.h"
 
 #include "kernels/kernel/gqa_attention_decode.cuh"
+#include "kernels/kernel/gqa_attention_decode_bf16.cuh"
+#include "kernels/kernel/gqa_attention_decode_i8.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 #include "qus/kernels/gqa_attention.h"
 
@@ -40,31 +42,55 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
     return (splits < kGqaDecodeSplits) ? splits : kGqaDecodeSplits;
 }
 
-template <int TokenTile, int WarpsPerCta, bool Quantized>
-void launch_tc_partial(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
-                       float scale, KVCache& kv, int layer, std::int32_t padded_context,
-                       std::int32_t max_context, std::int32_t window, Tensor& partial_acc,
-                       Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+template <int TokenTile, int WarpsPerCta>
+void launch_tc_partial_bf16(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
+                            float scale, KVCache& kv, int layer, std::int32_t padded_context,
+                            std::int32_t max_context, std::int32_t window, Tensor& partial_acc,
+                            Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+    constexpr int kBlock = 32 * WarpsPerCta;
+    const int tokens     = q.ne[2];
+    const int splits     = gqa_small_t_split_upper_bound(window);
+    const dim3 grid(kGqaKVHeads, splits, 1);
+    Tensor& cache_k = kv.k[static_cast<std::uint32_t>(layer)];
+    Tensor& cache_v = kv.v[static_cast<std::uint32_t>(layer)];
+    // bf16 kernel uses only static smem (no dynamic staging).
+    gqa_attention_small_t_tc_partial_bf16_kernel<TokenTile, WarpsPerCta>
+        <<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
+            static_cast<__nv_bfloat16*>(cache_k.data), static_cast<__nv_bfloat16*>(cache_v.data),
+            tokens, padded_context, max_context, scale,
+            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<float*>(partial_l.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int TokenTile, int WarpsPerCta>
+void launch_tc_partial_i8(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
+                          float scale, KVCache& kv, int layer, std::int32_t padded_context,
+                          std::int32_t max_context, std::int32_t window, Tensor& partial_acc,
+                          Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     constexpr int kBlock = 32 * WarpsPerCta;
     const int tokens     = q.ne[2];
     const int splits     = gqa_small_t_split_upper_bound(window);
     const dim3 grid(kGqaKVHeads, splits, 1);
     Tensor& cache_k       = kv.k[static_cast<std::uint32_t>(layer)];
     Tensor& cache_v       = kv.v[static_cast<std::uint32_t>(layer)];
-    Tensor* cache_k_scale = Quantized ? &kv.k_scale[static_cast<std::uint32_t>(layer)] : nullptr;
-    Tensor* cache_v_scale = Quantized ? &kv.v_scale[static_cast<std::uint32_t>(layer)] : nullptr;
-    gqa_attention_small_t_tc_partial_kernel<TokenTile, WarpsPerCta, Quantized>
-        <<<grid, kBlock, 0, stream>>>(
+    Tensor& cache_k_scale = kv.k_scale[static_cast<std::uint32_t>(layer)];
+    Tensor& cache_v_scale = kv.v_scale[static_cast<std::uint32_t>(layer)];
+    // The int8 kernel stages int8 codes + scales in dynamic smem (kGqaSmallTStageBytesI8
+    // = 8704 B). Static 36 KB + 8.5 KB stays under the 48 KB non-opt-in limit and keeps
+    // 2 blocks/SM on sm_120's 100 KB budget, matching the bf16 kernel.
+    constexpr unsigned smem_bytes = static_cast<unsigned>(kGqaSmallTStageBytesI8);
+    gqa_attention_small_t_tc_partial_i8_kernel<TokenTile, WarpsPerCta>
+        <<<grid, kBlock, smem_bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
             static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
-            Quantized ? nullptr : static_cast<__nv_bfloat16*>(cache_k.data),
-            Quantized ? nullptr : static_cast<__nv_bfloat16*>(cache_v.data),
-            Quantized ? static_cast<std::int8_t*>(cache_k.data) : nullptr,
-            Quantized ? static_cast<std::int8_t*>(cache_v.data) : nullptr,
-            Quantized ? static_cast<__half*>(cache_k_scale->data) : nullptr,
-            Quantized ? static_cast<__half*>(cache_v_scale->data) : nullptr, tokens,
-            padded_context, max_context, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+            static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
+            static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
+            tokens, padded_context, max_context, scale,
+            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -84,76 +110,44 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
     // real max_context for cache-bounds checks.
     const auto window = static_cast<std::int32_t>(kv.pos) + q.ne[2];
 
+    // Dispatch to the fully separate bf16 / int8 kernels. WarpsPerCta per T is the
+    // same for both formats.
+#define QUS_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                     \
+    do {                                                                                            \
+        if (kv.dtype == DType::I8) {                                                                \
+            launch_tc_partial_i8<(TOKENS), (WARPS)>(q, k, v, pos, scale, kv, layer, padded_context, \
+                                                    max_context, window, partial_acc, partial_m,    \
+                                                    partial_l, stream);                             \
+        } else {                                                                                    \
+            launch_tc_partial_bf16<(TOKENS), (WARPS)>(q, k, v, pos, scale, kv, layer,               \
+                                                      padded_context, max_context, window,          \
+                                                      partial_acc, partial_m, partial_l, stream);   \
+        }                                                                                           \
+    } while (0)
+
     switch (q.ne[2]) {
     case 1:
-        if (kv.dtype == DType::I8) {
-            launch_tc_partial<1, 2, true>(q, k, v, pos, scale, kv, layer, padded_context,
-                                          max_context, window, partial_acc, partial_m, partial_l,
-                                          stream);
-        } else {
-            launch_tc_partial<1, 2, false>(q, k, v, pos, scale, kv, layer, padded_context,
-                                           max_context, window, partial_acc, partial_m, partial_l,
-                                           stream);
-        }
+        QUS_GQA_SMALL_T_DISPATCH(1, 2);
         break;
     case 2:
-        if (kv.dtype == DType::I8) {
-            launch_tc_partial<2, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
-                                          max_context, window, partial_acc, partial_m, partial_l,
-                                          stream);
-        } else {
-            launch_tc_partial<2, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
-                                           max_context, window, partial_acc, partial_m, partial_l,
-                                           stream);
-        }
+        QUS_GQA_SMALL_T_DISPATCH(2, 4);
         break;
     case 3:
-        if (kv.dtype == DType::I8) {
-            launch_tc_partial<3, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
-                                          max_context, window, partial_acc, partial_m, partial_l,
-                                          stream);
-        } else {
-            launch_tc_partial<3, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
-                                           max_context, window, partial_acc, partial_m, partial_l,
-                                           stream);
-        }
+        QUS_GQA_SMALL_T_DISPATCH(3, 4);
         break;
     case 4:
-        if (kv.dtype == DType::I8) {
-            launch_tc_partial<4, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
-                                          max_context, window, partial_acc, partial_m, partial_l,
-                                          stream);
-        } else {
-            launch_tc_partial<4, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
-                                           max_context, window, partial_acc, partial_m, partial_l,
-                                           stream);
-        }
+        QUS_GQA_SMALL_T_DISPATCH(4, 4);
         break;
     case 5:
-        if (kv.dtype == DType::I8) {
-            launch_tc_partial<5, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
-                                          max_context, window, partial_acc, partial_m, partial_l,
-                                          stream);
-        } else {
-            launch_tc_partial<5, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
-                                           max_context, window, partial_acc, partial_m, partial_l,
-                                           stream);
-        }
+        QUS_GQA_SMALL_T_DISPATCH(5, 4);
         break;
     case 6:
-        if (kv.dtype == DType::I8) {
-            launch_tc_partial<6, 4, true>(q, k, v, pos, scale, kv, layer, padded_context,
-                                          max_context, window, partial_acc, partial_m, partial_l,
-                                          stream);
-        } else {
-            launch_tc_partial<6, 4, false>(q, k, v, pos, scale, kv, layer, padded_context,
-                                           max_context, window, partial_acc, partial_m, partial_l,
-                                           stream);
-        }
+        QUS_GQA_SMALL_T_DISPATCH(6, 4);
         break;
     default:
         throw std::invalid_argument("gqa_attention_small_t_launch: unsupported T");
     }
+#undef QUS_GQA_SMALL_T_DISPATCH
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;

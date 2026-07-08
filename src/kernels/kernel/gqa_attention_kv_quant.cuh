@@ -60,18 +60,14 @@ __device__ __forceinline__ unsigned gqa_kv_quant_pack_bf16(float lo, float hi) {
 }
 
 // Dequantize 8 consecutive int8 codes (dims [d, d+8), aligned to a multiple of 8
-// so they lie inside one 64-group) into 8 bf16 packed as an int4. The 8 codes are
-// read with ONE 64-bit (int2) coalesced load instead of 8 scalar byte loads, so
-// the global traffic is exactly half of the bf16 path and stays fully coalesced.
-__device__ __forceinline__ int4 gqa_kv_dequant_i8x8(const std::int8_t* __restrict__ cache,
-                                                    const __half* __restrict__ scale, int kv_head,
-                                                    int d, int position, int padded_context) {
-    const int group            = d >> 6; // d / 64
-    const std::int64_t scale_i = gqa_kv_quant_scale_index(kv_head, group, position, padded_context);
-    const float s              = __half2float(scale[scale_i]);
-    const std::int64_t code_off = gqa_kv_quant_code_index(kv_head, d, position, padded_context);
-    const int2 raw              = *reinterpret_cast<const int2*>(&cache[code_off]);
-    const std::int8_t* c        = reinterpret_cast<const std::int8_t*>(&raw);
+// so they lie inside one 64-group) into 8 bf16 packed as an int4, given a pointer
+// to the 8 codes and the group's dequant scale. The codes are read with ONE 64-bit
+// (int2) load; the pointer may be in global or shared memory. This keeps the dequant
+// ALU identical whether the codes were streamed via cp.async into smem (decode) or
+// read directly from the cache (prefill).
+__device__ __forceinline__ int4 gqa_kv_dequant_i8x8_from(const std::int8_t* codes8, float s) {
+    const int2 raw       = *reinterpret_cast<const int2*>(codes8);
+    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
     unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -81,6 +77,19 @@ __device__ __forceinline__ int4 gqa_kv_dequant_i8x8(const std::int8_t* __restric
     }
     return make_int4(static_cast<int>(packed[0]), static_cast<int>(packed[1]),
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
+}
+
+// Dequantize 8 codes read directly from the (global) int8 cache row. Used by the
+// prefill staging path. The 8 codes are one coalesced 64-bit load, half the bytes
+// of the bf16 path.
+__device__ __forceinline__ int4 gqa_kv_dequant_i8x8(const std::int8_t* __restrict__ cache,
+                                                    const __half* __restrict__ scale, int kv_head,
+                                                    int d, int position, int padded_context) {
+    const int group            = d >> 6; // d / 64
+    const std::int64_t scale_i = gqa_kv_quant_scale_index(kv_head, group, position, padded_context);
+    const float s              = __half2float(scale[scale_i]);
+    const std::int64_t code_off = gqa_kv_quant_code_index(kv_head, d, position, padded_context);
+    return gqa_kv_dequant_i8x8_from(&cache[code_off], s);
 }
 
 } // namespace qus::kernels

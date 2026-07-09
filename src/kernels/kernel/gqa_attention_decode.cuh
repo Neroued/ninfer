@@ -122,6 +122,24 @@ gqa_small_t_tc_mma_m16n8k16_bf16(float& c0, float& c1, float& c2, float& c3, uns
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// Signed int8 QK MMA, k=32 contraction. A = 16x32 s8 (4 regs/thread, 4 s8 each),
+// B = 8x32 s8 col-major (2 regs/thread), D = 16x8 s32 (4 regs/thread). The A/B
+// register byte layout is identical to the m16n8k16 bf16 fragments loaded by
+// gqa_small_t_tc_ldmatrix_x4/x2 over a d-contiguous int8 tile reinterpreted as
+// b16 (two packed int8 per 16-bit lane), so the same ldmatrix helpers and XOR
+// swizzle feed this MMA. The s32 accumulator layout matches the bf16 f32
+// accumulator (c0/c1 -> row groupID, c2/c3 -> row groupID+8), so score
+// consumption is unchanged; only per-64-group scale rescale differs.
+__device__ __forceinline__ void gqa_small_t_tc_mma_m16n8k32_s8(int& c0, int& c1, int& c2, int& c3,
+                                                               unsigned a0, unsigned a1,
+                                                               unsigned a2, unsigned a3,
+                                                               unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, int kv_head,
                                                          int& q_head, int& token) {
     token             = row / kGqaGroupSize;

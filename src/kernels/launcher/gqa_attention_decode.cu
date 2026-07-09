@@ -78,12 +78,10 @@ void launch_tc_partial_i8(const Tensor& q, const Tensor& k, const Tensor& v, con
     Tensor& cache_v       = kv.v[static_cast<std::uint32_t>(layer)];
     Tensor& cache_k_scale = kv.k_scale[static_cast<std::uint32_t>(layer)];
     Tensor& cache_v_scale = kv.v_scale[static_cast<std::uint32_t>(layer)];
-    // The int8 kernel stages int8 codes + scales in dynamic smem (kGqaSmallTStageBytesI8
-    // = 8704 B). Static 36 KB + 8.5 KB stays under the 48 KB non-opt-in limit and keeps
-    // 2 blocks/SM on sm_120's 100 KB budget, matching the bf16 kernel.
-    constexpr unsigned smem_bytes = static_cast<unsigned>(kGqaSmallTStageBytesI8);
+    // int8-native kernel: K/V int8 tiles + one bf16 V tile + P + scales fit in
+    // ~37.5 KB of static smem (< 48 KB non-opt-in limit), 2 blocks/SM on sm_120.
     gqa_attention_small_t_tc_partial_i8_kernel<TokenTile, WarpsPerCta>
-        <<<grid, kBlock, smem_bytes, stream>>>(
+        <<<grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
             static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
             static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),

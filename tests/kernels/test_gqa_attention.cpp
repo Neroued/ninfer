@@ -460,9 +460,9 @@ int one_int8_prefill_case(std::int32_t tokens, std::uint32_t seed) {
 
 // Fused int8 decode/verify: `base` quantized history tokens already in the cache,
 // then `tokens` (1..6) new tokens at [base, base+tokens). The kernel quantizes the
-// new tokens into the cache (fused append, no separate kernel) AND reads them back
-// for the current step from k_new/v_new at full precision (from_new). The reference
-// therefore uses dequantized history but the raw bf16 new tokens for the diagonal.
+// new tokens into the cache (fused append, no separate kernel) AND reads every key
+// (history and diagonal) back from the quantized cache for the int8-native QK. The
+// reference therefore applies the int8 round-trip to the new tokens as well.
 int one_int8_decode_case(std::int32_t base, std::int32_t tokens, std::uint32_t seed) {
     const std::size_t qn =
         static_cast<std::size_t>(kHeadDim) * kQHeads * static_cast<std::size_t>(tokens);
@@ -511,15 +511,33 @@ int one_int8_decode_case(std::int32_t base, std::int32_t tokens, std::uint32_t s
     cpu_quantize_append(k_new, v_new, new_positions, false, tokens, padded_context, expected_k,
                         expected_v, expected_k_scale, expected_v_scale);
 
-    // History is read from the quantized cache; the new tokens are placed at full
-    // precision by cpu_gqa_prefill (which overwrites cache[base+t] with k_new[t]).
+    // The int8-native decode kernel reads EVERY key (history and the current/diagonal
+    // tokens) back from the quantized cache, so the reference must apply the int8
+    // round-trip to the new tokens too (not the raw bf16 values). History comes from
+    // the dequantized initial cache; cpu_gqa_prefill overwrites [base, base+tokens)
+    // with the dequantized new tokens (extracted from the full quantized cache).
+    std::vector<float> full_cache_k =
+        dequantize_cache_bf16(expected_k, expected_k_scale, padded_context);
+    std::vector<float> full_cache_v =
+        dequantize_cache_bf16(expected_v, expected_v_scale, padded_context);
+    std::vector<float> k_deq_new(kvn), v_deq_new(kvn);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t h = 0; h < kKVHeads; ++h) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                k_deq_new[kv_tensor_index(h, d, t)] =
+                    full_cache_k[cache_index(h, d, base + t, padded_context)];
+                v_deq_new[kv_tensor_index(h, d, t)] =
+                    full_cache_v[cache_index(h, d, base + t, padded_context)];
+            }
+        }
+    }
     std::vector<float> ref_cache_k =
         dequantize_cache_bf16(initial_k, initial_k_scale, padded_context);
     std::vector<float> ref_cache_v =
         dequantize_cache_bf16(initial_v, initial_v_scale, padded_context);
     std::vector<float> ignored_k, ignored_v;
     std::vector<double> ref;
-    cpu_gqa_prefill(q, k_new, v_new, ref_cache_k, ref_cache_v, tokens, base, padded_context,
+    cpu_gqa_prefill(q, k_deq_new, v_deq_new, ref_cache_k, ref_cache_v, tokens, base, padded_context,
                     ignored_k, ignored_v, ref);
 
     DBuf dq   = to_device_bf16(q);

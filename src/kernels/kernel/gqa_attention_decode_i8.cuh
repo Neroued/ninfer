@@ -1,11 +1,23 @@
 #pragma once
 
 // qus::kernels - split-KV GQA small-T attention, int8 KV-cache partial kernel.
-// Standalone from the bf16 kernel (gqa_attention_decode_bf16.cuh): shared
-// scaffolding lives in gqa_attention_decode.cuh, but the body/append/load are not
-// shared so the int8 path can be tuned independently. Processes one KV head, one
-// query-head subgroup, and one token tile; a reducer combines the split-local
-// partials.
+// int8-native redesign (docs/2026-07-08-gqa-decode-int8-kernel-redesign.md):
+//
+//   * QK runs on native m16n8k32.s8 tensor cores. Q is quantized on-chip to int8
+//     per (row, 64-group); K stays int8 in the cache and is read straight into
+//     smem (no dequant). The int32 MMA output is rescaled per 64-group by
+//     qs[row,g]*ks[key,g]. This halves the QK MMA count vs bf16 and removes the
+//     entire K dequant.
+//   * PV stays bf16 (V is quantized per key, so its scale cannot be factored out
+//     of a key-contracted int8 accumulation): V int8 is staged, dequanted once to
+//     a bf16 tile, then the existing bf16 PV MMA runs. V is still read from DRAM
+//     as int8, so the bandwidth win is kept.
+//   * All keys (history AND the current/diagonal tokens) are read from the
+//     quantized cache; the fused append writes the new tokens first and a
+//     __syncthreads orders the in-block readback. No from_new special-casing.
+//
+// Standalone from the bf16 kernel; shared scaffolding (layout constants, ldmatrix
+// helpers, the s8/bf16 MMA helpers, the reducer) lives in gqa_attention_decode.cuh.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -19,21 +31,19 @@
 
 namespace qus::kernels {
 
-// Double-buffered int8 staging for the decode convert pipeline. The Bc=32 key tile
-// is loaded as 4 sub-tiles of Bc/2=16 keys (K-lo, K-hi, V-lo, V-hi); two 4 KB
-// buffers let the next sub-tile's cp.async overlap the current sub-tile's convert,
-// so DRAM stays busy at the low (~4-warp) decode occupancy. Both planes' fp16 group
-// scales (2*Bc*groups) are staged once up front so the convert touches only shared
-// memory. Code buffers (2*16*256 = 8 KB) + scales (256*2 = 512 B) = 8704 B; with
-// 36 KB static this stays under the 48 KB non-opt-in smem limit and keeps 2 blocks/SM
-// on sm_120's 100 KB/SM budget, matching the bf16 kernel (which uses 0 dynamic smem).
-inline constexpr int kGqaSmallTBc              = 32;
-inline constexpr int kGqaSmallTSubKeys         = kGqaSmallTBc / 2;
-inline constexpr int kGqaSmallTSubBytesI8      = kGqaSmallTSubKeys * kGqaHeadDim; // 4 KB
-inline constexpr int kGqaSmallTStageScaleCount = 2 * kGqaSmallTBc * kGqaKvQuantGroups;
-inline constexpr int kGqaSmallTStageBytesI8 =
-    2 * kGqaSmallTSubBytesI8 +
-    kGqaSmallTStageScaleCount * static_cast<int>(sizeof(__half));
+// Store one int8 code into a d-contiguous-as-b16 swizzled tile so the same
+// gqa_small_t_tc_swz / ldmatrix path that serves bf16 tiles serves the int8 tile.
+// A b16 lane holds two packed int8 (d even = low byte, d odd = high byte); this
+// matches the byte layout a 16 B cp.async of d-contiguous cache bytes produces
+// (see the design doc / kernel comments), so Q (byte stores) and K (cp.async)
+// agree.
+__device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int row, int d,
+                                                         int d_b16_stride, std::int8_t code) {
+    const int c   = d >> 1;
+    const int lo  = d & 1;
+    const int off = (row * d_b16_stride + gqa_small_t_tc_swz(row, c)) * 2 + lo;
+    tile[off]     = code;
+}
 
 template <int TokenTile, int WarpsPerCta>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_kernel(
@@ -48,25 +58,38 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
     constexpr int Wc            = WarpsPerCta;
     constexpr int Br            = Wc * 16;
     constexpr int Bc            = 32;
-    constexpr int D             = kGqaHeadDim;
+    constexpr int D             = kGqaHeadDim;         // 256
+    constexpr int DB16          = D / 2;               // 128 b16 per int8 row
     constexpr int Threads       = Wc * 32;
-    constexpr int QKNt          = Bc / 8;
-    constexpr int QKKs          = D / 16;
-    constexpr int PVNt          = D / 8;
-    constexpr int PVKs          = Bc / 16;
+    constexpr int Groups        = kGqaKvQuantGroups;   // 4 (64-dim groups)
+    constexpr int GroupKc       = kGqaKvQuantGroup / 32; // 2 s8 k-chunks per group
+    constexpr int QKKs          = D / 32;              // 8 s8 QK k-chunks
+    constexpr int QKNt          = Bc / 8;              // 4 QK n-tiles
+    constexpr int PVNt          = D / 8;               // 32 PV n-tiles
+    constexpr int PVKs          = Bc / 16;             // 2 PV contraction steps
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
-    constexpr int QkvRows       = 2 * Bc;
 
-    static_assert(QkvRows >= Br);
+    static_assert(QKKs == Groups * GroupKc);
+    static_assert(2 * Bc >= Br);
 
-    __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
+    // One reused byte arena: K int8 | V int8 | V bf16 during the key loop; Q int8
+    // in the prologue; the acc bf16 staging in the epilogue. 4*Bc*D bytes covers
+    // Q int8 (Br*D <= 4*Bc*D) and acc staging (row_count*D*2 <= 4*Bc*D).
+    constexpr int RBytes = 4 * Bc * D;
+    __shared__ __align__(16) std::int8_t r_s[RBytes];
+    std::int8_t* k_i8       = r_s;              // [Bc, D] swizzled (as b16)
+    std::int8_t* v_i8       = r_s + Bc * D;     // [Bc, D] d-contiguous stage
+    __nv_bfloat16* v_bf16   = reinterpret_cast<__nv_bfloat16*>(r_s + 2 * Bc * D); // [Bc, D] swz
+    std::int8_t* q_i8       = r_s;              // prologue: [Br, D] swizzled (as b16)
+    __nv_bfloat16* q_b16    = reinterpret_cast<__nv_bfloat16*>(r_s);
+    __nv_bfloat16* k_b16    = reinterpret_cast<__nv_bfloat16*>(k_i8);
+    __nv_bfloat16* acc_bf16 = reinterpret_cast<__nv_bfloat16*>(r_s); // epilogue staging
+
     __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
-    __nv_bfloat16* k_s = qkv_s;
-    __nv_bfloat16* v_s = qkv_s + Bc * D;
-
-    // Dynamic staging for int8 codes + scales (see kGqaSmallTStageBytesI8).
-    extern __shared__ __align__(16) std::int8_t gqa_decode_stage[];
+    __shared__ __half k_scale_s[Bc * Groups];
+    __shared__ __half v_scale_s[Bc * Groups];
+    __shared__ float q_scale_s[2 * Bc * Groups]; // rows < Br <= 2*Bc
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -124,12 +147,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
         return;
     }
 
-    // Fused int8 append (no separate kernel). The split that owns each new token's
-    // absolute position quantizes its K/V head vector per 64-group (warp absmax ->
-    // int8 code + fp16 scale) straight into the cache for FUTURE decode steps. The
-    // current step still reads the new tokens from k_new/v_new at full precision via
-    // the from_new path below, so no split reads back these just-written codes in the
-    // same launch: there is no cross-CTA race, exactly like the bf16 fused write.
+    // Fused int8 append: the split that owns each new token's absolute position
+    // quantizes its K/V head vector per 64-group into the cache. The current step
+    // then reads those codes back from the cache (below) after a __syncthreads;
+    // each position belongs to exactly one split so there is no cross-CTA race.
     for (int pair = warp; pair < tokens * kGqaKvQuantGroups; pair += Wc) {
         const int t        = pair / kGqaKvQuantGroups;
         const int grp      = pair - t * kGqaKvQuantGroups;
@@ -152,8 +173,6 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
             kamax = fmaxf(kamax, __shfl_xor_sync(FullMask, kamax, off));
             vamax = fmaxf(vamax, __shfl_xor_sync(FullMask, vamax, off));
         }
-        // Match the bf16-parity oracle: divide by 127, round the scale to fp16,
-        // then quantize with the inverse of that stored fp16 scale.
         const __half ksh  = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
         const __half vsh  = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
         const float ks    = __half2float(ksh);
@@ -177,17 +196,34 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
     }
     __syncthreads();
 
-    for (int idx = tid; idx < Br * D; idx += Threads) {
-        const int row = idx / D;
-        const int d   = idx - row * D;
+    // Prologue: quantize Q into the int8 tile (per row, per 64-group) and stash the
+    // per-(row,group) fp32 scale. Zero first so invalid rows/scales are 0 (their
+    // scores go through 0 code -> 0 -> masked).
+    for (int i = tid; i < Br * D; i += Threads) { q_i8[i] = 0; }
+    for (int i = tid; i < Br * Groups; i += Threads) { q_scale_s[i] = 0.0f; }
+    __syncthreads();
+
+    for (int unit = warp; unit < row_count * Groups; unit += Wc) {
+        const int row = unit / Groups;
+        const int g   = unit - row * Groups;
         int q_head    = 0;
         int token     = 0;
         gqa_small_t_tc_row_to_qt(row, tokens, kv_head, q_head, token);
-        __nv_bfloat16 value = __float2bfloat16(0.0f);
-        if (row < row_count && gqa_valid_q_head(kv_head, q_head)) {
-            value = q[gqa_q_index(q_head, d, token)];
+        if (!gqa_valid_q_head(kv_head, q_head)) { continue; }
+        const int d0    = g * kGqaKvQuantGroup + lane;
+        const int d1    = d0 + 32;
+        const float x0  = __bfloat162float(q[gqa_q_index(q_head, d0, token)]);
+        const float x1  = __bfloat162float(q[gqa_q_index(q_head, d1, token)]);
+        float amax      = fmaxf(fabsf(x0), fabsf(x1));
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(FullMask, amax, off));
         }
-        qkv_s[row * D + gqa_small_t_tc_swz(row, d)] = value;
+        const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
+        const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
+        gqa_small_t_i8_store_swz(q_i8, row, d0, DB16, gqa_kv_quant_code(x0, inv));
+        gqa_small_t_i8_store_swz(q_i8, row, d1, DB16, gqa_kv_quant_code(x1, inv));
+        if (lane == 0) { q_scale_s[row * Groups + g] = qs; }
     }
     __syncthreads();
 
@@ -204,16 +240,17 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
     const int warp_row0 = warp * 16;
     __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
 
+    // Q A-fragments (int8, loaded once as b16 via ldmatrix.x4).
     unsigned af_q[QKKs][4];
 #pragma unroll
     for (int k = 0; k < QKKs; ++k) {
         const int arow = warp_row0 + a_rowoff;
         const int acol = k * 16 + a_coloff;
-        gqa_small_t_tc_ldmatrix_x4(
-            af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
-            gqa_small_t_tc_smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
+        gqa_small_t_tc_ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
+                                   gqa_small_t_tc_smem_addr(&q_b16[arow * DB16 +
+                                                                   gqa_small_t_tc_swz(arow, acol)]));
     }
-    __syncthreads();
+    __syncthreads(); // q_i8 (== r_s) is now free for the K/V tiles
 
     float acc[PVNt][4];
 #pragma unroll
@@ -226,119 +263,95 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
     const int key_blocks = (split_end - split_start + Bc - 1) / Bc;
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = split_start + kb * Bc;
-        // Double-buffered convert pipeline. The Bc key tile is 4 sub-tiles of
-        // SubKeys=Bc/2 keys: (K-lo, K-hi, V-lo, V-hi). Two 4 KB buffers let the next
-        // sub-tile's int8 cp.async (half the DRAM bytes of bf16, fully coalesced)
-        // overlap the current sub-tile's dequant+store, so DRAM stays busy even at the
-        // ~4-warp decode occupancy. Both planes' fp16 group scales are staged up front
-        // so the convert touches only shared memory.
-        constexpr int kSub    = 4;
-        constexpr int SubKeys = Bc / 2;
-        std::int8_t* buf0     = gqa_decode_stage;
-        std::int8_t* buf1     = gqa_decode_stage + kGqaSmallTSubBytesI8;
-        __half* stage_scale = reinterpret_cast<__half*>(&gqa_decode_stage[2 * kGqaSmallTSubBytesI8]);
 
-        for (int i = tid; i < 2 * Bc * kGqaKvQuantGroups; i += Threads) {
-            const int pl      = i / (Bc * kGqaKvQuantGroups);
-            const int rem     = i - pl * (Bc * kGqaKvQuantGroups);
-            const int key_l   = rem / kGqaKvQuantGroups;
-            const int grp     = rem - key_l * kGqaKvQuantGroups;
-            const int key     = k0 + key_l;
-            const __half* csc = (pl == 0) ? cache_k_scale : cache_v_scale;
-            stage_scale[i]    = (key < split_end)
-                                 ? csc[gqa_kv_quant_scale_index(kv_head, grp, key, padded_context)]
-                                 : __float2half(0.0f);
-        }
-
-        auto load_sub = [&](int s) {
-            const int plane             = s >> 1;
-            const int key0              = (s & 1) * SubKeys;
-            const std::int8_t* cache_i8 = (plane == 0) ? cache_k_i8 : cache_v_i8;
-            std::int8_t* buf            = (s & 1) ? buf1 : buf0;
-#pragma unroll 1
-            for (int chunk = tid; chunk < SubKeys * (D / 16); chunk += Threads) {
-                const int kl  = chunk / (D / 16);
-                const int d   = (chunk - kl * (D / 16)) * 16;
-                const int key = k0 + key0 + kl;
-                if (key < split_end) {
-                    const int nt        = key - first_pos;
-                    const bool from_new = nt >= 0 && nt < tokens && key >= first_pos;
-                    if (!from_new) {
-                        const std::int64_t off =
-                            gqa_kv_quant_code_index(kv_head, d, key, padded_context);
-                        qus::kernels::async_copy_global_to_shared<16>(&buf[kl * D + d],
-                                                                      &cache_i8[off]);
-                    }
-                }
-            }
-            qus::kernels::async_copy_commit();
-        };
-
-        auto convert_sub = [&](int s) {
-            const int plane              = s >> 1;
-            const int key0               = (s & 1) * SubKeys;
-            const __nv_bfloat16* src_new = (plane == 0) ? k_new : v_new;
-            __nv_bfloat16* dst_tile      = (plane == 0) ? k_s : v_s;
-            const std::int8_t* buf       = (s & 1) ? buf1 : buf0;
-            const int scale_base         = plane * (Bc * kGqaKvQuantGroups);
-#pragma unroll 1
-            for (int chunk = tid; chunk < SubKeys * (D / 8); chunk += Threads) {
-                const int kl       = chunk / (D / 8);
-                const int d        = (chunk - kl * (D / 8)) * 8;
-                const int key_l    = key0 + kl;
-                const int key      = k0 + key_l;
-                __nv_bfloat16* dst = &dst_tile[key_l * D + gqa_small_t_tc_swz(key_l, d)];
-                if (key < split_end) {
-                    const int nt        = key - first_pos;
-                    const bool from_new = nt >= 0 && nt < tokens && key >= first_pos;
-                    if (from_new) {
-                        const std::int64_t off = gqa_kv_new_index(kv_head, d, nt);
-                        *reinterpret_cast<int4*>(dst) =
-                            *reinterpret_cast<const int4*>(&src_new[off]);
-                    } else {
-                        const int grp = d >> 6;
-                        const float s = __half2float(
-                            stage_scale[scale_base + key_l * kGqaKvQuantGroups + grp]);
-                        *reinterpret_cast<int4*>(dst) =
-                            gqa_kv_dequant_i8x8_from(&buf[kl * D + d], s);
-                    }
-                } else {
-                    *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
-                }
-            }
-        };
-
-        load_sub(0);
-#pragma unroll 1
-        for (int s = 0; s < kSub; ++s) {
-            if (s + 1 < kSub) {
-                load_sub(s + 1);
-                qus::kernels::async_copy_wait<1>();
+        // Single-wave stage: K int8 (swizzled) + V int8 (d-contiguous) + fp16
+        // scales in one cp.async group.
+        for (int i = tid; i < Bc * Groups; i += Threads) {
+            const int key_l = i / Groups;
+            const int g     = i - key_l * Groups;
+            const int key   = k0 + key_l;
+            if (key < split_end) {
+                k_scale_s[i] = cache_k_scale[gqa_kv_quant_scale_index(kv_head, g, key,
+                                                                      padded_context)];
+                v_scale_s[i] = cache_v_scale[gqa_kv_quant_scale_index(kv_head, g, key,
+                                                                      padded_context)];
             } else {
-                qus::kernels::async_copy_wait<0>();
+                k_scale_s[i] = __float2half(0.0f);
+                v_scale_s[i] = __float2half(0.0f);
             }
-            __syncthreads();
-            convert_sub(s);
-            if (s + 1 < kSub) { __syncthreads(); } // WAR before this buffer is reloaded
+        }
+#pragma unroll 1
+        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
+            const int key_l = chunk / (D / 16);
+            const int dc    = chunk - key_l * (D / 16);
+            const int d     = dc * 16;
+            const int key   = k0 + key_l;
+            if (key < split_end) {
+                const std::int64_t off = gqa_kv_quant_code_index(kv_head, d, key, padded_context);
+                // K -> swizzled (b16 block start = swz(key_l, dc*8)); V -> d-contiguous.
+                std::int8_t* kdst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
+                qus::kernels::async_copy_global_to_shared<16>(kdst, &cache_k_i8[off]);
+                qus::kernels::async_copy_global_to_shared<16>(&v_i8[key_l * D + d],
+                                                              &cache_v_i8[off]);
+            }
+        }
+        qus::kernels::async_copy_commit();
+        qus::kernels::async_copy_wait<0>();
+        __syncthreads();
+
+        // Dequant V int8 -> bf16 tile (swizzled, PV B operand).
+#pragma unroll 1
+        for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+            const int key_l    = chunk / (D / 8);
+            const int d        = (chunk - key_l * (D / 8)) * 8;
+            __nv_bfloat16* dst = &v_bf16[key_l * D + gqa_small_t_tc_swz(key_l, d)];
+            if (k0 + key_l < split_end) {
+                const int grp = d >> 6;
+                const float s = __half2float(v_scale_s[key_l * Groups + grp]);
+                *reinterpret_cast<int4*>(dst) = gqa_kv_dequant_i8x8_from(&v_i8[key_l * D + d], s);
+            } else {
+                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+            }
         }
         __syncthreads();
 
+        // S = Q Kᵀ in int8: per 64-group two m16n8k32.s8 MMAs into int32, then
+        // rescale by qs[row,g]*ks[key,g] into the fp32 score.
         float score[QKNt][4];
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
-            score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            const int keya = nt * 8 + 2 * lid;
+            const int keyb = keya + 1;
 #pragma unroll
-            for (int k = 0; k < QKKs; ++k) {
-                unsigned bf[2];
-                const int brow = nt * 8 + b_rin;
-                const int bcol = k * 16 + b_koff;
-                gqa_small_t_tc_ldmatrix_x2(
-                    bf[0], bf[1],
-                    gqa_small_t_tc_smem_addr(&k_s[brow * D + gqa_small_t_tc_swz(brow, bcol)]));
-                gqa_small_t_tc_mma_m16n8k16_bf16(score[nt][0], score[nt][1], score[nt][2],
-                                                 score[nt][3], af_q[k][0], af_q[k][1], af_q[k][2],
-                                                 af_q[k][3], bf[0], bf[1]);
+            for (int g = 0; g < Groups; ++g) {
+                int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+#pragma unroll
+                for (int kk = 0; kk < GroupKc; ++kk) {
+                    const int k    = g * GroupKc + kk;
+                    const int brow = nt * 8 + b_rin;
+                    const int bcol = k * 16 + b_koff;
+                    unsigned bf[2];
+                    gqa_small_t_tc_ldmatrix_x2(
+                        bf[0], bf[1],
+                        gqa_small_t_tc_smem_addr(&k_b16[brow * DB16 +
+                                                        gqa_small_t_tc_swz(brow, bcol)]));
+                    gqa_small_t_tc_mma_m16n8k32_s8(c0, c1, c2, c3, af_q[k][0], af_q[k][1],
+                                                   af_q[k][2], af_q[k][3], bf[0], bf[1]);
+                }
+                const float qg0 = q_scale_s[(warp_row0 + gid) * Groups + g];
+                const float qg1 = q_scale_s[(warp_row0 + gid + 8) * Groups + g];
+                const float ka  = __half2float(k_scale_s[keya * Groups + g]);
+                const float kb2 = __half2float(k_scale_s[keyb * Groups + g]);
+                s0 += qg0 * ka * static_cast<float>(c0);
+                s1 += qg0 * kb2 * static_cast<float>(c1);
+                s2 += qg1 * ka * static_cast<float>(c2);
+                s3 += qg1 * kb2 * static_cast<float>(c3);
             }
+            score[nt][0] = s0;
+            score[nt][1] = s1;
+            score[nt][2] = s2;
+            score[nt][3] = s3;
         }
 
         const int row0 = warp_row0 + gid;
@@ -352,13 +365,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0 = nt * 8 + 2 * lid;
-            const int col1 = col0 + 1;
-            const int key0 = k0 + col0;
-            const int key1 = col1 + k0;
-            // Both bf16 and int8 read the current-step tokens from k_new/v_new, so the
-            // causal mask is identical: drop keys past the query and any batch-mate new
-            // token that sits after this row's own token.
+            const int col0       = nt * 8 + 2 * lid;
+            const int col1       = col0 + 1;
+            const int key0       = k0 + col0;
+            const int key1       = col1 + k0;
             const int new_token0 = key0 - first_pos;
             const int new_token1 = key1 - first_pos;
             const bool from_new0 = new_token0 >= 0 && new_token0 < tokens && key0 >= first_pos;
@@ -449,7 +459,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
                 const int vcol = n * 8;
                 gqa_small_t_tc_ldmatrix_x2_trans(
                     vf[0], vf[1],
-                    gqa_small_t_tc_smem_addr(&v_s[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
+                    gqa_small_t_tc_smem_addr(&v_bf16[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
                 gqa_small_t_tc_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0],
                                                  pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
@@ -476,8 +486,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
         }
     }
 
-    // MMA fragments hold each row in four-lane groups. Stage the final split-local
-    // accumulator through shared memory so partial_acc is written as contiguous d-vector stores.
+    // Stage the final split-local accumulator through the reused arena so
+    // partial_acc is written as contiguous d-vector stores.
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
         const int d0   = n * 8 + 2 * lid;
@@ -485,12 +495,12 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
         const int row0 = warp_row0 + gid;
         const int row1 = row0 + 8;
         if (row0 < row_count) {
-            qkv_s[row0 * D + d0] = __float2bfloat16(acc[n][0]);
-            qkv_s[row0 * D + d1] = __float2bfloat16(acc[n][1]);
+            acc_bf16[row0 * D + d0] = __float2bfloat16(acc[n][0]);
+            acc_bf16[row0 * D + d1] = __float2bfloat16(acc[n][1]);
         }
         if (row1 < row_count) {
-            qkv_s[row1 * D + d0] = __float2bfloat16(acc[n][2]);
-            qkv_s[row1 * D + d1] = __float2bfloat16(acc[n][3]);
+            acc_bf16[row1 * D + d0] = __float2bfloat16(acc[n][2]);
+            acc_bf16[row1 * D + d1] = __float2bfloat16(acc[n][3]);
         }
     }
     __syncthreads();
@@ -504,7 +514,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_i8_ke
         if (gqa_valid_q_head(kv_head, q_head)) {
             const std::int64_t dst = gqa_partial_acc_index(q_head, d, token, split, tokens);
             *reinterpret_cast<int4*>(&partial_acc[dst]) =
-                *reinterpret_cast<const int4*>(&qkv_s[row * D + d]);
+                *reinterpret_cast<const int4*>(&acc_bf16[row * D + d]);
         }
     }
 }

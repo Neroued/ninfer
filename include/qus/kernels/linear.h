@@ -20,4 +20,18 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws, c
 void linear_w8g32_kv_pair(const Tensor& x, const Weight& k_weight, const Weight& v_weight,
                           Tensor& k_out, Tensor& v_out, WorkspaceArena& ws, cudaStream_t stream);
 
+// Text full-attention prefill input projection.  Large-T maps the four Q4/Q5
+// projections into one CTA-grouped launch; Small-T retains the normal linear
+// dispatch.
+void linear_attn_input_grouped(const Tensor& x, const Weight& q_weight, const Weight& gate_weight,
+                               const Weight& k_weight, const Weight& v_weight, Tensor& q,
+                               Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena& ws,
+                               cudaStream_t stream);
+
+// Text GDN prefill q/k/v projection. qk_weight is the existing fused Q4
+// [4096,5120] block; the grouped kernel writes Q4 q/k and Q5 v directly into
+// the contiguous [10240,T] qkv tensor.
+void linear_gdn_input_grouped(const Tensor& x, const Weight& qk_weight, const Weight& v_weight,
+                              Tensor& qkv, WorkspaceArena& ws, cudaStream_t stream);
+
 } // namespace qus::kernels

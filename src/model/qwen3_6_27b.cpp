@@ -171,18 +171,6 @@ MtpW bind_mtp(const WeightStore& store) {
     };
 }
 
-void copy_bf16_block(const Tensor& src, Tensor& dst, int dst_channel, cudaStream_t stream) {
-    const std::size_t elem_size = dtype_size(DType::BF16);
-    const std::size_t width     = static_cast<std::size_t>(src.ne[0]) * elem_size;
-    const std::size_t src_pitch = static_cast<std::size_t>(src.ne[0]) * elem_size;
-    const std::size_t dst_pitch = static_cast<std::size_t>(dst.ne[0]) * elem_size;
-    auto* dst_ptr =
-        static_cast<unsigned char*>(dst.data) + static_cast<std::size_t>(dst_channel) * elem_size;
-    CUDA_CHECK(cudaMemcpy2DAsync(dst_ptr, dst_pitch, src.data, src_pitch, width,
-                                 static_cast<std::size_t>(src.ne[1]), cudaMemcpyDeviceToDevice,
-                                 stream));
-}
-
 void extract_bf16_block(const Tensor& src, int src_channel, Tensor& dst, cudaStream_t stream) {
     const std::size_t elem_size = dtype_size(DType::BF16);
     const std::size_t width     = static_cast<std::size_t>(dst.ne[0]) * elem_size;
@@ -584,8 +572,7 @@ void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
     Tensor k_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
     Tensor v_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
-    kernels::linear_w8g32_kv_pair(
-        ah, *mtp_.k_proj, *mtp_.v_proj, k_flat, v_flat, work_, s);
+    kernels::linear_w8g32_kv_pair(ah, *mtp_.k_proj, *mtp_.v_proj, k_flat, v_flat, work_, s);
     Tensor k  = k_flat.view({kCfg.head_dim, kCfg.n_kv, T});
     Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
     Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
@@ -794,10 +781,8 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    kernels::linear(h, *w.q_proj, q_flat, work_, s);
-    kernels::linear(h, *w.gate_proj, gate_flat, work_, s);
-    kernels::linear(h, *w.k_proj, k_flat, work_, s);
-    kernels::linear(h, *w.v_proj, v_flat, work_, s);
+    kernels::linear_attn_input_grouped(h, *w.q_proj, *w.gate_proj, *w.k_proj, *w.v_proj, q_flat,
+                                       gate_flat, k_flat, v_flat, work_, s);
 
     Tensor qn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
     Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
@@ -810,9 +795,7 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     kernels::gqa_attention(qn, kn, v, positions, kAttnScale, kv_, fidx, work_, a, s);
     kernels::sigmoid_gate_mul(gate, a, s);
 
-    Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, T});
-    kernels::linear(a.view({kCfg.q_size, T}), *w.o_proj, o, work_, s);
-    kernels::residual_add(o, x, s);
+    kernels::linear_residual_add(a.view({kCfg.q_size, T}), *w.o_proj, x, work_, s);
 }
 
 void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
@@ -873,17 +856,8 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         return;
     }
 
-    Tensor q = work_.alloc(DType::BF16, {kCfg.key_dim, T});
-    Tensor k = work_.alloc(DType::BF16, {kCfg.key_dim, T});
-    Tensor v = work_.alloc(DType::BF16, {kCfg.value_dim, T});
-    kernels::linear(h, *w.in_q, q, work_, s);
-    kernels::linear(h, *w.in_k, k, work_, s);
-    kernels::linear(h, *w.in_v, v, work_, s);
-
     Tensor qkv = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
-    copy_bf16_block(q, qkv, 0, s);
-    copy_bf16_block(k, qkv, kCfg.key_dim, s);
-    copy_bf16_block(v, qkv, 2 * kCfg.key_dim, s);
+    kernels::linear_gdn_input_grouped(h, *w.in_qk_q4, *w.in_v, qkv, work_, s);
 
     Tensor qkv_c = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
     if (ph == Phase::Verify) {
@@ -936,36 +910,20 @@ void Qwen3_6_27B::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor on = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     kernels::rmsnorm(o, *w.gdn_norm, kCfg.rms_eps, false, &z, on, s);
 
-    Tensor out = work_.alloc(DType::BF16, {kCfg.hidden, T});
-    kernels::linear(on.view({kCfg.value_dim, T}), *w.out_proj, out, work_, s);
-    kernels::residual_add(out, x, s);
+    kernels::linear_residual_add(on.view({kCfg.value_dim, T}), *w.out_proj, x, work_, s);
 }
 
 void Qwen3_6_27B::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    (void)ph;
 
     Tensor h = work_.alloc(DType::BF16, {kCfg.hidden, T});
     kernels::rmsnorm(x, *post_norm, kCfg.rms_eps, true, nullptr, h, s);
 
-    if (ph == Phase::Decode) {
-        Tensor a = work_.alloc(DType::BF16, {kCfg.intermediate, 1});
-        kernels::mlp_gate_up_silu_decode(h, *m.gate_up, a, s);
-
-        kernels::linear_residual_add(a, *m.down, x, work_, s);
-        return;
-    }
-
-    Tensor gate_up = work_.alloc(DType::BF16, {2 * kCfg.intermediate, T});
-    kernels::linear(h, *m.gate_up, gate_up, work_, s);
-
     Tensor a = work_.alloc(DType::BF16, {kCfg.intermediate, T});
-    kernels::silu_and_mul(gate_up.slice(0, 0, kCfg.intermediate),
-                          gate_up.slice(0, kCfg.intermediate, kCfg.intermediate), a, s);
-
-    Tensor d = work_.alloc(DType::BF16, {kCfg.hidden, T});
-    kernels::linear(a, *m.down, d, work_, s);
-    kernels::residual_add(d, x, s);
+    kernels::mlp_gate_up_silu(h, *m.gate_up, a, work_, s);
+    kernels::linear_residual_add(a, *m.down, x, work_, s);
 }
 
 template <class Tap>

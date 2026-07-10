@@ -15,6 +15,18 @@ void linear_rowsplit_gemm_smallt_launch(const Tensor& x, const Weight& w, Tensor
 // LargeT (T > tau) tensor-core path: bf16 mma.sync with on-chip low-bit dequant.
 void linear_rowsplit_gemm_mma_launch(const Tensor& x, const Weight& w, Tensor& out,
                                      LinearFormat fmt, cudaStream_t stream);
+void linear_rowsplit_gemm_mma_residual_q5_launch(const Tensor& x, const Weight& w,
+                                                 Tensor& residual_out, cudaStream_t stream);
+void linear_rowsplit_attn_input_grouped_mma_launch(const Tensor& x, const Weight& q_weight,
+                                                   const Weight& gate_weight,
+                                                   const Weight& k_weight, const Weight& v_weight,
+                                                   Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
+                                                   cudaStream_t stream);
+void linear_rowsplit_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
+                                                  const Weight& v_weight, Tensor& qkv,
+                                                  cudaStream_t stream);
+void linear_rowsplit_q4_gate_up_silu_gemm_mma_launch(const Tensor& x, const Weight& weight,
+                                                     Tensor& out, cudaStream_t stream);
 void linear_rowsplit_w8g32_gemm_mma_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream);
 void linear_rowsplit_w8g32_kv_gemm_mma_launch(const Tensor& x, const Weight& k_weight,

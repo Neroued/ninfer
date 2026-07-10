@@ -65,30 +65,27 @@ void launch_tc_partial_bf16(const Tensor& q, const Tensor& k, const Tensor& v, c
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int TokenTile, int WarpsPerCta>
+template <int TokenTile>
 void launch_tc_partial_i8(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
                           float scale, KVCache& kv, int layer, std::int32_t padded_context,
                           std::int32_t max_context, std::int32_t window, Tensor& partial_acc,
                           Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-    constexpr int kBlock = 32 * WarpsPerCta;
-    const int tokens     = q.ne[2];
-    const int splits     = gqa_small_t_split_upper_bound(window);
+    const int splits = gqa_small_t_split_upper_bound(window);
     const dim3 grid(kGqaKVHeads, splits, 1);
-    Tensor& cache_k       = kv.k[static_cast<std::uint32_t>(layer)];
-    Tensor& cache_v       = kv.v[static_cast<std::uint32_t>(layer)];
-    Tensor& cache_k_scale = kv.k_scale[static_cast<std::uint32_t>(layer)];
-    Tensor& cache_v_scale = kv.v_scale[static_cast<std::uint32_t>(layer)];
-    // int8-native kernel: K/V int8 tiles + one bf16 V tile + P + scales fit in
-    // ~37.5 KB of static smem (< 48 KB non-opt-in limit), 2 blocks/SM on sm_120.
-    gqa_attention_small_t_tc_partial_i8_kernel<TokenTile, WarpsPerCta>
-        <<<grid, kBlock, 0, stream>>>(
+    Tensor& cache_k            = kv.k[static_cast<std::uint32_t>(layer)];
+    Tensor& cache_v            = kv.v[static_cast<std::uint32_t>(layer)];
+    Tensor& cache_k_scale      = kv.k_scale[static_cast<std::uint32_t>(layer)];
+    Tensor& cache_v_scale      = kv.v_scale[static_cast<std::uint32_t>(layer)];
+    constexpr int kTiledWarps  = (TokenTile == 6) ? 6 : 8;
+    constexpr int kMinBlocksSm = 2;
+    gqa_attention_decode_i8_tiled_kernel<TokenTile, kTiledWarps, kMinBlocksSm>
+        <<<grid, kTiledWarps * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data), static_cast<const __nv_bfloat16*>(k.data),
             static_cast<const __nv_bfloat16*>(v.data), static_cast<const std::int32_t*>(pos.data),
             static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
             static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
-            tokens, padded_context, max_context, scale,
-            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
-            static_cast<float*>(partial_l.data));
+            padded_context, max_context, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -108,19 +105,19 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
     // real max_context for cache-bounds checks.
     const auto window = static_cast<std::int32_t>(kv.pos) + q.ne[2];
 
-    // Dispatch to the fully separate bf16 / int8 kernels. WarpsPerCta per T is the
-    // same for both formats.
-#define QUS_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                     \
-    do {                                                                                            \
-        if (kv.dtype == DType::I8) {                                                                \
-            launch_tc_partial_i8<(TOKENS), (WARPS)>(q, k, v, pos, scale, kv, layer, padded_context, \
-                                                    max_context, window, partial_acc, partial_m,    \
-                                                    partial_l, stream);                             \
-        } else {                                                                                    \
-            launch_tc_partial_bf16<(TOKENS), (WARPS)>(q, k, v, pos, scale, kv, layer,               \
-                                                      padded_context, max_context, window,          \
-                                                      partial_acc, partial_m, partial_l, stream);   \
-        }                                                                                           \
+    // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
+    // geometry inside launch_tc_partial_i8.
+#define QUS_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                    \
+    do {                                                                                           \
+        if (kv.dtype == DType::I8) {                                                               \
+            launch_tc_partial_i8<(TOKENS)>(q, k, v, pos, scale, kv, layer, padded_context,         \
+                                           max_context, window, partial_acc, partial_m, partial_l, \
+                                           stream);                                                \
+        } else {                                                                                   \
+            launch_tc_partial_bf16<(TOKENS), (WARPS)>(q, k, v, pos, scale, kv, layer,              \
+                                                      padded_context, max_context, window,         \
+                                                      partial_acc, partial_m, partial_l, stream);  \
+        }                                                                                          \
     } while (0)
 
     switch (q.ne[2]) {

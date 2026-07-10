@@ -9,7 +9,9 @@
 
 namespace qus::kernels {
 
-inline constexpr int kGqaDecodeSplits = 192;
+// The long-context grid is four KV heads × 85 splits = 340 CTAs, matching two
+// CTA slots per SM on the RTX 5090's 170 SMs.
+inline constexpr int kGqaDecodeSplits = 85;
 
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    float scale, KVCache& kv, int layer, WorkspaceArena& ws, Tensor& out,

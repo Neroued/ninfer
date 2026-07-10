@@ -181,4 +181,4 @@ python tools/bench/flash_attn_gqa_bench.py --verify --verify-tokens 1,2,3,4 \
 
 Output correctness is independent of the split count (the partial kernel uses the
 device `positions` and the reduce handles any active count; the workspace is sized
-for the 192 cap), so the fix is a pure scheduling change.
+for the 85 cap), so the fix is a pure scheduling change.

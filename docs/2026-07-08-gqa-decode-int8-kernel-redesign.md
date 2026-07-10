@@ -1,12 +1,42 @@
 # GQA int8 decode kernel redesign — int8-native tensor core, occupancy-first
 
 Date: 2026-07-08
-Status: design + implementation plan (implementation starting)
-Scope: L1 `gqa_attention_small_t_tc_partial_i8_kernel`
+Status: implemented; final occupancy-first architecture landed 2026-07-10
+Scope: L1 `gqa_attention_decode_i8_tiled_kernel`
 (`src/kernels/kernel/gqa_attention_decode_i8.cuh`), the shared scaffolding it uses
 (`gqa_attention_decode.cuh`), and the int8 decode parity oracle in
 `tests/kernels/test_gqa_attention.cpp`. The bf16 decode kernel and the prefill
 kernels are **not** touched.
+
+## Implementation outcome (2026-07-10)
+
+The first native-s8 implementation still carried a full 256-wide PV accumulator
+in every warp. NCU measured 246–248 registers/thread, at most eight warps/SM,
+and 41.7–52.5% DRAM throughput. The final implementation replaces it directly
+with `gqa_attention_decode_i8_tiled_kernel`:
+
+- one producer warp per m16 query-row tile computes native-s8 QK and online
+  softmax;
+- all CTA warps partition the 256-wide PV output, reducing each thread's live PV
+  accumulator from 128 floats to 16, 32, or 64;
+- Q fragments are reloaded one 64-dimension group at a time instead of keeping
+  all groups live in registers;
+- K/V codes and scales use `cp.async`, V dequant overlaps QK, and the next K/V
+  tile is prefetched while current PV executes;
+- T=1..5 use eight warps; T=6 uses six warps with two resident CTAs/SM;
+- `kGqaDecodeSplits` is 85, so the long-context grid is 340 CTAs on the RTX
+  5090's 170 SMs.
+
+At T=1/context=131072 the final benchmark reports 188.82 us and 1466.1 GB/s of
+logical useful-KV traffic, versus 1487.7 GB/s aggregate modeled traffic for the
+same benchmark's stream-copy ceiling. NCU reports 73.58% DRAM SOL for attention
+and 81.04% for that copy kernel (90.8% of the profiler-observed copy SOL).
+The detailed capture reports 1.29 TB/s memory throughput, zero local/shared
+spills, 15.9 active warps/SM, and long-scoreboard waits as the remaining leading
+stall (35.0%).
+Real-weight `pp32768+tg32` improves from 40.07 tok/s with bf16 KV to 54.39 tok/s
+with int8 KV. The sections below retain the original Phase-1 rationale; their
+old kernel layout, 192-split assumption, and task checklist are historical.
 
 ---
 
@@ -60,8 +90,8 @@ Two phases:
 - No change to the int8 KV cache format (per-token, group-wise g=64, one fp16
   scale/group). The kernel consumes the fixed format.
 - No FP8 path, no int4, no per-channel-across-sequence K.
-- No change to the split-KV grid schedule (`kGqaDecodeSplits = 192`), the reducer
-  kernel, the launcher signature, or the public `gqa_attention` API.
+- No change to the reducer kernel, launcher signature, or public
+  `gqa_attention` API.
 - Phase-2 full-int8 PV is out of scope for the first landing.
 
 ---

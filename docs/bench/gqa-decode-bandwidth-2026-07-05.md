@@ -1,5 +1,9 @@
 # GQA decode bandwidth implementation evidence - 2026-07-05
 
+> Historical bf16 baseline. The int8 producer/consumer kernel, 85-split cap,
+> and current measurements are documented in
+> `docs/2026-07-08-gqa-decode-int8-kernel-redesign.md`.
+
 Design source: `docs/2026-07-05-gqa-decode-bandwidth-design.md`.
 
 ## Route selected

@@ -2,6 +2,10 @@
 
 Date: 2026-07-05
 
+> Historical bf16 roofline record. The current int8 tiled kernel and profiler
+> evidence are summarized in
+> `docs/2026-07-08-gqa-decode-int8-kernel-redesign.md`.
+
 Target kernel:
 `gqa_attention_small_t_tc_partial_kernel<4,4>`
 

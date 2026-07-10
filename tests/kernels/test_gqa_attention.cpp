@@ -5,7 +5,6 @@
 #include "qus/core/arena.h"
 #include "qus/core/kv_cache.h"
 #include "qus/kernels/gqa_attention.h"
-#include "kernels/launcher/gqa_attention.h"
 #include "kernels/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -368,6 +367,50 @@ std::vector<float> dequantize_cache_bf16(const std::vector<std::int8_t>& code,
     return out;
 }
 
+std::vector<float> dequantize_cache_f32(const std::vector<std::int8_t>& code,
+                                        const std::vector<std::uint16_t>& scale,
+                                        std::int32_t padded_context) {
+    std::vector<float> out(code.size(), 0.0f);
+    for (std::int32_t kv_head = 0; kv_head < kKVHeads; ++kv_head) {
+        for (std::int32_t position = 0; position < padded_context; ++position) {
+            for (std::int32_t group = 0; group < kKvQuantGroups; ++group) {
+                const float s =
+                    f16_bits_to_f32(scale[scale_index(kv_head, group, position, padded_context)]);
+                for (std::int32_t i = 0; i < kKvQuantGroup; ++i) {
+                    const std::int32_t d  = group * kKvQuantGroup + i;
+                    const std::size_t idx = cache_index(kv_head, d, position, padded_context);
+                    out[idx]              = static_cast<float>(code[idx]) * s;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<float> quantize_query_i8_roundtrip(const std::vector<float>& q, std::int32_t tokens) {
+    std::vector<float> out(q.size(), 0.0f);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t q_head = 0; q_head < kQHeads; ++q_head) {
+            for (std::int32_t group = 0; group < kKvQuantGroups; ++group) {
+                const std::int32_t d0 = group * kKvQuantGroup;
+                float absmax          = 0.0f;
+                for (std::int32_t i = 0; i < kKvQuantGroup; ++i) {
+                    absmax = std::max(absmax, std::abs(q[q_index(q_head, d0 + i, token)]));
+                }
+                const float scale = absmax > 0.0f ? absmax / 127.0f : 0.0f;
+                const float inv   = scale > 0.0f ? 1.0f / scale : 0.0f;
+                for (std::int32_t i = 0; i < kKvQuantGroup; ++i) {
+                    const std::size_t idx = q_index(q_head, d0 + i, token);
+                    int code = inv > 0.0f ? static_cast<int>(std::nearbyint(q[idx] * inv)) : 0;
+                    code     = std::max(-127, std::min(127, code));
+                    out[idx] = static_cast<float>(code) * scale;
+                }
+            }
+        }
+    }
+    return out;
+}
+
 void cache_to_kv_tokens(const std::vector<float>& cache, std::int32_t tokens,
                         std::int32_t padded_context, std::vector<float>& kv) {
     kv.assign(static_cast<std::size_t>(kHeadDim) * kKVHeads * static_cast<std::size_t>(tokens),
@@ -474,9 +517,9 @@ int one_int8_decode_case(std::int32_t base, std::int32_t tokens, std::uint32_t s
     const std::size_t scale_n         = scale_elements(padded_context);
 
     std::vector<float> history_k(static_cast<std::size_t>(kHeadDim) * kKVHeads *
-                                static_cast<std::size_t>(base));
+                                 static_cast<std::size_t>(base));
     std::vector<float> history_v(static_cast<std::size_t>(kHeadDim) * kKVHeads *
-                                static_cast<std::size_t>(base));
+                                 static_cast<std::size_t>(base));
     std::vector<float> q(qn), k_new(kvn), v_new(kvn);
     fill_uniform(history_k, seed, -0.25f, 0.25f);
     fill_uniform(history_v, seed + 1000u, -1.0f, 1.0f);
@@ -511,13 +554,11 @@ int one_int8_decode_case(std::int32_t base, std::int32_t tokens, std::uint32_t s
     cpu_quantize_append(k_new, v_new, new_positions, false, tokens, padded_context, expected_k,
                         expected_v, expected_k_scale, expected_v_scale);
 
-    // The int8-native decode kernel reads EVERY key (history and the current/diagonal
-    // tokens) back from the quantized cache, so the reference must apply the int8
-    // round-trip to the new tokens too (not the raw bf16 values). History comes from
-    // the dequantized initial cache; cpu_gqa_prefill overwrites [base, base+tokens)
-    // with the dequantized new tokens (extracted from the full quantized cache).
+    // Native s8 QK uses an fp32-scale int8 Q round-trip and exact int8*scale K
+    // values. PV consumes V after its int8*fp16-scale value is rounded to bf16.
+    // Every key, including the newly appended diagonal, comes back from the cache.
     std::vector<float> full_cache_k =
-        dequantize_cache_bf16(expected_k, expected_k_scale, padded_context);
+        dequantize_cache_f32(expected_k, expected_k_scale, padded_context);
     std::vector<float> full_cache_v =
         dequantize_cache_bf16(expected_v, expected_v_scale, padded_context);
     std::vector<float> k_deq_new(kvn), v_deq_new(kvn);
@@ -532,13 +573,14 @@ int one_int8_decode_case(std::int32_t base, std::int32_t tokens, std::uint32_t s
         }
     }
     std::vector<float> ref_cache_k =
-        dequantize_cache_bf16(initial_k, initial_k_scale, padded_context);
+        dequantize_cache_f32(initial_k, initial_k_scale, padded_context);
     std::vector<float> ref_cache_v =
         dequantize_cache_bf16(initial_v, initial_v_scale, padded_context);
+    const std::vector<float> q_roundtrip = quantize_query_i8_roundtrip(q, tokens);
     std::vector<float> ignored_k, ignored_v;
     std::vector<double> ref;
-    cpu_gqa_prefill(q, k_deq_new, v_deq_new, ref_cache_k, ref_cache_v, tokens, base, padded_context,
-                    ignored_k, ignored_v, ref);
+    cpu_gqa_prefill(q_roundtrip, k_deq_new, v_deq_new, ref_cache_k, ref_cache_v, tokens, base,
+                    padded_context, ignored_k, ignored_v, ref);
 
     DBuf dq   = to_device_bf16(q);
     DBuf dk   = to_device_bf16(k_new);
@@ -1128,9 +1170,8 @@ int main(int argc, char** argv) {
     }
 
     int f = 0;
-    // T<=6 routes to the small-t decode kernel (fused append + full-precision
-    // from_new diagonal); T>6 exercises the prefill kernel (reads all from the
-    // quantized cache). Cover both with their route-correct references.
+    // T<=6 routes to the native-int8 small-T decode kernel; T>6 exercises the
+    // bf16-MMA prefill kernel. Cover both with their route-correct references.
     f += one_int8_decode_case(0, 6, 903u);
     f += one_int8_prefill_case(65, 904u);
     f += one_int8_prefill_case(192, 911u);
@@ -1140,6 +1181,7 @@ int main(int argc, char** argv) {
     f += one_int8_decode_case(100, 3, 908u);
     f += one_int8_decode_case(100, 4, 909u);
     f += one_int8_decode_case(2048, 4, 910u);
+    f += one_int8_decode_case(100, 5, 912u);
     for (std::int32_t tokens = 1; tokens <= 6; ++tokens) {
         f += one_prefill_case(tokens, 100u + static_cast<std::uint32_t>(tokens), 0);
         f += one_prefill_case(tokens, 200u + static_cast<std::uint32_t>(tokens), 1);
@@ -1158,7 +1200,10 @@ int main(int argc, char** argv) {
     f += one_decode_case(2048, 23u);
     f += one_decode_case(2882, 29u);
     f += one_decode_case(8191, 37u);
-    if (long_decode) { f += one_decode_case(32768, 41u); }
+    if (long_decode) {
+        f += one_decode_case(32768, 41u);
+        f += one_int8_decode_case(40800, 1, 913u);
+    }
     f += one_decode_case(17, 31u, DecodeInputMode::Stress);
     f += one_future_token_isolation_case();
     f += one_graph_relaunch_positions_case();

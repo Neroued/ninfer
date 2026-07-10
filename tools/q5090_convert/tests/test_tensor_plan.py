@@ -4,7 +4,7 @@ import torch
 
 from .. import qtypes as qt
 from .. import tensor_plan as tp
-from ..convert import _prepare_source
+from ..convert import _prepare_source, build_conversion_plan
 from ..layouts import encode_tensor
 
 
@@ -204,16 +204,14 @@ def test_globals_are_standalone_text_blocks():
     assert lm_head.shape == (248320, 5120)
 
 
-def test_draft_head_blocks_appended_when_requested():
-    base = tp.build_text_manifest(_canonical_layer_types())
+def test_draft_head_is_an_independent_module_manifest():
     n = 131072
-    dm = tp.build_text_manifest(_canonical_layer_types(), draft_head_n=n)
+    dm = tp.build_lm_head_draft_manifest(n)
 
-    assert len(dm.blocks) == len(base.blocks) + 2
-    assert len(dm.segments) == len(base.segments) + 2
-    assert len(dm.fusion_groups) == len(base.fusion_groups)
-    assert [b.name for b in dm.blocks[-3:]] == [
-        "lm_head.weight",
+    assert len(dm.blocks) == 2
+    assert len(dm.segments) == 2
+    assert len(dm.fusion_groups) == 0
+    assert [b.name for b in dm.blocks] == [
         "lm_head_draft",
         "lm_head_draft.idmap",
     ]
@@ -222,7 +220,7 @@ def test_draft_head_blocks_appended_when_requested():
     assert weights.qtype == qt.QT_Q4G64
     assert weights.layout == qt.LAYOUT_ROW_SPLIT
     assert weights.shape == (n, 5120)
-    assert weights.module_kind == qt.MODULE_TEXT
+    assert weights.module_kind == qt.MODULE_LM_HEAD_DRAFT
     assert weights.source_kind == qt.SK_LM_HEAD_DRAFT
     assert weights.source_layer == qt.NO_LAYER
     assert weights.fusion_group_id == qt.FUSION_NONE
@@ -232,7 +230,7 @@ def test_draft_head_blocks_appended_when_requested():
     assert idmap.qtype == qt.QT_I32
     assert idmap.layout == qt.LAYOUT_CONTIGUOUS
     assert idmap.shape == (n,)
-    assert idmap.module_kind == qt.MODULE_TEXT
+    assert idmap.module_kind == qt.MODULE_LM_HEAD_DRAFT
     assert idmap.source_kind == qt.SK_LM_HEAD_DRAFT_IDMAP
     assert idmap.source_layer == qt.NO_LAYER
     assert idmap.segments[0].source.synthetic == "draft_idmap"
@@ -243,6 +241,36 @@ def test_draft_head_default_manifest_has_no_draft_blocks():
     names = {b.name for b in base.blocks}
     assert "lm_head_draft" not in names
     assert "lm_head_draft.idmap" not in names
+
+
+def test_draft_head_manifest_rejects_invalid_size():
+    for n in (0, -1, tp.VOCAB_SIZE + 1):
+        try:
+            tp.build_lm_head_draft_manifest(n)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted invalid draft-head N={n}")
+
+
+def test_conversion_plan_uses_v4_1_canonical_module_order():
+    cfg = {"layer_types": _canonical_layer_types()}
+    plan = build_conversion_plan(cfg, draft_head_n=131072)
+    assert [module.module_kind for module in plan.modules] == [
+        qt.MODULE_TEXT,
+        qt.MODULE_LM_HEAD_DRAFT,
+        qt.MODULE_MTP,
+        qt.MODULE_VISION,
+    ]
+    assert [(module.tensor_index_begin, module.tensor_index_count) for module in plan.modules] == [
+        (0, 819),
+        (819, 2),
+        (821, 12),
+        (833, 333),
+    ]
+    assert len(plan.blocks) == 1166
+    assert len(plan.segments) == 1314
+    assert len(plan.fusion_groups) == 130
 
 
 def test_mtp_manifest_counts_order_and_fusions():

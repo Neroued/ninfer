@@ -210,7 +210,7 @@ def test_i32_ctrl_contiguous_roundtrip():
     assert got.cpu().tolist() == ids.tolist()
 
 
-def test_v4_records_pack_unpack_and_string_table():
+def test_v4_1_records_pack_unpack_and_string_table():
     entry = fmt.TensorEntry(
         name="block.q4",
         qtype=qt.QT_Q4G64,
@@ -286,12 +286,33 @@ def test_v4_records_pack_unpack_and_string_table():
     assert parsed_fusion["total_n"] == 384
     assert parsed_fusion["shared_k"] == 128
 
-    module = fmt.ModuleRecord(qt.MODULE_TEXT, fmt.VERSION, 0, 1, 8192, 9984, qt.LOAD_RESIDENT)
+    module = fmt.ModuleRecord(qt.MODULE_TEXT, fmt.VERSION, 0, 1, 8192, 9984)
     packed_module = fmt.pack_module_record(module)
     assert len(packed_module) == fmt.MODULE_RECORD_SIZE
     parsed_module = fmt.unpack_module_record(packed_module)
     assert parsed_module["module_version"] == fmt.VERSION
     assert parsed_module["payload_bytes"] == 9984
+    assert parsed_module["reserved0"] == 0
+    assert parsed_module["reserved1"] == 0
+
+    tokenizer_record = fmt.TokenizerRecord(
+        kind=fmt.TOKENIZER_JSON,
+        encoding=fmt.TOKENIZER_RAW_UTF8,
+        data_offset=7040,
+        data_bytes=123,
+        crc32=0xABCDEF01,
+        sha256=b"\x22" * 32,
+    )
+    packed_tokenizer = fmt.pack_tokenizer_record(tokenizer_record)
+    assert len(packed_tokenizer) == fmt.TOKENIZER_RECORD_SIZE
+    parsed_tokenizer = fmt.unpack_tokenizer_record(packed_tokenizer)
+    assert parsed_tokenizer["kind"] == fmt.TOKENIZER_JSON
+    assert parsed_tokenizer["encoding"] == fmt.TOKENIZER_RAW_UTF8
+    assert parsed_tokenizer["data_offset"] == 7040
+    assert parsed_tokenizer["data_bytes"] == 123
+    assert parsed_tokenizer["crc32"] == 0xABCDEF01
+    assert parsed_tokenizer["reserved"] == 0
+    assert parsed_tokenizer["sha256"] == b"\x22" * 32
 
     header = fmt.FileHeaderFields(
         tensor_count=1,
@@ -326,10 +347,14 @@ def test_v4_records_pack_unpack_and_string_table():
         fusion_group_index_offset=6208,
         fusion_group_index_bytes=fmt.FUSION_GROUP_RECORD_SIZE,
         sha256_safetensors_index=b"\x11" * 32,
+        tokenizer_index_offset=6272,
+        tokenizer_index_bytes=3 * fmt.TOKENIZER_RECORD_SIZE,
+        tokenizer_data_offset=6464,
+        tokenizer_data_bytes=321,
     )
     packed_header = fmt.pack_header(header)
     assert len(packed_header) == fmt.HEADER_SIZE
-    assert packed_header[236:] == b"\x00" * (fmt.HEADER_SIZE - 236)
+    assert packed_header[280:] == b"\x00" * (fmt.HEADER_SIZE - 280)
     parsed_header = fmt.unpack_header(packed_header)
     assert parsed_header["magic"] == fmt.MAGIC
     assert parsed_header["version"] == fmt.VERSION
@@ -337,7 +362,12 @@ def test_v4_records_pack_unpack_and_string_table():
     assert parsed_header["fusion_group_count"] == 1
     assert parsed_header["segment_index_offset"] == 6144
     assert parsed_header["fusion_group_index_bytes"] == fmt.FUSION_GROUP_RECORD_SIZE
-    assert parsed_header["format_minor"] == 0
+    assert parsed_header["format_minor"] == 1
+    assert parsed_header["tokenizer_record_count"] == 3
+    assert parsed_header["tokenizer_record_size"] == 64
+    assert parsed_header["tokenizer_index_offset"] == 6272
+    assert parsed_header["tokenizer_data_offset"] == 6464
+    assert parsed_header["tokenizer_data_bytes"] == 321
     assert parsed_header["sha256_safetensors_index"] == b"\x11" * 32
 
 

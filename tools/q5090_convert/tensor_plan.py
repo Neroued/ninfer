@@ -386,10 +386,7 @@ def _append_fusion_group(
     )
 
 
-def build_text_manifest(
-    layer_types: List[str],
-    draft_head_n: Optional[int] = None,
-) -> ExpectedManifest:
+def build_text_manifest(layer_types: List[str]) -> ExpectedManifest:
     blocks: List[TensorBlockSpec] = []
     segments: List[TensorSegmentSpec] = []
     fusion_groups: List[TensorFusionGroupSpec] = []
@@ -820,36 +817,40 @@ def build_text_manifest(
         qt.SK_LM_HEAD,
     )
 
-    if draft_head_n is not None:
-        # Optional shortlisted draft lm_head (§14/§18): a Q4G64 [N,5120] block of
-        # the frequency-selected lm_head rows plus a paired int32 [N] id-map. Both
-        # are synthetic: their rows are computed by the converter from the ranking
-        # + original bf16 lm_head, not read verbatim from a safetensors key. The
-        # placeholder src_name keeps the (already-required) lm_head.weight present.
-        _append_standalone_block(
-            blocks,
-            segments,
-            "lm_head_draft",
-            qt.QT_Q4G64,
-            qt.LAYOUT_ROW_SPLIT,
-            (draft_head_n, HIDDEN_SIZE),
-            "lm_head.weight",
-            qt.SK_LM_HEAD_DRAFT,
-            synthetic="draft_weights",
-        )
-        _append_standalone_block(
-            blocks,
-            segments,
-            "lm_head_draft.idmap",
-            qt.QT_I32,
-            qt.LAYOUT_CONTIGUOUS,
-            (draft_head_n,),
-            "lm_head.weight",
-            qt.SK_LM_HEAD_DRAFT_IDMAP,
-            synthetic="draft_idmap",
-        )
-
     return ExpectedManifest(tuple(blocks), tuple(segments), tuple(fusion_groups))
+
+
+def build_lm_head_draft_manifest(n: int) -> ExpectedManifest:
+    if n <= 0 or n > VOCAB_SIZE:
+        raise ValueError(f"draft-head N must be in [1,{VOCAB_SIZE}], got {n}")
+
+    blocks: List[TensorBlockSpec] = []
+    segments: List[TensorSegmentSpec] = []
+    _append_standalone_block(
+        blocks,
+        segments,
+        "lm_head_draft",
+        qt.QT_Q4G64,
+        qt.LAYOUT_ROW_SPLIT,
+        (n, HIDDEN_SIZE),
+        "lm_head.weight",
+        qt.SK_LM_HEAD_DRAFT,
+        module_kind=qt.MODULE_LM_HEAD_DRAFT,
+        synthetic="draft_weights",
+    )
+    _append_standalone_block(
+        blocks,
+        segments,
+        "lm_head_draft.idmap",
+        qt.QT_I32,
+        qt.LAYOUT_CONTIGUOUS,
+        (n,),
+        "lm_head.weight",
+        qt.SK_LM_HEAD_DRAFT_IDMAP,
+        module_kind=qt.MODULE_LM_HEAD_DRAFT,
+        synthetic="draft_idmap",
+    )
+    return ExpectedManifest(tuple(blocks), tuple(segments), ())
 
 
 def build_text_specs(layer_types: List[str]) -> List[TensorBlockSpec]:

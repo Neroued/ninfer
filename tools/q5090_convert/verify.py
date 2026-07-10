@@ -1,18 +1,20 @@
-"""Verify a q5090_w4g64_mixed_v4 file with L0 structure checks and L1 value checks.
+"""Verify a q5090_w4g64_mixed_v4_1 artifact with L0 structure checks and L1 value checks.
 
 Usage:
-  python -m tools.q5090_convert.verify out/qwen3_6_27b.q5090_w4g64_mixed_v4.qus
+  python -m tools.q5090_convert.verify out/qwen3_6_27b.q5090_w4g64_mixed_v4_1.qus
 
 L0 validates the binary ABI and plan conformance. L1 recovers ROW_SPLIT scales/codes from the
 file and compares them bit-identically to tools.q5090_convert.quantize over the same block rows.
-The verifier writes a deterministic structural dump to out/conv_dump.v4.json by default.
+The verifier writes a deterministic structural dump to out/conv_dump.v4_1.json by default.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import struct
 import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -62,8 +64,6 @@ _TEXT_SOURCE_KINDS = {
     qt.SK_FINAL_NORM,
     qt.SK_INPUT_LAYERNORM,
     qt.SK_POST_ATTN_LAYERNORM,
-    qt.SK_LM_HEAD_DRAFT,
-    qt.SK_LM_HEAD_DRAFT_IDMAP,
     qt.SK_GDN_A_LOG,
     qt.SK_GDN_DT_BIAS,
     qt.SK_GDN_CONV1D,
@@ -85,6 +85,10 @@ _TEXT_SOURCE_KINDS = {
     qt.SK_MLP_GATE,
     qt.SK_MLP_UP,
     qt.SK_MLP_DOWN,
+}
+_LM_HEAD_DRAFT_SOURCE_KINDS = {
+    qt.SK_LM_HEAD_DRAFT,
+    qt.SK_LM_HEAD_DRAFT_IDMAP,
 }
 _MTP_SOURCE_KINDS = {
     qt.SK_OTHER,
@@ -133,6 +137,7 @@ _SOURCE_KINDS_BY_MODULE = {
     qt.MODULE_TEXT: _TEXT_SOURCE_KINDS,
     qt.MODULE_MTP: _MTP_SOURCE_KINDS,
     qt.MODULE_VISION: _VISION_SOURCE_KINDS,
+    qt.MODULE_LM_HEAD_DRAFT: _LM_HEAD_DRAFT_SOURCE_KINDS,
 }
 
 
@@ -157,30 +162,114 @@ def _read_name(table: bytes, offset: int, length: int, label: str, problems: Lis
 
 def _read_file(path: str):
     problems: List[str] = []
+    file_size = os.path.getsize(path)
+
+    def bounded_count(value: int, cap: int, label: str) -> int:
+        if value < 0 or value > cap:
+            problems.append(f"{label} {value} exceeds verifier cap {cap}")
+            return 0
+        return value
+
+    def read_records(f, offset: int, count: int, size: int, unpack, label: str) -> List[dict]:
+        if offset < 0 or offset > file_size:
+            problems.append(f"{label}: offset {offset} outside file")
+            return []
+        records = []
+        f.seek(offset)
+        for i in range(count):
+            raw = f.read(size)
+            if len(raw) != size:
+                problems.append(f"{label}[{i}]: short record {len(raw)} != {size}")
+                break
+            records.append(unpack(raw))
+        return records
+
     with open(path, "rb") as f:
-        hdr = fmt.unpack_header(f.read(fmt.HEADER_SIZE))
-        f.seek(hdr["module_index_offset"])
-        modules = [
-            fmt.unpack_module_record(f.read(fmt.MODULE_RECORD_SIZE))
-            for _ in range(hdr["module_count"])
-        ]
-        f.seek(hdr["tensor_index_offset"])
-        entries = [
-            fmt.unpack_tensor_entry(f.read(fmt.TENSOR_ENTRY_SIZE))
-            for _ in range(hdr["tensor_count"])
-        ]
-        f.seek(hdr["segment_index_offset"])
-        segments = [
-            fmt.unpack_segment_record(f.read(fmt.SEGMENT_RECORD_SIZE))
-            for _ in range(hdr["segment_count"])
-        ]
-        f.seek(hdr["fusion_group_index_offset"])
-        fusions = [
-            fmt.unpack_fusion_group_record(f.read(fmt.FUSION_GROUP_RECORD_SIZE))
-            for _ in range(hdr["fusion_group_count"])
-        ]
-        f.seek(hdr["string_table_offset"])
-        table = f.read(hdr["string_table_bytes"])
+        raw_header = f.read(fmt.HEADER_SIZE)
+        if len(raw_header) < fmt._HEADER_STRUCT.size:
+            raise ValueError(
+                f"truncated FileHeader: {len(raw_header)} bytes, need {fmt._HEADER_STRUCT.size}"
+            )
+        if len(raw_header) != fmt.HEADER_SIZE:
+            problems.append(
+                f"truncated FileHeader: {len(raw_header)} bytes, need {fmt.HEADER_SIZE}"
+            )
+        hdr = fmt.unpack_header(raw_header)
+        identity_errors = []
+        for key, want in (
+            ("magic", fmt.MAGIC),
+            ("version", fmt.VERSION),
+            ("endian", fmt.ENDIAN_TAG),
+            ("header_size", fmt.HEADER_SIZE),
+            ("format_minor", fmt.FORMAT_MINOR),
+        ):
+            if hdr[key] != want:
+                identity_errors.append(f"{key} {hdr[key]!r} != {want!r}")
+        if identity_errors:
+            problems.extend(identity_errors)
+            return hdr, [], [], [], [], [], problems
+        modules = read_records(
+            f,
+            hdr["module_index_offset"],
+            bounded_count(hdr["module_count"], 4, "module_count"),
+            fmt.MODULE_RECORD_SIZE,
+            fmt.unpack_module_record,
+            "ModuleRecord",
+        )
+        entries = read_records(
+            f,
+            hdr["tensor_index_offset"],
+            bounded_count(hdr["tensor_count"], 2000, "tensor_count"),
+            fmt.TENSOR_ENTRY_SIZE,
+            fmt.unpack_tensor_entry,
+            "TensorEntry",
+        )
+        segments = read_records(
+            f,
+            hdr["segment_index_offset"],
+            bounded_count(hdr["segment_count"], 2500, "segment_count"),
+            fmt.SEGMENT_RECORD_SIZE,
+            fmt.unpack_segment_record,
+            "SegmentRecord",
+        )
+        fusions = read_records(
+            f,
+            hdr["fusion_group_index_offset"],
+            bounded_count(hdr["fusion_group_count"], 256, "fusion_group_count"),
+            fmt.FUSION_GROUP_RECORD_SIZE,
+            fmt.unpack_fusion_group_record,
+            "FusionGroupRecord",
+        )
+        string_bytes = bounded_count(hdr["string_table_bytes"], 32 << 20, "string_table_bytes")
+        if hdr["string_table_offset"] > file_size:
+            problems.append("string_table_offset outside file")
+            table = b""
+        else:
+            f.seek(hdr["string_table_offset"])
+            table = f.read(string_bytes)
+            if len(table) != string_bytes:
+                problems.append(
+                    f"string table short read {len(table)} != {string_bytes}"
+                )
+        tokenizer_records = []
+        if hdr["tokenizer_record_count"] == fmt.TOKENIZER_RECORD_COUNT:
+            tokenizer_records = read_records(
+                f,
+                hdr["tokenizer_index_offset"],
+                fmt.TOKENIZER_RECORD_COUNT,
+                fmt.TOKENIZER_RECORD_SIZE,
+                fmt.unpack_tokenizer_record,
+                "TokenizerRecord",
+            )
+            for i, record in enumerate(tokenizer_records):
+                begin = record["data_offset"]
+                end = begin + record["data_bytes"]
+                if begin > file_size or end > file_size or end < begin:
+                    problems.append(f"tokenizer[{i}]: data range [{begin},{end}) outside file")
+                    record["data"] = b""
+                else:
+                    f.seek(begin)
+                    record["data"] = f.read(record["data_bytes"])
 
     for i, e in enumerate(entries):
         e["name"] = _read_name(table, e["name_offset"], e["name_len"], f"block[{i}]", problems)
@@ -190,7 +279,7 @@ def _read_file(path: str):
         s["name"] = _read_name(table, s["name_offset"], s["name_len"], f"segment[{i}]", problems)
         if fmt.fnv1a_64(s["name"]) != s["name_hash"]:
             problems.append(f"{s['name']}: segment name_hash mismatch")
-    return hdr, modules, entries, segments, fusions, problems
+    return hdr, modules, entries, segments, fusions, tokenizer_records, problems
 
 
 def _header_dump(hdr: dict) -> dict:
@@ -203,7 +292,7 @@ def _header_dump(hdr: dict) -> dict:
     return out
 
 
-def _make_dump(path: str, hdr, modules, entries, segments, fusions) -> dict:
+def _make_dump(path: str, hdr, modules, entries, segments, fusions, tokenizer_records) -> dict:
     blocks = []
     for i, e in enumerate(entries):
         begin = e["segment_begin"]
@@ -268,12 +357,23 @@ def _make_dump(path: str, hdr, modules, entries, segments, fusions) -> dict:
         )
 
     return {
-        "format": "q5090_w4g64_mixed_v4",
+        "format": "q5090_w4g64_mixed_v4_1",
         "file": path,
         "header": _header_dump(hdr),
         "modules": modules,
         "blocks": blocks,
         "fusion_groups": fusion_dump,
+        "tokenizer": [
+            {
+                "kind": fmt.TOKENIZER_KIND_NAME.get(record["kind"], str(record["kind"])),
+                "encoding": record["encoding"],
+                "data_offset": record["data_offset"],
+                "data_bytes": record["data_bytes"],
+                "crc32": f"{record['crc32']:08x}",
+                "sha256": record["sha256"].hex(),
+            }
+            for record in tokenizer_records
+        ],
     }
 
 
@@ -515,7 +615,76 @@ def _mtp_layout_checks(modules, entries, segments, fusions, plan) -> List[str]:
     return problems
 
 
-def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> List[str]:
+def _tokenizer_checks(records: Sequence[dict]) -> List[str]:
+    problems: List[str] = []
+    if len(records) != fmt.TOKENIZER_RECORD_COUNT:
+        return [
+            f"tokenizer record count {len(records)} != {fmt.TOKENIZER_RECORD_COUNT}"
+        ]
+    expected_offset = None
+    for i, (record, expected_kind) in enumerate(zip(records, fmt.TOKENIZER_KINDS)):
+        label = f"tokenizer[{i}]"
+        if record["kind"] != expected_kind:
+            problems.append(f"{label}: kind {record['kind']} != {expected_kind}")
+        if record["encoding"] != fmt.TOKENIZER_RAW_UTF8:
+            problems.append(f"{label}: encoding {record['encoding']} != RAW_UTF8")
+        if record["reserved"] != 0:
+            problems.append(f"{label}: reserved {record['reserved']} != 0")
+        if record["data_bytes"] <= 0:
+            problems.append(f"{label}: empty asset")
+        max_bytes = fmt.TOKENIZER_MAX_BYTES.get(expected_kind, 0)
+        if record["data_bytes"] > max_bytes:
+            problems.append(
+                f"{label}: data_bytes {record['data_bytes']} exceeds {max_bytes}"
+            )
+        if record["data_offset"] % fmt.TOKENIZER_ALIGN != 0:
+            problems.append(f"{label}: data_offset is not {fmt.TOKENIZER_ALIGN}-aligned")
+        if expected_offset is not None and record["data_offset"] != expected_offset:
+            problems.append(
+                f"{label}: data_offset {record['data_offset']} != {expected_offset}"
+            )
+        expected_offset = fmt.align_up(
+            record["data_offset"] + record["data_bytes"], fmt.TOKENIZER_ALIGN
+        )
+
+        data = record.get("data", b"")
+        if len(data) != record["data_bytes"]:
+            problems.append(
+                f"{label}: short data {len(data)} != {record['data_bytes']}"
+            )
+            continue
+        if fmt.crc32(data) != record["crc32"]:
+            problems.append(f"{label}: crc32 mismatch")
+        if hashlib.sha256(data).digest() != record["sha256"]:
+            problems.append(f"{label}: sha256 mismatch")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            problems.append(f"{label}: invalid UTF-8: {exc}")
+            continue
+        if expected_kind in (fmt.TOKENIZER_JSON, fmt.TOKENIZER_GENERATION_CONFIG):
+            try:
+                root = json.loads(text)
+            except json.JSONDecodeError as exc:
+                problems.append(f"{label}: malformed JSON: {exc}")
+                continue
+            if not isinstance(root, dict):
+                problems.append(f"{label}: JSON root is not an object")
+            elif expected_kind == fmt.TOKENIZER_JSON and "model" not in root:
+                problems.append(f"{label}: tokenizer.json missing model")
+            elif (
+                expected_kind == fmt.TOKENIZER_GENERATION_CONFIG
+                and "eos_token_id" not in root
+            ):
+                problems.append(f"{label}: generation_config.json missing eos_token_id")
+        elif "\x00" in text:
+            problems.append(f"{label}: merges.txt contains NUL")
+    return problems
+
+
+def _l0_checks(
+    path: str, hdr, modules, entries, segments, fusions, tokenizer_records, plan
+) -> List[str]:
     problems: List[str] = []
     file_size = os.path.getsize(path)
     if hdr["magic"] != fmt.MAGIC:
@@ -526,27 +695,45 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
         problems.append(f"bad endian {hdr['endian']:#x}")
     if hdr["header_size"] != fmt.HEADER_SIZE:
         problems.append(f"bad header_size {hdr['header_size']}")
-    if hdr["module_count"] != 3:
-        problems.append(f"module_count {hdr['module_count']} != 3")
+    if hdr["module_count"] != len(plan.modules):
+        problems.append(f"module_count {hdr['module_count']} != {len(plan.modules)}")
     if hdr["layer_count"] != 64:
         problems.append(f"layer_count {hdr['layer_count']} != 64")
     if hdr["format_minor"] != fmt.FORMAT_MINOR:
         problems.append(f"format_minor {hdr['format_minor']} != {fmt.FORMAT_MINOR}")
+    if hdr["tokenizer_record_count"] != fmt.TOKENIZER_RECORD_COUNT:
+        problems.append(
+            f"tokenizer_record_count {hdr['tokenizer_record_count']} != {fmt.TOKENIZER_RECORD_COUNT}"
+        )
+    if hdr["tokenizer_record_size"] != fmt.TOKENIZER_RECORD_SIZE:
+        problems.append(
+            f"tokenizer_record_size {hdr['tokenizer_record_size']} != {fmt.TOKENIZER_RECORD_SIZE}"
+        )
+    if hdr["tokenizer_flags"] != 0:
+        problems.append(f"tokenizer_flags {hdr['tokenizer_flags']} != 0")
     if hdr["flags"] & fmt.FLAG_RESERVED_MASK:
         problems.append(f"reserved header flags set: {hdr['flags']:#x}")
 
     draft_w = [
         e for e in entries
-        if e["module_kind"] == qt.MODULE_TEXT and e["source_kind"] == qt.SK_LM_HEAD_DRAFT
+        if e["module_kind"] == qt.MODULE_LM_HEAD_DRAFT
+        and e["source_kind"] == qt.SK_LM_HEAD_DRAFT
     ]
     draft_id = [
         e for e in entries
-        if e["module_kind"] == qt.MODULE_TEXT and e["source_kind"] == qt.SK_LM_HEAD_DRAFT_IDMAP
+        if e["module_kind"] == qt.MODULE_LM_HEAD_DRAFT
+        and e["source_kind"] == qt.SK_LM_HEAD_DRAFT_IDMAP
     ]
     draft_present = len(draft_w) > 0
-    expected_flags = fmt.FLAG_MODULE_PRESENT_MASK
-    if draft_present:
-        expected_flags |= fmt.FLAG_DRAFT_HEAD_PRESENT
+    module_flag = {
+        qt.MODULE_TEXT: fmt.FLAG_TEXT_PRESENT,
+        qt.MODULE_MTP: fmt.FLAG_MTP_PRESENT,
+        qt.MODULE_VISION: fmt.FLAG_VISION_PRESENT,
+        qt.MODULE_LM_HEAD_DRAFT: fmt.FLAG_LM_HEAD_DRAFT_PRESENT,
+    }
+    expected_flags = 0
+    for expected_module in plan.modules:
+        expected_flags |= module_flag[expected_module.module_kind]
     if hdr["flags"] != expected_flags:
         problems.append(f"flags {hdr['flags']:#x} != expected {expected_flags:#x}")
     exp_blocks = FULL_ARTIFACT_BLOCKS + (2 if draft_present else 0)
@@ -567,8 +754,8 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
         problems.append(f"fusion_group_count {hdr['fusion_group_count']} != table entries {len(fusions)}")
     present_mask = 0
     for m in modules:
-        if m["module_kind"] in (qt.MODULE_TEXT, qt.MODULE_MTP, qt.MODULE_VISION):
-            present_mask |= 1 << m["module_kind"]
+        if m["module_kind"] in module_flag:
+            present_mask |= module_flag[m["module_kind"]]
         else:
             problems.append(f"unknown module_kind {m['module_kind']}")
     if (hdr["flags"] & fmt.FLAG_MODULE_PRESENT_MASK) != present_mask:
@@ -578,13 +765,12 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
     if not (hdr["flags"] & fmt.FLAG_TEXT_PRESENT):
         problems.append("TEXT_PRESENT flag is not set")
 
-    # Draft-head structural coupling (§14): DRAFT_HEAD_PRESENT <-> exactly one
-    # LM_HEAD_DRAFT block and exactly one I32_CTRL CONTIGUOUS LM_HEAD_DRAFT_IDMAP
-    # block with matching N. Any other combination is rejected.
-    flag_draft = bool(hdr["flags"] & fmt.FLAG_DRAFT_HEAD_PRESENT)
+    # Draft-head structural coupling (§14): presence flag <-> one independent module
+    # containing exactly the Q4 weights and I32 id-map in canonical order.
+    flag_draft = bool(hdr["flags"] & fmt.FLAG_LM_HEAD_DRAFT_PRESENT)
     if flag_draft != draft_present:
         problems.append(
-            f"DRAFT_HEAD_PRESENT flag {flag_draft} != LM_HEAD_DRAFT block present {draft_present}"
+            f"LM_HEAD_DRAFT_PRESENT flag {flag_draft} != module payload present {draft_present}"
         )
     if len(draft_w) > 1:
         problems.append(f"more than one LM_HEAD_DRAFT block ({len(draft_w)})")
@@ -604,6 +790,11 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
             )
         if draft_w[0]["qtype"] != qt.QT_Q4G64:
             problems.append(f"draft-head qtype {draft_w[0]['qtype']} != Q4G64")
+        if [draft_w[0]["name"], draft_id[0]["name"]] != [
+            "lm_head_draft",
+            "lm_head_draft.idmap",
+        ]:
+            problems.append("LM_HEAD_DRAFT block names/order are not canonical")
 
     expected_offsets = [
         ("module_index_offset", fmt.HEADER_SIZE),
@@ -620,25 +811,61 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
         if hdr[key] != want:
             problems.append(f"{key} {hdr[key]} != {want}")
     string_end = hdr["string_table_offset"] + hdr["string_table_bytes"]
-    want_payload = fmt.align_up(string_end, fmt.REGION_ALIGN)
+    want_tokenizer_index = fmt.align_up(string_end, fmt.TOKENIZER_ALIGN)
+    if hdr["tokenizer_index_offset"] != want_tokenizer_index:
+        problems.append(
+            f"tokenizer_index_offset {hdr['tokenizer_index_offset']} != {want_tokenizer_index}"
+        )
+    want_tokenizer_index_bytes = fmt.TOKENIZER_RECORD_COUNT * fmt.TOKENIZER_RECORD_SIZE
+    if hdr["tokenizer_index_bytes"] != want_tokenizer_index_bytes:
+        problems.append(
+            f"tokenizer_index_bytes {hdr['tokenizer_index_bytes']} != {want_tokenizer_index_bytes}"
+        )
+    want_tokenizer_data = fmt.align_up(
+        want_tokenizer_index + want_tokenizer_index_bytes, fmt.TOKENIZER_ALIGN
+    )
+    if hdr["tokenizer_data_offset"] != want_tokenizer_data:
+        problems.append(
+            f"tokenizer_data_offset {hdr['tokenizer_data_offset']} != {want_tokenizer_data}"
+        )
+    if tokenizer_records:
+        if tokenizer_records[0]["data_offset"] != hdr["tokenizer_data_offset"]:
+            problems.append("first tokenizer asset does not start at tokenizer_data_offset")
+        final_tokenizer_end = (
+            tokenizer_records[-1]["data_offset"] + tokenizer_records[-1]["data_bytes"]
+        )
+        if hdr["tokenizer_data_bytes"] != final_tokenizer_end - hdr["tokenizer_data_offset"]:
+            problems.append(
+                f"tokenizer_data_bytes {hdr['tokenizer_data_bytes']} != asset span "
+                f"{final_tokenizer_end - hdr['tokenizer_data_offset']}"
+            )
+    want_payload = fmt.align_up(
+        hdr["tokenizer_data_offset"] + hdr["tokenizer_data_bytes"], fmt.REGION_ALIGN
+    )
     if hdr["payload_offset"] != want_payload:
-        problems.append(f"payload_offset {hdr['payload_offset']} != align_up(string table end) {want_payload}")
+        problems.append(
+            f"payload_offset {hdr['payload_offset']} != align_up(tokenizer end) {want_payload}"
+        )
     if hdr["payload_offset"] % fmt.REGION_ALIGN != 0:
         problems.append(f"payload_offset {hdr['payload_offset']} not {fmt.REGION_ALIGN}-aligned")
     if hdr["payload_bytes"] != file_size - hdr["payload_offset"]:
         problems.append(f"payload_bytes {hdr['payload_bytes']} != file payload {file_size - hdr['payload_offset']}")
     if hdr["payload_offset"] > file_size:
         problems.append(f"payload_offset {hdr['payload_offset']} > file size {file_size}")
+    problems += _tokenizer_checks(tokenizer_records)
 
     module_kinds = [m["module_kind"] for m in modules]
-    if module_kinds != [qt.MODULE_TEXT, qt.MODULE_MTP, qt.MODULE_VISION]:
-        problems.append(f"module kinds {module_kinds} != full artifact modules [TEXT, MTP, VISION]")
-    if module_kinds != sorted(module_kinds) or len(set(module_kinds)) != len(module_kinds):
-        problems.append(f"module kinds are not distinct TEXT->MTP->VISION ordered: {module_kinds}")
+    expected_module_kinds = [m.module_kind for m in plan.modules]
+    if module_kinds != expected_module_kinds:
+        problems.append(f"module kinds {module_kinds} != {expected_module_kinds}")
+    if len(set(module_kinds)) != len(module_kinds):
+        problems.append(f"module kinds are not distinct: {module_kinds}")
     next_tensor = 0
     for i, got in enumerate(modules):
-        if got["flags"] != 0:
-            problems.append(f"module[{i}]: flags {got['flags']} != 0")
+        if got["reserved0"] != 0 or got["reserved1"] != 0:
+            problems.append(
+                f"module[{i}]: reserved fields {got['reserved0']}/{got['reserved1']} != 0"
+            )
         if got["tensor_index_begin"] != next_tensor:
             problems.append(f"module[{i}]: tensor range begins at {got['tensor_index_begin']}, expected {next_tensor}")
         next_tensor = got["tensor_index_begin"] + got["tensor_index_count"]
@@ -661,8 +888,6 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
             problems.append(
                 f"module[{i}]: tensor_index_count {got['tensor_index_count']} != {expected.tensor_index_count}"
             )
-        if got["load_policy"] != expected.load_policy:
-            problems.append(f"module[{i}]: load_policy {got['load_policy']} != {expected.load_policy}")
         begin = got["tensor_index_begin"]
         end = begin + got["tensor_index_count"]
         if end <= len(entries) and begin < end:
@@ -738,6 +963,13 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
             begin = hdr["module_index_offset"] + i * fmt.MODULE_RECORD_SIZE
             _check_zero_range(
                 f,
+                begin + 40,
+                begin + 48,
+                f"ModuleRecord[{i}] policy/flags reserved",
+                problems,
+            )
+            _check_zero_range(
+                f,
                 begin + fmt._MODULE_STRUCT.size,
                 begin + fmt.MODULE_RECORD_SIZE,
                 f"ModuleRecord[{i}] reserved",
@@ -761,7 +993,38 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
                 f"FusionGroupRecord[{i}] reserved",
                 problems,
             )
-        _check_zero_range(f, string_end, hdr["payload_offset"], "string-to-payload padding", problems)
+        _check_zero_range(
+            f,
+            string_end,
+            hdr["tokenizer_index_offset"],
+            "string-to-tokenizer-index padding",
+            problems,
+        )
+        tokenizer_index_end = hdr["tokenizer_index_offset"] + hdr["tokenizer_index_bytes"]
+        _check_zero_range(
+            f,
+            tokenizer_index_end,
+            hdr["tokenizer_data_offset"],
+            "tokenizer-index-to-data padding",
+            problems,
+        )
+        previous_end = hdr["tokenizer_data_offset"]
+        for i, record in enumerate(tokenizer_records):
+            _check_zero_range(
+                f,
+                previous_end,
+                record["data_offset"],
+                f"tokenizer[{i}] leading padding",
+                problems,
+            )
+            previous_end = record["data_offset"] + record["data_bytes"]
+        _check_zero_range(
+            f,
+            previous_end,
+            hdr["payload_offset"],
+            "tokenizer-to-weight padding",
+            problems,
+        )
         for i, e in enumerate(entries):
             problems += _check_entry_planes(e)
             off, nb = e["payload_offset"], e["payload_bytes"]
@@ -779,6 +1042,17 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
             payload = f.read(nb)
             if fmt.crc32(payload) != e["crc32"]:
                 problems.append(f"{e['name']}: crc32 mismatch")
+            if (
+                e["module_kind"] == qt.MODULE_LM_HEAD_DRAFT
+                and e["source_kind"] == qt.SK_LM_HEAD_DRAFT_IDMAP
+                and e["qtype"] == qt.QT_I32
+                and nb % 4 == 0
+            ):
+                ids = struct.unpack(f"<{nb // 4}i", payload)
+                if len(set(ids)) != len(ids):
+                    problems.append(f"{e['name']}: id-map contains duplicate vocab ids")
+                if any(token_id < 0 or token_id >= hdr["vocab_size"] for token_id in ids):
+                    problems.append(f"{e['name']}: id-map contains out-of-range vocab ids")
             if (
                 e["layout"] == qt.LAYOUT_ROW_SPLIT
                 and qt.is_quant(e["qtype"])
@@ -884,7 +1158,9 @@ def _l0_checks(path: str, hdr, modules, entries, segments, fusions, plan) -> Lis
     return problems
 
 
-def _manifest_checks(path: str, hdr, modules, entries, segments, fusions) -> List[str]:
+def _manifest_checks(
+    path: str, hdr, modules, entries, segments, fusions, tokenizer_records
+) -> List[str]:
     problems: List[str] = []
     manifest_path = path + fmt.MANIFEST_SUFFIX
     try:
@@ -912,7 +1188,7 @@ def _manifest_checks(path: str, hdr, modules, entries, segments, fusions) -> Lis
         if any(e["layout"] == layout for e in entries)
     ]
 
-    expect("format", "q5090_w4g64_mixed_v4")
+    expect("format", "q5090_w4g64_mixed_v4_1")
     expect("format_version", fmt.VERSION)
     expect("format_minor", fmt.FORMAT_MINOR)
     expect("binary_spec", "docs/q5090_packed_file_format_v4.md")
@@ -921,12 +1197,22 @@ def _manifest_checks(path: str, hdr, modules, entries, segments, fusions) -> Lis
     expect("file_bytes", os.path.getsize(path))
     expect("sha256_safetensors_index", hdr["sha256_safetensors_index"].hex())
     expect("calibrated", bool(hdr["flags"] & fmt.FLAG_CALIBRATED))
-    expect("draft_head_present", bool(hdr["flags"] & fmt.FLAG_DRAFT_HEAD_PRESENT))
+    expect(
+        "lm_head_draft_present",
+        bool(hdr["flags"] & fmt.FLAG_LM_HEAD_DRAFT_PRESENT),
+    )
     expect("layouts", present_layouts)
     expect("code_planes", ["nibble", "high", "scale"])
     expect("qtypes", present_qtypes)
     expect("modules", module_names)
-    expect("absent_modules", [])
+    expect(
+        "absent_modules",
+        [
+            qt.MODULE_NAME[k]
+            for k in qt.MODULE_CANONICAL_ORDER
+            if qt.MODULE_NAME[k] not in module_names
+        ],
+    )
     expect("module_count", hdr["module_count"])
     expect("tensor_count", hdr["tensor_count"])
     expect("segment_count", hdr["segment_count"])
@@ -935,6 +1221,7 @@ def _manifest_checks(path: str, hdr, modules, entries, segments, fusions) -> Lis
     alignment = manifest.get("alignment")
     want_alignment = {
         "header": fmt.HEADER_SIZE,
+        "tokenizer": fmt.TOKENIZER_ALIGN,
         "payload": fmt.REGION_ALIGN,
         "block": fmt.PAYLOAD_ALIGN,
         "k_pad": 128,
@@ -942,6 +1229,47 @@ def _manifest_checks(path: str, hdr, modules, entries, segments, fusions) -> Lis
     }
     if alignment != want_alignment:
         problems.append(f"manifest alignment {alignment!r} != {want_alignment!r}")
+
+    tokenizer = manifest.get("tokenizer")
+    want_tokenizer = {
+        "record_count": len(tokenizer_records),
+        "assets": [
+            {
+                "kind": fmt.TOKENIZER_KIND_NAME.get(record["kind"], str(record["kind"])),
+                "bytes": record["data_bytes"],
+                "crc32": f"{record['crc32']:08x}",
+                "sha256": record["sha256"].hex(),
+            }
+            for record in tokenizer_records
+        ],
+    }
+    if tokenizer != want_tokenizer:
+        problems.append(f"manifest tokenizer {tokenizer!r} != binary tokenizer records")
+
+    draft_weights = next(
+        (
+            e
+            for e in entries
+            if e["module_kind"] == qt.MODULE_LM_HEAD_DRAFT
+            and e["source_kind"] == qt.SK_LM_HEAD_DRAFT
+        ),
+        None,
+    )
+    if draft_weights is not None:
+        draft_manifest = manifest.get("lm_head_draft")
+        if not isinstance(draft_manifest, dict):
+            problems.append("manifest lm_head_draft object is missing")
+        else:
+            if draft_manifest.get("module") != "LM_HEAD_DRAFT":
+                problems.append("manifest lm_head_draft.module != LM_HEAD_DRAFT")
+            if draft_manifest.get("n") != draft_weights["shape"][0]:
+                problems.append("manifest lm_head_draft.n does not match binary")
+            if draft_manifest.get("k") != draft_weights["shape"][1]:
+                problems.append("manifest lm_head_draft.k does not match binary")
+    elif "lm_head_draft" in manifest:
+        problems.append("manifest lm_head_draft object exists but module is absent")
+    if "draft_head_present" in manifest or "draft_head" in manifest:
+        problems.append("manifest contains retired v4.0 draft-head fields")
 
     return problems
 
@@ -1056,8 +1384,8 @@ def _write_dump(path: str, dump: dict) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="verify q5090_w4g64_mixed_v4 packed file")
-    ap.add_argument("file", help="v4 .qus file")
+    ap = argparse.ArgumentParser(description="verify q5090_w4g64_mixed_v4_1 artifact")
+    ap.add_argument("file", help="v4.1 .qus file")
     ap.add_argument("--model", default=DEFAULT_MODEL, help="HF bf16 source model for L1")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--quick", action="store_true", help="L0 + CRC only; skip L1")
@@ -1071,7 +1399,7 @@ def main() -> None:
         default=None,
         help="HF dir with tokenizer_config.json for force-include specials (default: --model)",
     )
-    ap.add_argument("--dump", default=os.path.join("out", "conv_dump.v4.json"))
+    ap.add_argument("--dump", default=os.path.join("out", "conv_dump.v4_1.json"))
     args = ap.parse_args()
 
     t0 = time.time()
@@ -1079,19 +1407,23 @@ def main() -> None:
     assert_config(cfg, force=False)
     tc = cfg.get("text_config", cfg)
 
-    hdr, modules, entries, segments, fusions, read_problems = _read_file(args.file)
+    hdr, modules, entries, segments, fusions, tokenizer_records, read_problems = _read_file(
+        args.file
+    )
     draft_n = next(
         (
             int(e["shape"][0])
             for e in entries
-            if e["module_kind"] == qt.MODULE_TEXT
+            if e["module_kind"] == qt.MODULE_LM_HEAD_DRAFT
             and e["source_kind"] == qt.SK_LM_HEAD_DRAFT
             and e["shape"]
         ),
         None,
     )
     plan = build_conversion_plan(cfg, draft_head_n=draft_n)
-    dump = _make_dump(args.file, hdr, modules, entries, segments, fusions)
+    dump = _make_dump(
+        args.file, hdr, modules, entries, segments, fusions, tokenizer_records
+    )
 
     print(f"file: {args.file}")
     print(
@@ -1109,8 +1441,19 @@ def main() -> None:
 
     l0 = (
         read_problems
-        + _l0_checks(args.file, hdr, modules, entries, segments, fusions, plan)
-        + _manifest_checks(args.file, hdr, modules, entries, segments, fusions)
+        + _l0_checks(
+            args.file,
+            hdr,
+            modules,
+            entries,
+            segments,
+            fusions,
+            tokenizer_records,
+            plan,
+        )
+        + _manifest_checks(
+            args.file, hdr, modules, entries, segments, fusions, tokenizer_records
+        )
     )
     print(f"L0 structural checks done; problems={len(l0)}", flush=True)
 

@@ -1,4 +1,4 @@
-"""Binary serialization for the q5090_w4g64_mixed_v4 packed file.
+"""Binary serialization for the q5090_w4g64_mixed_v4_1 artifact.
 
 Exact byte layout: ../../docs/q5090_packed_file_format_v4.md sections 2-9.
 """
@@ -14,7 +14,7 @@ MAGIC = b"Q5090MIXEDV4\x00\x00\x00\x00"
 assert len(MAGIC) == 16
 
 VERSION = 4
-FORMAT_MINOR = 0
+FORMAT_MINOR = 1
 ENDIAN_TAG = 0x01020304
 HEADER_SIZE = 4096
 MANIFEST_SUFFIX = ".manifest.json"
@@ -22,26 +22,58 @@ MODULE_RECORD_SIZE = 64
 TENSOR_ENTRY_SIZE = 128
 SEGMENT_RECORD_SIZE = 32
 FUSION_GROUP_RECORD_SIZE = 64
+TOKENIZER_RECORD_SIZE = 64
+TOKENIZER_RECORD_COUNT = 3
 
 FLAG_TEXT_PRESENT = 1 << 0
 FLAG_MTP_PRESENT = 1 << 1
 FLAG_VISION_PRESENT = 1 << 2
 FLAG_CALIBRATED = 1 << 3
-FLAG_DRAFT_HEAD_PRESENT = 1 << 4
-FLAG_MODULE_PRESENT_MASK = FLAG_TEXT_PRESENT | FLAG_MTP_PRESENT | FLAG_VISION_PRESENT
+FLAG_LM_HEAD_DRAFT_PRESENT = 1 << 4
+FLAG_MODULE_PRESENT_MASK = (
+    FLAG_TEXT_PRESENT | FLAG_MTP_PRESENT | FLAG_VISION_PRESENT | FLAG_LM_HEAD_DRAFT_PRESENT
+)
 FLAG_RESERVED_MASK = 0xFFFFFFE0
 
 PAYLOAD_ALIGN = 256
 REGION_ALIGN = 4096
+TOKENIZER_ALIGN = 64
 
-_HEADER_STRUCT = struct.Struct("<16s8I8Q14I32s4QI")
+TOKENIZER_RAW_UTF8 = 0
+TOKENIZER_JSON = 1
+TOKENIZER_MERGES = 2
+TOKENIZER_GENERATION_CONFIG = 3
+TOKENIZER_KINDS = (
+    TOKENIZER_JSON,
+    TOKENIZER_MERGES,
+    TOKENIZER_GENERATION_CONFIG,
+)
+TOKENIZER_KIND_NAME = {
+    TOKENIZER_JSON: "TOKENIZER_JSON",
+    TOKENIZER_MERGES: "MERGES_TXT",
+    TOKENIZER_GENERATION_CONFIG: "GENERATION_CONFIG_JSON",
+}
+TOKENIZER_SOURCE_NAME = {
+    TOKENIZER_JSON: "tokenizer.json",
+    TOKENIZER_MERGES: "merges.txt",
+    TOKENIZER_GENERATION_CONFIG: "generation_config.json",
+}
+TOKENIZER_MAX_BYTES = {
+    TOKENIZER_JSON: 256 << 20,
+    TOKENIZER_MERGES: 64 << 20,
+    TOKENIZER_GENERATION_CONFIG: 1 << 20,
+}
+
+_HEADER_STRUCT = struct.Struct("<16s8I8Q14I32s4QI3I4Q")
 _MODULE_STRUCT = struct.Struct("<IIQQQQII")
+_TOKENIZER_STRUCT = struct.Struct("<IIQQII32s")
 _ENTRY_STRUCT = struct.Struct("<IIQHHHH4I4IIHHQQIIIIHHQQQ")
 _SEGMENT_STRUCT = struct.Struct("<IIIIIIQ")
 _FUSION_GROUP_STRUCT = struct.Struct("<IIIIQQQII")
 
-assert _HEADER_STRUCT.size == 236, _HEADER_STRUCT.size
+assert _HEADER_STRUCT.size == 280, _HEADER_STRUCT.size
 assert _MODULE_STRUCT.size == 48, _MODULE_STRUCT.size
+assert _TOKENIZER_STRUCT.size == TOKENIZER_RECORD_SIZE, _TOKENIZER_STRUCT.size
 assert _ENTRY_STRUCT.size == 124, _ENTRY_STRUCT.size
 assert _SEGMENT_STRUCT.size == SEGMENT_RECORD_SIZE, _SEGMENT_STRUCT.size
 assert _FUSION_GROUP_STRUCT.size == 48, _FUSION_GROUP_STRUCT.size
@@ -109,6 +141,13 @@ class FileHeaderFields:
     fusion_group_index_bytes: int
     sha256_safetensors_index: bytes = b"\x00" * 32
     format_minor: int = FORMAT_MINOR
+    tokenizer_record_count: int = TOKENIZER_RECORD_COUNT
+    tokenizer_record_size: int = TOKENIZER_RECORD_SIZE
+    tokenizer_flags: int = 0
+    tokenizer_index_offset: int = 0
+    tokenizer_index_bytes: int = TOKENIZER_RECORD_COUNT * TOKENIZER_RECORD_SIZE
+    tokenizer_data_offset: int = 0
+    tokenizer_data_bytes: int = 0
 
 
 def pack_header(h: FileHeaderFields) -> bytes:
@@ -150,6 +189,13 @@ def pack_header(h: FileHeaderFields) -> bytes:
         h.fusion_group_index_offset,
         h.fusion_group_index_bytes,
         h.format_minor,
+        h.tokenizer_record_count,
+        h.tokenizer_record_size,
+        h.tokenizer_flags,
+        h.tokenizer_index_offset,
+        h.tokenizer_index_bytes,
+        h.tokenizer_data_offset,
+        h.tokenizer_data_bytes,
     )
     assert len(body) == _HEADER_STRUCT.size
     return body.ljust(HEADER_SIZE, b"\x00")
@@ -195,6 +241,13 @@ def unpack_header(buf: bytes) -> dict:
         "fusion_group_index_offset",
         "fusion_group_index_bytes",
         "format_minor",
+        "tokenizer_record_count",
+        "tokenizer_record_size",
+        "tokenizer_flags",
+        "tokenizer_index_offset",
+        "tokenizer_index_bytes",
+        "tokenizer_data_offset",
+        "tokenizer_data_bytes",
     ]
     return dict(zip(keys, vals))
 
@@ -207,8 +260,6 @@ class ModuleRecord:
     tensor_index_count: int
     payload_offset: int
     payload_bytes: int
-    load_policy: int
-    flags: int = 0
 
 
 def pack_module_record(m: ModuleRecord) -> bytes:
@@ -219,8 +270,8 @@ def pack_module_record(m: ModuleRecord) -> bytes:
         m.tensor_index_count,
         m.payload_offset,
         m.payload_bytes,
-        m.load_policy,
-        m.flags,
+        0,
+        0,
     )
     return body.ljust(MODULE_RECORD_SIZE, b"\x00")
 
@@ -234,8 +285,44 @@ def unpack_module_record(buf: bytes) -> dict:
         "tensor_index_count",
         "payload_offset",
         "payload_bytes",
-        "load_policy",
-        "flags",
+        "reserved0",
+        "reserved1",
+    ]
+    return dict(zip(keys, vals))
+
+
+@dataclass(frozen=True)
+class TokenizerRecord:
+    kind: int
+    encoding: int
+    data_offset: int
+    data_bytes: int
+    crc32: int
+    sha256: bytes
+
+
+def pack_tokenizer_record(record: TokenizerRecord) -> bytes:
+    return _TOKENIZER_STRUCT.pack(
+        record.kind,
+        record.encoding,
+        record.data_offset,
+        record.data_bytes,
+        record.crc32,
+        0,
+        record.sha256[:32].ljust(32, b"\x00"),
+    )
+
+
+def unpack_tokenizer_record(buf: bytes) -> dict:
+    vals = _TOKENIZER_STRUCT.unpack(buf[:TOKENIZER_RECORD_SIZE])
+    keys = [
+        "kind",
+        "encoding",
+        "data_offset",
+        "data_bytes",
+        "crc32",
+        "reserved",
+        "sha256",
     ]
     return dict(zip(keys, vals))
 

@@ -1,11 +1,10 @@
-"""CLI: Qwen3.6-27B bf16 safetensors -> q5090_w4g64_mixed_v4 packed file.
+"""CLI: Qwen3.6-27B bf16 safetensors -> q5090_w4g64_mixed_v4_1 artifact.
 
 Usage:
   python -m tools.q5090_convert.convert --model /path/to/Qwen3.6-27B --out out/file.qus
 
-Default output includes all modules present in the HF source: TEXT_CORE plus MTP_DRAFT and
-VISION_ENCODER when their weights exist, and (unless --no-draft-head) the optional shortlisted
-Q4 draft lm_head + int32 id-map embedded in TEXT_CORE. Binary format:
+Default output includes TEXT_CORE, the independent LM_HEAD_DRAFT module unless disabled, MTP_DRAFT,
+VISION_ENCODER, and the three mandatory tokenizer assets. Binary format:
 ../../docs/q5090_packed_file_format_v4.md
 """
 
@@ -50,7 +49,16 @@ EXPECTED = dict(
     vision_intermediate=4304,
     vision_out_hidden=5120,
 )
-OUTPUT_FORMAT_MARKER = "mixed_v4"
+OUTPUT_FORMAT_MARKER = "mixed_v4_1"
+
+
+@dataclass(frozen=True)
+class TokenizerAsset:
+    kind: int
+    source_name: str
+    data: bytes
+    crc32: int
+    sha256: bytes
 
 @dataclass(frozen=True)
 class SegmentPlan:
@@ -107,7 +115,6 @@ class ModulePlan:
     module_kind: int
     tensor_index_begin: int
     tensor_index_count: int
-    load_policy: int
 
 
 @dataclass(frozen=True)
@@ -227,9 +234,8 @@ def _prepare_source(reader: ShardReader, spec: tp.TensorSpec) -> torch.Tensor:
 
 def _text_plan(
     layer_types: Sequence[str],
-    draft_head_n: Optional[int] = None,
 ) -> Tuple[List[BlockPlan], List[SegmentPlan], List[FusionPlan]]:
-    manifest = tp.build_text_manifest(list(layer_types), draft_head_n=draft_head_n)
+    manifest = tp.build_text_manifest(list(layer_types))
     segments: List[SegmentPlan] = []
     blocks: List[BlockPlan] = []
     for b in manifest.blocks:
@@ -370,18 +376,28 @@ def build_conversion_plan(
 ) -> ConversionPlan:
     layer_types = _layer_types(cfg)
 
-    blocks, segments, fusion_groups = _text_plan(layer_types, draft_head_n=draft_head_n)
+    blocks, segments, fusion_groups = _text_plan(layer_types)
     modules: List[ModulePlan] = [
-        ModulePlan(qt.MODULE_TEXT, 0, len(blocks), qt.LOAD_RESIDENT),
+        ModulePlan(qt.MODULE_TEXT, 0, len(blocks)),
     ]
+
+    if draft_head_n is not None:
+        begin = len(blocks)
+        _append_manifest(
+            blocks,
+            segments,
+            fusion_groups,
+            tp.build_lm_head_draft_manifest(draft_head_n),
+        )
+        modules.append(ModulePlan(qt.MODULE_LM_HEAD_DRAFT, begin, len(blocks) - begin))
 
     begin = len(blocks)
     _append_manifest(blocks, segments, fusion_groups, tp.build_mtp_manifest())
-    modules.append(ModulePlan(qt.MODULE_MTP, begin, len(blocks) - begin, qt.LOAD_RESIDENT))
+    modules.append(ModulePlan(qt.MODULE_MTP, begin, len(blocks) - begin))
 
     begin = len(blocks)
     _append_standalone_blocks(blocks, segments, tp.build_vision_specs(EXPECTED["vision_depth"]))
-    modules.append(ModulePlan(qt.MODULE_VISION, begin, len(blocks) - begin, qt.LOAD_LAZY_GPU))
+    modules.append(ModulePlan(qt.MODULE_VISION, begin, len(blocks) - begin))
 
     return ConversionPlan(tuple(modules), tuple(blocks), tuple(segments), tuple(fusion_groups))
 
@@ -467,11 +483,80 @@ def _prod(xs: Sequence[int]) -> int:
     return p
 
 
-def _require_v4_output_path(out_path: str) -> None:
+def load_tokenizer_assets(tokenizer_dir: str) -> Tuple[TokenizerAsset, ...]:
+    assets = []
+    for kind in fmt.TOKENIZER_KINDS:
+        source_name = fmt.TOKENIZER_SOURCE_NAME[kind]
+        path = os.path.join(tokenizer_dir, source_name)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            raise ValueError(f"missing tokenizer asset {path}: {exc}") from exc
+        if not data:
+            raise ValueError(f"tokenizer asset is empty: {path}")
+        if len(data) > fmt.TOKENIZER_MAX_BYTES[kind]:
+            raise ValueError(
+                f"tokenizer asset {path} is {len(data)} bytes, max {fmt.TOKENIZER_MAX_BYTES[kind]}"
+            )
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"tokenizer asset is not UTF-8: {path}: {exc}") from exc
+        if kind in (fmt.TOKENIZER_JSON, fmt.TOKENIZER_GENERATION_CONFIG):
+            try:
+                root = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"malformed tokenizer JSON {path}: {exc}") from exc
+            if not isinstance(root, dict):
+                raise ValueError(f"tokenizer JSON root must be an object: {path}")
+            if kind == fmt.TOKENIZER_JSON and "model" not in root:
+                raise ValueError(f"tokenizer.json is missing model: {path}")
+            if kind == fmt.TOKENIZER_GENERATION_CONFIG and "eos_token_id" not in root:
+                raise ValueError(f"generation_config.json is missing eos_token_id: {path}")
+        elif "\x00" in text:
+            raise ValueError(f"merges.txt contains NUL: {path}")
+        assets.append(
+            TokenizerAsset(
+                kind=kind,
+                source_name=source_name,
+                data=data,
+                crc32=fmt.crc32(data),
+                sha256=hashlib.sha256(data).digest(),
+            )
+        )
+    return tuple(assets)
+
+
+def layout_tokenizer_assets(
+    assets: Sequence[TokenizerAsset], data_offset: int
+) -> Tuple[List[fmt.TokenizerRecord], bytes]:
+    if tuple(asset.kind for asset in assets) != fmt.TOKENIZER_KINDS:
+        raise ValueError("tokenizer assets are not in canonical kind order")
+    records: List[fmt.TokenizerRecord] = []
+    data_region = bytearray()
+    for asset in assets:
+        absolute = fmt.align_up(data_offset + len(data_region), fmt.TOKENIZER_ALIGN)
+        data_region.extend(b"\x00" * (absolute - (data_offset + len(data_region))))
+        records.append(
+            fmt.TokenizerRecord(
+                kind=asset.kind,
+                encoding=fmt.TOKENIZER_RAW_UTF8,
+                data_offset=absolute,
+                data_bytes=len(asset.data),
+                crc32=asset.crc32,
+                sha256=asset.sha256,
+            )
+        )
+        data_region.extend(asset.data)
+    return records, bytes(data_region)
+
+
+def _require_v4_1_output_path(out_path: str) -> None:
     basename = os.path.basename(os.path.normpath(out_path))
-    if OUTPUT_FORMAT_MARKER not in basename or not basename.endswith(".qus"):
+    if not basename.endswith(f"{OUTPUT_FORMAT_MARKER}.qus"):
         raise SystemExit(
-            f"q5090 v4 converter output path must be a {OUTPUT_FORMAT_MARKER} .qus file: "
+            f"q5090 v4.1 converter output path must be a {OUTPUT_FORMAT_MARKER} .qus file: "
             f"{out_path}"
         )
 
@@ -502,6 +587,8 @@ def _write_manifest(
     entries: Sequence[fmt.TensorEntry],
     segment_records: Sequence[fmt.SegmentRecord],
     fusion_records: Sequence[fmt.FusionGroupRecord],
+    tokenizer_assets: Sequence[TokenizerAsset],
+    tokenizer_records: Sequence[fmt.TokenizerRecord],
     file_size: int,
     source_index_sha256: bytes,
 ) -> None:
@@ -545,7 +632,7 @@ def _write_manifest(
     present_modules = [qt.MODULE_NAME[m.module_kind] for m in module_records]
     absent_modules = [
         qt.MODULE_NAME[k]
-        for k in (qt.MODULE_TEXT, qt.MODULE_MTP, qt.MODULE_VISION)
+        for k in qt.MODULE_CANONICAL_ORDER
         if qt.MODULE_NAME[k] not in present_modules
     ]
     present_qtypes = [
@@ -560,17 +647,27 @@ def _write_manifest(
     ]
 
     draft_w = next(
-        (e for e in entries if e.module_kind == qt.MODULE_TEXT and e.source_kind == qt.SK_LM_HEAD_DRAFT),
+        (
+            e
+            for e in entries
+            if e.module_kind == qt.MODULE_LM_HEAD_DRAFT
+            and e.source_kind == qt.SK_LM_HEAD_DRAFT
+        ),
         None,
     )
     draft_id = next(
-        (e for e in entries if e.module_kind == qt.MODULE_TEXT and e.source_kind == qt.SK_LM_HEAD_DRAFT_IDMAP),
+        (
+            e
+            for e in entries
+            if e.module_kind == qt.MODULE_LM_HEAD_DRAFT
+            and e.source_kind == qt.SK_LM_HEAD_DRAFT_IDMAP
+        ),
         None,
     )
     draft_present = draft_w is not None
 
     manifest = {
-        "format": "q5090_w4g64_mixed_v4",
+        "format": "q5090_w4g64_mixed_v4_1",
         "format_version": fmt.VERSION,
         "format_minor": fmt.FORMAT_MINOR,
         "binary_spec": "docs/q5090_packed_file_format_v4.md",
@@ -583,9 +680,10 @@ def _write_manifest(
         "file_bytes": int(file_size),
         "sha256_safetensors_index": source_index_sha256.hex(),
         "calibrated": False,
-        "draft_head_present": draft_present,
+        "lm_head_draft_present": draft_present,
         "alignment": {
             "header": fmt.HEADER_SIZE,
+            "tokenizer": fmt.TOKENIZER_ALIGN,
             "payload": fmt.REGION_ALIGN,
             "block": fmt.PAYLOAD_ALIGN,
             "k_pad": 128,
@@ -600,12 +698,25 @@ def _write_manifest(
         "tensor_count": len(entries),
         "segment_count": len(segment_records),
         "fusion_group_count": len(fusion_records),
+        "tokenizer": {
+            "record_count": len(tokenizer_records),
+            "assets": [
+                {
+                    "kind": fmt.TOKENIZER_KIND_NAME[asset.kind],
+                    "bytes": len(asset.data),
+                    "crc32": f"{record.crc32:08x}",
+                    "sha256": record.sha256.hex(),
+                }
+                for asset, record in zip(tokenizer_assets, tokenizer_records)
+            ],
+        },
         "fusion_groups": group_summary,
         "effective_text_bpw": round(text_bytes * 8 / max(1, text_elems), 4),
     }
     if draft_present:
-        manifest["draft_head"] = {
+        manifest["lm_head_draft"] = {
             "present": True,
+            "module": "LM_HEAD_DRAFT",
             "n": int(draft_w.shape[0]),
             "k": int(draft_w.shape[1]),
             "weights_qtype": qt.QTYPE_NAME[draft_w.qtype],
@@ -617,14 +728,18 @@ def _write_manifest(
             "selection": "docs/2026-07-06-lm-head-draft-q4-decision.md",
         }
     mpath = out_path + fmt.MANIFEST_SUFFIX
-    with open(mpath, "w") as f:
+    mpath_tmp = mpath + ".tmp"
+    with open(mpath_tmp, "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(mpath_tmp, mpath)
     print(f"wrote {mpath}")
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="q5090_w4g64_mixed_v4 quantizing converter")
+    ap = argparse.ArgumentParser(description="q5090_w4g64_mixed_v4_1 artifact converter")
     ap.add_argument("--model", required=True, help="path to original Qwen3.6-27B safetensors dir")
     ap.add_argument("--out", default=None, help="output .qus file path")
     ap.add_argument("--device", default="cuda")
@@ -638,16 +753,23 @@ def main() -> None:
     ap.add_argument(
         "--tokenizer",
         default=None,
-        help="HF dir with tokenizer_config.json for force-include special ids (default: --model)",
+        help=(
+            "HF tokenizer dir containing tokenizer.json, merges.txt, generation_config.json, and "
+            "tokenizer_config.json for draft special ids (default: --model)"
+        ),
     )
-    ap.add_argument("--no-draft-head", action="store_true", help="emit a v4 file without the draft head")
+    ap.add_argument(
+        "--no-draft-head",
+        action="store_true",
+        help="emit a v4.1 artifact without the LM_HEAD_DRAFT module",
+    )
     args = ap.parse_args()
 
     model_dir = args.model.rstrip("/")
     out_path = args.out or os.path.join(
-        os.getcwd(), "out", "qwen3_6_27b.q5090_w4g64_mixed_v4.qus"
+        os.getcwd(), "out", "qwen3_6_27b.q5090_w4g64_mixed_v4_1.qus"
     )
-    _require_v4_output_path(out_path)
+    _require_v4_1_output_path(out_path)
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -665,10 +787,16 @@ def main() -> None:
     weight_map = json.loads(index_raw)["weight_map"]
     reader = ShardReader(model_dir, weight_map)
 
+    tokenizer_dir = (args.tokenizer or model_dir).rstrip("/")
+    tokenizer_assets = load_tokenizer_assets(tokenizer_dir)
+    print(
+        "tokenizer assets: "
+        + ", ".join(f"{asset.source_name}={_fmt_bytes(len(asset.data))}" for asset in tokenizer_assets)
+    )
+
     draft: Optional[dh.DraftHeadContext] = None
     draft_head_n: Optional[int] = None
     if not args.no_draft_head:
-        tokenizer_dir = args.tokenizer or model_dir
         draft = dh.compute_shortlist(args.ranking, tokenizer_dir, args.draft_n, tc["vocab_size"])
         draft_head_n = draft.n
         print(
@@ -730,15 +858,32 @@ def main() -> None:
     fusion_group_index_bytes = fusion_group_count * fmt.FUSION_GROUP_RECORD_SIZE
     string_table_offset = fusion_group_index_offset + fusion_group_index_bytes
     string_table_bytes = len(string_table)
-    payload_region_start = fmt.align_up(string_table_offset + string_table_bytes, fmt.REGION_ALIGN)
+    tokenizer_index_offset = fmt.align_up(
+        string_table_offset + string_table_bytes, fmt.TOKENIZER_ALIGN
+    )
+    tokenizer_index_bytes = fmt.TOKENIZER_RECORD_COUNT * fmt.TOKENIZER_RECORD_SIZE
+    tokenizer_data_offset = fmt.align_up(
+        tokenizer_index_offset + tokenizer_index_bytes, fmt.TOKENIZER_ALIGN
+    )
+    tokenizer_records, tokenizer_data = layout_tokenizer_assets(
+        tokenizer_assets, tokenizer_data_offset
+    )
+    tokenizer_data_bytes = len(tokenizer_data)
+    payload_region_start = fmt.align_up(
+        tokenizer_data_offset + tokenizer_data_bytes, fmt.REGION_ALIGN
+    )
 
     print(
         f"blocks: {tensor_count}  segments: {segment_count}  fusion_groups: {fusion_group_count}  "
-        f"modules: {module_count}  payload starts @ {payload_region_start}"
+        f"modules: {module_count}  tokenizer: {_fmt_bytes(tokenizer_data_bytes)}  "
+        f"payload starts @ {payload_region_start}"
     )
 
     t0 = time.time()
-    with open(out_path, "wb") as f:
+    tmp_path = out_path + ".tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    with open(tmp_path, "wb") as f:
         f.seek(payload_region_start)
         for i, (block, entry) in enumerate(zip(plan.blocks, entries)):
             pos = f.tell()
@@ -800,7 +945,6 @@ def main() -> None:
                     tensor_index_count=m.tensor_index_count,
                     payload_offset=sp[0],
                     payload_bytes=sp[1] - sp[0],
-                    load_policy=m.load_policy,
                 )
             )
 
@@ -822,9 +966,15 @@ def main() -> None:
                 )
             )
 
-        flags = fmt.FLAG_TEXT_PRESENT | fmt.FLAG_MTP_PRESENT | fmt.FLAG_VISION_PRESENT
-        if draft is not None:
-            flags |= fmt.FLAG_DRAFT_HEAD_PRESENT
+        module_flags = {
+            qt.MODULE_TEXT: fmt.FLAG_TEXT_PRESENT,
+            qt.MODULE_MTP: fmt.FLAG_MTP_PRESENT,
+            qt.MODULE_VISION: fmt.FLAG_VISION_PRESENT,
+            qt.MODULE_LM_HEAD_DRAFT: fmt.FLAG_LM_HEAD_DRAFT_PRESENT,
+        }
+        flags = 0
+        for module in plan.modules:
+            flags |= module_flags[module.module_kind]
         header = fmt.FileHeaderFields(
             tensor_count=tensor_count,
             module_count=module_count,
@@ -858,6 +1008,10 @@ def main() -> None:
             max_position_embeddings=tc["max_position_embeddings"],
             fusion_group_count=fusion_group_count,
             sha256_safetensors_index=sha,
+            tokenizer_index_offset=tokenizer_index_offset,
+            tokenizer_index_bytes=tokenizer_index_bytes,
+            tokenizer_data_offset=tokenizer_data_offset,
+            tokenizer_data_bytes=tokenizer_data_bytes,
         )
         meta = bytearray()
         meta += fmt.pack_header(header)
@@ -870,10 +1024,21 @@ def main() -> None:
         for g in fusion_records:
             meta += fmt.pack_fusion_group_record(g)
         meta += string_table
+        meta = meta.ljust(tokenizer_index_offset, b"\x00")
+        for record in tokenizer_records:
+            meta += fmt.pack_tokenizer_record(record)
+        assert len(meta) == tokenizer_index_offset + tokenizer_index_bytes
+        meta = meta.ljust(tokenizer_data_offset, b"\x00")
+        meta += tokenizer_data
+        assert len(meta) == tokenizer_data_offset + tokenizer_data_bytes
         assert len(meta) <= payload_region_start, (len(meta), payload_region_start)
         meta = meta.ljust(payload_region_start, b"\x00")
         f.seek(0)
         f.write(meta)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_path, out_path)
 
     _write_manifest(
         out_path,
@@ -883,6 +1048,8 @@ def main() -> None:
         entries,
         segment_records,
         fusion_records,
+        tokenizer_assets,
+        tokenizer_records,
         file_size,
         sha,
     )
@@ -891,7 +1058,7 @@ def main() -> None:
     for m in module_records:
         print(
             f"  {qt.MODULE_NAME[m.module_kind]:14s} blocks={m.tensor_index_count:4d}  "
-            f"payload={_fmt_bytes(m.payload_bytes)}  policy={qt.MODULE_POLICY[m.module_kind]}"
+            f"payload={_fmt_bytes(m.payload_bytes)}  format={qt.MODULE_FORMAT[m.module_kind]}"
         )
 
 

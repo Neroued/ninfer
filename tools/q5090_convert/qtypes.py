@@ -1,4 +1,4 @@
-"""Enums and per-qtype constants for the q5090_w4g64_mixed_v4 packed format.
+"""Enums and per-qtype constants for the q5090_w4g64_mixed_v4_1 artifact.
 
 Values here are the on-disk ABI; do not renumber. See
 ../../docs/q5090_packed_file_format_v4.md sections 7-9.
@@ -43,27 +43,32 @@ LAYOUT_NAME = {
 MODULE_TEXT = 0
 MODULE_MTP = 1
 MODULE_VISION = 2
+MODULE_LM_HEAD_DRAFT = 3
 
 MODULE_NAME = {
     MODULE_TEXT: "TEXT_CORE",
     MODULE_MTP: "MTP_DRAFT",
     MODULE_VISION: "VISION_ENCODER",
+    MODULE_LM_HEAD_DRAFT: "LM_HEAD_DRAFT",
 }
 
-MODULE_POLICY = {
-    MODULE_TEXT: "q5090_w4g64_mixed_v4",
+MODULE_CANONICAL_ORDER = (
+    MODULE_TEXT,
+    MODULE_LM_HEAD_DRAFT,
+    MODULE_MTP,
+    MODULE_VISION,
+)
+
+MODULE_FORMAT = {
+    MODULE_TEXT: "q5090_w4g64_mixed_v4_1",
     MODULE_MTP: "mtp_w8g32_v3",
     MODULE_VISION: "vision_q4mix_merger_w8g128_v3",
+    MODULE_LM_HEAD_DRAFT: "lm_head_draft_q4g64_v1",
 }
 
 # --- scale dtype ---
 SCALE_NONE = 0
 SCALE_FP16 = 1
-
-# --- load policy (ModuleRecord.load_policy) ---
-LOAD_RESIDENT = 0
-LOAD_LAZY_GPU = 1
-LOAD_CPU_PINNED_THEN_GPU = 2
 
 # --- fusion groups (TensorEntry.fusion_group_id / FusionGroupRecord.group_id) ---
 FUSION_NONE = 0

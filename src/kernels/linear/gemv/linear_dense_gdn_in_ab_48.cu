@@ -217,9 +217,9 @@ void require_shape(const Weight& w, const char* name) {
 }
 
 int dense_prefill_split_k(std::int32_t tokens) {
-    if (tokens <= 128) { return 40; }
-    if (tokens <= 256) { return 20; }
-    if (tokens <= 512) { return 10; }
+    // Keep one K-association for every normal prefill chunk through 1024.
+    // Changing SplitK changes FP32 grouping before the final BF16 round and can
+    // make chunked and unchunked model execution cross an argmax boundary.
     if (tokens <= 1024) { return 8; }
     if (tokens <= 2048) { return 4; }
     if (tokens <= 4096) { return 2; }
@@ -350,18 +350,6 @@ void linear_dense_gdn_in_ab_gated_48_launch(const Tensor& x, const Weight& a_wei
         throw std::invalid_argument("gdn_in_ab_gated: dense prefill workspace is too small");
     }
     switch (dense_prefill_split_k(t)) {
-    case 40:
-        launch_dense_prefill_mma<40>(x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
-                                     stream);
-        break;
-    case 20:
-        launch_dense_prefill_mma<20>(x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
-                                     stream);
-        break;
-    case 10:
-        launch_dense_prefill_mma<10>(x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
-                                     stream);
-        break;
     case 8:
         launch_dense_prefill_mma<8, 8>(x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
                                        stream);

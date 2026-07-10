@@ -49,8 +49,8 @@ warps:        8, one 16-token tile per warp at T=1024 and unsplit T
 stages:       2
 ```
 
-The cooperative split routes normally compile a 16-warp specialization, but
-T=1024 dispatches the measured W8/S8 winner. W8 gives every warp four
+The longer-context cooperative split routes compile a 16-warp specialization,
+while `T=9..1024` dispatches the measured W8/S8 winner. W8 gives every warp four
 independent A/B accumulator chains and makes the 192-CTA grid's thread count
 match the 49,152 output elements exactly during the cooperative epilogue.
 
@@ -78,10 +78,7 @@ into contiguous 64-wide tiles:
 
 | T range | split-K | main CTAs at the upper bound |
 | ---: | ---: | ---: |
-| `9..128` | 40 | 120 |
-| `129..256` | 20 | 120 |
-| `257..512` | 10 | 120 |
-| `513..1024` | 8 | 192 |
+| `9..1024` | 8 | 192 |
 | `1025..2048` | 4 | 192 |
 | `2049..4096` | 2 | 192 |
 | `>4096` | 1 | at least 192 |
@@ -97,6 +94,12 @@ association differs from the unsplit WMMA kernel, but BF16 rounding still occurs
 only after the complete dot product. Correctness is judged against the existing
 mathematical oracle and `gdn_output_bf16` tolerance.
 
+`T=9..1024` deliberately keeps one canonical S8 K-association. Changing split-K
+changes the FP32 grouping before the final BF16 round; the earlier short-T
+S40/S20/S10 dispatch could therefore make 128-token chunked prefill and a
+single larger prefill cross an argmax boundary. Canonical S8 restores exact
+128/512 chunk token-stream parity while retaining the T=1024 roofline path.
+
 For `split-K=1`, an eight-warp specialization performs the BF16 rounding and
 gating epilogue directly and does not allocate workspace or execute a grid
 barrier. This avoids the long-context regression seen with the 16-warp split
@@ -108,7 +111,7 @@ The implementation was tuned in this order:
 
 1. choose split-K from `{4,5,8,10,16}` at T=1024;
 2. verify the choice at T=512 and T=2048;
-3. adjust the short-T split table only if CTA setup dominates;
+3. use one S8 association through T=1024 to preserve chunk-size parity;
 4. retain a single production dispatch with no tuning environment variables.
 
 The T=1024 standalone medians for the split sweep were S4 20.41 us, S5
@@ -123,16 +126,16 @@ per shape:
 
 | T | final median us | original median us | speedup |
 | ---: | ---: | ---: | ---: |
-| 17 | 9.60 | 156.12 | 16.27x |
-| 32 | 9.61 | 83.34 | 8.67x |
-| 64 | 10.05 | 87.44 | 8.70x |
-| 128 | 10.73 | 87.38 | 8.14x |
-| 256 | 9.44 | 88.52 | 9.38x |
-| 512 | 10.76 | 88.42 | 8.22x |
-| 1024 | 16.80 | 87.98 | 5.24x |
-| 2048 | 27.29 | 89.21 | 3.27x |
-| 4096 | 48.13 | 127.52 | 2.65x |
-| 8192 | 77.65 | 205.20 | 2.64x |
+| 17 | 10.78 | 156.12 | 14.48x |
+| 32 | 10.68 | 83.34 | 7.80x |
+| 64 | 10.67 | 87.44 | 8.20x |
+| 128 | 10.74 | 87.38 | 8.14x |
+| 256 | 10.80 | 88.52 | 8.20x |
+| 512 | 10.82 | 88.42 | 8.17x |
+| 1024 | 16.98 | 87.98 | 5.18x |
+| 2048 | 27.27 | 89.21 | 3.27x |
+| 4096 | 48.16 | 127.52 | 2.65x |
+| 8192 | 77.93 | 205.20 | 2.63x |
 
 At T=1024, Nsys measures the single production kernel at 13.60 us median. The
 contraction contains 1.0066 GFLOP, so the fused kernel delivers about 74.0
@@ -163,6 +166,7 @@ W8/W16, and S4/S5/S8/S10/S16 alternatives did not beat 13.60 us GPU time or
 - standalone T=1024 operator at least 3x faster than 87.98 us;
 - exact shape sweep covers `T={17,32,64,128,256,512,1024,2048,4096,8192}`;
 - numerical tests cover an unsplit route and representative split-K routes;
+- MTP E2E preserves exact 128/512 prefill-chunk token-stream parity;
 - Compute Sanitizer memcheck reports zero errors;
 - pp1024 Nsys confirms the cooperative single launch and a lower aggregate
   dense GDN time;

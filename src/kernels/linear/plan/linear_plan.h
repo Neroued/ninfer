@@ -20,6 +20,7 @@ enum class LinearFormat {
 enum class ShapeFamily {
     DenseCtrl48x5120,
     MtpFc5120x10240,
+    MtpKV1024x5120,
     MtpAttnIn14336x5120,
     AttnInQKV7168x5120,
     GdnInQK4096x5120,
@@ -38,6 +39,7 @@ enum class LinearBackendKind { Gemv, Gemm, Reference };
 enum class LinearPolicyId {
     RowsplitLowbitGemmSmallt,
     RowsplitLowbitGemmMma,
+    RowsplitW8G32GemmMma,
     GenericDenseGemv,
     GenericDenseGemm,
     MlpGateUp34816Q4RowsplitGemv,

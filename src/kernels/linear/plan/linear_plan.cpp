@@ -26,6 +26,7 @@ ShapeFamily classify_shape(std::int32_t n, std::int32_t k) {
     static constexpr Entry kTable[] = {
         {    48,  5120, ShapeFamily::DenseCtrl48x5120     },
         {  5120, 10240, ShapeFamily::MtpFc5120x10240      },
+        {  1024,  5120, ShapeFamily::MtpKV1024x5120       },
         { 14336,  5120, ShapeFamily::MtpAttnIn14336x5120  },
         {  7168,  5120, ShapeFamily::AttnInQKV7168x5120   },
         {  4096,  5120, ShapeFamily::GdnInQK4096x5120     },
@@ -125,7 +126,8 @@ LinearPlan resolve_plan(LinearPlanKey key) {
     // registered-shape T1 -> tuned GEMV above; generic T1 and SmallT -> the
     // small-T streaming GEMM (memory-bound, CUDA cores, weights streamed once
     // per column tile); LargeT -> bf16 tensor-core mma GEMM (compute-bound).
-    // W8G32 has no MMA path yet, so it uses the small-T GEMM for every regime.
+    // W8G32 owns a separate LargeT MMA backend so its group-32 dequantization and
+    // SM120 tile pipeline can be tuned without changing the Q4/Q5/Q6 kernel.
     if (key.format == LinearFormat::DenseBF16 || key.format == LinearFormat::DenseFP32) {
         const bool           gemv   = (key.regime == LinearRegime::T1);
         const LinearPolicyId policy =
@@ -133,7 +135,12 @@ LinearPlan resolve_plan(LinearPlanKey key) {
         return LinearPlan{LinearBackendKind::Reference, policy, policy_name(policy),
                           /*uses_tensor_cores=*/false};
     }
-    if (key.format != LinearFormat::W8G32_RowSplit && key.regime == LinearRegime::LargeT) {
+    if (key.format == LinearFormat::W8G32_RowSplit && key.regime == LinearRegime::LargeT) {
+        return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitW8G32GemmMma,
+                          policy_name(LinearPolicyId::RowsplitW8G32GemmMma),
+                          /*uses_tensor_cores=*/true};
+    }
+    if (key.regime == LinearRegime::LargeT) {
         return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmMma,
                           policy_name(LinearPolicyId::RowsplitLowbitGemmMma),
                           /*uses_tensor_cores=*/true};
@@ -160,6 +167,7 @@ const char* shape_name(ShapeFamily s) {
     switch (s) {
     case ShapeFamily::DenseCtrl48x5120:    return "dense_ctrl_48x5120";
     case ShapeFamily::MtpFc5120x10240:     return "mtp_fc_5120x10240";
+    case ShapeFamily::MtpKV1024x5120:      return "mtp_kv_1024x5120";
     case ShapeFamily::MtpAttnIn14336x5120: return "mtp_attn_in_14336x5120";
     case ShapeFamily::AttnInQKV7168x5120:  return "attn_in_qkv_7168x5120";
     case ShapeFamily::GdnInQK4096x5120:    return "gdn_in_qk_4096x5120";
@@ -188,6 +196,8 @@ const char* policy_name(LinearPolicyId p) {
         return "linear.rowsplit.gemm.smallt.v1";
     case LinearPolicyId::RowsplitLowbitGemmMma:
         return "linear.rowsplit.gemm.mma.bf16.v1";
+    case LinearPolicyId::RowsplitW8G32GemmMma:
+        return "linear.rowsplit.w8g32.gemm.mma.bf16.v1";
     case LinearPolicyId::GenericDenseGemv:  return "linear.ref.dense.gemv.generic.v1";
     case LinearPolicyId::GenericDenseGemm:  return "linear.ref.dense.gemm.generic.v1";
     case LinearPolicyId::MlpGateUp34816Q4RowsplitGemv:

@@ -4,7 +4,13 @@ Date: 2026-07-10
 
 Target: Qwen3.6-27B MTP prefill on one RTX 5090 (GB202, compute capability 12.0)
 
-Status: implementation-ready architecture
+Status: implemented and measured; see `2026-07-10-w8g32-tensor-core-gemm-implementation-report.md`
+
+Implementation note: finite tuning rejected the proposed direct-register producer/consumer
+pipeline. The production kernel uses the same BF16-MMA numerical contract and tile, but a
+cooperative raw-code `cp.async.cg` pipeline was faster and safer. The implementation report records
+the final architecture, measured deviations, and acceptance evidence; this document remains the
+original design and gate definition.
 
 ## 1. Decision
 

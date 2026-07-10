@@ -6,6 +6,7 @@
 #include "kernels/q5090_pack.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -236,9 +237,7 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
         // tensor-core mma GEMM, judged by the normwise linear_tc criterion; T <= tau
         // uses the fp32 multi-step / GEMV path (strict per-element). Keep this bound in
         // sync with detail::regime_threshold in linear_plan.cpp.
-        const Tolerance tol =
-            (qtype != QType::W8G32_F16S && t > 16) ? Tolerance::linear_tc()
-                                                   : Tolerance::linear_bf16();
+        const Tolerance tol = t > 16 ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         failures += verify(label.c_str(), from_device_bf16(dout, static_cast<std::size_t>(n) * t),
                            ref, tol);
     }
@@ -247,6 +246,58 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
 
 int one_q4_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     return one_quant_shape(QType::Q4G64_F16S, n, k, {1, 2, 7, 64}, seed);
+}
+
+int paired_w8g32_shape(std::int32_t n, std::int32_t k,
+                       const std::vector<std::int32_t>& ts, std::uint32_t seed) {
+    const std::int32_t max_t = *std::max_element(ts.begin(), ts.end());
+    std::vector<float> kw(static_cast<std::size_t>(n) * k);
+    std::vector<float> vw(static_cast<std::size_t>(n) * k);
+    std::vector<float> x(static_cast<std::size_t>(k) * max_t);
+    fill_uniform(kw, seed + 2000u, -0.125f, 0.125f);
+    fill_uniform(vw, seed + 3000u, -0.125f, 0.125f);
+    fill_uniform(x, seed, -8.0f, 8.0f);
+    round_to_bf16(kw);
+    round_to_bf16(vw);
+    round_to_bf16(x);
+
+    q5090::PackedWeight kpacked =
+        q5090::pack_row_split_lowbit(kw, n, k, QType::W8G32_F16S);
+    q5090::PackedWeight vpacked =
+        q5090::pack_row_split_lowbit(vw, n, k, QType::W8G32_F16S);
+    std::vector<double> kref;
+    std::vector<double> vref;
+    cpu_linear_dequant(x, kpacked.dequant, n, k, max_t, kref);
+    cpu_linear_dequant(x, vpacked.dequant, n, k, max_t, vref);
+
+    DBuf dx = to_device_bf16(x);
+    DBuf dkw(kpacked.payload.size());
+    DBuf dvw(vpacked.payload.size());
+    cudaMemcpy(dkw.p, kpacked.payload.data(), kpacked.payload.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dvw.p, vpacked.payload.data(), vpacked.payload.size(), cudaMemcpyHostToDevice);
+    WorkspaceArena ws(64ULL << 20);
+
+    int failures = 0;
+    for (std::int32_t t : ts) {
+        DBuf dkout(static_cast<std::size_t>(n) * t * 2u);
+        DBuf dvout(static_cast<std::size_t>(n) * t * 2u);
+        Tensor tx(dx.p, DType::BF16, {k, t});
+        Tensor tk(dkout.p, DType::BF16, {n, t});
+        Tensor tv(dvout.p, DType::BF16, {n, t});
+        kernels::linear_w8g32_kv_pair(tx, kpacked.device_weight(dkw.p),
+                                      vpacked.device_weight(dvw.p), tk, tv, ws, nullptr);
+        cudaDeviceSynchronize();
+        const std::size_t count = static_cast<std::size_t>(n) * t;
+        const std::vector<double> kr(kref.begin(), kref.begin() + count);
+        const std::vector<double> vr(vref.begin(), vref.begin() + count);
+        const std::string base = "linear w8g32 paired [" + std::to_string(n) + "," +
+                                 std::to_string(k) + "] T=" + std::to_string(t);
+        failures += verify((base + " K").c_str(), from_device_bf16(dkout, count), kr,
+                           Tolerance::linear_tc());
+        failures += verify((base + " V").c_str(), from_device_bf16(dvout, count), vr,
+                           Tolerance::linear_tc());
+    }
+    return failures;
 }
 
 int dense_metadata_validation() {
@@ -452,6 +503,15 @@ int main() {
         return 0;
     }
 
+    if (std::getenv("QUS_LINEAR_TEST_W8G32_ONLY") != nullptr) {
+        int f = 0;
+        f += one_quant_shape(QType::W8G32_F16S, 64, 256, {128}, 119u);
+        f += one_quant_shape(QType::W8G32_F16S, 70, 130, {17}, 121u);
+        f += paired_w8g32_shape(64, 256, {17, 128}, 127u);
+        std::cout << (f ? "FAIL" : "OK") << " linear W8G32 focused correctness\n";
+        return f ? 1 : 0;
+    }
+
     int f = 0;
     f += dense_metadata_validation();
     f += dense_alignment_validation();
@@ -495,6 +555,7 @@ int main() {
     }
     f += one_quant_shape(QType::W8G32_F16S, 96, 130, {1, 2, 5, 17}, 113u, 8.0f, 1.25f,
                          "stress");
+    f += paired_w8g32_shape(64, 256, {17, 128}, 127u);
     f += one_quant_shape(QType::Q4G64_F16S, 128, 128, {512}, 43u);
     f += one_quant_shape(QType::Q6G64_F16S, 128, 128, {512}, 47u);
     for (auto [n, k] : {std::pair<std::int32_t, std::int32_t>{34816, 5120},

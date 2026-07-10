@@ -584,8 +584,8 @@ void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
     Tensor k_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
     Tensor v_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
-    kernels::linear(ah, *mtp_.k_proj, k_flat, work_, s);
-    kernels::linear(ah, *mtp_.v_proj, v_flat, work_, s);
+    kernels::linear_w8g32_kv_pair(
+        ah, *mtp_.k_proj, *mtp_.v_proj, k_flat, v_flat, work_, s);
     Tensor k  = k_flat.view({kCfg.head_dim, kCfg.n_kv, T});
     Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
     Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});

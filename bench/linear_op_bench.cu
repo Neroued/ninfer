@@ -70,6 +70,7 @@ struct TargetSpec {
 
 constexpr ShapeSpec kShapes[] = {
     {"MtpFc5120x10240", 5120, 10240},
+    {"MtpKV1024x5120", 1024, 5120},
     {"MtpAttnIn14336x5120", 14336, 5120},
     {"MtpOProj5120x6144", 5120, 6144},
     {"MtpMlpGateUp34816x5120", 34816, 5120},
@@ -99,6 +100,7 @@ constexpr TargetSpec kTask2Targets[] = {
     {{"Proj6144x5120", 6144, 5120}, QType::Q5G64_F16S},
     {{"Out5120x6144", 5120, 6144}, QType::Q5G64_F16S},
     {{"MtpFc5120x10240", 5120, 10240}, QType::W8G32_F16S},
+    {{"MtpKV1024x5120", 1024, 5120}, QType::W8G32_F16S},
     {{"MtpAttnIn14336x5120", 14336, 5120}, QType::W8G32_F16S},
     {{"MtpOProj5120x6144", 5120, 6144}, QType::W8G32_F16S},
     {{"MtpMlpGateUp34816x5120", 34816, 5120}, QType::W8G32_F16S},
@@ -109,6 +111,7 @@ struct Options {
     bool          all_targets        = true;
     bool          have_shape         = false;
     bool          have_qtype         = false;
+    bool          paired_kv          = false;
     ShapeSpec     shape              = kTask2Targets[0].shape;
     QType         qtype              = kTask2Targets[0].qtype;
     int           warmup             = kDefaultWarmup;
@@ -357,6 +360,7 @@ void usage(const char* argv0) {
                  "  --all-targets              Run the registered target shape/qtype rows (default).\n"
                  "  --shape NAME               One ShapeFamily string, e.g. MlpGateUp34816x5120.\n"
                  "  --qtype Q4|Q5|Q6|W8G32     Low-bit ROW_SPLIT qtype for --shape.\n"
+                 "  --paired-kv                Benchmark paired MTP K/V (requires MtpKV + W8G32).\n"
                  "  --warmup N                 Cold-cache warmup GEMV launches (default %d).\n"
                  "  --repeat N                 Cold-cache measured GEMV launches (default %d).\n"
                  "  --copy-repeat N            Cold-cache copy-ceiling samples (default %d).\n"
@@ -387,6 +391,9 @@ Options parse_args(int argc, char** argv) {
             opt.qtype       = parse_qtype(next("qtype"));
             opt.have_qtype  = true;
             opt.all_targets = false;
+        } else if (arg == "--paired-kv") {
+            opt.paired_kv   = true;
+            opt.all_targets = false;
         } else if (arg == "--warmup") {
             opt.warmup = parse_int(next("warmup"), "warmup");
         } else if (arg == "--repeat") {
@@ -413,6 +420,11 @@ Options parse_args(int argc, char** argv) {
 
     if (!opt.all_targets && (!opt.have_shape || !opt.have_qtype)) {
         throw std::invalid_argument("--shape and --qtype must be provided together");
+    }
+    if (opt.paired_kv &&
+        (std::string_view(opt.shape.name) != "MtpKV1024x5120" ||
+         opt.qtype != QType::W8G32_F16S)) {
+        throw std::invalid_argument("--paired-kv requires --shape MtpKV1024x5120 --qtype W8G32");
     }
     if (opt.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (opt.warmup < 0) { throw std::invalid_argument("--warmup must be nonnegative"); }
@@ -716,6 +728,74 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     return r;
 }
 
+RunResult run_paired_kv(const Options& opt, double stream_ceiling_gbs,
+                        double tc_ceiling_tflops, std::int32_t t, DeviceBuffer& flush,
+                        cudaStream_t stream) {
+    constexpr ShapeSpec shape{"MtpKVPair1024x5120", 1024, 5120};
+    const std::uint64_t tt = static_cast<std::uint64_t>(t);
+    DeviceBuffer x = make_bf16_device(static_cast<std::uint64_t>(shape.k) * tt);
+    RowSplitPayload kbuf = make_row_split_payload(QType::W8G32_F16S, shape.n, shape.k, stream);
+    RowSplitPayload vbuf = make_row_split_payload(QType::W8G32_F16S, shape.n, shape.k, stream);
+    DeviceBuffer kout(static_cast<std::uint64_t>(shape.n) * tt * 2ULL);
+    DeviceBuffer vout(static_cast<std::uint64_t>(shape.n) * tt * 2ULL);
+    CUDA_CHECK(cudaMemsetAsync(kout.p, 0, kout.bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(vout.p, 0, vout.bytes, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    Tensor tx(x.p, DType::BF16, {shape.k, t});
+    Tensor tk(kout.p, DType::BF16, {shape.n, t});
+    Tensor tv(vout.p, DType::BF16, {shape.n, t});
+    Weight wk = make_weight(kbuf, QType::W8G32_F16S, shape.n, shape.k);
+    Weight wv = make_weight(vbuf, QType::W8G32_F16S, shape.n, shape.k);
+    WorkspaceArena ws(64ULL << 20);
+
+    const auto launch = [&](cudaStream_t s) {
+        kernels::linear_w8g32_kv_pair(tx, wk, wv, tk, tv, ws, s);
+    };
+    const TimingStats cold = measure_cold(launch, flush, stream, opt.warmup, opt.repeat);
+    const TimingStats warm = measure_warm(launch, stream, opt.warmup, opt.repeat);
+
+    const std::uint64_t weight_bytes = wk.payload_bytes + wv.payload_bytes;
+    const std::uint64_t x_bytes = static_cast<std::uint64_t>(shape.k) * tt * 2ULL;
+    const std::uint64_t out_bytes = 2ULL * static_cast<std::uint64_t>(shape.n) * tt * 2ULL;
+    const std::uint64_t bytes_streamed = weight_bytes + x_bytes + out_bytes;
+    const double sec = cold.median_us * 1e-6;
+    const double flops = 4.0 * static_cast<double>(shape.n) * static_cast<double>(shape.k) *
+                         static_cast<double>(t);
+
+    RunResult r;
+    r.shape_name = shape.name;
+    r.qtype_name = "W8G32x2";
+    r.n = shape.n * 2;
+    r.k = shape.k;
+    r.t = t;
+    r.weight_payload_bytes = weight_bytes;
+    r.x_bytes = x_bytes;
+    r.out_bytes = out_bytes;
+    r.bytes_streamed = bytes_streamed;
+    r.cold_median_us = cold.median_us;
+    r.cold_min_us = cold.min_us;
+    r.cold_p95_us = cold.p95_us;
+    r.warm_median_us = warm.median_us;
+    r.achieved_gbs = sec > 0.0 ? static_cast<double>(bytes_streamed) / sec / 1e9 : 0.0;
+    r.achieved_dram_pct = stream_ceiling_gbs > 0.0
+                              ? r.achieved_gbs / stream_ceiling_gbs * 100.0
+                              : 0.0;
+    r.achieved_tflops = sec > 0.0 ? flops / sec / 1e12 : 0.0;
+    r.tc_ceiling_tflops = tc_ceiling_tflops;
+    r.tc_pct = tc_ceiling_tflops > 0.0
+                   ? r.achieved_tflops / tc_ceiling_tflops * 100.0
+                   : 0.0;
+    r.stream_ceiling_gbs = stream_ceiling_gbs;
+    r.roofline_us = stream_ceiling_gbs > 0.0
+                        ? static_cast<double>(bytes_streamed) / (stream_ceiling_gbs * 1e9) * 1e6
+                        : 0.0;
+    r.repeat = opt.repeat;
+    r.warmup = opt.warmup;
+    r.flush_bytes = opt.flush_bytes;
+    return r;
+}
+
 void print_table(const std::vector<RunResult>& rows, double stream_ceiling_gbs,
                  double tc_ceiling_tflops, std::uint64_t copy_bytes) {
     std::printf("# stream_ceiling_gbs=%.3f tc_ceiling_tflops=%.3f\n", stream_ceiling_gbs,
@@ -789,8 +869,13 @@ int main(int argc, char** argv) {
         rows.reserve(targets.size() * opt.t_sweep.size());
         for (const TargetSpec& target : targets) {
             for (int t : opt.t_sweep) {
-                rows.push_back(run_target(target, opt, stream_ceiling_gbs, tc_ceiling_tflops, t,
-                                          flush, stream));
+                if (opt.paired_kv) {
+                    rows.push_back(run_paired_kv(opt, stream_ceiling_gbs, tc_ceiling_tflops, t,
+                                                 flush, stream));
+                } else {
+                    rows.push_back(run_target(target, opt, stream_ceiling_gbs, tc_ceiling_tflops,
+                                              t, flush, stream));
+                }
             }
         }
 

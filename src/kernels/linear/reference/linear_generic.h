@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kernels/linear/plan/linear_plan.h"   // LinearFormat
+#include "kernels/linear/plan/linear_plan.h" // LinearFormat
 #include "qus/core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -15,6 +15,11 @@ void linear_rowsplit_gemm_smallt_launch(const Tensor& x, const Weight& w, Tensor
 // LargeT (T > tau) tensor-core path: bf16 mma.sync with on-chip low-bit dequant.
 void linear_rowsplit_gemm_mma_launch(const Tensor& x, const Weight& w, Tensor& out,
                                      LinearFormat fmt, cudaStream_t stream);
+void linear_rowsplit_w8g32_gemm_mma_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                           cudaStream_t stream);
+void linear_rowsplit_w8g32_kv_gemm_mma_launch(const Tensor& x, const Weight& k_weight,
+                                              const Weight& v_weight, Tensor& k_out, Tensor& v_out,
+                                              cudaStream_t stream);
 
 // Dense (BF16/FP32): wrapper passes as_dense(w) as the weight Tensor.
 void linear_generic_dense_gemv_launch(const Tensor& x, const Tensor& weight, Tensor& out,

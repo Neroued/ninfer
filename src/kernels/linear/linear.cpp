@@ -302,8 +302,13 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
     const bool mma_routed_format =
         fmt == detail::LinearFormat::Q4G64_RowSplit ||
         fmt == detail::LinearFormat::Q5G64_RowSplit ||
-        fmt == detail::LinearFormat::Q6G64_RowSplit;
+        fmt == detail::LinearFormat::Q6G64_RowSplit ||
+        fmt == detail::LinearFormat::W8G32_RowSplit;
     if (mma_routed_format && regime == detail::LinearRegime::LargeT && (w.k % 8) != 0) {
+        regime = detail::LinearRegime::SmallT;
+    }
+    if (fmt == detail::LinearFormat::W8G32_RowSplit &&
+        (w.padded_shape[1] % 256) != 0) {
         regime = detail::LinearRegime::SmallT;
     }
     const detail::LinearPlan plan = detail::resolve_plan(detail::LinearPlanKey{fmt, shape, regime});
@@ -314,6 +319,9 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
         break;
     case detail::LinearPolicyId::RowsplitLowbitGemmMma:
         detail::linear_rowsplit_gemm_mma_launch(x, w, out, fmt, stream);
+        break;
+    case detail::LinearPolicyId::RowsplitW8G32GemmMma:
+        detail::linear_rowsplit_w8g32_gemm_mma_launch(x, w, out, stream);
         break;
     case detail::LinearPolicyId::GenericDenseGemv: {
         const Tensor dense = as_dense(w);
@@ -353,6 +361,39 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
         detail::linear_rowsplit_gemv_out_6144_q5_launch(x, w, out, ws, stream);
         break;
     }
+}
+
+void linear_w8g32_kv_pair(const Tensor& x, const Weight& k_weight, const Weight& v_weight,
+                          Tensor& k_out, Tensor& v_out, WorkspaceArena& ws,
+                          cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || k_out.dtype != DType::BF16 || v_out.dtype != DType::BF16) {
+        throw std::invalid_argument("linear_w8g32_kv_pair: x/out tensors must be BF16");
+    }
+    if (k_weight.qtype != QType::W8G32_F16S || v_weight.qtype != QType::W8G32_F16S) {
+        throw std::invalid_argument("linear_w8g32_kv_pair: weights must be W8G32");
+    }
+    require_row_split_lowbit_metadata(k_weight, "K W8G32_F16S", 32, 32u, 0u);
+    require_row_split_lowbit_metadata(v_weight, "V W8G32_F16S", 32, 32u, 0u);
+    require_matrix_shapes(x, k_weight, k_out);
+    require_matrix_shapes(x, v_weight, v_out);
+    require_tensor_strides(x, k_out);
+    require_tensor_strides(x, v_out);
+    if (k_weight.n != v_weight.n || k_weight.k != v_weight.k ||
+        k_weight.padded_shape[1] != v_weight.padded_shape[1]) {
+        throw std::invalid_argument("linear_w8g32_kv_pair: K/V weight shapes must match");
+    }
+    if (is_empty_T(x, k_out)) { return; }
+    require_tensor_data(x, k_out);
+    require_tensor_data(x, v_out);
+
+    if (x.ne[1] <= 16 || (k_weight.k % 8) != 0 ||
+        (k_weight.padded_shape[1] % 256) != 0) {
+        linear(x, k_weight, k_out, ws, stream);
+        linear(x, v_weight, v_out, ws, stream);
+        return;
+    }
+    detail::linear_rowsplit_w8g32_kv_gemm_mma_launch(
+        x, k_weight, v_weight, k_out, v_out, stream);
 }
 
 } // namespace qus::kernels

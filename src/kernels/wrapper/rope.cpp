@@ -1,7 +1,7 @@
 // qus::kernels - rope wrapper: public api validation and launcher dispatch.
 #include "qus/kernels/rope.h"
 
-#include "kernels/launcher/rope.h"  // detail::rope_launch
+#include "kernels/launcher/rope.h" // detail::rope_launch
 
 #include <cmath>
 #include <cstdint>
@@ -13,8 +13,8 @@ namespace qus::kernels {
 namespace {
 
 constexpr std::int32_t kHeadDim = 256;
-constexpr std::int32_t kQHeads = 24;
-constexpr std::int32_t kKHeads = 4;
+constexpr std::int32_t kQHeads  = 24;
+constexpr std::int32_t kKHeads  = 4;
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     bool has_zero = false;
@@ -65,9 +65,9 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
         throw std::invalid_argument("rope: theta must be positive and finite");
     }
 
-    (void) numel_allow_zero(positions, "positions");
+    (void)numel_allow_zero(positions, "positions");
     const std::int64_t q_numel = numel_allow_zero(q, "q");
-    (void) numel_allow_zero(k, "k");
+    (void)numel_allow_zero(k, "k");
 
     require_positions_shape(positions);
     const std::int32_t T = positions.ne[0];
@@ -87,6 +87,57 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     }
 
     detail::rope_launch(positions, rotary_dim, theta, q, k, stream);
+}
+
+namespace {
+
+void rope_single(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
+                 std::int32_t heads, const char* label, bool is_q, cudaStream_t stream) {
+    if (positions.dtype != DType::I32) {
+        throw std::invalid_argument(std::string("rope_") + label + ": positions must be I32");
+    }
+    if (x.dtype != DType::BF16) {
+        throw std::invalid_argument(std::string("rope_") + label + ": tensor must be BF16");
+    }
+    if (!(theta > 0.0f) || !std::isfinite(theta)) {
+        throw std::invalid_argument(std::string("rope_") + label +
+                                    ": theta must be positive and finite");
+    }
+
+    (void)numel_allow_zero(positions, "positions");
+    const std::int64_t x_numel = numel_allow_zero(x, label);
+    require_positions_shape(positions);
+    const std::int32_t T = positions.ne[0];
+    require_rope_tensor_shape(x, label, heads, T);
+    if (rotary_dim <= 0 || rotary_dim > x.ne[0] || (rotary_dim & 1) != 0) {
+        throw std::invalid_argument(std::string("rope_") + label +
+                                    ": rotary_dim must be positive, even, and <= head dim");
+    }
+    if (x_numel == 0) { return; }
+    if (!positions.is_contiguous() || !x.is_contiguous()) {
+        throw std::invalid_argument(std::string("rope_") + label +
+                                    ": positions/tensor must be contiguous");
+    }
+    if (positions.data == nullptr || x.data == nullptr) {
+        throw std::invalid_argument(std::string("rope_") + label +
+                                    ": positions/tensor data must be non-null");
+    }
+
+    if (is_q) {
+        detail::rope_q_launch(positions, rotary_dim, theta, x, stream);
+    } else {
+        detail::rope_k_launch(positions, rotary_dim, theta, x, stream);
+    }
+}
+
+} // namespace
+
+void rope_q(const Tensor& positions, int rotary_dim, float theta, Tensor& q, cudaStream_t stream) {
+    rope_single(positions, rotary_dim, theta, q, kQHeads, "q", true, stream);
+}
+
+void rope_k(const Tensor& positions, int rotary_dim, float theta, Tensor& k, cudaStream_t stream) {
+    rope_single(positions, rotary_dim, theta, k, kKHeads, "k", false, stream);
 }
 
 } // namespace qus::kernels

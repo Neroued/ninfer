@@ -66,6 +66,10 @@ struct MtpW {
     const Tensor* pre_fc_norm_hidden    = nullptr;
     const Tensor* input_norm            = nullptr;
     const Weight* attn_in               = nullptr;
+    const Weight* q_proj                = nullptr;
+    const Weight* gate_proj             = nullptr;
+    const Weight* k_proj                = nullptr;
+    const Weight* v_proj                = nullptr;
     const Tensor* q_norm                = nullptr;
     const Tensor* k_norm                = nullptr;
     const Weight* o_proj                = nullptr;
@@ -269,8 +273,13 @@ private:
     void attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph);
     void gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph);
     void mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph);
+    void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, Tensor& x, Tensor& ah);
+    void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions, Tensor& mtp_hidden);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                           Tensor& mtp_hidden);
+    void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
+                           bool final_chunk, Tensor* final_hidden, Tensor* logits,
+                           Tensor* draft_token);
     // Draft-proposal argmax at an MTP draft site. Uses the full `lm_head_` (writing
     // into `logits`) unless a draft head is set, in which case it projects with the
     // smaller `lm_head_draft_` into a work-scoped [n,1] buffer, argmaxes to a
@@ -304,12 +313,12 @@ private:
     // turn-boundary slot; -1 disables. Set via set_prefill_snapshot_boundary and reset by prefill.
     std::int64_t prefill_snapshot_boundary_ = -1;
 
-    const Weight* embed_      = nullptr;
-    const Tensor* final_norm_ = nullptr;
-    const Weight* lm_head_    = nullptr;
-    const Weight* lm_head_draft_            = nullptr;
-    const std::int32_t* lm_head_draft_ids_ = nullptr;
-    int lm_head_draft_n_                   = 0;
+    const Weight* embed_                            = nullptr;
+    const Tensor* final_norm_                       = nullptr;
+    const Weight* lm_head_                          = nullptr;
+    const Weight* lm_head_draft_                    = nullptr;
+    const std::int32_t* lm_head_draft_ids_          = nullptr;
+    int lm_head_draft_n_                            = 0;
     const kernels::SamplingConfig* sampling_config_ = nullptr;
     MtpW mtp_{};
     std::array<FullLayerW, ModelConfig::n_full()> full_{};

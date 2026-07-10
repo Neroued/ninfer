@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -379,8 +380,7 @@ std::vector<float> dequantize_cache_f16(const std::vector<std::int8_t>& code,
                 for (std::int32_t i = 0; i < kKvQuantGroup; ++i) {
                     const std::int32_t d  = group * kKvQuantGroup + i;
                     const std::size_t idx = cache_index(kv_head, d, position, padded_context);
-                    out[idx] = f16_bits_to_f32(
-                        f32_to_f16_bits(static_cast<float>(code[idx]) * s));
+                    out[idx] = f16_bits_to_f32(f32_to_f16_bits(static_cast<float>(code[idx]) * s));
                 }
             }
         }
@@ -458,9 +458,7 @@ int one_int8_prefill_case(std::int32_t tokens, std::uint32_t seed, std::int32_t 
     round_to_bf16(history_v);
 
     std::vector<int> positions(static_cast<std::size_t>(tokens));
-    for (std::int32_t t = 0; t < tokens; ++t) {
-        positions[static_cast<std::size_t>(t)] = base + t;
-    }
+    for (std::int32_t t = 0; t < tokens; ++t) { positions[static_cast<std::size_t>(t)] = base + t; }
     std::vector<std::int8_t> initial_k(code_n, 0), initial_v(code_n, 0);
     std::vector<std::uint16_t> initial_k_scale(scale_n, 0), initial_v_scale(scale_n, 0);
     if (base > 0) {
@@ -534,9 +532,9 @@ int one_int8_prefill_case(std::int32_t tokens, std::uint32_t seed, std::int32_t 
     kernels::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
     cudaDeviceSynchronize();
 
-    int f                   = 0;
-    const std::string label = "gqa int8 prefill base=" + std::to_string(base) +
-                              " T=" + std::to_string(tokens);
+    int f = 0;
+    const std::string label =
+        "gqa int8 prefill base=" + std::to_string(base) + " T=" + std::to_string(tokens);
     f += verify(label.c_str(), from_device_bf16(dout, qn), ref, Tolerance::attention_bf16());
     f += check_i8_equal((label + " k code").c_str(), from_device_i8(kv.k[0].data, code_n),
                         expected_k);
@@ -835,6 +833,113 @@ int one_prefill_case(std::int32_t tokens, std::uint32_t seed, std::int32_t cache
         std::cerr << label << ": attention op must not advance host KVCache.pos; got " << kv.pos
                   << '\n';
         ++f;
+    }
+    return f;
+}
+
+int split_api_parity_case(DType cache_dtype, std::int32_t tokens, std::int32_t base,
+                          std::uint32_t seed, bool final_row_only = false) {
+    const std::size_t qn =
+        static_cast<std::size_t>(kHeadDim) * kQHeads * static_cast<std::size_t>(tokens);
+    const std::size_t kvn =
+        static_cast<std::size_t>(kHeadDim) * kKVHeads * static_cast<std::size_t>(tokens);
+    const std::int32_t total          = base + tokens;
+    const std::int32_t padded_context = align_up_128(total);
+    const std::size_t code_n          = cache_elements(padded_context);
+    const std::size_t scale_n         = scale_elements(padded_context);
+
+    std::vector<float> q(qn), k(kvn), v(kvn);
+    fill_uniform(q, seed, -0.25f, 0.25f);
+    fill_uniform(k, seed + 1000u, -0.25f, 0.25f);
+    fill_uniform(v, seed + 2000u, -1.0f, 1.0f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    round_to_bf16(v);
+    std::vector<int> positions(static_cast<std::size_t>(tokens));
+    for (std::int32_t t = 0; t < tokens; ++t) { positions[static_cast<std::size_t>(t)] = base + t; }
+
+    DBuf dq         = to_device_bf16(q);
+    DBuf dk         = to_device_bf16(k);
+    DBuf dv         = to_device_bf16(v);
+    DBuf dpos       = to_device_i32(positions);
+    DBuf dout_full  = DBuf(qn * sizeof(std::uint16_t));
+    DBuf dout_split = DBuf(qn * sizeof(std::uint16_t));
+    WorkspaceArena ws(kGqaWorkspaceBytes);
+
+    const std::size_t arena_bytes =
+        cache_dtype == DType::BF16
+            ? 2 * (code_n * sizeof(std::uint16_t) + 256) + 4096
+            : 2 * (code_n + 256) + 2 * (scale_n * sizeof(std::uint16_t) + 256) + 4096;
+    DeviceArena full_arena(arena_bytes);
+    DeviceArena split_arena(arena_bytes);
+    KVCache full_cache(full_arena, 1, static_cast<std::uint32_t>(total), kKVHeads, kHeadDim,
+                       cache_dtype);
+    KVCache split_cache(split_arena, 1, static_cast<std::uint32_t>(total), kKVHeads, kHeadDim,
+                        cache_dtype);
+    const std::size_t code_bytes = code_n * dtype_size(cache_dtype);
+    for (KVCache* cache : {&full_cache, &split_cache}) {
+        cudaMemset(cache->k[0].data, 0, code_bytes);
+        cudaMemset(cache->v[0].data, 0, code_bytes);
+        if (cache_dtype == DType::I8) {
+            cudaMemset(cache->k_scale[0].data, 0, scale_n * sizeof(std::uint16_t));
+            cudaMemset(cache->v_scale[0].data, 0, scale_n * sizeof(std::uint16_t));
+        }
+        cache->pos = static_cast<std::uint32_t>(base);
+    }
+
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv(dv.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tpos(dpos.p, DType::I32, {tokens});
+    Tensor tout_full(dout_full.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    const std::size_t q_col_elems   = static_cast<std::size_t>(kHeadDim) * kQHeads;
+    auto* q_split_ptr               = static_cast<std::uint16_t*>(dq.p);
+    auto* pos_split_ptr             = static_cast<std::int32_t*>(dpos.p);
+    const std::int32_t split_tokens = final_row_only ? 1 : tokens;
+    if (final_row_only) {
+        q_split_ptr += static_cast<std::size_t>(tokens - 1) * q_col_elems;
+        pos_split_ptr += tokens - 1;
+    }
+    Tensor tq_split(q_split_ptr, DType::BF16, {kHeadDim, kQHeads, split_tokens});
+    Tensor tpos_split(pos_split_ptr, DType::I32, {split_tokens});
+    Tensor tout_split(dout_split.p, DType::BF16, {kHeadDim, kQHeads, split_tokens});
+
+    kernels::gqa_attention(tq, tk, tv, tpos, kScale, full_cache, 0, ws, tout_full, nullptr);
+    kernels::gqa_kv_append(tk, tv, tpos, split_cache, 0, nullptr);
+    kernels::gqa_attention_cached(tq_split, tpos_split, kScale, split_cache, 0, tout_split,
+                                  nullptr);
+    cudaDeviceSynchronize();
+
+    const std::string dtype_label = cache_dtype == DType::BF16 ? "bf16" : "int8";
+    const std::string label = "gqa split API " + dtype_label + " base=" + std::to_string(base) +
+                              " T=" + std::to_string(tokens) + (final_row_only ? " final-row" : "");
+    std::vector<double> expected = from_device_bf16(dout_full, qn);
+    if (final_row_only) {
+        expected.erase(expected.begin(), expected.end() - static_cast<std::ptrdiff_t>(q_col_elems));
+    }
+    int f = 0;
+    f += verify(label.c_str(), from_device_bf16(dout_split, q_col_elems * split_tokens), expected,
+                Tolerance::attention_bf16());
+    if (cache_dtype == DType::BF16) {
+        f += check_bits_equal((label + " k cache").c_str(),
+                              from_device_bf16_bits(split_cache.k[0].data, code_n),
+                              from_device_bf16_bits(full_cache.k[0].data, code_n));
+        f += check_bits_equal((label + " v cache").c_str(),
+                              from_device_bf16_bits(split_cache.v[0].data, code_n),
+                              from_device_bf16_bits(full_cache.v[0].data, code_n));
+    } else {
+        f += check_i8_equal((label + " k code").c_str(),
+                            from_device_i8(split_cache.k[0].data, code_n),
+                            from_device_i8(full_cache.k[0].data, code_n));
+        f += check_i8_equal((label + " v code").c_str(),
+                            from_device_i8(split_cache.v[0].data, code_n),
+                            from_device_i8(full_cache.v[0].data, code_n));
+        f += check_bits_equal((label + " k scale").c_str(),
+                              from_device_u16(split_cache.k_scale[0].data, scale_n),
+                              from_device_u16(full_cache.k_scale[0].data, scale_n));
+        f += check_bits_equal((label + " v scale").c_str(),
+                              from_device_u16(split_cache.v_scale[0].data, scale_n),
+                              from_device_u16(full_cache.v_scale[0].data, scale_n));
     }
     return f;
 }
@@ -1249,6 +1354,12 @@ int main(int argc, char** argv) {
     f += one_prefill_case(512, 139u, 128);
     f += one_prefill_case(65, 149u, 384);
     f += one_prefill_decode_consistency_case(128, 131u);
+    f += split_api_parity_case(DType::BF16, 1, 17, 1401u);
+    f += split_api_parity_case(DType::BF16, 128, 17, 1402u);
+    f += split_api_parity_case(DType::I8, 1, 17, 1403u);
+    f += split_api_parity_case(DType::I8, 128, 17, 1404u);
+    f += split_api_parity_case(DType::BF16, 1024, 17, 1405u, true);
+    f += split_api_parity_case(DType::I8, 1024, 17, 1406u, true);
     f += one_decode_case(1, 11u);
     f += one_decode_case(17, 17u);
     f += one_decode_case(2048, 23u);

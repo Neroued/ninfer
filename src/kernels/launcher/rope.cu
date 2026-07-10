@@ -2,25 +2,57 @@
 #include "kernels/launcher/rope.h"
 
 #include "kernels/kernel/rope.cuh"
-#include "qus/core/device.h"  // CUDA_CHECK
+#include "qus/core/device.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 
 namespace qus::kernels::detail {
+namespace {
+
+void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
+                        std::int32_t q_heads, std::int32_t k_heads, cudaStream_t stream) {
+    constexpr int kBlock           = 256;
+    const std::int64_t half        = static_cast<std::int64_t>(rotary_dim / 2);
+    const std::int64_t T           = static_cast<std::int64_t>(positions.ne[0]);
+    const std::int64_t total_pairs = static_cast<std::int64_t>(q_heads + k_heads) * T * half;
+    const auto addr                = reinterpret_cast<std::uintptr_t>(x.data);
+    const bool aligned16           = (addr & 0x0fU) == 0;
+
+    if (aligned16) {
+        const int grid =
+            static_cast<int>(std::min<std::int64_t>(T, std::numeric_limits<int>::max()));
+        rope_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(x.data),
+            static_cast<__nv_bfloat16*>(x.data), rotary_dim, theta, q_heads, k_heads,
+            positions.ne[0], total_pairs);
+    } else {
+        const std::int64_t blocks = (total_pairs + static_cast<std::int64_t>(kBlock) - 1) /
+                                    static_cast<std::int64_t>(kBlock);
+        const int grid =
+            static_cast<int>(std::min<std::int64_t>(blocks, std::numeric_limits<int>::max()));
+        rope_pair_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(x.data),
+            static_cast<__nv_bfloat16*>(x.data), rotary_dim, theta, q_heads, k_heads,
+            positions.ne[0], total_pairs);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
 
 void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
                  cudaStream_t stream) {
-    constexpr int kBlock = 256;
-    const std::int64_t half = static_cast<std::int64_t>(rotary_dim / 2);
-    const std::int64_t T = static_cast<std::int64_t>(positions.ne[0]);
-    const std::int64_t q_pairs = static_cast<std::int64_t>(q.ne[1]) * T * half;
-    const std::int64_t k_pairs = static_cast<std::int64_t>(k.ne[1]) * T * half;
+    constexpr int kBlock           = 256;
+    const std::int64_t half        = static_cast<std::int64_t>(rotary_dim / 2);
+    const std::int64_t T           = static_cast<std::int64_t>(positions.ne[0]);
+    const std::int64_t q_pairs     = static_cast<std::int64_t>(q.ne[1]) * T * half;
+    const std::int64_t k_pairs     = static_cast<std::int64_t>(k.ne[1]) * T * half;
     const std::int64_t total_pairs = q_pairs + k_pairs;
-    const auto q_addr = reinterpret_cast<std::uintptr_t>(q.data);
-    const auto k_addr = reinterpret_cast<std::uintptr_t>(k.data);
-    const bool aligned16 = ((q_addr | k_addr) & 0x0fU) == 0;
+    const auto q_addr              = reinterpret_cast<std::uintptr_t>(q.data);
+    const auto k_addr              = reinterpret_cast<std::uintptr_t>(k.data);
+    const bool aligned16           = ((q_addr | k_addr) & 0x0fU) == 0;
 
     if (aligned16) {
         const int grid =
@@ -30,9 +62,8 @@ void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q
             static_cast<__nv_bfloat16*>(k.data), rotary_dim, theta, q.ne[1], k.ne[1],
             positions.ne[0], total_pairs);
     } else {
-        const std::int64_t blocks =
-            (total_pairs + static_cast<std::int64_t>(kBlock) - 1) /
-            static_cast<std::int64_t>(kBlock);
+        const std::int64_t blocks = (total_pairs + static_cast<std::int64_t>(kBlock) - 1) /
+                                    static_cast<std::int64_t>(kBlock);
         const int grid =
             static_cast<int>(std::min<std::int64_t>(blocks, std::numeric_limits<int>::max()));
         rope_pair_kernel<<<grid, kBlock, 0, stream>>>(
@@ -41,6 +72,16 @@ void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q
             positions.ne[0], total_pairs);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void rope_q_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q,
+                   cudaStream_t stream) {
+    rope_single_launch(positions, rotary_dim, theta, q, /*q_heads=*/q.ne[1], /*k_heads=*/0, stream);
+}
+
+void rope_k_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& k,
+                   cudaStream_t stream) {
+    rope_single_launch(positions, rotary_dim, theta, k, /*q_heads=*/0, /*k_heads=*/k.ne[1], stream);
 }
 
 } // namespace qus::kernels::detail

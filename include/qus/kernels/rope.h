@@ -5,11 +5,17 @@
 
 #include "qus/core/tensor.h"
 
-#include <cuda_runtime.h>  // cudaStream_t
+#include <cuda_runtime.h> // cudaStream_t
 
 namespace qus::kernels {
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
           cudaStream_t stream);
+
+// Single-tensor variants used when prompt KV preparation only materializes K, or when a final-row
+// attention tail only materializes Q. They use the same partial NeoX rotation and arithmetic as
+// rope(), without requiring an unused companion tensor.
+void rope_q(const Tensor& positions, int rotary_dim, float theta, Tensor& q, cudaStream_t stream);
+void rope_k(const Tensor& positions, int rotary_dim, float theta, Tensor& k, cudaStream_t stream);
 
 } // namespace qus::kernels

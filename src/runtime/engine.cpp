@@ -431,31 +431,44 @@ std::size_t default_work_bytes_for(std::uint32_t prefill_chunk, int draft_tokens
     const bool include_mtp_work = draft_tokens > 0;
     std::size_t mtp             = 0;
     if (include_mtp_work) {
-        mtp = arena_sequence_bytes(
-            persistent,
+        const auto mtp_bf16_one = [&](std::size_t rows) {
+            return token_matrix_bytes(rows, 1, DType::BF16, "work arena size");
+        };
+        // Final-chunk x/ah survive the bulk rewind. The prompt phase keeps only the stem plus
+        // K/V projections alive; Q/gate, attention output, O and MLP are materialized for one
+        // final row after the rewind.
+        const std::size_t mtp_final_base = arena_sequence_bytes(
+            persistent, {mtp_bf16_one(model::kCfg.hidden), mtp_bf16_one(model::kCfg.hidden)},
+            "work arena size");
+        const std::size_t mtp_bulk = arena_sequence_bytes(mtp_final_base,
+                                                          {
+                                                              bf16(model::kCfg.hidden),
+                                                              bf16(model::kCfg.hidden),
+                                                              bf16(model::kCfg.hidden),
+                                                              bf16(model::kCfg.mtp_fc_in),
+                                                              bf16(model::kCfg.hidden),
+                                                              bf16(model::kCfg.hidden),
+                                                              bf16(model::kCfg.kv_size),
+                                                              bf16(model::kCfg.kv_size),
+                                                              bf16(model::kCfg.kv_size),
+                                                          },
+                                                          "work arena size");
+        const std::size_t mtp_tail = arena_sequence_bytes(
+            mtp_final_base,
             {
-                bf16(model::kCfg.hidden),
-                bf16(model::kCfg.hidden),
-                bf16(model::kCfg.mtp_fc_in),
-                bf16(model::kCfg.hidden),
-                bf16(model::kCfg.hidden),
-                bf16(model::kCfg.mtp_attn_in),
-                bf16(model::kCfg.q_size),
-                bf16(model::kCfg.kv_size),
-                bf16(model::kCfg.q_size),
-                bf16(model::kCfg.kv_size),
-                bf16(model::kCfg.q_size),
-                bf16(model::kCfg.kv_size),
-                bf16(model::kCfg.q_size),
-                bf16(model::kCfg.hidden),
-                bf16(model::kCfg.hidden),
-                bf16(model::kCfg.mtp_mlp_gateup_rows),
-                bf16(model::kCfg.intermediate),
-                bf16(model::kCfg.hidden),
-                bf16(model::kCfg.hidden),
+                mtp_bf16_one(model::kCfg.q_size),
+                mtp_bf16_one(model::kCfg.q_size),
+                mtp_bf16_one(model::kCfg.q_size),
+                mtp_bf16_one(model::kCfg.q_size),
+                mtp_bf16_one(model::kCfg.hidden),
+                mtp_bf16_one(model::kCfg.hidden),
+                mtp_bf16_one(model::kCfg.mtp_mlp_gateup_rows),
+                mtp_bf16_one(model::kCfg.intermediate),
+                mtp_bf16_one(model::kCfg.hidden),
                 tensor_bytes(model::kCfg.vocab, DType::BF16, "work arena size"),
             },
             "work arena size");
+        mtp = std::max(mtp_bulk, mtp_tail);
     }
 
     const std::size_t verify = std::max({verify_attention, verify_gdn, verify_mlp, verify_final});

@@ -211,6 +211,18 @@ int main() {
     failures +=
         expect_weight(mtp.attn_in, qus::SourceKind::Other, 0, qus::QType::W8G32_F16S,
                       qus::QuantLayout::RowSplit, 24, 8, "mtp.attn_in", qus::ModuleKind::MtpDraft);
+    failures +=
+        expect_weight(mtp.q_proj, qus::SourceKind::AttnQ, 0, qus::QType::W8G32_F16S,
+                      qus::QuantLayout::RowSplit, 8, 8, "mtp.q_proj", qus::ModuleKind::MtpDraft);
+    failures +=
+        expect_weight(mtp.gate_proj, qus::SourceKind::AttnGate, 0, qus::QType::W8G32_F16S,
+                      qus::QuantLayout::RowSplit, 8, 8, "mtp.gate_proj", qus::ModuleKind::MtpDraft);
+    failures +=
+        expect_weight(mtp.k_proj, qus::SourceKind::AttnK, 0, qus::QType::W8G32_F16S,
+                      qus::QuantLayout::RowSplit, 4, 8, "mtp.k_proj", qus::ModuleKind::MtpDraft);
+    failures +=
+        expect_weight(mtp.v_proj, qus::SourceKind::AttnV, 0, qus::QType::W8G32_F16S,
+                      qus::QuantLayout::RowSplit, 4, 8, "mtp.v_proj", qus::ModuleKind::MtpDraft);
     failures += expect_tensor(mtp.q_norm, qus::DType::BF16, {4}, "mtp.q_norm");
     failures += expect_tensor(mtp.k_norm, qus::DType::BF16, {4}, "mtp.k_norm");
     failures +=

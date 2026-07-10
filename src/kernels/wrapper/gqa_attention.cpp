@@ -173,4 +173,55 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                                  partial_m_ptr, partial_l_ptr, out, stream);
 }
 
+void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions, KVCache& kv,
+                   int layer, cudaStream_t stream) {
+    constexpr const char* op = "gqa_kv_append";
+    if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
+        throw std::invalid_argument("gqa_kv_append: k/v must be BF16");
+    }
+    if (positions.dtype != DType::I32) {
+        throw std::invalid_argument("gqa_kv_append: positions must be I32");
+    }
+    const std::int32_t tokens = k.ne[2];
+    if (tokens <= 0) { throw std::invalid_argument("gqa_kv_append: T must be positive"); }
+    require_shape(k, kHeadDim, kKVHeads, tokens, 1, op, "k");
+    require_shape(v, kHeadDim, kKVHeads, tokens, 1, op, "v");
+    require_shape(positions, tokens, 1, 1, 1, op, "positions");
+    require_contiguous_nonnull(k, op, "k");
+    require_contiguous_nonnull(v, op, "v");
+    require_contiguous_nonnull(positions, op, "positions");
+    validate_cache(kv, layer, op);
+    if (static_cast<std::uint32_t>(tokens) > kv.max_context) {
+        throw std::invalid_argument("gqa_kv_append: T exceeds KVCache max_context");
+    }
+    detail::gqa_kv_append_launch(k, v, positions, kv, layer, stream);
+}
+
+void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale, KVCache& kv,
+                          int layer, Tensor& out, cudaStream_t stream) {
+    constexpr const char* op = "gqa_attention_cached";
+    if (q.dtype != DType::BF16 || out.dtype != DType::BF16) {
+        throw std::invalid_argument("gqa_attention_cached: q/out must be BF16");
+    }
+    if (positions.dtype != DType::I32) {
+        throw std::invalid_argument("gqa_attention_cached: positions must be I32");
+    }
+    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-6f) {
+        throw std::invalid_argument("gqa_attention_cached: scale must be 1/sqrt(256)");
+    }
+    const std::int32_t tokens = q.ne[2];
+    if (tokens <= 0) { throw std::invalid_argument("gqa_attention_cached: T must be positive"); }
+    require_shape(q, kHeadDim, kQHeads, tokens, 1, op, "q");
+    require_shape(positions, tokens, 1, 1, 1, op, "positions");
+    require_shape(out, kHeadDim, kQHeads, tokens, 1, op, "out");
+    require_contiguous_nonnull(q, op, "q");
+    require_contiguous_nonnull(positions, op, "positions");
+    require_contiguous_nonnull(out, op, "out");
+    validate_cache(kv, layer, op);
+    if (static_cast<std::uint32_t>(tokens) > kv.max_context) {
+        throw std::invalid_argument("gqa_attention_cached: T exceeds KVCache max_context");
+    }
+    detail::gqa_attention_prompt_attention_launch(q, positions, scale, kv, layer, out, stream);
+}
+
 } // namespace qus::kernels

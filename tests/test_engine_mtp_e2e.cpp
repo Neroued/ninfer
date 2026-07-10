@@ -309,6 +309,42 @@ int scenario_graph_parity(const std::filesystem::path& weights) {
     return failures;
 }
 
+int scenario_prefill_chunk_parity(const std::filesystem::path& weights) {
+    const std::vector<int> seed = foundation_prompt_ids();
+    std::vector<int> prompt;
+    prompt.reserve(257);
+    while (prompt.size() < 257) {
+        const std::size_t remaining = 257 - prompt.size();
+        prompt.insert(prompt.end(), seed.begin(),
+                      seed.begin() + static_cast<std::ptrdiff_t>(std::min(remaining, seed.size())));
+    }
+
+    qus::EngineOptions chunked;
+    chunked.max_ctx          = 384;
+    chunked.prefill_chunk    = 128;
+    chunked.mtp_draft_tokens = 3;
+    chunked.use_cuda_graph   = false;
+    const Run a              = generate(weights, chunked, prompt, 8);
+
+    qus::EngineOptions single = chunked;
+    single.prefill_chunk      = 512;
+    const Run b               = generate(weights, single, prompt, 8);
+
+    int failures = 0;
+    failures += a.tokens == b.tokens ? 0 : fail("128/512 prefill chunk token streams differ");
+    failures += a.mtp.rounds == b.mtp.rounds ? 0 : fail("128/512 MTP round counts differ");
+    failures += a.mtp.draft_tokens == b.mtp.draft_tokens
+                    ? 0
+                    : fail("128/512 MTP draft-token counts differ");
+    failures += a.mtp.accepted_tokens == b.mtp.accepted_tokens
+                    ? 0
+                    : fail("128/512 MTP accepted-token counts differ");
+    failures += a.mtp.fallback_steps == b.mtp.fallback_steps
+                    ? 0
+                    : fail("128/512 MTP fallback counts differ");
+    return failures;
+}
+
 int run_scenario(std::string_view scenario, const std::filesystem::path& weights) {
     if (scenario == "batched") { return scenario_batched(weights); }
     if (scenario == "capacity_fallback") { return scenario_capacity_fallback(weights); }
@@ -317,6 +353,7 @@ int run_scenario(std::string_view scenario, const std::filesystem::path& weights
     if (scenario == "multiturn_prefix_cache") { return scenario_multiturn_prefix_cache(weights); }
     if (scenario == "partial_reuse_parity") { return scenario_partial_reuse_parity(weights); }
     if (scenario == "graph_parity") { return scenario_graph_parity(weights); }
+    if (scenario == "prefill_chunk_parity") { return scenario_prefill_chunk_parity(weights); }
     std::cerr << "unknown scenario: " << scenario << '\n';
     return 2;
 }
@@ -327,7 +364,8 @@ int main(int argc, char** argv) {
     if (argc > 2) {
         std::cerr << "usage: qus_engine_mtp_e2e_test "
                      "<batched|capacity_fallback|fallback_after_accept|stop_truncation|"
-                     "multiturn_prefix_cache|partial_reuse_parity|graph_parity>\n";
+                     "multiturn_prefix_cache|partial_reuse_parity|graph_parity|"
+                     "prefill_chunk_parity>\n";
         return 2;
     }
     const std::filesystem::path weights = real_weights_path();
@@ -358,7 +396,8 @@ int main(int argc, char** argv) {
     } else {
         for (std::string_view scenario :
              {"batched", "capacity_fallback", "fallback_after_accept", "stop_truncation",
-              "multiturn_prefix_cache", "partial_reuse_parity", "graph_parity"}) {
+              "multiturn_prefix_cache", "partial_reuse_parity", "graph_parity",
+              "prefill_chunk_parity"}) {
             const int scenario_failures = run_scenario(scenario, weights);
             if (scenario_failures != 0) { failures += scenario_failures; }
         }

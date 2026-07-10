@@ -157,6 +157,10 @@ MtpW bind_mtp(const WeightStore& store) {
                            "mtp.pre_fc_norm_hidden"),
         require_mtp_tensor(store, SourceKind::InputLayernorm, 0, "mtp.input_norm"),
         require_mtp_weight_fused(store, kFusionAttnIn, 0, 0, "mtp.attn_in"),
+        require_mtp_weight(store, SourceKind::AttnQ, 0, "mtp.q_proj"),
+        require_mtp_weight(store, SourceKind::AttnGate, 0, "mtp.gate_proj"),
+        require_mtp_weight(store, SourceKind::AttnK, 0, "mtp.k_proj"),
+        require_mtp_weight(store, SourceKind::AttnV, 0, "mtp.v_proj"),
         require_mtp_tensor(store, SourceKind::AttnQNorm, 0, "mtp.q_norm"),
         require_mtp_tensor(store, SourceKind::AttnKNorm, 0, "mtp.k_norm"),
         require_mtp_weight(store, SourceKind::AttnO, 0, "mtp.o_proj"),
@@ -465,13 +469,9 @@ const MtpW& Qwen3_6_27B::mtp_weights() const {
     return mtp_;
 }
 
-void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                                   Tensor& mtp_hidden) {
-    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+void Qwen3_6_27B::mtp_forward_stem(const Tensor& ids, const Tensor& hidden, Tensor& x, Tensor& ah) {
     cudaStream_t s = ctx_.stream;
     const int T    = ids.ne[0];
-
-    const std::size_t mark = work_.mark();
 
     Tensor emb = work_.alloc(DType::BF16, {kCfg.hidden, T});
     kernels::embed_gather(ids, *embed_, emb, s);
@@ -484,11 +484,17 @@ void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
     Tensor fc_in = work_.alloc(DType::BF16, {kCfg.mtp_fc_in, T});
     kernels::mtp_pack_fc_input(e, h, fc_in, s);
 
-    Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, T});
+    x = work_.alloc(DType::BF16, {kCfg.hidden, T});
     kernels::linear(fc_in, *mtp_.fc, x, work_, s);
 
-    Tensor ah = work_.alloc(DType::BF16, {kCfg.hidden, T});
+    ah = work_.alloc(DType::BF16, {kCfg.hidden, T});
     kernels::rmsnorm(x, *mtp_.input_norm, kCfg.rms_eps, true, nullptr, ah, s);
+}
+
+void Qwen3_6_27B::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
+                                   Tensor& mtp_hidden) {
+    cudaStream_t s = ctx_.stream;
+    const int T    = x.ne[1];
 
     Tensor attn_in = work_.alloc(DType::BF16, {kCfg.mtp_attn_in, T});
     kernels::linear(ah, *mtp_.attn_in, attn_in, work_, s);
@@ -528,6 +534,111 @@ void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden, cons
     kernels::residual_add(d, x, s);
 
     kernels::rmsnorm(x, *mtp_.norm, kCfg.rms_eps, true, nullptr, mtp_hidden, s);
+}
+
+void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
+                                   Tensor& mtp_hidden) {
+    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    const std::size_t mark = work_.mark();
+    Tensor x;
+    Tensor ah;
+    mtp_forward_stem(ids, hidden, x, ah);
+    mtp_forward_tail(x, ah, positions, mtp_hidden);
+    work_.rewind(mark);
+}
+
+void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
+                                    const Tensor& positions, bool final_chunk, Tensor* final_hidden,
+                                    Tensor* logits, Tensor* draft_token) {
+    if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP prefill is not enabled"); }
+    const int T = ids.ne[0];
+    if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
+        throw std::invalid_argument("MTP prefill chunk T must be in [1,prefill_chunk]");
+    }
+    require_tensor_shape(ids, DType::I32, {T}, "MTP prefill ids");
+    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "MTP prefill hidden");
+    require_tensor_shape(positions, DType::I32, {T}, "MTP prefill positions");
+    if (final_chunk) {
+        if (final_hidden == nullptr || logits == nullptr || draft_token == nullptr) {
+            throw std::invalid_argument("MTP final prefill outputs are required");
+        }
+        require_tensor_shape(*final_hidden, DType::BF16, {kCfg.hidden, 1},
+                             "MTP final prefill hidden");
+        require_tensor_shape(*logits, DType::BF16, {kCfg.vocab, 1}, "MTP final prefill logits");
+        require_tensor_shape(*draft_token, DType::I32, {1}, "MTP final prefill draft token");
+    }
+
+    cudaStream_t s         = ctx_.stream;
+    const std::size_t mark = work_.mark();
+    Tensor x_last;
+    Tensor ah_last;
+    if (final_chunk) {
+        x_last  = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+        ah_last = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+    }
+
+    const std::size_t bulk_mark = work_.mark();
+    Tensor x;
+    Tensor ah;
+    mtp_forward_stem(ids, hidden, x, ah);
+
+    Tensor k_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
+    Tensor v_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
+    kernels::linear(ah, *mtp_.k_proj, k_flat, work_, s);
+    kernels::linear(ah, *mtp_.v_proj, v_flat, work_, s);
+    Tensor k  = k_flat.view({kCfg.head_dim, kCfg.n_kv, T});
+    Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
+    Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
+    kernels::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, nullptr, kn, s);
+    kernels::rope_k(positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
+    kernels::gqa_kv_append(kn, v, positions, *mtp_kv_, 0, s);
+
+    if (final_chunk) {
+        const std::size_t column_bytes =
+            static_cast<std::size_t>(kCfg.hidden) * dtype_size(DType::BF16);
+        const auto* x_src = static_cast<const unsigned char*>(x.data) +
+                            static_cast<std::size_t>(T - 1) * column_bytes;
+        const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
+                             static_cast<std::size_t>(T - 1) * column_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(x_last.data, x_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(
+            cudaMemcpyAsync(ah_last.data, ah_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+    }
+    work_.rewind(bulk_mark);
+
+    if (final_chunk) {
+        Tensor q_flat    = work_.alloc(DType::BF16, {kCfg.q_size, 1});
+        Tensor gate_flat = work_.alloc(DType::BF16, {kCfg.q_size, 1});
+        kernels::linear(ah_last, *mtp_.q_proj, q_flat, work_, s);
+        kernels::linear(ah_last, *mtp_.gate_proj, gate_flat, work_, s);
+        Tensor q    = q_flat.view({kCfg.head_dim, kCfg.n_q, 1});
+        Tensor gate = gate_flat.view({kCfg.head_dim, kCfg.n_q, 1});
+        Tensor qn   = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
+        kernels::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, nullptr, qn, s);
+        Tensor last_position = positions.slice(0, T - 1, 1);
+        kernels::rope_q(last_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
+
+        Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
+        kernels::gqa_attention_cached(qn, last_position, kAttnScale, *mtp_kv_, 0, a, s);
+        kernels::sigmoid_gate_mul(gate, a, s);
+
+        Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+        kernels::linear(a.view({kCfg.q_size, 1}), *mtp_.o_proj, o, work_, s);
+        kernels::residual_add(o, x_last, s);
+
+        Tensor mh = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+        kernels::rmsnorm(x_last, *mtp_.post_attn_norm, kCfg.rms_eps, true, nullptr, mh, s);
+        Tensor gate_up = work_.alloc(DType::BF16, {kCfg.mtp_mlp_gateup_rows, 1});
+        kernels::linear(mh, *mtp_.gate_up, gate_up, work_, s);
+        Tensor act = work_.alloc(DType::BF16, {kCfg.intermediate, 1});
+        kernels::silu_and_mul(gate_up.slice(0, 0, kCfg.intermediate),
+                              gate_up.slice(0, kCfg.intermediate, kCfg.intermediate), act, s);
+        Tensor d = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+        kernels::linear(act, *mtp_.down, d, work_, s);
+        kernels::residual_add(d, x_last, s);
+        kernels::rmsnorm(x_last, *mtp_.norm, kCfg.rms_eps, true, nullptr, *final_hidden, s);
+        mtp_draft_argmax(*final_hidden, *logits, *draft_token);
+    }
     work_.rewind(mark);
 }
 
@@ -934,6 +1045,22 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
     const int snap_rel               = has_snapshot ? static_cast<int>(snap_abs - base64) : -1;
     const std::int32_t boundary_slot = state_.snapshot_slots - 1;
 
+    bool prepare_mtp_prompt = false;
+    if (mtp_enabled() && io_.drafts.data != nullptr) {
+        const std::uint64_t mtp_required_end =
+            static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) +
+            static_cast<std::uint64_t>(std::max(0, io_.drafts.ne[0] - 1));
+        // Engine::decode_round consumes these drafts only when the following target verify and
+        // proposal window fits. Avoid preparing a prompt/draft tail that the scheduler will
+        // immediately discard in favor of its one-token capacity fallback.
+        const std::uint64_t target_round_required_end =
+            static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) +
+            2ULL * static_cast<std::uint64_t>(io_.drafts.ne[0]);
+        prepare_mtp_prompt =
+            mtp_required_end <= static_cast<std::uint64_t>(mtp_kv_->max_context) &&
+            target_round_required_end <= static_cast<std::uint64_t>(kv_.max_context);
+    }
+
     for (int t0 = 0; t0 < T;) {
         int len = std::min(chunk, T - t0);
         // Cap the chunk so it ends exactly at the snapshot boundary. Because a capped chunk is
@@ -985,12 +1112,7 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                 }
             }
 
-            const bool can_prepare_final_mtp =
-                !mtp_enabled() || !is_last ||
-                (static_cast<std::uint64_t>(T) +
-                     static_cast<std::uint64_t>(std::max(0, io_.drafts.ne[0] - 1)) <=
-                 static_cast<std::uint64_t>(mtp_kv_->max_context));
-            if (mtp_enabled() && io_.drafts.data != nullptr && can_prepare_final_mtp) {
+            if (prepare_mtp_prompt) {
                 std::vector<int> mtp_ids_host(static_cast<std::size_t>(len));
                 if (is_last) {
                     for (int j = 0; j + 1 < len; ++j) {
@@ -1009,19 +1131,11 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
 
                 Tensor mtp_ids = work_.alloc(DType::I32, {len});
                 copy_i32_to_device(mtp_ids_host.data(), mtp_ids, s);
-                Tensor mtp_hidden = work_.alloc(DType::BF16, {kCfg.hidden, len});
                 if (is_last) {
                     Tensor logits = matrix_window(io_.logits, 1);
                     Tensor draft0 = io_.drafts.slice(0, 0, 1);
-                    mtp_forward_batch(mtp_ids, xf, positions, mtp_hidden, len - 1, &logits,
+                    mtp_prefill_chunk(mtp_ids, xf, positions, true, &io_.mtp_ar_hidden, &logits,
                                       &draft0);
-                    const auto* src = static_cast<const unsigned char*>(mtp_hidden.data) +
-                                      static_cast<std::size_t>(len - 1) *
-                                          static_cast<std::size_t>(kCfg.hidden) *
-                                          dtype_size(DType::BF16);
-                    CUDA_CHECK(cudaMemcpyAsync(io_.mtp_ar_hidden.data, src,
-                                               io_.mtp_ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
-                                               s));
 
                     detail::set_pos(io_.ar_pos, base_i + T, s);
                     for (int i = 1; i < io_.drafts.ne[0]; ++i) {
@@ -1036,7 +1150,7 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                         kernels::mtp_increment_i32(io_.ar_pos, s);
                     }
                 } else {
-                    mtp_forward_batch(mtp_ids, xf, positions, mtp_hidden, -1, nullptr, nullptr);
+                    mtp_prefill_chunk(mtp_ids, xf, positions, false, nullptr, nullptr, nullptr);
                 }
             }
         }

@@ -20,9 +20,9 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws, c
 void linear_w8g32_kv_pair(const Tensor& x, const Weight& k_weight, const Weight& v_weight,
                           Tensor& k_out, Tensor& v_out, WorkspaceArena& ws, cudaStream_t stream);
 
-// Text full-attention prefill input projection.  Large-T maps the four Q4/Q5
-// projections into one CTA-grouped launch; Small-T retains the normal linear
-// dispatch.
+// Text full-attention prefill input projection. Large-T groups Q+K into one
+// compile-time Q4 launch and Gate+V into one compile-time Q5 launch; Small-T
+// retains the normal linear dispatch.
 void linear_attn_input_grouped(const Tensor& x, const Weight& q_weight, const Weight& gate_weight,
                                const Weight& k_weight, const Weight& v_weight, Tensor& q,
                                Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena& ws,

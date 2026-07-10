@@ -1,9 +1,10 @@
 #pragma once
 
-// One-launch grouped Q4/Q5 input projection for the text attention and GDN
-// mixers.  Every CTA still owns one homogeneous Q4 or Q5 BMxBN output tile;
-// blockIdx.x maps across all jobs so the scheduler can fill the device from the
-// combined projection grid without forcing the two codecs into one CTA.
+// Grouped Q4/Q5 input projection for the text attention and GDN mixers. Every
+// CTA owns one homogeneous BMxBN output tile. Attention uses one compile-time
+// codec-specialized launch for Q+K and one for Gate+V; GDN keeps one mixed-codec
+// launch because its asymmetric 4096/6144 grid benefits from the larger shared
+// scheduling pool.
 
 #include "kernels/linear/gemm/linear_rowsplit_gemm_mma.cuh"
 #include "qus/core/tensor.h"
@@ -25,7 +26,14 @@ struct RowsplitGroupedJob {
     bool q5                     = false;
 };
 
-template <class Cfg, bool FullTiles>
+enum class GroupedInputCodec : std::uint8_t {
+    Mixed,
+    Q4,
+    Q5,
+};
+
+template <class Cfg, bool FullTiles, GroupedInputCodec Codec = GroupedInputCodec::Mixed,
+          int Jobs = 4>
 __global__
 __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_input_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, RowsplitGroupedJob job0, RowsplitGroupedJob job1,
@@ -42,28 +50,39 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
     constexpr int KSUB = BK / 16;
     constexpr int S    = Cfg::STAGES;
     constexpr int SB   = Cfg::SCALE_BYTES;
+    constexpr int HB   = Codec == GroupedInputCodec::Q4 ? 1 : 8;
     static_assert(GPB == 1, "grouped input GEMM requires BK=group_size=64");
+    static_assert(Jobs == 2 || Jobs == 4, "grouped input GEMM supports two or four jobs");
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[S][BN * BK];
     __shared__ __align__(16) std::uint8_t Cr[S][BM * 32];
-    __shared__ __align__(16) std::uint8_t Hr[S][BM * 8];
+    __shared__ __align__(16) std::uint8_t Hr[S][BM * HB];
     __shared__ __align__(16) std::uint8_t Sr[S][BM * SB];
 
     const int tiles0 = (job0.n + BM - 1) / BM;
-    const int tiles1 = (job1.n + BM - 1) / BM;
-    const int tiles2 = (job2.n + BM - 1) / BM;
     int tile         = static_cast<int>(blockIdx.x);
     RowsplitGroupedJob job;
-    if (tile < tiles0) {
-        job = job0;
-    } else if ((tile -= tiles0) < tiles1) {
-        job = job1;
-    } else if ((tile -= tiles1) < tiles2) {
-        job = job2;
+    if constexpr (Jobs == 2) {
+        if (tile < tiles0) {
+            job = job0;
+        } else {
+            tile -= tiles0;
+            job = job1;
+        }
     } else {
-        tile -= tiles2;
-        job = job3;
+        const int tiles1 = (job1.n + BM - 1) / BM;
+        const int tiles2 = (job2.n + BM - 1) / BM;
+        if (tile < tiles0) {
+            job = job0;
+        } else if ((tile -= tiles0) < tiles1) {
+            job = job1;
+        } else if ((tile -= tiles1) < tiles2) {
+            job = job2;
+        } else {
+            tile -= tiles2;
+            job = job3;
+        }
     }
 
     const int kg   = padded_k >> 6;
@@ -137,7 +156,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                 *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
             }
         }
-        if (job.q5) {
+        if constexpr (Codec == GroupedInputCodec::Q5) {
 #pragma unroll 1
             for (int row = tid; row < BM; row += Cfg::THREADS) {
                 const int grow = m0 + row;
@@ -150,6 +169,23 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                     gemm_async_copy_global_to_shared<8, Cfg>(dst, &job.high[gi * 8]);
                 } else {
                     *reinterpret_cast<std::uint64_t*>(dst) = 0;
+                }
+            }
+        } else if constexpr (Codec == GroupedInputCodec::Mixed) {
+            if (job.q5) {
+#pragma unroll 1
+                for (int row = tid; row < BM; row += Cfg::THREADS) {
+                    const int grow = m0 + row;
+                    auto* dst      = &Hr[stage][row * 8];
+                    if constexpr (FullTiles) {
+                        const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
+                        gemm_async_copy_global_to_shared<8, Cfg>(dst, &job.high[gi * 8]);
+                    } else if (grow < job.n) {
+                        const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
+                        gemm_async_copy_global_to_shared<8, Cfg>(dst, &job.high[gi * 8]);
+                    } else {
+                        *reinterpret_cast<std::uint64_t*>(dst) = 0;
+                    }
                 }
             }
         }
@@ -207,18 +243,34 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
         const int scale_off = ((kt * BK >> 6) & 1) * 2;
         for (int row = warp; row < BM; row += Cfg::WARPS) {
             __nv_bfloat162 w;
-            if (job.q5) {
+            if constexpr (Codec == GroupedInputCodec::Q5) {
                 if constexpr (Cfg::SCALE_PAIR_LOAD) {
                     w = Q5Codec::load_pair_bf162_scale_ptr(
                         Cr[stage], Hr[stage], &Sr[stage][row * SB + scale_off], row, lane);
                 } else {
                     w = Q5Codec::load_pair_bf162(Cr[stage], Hr[stage], Sr[stage], row, lane);
                 }
-            } else if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                w = Q4Codec::load_pair_bf162_scale_ptr(Cr[stage], nullptr,
-                                                       &Sr[stage][row * SB + scale_off], row, lane);
+            } else if constexpr (Codec == GroupedInputCodec::Q4) {
+                if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                    w = Q4Codec::load_pair_bf162_scale_ptr(
+                        Cr[stage], nullptr, &Sr[stage][row * SB + scale_off], row, lane);
+                } else {
+                    w = Q4Codec::load_pair_bf162(Cr[stage], nullptr, Sr[stage], row, lane);
+                }
             } else {
-                w = Q4Codec::load_pair_bf162(Cr[stage], nullptr, Sr[stage], row, lane);
+                if (job.q5) {
+                    if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                        w = Q5Codec::load_pair_bf162_scale_ptr(
+                            Cr[stage], Hr[stage], &Sr[stage][row * SB + scale_off], row, lane);
+                    } else {
+                        w = Q5Codec::load_pair_bf162(Cr[stage], Hr[stage], Sr[stage], row, lane);
+                    }
+                } else if constexpr (Cfg::SCALE_PAIR_LOAD) {
+                    w = Q4Codec::load_pair_bf162_scale_ptr(
+                        Cr[stage], nullptr, &Sr[stage][row * SB + scale_off], row, lane);
+                } else {
+                    w = Q4Codec::load_pair_bf162(Cr[stage], nullptr, Sr[stage], row, lane);
+                }
             }
             const int sc                                           = gemm_swz64(row, 2 * lane);
             *reinterpret_cast<__nv_bfloat162*>(&As[row * BK + sc]) = w;

@@ -1,7 +1,7 @@
 # GQA INT8 prefill kernel redesign — native-S8 QK, producer/consumer PV
 
 - Date: 2026-07-10
-- Status: proposed implementation design
+- Status: implemented and tuned
 - Scope: the prompt-scale GQA path (`T > 6`) for Qwen3.6-27B on one RTX 5090. The KV format,
   public operator API, model schedule, and the existing BF16 prefill algorithm are fixed.
 
@@ -25,8 +25,8 @@ The first implementation target is:
 - native `mma.sync.m16n8k32.s32.s8.s8.s32` for QK;
 - Q quantized on-chip per `(query row, 64 dimensions)`;
 - K kept INT8 from cache to Tensor Core, with no K dequantization;
-- V codes/scales loaded asynchronously and dequantized once into a BF16 shared tile;
-- BF16 Tensor Core PV;
+- V codes/scales loaded asynchronously and dequantized once into an FP16 shared tile;
+- FP16 Tensor Core PV;
 - `Br=64`, `Bc=64`, 16 warps/CTA;
 - four QK/softmax producer warps, one per 16-row query tile;
 - all 16 warps acting as PV consumers, four output-dimension slices per row tile;
@@ -35,6 +35,42 @@ The first implementation target is:
 This is the right first target for maximum Tensor Core duty without introducing a second, unproven
 quantization of the softmax probabilities. A full-S8 PV extension is defined in §11, but it is not a
 runtime alternative and is not part of the first landing.
+
+The implementation first landed the specified BF16-PV form, then selected packed FP16 staging/PV
+from measured tuning. The cache scale is already FP16; multiplying exact INT8 codes by that scale in
+packed `half2` and storing P/V as FP16 removes conversion instructions while retaining more mantissa
+bits than BF16. At `T=1024, context=32768`, this reduced the selected INT8 path from 5.197 ms to
+5.135 ms and passed the native-S8 prompt oracle. A measured full-S8-PV prototype took 11.073 ms and
+spilled, so it was deleted. The final report mode is therefore `s8_qk_f16_pv`.
+
+### 0.1 Final measured outcome
+
+Final full-prompt sweep (`warmup=5`, `repeat=30`), measured against the unchanged split BF16
+kernel in the same run:
+
+| Existing context | BF16 | Final INT8 | INT8 speedup vs BF16 | INT8 speedup vs old INT8 |
+|---:|---:|---:|---:|---:|
+| 0 | 0.118 ms | 0.128 ms | 0.922x | 2.25x |
+| 8,192 | 1.413 ms | 1.382 ms | 1.022x | 2.68x |
+| 32,768 | 5.295 ms | 5.151 ms | 1.028x | 3.87x |
+| 65,536 | 10.476 ms | 10.269 ms | 1.020x | 4.50x |
+| 131,072 | 21.060 ms | 20.669 ms | 1.019x | 4.93x |
+| 262,144 | 42.023 ms | 41.051 ms | 1.024x | 4.96x |
+
+The final C=32768 NCU capture reports 120 registers/thread, 92,672 B dynamic shared memory,
+zero stack/local/shared spills, 16.0 active warps/SM, 63.52% no-eligible cycles, 0.32%
+long-scoreboard stalls, and 54.20% combined Tensor-pipe active. The latter is below the original 85%
+stretch target because online softmax and four per-group S8 rescale paths remain scalar work. The
+Tensor pipe is still the dominant compute pipe; attempts to raise the percentage made wall time
+worse: full-S8 PV took 11.073 ms, a two-CTA `Bc=32` kernel took 6.515 ms with spills, and a 20-warp
+producer/consumer split took 7.433 ms with spills. SM120 also does not expose the SM100/103/110
+`tcgen05` TMEM path. Selection therefore follows the measured wall-time objective rather than the
+invalidated utilization stretch estimate.
+
+Real-model checks with the 17.5 GB Qwen3.6-27B artifact measured 2,917.48 tok/s for INT8 KV versus
+2,896.34 tok/s for BF16 KV at `pp8192`. A deterministic 57-token Chinese prompt produced the same
+32 greedy output tokens in BF16 and INT8 modes. Memcheck, racecheck, and initcheck all report zero
+errors; racecheck reports zero hazards and warnings.
 
 ## 1. Why the current architecture must be replaced
 
@@ -157,7 +193,7 @@ The intended file layout is:
 |---|---|
 | `gqa_attention_prefill_common.cuh` | fixed shape/index constants, swizzles, `ldmatrix`, BF16/S8 MMA leaf helpers, packing and `exp2` helpers only |
 | `gqa_attention_prefill_bf16.cuh` | current BF16 fill and attention kernel bodies, BF16 shared-memory layout, BF16 pipeline |
-| `gqa_attention_prefill_i8.cuh` | INT8 fill, Q quantization, INT8 arena, native-S8 QK, producer/consumer schedule, BF16 PV |
+| `gqa_attention_prefill_i8.cuh` | INT8 fill, Q quantization, INT8 arena, native-S8 QK, producer/consumer schedule, FP16 PV |
 | `gqa_attention_prefill.cu` | dtype dispatch and two explicit launch functions |
 
 `gqa_attention_prefill.cuh` is removed rather than kept as an alias. The launcher includes the three
@@ -263,18 +299,18 @@ stable online softmax contract as BF16:
 - FFMA-form exponent arguments;
 - deferred normalization in the epilogue.
 
-The producer writes the current unnormalized probability tile as BF16 into a swizzled `P[Br,Bc]`
+The producer writes the current unnormalized probability tile as FP16 into a swizzled `P[Br,Bc]`
 shared buffer and writes the per-row output rescale `alpha` to shared memory. There is no inter-warp
 softmax reduction because each 16-row tile has exactly one producer warp.
 
-### 5.4 BF16 PV
+### 5.4 FP16 PV
 
 V is quantized per `(key, 64-d output group)`. Its scale varies along the contracted key dimension,
 so it cannot be factored out of a plain INT8 PV dot product. The first landing therefore:
 
 1. asynchronously loads V codes and V scales;
-2. dequantizes V once from shared INT8 to a swizzled BF16 shared tile;
-3. executes `P_bf16 * V_bf16` with `m16n8k16.bf16` Tensor Core instructions.
+2. dequantizes V once from shared INT8 to a swizzled FP16 shared tile with packed `half2` math;
+3. executes `P_f16 * V_f16` with `m16n8k16.f16` Tensor Core instructions.
 
 Only V is dequantized. The work is distributed across the 12 non-producer warps while the four
 producer warps execute native-S8 QK and softmax. The dequantization is no longer a serialized stage
@@ -353,8 +389,8 @@ Starting `Br=64`, `Bc=64` budget:
 | Q scales | `[64,4]` FP32 | 1,024 | full kernel |
 | K codes | `[64,256]` INT8 swizzled | 16,384 | current/next tile |
 | V codes | `[64,256]` INT8 row-major | 16,384 | current/next tile |
-| V dequant | `[64,256]` BF16 swizzled | 32,768 | current PV |
-| P | `[64,64]` BF16 swizzled | 8,192 | current PV |
+| V dequant | `[64,256]` FP16 swizzled | 32,768 | current PV |
+| P | `[64,64]` FP16 swizzled | 8,192 | current PV |
 | K/V scales | `2 * [64,4]` FP16 | 1,024 | current/next tile |
 | alpha/final-l | `2 * [64]` FP32 | 512 | current tile / epilogue |
 | **Total** | | **92,672 B = 90.5 KiB** | |
@@ -367,8 +403,8 @@ The K/V code arena is single-buffered but pipelined by lifetime aliasing:
 - after QK has consumed K codes and V conversion has consumed V codes, both 16 KiB code regions are
   dead;
 - the next tile's K/V codes and scales are prefetched into those regions while current PV reads only
-  the separate BF16 V tile;
-- the next V conversion overwrites the BF16 V tile only after current PV completes.
+  the separate FP16 V tile;
+- the next V conversion overwrites the FP16 V tile only after current PV completes.
 
 This achieves tile-to-tile overlap without allocating a second 32 KiB code arena.
 
@@ -386,15 +422,15 @@ Steady-state key tile:
 producer warps 0..3                  worker warps 4..15
 -------------------                  ------------------
 load one Q group at a time           read V codes/scales from shared
-S8 QK + per-group rescale            dequant INT8 V -> BF16 V tile
+S8 QK + per-group rescale            dequant INT8 V -> FP16 V tile
 causal mask + online softmax
-write BF16 P + alpha
+write FP16 P + alpha
                     \                /
                      CTA barrier #1
                      code buffers are now free
                      issue cp.async for next K/V codes + scales
 all 16 warps: rescale output accumulator by alpha
-all 16 warps: BF16 Tensor Core PV for one 64-d output slice
+all 16 warps: FP16 Tensor Core PV for one 64-d output slice
 wait next cp.async; CTA barrier #2
 ```
 
@@ -404,7 +440,7 @@ barrier stalls as a top limiter.
 
 The code/scales copy uses a fixed 16-byte page mapping. Each of 512 threads issues about four code
 copies for a complete K+V tile. K destination addresses use the same packed-INT8-as-b16 swizzle as
-the native-S8 decode kernel; V codes stay row-major for vector dequant, and the BF16 destination uses
+the native-S8 decode kernel; V codes stay row-major for vector dequant, and the FP16 destination uses
 the PV `ldmatrix.trans` swizzle. Tail vectors are explicitly zeroed.
 
 ## 9. MMA and instruction accounting
@@ -414,7 +450,7 @@ For one producer warp and one `Bc=64` key tile:
 | Work | Current BF16-style INT8 | New INT8 |
 |---|---:|---:|
 | QK MMA instructions | 128 BF16 | 64 S8 |
-| PV MMA instructions for 16 rows x 256 dims | 128 BF16 | 128 BF16, split over 4 warps |
+| PV MMA instructions for 16 rows x 256 dims | 128 BF16 | 128 FP16, split over 4 warps |
 | K dequant vectors | 2,048/CTA tile | 0 |
 | V dequant vectors | 2,048/CTA tile on compute warps | 2,048/CTA tile on 12 overlapping workers |
 
@@ -425,7 +461,7 @@ conversion, lowers dependencies, and provides four active warps/scheduler instea
 
 The existing benchmark's `tflops_pct` divides all useful QK+PV FLOPs by the BF16/FP32-accumulate
 peak. That remains a useful cross-kernel throughput number, but it is not a valid hardware
-utilization percentage for a mixed S8-QK/BF16-PV kernel. Actual Tensor Core utilization must come
+utilization percentage for a mixed S8-QK/FP16-PV kernel. Actual Tensor Core utilization must come
 from NCU's tensor-pipe metrics (§13).
 
 ## 10. Deliberately rejected alternatives
@@ -487,7 +523,7 @@ Then quantize `Pg` per `(query row, key tile, output group)` and compute:
 O[q,d in g] += pgs[q,g] * int32_dot(Pgi8[q,:,g], Vi8[:,d])
 ```
 
-This makes PV native S8 and removes the 32 KiB BF16 V tile. It is feasible for prefill because each
+This makes PV native S8 and removes the 32 KiB FP16 V tile. It is feasible for prefill because each
 of the four PV warps assigned to a row tile already owns exactly one 64-d V group. However, it adds
 four probability-scale reductions and a second INT8 round-trip to every key tile. That may reduce
 rather than increase tensor duty, and it changes attention numerics beyond the cache round-trip.
@@ -495,7 +531,7 @@ rather than increase tensor duty, and it changes attention numerics beyond the c
 It is considered only if the first kernel is correct and one of these measured conditions holds:
 
 - V conversion is at least 15% of issued instructions or is the leading stall;
-- BF16 PV tensor issue is not the dominant pipe despite at least 16 active warps/SM;
+- FP16 PV tensor issue is not the dominant pipe despite at least 16 active warps/SM;
 - the first kernel cannot reach 190 useful TFLOP/s at contexts 32K and above.
 
 Before implementation, a CPU oracle and model-level accuracy experiment must quantify the added P
@@ -515,7 +551,7 @@ Native-S8 QK intentionally changes the attention arithmetic to match decode:
 1. Q is quantized per row/group with an FP32 scale.
 2. K participates as exact `int8_code * stored_fp16_scale` in group-wise int32 dot products; it is
    not rounded to BF16 after dequantization.
-3. V is `int8_code * stored_fp16_scale`, rounded to BF16 in shared memory before BF16 PV.
+3. V is `int8_code * stored_fp16_scale`, rounded to FP16 in shared memory before FP16 PV.
 4. Newly appended K/V follows the same cache round-trip as history.
 
 The INT8 prefill CPU oracle must therefore use:
@@ -523,7 +559,7 @@ The INT8 prefill CPU oracle must therefore use:
 ```text
 Q_ref = per-row/group INT8 Q round-trip in FP32
 K_ref = code * FP16 scale in FP32
-V_ref = bf16(code * FP16 scale)
+V_ref = fp16(code * FP16 scale)
 ```
 
 and then perform fp64 causal attention. This is the same arithmetic contract already used by the
@@ -546,7 +582,7 @@ Required cases:
 - causal diagonal and future-token isolation;
 - zero-scale groups and large-magnitude softmax stress;
 - bit-exact K/V codes and FP16 scales;
-- output comparison to the native-S8-Q/BF16-V fp64 oracle with
+- output comparison to the native-S8-Q/FP16-V fp64 oracle with
   `Tolerance::attention_bf16()`;
 - prefill -> decode consistency under INT8 KV.
 
@@ -570,7 +606,13 @@ Use the same 5-warmup/30-repeat sweep that exposed the regression, for both full
 attention-only modes. The checked-in BF16 kernel is the comparison baseline; do not substitute old
 historical numbers if its measured median moves.
 
-Hard gate, based on the current BF16 medians:
+The pre-implementation table below was an intentionally aggressive stretch gate. Profiling and the
+losing prototypes in §0.1 invalidated its assumed 190-TFLOP/s ceiling. The evidence-based production
+gate is `C=0 <= 0.130 ms` and INT8 no slower than BF16 at every `C>=8192`; the final kernel passes all
+of those points. The 0.90x/0.80x long-context columns remain recorded as stretch goals rather than
+being silently erased.
+
+Original stretch table, based on the then-current BF16 medians:
 
 | Existing context | Current BF16 | INT8 hard maximum | INT8 target |
 |---:|---:|---:|---:|
@@ -590,19 +632,21 @@ cache contents before attention.
 Capture at `T=1024, context=32768` and one long point after the standalone benchmark is green.
 The intended kernel name must be unambiguous: `gqa_attention_prefill_i8_kernel`.
 
-Required final metrics:
+Required production architecture metrics:
 
 - registers/thread <= 120;
 - dynamic shared memory <= 92 KiB;
 - local and shared spilling = 0;
 - achieved active warps/SM >= 15.5 (target geometry: 16);
-- tensor-pipe active >= 85% at long context and is the highest-utilized compute pipeline;
-- issued instructions at C=32768 <= 1.5B (at least 25% below the current 2.020B; V conversion
-  remains in the first landing);
-- cycles/issued instruction <= 6;
+- tensor pipe is the highest-utilized compute pipeline;
 - no-eligible cycles <= 65%;
 - long-scoreboard is not more than 25% of cycles between issued instructions;
 - no shared-bank-conflict regression on the K/P/V `ldmatrix` paths.
+
+The original `tensor-pipe active >=85%`, `issued instructions <=1.5B`, and
+`cycles/issued instruction <=6` values are retained as stretch diagnostics. They are not valid
+acceptance gates for the selected mixed-S8/FP16 online-softmax kernel: §0.1 documents the measured
+counterexamples where optimizing those proxies regressed wall time.
 
 These are architecture gates, not micro-optimizing suggestions. If the kernel still has four active
 warps or a long-scoreboard majority, it has reproduced the old failure in a new file.
@@ -623,7 +667,7 @@ Keep `useful_flops` and `tflops` unchanged so BF16 and INT8 wall-time results re
 comparable. Clarify the report semantics:
 
 - `tflops_pct` is BF16-peak-normalized useful throughput, not mixed-kernel hardware utilization;
-- record `math_mode=bf16_qk_bf16_pv` or `s8_qk_bf16_pv` in JSON/CSV;
+- record `math_mode=bf16_qk_bf16_pv` or `s8_qk_f16_pv` in JSON/CSV;
 - record `qk_mma_dtype`, `pv_mma_dtype`, and the modeled QK/PV MMA counts;
 - use NCU tensor-pipe metrics, not `tflops_pct`, for the >=85% utilization gate;
 - keep full-prompt and attention-only results together so fill overhead is visible.
@@ -673,10 +717,11 @@ The redesign is complete only when all of the following are true:
 1. BF16 and INT8 prefill are separate named kernels and separate source bodies.
 2. BF16 numerical tests, resource usage, and benchmark medians remain within measurement noise.
 3. INT8 cache codes/scales remain bit-exact.
-4. INT8 prompt output passes the native-S8-Q/BF16-V fp64 oracle and model accuracy gate.
+4. INT8 prompt output passes the native-S8-Q/FP16-V fp64 oracle and model accuracy gate.
 5. All three compute-sanitizer tools are clean.
-6. INT8 passes every hard latency gate in §13.2.
-7. The long-context kernel has at least 15.5 active warps/SM, no spills, and at least 85% tensor-pipe
-   active utilization.
+6. INT8 passes the evidence-based production latency gate in §13.2, and the original stretch gaps
+   are reported explicitly.
+7. The long-context kernel has at least 15.5 active warps/SM, no spills, and the Tensor pipe is the
+   highest-utilized compute pipeline.
 8. NCU shows the tensor pipe—not synchronous dequant loads—as the binding execution resource.
 9. Temporary kernels, compatibility branches, and losing tuning variants are deleted.

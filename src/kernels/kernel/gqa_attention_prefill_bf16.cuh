@@ -1,8 +1,7 @@
 #pragma once
 
-// qus::kernels - gqa_attention prompt-scale kernels, rewritten to mirror the
-// FlashAttention-2 forward kernel (Flash_fwd_kernel_traits<256, 64, 64, 4>) that
-// flash-attn selects for our shape on the RTX 5090 (bf16, causal, head_dim 256):
+// BF16-only GQA prompt kernel. INT8 has an independent kernel body and resource
+// policy in gqa_attention_prefill_i8.cuh.
 //
 //   * Br = 64 query rows and Bc = 64 key columns per CTA tile.
 //   * 4 warps / 128 threads; each warp owns 16 query rows of the tile.
@@ -11,116 +10,19 @@
 //     QK / PV tensor-core work (exactly FA's single-buffer overlap pattern).
 //   * m16n8k16 bf16 MMA for both S = Q Kᵀ and O += P V, online softmax in exp2.
 //
-// The op still writes the new chunk k/v into absolute KVCache positions first
-// (gqa_attention_prefill_fill_kernel), then computes causal GQA attention for
+// The op still writes the new chunk k/v into absolute KVCache positions first,
+// then computes causal GQA attention for
 // every chunk token over all cached history using bottom-right causal alignment
 // (query row i attends to keys [0, base_pos + i]).
 
-#include <cuda_bf16.h>
 #include <math_constants.h>
 
 #include "kernels/kernel/gdn_common.cuh"
-#include "kernels/kernel/gqa_attention_kv_quant.cuh"
-
-#include <cstdint>
+#include "kernels/kernel/gqa_attention_prefill_common.cuh"
 
 namespace qus::kernels {
 
-inline constexpr int kGqaPrefillHeadDim   = 256;
-inline constexpr int kGqaPrefillQHeads    = 24;
-inline constexpr int kGqaPrefillKVHeads   = 4;
-inline constexpr int kGqaPrefillGroupSize = 6;
-
-// FA tile geometry for this shape.
-inline constexpr int kGqaPrefillBr        = 64;
-inline constexpr int kGqaPrefillBc        = 64;
-inline constexpr int kGqaPrefillThreads   = 128;
-inline constexpr int kGqaPrefillSmemBytes = (kGqaPrefillBr + 2 * kGqaPrefillBc) *
-                                            kGqaPrefillHeadDim *
-                                            static_cast<int>(sizeof(__nv_bfloat16));
-
-__device__ __forceinline__ std::int64_t gqa_prefill_cache_index(int kv_head, int d, int position,
-                                                                int padded_context) {
-    return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaPrefillHeadDim) *
-                                              (static_cast<std::int64_t>(position) +
-                                               static_cast<std::int64_t>(padded_context) * kv_head);
-}
-
-__device__ __forceinline__ std::int64_t gqa_prefill_q_index(int q_head, int d, int token) {
-    return static_cast<std::int64_t>(d) +
-           static_cast<std::int64_t>(kGqaPrefillHeadDim) *
-               (static_cast<std::int64_t>(q_head) +
-                static_cast<std::int64_t>(kGqaPrefillQHeads) * token);
-}
-
-// 128-bit (8 bf16) XOR swizzle over an 8-row period, matching the CUTLASS
-// Swizzle<3,3,3> layout FA uses for its Q/K/V smem tiles. Conflict-free for the
-// ldmatrix accesses below.
-__device__ __forceinline__ int gqa_prefill_swz(int row, int col) {
-    return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
-}
-
-__device__ __forceinline__ unsigned gqa_prefill_pack_bf16(float lo, float hi) {
-    unsigned out;
-    const unsigned lo_bits = __float_as_uint(lo);
-    const unsigned hi_bits = __float_as_uint(hi);
-    asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
-    return out;
-}
-
-__device__ __forceinline__ unsigned gqa_prefill_smem_addr(const void* p) {
-    return static_cast<unsigned>(__cvta_generic_to_shared(p));
-}
-
-__device__ __forceinline__ void gqa_prefill_cp_async_cg_16(void* smem_dst, const void* gmem_src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(
-                     static_cast<unsigned>(__cvta_generic_to_shared(smem_dst))),
-                 "l"(gmem_src));
-}
-
-// Shared-memory byte address of a swizzled element from per-lane precomputed
-// pieces. For (row, col) with col a multiple of 8 the swizzled byte offset is
-// 512*row + (((col>>3)<<4) ^ ((row&7)<<4)); we fold 512*row (plus the buffer
-// base) into lane_base, (row&7)<<4 into r, and split (col>>3)<<4 into a
-// compile-time immediate ck plus the per-lane low bit as. Each ldmatrix address
-// is then a single LOP3 + IADD3.
-__device__ __forceinline__ unsigned gqa_prefill_swz_addr(unsigned lane_base, unsigned ck,
-                                                         unsigned as, unsigned r) {
-    return lane_base + ((ck | as) ^ r);
-}
-
-__device__ __forceinline__ void gqa_prefill_ldmatrix_x4(unsigned& a0, unsigned& a1, unsigned& a2,
-                                                        unsigned& a3, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void gqa_prefill_ldmatrix_x4_trans(unsigned& b0, unsigned& b1,
-                                                              unsigned& b2, unsigned& b3,
-                                                              unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3)
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void gqa_prefill_mma_m16n8k16_bf16(float& c0, float& c1, float& c2,
-                                                              float& c3, unsigned a0, unsigned a1,
-                                                              unsigned a2, unsigned a3, unsigned b0,
-                                                              unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ float gqa_prefill_exp2_fast(float x) {
-    float y;
-    asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-__global__ void gqa_attention_prefill_fill_kernel(
+__global__ void gqa_attention_prefill_fill_bf16_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, __nv_bfloat16* __restrict__ cache_k,
     __nv_bfloat16* __restrict__ cache_v, std::int32_t tokens, std::int32_t padded_context) {
@@ -143,61 +45,6 @@ __global__ void gqa_attention_prefill_fill_kernel(
     const std::int64_t cache_off = gqa_prefill_cache_index(kv_head, d, position, padded_context);
     *reinterpret_cast<int4*>(&cache_k[cache_off]) = *reinterpret_cast<const int4*>(&k[src_off]);
     *reinterpret_cast<int4*>(&cache_v[cache_off]) = *reinterpret_cast<const int4*>(&v[src_off]);
-}
-
-// int8 counterpart of the prefill fill: quantize the new chunk's K/V into the
-// int8 cache (per 64-group absmax -> int8 code + fp16 scale). One CTA per
-// (group, kv_head, token); the 64 threads own one 64-group and reduce its absmax
-// in shared memory. This is the prefill fill for the quantized cache, not a
-// standalone quant pass: the attention kernel below reads it straight back.
-__global__ void gqa_attention_prefill_fill_i8_kernel(
-    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    const std::int32_t* __restrict__ positions, std::int8_t* __restrict__ cache_k,
-    std::int8_t* __restrict__ cache_v, __half* __restrict__ scale_k, __half* __restrict__ scale_v,
-    std::int32_t tokens, std::int32_t padded_context) {
-    __shared__ float k_abs[kGqaKvQuantGroup];
-    __shared__ float v_abs[kGqaKvQuantGroup];
-
-    const int group   = static_cast<int>(blockIdx.x);
-    const int kv_head = static_cast<int>(blockIdx.y);
-    const int token   = static_cast<int>(blockIdx.z);
-    const int lane    = static_cast<int>(threadIdx.x);
-    if (group >= kGqaKvQuantGroups || kv_head >= kGqaPrefillKVHeads || token >= tokens ||
-        lane >= kGqaKvQuantGroup) {
-        return;
-    }
-
-    const int position         = positions[0] + token;
-    const int d                = group * kGqaKvQuantGroup + lane;
-    const std::int64_t src_off = gqa_kv_quant_src_index(kv_head, d, token);
-    const float k_value        = __bfloat162float(k[src_off]);
-    const float v_value        = __bfloat162float(v[src_off]);
-    k_abs[lane]                = fabsf(k_value);
-    v_abs[lane]                = fabsf(v_value);
-    __syncthreads();
-    for (int stride = kGqaKvQuantGroup / 2; stride > 0; stride >>= 1) {
-        if (lane < stride) {
-            k_abs[lane] = fmaxf(k_abs[lane], k_abs[lane + stride]);
-            v_abs[lane] = fmaxf(v_abs[lane], v_abs[lane + stride]);
-        }
-        __syncthreads();
-    }
-
-    const __half ksh   = __float2half_rn(k_abs[0] > 0.0f ? k_abs[0] / 127.0f : 0.0f);
-    const __half vsh   = __float2half_rn(v_abs[0] > 0.0f ? v_abs[0] / 127.0f : 0.0f);
-    const float k_scl  = __half2float(ksh);
-    const float v_scl  = __half2float(vsh);
-    const float k_inv  = k_scl > 0.0f ? 1.0f / k_scl : 0.0f;
-    const float v_inv  = v_scl > 0.0f ? 1.0f / v_scl : 0.0f;
-    const std::int64_t code_off = gqa_kv_quant_code_index(kv_head, d, position, padded_context);
-    cache_k[code_off]           = gqa_kv_quant_code(k_value, k_inv);
-    cache_v[code_off]           = gqa_kv_quant_code(v_value, v_inv);
-    if (lane == 0) {
-        const std::int64_t scale_off =
-            gqa_kv_quant_scale_index(kv_head, group, position, padded_context);
-        scale_k[scale_off] = ksh;
-        scale_v[scale_off] = vsh;
-    }
 }
 
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the
@@ -238,36 +85,12 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
     }
 }
 
-__device__ __forceinline__ void
-gqa_prefill_stage_kv_i8(__nv_bfloat16* dst, const std::int8_t* cache, const __half* scale,
-                        int kv_head, int k0, int max_query_abs, int padded_context, int tid) {
-    constexpr int D         = kGqaPrefillHeadDim;
-    constexpr int Bc        = kGqaPrefillBc;
-    constexpr int Threads   = kGqaPrefillThreads;
-    constexpr int VecPerRow = D / 8;
-#pragma unroll
-    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += Threads) {
-        const int key_l  = chunk >> 5;
-        const int d      = (chunk & 31) << 3;
-        __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
-        if ((k0 + key_l) <= max_query_abs) {
-            *reinterpret_cast<int4*>(p) =
-                gqa_kv_dequant_i8x8(cache, scale, kv_head, d, k0 + key_l, padded_context);
-        } else {
-            *reinterpret_cast<int4*>(p) = make_int4(0, 0, 0, 0);
-        }
-    }
-}
-
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-template <bool Quantized>
-__launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_kernel(
+__launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_bf16_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ cache_k,
-    const __nv_bfloat16* __restrict__ cache_v, const std::int8_t* __restrict__ cache_k_i8,
-    const std::int8_t* __restrict__ cache_v_i8, const __half* __restrict__ cache_k_scale,
-    const __half* __restrict__ cache_v_scale, const std::int32_t* __restrict__ positions,
+    const __nv_bfloat16* __restrict__ cache_v, const std::int32_t* __restrict__ positions,
     float scale, __nv_bfloat16* __restrict__ out, std::int32_t tokens,
     std::int32_t padded_context) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
@@ -378,12 +201,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_k
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
     qus::kernels::async_copy_commit();
-    if constexpr (Quantized) {
-        gqa_prefill_stage_kv_i8(k_s, cache_k_i8, cache_k_scale, kv_head, 0, max_query_abs,
-                                padded_context, tid);
-    } else {
-        gqa_prefill_stage_kv(k_s, cache_k, kv_head, 0, max_query_abs, padded_context, tid);
-    }
+    gqa_prefill_stage_kv(k_s, cache_k, kv_head, 0, max_query_abs, padded_context, tid);
     qus::kernels::async_copy_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
@@ -393,12 +211,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_k
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
-        if constexpr (Quantized) {
-            gqa_prefill_stage_kv_i8(v_s, cache_v_i8, cache_v_scale, kv_head, k0, max_query_abs,
-                                    padded_context, tid);
-        } else {
-            gqa_prefill_stage_kv(v_s, cache_v, kv_head, k0, max_query_abs, padded_context, tid);
-        }
+        gqa_prefill_stage_kv(v_s, cache_v, kv_head, k0, max_query_abs, padded_context, tid);
         qus::kernels::async_copy_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
@@ -564,13 +377,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_k
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
-            if constexpr (Quantized) {
-                gqa_prefill_stage_kv_i8(k_s, cache_k_i8, cache_k_scale, kv_head, (kb + 1) * Bc,
-                                        max_query_abs, padded_context, tid);
-            } else {
-                gqa_prefill_stage_kv(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
-                                     padded_context, tid);
-            }
+            gqa_prefill_stage_kv(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
+                                 padded_context, tid);
             qus::kernels::async_copy_commit();
         }
 

@@ -448,6 +448,11 @@ struct AppendPromptMetrics {
     std::int64_t key_tiles       = 0;
     int runs                     = 0;
     int inner_iters              = 1;
+    const char* math_mode        = "bf16_qk_bf16_pv";
+    const char* qk_mma_dtype     = "bf16";
+    const char* pv_mma_dtype     = "bf16";
+    std::int64_t qk_mma_count    = 0;
+    std::int64_t pv_mma_count    = 0;
     double median_ms             = 0.0;
     double min_ms                = 0.0;
     double p95_ms                = 0.0;
@@ -489,8 +494,15 @@ AppendPromptMetrics append_prompt_metrics_from_result(std::int32_t tokens, std::
     m.q_blocks           = append_prompt_q_blocks(tokens);
     m.attention_ctas     = static_cast<std::int64_t>(m.q_blocks) * kQHeads;
     m.key_tiles          = append_prompt_key_tiles_per_head(tokens, context) * kQHeads;
+    m.qk_mma_count       = m.key_tiles * (kv_dtype == DType::I8 ? 256 : 512);
+    m.pv_mma_count       = m.key_tiles * 512;
     m.runs               = r.n_runs;
     m.inner_iters        = r.inner_iters;
+    if (kv_dtype == DType::I8) {
+        m.math_mode    = "s8_qk_f16_pv";
+        m.qk_mma_dtype = "s8";
+        m.pv_mma_dtype = "f16";
+    }
     m.median_ms          = r.median_us * 1.0e-3;
     m.min_ms             = r.min_us * 1.0e-3;
     m.p95_ms             = r.p95_us * 1.0e-3;
@@ -992,7 +1004,8 @@ std::string format_prefill_json(const std::vector<PrefillMetrics>& results,
 
 std::string format_append_prompt_csv(const std::vector<AppendPromptMetrics>& results) {
     std::ostringstream out;
-    out << "T,context,end_context,kv_dtype,ms,tflops,tflops_pct,global_floor_gbps,"
+    out << "T,context,end_context,kv_dtype,math_mode,qk_mma_dtype,pv_mma_dtype,qk_mma_count,"
+           "pv_mma_count,ms,tflops,tflops_pct,global_floor_gbps,"
            "global_floor_gbps_pct,tile_kv_read_gbps,logical_kv_gbps,avg_keys_per_query,"
            "ns_per_key_query,us_per_token,q_blocks,attention_ctas,key_tiles,tile_reuse_queries,"
            "bound,roofline_tflops,roofline_eff_pct,global_floor_bytes,tile_kv_read_bytes,"
@@ -1000,7 +1013,9 @@ std::string format_append_prompt_csv(const std::vector<AppendPromptMetrics>& res
            "mean_ms,runs,inner_iters\n";
     for (const AppendPromptMetrics& m : results) {
         out << m.tokens << ',' << m.context << ',' << m.end_context << ','
-            << kv_dtype_name(m.kv_dtype) << ',' << json_number(m.median_ms) << ','
+            << kv_dtype_name(m.kv_dtype) << ',' << m.math_mode << ',' << m.qk_mma_dtype << ','
+            << m.pv_mma_dtype << ',' << m.qk_mma_count << ',' << m.pv_mma_count << ','
+            << json_number(m.median_ms) << ','
             << json_number(m.tflops) << ',' << json_number(m.tflops_pct) << ','
             << json_number(m.global_floor_gbps) << ',' << json_number(m.global_floor_gbps_pct)
             << ',' << json_number(m.tile_kv_read_gbps) << ',' << json_number(m.logical_kv_gbps)
@@ -1022,13 +1037,15 @@ std::string format_append_prompt_json(const std::vector<AppendPromptMetrics>& re
                                       const PrefillTimingOptions& timing) {
     std::ostringstream out;
     out << "{\n"
-        << "  \"schema_version\": 1,\n"
+        << "  \"schema_version\": 2,\n"
         << "  \"artifact_type\": \"qus_gqa_attention_append_prompt_bench\",\n"
         << "  \"tc_peak_tflops\": " << json_number(kDenseTcPeakTflops) << ",\n"
         << "  \"dram_peak_gbps\": " << json_number(kDramPeakGBs) << ",\n"
         << "  \"q_block\": " << kPromptQBlock << ",\n"
         << "  \"k_block\": " << kPromptKBlock << ",\n"
         << "  \"flops_definition\": \"useful_causal_4*d*Hq*sum_{i=0}^{T-1}(context+i+1)\",\n"
+        << "  \"tflops_pct_definition\": \"useful_flops_per_second / dense_bf16_tc_peak; not "
+           "mixed-kernel hardware utilization\",\n"
         << "  \"logical_kv_bytes_definition\": \"per-query unique GQA K/V references, no "
            "query-block reuse\",\n"
         << "  \"global_floor_bytes_definition\": \"Q read + output write + input K/V read + "
@@ -1043,6 +1060,11 @@ std::string format_append_prompt_json(const std::vector<AppendPromptMetrics>& re
         out << "    {\"T\": " << m.tokens << ", \"context\": " << m.context
             << ", \"end_context\": " << m.end_context << ", \"ms\": " << json_number(m.median_ms)
             << ", \"kv_dtype\": \"" << kv_dtype_name(m.kv_dtype) << "\""
+            << ", \"math_mode\": \"" << m.math_mode << "\""
+            << ", \"qk_mma_dtype\": \"" << m.qk_mma_dtype << "\""
+            << ", \"pv_mma_dtype\": \"" << m.pv_mma_dtype << "\""
+            << ", \"qk_mma_count\": " << m.qk_mma_count
+            << ", \"pv_mma_count\": " << m.pv_mma_count
             << ", \"tflops\": " << json_number(m.tflops)
             << ", \"tflops_pct\": " << json_number(m.tflops_pct)
             << ", \"global_floor_gbps\": " << json_number(m.global_floor_gbps)

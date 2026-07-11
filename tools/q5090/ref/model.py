@@ -9,6 +9,7 @@ from typing import Iterable
 import torch
 
 from tools.q5090.reader import Reader
+from tools.q5090.tokenizer import Tokenizer
 from tools.q5090_convert import format as fmt
 
 from .config import CFG
@@ -56,6 +57,7 @@ class RefModel:
         if draft_head and not mtp:
             raise ValueError("draft_head requires mtp")
         self.reader = Reader(weights)
+        self.tokenizer = Tokenizer(self.reader)
         CFG.validate_header(self.reader.header)
         if mtp and not (self.reader.header["flags"] & fmt.FLAG_MTP_PRESENT):
             raise ValueError("MTP was requested but the q5090 artifact has no MTP module")

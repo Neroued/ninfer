@@ -20,8 +20,12 @@ Use the CUDA environment that contains PyTorch and `flash-linear-attention`:
 ```bash
 /home/neroued/miniconda3/envs/py311/bin/python -m tools.q5090.ref \
   --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_1.qus \
-  --ids "1" --decode 4
+  --prompt "请简短介绍一下你自己。" --decode 16
 ```
+
+The CLI encodes `--prompt` with the tokenizer embedded in the q5090 artifact and prints both token
+IDs and decoded generated text. Use `--ids "1 2 3"` instead when an exact token fixture is required.
+Stop token IDs default to the embedded `generation_config.json`; `--stop-ids` overrides them.
 
 Useful options:
 

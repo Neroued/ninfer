@@ -29,7 +29,9 @@ def parse_bytes(text: str | None) -> int | None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights", required=True)
-    parser.add_argument("--ids", required=True, help="comma/space-separated prompt token ids")
+    prompt = parser.add_mutually_exclusive_group(required=True)
+    prompt.add_argument("--prompt", help="raw prompt text encoded by the embedded tokenizer")
+    prompt.add_argument("--ids", help="comma/space-separated prompt token ids")
     parser.add_argument("--decode", type=int, default=16)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gpu-memory", default="auto")
@@ -38,7 +40,10 @@ def main() -> None:
     parser.add_argument("--kv-dtype", choices=["bf16", "int8"], default="bf16")
     parser.add_argument("--mtp", action="store_true")
     parser.add_argument("--draft-head", action="store_true")
-    parser.add_argument("--stop-ids", default="248046,248044")
+    parser.add_argument(
+        "--stop-ids",
+        help="comma/space-separated override; defaults to embedded generation config",
+    )
     parser.add_argument("--structural-dump")
     parser.add_argument("--activation-dump")
     parser.add_argument("--dump-level", choices=["layer", "op"], default="layer")
@@ -60,13 +65,21 @@ def main() -> None:
         load_seconds = time.perf_counter() - load_start
         if args.structural_dump:
             model.reader.structural_dump(args.structural_dump)
-        prompt = parse_ids(args.ids)
-        stops = set(parse_ids(args.stop_ids))
+        prompt_ids = (
+            parse_ids(args.ids) if args.ids is not None else model.tokenizer.encode(args.prompt)
+        )
+        if not prompt_ids:
+            parser.error("prompt must encode to at least one token")
+        stops = set(
+            parse_ids(args.stop_ids)
+            if args.stop_ids is not None
+            else model.tokenizer.default_stop_token_ids
+        )
         if model.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(model.device)
         prepare_start = time.perf_counter()
         model.prepare(
-            len(prompt) + max(1, args.decode),
+            len(prompt_ids) + max(1, args.decode),
             compile_codec=args.decode >= COMPILED_CODEC_MIN_TOKENS,
         )
         if model.device.type == "cuda":
@@ -75,7 +88,7 @@ def main() -> None:
         tokens = []
         prefill_start = time.perf_counter()
         if args.decode > 0:
-            token = model.prefill(prompt, tap=tap)
+            token = model.prefill(prompt_ids, tap=tap)
             tokens.append(token)
         if model.device.type == "cuda":
             torch.cuda.synchronize(model.device)
@@ -99,14 +112,20 @@ def main() -> None:
                 f"allocated={torch.cuda.max_memory_allocated(model.device) / (1 << 30):.2f}GiB "
                 f"reserved={torch.cuda.max_memory_reserved(model.device) / (1 << 30):.2f}GiB"
             )
+        generated_text = model.tokenizer.decode(tokens, skip_special_tokens=True)
+        print("PROMPT_TOKEN_IDS:", prompt_ids)
         print("GENERATED_TOKEN_IDS:", tokens)
+        print("GENERATED_TEXT:")
+        print(generated_text)
         if args.mtp:
             print("MTP_LAST_DRAFT:", model.last_draft)
         if tap:
             tap.close(
                 weights=str(model.reader.path),
-                prompt_ids=parse_ids(args.ids),
+                prompt_text=args.prompt,
+                prompt_ids=prompt_ids,
                 generated_token_ids=tokens,
+                generated_text=generated_text,
                 kv_dtype=args.kv_dtype,
                 prefill_chunk=args.prefill_chunk,
             )

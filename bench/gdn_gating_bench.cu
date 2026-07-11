@@ -1,7 +1,7 @@
 // Performance bench for gdn_gating at the Qwen3.6-27B Gated DeltaNet gate
 // shape ([48,T]). This binary is the ncu/nsys target; the GB/s it prints is
 // informational only -- the gate is ncu sustained DRAM % (see
-// docs/l1-op-test-standard.md section 2).
+// docs/kernel-development.md §8).
 //   ./qus_gdn_gating_bench [--decode] [--prefill]   (default: both)
 #include "qus/kernels/gdn_gating.h"
 #include "qus_bench_common.h"

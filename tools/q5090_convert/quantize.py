@@ -3,7 +3,7 @@
 For a logical [N, K] matrix this produces fp16 group scales [N, K/group] and signed
 codes [N, K/group, group]. Codes are quantized with the *fp16-rounded* scale so the
 on-disk value is optimal for what the runtime reads back. See
-../../docs/q5090_packed_file_format_v2.md sections 8-9.
+../../docs/q5090_packed_file_format_v4.md section 8.
 """
 
 from __future__ import annotations

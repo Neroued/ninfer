@@ -2,7 +2,7 @@
 //
 // op_tester.h — device buffers, seeded honest input generators, and the
 // fp64-golden verify step for L1 op correctness tests. Pairs with op_check.h
-// (the frozen tolerance presets). See docs/l1-op-test-standard.md.
+// (the frozen tolerance presets). See docs/kernel-development.md.
 //
 // Typical per-op test flow (one shape):
 //   std::vector<float> x(n); fill_uniform(x, seed, -8.f, 8.f);

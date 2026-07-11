@@ -2,7 +2,7 @@
 
 // qus::kernels - sigmoid_mul: x *= sigmoid(gate), elementwise in place.
 // Reference example for the L1 api/wrapper/launcher/kernel layout; see
-// docs/l1-kernel-layering.md and docs/l1-operator-catalog.md section 3.4.
+// See docs/kernel-development.md §3.
 
 #include "qus/core/tensor.h"
 

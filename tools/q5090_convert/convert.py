@@ -735,7 +735,8 @@ def _write_manifest(
             "idmap_qtype": qt.QTYPE_NAME[draft_id.qtype],
             "idmap_source_kind": "LM_HEAD_DRAFT_IDMAP",
             "idmap_payload_bytes": int(draft_id.payload_bytes),
-            "selection": "docs/2026-07-06-lm-head-draft-q4-decision.md",
+            "selection":
+                "docs/archive/optimization-era/2026-07-06-lm-head-draft-q4-decision.md",
         }
     mpath = out_path + fmt.MANIFEST_SUFFIX
     mpath_tmp = mpath + ".tmp"

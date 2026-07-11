@@ -1,5 +1,5 @@
 // Correctness + coverage for rmsnorm, against the frozen op-test standard
-// (docs/l1-op-test-standard.md): fp64 golden from bf16-rounded inputs, honest
+// (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges, composite tolerance bf16_reduction.
 #include "qus/kernels/rmsnorm.h"
 #include "qus/kernels/gated_rmsnorm.h"

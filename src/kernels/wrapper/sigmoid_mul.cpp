@@ -1,6 +1,6 @@
 // qus::kernels - sigmoid_mul wrapper: implements the public api, validates parameters,
 // and dispatches to the launcher. Host-compiled; never includes the kernel header.
-// See docs/l1-kernel-layering.md section 5.
+// See docs/kernel-development.md §2.
 #include "qus/kernels/sigmoid_mul.h"
 
 #include "kernels/launcher/sigmoid_gate_mul.h" // detail::sigmoid_gate_mul_launch

@@ -2,7 +2,7 @@
 
 // qus::kernels::detail - private launch prototype for residual_add. Included by the wrapper
 // (host) and defined by the launcher (.cu). Not part of the public api.
-// See docs/l1-kernel-layering.md section 4.
+// See docs/kernel-development.md §2.
 
 #include "qus/core/tensor.h"
 

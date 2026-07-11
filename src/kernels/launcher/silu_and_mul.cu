@@ -1,6 +1,6 @@
 // qus::kernels — silu_mul launcher: grid/block/stream configuration + kernel launch.
 // The only translation unit that includes this op's kernel header.
-// See docs/l1-kernel-layering.md §4.
+// See docs/kernel-development.md §2.
 #include "kernels/launcher/silu_and_mul.h"
 
 #include "kernels/common/math.h"

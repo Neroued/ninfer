@@ -1,430 +1,308 @@
-# qwen3.6-ultraspeed — Master Design & Goal Document
+# System Design
 
-> Status: **text, MTP, sampling, INT8 KV, and native Vision inference are implemented; current work
-> is correctness hardening and kernel optimization**.
-> Date: original design 2026-06-25; status synchronized 2026-07-12.
-> This document remains the architectural source of truth for *what we are building and why*.
-> The implementation has caught up through M2 and much of M2.5; M2.8 now defines the measurement and
-> readiness gate required before M3 headline kernel work. Kernel-level micro-decisions remain flexible;
-> architecture, scope, and boundaries are fixed here.
+> Status: current system architecture.
+>
+> This document defines repository boundaries, ownership, runtime flows, and supported scope. Model
+> mathematics belong in [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md); the packed
+> artifact contract belongs in
+> [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md).
 
----
+## 1. Purpose
 
-## 1. Purpose & success criteria
+qwen3.6-ultraspeed is a from-scratch C++/CUDA inference engine for one fixed deployment:
 
-Build a from-scratch C++/CUDA inference engine that runs **Qwen3.6-27B** **as fast as
-physically possible** under one fixed scenario:
+- Qwen3.6-27B;
+- one RTX 5090 (`sm_120a`, 32 GB);
+- one user and one active sequence;
+- BF16 activations with offline-packed low-bit weights;
+- maximum single-stream decode throughput, with prefill/TTFT as the secondary target.
 
-- **Single user, single sequence** (batch size = 1, no concurrent requests).
-- **Single RTX 5090** (Blackwell, sm_120, 32 GB GDDR7, ~1.79 TB/s).
+The fixed target is an architectural constraint, not a starting point for a generic runtime. The
+project deliberately uses compile-time dimensions, hand-written model schedules, model-shape CUDA
+kernels, a single artifact ABI, and direct frontends.
 
-Because the scenario is fixed, we optimize for it exclusively — no dynamic compute graph,
-no general-purpose model zoo (cf. llama.cpp). We hand-write the computation for *this one
-model* and specialize aggressively.
+## 2. Scope
 
-### Metrics
+### Supported
 
-| Metric | Priority | Definition |
+- text, image, and video chat input;
+- native tokenization, chat templates, media decoding/preprocessing, Vision inference, and Text
+  inference;
+- chunked prefill and autoregressive decode;
+- eager and CUDA Graph decode;
+- optional one-layer MTP speculative decoding with up to five draft tokens per round;
+- optional shortlisted Q4 draft `lm_head` for proposal sites;
+- greedy and sampled generation;
+- BF16 or INT8 KV cache;
+- command-line generation, OpenAI Chat Completions, and Anthropic Messages;
+- offline q5090 conversion plus Python reference/diagnostic tooling;
+- real-weight and per-operator benchmarking.
+
+### Deliberately unsupported
+
+- models other than the fixed Qwen3.6-27B checkpoint architecture;
+- batching or concurrent GPU execution;
+- tensor/pipeline parallelism and multi-GPU inference;
+- dynamic computation graphs or runtime model discovery;
+- runtime weight repacking or alternate weight loaders;
+- compatibility parsing for retired q5090 formats;
+- server-side tool execution or constrained JSON decoding;
+- a qualified 128K/256K operating point without explicit memory, numerical, and performance
+  evidence.
+
+## 3. Component ownership
+
+| Component | Paths | Owns |
 |---|---|---|
-| **Decode throughput** | **Primary (headline)** | tokens/sec, batch=1, single-token autoregression |
-| Prefill / TTFT | Secondary (tracked) | time-to-first-token and prefill tok/s for long prompts |
+| L0 infrastructure | `include/qus/core`, `src/core` | device/stream setup, tensors, arenas, q5090 parsing/loading, KV cache, GDN state |
+| L1 operators | `include/qus/kernels`, `src/kernels` | mathematical operator APIs, dispatch, launchers, specialized CUDA kernels |
+| L2 model | `include/qus/model`, `src/model` | frozen dimensions, weight binding, Text/MTP/Vision schedules, model-private CUDA helpers |
+| Runtime | `include/qus/runtime`, `src/runtime` | resource lifetime, Engine API, prefix reuse, eager/graph execution, MTP rounds, sampling state |
+| Text frontend | `include/qus/text`, `src/text` | tokenizer, chat template, CLI translation, output decoding |
+| Media frontend | `include/qus/media`, `src/media`, model processor | local/remote media acquisition, decode, resize, normalization, patch construction, budgets |
+| Serving | `include/qus/serve`, `src/serve` | HTTP transport, OpenAI/Anthropic schemas, request translation, streaming, tool-call parsing |
+| Offline tools | `tools/q5090_convert`, `tools/q5090`, `tools/parity` | artifact production, Python reference, structural/numerical diagnostics |
+| Measurement | `bench`, `tools/bench` | real-weight throughput, per-operator benchmarks, corpus tooling, report schemas |
 
-### Roofline anchor
+The layer names L0/L1/L2 describe the inference core. Runtime and frontends are explicit peers above
+that core, not hidden responsibilities of the model card.
 
-At batch=1, every linear layer is a **GEMV that is memory-bandwidth-bound on the weights**.
-A dense forward reads ~all weights once per token:
+## 4. Fixed artifact boundary
 
+The offline converter is the only path from the source BF16 checkpoint to runtime weights:
+
+```text
+HF safetensors + tokenizer assets
+              │
+              ▼
+tools.q5090_convert: quantize + slice + fuse + pack + verify
+              │
+              ▼
+one q5090 v4.2 .qus artifact + diagnostic sidecar manifest
 ```
-~14–15 GB (4-bit weights) ÷ 1.79 TB/s ≈ 7.8–8.4 ms/token  ⇒  ~120–130 tok/s ceiling
+
+The artifact contains four logical module kinds:
+
+- `TEXT_CORE` — embeddings, 64 decoder layers, final norm, and full `lm_head`;
+- `MTP_DRAFT` — the one-layer MTP module;
+- `VISION_ENCODER` — patch embedding, 27 Vision blocks, and merger;
+- `LM_HEAD_DRAFT` — optional Q4 shortlisted proposal head and vocab-id map.
+
+It also embeds the three CPU tokenizer assets. `WeightStore` validates the 4 KiB header before CUDA
+initialization, reads the bounded metadata/tokenizer prefix, and selectively uploads requested
+module payloads. Quantized weights remain packed on device; CUDA kernels decode them while computing.
+
+The runtime accepts only the active v4.2 contract. Retired format documents are historical and do
+not imply parser or converter compatibility.
+
+## 5. Core layering
+
+### 5.1 L0: storage and lifetime
+
+L0 types expose bytes, shapes, and state without knowing model semantics:
+
+- `DeviceContext` owns the CUDA device and stream;
+- `DeviceArena` owns long-lived device allocations;
+- `WorkspaceArena` is a mark/rewind bump allocator for transient tensors;
+- `WeightStore` owns validated catalog metadata and resident module payloads;
+- `KVCache` owns GQA K/V planes and logical position;
+- `GdnState` owns convolution and FP32 recurrent state slots;
+- `Tensor` and `Weight` describe dense/control storage and packed quantized views.
+
+No hot-path operator performs hidden device allocation, filesystem access, or runtime repacking.
+
+### 5.2 L1: operators and CUDA specialization
+
+Public headers under `include/qus/kernels/` define mathematical contracts. Implementations follow
+the normal path:
+
+```text
+public wrapper → private launcher → CUDA kernel
 ```
 
-The entire project is a campaign to approach this ceiling. (Note: `lm_head` (5120×248320)
-is read *every* decode step — its precision is itself a bandwidth lever; see §9.)
+The linear family has a larger private subtree because codec, shape policy, GEMV, GEMM, and dense
+reference paths are independently specialized. Dispatch keys are limited to facts that change the
+implementation: qtype/layout, real `(N,K)` shape, token-count regime, state form, and KV dtype.
 
----
+Fused public operators are used only when fusion changes the useful contract, such as shared-input
+projections, projection-plus-SwiGLU, or projection-plus-residual. Model-only bookkeeping kernels stay
+under `src/model` rather than becoming reusable L1 APIs.
 
-## 2. Hardware & toolchain target
+See [`kernel-development.md`](kernel-development.md) for the source layout and verification rules.
 
-| Item | Value |
+### 5.3 L2: fixed schedules
+
+`Qwen3_6_27B` binds catalog entries to fixed per-layer structs once during construction. Its hot
+path then issues straight-line operator calls for the 64-layer Text decoder and MTP module without
+name lookup or virtual dispatch.
+
+`Qwen3_6_Vision` similarly binds the fixed 27-layer Vision tower. It runs before multimodal text
+prefill and returns merged `[5120,V]` BF16 embeddings that remain valid in the Vision workspace until
+the text prompt consumes them.
+
+The model layer owns computation order and model-specific state semantics. It does not own physical
+arenas, HTTP behavior, or kernel selection policy.
+
+## 6. Load and resource lifecycle
+
+`Engine::load()` performs one bounded setup sequence:
+
+1. validate options, including prefill-chunk alignment, KV dtype, and MTP draft count;
+2. parse the q5090 header/catalog/tokenizer assets;
+3. allocate persistent weight, cache/state, workspace, and Vision resources;
+4. upload `TEXT_CORE` and `VISION_ENCODER`, plus MTP/draft modules when requested;
+5. construct and bind Text/MTP and Vision model objects;
+6. initialize stable device-resident step and sampling buffers.
+
+Default workspace capacity is a function of the configured prefill chunk, not total prompt length.
+The prompt is processed in aligned chunks, and block-scoped workspace marks are rewound between
+mixer and MLP phases. KV/state capacity is a function of configured context, KV dtype, and whether
+MTP state is enabled.
+
+## 7. Text request flow
+
+```text
+prompt/messages
+    │
+    ▼
+chat template → embedded tokenizer → token ids
+    │
+    ▼
+Engine prefill (chunked) → first sampled token
+    │
+    ▼
+decode step/round → token stream decoder → stdout or HTTP stream
+```
+
+Text prefill resets the active sequence unless the runtime selects an explicit prefix-reuse path.
+The final prompt column is normalized and projected by the full `lm_head`; the first generated token
+is selected by the configured sampler. Subsequent calls continue from resident KV/GDN state.
+
+The server can reuse a stable text prefix across turns. `prefill_cached()` compares the requested
+tokens with the resident logical-token mirror and chooses one of three behaviors:
+
+- append an exact resident prefix;
+- restore the saved assistant-content boundary and append from there;
+- perform a full reset prefill when reuse is unsafe.
+
+Multimodal resident prefixes are not reused through this text-only mechanism.
+
+## 8. Multimodal request flow
+
+```text
+structured messages
+    │
+    ├─ chat template/tokenizer ──────────────► expanded text ids and placeholders
+    │
+    └─ media fetch/decode/resize/normalize ─► [P,1536] FP32 patches
+                                                │
+                                                ▼
+                                    27-layer Vision + merger
+                                                │
+                                                ▼
+                                    [5120,V] visual embeddings
+                                                │
+                                                ▼
+                         scatter into text embeddings + three-axis MRoPE
+                                                │
+                                                ▼
+                                      ordinary Text prefill/decode
+```
+
+The processor produces token types, axis-major temporal/height/width positions, `rope_delta`, Vision
+grids, timestamps, scatter spans, and the patch buffer. It enforces byte, decoded-pixel, patch,
+Vision-token, attention-work, duration, and item-count budgets before expensive execution.
+
+Vision runs only for prefill. Decode continues exclusively through Text state using the resulting
+MRoPE offset.
+
+## 9. Decode paths
+
+### 9.1 Ordinary decode
+
+With MTP disabled, one logical decode step consumes the current token, advances all Text layers,
+projects the new hidden state through the full `lm_head`, samples the next token, and updates the
+position/state buffers.
+
+CUDA Graph execution is enabled by default. Stable device addresses and fixed step shapes allow the
+runtime to warm the eager path, capture the record path, and replay it on later steps. Disabling
+graphs changes execution mechanics, not model semantics.
+
+### 9.2 MTP speculative decode
+
+With `mtp_draft_tokens = k`, a round:
+
+1. prepares up to `k` proposals with the one-layer MTP model;
+2. evaluates the target model over the candidate window;
+3. samples/compares the target distribution at each position;
+4. accepts the valid prefix and commits the matching KV/GDN snapshot slot;
+5. falls back to a normal target token when the proposal prefix ends or is rejected.
+
+The target model always decides emitted tokens. The optional shortlisted `lm_head` is used only at
+MTP proposal sites, so it can change acceptance and speed but not the target distribution. Both the
+ordinary one-token path and the complete MTP round have eager and captured execution forms.
+
+## 10. Sampling and output
+
+Sampling configuration lives in stable device-resident storage so graph replay can read new request
+values without changing captured addresses. Temperature zero is an exact greedy bypass. Nonzero
+temperature uses the supported top-k/top-p/min-p and penalty semantics described in
+[`serving.md`](serving.md).
+
+Token selection happens on device. The runtime synchronizes and returns caller-visible tokens at the
+Engine boundary, where CLI/server code applies stop-token handling and incremental UTF-8 decoding.
+
+## 11. Precision and state
+
+The main precision policy is:
+
+- Q4/Q5/Q6 or W8G32 packed weights according to the active q5090 tensor assignment;
+- BF16 activations and most persistent dense parameters;
+- FP32 GDN recurrent state and control tensors where required by the model;
+- BF16 or group-quantized INT8 GQA/MTP KV storage;
+- FP32 accumulation where operator numerics require it.
+
+The `Weight` handle is the precision seam: qtype/layout are data, while the model schedule invokes a
+stable operator contract. Structural model flexibility is intentionally not a seam.
+
+Persistent state is divided by lifetime:
+
+- weights: process lifetime;
+- KV/GDN/MTP state: active sequence lifetime;
+- step/sampling buffers: Engine lifetime with stable addresses;
+- Vision workspace: one multimodal prefill;
+- Text workspace: block/chunk scoped with arena rewind;
+- frontend request/media buffers: request lifetime.
+
+## 12. Performance method
+
+The primary objective is caller-visible single-stream decode throughput. The weight-bandwidth
+roofline is a design anchor, not a published performance result. Optimizations are accepted using the
+smallest evidence that covers their risk:
+
+- numerical or behavior checks for the affected operator;
+- per-operator benchmark and NCU evidence for kernel changes;
+- NSYS for full inference, launch gaps, CPU/GPU overlap, and phase breakdown;
+- before/after `qus_bench` reports for relevant prefill/decode matrices;
+- `compute-sanitizer` when memory access or lifetime is at risk.
+
+Historical profiles live in the archive. They are not silently promoted to current performance
+claims after the implementation, artifact, or measurement contract changes.
+
+## 13. Source map
+
+| Concern | Primary implementation |
 |---|---|
-| GPU | NVIDIA RTX 5090, Blackwell, **sm_120**, 32 GB, ~1.79 TB/s, FP8 + FP4 tensor cores |
-| CUDA | 13.1 |
-| Host compiler | gcc 13.3 |
-| Build | CMake ≥ 3.28 |
-| OS | Linux (WSL2) |
-
-We target sm_120 specifically and may use Blackwell-only features (FP8/FP4 tensor cores,
-TMA, large shared memory) where they help.
-
----
-
-## 3. Target model — frozen reference (`qwen3_5` architecture)
-
-`Qwen3.6-27B` is internally `Qwen3_5ForConditionalGeneration` (`model_type: qwen3_5`): a
-**hybrid-attention, multimodal model with built-in MTP**. The runtime implements the fixed text
-decoder, one-layer MTP module, and 27-layer Vision tower. These dimensions are the "固化" truth
-everything specializes to.
-
-### 3.1 Text decoder
-
-| Field | Value |
-|---|---|
-| num_hidden_layers | **64** |
-| hidden_size | 5120 |
-| intermediate_size (SwiGLU) | 17408 |
-| hidden_act | silu (SwiGLU) |
-| norm | RMSNorm, eps 1e-6 |
-| vocab_size | **248320** |
-| tie_word_embeddings | **false** (separate `lm_head`) |
-| max_position_embeddings | 262144 (256K model capacity); current M2.8 runtime gate `max_ctx = 8192`; 128K/256K deferred |
-| torch_dtype | bfloat16 |
-
-### 3.2 Hybrid attention — 3:1 pattern (`full_attention_interval = 4`)
-
-64 layers: every 4th layer is full softmax attention, the other three are linear attention.
-⇒ **48 linear-attention layers + 16 full-attention layers.**
-
-**Linear-attention layers (Gated DeltaNet):**
-
-| Field | Value |
-|---|---|
-| linear_conv_kernel_dim | 4 (causal conv1d) |
-| linear_num_key_heads | 16 |
-| linear_key_head_dim | 128 |
-| linear_num_value_heads | 48 |
-| linear_value_head_dim | 128 |
-| output_gate_type | swish |
-| state dtype | **fp32** (`mamba_ssm_dtype`) |
-| state size | fixed, **context-independent** |
-
-**Full-attention layers (GQA):**
-
-| Field | Value |
-|---|---|
-| num_attention_heads (Q) | 24 |
-| num_key_value_heads (KV) | 4 (GQA) |
-| head_dim | 256 |
-| partial_rotary_factor | 0.25 (64 of 256 dims rotated) |
-| rope | MRoPE, sections [11, 11, 10], interleaved |
-| rope_theta | 1e7 |
-| attn_output_gate | true |
-
-### 3.3 Integrated checkpoint modules
-- **MTP** (`mtp_num_hidden_layers: 1`) — self-speculative decode with eager and CUDA Graph paths.
-- **Vision tower** (depth 27, hidden 1152) plus merger — native image/video preprocessing,
-  W8G32 Vision weights, visual embedding injection, and three-axis MRoPE.
-
-### 3.4 Parameter budget (~26B params, ~52 GB bf16 across 15 safetensors shards)
-- 64 transformer layers ≈ ~24B params.
-- `embed_tokens` (248320×5120) ≈ 1.27B — gathered (1 row) at decode → memory cost only.
-- `lm_head` (5120×248320) ≈ 1.27B — **read fully every decode step** → bandwidth-critical.
-
----
-
-## 4. Scope & boundaries
-
-### 4.1 In scope
-- Text and multimodal decoder forward (prefill + decode), including native image/video processing.
-- Primary user CLI: text/messages in -> text out through a project-owned Qwen3.6 C++ text frontend.
-- Core Engine, M2.8 benchmark, and parity tools: token ids in/out for stable performance and debug
-  contracts.
-- Greedy and temperature/top-k/top-p sampling.
-- MTP self-speculative decode and CUDA Graph replay.
-- Runtime-sized context with bf16 or INT8 KV.
-- **W4A16** linear layers (bf16 activations, 4-bit weights dequantized to bf16).
-- Python offline tooling (quantize + relayout/pack → one fixed weight file).
-- C++/CUDA runtime: load the fixed file + run inference.
-
-### 4.2 Frozen (固化)
-- Model dimensions / shape, the 3:1 hybrid layer pattern.
-- On-disk weight-file layout (the Python↔C++ contract).
-- The model card (`qwen3_6_27b`) as the static compute graph.
-- Kernel-fusion targets specialized to this model's shapes.
-
-### 4.3 Flexible (自由)
-- Kernel **API surface**: generic interfaces with multiple impls + a dispatcher.
-- Memory-pool sizes, max-context, future KV-precision knob.
-- Specialized implementations and routing underneath the compact L1 operator APIs.
-
-### 4.4 Explicitly OUT (deferred, in priority order)
-1. fp8/fp4 activation kernels.
-2. **128K/256K** production qualification and fp8 KV.
-3. Multi-GPU, tensor/pipeline parallelism, continuous batching, paged attention.
-
-### 4.5 Decisions log (from brainstorm)
-| # | Decision | Choice |
-|---|---|---|
-| 1 | Primary metric | Decode tok/s primary; prefill/TTFT tracked |
-| 2 | Architecture | Dense (hybrid linear+full attention) |
-| 3 | Multimodal | Native fixed Qwen3.6 Vision tower and processor |
-| 4 | MTP | Integrated self-speculative decode; report acceptance separately |
-| 5 | Compute precision | bf16 activations + W4A16 baseline; fp8/fp4 prefill later |
-| 6 | Context / KV | pool runtime-sized; bf16 and INT8 KV implemented; 128K/256K qualification deferred |
-| 7 | 固化/自由 | Model-card graph + generic kernel API + routed specialized impls |
-| 8 | Runtime I/O | primary `qus` text/messages in -> text out; Engine/bench/parity use token ids |
-| 9 | Weight pipeline | Python (quant+pack) → fixed file; C++ only loads |
-| 10 | Execution model | Optimization ladder, correctness-gated |
-
----
-
-## 5. System architecture — 3 layers
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ L2  Fixed Qwen3.6 model cards                                 │
-│     Vision tower/merger → scatter → 64-layer text model       │
-│     MTP proposal/verify + KV/GDN/rope state lifecycle          │
-├─────────────────────────────────────────────────────────────┤
-│ L1  Kernels: generic API  ⟂  specialized impl + routing      │
-│     rmsnorm · w4a16_gemm · gqa_attention · gdn_linear_attn    │
-│     causal_conv1d · swiglu · rope_mrope · argmax              │
-│     (clean header per op; dispatcher routes by dims + phase)  │
-├─────────────────────────────────────────────────────────────┤
-│ L0  Infra (model-agnostic, reusable)                         │
-│     memory pool (device + pinned host) · weight-file loader   │
-│     KV & GDN-state allocators · workspace arena · streams     │
-│     tensor/view type                                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Principle:** freedom at the API surface, 固化 in the implementation/fusion and the model
-card. Adding another model later = a new L2 card reusing L0/L1, never an engine rewrite.
-No dynamic graph is built at runtime — the schedule is the C++ in the model card.
-
-### Kernel api/wrapper/launcher/kernel split
-Each operator is organized **by layer, not by operator family** (one flat folder per layer), in
-four layers that read top-to-bottom as the call chain:
-- **api** — a public header (`include/qus/kernels/<op>.h`) declaring the generic,
-  shape-parameterized entry point(s) L2 calls;
-- **wrapper** — host C++ (`src/kernels/wrapper/<op>.cpp`) that validates parameters and
-  **dispatches** to the right impl by phase (prefill vs decode) + dims;
-- **launcher** — `src/kernels/launcher/<op>[_<variant>].cu` that configures grid/block/stream and
-  launches the kernel;
-- **kernel** — `src/kernels/kernel/<op>[_<variant>].cuh` with the `__global__`/`__device__` compute.
-
-Parameter checks live in the wrapper; dispatch is the wrapper's routing logic (no separate
-dispatcher object). A CUDA Graph (later) simply records whatever impls the wrappers launched for
-the decode step. Full conventions: [`l1-kernel-layering.md`](l1-kernel-layering.md).
-
----
-
-## 6. Component breakdown
-
-### L0 — Infra
-- **MemoryPool** — device + pinned-host suballocation; large initial reservation, sub-buffers.
-- **WeightStore / Loader** — mmap the fixed weight file; expose typed weight views; place into
-  device buffers; validate header/dims against the model card's `constexpr` config.
-- **KVCache** — contiguous per-(full-attn-layer) K/V buffers sized for `max_context`.
-- **StateStore** — fixed-size GDN recurrent + conv state per linear-attn layer (fp32).
-- **WorkspaceArena** — per-step scratch (bump allocator, reset each step).
-- **Stream/handle/event** wrappers; error-checking macros.
-- **Tensor** — lightweight shape/stride/dtype view (no ownership).
-
-### L1 — Kernels (API + routed impls)
-- `rmsnorm` (fp32 accumulate)
-- `w4a16_gemm` / `w4a16_gemv` — 4-bit weight dequant + matmul; the decode workhorse
-- `gqa_attention` — full-attn: prefill (flash-style) + decode (single-query) paths
-- `gdn_linear_attn` — chunked/parallel (prefill) + recurrent (decode) paths
-- `causal_conv1d` — kernel-4 short conv for linear-attn layers
-- `rope_mrope` — partial RoPE (0.25) with MRoPE sections
-- `swiglu` — fused gate·up + down projections
-- attention output gate, residual adds, embedding gather, `argmax`
-
-### L2 — Model card
-- `constexpr ModelConfig` (the frozen dims).
-- `prefill(prompt_ids) -> first_token`, `decode_step(prev_token) -> next_token`.
-- Layer loop dispatching linear vs full attention on the 3:1 pattern.
-- KV/state lifecycle and position bookkeeping.
-
-### Runtime / driver
-- Primary `src/main.cpp` CLI: Qwen3.6 chat text/messages -> C++ text frontend -> Engine ->
-  decoded text.
-- Engine init (load weights, size pools), the prefill+decode loop, benchmark harness, and parity
-  tooling keep token ids in/out internally.
-
----
-
-## 7. Data flow
-
-### Prefill (prompt, many tokens, compute-bound)
-```
-embed gather
-for layer in 0..63:
-    h = rmsnorm(x)
-    if full_attn(layer):  attn = gqa_attention(h, positions) # fills KV
-    else:                 attn = gdn_linear_attn_chunked(h)  # folds prompt into state
-    x = x + attn_output_gate(attn)
-    h = rmsnorm(x)
-    x = x + swiglu(h)
-x = rmsnorm(x)
-logits = lm_head(x[last])     # only last position
-first_token = argmax(logits)
-```
-
-### Decode (1 token/step, memory-bound)
-```
-embed gather (1 token)
-for layer in 0..63:
-    h = rmsnorm(x)
-    if full_attn(layer):  attn = gqa_attention(h, pos)        # append 1 KV slot, attend window
-    else:                 attn = gdn_linear_attn_recurrent(h)# in-place state update
-    x = x + attn_output_gate(attn)
-    h = rmsnorm(x)
-    x = x + swiglu(h)
-x = rmsnorm(x)
-logits = lm_head(x)
-next_token = argmax(logits)
-```
-The decode step's kernel sequence is the unit later captured by CUDA Graph / fused / merged
-into a megakernel.
-
----
-
-## 8. Memory management (future 128K budget anchor, bf16 KV)
-
-| Region | Size | Notes |
-|---|---|---|
-| 4-bit weights (+ scales, + hi-precision sensitive tensors) | ~14–15 GB | loaded once |
-| Full-attn KV (16 layers) at future 128K | ~8 GB | 64 KB/token; budget anchor only; current M2.8 gate is `max_ctx = 8192` |
-| GDN recurrent + conv state | ~0.15–0.2 GB | fixed-size, context-independent |
-| Activations / workspace arena | ~1–2 GB | reused across layers |
-| **Total** | **~24–26 GB / 32 GB** | future 128K budget anchor; headroom planning for fp8-KV / 256K later |
-
-- Weights mmap'd from the one fixed file into device buffers (no runtime relayout).
-- KV/state pools sized at startup from `(max_context, dims)`.
-- Workspace arena reset every step; no per-step `cudaMalloc`.
-
----
-
-## 9. Numerics & precision
-
-| Quantity | Precision |
-|---|---|
-| Master activations | bf16 |
-| Linear layers | **W4A16** (4-bit weights → bf16 dequant matmul) |
-| KV cache | bf16 |
-| GDN recurrent/conv state | fp32 |
-| Norms / softmax / reductions | fp32 accumulate |
-
-- No runtime/dynamic quantization — the file is pre-quantized and pre-laid-out.
-- fp8/fp4 activation kernels are a **prefill-only** later optimization.
-- **Open lever:** `lm_head` precision. Kept high-precision it costs ~2.5 GB/token of decode
-  bandwidth; at 4-bit ~0.64 GB/token. To be decided by quality-vs-speed measurement.
-
----
-
-## 10. Weight pipeline & file-format contract
-
-**Two halves, one contract:**
-
-```
-bf16 safetensors ─┐
-                  │  (Python, in-repo, offline)
-                  ▼
-        tools/q5090_convert
-        quantize selected tensors; keep control tensors high-precision
-                  ▼
-        encode q5090 payload layouts
-        (tile/interleave bytes + inline scales; no semantic math folds)
-                  ▼
-        ONE fixed q5090 file ──────────► C++/CUDA runtime: validate + load + run
-                                          (runtime applies model math transforms)
-```
-
-- The **file format** is a stable, self-describing container: header (magic, version, dims,
-  module index, tensor index, string table, payload offsets, qtypes, layouts, CRCs) + tensor
-  blobs. Spec lives in [`q5090_packed_file_format_v1.md`](q5090_packed_file_format_v1.md).
-- Python owns quantization and byte-level payload layout. It does not fold RMSNorm `+1`,
-  log-decay exponentiation, or other model-semantic transforms into the stored weights.
-- The C++ loader validates q5090 metadata against the model card's `constexpr` config, uploads
-  selected modules, and fails fast on structural mismatches. It does not recompute payload CRCs during
-  normal model load; CRC is retained for converter and offline audit tooling.
-
----
-
-## 11. Performance methodology — the optimization ladder
-
-Profiler-driven, **correctness-gated**, in strict order:
-
-1. **Correctness baseline** — eager driver, simplest kernels. Validate (see §12).
-2. **Per-kernel optimization** — drive each kernel to its roofline (ncu: occupancy, memory
-   throughput, stall reasons).
-3. **Inter-kernel fusion** — kill global round-trips & launches (e.g. dequant+GEMV,
-   RMSNorm+QKV, RoPE+KV-write, SwiGLU, gate+residual).
-4. **CUDA Graph replay / persistent megakernel / any effective means** — collapse launch
-   overhead for the decode step.
-
-Tools: **nsys** (timeline, launch overhead), **ncu** (per-kernel roofline),
-**compute-sanitizer** (correctness gate). Never optimize ahead of correctness.
-
----
-
-## 12. Validation & correctness
-
-- **Per-layer numerical parity**: dump activations from HF/vLLM for fixed inputs; compare
-  cosine similarity / max-abs-error per layer.
-- **End-to-end greedy token-match**: identical prompt + greedy must match the q5090 oracle
-  token-for-token (greedy determinism makes this nearly free).
-- **compute-sanitizer** clean (memcheck/racecheck) at each stage.
-- **Perf tracking** vs the §1 roofline at every ladder stage.
-
----
-
-## 13. Repository layout
-
-```
-qwen3.6-ultraspeed/
-  README.md                 # simple overview + quickstart
-  docs/design.md            # this document
-  CMakeLists.txt
-  tools/                    # Python offline tooling (in-repo)
-    q5090_convert/          # bf16 safetensors -> canonical q5090 packed file
-  docs/q5090_packed_file_format_v1.md  # file-format spec (Python<->C++ contract)
-  include/qus/
-    core/                   # mem pool, allocators, tensor, loader (public headers)
-    kernels/                # kernel API headers
-    model/                  # model config + model-card interface
-  src/
-    core/                   # infra impl
-    kernels/                # L1 ops, organized by layer (see l1-kernel-layering.md)
-      wrapper/              # <op>.cpp     — validate params + dispatch
-      launcher/             # <op>.cu/.h   — grid/block/stream + launch
-      kernel/               # <op>.cuh     — __global__ / __device__ compute
-    model/qwen3_6_27b.cpp   # the model card / static graph
-    runtime/                # engine: load + prefill + decode loop
-    main.cpp                # primary text CLI
-  tests/                    # parity + kernel unit tests; parity remains token-id based
-  bench/                    # benchmark scripts and .ids fixture consumers
-```
-
----
-
-## 14. Roadmap / milestones
-
-- **M0 — Skeleton:** implemented; repo, CMake, L0 infra, tensor/device arenas, and model config exist.
-- **M1 — Weight pipeline:** implemented; q5090 Python converter, fixed file format, C++ parser/loader,
-  and full-model load path exist.
-- **L1 — Operator layer:** implemented; the 13 public operator APIs and their current CUDA
-  implementations exist, with focused kernel tests.
-- **M2 — Correctness baseline:** implemented; L2 model card, Engine, block parity tooling, greedy
-  token-match tooling, and FileTap localization exist.
-- **M2.5 — Hardening/documentation sync:** mostly landed / in progress; graph-readiness fixes, EOS
-  handling, parity tap structure, and cleanup structural checks are present. Keep unknown or
-  environment-heavy gates as verify-current items.
-- **M2.8 — Pre-M3 benchmark/I/O/memory observability gate:** complete; gate evidence lives in
-  [`m3-readiness.md`](m3-readiness.md), with the historical standard archived under
-  [`archive/pre-optimization/`](archive/pre-optimization/).
-- **M3 — Per-kernel optimization:** follows M2.8 readiness; each kernel to roofline (W4A16 GEMV, GQA,
-  GDN, conv, RoPE, SwiGLU, argmax).
-- **M4 — Fusion:** fuse adjacent ops; reduce launches/round-trips.
-- **M5 — Launch-overhead elimination:** CUDA Graph decode replay; explore megakernel.
-- **Later:** fp8/fp4 activations → 256K/fp8-KV qualification → multi-GPU/batching only if scope
-  changes.
-
----
-
-## 15. Open questions (to resolve during optimization/future phases, non-blocking)
-- `lm_head` precision (decode-bandwidth vs quality) — decide by measurement.
-- Exact GDN state layout & chunk size for the prefill scan.
-- W4A16 weight packing/interleave layout that best feeds the GEMV access pattern.
-- Whether the embedding table stays bf16 (memory) or 4-bit.
+| fixed dimensions | `include/qus/model/config.h` |
+| Text/MTP schedule and binding | `include/qus/model/model.h`, `src/model/qwen3_6_27b.cpp` |
+| Vision schedule | `include/qus/model/vision.h`, `src/model/qwen3_6_vision.cpp` |
+| multimodal processor | `include/qus/model/processor.h`, `src/model/processor.cpp`, `src/media` |
+| Engine and prefix reuse | `include/qus/runtime/engine.h`, `src/runtime/engine.cpp` |
+| graph capture/replay | `include/qus/runtime/decode_graph.h`, `src/runtime/decode_graph.cpp` |
+| q5090 parser/loader | `include/qus/core/weight_store*.h`, `src/core/weight_store*.cpp` |
+| public operators | `include/qus/kernels` |
+| CUDA implementations | `src/kernels` |
+| CLI and text frontend | `include/qus/text`, `src/text`, `src/main.cpp` |
+| HTTP serving | `include/qus/serve`, `src/serve` |
+| converter/reference | `tools/q5090_convert`, `tools/q5090` |
+| measurement | `bench`, `tools/bench` |

@@ -6,7 +6,7 @@ Offline, GPU-accelerated quantizing converter: original **Qwen3.6-27B** bf16 saf
 - Binary file contract (self-contained v4.2, including tokenizer and optional draft `lm_head`):
   [`docs/q5090_packed_file_format_v4.md`](../../docs/q5090_packed_file_format_v4.md)
 - Draft-head decision (Q4 @ N=131072):
-  [`docs/2026-07-06-lm-head-draft-q4-decision.md`](../../docs/2026-07-06-lm-head-draft-q4-decision.md)
+  [`docs/archive/optimization-era/2026-07-06-lm-head-draft-q4-decision.md`](../../docs/archive/optimization-era/2026-07-06-lm-head-draft-q4-decision.md)
 
 The output contains TEXT_CORE + MTP_DRAFT + VISION_ENCODER and, unless disabled, the independent
 LM_HEAD_DRAFT module. It also embeds `tokenizer.json`, `merges.txt`, and `generation_config.json` as

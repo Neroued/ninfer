@@ -1,8 +1,5 @@
 # QUS Packed Artifact Format `q5090_w4g64_mixed_v4_2` (binary spec)
 
-> Status: current and normative artifact contract. The converter, verifier, Python reader, C++
-> parser/loader, and CUDA consumers all target this exact format.
-
 This document is the **decode-optimal canonical binary contract** for Qwen3.6-27B on one RTX 5090. It
 is the single model-artifact ABI the C++ runtime consumes. It contains the packed weights and the
 CPU-only tokenizer assets required by the text frontend. There is no other in-tree weight path, no
@@ -22,12 +19,12 @@ speculative drafting: a standalone Q4 weights block plus a small `int32` index -
 optional and, when present, changes only *which* tokens are proposed during drafting; verification
 always uses the full `lm_head`, so emitted tokens are unaffected (§18). The selection method and the
 measured decision to ship it are recorded in
-[the archived draft-head decision](archive/optimization-era/2026-07-06-lm-head-draft-q4-decision.md).
+[2026-07-06-lm-head-draft-q4-decision.md](2026-07-06-lm-head-draft-q4-decision.md).
 
-The current policy has one W8 format (`W8G32_F16S`), uses W8G32 for both Vision merger FC weights,
-uses Q6G64 for the flattened Vision patch embedding, embeds the tokenizer assets, and represents the
-shortlisted head as an independent `LM_HEAD_DRAFT` module. No earlier major/minor is accepted and no
-compatibility parser exists.
+v4.2 removes `W8G128_F16S`, assigns tag 3 to the sole W8 format `W8G32_F16S`, moves `I32_CTRL` to tag
+6, changes both vision merger FC weights to W8G32, and changes the flattened vision patch embedding
+to Q6G64. It retains the self-contained tokenizer and independent `LM_HEAD_DRAFT` module introduced
+by the retired v4.1 artifact. No earlier minor is accepted and no compatibility parser exists.
 
 ## Why this layout
 
@@ -191,7 +188,7 @@ quantizer pass (§8). bit4 `LM_HEAD_DRAFT_PRESENT` — set **iff** an `LM_HEAD_D
 present (§14). A full artifact sets
 `TEXT_PRESENT | MTP_PRESENT | VISION_PRESENT | LM_HEAD_DRAFT_PRESENT`. Bits 5..31 are reserved and MUST
 be zero. A loader MUST reject a file whose reserved flag bits are set or whose presence bits disagree
-with the module table. No alternate name or alias exists for bit4.
+with the module table. `DRAFT_HEAD_PRESENT` is a retired v4.0 name and is not an alias.
 
 ### 2.1 TokenizerRecord (64 bytes)
 
@@ -491,7 +488,7 @@ that projection (the same numbers regardless of storage). The one exception is t
 subset, quantized fresh at `Q4G64` (`qmax = 7`, `qmin = -8`) — i.e. re-derived from bf16, not shared
 with the full `Q6` `lm_head` block. The format still stores that quantizer output verbatim (invariant
 0.1 holds for the draft-head tensor's own values). The shortlist selection and id-map are described in
-[the archived draft-head decision](archive/optimization-era/2026-07-06-lm-head-draft-q4-decision.md).
+[2026-07-06-lm-head-draft-q4-decision.md](2026-07-06-lm-head-draft-q4-decision.md).
 
 ## 9. Payload encodings
 
@@ -890,8 +887,7 @@ exactly these two standalone blocks, the id-map immediately after the weights:
 The `lm_head_draft` codes/scales are the `Q4G64` quantization of the original bf16 `lm_head.weight` rows
 selected by a frequency-ranked shortlist (plus force-included special ids); the id-map entries are those
 rows' vocab ids (§8, §9.4). The shortlist size (`N = 131072`), selection method, and measured
-justification are in
-[the archived draft-head decision](archive/optimization-era/2026-07-06-lm-head-draft-q4-decision.md).
+justification are in [2026-07-06-lm-head-draft-q4-decision.md](2026-07-06-lm-head-draft-q4-decision.md).
 
 **MTP_DRAFT canonical block order:**
 
@@ -1027,7 +1023,7 @@ fields:
     "idmap_qtype": "I32_CTRL",
     "idmap_source_kind": "LM_HEAD_DRAFT_IDMAP",
     "idmap_payload_bytes": 524288,
-    "selection": "docs/archive/optimization-era/2026-07-06-lm-head-draft-q4-decision.md"
+    "selection": "docs/2026-07-06-lm-head-draft-q4-decision.md"
   },
   "fusion_groups": [
     {"module": "TEXT_CORE", "group_id": "ATTN_IN", "group_count": 16, "blocks_per_group": 2, "total_n": 14336, "shared_k": 5120},
@@ -1108,7 +1104,7 @@ The format's distinctive capabilities, stated as its own feature list:
 - **`LM_HEAD_DRAFT_PRESENT` header flag** (bit4) with structural coupling: set iff the independent
   two-block module is present, and the id-map `N` must equal the weights `N` (§2, §13).
 - **Compact qtype enum.** Tags 0..6 are Q4G64, Q5G64, Q6G64, W8G32, BF16, FP32, and I32; there are
-  no tag holes (§7).
+  no retired tag holes (§7).
 - **Container identity.** `magic = "Q5090MIXEDV4\0\0\0\0"`, `version = 4`,
   `format = q5090_w4g64_mixed_v4_2`, `format_minor = 2`, `module_version = 4` (§2, §3).
 - **Strict invariants.** Value preservation, single resident copy, on-chip dequant only, one layout

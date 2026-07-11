@@ -1,6 +1,6 @@
 // Performance bench for embedding Q6 ROW_SPLIT at the real Qwen3.6
 // embedding shape. The printed GB/s is informational only; the gate is ncu
-// sustained DRAM percent (see docs/l1-op-test-standard.md section 2).
+// sustained DRAM percent (see docs/kernel-development.md §8).
 //   ./qus_embed_gather_bench [--decode] [--t64|--prefill]   (default: both)
 #include "qus/kernels/embedding.h"
 #include "qus/core/device.h"

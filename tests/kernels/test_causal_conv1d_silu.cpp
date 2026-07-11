@@ -1,5 +1,5 @@
 // Correctness + coverage for causal_conv1d, against the frozen op-test
-// standard (docs/l1-op-test-standard.md): fp64 golden from bf16-rounded
+// standard (docs/kernel-development.md): fp64 golden from bf16-rounded
 // inputs, honest [-8,8] ranges, composite tolerance bf16_reduction.
 #include "qus/kernels/causal_conv1d_silu.h"
 #include "kernels/op_tester.h"

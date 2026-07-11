@@ -2,7 +2,7 @@
 
 // qus::kernels - residual_add kernel: x += y, elementwise in place.
 // Vectorized over bf16 pairs; included only by its launcher. See
-// docs/l1-kernel-layering.md section 6 and docs/l1-op-test-standard.md section 0.
+// docs/kernel-development.md §6.
 
 #include <cuda_bf16.h>
 

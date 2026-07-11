@@ -1,5 +1,5 @@
 // Correctness + coverage for embedding, against the frozen op-test standard
-// (docs/l1-op-test-standard.md): fp64 golden from bf16-rounded dense inputs,
+// (docs/kernel-development.md): fp64 golden from bf16-rounded dense inputs,
 // exact Q6 ROW_SPLIT dequant reference, composite tolerance bf16_elementwise.
 #include "qus/kernels/embedding.h"
 #include "kernels/op_tester.h"

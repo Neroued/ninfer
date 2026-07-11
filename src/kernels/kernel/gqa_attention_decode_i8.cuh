@@ -1,7 +1,7 @@
 #pragma once
 
 // qus::kernels - split-KV GQA small-T attention, int8 KV-cache partial kernel.
-// int8-native redesign (docs/2026-07-08-gqa-decode-int8-kernel-redesign.md):
+// Historical design: docs/archive/optimization-era/2026-07-08-gqa-decode-int8-kernel-redesign.md.
 //
 //   * QK runs on native m16n8k32.s8 tensor cores. Q is quantized on-chip to int8
 //     per (row, 64-group); K stays int8 in the cache and is read straight into

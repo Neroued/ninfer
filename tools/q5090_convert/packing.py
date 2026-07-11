@@ -4,7 +4,7 @@ Layout: within each group of `gs` signed codes, each code is stored as a `bits`-
 two's-complement value. Q4/Q5/Q6 store the low nibble in a Q4-compatible base
 plane, and Q5/Q6 store the remaining high bit(s) in a separate high plane. W8
 stores one signed int8 byte per code in the base plane. See
-../../docs/q5090_packed_file_format_v3.md section 9.1.
+../../docs/q5090_packed_file_format_v4.md section 9.1.
 
 Two implementations:
   * numpy `*_groups`     -- reference, used by the unit tests

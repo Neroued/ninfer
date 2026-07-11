@@ -1,7 +1,7 @@
 // Performance bench for l2norm at the Qwen3.6-27B attention head shape
 // ([head_dim, heads, T] = [128,16,T]). This binary is the ncu/nsys target;
 // the GB/s it prints is informational only -- the gate is ncu sustained DRAM %
-// (see docs/l1-op-test-standard.md section 2).
+// (see docs/kernel-development.md §8).
 //   ./qus_l2norm_bench [--decode] [--prefill]   (default: both)
 #include "qus/kernels/l2norm.h"
 #include "qus_bench_common.h"

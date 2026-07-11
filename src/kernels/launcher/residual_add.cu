@@ -1,6 +1,6 @@
 // qus::kernels - residual_add launcher: grid/block/stream configuration + kernel launch.
 // The only translation unit that includes this op's kernel header.
-// See docs/l1-kernel-layering.md section 4.
+// See docs/kernel-development.md §2.
 #include "kernels/launcher/residual_add.h"
 
 #include "kernels/common/math.h"

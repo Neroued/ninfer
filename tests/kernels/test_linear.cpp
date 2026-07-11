@@ -1,5 +1,5 @@
 // Correctness + coverage for linear dense BF16/FP32, against the frozen
-// op-test standard (docs/l1-op-test-standard.md): fp64 golden W @ x from
+// op-test standard (docs/kernel-development.md): fp64 golden W @ x from
 // bf16-rounded inputs and weights, composite tolerance linear_bf16.
 #include "qus/kernels/linear.h"
 #include "qus/kernels/attn_input_proj.h"

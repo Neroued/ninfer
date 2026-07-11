@@ -1,5 +1,5 @@
 // Correctness + coverage for sigmoid_mul, against the frozen op-test standard
-// (docs/l1-op-test-standard.md): fp64 golden from bf16-rounded inputs, honest
+// (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges (incl. a large-magnitude stress case), composite tolerance
 // bf16_elementwise.
 #include "qus/kernels/sigmoid_mul.h"

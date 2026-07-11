@@ -6,7 +6,7 @@
 // the per-op test computes its reference in `double` from bf16-rounded inputs,
 // upcasts the kernel output to `double`, and calls compute_diff/diff_passes.
 //
-// THE RULE (docs/l1-op-test-standard.md §0): if a test fails, fix the kernel,
+// THE RULE (docs/kernel-development.md §7): if a test fails, fix the kernel,
 // not the tolerance. Presets are `static constexpr` and there is no per-op or
 // CLI override. A test selects a preset BY NAME (e.g. Tolerance::bf16_elementwise()).
 //
@@ -29,7 +29,7 @@ struct Tolerance {
     double worst_ratio_max; // max |a-b| / (atol + rtol*|b|) among violators
     double rel_l2_tol;      // max ||a-b||_2 / ||b||_2
 
-    // ---- frozen presets (see docs/l1-op-test-standard.md §1.3) -------------
+    // ---- frozen presets (see docs/kernel-development.md §7) -------------
     static constexpr Tolerance bf16_elementwise() {
         return {/*atol*/ 1e-3, /*rtol*/ 8e-3, /*tail_frac*/ 1e-3,
                 /*worst_ratio_max*/ 4.0, /*rel_l2_tol*/ 4e-3};
@@ -54,7 +54,7 @@ struct Tolerance {
     // fp32 path). This preset gates on rel_l2 only (tightened, a strong bug net since
     // any layout/index bug spikes it) with NaN/inf still fatal; the per-element
     // worst/frequency caps are neutralized (they mis-fire on cancellation). See
-    // docs/l1-op-test-standard.md §1.3.
+    // docs/kernel-development.md §7.
     static constexpr Tolerance linear_tc() { return {2e-3, 1.6e-2, 1.0, 1e30, 4e-3}; }
 
     static constexpr Tolerance attention_bf16() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }

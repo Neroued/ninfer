@@ -2,7 +2,7 @@
 # at the real Qwen3.6-27B shapes and is the target for ncu/nsys.
 #   qus_add_bench(<name> SOURCES <files...>)
 # Built with -lineinfo so ncu can attribute SASS to source lines.
-# Performance is GATED by ncu (see docs/l1-op-test-standard.md §2), not by the
+# Performance is GATED by ncu (see docs/kernel-development.md §8), not by the
 # GB/s these binaries print.
 function(qus_add_bench name)
   cmake_parse_arguments(arg "" "" "SOURCES" ${ARGN})

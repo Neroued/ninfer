@@ -6,7 +6,7 @@
 // with inner-iter batching to amortize the per-sample host sync; throughput is
 // reported from the MEDIAN per-launch time (robust to host scheduling spikes).
 //
-// IMPORTANT (docs/l1-op-test-standard.md §2): the GB/s printed here is a
+// IMPORTANT (docs/kernel-development.md §8): the GB/s printed here is a
 // convenience readout, NOT the acceptance gate. The gate is ncu
 // dram__throughput.avg.pct_of_peak_sustained_elapsed >= 85%. Always profile.
 

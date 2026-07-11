@@ -1,6 +1,6 @@
 // qus::kernels — silu_mul wrapper: implements the public api, validates parameters, and
 // dispatches to the launcher. Host-compiled; never includes the kernel header.
-// See docs/l1-kernel-layering.md §5.
+// See docs/kernel-development.md §2.
 #include "qus/kernels/silu_mul.h"
 
 #include "kernels/launcher/silu_and_mul.h" // detail::silu_and_mul_launch

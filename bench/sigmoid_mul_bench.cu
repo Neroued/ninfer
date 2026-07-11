@@ -1,7 +1,7 @@
 // Performance bench for sigmoid_mul at the real Qwen3.6-27B gate shape
 // (hidden_size = 6144). This binary is the ncu/nsys target; the GB/s it prints
 // is informational only -- the gate is ncu sustained DRAM % (see
-// docs/l1-op-test-standard.md section 2).
+// docs/kernel-development.md §8).
 //   ./qus_sigmoid_gate_mul_bench [--decode] [--prefill]   (default: both)
 #include "qus/kernels/sigmoid_mul.h"
 #include "qus_bench_common.h"

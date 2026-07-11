@@ -1,5 +1,5 @@
 // Correctness + coverage for gdn_gating, against the frozen op-test standard
-// (docs/l1-op-test-standard.md): fp64 golden from bf16-rounded inputs, honest
+// (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // GDN gate ranges including the softplus guard, composite tolerance
 // fp32_transcendental.
 #include "qus/kernels/gdn_gating.h"

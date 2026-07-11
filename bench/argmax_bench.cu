@@ -1,6 +1,6 @@
 // Performance bench for argmax over the real Qwen3.6 vocabulary decode shape.
 // The printed GB/s is informational only; the gate is ncu sustained DRAM %
-// (see docs/l1-op-test-standard.md section 2).
+// (see docs/kernel-development.md §8).
 //   ./qus_argmax_bench [--decode]   (default: decode)
 #include "qus/kernels/argmax.h"
 #include "qus/core/device.h"

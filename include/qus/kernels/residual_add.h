@@ -2,7 +2,7 @@
 
 // qus::kernels - residual_add: x += y, elementwise in place.
 // Reference example for the L1 api/wrapper/launcher/kernel layout; see
-// docs/l1-kernel-layering.md and docs/design.md section 5.
+// docs/kernel-development.md and docs/design.md section 5.
 
 #include "qus/core/tensor.h"
 

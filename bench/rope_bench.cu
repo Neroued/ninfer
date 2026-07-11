@@ -1,6 +1,6 @@
 // Performance bench for partial NeoX RoPE at the real Qwen3.6-27B attention
 // q/k shapes. The printed GB/s is informational only; the gate is ncu sustained
-// DRAM % (see docs/l1-op-test-standard.md section 2).
+// DRAM % (see docs/kernel-development.md §8).
 //   ./qus_rope_bench [--decode] [--prefill]   (default: both)
 #include "qus/kernels/rope.h"
 #include "qus/core/device.h"

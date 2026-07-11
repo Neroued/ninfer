@@ -8,7 +8,7 @@
 // Numerics: bf16 operands (A16-native, 2x the tf32 throughput). This rounds the
 // dequantized weight to bf16; the fp64 golden keeps it in fp32, so the tensor-core
 // path is judged by a normwise criterion (Tolerance::linear_tc, rel_l2 <= 4e-3),
-// per docs/l1-op-test-standard.md.
+// per docs/kernel-development.md.
 //
 // Architecture (P2 pushdown): a tiled GEMM behind a compile-time GemmCfg. Each
 // block owns a BM(rows) x BN(tokens) output tile and contracts K in BK=64 steps

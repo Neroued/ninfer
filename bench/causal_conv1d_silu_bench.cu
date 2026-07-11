@@ -1,7 +1,7 @@
 // Performance bench for causal_conv1d at the real Qwen3.6-27B convolution
 // shape ([C,T] = [10240,T], depthwise width 4). This binary is the ncu target;
 // the GB/s it prints is informational only -- the gate is ncu sustained DRAM %
-// (see docs/l1-op-test-standard.md section 2).
+// (see docs/kernel-development.md §8).
 //   ./qus_causal_conv1d_silu_bench [--decode] [--prefill]   (default: both)
 #include "qus/kernels/causal_conv1d_silu.h"
 #include "qus/core/device.h"

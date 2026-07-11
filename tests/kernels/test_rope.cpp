@@ -1,5 +1,5 @@
 // Correctness + coverage for rope, against the frozen op-test standard
-// (docs/l1-op-test-standard.md): fp64 golden from bf16-rounded q/k,
+// (docs/kernel-development.md): fp64 golden from bf16-rounded q/k,
 // positions read from device, composite tolerance bf16_elementwise.
 #include "qus/kernels/rope.h"
 #include "kernels/op_tester.h"

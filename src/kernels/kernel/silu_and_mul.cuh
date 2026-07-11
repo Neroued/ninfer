@@ -3,7 +3,7 @@
 // qus::kernels — silu_mul kernel: out = silu(gate) * up, elementwise.
 // silu(x) = x / (1 + e^-x), computed exactly in fp32 (NOT a polynomial fit).
 // Vectorized over bf16 pairs; included only by its launcher. See
-// docs/l1-kernel-layering.md §6 and docs/l1-op-test-standard.md §0 (no math approximation).
+// docs/kernel-development.md §6 (no math approximation).
 
 #include "kernels/common/math.cuh"
 

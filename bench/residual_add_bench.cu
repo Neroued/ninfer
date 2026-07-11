@@ -1,7 +1,7 @@
 // Performance bench for residual_add at the real Qwen3.6-27B hidden shape
 // (hidden_size = 5120). This binary is the ncu/nsys target; the GB/s it prints
 // is informational only -- the gate is ncu sustained DRAM % (see
-// docs/l1-op-test-standard.md section 2).
+// docs/kernel-development.md §8).
 //   ./qus_residual_add_bench [--decode] [--prefill]   (default: both)
 #include "qus/kernels/residual_add.h"
 #include "qus_bench_common.h"

@@ -2,7 +2,7 @@
 
 // qus::kernels — silu_mul (SwiGLU activation): out = silu(gate) * up, elementwise.
 // Reference example for the L1 api/wrapper/launcher/kernel layout; see
-// docs/l1-kernel-layering.md and docs/design.md §5.
+// docs/kernel-development.md and docs/design.md §5.
 
 #include "qus/core/tensor.h"
 

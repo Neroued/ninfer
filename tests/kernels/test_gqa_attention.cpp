@@ -1,5 +1,5 @@
 // Correctness + coverage for gqa_attention prefill/decode, against the frozen
-// op-test standard (docs/l1-op-test-standard.md): fp64 golden from
+// op-test standard (docs/kernel-development.md): fp64 golden from
 // bf16-rounded q/k/v/cache inputs, device scalar pos for decode, composite
 // tolerance attention_bf16.
 #include "qus/core/arena.h"

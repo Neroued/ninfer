@@ -1,6 +1,6 @@
 // qus::kernels - residual_add wrapper: implements the public api, validates parameters, and
 // dispatches to the launcher. Host-compiled; never includes the kernel header.
-// See docs/l1-kernel-layering.md section 5.
+// See docs/kernel-development.md §2.
 #include "qus/kernels/residual_add.h"
 
 #include "kernels/launcher/residual_add.h" // detail::residual_add_launch

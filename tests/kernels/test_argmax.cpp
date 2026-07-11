@@ -1,5 +1,5 @@
 // Correctness + coverage for argmax, against the frozen op-test standard
-// (docs/l1-op-test-standard.md): exact i32 index match from bf16-rounded
+// (docs/kernel-development.md): exact i32 index match from bf16-rounded
 // logits, with lowest-index tie-break and no tolerance preset.
 #include "qus/kernels/argmax.h"
 #include "kernels/op_tester.h"

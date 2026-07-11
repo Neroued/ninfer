@@ -1,11 +1,12 @@
 #pragma once
 
 // Owns the resident engine + tokenizer and serializes all engine use behind one
-// mutex (the engine is single-sequence and not thread-safe). Validation and
-// tokenization (prepare) need no engine lock; execution (run) takes it for the
-// whole generation.
+// mutex (the engine is single-sequence and not thread-safe). Validation,
+// tokenization, and CPU media preprocessing need no engine lock; execution
+// (run) takes it for the whole generation.
 
 #include "qus/runtime/engine.h"
+#include "qus/model/processor.h"
 #include "qus/serve/request.h"
 #include "qus/serve/serve_options.h"
 #include "qus/text/text_runner.h"
@@ -15,6 +16,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -23,11 +25,11 @@ namespace qus::serve {
 // Per-request timing and speculative-decoding counters for console observability.
 // Raw values only; the log layer derives tok/s, TTFT and acceptance rates.
 struct GenerationMetrics {
-    double render_tokenize_seconds = 0.0;
-    double prefill_seconds         = 0.0;
-    double decode_seconds          = 0.0;
-    double total_seconds           = 0.0;
-    bool mtp_enabled               = false;
+    double render_tokenize_seconds   = 0.0;
+    double prefill_seconds           = 0.0;
+    double decode_seconds            = 0.0;
+    double total_seconds             = 0.0;
+    bool mtp_enabled                 = false;
     std::int64_t mtp_rounds          = 0;
     std::int64_t mtp_draft_tokens    = 0;
     std::int64_t mtp_accepted_tokens = 0;
@@ -36,8 +38,8 @@ struct GenerationMetrics {
 };
 
 struct GenerationOutcome {
-    std::string text;       // answer text (non-streaming); empty when streamed via a sink
-    std::string reasoning;  // thinking text split out of the <think> block (non-streaming)
+    std::string text;      // answer text (non-streaming); empty when streamed via a sink
+    std::string reasoning; // thinking text split out of the <think> block (non-streaming)
     std::vector<ToolCall> tool_calls;
     int prompt_tokens                     = 0;
     int completion_tokens                 = 0;
@@ -58,17 +60,19 @@ struct StreamSink {
 // tokenized once here in prepare(); run() reuses prompt_token_ids so a served
 // request renders the chat template exactly once.
 struct PreparedRequest {
-    std::vector<qus::text::ChatMessage> messages;
     qus::text::TextGenerationOptions options;
     std::vector<std::string> stop_strings;
     std::vector<int> prompt_token_ids;
+    std::optional<qus::model::ProcessedInput> multimodal;
+    // Serializes memory-heavy media preprocessing. Released immediately after Vision prefill.
+    std::unique_lock<std::mutex> media_permit;
     double render_tokenize_seconds = 0.0;
-    int prompt_tokens  = 0;
-    // Absolute assistant-content boundary (prompt_tokens - generation-prompt opener length) threaded
-    // into the engine prefix cache so a later thinking-stripped turn can reuse up to it.
+    int prompt_tokens              = 0;
+    // Absolute assistant-content boundary (prompt_tokens - generation-prompt opener length)
+    // threaded into the engine prefix cache so a later thinking-stripped turn can reuse up to it.
     std::uint32_t content_boundary = 0;
-    bool include_usage = false;
-    bool tool_capable  = false;
+    bool include_usage             = false;
+    bool tool_capable              = false;
 };
 
 // Which optional generation features the engine currently honors. Sampling is
@@ -83,21 +87,23 @@ public:
     explicit GenerationService(ServeOptions options);
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+
     [[nodiscard]] const ServerCapabilities& capabilities() const noexcept { return caps_; }
+
     [[nodiscard]] qus::EngineMemoryStats memory_stats() const;
 
-    // Validate + tokenize (tokenizer only). Throws ApiException on bad/oversized input.
+    // Validate and prepare text or media input without taking the engine lock.
+    // Throws ApiException on bad/oversized input.
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req) const;
 
-    // Render + tokenize only: the prompt token count for the Anthropic
-    // count_tokens endpoint. No context-length check and no engine lock (tokenizer
-    // only). Throws ApiException on bad input (unsupported role/modality) like
-    // prepare(), but never rejects an over-context prompt.
+    // Return the fully expanded prompt token count for the Anthropic count_tokens
+    // endpoint. Media is decoded and processed, but no GPU model work or engine
+    // lock is needed. Never rejects solely because the expanded prompt is over context.
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req) const;
 
     // Execute under the engine lock. When sink != nullptr, deltas stream through
     // the sink and text is left empty; otherwise the full text is returned.
-    GenerationOutcome run(const PreparedRequest& prepared, const StreamSink* sink);
+    GenerationOutcome run(PreparedRequest& prepared, const StreamSink* sink);
 
     // One short generation to trigger CUDA-graph capture before serving traffic.
     void warmup();
@@ -107,6 +113,7 @@ private:
     ServerCapabilities caps_;
     std::unique_ptr<qus::text::QwenTokenizer> tokenizer_;
     std::unique_ptr<qus::Engine> engine_;
+    mutable std::mutex media_mutex_;
     std::mutex engine_mutex_;
 };
 

@@ -72,6 +72,8 @@ qus::model::StepState make_step_state(qus::DeviceArena& arena, int window_cols, 
     return qus::model::StepState{
         arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::BF16, {qus::model::kCfg.vocab, window_cols}),
         arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, window_cols}),
         arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, prefill_chunk}),
@@ -170,6 +172,8 @@ int main(int argc, char** argv) {
             workspace.reset();
             copy_i32_scalar(1, io.token, ctx->stream);
             copy_i32_scalar(0, io.pos, ctx->stream);
+            copy_i32_scalar(0, io.rope_pos, ctx->stream);
+            copy_i32_scalar(0, io.rope_delta, ctx->stream);
             copy_i32_scalar(0, io.gdn_initial_slot, ctx->stream);
             ctx->synchronize();
         };
@@ -177,6 +181,7 @@ int main(int argc, char** argv) {
             kv.reset();
             state.reset(ctx->stream);
             workspace.reset();
+            copy_i32_scalar(0, io.rope_delta, ctx->stream);
             copy_i32_scalar(0, io.gdn_initial_slot, ctx->stream);
             ctx->synchronize();
         };

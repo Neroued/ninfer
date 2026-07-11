@@ -7,10 +7,29 @@
 #include <cstdint>
 #include <filesystem>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace qus::model {
+
+enum class ProcessorErrorKind {
+    BudgetExceeded,
+    RemoteUnavailable,
+    RemoteTimeout,
+};
+
+class ProcessorError final : public std::runtime_error {
+public:
+    ProcessorError(ProcessorErrorKind kind, std::string message)
+        : std::runtime_error(std::move(message)), kind_(kind) {}
+
+    [[nodiscard]] ProcessorErrorKind kind() const noexcept { return kind_; }
+
+private:
+    ProcessorErrorKind kind_;
+};
 
 enum class Modality : std::uint8_t {
     Image = 1,

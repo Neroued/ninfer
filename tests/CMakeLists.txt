@@ -27,6 +27,8 @@ qus_add_test(qus_weight_store_real_file_test SOURCES test_weight_store_real.cpp 
 qus_add_test(qus_engine_real_file_test       SOURCES test_engine_real_file.cpp   NEEDS_SOURCE_DIR)
 qus_add_test(qus_engine_mtp_e2e_test
              SOURCES test_engine_mtp_e2e.cpp NEEDS_SOURCE_DIR)
+qus_add_test(qus_engine_vision_e2e_test
+             SOURCES test_engine_vision_e2e.cpp NEEDS_SOURCE_DIR)
 add_test(NAME qus_engine_mtp_e2e_test_capacity_fallback
          COMMAND qus_engine_mtp_e2e_test capacity_fallback)
 add_test(NAME qus_engine_mtp_e2e_test_fallback_after_accept

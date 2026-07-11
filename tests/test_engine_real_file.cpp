@@ -12,11 +12,12 @@
 
 namespace {
 
-constexpr std::size_t kMiB               = 1024ULL * 1024ULL;
-constexpr std::size_t kGiB               = 1024ULL * 1024ULL * 1024ULL;
-constexpr std::size_t kTextPayloadBytes  = 16378329088ULL;
-constexpr std::size_t kMtpPayloadBytes   = 451267584ULL;
-constexpr std::size_t kDraftPayloadBytes = 357040128ULL;
+constexpr std::size_t kMiB                = 1024ULL * 1024ULL;
+constexpr std::size_t kGiB                = 1024ULL * 1024ULL * 1024ULL;
+constexpr std::size_t kTextPayloadBytes   = 16378329088ULL;
+constexpr std::size_t kMtpPayloadBytes    = 451267584ULL;
+constexpr std::size_t kDraftPayloadBytes  = 357040128ULL;
+constexpr std::size_t kVisionPayloadBytes = 295719424ULL;
 
 bool cuda_unavailable(cudaError_t err) {
     return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
@@ -167,8 +168,8 @@ int expect_lm_head_draft_parity(const std::filesystem::path& weights_path) {
     qus::Engine engine(options);
     engine.load(weights_path.string());
     const qus::EngineMemoryStats stats = engine.memory_stats();
-    failures += stats.q5090_loaded_payload_bytes ==
-                        kTextPayloadBytes + kMtpPayloadBytes + kDraftPayloadBytes
+    failures += stats.q5090_loaded_payload_bytes == kTextPayloadBytes + kMtpPayloadBytes +
+                                                        kDraftPayloadBytes + kVisionPayloadBytes
                     ? 0
                     : fail("LM_HEAD_DRAFT exact resident bytes mismatch");
     try {
@@ -309,20 +310,22 @@ int main() {
     }
 
     const std::size_t max_weight_capacity =
-        kTextPayloadBytes + kMtpPayloadBytes + kDraftPayloadBytes;
+        kTextPayloadBytes + kMtpPayloadBytes + kDraftPayloadBytes + kVisionPayloadBytes;
     if (!enough_free_memory(max_weight_capacity + kGiB)) { return 0; }
 
     int failures = 0;
     {
         const qus::EngineMemoryStats stats = load_real_engine(weights_path, 0);
         print_stats("mtp=0", stats);
-        failures += expect_stats(stats, kTextPayloadBytes, kTextPayloadBytes, "mtp=0");
+        failures += expect_stats(stats, kTextPayloadBytes + kVisionPayloadBytes,
+                                 kTextPayloadBytes + kVisionPayloadBytes, "mtp=0");
     }
     {
         const qus::EngineMemoryStats stats = load_real_engine(weights_path, 1);
         print_stats("mtp=1", stats);
-        failures += expect_stats(stats, kTextPayloadBytes + kMtpPayloadBytes,
-                                 kTextPayloadBytes + kMtpPayloadBytes, "mtp=1");
+        failures +=
+            expect_stats(stats, kTextPayloadBytes + kMtpPayloadBytes + kVisionPayloadBytes,
+                         kTextPayloadBytes + kMtpPayloadBytes + kVisionPayloadBytes, "mtp=1");
     }
     failures += expect_k5_8192_memory_budget(weights_path);
     failures += expect_mtp_rounds_across_k(weights_path);

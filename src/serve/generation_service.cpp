@@ -7,12 +7,35 @@
 #include <chrono>
 #include <cstddef>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <string>
 #include <utility>
 
 namespace qus::serve {
 namespace {
+
+[[noreturn]] void throw_processor_error(const qus::model::ProcessorError& exception) {
+    ApiError error;
+    error.type    = "invalid_request_error";
+    error.param   = "messages";
+    error.message = exception.what();
+    switch (exception.kind()) {
+    case qus::model::ProcessorErrorKind::BudgetExceeded:
+        error.status = 413;
+        error.code   = "media_budget_exceeded";
+        break;
+    case qus::model::ProcessorErrorKind::RemoteUnavailable:
+        error.status = 502;
+        error.code   = "media_fetch_failed";
+        break;
+    case qus::model::ProcessorErrorKind::RemoteTimeout:
+        error.status = 504;
+        error.code   = "media_fetch_timeout";
+        break;
+    }
+    throw ApiException(std::move(error));
+}
 
 // Back a byte offset up to the start of a UTF-8 code point so a held-back tail
 // never splits a multibyte character. `len` is clamped to [0, buffer.size()].
@@ -103,28 +126,40 @@ qus::EngineMemoryStats GenerationService::memory_stats() const { return engine_-
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
     PreparedRequest prepared;
-    prepared.messages = to_chat_messages(req);
-    if (std::any_of(prepared.messages.begin(), prepared.messages.end(),
-                    [](const qus::text::ChatMessage& message) { return message.has_media(); })) {
-        ApiError error;
-        error.status  = 400;
-        error.type    = "invalid_request_error";
-        error.code    = "vision_runtime_not_ready";
-        error.param   = "messages";
-        error.message = "multimodal preprocessing is available, but Vision forward is not "
-                        "connected to the inference engine yet";
-        throw ApiException(std::move(error));
-    }
-    prepared.options       = to_generation_options(req, options_);
-    prepared.stop_strings  = req.stop_strings;
-    prepared.include_usage = req.include_usage;
-    prepared.tool_capable  = req.uses_tools() || req.has_tool_history();
+    const std::vector<qus::text::ChatMessage> messages = to_chat_messages(req);
+    prepared.options                                   = to_generation_options(req, options_);
+    prepared.stop_strings                              = req.stop_strings;
+    prepared.include_usage                             = req.include_usage;
+    prepared.tool_capable                              = req.uses_tools() || req.has_tool_history();
 
     qus::text::ChatRenderOptions render_options = prepared.options.render_options;
     render_options.enable_thinking              = prepared.options.enable_thinking;
     const auto render_start                     = std::chrono::steady_clock::now();
-    const std::string prompt = qus::text::render_qwen_chat(prepared.messages, render_options);
-    std::vector<int> ids     = tokenizer_->encode(prompt);
+    std::vector<int> ids;
+    const bool has_media =
+        std::any_of(messages.begin(), messages.end(),
+                    [](const qus::text::ChatMessage& message) { return message.has_media(); });
+    if (has_media) {
+        prepared.media_permit = std::unique_lock<std::mutex>(media_mutex_);
+        try {
+            qus::model::Processor processor(*tokenizer_);
+            prepared.multimodal.emplace(processor.process(messages, render_options));
+        } catch (const qus::model::ProcessorError& exception) {
+            throw_processor_error(exception);
+        } catch (const std::invalid_argument& exception) {
+            ApiError error;
+            error.status  = 400;
+            error.type    = "invalid_request_error";
+            error.code    = "invalid_media";
+            error.param   = "messages";
+            error.message = exception.what();
+            throw ApiException(std::move(error));
+        }
+        ids = prepared.multimodal->input_ids;
+    } else {
+        const std::string prompt = qus::text::render_qwen_chat(messages, render_options);
+        ids                      = tokenizer_->encode(prompt);
+    }
     prepared.render_tokenize_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - render_start).count();
     prepared.prompt_tokens = static_cast<int>(ids.size());
@@ -156,25 +191,34 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& req) const {
     const std::vector<qus::text::ChatMessage> messages = to_chat_messages(req);
+    qus::text::TextGenerationOptions options           = to_generation_options(req, options_);
+    qus::text::ChatRenderOptions render_options        = options.render_options;
+    render_options.enable_thinking                     = options.enable_thinking;
     if (std::any_of(messages.begin(), messages.end(),
                     [](const qus::text::ChatMessage& message) { return message.has_media(); })) {
-        ApiError error;
-        error.status  = 400;
-        error.type    = "invalid_request_error";
-        error.code    = "vision_runtime_not_ready";
-        error.param   = "messages";
-        error.message = "multimodal token counting is unavailable until Vision forward is "
-                        "connected to the inference engine";
-        throw ApiException(std::move(error));
+        std::unique_lock<std::mutex> media_permit(media_mutex_);
+        try {
+            qus::model::ProcessorOptions processor_options;
+            processor_options.max_prompt_tokens = std::numeric_limits<std::size_t>::max();
+            qus::model::Processor processor(*tokenizer_, processor_options);
+            return static_cast<int>(processor.process(messages, render_options).input_ids.size());
+        } catch (const qus::model::ProcessorError& exception) {
+            throw_processor_error(exception);
+        } catch (const std::invalid_argument& exception) {
+            ApiError error;
+            error.status  = 400;
+            error.type    = "invalid_request_error";
+            error.code    = "invalid_media";
+            error.param   = "messages";
+            error.message = exception.what();
+            throw ApiException(std::move(error));
+        }
     }
-    qus::text::TextGenerationOptions options    = to_generation_options(req, options_);
-    qus::text::ChatRenderOptions render_options = options.render_options;
-    render_options.enable_thinking              = options.enable_thinking;
     const std::string prompt = qus::text::render_qwen_chat(messages, render_options);
     return static_cast<int>(tokenizer_->encode(prompt).size());
 }
 
-GenerationOutcome GenerationService::run(const PreparedRequest& prepared, const StreamSink* sink) {
+GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink) {
     std::lock_guard<std::mutex> lock(engine_mutex_);
 
     qus::text::TextGenerationRunner runner(*tokenizer_, *engine_);
@@ -213,8 +257,15 @@ GenerationOutcome GenerationService::run(const PreparedRequest& prepared, const 
     engine_->reset_mtp_stats();
     // The prompt was already rendered + tokenized in prepare(); reuse those ids so
     // the chat template renders exactly once per request.
-    const qus::text::TextGenerationResult result = runner.generate(
-        std::span<const int>(prepared.prompt_token_ids), opt, prepared.content_boundary);
+    const qus::text::TextGenerationResult result =
+        prepared.multimodal ? runner.generate(*prepared.multimodal, opt, prepared.content_boundary,
+                                              [&] {
+                                                  if (prepared.media_permit.owns_lock()) {
+                                                      prepared.media_permit.unlock();
+                                                  }
+                                              })
+                            : runner.generate(std::span<const int>(prepared.prompt_token_ids), opt,
+                                              prepared.content_boundary);
     const qus::EngineMtpStats mtp = engine_->mtp_stats();
 
     GenerationOutcome outcome;

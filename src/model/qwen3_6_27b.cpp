@@ -3,6 +3,7 @@
 #include "model/position.h"
 #include "model/gqa_prompt_ops.h"
 #include "model/mtp_ops.h"
+#include "model/vision_ops.h"
 #include "qus/core/device.h"
 #include "qus/core/weight_store_parser.h"
 #include "qus/kernels/argmax.h"
@@ -24,6 +25,7 @@
 #include "qus/kernels/rmsnorm.h"
 #include "qus/kernels/rope.h"
 #include "qus/kernels/sampling.h"
+#include "qus/kernels/scatter.h"
 #include "qus/kernels/sigmoid_mul.h"
 #include "qus/kernels/silu_mul.h"
 
@@ -184,11 +186,6 @@ void extract_bf16_block(const Tensor& src, int src_channel, Tensor& dst, cudaStr
     CUDA_CHECK(cudaMemcpy2DAsync(dst.data, dst_pitch, src_ptr, src_pitch, width,
                                  static_cast<std::size_t>(dst.ne[1]), cudaMemcpyDeviceToDevice,
                                  stream));
-}
-
-void copy_i32_to_device(const int* src, Tensor& dst, cudaStream_t stream) {
-    CUDA_CHECK(cudaMemcpyAsync(dst.data, src, static_cast<std::size_t>(dst.ne[0]) * sizeof(int),
-                               cudaMemcpyHostToDevice, stream));
 }
 
 void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
@@ -483,7 +480,7 @@ void Qwen3_6_27B::mtp_forward_stem(const Tensor& ids, const Tensor& hidden, Tens
 }
 
 void Qwen3_6_27B::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
-                                   Tensor& mtp_hidden) {
+                                   const Tensor& rope_positions, Tensor& mtp_hidden) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
@@ -500,7 +497,7 @@ void Qwen3_6_27B::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
     kernels::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
     kernels::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
-    kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    kernels::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
     kernels::gqa_attention(qn, kn, v, positions, kAttnScale, *mtp_kv_, 0, work_, a, s);
@@ -528,18 +525,19 @@ void Qwen3_6_27B::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 }
 
 void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                                   Tensor& mtp_hidden) {
+                                   const Tensor& rope_positions, Tensor& mtp_hidden) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     auto scratch_scope = work_.scope();
     Tensor x;
     Tensor ah;
     mtp_forward_stem(ids, hidden, x, ah);
-    mtp_forward_tail(x, ah, positions, mtp_hidden);
+    mtp_forward_tail(x, ah, positions, rope_positions, mtp_hidden);
 }
 
 void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
-                                    const Tensor& positions, bool final_chunk, Tensor* final_hidden,
-                                    Tensor* logits, Tensor* draft_token) {
+                                    const Tensor& positions, const Tensor& rope_positions,
+                                    bool final_chunk, Tensor* final_hidden, Tensor* logits,
+                                    Tensor* draft_token) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP prefill is not enabled"); }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
@@ -548,6 +546,12 @@ void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     require_tensor_shape(ids, DType::I32, {T}, "MTP prefill ids");
     require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "MTP prefill hidden");
     require_tensor_shape(positions, DType::I32, {T}, "MTP prefill positions");
+    if (rope_positions.dtype != DType::I32 || rope_positions.ne[0] != T ||
+        (rope_positions.ne[1] != 1 && rope_positions.ne[1] != 3) || rope_positions.ne[2] != 1 ||
+        rope_positions.ne[3] != 1 || !rope_positions.is_contiguous() ||
+        rope_positions.data == nullptr) {
+        throw std::invalid_argument("MTP prefill rope positions must be [T] or [T,3]");
+    }
     if (final_chunk) {
         if (final_hidden == nullptr || logits == nullptr || draft_token == nullptr) {
             throw std::invalid_argument("MTP final prefill outputs are required");
@@ -580,7 +584,7 @@ void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
         kernels::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
-        kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
+        kernels::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
         kernels::gqa_kv_append(kn, v, positions, *mtp_kv_, 0, s);
 
         if (final_chunk) {
@@ -607,7 +611,20 @@ void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor qn   = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
         kernels::rmsnorm(q, *mtp_.q_norm, kCfg.rms_eps, true, qn, s);
         Tensor last_position = positions.slice(0, T - 1, 1);
-        kernels::rope(last_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
+        Tensor last_rope_position;
+        if (rope_positions.ne[1] == 1) {
+            last_rope_position = rope_positions.slice(0, T - 1, 1);
+        } else {
+            last_rope_position = work_.alloc(DType::I32, {1, 3});
+            for (int axis = 0; axis < 3; ++axis) {
+                const auto* src = static_cast<const std::int32_t*>(rope_positions.data) +
+                                  static_cast<std::size_t>(axis) * T + (T - 1);
+                auto* dst = static_cast<std::int32_t*>(last_rope_position.data) + axis;
+                CUDA_CHECK(
+                    cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
+            }
+        }
+        kernels::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
         kernels::gqa_attention_cached(qn, last_position, kAttnScale, *mtp_kv_, 0, a, s);
@@ -666,7 +683,10 @@ void Qwen3_6_27B::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP draft token");
     }
 
-    mtp_forward_core(ids, hidden, positions, mtp_hidden);
+    auto position_scope   = work_.scope();
+    Tensor rope_positions = work_.alloc(DType::I32, {T});
+    detail::offset_positions(positions, io_.rope_delta, rope_positions, ctx_.stream);
+    mtp_forward_core(ids, hidden, positions, rope_positions, mtp_hidden);
 
     if (logits_column >= 0) {
         auto logits_scope = work_.scope();
@@ -686,7 +706,10 @@ void Qwen3_6_27B::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, 1}, "MTP AR logits");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
 
-    mtp_forward_core(token, previous_hidden, position, mtp_hidden);
+    auto position_scope  = work_.scope();
+    Tensor rope_position = work_.alloc(DType::I32, {1});
+    detail::offset_positions(position, io_.rope_delta, rope_position, ctx_.stream);
+    mtp_forward_core(token, previous_hidden, position, rope_position, mtp_hidden);
     auto logits_scope = work_.scope();
     mtp_draft_argmax(mtp_hidden, logits, draft_token);
 }
@@ -723,9 +746,12 @@ void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions) {
     work_.reset();
 
     {
+        Tensor rope_positions = work_.alloc(DType::I32, {T});
+        detail::offset_positions(positions, io_.rope_delta, rope_positions, ctx_.stream);
         Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, T});
         kernels::embedding(ids, *embed_, x, s);
-        ScopedPositions scoped_positions(active_positions_, positions);
+        ScopedPositions scoped_cache(active_cache_positions_, positions);
+        ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
 
@@ -762,11 +788,14 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, 1});
         kernels::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
         kernels::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
-        const Tensor& positions = active_positions_ != nullptr ? *active_positions_ : io_.pos;
-        kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+        const Tensor& cache_positions =
+            active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
+        const Tensor& rope_positions =
+            active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
+        kernels::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        kernels::gqa_attention(qn, kn, v, positions, kAttnScale, kv_, fidx, work_, a, s);
+        kernels::gqa_attention(qn, kn, v, cache_positions, kAttnScale, kv_, fidx, work_, a, s);
         kernels::sigmoid_mul(gate, a, s);
 
         kernels::linear_add(a.view({kCfg.q_size, 1}), *w.o_proj, x, work_, s);
@@ -788,11 +817,14 @@ void Qwen3_6_27B::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
     kernels::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
     kernels::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
-    const Tensor& positions = active_positions_ != nullptr ? *active_positions_ : io_.pos;
-    kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
+    const Tensor& cache_positions =
+        active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
+    const Tensor& rope_positions =
+        active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
+    kernels::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
-    kernels::gqa_attention(qn, kn, v, positions, kAttnScale, kv_, fidx, work_, a, s);
+    kernels::gqa_attention(qn, kn, v, cache_positions, kAttnScale, kv_, fidx, work_, a, s);
     kernels::sigmoid_mul(gate, a, s);
 
     kernels::linear_add(a.view({kCfg.q_size, T}), *w.o_proj, x, work_, s);
@@ -963,7 +995,8 @@ void Qwen3_6_27B::run_layers(Tensor& x, Phase ph) {
 }
 
 template <class Tap>
-void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
+void Qwen3_6_27B::prefill_impl(std::span<const int> ids, const MultimodalPrefill* multimodal,
+                               Tap& tap) {
     if (ids.empty()) { throw std::invalid_argument("Qwen3_6_27B::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("Qwen3_6_27B::prefill token count exceeds int32");
@@ -971,6 +1004,37 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
     cudaStream_t s  = ctx_.stream;
     const int T     = static_cast<int>(ids.size());
     const int chunk = static_cast<int>(prefill_chunk_);
+
+    if (multimodal != nullptr) {
+        if (kv_.pos != 0) {
+            throw std::invalid_argument("multimodal prefill must start from an empty cache");
+        }
+        if (multimodal->positions.size() != static_cast<std::size_t>(3) * ids.size()) {
+            throw std::invalid_argument("multimodal positions must have shape [3,T]");
+        }
+        if (multimodal->embeddings == nullptr || multimodal->embeddings->dtype != DType::BF16 ||
+            multimodal->embeddings->ne[0] != kCfg.hidden ||
+            multimodal->embeddings->ne[1] !=
+                static_cast<std::int32_t>(multimodal->scatter_indices.size()) ||
+            multimodal->embeddings->ne[2] != 1 || multimodal->embeddings->ne[3] != 1 ||
+            !multimodal->embeddings->is_contiguous() || multimodal->embeddings->data == nullptr) {
+            throw std::invalid_argument("multimodal embeddings must be contiguous BF16 [5120,V]");
+        }
+        if (!std::is_sorted(multimodal->scatter_indices.begin(),
+                            multimodal->scatter_indices.end()) ||
+            std::adjacent_find(multimodal->scatter_indices.begin(),
+                               multimodal->scatter_indices.end()) !=
+                multimodal->scatter_indices.end() ||
+            (!multimodal->scatter_indices.empty() && (multimodal->scatter_indices.front() < 0 ||
+                                                      multimodal->scatter_indices.back() >= T))) {
+            throw std::invalid_argument(
+                "multimodal scatter indices must be unique, sorted, and inside prompt");
+        }
+        rope_delta_ = multimodal->rope_delta;
+    } else if (kv_.pos == 0) {
+        rope_delta_ = 0;
+    }
+    detail::set_pos(io_.rope_delta, rope_delta_, s);
 
     // Prefix-append prefill continues an existing cache: positions are absolute (start at the
     // resident length) and KV/GDN state is not reset. For a reset prefill base == 0.
@@ -1035,14 +1099,51 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
 
         {
             Tensor ids_device = work_.alloc(DType::I32, {len});
-            copy_i32_to_device(ids.data() + t0, ids_device, s);
+            detail::copy_i32(ids.data() + t0, ids_device, s);
 
             Tensor positions = work_.alloc(DType::I32, {len});
             detail::fill_positions(positions, base_i + t0, s);
-            ScopedPositions scoped_positions(active_positions_, positions);
+
+            Tensor rope_positions = positions;
+            std::vector<std::int32_t> rope_positions_host;
+            if (multimodal != nullptr) {
+                rope_positions = work_.alloc(DType::I32, {len, 3});
+                rope_positions_host.resize(static_cast<std::size_t>(3) * len);
+                for (int axis = 0; axis < 3; ++axis) {
+                    const auto* src =
+                        multimodal->positions.data() + static_cast<std::size_t>(axis) * T + t0;
+                    std::copy_n(src, len,
+                                rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
+                }
+                detail::copy_i32(rope_positions_host.data(), rope_positions, s);
+            } else if (rope_delta_ != 0) {
+                rope_positions = work_.alloc(DType::I32, {len});
+                detail::offset_positions(positions, io_.rope_delta, rope_positions, s);
+            }
+            ScopedPositions scoped_cache(active_cache_positions_, positions);
+            ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
 
             Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, len});
             kernels::embedding(ids_device, *embed_, x, s);
+            if (multimodal != nullptr && !multimodal->scatter_indices.empty()) {
+                const auto begin = std::lower_bound(multimodal->scatter_indices.begin(),
+                                                    multimodal->scatter_indices.end(), t0);
+                const auto end =
+                    std::lower_bound(begin, multimodal->scatter_indices.end(), t0 + len);
+                const auto count = static_cast<std::int32_t>(end - begin);
+                if (count > 0) {
+                    const auto visual_begin =
+                        static_cast<std::int32_t>(begin - multimodal->scatter_indices.begin());
+                    std::vector<std::int32_t> local_indices(static_cast<std::size_t>(count));
+                    for (std::int32_t i = 0; i < count; ++i) {
+                        local_indices[static_cast<std::size_t>(i)] = begin[i] - t0;
+                    }
+                    Tensor indices_device = work_.alloc(DType::I32, {count});
+                    detail::copy_i32(local_indices.data(), indices_device, s);
+                    Tensor embeddings = multimodal->embeddings->slice(1, visual_begin, count);
+                    kernels::scatter(embeddings, indices_device, x, s);
+                }
+            }
             if constexpr (Tap::enabled) { tap(TapId::AfterEmbed, -1, Phase::Prefill, x, s); }
             run_layers(x, Phase::Prefill, tap);
 
@@ -1063,6 +1164,7 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).
                 detail::set_pos(io_.pos, base_i + T, s);
+                detail::set_pos(io_.rope_pos, base_i + T + rope_delta_, s);
                 if (sampling_config_ != nullptr) {
                     kernels::sample(logits, io_.token, sampling_config_,
                                     static_cast<const std::int32_t*>(io_.pos.data),
@@ -1090,12 +1192,12 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                 }
 
                 Tensor mtp_ids = work_.alloc(DType::I32, {len});
-                copy_i32_to_device(mtp_ids_host.data(), mtp_ids, s);
+                detail::copy_i32(mtp_ids_host.data(), mtp_ids, s);
                 if (is_last) {
                     Tensor logits = matrix_window(io_.logits, 1);
                     Tensor draft0 = io_.drafts.slice(0, 0, 1);
-                    mtp_prefill_chunk(mtp_ids, xf, positions, true, &io_.mtp_ar_hidden, &logits,
-                                      &draft0);
+                    mtp_prefill_chunk(mtp_ids, xf, positions, rope_positions, true,
+                                      &io_.mtp_ar_hidden, &logits, &draft0);
 
                     detail::set_pos(io_.ar_pos, base_i + T, s);
                     for (int i = 1; i < io_.drafts.ne[0]; ++i) {
@@ -1110,7 +1212,8 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
                         kernels::mtp_increment_i32(io_.ar_pos, s);
                     }
                 } else {
-                    mtp_prefill_chunk(mtp_ids, xf, positions, false, nullptr, nullptr, nullptr);
+                    mtp_prefill_chunk(mtp_ids, xf, positions, rope_positions, false, nullptr,
+                                      nullptr, nullptr);
                 }
             }
         }
@@ -1138,13 +1241,21 @@ void Qwen3_6_27B::prefill_impl(std::span<const int> ids, Tap& tap) {
 
 void Qwen3_6_27B::prefill(std::span<const int> ids) {
     NullTap tap;
-    prefill_impl(ids, tap);
+    prefill_impl(ids, nullptr, tap);
+}
+
+void Qwen3_6_27B::prefill(const ProcessedInput& input, const Tensor& visual_embeddings) {
+    const detail::VisionControl control = detail::build_vision_control(input);
+    const MultimodalPrefill multimodal{input.positions, control.scatter_indices, &visual_embeddings,
+                                       input.rope_delta};
+    NullTap tap;
+    prefill_impl(input.input_ids, &multimodal, tap);
 }
 
 void Qwen3_6_27B::prefill_erased(std::span<const int> ids, void* tap, TapCallback callback) {
     if (callback == nullptr) { throw std::invalid_argument("Qwen3_6_27B::prefill tap is null"); }
     ErasedTap erased{tap, callback};
-    prefill_impl(ids, erased);
+    prefill_impl(ids, nullptr, erased);
 }
 
 template <class Tap>
@@ -1174,6 +1285,7 @@ void Qwen3_6_27B::decode_step_impl(Tap& tap) {
     }
 
     detail::advance_pos(io_.pos, s);
+    detail::advance_pos(io_.rope_pos, s);
     work_.reset();
 }
 

@@ -30,6 +30,9 @@ float coordinate(int index, int size) {
 } // namespace
 
 VisionControl build_vision_control(const ProcessedInput& input) {
+    if (input.input_ids.size() != input.token_types.size()) {
+        throw std::invalid_argument("vision control token types must cover the prompt");
+    }
     VisionControl out;
     const std::size_t patches = static_cast<std::size_t>(input.stats.raw_patches);
     const std::size_t tokens  = static_cast<std::size_t>(input.stats.vision_tokens);
@@ -56,6 +59,31 @@ VisionControl build_vision_control(const ProcessedInput& input) {
         if (item.token_spans.size() !=
             static_cast<std::size_t>(item.modality == Modality::Video ? t : 1)) {
             throw std::invalid_argument("vision control token spans do not match modality grid");
+        }
+        std::size_t item_tokens = 0;
+        std::size_t next_span_begin =
+            out.scatter_indices.empty() ? 0
+                                        : static_cast<std::size_t>(out.scatter_indices.back()) + 1;
+        for (const TokenSpan& span : item.token_spans) {
+            if (span.count == 0 || span.begin > input.token_types.size() ||
+                span.count > input.token_types.size() - span.begin) {
+                throw std::invalid_argument("vision control token span exceeds prompt");
+            }
+            if (span.begin < next_span_begin) {
+                throw std::invalid_argument("vision control token spans are not ordered");
+            }
+            const auto expected = static_cast<std::uint8_t>(item.modality);
+            if (!std::all_of(input.token_types.begin() + static_cast<std::ptrdiff_t>(span.begin),
+                             input.token_types.begin() +
+                                 static_cast<std::ptrdiff_t>(span.begin + span.count),
+                             [expected](std::uint8_t value) { return value == expected; })) {
+                throw std::invalid_argument("vision control token span modality mismatch");
+            }
+            item_tokens += span.count;
+            next_span_begin = span.begin + span.count;
+        }
+        if (item_tokens != item_patches / (kMerge * kMerge)) {
+            throw std::invalid_argument("vision control token spans do not cover merged patches");
         }
 
         for (int temporal = 0; temporal < t; ++temporal) {

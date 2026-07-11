@@ -58,6 +58,7 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <weights.qus> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
+           "[--max-request-mib N] "
            "[--kv-dtype bf16|int8] [--mtp-draft-tokens N] [--default-max-tokens N] "
            "[--no-cuda-graph] "
            "[--lm-head-draft] [--no-thinking] [--cors] "
@@ -67,6 +68,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --default-max-tokens defaults to min(max_context/2, " +
            std::to_string(kDefaultMaxTokensCeiling) +
            ") when omitted\n"
+           "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
            "top-k 20, presence-penalty 1.0); a request may override any field.\n"
            "       --greedy forces temperature 0 (exact argmax) for determinism/parity.\n";
@@ -101,6 +103,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--max-request-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--max-request-mib"), "max-request-mib");
+            if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--max-request-mib is out of range");
+            }
+            options.max_request_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
@@ -145,6 +154,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
+    if (options.max_request_bytes == 0) {
+        throw std::invalid_argument("--max-request-mib must be positive");
+    }
     if (options.prefill_chunk == 0 || options.prefill_chunk % model::kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }

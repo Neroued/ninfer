@@ -41,11 +41,23 @@ __global__ void fill_positions_kernel(std::int32_t* positions, std::int32_t n, s
     if (i < n) { positions[i] = start + i; }
 }
 
+__global__ void offset_positions_kernel(const std::int32_t* src, std::int32_t* dst, std::int32_t n,
+                                        const std::int32_t* delta) {
+    const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) { dst[i] = src[i] + delta[0]; }
+}
+
 __global__ void set_pos_kernel(std::int32_t* pos, std::int32_t value) { pos[0] = value; }
 
 __global__ void advance_pos_kernel(std::int32_t* pos) { ++pos[0]; }
 
 } // namespace
+
+void copy_i32(const std::int32_t* src, Tensor& dst, cudaStream_t stream) {
+    if (src == nullptr) { throw std::invalid_argument("copy_i32: source is null"); }
+    require_i32_contiguous_nonnull(dst, "copy_i32 dst");
+    CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
+}
 
 void fill_positions(Tensor& positions, int start, cudaStream_t stream) {
     require_i32_contiguous_nonnull(positions, "fill_positions");
@@ -58,6 +70,24 @@ void fill_positions(Tensor& positions, int start, cudaStream_t stream) {
     const int grid = (n + kBlock - 1) / kBlock;
     fill_positions_kernel<<<grid, kBlock, 0, stream>>>(static_cast<std::int32_t*>(positions.data),
                                                        n, start);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void offset_positions(const Tensor& src, const Tensor& delta, Tensor& dst, cudaStream_t stream) {
+    require_i32_contiguous_nonnull(src, "offset_positions src");
+    require_i32_contiguous_nonnull(delta, "offset_positions delta");
+    require_i32_contiguous_nonnull(dst, "offset_positions dst");
+    require_vector_shape(src, "offset_positions src");
+    require_pos_shape(delta, "offset_positions delta");
+    require_vector_shape(dst, "offset_positions dst");
+    if (src.ne[0] != dst.ne[0]) {
+        throw std::invalid_argument("offset_positions: shapes must match");
+    }
+    const int n    = src.ne[0];
+    const int grid = (n + kBlock - 1) / kBlock;
+    offset_positions_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(src.data), static_cast<std::int32_t*>(dst.data), n,
+        static_cast<const std::int32_t*>(delta.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

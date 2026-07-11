@@ -1,9 +1,8 @@
 # qwen3.6-ultraspeed — Master Design & Goal Document
 
-> Status: **M2 correctness baseline implemented; M2.5 hardening/documentation sync mostly landed;
-> M2.8 benchmark/I/O/memory observability is the active pre-M3 gate; M3 performance optimization follows
-> after M2.8 readiness**.
-> Date: original design 2026-06-25; status synchronized 2026-06-27.
+> Status: **text, MTP, sampling, INT8 KV, and native Vision inference are implemented; current work
+> is correctness hardening and kernel optimization**.
+> Date: original design 2026-06-25; status synchronized 2026-07-12.
 > This document remains the architectural source of truth for *what we are building and why*.
 > The implementation has caught up through M2 and much of M2.5; M2.8 now defines the measurement and
 > readiness gate required before M3 headline kernel work. Kernel-level micro-decisions remain flexible;
@@ -62,8 +61,9 @@ TMA, large shared memory) where they help.
 ## 3. Target model — frozen reference (`qwen3_5` architecture)
 
 `Qwen3.6-27B` is internally `Qwen3_5ForConditionalGeneration` (`model_type: qwen3_5`): a
-**hybrid-attention, multimodal model with built-in MTP**. v1 freezes to the **text decoder
-only**. These dimensions are the "固化" truth everything specializes to.
+**hybrid-attention, multimodal model with built-in MTP**. The runtime implements the fixed text
+decoder, one-layer MTP module, and 27-layer Vision tower. These dimensions are the "固化" truth
+everything specializes to.
 
 ### 3.1 Text decoder
 
@@ -109,9 +109,10 @@ only**. These dimensions are the "固化" truth everything specializes to.
 | rope_theta | 1e7 |
 | attn_output_gate | true |
 
-### 3.3 Components present in checkpoint but OUT of v1
-- **MTP** (`mtp_num_hidden_layers: 1`) — self-speculative decoding; planned later.
-- **Vision tower** (depth 27, hidden 1152) + `mmproj` — multimodal; planned later.
+### 3.3 Integrated checkpoint modules
+- **MTP** (`mtp_num_hidden_layers: 1`) — self-speculative decode with eager and CUDA Graph paths.
+- **Vision tower** (depth 27, hidden 1152) plus merger — native image/video preprocessing,
+  W8G32 Vision weights, visual embedding injection, and three-axis MRoPE.
 
 ### 3.4 Parameter budget (~26B params, ~52 GB bf16 across 15 safetensors shards)
 - 64 transformer layers ≈ ~24B params.
@@ -122,13 +123,14 @@ only**. These dimensions are the "固化" truth everything specializes to.
 
 ## 4. Scope & boundaries
 
-### 4.1 In scope (v1)
-- Text-only decoder forward (prefill + decode).
+### 4.1 In scope
+- Text and multimodal decoder forward (prefill + decode), including native image/video processing.
 - Primary user CLI: text/messages in -> text out through a project-owned Qwen3.6 C++ text frontend.
 - Core Engine, M2.8 benchmark, and parity tools: token ids in/out for stable performance and debug
   contracts.
-- **Greedy (argmax)** next-token selection.
-- Current M2.8 official runtime gate: `max_ctx = 8192`, **bf16 KV**.
+- Greedy and temperature/top-k/top-p sampling.
+- MTP self-speculative decode and CUDA Graph replay.
+- Runtime-sized context with bf16 or INT8 KV.
 - **W4A16** linear layers (bf16 activations, 4-bit weights dequantized to bf16).
 - Python offline tooling (quantize + relayout/pack → one fixed weight file).
 - C++/CUDA runtime: load the fixed file + run inference.
@@ -142,26 +144,22 @@ only**. These dimensions are the "固化" truth everything specializes to.
 ### 4.3 Flexible (自由)
 - Kernel **API surface**: generic interfaces with multiple impls + a dispatcher.
 - Memory-pool sizes, max-context, future KV-precision knob.
-- Pluggable future model cards reusing L0/L1.
+- Specialized implementations and routing underneath the compact L1 operator APIs.
 
 ### 4.4 Explicitly OUT (deferred, in priority order)
-1. **MTP self-speculative decode** (planned; deferred so single-token throughput can be
-   optimized without accept-rate confounding the measurements).
-2. fp8/fp4 **prefill** kernels.
-3. **128K/256K** context / **fp8 KV**.
-4. Full sampler (temperature / top-k / top-p / RNG).
-5. Vision / multimodal path.
-6. Multi-GPU, tensor/pipeline parallelism, continuous batching, paged attention.
+1. fp8/fp4 activation kernels.
+2. **128K/256K** production qualification and fp8 KV.
+3. Multi-GPU, tensor/pipeline parallelism, continuous batching, paged attention.
 
 ### 4.5 Decisions log (from brainstorm)
 | # | Decision | Choice |
 |---|---|---|
 | 1 | Primary metric | Decode tok/s primary; prefill/TTFT tracked |
 | 2 | Architecture | Dense (hybrid linear+full attention) |
-| 3 | Multimodal | Text-only v1; don't preclude vision later |
-| 4 | MTP | Planned later; single-token first |
+| 3 | Multimodal | Native fixed Qwen3.6 Vision tower and processor |
+| 4 | MTP | Integrated self-speculative decode; report acceptance separately |
 | 5 | Compute precision | bf16 activations + W4A16 baseline; fp8/fp4 prefill later |
-| 6 | Context / KV | current M2.8 gate `max_ctx = 8192`, bf16 KV; 128K/256K deferred; pool runtime-sized |
+| 6 | Context / KV | pool runtime-sized; bf16 and INT8 KV implemented; 128K/256K qualification deferred |
 | 7 | 固化/自由 | Model-card graph + generic kernel API + routed specialized impls |
 | 8 | Runtime I/O | primary `qus` text/messages in -> text out; Engine/bench/parity use token ids |
 | 9 | Weight pipeline | Python (quant+pack) → fixed file; C++ only loads |
@@ -173,9 +171,9 @@ only**. These dimensions are the "固化" truth everything specializes to.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ L2  Model card / static graph   (src/model/qwen3_6_27b.cpp)  │
-│     embed → 64-layer loop (3:1 dispatch) → norm → lm_head     │
-│     owns prefill/decode drivers + KV/state lifecycle          │
+│ L2  Fixed Qwen3.6 model cards                                 │
+│     Vision tower/merger → scatter → 64-layer text model       │
+│     MTP proposal/verify + KV/GDN/rope state lifecycle          │
 ├─────────────────────────────────────────────────────────────┤
 │ L1  Kernels: generic API  ⟂  specialized impl + routing      │
 │     rmsnorm · w4a16_gemm · gqa_attention · gdn_linear_attn    │
@@ -420,8 +418,8 @@ qwen3.6-ultraspeed/
   GDN, conv, RoPE, SwiGLU, argmax).
 - **M4 — Fusion:** fuse adjacent ops; reduce launches/round-trips.
 - **M5 — Launch-overhead elimination:** CUDA Graph decode replay; explore megakernel.
-- **Later:** MTP speculative decode → fp8/fp4 prefill → 256K/fp8-KV → sampler →
-  vision → (multi-GPU/batching, only if ever needed).
+- **Later:** fp8/fp4 activations → 256K/fp8-KV qualification → multi-GPU/batching only if scope
+  changes.
 
 ---
 

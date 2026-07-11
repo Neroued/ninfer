@@ -7,6 +7,8 @@
 #include "qus/core/weight_store.h"
 #include "qus/kernels/sampling.h"
 #include "qus/model/model.h"
+#include "qus/model/processor.h"
+#include "qus/model/vision.h"
 #include "qus/runtime/decode_graph.h"
 
 #include <array>
@@ -88,6 +90,9 @@ public:
     void set_sampling(const kernels::SamplingConfig& config);
 
     int prefill(std::span<const int> ids);
+    // Full-reset multimodal prefill. Runs the Vision tower, injects merger
+    // embeddings, applies three-axis MRoPE, and retains only text-model state.
+    int prefill(const model::ProcessedInput& input);
     // Single-user multi-turn prefix caching with partial longest-common-prefix reuse.
     //
     // `content_boundary` is the absolute token position of THIS turn's assistant-content boundary
@@ -103,7 +108,7 @@ public:
     int decode_step();
     std::vector<int> generate(std::span<const int> prompt, int max_new_tokens);
 
-    [[nodiscard]] bool loaded() const noexcept { return card_.has_value(); }
+    [[nodiscard]] bool loaded() const noexcept { return load_complete_; }
 
     [[nodiscard]] std::uint32_t position() const noexcept;
 
@@ -127,7 +132,11 @@ public:
 private:
     [[nodiscard]] static std::size_t default_cache_bytes(std::uint32_t max_ctx);
 
+    void unload() noexcept;
     void require_loaded() const;
+    void invalidate_sequence_identity() noexcept;
+    void reset_sequence_state();
+    void recover_sequence_after_failure() noexcept;
     // Append-only prefill continuation: extends the resident cache with `ids` without resetting
     // kv_/mtp_kv_/state_/gdn_initial_slot. Resolves the GDN read slot from gdn_initial_slot inside
     // the model card, writes the running state to slot 0. Returns the first generated token.
@@ -147,6 +156,7 @@ private:
     std::optional<DeviceContext> ctx_;
     std::optional<DeviceArena> cache_arena_;
     std::optional<WorkspaceArena> work_;
+    std::optional<WorkspaceArena> vision_work_;
     std::optional<WeightStore> weights_;
     std::optional<KVCache> kv_;
     std::optional<KVCache> mtp_kv_;
@@ -159,8 +169,10 @@ private:
     Tensor token_counts_{};
     kernels::SamplingConfig sampling_host_{};
     std::optional<model::Qwen3_6_27B> card_;
+    std::optional<model::Qwen3_6_Vision> vision_card_;
     DecodeGraph decode_graph_;
     DecodeGraph round_graph_;
+    bool load_complete_ = false;
     bool decode_warmed_ = false;
     bool round_warmed_  = false;
     std::vector<int> pending_sampled_;
@@ -176,6 +188,9 @@ private:
     // returned by prefill/decode. The reusable prefix is logical_tokens_[0 : kv_.pos]; the tail
     // beyond kv_.pos (if any) holds the last emitted-but-uncommitted bonus token.
     std::vector<int> logical_tokens_;
+    // Token IDs alone do not identify media content. A multimodal resident is
+    // therefore never eligible for the text-only prefix cache.
+    bool resident_multimodal_ = false;
 };
 
 } // namespace qus

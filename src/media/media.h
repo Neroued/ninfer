@@ -5,10 +5,29 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace qus::media::internal {
+
+enum class ErrorKind {
+    BudgetExceeded,
+    RemoteUnavailable,
+    RemoteTimeout,
+};
+
+class Error final : public std::runtime_error {
+public:
+    Error(ErrorKind kind, std::string message)
+        : std::runtime_error(std::move(message)), kind_(kind) {}
+
+    [[nodiscard]] ErrorKind kind() const noexcept { return kind_; }
+
+private:
+    ErrorKind kind_;
+};
 
 struct Policy {
     std::size_t max_bytes                  = 256ULL << 20;

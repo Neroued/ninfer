@@ -272,7 +272,10 @@ int test_attention_budget_rejection(const std::filesystem::path& image_path) {
     message.parts.push_back(qus::text::ChatPart::image(path_source(image_path)));
     try {
         (void)processor.process({message});
-    } catch (const std::invalid_argument&) { return 0; }
+    } catch (const qus::model::ProcessorError& error) {
+        return check(error.kind() == qus::model::ProcessorErrorKind::BudgetExceeded,
+                     "vision attention budget used the wrong error category");
+    }
     return check(false, "vision attention budget was not enforced");
 }
 

@@ -97,7 +97,14 @@ python -m tools.q5090.diagnostics.structure out/conv_dump.v4_2.json /tmp/ref_dum
 python -m tools.q5090.diagnostics.activations /tmp/cpp_dump /tmp/python_dump
 python -m tools.q5090.diagnostics.vision \
   --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
-  --model-dir /path/to/base-hf-bf16 --messages /tmp/qwen_messages.json
+  --model-dir /path/to/base-hf-bf16 --messages /tmp/qwen_messages.json \
+  --q5090-dump /tmp/python-vision
+
+build/src/qus-vision-dump \
+  out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+  /tmp/qwen_messages.json /tmp/cpp-vision --no-thinking
+
+python -m tools.q5090.diagnostics.activations /tmp/python-vision /tmp/cpp-vision
 
 PYTHONPATH=. python tools/q5090/diagnostics/preprocess.py \
   --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \

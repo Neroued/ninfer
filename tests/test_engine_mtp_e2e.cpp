@@ -13,9 +13,10 @@
 
 namespace {
 
-constexpr std::size_t kGiB              = 1024ULL * 1024ULL * 1024ULL;
-constexpr std::size_t kMtpPayloadBytes  = 451267584ULL;
-constexpr std::size_t kTextPayloadBytes = 16378329088ULL;
+constexpr std::size_t kGiB                = 1024ULL * 1024ULL * 1024ULL;
+constexpr std::size_t kMtpPayloadBytes    = 451267584ULL;
+constexpr std::size_t kTextPayloadBytes   = 16378329088ULL;
+constexpr std::size_t kVisionPayloadBytes = 295719424ULL;
 
 bool cuda_unavailable(cudaError_t err) {
     return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
@@ -385,7 +386,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (!enough_free_memory(kTextPayloadBytes + kMtpPayloadBytes + kGiB)) { return 0; }
+    if (!enough_free_memory(kTextPayloadBytes + kMtpPayloadBytes + kVisionPayloadBytes + kGiB)) {
+        return 0;
+    }
 
     int failures = 0;
     if (argc == 2) {

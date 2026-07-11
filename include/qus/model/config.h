@@ -59,7 +59,25 @@ struct ModelConfig {
     }
 };
 
+struct VisionConfig {
+    static constexpr int depth               = 27;
+    static constexpr int hidden              = 1152;
+    static constexpr int intermediate        = 4304;
+    static constexpr int out_hidden          = ModelConfig::hidden;
+    static constexpr int heads               = 16;
+    static constexpr int head_dim            = hidden / heads;
+    static constexpr int patch_dim           = 3 * 2 * 16 * 16;
+    static constexpr int merge               = 2;
+    static constexpr int merge_unit          = merge * merge;
+    static constexpr int merger_hidden       = hidden * merge_unit;
+    static constexpr int position_embeddings = 48 * 48;
+    static constexpr int rotary_dim          = head_dim;
+    static constexpr float rope_theta        = 10'000.0f;
+    static constexpr float norm_eps          = 1.0e-6f;
+};
+
 inline constexpr ModelConfig kCfg{};
+inline constexpr VisionConfig kVisionCfg{};
 inline constexpr float kAttnScale                     = 0.0625f;
 inline constexpr float kGdnScale                      = 0.08838834764831845f;
 inline constexpr std::uint32_t kPrefillChunkAlignment = 128;

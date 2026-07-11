@@ -1,6 +1,7 @@
 #pragma once
 
 #include "qus/runtime/engine.h"
+#include "qus/model/processor.h"
 #include "qus/text/chat_template.h"
 #include "qus/text/tokenizer.h"
 
@@ -28,9 +29,9 @@ using TextStreamCallback = std::function<void(const TextStreamChunk&)>;
 
 struct TextGenerationTimings {
     double render_tokenize_seconds = 0.0;
-    double prefill_seconds = 0.0;
-    double decode_seconds = 0.0;
-    double total_seconds = 0.0;
+    double prefill_seconds         = 0.0;
+    double decode_seconds          = 0.0;
+    double total_seconds           = 0.0;
 };
 
 // Why generation stopped. Cancelled means an external caller (e.g. a disconnected
@@ -43,9 +44,9 @@ enum class FinishReason {
 
 struct TextGenerationOptions {
     int max_new_tokens = 128;
-    bool raw_output = false;
+    bool raw_output    = false;
     // Default thinking-ON, matching the Qwen3.6 template's default generation prompt.
-    bool enable_thinking = true;
+    bool enable_thinking         = true;
     bool preserve_special_tokens = false;
     ChatRenderOptions render_options;
     std::vector<int> stop_token_ids;
@@ -62,8 +63,8 @@ struct TextGenerationOptions {
 struct TextGenerationResult {
     std::vector<int> prompt_token_ids;
     std::vector<int> generated_token_ids;
-    std::string text;       // answer only; the <think> block is split into `reasoning`
-    std::string reasoning;  // <think> block content, empty unless thinking is active
+    std::string text;      // answer only; the <think> block is split into `reasoning`
+    std::string reasoning; // <think> block content, empty unless thinking is active
     TextGenerationTimings timings;
     FinishReason finish_reason = FinishReason::Length;
 };
@@ -72,7 +73,7 @@ class TextGenerationRunner {
 public:
     TextGenerationRunner(QwenTokenizer& tokenizer, qus::Engine& engine);
 
-    // Renders the chat template, tokenizes, then prefills/decodes. Used by the CLI.
+    // Prepares text or structured media messages, then prefills/decodes. Used by the CLI.
     TextGenerationResult generate(const std::vector<ChatMessage>& messages,
                                   const TextGenerationOptions& options);
 
@@ -85,14 +86,20 @@ public:
                                   const TextGenerationOptions& options,
                                   std::uint32_t content_boundary);
 
+    TextGenerationResult generate(qus::model::ProcessedInput& input,
+                                  const TextGenerationOptions& options,
+                                  std::uint32_t content_boundary,
+                                  std::function<void()> on_prefill_complete = {});
+
 private:
     // Shared prefill/decode body. render_tokenize_seconds is folded into the
     // total time so the metric stays meaningful regardless of the entry point.
     // `content_boundary` is passed straight to Engine::prefill_cached.
     TextGenerationResult run_tokens(std::vector<int> prompt_token_ids,
                                     const TextGenerationOptions& options,
-                                    double render_tokenize_seconds,
-                                    std::uint32_t content_boundary);
+                                    double render_tokenize_seconds, std::uint32_t content_boundary,
+                                    qus::model::ProcessedInput* multimodal    = nullptr,
+                                    std::function<void()> on_prefill_complete = {});
 
     QwenTokenizer& tokenizer_;
     qus::Engine& engine_;

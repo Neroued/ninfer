@@ -3,6 +3,7 @@
 #include "qus/core/dtype.h"
 #include "qus/model/config.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -12,22 +13,24 @@ namespace qus::serve {
 // Upper bound for the auto-derived default output length. Requests that omit
 // max_tokens get min(max_context/2, this); half the window is reserved for the
 // prompt, and this ceiling keeps a no-limit client from generating for minutes.
-inline constexpr int kDefaultMaxTokensCeiling = 8192;
+inline constexpr int kDefaultMaxTokensCeiling        = 8192;
+inline constexpr std::size_t kDefaultMaxRequestBytes = 384ULL << 20;
 
 struct ServeOptions {
     bool help_requested = false;
     std::string weights_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
-    std::string api_key;                         // empty => no auth
-    std::string model_id        = "qwen3.6-27b"; // reported by /v1/models
-    std::uint32_t max_context   = 8192;
-    std::uint32_t prefill_chunk = model::kDefaultPrefillChunk;
-    int device                  = 0;
-    int mtp_draft_tokens        = 0;
-    DType kv_dtype              = DType::BF16;
-    bool use_cuda_graph         = true;
-    bool use_lm_head_draft      = false;
+    std::string api_key;                           // empty => no auth
+    std::string model_id          = "qwen3.6-27b"; // reported by /v1/models
+    std::uint32_t max_context     = 8192;
+    std::uint32_t prefill_chunk   = model::kDefaultPrefillChunk;
+    std::size_t max_request_bytes = kDefaultMaxRequestBytes;
+    int device                    = 0;
+    int mtp_draft_tokens          = 0;
+    DType kv_dtype                = DType::BF16;
+    bool use_cuda_graph           = true;
+    bool use_lm_head_draft        = false;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     // Used when a request omits max_tokens. 0 => derive from max_context in

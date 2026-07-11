@@ -15,7 +15,7 @@ present. The M2.8 benchmark/I/O/memory observability gate is complete; M3 planni
 [`docs/m3-readiness.md`](docs/m3-readiness.md).
 
 Current code includes L0 infrastructure, the q5090 `WeightStore`/loader and unified `Weight` handle,
-the 13 public L1 operator APIs and implementations, the L2 `Qwen3_6_27B` model card, the `Engine`,
+the public L1 operator surface and implementations, the L2 text/Vision model cards, the `Engine`,
 and q5090 Python reference/diagnostic tooling. No performance numbers are claimed
 here; performance claims require the M2.8 e2e benchmark/report standard.
 
@@ -30,20 +30,20 @@ here; performance claims require the M2.8 e2e benchmark/report standard.
 
 `Qwen3.6-27B` (internally the `qwen3_5` architecture): a **hybrid-attention** dense model —
 64 layers in a 3:1 pattern of **Gated-DeltaNet linear attention** (48 layers) and **GQA full
-attention** (16 layers), SwiGLU MLP, vocab 248320. v1 freezes to the **text decoder only**
-(vision tower and the MTP layer ship in the checkpoint but are deferred).
+attention** (16 layers), SwiGLU MLP, vocab 248320, plus the fixed 27-layer Vision tower and patch
+merger. The runtime supports the target decoder, MTP speculative decoding, and native image/video
+prefill.
 
 ## Scope (v1)
 
-- Text-only; the primary `qus` binary accepts Qwen3.6 chat text and prints decoded text.
-  The runtime engine and benchmark/parity tools still use token ids internally.
-- **Greedy** decoding, **bf16 KV**, current M2.8 official **max_ctx = 8192**.
+- Text, image, and video chat input. Vision runs only during prefill; decode uses the resulting
+  language-model KV/GDN state.
+- Greedy or sampled decoding, BF16 or INT8 KV, and current official **max_ctx = 8192**.
 - **W4A16**: 4-bit weights, bf16 activations.
 - Single sequence (batch = 1), single GPU.
 
 128K context is a later target, not part of the current M2.8 gate. Deferred (in order):
-MTP speculative decode → fp8/fp4 prefill → 128K/256K context and fp8-KV → full sampler →
-vision → multi-GPU/batching.
+fp8/fp4 prefill → 128K/256K context and fp8-KV → multi-GPU/batching.
 
 ## Architecture (3 layers)
 
@@ -62,7 +62,7 @@ bf16 safetensors + tokenizer ──(Python, offline)──> quantize + relayout/
                                                                           │
                                                 (C++/CUDA runtime) selective staged load + run
                                                                           │
-           text/messages -> C++ Qwen tokenizer/chat template -> token ids -> forward -> greedy -> ids -> text
+ text/image/video -> native processor -> Vision + mixed embeddings -> text forward -> sampler -> text
 ```
 
 ## Build (intended)
@@ -87,8 +87,13 @@ The v4.2 artifact embeds `tokenizer.json`, `merges.txt`, and `generation_config.
 commands do not accept a tokenizer directory. The loader validates the 4 KiB header before CUDA
 initialization, reads only the bounded catalog/tokenizer prefix, and uploads only requested modules.
 
-The native multimodal preprocessor can be exercised independently while the C++ Vision forward is
-being implemented:
+For multimodal inference, pass a structured messages file directly to `qus`:
+
+```bash
+./build/src/qus MODEL.qus --messages messages.json --no-thinking --max-new 256
+```
+
+The same native multimodal preprocessor can also be exercised independently:
 
 ```bash
 ./build/src/qus-preprocess MODEL.qus messages.json preprocess.json patches.f32 --no-thinking
@@ -96,15 +101,17 @@ being implemented:
 
 It reads the tokenizer from the q5090 catalog, supports structured text/image/video messages, and
 emits expanded token IDs, token types, three-axis positions, `rope_delta`, grids, timestamps and the
-row-major `[P,1536]` patch buffer. The main inference binary rejects media until those outputs are
-connected to the Vision tower, preventing a single unexpanded placeholder from being executed as a
-text-only prompt.
+row-major `[P,1536]` patch buffer. `qus` and `qus-serve` feed those outputs through the native Vision
+tower, scatter the merged `[V,5120]` embeddings into the text prompt, and continue decode with the
+correct MRoPE offset.
 
 `bench/qus_bench` is the real-weight throughput tool (llama-bench-style prefill/decode rates); see
 [`bench/README.md`](bench/README.md).
 
 The OpenAI-compatible server includes best-effort function tool calling; see
 [`docs/non-strict-tool-calling.md`](docs/non-strict-tool-calling.md).
+Its HTTP request body is capped at 384 MiB by default; use `--max-request-mib N` to set a tighter
+deployment limit. Memory-heavy media preprocessing admits one in-flight request at a time.
 
 ## Toolchain target
 
@@ -119,6 +126,8 @@ NVIDIA RTX 5090 (Blackwell, sm_120, 32 GB) · CUDA 13.1 · gcc 13.3 · CMake 3.2
 - [`docs/qwen3.6-27b-architecture.md`](docs/qwen3.6-27b-architecture.md) — exact model
   architecture reference: per-layer parameters, computation flow, Gated-DeltaNet math,
   operator inventory, and runtime tensor-transform ownership.
+- [`docs/2026-07-12-qwen3-6-vision-engine-integration.md`](docs/2026-07-12-qwen3-6-vision-engine-integration.md)
+  — native Vision tower, text/MRoPE integration, serving lifecycle, and numerical evidence.
 - [`docs/q5090_packed_file_format_v4.md`](docs/q5090_packed_file_format_v4.md) — canonical
   packed-weight ABI consumed by the C++ runtime.
 - [`docs/archive/pre-optimization/`](docs/archive/pre-optimization/) — completed pre-optimization

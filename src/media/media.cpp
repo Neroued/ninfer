@@ -148,8 +148,8 @@ std::string resolve_public(const UrlParts& url, bool allow_private) {
     addrinfo* raw     = nullptr;
     const int rc      = getaddrinfo(url.host.c_str(), url.port.c_str(), &hints, &raw);
     if (rc != 0) {
-        throw std::runtime_error("failed to resolve media URL host: " +
-                                 std::string(gai_strerror(rc)));
+        throw Error(ErrorKind::RemoteUnavailable,
+                    "failed to resolve media URL host: " + std::string(gai_strerror(rc)));
     }
     std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(raw, freeaddrinfo);
     std::string selected;
@@ -228,23 +228,31 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
         curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "qus/vision");
         const CURLcode code = curl_easy_perform(curl.get());
         if (code != CURLE_OK) {
-            throw std::runtime_error("failed to fetch media URL: " +
-                                     std::string(curl_easy_strerror(code)));
+            if (code == CURLE_OPERATION_TIMEDOUT) {
+                throw Error(ErrorKind::RemoteTimeout,
+                            "media URL fetch timed out: " + std::string(curl_easy_strerror(code)));
+            }
+            if (code == CURLE_FILESIZE_EXCEEDED || code == CURLE_WRITE_ERROR) {
+                throw Error(ErrorKind::BudgetExceeded, "media URL exceeds byte limit");
+            }
+            throw Error(ErrorKind::RemoteUnavailable,
+                        "failed to fetch media URL: " + std::string(curl_easy_strerror(code)));
         }
         long status = 0;
         curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
         if (status >= 200 && status < 300) { return buffer.bytes; }
         if (status < 300 || status >= 400 || redirect == policy.max_redirects) {
-            throw std::runtime_error("media URL returned HTTP " + std::to_string(status));
+            throw Error(ErrorKind::RemoteUnavailable,
+                        "media URL returned HTTP " + std::to_string(status));
         }
         char* next = nullptr;
         curl_easy_getinfo(curl.get(), CURLINFO_REDIRECT_URL, &next);
         if (next == nullptr || *next == '\0') {
-            throw std::runtime_error("media URL redirect has no location");
+            throw Error(ErrorKind::RemoteUnavailable, "media URL redirect has no location");
         }
         url = next;
     }
-    throw std::runtime_error("too many media URL redirects");
+    throw Error(ErrorKind::RemoteUnavailable, "too many media URL redirects");
 }
 
 struct InputData {
@@ -337,11 +345,11 @@ InputData load_source(const Source& source, const Policy& policy) {
         }
         const std::size_t encoded = source.value.size() - comma - 1;
         if (encoded > (policy.max_bytes / 3 + 1) * 4) {
-            throw std::invalid_argument("media data exceeds byte limit");
+            throw Error(ErrorKind::BudgetExceeded, "media data exceeds byte limit");
         }
         out.bytes = decode_base64(std::string_view(source.value).substr(comma + 1));
         if (out.bytes.size() > policy.max_bytes) {
-            throw std::invalid_argument("media data exceeds byte limit");
+            throw Error(ErrorKind::BudgetExceeded, "media data exceeds byte limit");
         }
     } else {
         std::error_code ec;
@@ -358,8 +366,9 @@ InputData load_source(const Source& source, const Policy& policy) {
             }
         }
         const std::uintmax_t size = std::filesystem::file_size(path, ec);
-        if (ec || size > policy.max_bytes) {
-            throw std::invalid_argument("media file exceeds byte limit");
+        if (ec) { throw std::invalid_argument("failed to inspect media file: " + source.value); }
+        if (size > policy.max_bytes) {
+            throw Error(ErrorKind::BudgetExceeded, "media file exceeds byte limit");
         }
         out.path = std::move(path);
     }
@@ -508,9 +517,11 @@ public:
     Image rgb(const AVFrame* frame, int orientation, bool composite_alpha = false) {
         const int width  = frame->width;
         const int height = frame->height;
-        if (width <= 0 || height <= 0 ||
-            static_cast<std::uint64_t>(width) * height > max_decoded_pixels_) {
+        if (width <= 0 || height <= 0) {
             throw std::invalid_argument("decoded media dimensions are invalid");
+        }
+        if (static_cast<std::uint64_t>(width) * height > max_decoded_pixels_) {
+            throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
         }
         Image out;
         out.width  = width;
@@ -645,7 +656,8 @@ int count_frames(const InputData& input, const Policy& policy) {
     decoder.frames([&](int index, const AVFrame*) {
         count = index + 1;
         if (count > policy.max_video_source_frames) {
-            throw std::invalid_argument("video source frame count exceeds processor limit");
+            throw Error(ErrorKind::BudgetExceeded,
+                        "video source frame count exceeds processor limit");
         }
     });
     return count;
@@ -700,18 +712,19 @@ Video decode_video(const Source& source, const Policy& policy, double target_fps
     const double duration = probe.duration_seconds();
     if (total == 0 && duration > 0.0) { total = static_cast<int>(std::nearbyint(duration * fps)); }
     if (duration > policy.max_video_duration_seconds) {
-        throw std::invalid_argument("video duration exceeds processor limit");
+        throw Error(ErrorKind::BudgetExceeded, "video duration exceeds processor limit");
     }
     if (total == 0) { total = count_frames(input, policy); }
     if (total > policy.max_video_source_frames) {
-        throw std::invalid_argument("video source frame count exceeds processor limit");
+        throw Error(ErrorKind::BudgetExceeded, "video source frame count exceeds processor limit");
     }
     const std::vector<int> indices = sample_indices(total, fps, target_fps, min_frames, max_frames);
     const std::uint64_t coded_pixels =
         static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->width, 0)) *
         static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->height, 0));
     if (coded_pixels != 0 && indices.size() > policy.max_decoded_video_pixels / coded_pixels) {
-        throw std::invalid_argument("sampled source video pixels exceed processor limit");
+        throw Error(ErrorKind::BudgetExceeded,
+                    "sampled source video pixels exceed processor limit");
     }
 
     Decoder decoder(input, policy.max_decoded_pixels);
@@ -732,7 +745,8 @@ Video decode_video(const Source& source, const Policy& policy, double target_fps
                                          static_cast<std::uint64_t>(std::max(frame->height, 0));
             if (retained_pixels > policy.max_decoded_video_pixels ||
                 pixels > policy.max_decoded_video_pixels - retained_pixels) {
-                throw std::invalid_argument("sampled source video pixels exceed processor limit");
+                throw Error(ErrorKind::BudgetExceeded,
+                            "sampled source video pixels exceed processor limit");
             }
             retained_pixels += pixels;
             out.frames.push_back(decoder.rgb(frame, orientation, true));

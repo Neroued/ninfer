@@ -67,13 +67,16 @@ int expect_finite_hidden(const qus::Tensor& x, const char* label) {
 void set_positions(qus::model::StepState& io, qus::test::DBuf& pos, int T) {
     std::vector<int> host(static_cast<std::size_t>(T));
     qus::test::fill_iota_i32(host);
-    pos    = qus::test::to_device_i32(host);
-    io.pos = qus::Tensor(pos.p, qus::DType::I32, {T});
+    pos         = qus::test::to_device_i32(host);
+    io.pos      = qus::Tensor(pos.p, qus::DType::I32, {T});
+    io.rope_pos = io.pos;
 }
 
 qus::model::StepState make_step_state(qus::DeviceArena& arena, int window_cols, int prefill_chunk) {
     const int draft_cols = std::max(1, window_cols - 1);
     return qus::model::StepState{
+        arena.alloc(qus::DType::I32, {1}),
+        arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::I32, {1}),
         arena.alloc(qus::DType::BF16, {qus::model::kCfg.vocab, window_cols}),

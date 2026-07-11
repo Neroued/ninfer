@@ -72,6 +72,7 @@ private:
 // destroys the captured content-provider/releaser closures when the stream ends.
 struct JoiningThread {
     std::thread thread;
+
     ~JoiningThread() {
         if (thread.joinable()) { thread.join(); }
     }
@@ -105,6 +106,7 @@ std::string sse_error_event(const ApiError& error) {
 
 HttpServer::HttpServer(GenerationService& service, ServeOptions options)
     : service_(service), options_(std::move(options)) {
+    server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
 }
 
@@ -114,44 +116,56 @@ void HttpServer::log_line(const std::string& line) {
 }
 
 void HttpServer::register_routes() {
+    server_.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+        if (res.status != 413) { return; }
+        ApiError error;
+        error.status  = 413;
+        error.type    = "invalid_request_error";
+        error.code    = "request_too_large";
+        error.message = "request body exceeds the configured payload limit";
+        if (req.path.rfind("/v1/messages", 0) == 0) {
+            write_messages_error(res, error);
+        } else {
+            write_error(res, error);
+        }
+    });
     if (options_.enable_cors) {
-        server_.set_default_headers({{"Access-Control-Allow-Origin", "*"},
-                                     {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
-                                     {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"}});
+        server_.set_default_headers(
+            {{"Access-Control-Allow-Origin", "*"},
+             {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
+             {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
-        server_.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
-            res.status = 204;
-        });
+        server_.Options(R"(.*)",
+                        [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
     }
 
-    server_.set_pre_routing_handler(
-        [this](const httplib::Request& req, httplib::Response& res) {
-            if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
-                return httplib::Server::HandlerResponse::Unhandled;
-            }
-            // Accept both the OpenAI-style bearer token and the Anthropic-style
-            // x-api-key header so OpenAI clients and Claude Code (ANTHROPIC_API_KEY
-            // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
-            const bool bearer_ok =
-                req.get_header_value("Authorization") == ("Bearer " + options_.api_key);
-            const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
-            if (!bearer_ok && !x_api_key_ok) {
-                ApiError error;
-                error.status  = 401;
-                error.type    = "invalid_request_error";
-                error.code    = "invalid_api_key";
-                error.message = "missing or invalid API key";
-                // Render the 401 in the shape the target endpoint speaks.
-                if (req.path.rfind("/v1/messages", 0) == 0) {
-                    write_messages_error(res, error);
-                } else {
-                    write_error(res, error);
-                }
-                return httplib::Server::HandlerResponse::Handled;
-            }
+    server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
-        });
+        }
+        // Accept both the OpenAI-style bearer token and the Anthropic-style
+        // x-api-key header so OpenAI clients and Claude Code (ANTHROPIC_API_KEY
+        // -> x-api-key, ANTHROPIC_AUTH_TOKEN -> Authorization: Bearer) both work.
+        const bool bearer_ok =
+            req.get_header_value("Authorization") == ("Bearer " + options_.api_key);
+        const bool x_api_key_ok = req.get_header_value("x-api-key") == options_.api_key;
+        if (!bearer_ok && !x_api_key_ok) {
+            ApiError error;
+            error.status  = 401;
+            error.type    = "invalid_request_error";
+            error.code    = "invalid_api_key";
+            error.message = "missing or invalid API key";
+            // Render the 401 in the shape the target endpoint speaks.
+            if (req.path.rfind("/v1/messages", 0) == 0) {
+                write_messages_error(res, error);
+            } else {
+                write_error(res, error);
+            }
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
 
     server_.set_exception_handler(
         [](const httplib::Request&, httplib::Response& res, std::exception_ptr ep) {
@@ -159,9 +173,7 @@ void HttpServer::register_routes() {
                 std::rethrow_exception(ep);
             } catch (const ApiException& e) {
                 write_error(res, e.error());
-            } catch (const std::exception& e) {
-                write_exception(res, e);
-            } catch (...) {
+            } catch (const std::exception& e) { write_exception(res, e); } catch (...) {
                 ApiError error;
                 error.status  = 500;
                 error.type    = "internal_error";
@@ -173,13 +185,16 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
-    server_.Get("/v1/models",
-                [this](const httplib::Request& req, httplib::Response& res) { handle_models(req, res); });
-    server_.Get(R"(/v1/models/(.+))",
-                [this](const httplib::Request& req, httplib::Response& res) { handle_model(req, res); });
-    server_.Post("/v1/chat/completions", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_chat_completions(req, res);
+    server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_models(req, res);
     });
+    server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_model(req, res);
+    });
+    server_.Post("/v1/chat/completions",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_chat_completions(req, res);
+                 });
     server_.Post("/v1/messages/count_tokens",
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_count_tokens(req, res);
@@ -261,10 +276,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                                                    outcome.tool_calls, usage),
                                 "application/json");
             } else {
-                res.set_content(make_chat_completion_response(id, model, created, outcome.text,
-                                                              outcome.reasoning,
-                                                              finish_reason_wire(outcome.finish_reason),
-                                                              usage),
+                res.set_content(make_chat_completion_response(
+                                    id, model, created, outcome.text, outcome.reasoning,
+                                    finish_reason_wire(outcome.finish_reason), usage),
                                 "application/json");
             }
         } catch (const std::exception& e) {
@@ -274,10 +288,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    auto queue     = std::make_shared<SseQueue>();
-    auto cancelled = std::make_shared<std::atomic<bool>>(false);
-    auto worker    = std::make_shared<JoiningThread>();
-    auto prepared_ptr = std::make_shared<PreparedRequest>(std::move(prepared));
+    auto queue               = std::make_shared<SseQueue>();
+    auto cancelled           = std::make_shared<std::atomic<bool>>(false);
+    auto worker              = std::make_shared<JoiningThread>();
+    auto prepared_ptr        = std::make_shared<PreparedRequest>(std::move(prepared));
     const bool include_usage = prepared_ptr->include_usage;
     const bool tool_capable  = prepared_ptr->tool_capable;
 
@@ -298,20 +312,19 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             log_line(format_request_done(req_id, outcome));
             if (!outcome.tool_calls.empty()) {
                 if (!outcome.text.empty()) {
-                    queue->push(make_chat_chunk_content(id, model, created, outcome.text,
-                                                        include_usage));
+                    queue->push(
+                        make_chat_chunk_content(id, model, created, outcome.text, include_usage));
                 }
                 queue->push(make_chat_chunk_tool_calls(id, model, created, outcome.tool_calls,
                                                        include_usage));
                 queue->push(make_chat_chunk_final(id, model, created, "tool_calls", include_usage));
             } else {
                 if (tool_capable && !outcome.text.empty()) {
-                    queue->push(make_chat_chunk_content(id, model, created, outcome.text,
-                                                        include_usage));
+                    queue->push(
+                        make_chat_chunk_content(id, model, created, outcome.text, include_usage));
                 }
-                queue->push(make_chat_chunk_final(id, model, created,
-                                                  finish_reason_wire(outcome.finish_reason),
-                                                  include_usage));
+                queue->push(make_chat_chunk_final(
+                    id, model, created, finish_reason_wire(outcome.finish_reason), include_usage));
             }
             if (include_usage) {
                 const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
@@ -421,8 +434,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         limits.max_context        = options_.max_context;
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
         // Claude model names) and echoes it back; it never 404s on model id.
-        request                   = parse_messages_request(body, limits);
-        prepared                  = service_.prepare(request);
+        request  = parse_messages_request(body, limits);
+        prepared = service_.prepare(request);
     } catch (const ApiException& e) {
         write_messages_error(res, e.error());
         return;
@@ -435,9 +448,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    const std::string id     = new_message_id();
-    const std::string model  = request.model;  // echo the requested model
-    const int input_tokens   = prepared.prompt_tokens;
+    const std::string id    = new_message_id();
+    const std::string model = request.model; // echo the requested model
+    const int input_tokens  = prepared.prompt_tokens;
 
     const std::uint64_t req_id = ++request_seq_;
     log_line(format_request_start(req_id, request.stream, request.messages.size(),
@@ -469,104 +482,104 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    auto queue        = std::make_shared<SseQueue>();
-    auto cancelled    = std::make_shared<std::atomic<bool>>(false);
-    auto worker       = std::make_shared<JoiningThread>();
-    auto prepared_ptr = std::make_shared<PreparedRequest>(std::move(prepared));
+    auto queue              = std::make_shared<SseQueue>();
+    auto cancelled          = std::make_shared<std::atomic<bool>>(false);
+    auto worker             = std::make_shared<JoiningThread>();
+    auto prepared_ptr       = std::make_shared<PreparedRequest>(std::move(prepared));
     const bool tool_capable = prepared_ptr->tool_capable;
 
-    worker->thread = std::thread([this, queue, cancelled, prepared_ptr, id, model, input_tokens,
-                                  tool_capable, req_id]() {
-        // Anthropic content-block state machine: an optional thinking block (fed by
-        // the reasoning channel) precedes an optional text block; tool_use blocks
-        // are appended after generation. Block indices increase in emission order.
-        int next_index     = 0;
-        bool thinking_open = false;
-        int thinking_index = -1;
-        bool text_open     = false;
-        int text_index     = -1;
-        try {
-            queue->push(make_message_start(id, model, input_tokens));
+    worker->thread = std::thread(
+        [this, queue, cancelled, prepared_ptr, id, model, input_tokens, tool_capable, req_id]() {
+            // Anthropic content-block state machine: an optional thinking block (fed by
+            // the reasoning channel) precedes an optional text block; tool_use blocks
+            // are appended after generation. Block indices increase in emission order.
+            int next_index     = 0;
+            bool thinking_open = false;
+            int thinking_index = -1;
+            bool text_open     = false;
+            int text_index     = -1;
+            try {
+                queue->push(make_message_start(id, model, input_tokens));
 
-            StreamSink sink;
-            sink.on_reasoning = [&](const std::string& text) {
-                if (!thinking_open) {
-                    thinking_index = next_index++;
-                    thinking_open  = true;
-                    queue->push(make_content_block_start_thinking(thinking_index));
-                }
-                queue->push(make_content_block_delta_thinking(thinking_index, text));
-            };
-            sink.on_content = [&](const std::string& text) {
-                // Reasoning fully precedes the answer in Qwen output; close the
-                // thinking block before the first text delta.
+                StreamSink sink;
+                sink.on_reasoning = [&](const std::string& text) {
+                    if (!thinking_open) {
+                        thinking_index = next_index++;
+                        thinking_open  = true;
+                        queue->push(make_content_block_start_thinking(thinking_index));
+                    }
+                    queue->push(make_content_block_delta_thinking(thinking_index, text));
+                };
+                sink.on_content = [&](const std::string& text) {
+                    // Reasoning fully precedes the answer in Qwen output; close the
+                    // thinking block before the first text delta.
+                    if (thinking_open) {
+                        queue->push(make_content_block_stop(thinking_index));
+                        thinking_open = false;
+                    }
+                    if (!text_open) {
+                        text_index = next_index++;
+                        text_open  = true;
+                        queue->push(make_content_block_start_text(text_index));
+                    }
+                    queue->push(make_content_block_delta_text(text_index, text));
+                };
+                sink.is_cancelled = [&]() { return cancelled->load(); };
+
+                const GenerationOutcome outcome = service_.run(*prepared_ptr, &sink);
+                log_line(format_request_done(req_id, outcome));
+
+                // Close any block still open from live streaming.
                 if (thinking_open) {
                     queue->push(make_content_block_stop(thinking_index));
                     thinking_open = false;
                 }
-                if (!text_open) {
-                    text_index = next_index++;
-                    text_open  = true;
-                    queue->push(make_content_block_start_text(text_index));
+                if (text_open) {
+                    queue->push(make_content_block_stop(text_index));
+                    text_open = false;
                 }
-                queue->push(make_content_block_delta_text(text_index, text));
-            };
-            sink.is_cancelled = [&]() { return cancelled->load(); };
 
-            const GenerationOutcome outcome = service_.run(*prepared_ptr, &sink);
-            log_line(format_request_done(req_id, outcome));
+                // In tool mode the service buffers the answer instead of streaming it;
+                // emit the text and tool_use blocks now from the final outcome.
+                if (tool_capable) {
+                    if (!outcome.text.empty()) {
+                        const int idx = next_index++;
+                        queue->push(make_content_block_start_text(idx));
+                        queue->push(make_content_block_delta_text(idx, outcome.text));
+                        queue->push(make_content_block_stop(idx));
+                    }
+                    for (const ToolCall& call : outcome.tool_calls) {
+                        const int idx = next_index++;
+                        queue->push(make_content_block_start_tool_use(idx, call));
+                        queue->push(make_content_block_delta_tool_json(idx, call.arguments_json));
+                        queue->push(make_content_block_stop(idx));
+                    }
+                }
 
-            // Close any block still open from live streaming.
-            if (thinking_open) {
-                queue->push(make_content_block_stop(thinking_index));
-                thinking_open = false;
-            }
-            if (text_open) {
-                queue->push(make_content_block_stop(text_index));
-                text_open = false;
-            }
-
-            // In tool mode the service buffers the answer instead of streaming it;
-            // emit the text and tool_use blocks now from the final outcome.
-            if (tool_capable) {
-                if (!outcome.text.empty()) {
+                if (next_index == 0) {
+                    // Nothing was produced; Anthropic content must not be empty.
                     const int idx = next_index++;
                     queue->push(make_content_block_start_text(idx));
-                    queue->push(make_content_block_delta_text(idx, outcome.text));
                     queue->push(make_content_block_stop(idx));
                 }
-                for (const ToolCall& call : outcome.tool_calls) {
-                    const int idx = next_index++;
-                    queue->push(make_content_block_start_tool_use(idx, call));
-                    queue->push(make_content_block_delta_tool_json(idx, call.arguments_json));
-                    queue->push(make_content_block_stop(idx));
-                }
-            }
 
-            if (next_index == 0) {
-                // Nothing was produced; Anthropic content must not be empty.
-                const int idx = next_index++;
-                queue->push(make_content_block_start_text(idx));
-                queue->push(make_content_block_stop(idx));
+                const char* stop_reason =
+                    messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
+                queue->push(make_message_delta(stop_reason, outcome.completion_tokens));
+                queue->push(make_message_stop());
+            } catch (const ApiException& e) {
+                log_line(format_request_error(req_id, e.error().message));
+                queue->push(messages_sse_error_event(e.error()));
+            } catch (const std::exception& e) {
+                log_line(format_request_error(req_id, e.what()));
+                ApiError error;
+                error.status  = 500;
+                error.type    = "internal_error";
+                error.message = e.what();
+                queue->push(messages_sse_error_event(error));
             }
-
-            const char* stop_reason =
-                messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
-            queue->push(make_message_delta(stop_reason, outcome.completion_tokens));
-            queue->push(make_message_stop());
-        } catch (const ApiException& e) {
-            log_line(format_request_error(req_id, e.error().message));
-            queue->push(messages_sse_error_event(e.error()));
-        } catch (const std::exception& e) {
-            log_line(format_request_error(req_id, e.what()));
-            ApiError error;
-            error.status  = 500;
-            error.type    = "internal_error";
-            error.message = e.what();
-            queue->push(messages_sse_error_event(error));
-        }
-        queue->mark_producer_done();
-    });
+            queue->mark_producer_done();
+        });
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");

@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <exception>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -180,6 +181,8 @@ std::size_t default_cache_bytes_for(std::uint32_t max_ctx, int draft_tokens,
         checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
     io_bytes =
         checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
+    io_bytes =
+        checked_add(io_bytes, tensor_bytes(1, DType::I32, "cache arena size"), "cache arena size");
     io_bytes = checked_add(
         io_bytes,
         token_matrix_bytes(model::kCfg.vocab, window_cols, DType::BF16, "cache arena size"),
@@ -234,7 +237,7 @@ std::size_t default_cache_bytes_for(std::uint32_t max_ctx, int draft_tokens,
     total             = checked_add(total, io_bytes, "cache arena size");
     const std::size_t kv_tensors =
         checked_mul(kv_layers, kv_dtype == DType::I8 ? 4ULL : 2ULL, "cache arena size");
-    total = checked_add(total, align_slack(kv_tensors + model::kCfg.n_gdn() * 2 + 18),
+    total = checked_add(total, align_slack(kv_tensors + model::kCfg.n_gdn() * 2 + 19),
                         "cache arena size");
     return checked_add(total, 64ULL * kMiB, "cache arena size");
 }
@@ -484,123 +487,144 @@ std::size_t Engine::default_work_bytes(std::uint32_t prefill_chunk) {
     return default_work_bytes_for(prefill_chunk, 0);
 }
 
-void Engine::load(const std::string& path) {
+void Engine::unload() noexcept {
+    load_complete_ = false;
     decode_graph_.reset();
     round_graph_.reset();
     decode_warmed_ = false;
     round_warmed_  = false;
-    pending_sampled_.clear();
-    logical_tokens_.clear();
+    invalidate_sequence_identity();
     card_.reset();
+    vision_card_.reset();
     state_.reset();
     kv_.reset();
     mtp_kv_.reset();
     weights_.reset();
     work_.reset();
+    vision_work_.reset();
     cache_arena_.reset();
     ctx_.reset();
-    io_ = {};
+    io_                  = {};
+    sampling_config_dev_ = {};
+    token_counts_        = {};
+}
 
-    const bool enable_mtp = options_.mtp_draft_tokens > 0;
-    weights_.emplace();
+void Engine::load(const std::string& path) {
+    unload();
 
-    LoadOptions load_options;
-    load_options.progress           = options_.progress;
-    load_options.load_mtp           = options_.mtp_draft_tokens > 0;
-    load_options.load_lm_head_draft = options_.use_lm_head_draft;
-    weights_->prepare(path.c_str(), load_options);
+    try {
+        const bool enable_mtp = options_.mtp_draft_tokens > 0;
+        weights_.emplace();
 
-    ctx_.emplace(options_.device);
-    weights_->upload(*ctx_);
-    if (load_options.load_mtp) { weights_->require_mtp_module_expectations(); }
+        LoadOptions load_options;
+        load_options.progress           = options_.progress;
+        load_options.load_mtp           = options_.mtp_draft_tokens > 0;
+        load_options.load_vision        = true;
+        load_options.load_lm_head_draft = options_.use_lm_head_draft;
+        weights_->prepare(path.c_str(), load_options);
 
-    work_.emplace(options_.work_bytes == 0
-                      ? default_work_bytes_for(options_.prefill_chunk, options_.mtp_draft_tokens)
-                      : options_.work_bytes);
+        ctx_.emplace(options_.device);
+        weights_->upload(*ctx_);
+        if (load_options.load_mtp) { weights_->require_mtp_module_expectations(); }
 
-    cache_arena_.emplace(options_.cache_bytes == 0
-                             ? default_cache_bytes_for(options_.max_ctx, options_.mtp_draft_tokens,
-                                                       options_.prefill_chunk, options_.kv_dtype,
-                                                       options_.kv_quant_group)
-                             : options_.cache_bytes);
-    const int cache_quant_group =
-        runtime_kv_quant_group(options_.kv_dtype, options_.kv_quant_group);
-    kv_.emplace(*cache_arena_, model::kCfg.n_full(), options_.max_ctx, model::kCfg.n_kv,
-                model::kCfg.head_dim, options_.kv_dtype, cache_quant_group);
-    if (enable_mtp) {
-        mtp_kv_.emplace(*cache_arena_, model::kCfg.mtp_layers, options_.max_ctx, model::kCfg.n_kv,
-                        model::kCfg.head_dim, options_.kv_dtype, cache_quant_group);
-    }
-    const auto window_cols =
-        static_cast<std::int32_t>(options_.mtp_draft_tokens) + static_cast<std::int32_t>(1);
-    // One extra GDN snapshot slot (index window_cols) is the dedicated turn-boundary slot used for
-    // partial prefix reuse; decode/MTP only cycle slots 0..mtp_draft_tokens.
-    const auto gdn_snapshot_slots = window_cols + static_cast<std::int32_t>(1);
-    const auto draft_cols =
-        std::max<std::int32_t>(1, static_cast<std::int32_t>(options_.mtp_draft_tokens));
-    state_.emplace(*cache_arena_, model::kCfg.n_gdn(), model::kCfg.conv_dim,
-                   model::kCfg.gdn_conv_state_width, model::kCfg.gdn_v_heads, model::kCfg.gdn_v_dim,
-                   model::kCfg.gdn_k_dim, gdn_snapshot_slots);
-    io_ = model::StepState{
-        cache_arena_->alloc(DType::I32, {1}),
-        cache_arena_->alloc(DType::I32, {1}),
-        cache_arena_->alloc(DType::BF16, {model::kCfg.vocab, window_cols}),
-        cache_arena_->alloc(DType::BF16, {model::kCfg.hidden, window_cols}),
-        cache_arena_->alloc(
-            DType::BF16, {model::kCfg.hidden, static_cast<std::int32_t>(options_.prefill_chunk)}),
-        cache_arena_->alloc(DType::I32, {window_cols}),
-        cache_arena_->alloc(DType::I32, {draft_cols}),
-        cache_arena_->alloc(DType::I32, {window_cols}),
-        cache_arena_->alloc(DType::I32, {1}),
-        cache_arena_->alloc(DType::I32, {window_cols}),
-        cache_arena_->alloc(DType::I32, {window_cols}),
-        cache_arena_->alloc(DType::I32, {window_cols}),
-        cache_arena_->alloc(DType::I32, {1}),
-        cache_arena_->alloc(DType::I32, {1}),
-        cache_arena_->alloc(DType::I32, {1}),
-        cache_arena_->alloc(DType::I32, {1}),
-        cache_arena_->alloc(DType::BF16, {model::kCfg.hidden, 1}),
-        cache_arena_->alloc(DType::I64, {model::kStepStatsCounters}),
-    };
-    CUDA_CHECK(cudaMemsetAsync(io_.num_sampled.data, 0, io_.num_sampled.bytes(), ctx_->stream));
-    CUDA_CHECK(cudaMemsetAsync(io_.window_base.data, 0, io_.window_base.bytes(), ctx_->stream));
-    CUDA_CHECK(cudaMemsetAsync(io_.accepted.data, 0, io_.accepted.bytes(), ctx_->stream));
-    CUDA_CHECK(
-        cudaMemsetAsync(io_.gdn_initial_slot.data, 0, io_.gdn_initial_slot.bytes(), ctx_->stream));
-    CUDA_CHECK(cudaMemsetAsync(io_.ar_pos.data, 0, io_.ar_pos.bytes(), ctx_->stream));
-    CUDA_CHECK(cudaMemsetAsync(io_.stats.data, 0, io_.stats.bytes(), ctx_->stream));
+        work_.emplace(options_.work_bytes == 0 ? default_work_bytes_for(options_.prefill_chunk,
+                                                                        options_.mtp_draft_tokens)
+                                               : options_.work_bytes);
 
-    // Device-resident sampler state. The config buffer defaults to greedy so a
-    // freshly loaded engine (no set_sampling call) reproduces argmax exactly.
-    token_counts_        = cache_arena_->alloc(DType::I32, {model::kCfg.vocab});
-    const auto cfg_words = static_cast<std::int32_t>(
-        (sizeof(kernels::SamplingConfig) + sizeof(std::int32_t) - 1) / sizeof(std::int32_t));
-    sampling_config_dev_ = cache_arena_->alloc(DType::I32, {cfg_words});
-    CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
-    sampling_host_              = kernels::SamplingConfig{}; // temperature 0 => greedy
-    sampling_host_.token_counts = nullptr;
-    CUDA_CHECK(cudaMemcpyAsync(sampling_config_dev_.data, &sampling_host_, sizeof(sampling_host_),
-                               cudaMemcpyHostToDevice, ctx_->stream));
-
-    card_.emplace(*ctx_, *weights_, *work_, *kv_, *state_, io_, options_.prefill_chunk,
-                  mtp_kv_ ? &*mtp_kv_ : nullptr);
-    card_->set_sampling(static_cast<const kernels::SamplingConfig*>(sampling_config_dev_.data));
-
-    // bind() auto-binds the embedded draft head when present. Enforce the two-mode
-    // toggle here: keep it only when explicitly enabled, and fail loudly if enabled
-    // for a file that has no draft head instead of silently running the full head.
-    if (options_.use_lm_head_draft) {
-        if (card_->lm_head_draft() == nullptr) {
-            throw std::runtime_error(
-                "engine: use_lm_head_draft is set but the weight file has no draft head");
+        cache_arena_.emplace(
+            options_.cache_bytes == 0
+                ? default_cache_bytes_for(options_.max_ctx, options_.mtp_draft_tokens,
+                                          options_.prefill_chunk, options_.kv_dtype,
+                                          options_.kv_quant_group)
+                : options_.cache_bytes);
+        const int cache_quant_group =
+            runtime_kv_quant_group(options_.kv_dtype, options_.kv_quant_group);
+        kv_.emplace(*cache_arena_, model::kCfg.n_full(), options_.max_ctx, model::kCfg.n_kv,
+                    model::kCfg.head_dim, options_.kv_dtype, cache_quant_group);
+        if (enable_mtp) {
+            mtp_kv_.emplace(*cache_arena_, model::kCfg.mtp_layers, options_.max_ctx,
+                            model::kCfg.n_kv, model::kCfg.head_dim, options_.kv_dtype,
+                            cache_quant_group);
         }
-    } else {
-        card_->set_lm_head_draft(nullptr, nullptr, 0);
+        const auto window_cols =
+            static_cast<std::int32_t>(options_.mtp_draft_tokens) + static_cast<std::int32_t>(1);
+        // One extra GDN snapshot slot (index window_cols) is the dedicated turn-boundary slot used
+        // for partial prefix reuse; decode/MTP only cycle slots 0..mtp_draft_tokens.
+        const auto gdn_snapshot_slots = window_cols + static_cast<std::int32_t>(1);
+        const auto draft_cols =
+            std::max<std::int32_t>(1, static_cast<std::int32_t>(options_.mtp_draft_tokens));
+        state_.emplace(*cache_arena_, model::kCfg.n_gdn(), model::kCfg.conv_dim,
+                       model::kCfg.gdn_conv_state_width, model::kCfg.gdn_v_heads,
+                       model::kCfg.gdn_v_dim, model::kCfg.gdn_k_dim, gdn_snapshot_slots);
+        io_ = model::StepState{
+            cache_arena_->alloc(DType::I32, {1}),
+            cache_arena_->alloc(DType::I32, {1}),
+            cache_arena_->alloc(DType::I32, {1}),
+            cache_arena_->alloc(DType::I32, {1}),
+            cache_arena_->alloc(DType::BF16, {model::kCfg.vocab, window_cols}),
+            cache_arena_->alloc(DType::BF16, {model::kCfg.hidden, window_cols}),
+            cache_arena_->alloc(DType::BF16, {model::kCfg.hidden,
+                                              static_cast<std::int32_t>(options_.prefill_chunk)}),
+            cache_arena_->alloc(DType::I32, {window_cols}),
+            cache_arena_->alloc(DType::I32, {draft_cols}),
+            cache_arena_->alloc(DType::I32, {window_cols}),
+            cache_arena_->alloc(DType::I32, {1}),
+            cache_arena_->alloc(DType::I32, {window_cols}),
+            cache_arena_->alloc(DType::I32, {window_cols}),
+            cache_arena_->alloc(DType::I32, {window_cols}),
+            cache_arena_->alloc(DType::I32, {1}),
+            cache_arena_->alloc(DType::I32, {1}),
+            cache_arena_->alloc(DType::I32, {1}),
+            cache_arena_->alloc(DType::I32, {1}),
+            cache_arena_->alloc(DType::BF16, {model::kCfg.hidden, 1}),
+            cache_arena_->alloc(DType::I64, {model::kStepStatsCounters}),
+        };
+        CUDA_CHECK(cudaMemsetAsync(io_.num_sampled.data, 0, io_.num_sampled.bytes(), ctx_->stream));
+        CUDA_CHECK(cudaMemsetAsync(io_.rope_delta.data, 0, io_.rope_delta.bytes(), ctx_->stream));
+        CUDA_CHECK(cudaMemsetAsync(io_.window_base.data, 0, io_.window_base.bytes(), ctx_->stream));
+        CUDA_CHECK(cudaMemsetAsync(io_.accepted.data, 0, io_.accepted.bytes(), ctx_->stream));
+        CUDA_CHECK(cudaMemsetAsync(io_.gdn_initial_slot.data, 0, io_.gdn_initial_slot.bytes(),
+                                   ctx_->stream));
+        CUDA_CHECK(cudaMemsetAsync(io_.ar_pos.data, 0, io_.ar_pos.bytes(), ctx_->stream));
+        CUDA_CHECK(cudaMemsetAsync(io_.stats.data, 0, io_.stats.bytes(), ctx_->stream));
+
+        // Device-resident sampler state. The config buffer defaults to greedy so a
+        // freshly loaded engine (no set_sampling call) reproduces argmax exactly.
+        token_counts_        = cache_arena_->alloc(DType::I32, {model::kCfg.vocab});
+        const auto cfg_words = static_cast<std::int32_t>(
+            (sizeof(kernels::SamplingConfig) + sizeof(std::int32_t) - 1) / sizeof(std::int32_t));
+        sampling_config_dev_ = cache_arena_->alloc(DType::I32, {cfg_words});
+        CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
+        sampling_host_              = kernels::SamplingConfig{}; // temperature 0 => greedy
+        sampling_host_.token_counts = nullptr;
+        CUDA_CHECK(cudaMemcpyAsync(sampling_config_dev_.data, &sampling_host_,
+                                   sizeof(sampling_host_), cudaMemcpyHostToDevice, ctx_->stream));
+
+        card_.emplace(*ctx_, *weights_, *work_, *kv_, *state_, io_, options_.prefill_chunk,
+                      mtp_kv_ ? &*mtp_kv_ : nullptr);
+        vision_card_.emplace(*ctx_, *weights_);
+        card_->set_sampling(static_cast<const kernels::SamplingConfig*>(sampling_config_dev_.data));
+
+        // bind() auto-binds the embedded draft head when present. Enforce the two-mode
+        // toggle here: keep it only when explicitly enabled, and fail loudly if enabled
+        // for a file that has no draft head instead of silently running the full head.
+        if (options_.use_lm_head_draft) {
+            if (card_->lm_head_draft() == nullptr) {
+                throw std::runtime_error(
+                    "engine: use_lm_head_draft is set but the weight file has no draft head");
+            }
+        } else {
+            card_->set_lm_head_draft(nullptr, nullptr, 0);
+        }
+        load_complete_ = true;
+    } catch (...) {
+        unload();
+        throw;
     }
 }
 
 Q5090TokenizerBundle Engine::take_tokenizer_bundle() {
-    if (!weights_) { throw std::runtime_error("Engine tokenizer is not available"); }
+    require_loaded();
     return weights_->take_tokenizer_bundle();
 }
 
@@ -615,17 +639,60 @@ void Engine::require_loaded() const {
     if (!loaded()) { throw std::runtime_error("Engine is not loaded"); }
 }
 
+void Engine::invalidate_sequence_identity() noexcept {
+    pending_sampled_.clear();
+    logical_tokens_.clear();
+    resident_multimodal_    = false;
+    last_prefix_hit_tokens_ = 0;
+    content_boundary_prev_  = kNoBoundary;
+}
+
+void Engine::reset_sequence_state() {
+    invalidate_sequence_identity();
+    kv_->reset();
+    if (mtp_kv_) { mtp_kv_->reset(); }
+    card_->set_prefill_snapshot_boundary(-1);
+    state_->reset(ctx_->stream);
+    kernels::mtp_reset_gdn_initial_slot(io_.gdn_initial_slot, ctx_->stream);
+    CUDA_CHECK(cudaMemsetAsync(io_.pos.data, 0, io_.pos.bytes(), ctx_->stream));
+    CUDA_CHECK(cudaMemsetAsync(io_.rope_pos.data, 0, io_.rope_pos.bytes(), ctx_->stream));
+    CUDA_CHECK(cudaMemsetAsync(io_.rope_delta.data, 0, io_.rope_delta.bytes(), ctx_->stream));
+    CUDA_CHECK(cudaMemsetAsync(io_.ar_pos.data, 0, io_.ar_pos.bytes(), ctx_->stream));
+    CUDA_CHECK(cudaMemsetAsync(io_.num_sampled.data, 0, io_.num_sampled.bytes(), ctx_->stream));
+    CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
+    work_->reset();
+    if (vision_work_) { vision_work_->reset(); }
+}
+
+void Engine::recover_sequence_after_failure() noexcept {
+    invalidate_sequence_identity();
+    try {
+        reset_sequence_state();
+    } catch (...) {
+        // Preserve the original prefill failure. Host identity remains empty, so no partial
+        // device state can be selected by prefix reuse even if CUDA recovery itself failed.
+        invalidate_sequence_identity();
+    }
+}
+
 std::uint32_t Engine::position() const noexcept { return kv_ ? kv_->pos : 0; }
 
 EngineMemoryStats Engine::memory_stats() const noexcept {
     EngineMemoryStats stats;
-    stats.loaded         = loaded();
-    stats.device         = options_.device;
-    stats.max_context    = options_.max_ctx;
-    stats.position       = position();
-    stats.weights        = weight_arena_stats(weights_);
-    stats.cache          = arena_stats(cache_arena_);
-    stats.workspace      = arena_stats(work_);
+    stats.loaded      = loaded();
+    stats.device      = options_.device;
+    stats.max_context = options_.max_ctx;
+    stats.position    = position();
+    stats.weights     = weight_arena_stats(weights_);
+    stats.cache       = arena_stats(cache_arena_);
+    stats.workspace   = arena_stats(work_);
+    if (vision_work_) {
+        const ArenaMemoryStats vision = arena_stats(vision_work_);
+        stats.workspace.present       = true;
+        stats.workspace.capacity_bytes += vision.capacity_bytes;
+        stats.workspace.used_bytes += vision.used_bytes;
+        stats.workspace.peak_used_bytes += vision.peak_used_bytes;
+    }
     stats.kv_dtype       = options_.kv_dtype;
     stats.kv_quant_group = options_.kv_dtype == DType::I8 ? options_.kv_quant_group : 0;
     if (kv_) {
@@ -670,6 +737,7 @@ void Engine::reset_memory_peaks() noexcept {
     if (weights_) { weights_->reset_arena_peaks(); }
     if (cache_arena_) { cache_arena_->reset_peak(); }
     if (work_) { work_->reset_peak(); }
+    if (vision_work_) { vision_work_->reset_peak(); }
 }
 
 void Engine::reset_mtp_stats() {
@@ -740,22 +808,65 @@ int Engine::prefill(std::span<const int> ids) {
     if (ids.size() > options_.max_ctx) {
         throw std::invalid_argument("Engine::prefill exceeds max_ctx");
     }
-    kv_->reset();
-    if (mtp_kv_) { mtp_kv_->reset(); }
-    pending_sampled_.clear();
-    last_prefix_hit_tokens_ = 0;
-    // A full reset invalidates any resident turn-boundary GDN snapshot (slot data is about to be
-    // overwritten). prefill_cached re-establishes it after this call if a snapshot is taken.
-    content_boundary_prev_ = kNoBoundary;
-    state_->reset(ctx_->stream);
-    kernels::mtp_reset_gdn_initial_slot(io_.gdn_initial_slot, ctx_->stream);
-    // Penalty counts are per-request: clear them before this prompt's first pick.
-    CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
-    card_->prefill(ids);
-    logical_tokens_.assign(ids.begin(), ids.end());
-    const int tok = read_token();
-    logical_tokens_.push_back(tok);
-    return tok;
+    reset_sequence_state();
+    try {
+        card_->prefill(ids);
+        const int tok = read_token();
+        logical_tokens_.assign(ids.begin(), ids.end());
+        logical_tokens_.push_back(tok);
+        return tok;
+    } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        recover_sequence_after_failure();
+        std::rethrow_exception(failure);
+    }
+}
+
+int Engine::prefill(const model::ProcessedInput& input) {
+    require_loaded();
+    if (!vision_card_) { throw std::runtime_error("Engine Vision card is not loaded"); }
+    if (input.input_ids.empty()) {
+        throw std::invalid_argument("Engine::prefill multimodal input requires tokens");
+    }
+    validate_token_ids(input.input_ids, "Engine::prefill multimodal");
+    if (input.input_ids.size() > options_.max_ctx) {
+        throw std::invalid_argument("Engine::prefill multimodal input exceeds max_ctx");
+    }
+    if (input.vision_items.empty()) {
+        throw std::invalid_argument("Engine::prefill multimodal input requires media");
+    }
+    const std::int64_t next_rope_position =
+        static_cast<std::int64_t>(input.input_ids.size()) + input.rope_delta;
+    if (next_rope_position < 0 || next_rope_position > std::numeric_limits<std::int32_t>::max()) {
+        throw std::invalid_argument("Engine::prefill multimodal rope_delta is out of range");
+    }
+
+    reset_sequence_state();
+    try {
+        const std::size_t required = model::Qwen3_6_Vision::workspace_bytes(input);
+        if (!vision_work_ || vision_work_->capacity() < required) {
+            std::size_t free_bytes  = 0;
+            std::size_t total_bytes = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+            const std::size_t reclaimable = vision_work_ ? vision_work_->capacity() : 0;
+            if (required > checked_add(free_bytes, reclaimable, "Vision available memory")) {
+                throw std::runtime_error("Engine Vision workspace exceeds available GPU memory");
+            }
+            vision_work_.emplace(required);
+        }
+        Tensor visual_embeddings = vision_card_->encode(input, *vision_work_);
+        card_->prefill(input, visual_embeddings);
+        vision_work_->reset();
+        const int tok = read_token();
+        logical_tokens_.assign(input.input_ids.begin(), input.input_ids.end());
+        logical_tokens_.push_back(tok);
+        resident_multimodal_ = true;
+        return tok;
+    } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        recover_sequence_after_failure();
+        std::rethrow_exception(failure);
+    }
 }
 
 int Engine::prefill_append(std::span<const int> ids) {
@@ -768,19 +879,30 @@ int Engine::prefill_append(std::span<const int> ids) {
     if (static_cast<std::uint64_t>(kv_->pos) + ids.size() > options_.max_ctx) {
         throw std::invalid_argument("Engine::prefill_append exceeds max_ctx");
     }
+    if (logical_tokens_.size() < kv_->pos) {
+        recover_sequence_after_failure();
+        throw std::runtime_error("Engine::prefill_append resident token mirror is inconsistent");
+    }
     // Append path: do NOT reset kv_/mtp_kv_/state_/gdn_initial_slot. The model card continues from
     // the current kv_->pos (absolute positions) and reads the committed GDN state from the slot in
     // gdn_initial_slot for the first chunk, writing the running state back to slot 0.
-    pending_sampled_.clear();
-    // Penalty counts are per-turn: clear them before this turn's first pick.
-    CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
-    // Drop any emitted-but-uncommitted tail; keep only the reusable resident prefix.
-    logical_tokens_.resize(kv_->pos);
-    card_->prefill(ids);
-    logical_tokens_.insert(logical_tokens_.end(), ids.begin(), ids.end());
-    const int tok = read_token();
-    logical_tokens_.push_back(tok);
-    return tok;
+    std::vector<int> next_logical(logical_tokens_.begin(),
+                                  logical_tokens_.begin() + static_cast<std::ptrdiff_t>(kv_->pos));
+    next_logical.insert(next_logical.end(), ids.begin(), ids.end());
+    try {
+        pending_sampled_.clear();
+        // Penalty counts are per-turn: clear them before this turn's first pick.
+        CUDA_CHECK(cudaMemsetAsync(token_counts_.data, 0, token_counts_.bytes(), ctx_->stream));
+        card_->prefill(ids);
+        const int tok = read_token();
+        next_logical.push_back(tok);
+        logical_tokens_ = std::move(next_logical);
+        return tok;
+    } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        recover_sequence_after_failure();
+        std::rethrow_exception(failure);
+    }
 }
 
 int Engine::prefill_cached(std::span<const int> ids, std::uint32_t content_boundary) {
@@ -790,6 +912,7 @@ int Engine::prefill_cached(std::span<const int> ids, std::uint32_t content_bound
     if (ids.size() > options_.max_ctx) {
         throw std::invalid_argument("Engine::prefill_cached exceeds max_ctx");
     }
+    if (resident_multimodal_) { return prefill(ids); }
 
     // Snapshot the GDN recurrent state at THIS turn's assistant-content boundary regardless of
     // which reuse branch runs, so the next turn can continue from it. The card no-ops the snapshot
@@ -830,15 +953,23 @@ int Engine::prefill_cached(std::span<const int> ids, std::uint32_t content_bound
     if (B != kNoBoundary && B > 0 && static_cast<std::size_t>(B) <= E &&
         static_cast<std::size_t>(B) <= mirror && lcp >= static_cast<std::size_t>(B) &&
         ids.size() > static_cast<std::size_t>(B)) {
-        kv_->rewind(B);
-        // Restore the turn-boundary GDN state into the running slot so the continuation prefill's
-        // first chunk reads it (non-MTP forces slot 0; MTP reads gdn_initial_slot, set to 0 here).
-        state_->copy_slot(static_cast<std::int32_t>(state_->snapshot_slots - 1), 0, ctx_->stream);
-        set_gdn_initial_slot(0);
-        const int tok           = prefill_append(ids.subspan(B));
-        last_prefix_hit_tokens_ = B;
-        commit_boundary(static_cast<std::size_t>(B));
-        return tok;
+        try {
+            kv_->rewind(B);
+            // Restore the turn-boundary GDN state into the running slot so the continuation
+            // prefill's first chunk reads it (non-MTP forces slot 0; MTP reads
+            // gdn_initial_slot, set to 0 here).
+            state_->copy_slot(static_cast<std::int32_t>(state_->snapshot_slots - 1), 0,
+                              ctx_->stream);
+            set_gdn_initial_slot(0);
+            const int tok           = prefill_append(ids.subspan(B));
+            last_prefix_hit_tokens_ = B;
+            commit_boundary(static_cast<std::size_t>(B));
+            return tok;
+        } catch (...) {
+            const std::exception_ptr failure = std::current_exception();
+            recover_sequence_after_failure();
+            std::rethrow_exception(failure);
+        }
     }
 
     // Branch 3: nothing reusable -> full reset prefill.
@@ -937,6 +1068,9 @@ std::vector<int> Engine::decode_round() {
 
 int Engine::decode_step() {
     require_loaded();
+    if (kv_->pos == 0 || logical_tokens_.empty()) {
+        throw std::runtime_error("Engine::decode_step requires a successful prefill");
+    }
     if (!pending_sampled_.empty()) {
         const int token = pending_sampled_.front();
         pending_sampled_.erase(pending_sampled_.begin());

@@ -9,6 +9,7 @@
 #include "qus/core/weight_store.h"
 #include "qus/kernels/sampling.h"
 #include "qus/model/config.h"
+#include "qus/model/processor.h"
 
 #include <array>
 #include <cstddef>
@@ -82,6 +83,9 @@ struct MtpW {
 struct StepState {
     Tensor token;
     Tensor pos;
+    Tensor rope_pos;
+    // Stable device address read by MTP position kernels captured in CUDA graphs.
+    Tensor rope_delta;
     Tensor logits;
     Tensor verify_hidden;
     Tensor prefill_hidden;
@@ -210,6 +214,7 @@ public:
     void target_verify(const Tensor& ids, const Tensor& positions);
 
     void prefill(std::span<const int> ids);
+    void prefill(const ProcessedInput& input, const Tensor& visual_embeddings);
 
     template <class Tap>
     void prefill(std::span<const int> ids, Tap& tap) {
@@ -274,12 +279,13 @@ private:
     void gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph);
     void mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph);
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, Tensor& x, Tensor& ah);
-    void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions, Tensor& mtp_hidden);
+    void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
+                          const Tensor& rope_positions, Tensor& mtp_hidden);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                          Tensor& mtp_hidden);
+                          const Tensor& rope_positions, Tensor& mtp_hidden);
     void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                           bool final_chunk, Tensor* final_hidden, Tensor* logits,
-                           Tensor* draft_token);
+                           const Tensor& rope_positions, bool final_chunk, Tensor* final_hidden,
+                           Tensor* logits, Tensor* draft_token);
     // Draft-proposal argmax at an MTP draft site. Uses the full `lm_head_` (writing
     // into `logits`) unless a draft head is set, in which case it projects with the
     // smaller `lm_head_draft_` into a work-scoped [n,1] buffer, argmaxes to a
@@ -288,8 +294,16 @@ private:
     void mtp_draft_argmax(const Tensor& hidden_col, Tensor& logits, Tensor& draft_token);
     void prefill_erased(std::span<const int> ids, void* tap, TapCallback callback);
     void decode_step_erased(void* tap, TapCallback callback);
+
+    struct MultimodalPrefill {
+        std::span<const std::int32_t> positions;
+        std::span<const std::int32_t> scatter_indices;
+        const Tensor* embeddings = nullptr;
+        std::int32_t rope_delta  = 0;
+    };
+
     template <class Tap>
-    void prefill_impl(std::span<const int> ids, Tap& tap);
+    void prefill_impl(std::span<const int> ids, const MultimodalPrefill* multimodal, Tap& tap);
     template <class Tap>
     void decode_step_impl(Tap& tap);
     template <class Tap>
@@ -303,8 +317,10 @@ private:
     KVCache* mtp_kv_ = nullptr;
     GdnState& state_;
     StepState& io_;
-    std::uint32_t prefill_chunk_    = kDefaultPrefillChunk;
-    const Tensor* active_positions_ = nullptr;
+    std::uint32_t prefill_chunk_          = kDefaultPrefillChunk;
+    const Tensor* active_cache_positions_ = nullptr;
+    const Tensor* active_rope_positions_  = nullptr;
+    std::int32_t rope_delta_              = 0;
     // GDN snapshot slot the current prefill chunk reads its initial recurrent/conv state from.
     // Slot 0 for the reset path and for every chunk after the first; the committed snapshot slot
     // for chunk 0 of a prefix-append prefill (MTP). The running state is always written to slot 0.

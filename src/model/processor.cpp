@@ -380,19 +380,24 @@ void add_budget(PreprocessStats& stats, const VisionItem& item) {
 
 void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& options) {
     if (stats.media_items > options.max_media_items) {
-        throw std::invalid_argument("media item count exceeds processor budget");
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "media item count exceeds processor budget");
     }
     if (stats.raw_patches > options.max_raw_patches) {
-        throw std::invalid_argument("vision raw patches exceed processor budget");
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "vision raw patches exceed processor budget");
     }
     if (stats.vision_tokens > options.max_vision_tokens) {
-        throw std::invalid_argument("vision tokens exceed processor budget");
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "vision tokens exceed processor budget");
     }
     if (stats.attention_pairs > options.max_attention_pairs) {
-        throw std::invalid_argument("vision attention pairs exceed processor budget");
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "vision attention pairs exceed processor budget");
     }
     if (stats.prompt_tokens > options.max_prompt_tokens) {
-        throw std::invalid_argument("prompt tokens exceed processor budget");
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "prompt tokens exceed processor budget");
     }
 }
 
@@ -525,7 +530,8 @@ ProcessedInput Processor::process(const std::vector<text::ChatMessage>& messages
                                   text::ChatRenderOptions render_options) const {
     const std::vector<const text::ChatPart*> parts = media_parts(messages);
     if (parts.size() > options_.max_media_items) {
-        throw std::invalid_argument("media item count exceeds processor budget");
+        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
+                             "media item count exceeds processor budget");
     }
     std::string rendered = text::render_qwen_chat(messages, std::move(render_options));
     const media::internal::Policy policy{
@@ -547,9 +553,20 @@ ProcessedInput Processor::process(const std::vector<text::ChatMessage>& messages
     PreprocessStats stats;
     stats.media_items = parts.size();
     for (const text::ChatPart* part : parts) {
-        Prepared media = part->kind == text::ChatPartKind::Image
-                             ? prepare_image(*part, options_, policy, stats)
-                             : prepare_video(*part, options_, policy, stats);
+        Prepared media;
+        try {
+            media = part->kind == text::ChatPartKind::Image
+                        ? prepare_image(*part, options_, policy, stats)
+                        : prepare_video(*part, options_, policy, stats);
+        } catch (const media::internal::Error& error) {
+            ProcessorErrorKind kind = ProcessorErrorKind::RemoteUnavailable;
+            if (error.kind() == media::internal::ErrorKind::BudgetExceeded) {
+                kind = ProcessorErrorKind::BudgetExceeded;
+            } else if (error.kind() == media::internal::ErrorKind::RemoteTimeout) {
+                kind = ProcessorErrorKind::RemoteTimeout;
+            }
+            throw ProcessorError(kind, error.what());
+        }
         if (media.patches.size() % kPatchFeatures != 0) {
             throw std::logic_error("preprocessed patch buffer is not row aligned");
         }

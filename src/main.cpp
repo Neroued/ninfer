@@ -217,14 +217,6 @@ int main(int argc, char** argv) {
         const std::vector<qus::text::ChatMessage> messages =
             cli.messages_path.empty() ? qus::text::messages_from_prompt(cli.prompt)
                                       : qus::text::read_messages_json(cli.messages_path);
-        if (std::any_of(
-                messages.begin(), messages.end(),
-                [](const qus::text::ChatMessage& message) { return message.has_media(); })) {
-            throw std::invalid_argument(
-                "multimodal preprocessing is available through qus-preprocess, but Vision "
-                "forward is not connected to the inference engine yet");
-        }
-
         qus::text::TextGenerationOptions generation_options;
         generation_options.max_new_tokens  = cli.max_new;
         generation_options.raw_output      = cli.output_mode == qus::text::OutputMode::Raw;

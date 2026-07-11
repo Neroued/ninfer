@@ -24,13 +24,17 @@ target_link_libraries(qus_core PUBLIC CUDA::cudart)
 target_link_libraries(qus_core PRIVATE PkgConfig::FFMPEG PkgConfig::LIBCURL)
 target_compile_options(qus_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
-# --- Driver executable (text in -> text out) ---------------------------------
+# --- Driver executable (text/image/video in -> text out) ---------------------
 add_executable(qus ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 target_link_libraries(qus PRIVATE qus_core)
 
 add_executable(qus-preprocess ${PROJECT_SOURCE_DIR}/tools/q5090/preprocess.cpp)
 target_include_directories(qus-preprocess PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 target_link_libraries(qus-preprocess PRIVATE qus_core)
+
+add_executable(qus-vision-dump ${PROJECT_SOURCE_DIR}/tools/q5090/vision_dump.cpp)
+target_include_directories(qus-vision-dump PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(qus-vision-dump PRIVATE qus_core)
 
 # --- Serving layer: OpenAI-compatible HTTP server ----------------------------
 # qus_serve holds the protocol/translation/service/transport code (no main), so

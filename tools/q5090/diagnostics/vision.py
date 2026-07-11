@@ -60,6 +60,7 @@ def main() -> None:
     parser.add_argument("--messages", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output")
+    parser.add_argument("--q5090-dump")
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -131,6 +132,39 @@ def main() -> None:
         },
         "comparisons": comparisons,
     }
+    if args.q5090_dump:
+        root = Path(args.q5090_dump)
+        root.mkdir(parents=True, exist_ok=True)
+        records = []
+        for short_name in ("patch_embed", "block_00", "block_13", "block_26", "merger"):
+            value = q5090_captures[short_name].float().contiguous()
+            file_name = f"{short_name}.f32"
+            value.numpy().tofile(root / file_name)
+            records.append(
+                {
+                    "name": f"vision/{short_name}",
+                    "file": file_name,
+                    "shape": list(value.shape),
+                    "source_dtype": "bf16",
+                    "phase": "prefill",
+                    "step": 0,
+                    "chunk": 0,
+                    "position_begin": 0,
+                    "position_end": int(value.shape[0]),
+                }
+            )
+        (root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "format": "qus_activation_dump_v1",
+                    "runtime": "python-q5090",
+                    "tensors": records,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
     rendered = json.dumps(report, ensure_ascii=False, indent=2)
     if args.output:
         Path(args.output).write_text(rendered + "\n", encoding="utf-8")

@@ -46,8 +46,17 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
         cu_seqlens.data == nullptr) {
         throw std::invalid_argument("vision_attention: cu_seqlens must be contiguous I32 [S+1]");
     }
-    (void)workspace;
-    detail::vision_attention_launch(q, k, v, cu_seqlens, out, stream);
+    constexpr std::int32_t tile_rows = 64;
+    const std::int32_t segments      = cu_seqlens.ne[0] - 1;
+    auto scratch_scope               = workspace.scope();
+    Tensor tiles;
+    Tensor* tiles_ptr = nullptr;
+    if (segments > 1) {
+        const std::int32_t max_tiles = (patches + tile_rows - 1) / tile_rows + segments - 1;
+        tiles                        = workspace.alloc(DType::I32, {4, max_tiles});
+        tiles_ptr                    = &tiles;
+    }
+    detail::vision_attention_launch(q, k, v, cu_seqlens, tiles_ptr, out, stream);
 }
 
 } // namespace qus::kernels

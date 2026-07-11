@@ -132,6 +132,7 @@ int main() {
     int failures = 0;
     failures += one_case({0, 4, 11}, 1u, false);
     failures += one_case({0, 4, 11}, 7u, true);
+    failures += one_case({0, 65, 194}, 31u, true);
     failures += one_case({0, 16}, 99u, true);
     failures += one_case({0, 256}, 2026u, true);
     std::cout << (failures ? "FAIL" : "OK") << " vision_attention correctness\n";

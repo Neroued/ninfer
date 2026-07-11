@@ -76,7 +76,8 @@ internal. Prompt-only cache append and cached-attention decomposition are not pu
 
 `vision_attention` is separate because it is packed non-causal MHA with 16 equal Q/K/V heads,
 head dimension 72, independent `cu_seqlens` segments, and no KV cache. Its workspace does not grow
-with the square of segment length.
+with the square of segment length. Single-segment calls require no workspace; packed multi-segment
+calls use compact `O(ceil(P/64)+S)` tile descriptors.
 
 ### GDN recurrence
 

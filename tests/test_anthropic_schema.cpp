@@ -30,9 +30,7 @@ int check(bool condition, const std::string& message) { return condition ? 0 : f
 bool throws_api(const std::function<void()>& f) {
     try {
         f();
-    } catch (const ApiException&) {
-        return true;
-    } catch (...) {
+    } catch (const ApiException&) { return true; } catch (...) {
         return false;
     }
     return false;
@@ -58,17 +56,18 @@ Json parse_sse(const std::string& event, std::string* out_type = nullptr) {
         *out_type = event.substr(ev_prefix.size(), data_pos - ev_prefix.size());
     }
     const std::size_t json_begin = data_pos + data_marker.size();
-    if (event.size() < json_begin + suffix.size()) { throw std::runtime_error("short SSE: " + event); }
+    if (event.size() < json_begin + suffix.size()) {
+        throw std::runtime_error("short SSE: " + event);
+    }
     return Json::parse(event.substr(json_begin, event.size() - json_begin - suffix.size()));
 }
 
 int test_parse_basic_and_system() {
-    int failures = 0;
-    const Json body = {
-        {"model", "claude-sonnet-4-5"},
-        {"max_tokens", 256},
-        {"system", "be terse"},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
+    int failures                = 0;
+    const Json body             = {{"model", "claude-sonnet-4-5"},
+                                   {"max_tokens", 256},
+                                   {"system", "be terse"},
+                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
     const GenerationRequest req = parse_messages_request(body, default_limits());
     failures += check(req.model == "claude-sonnet-4-5", "model echoed verbatim");
     failures += check(req.max_tokens == 256 && req.max_tokens_set, "max_tokens parsed");
@@ -82,21 +81,22 @@ int test_parse_basic_and_system() {
 }
 
 int test_parse_system_array_and_blocks() {
-    int failures = 0;
+    int failures    = 0;
     const Json body = {
         {"model", "m"},
         {"max_tokens", 16},
         {"system", Json::array({Json{{"type", "text"}, {"text", "a"}},
                                 Json{{"type", "text"}, {"text", "b"}}})},
-        {"messages", Json::array({Json{{"role", "user"},
-                                       {"content", Json::array({Json{{"type", "text"}, {"text", "x"}},
-                                                                Json{{"type", "text"}, {"text", "y"}}})}}})}};
+        {"messages",
+         Json::array({Json{{"role", "user"},
+                           {"content", Json::array({Json{{"type", "text"}, {"text", "x"}},
+                                                    Json{{"type", "text"}, {"text", "y"}}})}}})}};
     const GenerationRequest req = parse_messages_request(body, default_limits());
     failures += check(req.messages[0].role == "system", "system first");
     failures += check(req.messages[0].content[0].text == "a\nb", "system blocks joined");
     const auto messages = to_chat_messages(req);
     failures += check(messages.size() == 2, "flattened system + user");
-    failures += check(messages[1].content == "x\ny", "user blocks joined");
+    failures += check(messages[1].rendered_content() == "x\ny", "user blocks joined");
     return failures;
 }
 
@@ -106,7 +106,7 @@ int test_parse_system_array_and_blocks() {
 // 'assistant'". They must instead fold into the single leading system turn so the
 // Qwen template (which drops non-leading system turns) keeps the content.
 int test_system_role_in_messages_folds() {
-    int failures = 0;
+    int failures    = 0;
     const Json body = {
         {"model", "m"},
         {"max_tokens", 16},
@@ -141,21 +141,23 @@ int test_system_role_in_messages_folds() {
 }
 
 int test_missing_and_bad_fields() {
-    int failures = 0;
+    int failures        = 0;
     const Json no_model = {{"max_tokens", 8},
                            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
     failures += check(throws_api([&] { (void)parse_messages_request(no_model, default_limits()); }),
                       "missing model rejected");
 
-    const Json bad_role = {{"model", "m"},
-                           {"max_tokens", 8},
-                           {"messages", Json::array({Json{{"role", "developer"}, {"content", "hi"}}})}};
+    const Json bad_role = {
+        {"model", "m"},
+        {"max_tokens", 8},
+        {"messages", Json::array({Json{{"role", "developer"}, {"content", "hi"}}})}};
     failures += check(throws_api([&] { (void)parse_messages_request(bad_role, default_limits()); }),
                       "unknown message role rejected");
 
     const Json empty_msgs = {{"model", "m"}, {"max_tokens", 8}, {"messages", Json::array()}};
-    failures += check(throws_api([&] { (void)parse_messages_request(empty_msgs, default_limits()); }),
-                      "empty messages rejected");
+    failures +=
+        check(throws_api([&] { (void)parse_messages_request(empty_msgs, default_limits()); }),
+              "empty messages rejected");
 
     const Json bad_max = {{"model", "m"},
                           {"max_tokens", 0},
@@ -164,36 +166,49 @@ int test_missing_and_bad_fields() {
                       "non-positive max_tokens rejected");
 
     // Omitting max_tokens falls back to the server default (lenient vs the API).
-    const Json no_max = {{"model", "m"},
-                         {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    const Json no_max           = {{"model", "m"},
+                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
     const GenerationRequest req = parse_messages_request(no_max, default_limits());
     failures += check(req.max_tokens == 512 && !req.max_tokens_set, "max_tokens default applied");
     return failures;
 }
 
-int test_reject_image() {
+int test_parse_image() {
     const Json body = {
         {"model", "m"},
         {"max_tokens", 8},
-        {"messages", Json::array({Json{{"role", "user"},
-                                       {"content", Json::array({Json{{"type", "image"},
-                                                                     {"source", Json::object()}}})}}})}};
-    return check(throws_api([&] { (void)parse_messages_request(body, default_limits()); }),
-                 "image content rejected");
+        {"messages", Json::array({Json{
+                         {"role", "user"},
+                         {"content", Json::array({Json{{"type", "image"},
+                                                       {"source", Json{{"type", "base64"},
+                                                                       {"media_type", "image/png"},
+                                                                       {"data", "AA=="}}}}})}}})}};
+    const GenerationRequest req = parse_messages_request(body, default_limits());
+    const auto messages         = to_chat_messages(req);
+    int failures                = 0;
+    failures += check(req.messages[0].content[0].kind == ContentKind::Image,
+                      "Anthropic image kind preserved");
+    failures += check(req.messages[0].content[0].source.value == "data:image/png;base64,AA==",
+                      "Anthropic base64 converted to data URI");
+    failures += check(messages[0].parts[0].kind == qus::text::ChatPartKind::Image,
+                      "Anthropic image translated to structured chat part");
+    return failures;
 }
 
 int test_tools_and_choice() {
     int failures = 0;
-    const Json tool = Json{{"name", "get_weather"},
-                           {"description", "Look up weather"},
-                           {"input_schema", Json{{"type", "object"},
-                                                 {"properties", Json{{"city", Json{{"type", "string"}}}}},
-                                                 {"required", Json::array({"city"})}}}};
-    Json body = {{"model", "m"},
-                 {"max_tokens", 8},
-                 {"tools", Json::array({tool})},
-                 {"tool_choice", Json{{"type", "auto"}}},
-                 {"messages", Json::array({Json{{"role", "user"}, {"content", "weather in Paris?"}}})}};
+    const Json tool =
+        Json{{"name", "get_weather"},
+             {"description", "Look up weather"},
+             {"input_schema", Json{{"type", "object"},
+                                   {"properties", Json{{"city", Json{{"type", "string"}}}}},
+                                   {"required", Json::array({"city"})}}}};
+    Json body = {
+        {"model", "m"},
+        {"max_tokens", 8},
+        {"tools", Json::array({tool})},
+        {"tool_choice", Json{{"type", "auto"}}},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "weather in Paris?"}}})}};
 
     const GenerationRequest req = parse_messages_request(body, default_limits());
     failures += check(req.tools.size() == 1, "one tool parsed");
@@ -209,57 +224,64 @@ int test_tools_and_choice() {
                       "input_schema mapped to parameters");
     failures += check(def.at("function").at("strict") == false, "strict defaulted false");
 
-    Json any = body;
+    Json any           = body;
     any["tool_choice"] = Json{{"type", "any"}};
     failures += check(parse_messages_request(any, default_limits()).tool_choice.mode ==
                           ToolChoiceMode::Required,
                       "any -> Required");
 
-    Json none = body;
+    Json none           = body;
     none["tool_choice"] = Json{{"type", "none"}};
     failures += check(parse_messages_request(none, default_limits()).tool_choice.mode ==
                           ToolChoiceMode::None,
                       "none -> None");
 
-    Json named = body;
-    named["tool_choice"] = Json{{"type", "tool"}, {"name", "get_weather"}};
+    Json named                        = body;
+    named["tool_choice"]              = Json{{"type", "tool"}, {"name", "get_weather"}};
     const GenerationRequest named_req = parse_messages_request(named, default_limits());
-    failures += check(named_req.tool_choice.mode == ToolChoiceMode::Named && named_req.tool_choice.name == "get_weather",
+    failures += check(named_req.tool_choice.mode == ToolChoiceMode::Named &&
+                          named_req.tool_choice.name == "get_weather",
                       "tool+name -> Named");
 
-    Json unknown = body;
+    Json unknown           = body;
     unknown["tool_choice"] = Json{{"type", "tool"}, {"name", "nope"}};
     failures += check(throws_api([&] { (void)parse_messages_request(unknown, default_limits()); }),
                       "unknown named tool rejected");
 
-    Json server_tool = body;
+    Json server_tool     = body;
     server_tool["tools"] = Json::array({Json{{"type", "bash_20250124"}, {"name", "bash"}}});
-    failures += check(throws_api([&] { (void)parse_messages_request(server_tool, default_limits()); }),
-                      "server tool without input_schema rejected");
+    failures +=
+        check(throws_api([&] { (void)parse_messages_request(server_tool, default_limits()); }),
+              "server tool without input_schema rejected");
     return failures;
 }
 
 int test_tool_use_result_roundtrip() {
-    int failures = 0;
-    const Json tool = Json{{"name", "get_weather"},
-                           {"input_schema", Json{{"type", "object"}}}};
-    const Json assistant = Json{
-        {"role", "assistant"},
-        {"content", Json::array({Json{{"type", "text"}, {"text", "let me check"}},
-                                 Json{{"type", "tool_use"},
-                                      {"id", "toolu_1"},
-                                      {"name", "get_weather"},
-                                      {"input", Json{{"city", "Paris"}}}}})}};
-    const Json user_result = Json{
-        {"role", "user"},
-        {"content", Json::array({Json{{"type", "tool_result"},
-                                      {"tool_use_id", "toolu_1"},
-                                      {"content", "sunny"}}})}};
-    const Json body = {
-        {"model", "m"},
-        {"max_tokens", 8},
-        {"tools", Json::array({tool})},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "weather?"}}, assistant, user_result})}};
+    int failures    = 0;
+    const Json tool = Json{{"name", "get_weather"}, {"input_schema", Json{{"type", "object"}}}};
+    const Json assistant =
+        Json{{"role", "assistant"},
+             {"content", Json::array({Json{{"type", "text"}, {"text", "let me check"}},
+                                      Json{{"type", "tool_use"},
+                                           {"id", "toolu_1"},
+                                           {"name", "get_weather"},
+                                           {"input", Json{{"city", "Paris"}}}}})}};
+    const Json user_result =
+        Json{{"role", "user"},
+             {"content",
+              Json::array(
+                  {Json{{"type", "tool_result"},
+                        {"tool_use_id", "toolu_1"},
+                        {"content", Json::array({Json{{"type", "text"}, {"text", "sunny"}},
+                                                 Json{{"type", "image"},
+                                                      {"source", Json{{"type", "base64"},
+                                                                      {"media_type", "image/png"},
+                                                                      {"data", "AA=="}}}}})}}})}};
+    const Json body = {{"model", "m"},
+                       {"max_tokens", 8},
+                       {"tools", Json::array({tool})},
+                       {"messages", Json::array({Json{{"role", "user"}, {"content", "weather?"}},
+                                                 assistant, user_result})}};
 
     const GenerationRequest req = parse_messages_request(body, default_limits());
     // user, assistant, tool
@@ -273,21 +295,28 @@ int test_tool_use_result_roundtrip() {
     failures += check(req.messages[1].content[0].text == "let me check", "assistant text carried");
     failures += check(req.messages[2].role == "tool", "tool_result -> tool turn");
     failures += check(req.messages[2].tool_call_id == "toolu_1", "tool_result tool_use_id carried");
-    failures += check(req.messages[2].content[0].text == "sunny", "tool_result content flattened");
+    failures += check(req.messages[2].content[0].text == "sunny", "tool_result text carried");
+    failures += check(req.messages[2].content.size() == 2 &&
+                          req.messages[2].content[1].kind == ContentKind::Image,
+                      "tool_result image carried");
+    const auto messages = to_chat_messages(req);
+    failures += check(messages[2].parts.size() == 2 &&
+                          messages[2].parts[1].kind == qus::text::ChatPartKind::Image,
+                      "tool_result image translated to structured chat");
     failures += check(req.has_tool_history(), "tool history detected");
     return failures;
 }
 
 int test_thinking_and_sampling() {
-    int failures = 0;
-    Json body = {{"model", "m"},
-                 {"max_tokens", 8},
-                 {"temperature", 0.3},
-                 {"top_p", 0.8},
-                 {"top_k", 40},
-                 {"stop_sequences", Json::array({"STOP", "END"})},
-                 {"thinking", Json{{"type", "enabled"}, {"budget_tokens", 1024}}},
-                 {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    int failures                = 0;
+    Json body                   = {{"model", "m"},
+                                   {"max_tokens", 8},
+                                   {"temperature", 0.3},
+                                   {"top_p", 0.8},
+                                   {"top_k", 40},
+                                   {"stop_sequences", Json::array({"STOP", "END"})},
+                                   {"thinking", Json{{"type", "enabled"}, {"budget_tokens", 1024}}},
+                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
     const GenerationRequest req = parse_messages_request(body, default_limits());
     failures += check(req.sampling.temperature.has_value() && *req.sampling.temperature == 0.3,
                       "temperature parsed");
@@ -297,30 +326,36 @@ int test_thinking_and_sampling() {
                       "stop_sequences parsed");
     failures += check(req.enable_thinking.has_value() && *req.enable_thinking, "thinking enabled");
 
-    Json disabled = body;
-    disabled["thinking"] = Json{{"type", "disabled"}};
+    Json disabled                = body;
+    disabled["thinking"]         = Json{{"type", "disabled"}};
     const GenerationRequest dreq = parse_messages_request(disabled, default_limits());
-    failures += check(dreq.enable_thinking.has_value() && !*dreq.enable_thinking, "thinking disabled");
+    failures +=
+        check(dreq.enable_thinking.has_value() && !*dreq.enable_thinking, "thinking disabled");
 
     // Claude Code sends thinking.type == "adaptive" (extended thinking); any
     // non-"disabled" mode must map to thinking-on, not a 400.
-    Json adaptive = body;
-    adaptive["thinking"] = Json{{"type", "adaptive"}};
+    Json adaptive                = body;
+    adaptive["thinking"]         = Json{{"type", "adaptive"}};
     const GenerationRequest areq = parse_messages_request(adaptive, default_limits());
-    failures += check(areq.enable_thinking.has_value() && *areq.enable_thinking, "adaptive -> thinking on");
+    failures +=
+        check(areq.enable_thinking.has_value() && *areq.enable_thinking, "adaptive -> thinking on");
     return failures;
 }
 
 int test_stop_reason_mapping() {
     int failures = 0;
-    failures += check(std::string(messages_stop_reason(qus::text::FinishReason::Length, false)) == "max_tokens",
+    failures += check(std::string(messages_stop_reason(qus::text::FinishReason::Length, false)) ==
+                          "max_tokens",
                       "length -> max_tokens");
-    failures += check(std::string(messages_stop_reason(qus::text::FinishReason::Stop, false)) == "end_turn",
-                      "stop -> end_turn");
-    failures += check(std::string(messages_stop_reason(qus::text::FinishReason::Cancelled, false)) == "end_turn",
-                      "cancelled -> end_turn");
-    failures += check(std::string(messages_stop_reason(qus::text::FinishReason::Stop, true)) == "tool_use",
-                      "tool calls -> tool_use");
+    failures +=
+        check(std::string(messages_stop_reason(qus::text::FinishReason::Stop, false)) == "end_turn",
+              "stop -> end_turn");
+    failures += check(
+        std::string(messages_stop_reason(qus::text::FinishReason::Cancelled, false)) == "end_turn",
+        "cancelled -> end_turn");
+    failures +=
+        check(std::string(messages_stop_reason(qus::text::FinishReason::Stop, true)) == "tool_use",
+              "tool calls -> tool_use");
     return failures;
 }
 
@@ -329,8 +364,8 @@ int test_response_serialization() {
     const CompletionUsage usage{7, 3};
     const std::vector<ToolCall> tools = {ToolCall{"toolu_9", "get_weather", R"({"city":"Paris"})"}};
 
-    const Json resp = Json::parse(make_messages_response("msg_1", "claude-x", "the answer",
-                                                         "the reasoning", tools, "tool_use", usage));
+    const Json resp = Json::parse(make_messages_response(
+        "msg_1", "claude-x", "the answer", "the reasoning", tools, "tool_use", usage));
     failures += check(resp.at("id") == "msg_1", "id echoed");
     failures += check(resp.at("type") == "message", "type message");
     failures += check(resp.at("role") == "assistant", "role assistant");
@@ -341,19 +376,23 @@ int test_response_serialization() {
     failures += check(resp.at("usage").at("output_tokens") == 3, "output_tokens");
     const Json& content = resp.at("content");
     failures += check(content.size() == 3, "thinking + text + tool_use blocks");
-    failures += check(content.at(0).at("type") == "thinking" && content.at(0).at("thinking") == "the reasoning",
+    failures += check(content.at(0).at("type") == "thinking" &&
+                          content.at(0).at("thinking") == "the reasoning",
                       "thinking block");
-    failures += check(content.at(1).at("type") == "text" && content.at(1).at("text") == "the answer",
-                      "text block");
+    failures +=
+        check(content.at(1).at("type") == "text" && content.at(1).at("text") == "the answer",
+              "text block");
     failures += check(content.at(2).at("type") == "tool_use" && content.at(2).at("id") == "toolu_9",
                       "tool_use block");
     failures += check(content.at(2).at("input").at("city") == "Paris", "tool_use input is object");
 
     // Empty output falls back to a single empty text block.
-    const Json empty = Json::parse(make_messages_response("msg_2", "m", "", "", {}, "end_turn", CompletionUsage{1, 0}));
-    failures += check(empty.at("content").size() == 1 && empty.at("content").at(0).at("type") == "text" &&
-                          empty.at("content").at(0).at("text") == "",
-                      "empty output -> empty text block");
+    const Json empty = Json::parse(
+        make_messages_response("msg_2", "m", "", "", {}, "end_turn", CompletionUsage{1, 0}));
+    failures +=
+        check(empty.at("content").size() == 1 && empty.at("content").at(0).at("type") == "text" &&
+                  empty.at("content").at(0).at("text") == "",
+              "empty output -> empty text block");
     return failures;
 }
 
@@ -366,8 +405,10 @@ int test_streaming_events() {
     failures += check(start.at("type") == "message_start", "message_start payload type");
     failures += check(start.at("message").at("id") == "msg_1", "message_start id");
     failures += check(start.at("message").at("model") == "claude-x", "message_start model");
-    failures += check(start.at("message").at("usage").at("input_tokens") == 11, "message_start input_tokens");
-    failures += check(start.at("message").at("content").is_array() && start.at("message").at("content").empty(),
+    failures += check(start.at("message").at("usage").at("input_tokens") == 11,
+                      "message_start input_tokens");
+    failures += check(start.at("message").at("content").is_array() &&
+                          start.at("message").at("content").empty(),
                       "message_start empty content");
 
     const Json tstart = parse_sse(make_content_block_start_text(1), &type);
@@ -376,12 +417,14 @@ int test_streaming_events() {
                       "text block start");
 
     const Json think_start = parse_sse(make_content_block_start_thinking(0), &type);
-    failures += check(think_start.at("content_block").at("type") == "thinking", "thinking block start");
+    failures +=
+        check(think_start.at("content_block").at("type") == "thinking", "thinking block start");
 
     const Json tdelta = parse_sse(make_content_block_delta_text(1, "hi"), &type);
-    failures += check(type == "content_block_delta" && tdelta.at("delta").at("type") == "text_delta" &&
-                          tdelta.at("delta").at("text") == "hi",
-                      "text_delta");
+    failures +=
+        check(type == "content_block_delta" && tdelta.at("delta").at("type") == "text_delta" &&
+                  tdelta.at("delta").at("text") == "hi",
+              "text_delta");
 
     const Json thdelta = parse_sse(make_content_block_delta_thinking(0, "hmm"), &type);
     failures += check(thdelta.at("delta").at("type") == "thinking_delta" &&
@@ -397,7 +440,8 @@ int test_streaming_events() {
                           tustart.at("content_block").at("input").empty(),
                       "tool_use block start with empty input");
 
-    const Json ijdelta = parse_sse(make_content_block_delta_tool_json(2, R"({"city":"Paris"})"), &type);
+    const Json ijdelta =
+        parse_sse(make_content_block_delta_tool_json(2, R"({"city":"Paris"})"), &type);
     failures += check(ijdelta.at("delta").at("type") == "input_json_delta" &&
                           ijdelta.at("delta").at("partial_json") == R"({"city":"Paris"})",
                       "input_json_delta");
@@ -406,10 +450,11 @@ int test_streaming_events() {
     failures += check(type == "content_block_stop" && stop.at("index") == 2, "content_block_stop");
 
     const Json mdelta = parse_sse(make_message_delta("tool_use", 5), &type);
-    failures += check(type == "message_delta" && mdelta.at("delta").at("stop_reason") == "tool_use" &&
-                          mdelta.at("delta").at("stop_sequence").is_null() &&
-                          mdelta.at("usage").at("output_tokens") == 5,
-                      "message_delta stop_reason + usage");
+    failures +=
+        check(type == "message_delta" && mdelta.at("delta").at("stop_reason") == "tool_use" &&
+                  mdelta.at("delta").at("stop_sequence").is_null() &&
+                  mdelta.at("usage").at("output_tokens") == 5,
+              "message_delta stop_reason + usage");
 
     const Json mstop = parse_sse(make_message_stop(), &type);
     failures += check(type == "message_stop" && mstop.at("type") == "message_stop", "message_stop");
@@ -420,21 +465,23 @@ int test_streaming_events() {
 }
 
 int test_count_tokens_and_error() {
-    int failures = 0;
+    int failures  = 0;
     const Json ct = Json::parse(make_count_tokens_response(123));
     failures += check(ct.at("input_tokens") == 123, "count_tokens body");
 
     ApiError err;
-    err.status  = 401;
-    err.message = "missing or invalid API key";
+    err.status      = 401;
+    err.message     = "missing or invalid API key";
     const Json body = Json::parse(make_messages_error_body(err));
     failures += check(body.at("type") == "error", "error envelope type");
-    failures += check(body.at("error").at("type") == "authentication_error", "401 -> authentication_error");
-    failures += check(body.at("error").at("message") == "missing or invalid API key", "error message");
+    failures +=
+        check(body.at("error").at("type") == "authentication_error", "401 -> authentication_error");
+    failures +=
+        check(body.at("error").at("message") == "missing or invalid API key", "error message");
 
     ApiError server;
-    server.status = 500;
-    server.message = "boom";
+    server.status          = 500;
+    server.message         = "boom";
     const Json server_body = Json::parse(make_messages_error_body(server));
     failures += check(server_body.at("error").at("type") == "api_error", "500 -> api_error");
 
@@ -452,7 +499,7 @@ int main() {
     failures += test_parse_system_array_and_blocks();
     failures += test_system_role_in_messages_folds();
     failures += test_missing_and_bad_fields();
-    failures += test_reject_image();
+    failures += test_parse_image();
     failures += test_tools_and_choice();
     failures += test_tool_use_result_roundtrip();
     failures += test_thinking_and_sampling();

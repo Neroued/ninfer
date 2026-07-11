@@ -3,6 +3,7 @@ file(GLOB_RECURSE QUS_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/core/*.cpp     ${CMAKE_CURRENT_SOURCE_DIR}/core/*.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.cpp  ${CMAKE_CURRENT_SOURCE_DIR}/kernels/*.cu
   ${CMAKE_CURRENT_SOURCE_DIR}/model/*.cpp    ${CMAKE_CURRENT_SOURCE_DIR}/model/*.cu
+  ${CMAKE_CURRENT_SOURCE_DIR}/media/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/runtime/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/text/*.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
@@ -20,11 +21,16 @@ target_include_directories(qus_core PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc)
 target_link_libraries(qus_core PUBLIC CUDA::cudart)
+target_link_libraries(qus_core PRIVATE PkgConfig::FFMPEG PkgConfig::LIBCURL)
 target_compile_options(qus_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 
 # --- Driver executable (text in -> text out) ---------------------------------
 add_executable(qus ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 target_link_libraries(qus PRIVATE qus_core)
+
+add_executable(qus-preprocess ${PROJECT_SOURCE_DIR}/tools/q5090/preprocess.cpp)
+target_include_directories(qus-preprocess PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(qus-preprocess PRIVATE qus_core)
 
 # --- Serving layer: OpenAI-compatible HTTP server ----------------------------
 # qus_serve holds the protocol/translation/service/transport code (no main), so

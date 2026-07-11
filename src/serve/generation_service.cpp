@@ -103,7 +103,18 @@ qus::EngineMemoryStats GenerationService::memory_stats() const { return engine_-
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
     PreparedRequest prepared;
-    prepared.messages      = to_chat_messages(req);
+    prepared.messages = to_chat_messages(req);
+    if (std::any_of(prepared.messages.begin(), prepared.messages.end(),
+                    [](const qus::text::ChatMessage& message) { return message.has_media(); })) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "vision_runtime_not_ready";
+        error.param   = "messages";
+        error.message = "multimodal preprocessing is available, but Vision forward is not "
+                        "connected to the inference engine yet";
+        throw ApiException(std::move(error));
+    }
     prepared.options       = to_generation_options(req, options_);
     prepared.stop_strings  = req.stop_strings;
     prepared.include_usage = req.include_usage;
@@ -145,9 +156,20 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& req) const {
     const std::vector<qus::text::ChatMessage> messages = to_chat_messages(req);
-    qus::text::TextGenerationOptions options           = to_generation_options(req, options_);
-    qus::text::ChatRenderOptions render_options        = options.render_options;
-    render_options.enable_thinking                     = options.enable_thinking;
+    if (std::any_of(messages.begin(), messages.end(),
+                    [](const qus::text::ChatMessage& message) { return message.has_media(); })) {
+        ApiError error;
+        error.status  = 400;
+        error.type    = "invalid_request_error";
+        error.code    = "vision_runtime_not_ready";
+        error.param   = "messages";
+        error.message = "multimodal token counting is unavailable until Vision forward is "
+                        "connected to the inference engine";
+        throw ApiException(std::move(error));
+    }
+    qus::text::TextGenerationOptions options    = to_generation_options(req, options_);
+    qus::text::ChatRenderOptions render_options = options.render_options;
+    render_options.enable_thinking              = options.enable_thinking;
     const std::string prompt = qus::text::render_qwen_chat(messages, render_options);
     return static_cast<int>(tokenizer_->encode(prompt).size());
 }

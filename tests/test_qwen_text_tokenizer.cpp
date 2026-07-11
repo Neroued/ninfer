@@ -663,8 +663,9 @@ int test_hf_golden_message_cases() {
         std::vector<qus::text::ChatMessage> messages;
         for (const auto& msg : item.at("messages")) {
             qus::text::ChatMessage cm;
-            cm.role    = msg.at("role").get<std::string>();
-            cm.content = msg.at("content").get<std::string>();
+            cm.role = msg.at("role").get<std::string>();
+            cm.parts.push_back(
+                qus::text::ChatPart::text_part(msg.at("content").get<std::string>()));
             if (msg.contains("reasoning_content")) {
                 cm.reasoning_content = msg.at("reasoning_content").get<std::string>();
             }

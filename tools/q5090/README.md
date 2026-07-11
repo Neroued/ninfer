@@ -98,4 +98,14 @@ python -m tools.q5090.diagnostics.activations /tmp/cpp_dump /tmp/python_dump
 python -m tools.q5090.diagnostics.vision \
   --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
   --model-dir /path/to/base-hf-bf16 --messages /tmp/qwen_messages.json
+
+PYTHONPATH=. python tools/q5090/diagnostics/preprocess.py \
+  --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+  --processor /path/to/base-hf-bf16 --messages /tmp/qwen_messages.json \
+  --no-thinking --output /tmp/preprocess-parity.json
 ```
+
+The preprocessing diagnostic runs the native `qus-preprocess` executable and the Hugging Face
+processor on the same message file. Token IDs, modality types, MRoPE positions and `rope_delta` are
+exact gates; patch error is reported separately because independent media decoders can return
+slightly different pixels for damaged or variable-frame-rate video streams.

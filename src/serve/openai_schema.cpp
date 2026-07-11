@@ -73,6 +73,33 @@ bool has_tool_named(const GenerationRequest& req, const std::string& name) {
     return false;
 }
 
+qus::media::Source parse_media_url(const Json& part, const char* field) {
+    if (!part.contains(field)) {
+        bad_request(std::string(field) + " content part must contain " + field, "messages");
+    }
+    const Json& value = part.at(field);
+    std::string url;
+    if (value.is_string()) {
+        url = value.get<std::string>();
+    } else if (value.is_object() && value.contains("url") && value.at("url").is_string()) {
+        url = value.at("url").get<std::string>();
+    } else {
+        bad_request(std::string(field) + " must be a URL string or object containing url",
+                    "messages");
+    }
+    if (url.empty()) { bad_request(std::string(field) + " URL must not be empty", "messages"); }
+    qus::media::Source source;
+    source.value = std::move(url);
+    if (source.value.starts_with("data:")) {
+        source.kind = qus::media::SourceKind::Data;
+    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
+        source.kind = qus::media::SourceKind::Url;
+    } else {
+        bad_request(std::string(field) + " must use HTTP(S) or a data URI", "messages");
+    }
+    return source;
+}
+
 void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index) {
     if (content.is_string()) {
         turn.content.push_back(ContentPart{ContentKind::Text, content.get<std::string>(), "text"});
@@ -98,7 +125,11 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
             out.kind = ContentKind::Text;
             out.text = part.at("text").get<std::string>();
         } else if (type == "image_url") {
-            out.kind = ContentKind::ImageUrl;
+            out.kind   = ContentKind::Image;
+            out.source = parse_media_url(part, "image_url");
+        } else if (type == "video_url") {
+            out.kind   = ContentKind::Video;
+            out.source = parse_media_url(part, "video_url");
         } else if (type == "input_audio") {
             out.kind = ContentKind::InputAudio;
         } else {
@@ -169,7 +200,8 @@ void parse_messages(const Json& body, GenerationRequest& out) {
         }
         const std::string role = item.at("role").get<std::string>();
         if (item.contains("function_call") && !item.at("function_call").is_null()) {
-            bad_request("message function_call is not supported", "messages", "tools_not_supported");
+            bad_request("message function_call is not supported", "messages",
+                        "tools_not_supported");
         }
         if (role == "function") {
             ApiError error;
@@ -205,7 +237,8 @@ void parse_messages(const Json& body, GenerationRequest& out) {
             if (item.contains("content") && !item.at("content").is_null()) {
                 parse_content_parts(item.at("content"), turn, i);
             } else if (turn.tool_calls.empty()) {
-                bad_request("assistant message " + std::to_string(i) + " must have content or tool_calls",
+                bad_request("assistant message " + std::to_string(i) +
+                                " must have content or tool_calls",
                             "messages");
             }
             if (item.contains("reasoning_content") && !item.at("reasoning_content").is_null()) {
@@ -265,7 +298,9 @@ void parse_tools(const Json& body, GenerationRequest& out) {
         }
         tool.parameters_json = fn.at("parameters").dump();
         if (fn.contains("strict") && !fn.at("strict").is_null()) {
-            if (!fn.at("strict").is_boolean()) { bad_request("function strict must be a boolean", "tools"); }
+            if (!fn.at("strict").is_boolean()) {
+                bad_request("function strict must be a boolean", "tools");
+            }
             tool.strict = fn.at("strict").get<bool>();
         } else {
             fn["strict"] = false;
@@ -307,7 +342,8 @@ void parse_tool_choice(const Json& body, GenerationRequest& out) {
     if (out.tool_choice.mode != ToolChoiceMode::None && out.tools.empty()) {
         bad_request("tool_choice requires tools", "tool_choice");
     }
-    if (out.tool_choice.mode == ToolChoiceMode::Named && !has_tool_named(out, out.tool_choice.name)) {
+    if (out.tool_choice.mode == ToolChoiceMode::Named &&
+        !has_tool_named(out, out.tool_choice.name)) {
         bad_request("tool_choice references unknown function: " + out.tool_choice.name,
                     "tool_choice");
     }
@@ -317,7 +353,9 @@ void parse_stop(const Json& body, GenerationRequest& out) {
     if (!body.contains("stop") || body.at("stop").is_null()) { return; }
     const Json& stop = body.at("stop");
     if (stop.is_string()) {
-        if (!stop.get<std::string>().empty()) { out.stop_strings.push_back(stop.get<std::string>()); }
+        if (!stop.get<std::string>().empty()) {
+            out.stop_strings.push_back(stop.get<std::string>());
+        }
         return;
     }
     if (stop.is_array()) {
@@ -331,7 +369,7 @@ void parse_stop(const Json& body, GenerationRequest& out) {
 }
 
 void parse_sampling(const Json& body, GenerationRequest& out) {
-    SamplingParams& s = out.sampling;
+    SamplingParams& s   = out.sampling;
     s.temperature       = get_number(body, "temperature");
     s.top_p             = get_number(body, "top_p");
     s.top_k             = get_int(body, "top_k");
@@ -377,7 +415,7 @@ void reject_unsupported_features(const Json& body) {
         }
     }
     if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt = body.at("response_format");
+        const Json& fmt  = body.at("response_format");
         std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
                                ? fmt.at("type").get<std::string>()
                                : std::string();
@@ -392,19 +430,17 @@ void reject_unsupported_features(const Json& body) {
 }
 
 Json base_chunk(const std::string& id, const std::string& model, std::int64_t created) {
-    return Json{{"id", id},
-                {"object", "chat.completion.chunk"},
-                {"created", created},
-                {"model", model}};
+    return Json{
+        {"id", id}, {"object", "chat.completion.chunk"}, {"created", created}, {"model", model}};
 }
 
 Json tool_calls_json(const std::vector<ToolCall>& tool_calls, bool include_index) {
     Json out = Json::array();
     for (std::size_t i = 0; i < tool_calls.size(); ++i) {
         const ToolCall& call = tool_calls[i];
-        Json item = {{"id", call.id},
-                     {"type", "function"},
-                     {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
+        Json item            = {{"id", call.id},
+                                {"type", "function"},
+                                {"function", Json{{"name", call.name}, {"arguments", call.arguments_json}}}};
         if (include_index) { item["index"] = static_cast<int>(i); }
         out.push_back(std::move(item));
     }
@@ -455,8 +491,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
 
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
-                                          const std::string& reasoning,
-                                          const char* finish_reason,
+                                          const std::string& reasoning, const char* finish_reason,
                                           const CompletionUsage& usage) {
     Json message = {{"role", "assistant"}, {"content", content}};
     if (!reasoning.empty()) { message["reasoning_content"] = reasoning; }
@@ -466,21 +501,19 @@ std::string make_chat_completion_response(const std::string& id, const std::stri
         {"created", created},
         {"model", model},
         {"choices",
-         Json::array({Json{{"index", 0},
-                           {"message", std::move(message)},
-                           {"finish_reason", finish_reason}}})},
-        {"usage",
-         Json{{"prompt_tokens", usage.prompt_tokens},
-              {"completion_tokens", usage.completion_tokens},
-              {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+         Json::array({Json{
+             {"index", 0}, {"message", std::move(message)}, {"finish_reason", finish_reason}}})},
+        {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
+                       {"completion_tokens", usage.completion_tokens},
+                       {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
     return payload.dump();
 }
 
 std::string make_chat_completion_tool_response(const std::string& id, const std::string& model,
-                                                std::int64_t created, const std::string& content,
-                                                const std::string& reasoning,
-                                                const std::vector<ToolCall>& tool_calls,
-                                                const CompletionUsage& usage) {
+                                               std::int64_t created, const std::string& content,
+                                               const std::string& reasoning,
+                                               const std::vector<ToolCall>& tool_calls,
+                                               const CompletionUsage& usage) {
     Json message = {{"role", "assistant"},
                     {"content", content.empty() ? Json(nullptr) : Json(content)},
                     {"tool_calls", tool_calls_json(tool_calls, false)}};
@@ -491,22 +524,20 @@ std::string make_chat_completion_tool_response(const std::string& id, const std:
         {"created", created},
         {"model", model},
         {"choices",
-         Json::array({Json{{"index", 0},
-                           {"message", std::move(message)},
-                           {"finish_reason", "tool_calls"}}})},
-        {"usage",
-         Json{{"prompt_tokens", usage.prompt_tokens},
-              {"completion_tokens", usage.completion_tokens},
-              {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
+         Json::array({Json{
+             {"index", 0}, {"message", std::move(message)}, {"finish_reason", "tool_calls"}}})},
+        {"usage", Json{{"prompt_tokens", usage.prompt_tokens},
+                       {"completion_tokens", usage.completion_tokens},
+                       {"total_tokens", usage.prompt_tokens + usage.completion_tokens}}}};
     return payload.dump();
 }
 
 std::string make_chat_chunk_role(const std::string& id, const std::string& model,
                                  std::int64_t created, bool include_usage) {
-    Json payload            = base_chunk(id, model, created);
-    payload["choices"]      = Json::array({Json{{"index", 0},
-                                                {"delta", Json{{"role", "assistant"}, {"content", ""}}},
-                                                {"finish_reason", nullptr}}});
+    Json payload       = base_chunk(id, model, created);
+    payload["choices"] = Json::array({Json{{"index", 0},
+                                           {"delta", Json{{"role", "assistant"}, {"content", ""}}},
+                                           {"finish_reason", nullptr}}});
     if (include_usage) { payload["usage"] = nullptr; }
     return sse_event(payload);
 }
@@ -523,12 +554,11 @@ std::string make_chat_chunk_reasoning(const std::string& id, const std::string& 
 }
 
 std::string make_chat_chunk_content(const std::string& id, const std::string& model,
-                                     std::int64_t created, const std::string& delta_text,
-                                     bool include_usage) {
+                                    std::int64_t created, const std::string& delta_text,
+                                    bool include_usage) {
     Json payload       = base_chunk(id, model, created);
-    payload["choices"] = Json::array({Json{{"index", 0},
-                                           {"delta", Json{{"content", delta_text}}},
-                                           {"finish_reason", nullptr}}});
+    payload["choices"] = Json::array(
+        {Json{{"index", 0}, {"delta", Json{{"content", delta_text}}}, {"finish_reason", nullptr}}});
     if (include_usage) { payload["usage"] = nullptr; }
     return sse_event(payload);
 }
@@ -537,18 +567,18 @@ std::string make_chat_chunk_tool_calls(const std::string& id, const std::string&
                                        std::int64_t created,
                                        const std::vector<ToolCall>& tool_calls,
                                        bool include_usage) {
-    Json payload       = base_chunk(id, model, created);
-    payload["choices"] = Json::array({Json{{"index", 0},
-                                           {"delta",
-                                            Json{{"tool_calls", tool_calls_json(tool_calls, true)}}},
-                                           {"finish_reason", nullptr}}});
+    Json payload = base_chunk(id, model, created);
+    payload["choices"] =
+        Json::array({Json{{"index", 0},
+                          {"delta", Json{{"tool_calls", tool_calls_json(tool_calls, true)}}},
+                          {"finish_reason", nullptr}}});
     if (include_usage) { payload["usage"] = nullptr; }
     return sse_event(payload);
 }
 
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
-                                   std::int64_t created, const char* finish_reason,
-                                   bool include_usage) {
+                                  std::int64_t created, const char* finish_reason,
+                                  bool include_usage) {
     Json payload       = base_chunk(id, model, created);
     payload["choices"] = Json::array(
         {Json{{"index", 0}, {"delta", Json::object()}, {"finish_reason", finish_reason}}});
@@ -571,23 +601,20 @@ std::string sse_done() { return "data: [DONE]\n\n"; }
 std::string make_models_list(const std::string& model_id, std::int64_t created) {
     const Json payload = {
         {"object", "list"},
-        {"data", Json::array({Json{{"id", model_id},
-                                   {"object", "model"},
-                                   {"created", created},
-                                   {"owned_by", "qus"}}})}};
+        {"data",
+         Json::array({Json{
+             {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "qus"}}})}};
     return payload.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created) {
-    const Json payload = {{"id", model_id},
-                          {"object", "model"},
-                          {"created", created},
-                          {"owned_by", "qus"}};
+    const Json payload = {
+        {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "qus"}};
     return payload.dump();
 }
 
 std::string make_error_body(const ApiError& error) {
-    Json err = {{"message", error.message}, {"type", error.type}};
+    Json err     = {{"message", error.message}, {"type", error.type}};
     err["param"] = error.param.empty() ? Json(nullptr) : Json(error.param);
     err["code"]  = error.code.empty() ? Json(nullptr) : Json(error.code);
     return Json{{"error", err}}.dump();
@@ -597,8 +624,7 @@ std::string new_chat_completion_id() {
     static thread_local std::mt19937_64 rng{std::random_device{}()};
     std::uniform_int_distribution<std::uint64_t> dist;
     std::array<char, 32> buf{};
-    std::snprintf(buf.data(), buf.size(), "%016llx",
-                  static_cast<unsigned long long>(dist(rng)));
+    std::snprintf(buf.data(), buf.size(), "%016llx", static_cast<unsigned long long>(dist(rng)));
     return "chatcmpl-" + std::string(buf.data());
 }
 

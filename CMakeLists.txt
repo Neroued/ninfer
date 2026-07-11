@@ -21,6 +21,10 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+  libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
 
 # --- Subdirectories ----------------------------------------------------------
 enable_testing()

@@ -48,6 +48,9 @@ qus_add_test(qus_qwen_text_tokenizer_test
              NEEDS_SOURCE_DIR)
 target_include_directories(qus_qwen_text_tokenizer_test PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 qus_add_test(qus_qwen_text_runner_test SOURCES test_qwen_text_runner.cpp)
+qus_add_test(qus_processor_test SOURCES test_processor.cpp)
+target_include_directories(qus_processor_test PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(qus_processor_test PRIVATE Threads::Threads)
 
 # Serving-layer schema/translation contract (consumed by external OpenAI clients).
 add_executable(qus_openai_schema_test test_openai_schema.cpp)

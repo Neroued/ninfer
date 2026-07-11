@@ -94,6 +94,31 @@ std::string require_string_field(const Json& block, const char* field, const cha
     return block.at(field).get<std::string>();
 }
 
+qus::media::Source parse_image_source(const Json& block) {
+    if (!block.contains("source") || !block.at("source").is_object()) {
+        bad_request("image block must contain a source object", "messages");
+    }
+    const Json& source     = block.at("source");
+    const std::string type = require_string_field(source, "type", "image source");
+    qus::media::Source out;
+    if (type == "base64") {
+        out.media_type         = require_string_field(source, "media_type", "base64 image source");
+        const std::string data = require_string_field(source, "data", "base64 image source");
+        if (data.empty()) { bad_request("base64 image data must not be empty", "messages"); }
+        out.kind  = qus::media::SourceKind::Data;
+        out.value = "data:" + out.media_type + ";base64," + data;
+    } else if (type == "url") {
+        out.value = require_string_field(source, "url", "URL image source");
+        if (!out.value.starts_with("http://") && !out.value.starts_with("https://")) {
+            bad_request("image URL must use HTTP(S)", "messages");
+        }
+        out.kind = qus::media::SourceKind::Url;
+    } else {
+        bad_request("unsupported image source type: " + type, "messages");
+    }
+    return out;
+}
+
 // --- request parsing --------------------------------------------------------
 
 void parse_tools(const Json& body, GenerationRequest& out) {
@@ -114,13 +139,13 @@ void parse_tools(const Json& body, GenerationRequest& out) {
             bad_request("tool input_schema must be a JSON object", "tools");
         }
         ToolDefinition tool;
-        tool.name = require_function_name(item, "tools");
+        tool.name     = require_function_name(item, "tools");
         Json function = Json{{"name", tool.name}};
         if (item.contains("description") && !item.at("description").is_null()) {
             if (!item.at("description").is_string()) {
                 bad_request("tool description must be a string", "tools");
             }
-            tool.description     = item.at("description").get<std::string>();
+            tool.description        = item.at("description").get<std::string>();
             function["description"] = tool.description;
         }
         const Json& parameters = item.at("input_schema");
@@ -202,22 +227,32 @@ ToolCall parse_tool_use(const Json& block) {
     return call;
 }
 
-std::string flatten_tool_result_content(const Json& block) {
-    if (!block.contains("content") || block.at("content").is_null()) { return {}; }
+std::vector<ContentPart> parse_tool_result_content(const Json& block) {
+    if (!block.contains("content") || block.at("content").is_null()) {
+        return {ContentPart{ContentKind::Text, {}, "text"}};
+    }
     const Json& content = block.at("content");
-    if (content.is_string()) { return content.get<std::string>(); }
+    if (content.is_string()) {
+        return {ContentPart{ContentKind::Text, content.get<std::string>(), "text"}};
+    }
     if (content.is_array()) {
-        std::string text;
+        std::vector<ContentPart> parts;
         for (const Json& part : content) {
-            if (part.is_object() && part.contains("type") && part.at("type").is_string() &&
-                part.at("type").get<std::string>() == "text" && part.contains("text") &&
-                part.at("text").is_string()) {
-                append_text(text, part.at("text").get<std::string>());
+            const std::string type = require_block_type(part, "messages");
+            if (type == "text") {
+                parts.push_back(ContentPart{
+                    ContentKind::Text, require_string_field(part, "text", "text block"), "text"});
+            } else if (type == "image") {
+                ContentPart image;
+                image.kind     = ContentKind::Image;
+                image.type_raw = "image";
+                image.source   = parse_image_source(part);
+                parts.push_back(std::move(image));
+            } else {
+                bad_request("unsupported tool_result content block: " + type, "messages");
             }
-            // Non-text tool_result parts (e.g. images) are dropped: the text
-            // frontend cannot render them yet.
         }
-        return text;
+        return parts;
     }
     bad_request("tool_result content must be a string or array of blocks", "messages");
     return {};
@@ -256,11 +291,13 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
     // A user turn may carry tool_result blocks (each -> its own tool turn) and/or
     // text blocks (folded into one user turn emitted after the tool turns, matching
     // the Qwen template's assistant-tool_calls -> tool-responses -> user order).
-    std::string text;
+    ChatTurn user_turn;
+    user_turn.role = "user";
     for (const Json& block : content) {
         const std::string type = require_block_type(block, "messages");
         if (type == "text") {
-            append_text(text, require_string_field(block, "text", "text block"));
+            std::string text = require_string_field(block, "text", "text block");
+            user_turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
         } else if (type == "tool_result") {
             if (!block.contains("tool_use_id") || !block.at("tool_use_id").is_string() ||
                 block.at("tool_use_id").get<std::string>().empty()) {
@@ -269,21 +306,19 @@ void parse_user_content(const Json& content, GenerationRequest& out) {
             ChatTurn tool_turn;
             tool_turn.role         = "tool";
             tool_turn.tool_call_id = block.at("tool_use_id").get<std::string>();
-            tool_turn.content.push_back(
-                ContentPart{ContentKind::Text, flatten_tool_result_content(block), "text"});
+            tool_turn.content      = parse_tool_result_content(block);
             out.messages.push_back(std::move(tool_turn));
         } else if (type == "image") {
-            bad_request("image content is not supported yet", "messages", "modality_not_supported");
+            ContentPart part;
+            part.kind     = ContentKind::Image;
+            part.type_raw = "image";
+            part.source   = parse_image_source(block);
+            user_turn.content.push_back(std::move(part));
         } else {
             bad_request("unsupported user content block: " + type, "messages");
         }
     }
-    if (!text.empty()) {
-        ChatTurn turn;
-        turn.role = "user";
-        turn.content.push_back(ContentPart{ContentKind::Text, std::move(text), "text"});
-        out.messages.push_back(std::move(turn));
-    }
+    if (!user_turn.content.empty()) { out.messages.push_back(std::move(user_turn)); }
 }
 
 void parse_messages(const Json& body, GenerationRequest& out, std::string& system_text) {
@@ -319,7 +354,8 @@ void parse_messages(const Json& body, GenerationRequest& out, std::string& syste
         if (content.is_string()) {
             ChatTurn turn;
             turn.role = role;
-            turn.content.push_back(ContentPart{ContentKind::Text, content.get<std::string>(), "text"});
+            turn.content.push_back(
+                ContentPart{ContentKind::Text, content.get<std::string>(), "text"});
             out.messages.push_back(std::move(turn));
         } else if (content.is_array()) {
             if (role == "assistant") {
@@ -337,9 +373,13 @@ void parse_messages(const Json& body, GenerationRequest& out, std::string& syste
 void parse_stop_sequences(const Json& body, GenerationRequest& out) {
     if (!body.contains("stop_sequences") || body.at("stop_sequences").is_null()) { return; }
     const Json& stop = body.at("stop_sequences");
-    if (!stop.is_array()) { bad_request("stop_sequences must be an array of strings", "stop_sequences"); }
+    if (!stop.is_array()) {
+        bad_request("stop_sequences must be an array of strings", "stop_sequences");
+    }
     for (const Json& s : stop) {
-        if (!s.is_string()) { bad_request("stop_sequences entries must be strings", "stop_sequences"); }
+        if (!s.is_string()) {
+            bad_request("stop_sequences entries must be strings", "stop_sequences");
+        }
         if (!s.get<std::string>().empty()) { out.stop_strings.push_back(s.get<std::string>()); }
     }
 }
@@ -446,46 +486,43 @@ const char* messages_stop_reason(qus::text::FinishReason reason, bool has_tool_c
 
 std::string make_messages_response(const std::string& id, const std::string& model,
                                    const std::string& content, const std::string& reasoning,
-                                   const std::vector<ToolCall>& tool_calls,
-                                   const char* stop_reason, const CompletionUsage& usage) {
+                                   const std::vector<ToolCall>& tool_calls, const char* stop_reason,
+                                   const CompletionUsage& usage) {
     Json blocks = Json::array();
     if (!reasoning.empty()) {
         blocks.push_back(Json{{"type", "thinking"}, {"thinking", reasoning}, {"signature", ""}});
     }
-    if (!content.empty()) {
-        blocks.push_back(Json{{"type", "text"}, {"text", content}});
-    }
+    if (!content.empty()) { blocks.push_back(Json{{"type", "text"}, {"text", content}}); }
     for (const ToolCall& call : tool_calls) {
         Json input = Json::parse(call.arguments_json, nullptr, false);
         if (input.is_discarded() || !input.is_object()) { input = Json::object(); }
-        blocks.push_back(
-            Json{{"type", "tool_use"}, {"id", call.id}, {"name", call.name}, {"input", std::move(input)}});
+        blocks.push_back(Json{{"type", "tool_use"},
+                              {"id", call.id},
+                              {"name", call.name},
+                              {"input", std::move(input)}});
     }
-    if (blocks.empty()) {
-        blocks.push_back(Json{{"type", "text"}, {"text", ""}});
-    }
-    const Json payload = {
-        {"id", id},
-        {"type", "message"},
-        {"role", "assistant"},
-        {"model", model},
-        {"content", std::move(blocks)},
-        {"stop_reason", stop_reason},
-        {"stop_sequence", nullptr},
-        {"usage", Json{{"input_tokens", usage.prompt_tokens}, {"output_tokens", usage.completion_tokens}}}};
+    if (blocks.empty()) { blocks.push_back(Json{{"type", "text"}, {"text", ""}}); }
+    const Json payload = {{"id", id},
+                          {"type", "message"},
+                          {"role", "assistant"},
+                          {"model", model},
+                          {"content", std::move(blocks)},
+                          {"stop_reason", stop_reason},
+                          {"stop_sequence", nullptr},
+                          {"usage", Json{{"input_tokens", usage.prompt_tokens},
+                                         {"output_tokens", usage.completion_tokens}}}};
     return payload.dump();
 }
 
 std::string make_message_start(const std::string& id, const std::string& model, int input_tokens) {
-    const Json message = {
-        {"id", id},
-        {"type", "message"},
-        {"role", "assistant"},
-        {"model", model},
-        {"content", Json::array()},
-        {"stop_reason", nullptr},
-        {"stop_sequence", nullptr},
-        {"usage", Json{{"input_tokens", input_tokens}, {"output_tokens", 0}}}};
+    const Json message = {{"id", id},
+                          {"type", "message"},
+                          {"role", "assistant"},
+                          {"model", model},
+                          {"content", Json::array()},
+                          {"stop_reason", nullptr},
+                          {"stop_sequence", nullptr},
+                          {"usage", Json{{"input_tokens", input_tokens}, {"output_tokens", 0}}}};
     return sse("message_start", Json{{"type", "message_start"}, {"message", message}});
 }
 
@@ -504,13 +541,12 @@ std::string make_content_block_start_thinking(int index) {
 }
 
 std::string make_content_block_start_tool_use(int index, const ToolCall& call) {
-    return sse("content_block_start",
-               Json{{"type", "content_block_start"},
-                    {"index", index},
-                    {"content_block", Json{{"type", "tool_use"},
-                                           {"id", call.id},
-                                           {"name", call.name},
-                                           {"input", Json::object()}}}});
+    return sse("content_block_start", Json{{"type", "content_block_start"},
+                                           {"index", index},
+                                           {"content_block", Json{{"type", "tool_use"},
+                                                                  {"id", call.id},
+                                                                  {"name", call.name},
+                                                                  {"input", Json::object()}}}});
 }
 
 std::string make_content_block_delta_text(int index, const std::string& delta_text) {
@@ -545,9 +581,7 @@ std::string make_message_delta(const char* stop_reason, int output_tokens) {
                     {"usage", Json{{"output_tokens", output_tokens}}}});
 }
 
-std::string make_message_stop() {
-    return sse("message_stop", Json{{"type", "message_stop"}});
-}
+std::string make_message_stop() { return sse("message_stop", Json{{"type", "message_stop"}}); }
 
 std::string make_messages_ping() { return sse("ping", Json{{"type", "ping"}}); }
 

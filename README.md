@@ -67,7 +67,8 @@ bf16 safetensors + tokenizer ──(Python, offline)──> quantize + relayout/
 
 ## Build (intended)
 
-Requires CUDA 13.1+ (sm_120), gcc 13+, CMake 3.28+.
+Requires CUDA 13.1+ (sm_120), gcc 13+, CMake 3.28+, FFmpeg 6 development libraries
+(`libavformat`, `libavcodec`, `libavutil`, `libswscale`) and libcurl 7.85+.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -85,6 +86,19 @@ cmake --build build -j
 The v4.2 artifact embeds `tokenizer.json`, `merges.txt`, and `generation_config.json`; runtime
 commands do not accept a tokenizer directory. The loader validates the 4 KiB header before CUDA
 initialization, reads only the bounded catalog/tokenizer prefix, and uploads only requested modules.
+
+The native multimodal preprocessor can be exercised independently while the C++ Vision forward is
+being implemented:
+
+```bash
+./build/src/qus-preprocess MODEL.qus messages.json preprocess.json patches.f32 --no-thinking
+```
+
+It reads the tokenizer from the q5090 catalog, supports structured text/image/video messages, and
+emits expanded token IDs, token types, three-axis positions, `rope_delta`, grids, timestamps and the
+row-major `[P,1536]` patch buffer. The main inference binary rejects media until those outputs are
+connected to the Vision tower, preventing a single unexpanded placeholder from being executed as a
+text-only prompt.
 
 `bench/qus_bench` is the real-weight throughput tool (llama-bench-style prefill/decode rates); see
 [`bench/README.md`](bench/README.md).

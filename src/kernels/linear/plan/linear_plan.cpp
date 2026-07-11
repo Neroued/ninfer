@@ -45,9 +45,9 @@ ShapeFamily classify_shape(std::int32_t n, std::int32_t k) {
     return ShapeFamily::Generic;
 }
 
-// SmallT -> LargeT crossover per (format, shape). Calibrated from the T-swept
-// bench (profiles/prefill-linear-foundation/baseline_p2.csv): the cp.async
-// tensor-core GEMM overtakes the multi-step GEMV around T~16 on every shape (at
+// SmallT -> LargeT crossover per (format, shape). The original T-swept
+// calibration found that the cp.async tensor-core GEMM overtakes the multi-step
+// GEMV around T~16 on every shape (at
 // T<=8 its BN-wide token tile is mostly empty, so the GEMV is faster; from T=32
 // it is ~3-6x faster and keeps climbing to ~65-74% of the bf16 mma ceiling). So
 // route T<=16 to the multi-step GEMV and T>16 to the mma GEMM.

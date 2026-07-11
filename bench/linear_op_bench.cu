@@ -1,9 +1,9 @@
-// Cold-cache per-op GEMV measurement rig for q5090 v3 ROW_SPLIT low-bit
+// Cold-cache per-op GEMV measurement rig for current q5090 ROW_SPLIT low-bit
 // linears. This is measurement-only: it dispatches through qus::kernels::linear
-// so the current generic ROW_SPLIT plan remains the measured implementation.
+// so the current registered ROW_SPLIT plan remains the measured implementation.
 //
 // Examples:
-//   ./build/bench/qus_linear_op_bench --all-targets --csv-out profiles/ncu-linear-v3/baseline.csv
+//   ./build/bench/qus_linear_op_bench --all-targets --csv-out profiles/ncu/linear-baseline.csv
 //   ./build/bench/qus_linear_op_bench --shape MlpGateUp34816x5120 --qtype Q4 --repeat 200
 
 #include "qus/kernels/linear.h"

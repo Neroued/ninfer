@@ -1,5 +1,9 @@
 # Python q5090 Tools Restructure Design
 
+> Status: superseded for the reference-model surface by [`tools/q5090/README.md`](../tools/q5090/README.md).
+> The converter remains under `tools/q5090_convert`; the implemented v4.1 reader/ref split is narrower
+> than this historical v2 whole-toolchain proposal.
+
 Date: 2026-06-29
 
 ## Goal

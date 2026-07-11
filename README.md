@@ -16,7 +16,7 @@ present. The M2.8 benchmark/I/O/memory observability gate is complete; M3 planni
 
 Current code includes L0 infrastructure, the q5090 `WeightStore`/loader and unified `Weight` handle,
 the 13 public L1 operator APIs and implementations, the L2 `Qwen3_6_27B` model card, the `Engine`,
-and parity tooling for block parity and greedy token matching. No performance numbers are claimed
+and q5090 Python reference/diagnostic tooling. No performance numbers are claimed
 here; performance claims require the M2.8 e2e benchmark/report standard.
 
 ## Goal
@@ -110,3 +110,4 @@ NVIDIA RTX 5090 (Blackwell, sm_120, 32 GB) · CUDA 13.1 · gcc 13.3 · CMake 3.2
 - [`docs/archive/pre-optimization/`](docs/archive/pre-optimization/) — completed pre-optimization
   plans, specs, and historical M2.8 standard material.
 - [`tools/q5090_convert`](tools/q5090_convert) — canonical safetensors-to-q5090 converter.
+- [`tools/q5090`](tools/q5090) — budget-aware Python reference model and q5090 diagnostics.

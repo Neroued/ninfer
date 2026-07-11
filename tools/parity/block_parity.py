@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""L2 weight-level sanity gate for q5090 v2 text weights."""
+"""Weight-level sanity gate for q5090 v4.1 text weights."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from tools.parity import hf_reference as hfref  # noqa: E402
-from tools.parity.ref_model import RefModel  # noqa: E402
+from tools.q5090.reader import Reader  # noqa: E402
 from tools.q5090_convert import qtypes as qt  # noqa: E402
 from tools.q5090_convert import tensor_plan as tp  # noqa: E402
 from tools.q5090_convert.convert import _layer_types, load_config  # noqa: E402
@@ -139,24 +139,24 @@ def run_l2(
     rows_per_chunk: int,
 ) -> bool:
     reader = hfref.HfShardReader(hf_dir)
-    model = RefModel(weights, device=str(device), resident="stream")
+    q5090 = Reader(weights)
     failed = False
     by_qtype: dict[int, Metrics] = {}
 
     try:
         for seg in segment_specs(hf_dir):
-            if seg.name not in model.q5090.views:
+            if seg.name not in q5090.views:
                 print(f"L2 FAIL {seg.name}: missing q5090 logical view", file=sys.stderr)
                 failed = True
                 continue
-            view = model.q5090.views[seg.name]
+            view = q5090.views[seg.name]
             qtype = view.block.qtype
             qtype_metrics = by_qtype.setdefault(qtype, Metrics())
 
             tensor_metrics = Metrics()
             if view.block.layout == qt.LAYOUT_ROW_SPLIT:
-                for row0, row1, q_chunk in model.q5090.row_split_row_chunks(
-                    seg.name, device, rows_per_chunk=rows_per_chunk
+                for row0, row1, q_chunk in q5090.row_chunks(
+                    view, device, rows_per_chunk, dtype=torch.float32
                 ):
                     h_chunk = hfref.prepare_source_rows(reader, seg.source, row0, row1).to(
                         device=device, non_blocking=True
@@ -166,7 +166,7 @@ def run_l2(
                     qtype_metrics.add(chunk_metrics)
                     del q_chunk, h_chunk
             else:
-                q_tensor = model.q5090.tensor(seg.name, device)
+                q_tensor = q5090.decode_view(view, device, dtype=torch.float32)
                 h_tensor = hfref.prepare_source_tensor(reader, seg.source).to(
                     device=device, non_blocking=True
                 )
@@ -199,8 +199,7 @@ def run_l2(
             )
     finally:
         reader.close()
-        model.q5090.close()
-        del model
+        q5090.close()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

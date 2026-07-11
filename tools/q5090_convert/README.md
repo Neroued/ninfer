@@ -34,6 +34,10 @@ unioned with the tokenizer's special ids; its rows are re-quantized from the ori
 | `verify.py` | L0 structure/tokenizer/plan checks, L1 bit-exact checks, and `conv_dump.v4_1.json` |
 | `tests/` | CPU round-trip tests for packing/quant/layouts/container/shortlist |
 
+The mmap reader, CUDA decode path and reference inference schedule live in
+[`tools/q5090`](../q5090). The converter/verifier and reader share these ABI and packing definitions;
+the reference model does not carry a second binary parser.
+
 GDN `linear_attn.conv1d.weight` is transformed from HF raw `[10240,1,4]` into q5090 canonical
 `[10240,4,1]` with runtime-native tap-major payload order. This is an offline converter transform; the
 runtime model bind path does not allocate temporary conv1d storage.

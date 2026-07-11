@@ -32,6 +32,8 @@ Operational documentation stays next to the code it describes:
 - [`../tools/bench/README.md`](../tools/bench/README.md) — benchmark corpus and matrix tooling;
 - [`../tools/q5090/README.md`](../tools/q5090/README.md) — Python reference and diagnostics;
 - [`../tools/q5090_convert/README.md`](../tools/q5090_convert/README.md) — converter and verifier.
+- [`../eval/README.md`](../eval/README.md) — configurable capability evaluation, progress, logs,
+  resume, and normalized reports.
 
 ## Authority and lifecycle
 

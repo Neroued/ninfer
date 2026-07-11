@@ -1,0 +1,41 @@
+schema_version: 1
+
+targets:
+  shared:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: mock-model
+    max_concurrency: 3
+
+suites:
+  all:
+    jobs:
+      - id: mock_accuracy
+        backend: mock
+        dataset: mock_accuracy
+        target: shared
+        max_concurrency: 3
+        backend_args:
+          items: 12
+          sleep_seconds: 0.01
+          wrong_every: 4
+
+      - id: mock_unknown_total
+        backend: mock
+        dataset: mock_unknown_total
+        target: shared
+        max_concurrency: 2
+        backend_args:
+          items: 5
+          sleep_seconds: 0.01
+          unknown_total: true
+
+runtime:
+  max_parallel_jobs: 2
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 5
+  samples:
+    retention: all

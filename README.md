@@ -24,7 +24,9 @@ The current implementation includes:
 - OpenAI Chat Completions and Anthropic Messages HTTP endpoints, including streaming and
   best-effort function tool calling;
 - a Python q5090 reference model, converter, structural verifier, numerical diagnostics, and
-  real-weight/per-operator benchmarks.
+  real-weight/per-operator benchmarks;
+- a configurable capability-evaluation coordinator for local or online OpenAI-compatible targets,
+  with EvalScope adapters, progress, persistent logs, resume, and normalized reports.
 
 The project does not support other models, batching, multi-GPU inference, or old q5090 formats.
 Context capacity is configured at process start and bounded by GPU memory. The CLI defaults to

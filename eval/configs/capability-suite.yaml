@@ -1,0 +1,131 @@
+schema_version: 1
+
+targets:
+  model_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.6-27b
+    # Uncomment when authentication is required.
+    # api_key_env: MODEL_API_KEY
+    max_concurrency: 1
+    request:
+      timeout_seconds: 3600
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  smoke:
+    jobs:
+      - id: aime25_smoke
+        backend: evalscope
+        dataset: aime25
+        target: model_api
+        limit: 2
+        generation:
+          temperature: 0.6
+          top_p: 0.95
+          max_tokens: 16384
+          seed: 42
+        backend_args:
+          judge_strategy: rule
+
+      - id: aime26_smoke
+        backend: evalscope
+        dataset: aime26
+        target: model_api
+        limit: 2
+        generation:
+          temperature: 0.6
+          top_p: 0.95
+          max_tokens: 16384
+          seed: 42
+        backend_args:
+          judge_strategy: rule
+
+      - id: gpqa_diamond_smoke
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: model_api
+        limit: 2
+        generation:
+          temperature: 0.6
+          top_p: 0.95
+          max_tokens: 16384
+          seed: 42
+
+      - id: bfcl_v4_smoke
+        backend: evalscope
+        dataset: bfcl_v4
+        target: model_api
+        limit: 2
+        generation:
+          temperature: 0
+        backend_args:
+          subset_list:
+            - simple_python
+            - multiple
+            - parallel
+            - irrelevance
+            - multi_turn_base
+          is_fc_model: true
+          underscore_to_dot: true
+
+  reasoning:
+    jobs:
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: model_api
+        generation:
+          temperature: 0.6
+          top_p: 0.95
+          max_tokens: 16384
+          seed: 42
+        backend_args:
+          judge_strategy: rule
+
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: model_api
+        generation:
+          temperature: 0.6
+          top_p: 0.95
+          max_tokens: 16384
+          seed: 42
+        backend_args:
+          judge_strategy: rule
+
+      - id: gpqa_diamond
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: model_api
+        generation:
+          temperature: 0.6
+          top_p: 0.95
+          max_tokens: 16384
+          seed: 42
+
+  bfcl_full:
+    jobs:
+      - id: bfcl_v4
+        backend: evalscope
+        dataset: bfcl_v4
+        target: model_api
+        generation:
+          temperature: 0
+        backend_args:
+          is_fc_model: true
+          underscore_to_dot: true
+          serpapi_api_key_env: SERPAPI_API_KEY
+          allow_network_downloads: true
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 30
+  samples:
+    retention: all

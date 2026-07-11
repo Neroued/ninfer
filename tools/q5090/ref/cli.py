@@ -8,6 +8,9 @@ import time
 import torch
 
 from .model import COMPILED_CODEC_MIN_TOKENS, RefModel
+from .chat import render_prompt
+from .config import CFG
+from .sampling import Sampler, SamplingConfig
 from .tap import FileTap
 
 
@@ -30,9 +33,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights", required=True)
     prompt = parser.add_mutually_exclusive_group(required=True)
-    prompt.add_argument("--prompt", help="raw prompt text encoded by the embedded tokenizer")
+    prompt.add_argument("--prompt", help="single user message rendered as Qwen3.6 chat")
     prompt.add_argument("--ids", help="comma/space-separated prompt token ids")
-    parser.add_argument("--decode", type=int, default=16)
+    parser.add_argument(
+        "--thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable/disable the Qwen thinking generation prompt",
+    )
+    parser.add_argument("--decode", type=int, default=512)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--gpu-memory", default="auto")
     parser.add_argument("--headroom", default="2GiB")
@@ -40,6 +49,13 @@ def main() -> None:
     parser.add_argument("--kv-dtype", choices=["bf16", "int8"], default="bf16")
     parser.add_argument("--mtp", action="store_true")
     parser.add_argument("--draft-head", action="store_true")
+    parser.add_argument("--greedy", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--presence-penalty", type=float, default=1.0)
+    parser.add_argument("--frequency-penalty", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--stop-ids",
         help="comma/space-separated override; defaults to embedded generation config",
@@ -65,8 +81,11 @@ def main() -> None:
         load_seconds = time.perf_counter() - load_start
         if args.structural_dump:
             model.reader.structural_dump(args.structural_dump)
-        prompt_ids = (
-            parse_ids(args.ids) if args.ids is not None else model.tokenizer.encode(args.prompt)
+        rendered_prompt = None if args.prompt is None else render_prompt(
+            args.prompt, thinking=args.thinking
+        )
+        prompt_ids = parse_ids(args.ids) if args.ids is not None else model.tokenizer.encode(
+            rendered_prompt
         )
         if not prompt_ids:
             parser.error("prompt must encode to at least one token")
@@ -75,6 +94,18 @@ def main() -> None:
             if args.stop_ids is not None
             else model.tokenizer.default_stop_token_ids
         )
+        sampling = SamplingConfig(
+            temperature=0.0 if args.greedy else args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            presence_penalty=args.presence_penalty,
+            frequency_penalty=args.frequency_penalty,
+            seed=args.seed,
+        )
+        try:
+            sampler = Sampler(sampling, CFG.vocab, model.device)
+        except ValueError as exc:
+            parser.error(str(exc))
         if model.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(model.device)
         prepare_start = time.perf_counter()
@@ -88,19 +119,27 @@ def main() -> None:
         tokens = []
         prefill_start = time.perf_counter()
         if args.decode > 0:
-            token = model.prefill(prompt_ids, tap=tap)
+            token = model.prefill(prompt_ids, sampler=sampler, tap=tap)
             tokens.append(token)
         if model.device.type == "cuda":
             torch.cuda.synchronize(model.device)
         prefill_seconds = time.perf_counter() - prefill_start
         decode_start = time.perf_counter()
         while len(tokens) < args.decode and tokens[-1] not in stops:
-            tokens.append(model.decode(tokens[-1], step=len(tokens) - 1, tap=tap))
+            tokens.append(
+                model.decode(
+                    tokens[-1],
+                    step=len(tokens) - 1,
+                    sampler=sampler,
+                    tap=tap,
+                )
+            )
         if model.device.type == "cuda":
             torch.cuda.synchronize(model.device)
         decode_seconds = time.perf_counter() - decode_start
         print("MEMORY_PLAN:", model.weights.plan.summary())
         print("CODEC:", "compiled" if model.active_compile_codec else "eager")
+        print("SAMPLING:", sampler.summary())
         print(
             f"TIMING: load={load_seconds:.3f}s prepare={prepare_seconds:.3f}s "
             f"prefill={prefill_seconds:.3f}s decode={decode_seconds:.3f}s "
@@ -113,8 +152,16 @@ def main() -> None:
                 f"reserved={torch.cuda.max_memory_reserved(model.device) / (1 << 30):.2f}GiB"
             )
         generated_text = model.tokenizer.decode(tokens, skip_special_tokens=True)
+        stop_reason = (
+            "disabled"
+            if args.decode == 0
+            else "stop_token"
+            if tokens and tokens[-1] in stops
+            else "length"
+        )
         print("PROMPT_TOKEN_IDS:", prompt_ids)
         print("GENERATED_TOKEN_IDS:", tokens)
+        print("STOP_REASON:", stop_reason)
         print("GENERATED_TEXT:")
         print(generated_text)
         if args.mtp:
@@ -123,9 +170,13 @@ def main() -> None:
             tap.close(
                 weights=str(model.reader.path),
                 prompt_text=args.prompt,
+                rendered_prompt=rendered_prompt,
                 prompt_ids=prompt_ids,
                 generated_token_ids=tokens,
                 generated_text=generated_text,
+                stop_reason=stop_reason,
+                thinking=args.thinking if args.prompt is not None else None,
+                sampling=sampler.summary(),
                 kv_dtype=args.kv_dtype,
                 prefill_chunk=args.prefill_chunk,
             )

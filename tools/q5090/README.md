@@ -20,12 +20,20 @@ Use the CUDA environment that contains PyTorch and `flash-linear-attention`:
 ```bash
 /home/neroued/miniconda3/envs/py311/bin/python -m tools.q5090.ref \
   --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_1.qus \
-  --prompt "请简短介绍一下你自己。" --decode 16
+  --prompt "请简短介绍一下你自己。" --decode 512
 ```
 
-The CLI encodes `--prompt` with the tokenizer embedded in the q5090 artifact and prints both token
-IDs and decoded generated text. Use `--ids "1 2 3"` instead when an exact token fixture is required.
-Stop token IDs default to the embedded `generation_config.json`; `--stop-ids` overrides them.
+The CLI renders `--prompt` as a single-turn Qwen3.6 chat, encodes it with the tokenizer embedded in
+the q5090 artifact and prints both token IDs and decoded generated text. Thinking is enabled by
+default; use `--no-thinking` for a direct answer. Sampling defaults match normal Qwen thinking usage
+(`0.6/0.95/top-20`, presence penalty 1); use `--greedy` for deterministic correctness diagnostics.
+Use `--ids "1 2 3"` when an exact token fixture is required. Stop token IDs default to the embedded
+`generation_config.json`; `--stop-ids` overrides them.
+
+The default decode budget is 512 because thinking responses routinely need hundreds of tokens before
+`</think>` and the final answer. Non-thinking checks can usually use `--no-thinking --decode 128` or
+`256`; raise thinking runs to `--decode 1024` when the task itself invites a long analysis. Reaching
+the budget without EOS is a truncated diagnostic result, not a successful generation.
 
 Useful options:
 
@@ -34,6 +42,8 @@ Useful options:
 - `--kv-dtype bf16|int8`;
 - `--prefill-chunk N`;
 - `--mtp --draft-head`: load and expose the MTP/draft forward path;
+- `--thinking|--no-thinking` and `--temperature/--top-p/--top-k`;
+- `--greedy`: deterministic argmax for numerical diagnostics;
 - `--structural-dump FILE`;
 - `--activation-dump DIR --dump-level layer|op`.
 

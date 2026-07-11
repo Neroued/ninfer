@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 
@@ -183,7 +183,14 @@ class RefModel:
             logits[row0:row1] = (last @ weight.t())[0]
         return logits
 
-    def prefill(self, ids: Iterable[int], *, capacity: int | None = None, tap=None) -> int:
+    def prefill(
+        self,
+        ids: Iterable[int],
+        *,
+        capacity: int | None = None,
+        sampler: Callable[[torch.Tensor], int] | None = None,
+        tap=None,
+    ) -> int:
         ids = list(ids)
         if not ids:
             raise ValueError("prefill ids must not be empty")
@@ -236,10 +243,11 @@ class RefModel:
                     )
         assert last_hidden is not None
         logits = self.logits_last(last_hidden)
+        target = sampler(logits) if sampler is not None else int(torch.argmax(logits).item())
         self.last_hidden = last_hidden
         if self.mtp_enabled:
             _, draft = self.mtp_forward(
-                [int(torch.argmax(logits).item())],
+                [target],
                 last_hidden[-1:],
                 torch.tensor([state.position - 1], device=self.device, dtype=torch.int32),
                 start=state.mtp_kv.length,
@@ -254,13 +262,14 @@ class RefModel:
             chunk=chunk,
             position=state.position - 1,
         )
-        return int(torch.argmax(logits).item())
+        return target
 
     def _decode(
         self,
         token: int,
         *,
         step: int = 0,
+        sampler: Callable[[torch.Tensor], int] | None = None,
         tap=None,
     ) -> tuple[int, torch.Tensor, torch.Tensor]:
         _, state = self._ready()
@@ -288,7 +297,7 @@ class RefModel:
         logits = self.logits_last(hidden)
         self.last_hidden = hidden
         self._tap(tap, "logits", logits, phase="decode", step=step, chunk=0, position=start)
-        target = int(torch.argmax(logits).item())
+        target = sampler(logits) if sampler is not None else int(torch.argmax(logits).item())
         if self.mtp_enabled:
             _, self.last_draft = self.mtp_forward(
                 [target],
@@ -298,8 +307,15 @@ class RefModel:
             )
         return target, hidden, logits
 
-    def decode(self, token: int, *, step: int = 0, tap=None) -> int:
-        return self._decode(token, step=step, tap=tap)[0]
+    def decode(
+        self,
+        token: int,
+        *,
+        step: int = 0,
+        sampler: Callable[[torch.Tensor], int] | None = None,
+        tap=None,
+    ) -> int:
+        return self._decode(token, step=step, sampler=sampler, tap=tap)[0]
 
     def snapshot(self) -> ModelSnapshot:
         _, state = self._ready()
@@ -356,6 +372,7 @@ class RefModel:
         max_new_tokens: int,
         *,
         stop_token_ids: set[int] | None = None,
+        sampler: Callable[[torch.Tensor], int] | None = None,
         tap=None,
     ) -> list[int]:
         prompt = list(prompt)
@@ -367,10 +384,10 @@ class RefModel:
         if compile_codec is None:
             compile_codec = max_new_tokens >= COMPILED_CODEC_MIN_TOKENS
         self.prepare(len(prompt) + max_new_tokens, compile_codec=compile_codec)
-        token = self.prefill(prompt, tap=tap)
+        token = self.prefill(prompt, sampler=sampler, tap=tap)
         output = [token]
         while len(output) < max_new_tokens and not (stop_token_ids and token in stop_token_ids):
-            token = self.decode(token, step=len(output) - 1, tap=tap)
+            token = self.decode(token, step=len(output) - 1, sampler=sampler, tap=tap)
             output.append(token)
         return output
 

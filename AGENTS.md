@@ -1,183 +1,279 @@
 # AGENTS.md
 
-## Scope
+## Project Scope
 
 These rules apply to the entire repository.
 
 This project is a from-scratch C++/CUDA inference engine specialized for Qwen3.6-27B on one RTX
-5090. It is not a general-purpose runtime, compatibility layer, or model zoo.
+5090. The supported system includes the fixed Text decoder, MTP speculative decoding, native Vision,
+the q5090 v4.2 artifact, command-line generation, and OpenAI/Anthropic serving.
 
-If any instruction outside this file conflicts with this file, follow this file.
+The target workload is one user, one active sequence, and one GPU. This is not a general-purpose
+runtime, compatibility layer, model zoo, batching framework, or multi-GPU system.
 
-## No Backward Compatibility
+## Local Environment
 
-This project does not preserve backward compatibility.
+Use these canonical paths on the current development machine:
 
-When changing project-owned code, tests, scripts, CLIs, fixtures, schemas, or active documentation:
+| Purpose | Path |
+|---|---|
+| repository | `/home/neroued/qwen3.6-ultraspeed` |
+| Python 3.11 | `/home/neroued/miniconda3/envs/py311/bin/python` |
+| BF16 source model | `/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16` |
+| current q5090 artifact | `out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus` |
+| artifact manifest | `out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus.manifest.json` |
+| CMake build | `build/` |
+| local profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
+| hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
 
-- Replace the old behavior directly with the new behavior.
-- Delete deprecated aliases, compatibility shims, legacy flags, legacy fields, fallback branches,
-  and transition code.
-- Do not keep old and new behavior side by side.
-- Do not add deprecation warnings for project-owned behavior; remove the behavior.
-- Do not preserve tests whose only purpose is to prove old behavior still works.
+For Python work, invoke the canonical interpreter explicitly. Do not use an arbitrary ambient
+`python` or `pip`, and do not install or upgrade dependencies unless the task requires it.
 
-Do not design for migration windows, external legacy users, old artifact formats, or old command
-surfaces unless the user explicitly redefines the project scope.
+`out/` contains old experimental artifacts. Never choose an artifact by glob, modification time, or
+an unqualified “latest” name. Use the v4.2 path above unless the task explicitly names another file.
+Retained v1/v2/v3/v4/v4.1 artifacts are historical diagnostics, not valid current runtime inputs.
 
-## Implementation Style
+The model, q5090 artifact, and profiler outputs are large local prerequisites. If one is missing,
+report it clearly; do not download a model, regenerate a large artifact, or launch a long profile
+unless that work is in scope. Files under `out/` and `profiles/` are normally local and uncommitted.
+
+Useful shell variables:
+
+```bash
+PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
+MODEL=/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16
+WEIGHTS=out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus
+```
+
+## Sources of Truth
+
+Use the smallest relevant current source:
+
+- `README.md` — capabilities, build, and quick-start commands;
+- `docs/README.md` — active documentation map and authority boundaries;
+- `docs/design.md` — system ownership, runtime flows, and supported scope;
+- `docs/qwen3.6-27b-architecture.md` — Text/MTP/Vision mathematics and state semantics;
+- `docs/q5090_packed_file_format_v4.md` — the only normative q5090 artifact contract;
+- `docs/kernel-development.md` — kernel layering and correctness/performance workflow;
+- `docs/serving.md` — CLI, sampling, multimodal, OpenAI, and Anthropic behavior;
+- public headers under `include/qus/` — current C++ API;
+- executable `--help` output — exact current command options.
+
+Read the q5090 specification before converter/parser/layout work; the system design and model
+reference before model/runtime/MTP/Vision work; the kernel guide and relevant model section before
+CUDA work; and the serving guide before schema/sampling/protocol work. Do not require unrelated
+documents to be read for every task.
+
+Documents under `docs/archive/` are historical evidence. They may explain why a decision was made,
+but they do not define current behavior.
+
+## Compatibility Policy
+
+Project-owned interfaces do not preserve backward compatibility. This includes C++ APIs, CLIs,
+Python tooling, fixtures, reports, q5090 formats, project extensions, and active documentation.
+
+When changing them:
+
+- replace the old behavior directly;
+- delete deprecated flags, fields, aliases, shims, fallback branches, and transition code;
+- do not keep old and new behavior side by side;
+- do not add project-owned deprecation windows;
+- do not retain tests whose only purpose is to protect removed behavior.
+
+The currently advertised OpenAI and Anthropic protocol surfaces are real external contracts.
+Changes to them must update schema behavior, schema tests, and `docs/serving.md` together. This does
+not require preserving deleted project-specific extensions or obsolete aliases.
+
+Archiving an old specification is provenance, not a promise that the runtime can read it.
+
+## Ownership and Implementation Style
 
 Prefer direct, explicit implementation over framework-like abstraction.
 
-Use the project layering deliberately:
+- L0 (`core`) owns devices, streams, arenas, tensors, q5090 loading, KV cache, and recurrent state.
+- L1 (`kernels`) owns mathematical operator APIs, dispatch, launchers, and CUDA implementations.
+- L2 (`model`) owns fixed Text/MTP/Vision schedules, weight binding, and model-private helpers.
+- `runtime` owns Engine lifetime, prefix reuse, sampling state, CUDA Graphs, and MTP rounds.
+- `text` and `media` own tokenization, templates, media acquisition, and preprocessing.
+- `serve` owns protocol schemas, request translation, streaming, and transport behavior.
+- `tools` own conversion, reference inference, parity, and diagnostics.
+- `bench` owns executable measurement and report behavior.
 
-- L0 owns reusable infrastructure.
-- L1 owns operator APIs and CUDA implementations.
-- L2 owns the Qwen3.6 model card and static schedule.
-- Tools and benchmarks own their practical CLI/report behavior.
+Use `docs/design.md` when detailed ownership is unclear. Do not duplicate a competing architecture
+inside a local implementation note.
 
-Do not add abstractions for hypothetical future models, generic runtime flexibility, legacy
-surfaces, or speculative reuse.
+Do not add abstractions for hypothetical models, hardware, formats, or future runtime flexibility.
+Do not introduce dynamic model graphs, string-driven model structure, hidden device allocation,
+runtime weight repacking, or filesystem access on inference hot paths. Public operator APIs describe
+mathematical semantics; kernel strategy and hardware policy remain private. Keep model-specific
+bookkeeping out of reusable L1 unless it becomes a genuine operator contract.
 
-## Commit Messages
+## CUDA, Numerical, and Performance Rules
 
-Use Conventional Commit-style subjects for project commits:
-`type(scope): concise imperative summary`, or `type: concise imperative summary` when no useful
-scope exists.
+Numerical changes must identify the mathematical oracle, input rounding boundary, accumulation
+precision, output tolerance, and real model shapes. Do not copy the CUDA algorithm into a test and
+call it an independent oracle.
 
-Use lowercase types consistent with project history, such as `docs`, `feat`, `fix`, `perf`,
-`bench`, `test`, `build`, `refactor`, or `chore`. Do not use free-form title-case subjects.
+Treat these as high-risk boundaries:
 
-## Implementation Plan Writing
+- q5090 code/scale decode and tensor assignment;
+- BF16 rounding and fusion order;
+- zero-centered versus plain RMSNorm;
+- FP32 GDN gates and recurrent state;
+- BF16/INT8 KV representation;
+- MTP proposal, target verification, and state-slot commit;
+- arena mark/rewind lifetime;
+- CUDA Graph address and shape stability.
 
-These rules apply to formal implementation plans under `docs/plans/**` and
-`docs/superpowers/plans/**`. They do not apply to design specs, roadmaps, milestone standards,
-historical notes, or informal chat plans unless the user explicitly says so.
+Final-token plausibility is not a substitute for operator or block numerical verification.
 
-When writing a formal implementation plan, default to a subagent-driven execution target unless the
-user explicitly requests another mode. The plan should be executable by a coordinator that dispatches
-bounded work to fresh subagents, then integrates and verifies the results. If a plan should not use
-subagents, state the reason and the intended execution mode in the plan.
+For performance work:
 
-Whenever using subagents, assign every subagent the current strongest available model. Do not choose
-weaker, cheaper, legacy, or compatibility-oriented models for subagent work.
+- use NSYS first for full-inference phase attribution, launch gaps, synchronization, and CPU/GPU
+  overlap;
+- use NCU after a specific hot kernel has been identified;
+- do not use an isolated microbenchmark improvement as proof of end-to-end speed;
+- protect numerical behavior and the relevant `qus_bench` path together;
+- record the git commit, dirty state, GPU/CUDA, artifact identity, complete command, test matrix, and
+  before/after reports for any performance claim.
 
-Every formal implementation plan should include at least:
-
-- goal and non-goals;
-- execution mode, including whether subagent-driven development is required, recommended, or
-  intentionally not used;
-- scope and ownership, including files, artifacts, or subsystems each task may change;
-- task breakdown;
-- reading list for each task or task group;
-- definition of done and verification commands for each task or phase;
-- review phase, scaled to the risk of the change.
-
-Tasks must be split by meaningful, verifiable delivery boundaries. A task should usually own a
-coherent behavior, interface, artifact, or risk area and include the files needed to complete and
-verify that boundary. Do not split tasks by individual file, tiny edit, or mechanical step when those
-pieces cannot be independently verified. Do not merge unrelated risk areas merely to reduce task
-count.
-
-Prefer fewer, well-bounded subagent tasks over many tiny tasks. A good task gives a subagent enough
-context to finish one meaningful unit without reading the whole plan or carrying state from previous
-tasks. Use task groups when several small edits share one verification boundary.
-
-Plans must make dependencies and sequencing explicit. Parallelize independent tasks only when they
-have separate file ownership or clear integration points. Shared files such as CMake registrations,
-schema definitions, fixture manifests, or plan indexes must be called out as coordination points.
-
-Review requirements scale with risk. Plans that touch CUDA kernels, numerical behavior, q5090
-formats, CLI/report schemas, benchmark evidence, GPU memory lifetime, or multi-step runtime flows
-should include independent review subagents or an equivalent strict review phase. Small
-documentation-only or single-surface plans may use a focused checklist instead.
-
-Verification must follow the repository testing policy. Do not add low-value tests to satisfy a plan
-template. Use builds, existing tests, allowed high-value tests, `compute-sanitizer`,
-benchmark/report checks, or manual artifact inspection as appropriate for the changed behavior.
+Historical profiler reports are not current baselines after code, artifacts, or measurement
+contracts change.
 
 ## Testing Policy
 
-Tests are not added by default.
-
-A test is allowed only when it protects a real, observable project risk and can fail for a
-meaningful regression. Tests that only increase coverage numbers, lock implementation shape, or
-preserve compatibility are not allowed.
-
-## Restricted TDD
-
-TDD is allowed only for the categories below. For other work, use build checks, existing tests,
-sanitizer runs, benchmarks, review checklists, or manual verification as appropriate.
+Tests are not added by default. A test is allowed only when it protects a real, observable project
+risk and can fail for a meaningful regression. Tests that only increase coverage, lock private
+implementation shape, or preserve compatibility are not allowed.
 
 ### Hard Whitelist
 
-1. Numerical correctness for CUDA kernels, operators, or model block parity.
-   - Must have a clear mathematical oracle.
-   - Must use real project shapes where applicable.
-   - Must include stress or edge cases that can expose wrong math.
-
+1. Numerical correctness for CUDA kernels, operators, or model-block parity.
+   - Use a clear mathematical oracle.
+   - Use real project shapes where applicable.
+   - Include stress or edge cases that can expose the targeted wrong math.
 2. Binary and file-format contracts.
-   - Examples: q5090 parser, pack/unpack, manifest, CRC, shape, dtype, layout, and weight-loading
-     boundaries.
-   - The test must reject malformed or dangerous input that could otherwise load wrong weights or
-     corrupt runtime behavior.
-
+   - Cover q5090 parser, pack/unpack, manifest, CRC, shape, dtype, layout, and loading boundaries.
+   - Reject malformed or dangerous input that could load wrong weights or corrupt runtime state.
 3. Real CLI and report/schema contracts.
-   - Examples: benchmark reports, summaries, tokenizer tools, fixture manifests, JSON fields
-     consumed by scripts or docs.
-   - The test must validate user-visible or downstream-consumed behavior.
+   - Cover benchmark reports, tokenizer tools, fixtures, and externally consumed JSON/protocol fields.
+   - Validate user-visible or downstream-consumed behavior.
 
 ### Conditional Whitelist
 
 4. End-to-end observable behavior.
-   - Allowed only with a small number of canonical fixtures.
-   - Must validate final user-visible output or downstream-consumed artifacts.
-   - Must not test internal call paths, private functions, or source layout.
-
+   - Use a small number of canonical fixtures.
+   - Validate final output or downstream artifacts, not private call paths.
 5. GPU memory and lifetime risks.
-   - Allowed only when the test actually runs the risky behavior or is paired with
-     `compute-sanitizer`.
-   - Examples: out-of-bounds access, use-after-rewind, arena lifetime, KV/state/workspace shape
-     mismatch, repeated prefill/decode lifetime bugs.
-   - Source-code string scanning does not qualify.
-
-6. Reproduced bug regression.
-   - The bug must have a known failing behavior before the fix.
-   - The test must document the trigger condition, expected behavior, and why existing tests missed
-     it.
+   - Exercise the risky behavior directly or pair the check with `compute-sanitizer`.
+   - Examples include OOB access, use-after-rewind, state-slot mismatch, and repeated prefill/decode.
+6. Reproduced bug regressions.
+   - Record the trigger, expected behavior, and why existing checks missed it.
    - Prefer the smallest layer that exposes the bug.
-   - Delete the regression test later if the underlying risk disappears.
+   - Remove the regression later if the underlying risk disappears.
 
-## Forbidden Tests
+### Forbidden Tests
 
 Do not add tests that:
 
-- scan source files for strings, function names, call order, or private layout;
-- preserve deprecated aliases, compatibility shims, legacy flags, or legacy fields;
-- only test getters, setters, default constructors, enum spellings, or trivial mappings;
-- only check that a document or file exists;
-- duplicate another test without increasing risk coverage;
+- scan source files for strings, symbols, call order, or private layout;
+- preserve removed flags, fields, aliases, shims, formats, or command surfaces;
+- only test getters, setters, constructors, enum spellings, or trivial mappings;
+- only check that a file or document exists;
+- duplicate existing coverage without increasing risk protection;
 - lock implementation details that should remain free to change;
-- exist only to satisfy a TDD process or coverage metric.
+- exist only to satisfy TDD ceremony or a coverage metric.
 
-## Rewriting Bad Tests
+If an existing bad test protects a real risk, replace it with numerical, parser/schema, behavioral,
+integration, or sanitizer-backed coverage before removing it. If it protects no meaningful risk,
+remove it without replacement. Preferred implementation shape belongs in review, not source scans.
 
-If an existing bad test protects a real risk, replace it with a behavior, numerical,
-parser/schema, integration, or sanitizer-backed test before removing the bad test.
+## Documentation Lifecycle
 
-If a test does not protect a real risk, remove it without replacement.
+The stable active documentation set is defined by `docs/README.md`. New stable requirements must be
+integrated into an existing authoritative document whenever possible. Do not create parallel
+`final`, `v2`, `updated`, or `new-design` documents for the same current subject.
 
-Source-structure tests are not acceptable. If the only enforceable claim is a preferred
-implementation shape, enforce it through review, not through tests.
+Only the active q5090 specification may be called the normative artifact contract. Public headers,
+not a hand-maintained operator catalog, enumerate C++ APIs. Executable `--help`, not a copied flag
+list, enumerates command options.
 
-## Verification
+Complex active work may temporarily create `docs/plans/YYYY-MM-DD-topic.md`. A plan must be moved
+under the appropriate `docs/archive/` era when the work is completed, abandoned, or superseded,
+preferably in the finishing change. Small changes should not create a plan file merely to satisfy a
+template. Do not recreate `docs/superpowers/`.
 
-Before claiming a change is complete, run the smallest verification set that proves the changed
-behavior:
+Dated investigations, implementation reports, benchmark evidence, and profiler summaries may exist
+while work is active. Distill stable conclusions into the authoritative documents, then archive the
+dated material. Current behavior must not depend on an archived report or plan.
 
-- build affected targets;
-- run affected tests;
-- run `compute-sanitizer` for GPU memory/lifetime changes when available;
-- run benchmark/report tooling checks for schema or CLI changes.
+Archive rules:
 
-Do not add low-value tests to compensate for weak verification.
+- status words inside archived files describe their historical moment;
+- normally preserve historical technical content rather than rewriting it as if it were current;
+- repair archive indexes, move notes, and links when useful;
+- annotate a material historical error instead of silently rewriting the record;
+- active documents may cite archived rationale but must state current normative requirements
+  themselves;
+- update `docs/archive/README.md` when adding a new archive era.
+
+Documentation changes must check active Markdown links, stale references to moved files, conflicting
+current/canonical/normative claims, README navigation, and `git diff --check`. Enforce these through
+review and lightweight tooling, not source-scanning unit tests.
+
+## Implementation Plans and Review
+
+A formal implementation plan is appropriate when the user requests one or when work is multi-stage
+and high-risk, such as CUDA numerical changes, q5090 ABI changes, GPU lifetime changes, or complex
+external schema changes. Ordinary localized work does not need a plan document.
+
+A formal plan must include:
+
+- goal and non-goals;
+- current facts and a focused reading list;
+- scope, ownership, and shared coordination points;
+- dependencies and sequence;
+- tasks split by independently verifiable delivery boundaries;
+- definition of done and exact verification commands for each phase;
+- a risk-scaled final review;
+- the archive destination for the completed plan and evidence.
+
+Do not split work by individual file or mechanical step when those pieces cannot be verified
+independently. Do not merge unrelated risk areas merely to reduce task count. Do not structure plans
+around orchestration mechanics; structure them around behavior, interfaces, artifacts, and risks.
+
+High-risk changes require a separate final review pass after implementation. Re-read the final diff
+from the numerical, lifetime, ABI, protocol, or performance perspective involved, then run the final
+gate after findings are resolved. Small documentation-only or single-surface changes may use a
+focused checklist.
+
+## Verification Before Completion
+
+Run the smallest verification set that proves the changed behavior:
+
+| Change | Minimum verification |
+|---|---|
+| documentation | active-link and stale-reference audit; `git diff --check` |
+| C++ API/runtime | affected build targets and affected tests |
+| Python tooling | `py_compile` and affected Python tests |
+| q5090 converter/parser/layout | format tests, verifier, malformed-input checks, and real artifact when needed |
+| CUDA numerical behavior | oracle tests at real shapes |
+| CUDA memory/lifetime | affected execution plus `compute-sanitizer` when available |
+| kernel performance | microbenchmark, NCU, and relevant `qus_bench` comparison |
+| full inference performance | NSYS and before/after `qus_bench` |
+| CLI/report/schema | real command/output or affected schema tests |
+| serving | OpenAI/Anthropic schema tests and observable response behavior |
+
+Do not add low-value tests to compensate for weak verification. State clearly when a relevant check
+could not run and why. Never present an archived report as evidence from the current change.
+
+## Commit Messages
+
+Use Conventional Commit-style subjects:
+
+```text
+type(scope): concise imperative summary
+```
+
+Use lowercase types consistent with project history, such as `docs`, `feat`, `fix`, `perf`, `bench`,
+`test`, `build`, `refactor`, or `chore`. Do not use free-form title-case subjects.

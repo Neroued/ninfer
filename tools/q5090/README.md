@@ -7,7 +7,7 @@ a general model runtime and does not try to reproduce the C++ kernel instruction
 
 - `reader.py`: the only mmap-backed Python v4.2 reader and canonical structural dump producer.
 - `codec.py`: bit-exact Q4/Q5/Q6/W8 decode; CUDA unpack is fused with `torch.compile`.
-- `ref/`: the Qwen3.6-27B text/MTP schedule, state, library-backed operators and CLI.
+- `ref/`: the Qwen3.6-27B text/MTP/Vision schedule, state, library-backed operators and CLI.
 - `diagnostics/`: exact structure comparison and report-only activation comparison.
 
 The converter continues to own encoding, source tensor transforms and G-VALUE verification under
@@ -54,6 +54,37 @@ Short runs use the eager bit-exact codec to avoid compilation startup cost; long
 compiled codec for higher steady-state throughput. Library callers can override this decision with
 `RefModel(..., compile_codec=True|False)`.
 
+### Image and video input
+
+Multimodal mode uses the checkpoint's Hugging Face processor for media decoding, dynamic resize,
+normalization, patch packing, chat-template expansion and `mm_token_type_ids`. The q5090 reference
+still owns the complete quantized 27-layer ViT, patch merger, embedding injection and text MRoPE;
+it never calls the Hugging Face Vision forward.
+
+The ref caps a processed image at roughly 1M pixels and all sampled frames of each video at roughly
+4M pixels. Hugging Face still chooses the aligned dimensions and temporal samples. These limits keep
+real 4K screenshots and videos practical for the unfused PyTorch Vision implementation.
+
+```bash
+/home/neroued/miniconda3/envs/py311/bin/python -m tools.q5090.ref \
+  --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+  --processor /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16 \
+  --messages /tmp/qwen_messages.json \
+  --no-thinking --decode 256
+```
+
+The messages file is either a Qwen/Hugging Face message array or an object with a `messages` array.
+Image/video content keeps its normal structured form and may use any local media representation the
+active Hugging Face processor supports. Local video files use TorchCodec when installed and the
+OpenCV backend otherwise. The CUDA environment must provide `transformers>=5.12` so the processor
+returns `mm_token_type_ids`.
+
+Vision executes before text weight preparation. Quantized vision matrices are decoded one at a time,
+the full 878 MiB BF16 tower is never resident, and only the final `[visual_tokens,5120]` embeddings
+survive into text prefill. `VISION:` reports raw patches, merged LLM tokens, attention-pair work,
+encoding time and peak allocation. `--vision-attention-limit N` rejects a request before execution
+when `sum(T*(H*W)^2)` exceeds an operator-selected compute budget.
+
 ## Correctness standard
 
 Hard exact contracts are the v4.2 catalog/tokenizer structure, low-bit codes/scales, decoded BF16
@@ -64,4 +95,7 @@ attention and GDN accumulation paths differ, so final greedy token equality is n
 ```bash
 python -m tools.q5090.diagnostics.structure out/conv_dump.v4_2.json /tmp/ref_dump.v4_2.json
 python -m tools.q5090.diagnostics.activations /tmp/cpp_dump /tmp/python_dump
+python -m tools.q5090.diagnostics.vision \
+  --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+  --model-dir /path/to/base-hf-bf16 --messages /tmp/qwen_messages.json
 ```

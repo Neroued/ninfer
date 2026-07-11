@@ -14,10 +14,12 @@ from tools.q5090_convert import format as fmt
 
 from .config import CFG
 from . import mtp as mtp_schedule
+from .multimodal import MultimodalBatch
 from .ops import attention, linear, rmsnorm
 from .state import ModelState, StateSnapshot
 from .tap import NullTap
 from .text import run as run_text
+from .vision import VisionEncoder, VisionOutput, VisionStats
 from .weights import WeightStore
 
 
@@ -77,6 +79,7 @@ class RefModel:
         self.state: ModelState | None = None
         self.last_hidden: torch.Tensor | None = None
         self.last_draft: int | None = None
+        self.vision_stats: VisionStats | None = None
 
     def prepare(self, capacity: int, *, compile_codec: bool | None = None) -> None:
         if capacity <= 0:
@@ -107,7 +110,39 @@ class RefModel:
         self.last_hidden = None
         self.active_compile_codec = compile_codec
 
+    def encode_vision(
+        self,
+        batch: MultimodalBatch,
+        *,
+        compile_codec: bool = True,
+        attention_limit: int | None = None,
+        tap=None,
+    ) -> VisionOutput:
+        encoder = VisionEncoder(
+            self.reader,
+            self.device,
+            compile_codec=compile_codec,
+            memory_bytes=self.memory_bytes,
+            headroom_bytes=self.headroom_bytes,
+            attention_limit=attention_limit,
+        )
+        try:
+            output = encoder.encode(
+                batch.pixel_values,
+                batch.image_grid_thw,
+                batch.pixel_values_videos,
+                batch.video_grid_thw,
+                tap=tap,
+            )
+        finally:
+            encoder.close()
+        self.vision_stats = output.stats
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return output
+
     def reset(self, capacity: int) -> None:
+        self.vision_stats = None
         self.prepare(capacity, compile_codec=self.active_compile_codec)
 
     def _ready(self) -> tuple[WeightStore, ModelState]:
@@ -264,6 +299,120 @@ class RefModel:
         )
         return target
 
+    def prefill_multimodal(
+        self,
+        batch: MultimodalBatch,
+        vision: VisionOutput,
+        *,
+        capacity: int | None = None,
+        sampler: Callable[[torch.Tensor], int] | None = None,
+        tap=None,
+    ) -> int:
+        ids = batch.input_ids.tolist()
+        if not ids:
+            raise ValueError("multimodal prompt must not be empty")
+        if self.state is None:
+            self.prepare(capacity or len(ids) + 1)
+        _, state = self._ready()
+        if state.position != 0:
+            raise ValueError("multimodal prefill requires a fresh model state")
+        if state.position + len(ids) > state.capacity:
+            raise ValueError("multimodal prefill exceeds prepared context capacity")
+        types = batch.mm_token_type_ids.flatten()
+        if types.numel() != len(ids) or batch.position_ids.shape != (3, len(ids)):
+            raise ValueError("multimodal token metadata shape mismatch")
+        image_count = int((types == 1).sum().item())
+        video_count = int((types == 2).sum().item())
+        if image_count != (0 if vision.image_embeddings is None else vision.image_embeddings.shape[0]):
+            raise ValueError("image placeholder/embedding count mismatch")
+        if video_count != (0 if vision.video_embeddings is None else vision.video_embeddings.shape[0]):
+            raise ValueError("video placeholder/embedding count mismatch")
+        state.mrope = True
+        state.rope_delta = batch.rope_delta
+        tap = tap or NullTap()
+        image_cursor = 0
+        video_cursor = 0
+        last_hidden = None
+        last_positions = None
+        for chunk, offset in enumerate(range(0, len(ids), self.prefill_chunk)):
+            part = ids[offset:offset + self.prefill_chunk]
+            start = state.position
+            x = self.embed(part)
+            part_types = types[offset:offset + len(part)].to(device=self.device)
+            image_mask = part_types == 1
+            video_mask = part_types == 2
+            nimage = int(image_mask.sum().item())
+            nvideo = int(video_mask.sum().item())
+            if nimage:
+                assert vision.image_embeddings is not None
+                x[image_mask] = vision.image_embeddings[image_cursor:image_cursor + nimage]
+                image_cursor += nimage
+            if nvideo:
+                assert vision.video_embeddings is not None
+                x[video_mask] = vision.video_embeddings[video_cursor:video_cursor + nvideo]
+                video_cursor += nvideo
+            self._tap(tap, "embed", x, phase="prefill", step=0, chunk=chunk, position=start)
+            positions = batch.position_ids[:, offset:offset + len(part)].to(
+                device=self.device, dtype=torch.int32
+            )
+            x = run_text(
+                self,
+                x,
+                positions,
+                start,
+                phase="prefill",
+                step=0,
+                chunk=chunk,
+                tap=tap,
+            )
+            state.position += len(part)
+            state.kv.length = state.position
+            last_hidden = self.final_hidden(x)
+            last_positions = positions
+            self._tap(
+                tap,
+                "final_norm",
+                last_hidden,
+                phase="prefill",
+                step=0,
+                chunk=chunk,
+                position=start,
+            )
+            if self.mtp_enabled:
+                known = min(len(part), len(ids) - 1 - offset)
+                if known > 0:
+                    self.mtp_forward(
+                        ids[offset + 1:offset + 1 + known],
+                        last_hidden[:known],
+                        positions[..., :known],
+                        start=state.mtp_kv.length,
+                        sample=False,
+                    )
+        assert last_hidden is not None and last_positions is not None
+        if image_cursor != image_count or video_cursor != video_count:
+            raise RuntimeError("not all visual embeddings were consumed during prefill")
+        logits = self.logits_last(last_hidden)
+        target = sampler(logits) if sampler is not None else int(torch.argmax(logits).item())
+        self.last_hidden = last_hidden
+        if self.mtp_enabled:
+            _, draft = self.mtp_forward(
+                [target],
+                last_hidden[-1:],
+                last_positions[..., -1:],
+                start=state.mtp_kv.length,
+            )
+            self.last_draft = draft
+        self._tap(
+            tap,
+            "logits",
+            logits,
+            phase="prefill",
+            step=0,
+            chunk=chunk,
+            position=state.position - 1,
+        )
+        return target
+
     def _decode(
         self,
         token: int,
@@ -279,7 +428,11 @@ class RefModel:
         start = state.position
         x = self.embed([token])
         self._tap(tap, "embed", x, phase="decode", step=step, chunk=0, position=start)
-        positions = torch.tensor([start], device=self.device, dtype=torch.int32)
+        if state.mrope:
+            value = start + state.rope_delta
+            positions = torch.full((3, 1), value, device=self.device, dtype=torch.int32)
+        else:
+            positions = torch.tensor([start], device=self.device, dtype=torch.int32)
         x = run_text(
             self,
             x,
@@ -383,6 +536,7 @@ class RefModel:
         compile_codec = self.compile_codec
         if compile_codec is None:
             compile_codec = max_new_tokens >= COMPILED_CODEC_MIN_TOKENS
+        self.vision_stats = None
         self.prepare(len(prompt) + max_new_tokens, compile_codec=compile_codec)
         token = self.prefill(prompt, sampler=sampler, tap=tap)
         output = [token]
@@ -396,6 +550,7 @@ class RefModel:
         self.state = None
         self.last_hidden = None
         self.last_draft = None
+        self.vision_stats = None
         self.active_compile_codec = None
         self.reader.close()
 

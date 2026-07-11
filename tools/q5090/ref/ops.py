@@ -69,7 +69,19 @@ def _rope_frequency(device_type: str, device_index: int | None) -> torch.Tensor:
 def apply_rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     half = CFG.rotary_dim // 2
     freq = _rope_frequency(x.device.type, x.device.index)
-    angle = positions.to(device=x.device, dtype=torch.float32)[:, None] * freq[None, :]
+    positions = positions.to(device=x.device, dtype=torch.float32)
+    if positions.ndim == 1:
+        angle = positions[:, None] * freq[None, :]
+    elif positions.ndim == 2 and positions.shape[0] == 3:
+        if positions.shape[1] != x.shape[0]:
+            raise ValueError("MRoPE position length must match token count")
+        axes = positions[:, :, None] * freq[None, None, :]
+        angle = axes[0].clone()
+        for axis, offset in ((1, 1), (2, 2)):
+            end = CFG.mrope_section[axis] * 3
+            angle[:, offset:end:3] = axes[axis, :, offset:end:3]
+    else:
+        raise ValueError("RoPE positions must have shape [T] or [3,T]")
     cos = torch.cos(angle)[:, None, :]
     sin = torch.sin(angle)[:, None, :]
     out = x.clone()

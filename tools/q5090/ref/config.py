@@ -24,6 +24,7 @@ class ModelConfig:
     conv_width: int = 4
     rms_eps: float = 1.0e-6
     rope_theta: float = 1.0e7
+    mrope_section: tuple[int, int, int] = (11, 11, 10)
     prefill_chunk: int = 1024
 
     @property
@@ -86,5 +87,44 @@ class ModelConfig:
 
 
 CFG = ModelConfig()
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    depth: int = 27
+    hidden: int = 1152
+    intermediate: int = 4304
+    out_hidden: int = 5120
+    heads: int = 16
+    in_channels: int = 3
+    patch: int = 16
+    temporal_patch: int = 2
+    spatial_merge: int = 2
+    position_embeddings: int = 2304
+    rope_theta: float = 10000.0
+    norm_eps: float = 1.0e-6
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden // self.heads
+
+    @property
+    def patch_dim(self) -> int:
+        return self.in_channels * self.temporal_patch * self.patch * self.patch
+
+    @property
+    def merge_unit(self) -> int:
+        return self.spatial_merge * self.spatial_merge
+
+    @property
+    def merger_hidden(self) -> int:
+        return self.hidden * self.merge_unit
+
+    @property
+    def position_side(self) -> int:
+        return int(self.position_embeddings**0.5)
+
+
+VISION_CFG = VisionConfig()
 ATTN_SCALE = CFG.head_dim ** -0.5
 GDN_SCALE = CFG.gdn_k_dim ** -0.5

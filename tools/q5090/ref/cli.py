@@ -10,6 +10,7 @@ import torch
 from .model import COMPILED_CODEC_MIN_TOKENS, RefModel
 from .chat import render_prompt
 from .config import CFG
+from .multimodal import Processor, load_messages
 from .sampling import Sampler, SamplingConfig
 from .tap import FileTap
 
@@ -35,6 +36,11 @@ def main() -> None:
     prompt = parser.add_mutually_exclusive_group(required=True)
     prompt.add_argument("--prompt", help="single user message rendered as Qwen3.6 chat")
     prompt.add_argument("--ids", help="comma/space-separated prompt token ids")
+    prompt.add_argument("--messages", help="structured Qwen messages JSON with image/video content")
+    parser.add_argument(
+        "--processor",
+        help="local Hugging Face checkpoint directory; required with --messages",
+    )
     parser.add_argument(
         "--thinking",
         action=argparse.BooleanOptionalAction,
@@ -63,9 +69,16 @@ def main() -> None:
     parser.add_argument("--structural-dump")
     parser.add_argument("--activation-dump")
     parser.add_argument("--dump-level", choices=["layer", "op"], default="layer")
+    parser.add_argument(
+        "--vision-attention-limit",
+        type=int,
+        help="reject prompts whose sum(T*(H*W)^2) exceeds this value",
+    )
     args = parser.parse_args()
     if args.decode < 0:
         parser.error("--decode must be nonnegative")
+    if args.vision_attention_limit is not None and args.vision_attention_limit <= 0:
+        parser.error("--vision-attention-limit must be positive")
     tap = FileTap(args.activation_dump, args.dump_level) if args.activation_dump else None
     load_start = time.perf_counter()
     with RefModel(
@@ -81,12 +94,32 @@ def main() -> None:
         load_seconds = time.perf_counter() - load_start
         if args.structural_dump:
             model.reader.structural_dump(args.structural_dump)
-        rendered_prompt = None if args.prompt is None else render_prompt(
-            args.prompt, thinking=args.thinking
-        )
-        prompt_ids = parse_ids(args.ids) if args.ids is not None else model.tokenizer.encode(
-            rendered_prompt
-        )
+        multimodal = None
+        rendered_prompt = None
+        if args.messages is not None:
+            if not args.processor:
+                parser.error("--processor is required with --messages")
+            processor = Processor(
+                args.processor,
+                expected_token_ids={
+                    "<|vision_start|>": 248053,
+                    "<|vision_end|>": 248054,
+                    "<|image_pad|>": 248056,
+                    "<|video_pad|>": 248057,
+                },
+            )
+            multimodal = processor.process(load_messages(args.messages), thinking=args.thinking)
+            prompt_ids = multimodal.input_ids.tolist()
+            rendered_prompt = processor.impl.tokenizer.decode(
+                prompt_ids, skip_special_tokens=False
+            )
+        else:
+            rendered_prompt = None if args.prompt is None else render_prompt(
+                args.prompt, thinking=args.thinking
+            )
+            prompt_ids = parse_ids(args.ids) if args.ids is not None else model.tokenizer.encode(
+                rendered_prompt
+            )
         if not prompt_ids:
             parser.error("prompt must encode to at least one token")
         stops = set(
@@ -106,12 +139,20 @@ def main() -> None:
             sampler = Sampler(sampling, CFG.vocab, model.device)
         except ValueError as exc:
             parser.error(str(exc))
+        compile_codec = args.decode >= COMPILED_CODEC_MIN_TOKENS
+        vision_output = None
         if model.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(model.device)
+        if multimodal is not None and (multimodal.image_tokens or multimodal.video_tokens):
+            vision_output = model.encode_vision(
+                multimodal,
+                compile_codec=compile_codec,
+                attention_limit=args.vision_attention_limit,
+            )
         prepare_start = time.perf_counter()
         model.prepare(
             len(prompt_ids) + max(1, args.decode),
-            compile_codec=args.decode >= COMPILED_CODEC_MIN_TOKENS,
+            compile_codec=compile_codec,
         )
         if model.device.type == "cuda":
             torch.cuda.synchronize(model.device)
@@ -119,8 +160,13 @@ def main() -> None:
         tokens = []
         prefill_start = time.perf_counter()
         if args.decode > 0:
-            token = model.prefill(prompt_ids, sampler=sampler, tap=tap)
+            token = (
+                model.prefill_multimodal(multimodal, vision_output, sampler=sampler, tap=tap)
+                if vision_output is not None
+                else model.prefill(prompt_ids, sampler=sampler, tap=tap)
+            )
             tokens.append(token)
+        vision_output = None
         if model.device.type == "cuda":
             torch.cuda.synchronize(model.device)
         prefill_seconds = time.perf_counter() - prefill_start
@@ -138,6 +184,8 @@ def main() -> None:
             torch.cuda.synchronize(model.device)
         decode_seconds = time.perf_counter() - decode_start
         print("MEMORY_PLAN:", model.weights.plan.summary())
+        if model.vision_stats is not None:
+            print("VISION:", model.vision_stats.summary())
         print("CODEC:", "compiled" if model.active_compile_codec else "eager")
         print("SAMPLING:", sampler.summary())
         print(
@@ -169,13 +217,13 @@ def main() -> None:
         if tap:
             tap.close(
                 weights=str(model.reader.path),
-                prompt_text=args.prompt,
+                prompt_text=args.prompt if args.prompt is not None else args.messages,
                 rendered_prompt=rendered_prompt,
                 prompt_ids=prompt_ids,
                 generated_token_ids=tokens,
                 generated_text=generated_text,
                 stop_reason=stop_reason,
-                thinking=args.thinking if args.prompt is not None else None,
+                thinking=args.thinking if args.ids is None else None,
                 sampling=sampler.summary(),
                 kv_dtype=args.kv_dtype,
                 prefill_chunk=args.prefill_chunk,

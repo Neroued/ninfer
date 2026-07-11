@@ -2,3 +2,7 @@ torch>=2.7
 numpy>=1.24
 tokenizers>=0.22
 flash-linear-attention>=0.5.1
+transformers>=5.12
+pillow>=10
+torchvision
+opencv-python-headless>=4.10

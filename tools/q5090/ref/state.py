@@ -95,6 +95,8 @@ class ModelState:
     conv: list[torch.Tensor] = field(init=False)
     ssm: list[torch.Tensor] = field(init=False)
     position: int = 0
+    rope_delta: int = 0
+    mrope: bool = False
 
     def __post_init__(self) -> None:
         self.kv = KVCache(CFG.full_layers, self.capacity, self.device, self.kv_dtype)
@@ -118,6 +120,8 @@ class ModelState:
     def snapshot(self) -> "StateSnapshot":
         return StateSnapshot(
             position=self.position,
+            rope_delta=self.rope_delta,
+            mrope=self.mrope,
             kv_length=self.kv.length,
             mtp_kv_length=self.mtp_kv.length,
             conv=[tensor.clone() for tensor in self.conv],
@@ -128,6 +132,8 @@ class ModelState:
         if snapshot.position < 0 or snapshot.position > self.capacity:
             raise ValueError("snapshot position is outside state capacity")
         self.position = snapshot.position
+        self.rope_delta = snapshot.rope_delta
+        self.mrope = snapshot.mrope
         self.kv.length = snapshot.kv_length
         self.mtp_kv.length = snapshot.mtp_kv_length
         for target, source in zip(self.conv, snapshot.conv, strict=True):
@@ -139,6 +145,8 @@ class ModelState:
 @dataclass
 class StateSnapshot:
     position: int
+    rope_delta: int
+    mrope: bool
     kv_length: int
     mtp_kv_length: int
     conv: list[torch.Tensor]

@@ -6,18 +6,37 @@
 
 namespace qus::kernels {
 
-__global__ void scatter_kernel(const __nv_bfloat16* src, const std::int32_t* indices,
-                               __nv_bfloat16* dst, std::int32_t d, std::int32_t columns,
-                               std::int64_t n) {
-    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
-    for (std::int64_t i = start; i < n; i += stride) {
-        const std::int32_t row     = static_cast<std::int32_t>(i % d);
-        const std::int32_t col     = static_cast<std::int32_t>(i / d);
-        const std::int32_t dst_col = indices[col];
-        if (dst_col >= 0 && dst_col < columns) {
-            dst[static_cast<std::int64_t>(dst_col) * d + row] = src[i];
-        }
+__global__ void scatter_bf16x2_kernel(const __nv_bfloat162* src, const std::int32_t* indices,
+                                      __nv_bfloat162* dst, std::int32_t pairs,
+                                      std::int32_t columns) {
+    const std::int32_t src_col = static_cast<std::int32_t>(blockIdx.x);
+    __shared__ std::int32_t dst_col;
+    if (threadIdx.x == 0) { dst_col = indices[src_col]; }
+    __syncthreads();
+    if (dst_col < 0 || dst_col >= columns) { return; }
+
+    const std::int64_t src_base = static_cast<std::int64_t>(src_col) * pairs;
+    const std::int64_t dst_base = static_cast<std::int64_t>(dst_col) * pairs;
+    for (std::int32_t pair = static_cast<std::int32_t>(threadIdx.x); pair < pairs;
+         pair += static_cast<std::int32_t>(blockDim.x)) {
+        dst[dst_base + pair] = src[src_base + pair];
+    }
+}
+
+__global__ void scatter_scalar_kernel(const __nv_bfloat16* src, const std::int32_t* indices,
+                                      __nv_bfloat16* dst, std::int32_t d,
+                                      std::int32_t columns) {
+    const std::int32_t src_col = static_cast<std::int32_t>(blockIdx.x);
+    __shared__ std::int32_t dst_col;
+    if (threadIdx.x == 0) { dst_col = indices[src_col]; }
+    __syncthreads();
+    if (dst_col < 0 || dst_col >= columns) { return; }
+
+    const std::int64_t src_base = static_cast<std::int64_t>(src_col) * d;
+    const std::int64_t dst_base = static_cast<std::int64_t>(dst_col) * d;
+    for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < d;
+         row += static_cast<std::int32_t>(blockDim.x)) {
+        dst[dst_base + row] = src[src_base + row];
     }
 }
 

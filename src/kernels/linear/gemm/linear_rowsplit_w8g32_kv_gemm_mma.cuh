@@ -72,10 +72,10 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
             const int nn = n0 + nl;
             auto* dst    = &Bs[stage][nl * BK + w8g32_swz64(nl, k8 * 8)];
             if constexpr (FullTiles) {
-                w8g32_async_copy_cg_16(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
+                cp_async<16, Cache::cg>(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
             } else {
                 const int valid = (nn < n && kk < k) ? min(8, k - kk) * 2 : 0;
-                qus::kernels::async_copy_global_to_shared_pred<16>(
+                qus::kernels::cp_async_zfill<16>(
                     dst, &x[static_cast<std::int64_t>(nn < n ? nn : 0) * k + (kk < k ? kk : 0)],
                     valid);
             }
@@ -93,10 +93,10 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
             auto* dst       = &Cr[p][row * BK + chunk * 16];
             if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
-                w8g32_async_copy_cg_16(dst, &codes[gi * 32 + chunk * 16]);
+                cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
                 const std::int64_t gi = static_cast<std::int64_t>(grow < m ? grow : 0) * kg + g0;
-                qus::kernels::async_copy_global_to_shared_pred<16>(
+                qus::kernels::cp_async_zfill<16>(
                     dst, &codes[gi * 32 + chunk * 16], grow < m ? 16 : 0);
             }
         }
@@ -112,9 +112,9 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
                 if constexpr (FullTiles) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                     if (g0 + 8 <= kg) {
-                        w8g32_async_copy_cg_16(dst, &scales[gi * 2]);
+                        cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
                     } else {
-                        qus::kernels::async_copy_global_to_shared_pred<16>(dst, &scales[gi * 2],
+                        qus::kernels::cp_async_zfill<16>(dst, &scales[gi * 2],
                                                                            max(0, kg - g0) * 2);
                     }
                 } else {
@@ -122,7 +122,7 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
-                    qus::kernels::async_copy_global_to_shared_pred<16>(dst, &scales[gi * 2],
+                    qus::kernels::cp_async_zfill<16>(dst, &scales[gi * 2],
                                                                        valid_scales * 2);
                 }
             }
@@ -151,7 +151,7 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
                 const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
                 const __nv_bfloat162 values = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
                                                                     static_cast<float>(q1) * scale);
-                *reinterpret_cast<__nv_bfloat162*>(&As[row * BK + w8g32_swz64(row, col)]) = values;
+                store_vec(&As[row * BK + w8g32_swz64(row, col)], values);
             }
         }
     };
@@ -164,16 +164,16 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
             for (int mi = 0; mi < MT; ++mi) {
                 const int ar = mi * 16 + a_rowoff;
                 const int ac = ks * 16 + a_coloff;
-                w8g32_ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
+                ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
                                   af[slot][mi][3],
-                                  w8g32_smem_addr(&As[ar * BK + w8g32_swz64(ar, ac)]));
+                                  smem_addr(&As[ar * BK + w8g32_swz64(ar, ac)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int br = wn * WN + ni * 8 + b_rin;
                 const int bc = ks * 16 + b_koff;
-                w8g32_ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
-                                  w8g32_smem_addr(&Bs[stage][br * BK + w8g32_swz64(br, bc)]));
+                ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
+                                  smem_addr(&Bs[stage][br * BK + w8g32_swz64(br, bc)]));
             }
         };
         load_fragments(0, 0);
@@ -186,12 +186,12 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
                     if (p == 0) {
-                        w8g32_mma_m16n8k16_bf16(acc_k[mi][ni][0], acc_k[mi][ni][1],
+                        mma_bf16(acc_k[mi][ni][0], acc_k[mi][ni][1],
                                                 acc_k[mi][ni][2], acc_k[mi][ni][3], af[slot][mi][0],
                                                 af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
                                                 bf[slot][ni][0], bf[slot][ni][1]);
                     } else {
-                        w8g32_mma_m16n8k16_bf16(acc_v[mi][ni][0], acc_v[mi][ni][1],
+                        mma_bf16(acc_v[mi][ni][0], acc_v[mi][ni][1],
                                                 acc_v[mi][ni][2], acc_v[mi][ni][3], af[slot][mi][0],
                                                 af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
                                                 bf[slot][ni][0], bf[slot][ni][1]);
@@ -207,12 +207,12 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
     stage_codes(1, 0);
     stage_scales(0, 0);
     stage_scales(1, 0);
-    qus::kernels::async_copy_commit();
+    qus::kernels::cp_commit();
 
 #pragma unroll 2
     for (int kt = 0; kt < nkt; ++kt) {
         const int stage = kt & 1;
-        qus::kernels::async_copy_wait<0>();
+        qus::kernels::cp_wait<0>();
         __syncthreads();
 
         dequant(0, kt);
@@ -230,7 +230,7 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
             stage_codes(1, next);
             stage_scales(0, next);
             stage_scales(1, next);
-            qus::kernels::async_copy_commit();
+            qus::kernels::cp_commit();
         }
         mma_pair(1, stage);
     }

@@ -3,14 +3,14 @@
 // qus::kernels - causal_conv1d kernel: depthwise causal k=4 with fused SiLU.
 // SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation.
 
+#include "kernels/common/math.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cmath>
 #include <cstdint>
 
 namespace qus::kernels {
-
-__device__ __forceinline__ float causal_conv1d_silu_f32(float x) { return x / (1.0f + expf(-x)); }
 
 __device__ __forceinline__ void causal_conv1d_acc_pair(__nv_bfloat162 w, __nv_bfloat162 x,
                                                        float& acc0, float& acc1) {
@@ -22,7 +22,7 @@ __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_
                                              const __nv_bfloat16* conv_state, __nv_bfloat16* out,
                                              std::int32_t C, std::int32_t T) {
     const std::int64_t C64      = static_cast<std::int64_t>(C);
-    const std::int64_t c_blocks = (C64 + static_cast<std::int64_t>(blockDim.x) - 1) / blockDim.x;
+    const std::int64_t c_blocks = div_up(C64, static_cast<std::int64_t>(blockDim.x));
     const std::int64_t block    = static_cast<std::int64_t>(blockIdx.x);
     const std::int32_t t        = static_cast<std::int32_t>(block / c_blocks);
     const std::int64_t c_base   = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x;
@@ -44,7 +44,7 @@ __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_
     acc += __bfloat162float(weight[C64 + c]) * __bfloat162float(x1);
     acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(x2);
     acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x3);
-    out[out_idx] = __float2bfloat16_rn(causal_conv1d_silu_f32(acc));
+    out[out_idx] = __float2bfloat16_rn(silu(acc));
 }
 
 __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
@@ -53,7 +53,7 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
                                                    __nv_bfloat16* out, std::int32_t C,
                                                    std::int32_t T) {
     const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
-    const std::int64_t c_blocks  = (C2 + static_cast<std::int64_t>(blockDim.x) - 1) / blockDim.x;
+    const std::int64_t c_blocks = div_up(C2, static_cast<std::int64_t>(blockDim.x));
     const std::int64_t block     = static_cast<std::int64_t>(blockIdx.x);
     const std::int32_t t         = static_cast<std::int32_t>(block / c_blocks);
     const std::int64_t pair_base = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x;
@@ -81,7 +81,7 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     causal_conv1d_acc_pair(weight2[2 * C2 + p], x2v, acc0, acc1);
     causal_conv1d_acc_pair(weight2[3 * C2 + p], x3, acc0, acc1);
     out2[out_idx] =
-        __floats2bfloat162_rn(causal_conv1d_silu_f32(acc0), causal_conv1d_silu_f32(acc1));
+        __floats2bfloat162_rn(silu(acc0), silu(acc1));
 }
 
 // Writes the trailing width-3 conv window after consuming the T input columns.
@@ -142,7 +142,7 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
         acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
         acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
 
-        out[c]                  = __float2bfloat16_rn(causal_conv1d_silu_f32(acc));
+        out[c]                  = __float2bfloat16_rn(silu(acc));
         conv_state[c]           = s1;
         conv_state[C64 + c]     = s2;
         conv_state[2 * C64 + c] = x0;
@@ -180,7 +180,7 @@ __global__ void causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x,
             acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
             acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
 
-            out[out_idx] = __float2bfloat16_rn(causal_conv1d_silu_f32(acc));
+            out[out_idx] = __float2bfloat16_rn(silu(acc));
             s0           = s1;
             s1           = s2;
             s2           = x0;

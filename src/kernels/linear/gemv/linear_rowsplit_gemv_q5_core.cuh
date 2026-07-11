@@ -18,20 +18,21 @@
 // (8 uint4), 32 scale bytes (2 uint4). All weight reads are fully coalesced 128-bit
 // loads, so the kernel runs DRAM-bound instead of L1/LSU- or latency-bound.
 
+#include "kernels/common/math.h"
+#include "kernels/common/memory.cuh"
+#include "kernels/common/warp.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
 namespace qus::kernels::detail {
 
-__device__ __forceinline__ int q5_sign_extend(int v) { return (v ^ 0x10) - 0x10; }
-
 // Issue the cp.async copies for one 16-group tile into a shared buffer slot, then
 // commit them as one pipeline group. Every lane commits (even lanes that issue
-// fewer copies) so a uniform __pipeline_wait_prior works warp-wide.
+// fewer copies) so a uniform pipe_wait works warp-wide.
 __device__ __forceinline__ void q5_issue_tile(uint4* __restrict__ s_nib, uint4* __restrict__ s_hi,
                                               uint4* __restrict__ s_sc,
                                               const std::uint8_t* __restrict__ code_row,
@@ -40,20 +41,14 @@ __device__ __forceinline__ void q5_issue_tile(uint4* __restrict__ s_nib, uint4* 
                                               int lane) {
     constexpr int kGroupsPerTile = 16;
     const int     g0             = tile * kGroupsPerTile;
-    __pipeline_memcpy_async(&s_nib[lane],
-                            reinterpret_cast<const uint4*>(code_row + g0 * 32) + lane,
-                            sizeof(uint4));
+    pipe_copy<16>(&s_nib[lane], reinterpret_cast<const uint4*>(code_row + g0 * 32) + lane);
     if (lane < 8) {
-        __pipeline_memcpy_async(&s_hi[lane],
-                                reinterpret_cast<const uint4*>(high_row + g0 * 8) + lane,
-                                sizeof(uint4));
+        pipe_copy<16>(&s_hi[lane], reinterpret_cast<const uint4*>(high_row + g0 * 8) + lane);
     }
     if (lane < 2) {
-        __pipeline_memcpy_async(&s_sc[lane],
-                                reinterpret_cast<const uint4*>(scale_row + g0 * 2) + lane,
-                                sizeof(uint4));
+        pipe_copy<16>(&s_sc[lane], reinterpret_cast<const uint4*>(scale_row + g0 * 2) + lane);
     }
-    __pipeline_commit();
+    pipe_commit();
 }
 
 // Unpack + accumulate one staged 16-group tile. x is read from x2 (shared or global).
@@ -75,8 +70,8 @@ __device__ __forceinline__ float q5_consume_tile(const __nv_bfloat162* __restric
         const float        scale = __half2float(__ushort_as_half(tsc[tg]));
         const std::uint8_t low   = tn[tg * kNibbleBytesPerGroup + lane];
         const std::uint8_t high  = th[tg * kHighBytesPerGroup + (lane >> 2)] >> ((lane & 3) * 2);
-        const int q0 = q5_sign_extend(static_cast<int>((low & 0x0fu) | ((high & 0x01u) << 4)));
-        const int q1 = q5_sign_extend(static_cast<int>((low >> 4) | ((high & 0x02u) << 3)));
+        const int q0 = sign_extend<5>(static_cast<int>((low & 0x0fu) | ((high & 0x01u) << 4)));
+        const int q1 = sign_extend<5>(static_cast<int>((low >> 4) | ((high & 0x02u) << 3)));
 
         const int    k0 = (g0 + tg) * kGroupK + lane * 2;
         const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
@@ -141,14 +136,14 @@ __global__ void linear_rowsplit_gemv_q5_kernel(const __nv_bfloat16* __restrict__
                 : reinterpret_cast<const __nv_bfloat162*>(x);
 
     // Prime up to kPrefetch tiles; empty commits keep the group count uniform so the
-    // constant __pipeline_wait_prior(kPrefetch) in the loop is always valid.
+    // constant pipe_wait<kPrefetch>() in the loop is always valid.
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
         if (p < kTiles) {
             q5_issue_tile(s_nib[warp][p], s_hi[warp][p], s_sc[warp][p], code_row, high_row,
                           scale_row, p, lane);
         } else {
-            __pipeline_commit();
+            pipe_commit();
         }
     }
 
@@ -161,9 +156,9 @@ __global__ void linear_rowsplit_gemv_q5_kernel(const __nv_bfloat16* __restrict__
             q5_issue_tile(s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf], code_row, high_row,
                           scale_row, fetch, lane);
         } else {
-            __pipeline_commit();
+            pipe_commit();
         }
-        __pipeline_wait_prior(kPrefetch);
+        pipe_wait<kPrefetch>();
         __syncwarp();
 
         const int buf = tile % kStages;
@@ -172,10 +167,7 @@ __global__ void linear_rowsplit_gemv_q5_kernel(const __nv_bfloat16* __restrict__
         __syncwarp();
     }
 
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, offset);
-    }
+    acc = warp_reduce_sum(acc);
     if constexpr (kResidual) {
         if (lane == 0) {
             const __nv_bfloat16 y = __float2bfloat16_rn(acc);
@@ -245,7 +237,7 @@ __global__ void linear_rowsplit_gemv_q5_dual_kernel(
             q5_issue_tile(s_nib[warp][p], s_hi[warp][p], s_sc[warp][p], code_row, high_row,
                           scale_row, p, lane);
         } else {
-            __pipeline_commit();
+            pipe_commit();
         }
     }
 
@@ -258,9 +250,9 @@ __global__ void linear_rowsplit_gemv_q5_dual_kernel(
             q5_issue_tile(s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf], code_row, high_row,
                           scale_row, fetch, lane);
         } else {
-            __pipeline_commit();
+            pipe_commit();
         }
-        __pipeline_wait_prior(kPrefetch);
+        pipe_wait<kPrefetch>();
         __syncwarp();
 
         const int buf = tile % kStages;
@@ -269,10 +261,7 @@ __global__ void linear_rowsplit_gemv_q5_dual_kernel(
         __syncwarp();
     }
 
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, offset);
-    }
+    acc = warp_reduce_sum(acc);
     if (lane == 0) { out[row] = __float2bfloat16(acc); }
 }
 

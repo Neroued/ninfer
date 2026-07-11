@@ -74,13 +74,13 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
             const int kk       = k0 + kl;
             __nv_bfloat16* dst = &Bs[stage][tl * BK + gemm_swz64(tl, kl)];
             if constexpr (FullTiles) {
-                gemm_async_copy_global_to_shared<16, Cfg>(
+                gemm_cp_async<16, Cfg>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else if (col < t && kk + 8 <= k) {
-                gemm_async_copy_global_to_shared<16, Cfg>(
+                gemm_cp_async<16, Cfg>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
-                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                store_vec(dst, make_int4(0, 0, 0, 0));
             }
         }
     };
@@ -97,12 +97,12 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
             auto* dst      = &Cr[stage][row * 32 + half * 16];
             if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                gemm_async_copy_global_to_shared<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
+                gemm_cp_async<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
             } else if (m0 + (row & (PM - 1)) < intermediate) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                gemm_async_copy_global_to_shared<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
+                gemm_cp_async<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
             } else {
-                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                store_vec(dst, make_int4(0, 0, 0, 0));
             }
         }
 #pragma unroll 1
@@ -114,7 +114,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
                 const std::int64_t gi         = static_cast<std::int64_t>(grow) * kg + g;
                 const std::int64_t aligned_gi = static_cast<std::int64_t>(grow) * kg + aligned_g;
                 if (aligned_g + 1 < kg) {
-                    gemm_async_copy_global_to_shared<4, Cfg>(dst, &scales[aligned_gi * 2]);
+                    gemm_cp_async<4, Cfg>(dst, &scales[aligned_gi * 2]);
                 } else {
                     *reinterpret_cast<std::uint16_t*>(dst) =
                         *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
@@ -125,7 +125,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
                 const std::int64_t gi         = static_cast<std::int64_t>(grow) * kg + g;
                 const std::int64_t aligned_gi = static_cast<std::int64_t>(grow) * kg + aligned_g;
                 if (aligned_g + 1 < kg) {
-                    gemm_async_copy_global_to_shared<4, Cfg>(dst, &scales[aligned_gi * 2]);
+                    gemm_cp_async<4, Cfg>(dst, &scales[aligned_gi * 2]);
                 } else {
                     *reinterpret_cast<std::uint16_t*>(dst) =
                         *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
@@ -148,19 +148,19 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
             const __nv_bfloat162 w = Q4Codec::load_pair_bf162_scale_ptr(
                 Cr[stage], nullptr, &Sr[stage][row * SB + scale_off], row, lane);
             const int sc                                           = gemm_swz64(row, 2 * lane);
-            *reinterpret_cast<__nv_bfloat162*>(&As[row * BK + sc]) = w;
+            store_vec(&As[row * BK + sc], w);
         }
     };
 
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         if (s < NKT) { stage_load(s, s); }
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
     }
 
     for (int it = 0; it < NKT; ++it) {
         const int stage = it % S;
-        qus::kernels::async_copy_wait<S - 1>();
+        qus::kernels::cp_wait<S - 1>();
         __syncthreads();
         dequant_to_As(stage, it);
         __syncthreads();
@@ -173,21 +173,21 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
                 const int arow = mi * 16 + a_rowoff;
-                gemm_ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                                 gemm_smem_addr(&As[arow * BK + gemm_swz64(arow, ks + a_coloff)]));
+                ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                                 smem_addr(&As[arow * BK + gemm_swz64(arow, ks + a_coloff)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int brow = wn * WN + ni * 8 + b_rin;
-                gemm_ldmatrix_x2(
+                ldmatrix_x2(
                     bf[ni][0], bf[ni][1],
-                    gemm_smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, ks + b_koff)]));
+                    smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, ks + b_koff)]));
             }
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    gemm_mma_m16n8k16_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
+                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
                                            acc[mi][ni][3], af[mi][0], af[mi][1], af[mi][2],
                                            af[mi][3], bf[ni][0], bf[ni][1]);
                 }
@@ -197,7 +197,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
         __syncthreads();
         const int next = it + S;
         if (next < NKT) { stage_load(stage, next); }
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
     }
 
 #pragma unroll
@@ -212,7 +212,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
                 const float g = __bfloat162float(__float2bfloat16_rn(gv));
                 const float u = __bfloat162float(__float2bfloat16_rn(uv));
                 out[static_cast<std::int64_t>(col) * intermediate + row] =
-                    __float2bfloat16_rn(gate_up_silu_f32(g) * u);
+                    __float2bfloat16_rn(silu(g) * u);
             };
             if constexpr (FullTiles) {
                 store(cc0, r0, acc[mi][ni][0], acc[mi + MT / 2][ni][0]);

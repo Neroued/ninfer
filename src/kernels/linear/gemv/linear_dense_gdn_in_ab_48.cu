@@ -1,5 +1,8 @@
 #include "kernels/linear/gemv/linear_dense_gdn_in_ab_48.cuh"
 
+#include "kernels/common/math.cuh"
+#include "kernels/common/memory.cuh"
+#include "kernels/common/warp.cuh"
 #include "kernels/linear/gemm/linear_dense_gdn_in_ab_gemm_mma.cuh"
 
 #include "qus/core/device.h" // CUDA_CHECK
@@ -26,38 +29,6 @@ constexpr int kSmallTRowsPerBlock   = 4;
 constexpr int kSmallTThreads        = kSmallTRowsPerBlock * 32;
 static_assert(kK % kSmallTKSlice == 0, "small-T K split must divide K");
 
-template <int Width = 32>
-__device__ __forceinline__ float warp_reduce_sum(float v) {
-#pragma unroll
-    for (int offset = Width / 2; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, offset, Width);
-    }
-    return v;
-}
-
-template <int BlockSize>
-__device__ __forceinline__ float block_reduce_sum(float v) {
-    __shared__ float warp_sums[BlockSize / 32];
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-
-    v = warp_reduce_sum(v);
-    if (lane == 0) { warp_sums[warp] = v; }
-    __syncthreads();
-
-    v = (static_cast<int>(threadIdx.x) < (BlockSize / 32)) ? warp_sums[lane] : 0.0f;
-    if (warp == 0) { v = warp_reduce_sum<BlockSize / 32>(v); }
-    return v;
-}
-
-__device__ __forceinline__ float2 bf162_to_float2(__nv_bfloat162 v) {
-    return __bfloat1622float2(v);
-}
-
-__device__ __forceinline__ float2 bf162_from_u32(std::uint32_t v) {
-    return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v));
-}
-
 template <int TokenTile, int KSlice, int RowsPerBlock>
 __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
@@ -82,9 +53,8 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
          i += static_cast<int>(blockDim.x)) {
         const int col = i / kVecsPerCol;
         const int vec = i - col * kVecsPerCol;
-        x_sh_v[col * kVecsPerCol + vec] =
-            *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(token0 + col) * kK +
-                                            k0 + vec * 8);
+        x_sh_v[col * kVecsPerCol + vec] = load_vec<uint4>(
+            x + static_cast<std::int64_t>(token0 + col) * kK + k0 + vec * 8);
     }
     __syncthreads();
 
@@ -100,20 +70,20 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
     for (int tt = 0; tt < TokenTile; ++tt) { acc[tt] = 0.0f; }
 
     for (int vec = lane; vec < kVecsPerCol; vec += 32) {
-        const uint4 wv = *reinterpret_cast<const uint4*>(wrow + vec * 8);
-        const float2 wf0 = bf162_from_u32(wv.x);
-        const float2 wf1 = bf162_from_u32(wv.y);
-        const float2 wf2 = bf162_from_u32(wv.z);
-        const float2 wf3 = bf162_from_u32(wv.w);
+        const uint4 wv = load_vec<uint4>(wrow + vec * 8);
+        const float2 wf0 = bf16x2_bits_to_float2(wv.x);
+        const float2 wf1 = bf16x2_bits_to_float2(wv.y);
+        const float2 wf2 = bf16x2_bits_to_float2(wv.z);
+        const float2 wf3 = bf16x2_bits_to_float2(wv.w);
 
 #pragma unroll
         for (int tt = 0; tt < TokenTile; ++tt) {
             if (tt < ncols) {
                 const uint4 xv = x_sh_v[tt * kVecsPerCol + vec];
-                const float2 xf0 = bf162_from_u32(xv.x);
-                const float2 xf1 = bf162_from_u32(xv.y);
-                const float2 xf2 = bf162_from_u32(xv.z);
-                const float2 xf3 = bf162_from_u32(xv.w);
+                const float2 xf0 = bf16x2_bits_to_float2(xv.x);
+                const float2 xf1 = bf16x2_bits_to_float2(xv.y);
+                const float2 xf2 = bf16x2_bits_to_float2(xv.z);
+                const float2 xf3 = bf16x2_bits_to_float2(xv.w);
                 acc[tt]          = fmaf(wf0.x, xf0.x, acc[tt]);
                 acc[tt]          = fmaf(wf0.y, xf0.y, acc[tt]);
                 acc[tt]          = fmaf(wf1.x, xf1.x, acc[tt]);
@@ -137,14 +107,6 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
             }
         }
     }
-}
-
-__device__ __forceinline__ float gdn_ab_softplus_f32(float x) {
-    return (x > 20.0f) ? x : log1pf(expf(x));
-}
-
-__device__ __forceinline__ float gdn_ab_sigmoid_f32(float x) {
-    return 1.0f / (1.0f + expf(-x));
 }
 
 __global__ void linear_dense_gdn_in_ab_gated_smallt_reduce_48_kernel(
@@ -171,9 +133,9 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_reduce_48_kernel(
     const float a_rounded = __bfloat162float(__float2bfloat16(acc_a));
     const float b_rounded = __bfloat162float(__float2bfloat16(acc_b));
     const std::int64_t out_index = static_cast<std::int64_t>(token) * kN + row;
-    const float sp = gdn_ab_softplus_f32(a_rounded + dt_bias[row]);
+    const float sp = softplus(a_rounded + dt_bias[row]);
     g[out_index] = -expf(A_log[row]) * sp;
-    beta[out_index] = gdn_ab_sigmoid_f32(b_rounded);
+    beta[out_index] = sigmoid(b_rounded);
 }
 
 __global__ void linear_dense_gdn_in_ab_gated_48_kernel(
@@ -183,6 +145,7 @@ __global__ void linear_dense_gdn_in_ab_gated_48_kernel(
     const bool is_b      = global_row >= kN;
     const int row        = is_b ? global_row - kN : global_row;
     const auto* weight   = is_b ? b_weight : a_weight;
+    __shared__ float warp_sums[kThreads / kWarpSize];
 
     float acc                   = 0.0f;
     constexpr int kPairs        = kK / 2;
@@ -191,19 +154,19 @@ __global__ void linear_dense_gdn_in_ab_gated_48_kernel(
     const auto* w2 =
         reinterpret_cast<const __nv_bfloat162*>(weight + static_cast<std::int64_t>(row_base));
     for (int p = static_cast<int>(threadIdx.x); p < kPairs; p += static_cast<int>(blockDim.x)) {
-        const float2 wf = bf162_to_float2(w2[p]);
-        const float2 xf = bf162_to_float2(x2[p]);
+        const float2 wf = bf16x2_to_float2(w2[p]);
+        const float2 xf = bf16x2_to_float2(x2[p]);
         acc             = fmaf(wf.x, xf.x, acc);
         acc             = fmaf(wf.y, xf.y, acc);
     }
 
-    acc = block_reduce_sum<kThreads>(acc);
+    acc = block_reduce_sum<kThreads>(acc, warp_sums);
     if (threadIdx.x == 0) {
         const float rounded = __bfloat162float(__float2bfloat16(acc));
         if (is_b) {
-            beta[row] = gdn_ab_sigmoid_f32(rounded);
+            beta[row] = sigmoid(rounded);
         } else {
-            const float sp = gdn_ab_softplus_f32(rounded + dt_bias[row]);
+            const float sp = softplus(rounded + dt_bias[row]);
             g[row] = -expf(A_log[row]) * sp;
         }
     }
@@ -232,7 +195,7 @@ void launch_dense_prefill_mma(const Tensor& x, const Weight& a_weight, const Wei
                               Tensor& g, Tensor& beta, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
     const dim3 block(Warps * 32);
-    const dim3 grid(static_cast<unsigned>((t + kDenseGdnBlockN - 1) / kDenseGdnBlockN),
+    const dim3 grid(static_cast<unsigned>(div_up(t, kDenseGdnBlockN)),
                     static_cast<unsigned>(kDenseGdnHeads / kDenseGdnBlockM),
                     static_cast<unsigned>(SplitK));
     auto launch = [&](auto full_tokens) {
@@ -322,8 +285,8 @@ void linear_dense_gdn_in_ab_gated_48_launch(const Tensor& x, const Weight& a_wei
             throw std::invalid_argument("gdn_gating_proj: small-T workspace is too small");
         }
         dim3 partial_block(kSmallTThreads);
-        dim3 partial_grid((kLogicalRows + kSmallTRowsPerBlock - 1) / kSmallTRowsPerBlock,
-                          kSmallTSplits, (t + kSmallTMax - 1) / kSmallTMax);
+        dim3 partial_grid(div_up(kLogicalRows, kSmallTRowsPerBlock), kSmallTSplits,
+                          div_up(t, kSmallTMax));
         linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel<kSmallTMax, kSmallTKSlice,
                                                               kSmallTRowsPerBlock>
             <<<partial_grid, partial_block, 0, stream>>>(
@@ -335,7 +298,7 @@ void linear_dense_gdn_in_ab_gated_48_launch(const Tensor& x, const Weight& a_wei
 
         constexpr int kReduceThreads = 128;
         const int reduce_elems = kN * t;
-        const int reduce_blocks = (reduce_elems + kReduceThreads - 1) / kReduceThreads;
+        const int reduce_blocks = div_up(reduce_elems, kReduceThreads);
         linear_dense_gdn_in_ab_gated_smallt_reduce_48_kernel<<<reduce_blocks, kReduceThreads, 0,
                                                                stream>>>(
             static_cast<const float*>(workspace), static_cast<const float*>(A_log.data),

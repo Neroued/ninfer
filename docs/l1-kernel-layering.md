@@ -18,6 +18,7 @@ public API -> host wrapper -> CUDA launcher -> CUDA kernel
 | Public API | `include/qus/kernels/<op>.h` | Stable semantic operation declaration |
 | Wrapper | `src/kernels/wrapper/<op>.cpp` | Validation, workspace lifetime, qtype/shape/T dispatch |
 | Launcher | `src/kernels/launcher/*.h,*.cu` | Grid/block/shared-memory setup and kernel launch |
+| Common primitive | `src/kernels/common/*` | Zero-cost host/device math, memory, warp, and MMA leaves |
 | Kernel | `src/kernels/kernel/*.cuh` | Device computation |
 
 Only the public layer is an operator contract. Launcher/kernel names may describe phase, qtype,
@@ -104,7 +105,28 @@ src/kernels/linear/
 call private launch declarations from the subtree. Backend filenames are allowed to encode shape,
 qtype, regime, and fusion policy.
 
-## 7. Host/device seam
+## 7. Common kernel primitives
+
+Reusable CUDA leaves live under `src/kernels/common/`:
+
+- `math.h`: host/device integer division, rounding, alignment, and sign extension;
+- `math.cuh`: device activation math, approximate exp2, and packed FP16/BF16 conversions;
+- `memory.cuh`: typed vector access, shared addresses, raw `cp.async`, and CUDA pipeline leaves;
+- `warp.cuh`: sum/max warp collectives and the lane-0 block sum primitive;
+- `mma.cuh`: `ldmatrix` and the exact MMA forms used by the fixed SM120 kernels.
+
+These are private L1 headers, not operator APIs. Template parameters carry instruction immediates
+such as copy width, cache policy, subgroup width, and wait depth. Device leaves are force-inlined;
+they own no storage, launch policy, pipeline state, fragment class, or compatibility fallback.
+
+Layout and algorithm policy remain local to the consuming kernel. In particular, shared-memory
+swizzles, tile views, quantization codecs, online softmax, pipeline stage ownership, index mapping,
+and compound reductions such as argmax are not common primitives.
+
+Kernels include the leaf header they use. A linear or attention implementation must never include a
+GDN header merely to obtain a CUDA intrinsic wrapper.
+
+## 8. Host/device seam
 
 Wrappers are ordinary host C++ and do not include device kernel headers. A private launcher header
 declares a host-callable function in `qus::kernels::detail`; its `.cu` definition includes the
@@ -117,14 +139,14 @@ wrapper.cpp -> launcher.h -> launcher.cu -> kernel.cuh
 The launcher checks `cudaGetLastError()` after launch. Kernels assume wrapper validation has already
 succeeded.
 
-## 8. Build integration
+## 9. Build integration
 
 `src/CMakeLists.txt` recursively collects `.cpp` and `.cu` files below `src/kernels/`. Public include
 directories expose only `include/`; `src/` is a private include directory for the core library.
 Tests or benchmarks that intentionally exercise model-private helpers add `src/` explicitly to their
 own private include path.
 
-## 9. Change policy
+## 10. Change policy
 
 When the operator contract changes:
 

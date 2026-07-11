@@ -4,6 +4,7 @@
 // T==1 shapes, and the k%8!=0 LargeT fallback. The codec is selected by fmt.
 #include "kernels/linear/gemv/linear_rowsplit_gemm_smallt.cuh"
 
+#include "kernels/common/math.h"
 #include "kernels/linear/reference/linear_generic.h" // launch declaration
 #include "qus/core/device.h"                          // CUDA_CHECK
 
@@ -17,16 +18,14 @@ namespace {
 constexpr int kRowsPerBlockDefault = 8;
 constexpr int kStages              = 2;
 
-int ceil_div(int a, int b) { return (a + b - 1) / b; }
-
 template <class SC, int kTt, int kRowsPerBlock>
 void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::uint8_t* high,
                const std::uint8_t* scales, __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
                std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
                cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
-    const dim3 grid(static_cast<unsigned>(ceil_div(n, kRowsPerBlock)),
-                    static_cast<unsigned>(ceil_div(t, kTt)), 1u);
+    const dim3 grid(static_cast<unsigned>(div_up(n, kRowsPerBlock)),
+                    static_cast<unsigned>(div_up(t, kTt)), 1u);
     linear_rowsplit_gemm_smallt_kernel<SC, kTt, kRowsPerBlock, kStages>
         <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
                                              full_slabs);

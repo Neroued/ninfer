@@ -1,6 +1,7 @@
 #include "qus/kernels/linear.h"
 #include "qus/kernels/linear_pair.h"
 
+#include "kernels/common/math.h"
 #include "kernels/linear/plan/linear_plan.h"
 #include "kernels/linear/gemv/linear_rowsplit_gemv_attn_in_7168.cuh"
 #include "kernels/linear/gemv/linear_rowsplit_gemv_gdn_in_qk_4096.cuh"
@@ -54,13 +55,13 @@ std::uint64_t align_up_u64(std::uint64_t x, std::uint64_t m) {
     if (x > std::numeric_limits<std::uint64_t>::max() - add) {
         throw std::overflow_error("linear: aligned size overflows uint64");
     }
-    return ((x + add) / m) * m;
+    return round_up(x, m);
 }
 
 std::int32_t align_up_checked(std::int32_t x, std::int32_t m, const char* label) {
     const std::int64_t xi = x;
     const std::int64_t mi = m;
-    const std::int64_t y  = ((xi + mi - 1) / mi) * mi;
+    const std::int64_t y  = round_up(xi, mi);
     if (y > std::numeric_limits<std::int32_t>::max()) {
         throw std::overflow_error(std::string("linear: ") + label +
                                   " padded shape overflows int32");

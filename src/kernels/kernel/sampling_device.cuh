@@ -6,6 +6,7 @@
 // truncated-distribution builder used by both sample and the MTP
 // rejection-sampling accept kernel.
 
+#include "kernels/common/math.h"
 #include "qus/kernels/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>
@@ -40,7 +41,7 @@ static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTi
 
 // Number of group blocks needed to merge `partial_blocks` partials.
 __host__ __device__ inline int sampler_group_count(int partial_blocks) {
-    return (partial_blocks + kSamplerPartialsPerGroup - 1) / kSamplerPartialsPerGroup;
+    return div_up(partial_blocks, kSamplerPartialsPerGroup);
 }
 
 // True when the fixed sampler scratch and merge tiles can represent this launch.

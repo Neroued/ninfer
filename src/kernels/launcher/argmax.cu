@@ -1,6 +1,7 @@
 // qus::kernels - argmax launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/argmax.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/argmax.cuh"
 #include "qus/core/device.h"  // CUDA_CHECK
 
@@ -14,7 +15,7 @@ void argmax_launch(const Tensor& logits, Tensor& out, cudaStream_t stream) {
     if (t_count == 0) { return; }
 
     constexpr int kTileElems = kArgmaxBlock * kArgmaxItemsPerThread;
-    const int tiled_blocks = static_cast<int>((vocab + kTileElems - 1) / kTileElems);
+    const int tiled_blocks = div_up(vocab, kTileElems);
     if (tiled_blocks < 2) {
         argmax_kernel<<<static_cast<unsigned int>(t_count), kArgmaxBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),

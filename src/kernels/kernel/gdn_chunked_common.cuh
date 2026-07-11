@@ -36,14 +36,10 @@ struct workspace_layout {
     std::int64_t total_bytes    = 0;
 };
 
-inline std::int64_t align_up(std::int64_t x) {
-    return (x + kWorkspaceAlign - 1) & ~(kWorkspaceAlign - 1);
-}
-
 inline std::int64_t reserve(std::int64_t& cursor, std::int64_t bytes) {
     if (bytes == 0) { return cursor; }
     const std::int64_t off = cursor;
-    cursor                 = align_up(off + bytes);
+    cursor                 = qus::kernels::align_up<kWorkspaceAlign>(off + bytes);
     return off;
 }
 
@@ -53,7 +49,7 @@ inline workspace_layout compute_workspace_layout(std::int64_t S, std::int64_t H_
     constexpr std::int64_t f    = static_cast<std::int64_t>(sizeof(float));
     constexpr std::int64_t bf16 = static_cast<std::int64_t>(sizeof(__nv_bfloat16));
     const std::int64_t T     = L;
-    const std::int64_t NT    = (T + kChunkSize - 1) / kChunkSize;
+    const std::int64_t NT    = div_up(T, kChunkSize);
 
     const std::int64_t per_token_g   = B * T * H_v;
     const std::int64_t per_token_S   = B * T * H_v * S;

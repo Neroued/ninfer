@@ -1,5 +1,6 @@
 #include "kernels/linear/gemm/linear_rowsplit_q4_gate_up_silu_gemm_mma_folded.cuh"
 
+#include "kernels/common/math.h"
 #include "qus/core/device.h"
 
 namespace qus::kernels::detail {
@@ -10,8 +11,8 @@ using GateUpCfg = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
 void launch_folded(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     constexpr int PM = GateUpCfg::BM / 2;
     const int t      = x.ne[1];
-    const dim3 grid(static_cast<unsigned>((out.ne[0] + PM - 1) / PM),
-                    static_cast<unsigned>((t + GateUpCfg::BN - 1) / GateUpCfg::BN));
+    const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], PM)),
+                    static_cast<unsigned>(div_up(t, GateUpCfg::BN)));
     const bool full_tiles = (out.ne[0] % PM) == 0 && (t % GateUpCfg::BN) == 0;
     if (full_tiles) {
         linear_rowsplit_q4_gate_up_silu_gemm_mma_folded_kernel<GateUpCfg, true>

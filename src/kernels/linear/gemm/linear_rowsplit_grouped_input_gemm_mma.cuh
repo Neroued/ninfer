@@ -6,6 +6,7 @@
 // launch because its asymmetric 4096/6144 grid benefits from the larger shared
 // scheduling pool.
 
+#include "kernels/common/math.h"
 #include "kernels/linear/gemm/linear_rowsplit_gemm_mma.cuh"
 #include "qus/core/tensor.h"
 
@@ -60,7 +61,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
     __shared__ __align__(16) std::uint8_t Hr[S][BM * HB];
     __shared__ __align__(16) std::uint8_t Sr[S][BM * SB];
 
-    const int tiles0 = (job0.n + BM - 1) / BM;
+    const int tiles0 = div_up(job0.n, BM);
     int tile         = static_cast<int>(blockIdx.x);
     RowsplitGroupedJob job;
     if constexpr (Jobs == 2) {
@@ -71,8 +72,8 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
             job = job1;
         }
     } else {
-        const int tiles1 = (job1.n + BM - 1) / BM;
-        const int tiles2 = (job2.n + BM - 1) / BM;
+        const int tiles1 = div_up(job1.n, BM);
+        const int tiles2 = div_up(job2.n, BM);
         if (tile < tiles0) {
             job = job0;
         } else if ((tile -= tiles0) < tiles1) {
@@ -127,13 +128,13 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
             const int kk       = k0 + kl;
             __nv_bfloat16* dst = &Bs[stage][tl * BK + gemm_swz64(tl, kl)];
             if constexpr (FullTiles) {
-                gemm_async_copy_global_to_shared<16, Cfg>(
+                gemm_cp_async<16, Cfg>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else if (col < t && kk + 8 <= k) {
-                gemm_async_copy_global_to_shared<16, Cfg>(
+                gemm_cp_async<16, Cfg>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
-                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                store_vec(dst, make_int4(0, 0, 0, 0));
             }
         }
     };
@@ -148,12 +149,12 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
             auto* dst      = &Cr[stage][row * 32 + half * 16];
             if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                gemm_async_copy_global_to_shared<16, Cfg>(dst, &job.codes[gi * 32 + half * 16]);
+                gemm_cp_async<16, Cfg>(dst, &job.codes[gi * 32 + half * 16]);
             } else if (grow < job.n) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                gemm_async_copy_global_to_shared<16, Cfg>(dst, &job.codes[gi * 32 + half * 16]);
+                gemm_cp_async<16, Cfg>(dst, &job.codes[gi * 32 + half * 16]);
             } else {
-                *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                store_vec(dst, make_int4(0, 0, 0, 0));
             }
         }
         if constexpr (Codec == GroupedInputCodec::Q5) {
@@ -163,10 +164,10 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                 auto* dst      = &Hr[stage][row * 8];
                 if constexpr (FullTiles) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                    gemm_async_copy_global_to_shared<8, Cfg>(dst, &job.high[gi * 8]);
+                    gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
                 } else if (grow < job.n) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                    gemm_async_copy_global_to_shared<8, Cfg>(dst, &job.high[gi * 8]);
+                    gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
                 } else {
                     *reinterpret_cast<std::uint64_t*>(dst) = 0;
                 }
@@ -179,10 +180,10 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                     auto* dst      = &Hr[stage][row * 8];
                     if constexpr (FullTiles) {
                         const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                        gemm_async_copy_global_to_shared<8, Cfg>(dst, &job.high[gi * 8]);
+                        gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
                     } else if (grow < job.n) {
                         const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g;
-                        gemm_async_copy_global_to_shared<8, Cfg>(dst, &job.high[gi * 8]);
+                        gemm_cp_async<8, Cfg>(dst, &job.high[gi * 8]);
                     } else {
                         *reinterpret_cast<std::uint64_t*>(dst) = 0;
                     }
@@ -199,7 +200,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                 const std::int64_t aligned_gi = static_cast<std::int64_t>(grow) * kg + aligned_g;
                 if constexpr (Cfg::SCALE_PAIR_LOAD) {
                     if (aligned_g + 1 < kg) {
-                        gemm_async_copy_global_to_shared<4, Cfg>(dst, &job.scales[aligned_gi * 2]);
+                        gemm_cp_async<4, Cfg>(dst, &job.scales[aligned_gi * 2]);
                     } else {
                         *reinterpret_cast<std::uint16_t*>(dst) =
                             *reinterpret_cast<const std::uint16_t*>(&job.scales[gi * 2]);
@@ -215,7 +216,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                 const std::int64_t aligned_gi = static_cast<std::int64_t>(grow) * kg + aligned_g;
                 if constexpr (Cfg::SCALE_PAIR_LOAD) {
                     if (aligned_g + 1 < kg) {
-                        gemm_async_copy_global_to_shared<4, Cfg>(dst, &job.scales[aligned_gi * 2]);
+                        gemm_cp_async<4, Cfg>(dst, &job.scales[aligned_gi * 2]);
                     } else {
                         *reinterpret_cast<std::uint16_t*>(dst) =
                             *reinterpret_cast<const std::uint16_t*>(&job.scales[gi * 2]);
@@ -273,19 +274,19 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                 }
             }
             const int sc                                           = gemm_swz64(row, 2 * lane);
-            *reinterpret_cast<__nv_bfloat162*>(&As[row * BK + sc]) = w;
+            store_vec(&As[row * BK + sc], w);
         }
     };
 
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         if (s < NKT) { stage_load(s, s); }
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
     }
 
     for (int it = 0; it < NKT; ++it) {
         const int stage = it % S;
-        qus::kernels::async_copy_wait<S - 1>();
+        qus::kernels::cp_wait<S - 1>();
         __syncthreads();
         dequant_to_As(stage, it);
         __syncthreads();
@@ -298,21 +299,21 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
                 const int arow = wm * WM + mi * 16 + a_rowoff;
-                gemm_ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                                 gemm_smem_addr(&As[arow * BK + gemm_swz64(arow, ks + a_coloff)]));
+                ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                                 smem_addr(&As[arow * BK + gemm_swz64(arow, ks + a_coloff)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int brow = wn * WN + ni * 8 + b_rin;
-                gemm_ldmatrix_x2(
+                ldmatrix_x2(
                     bf[ni][0], bf[ni][1],
-                    gemm_smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, ks + b_koff)]));
+                    smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, ks + b_koff)]));
             }
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    gemm_mma_m16n8k16_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
+                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
                                            acc[mi][ni][3], af[mi][0], af[mi][1], af[mi][2],
                                            af[mi][3], bf[ni][0], bf[ni][1]);
                 }
@@ -321,7 +322,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
         __syncthreads();
         const int next = it + S;
         if (next < NKT) { stage_load(stage, next); }
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
     }
 
 #pragma unroll

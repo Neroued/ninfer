@@ -39,11 +39,13 @@
 // reading global memory directly, masked at the k boundary. Weights in the
 // padded region [k, padded_k) are never used.
 
+#include "kernels/common/math.cuh"
+#include "kernels/common/memory.cuh"
+#include "kernels/common/warp.cuh"
 #include "kernels/linear/codec/linear_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cuda_pipeline.h>
 
 #include <cstdint>
 #include <type_traits>
@@ -81,7 +83,7 @@ struct Q4Smallt {
 #pragma unroll
         for (int p = 0; p < 4; ++p) {
             std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
-            const __half2 h    = __hsub2(*reinterpret_cast<const __half2*>(&bits), bias);
+            const __half2 h    = __hsub2(half2_from_bits(bits), bias);
             const float2  f    = __half22float2(h);
             w[p]     = f.x * scale;
             w[p + 4] = f.y * scale;
@@ -112,7 +114,7 @@ struct Q5Smallt {
         for (int p = 0; p < 4; ++p) {
             std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
             bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
-            const __half2 h = __hsub2(*reinterpret_cast<const __half2*>(&bits), bias);
+            const __half2 h = __hsub2(half2_from_bits(bits), bias);
             const float2  f = __half22float2(h);
             w[p]     = f.x * scale;
             w[p + 4] = f.y * scale;
@@ -144,7 +146,7 @@ struct Q6Smallt {
         for (int p = 0; p < 4; ++p) {
             std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
             bits |= (((hw >> (2 * p)) & 3u) << 4) | (((hw >> (2 * p + 8)) & 3u) << 20);
-            const __half2 h = __hsub2(*reinterpret_cast<const __half2*>(&bits), bias);
+            const __half2 h = __hsub2(half2_from_bits(bits), bias);
             const float2  f = __half22float2(h);
             w[p]     = f.x * scale;
             w[p + 4] = f.y * scale;
@@ -191,28 +193,22 @@ smallt_issue_slab(uint4* __restrict__ s_nib, uint4* __restrict__ s_hi,
 #pragma unroll
     for (int j = 0; j < SC::kNibU4 / 32; ++j) {
         const int i = j * 32 + lane;
-        __pipeline_memcpy_async(&s_nib[i],
-                                code_row + static_cast<std::int64_t>(slab) * (SC::kNibU4 * 16) +
-                                    i * 16,
-                                16);
+        pipe_copy<16>(
+            &s_nib[i],
+            code_row + static_cast<std::int64_t>(slab) * (SC::kNibU4 * 16) + i * 16);
     }
     if constexpr (SC::kHighU4 > 0) {
         if (lane < SC::kHighU4) {
-            __pipeline_memcpy_async(&s_hi[lane],
-                                    high_row +
-                                        static_cast<std::int64_t>(slab) * (SC::kHighU4 * 16) +
-                                        lane * 16,
-                                    16);
+            pipe_copy<16>(
+                &s_hi[lane],
+                high_row + static_cast<std::int64_t>(slab) * (SC::kHighU4 * 16) + lane * 16);
         }
     }
     if (lane < SC::kScaleU32) {
-        __pipeline_memcpy_async(&s_sc[lane],
-                                scale_row +
-                                    static_cast<std::int64_t>(slab) * (SC::kScaleU32 * 4) +
-                                    lane * 4,
-                                4);
+        pipe_copy<4>(&s_sc[lane],
+                     scale_row + static_cast<std::int64_t>(slab) * (SC::kScaleU32 * 4) + lane * 4);
     }
-    __pipeline_commit();
+    pipe_commit();
 }
 
 // x0 points at the column tile base (x + col0*k); xslab is the slab's first
@@ -230,16 +226,16 @@ smallt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, st
 #pragma unroll
         for (int tt = 0; tt < kTt; ++tt) {
             if (tt < ncols) {
-                const uint4 xv = *reinterpret_cast<const uint4*>(
-                    x0 + static_cast<std::int64_t>(tt) * k + xoff);
+                const uint4 xv =
+                    load_vec<uint4>(x0 + static_cast<std::int64_t>(tt) * k + xoff);
                 const float2 f0 =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+                    bf16x2_bits_to_float2(xv.x);
                 const float2 f1 =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+                    bf16x2_bits_to_float2(xv.y);
                 const float2 f2 =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.z));
+                    bf16x2_bits_to_float2(xv.z);
                 const float2 f3 =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.w));
+                    bf16x2_bits_to_float2(xv.w);
                 acc[tt] = fmaf(w[0], f0.x, acc[tt]);
                 acc[tt] = fmaf(w[1], f0.y, acc[tt]);
                 acc[tt] = fmaf(w[2], f1.x, acc[tt]);
@@ -309,7 +305,7 @@ __launch_bounds__(64, 16) __global__ void linear_rowsplit_gemm_smallt_kernel_dir
             for (int p = 0; p < 4; ++p) {
                 std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
                 bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
-                const __half2 h = __hsub2(*reinterpret_cast<const __half2*>(&bits), bias);
+                const __half2 h = __hsub2(half2_from_bits(bits), bias);
                 const float2  f = __half22float2(h);
                 w[p]            = f.x * scale;
                 w[p + 4]        = f.y * scale;
@@ -319,16 +315,16 @@ __launch_bounds__(64, 16) __global__ void linear_rowsplit_gemm_smallt_kernel_dir
                 static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
 #pragma unroll
             for (int tt = 0; tt < kTt; ++tt) {
-                const uint4 xv = *reinterpret_cast<const uint4*>(
-                    x + static_cast<std::int64_t>(tt) * kStride + xoff);
+                const uint4 xv =
+                    load_vec<uint4>(x + static_cast<std::int64_t>(tt) * kStride + xoff);
                 const float2 f0 =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+                    bf16x2_bits_to_float2(xv.x);
                 const float2 f1 =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+                    bf16x2_bits_to_float2(xv.y);
                 const float2 f2 =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.z));
+                    bf16x2_bits_to_float2(xv.z);
                 const float2 f3 =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.w));
+                    bf16x2_bits_to_float2(xv.w);
                 acc[tt] = fmaf(w[0], f0.x, acc[tt]);
                 acc[tt] = fmaf(w[1], f0.y, acc[tt]);
                 acc[tt] = fmaf(w[2], f1.x, acc[tt]);
@@ -344,8 +340,7 @@ __launch_bounds__(64, 16) __global__ void linear_rowsplit_gemm_smallt_kernel_dir
 #pragma unroll
     for (int tt = 0; tt < kTt; ++tt) {
         float a = acc[tt];
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) { a += __shfl_down_sync(0xffffffffu, a, off); }
+        a = warp_reduce_sum(a);
         if (lane == 0) { s_part[part][tt] = a; }
     }
 
@@ -410,7 +405,7 @@ __launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_di
         for (int p = 0; p < 4; ++p) {
             std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
             bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
-            const __half2 h = __hsub2(*reinterpret_cast<const __half2*>(&bits), bias);
+            const __half2 h = __hsub2(half2_from_bits(bits), bias);
             const float2  f = __half22float2(h);
             w[p]            = f.x * scale;
             w[p + 4]        = f.y * scale;
@@ -420,16 +415,16 @@ __launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_di
             static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
 #pragma unroll
         for (int tt = 0; tt < kTt; ++tt) {
-            const uint4 xv = *reinterpret_cast<const uint4*>(
-                x + static_cast<std::int64_t>(tt) * kStride + xoff);
+            const uint4 xv =
+                load_vec<uint4>(x + static_cast<std::int64_t>(tt) * kStride + xoff);
             const float2 f0 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+                bf16x2_bits_to_float2(xv.x);
             const float2 f1 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+                bf16x2_bits_to_float2(xv.y);
             const float2 f2 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.z));
+                bf16x2_bits_to_float2(xv.z);
             const float2 f3 =
-                __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.w));
+                bf16x2_bits_to_float2(xv.w);
             acc[tt] = fmaf(w[0], f0.x, acc[tt]);
             acc[tt] = fmaf(w[1], f0.y, acc[tt]);
             acc[tt] = fmaf(w[2], f1.x, acc[tt]);
@@ -444,8 +439,7 @@ __launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_di
 #pragma unroll
     for (int tt = 0; tt < kTt; ++tt) {
         float a = acc[tt];
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) { a += __shfl_down_sync(0xffffffffu, a, off); }
+        a = warp_reduce_sum(a);
         if (lane == 0) { s_part[chunk][tt] = a; }
     }
 
@@ -501,7 +495,7 @@ __global__ void linear_rowsplit_gemm_smallt_kernel(
             smallt_issue_slab<SC>(s_nib[warp][p], s_hi[warp][p], s_sc[warp][p], code_row,
                                   high_row, scale_row, p, lane);
         } else {
-            __pipeline_commit();
+            pipe_commit();
         }
     }
 
@@ -513,9 +507,9 @@ __global__ void linear_rowsplit_gemm_smallt_kernel(
             smallt_issue_slab<SC>(s_nib[warp][buf], s_hi[warp][buf], s_sc[warp][buf], code_row,
                                   high_row, scale_row, fetch, lane);
         } else {
-            __pipeline_commit();
+            pipe_commit();
         }
-        __pipeline_wait_prior(kPrefetch);
+        pipe_wait<kPrefetch>();
         __syncwarp();
 
         const int buf = s % kStages;
@@ -527,7 +521,7 @@ __global__ void linear_rowsplit_gemm_smallt_kernel(
 
     // Scalar tail: remaining groups read global memory directly, masked at k.
     const int g0      = (full_slabs * 1024) / Codec::kGroupK;
-    const int kg_used = (k + Codec::kGroupK - 1) / Codec::kGroupK;
+    const int kg_used = div_up(k, Codec::kGroupK);
     for (int g = g0; g < kg_used; ++g) {
         const int kk = g * Codec::kGroupK + lane * 2;
         if (kk >= k) { continue; }
@@ -549,8 +543,7 @@ __global__ void linear_rowsplit_gemm_smallt_kernel(
     for (int tt = 0; tt < kTt; ++tt) {
         if (tt >= ncols) { continue; }
         float a = acc[tt];
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) { a += __shfl_down_sync(0xffffffffu, a, off); }
+        a = warp_reduce_sum(a);
         if (lane == 0) {
             out[static_cast<std::int64_t>(col0 + tt) * n + row] = __float2bfloat16(a);
         }

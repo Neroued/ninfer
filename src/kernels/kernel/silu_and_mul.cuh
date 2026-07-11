@@ -5,6 +5,8 @@
 // Vectorized over bf16 pairs; included only by its launcher. See
 // docs/l1-kernel-layering.md §6 and docs/l1-op-test-standard.md §0 (no math approximation).
 
+#include "kernels/common/math.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -13,11 +15,9 @@ namespace qus::kernels {
 
 inline constexpr int kSiluAndMulPairsPerThread = 4;
 
-__device__ __forceinline__ float silu_f32(float x) { return x / (1.0f + expf(-x)); }
-
 __device__ __forceinline__ __nv_bfloat162 silu_mul_pair(__nv_bfloat162 g, __nv_bfloat162 u) {
-    const float r0 = silu_f32(__low2float(g)) * __low2float(u);
-    const float r1 = silu_f32(__high2float(g)) * __high2float(u);
+    const float r0 = silu(__low2float(g)) * __low2float(u);
+    const float r1 = silu(__high2float(g)) * __high2float(u);
     return __floats2bfloat162_rn(r0, r1);
 }
 
@@ -26,7 +26,7 @@ __global__ void silu_and_mul_scalar_kernel(const __nv_bfloat16* gate, const __nv
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
-        out[i] = __float2bfloat16(silu_f32(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
+        out[i] = __float2bfloat16(silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
     }
 }
 
@@ -58,7 +58,7 @@ __global__ void silu_and_mul_strided_input_kernel(
                                   static_cast<std::int64_t>(d3) * unb3;
         const auto gv = *reinterpret_cast<const __nv_bfloat16*>(gate_bytes + goff);
         const auto uv = *reinterpret_cast<const __nv_bfloat16*>(up_bytes + uoff);
-        out[i]        = __float2bfloat16(silu_f32(__bfloat162float(gv)) * __bfloat162float(uv));
+        out[i]        = __float2bfloat16(silu(__bfloat162float(gv)) * __bfloat162float(uv));
     }
 }
 
@@ -118,7 +118,7 @@ __launch_bounds__(256) __global__
         if ((n & 1) != 0) {
             const std::int64_t i = n - 1;
             out[i] =
-                __float2bfloat16(silu_f32(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
+                __float2bfloat16(silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
         }
     }
 }

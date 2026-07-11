@@ -23,7 +23,6 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
-#include "kernels/kernel/gdn_common.cuh"
 #include "kernels/kernel/gqa_attention_decode.cuh"
 #include "kernels/kernel/gqa_attention_kv_quant.cuh"
 
@@ -154,7 +153,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int active_split_count = gqa_small_t_active_splits(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
 
-    const int kps         = (window + active_split_count - 1) / active_split_count;
+    const int kps         = div_up(window, active_split_count);
     const int split_start = split * kps;
     const int split_limit = split_start + kps;
     const int split_end   = (split_limit < window) ? split_limit : window;
@@ -180,11 +179,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const float vv1         = __bfloat162float(v_new[src1]);
         float kamax             = fmaxf(fabsf(kv0), fabsf(kv1));
         float vamax             = fmaxf(fabsf(vv0), fabsf(vv1));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            kamax = fmaxf(kamax, __shfl_xor_sync(FullMask, kamax, off));
-            vamax = fmaxf(vamax, __shfl_xor_sync(FullMask, vamax, off));
-        }
+        kamax = warp_max(kamax, FullMask);
+        vamax = warp_max(vamax, FullMask);
         const __half ksh  = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
         const __half vsh  = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
         const float ks    = __half2float(ksh);
@@ -223,10 +219,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const float x0 = __bfloat162float(q[gqa_q_index(q_head, d0, token)]);
         const float x1 = __bfloat162float(q[gqa_q_index(q_head, d1, token)]);
         float amax     = fmaxf(fabsf(x0), fabsf(x1));
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            amax = fmaxf(amax, __shfl_xor_sync(FullMask, amax, off));
-        }
+        amax = warp_max(amax, FullMask);
         const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
         const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
         gqa_small_t_i8_store_swz(q_i8, row, d0, DB16, gqa_kv_quant_code(x0, inv));
@@ -278,9 +271,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int key = tile_k0 + key_l;
             if (key < split_end) {
                 const std::int64_t off = gqa_kv_quant_scale_index(kv_head, 0, key, padded_context);
-                qus::kernels::async_copy_global_to_shared<8>(&k_scale_s[key_l * Groups],
+                qus::kernels::cp_async<8>(&k_scale_s[key_l * Groups],
                                                              &cache_k_scale[off]);
-                qus::kernels::async_copy_global_to_shared<8>(&v_scale_s[key_l * Groups],
+                qus::kernels::cp_async<8>(&v_scale_s[key_l * Groups],
                                                              &cache_v_scale[off]);
             }
         }
@@ -293,17 +286,17 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             if (key < split_end) {
                 const std::int64_t off = gqa_kv_quant_code_index(kv_head, d, key, padded_context);
                 std::int8_t* dst       = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
-                qus::kernels::async_copy_global_to_shared<16>(dst, &cache_k_i8[off]);
-                qus::kernels::async_copy_global_to_shared<16>(&v_i8[key_l * D + d],
+                qus::kernels::cp_async<16>(dst, &cache_k_i8[off]);
+                qus::kernels::cp_async<16>(&v_i8[key_l * D + d],
                                                               &cache_v_i8[off]);
             }
         }
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
     };
 
-    const int key_blocks = (split_end - split_start + Bc - 1) / Bc;
+    const int key_blocks = div_up(split_end - split_start, Bc);
     issue_kv_tile(split_start);
-    qus::kernels::async_copy_wait<0>();
+    qus::kernels::cp_wait<0>();
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
@@ -330,9 +323,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 for (int kk = 0; kk < GroupKc; ++kk) {
                     const int k    = g * GroupKc + kk;
                     const int acol = k * 16 + a_coloff;
-                    gqa_small_t_tc_ldmatrix_x4(
+                    ldmatrix_x4(
                         af[kk][0], af[kk][1], af[kk][2], af[kk][3],
-                        gqa_small_t_tc_smem_addr(
+                        smem_addr(
                             &q_b16[(producer_row_base + a_rowoff) * DB16 +
                                    gqa_small_t_tc_swz(producer_row_base + a_rowoff, acol)]));
                 }
@@ -346,11 +339,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         const int brow = nt * 8 + b_rin;
                         const int bcol = k * 16 + b_koff;
                         unsigned bf[2];
-                        gqa_small_t_tc_ldmatrix_x2(
+                        ldmatrix_x2(
                             bf[0], bf[1],
-                            gqa_small_t_tc_smem_addr(
+                            smem_addr(
                                 &k_b16[brow * DB16 + gqa_small_t_tc_swz(brow, bcol)]));
-                        gqa_small_t_tc_mma_m16n8k32_s8(c0, c1, c2, c3, af[kk][0], af[kk][1],
+                        mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1],
                                                        af[kk][2], af[kk][3], bf[0], bf[1]);
                     }
                     const int keya = nt * 8 + 2 * lid;
@@ -409,15 +402,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 bm0          = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1          = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }
-            bm0 = fmaxf(bm0, __shfl_xor_sync(FullMask, bm0, 1));
-            bm0 = fmaxf(bm0, __shfl_xor_sync(FullMask, bm0, 2));
-            bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 1));
-            bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 2));
+            bm0 = warp_max<4>(bm0, FullMask);
+            bm1 = warp_max<4>(bm1, FullMask);
 
             const float nm0    = fmaxf(m0, bm0);
             const float nm1    = fmaxf(m1, bm1);
-            const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : gqa_exp2_fast((m0 - nm0) * Log2E);
-            const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : gqa_exp2_fast((m1 - nm1) * Log2E);
+            const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
+            const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
 
             float bl0 = 0.0f, bl1 = 0.0f;
 #pragma unroll
@@ -425,16 +416,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int col0  = nt * 8 + 2 * lid;
                 const int col1  = col0 + 1;
                 const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
-                                      ? gqa_exp2_fast((score[nt][0] - nm0) * Log2E)
+                                      ? exp2_approx((score[nt][0] - nm0) * Log2E)
                                       : 0.0f;
                 const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
-                                      ? gqa_exp2_fast((score[nt][1] - nm0) * Log2E)
+                                      ? exp2_approx((score[nt][1] - nm0) * Log2E)
                                       : 0.0f;
                 const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
-                                      ? gqa_exp2_fast((score[nt][2] - nm1) * Log2E)
+                                      ? exp2_approx((score[nt][2] - nm1) * Log2E)
                                       : 0.0f;
                 const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
-                                      ? gqa_exp2_fast((score[nt][3] - nm1) * Log2E)
+                                      ? exp2_approx((score[nt][3] - nm1) * Log2E)
                                       : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
@@ -443,10 +434,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col0)] = __float2bfloat16(p10);
                 p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col1)] = __float2bfloat16(p11);
             }
-            bl0 += __shfl_xor_sync(FullMask, bl0, 1);
-            bl0 += __shfl_xor_sync(FullMask, bl0, 2);
-            bl1 += __shfl_xor_sync(FullMask, bl1, 1);
-            bl1 += __shfl_xor_sync(FullMask, bl1, 2);
+            bl0 = warp_sum<4>(bl0, FullMask);
+            bl1 = warp_sum<4>(bl1, FullMask);
 
             l0 = l0 * alpha0 + bl0;
             l1 = l1 * alpha1 + bl1;
@@ -470,10 +459,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
                     vs = __shfl_sync(FullMask, vs, grp * 8);
-                    *reinterpret_cast<int4*>(dst) =
-                        gqa_kv_dequant_i8x8_from(&v_i8[key_l * D + d], vs);
+                    store_vec(dst, gqa_kv_dequant_i8x8_from(&v_i8[key_l * D + d], vs));
                 } else {
-                    *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                    store_vec(dst, make_int4(0, 0, 0, 0));
                 }
             }
         }
@@ -503,21 +491,21 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             for (int k = 0; k < PVKs; ++k) {
                 unsigned pf[4];
                 const int pcol = k * 16 + a_coloff;
-                gqa_small_t_tc_ldmatrix_x4(
+                ldmatrix_x4(
                     pf[0], pf[1], pf[2], pf[3],
-                    gqa_small_t_tc_smem_addr(
+                    smem_addr(
                         &p_consumer[a_rowoff * Bc + gqa_small_t_tc_swz32(a_rowoff, pcol)]));
                 unsigned vf[2];
                 const int vrow = k * 16 + b_koff + b_rin;
                 const int vcol = global_n * 8;
-                gqa_small_t_tc_ldmatrix_x2_trans(
+                ldmatrix_x2_t(
                     vf[0], vf[1],
-                    gqa_small_t_tc_smem_addr(&v_bf16[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
-                gqa_small_t_tc_mma_m16n8k16_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0],
+                    smem_addr(&v_bf16[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
+                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0],
                                                  pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
         }
-        if (has_next) { qus::kernels::async_copy_wait<0>(); }
+        if (has_next) { qus::kernels::cp_wait<0>(); }
         __syncthreads();
     }
 
@@ -554,7 +542,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             gqa_small_t_tc_row_to_qt(row0, TokenTile, kv_head, q_head, token);
             const std::int64_t dst = gqa_partial_acc_index(q_head, d0, token, split, TokenTile);
             *reinterpret_cast<unsigned*>(&partial_acc[dst]) =
-                gqa_kv_quant_pack_bf16(acc[n][0], acc[n][1]);
+                pack_bf16x2(acc[n][0], acc[n][1]);
         }
         if (row1 < RowCount) {
             int q_head = 0;
@@ -562,7 +550,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             gqa_small_t_tc_row_to_qt(row1, TokenTile, kv_head, q_head, token);
             const std::int64_t dst = gqa_partial_acc_index(q_head, d0, token, split, TokenTile);
             *reinterpret_cast<unsigned*>(&partial_acc[dst]) =
-                gqa_kv_quant_pack_bf16(acc[n][2], acc[n][3]);
+                pack_bf16x2(acc[n][2], acc[n][3]);
         }
     }
 }

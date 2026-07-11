@@ -1,5 +1,7 @@
 #pragma once
 
+#include "kernels/common/math.h"
+
 // qus::kernels - embedding kernels. Dense copies BF16 rows; Q6 decodes
 // ROW_SPLIT nibble, high, and scale planes.
 
@@ -76,8 +78,7 @@ __global__ void embed_gather_q6_grouped_kernel(const std::int32_t* ids,
                                                __nv_bfloat16* out, std::int32_t d,
                                                std::int32_t T) {
     const std::int32_t kg = d / kEmbedGatherQ6Group;
-    const std::int32_t group_blocks =
-        (kg + kEmbedGatherQ6GroupsPerBlock - 1) / kEmbedGatherQ6GroupsPerBlock;
+    const std::int32_t group_blocks = div_up(kg, kEmbedGatherQ6GroupsPerBlock);
     const std::int32_t t = static_cast<std::int32_t>(blockIdx.x) / group_blocks;
     const std::int32_t block_group =
         static_cast<std::int32_t>(blockIdx.x) - t * group_blocks;

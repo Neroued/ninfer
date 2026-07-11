@@ -1,6 +1,7 @@
 // qus::kernels - embedding launcher: variant grid/block/stream setup.
 #include "kernels/launcher/embed_gather.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/embed_gather.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 
@@ -14,13 +15,13 @@ constexpr int kBlock = 128;
 constexpr int kQ6GroupedBlock = kEmbedGatherQ6Group * kEmbedGatherQ6GroupsPerBlock;
 
 int grid_for(std::int64_t n) {
-    return static_cast<int>(std::max<std::int64_t>(1, (n + kBlock - 1) / kBlock));
+    return static_cast<int>(
+        std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock))));
 }
 
 int grid_for_q6_grouped(std::int32_t d, std::int32_t T) {
     const std::int32_t kg = d / kEmbedGatherQ6Group;
-    const std::int32_t group_blocks = (kg + kEmbedGatherQ6GroupsPerBlock - 1) /
-                                      kEmbedGatherQ6GroupsPerBlock;
+    const std::int32_t group_blocks = div_up(kg, kEmbedGatherQ6GroupsPerBlock);
     return static_cast<int>(std::max<std::int64_t>(
         1, static_cast<std::int64_t>(T) * static_cast<std::int64_t>(group_blocks)));
 }

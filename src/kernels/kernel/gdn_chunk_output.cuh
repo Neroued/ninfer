@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kernels/common/mma.cuh"
 #include "kernels/kernel/gdn_chunked_common.cuh"
 
 #include <cmath>
@@ -27,15 +28,15 @@ using gdn_chunked::MMA_K;
 using gdn_chunked::bh_decode_t;
 using gdn_chunked::zero_frag;
 using qus::kernels::SmemTile;
-using qus::kernels::mma_m16n8k8_tf32;
-using qus::kernels::exp2_fast;
+using qus::kernels::mma_tf32;
+using qus::kernels::exp2_approx;
 using qus::kernels::RCP_LN2_F;
 
 static_assert(gdn_chunked::kChunkSize == 64,
               "stage_chunk_output: kChunkSize must be 64 (kernel hard-codes BT=64)");
 
 constexpr int N_WARPS = 4;
-constexpr int THREADS = N_WARPS * qus::kernels::WARP_SIZE; // 128
+constexpr int THREADS = N_WARPS * qus::kernels::kWarpSize; // 128
 
 static_assert(BT == N_WARPS * MMA_M,
               "kernel assigns one 16-row strip per warp; BT must equal N_WARPS * MMA_M");
@@ -188,7 +189,7 @@ __launch_bounds__(THREADS, 3) __global__
                     n_off + lane_g; // B operand: row=t, but B is K^T so rows are k cols
                 const float b0 = k_pass_view.at(row_t, col_t0_l);
                 const float b1 = k_pass_view.at(row_t, col_t1_l);
-                mma_m16n8k8_tf32(A_strip[nt][0], A_strip[nt][1], A_strip[nt][2], A_strip[nt][3], a0,
+                mma_tf32(A_strip[nt][0], A_strip[nt][1], A_strip[nt][2], A_strip[nt][3], a0,
                                  a1, a2, a3, b0, b1);
             }
         }
@@ -218,10 +219,10 @@ __launch_bounds__(THREADS, 3) __global__
             const float g_s0 = g_smem[s0];
             const float g_s1 = g_smem[s1];
 
-            const float dec00 = exp2_fast((g_r0 - g_s0) * RCP_LN2_F);
-            const float dec01 = exp2_fast((g_r0 - g_s1) * RCP_LN2_F);
-            const float dec10 = exp2_fast((g_r1 - g_s0) * RCP_LN2_F);
-            const float dec11 = exp2_fast((g_r1 - g_s1) * RCP_LN2_F);
+            const float dec00 = exp2_approx((g_r0 - g_s0) * RCP_LN2_F);
+            const float dec01 = exp2_approx((g_r0 - g_s1) * RCP_LN2_F);
+            const float dec10 = exp2_approx((g_r1 - g_s0) * RCP_LN2_F);
+            const float dec11 = exp2_approx((g_r1 - g_s1) * RCP_LN2_F);
 
             A_strip[nt][0] = (s0 <= r0) ? A_strip[nt][0] * dec00 : 0.0f;
             A_strip[nt][1] = (s1 <= r0) ? A_strip[nt][1] * dec01 : 0.0f;
@@ -268,8 +269,8 @@ __launch_bounds__(THREADS, 3) __global__
     //
     // gamma_r0 / gamma_r1 in [0, 1] under the test's g distribution; underflow
     // to 0 is safe.
-    const float gamma_r0 = exp2_fast(g_smem[row_g0] * RCP_LN2_F);
-    const float gamma_r1 = exp2_fast(g_smem[row_g1] * RCP_LN2_F);
+    const float gamma_r0 = exp2_approx(g_smem[row_g0] * RCP_LN2_F);
+    const float gamma_r1 = exp2_approx(g_smem[row_g1] * RCP_LN2_F);
 
 #pragma unroll 1
     for (int c = 0; c < N_CHUNKS; ++c) {
@@ -304,7 +305,7 @@ __launch_bounds__(THREADS, 3) __global__
                 const int row_t = n_off + lane_g;
                 const float b0  = h_part_view.at(row_t, col_t0);
                 const float b1  = h_part_view.at(row_t, col_t1);
-                mma_m16n8k8_tf32(D_frag[nt][0], D_frag[nt][1], D_frag[nt][2], D_frag[nt][3], a0, a1,
+                mma_tf32(D_frag[nt][0], D_frag[nt][1], D_frag[nt][2], D_frag[nt][3], a0, a1,
                                  a2, a3, b0, b1);
             }
         }
@@ -345,7 +346,7 @@ __launch_bounds__(THREADS, 3) __global__
                 const int col_g  = n_off + lane_g;
                 const float b0   = v_part_view.at(row_t0, col_g);
                 const float b1   = v_part_view.at(row_t1, col_g);
-                mma_m16n8k8_tf32(D_frag[nt][0], D_frag[nt][1], D_frag[nt][2], D_frag[nt][3], a0, a1,
+                mma_tf32(D_frag[nt][0], D_frag[nt][1], D_frag[nt][2], D_frag[nt][3], a0, a1,
                                  a2, a3, b0, b1);
             }
         }
@@ -360,12 +361,10 @@ __launch_bounds__(THREADS, 3) __global__
             const __nv_bfloat162 v1 =
                 __floats2bfloat162_rn(scale * D_frag[nt][2], scale * D_frag[nt][3]);
             if (row_g0 < cl) {
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &attn_out[out_base + (int64_t)row_g0 * out_row_stride + d_global]) = v0;
+                store_vec(&attn_out[out_base + (int64_t)row_g0 * out_row_stride + d_global], v0);
             }
             if (row_g1 < cl) {
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &attn_out[out_base + (int64_t)row_g1 * out_row_stride + d_global]) = v1;
+                store_vec(&attn_out[out_base + (int64_t)row_g1 * out_row_stride + d_global], v1);
             }
         }
 
@@ -408,7 +407,7 @@ cudaError_t launch_chunk_output(const gdn_chunked::chunk_output_config& cfg) {
     if (cfg.k == nullptr) return cudaErrorInvalidValue;
 
     const auto qk_map = qus::kernels::head_map::of((int)cfg.H_qk, (int)cfg.H_v);
-    const int64_t NT  = (cfg.L + BT - 1) / BT;
+    const int64_t NT  = div_up(cfg.L, static_cast<int64_t>(BT));
     const int64_t bh  = cfg.B * cfg.H_v;
     const float scale = cfg.scale;
     QUS_GDN_PROPAGATE(v.check_grid(NT, bh));

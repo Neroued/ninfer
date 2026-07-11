@@ -8,7 +8,7 @@
 // shared tile; x uses a two-stage cp.async pipeline. Tensor Cores execute
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
-#include "kernels/kernel/gdn_common.cuh" // existing cp.async helpers
+#include "kernels/common/mma.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -44,44 +44,8 @@ struct W8G32GemmCfg {
     static_assert(SMEM_BYTES <= 48 * 1024);
 };
 
-__device__ __forceinline__ unsigned w8g32_smem_addr(const void* p) {
-    return static_cast<unsigned>(__cvta_generic_to_shared(p));
-}
-
 __device__ __forceinline__ int w8g32_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
-}
-
-__device__ __forceinline__ void w8g32_async_copy_cg_16(void* dst, const void* src) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                 :
-                 : "r"(w8g32_smem_addr(dst)), "l"(src));
-#else
-    *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
-#endif
-}
-
-__device__ __forceinline__ void w8g32_ldmatrix_x4(unsigned& a0, unsigned& a1, unsigned& a2,
-                                                  unsigned& a3, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void w8g32_ldmatrix_x2(unsigned& b0, unsigned& b1, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
-                 : "=r"(b0), "=r"(b1)
-                 : "r"(addr));
-}
-
-__device__ __forceinline__ void w8g32_mma_m16n8k16_bf16(float& c0, float& c1, float& c2, float& c3,
-                                                        unsigned a0, unsigned a1, unsigned a2,
-                                                        unsigned a3, unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
 template <class Cfg, bool FullTiles>
@@ -145,10 +109,10 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
             const int nn = n0 + nl;
             auto* dst    = &Bs[stage][nl * BK + w8g32_swz64(nl, k8 * 8)];
             if constexpr (FullTiles) {
-                w8g32_async_copy_cg_16(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
+                cp_async<16, Cache::cg>(dst, &x[static_cast<std::int64_t>(nn) * k + kk]);
             } else {
                 const int valid = (nn < n && kk < k) ? min(8, k - kk) * 2 : 0;
-                qus::kernels::async_copy_global_to_shared_pred<16>(
+                qus::kernels::cp_async_zfill<16>(
                     dst, &x[static_cast<std::int64_t>(nn < n ? nn : 0) * k + (kk < k ? kk : 0)],
                     valid);
             }
@@ -167,10 +131,10 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
             auto* dst       = &Cr[row * BK + chunk * 16];
             if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
-                w8g32_async_copy_cg_16(dst, &codes[gi * 32 + chunk * 16]);
+                cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
                 const std::int64_t gi = static_cast<std::int64_t>(grow < m ? grow : 0) * kg + g0;
-                qus::kernels::async_copy_global_to_shared_pred<16>(
+                qus::kernels::cp_async_zfill<16>(
                     dst, &codes[gi * 32 + chunk * 16], grow < m ? 16 : 0);
             }
         }
@@ -180,13 +144,13 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
                 auto* dst      = &Sr[row * Cfg::SCALE_CACHE_BYTES];
                 if constexpr (FullTiles) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
-                    w8g32_async_copy_cg_16(dst, &scales[gi * 2]);
+                    cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
                 } else {
                     const bool valid_row   = grow < m;
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
-                    qus::kernels::async_copy_global_to_shared_pred<16>(dst, &scales[gi * 2],
+                    qus::kernels::cp_async_zfill<16>(dst, &scales[gi * 2],
                                                                        valid_scales * 2);
                 }
             }
@@ -225,7 +189,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
                 const int q1 = static_cast<int>(static_cast<std::int8_t>(packed >> 8));
                 const __nv_bfloat162 values = __floats2bfloat162_rn(static_cast<float>(q0) * scale,
                                                                     static_cast<float>(q1) * scale);
-                *reinterpret_cast<__nv_bfloat162*>(&As[row * BK + w8g32_swz64(row, col)]) = values;
+                store_vec(&As[row * BK + w8g32_swz64(row, col)], values);
             }
         }
     };
@@ -233,12 +197,12 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
     const int nkt = padded_k / BK;
     stage_x(0, 0);
     stage_w(0);
-    qus::kernels::async_copy_commit();
+    qus::kernels::cp_commit();
 
 #pragma unroll 4
     for (int kt = 0; kt < nkt; ++kt) {
         const int stage = kt % Cfg::STAGES;
-        qus::kernels::async_copy_wait<0>();
+        qus::kernels::cp_wait<0>();
         __syncthreads();
 
         dequant_w(kt);
@@ -248,7 +212,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
         if (next < nkt) {
             stage_x(next % Cfg::STAGES, next);
             stage_w(next);
-            qus::kernels::async_copy_commit();
+            qus::kernels::cp_commit();
         }
 
         unsigned af[2][MT][4];
@@ -258,16 +222,16 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
             for (int mi = 0; mi < MT; ++mi) {
                 const int ar = wm * WM + mi * 16 + a_rowoff;
                 const int ac = ks * 16 + a_coloff;
-                w8g32_ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
+                ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
                                   af[slot][mi][3],
-                                  w8g32_smem_addr(&As[ar * BK + w8g32_swz64(ar, ac)]));
+                                  smem_addr(&As[ar * BK + w8g32_swz64(ar, ac)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int br = wn * WN + ni * 8 + b_rin;
                 const int bc = ks * 16 + b_koff;
-                w8g32_ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
-                                  w8g32_smem_addr(&Bs[stage][br * BK + w8g32_swz64(br, bc)]));
+                ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
+                                  smem_addr(&Bs[stage][br * BK + w8g32_swz64(br, bc)]));
             }
         };
 
@@ -280,7 +244,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    w8g32_mma_m16n8k16_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
+                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
                                             acc[mi][ni][3], af[slot][mi][0], af[slot][mi][1],
                                             af[slot][mi][2], af[slot][mi][3], bf[slot][ni][0],
                                             bf[slot][ni][1]);

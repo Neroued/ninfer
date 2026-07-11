@@ -3,6 +3,7 @@
 // and the universal fallback.
 #include "kernels/linear/gemm/linear_rowsplit_gemm_mma.cuh"
 
+#include "kernels/common/math.h"
 #include "kernels/linear/reference/linear_generic.h" // launch declaration
 #include "qus/core/device.h"                         // CUDA_CHECK
 
@@ -13,15 +14,13 @@
 namespace qus::kernels::detail {
 namespace {
 
-int ceil_div(int a, int b) { return (a + b - 1) / b; }
-
 template <class Codec, class Cfg, bool Residual = false>
 void launch_cfg(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::uint8_t* high,
                 const std::uint8_t* scales, const __nv_bfloat16* residual, __nv_bfloat16* outp,
                 std::int32_t n, std::int32_t k, std::int32_t t, std::int32_t padded_k,
                 cudaStream_t stream) {
-    const dim3 grid(static_cast<unsigned>(ceil_div(n, Cfg::BM)),
-                    static_cast<unsigned>(ceil_div(t, Cfg::BN)), 1u);
+    const dim3 grid(static_cast<unsigned>(div_up(n, Cfg::BM)),
+                    static_cast<unsigned>(div_up(t, Cfg::BN)), 1u);
     const bool full_tiles =
         (n % Cfg::BM) == 0 && (t % Cfg::BN) == 0 && k == padded_k && (k % Cfg::BK) == 0;
     if (full_tiles) {

@@ -2,6 +2,7 @@
 // positions then launch causal attention over absolute cached history.
 #include "kernels/launcher/gqa_attention.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/gqa_attention_prefill_bf16.cuh"
 #include "kernels/kernel/gqa_attention_prefill_i8.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
@@ -29,7 +30,7 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
     const auto padded_context = static_cast<std::int32_t>(kv.padded_context);
     if (kv.dtype == DType::I8) {
         const dim3 attention_grid(
-            static_cast<unsigned>((tokens + kGqaPrefillI8Br - 1) / kGqaPrefillI8Br),
+            static_cast<unsigned>(div_up(tokens, kGqaPrefillI8Br)),
             static_cast<unsigned>(kGqaPrefillQHeads), 1u);
         Tensor& cache_k_scale = kv.k_scale[static_cast<std::uint32_t>(layer)];
         Tensor& cache_v_scale = kv.v_scale[static_cast<std::uint32_t>(layer)];
@@ -44,7 +45,7 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
             static_cast<__nv_bfloat16*>(out.data), tokens, padded_context);
     } else {
         const dim3 attention_grid(
-            static_cast<unsigned>((tokens + kGqaPrefillBr - 1) / kGqaPrefillBr),
+            static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
             static_cast<unsigned>(kGqaPrefillQHeads), 1u);
         gqa_attention_prefill_bf16_kernel<<<attention_grid, kGqaPrefillThreads,
                                             kGqaPrefillSmemBytes, stream>>>(
@@ -70,7 +71,8 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
         constexpr int kFillWarps = kFillBlock / 32;
         const std::int64_t fill_units =
             static_cast<std::int64_t>(tokens) * kGqaPrefillKVHeads * kGqaKvQuantGroups;
-        const int fill_grid = static_cast<int>((fill_units + kFillWarps - 1) / kFillWarps);
+        const int fill_grid = static_cast<int>(
+            div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
         gqa_attention_prefill_fill_i8_kernel<<<fill_grid, kFillBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
             static_cast<const std::int32_t*>(positions.data),
@@ -83,7 +85,8 @@ void gqa_kv_append_launch(const Tensor& k, const Tensor& v, const Tensor& positi
         constexpr int kFillVecElems    = 8;
         const std::int64_t kv_elements = static_cast<std::int64_t>(tokens) * kGqaPrefillKVHeads *
                                          (kGqaPrefillHeadDim / kFillVecElems);
-        const int fill_grid = static_cast<int>((kv_elements + kBlock - 1) / kBlock);
+        const int fill_grid =
+            static_cast<int>(div_up(kv_elements, static_cast<std::int64_t>(kBlock)));
         gqa_attention_prefill_fill_bf16_kernel<<<fill_grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
             static_cast<const std::int32_t*>(positions.data),

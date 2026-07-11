@@ -2,6 +2,8 @@
 
 // qus::kernels - l2norm kernel. One warp handles one row, reducing over ne[0].
 
+#include "kernels/common/warp.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -39,9 +41,7 @@ __launch_bounds__(512) __global__ void l2norm_kernel(const __nv_bfloat16* x, __n
         if (i3 < d64) { v3 = __bfloat162float(x[base + i3]); }
         sum = v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
 
-        for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-            sum += __shfl_down_sync(kFullWarpMask, sum, offset);
-        }
+        sum = warp_reduce_sum(sum, kFullWarpMask);
 
         float inv = (lane == 0) ? rsqrtf(sum + eps) : 0.0f;
         inv = __shfl_sync(kFullWarpMask, inv, 0);
@@ -57,9 +57,7 @@ __launch_bounds__(512) __global__ void l2norm_kernel(const __nv_bfloat16* x, __n
         sum += xv * xv;
     }
 
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        sum += __shfl_down_sync(kFullWarpMask, sum, offset);
-    }
+    sum = warp_reduce_sum(sum, kFullWarpMask);
 
     float inv = (lane == 0) ? rsqrtf(sum + eps) : 0.0f;
     inv = __shfl_sync(kFullWarpMask, inv, 0);

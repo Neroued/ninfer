@@ -1,5 +1,6 @@
 #include "kernels/linear/gemm/linear_rowsplit_grouped_input_gemm_mma.cuh"
 
+#include "kernels/common/math.h"
 #include "qus/core/device.h"
 
 #include <cstdint>
@@ -24,11 +25,10 @@ RowsplitGroupedJob make_job(const Weight& weight, Tensor& out, std::int32_t out_
 template <class Cfg, GroupedInputCodec Codec = GroupedInputCodec::Mixed, int Jobs = 4>
 void launch_grouped_cfg(const Tensor& x, RowsplitGroupedJob job0, RowsplitGroupedJob job1,
                         RowsplitGroupedJob job2, RowsplitGroupedJob job3, cudaStream_t stream) {
-    const int tiles = (job0.n + Cfg::BM - 1) / Cfg::BM + (job1.n + Cfg::BM - 1) / Cfg::BM +
-                      (job2.n + Cfg::BM - 1) / Cfg::BM + (job3.n + Cfg::BM - 1) / Cfg::BM;
+    const int tiles = div_up(job0.n, Cfg::BM) + div_up(job1.n, Cfg::BM) +
+                      div_up(job2.n, Cfg::BM) + div_up(job3.n, Cfg::BM);
     const int t = x.ne[1];
-    const dim3 grid(static_cast<unsigned>(tiles),
-                    static_cast<unsigned>((t + Cfg::BN - 1) / Cfg::BN));
+    const dim3 grid(static_cast<unsigned>(tiles), static_cast<unsigned>(div_up(t, Cfg::BN)));
     const bool full_tiles = (t % Cfg::BN) == 0;
     if (full_tiles) {
         linear_rowsplit_grouped_input_gemm_mma_kernel<Cfg, true, Codec, Jobs>

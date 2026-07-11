@@ -1,6 +1,7 @@
 // qus::kernels::detail - generic dense linear GEMV/GEMM launchers.
 #include "kernels/linear/reference/linear_generic.h"
 
+#include "kernels/common/math.h"
 #include "kernels/linear/reference/linear_generic_dense.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 
@@ -21,10 +22,10 @@ int checked_grid(std::int64_t blocks) {
 }
 
 dim3 tiled_gemm_grid_for(std::int32_t n, std::int32_t t) {
-    const std::int64_t grid_m =
-        (static_cast<std::int64_t>(n) + kDenseGemmBlockRows - 1) / kDenseGemmBlockRows;
-    const std::int64_t grid_n =
-        (static_cast<std::int64_t>(t) + kDenseGemmBlockCols - 1) / kDenseGemmBlockCols;
+    const std::int64_t grid_m = div_up(static_cast<std::int64_t>(n),
+                                       static_cast<std::int64_t>(kDenseGemmBlockRows));
+    const std::int64_t grid_n = div_up(static_cast<std::int64_t>(t),
+                                       static_cast<std::int64_t>(kDenseGemmBlockCols));
     if (grid_m > std::numeric_limits<unsigned>::max() ||
         grid_n > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("linear: dense launch grid exceeds CUDA limit");

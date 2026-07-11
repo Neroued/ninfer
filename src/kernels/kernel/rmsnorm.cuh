@@ -2,20 +2,14 @@
 
 // qus::kernels - rmsnorm kernel. One CUDA block handles one row, reducing over ne[0].
 
+#include "kernels/common/math.cuh"
+#include "kernels/common/warp.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
 
 namespace qus::kernels {
-
-__device__ __forceinline__ float rmsnorm_silu_f32(float x) { return x / (1.0f + expf(-x)); }
-
-__device__ __forceinline__ float rmsnorm_warp_sum(float v) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, offset);
-    }
-    return v;
-}
 
 __launch_bounds__(256) __global__
     void rmsnorm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* z,
@@ -47,7 +41,7 @@ __launch_bounds__(256) __global__
         float w                = __bfloat162float(weight[i]);
         if (unit_offset) { w += 1.0f; }
         float v = __bfloat162float(x[idx]) * inv * w;
-        if (z != nullptr) { v *= rmsnorm_silu_f32(__bfloat162float(z[idx])); }
+        if (z != nullptr) { v *= silu(__bfloat162float(z[idx])); }
         out[idx] = __float2bfloat16_rn(v);
     }
 }
@@ -80,13 +74,13 @@ __launch_bounds__(512) __global__
         sum += xf.x * xf.x + xf.y * xf.y;
     }
 
-    sum = rmsnorm_warp_sum(sum);
+    sum = warp_reduce_sum(sum);
     __shared__ float warp_sums[16];
     if ((threadIdx.x & 31) == 0) { warp_sums[threadIdx.x >> 5] = sum; }
     __syncthreads();
 
     float block_sum = (threadIdx.x < 16) ? warp_sums[threadIdx.x] : 0.0f;
-    if (threadIdx.x < 32) { block_sum = rmsnorm_warp_sum(block_sum); }
+    if (threadIdx.x < 32) { block_sum = warp_reduce_sum(block_sum); }
 
     __shared__ float inv_shared;
     if (threadIdx.x == 0) { inv_shared = rsqrtf(block_sum / static_cast<float>(kD) + eps); }

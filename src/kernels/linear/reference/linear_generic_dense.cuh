@@ -4,6 +4,9 @@
 // [N,K], so K is the fastest varying weight dimension. The dense GEMM path is intentionally simple
 // and masked; dense control weights are correctness-only.
 
+#include "kernels/common/math.cuh"
+#include "kernels/common/warp.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -16,35 +19,6 @@ constexpr int kDenseGemmBlockRows = 16;
 constexpr int kDenseGemmBlockCols = 16;
 constexpr int kDenseSmallGemvMaxN = 128;
 constexpr int kDenseSmallGemvMaxT = 16;
-
-template <int Width = 32>
-__device__ __forceinline__ float dense_warp_reduce_sum(float v) {
-#pragma unroll
-    for (int offset = Width / 2; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(0xffffffffu, v, offset, Width);
-    }
-    return v;
-}
-
-template <int BlockSize>
-__device__ __forceinline__ float dense_block_reduce_sum(float v) {
-    static_assert(BlockSize % 32 == 0, "BlockSize must be a whole number of warps");
-    __shared__ float warp_sums[BlockSize / 32];
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-
-    v = dense_warp_reduce_sum(v);
-    if (lane == 0) { warp_sums[warp] = v; }
-    __syncthreads();
-
-    v = (threadIdx.x < (BlockSize / 32)) ? warp_sums[lane] : 0.0f;
-    if (warp == 0) { v = dense_warp_reduce_sum<BlockSize / 32>(v); }
-    return v;
-}
-
-__device__ __forceinline__ float2 bf162_to_float2(__nv_bfloat162 v) {
-    return __bfloat1622float2(v);
-}
 
 } // namespace
 
@@ -59,6 +33,7 @@ __global__ void linear_generic_dense_gemv_kernel(const __nv_bfloat16* x, const v
                                                  std::int32_t k, bool weight_fp32) {
     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x);
     if (row >= n) { return; }
+    __shared__ float warp_sums[kDenseGemvThreads / kWarpSize];
 
     float acc                   = 0.0f;
     const std::int64_t row_base = static_cast<std::int64_t>(row) * k;
@@ -71,7 +46,7 @@ __global__ void linear_generic_dense_gemv_kernel(const __nv_bfloat16* x, const v
                 reinterpret_cast<const float2*>(static_cast<const float*>(weight) + row_base);
             for (std::int32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
                 const float2 wf = w2[p];
-                const float2 xf = bf162_to_float2(x2[p]);
+                const float2 xf = bf16x2_to_float2(x2[p]);
                 acc             = fmaf(wf.x, xf.x, acc);
                 acc             = fmaf(wf.y, xf.y, acc);
             }
@@ -79,8 +54,8 @@ __global__ void linear_generic_dense_gemv_kernel(const __nv_bfloat16* x, const v
             const auto* w2 = reinterpret_cast<const __nv_bfloat162*>(
                 static_cast<const __nv_bfloat16*>(weight) + row_base);
             for (std::int32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
-                const float2 wf = bf162_to_float2(w2[p]);
-                const float2 xf = bf162_to_float2(x2[p]);
+                const float2 wf = bf16x2_to_float2(w2[p]);
+                const float2 xf = bf16x2_to_float2(x2[p]);
                 acc             = fmaf(wf.x, xf.x, acc);
                 acc             = fmaf(wf.y, xf.y, acc);
             }
@@ -93,7 +68,7 @@ __global__ void linear_generic_dense_gemv_kernel(const __nv_bfloat16* x, const v
         }
     }
 
-    acc = dense_block_reduce_sum<kDenseGemvThreads>(acc);
+    acc = block_reduce_sum<kDenseGemvThreads>(acc, warp_sums);
     if (threadIdx.x == 0) { out[row] = __float2bfloat16(acc); }
 }
 
@@ -104,6 +79,7 @@ __global__ void linear_generic_dense_small_gemv_kernel(const __nv_bfloat16* x, c
     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t col = static_cast<std::int32_t>(blockIdx.y);
     if (row >= n || col >= t) { return; }
+    __shared__ float warp_sums[kDenseGemvThreads / kWarpSize];
 
     float acc                    = 0.0f;
     const std::int64_t row_base  = static_cast<std::int64_t>(row) * k;
@@ -118,7 +94,7 @@ __global__ void linear_generic_dense_small_gemv_kernel(const __nv_bfloat16* x, c
                 reinterpret_cast<const float2*>(static_cast<const float*>(weight) + row_base);
             for (std::int32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
                 const float2 wf = w2[p];
-                const float2 xf = bf162_to_float2(x2[p]);
+                const float2 xf = bf16x2_to_float2(x2[p]);
                 acc             = fmaf(wf.x, xf.x, acc);
                 acc             = fmaf(wf.y, xf.y, acc);
             }
@@ -126,8 +102,8 @@ __global__ void linear_generic_dense_small_gemv_kernel(const __nv_bfloat16* x, c
             const auto* w2 = reinterpret_cast<const __nv_bfloat162*>(
                 static_cast<const __nv_bfloat16*>(weight) + row_base);
             for (std::int32_t p = threadIdx.x; p < pairs; p += blockDim.x) {
-                const float2 wf = bf162_to_float2(w2[p]);
-                const float2 xf = bf162_to_float2(x2[p]);
+                const float2 wf = bf16x2_to_float2(w2[p]);
+                const float2 xf = bf16x2_to_float2(x2[p]);
                 acc             = fmaf(wf.x, xf.x, acc);
                 acc             = fmaf(wf.y, xf.y, acc);
             }
@@ -140,7 +116,7 @@ __global__ void linear_generic_dense_small_gemv_kernel(const __nv_bfloat16* x, c
         }
     }
 
-    acc = dense_block_reduce_sum<kDenseGemvThreads>(acc);
+    acc = block_reduce_sum<kDenseGemvThreads>(acc, warp_sums);
     if (threadIdx.x == 0) { out[out_index] = __float2bfloat16(acc); }
 }
 
@@ -166,7 +142,7 @@ __global__ void linear_generic_dense_gemm_kernel(const __nv_bfloat16* x, const v
                 reinterpret_cast<const float2*>(static_cast<const float*>(weight) + row_base);
             for (std::int32_t p = 0; p < pairs; ++p) {
                 const float2 wf = w2[p];
-                const float2 xf = bf162_to_float2(x2[p]);
+                const float2 xf = bf16x2_to_float2(x2[p]);
                 acc             = fmaf(wf.x, xf.x, acc);
                 acc             = fmaf(wf.y, xf.y, acc);
             }
@@ -174,8 +150,8 @@ __global__ void linear_generic_dense_gemm_kernel(const __nv_bfloat16* x, const v
             const auto* w2 = reinterpret_cast<const __nv_bfloat162*>(
                 static_cast<const __nv_bfloat16*>(weight) + row_base);
             for (std::int32_t p = 0; p < pairs; ++p) {
-                const float2 wf = bf162_to_float2(w2[p]);
-                const float2 xf = bf162_to_float2(x2[p]);
+                const float2 wf = bf16x2_to_float2(w2[p]);
+                const float2 xf = bf16x2_to_float2(x2[p]);
                 acc             = fmaf(wf.x, xf.x, acc);
                 acc             = fmaf(wf.y, xf.y, acc);
             }

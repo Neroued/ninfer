@@ -1,5 +1,6 @@
 #include "kernels/launcher/gated_delta_rule.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/gated_delta_rule_recurrent.cuh"
 #include "qus/core/device.h"
 
@@ -12,9 +13,9 @@ void gated_delta_rule_recurrent_launch(const Tensor& q, const Tensor& k, const T
                                        Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
     const std::int64_t T = q.ne[2];
     const auto heads     = head_map::of(q.ne[1], v.ne[1]);
-    const int n_block_dv = (q.ne[0] + kGdnBlockDv - 1) / kGdnBlockDv;
+    const int n_block_dv = div_up(q.ne[0], kGdnBlockDv);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(n_block_dv));
-    const dim3 block(WARP_SIZE, kGdnNumWarps, 1);
+    const dim3 block(kWarpSize, kGdnNumWarps, 1);
 
     gated_delta_rule_recurrent_kernel<128><<<grid, block, 0, stream>>>(
         static_cast<const float*>(q.data), static_cast<const float*>(k.data),
@@ -29,9 +30,9 @@ void gated_delta_rule_recurrent_bf16_launch(const Tensor& q, const Tensor& k, co
                                             Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
     const std::int64_t T = q.ne[2];
     const auto heads     = head_map::of(q.ne[1], v.ne[1]);
-    const int n_block_dv = (q.ne[0] + kGdnBlockDv - 1) / kGdnBlockDv;
+    const int n_block_dv = div_up(q.ne[0], kGdnBlockDv);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(n_block_dv));
-    const dim3 block(WARP_SIZE, kGdnNumWarps, 1);
+    const dim3 block(kWarpSize, kGdnNumWarps, 1);
 
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(ssm_state.ne[0]) * static_cast<std::int64_t>(ssm_state.ne[1]) *
@@ -52,9 +53,9 @@ void gated_delta_rule_recurrent_inout_bf16_launch(const Tensor& q, const Tensor&
                                                   Tensor& out, cudaStream_t stream) {
     const std::int64_t T = q.ne[2];
     const auto heads     = head_map::of(q.ne[1], v.ne[1]);
-    const int n_block_dv = (q.ne[0] + kGdnBlockDv - 1) / kGdnBlockDv;
+    const int n_block_dv = div_up(q.ne[0], kGdnBlockDv);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(n_block_dv));
-    const dim3 block(WARP_SIZE, kGdnNumWarps, 1);
+    const dim3 block(kWarpSize, kGdnNumWarps, 1);
 
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(ssm_state_out.ne[0]) *
@@ -79,9 +80,9 @@ void gated_delta_rule_recurrent_snapshot_bf16_launch(const Tensor& q, const Tens
                                                      cudaStream_t stream) {
     const std::int64_t T = q.ne[2];
     const auto heads     = head_map::of(q.ne[1], v.ne[1]);
-    const int n_block_dv = (q.ne[0] + kGdnBlockDv - 1) / kGdnBlockDv;
+    const int n_block_dv = div_up(q.ne[0], kGdnBlockDv);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(n_block_dv));
-    const dim3 block(WARP_SIZE, kGdnNumWarps, 1);
+    const dim3 block(kWarpSize, kGdnNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(ssm_states.ne[0]) * static_cast<std::int64_t>(ssm_states.ne[1]) *
         static_cast<std::int64_t>(ssm_states.ne[2]);

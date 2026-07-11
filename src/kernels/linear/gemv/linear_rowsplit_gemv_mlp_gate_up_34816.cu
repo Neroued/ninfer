@@ -1,10 +1,12 @@
 #include "kernels/linear/gemv/linear_rowsplit_gemv_mlp_gate_up_34816.cuh"
 
+#include "kernels/common/math.cuh"
+#include "kernels/common/memory.cuh"
+#include "kernels/common/warp.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cuda_pipeline.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -30,10 +32,6 @@ static_assert(kIntermediate % kPairsPerBlock == 0);
 static_assert(kBytesPerGroup == 2 * kVecBytes);
 static_assert(kGroups % kGroupsPerWarpTile == 0);
 static_assert(kVecsPerWarpTile == 32);
-
-__device__ __forceinline__ int sign_extend_q4(int v) {
-    return (v ^ 0x08) - 0x08;
-}
 
 __global__ void linear_rowsplit_gemv_mlp_gate_up_34816_q4_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
@@ -82,8 +80,8 @@ __global__ void linear_rowsplit_gemv_mlp_gate_up_34816_q4_kernel(
             const float scale = __half2float(__ushort_as_half(scale_bits));
 
             const int packed = static_cast<int>(tile_codes[tile_group * kBytesPerGroup + lane]);
-            const int q0 = sign_extend_q4(packed & 0x0f);
-            const int q1 = sign_extend_q4(packed >> 4);
+            const int q0 = sign_extend<4>(packed & 0x0f);
+            const int q1 = sign_extend<4>(packed >> 4);
             const int k0 = (tile + tile_group) * kGroupK + lane * 2;
             const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
             acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
@@ -92,15 +90,8 @@ __global__ void linear_rowsplit_gemv_mlp_gate_up_34816_q4_kernel(
         __syncwarp();
     }
 
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, offset);
-    }
+    acc = warp_reduce_sum(acc);
     if (lane == 0) { out[row] = __float2bfloat16(acc); }
-}
-
-__device__ __forceinline__ float mlp_silu_f32(float x) {
-    return x / (1.0f + expf(-x));
 }
 
 __device__ __forceinline__ void q4_issue_pair_tile(
@@ -110,23 +101,20 @@ __device__ __forceinline__ void q4_issue_pair_tile(
     const std::uint8_t* __restrict__ up_code_row,
     const std::uint8_t* __restrict__ up_scale_row, int tile, int lane) {
     const int g0 = tile * kGroupsPerWarpTile;
-    __pipeline_memcpy_async(&s_code[0][lane],
-                            reinterpret_cast<const uint4*>(gate_code_row + g0 * kBytesPerGroup) +
-                                lane,
-                            sizeof(uint4));
-    __pipeline_memcpy_async(&s_code[1][lane],
-                            reinterpret_cast<const uint4*>(up_code_row + g0 * kBytesPerGroup) +
-                                lane,
-                            sizeof(uint4));
+    pipe_copy<16>(
+        &s_code[0][lane],
+        reinterpret_cast<const uint4*>(gate_code_row + g0 * kBytesPerGroup) + lane);
+    pipe_copy<16>(
+        &s_code[1][lane],
+        reinterpret_cast<const uint4*>(up_code_row + g0 * kBytesPerGroup) + lane);
     if (lane < 2) {
-        __pipeline_memcpy_async(&s_scale[0][lane],
-                                reinterpret_cast<const uint4*>(gate_scale_row + g0 * 2) + lane,
-                                sizeof(uint4));
-        __pipeline_memcpy_async(&s_scale[1][lane],
-                                reinterpret_cast<const uint4*>(up_scale_row + g0 * 2) + lane,
-                                sizeof(uint4));
+        pipe_copy<16>(
+            &s_scale[0][lane],
+            reinterpret_cast<const uint4*>(gate_scale_row + g0 * 2) + lane);
+        pipe_copy<16>(&s_scale[1][lane],
+                      reinterpret_cast<const uint4*>(up_scale_row + g0 * 2) + lane);
     }
-    __pipeline_commit();
+    pipe_commit();
 }
 
 __global__ void linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_kernel(
@@ -168,7 +156,7 @@ __global__ void linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_kernel(
             q4_issue_pair_tile(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
                                gate_scale_row, up_code_row, up_scale_row, p, lane);
         } else {
-            __pipeline_commit();
+            pipe_commit();
         }
     }
 
@@ -180,9 +168,9 @@ __global__ void linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_kernel(
             q4_issue_pair_tile(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
                                gate_scale_row, up_code_row, up_scale_row, fetch, lane);
         } else {
-            __pipeline_commit();
+            pipe_commit();
         }
-        __pipeline_wait_prior(kPrefetch);
+        pipe_wait<kPrefetch>();
         __syncwarp();
 
         const int buf = tile % kStages;
@@ -203,11 +191,11 @@ __global__ void linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_kernel(
 
             const int gate_packed =
                 static_cast<int>(gate_codes[tile_group * kBytesPerGroup + lane]);
-            const int gate_q0 = sign_extend_q4(gate_packed & 0x0f);
-            const int gate_q1 = sign_extend_q4(gate_packed >> 4);
+            const int gate_q0 = sign_extend<4>(gate_packed & 0x0f);
+            const int gate_q1 = sign_extend<4>(gate_packed >> 4);
             const int up_packed = static_cast<int>(up_codes[tile_group * kBytesPerGroup + lane]);
-            const int up_q0 = sign_extend_q4(up_packed & 0x0f);
-            const int up_q1 = sign_extend_q4(up_packed >> 4);
+            const int up_q0 = sign_extend<4>(up_packed & 0x0f);
+            const int up_q1 = sign_extend<4>(up_packed >> 4);
             const int k0 = (tile * kGroupsPerWarpTile + tile_group) * kGroupK + lane * 2;
             const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
             gate_acc = fmaf(static_cast<float>(gate_q0) * gate_scale, xv.x, gate_acc);
@@ -218,15 +206,12 @@ __global__ void linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_kernel(
         __syncwarp();
     }
 
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        gate_acc += __shfl_down_sync(0xffffffffu, gate_acc, offset);
-        up_acc += __shfl_down_sync(0xffffffffu, up_acc, offset);
-    }
+    gate_acc = warp_reduce_sum(gate_acc);
+    up_acc   = warp_reduce_sum(up_acc);
     if (lane == 0) {
         const float g = __bfloat162float(__float2bfloat16(gate_acc));
         const float u = __bfloat162float(__float2bfloat16(up_acc));
-        out[out_row] = __float2bfloat16(mlp_silu_f32(g) * u);
+        out[out_row] = __float2bfloat16(silu(g) * u);
     }
 }
 
@@ -239,7 +224,7 @@ void linear_rowsplit_gemv_mlp_gate_up_34816_q4_launch(const Tensor& x, const Wei
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
         throw std::invalid_argument("linear: MLP gate/up Q4 fused GEMV requires 34816x5120");
     }
-    const int grid = (kN + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    const int grid = div_up(kN, kWarpsPerBlock);
     linear_rowsplit_gemv_mlp_gate_up_34816_q4_kernel<<<grid, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));

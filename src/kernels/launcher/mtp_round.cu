@@ -1,5 +1,6 @@
 #include "kernels/launcher/mtp_round.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/mtp_round.cuh"
 #include "qus/core/device.h"
 
@@ -31,8 +32,7 @@ void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
                               cudaStream_t stream) {
     const std::int32_t vocab = logits.ne[0];
     const std::int32_t cols = drafts.ne[0] + 1;
-    const std::int32_t partial_blocks =
-        (vocab + kSamplerPartialTileItems - 1) / kSamplerPartialTileItems;
+    const std::int32_t partial_blocks = div_up(vocab, kSamplerPartialTileItems);
     const std::int32_t groups = sampler_group_count(partial_blocks);
     // Same shared predicate the accept kernel self-guards on, so exactly one of
     // the single-block and multi-block paths runs for any shape.
@@ -80,7 +80,7 @@ void mtp_gather_hidden_row_launch(const Tensor& hidden, const Tensor& accepted, 
                                   cudaStream_t stream) {
     constexpr int kBlock = 256;
     const int rows       = hidden.ne[0];
-    const int grid       = static_cast<int>(std::max(1, (rows + kBlock - 1) / kBlock));
+    const int grid       = std::max(1, div_up(rows, kBlock));
     mtp_gather_hidden_row_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(hidden.data),
         static_cast<const std::int32_t*>(accepted.data), static_cast<__nv_bfloat16*>(out.data),

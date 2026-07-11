@@ -1,5 +1,6 @@
 #include "qus/kernels/gdn_gating_proj.h"
 
+#include "kernels/common/math.h"
 #include "kernels/linear/gemv/linear_dense_gdn_in_ab_48.cuh"
 
 #include <cstdint>
@@ -33,7 +34,7 @@ void require_sequence_tensor(const Tensor& t, DType dtype, std::int32_t n0, std:
 }
 
 std::int32_t checked_workspace_floats(std::size_t bytes) {
-    const std::size_t floats = (bytes + sizeof(float) - 1) / sizeof(float);
+    const std::size_t floats = div_up(bytes, sizeof(float));
     if (floats > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("gdn_gating_proj: workspace exceeds Tensor shape limit");
     }

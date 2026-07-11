@@ -27,8 +27,8 @@
 // b0/b1 = the two k-halves of the 16x8 B tile). ldmatrix, cp.async pipelining,
 // and the shared-staged epilogue are layered on top during the ncu tuning phase.
 
+#include "kernels/common/mma.cuh"
 #include "kernels/linear/codec/linear_codec.cuh"
-#include "kernels/kernel/gdn_common.cuh" // cp.async helpers
 
 #include <cuda_bf16.h>
 
@@ -95,31 +95,12 @@ struct GemmCfg {
     static_assert(smem_est_bytes <= 48 * 1024, "GemmCfg: staged shared exceeds the 48KB budget");
 };
 
-__device__ __forceinline__ void gemm_mma_m16n8k16_bf16(float& c0, float& c1, float& c2, float& c3,
-                                                       unsigned a0, unsigned a1, unsigned a2,
-                                                       unsigned a3, unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ unsigned gemm_smem_addr(const void* p) {
-    return static_cast<unsigned>(__cvta_generic_to_shared(p));
-}
-
 template <int N_BYTES, class Cfg>
-__device__ __forceinline__ void gemm_async_copy_global_to_shared(void* dst, const void* src) {
+__device__ __forceinline__ void gemm_cp_async(void* dst, const void* src) {
     if constexpr (Cfg::CG_LOAD && N_BYTES == 16) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-        asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" ::"r"(
-                         static_cast<unsigned>(__cvta_generic_to_shared(dst))),
-                     "l"(src), "n"(N_BYTES));
-#else
-        *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
-#endif
+        cp_async<N_BYTES, Cache::cg>(dst, src);
     } else {
-        qus::kernels::async_copy_global_to_shared<N_BYTES>(dst, src);
+        cp_async<N_BYTES>(dst, src);
     }
 }
 
@@ -131,25 +112,6 @@ __device__ __forceinline__ void gemm_async_copy_global_to_shared(void* dst, cons
 // dequant write and both ldmatrix reads so it is transparent to the math.
 __device__ __forceinline__ int gemm_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
-}
-
-// ldmatrix.x4: load a 16x16 bf16 A tile as the four 8x8 quadrants (a0..a3 =
-// Q0=[r0-7,c0-7], Q1=[r8-15,c0-7], Q2=[r0-7,c8-15], Q3=[r8-15,c8-15]) directly
-// into the m16n8k16 A-fragment registers. Natural {a0,a1,a2,a3} order to match
-// the mma fragment layout (see the correctness-first per-element mapping).
-__device__ __forceinline__ void gemm_ldmatrix_x4(unsigned& a0, unsigned& a1, unsigned& a2,
-                                                 unsigned& a3, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-                 : "r"(addr));
-}
-
-// ldmatrix.x2: load a 16(k)x8(n) bf16 B tile (stored [n][k], k-contiguous) as the
-// two k-halves (b0 = k0-7, b1 = k8-15) into the m16n8k16 B-fragment registers.
-__device__ __forceinline__ void gemm_ldmatrix_x2(unsigned& b0, unsigned& b1, unsigned addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
-                 : "=r"(b0), "=r"(b1)
-                 : "r"(addr));
 }
 
 template <class Codec, class Cfg, bool FullTiles, bool Residual = false>
@@ -226,14 +188,14 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             const int kk       = k0 + kl;
             __nv_bfloat16* dst = &Bs[stage][tl * BK + gemm_swz64(tl, kl)];
             if constexpr (FullTiles) {
-                gemm_async_copy_global_to_shared<16, Cfg>(
+                gemm_cp_async<16, Cfg>(
                     dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
                 if (col < t && kk + 8 <= k) {
-                    gemm_async_copy_global_to_shared<16, Cfg>(
+                    gemm_cp_async<16, Cfg>(
                         dst, &x[static_cast<std::int64_t>(col) * k + kk]);
                 } else {
-                    *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                    store_vec(dst, make_int4(0, 0, 0, 0));
                 }
             }
         }
@@ -252,13 +214,13 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             std::uint8_t* dst = &Cr[stage][rg * 32 + half * 16];
             if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                gemm_async_copy_global_to_shared<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
+                gemm_cp_async<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
             } else {
                 if (grow < n) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                    gemm_async_copy_global_to_shared<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
+                    gemm_cp_async<16, Cfg>(dst, &codes[gi * 32 + half * 16]);
                 } else {
-                    *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                    store_vec(dst, make_int4(0, 0, 0, 0));
                 }
             }
         }
@@ -271,11 +233,11 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 std::uint8_t* dst = &Hr[stage][rg * HB];
                 if constexpr (FullTiles) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                    gemm_async_copy_global_to_shared<HB, Cfg>(dst, &high[gi * HB]);
+                    gemm_cp_async<HB, Cfg>(dst, &high[gi * HB]);
                 } else {
                     if (grow < n) {
                         const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + (g + gg);
-                        gemm_async_copy_global_to_shared<HB, Cfg>(dst, &high[gi * HB]);
+                        gemm_cp_async<HB, Cfg>(dst, &high[gi * HB]);
                     } else {
 #pragma unroll
                         for (int b = 0; b < HB; ++b) { dst[b] = 0; }
@@ -297,7 +259,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                         static_cast<std::int64_t>(grow) * kg + aligned_sg;
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + sg;
                     if (aligned_sg + 1 < kg) {
-                        gemm_async_copy_global_to_shared<4, Cfg>(dst, &scales[aligned_gi * 2]);
+                        gemm_cp_async<4, Cfg>(dst, &scales[aligned_gi * 2]);
                     } else {
                         *reinterpret_cast<std::uint16_t*>(dst) =
                             *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
@@ -316,7 +278,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                         const std::int64_t aligned_gi =
                             static_cast<std::int64_t>(grow) * kg + aligned_sg;
                         if (aligned_sg + 1 < kg) {
-                            gemm_async_copy_global_to_shared<4, Cfg>(dst, &scales[aligned_gi * 2]);
+                            gemm_cp_async<4, Cfg>(dst, &scales[aligned_gi * 2]);
                         } else {
                             *reinterpret_cast<std::uint16_t*>(dst) =
                                 *reinterpret_cast<const std::uint16_t*>(&scales[gi * 2]);
@@ -364,7 +326,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                     w = Codec::load_pair_bf162(Cr[stage], Hr[stage], Sr[stage], group_index, lane);
                 }
                 const int sc                                 = gemm_swz64(row, gg * 64 + 2 * lane);
-                *reinterpret_cast<__nv_bfloat162*>(&dst[sc]) = w;
+                store_vec(&dst[sc], w);
             }
         }
     };
@@ -373,12 +335,12 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         if (s < NKT) { stage_load(s, s); }
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
     }
 
     for (int it = 0; it < NKT; ++it) {
         const int stage = it % S;
-        qus::kernels::async_copy_wait<S - 1>();
+        qus::kernels::cp_wait<S - 1>();
         __syncthreads();
 
         dequant_to_As(stage, it);
@@ -391,15 +353,15 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             for (int mi = 0; mi < MT; ++mi) {
                 const int arow = wm * WM + mi * 16 + a_rowoff;
                 const int acol = ks + a_coloff;
-                gemm_ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                                 gemm_smem_addr(&As[arow * BK + gemm_swz64(arow, acol)]));
+                ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
+                                 smem_addr(&As[arow * BK + gemm_swz64(arow, acol)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int brow = wn * WN + ni * 8 + b_rin;
                 const int bcol = ks + b_koff;
-                gemm_ldmatrix_x2(bf[ni][0], bf[ni][1],
-                                 gemm_smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, bcol)]));
+                ldmatrix_x2(bf[ni][0], bf[ni][1],
+                                 smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, bcol)]));
             }
         };
 
@@ -416,7 +378,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        gemm_mma_m16n8k16_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
+                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
                                                acc[mi][ni][3], af[cur][mi][0], af[cur][mi][1],
                                                af[cur][mi][2], af[cur][mi][3], bf[cur][ni][0],
                                                bf[cur][ni][1]);
@@ -433,7 +395,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        gemm_mma_m16n8k16_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
+                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
                                                acc[mi][ni][3], af[mi][0], af[mi][1], af[mi][2],
                                                af[mi][3], bf[ni][0], bf[ni][1]);
                     }
@@ -443,7 +405,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
         __syncthreads();
 
         if (itp < NKT) { stage_load(stage, itp); }
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
     }
 
     // Epilogue: C lane layout c0={gid,2lid} c1={gid,2lid+1} c2={gid+8,2lid} c3={gid+8,2lid+1}.

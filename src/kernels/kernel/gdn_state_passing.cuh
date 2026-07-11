@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kernels/common/mma.cuh"
 #include "kernels/kernel/gdn_chunked_common.cuh"
 
 #include <cmath>
@@ -26,12 +27,12 @@ using gdn_chunked::MMA_K;
 using gdn_chunked::bh_decode_t;
 using gdn_chunked::zero_frag;
 using qus::kernels::SmemTile;
-using qus::kernels::mma_m16n8k8_tf32;
-using qus::kernels::mma_m16n8k8_tf32_b32;
-using qus::kernels::ldmatrix_x4_b16;
-using qus::kernels::ldmatrix_x2_b16;
-using qus::kernels::smem_addr_b32;
-using qus::kernels::exp2_fast;
+using qus::kernels::mma_tf32;
+using qus::kernels::mma_tf32_bits;
+using qus::kernels::ldmatrix_x4;
+using qus::kernels::ldmatrix_x2;
+using qus::kernels::smem_addr;
+using qus::kernels::exp2_approx;
 using qus::kernels::RCP_LN2_F;
 
 static_assert(gdn_chunked::kChunkSize == 64, "stage_state_passing: kChunkSize must be 64");
@@ -88,7 +89,7 @@ struct kernel_dims<128> {
     static constexpr int DT_TILES_PER_BLOCK = 4;
     static constexpr int BT_SPLITS          = 2;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS; // 8
-    static constexpr int THREADS            = N_WARPS * qus::kernels::WARP_SIZE;
+    static constexpr int THREADS            = N_WARPS * qus::kernels::kWarpSize;
     static constexpr int W_HALVES           = 1;
     static constexpr int K_HALVES           = 1;
 };
@@ -100,7 +101,7 @@ struct kernel_dims<64> {
     static constexpr int DT_TILES_PER_BLOCK = 2;
     static constexpr int BT_SPLITS          = 4;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS;
-    static constexpr int THREADS            = N_WARPS * qus::kernels::WARP_SIZE;
+    static constexpr int THREADS            = N_WARPS * qus::kernels::kWarpSize;
     static constexpr int W_HALVES           = 2;
     static constexpr int K_HALVES           = 2;
 };
@@ -112,7 +113,7 @@ struct kernel_dims<32> {
     static constexpr int DT_TILES_PER_BLOCK = 2;
     static constexpr int BT_SPLITS          = 2;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS;
-    static constexpr int THREADS            = N_WARPS * qus::kernels::WARP_SIZE;
+    static constexpr int THREADS            = N_WARPS * qus::kernels::kWarpSize;
     static constexpr int W_HALVES           = 2;
     static constexpr int K_HALVES           = 2;
 };
@@ -124,7 +125,7 @@ struct kernel_dims<16> {
     static constexpr int DT_TILES_PER_BLOCK = 2;
     static constexpr int BT_SPLITS          = 1;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS;
-    static constexpr int THREADS            = N_WARPS * qus::kernels::WARP_SIZE;
+    static constexpr int THREADS            = N_WARPS * qus::kernels::kWarpSize;
     // S=16 W half stride would be 8 -- SmemTile requires >= 16. Load full W.
     static constexpr int W_HALVES = 1;
     static constexpr int K_HALVES = 2;
@@ -310,10 +311,10 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
             const int row_g1 = row_g0 + 8;
             const int col_d0 = warp_d_global + 2 * lane_t;
             const int col_d1 = col_d0 + 1;
-            h_frag[m][0]     = __ldg(state_in + st_base + (int64_t)col_d0 * S + row_g0);
-            h_frag[m][1]     = __ldg(state_in + st_base + (int64_t)col_d1 * S + row_g0);
-            h_frag[m][2]     = __ldg(state_in + st_base + (int64_t)col_d0 * S + row_g1);
-            h_frag[m][3]     = __ldg(state_in + st_base + (int64_t)col_d1 * S + row_g1);
+            h_frag[m][0] = load_ldg<float>(state_in + st_base + (int64_t)col_d0 * S + row_g0);
+            h_frag[m][1] = load_ldg<float>(state_in + st_base + (int64_t)col_d1 * S + row_g0);
+            h_frag[m][2] = load_ldg<float>(state_in + st_base + (int64_t)col_d0 * S + row_g1);
+            h_frag[m][3] = load_ldg<float>(state_in + st_base + (int64_t)col_d1 * S + row_g1);
         }
     }
 
@@ -459,10 +460,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                         const int d_global = d_off + d_local;
                         __nv_bfloat16* out =
                             &h_chunk[hc_base + (int64_t)d_global * S + k_row_off + k_off];
-                        reinterpret_cast<__nv_bfloat162*>(out)[0] =
-                            __floats2bfloat162_rn(val.x, val.y);
-                        reinterpret_cast<__nv_bfloat162*>(out)[1] =
-                            __floats2bfloat162_rn(val.z, val.w);
+                        store_vec(out, __floats2bfloat162_rn(val.x, val.y));
+                        store_vec(out + 2, __floats2bfloat162_rn(val.z, val.w));
                     }
                 }
 
@@ -523,20 +522,21 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
 
                     const int b_row       = warp_d_local + lane_in_8;
                     const int b_col       = snap_k + which_horiz * 4;
-                    const unsigned b_addr = smem_addr_b32(&snap.at(b_row, b_col));
+                    const unsigned b_addr = smem_addr(&snap.at(b_row, b_col));
                     unsigned ub0, ub1;
-                    ldmatrix_x2_b16(ub0, ub1, b_addr);
+                    ldmatrix_x2(ub0, ub1, b_addr);
 
 #pragma unroll
                     for (int m_mm1 = 0; m_mm1 < M_TILES_MM1_PW; ++m_mm1) {
                         const int row_base    = s_idx * BT_PER_WARP + m_mm1 * MMA_M;
                         const int a_row       = row_base + which_vert * 8 + lane_in_8;
                         const int a_col       = W_k_local + which_horiz * 4;
-                        const unsigned a_addr = smem_addr_b32(&W_view.at(a_row, a_col));
+                        const unsigned a_addr = smem_addr(&W_view.at(a_row, a_col));
                         unsigned ua0, ua1, ua2, ua3;
-                        ldmatrix_x4_b16(ua0, ua1, ua2, ua3, a_addr);
+                        // GDN's TF32 fragment consumes ldmatrix registers in 0,2,1,3 order.
+                        ldmatrix_x4(ua0, ua2, ua1, ua3, a_addr);
 
-                        mma_m16n8k8_tf32_b32(vnew_frag[m_mm1][0], vnew_frag[m_mm1][1],
+                        mma_tf32_bits(vnew_frag[m_mm1][0], vnew_frag[m_mm1][1],
                                              vnew_frag[m_mm1][2], vnew_frag[m_mm1][3], ua0, ua1,
                                              ua2, ua3, ub0, ub1);
                     }
@@ -565,8 +565,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
             const int row_g0    = s_idx * BT_PER_WARP + m_mm1 * MMA_M + lane_g;
             const int row_g1    = row_g0 + 8;
             const int col_d0    = warp_d_local + 2 * lane_t;
-            const float2 u_top  = *reinterpret_cast<const float2*>(&U_view.at(row_g0, col_d0));
-            const float2 u_bot  = *reinterpret_cast<const float2*>(&U_view.at(row_g1, col_d0));
+            const float2 u_top  = load_vec<float2>(&U_view.at(row_g0, col_d0));
+            const float2 u_bot  = load_vec<float2>(&U_view.at(row_g1, col_d0));
             vnew_frag[m_mm1][0] = u_top.x - vnew_frag[m_mm1][0];
             vnew_frag[m_mm1][1] = u_top.y - vnew_frag[m_mm1][1];
             vnew_frag[m_mm1][2] = u_bot.x - vnew_frag[m_mm1][2];
@@ -575,7 +575,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
 
         // === Phase D: STG vnew (UNDECAYED), STS v_decay -> vd_view, scale h_frag ===
         const float g_C     = g_smem[cl - 1];
-        const float gamma_C = exp2_fast(g_C * RCP_LN2_F);
+        const float gamma_C = exp2_approx(g_C * RCP_LN2_F);
 
 #pragma unroll
         for (int m_mm1 = 0; m_mm1 < M_TILES_MM1_PW; ++m_mm1) {
@@ -588,8 +588,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
 
             const float g_top   = top_in_chunk ? g_smem[row_g0] : g_C;
             const float g_bot   = bot_in_chunk ? g_smem[row_g1] : g_C;
-            const float dec_top = top_in_chunk ? exp2_fast((g_C - g_top) * RCP_LN2_F) : 0.0f;
-            const float dec_bot = bot_in_chunk ? exp2_fast((g_C - g_bot) * RCP_LN2_F) : 0.0f;
+            const float dec_top = top_in_chunk ? exp2_approx((g_C - g_top) * RCP_LN2_F) : 0.0f;
+            const float dec_bot = bot_in_chunk ? exp2_approx((g_C - g_bot) * RCP_LN2_F) : 0.0f;
 
             const float v0 = vnew_frag[m_mm1][0];
             const float v1 = vnew_frag[m_mm1][1];
@@ -598,22 +598,20 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
 
             if (top_in_chunk) {
                 const __nv_bfloat162 out = __floats2bfloat162_rn(v0, v1);
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &v_new[vn_base + (int64_t)row_g0 * vn_stride + col_d0]) = out;
+                store_vec(&v_new[vn_base + (int64_t)row_g0 * vn_stride + col_d0], out);
             }
             if (bot_in_chunk) {
                 const __nv_bfloat162 out = __floats2bfloat162_rn(v2, v3);
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &v_new[vn_base + (int64_t)row_g1 * vn_stride + col_d0]) = out;
+                store_vec(&v_new[vn_base + (int64_t)row_g1 * vn_stride + col_d0], out);
             }
 
             const int row_g0_loc = s_idx * BT_PER_WARP + m_mm1 * MMA_M + lane_g;
             const int row_g1_loc = row_g0_loc + 8;
             const int col_d0_loc = warp_d_local + 2 * lane_t;
-            *reinterpret_cast<float2*>(&vd_view.at(row_g0_loc, col_d0_loc)) =
-                make_float2(v0 * dec_top, v1 * dec_top);
-            *reinterpret_cast<float2*>(&vd_view.at(row_g1_loc, col_d0_loc)) =
-                make_float2(v2 * dec_bot, v3 * dec_bot);
+            store_vec(&vd_view.at(row_g0_loc, col_d0_loc),
+                      make_float2(v0 * dec_top, v1 * dec_top));
+            store_vec(&vd_view.at(row_g1_loc, col_d0_loc),
+                      make_float2(v2 * dec_bot, v3 * dec_bot));
         }
 
 #pragma unroll
@@ -660,7 +658,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                     const float a2 = k_view.at(row_a1, col_a_top);
                     const float a3 = k_view.at(row_a1, col_a_bot);
 
-                    mma_m16n8k8_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1,
+                    mma_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1,
                                      a2, a3, b0, b1);
                 }
             }
@@ -687,7 +685,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                     const float a2 = k_view.at(row_a1, col_a_top);
                     const float a3 = k_view.at(row_a1, col_a_bot);
 
-                    mma_m16n8k8_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1,
+                    mma_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1,
                                      a2, a3, b0, b1);
                 }
             }
@@ -723,7 +721,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                     const float a2 = k_view.at(row_a1, col_a_top);
                     const float a3 = k_view.at(row_a1, col_a_bot);
 
-                    mma_m16n8k8_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1,
+                    mma_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1,
                                      a2, a3, b0, b1);
                 }
             }
@@ -800,7 +798,7 @@ cudaError_t launch_state_passing(const gdn_chunked::state_passing_config& cfg) {
     }
 
     const auto qk_map = qus::kernels::head_map::of((int)cfg.H_qk, (int)cfg.H_v);
-    const int64_t NT  = (cfg.L + BT - 1) / BT;
+    const int64_t NT  = div_up(cfg.L, static_cast<int64_t>(BT));
 
     // grid_x = B * H_v * D_STRIPS depends on S; check inside each case.
     auto check_grid_for = [&](int d_strips) -> cudaError_t {

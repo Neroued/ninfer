@@ -11,7 +11,7 @@
 // eight warps for more independent MMA accumulators. Both preserve a single
 // kernel launch.
 
-#include "kernels/kernel/gdn_common.cuh"
+#include "kernels/common/math.cuh"
 #include "kernels/linear/gemm/linear_rowsplit_gemm_mma.cuh"
 
 #include <cuda_bf16.h>
@@ -40,38 +40,6 @@ static_assert(kDenseGdnHidden % kDenseGdnBlockK == 0);
 __device__ __forceinline__ int dense_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);
 }
-
-__device__ __forceinline__ void dense_gdn_async_copy_cg(void* dst, const void* src) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                 :
-                 : "r"(static_cast<unsigned>(__cvta_generic_to_shared(dst))), "l"(src));
-#else
-    *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
-#endif
-}
-
-__device__ __forceinline__ void dense_gdn_async_copy_cg_zero(void* dst, const void* src,
-                                                             int src_bytes) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-                 :
-                 : "r"(static_cast<unsigned>(__cvta_generic_to_shared(dst))), "l"(src),
-                   "r"(src_bytes));
-#else
-    if (src_bytes == 16) {
-        *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
-    } else {
-        *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
-    }
-#endif
-}
-
-__device__ __forceinline__ float dense_gdn_softplus(float x) {
-    return (x > 20.0f) ? x : log1pf(expf(x));
-}
-
-__device__ __forceinline__ float dense_gdn_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
 template <int SplitK, bool FullTokens, int Warps>
 __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma_kernel(
@@ -119,12 +87,12 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
                 &xs[stage * kDenseGdnBlockN * kDenseGdnBlockK + token_local * kDenseGdnBlockK +
                     dense_gdn_swizzle(token_local, kk)];
             if constexpr (FullTokens) {
-                dense_gdn_async_copy_cg(
+                cp_async<16, Cache::cg>(
                     dst, &x[static_cast<std::int64_t>(token) * kDenseGdnHidden + k0 + kk]);
             } else {
                 const bool valid     = token < t;
                 const int safe_token = valid ? token : 0;
-                dense_gdn_async_copy_cg_zero(
+                cp_async_zfill<16, Cache::cg>(
                     dst, &x[static_cast<std::int64_t>(safe_token) * kDenseGdnHidden + k0 + kk],
                     valid ? 16 : 0);
             }
@@ -142,7 +110,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
             __nv_bfloat16* dst = (is_b ? bws : aws) + stage * kDenseGdnBlockM * kDenseGdnBlockK +
                                  row * kDenseGdnBlockK + dense_gdn_swizzle(row, kk);
             const __nv_bfloat16* weight = is_b ? b_weight : a_weight;
-            dense_gdn_async_copy_cg(
+            cp_async<16, Cache::cg>(
                 dst, &weight[static_cast<std::int64_t>(head0 + row) * kDenseGdnHidden + k0 + kk]);
         }
     };
@@ -150,7 +118,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
 #pragma unroll
     for (int stage = 0; stage < kDenseGdnStages; ++stage) {
         if (stage < kTilesPerSplit) { stage_load(stage, kt_begin + stage); }
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
     }
 
     // ldmatrix fragment lane offsets. A is [M,K], while the token-major x tile
@@ -165,7 +133,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
 #pragma unroll 1
     for (int it = 0; it < kTilesPerSplit; ++it) {
         const int stage = it & 1;
-        qus::kernels::async_copy_wait<kDenseGdnStages - 1>();
+        qus::kernels::cp_wait<kDenseGdnStages - 1>();
         __syncthreads();
 
 #pragma unroll
@@ -175,9 +143,9 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
             for (int ni = 0; ni < kNFragments; ++ni) {
                 const int xrow = warp * kWarpN + ni * 8 + x_rin;
                 const int xcol = ki * 16 + x_koff;
-                gemm_ldmatrix_x2(
+                ldmatrix_x2(
                     xf[ni][0], xf[ni][1],
-                    gemm_smem_addr(&xs[stage * kDenseGdnBlockN * kDenseGdnBlockK +
+                    smem_addr(&xs[stage * kDenseGdnBlockN * kDenseGdnBlockK +
                                        xrow * kDenseGdnBlockK + dense_gdn_swizzle(xrow, xcol)]));
             }
 #pragma unroll
@@ -186,18 +154,18 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
                 const int arow         = mi * 16 + a_rowoff;
                 const int acol         = ki * 16 + a_coloff;
                 const int weight_stage = stage * kDenseGdnBlockM * kDenseGdnBlockK;
-                gemm_ldmatrix_x4(af[0], af[1], af[2], af[3],
-                                 gemm_smem_addr(&aws[weight_stage + arow * kDenseGdnBlockK +
+                ldmatrix_x4(af[0], af[1], af[2], af[3],
+                                 smem_addr(&aws[weight_stage + arow * kDenseGdnBlockK +
                                                      dense_gdn_swizzle(arow, acol)]));
-                gemm_ldmatrix_x4(bf[0], bf[1], bf[2], bf[3],
-                                 gemm_smem_addr(&bws[weight_stage + arow * kDenseGdnBlockK +
+                ldmatrix_x4(bf[0], bf[1], bf[2], bf[3],
+                                 smem_addr(&bws[weight_stage + arow * kDenseGdnBlockK +
                                                      dense_gdn_swizzle(arow, acol)]));
 #pragma unroll
                 for (int ni = 0; ni < kNFragments; ++ni) {
-                    gemm_mma_m16n8k16_bf16(a_acc[mi][ni][0], a_acc[mi][ni][1], a_acc[mi][ni][2],
+                    mma_bf16(a_acc[mi][ni][0], a_acc[mi][ni][1], a_acc[mi][ni][2],
                                            a_acc[mi][ni][3], af[0], af[1], af[2], af[3], xf[ni][0],
                                            xf[ni][1]);
-                    gemm_mma_m16n8k16_bf16(b_acc[mi][ni][0], b_acc[mi][ni][1], b_acc[mi][ni][2],
+                    mma_bf16(b_acc[mi][ni][0], b_acc[mi][ni][1], b_acc[mi][ni][2],
                                            b_acc[mi][ni][3], bf[0], bf[1], bf[2], bf[3], xf[ni][0],
                                            xf[ni][1]);
                 }
@@ -207,7 +175,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
         __syncthreads();
         const int next = it + kDenseGdnStages;
         if (next < kTilesPerSplit) { stage_load(stage, kt_begin + next); }
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
     }
 
 #pragma unroll
@@ -224,8 +192,8 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
                     const float b = __bfloat162float(__float2bfloat16_rn(bv));
                     const std::int64_t out_i =
                         static_cast<std::int64_t>(token) * kDenseGdnHeads + row;
-                    g[out_i]    = -expf(A_log[row]) * dense_gdn_softplus(a + dt_bias[row]);
-                    beta[out_i] = dense_gdn_sigmoid(b);
+                    g[out_i]    = -expf(A_log[row]) * softplus(a + dt_bias[row]);
+                    beta[out_i] = sigmoid(b);
                 } else {
                     const std::int64_t base =
                         (static_cast<std::int64_t>(split) * t + token) * kDenseGdnLogicalRows;
@@ -274,8 +242,8 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
             }
             const float a = __bfloat162float(__float2bfloat16_rn(av));
             const float b = __bfloat162float(__float2bfloat16_rn(bv));
-            g[i]          = -expf(A_log[row]) * dense_gdn_softplus(a + dt_bias[row]);
-            beta[i]       = dense_gdn_sigmoid(b);
+            g[i]          = -expf(A_log[row]) * softplus(a + dt_bias[row]);
+            beta[i]       = sigmoid(b);
         }
     }
 }

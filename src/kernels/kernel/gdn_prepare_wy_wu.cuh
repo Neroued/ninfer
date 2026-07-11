@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kernels/common/mma.cuh"
 #include "kernels/kernel/gdn_chunked_common.cuh"
 
 #include <cmath>
@@ -29,7 +30,7 @@ using gdn_chunked::MMA_K;
 using gdn_chunked::bh_decode_t;
 using gdn_chunked::zero_frag;
 using qus::kernels::SmemTile;
-using qus::kernels::mma_m16n8k8_tf32;
+using qus::kernels::mma_tf32;
 
 static_assert(gdn_chunked::kChunkSize == 64,
               "stage_prepare_wy_wu: kChunkSize must be 64 (kernel hard-codes "
@@ -37,7 +38,7 @@ static_assert(gdn_chunked::kChunkSize == 64,
 
 constexpr int N_SUB     = BT / BC;                           // 4
 constexpr int N_WARPS   = N_SUB;                             // 4 warps
-constexpr int THREADS   = N_WARPS * qus::kernels::WARP_SIZE; // 128
+constexpr int THREADS   = N_WARPS * qus::kernels::kWarpSize; // 128
 constexpr int N_K_TILES = BT / MMA_K;                        // 8 (recompute_wu)
 
 static_assert(MMA_M == BC, "kernel assumes MMA m == BC");
@@ -126,7 +127,7 @@ __device__ __forceinline__ void mma16_raw_x_swiz(float D[8], int lane,
             const int n_off = nt * MMA_N;
             const float b0  = M_view.at(M_row_off + k_off + lane_t, M_col_off + n_off + lane_g);
             const float b1  = M_view.at(M_row_off + k_off + lane_t + 4, M_col_off + n_off + lane_g);
-            mma_m16n8k8_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2,
+            mma_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2,
                              a3, b0, b1);
         }
     }
@@ -150,7 +151,7 @@ __device__ __forceinline__ void mma16_swiz_x_raw(float D[8], int lane, SmemTile<
             const int n_off = nt * MMA_N;
             const float b0  = B_buf[(k_off + lane_t) * SCR_STRIDE + (n_off + lane_g)];
             const float b1  = B_buf[(k_off + lane_t + 4) * SCR_STRIDE + (n_off + lane_g)];
-            mma_m16n8k8_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2,
+            mma_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2,
                              a3, b0, b1);
         }
     }
@@ -292,7 +293,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
         // Hillis-Steele inclusive scan over per-lane partials (a + bv).
         float partial = a + bv;
 #pragma unroll
-        for (int o = 1; o < qus::kernels::WARP_SIZE; o <<= 1) {
+        for (int o = 1; o < qus::kernels::kWarpSize; o <<= 1) {
             const float n = __shfl_up_sync(0xffffffffu, partial, o);
             if (lane >= o) partial += n;
         }
@@ -346,7 +347,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
                     const float b0  = K_view.at(row_b, col_t0);
                     const float b1  = K_view.at(row_b, col_t1);
 
-                    mma_m16n8k8_tf32(A_reg[j_sub][n_tile * 4 + 0], A_reg[j_sub][n_tile * 4 + 1],
+                    mma_tf32(A_reg[j_sub][n_tile * 4 + 0], A_reg[j_sub][n_tile * 4 + 1],
                                      A_reg[j_sub][n_tile * 4 + 2], A_reg[j_sub][n_tile * 4 + 3], a0,
                                      a1, a2, a3, b0, b1);
                 }
@@ -583,7 +584,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
                 const float b0  = VK_view.at(row_t0, col_g) * s0;
                 const float b1  = VK_view.at(row_t1, col_g) * s1;
 
-                mma_m16n8k8_tf32(D[t][0], D[t][1], D[t][2], D[t][3], a0, a1, a2, a3, b0, b1);
+                mma_tf32(D[t][0], D[t][1], D[t][2], D[t][3], a0, a1, a2, a3, b0, b1);
             }
         }
 
@@ -592,13 +593,11 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
             const int col = n_chunk_off + t * MMA_N + col_d0;
             if (t_row_g0 < cl) {
                 const __nv_bfloat162 v0 = __floats2bfloat162_rn(D[t][0], D[t][1]);
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &out_gmem[(int64_t)t_row_g0 * out_row_stride + col]) = v0;
+                store_vec(&out_gmem[(int64_t)t_row_g0 * out_row_stride + col], v0);
             }
             if (t_row_g1 < cl) {
                 const __nv_bfloat162 v1 = __floats2bfloat162_rn(D[t][2], D[t][3]);
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &out_gmem[(int64_t)t_row_g1 * out_row_stride + col]) = v1;
+                store_vec(&out_gmem[(int64_t)t_row_g1 * out_row_stride + col], v1);
             }
         }
     };
@@ -635,7 +634,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
                 const float b0  = VK_view.at(row_t0, col_g) * s0;
                 const float b1  = VK_view.at(row_t1, col_g) * s1;
 
-                mma_m16n8k8_tf32(D0[t][0], D0[t][1], D0[t][2], D0[t][3], a0, a1, a2, a3, b0, b1);
+                mma_tf32(D0[t][0], D0[t][1], D0[t][2], D0[t][3], a0, a1, a2, a3, b0, b1);
             }
 
 #pragma unroll
@@ -645,7 +644,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
                 const float b0  = VK_view.at(row_t0, col_g) * s0;
                 const float b1  = VK_view.at(row_t1, col_g) * s1;
 
-                mma_m16n8k8_tf32(D1[t][0], D1[t][1], D1[t][2], D1[t][3], a0, a1, a2, a3, b0, b1);
+                mma_tf32(D1[t][0], D1[t][1], D1[t][2], D1[t][3], a0, a1, a2, a3, b0, b1);
             }
         }
 
@@ -654,13 +653,11 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
             const int col = c0_off + t * MMA_N + col_d0;
             if (t_row_g0 < cl) {
                 const __nv_bfloat162 v0 = __floats2bfloat162_rn(D0[t][0], D0[t][1]);
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &out_gmem[(int64_t)t_row_g0 * out_row_stride + col]) = v0;
+                store_vec(&out_gmem[(int64_t)t_row_g0 * out_row_stride + col], v0);
             }
             if (t_row_g1 < cl) {
                 const __nv_bfloat162 v1 = __floats2bfloat162_rn(D0[t][2], D0[t][3]);
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &out_gmem[(int64_t)t_row_g1 * out_row_stride + col]) = v1;
+                store_vec(&out_gmem[(int64_t)t_row_g1 * out_row_stride + col], v1);
             }
         }
 
@@ -669,13 +666,11 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
             const int col = c1_off + t * MMA_N + col_d0;
             if (t_row_g0 < cl) {
                 const __nv_bfloat162 v0 = __floats2bfloat162_rn(D1[t][0], D1[t][1]);
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &out_gmem[(int64_t)t_row_g0 * out_row_stride + col]) = v0;
+                store_vec(&out_gmem[(int64_t)t_row_g0 * out_row_stride + col], v0);
             }
             if (t_row_g1 < cl) {
                 const __nv_bfloat162 v1 = __floats2bfloat162_rn(D1[t][2], D1[t][3]);
-                *reinterpret_cast<__nv_bfloat162*>(
-                    &out_gmem[(int64_t)t_row_g1 * out_row_stride + col]) = v1;
+                store_vec(&out_gmem[(int64_t)t_row_g1 * out_row_stride + col], v1);
             }
         }
     };
@@ -745,7 +740,7 @@ cudaError_t launch_prepare_wy_wu(const gdn_chunked::prepare_wy_wu_config& cfg) {
     }
 
     const auto qk_map = qus::kernels::head_map::of((int)cfg.H_qk, (int)cfg.H_v);
-    const int64_t NT  = (cfg.L + BT - 1) / BT;
+    const int64_t NT  = div_up(cfg.L, static_cast<int64_t>(BT));
     const int64_t bh  = cfg.B * cfg.H_v;
     QUS_GDN_PROPAGATE(v.check_grid(NT, bh));
 

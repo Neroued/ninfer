@@ -1,5 +1,6 @@
 #include "kernels/linear/gemm/linear_rowsplit_w8g32_gemm_mma.cuh"
 
+#include "kernels/common/math.h"
 #include "qus/core/device.h"
 #include "qus/core/tensor.h"
 
@@ -9,16 +10,14 @@
 namespace qus::kernels::detail {
 namespace {
 
-int ceil_div_w8(int x, int y) { return (x + y - 1) / y; }
-
 template <class Cfg>
 void launch_w8_cfg(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const std::int32_t m        = w.n;
     const std::int32_t k        = w.k;
     const std::int32_t n        = x.ne[1];
     const std::int32_t padded_k = w.padded_shape[1];
-    const dim3 grid(static_cast<unsigned>(ceil_div_w8(m, Cfg::BM)),
-                    static_cast<unsigned>(ceil_div_w8(n, Cfg::BN)), 1u);
+    const dim3 grid(static_cast<unsigned>(div_up(m, Cfg::BM)),
+                    static_cast<unsigned>(div_up(n, Cfg::BN)), 1u);
     const bool full =
         (m % Cfg::BM) == 0 && (n % Cfg::BN) == 0 && k == padded_k && (k % Cfg::BK) == 0;
     const auto* xp     = static_cast<const __nv_bfloat16*>(x.data);

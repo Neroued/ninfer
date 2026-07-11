@@ -1,6 +1,7 @@
 // qus::kernels::detail - sample launch. One block per logits column.
 #include "kernels/launcher/sampling.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/sampling.cuh"
 #include "qus/core/device.h"
 
@@ -11,8 +12,7 @@ void sample_column_launch(const Tensor& logits, Tensor& out, const SamplingConfi
                           cudaStream_t stream) {
     const std::int32_t vocab = logits.ne[0];
     const std::int32_t cols  = logits.ne[1];
-    const std::int32_t partial_blocks =
-        (vocab + kSamplerPartialTileItems - 1) / kSamplerPartialTileItems;
+    const std::int32_t partial_blocks = div_up(vocab, kSamplerPartialTileItems);
     const std::int32_t groups = sampler_group_count(partial_blocks);
     // The single-block fallback and the multi-block scratch path share
     // sampler_multiblock_ok so exactly one owns any given shape; it also bounds

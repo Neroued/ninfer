@@ -46,7 +46,7 @@ __launch_bounds__(kSamplerBlock) __global__ void sample_column_kernel(
         return;
     }
 
-    const int partial_blocks = (vocab + kSamplerPartialTileItems - 1) / kSamplerPartialTileItems;
+    const int partial_blocks = div_up(vocab, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
     // No-op when the scratch/group path owns this shape (see sample_column_launch).
     if (sampler_multiblock_ok(vocab, static_cast<int>(gridDim.x), partial_blocks, group_count)) {

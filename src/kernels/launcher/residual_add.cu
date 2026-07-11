@@ -3,6 +3,7 @@
 // See docs/l1-kernel-layering.md section 4.
 #include "kernels/launcher/residual_add.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/residual_add.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 
@@ -17,7 +18,8 @@ void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     const auto y_addr = reinterpret_cast<std::uintptr_t>(y.data);
     const auto x_addr = reinterpret_cast<std::uintptr_t>(x.data);
     if (((y_addr | x_addr) & (alignof(__nv_bfloat162) - 1)) != 0) {
-        const int scalar_grid = static_cast<int>((n + kBlock - 1) / kBlock);
+        const int scalar_grid =
+            static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
         residual_add_scalar_kernel<<<scalar_grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(y.data), static_cast<__nv_bfloat16*>(x.data), n);
         CUDA_CHECK(cudaGetLastError());
@@ -25,8 +27,9 @@ void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     }
 
     const std::int64_t n2 = n / 2;
-    const int grid        = static_cast<int>(std::max<std::int64_t>(
-        1, (n2 + kBlock * kResidualAddPairsPerThread - 1) / (kBlock * kResidualAddPairsPerThread)));
+    constexpr std::int64_t kPairsPerBlock = kBlock * kResidualAddPairsPerThread;
+    const int grid =
+        static_cast<int>(std::max<std::int64_t>(1, div_up(n2, kPairsPerBlock)));
 
     residual_add_kernel<<<grid, kBlock, 0, stream>>>(static_cast<const __nv_bfloat16*>(y.data),
                                                      static_cast<__nv_bfloat16*>(x.data), n);

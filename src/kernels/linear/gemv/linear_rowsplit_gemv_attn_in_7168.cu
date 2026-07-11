@@ -1,5 +1,8 @@
 #include "kernels/linear/gemv/linear_rowsplit_gemv_attn_in_7168.cuh"
 
+#include "kernels/common/math.h"
+#include "kernels/common/memory.cuh"
+#include "kernels/common/warp.cuh"
 #include "kernels/linear/gemv/linear_rowsplit_gemv_q5_core.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 
@@ -23,22 +26,6 @@ constexpr int kQ4BlockThreads = kQ4WarpsPerRow * 32;
 constexpr int kQ4ProjBlocks   = kProjRows / kQ4WarpsPerRow;
 constexpr int kQ4BytesPerGroup = 32;
 
-__device__ __forceinline__ int sign_extend_q4(int v) { return (v & 0x08) ? (v - 16) : v; }
-
-__device__ __forceinline__ std::uint16_t load_scale_bits(const std::uint8_t* scale_row, int group) {
-    const std::uint8_t* sp = scale_row + group * 2;
-    return static_cast<std::uint16_t>(sp[0]) |
-           static_cast<std::uint16_t>(static_cast<std::uint16_t>(sp[1]) << 8);
-}
-
-__device__ __forceinline__ float warp_reduce_sum(float acc) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, offset);
-    }
-    return acc;
-}
-
 // Q4 attention-in GEMV: 6144 "proj" rows use one warp per row (8 warps/block), the
 // remaining 1024 rows use a 4-way split-K block. Byte-load path retained as-is.
 __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
@@ -59,7 +46,9 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
         for (int tile = 0; tile < kGroups; tile += 32) {
             const int tile_count = (kGroups - tile) < 32 ? (kGroups - tile) : 32;
             std::uint16_t lane_scale_bits = 0;
-            if (lane < tile_count) { lane_scale_bits = load_scale_bits(scale_row, tile + lane); }
+            if (lane < tile_count) {
+                lane_scale_bits = load_vec<std::uint16_t>(scale_row + (tile + lane) * 2);
+            }
 
 #pragma unroll
             for (int tile_group = 0; tile_group < 32; ++tile_group) {
@@ -70,8 +59,8 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
                 const float scale = __half2float(__ushort_as_half(scale_bits));
 
                 const std::uint8_t packed = code_row[group * kQ4BytesPerGroup + lane];
-                const int q0 = sign_extend_q4(packed & 0x0f);
-                const int q1 = sign_extend_q4(packed >> 4);
+                const int q0 = sign_extend<4>(packed & 0x0f);
+                const int q1 = sign_extend<4>(packed >> 4);
                 const int k0 = group * kGroupK + lane * 2;
                 const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
                 acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
@@ -96,7 +85,7 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
 
     std::uint16_t lane_scale_bits = 0;
     if (lane < kQ4GroupsPerWarp) {
-        lane_scale_bits = load_scale_bits(scale_row, group_begin + lane);
+        lane_scale_bits = load_vec<std::uint16_t>(scale_row + (group_begin + lane) * 2);
     }
 
 #pragma unroll
@@ -107,8 +96,8 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
         const float scale = __half2float(__ushort_as_half(scale_bits));
 
         const std::uint8_t packed = code_row[group * kQ4BytesPerGroup + lane];
-        const int q0 = sign_extend_q4(packed & 0x0f);
-        const int q1 = sign_extend_q4(packed >> 4);
+        const int q0 = sign_extend<4>(packed & 0x0f);
+        const int q1 = sign_extend<4>(packed >> 4);
         const int k0 = group * kGroupK + lane * 2;
         const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
         acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);

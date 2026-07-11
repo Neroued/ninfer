@@ -85,7 +85,7 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_accept_tokens_kernel(
     __shared__ int tstar_sh;
     __shared__ int L_sh;
 
-    const int partial_blocks = (vocab + kSamplerPartialTileItems - 1) / kSamplerPartialTileItems;
+    const int partial_blocks = div_up(vocab, kSamplerPartialTileItems);
     const int group_count    = sampler_group_count(partial_blocks);
     // No-op when the scratch/group path owns this shape (see mtp_accept_tokens_launch).
     if (sampler_multiblock_ok(vocab, k + 1, partial_blocks, group_count)) { return; }

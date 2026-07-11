@@ -1,6 +1,7 @@
 // qus::kernels - rope launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/rope.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/rope.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 
@@ -28,8 +29,7 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Te
             static_cast<__nv_bfloat16*>(x.data), rotary_dim, theta, q_heads, k_heads,
             positions.ne[0], total_pairs);
     } else {
-        const std::int64_t blocks = (total_pairs + static_cast<std::int64_t>(kBlock) - 1) /
-                                    static_cast<std::int64_t>(kBlock);
+        const std::int64_t blocks = div_up(total_pairs, static_cast<std::int64_t>(kBlock));
         const int grid =
             static_cast<int>(std::min<std::int64_t>(blocks, std::numeric_limits<int>::max()));
         rope_pair_kernel<<<grid, kBlock, 0, stream>>>(
@@ -62,8 +62,7 @@ void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q
             static_cast<__nv_bfloat16*>(k.data), rotary_dim, theta, q.ne[1], k.ne[1],
             positions.ne[0], total_pairs);
     } else {
-        const std::int64_t blocks = (total_pairs + static_cast<std::int64_t>(kBlock) - 1) /
-                                    static_cast<std::int64_t>(kBlock);
+        const std::int64_t blocks = div_up(total_pairs, static_cast<std::int64_t>(kBlock));
         const int grid =
             static_cast<int>(std::min<std::int64_t>(blocks, std::numeric_limits<int>::max()));
         rope_pair_kernel<<<grid, kBlock, 0, stream>>>(

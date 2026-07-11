@@ -1,6 +1,7 @@
 // qus::kernels - split-KV GQA small-T launcher and unified route dispatcher.
 #include "kernels/launcher/gqa_attention.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/gqa_attention_decode.cuh"
 #include "kernels/kernel/gqa_attention_decode_bf16.cuh"
 #include "kernels/kernel/gqa_attention_decode_i8.cuh"
@@ -12,8 +13,6 @@
 
 namespace qus::kernels::detail {
 namespace {
-
-std::int32_t ceil_div_i32(std::int32_t x, std::int32_t y) { return (x + y - 1) / y; }
 
 // Split-KV grid sizing keyed on the actual attention window (kv.pos + tokens),
 // not the allocation ceiling. Over-splitting inflates the partial scratch that
@@ -29,7 +28,7 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
     const auto include_tier = [&](std::int32_t window_limit, std::int32_t target_keys_per_split) {
         const std::int32_t tier_window = (window < window_limit) ? window : window_limit;
         if (tier_window > 0) {
-            const std::int32_t tier_splits = ceil_div_i32(tier_window, target_keys_per_split);
+            const std::int32_t tier_splits = div_up(tier_window, target_keys_per_split);
             splits                         = (splits > tier_splits) ? splits : tier_splits;
         }
     };
@@ -47,15 +46,15 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
     // kernel execute a nearly empty second tile. These short ranges instead
     // launch one 32-key tile per split; the larger CTAs keep the small grid busy.
     if (kv_dtype == DType::I8 && tokens == 5 && window > 128 && window <= 512) {
-        return ceil_div_i32(window, 32);
+        return div_up(window, 32);
     }
     if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
-        return ceil_div_i32(window, 24);
+        return div_up(window, 24);
     }
     // Bc=64 is one CTA/SM on this model shape. Keep the 8K grid at or below
     // 4*42=168 blocks so it completes in one 170-SM wave.
     if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
-        const std::int32_t splits  = ceil_div_i32(window, 192);
+        const std::int32_t splits  = div_up(window, 192);
         const std::int32_t clamped = (splits > 4) ? splits : 4;
         return (clamped < 42) ? clamped : 42;
     }
@@ -209,7 +208,7 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
 
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;
-    const dim3 reduce_grid(kGqaQHeads, (kGqaHeadDim + kDChunk - 1) / kDChunk, q.ne[2]);
+    const dim3 reduce_grid(kGqaQHeads, div_up(kGqaHeadDim, kDChunk), q.ne[2]);
     gqa_attention_small_t_reduce_output_kernel<kDChunk><<<reduce_grid, kReduceBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(partial_acc.data),
         static_cast<const float*>(partial_m.data), static_cast<const float*>(partial_l.data),

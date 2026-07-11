@@ -1,5 +1,6 @@
 #include "qus/kernels/gated_delta_rule.h"
 
+#include "kernels/common/math.h"
 #include "kernels/launcher/gated_delta_rule.h"
 #include "qus/core/device.h"
 
@@ -128,7 +129,7 @@ void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const T
 }
 
 std::int32_t checked_arena_floats(std::size_t bytes) {
-    const std::size_t floats = (bytes + sizeof(float) - 1) / sizeof(float);
+    const std::size_t floats = div_up(bytes, sizeof(float));
     if (floats > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("gated_delta_rule: chunked workspace exceeds Tensor shape limit");
     }

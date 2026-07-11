@@ -1,5 +1,8 @@
 #include "kernels/linear/gemv/linear_rowsplit_gemv_lm_head.cuh"
 
+#include "kernels/common/math.h"
+#include "kernels/common/memory.cuh"
+#include "kernels/common/warp.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 
 #include <cuda_bf16.h>
@@ -26,17 +29,6 @@ static_assert(kGroups % kGroupsPerWarpTile == 0);
 static_assert(kNibbleVecsPerWarpTile == 32);
 static_assert(kHighVecsPerWarpTile == 16);
 
-__device__ __forceinline__ int sign_extend_q6(int v) {
-    return (v & 0x20) ? (v - 64) : v;
-}
-
-__device__ __forceinline__ std::uint16_t load_scale_bits(const std::uint8_t* scale_row,
-                                                         int group) {
-    const std::uint8_t* sp = scale_row + group * 2;
-    return static_cast<std::uint16_t>(sp[0]) |
-           static_cast<std::uint16_t>(static_cast<std::uint16_t>(sp[1]) << 8);
-}
-
 __device__ __forceinline__ float accumulate_group(const __nv_bfloat162* __restrict__ x2,
                                                   const std::uint8_t* __restrict__ nibble_group,
                                                   const std::uint8_t* __restrict__ high_group,
@@ -47,8 +39,8 @@ __device__ __forceinline__ float accumulate_group(const __nv_bfloat162* __restri
     const std::uint8_t low = nibble_group[lane];
     const std::uint8_t high = high_group[lane >> 1] >> ((lane & 1) * 4);
 
-    const int q0 = sign_extend_q6(static_cast<int>((low & 0x0fu) | ((high & 0x03u) << 4)));
-    const int q1 = sign_extend_q6(static_cast<int>((low >> 4) | ((high & 0x0cu) << 2)));
+    const int q0 = sign_extend<6>(static_cast<int>((low & 0x0fu) | ((high & 0x03u) << 4)));
+    const int q1 = sign_extend<6>(static_cast<int>((low >> 4) | ((high & 0x0cu) << 2)));
     const int k0 = group * kGroupK + lane * 2;
     const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
     acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
@@ -89,7 +81,7 @@ __global__ void linear_rowsplit_gemv_lm_head_q6_kernel(const __nv_bfloat16* __re
 
         std::uint16_t lane_scale_bits = 0;
         if (lane < kGroupsPerWarpTile) {
-            lane_scale_bits = load_scale_bits(scale_row, tile + lane);
+            lane_scale_bits = load_vec<std::uint16_t>(scale_row + (tile + lane) * 2);
         }
         const auto* tile_nibbles = reinterpret_cast<const std::uint8_t*>(nibble_tile[warp]);
         const auto* tile_highs = reinterpret_cast<const std::uint8_t*>(high_tile[warp]);
@@ -106,20 +98,13 @@ __global__ void linear_rowsplit_gemv_lm_head_q6_kernel(const __nv_bfloat16* __re
         __syncwarp();
     }
 
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, offset);
-    }
+    acc = warp_reduce_sum(acc);
     if (lane == 0) { out[row] = __float2bfloat16(acc); }
-}
-
-__device__ __forceinline__ int sign_extend_q4(int v) {
-    return (v ^ 0x08) - 0x08;
 }
 
 // Q4 variant of the tuned warp-per-row lm_head GEMV. Identical geometry to the Q6
 // kernel minus the high-bit plane: each nibble byte holds two signed 4-bit codes,
-// so there is no high tile to stage and each code dequants to sign_extend_q4(nibble).
+// so there is no high tile to stage and each code dequants by sign-extending its nibble.
 __global__ void linear_rowsplit_gemv_lm_head_q4_kernel(const __nv_bfloat16* __restrict__ x,
                                                        const std::uint8_t* __restrict__ codes,
                                                        const std::uint8_t* __restrict__ scales,
@@ -146,7 +131,7 @@ __global__ void linear_rowsplit_gemv_lm_head_q4_kernel(const __nv_bfloat16* __re
 
         std::uint16_t lane_scale_bits = 0;
         if (lane < kGroupsPerWarpTile) {
-            lane_scale_bits = load_scale_bits(scale_row, tile + lane);
+            lane_scale_bits = load_vec<std::uint16_t>(scale_row + (tile + lane) * 2);
         }
         const auto* tile_nibbles = reinterpret_cast<const std::uint8_t*>(nibble_tile[warp]);
 
@@ -157,8 +142,8 @@ __global__ void linear_rowsplit_gemv_lm_head_q4_kernel(const __nv_bfloat16* __re
             const float scale = __half2float(__ushort_as_half(scale_bits));
 
             const std::uint8_t low = tile_nibbles[tile_group * kNibbleBytesPerGroup + lane];
-            const int q0 = sign_extend_q4(static_cast<int>(low & 0x0fu));
-            const int q1 = sign_extend_q4(static_cast<int>(low >> 4));
+            const int q0 = sign_extend<4>(static_cast<int>(low & 0x0fu));
+            const int q1 = sign_extend<4>(static_cast<int>(low >> 4));
             const int k0 = (tile + tile_group) * kGroupK + lane * 2;
             const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
             acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
@@ -167,10 +152,7 @@ __global__ void linear_rowsplit_gemv_lm_head_q4_kernel(const __nv_bfloat16* __re
         __syncwarp();
     }
 
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xffffffffu, acc, offset);
-    }
+    acc = warp_reduce_sum(acc);
     if (lane == 0) { out[row] = __float2bfloat16(acc); }
 }
 
@@ -187,7 +169,7 @@ void linear_rowsplit_gemv_lm_head_q6_launch(const Tensor& x, const Weight& w, Te
     }
     if (w.n <= 0) { throw std::invalid_argument("linear: lm_head Q6 tuned GEMV requires n>0"); }
     const int n    = static_cast<int>(w.n);
-    const int grid = (n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    const int grid = div_up(n, kWarpsPerBlock);
     linear_rowsplit_gemv_lm_head_q6_kernel<<<grid, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.qhigh),
@@ -205,7 +187,7 @@ void linear_rowsplit_gemv_lm_head_q4_launch(const Tensor& x, const Weight& w, Te
     }
     if (w.n <= 0) { throw std::invalid_argument("linear: lm_head Q4 tuned GEMV requires n>0"); }
     const int n    = static_cast<int>(w.n);
-    const int grid = (n + kWarpsPerBlock - 1) / kWarpsPerBlock;
+    const int grid = div_up(n, kWarpsPerBlock);
     linear_rowsplit_gemv_lm_head_q4_kernel<<<grid, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), n, static_cast<__nv_bfloat16*>(out.data));

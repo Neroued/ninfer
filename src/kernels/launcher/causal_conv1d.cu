@@ -1,6 +1,7 @@
 // qus::kernels - causal_conv1d launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/causal_conv1d.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/causal_conv1d.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 
@@ -14,7 +15,7 @@ namespace qus::kernels::detail {
 namespace {
 
 int grid_for(std::int64_t n, int block, const char* label) {
-    const std::int64_t grid = (n + static_cast<std::int64_t>(block) - 1) / block;
+    const std::int64_t grid = div_up(n, static_cast<std::int64_t>(block));
     if (grid > std::numeric_limits<int>::max()) {
         throw std::overflow_error(std::string("causal_conv1d: ") + label +
                                   " grid exceeds CUDA limit");
@@ -24,7 +25,7 @@ int grid_for(std::int64_t n, int block, const char* label) {
 
 int prefill_output_grid_for(std::int32_t C, std::int32_t T, int block) {
     const std::int64_t c_blocks =
-        (static_cast<std::int64_t>(C) + static_cast<std::int64_t>(block) - 1) / block;
+        div_up(static_cast<std::int64_t>(C), static_cast<std::int64_t>(block));
     const std::int64_t grid = c_blocks * static_cast<std::int64_t>(T);
     if (grid > std::numeric_limits<int>::max()) {
         throw std::overflow_error("causal_conv1d: prefill output grid exceeds CUDA limit");

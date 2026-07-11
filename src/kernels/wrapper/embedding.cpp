@@ -1,6 +1,7 @@
 // qus::kernels - embedding wrapper: public api validation and qtype dispatch.
 #include "qus/kernels/embedding.h"
 
+#include "kernels/common/math.h"
 #include "kernels/launcher/embed_gather.h" // detail::embed_gather_*_launch
 #include "qus/core/weight.h"
 
@@ -42,7 +43,7 @@ std::uint64_t checked_mul_u64(std::uint64_t a, std::uint64_t b) {
 
 std::int32_t align_up_i32(std::int32_t x, std::int32_t m) {
     const std::int64_t y =
-        ((static_cast<std::int64_t>(x) + m - 1) / m) * static_cast<std::int64_t>(m);
+        round_up(static_cast<std::int64_t>(x), static_cast<std::int64_t>(m));
     if (y > std::numeric_limits<std::int32_t>::max()) {
         throw std::overflow_error("embedding: padded shape overflows int32");
     }

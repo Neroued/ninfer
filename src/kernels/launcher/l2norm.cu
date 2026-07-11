@@ -1,6 +1,7 @@
 // qus::kernels - l2norm launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/l2norm.h"
 
+#include "kernels/common/math.h"
 #include "kernels/kernel/l2norm.cuh"
 #include "qus/core/device.h" // CUDA_CHECK
 
@@ -20,7 +21,8 @@ void l2norm_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream)
     }
 
     constexpr int kRowsPerBlock = kBlock / 32;
-    const auto blocks = static_cast<unsigned int>((rows + kRowsPerBlock - 1) / kRowsPerBlock);
+    const auto blocks = static_cast<unsigned int>(
+        div_up(rows, static_cast<std::int64_t>(kRowsPerBlock)));
     l2norm_kernel<<<blocks, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data), d,
         rows, eps);

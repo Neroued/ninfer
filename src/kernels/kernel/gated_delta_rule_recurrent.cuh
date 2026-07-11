@@ -15,31 +15,43 @@ inline constexpr int kGdnBlockDv   = kGdnNumWarps * kGdnDvPerWarp;
 template <int S, int DQK_PER_LANE, int ACTIVE_LANES>
 __device__ __forceinline__ void gdn_load_qk_lane(float (&reg)[DQK_PER_LANE], const float* base,
                                                  int lane, std::uint32_t dqk_base) {
-    if constexpr (S < WARP_SIZE) {
+    if constexpr (S < kWarpSize) {
         reg[0] = (lane < ACTIVE_LANES) ? base[lane] : 0.0f;
+    } else if constexpr (DQK_PER_LANE == 1) {
+        reg[0] = base[dqk_base];
+    } else if constexpr (DQK_PER_LANE == 2) {
+        store_vec(reg, load_vec<float2>(base + dqk_base));
+    } else if constexpr (DQK_PER_LANE == 4) {
+        store_vec(reg, load_vec<float4>(base + dqk_base));
     } else {
-        cuda_memcpy_1<DQK_PER_LANE * sizeof(float)>(reg, base + dqk_base);
+        static_assert(DQK_PER_LANE <= 4, "unsupported GDN lane vector width");
     }
 }
 
 template <int S, int DQK_PER_LANE, int ACTIVE_LANES>
 __device__ __forceinline__ void gdn_store_qk_lane(const float (&reg)[DQK_PER_LANE], float* base,
                                                   int lane, std::uint32_t dqk_base) {
-    if constexpr (S < WARP_SIZE) {
+    if constexpr (S < kWarpSize) {
         if (lane < ACTIVE_LANES) { base[lane] = reg[0]; }
+    } else if constexpr (DQK_PER_LANE == 1) {
+        base[dqk_base] = reg[0];
+    } else if constexpr (DQK_PER_LANE == 2) {
+        store_vec(base + dqk_base, load_vec<float2>(reg));
+    } else if constexpr (DQK_PER_LANE == 4) {
+        store_vec(base + dqk_base, load_vec<float4>(reg));
     } else {
-        cuda_memcpy_1<DQK_PER_LANE * sizeof(float)>(base + dqk_base, reg);
+        static_assert(DQK_PER_LANE <= 4, "unsupported GDN lane vector width");
     }
 }
 
 template <int S>
-__global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kGdnNumWarps, 2)
     gated_delta_rule_recurrent_kernel(const float* __restrict__ q, const float* __restrict__ k,
                                       const float* __restrict__ v, const float* __restrict__ g,
                                       const float* __restrict__ beta, float* __restrict__ ssm_state,
                                       float* __restrict__ out, std::int64_t T, head_map heads,
                                       float scale) {
-    constexpr int active_lanes  = (S < WARP_SIZE) ? S : WARP_SIZE;
+    constexpr int active_lanes  = (S < kWarpSize) ? S : kWarpSize;
     constexpr int d_qk_per_lane = S / active_lanes;
     static_assert(S % active_lanes == 0, "S must be a multiple of active_lanes");
     static_assert(S % kGdnBlockDv == 0, "S must be a multiple of kGdnBlockDv");
@@ -80,9 +92,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
             float partial = 0.0f;
 #pragma unroll
             for (int c = 0; c < d_qk_per_lane; ++c) { partial += s_tile[r][c] * k_reg[c]; }
-            partial = warp_reduce_sum<WARP_SIZE>(partial);
+            partial = warp_sum<kWarpSize>(partial);
 
-            const float v_r   = __shfl_sync(0xffffffff, v_local, r, WARP_SIZE);
+            const float v_r   = __shfl_sync(0xffffffff, v_local, r, kWarpSize);
             const float delta = beta_val * (v_r - alpha * partial);
 
 #pragma unroll
@@ -106,7 +118,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
             float partial = 0.0f;
 #pragma unroll
             for (int c = 0; c < d_qk_per_lane; ++c) { partial += s_tile[r][c] * q_reg[c]; }
-            partial = warp_reduce_sum<WARP_SIZE>(partial);
+            partial = warp_sum<kWarpSize>(partial);
             if (lane == r) { attn_val = partial; }
         }
 
@@ -126,7 +138,7 @@ template <int S, int DQK_PER_LANE, int ACTIVE_LANES>
 __device__ __forceinline__ void gdn_load_qk_lane_bf16(float (&reg)[DQK_PER_LANE],
                                                       const __nv_bfloat16* base, int lane,
                                                       std::uint32_t dqk_base) {
-    if constexpr (S < WARP_SIZE) {
+    if constexpr (S < kWarpSize) {
         reg[0] = (lane < ACTIVE_LANES) ? __bfloat162float(base[lane]) : 0.0f;
     } else {
 #pragma unroll
@@ -144,7 +156,7 @@ __device__ __forceinline__ void gdn_load_qk_lane_bf16(float (&reg)[DQK_PER_LANE]
 //                       in-place form; distinct views let prefix-append prefill read a committed
 //                       snapshot slot and publish the running state to slot 0.
 template <int HeadDim, bool Spec>
-__global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
+__global__ void __launch_bounds__(kWarpSize* kGdnNumWarps, 2)
     gated_delta_rule_recurrent_bf16_kernel(const __nv_bfloat16* __restrict__ q,
                                            const __nv_bfloat16* __restrict__ k,
                                            const __nv_bfloat16* __restrict__ v,
@@ -156,7 +168,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
                                            __nv_bfloat16* __restrict__ out, std::int64_t T,
                                            head_map heads, float scale,
                                            std::int64_t state_slot_stride, std::int32_t slots) {
-    constexpr int active_lanes  = (HeadDim < WARP_SIZE) ? HeadDim : WARP_SIZE;
+    constexpr int active_lanes  = (HeadDim < kWarpSize) ? HeadDim : kWarpSize;
     constexpr int d_qk_per_lane = HeadDim / active_lanes;
     static_assert(HeadDim % active_lanes == 0, "HeadDim must be a multiple of active_lanes");
     static_assert(HeadDim % kGdnBlockDv == 0, "HeadDim must be a multiple of kGdnBlockDv");
@@ -204,9 +216,9 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
             float partial = 0.0f;
 #pragma unroll
             for (int c = 0; c < d_qk_per_lane; ++c) { partial += s_tile[r][c] * k_reg[c]; }
-            partial = warp_reduce_sum<WARP_SIZE>(partial);
+            partial = warp_sum<kWarpSize>(partial);
 
-            const float v_r   = __shfl_sync(0xffffffff, v_local, r, WARP_SIZE);
+            const float v_r   = __shfl_sync(0xffffffff, v_local, r, kWarpSize);
             const float delta = beta_val * (v_r - alpha * partial);
 
 #pragma unroll
@@ -230,7 +242,7 @@ __global__ void __launch_bounds__(WARP_SIZE* kGdnNumWarps, 2)
             float partial = 0.0f;
 #pragma unroll
             for (int c = 0; c < d_qk_per_lane; ++c) { partial += s_tile[r][c] * q_reg[c]; }
-            partial = warp_reduce_sum<WARP_SIZE>(partial);
+            partial = warp_sum<kWarpSize>(partial);
             if (lane == r) { attn_val = partial; }
         }
 

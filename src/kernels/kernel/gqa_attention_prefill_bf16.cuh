@@ -17,7 +17,6 @@
 
 #include <math_constants.h>
 
-#include "kernels/kernel/gdn_common.cuh"
 #include "kernels/kernel/gqa_attention_prefill_common.cuh"
 
 namespace qus::kernels {
@@ -43,8 +42,8 @@ __global__ void gqa_attention_prefill_fill_bf16_kernel(
         static_cast<std::int64_t>(d) +
         static_cast<std::int64_t>(kGqaPrefillHeadDim) * (kv_head + kGqaPrefillKVHeads * token);
     const std::int64_t cache_off = gqa_prefill_cache_index(kv_head, d, position, padded_context);
-    *reinterpret_cast<int4*>(&cache_k[cache_off]) = *reinterpret_cast<const int4*>(&k[src_off]);
-    *reinterpret_cast<int4*>(&cache_v[cache_off]) = *reinterpret_cast<const int4*>(&v[src_off]);
+    store_vec(&cache_k[cache_off], load_vec<int4>(&k[src_off]));
+    store_vec(&cache_v[cache_off], load_vec<int4>(&v[src_off]));
 }
 
 // Stage one [Bc, D] K or V tile from the per-kv-head contiguous cache into the
@@ -68,7 +67,7 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
             const int key_l  = chunk >> 5;        // / VecPerRow (32)
             const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
             __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
-            gqa_prefill_cp_async_cg_16(p, &cache_block[key_l * D + d]);
+            cp_async<16, Cache::cg>(p, &cache_block[key_l * D + d]);
         }
     } else {
 #pragma unroll
@@ -77,9 +76,9 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
             const int d      = (chunk & 31) << 3; // (chunk % 32) * 8
             __nv_bfloat16* p = &dst[key_l * D + gqa_prefill_swz(key_l, d)];
             if ((k0 + key_l) <= max_query_abs) {
-                gqa_prefill_cp_async_cg_16(p, &cache_block[key_l * D + d]);
+                cp_async<16, Cache::cg>(p, &cache_block[key_l * D + d]);
             } else {
-                *reinterpret_cast<int4*>(p) = make_int4(0, 0, 0, 0);
+                store_vec(p, make_int4(0, 0, 0, 0));
             }
         }
     }
@@ -133,9 +132,9 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
     const int warp_row0 = warp * 16; // this warp owns rows [warp_row0, warp_row0+16)
 
     // Per-lane precomputed swizzled ldmatrix base addresses (see gqa_prefill_swz_addr).
-    const unsigned q_sbase = gqa_prefill_smem_addr(q_s);
-    const unsigned k_sbase = gqa_prefill_smem_addr(k_s);
-    const unsigned v_sbase = gqa_prefill_smem_addr(v_s);
+    const unsigned q_sbase = smem_addr(q_s);
+    const unsigned k_sbase = smem_addr(k_s);
+    const unsigned v_sbase = smem_addr(v_s);
     // Q A-fragment: row = warp_row0 + a_rowoff, col = k*16 + a_coloff.
     const unsigned q_lane_base = q_sbase + static_cast<unsigned>((warp_row0 + a_rowoff) * 512);
     const unsigned q_as        = static_cast<unsigned>((a_mat >> 1) << 4);
@@ -166,7 +165,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
                 const int row    = chunk >> 5;
                 const int d      = (chunk & 31) << 3;
                 __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
-                gqa_prefill_cp_async_cg_16(p, &q_block[row * QRowStride + d]);
+                cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
             }
         } else {
 #pragma unroll
@@ -175,9 +174,9 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
                 const int d      = (chunk & 31) << 3;
                 __nv_bfloat16* p = &q_s[row * D + gqa_prefill_swz(row, d)];
                 if (q0 + row < tokens) {
-                    gqa_prefill_cp_async_cg_16(p, &q_block[row * QRowStride + d]);
+                    cp_async<16, Cache::cg>(p, &q_block[row * QRowStride + d]);
                 } else {
-                    *reinterpret_cast<int4*>(p) = make_int4(0, 0, 0, 0);
+                    store_vec(p, make_int4(0, 0, 0, 0));
                 }
             }
         }
@@ -200,19 +199,19 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
     const float scale_l2 = scale * Log2E;
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
-    qus::kernels::async_copy_commit();
+    qus::kernels::cp_commit();
     gqa_prefill_stage_kv(k_s, cache_k, kv_head, 0, max_query_abs, padded_context, tid);
-    qus::kernels::async_copy_commit();
+    qus::kernels::cp_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
         const int k0 = kb * Bc;
 
-        qus::kernels::async_copy_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
+        qus::kernels::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
         gqa_prefill_stage_kv(v_s, cache_v, kv_head, k0, max_query_abs, padded_context, tid);
-        qus::kernels::async_copy_commit();
+        qus::kernels::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
         // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
@@ -227,11 +226,11 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
         unsigned af[2][4];
         unsigned bf[2][QKNt][2];
         {
-            gqa_prefill_ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
+            ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
                                     gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
 #pragma unroll
             for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                gqa_prefill_ldmatrix_x4(
+                ldmatrix_x4(
                     bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
                     gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2 * 4096), 0u, k_as,
                                          k_r));
@@ -243,11 +242,11 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
             const int nxt = cur ^ 1;
             if (k + 1 < QKKs) {
                 const unsigned ck = static_cast<unsigned>((k + 1) << 5);
-                gqa_prefill_ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
+                ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
                                         gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
 #pragma unroll
                 for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                    gqa_prefill_ldmatrix_x4(
+                    ldmatrix_x4(
                         bf[nxt][nt2][0], bf[nxt][nt2][1], bf[nxt][nt2 + 1][0], bf[nxt][nt2 + 1][1],
                         gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2 * 4096), ck,
                                              k_as, k_r));
@@ -255,7 +254,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
             }
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                gqa_prefill_mma_m16n8k16_bf16(score[nt][0], score[nt][1], score[nt][2],
+                mma_bf16(score[nt][0], score[nt][1], score[nt][2],
                                               score[nt][3], af[cur][0], af[cur][1], af[cur][2],
                                               af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
             }
@@ -290,17 +289,15 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }
         }
-        bm0 = fmaxf(bm0, __shfl_xor_sync(FullMask, bm0, 1));
-        bm0 = fmaxf(bm0, __shfl_xor_sync(FullMask, bm0, 2));
-        bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 1));
-        bm1 = fmaxf(bm1, __shfl_xor_sync(FullMask, bm1, 2));
+        bm0 = warp_max<4>(bm0, FullMask);
+        bm1 = warp_max<4>(bm1, FullMask);
 
         const float nm0        = fmaxf(m0, bm0);
         const float nm1        = fmaxf(m1, bm1);
         const float nm0_scaled = nm0 * scale_l2;
         const float nm1_scaled = nm1 * scale_l2;
-        const float alpha0     = gqa_prefill_exp2_fast(__fmaf_rn(m0, scale_l2, -nm0_scaled));
-        const float alpha1     = gqa_prefill_exp2_fast(__fmaf_rn(m1, scale_l2, -nm1_scaled));
+        const float alpha0     = exp2_approx(__fmaf_rn(m0, scale_l2, -nm0_scaled));
+        const float alpha1     = exp2_approx(__fmaf_rn(m1, scale_l2, -nm1_scaled));
 
         // P = exp2(S - m), repacked into the PV A-fragment layout, plus local block row-sum.
         // The row-sum allreduce is deferred to the epilogue; only row max must be reduced per tile.
@@ -310,22 +307,22 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const float p00 =
-                    gqa_prefill_exp2_fast(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled));
+                    exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled));
                 const float p01 =
-                    gqa_prefill_exp2_fast(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled));
+                    exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled));
                 const float p10 =
-                    gqa_prefill_exp2_fast(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled));
+                    exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled));
                 const float p11 =
-                    gqa_prefill_exp2_fast(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled));
+                    exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled));
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
                 if ((nt & 1) == 0) {
-                    p_frag[pk][0] = gqa_prefill_pack_bf16(p00, p01);
-                    p_frag[pk][1] = gqa_prefill_pack_bf16(p10, p11);
+                    p_frag[pk][0] = pack_bf16x2(p00, p01);
+                    p_frag[pk][1] = pack_bf16x2(p10, p11);
                 } else {
-                    p_frag[pk][2] = gqa_prefill_pack_bf16(p00, p01);
-                    p_frag[pk][3] = gqa_prefill_pack_bf16(p10, p11);
+                    p_frag[pk][2] = pack_bf16x2(p00, p01);
+                    p_frag[pk][3] = pack_bf16x2(p10, p11);
                 }
             }
         } else {
@@ -333,29 +330,29 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
             for (int nt = 0; nt < QKNt; ++nt) {
                 const float p00 =
                     (score[nt][0] > -CUDART_INF_F)
-                        ? gqa_prefill_exp2_fast(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
+                        ? exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
                         : 0.0f;
                 const float p01 =
                     (score[nt][1] > -CUDART_INF_F)
-                        ? gqa_prefill_exp2_fast(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
+                        ? exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
                         : 0.0f;
                 const float p10 =
                     (score[nt][2] > -CUDART_INF_F)
-                        ? gqa_prefill_exp2_fast(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
+                        ? exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
                         : 0.0f;
                 const float p11 =
                     (score[nt][3] > -CUDART_INF_F)
-                        ? gqa_prefill_exp2_fast(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
+                        ? exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
                         : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
                 if ((nt & 1) == 0) {
-                    p_frag[pk][0] = gqa_prefill_pack_bf16(p00, p01);
-                    p_frag[pk][1] = gqa_prefill_pack_bf16(p10, p11);
+                    p_frag[pk][0] = pack_bf16x2(p00, p01);
+                    p_frag[pk][1] = pack_bf16x2(p10, p11);
                 } else {
-                    p_frag[pk][2] = gqa_prefill_pack_bf16(p00, p01);
-                    p_frag[pk][3] = gqa_prefill_pack_bf16(p10, p11);
+                    p_frag[pk][2] = pack_bf16x2(p00, p01);
+                    p_frag[pk][3] = pack_bf16x2(p10, p11);
                 }
             }
         }
@@ -372,14 +369,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
             acc[n][3] *= alpha1;
         }
 
-        qus::kernels::async_copy_wait<0>(); // V(kb) landed; QK done reading k_s
+        qus::kernels::cp_wait<0>(); // V(kb) landed; QK done reading k_s
         __syncthreads();
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
             gqa_prefill_stage_kv(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
                                  padded_context, tid);
-            qus::kernels::async_copy_commit();
+            qus::kernels::cp_commit();
         }
 
         // O += P V, contracting over the Bc keys. The (k, n) iteration space is
@@ -392,7 +389,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
         // Swizzled V x4.trans addresses via precomputed per-lane base + immediates.
         unsigned vf[2][4];
         {
-            gqa_prefill_ldmatrix_x4_trans(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
+            ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
                                           gqa_prefill_swz_addr(v_lane_base, 0u, v_as, v_r));
         }
 #pragma unroll
@@ -405,24 +402,22 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
                 const int k2       = (li + 1) / PVHalf;
                 const int n2b      = ((li + 1) % PVHalf) * 2;
                 const unsigned ckv = static_cast<unsigned>(n2b << 4);
-                gqa_prefill_ldmatrix_x4_trans(
+                ldmatrix_x4_t(
                     vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
                     gqa_prefill_swz_addr(v_lane_base + static_cast<unsigned>(k2 * 8192), ckv, v_as,
                                          v_r));
             }
-            gqa_prefill_mma_m16n8k16_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3],
+            mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3],
                                           p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3],
                                           vf[cur][0], vf[cur][1]);
-            gqa_prefill_mma_m16n8k16_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2],
+            mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2],
                                           acc[n2 + 1][3], p_frag[k][0], p_frag[k][1], p_frag[k][2],
                                           p_frag[k][3], vf[cur][2], vf[cur][3]);
         }
     }
 
-    l0 += __shfl_xor_sync(FullMask, l0, 1);
-    l0 += __shfl_xor_sync(FullMask, l0, 2);
-    l1 += __shfl_xor_sync(FullMask, l1, 1);
-    l1 += __shfl_xor_sync(FullMask, l1, 2);
+    l0 = warp_sum<4>(l0, FullMask);
+    l1 = warp_sum<4>(l1, FullMask);
 
     // Normalize once per row via reciprocal-multiply instead of 128 IEEE divides.
     const float inv_l0 = (l0 > 0.0f) ? __frcp_rn(l0) : 0.0f;
@@ -434,11 +429,11 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
         const int qrow1 = q0 + warp_row0 + gid + 8;
         if (qrow0 < tokens) {
             *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index(q_head, d0, qrow0)]) =
-                gqa_prefill_pack_bf16(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
+                pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
         }
         if (qrow1 < tokens) {
             *reinterpret_cast<unsigned*>(&out[gqa_prefill_q_index(q_head, d0, qrow1)]) =
-                gqa_prefill_pack_bf16(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
+                pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
 }

@@ -42,7 +42,7 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Te
 
 void rope_nd_common_launch(const Tensor& positions, int rotary_dim, float theta, Tensor* q,
                            Tensor* k, cudaStream_t stream) {
-    constexpr int block    = 256;
+    constexpr int block    = 128;
     Tensor& sample         = q != nullptr ? *q : *k;
     const int T            = sample.ne[2];
     const auto elem_stride = [](const Tensor* tensor, int dim) -> std::int64_t {

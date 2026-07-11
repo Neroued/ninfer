@@ -46,33 +46,44 @@ __global__ void rope_nd_kernel(const std::int32_t* positions, std::int32_t axes,
                                std::int64_t k_stride_h, std::int64_t k_stride_t) {
     const std::int32_t t = static_cast<std::int32_t>(blockIdx.x);
     if (t >= T) { return; }
-    const int half        = rotary_dim / 2;
-    const int q_pairs     = q_heads * half;
-    const int total_pairs = q_pairs + k_heads * half;
-    for (int linear = static_cast<int>(threadIdx.x); linear < total_pairs;
-         linear += static_cast<int>(blockDim.x)) {
-        const bool is_q = linear < q_pairs;
-        const int local = is_q ? linear : linear - q_pairs;
-        const int pair  = local % half;
-        const int head  = local / half;
-        int axis        = 0;
-        float exponent  = 0.0f;
+    const int half = rotary_dim / 2;
+    __shared__ float cos_cache[kRopeHeadDim / 2];
+    __shared__ float sin_cache[kRopeHeadDim / 2];
+    if (threadIdx.x < static_cast<unsigned>(half)) {
+        const int pair = static_cast<int>(threadIdx.x);
+        int axis       = 0;
+        float exponent = 0.0f;
         rope_axis_frequency(axes, head_dim, rotary_dim, pair, &axis, &exponent);
         const float frequency = powf(theta, exponent);
         const float angle =
             static_cast<float>(positions[static_cast<std::int64_t>(axis) * T + t]) * frequency;
-        const float c               = cosf(angle);
-        const float s               = sinf(angle);
+        cos_cache[pair] = cosf(angle);
+        sin_cache[pair] = sinf(angle);
+    }
+    __syncthreads();
+
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int warp        = static_cast<int>(threadIdx.x) >> 5;
+    const int block_warps = static_cast<int>(blockDim.x) >> 5;
+    const int total_heads = q_heads + k_heads;
+    for (int combined_head = warp; combined_head < total_heads; combined_head += block_warps) {
+        const bool is_q             = combined_head < q_heads;
+        const int head              = is_q ? combined_head : combined_head - q_heads;
         __nv_bfloat16* data         = is_q ? q : k;
         const std::int64_t stride_d = is_q ? q_stride_d : k_stride_d;
         const std::int64_t stride_h = is_q ? q_stride_h : k_stride_h;
         const std::int64_t stride_t = is_q ? q_stride_t : k_stride_t;
-        __nv_bfloat16* first        = rope_ptr(data, stride_d, stride_h, stride_t, pair, head, t);
-        __nv_bfloat16* second = rope_ptr(data, stride_d, stride_h, stride_t, pair + half, head, t);
-        const float x1        = __bfloat162float(*first);
-        const float x2        = __bfloat162float(*second);
-        *first                = __float2bfloat16_rn(x1 * c - x2 * s);
-        *second               = __float2bfloat16_rn(x2 * c + x1 * s);
+        for (int pair = lane; pair < half; pair += 32) {
+            __nv_bfloat16* first = rope_ptr(data, stride_d, stride_h, stride_t, pair, head, t);
+            __nv_bfloat16* second =
+                rope_ptr(data, stride_d, stride_h, stride_t, pair + half, head, t);
+            const float x1 = __bfloat162float(*first);
+            const float x2 = __bfloat162float(*second);
+            const float c  = cos_cache[pair];
+            const float s  = sin_cache[pair];
+            *first         = __float2bfloat16_rn(x1 * c - x2 * s);
+            *second        = __float2bfloat16_rn(x2 * c + x1 * s);
+        }
     }
 }
 

@@ -42,6 +42,8 @@ Embedding lookup. Dense BF16 copy and Q6 row-split dequant-gather are internal q
 ```cpp
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps,
              bool unit_offset, Tensor& out, cudaStream_t stream);
+void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias,
+                float eps, Tensor& out, cudaStream_t stream);
 void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream);
 
 void rope(const Tensor& positions, int rotary_dim, float theta,
@@ -49,6 +51,11 @@ void rope(const Tensor& positions, int rotary_dim, float theta,
 void rope(const Tensor& positions, int rotary_dim, float theta,
           Tensor& q, Tensor& k, cudaStream_t stream);
 ```
+
+`layer_norm` is the affine Vision normalization primitive. It uses FP32 mean/variance and affine
+math and emits BF16. `rope` dispatches the fixed Qwen3.6 Text 1-D, Text three-axis MRoPE, and Vision
+two-axis layouts from the position rank and tensor shape. Vision Q/K may be strided views into the
+packed QKV projection.
 
 The unary `rope` overload infers Q/K specialization from the head-count shape. The two-tensor
 overload preserves the combined Q+K launch.
@@ -59,10 +66,17 @@ overload preserves the combined Q+K launch.
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                    const Tensor& positions, float scale, KVCache& kv, int layer,
                    WorkspaceArena& ws, Tensor& out, cudaStream_t stream);
+void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                      const Tensor& cu_seqlens, WorkspaceArena& ws,
+                      Tensor& out, cudaStream_t stream);
 ```
 
 Appends K/V and computes causal grouped-query attention. T-regime and BF16/I8 KV-cache dispatch are
 internal. Prompt-only cache append and cached-attention decomposition are not public operators.
+
+`vision_attention` is separate because it is packed non-causal MHA with 16 equal Q/K/V heads,
+head dimension 72, independent `cu_seqlens` segments, and no KV cache. Its workspace does not grow
+with the square of segment length.
 
 ### GDN recurrence
 
@@ -101,10 +115,19 @@ publication.
 void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream);
 void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream);
 void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream);
+void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream);
+void gelu(Tensor& x, GeluMode mode, cudaStream_t stream);
+void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream);
+void vision_pos_embed_add(const Tensor& table, const Tensor& indices,
+                          const Tensor& weights, Tensor& x, cudaStream_t stream);
 void argmax(const Tensor& logits, Tensor& out, cudaStream_t stream);
 void sample(const Tensor& logits, Tensor& out, const SamplingConfig* config,
             const std::int32_t* pos_base, std::int32_t purpose, cudaStream_t stream);
 ```
+
+`vision_pos_embed_add` explicitly names its fused residual semantics: four-corner interpolated
+positions are rounded to BF16 before the BF16 residual add. `scatter` overwrites destination
+columns and is used to inject merger output into image/video placeholder positions.
 
 ## 3. Public fused operators
 
@@ -143,6 +166,7 @@ The following declarations live under `src/model/`, not `include/qus/kernels/`:
 - `gqa_prompt_ops.h`: prompt-only KV append and cached attention for the MTP schedule;
 - `mtp_ops.h`: MTP packing, verification-input preparation, accept/commit, remapping, counters,
   and GDN snapshot-slot updates.
+- `vision_ops.h`: processor-grid control metadata and the fixed F32-patch to BF16 upload cast.
 
 They remain CUDA wrappers but are not part of the reusable L1 operator contract.
 

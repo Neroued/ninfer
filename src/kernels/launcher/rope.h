@@ -17,4 +17,9 @@ void rope_q_launch(const Tensor& positions, int rotary_dim, float theta, Tensor&
 void rope_k_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& k,
                    cudaStream_t stream);
 
+void rope_nd_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
+                    cudaStream_t stream);
+void rope_nd_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
+                           cudaStream_t stream);
+
 } // namespace qus::kernels::detail

@@ -4,6 +4,7 @@
 #include "qus/kernels/rope.h"
 #include "kernels/op_tester.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -270,6 +271,123 @@ int split_api_parity_case(std::int32_t T, std::uint32_t seed) {
     return f;
 }
 
+void cpu_rope_nd(const std::vector<float>& input, const std::vector<int>& positions, int axes,
+                 int head_dim, int heads, int tokens, int rotary_dim, float theta,
+                 std::vector<double>& output) {
+    output.assign(input.begin(), input.end());
+    const int half = rotary_dim / 2;
+    for (int token = 0; token < tokens; ++token) {
+        for (int head = 0; head < heads; ++head) {
+            for (int pair = 0; pair < half; ++pair) {
+                int axis;
+                double exponent;
+                if (axes == 2) {
+                    axis     = pair / 18;
+                    exponent = -2.0 * static_cast<double>(pair % 18) / 36.0;
+                } else {
+                    axis     = axes == 3 ? pair % 3 : 0;
+                    exponent = -2.0 * static_cast<double>(pair) / rotary_dim;
+                }
+                const double frequency = std::pow(static_cast<double>(theta), exponent);
+                const double angle =
+                    static_cast<double>(positions[axis * tokens + token]) * frequency;
+                const std::size_t base =
+                    (static_cast<std::size_t>(token) * heads + head) * head_dim;
+                const double first         = input[base + pair];
+                const double second        = input[base + pair + half];
+                output[base + pair]        = first * std::cos(angle) - second * std::sin(angle);
+                output[base + pair + half] = second * std::cos(angle) + first * std::sin(angle);
+            }
+        }
+    }
+}
+
+int text_mrope_case() {
+    constexpr int tokens = 7;
+    std::vector<float> q(tensor_size(kQHeads, tokens));
+    std::vector<float> k(tensor_size(kKHeads, tokens));
+    std::vector<int> positions(3 * tokens);
+    fill_uniform(q, 3001u, -8.0f, 8.0f);
+    fill_uniform(k, 3002u, -8.0f, 8.0f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    for (int token = 0; token < tokens; ++token) {
+        positions[token]              = 10 + token;
+        positions[tokens + token]     = 20 + token * 2;
+        positions[2 * tokens + token] = 30 + token * 3;
+    }
+    std::vector<double> q_ref;
+    std::vector<double> k_ref;
+    cpu_rope_nd(q, positions, 3, kHeadDim, kQHeads, tokens, kRotaryDim, kTheta, q_ref);
+    cpu_rope_nd(k, positions, 3, kHeadDim, kKHeads, tokens, kRotaryDim, kTheta, k_ref);
+    DBuf dpos = to_device_i32(positions);
+    DBuf dq   = to_device_bf16(q);
+    DBuf dk   = to_device_bf16(k);
+    Tensor tpos(dpos.p, DType::I32, {tokens, 3});
+    Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, tokens});
+    kernels::rope(tpos, kRotaryDim, kTheta, tq, tk, nullptr);
+    cudaDeviceSynchronize();
+    int failures = 0;
+    failures += verify("text MRoPE q", from_device_bf16(dq, q.size()), q_ref,
+                       Tolerance::bf16_elementwise());
+    failures += verify("text MRoPE k", from_device_bf16(dk, k.size()), k_ref,
+                       Tolerance::bf16_elementwise());
+    return failures;
+}
+
+int vision_rope_packed_case() {
+    constexpr int head_dim = 72;
+    constexpr int heads    = 16;
+    constexpr int tokens   = 11;
+    constexpr int hidden   = head_dim * heads;
+    constexpr int qkv      = hidden * 3;
+    std::vector<float> q(static_cast<std::size_t>(tokens) * hidden);
+    std::vector<float> k(static_cast<std::size_t>(tokens) * hidden);
+    std::vector<float> packed(static_cast<std::size_t>(tokens) * qkv, 0.0f);
+    std::vector<int> positions(2 * tokens);
+    fill_uniform(q, 4001u, -8.0f, 8.0f);
+    fill_uniform(k, 4002u, -8.0f, 8.0f);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    for (int token = 0; token < tokens; ++token) {
+        positions[token]          = token / 4;
+        positions[tokens + token] = token % 4;
+        std::copy_n(q.data() + static_cast<std::size_t>(token) * hidden, hidden,
+                    packed.data() + static_cast<std::size_t>(token) * qkv);
+        std::copy_n(k.data() + static_cast<std::size_t>(token) * hidden, hidden,
+                    packed.data() + static_cast<std::size_t>(token) * qkv + hidden);
+    }
+    std::vector<double> q_ref;
+    std::vector<double> k_ref;
+    cpu_rope_nd(q, positions, 2, head_dim, heads, tokens, head_dim, 10000.0f, q_ref);
+    cpu_rope_nd(k, positions, 2, head_dim, heads, tokens, head_dim, 10000.0f, k_ref);
+    DBuf dpacked = to_device_bf16(packed);
+    DBuf dpos    = to_device_i32(positions);
+    Tensor tq(dpacked.p, DType::BF16, {head_dim, heads, tokens});
+    tq.nb[2]  = qkv * 2;
+    Tensor tk = tq;
+    tk.data   = static_cast<unsigned char*>(dpacked.p) + hidden * 2;
+    Tensor tpos(dpos.p, DType::I32, {tokens, 2});
+    kernels::rope(tpos, head_dim, 10000.0f, tq, tk, nullptr);
+    cudaDeviceSynchronize();
+    const std::vector<std::uint16_t> bits = from_device_bf16_bits(dpacked, packed.size());
+    std::vector<double> q_got(q.size());
+    std::vector<double> k_got(k.size());
+    for (int token = 0; token < tokens; ++token) {
+        for (int i = 0; i < hidden; ++i) {
+            q_got[static_cast<std::size_t>(token) * hidden + i] =
+                bf16_to_f32(bits[static_cast<std::size_t>(token) * qkv + i]);
+            k_got[static_cast<std::size_t>(token) * hidden + i] =
+                bf16_to_f32(bits[static_cast<std::size_t>(token) * qkv + hidden + i]);
+        }
+    }
+    int failures = 0;
+    failures += verify("vision RoPE packed q", q_got, q_ref, Tolerance::bf16_elementwise());
+    failures += verify("vision RoPE packed k", k_got, k_ref, Tolerance::bf16_elementwise());
+    return failures;
+}
+
 template <typename Fn>
 int expect_invalid(const char* label, Fn&& fn) {
     try {
@@ -421,6 +539,8 @@ int main() {
     f += split_api_parity_case(1, 2001u);
     f += split_api_parity_case(7, 2007u);
     f += split_api_parity_case(1024, 2024u);
+    f += text_mrope_case();
+    f += vision_rope_packed_case();
 
     std::cout << (f ? "FAIL" : "OK") << " rope correctness\n";
     return f ? 1 : 0;

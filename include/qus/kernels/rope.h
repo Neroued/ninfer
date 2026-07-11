@@ -1,7 +1,7 @@
 #pragma once
 
-// qus::kernels - partial NeoX RoPE over q=[256,24,T] and k=[256,4,T], in place.
-// Rotates the first rotary_dim channels and leaves remaining head dimensions untouched.
+// In-place Qwen3.6 RoPE. Dispatches Text 1-D [T], Text MRoPE [T,3], and
+// Vision 2-D [T,2] from position rank and fixed model tensor shapes.
 
 #include "qus/core/tensor.h"
 

@@ -40,18 +40,6 @@ std::int32_t checked_workspace_floats(std::size_t bytes) {
     return static_cast<std::int32_t>(floats);
 }
 
-struct ArenaScope {
-    WorkspaceArena& ws;
-    std::size_t mark;
-
-    explicit ArenaScope(WorkspaceArena& arena) : ws(arena), mark(arena.mark()) {}
-
-    ~ArenaScope() { ws.rewind(mark); }
-
-    ArenaScope(const ArenaScope&)            = delete;
-    ArenaScope& operator=(const ArenaScope&) = delete;
-};
-
 } // namespace
 
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
@@ -68,7 +56,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     require_dense_bf16(a_weight, "a_weight");
     require_dense_bf16(b_weight, "b_weight");
 
-    ArenaScope arena_scope(ws);
+    auto scratch_scope = ws.scope();
     const std::size_t workspace_bytes =
         detail::linear_dense_gdn_in_ab_gated_48_workspace_bytes(tokens);
     Tensor workspace;

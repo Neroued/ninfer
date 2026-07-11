@@ -94,32 +94,49 @@ int main() {
     failures += expect_size(arena.used(), 81, "arena.used after second allocation");
     failures += expect_size(arena.peak_used(), 81, "arena.peak after second allocation");
 
-    const std::size_t mark = arena.mark();
-    qus::Tensor transient  = arena.alloc(qus::DType::U8, {11}, 128);
-    if (arena.used() <= mark) {
-        ++failures;
-        std::cerr << "transient allocation did not advance arena mark\n";
+    const std::size_t used_before_scope = arena.used();
+    void* transient_ptr                 = nullptr;
+    std::size_t peak_after_transient    = 0;
+    {
+        auto outer_scope       = arena.scope();
+        qus::Tensor transient  = arena.alloc(qus::DType::U8, {11}, 128);
+        transient_ptr          = transient.data;
+        const std::size_t used = arena.used();
+        if (used <= used_before_scope) {
+            ++failures;
+            std::cerr << "transient allocation did not advance arena cursor\n";
+        }
+        {
+            auto inner_scope = arena.scope();
+            (void)arena.alloc(qus::DType::U8, {7}, 64);
+        }
+        failures += expect_size(arena.used(), used, "arena.used after nested scope");
+        peak_after_transient = arena.peak_used();
     }
-    failures += expect_size(arena.peak_used(), arena.used(), "arena.peak after transient");
-    const std::size_t peak_after_transient = arena.peak_used();
-    arena.rewind(mark);
-    failures += expect_size(arena.peak_used(), peak_after_transient, "arena.peak after rewind");
-    failures += expect_size(arena.used(), mark, "arena.used after rewind");
+    failures += expect_size(arena.peak_used(), peak_after_transient, "arena.peak after scope exit");
+    failures += expect_size(arena.used(), used_before_scope, "arena.used after scope exit");
     qus::Tensor reused = arena.alloc(qus::DType::U8, {5}, 128);
-    failures += expect_ptr(reused.data, transient.data, "allocation after rewind pointer");
-    const std::size_t used_before_future_rewind = arena.used();
-    arena.rewind(arena.capacity());
+    failures += expect_ptr(reused.data, transient_ptr, "allocation after scope pointer");
+
+    const std::size_t used_before_exception_scope = arena.used();
+    failures += expect_throws<std::runtime_error>(
+        [&] {
+            auto exception_scope = arena.scope();
+            (void)arena.alloc(qus::DType::U8, {9}, 64);
+            throw std::runtime_error("scope unwind");
+        },
+        "arena scope exception");
     failures +=
-        expect_size(arena.used(), used_before_future_rewind, "arena.used after future rewind");
+        expect_size(arena.used(), used_before_exception_scope, "arena.used after exception scope");
 
     const std::size_t used_before_failures = arena.used();
     const std::size_t peak_before_failures = arena.peak_used();
     failures += expect_throws<std::invalid_argument>(
         [&] { (void)arena.alloc(qus::DType::U8, {1}, 3); }, "invalid alignment");
-    failures += expect_size(arena.used(), used_before_failures,
-                            "arena.used after invalid alignment");
-    failures += expect_size(arena.peak_used(), peak_before_failures,
-                            "arena.peak after invalid alignment");
+    failures +=
+        expect_size(arena.used(), used_before_failures, "arena.used after invalid alignment");
+    failures +=
+        expect_size(arena.peak_used(), peak_before_failures, "arena.peak after invalid alignment");
     failures += expect_throws<std::bad_alloc>(
         [&] { (void)arena.alloc(qus::DType::FP32, {300}, 256); }, "arena oom");
     failures += expect_size(arena.used(), used_before_failures, "arena.used after oom");

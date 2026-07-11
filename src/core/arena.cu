@@ -53,6 +53,18 @@ void free_pinned(void*& ptr) noexcept {
 
 } // namespace
 
+DeviceArena::Scope::Scope(DeviceArena& arena) noexcept
+    : arena_(&arena), saved_offset_(arena.off_) {}
+
+DeviceArena::Scope::~Scope() noexcept {
+    if (arena_ != nullptr && saved_offset_ <= arena_->off_) { arena_->off_ = saved_offset_; }
+}
+
+DeviceArena::Scope::Scope(Scope&& other) noexcept
+    : arena_(other.arena_), saved_offset_(other.saved_offset_) {
+    other.arena_ = nullptr;
+}
+
 DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     if (capacity_bytes == 0) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
@@ -125,11 +137,7 @@ Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape
     return Tensor(ptr, dtype, shape);
 }
 
-std::size_t DeviceArena::mark() const noexcept { return off_; }
-
-void DeviceArena::rewind(std::size_t mark) noexcept {
-    if (mark <= off_) { off_ = mark; }
-}
+DeviceArena::Scope DeviceArena::scope() noexcept { return Scope(*this); }
 
 void DeviceArena::reset() noexcept { off_ = 0; }
 

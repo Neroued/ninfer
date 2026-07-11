@@ -43,10 +43,10 @@ A wrapper performs these steps in order:
 
 1. Validate dtype, shape, layout, contiguity, data pointers, and operator invariants.
 2. Return for supported empty inputs where the operator contract allows them.
-3. Mark any `WorkspaceArena` scope and allocate temporary tensors.
+3. Open a `WorkspaceArena::scope()` and allocate temporary tensors.
 4. Classify qtype, registered shape, T regime, cache dtype, or state form.
 5. Call the selected private launcher.
-6. Rewind temporary workspace before returning.
+6. Let the lexical scope restore the workspace cursor on normal or exceptional exit.
 
 There is no public phase enum and no dispatcher object. The wrapper derives execution policy from
 the tensors and state-form overload selected by the caller.

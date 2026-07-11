@@ -199,7 +199,10 @@ struct GdnState {                // sized for 48 GDN layers
 
 ### 5.5 WorkspaceArena
 The bump-reset arena (§3) over the Workspace region; kernels request typed scratch `Tensor`s;
-the model card calls `reset()` at the end of each prefill/decode step.
+temporary lifetimes use the arena-owned RAII guard returned by `scope()`, including nested scopes.
+Raw cursor marks and rewinds are not public. The model card calls `reset()` at the end of each
+prefill/decode step. Scope destruction only restores the host cursor; it does not synchronize CUDA,
+so reuse remains ordered by the owning stream.
 
 ---
 

@@ -11,6 +11,24 @@ namespace qus {
 
 class DeviceArena {
 public:
+    class Scope {
+    public:
+        ~Scope() noexcept;
+
+        Scope(const Scope&)            = delete;
+        Scope& operator=(const Scope&) = delete;
+        Scope(Scope&& other) noexcept;
+        Scope& operator=(Scope&&) = delete;
+
+    private:
+        friend class DeviceArena;
+
+        explicit Scope(DeviceArena& arena) noexcept;
+
+        DeviceArena* arena_       = nullptr;
+        std::size_t saved_offset_ = 0;
+    };
+
     explicit DeviceArena(std::size_t capacity_bytes);
     ~DeviceArena();
 
@@ -20,8 +38,7 @@ public:
     DeviceArena& operator=(DeviceArena&& other) noexcept;
 
     Tensor alloc(DType dtype, std::initializer_list<std::int32_t> shape, std::size_t align = 256);
-    std::size_t mark() const noexcept;
-    void rewind(std::size_t mark) noexcept;
+    [[nodiscard]] Scope scope() noexcept;
     void reset() noexcept;
 
     void* base() const noexcept;

@@ -47,11 +47,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
         return;
     }
 
-    const std::size_t mark = ws.mark();
-    Tensor gate_up         = ws.alloc(DType::BF16, {34816, t});
+    auto scratch_scope = ws.scope();
+    Tensor gate_up     = ws.alloc(DType::BF16, {34816, t});
     linear(x, gate_up_weight, gate_up, ws, stream);
     silu_mul(gate_up.slice(0, 0, 17408), gate_up.slice(0, 17408, 17408), out, stream);
-    ws.rewind(mark);
 }
 
 } // namespace qus::kernels

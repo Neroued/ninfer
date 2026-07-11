@@ -530,12 +530,11 @@ void Qwen3_6_27B::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 void Qwen3_6_27B::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                                    Tensor& mtp_hidden) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
-    const std::size_t mark = work_.mark();
+    auto scratch_scope = work_.scope();
     Tensor x;
     Tensor ah;
     mtp_forward_stem(ids, hidden, x, ah);
     mtp_forward_tail(x, ah, positions, mtp_hidden);
-    work_.rewind(mark);
 }
 
 void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
@@ -559,8 +558,8 @@ void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP final prefill draft token");
     }
 
-    cudaStream_t s         = ctx_.stream;
-    const std::size_t mark = work_.mark();
+    cudaStream_t s     = ctx_.stream;
+    auto scratch_scope = work_.scope();
     Tensor x_last;
     Tensor ah_last;
     if (final_chunk) {
@@ -568,33 +567,35 @@ void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ah_last = work_.alloc(DType::BF16, {kCfg.hidden, 1});
     }
 
-    const std::size_t bulk_mark = work_.mark();
-    Tensor x;
-    Tensor ah;
-    mtp_forward_stem(ids, hidden, x, ah);
+    {
+        auto bulk_scope = work_.scope();
+        Tensor x;
+        Tensor ah;
+        mtp_forward_stem(ids, hidden, x, ah);
 
-    Tensor k_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
-    Tensor v_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
-    kernels::linear_pair(ah, *mtp_.k_proj, *mtp_.v_proj, k_flat, v_flat, work_, s);
-    Tensor k  = k_flat.view({kCfg.head_dim, kCfg.n_kv, T});
-    Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
-    Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
-    kernels::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
-    kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
-    kernels::gqa_kv_append(kn, v, positions, *mtp_kv_, 0, s);
+        Tensor k_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
+        Tensor v_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
+        kernels::linear_pair(ah, *mtp_.k_proj, *mtp_.v_proj, k_flat, v_flat, work_, s);
+        Tensor k  = k_flat.view({kCfg.head_dim, kCfg.n_kv, T});
+        Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
+        Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
+        kernels::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
+        kernels::rope(positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
+        kernels::gqa_kv_append(kn, v, positions, *mtp_kv_, 0, s);
 
-    if (final_chunk) {
-        const std::size_t column_bytes =
-            static_cast<std::size_t>(kCfg.hidden) * dtype_size(DType::BF16);
-        const auto* x_src = static_cast<const unsigned char*>(x.data) +
-                            static_cast<std::size_t>(T - 1) * column_bytes;
-        const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
-                             static_cast<std::size_t>(T - 1) * column_bytes;
-        CUDA_CHECK(cudaMemcpyAsync(x_last.data, x_src, column_bytes, cudaMemcpyDeviceToDevice, s));
-        CUDA_CHECK(
-            cudaMemcpyAsync(ah_last.data, ah_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+        if (final_chunk) {
+            const std::size_t column_bytes =
+                static_cast<std::size_t>(kCfg.hidden) * dtype_size(DType::BF16);
+            const auto* x_src = static_cast<const unsigned char*>(x.data) +
+                                static_cast<std::size_t>(T - 1) * column_bytes;
+            const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
+                                 static_cast<std::size_t>(T - 1) * column_bytes;
+            CUDA_CHECK(
+                cudaMemcpyAsync(x_last.data, x_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+            CUDA_CHECK(
+                cudaMemcpyAsync(ah_last.data, ah_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+        }
     }
-    work_.rewind(bulk_mark);
 
     if (final_chunk) {
         Tensor q_flat    = work_.alloc(DType::BF16, {kCfg.q_size, 1});
@@ -629,7 +630,6 @@ void Qwen3_6_27B::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         kernels::rmsnorm(x_last, *mtp_.norm, kCfg.rms_eps, true, *final_hidden, s);
         mtp_draft_argmax(*final_hidden, *logits, *draft_token);
     }
-    work_.rewind(mark);
 }
 
 void Qwen3_6_27B::mtp_draft_argmax(const Tensor& hidden_col, Tensor& logits, Tensor& draft_token) {
@@ -669,10 +669,9 @@ void Qwen3_6_27B::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     mtp_forward_core(ids, hidden, positions, mtp_hidden);
 
     if (logits_column >= 0) {
-        const std::size_t logits_mark = work_.mark();
-        Tensor col                    = mtp_hidden.slice(1, logits_column, 1);
+        auto logits_scope = work_.scope();
+        Tensor col        = mtp_hidden.slice(1, logits_column, 1);
         mtp_draft_argmax(col, *logits, *draft_token);
-        work_.rewind(logits_mark);
     }
 }
 
@@ -688,9 +687,8 @@ void Qwen3_6_27B::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
 
     mtp_forward_core(token, previous_hidden, position, mtp_hidden);
-    const std::size_t logits_mark = work_.mark();
+    auto logits_scope = work_.scope();
     mtp_draft_argmax(mtp_hidden, logits, draft_token);
-    work_.rewind(logits_mark);
 }
 
 void Qwen3_6_27B::mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Tensor& row,
@@ -707,10 +705,9 @@ void Qwen3_6_27B::mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Ten
     require_tensor_shape(logits, DType::BF16, {kCfg.vocab, 1}, "MTP sample logits");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP sample draft token");
 
-    const std::size_t mark = work_.mark();
+    auto scratch_scope = work_.scope();
     kernels::mtp_gather_hidden_row(mtp_hidden, row, out_hidden, ctx_.stream);
     mtp_draft_argmax(out_hidden, logits, draft_token);
-    work_.rewind(mark);
 }
 
 void Qwen3_6_27B::target_verify(const Tensor& ids, const Tensor& positions) {
@@ -931,27 +928,31 @@ template <class Tap>
 void Qwen3_6_27B::run_layers(Tensor& x, Phase ph, Tap& tap) {
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
-            const int fidx               = ModelConfig::full_idx(layer);
-            const FullLayerW& full       = full_.at(static_cast<std::size_t>(fidx));
-            const std::size_t mixer_mark = work_.mark();
-            attn_mix(full, x, fidx, ph);
-            if constexpr (Tap::enabled) { tap(TapId::AfterMixer, layer, ph, x, ctx_.stream); }
-            work_.rewind(mixer_mark);
-            const std::size_t mlp_mark = work_.mark();
-            mlp_tail(full.post_attn_norm, full.mlp, x, ph);
-            if constexpr (Tap::enabled) { tap(TapId::AfterMlp, layer, ph, x, ctx_.stream); }
-            work_.rewind(mlp_mark);
+            const int fidx         = ModelConfig::full_idx(layer);
+            const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
+            {
+                auto mixer_scope = work_.scope();
+                attn_mix(full, x, fidx, ph);
+                if constexpr (Tap::enabled) { tap(TapId::AfterMixer, layer, ph, x, ctx_.stream); }
+            }
+            {
+                auto mlp_scope = work_.scope();
+                mlp_tail(full.post_attn_norm, full.mlp, x, ph);
+                if constexpr (Tap::enabled) { tap(TapId::AfterMlp, layer, ph, x, ctx_.stream); }
+            }
         } else {
-            const int gidx               = ModelConfig::gdn_idx(layer);
-            const GdnLayerW& gdn         = gdn_.at(static_cast<std::size_t>(gidx));
-            const std::size_t mixer_mark = work_.mark();
-            gdn_mix(gdn, x, gidx, ph);
-            if constexpr (Tap::enabled) { tap(TapId::AfterMixer, layer, ph, x, ctx_.stream); }
-            work_.rewind(mixer_mark);
-            const std::size_t mlp_mark = work_.mark();
-            mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
-            if constexpr (Tap::enabled) { tap(TapId::AfterMlp, layer, ph, x, ctx_.stream); }
-            work_.rewind(mlp_mark);
+            const int gidx       = ModelConfig::gdn_idx(layer);
+            const GdnLayerW& gdn = gdn_.at(static_cast<std::size_t>(gidx));
+            {
+                auto mixer_scope = work_.scope();
+                gdn_mix(gdn, x, gidx, ph);
+                if constexpr (Tap::enabled) { tap(TapId::AfterMixer, layer, ph, x, ctx_.stream); }
+            }
+            {
+                auto mlp_scope = work_.scope();
+                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
+                if constexpr (Tap::enabled) { tap(TapId::AfterMlp, layer, ph, x, ctx_.stream); }
+            }
         }
     }
 }

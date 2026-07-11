@@ -18,18 +18,6 @@ constexpr std::int32_t kQHeads  = 24;
 constexpr std::int32_t kKVHeads = 4;
 constexpr float kExpectedScale  = 0.0625f;
 
-struct ArenaScope {
-    WorkspaceArena& ws;
-    std::size_t mark;
-
-    explicit ArenaScope(WorkspaceArena& arena) : ws(arena), mark(arena.mark()) {}
-
-    ~ArenaScope() { ws.rewind(mark); }
-
-    ArenaScope(const ArenaScope&)            = delete;
-    ArenaScope& operator=(const ArenaScope&) = delete;
-};
-
 std::int32_t checked_i32(std::uint32_t value, const char* op, const char* name) {
     if (value > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error(std::string(op) + ": " + name + " exceeds int32");
@@ -154,7 +142,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         throw std::overflow_error("gqa_attention: T exceeds int32");
     }
 
-    ArenaScope arena_scope(ws);
+    auto scratch_scope = ws.scope();
     Tensor partial_acc;
     Tensor partial_m;
     Tensor partial_l;

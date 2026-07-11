@@ -55,11 +55,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
         return;
     }
 
-    const std::size_t mark = ws.mark();
-    Tensor linear_out      = ws.alloc(DType::BF16, {w.n, t});
+    auto scratch_scope = ws.scope();
+    Tensor linear_out  = ws.alloc(DType::BF16, {w.n, t});
     linear(x, w, linear_out, ws, stream);
     residual_add(linear_out, residual_out, stream);
-    ws.rewind(mark);
 }
 
 } // namespace qus::kernels

@@ -135,18 +135,6 @@ std::int32_t checked_arena_floats(std::size_t bytes) {
     return static_cast<std::int32_t>(floats);
 }
 
-struct ArenaScope {
-    WorkspaceArena& ws;
-    std::size_t mark;
-
-    explicit ArenaScope(WorkspaceArena& arena) : ws(arena), mark(arena.mark()) {}
-
-    ~ArenaScope() { ws.rewind(mark); }
-
-    ArenaScope(const ArenaScope&)            = delete;
-    ArenaScope& operator=(const ArenaScope&) = delete;
-};
-
 } // namespace
 
 void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -179,7 +167,7 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
                       cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
 
-    ArenaScope arena_scope(ws);
+    auto scratch_scope        = ws.scope();
     const std::int32_t T      = q.ne[2];
     const std::int32_t T_full = (T / kChunkSize) * kChunkSize;
     if (T_full > 0) {

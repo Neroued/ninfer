@@ -76,9 +76,9 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& v_we
     require_rowsplit(v_weight, QType::Q5G64_F16S, kVRows, kHidden, "GDN v weight");
 
     if (t <= 16) {
-        const std::size_t mark = ws.mark();
-        Tensor qk              = ws.alloc(DType::BF16, {kQkRows, t});
-        Tensor vv              = ws.alloc(DType::BF16, {kVRows, t});
+        auto scratch_scope = ws.scope();
+        Tensor qk          = ws.alloc(DType::BF16, {kQkRows, t});
+        Tensor vv          = ws.alloc(DType::BF16, {kVRows, t});
         linear(x, qk_weight, qk, ws, stream);
         linear(x, v_weight, vv, ws, stream);
         CUDA_CHECK(cudaMemcpy2DAsync(qkv.data, static_cast<std::size_t>(kRows) * 2, qk.data,
@@ -90,7 +90,6 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& v_we
                                      static_cast<std::size_t>(kVRows) * 2,
                                      static_cast<std::size_t>(kVRows) * 2, t,
                                      cudaMemcpyDeviceToDevice, stream));
-        ws.rewind(mark);
         return;
     }
     detail::linear_rowsplit_gdn_input_grouped_mma_launch(x, qk_weight, v_weight, qkv, stream);

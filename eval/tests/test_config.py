@@ -35,9 +35,16 @@ class ConfigTest(unittest.TestCase):
     def test_loads_strict_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            config = load_config(self.write(BASE.format(runs_dir=root / "runs"), root))
+            text = BASE.replace(
+                "target: api",
+                "target: api\n        generation:\n          parallel_tool_calls: true",
+            )
+            config = load_config(self.write(text.format(runs_dir=root / "runs"), root))
             self.assertEqual(config.target("api").max_concurrency, 2)
             self.assertEqual(config.suite("test").jobs[0].backend, "mock")
+            self.assertTrue(
+                config.suite("test").jobs[0].generation["parallel_tool_calls"]
+            )
 
     def test_rejects_literal_api_key(self):
         with tempfile.TemporaryDirectory() as tmp:

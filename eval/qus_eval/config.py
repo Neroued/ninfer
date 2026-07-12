@@ -201,6 +201,7 @@ class JobConfig:
             "stream",
             "frequency_penalty",
             "presence_penalty",
+            "parallel_tool_calls",
             "stop_seqs",
             "extra_body",
         }

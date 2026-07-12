@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import time
@@ -100,6 +101,46 @@ class EvalScopeBackendTest(unittest.TestCase):
             self.assertEqual(result.metrics["accuracy"], 1.0)
             self.assertEqual(result.metrics["multi_turn"], 1.0)
             self.assertNotIn("overall", result.metrics)
+
+    def test_normalization_surfaces_provider_errors_wrapped_by_bfcl(self):
+        backend = EvalScopeBackend()
+        job = JobConfig(
+            "bfcl",
+            "evalscope",
+            "bfcl_v4",
+            "api",
+            1,
+            1,
+            1,
+            {},
+            {"subset_list": ["simple_python"]},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp) / "backends" / "bfcl"
+            predictions = job_dir / "predictions" / "model"
+            predictions.mkdir(parents=True)
+            wrapped = {
+                "error": "Error code: 400",
+                "error_message": "provider traceback",
+            }
+            record = {
+                "model_output": {
+                    "error": None,
+                    "choices": [{"message": {"content": json.dumps(wrapped)}}],
+                }
+            }
+            (predictions / "bfcl.jsonl").write_text(
+                json.dumps(record) + "\n", encoding="utf-8"
+            )
+            context = RunContext(
+                "run", job, job_dir, None, 1, threading.Event(), False, WorkPlan(1)
+            )
+            raw = {"bfcl_v4": {"score": 0.0, "num": 1, "metrics": []}}
+            result = backend.normalize(
+                context, BackendRun(time.monotonic(), time.monotonic(), raw)
+            )
+            self.assertEqual(result.counts.completed, 1)
+            self.assertEqual(result.counts.failed, 1)
 
     def test_bfcl_task_snapshot_does_not_contain_serpapi_secret(self):
         backend = EvalScopeBackend()

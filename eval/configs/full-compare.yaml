@@ -1,0 +1,209 @@
+schema_version: 1
+
+targets:
+  qus_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.6-27b
+    max_concurrency: 1
+    request: &request
+      timeout_seconds: 3600
+      retries: 2
+      retry_interval_seconds: 10
+
+  llama_latency_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.6-27b
+    max_concurrency: 1
+    request: *request
+
+  llama_capacity_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.6-27b
+    max_concurrency: 2
+    request: *request
+
+suites:
+  qus_smoke:
+    jobs:
+      - &aime25_smoke
+        id: aime25_smoke
+        backend: evalscope
+        dataset: aime25
+        target: qus_api
+        limit: 2
+        generation: &reasoning_generation
+          temperature: 0.6
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 1.0
+          frequency_penalty: 0.0
+          max_tokens: 65000
+          seed: 42
+        backend_args:
+          judge_strategy: rule
+      - &aime26_smoke
+        id: aime26_smoke
+        backend: evalscope
+        dataset: aime26
+        target: qus_api
+        limit: 2
+        generation: *reasoning_generation
+        backend_args:
+          judge_strategy: rule
+      - &gpqa_smoke
+        id: gpqa_diamond_smoke
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: qus_api
+        limit: 2
+        generation: *reasoning_generation
+      - &bfcl_smoke
+        id: bfcl_v4_smoke
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qus_api
+        limit: 2
+        generation: &bfcl_generation
+          temperature: 0
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          max_tokens: 8192
+          seed: 42
+          parallel_tool_calls: true
+        backend_args:
+          subset_list:
+            - simple_python
+            - multiple
+            - parallel
+            - irrelevance
+            - multi_turn_base
+          is_fc_model: true
+          underscore_to_dot: true
+
+  llama_latency_smoke:
+    jobs:
+      - <<: *aime25_smoke
+        target: llama_latency_api
+      - <<: *aime26_smoke
+        target: llama_latency_api
+      - <<: *gpqa_smoke
+        target: llama_latency_api
+      - <<: *bfcl_smoke
+        target: llama_latency_api
+
+  qus_bfcl_smoke:
+    jobs:
+      - <<: *bfcl_smoke
+
+  llama_bfcl_smoke:
+    jobs:
+      - <<: *bfcl_smoke
+        target: llama_latency_api
+
+  llama_capacity_smoke:
+    jobs:
+      - <<: *aime25_smoke
+        target: llama_capacity_api
+      - <<: *aime26_smoke
+        target: llama_capacity_api
+      - <<: *gpqa_smoke
+        target: llama_capacity_api
+      - <<: *bfcl_smoke
+        target: llama_capacity_api
+
+  qus_reasoning_full:
+    jobs:
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: qus_api
+        generation: *reasoning_generation
+        backend_args:
+          judge_strategy: rule
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: qus_api
+        generation: *reasoning_generation
+        backend_args:
+          judge_strategy: rule
+      - id: gpqa_diamond
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: qus_api
+        generation: *reasoning_generation
+
+  llama_reasoning_full:
+    jobs:
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: llama_capacity_api
+        generation: *reasoning_generation
+        backend_args:
+          judge_strategy: rule
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: llama_capacity_api
+        generation: *reasoning_generation
+        backend_args:
+          judge_strategy: rule
+      - id: gpqa_diamond
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: llama_capacity_api
+        generation: *reasoning_generation
+
+  qus_bfcl_no_web:
+    jobs:
+      - &bfcl_no_web
+        id: bfcl_v4_no_web
+        backend: evalscope
+        dataset: bfcl_v4
+        target: qus_api
+        generation: *bfcl_generation
+        backend_args: &bfcl_no_web_args
+          subset_list:
+            - simple_python
+            - simple_java
+            - simple_javascript
+            - multiple
+            - parallel
+            - parallel_multiple
+            - irrelevance
+            - live_simple
+            - live_multiple
+            - live_parallel
+            - live_parallel_multiple
+            - live_irrelevance
+            - live_relevance
+            - multi_turn_base
+            - multi_turn_miss_func
+            - multi_turn_miss_param
+            - multi_turn_long_context
+            - memory_kv
+            - memory_vector
+            - memory_rec_sum
+          is_fc_model: true
+          underscore_to_dot: true
+          allow_network_downloads: true
+
+  llama_bfcl_no_web:
+    jobs:
+      - <<: *bfcl_no_web
+        target: llama_capacity_api
+        backend_args: *bfcl_no_web_args
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 30
+  samples:
+    retention: all

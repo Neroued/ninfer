@@ -397,6 +397,7 @@ class EvalScopeBackend:
             artifacts.append(
                 str(report_path.relative_to(context.job_dir.parent.parent))
             )
+        failed = self._prediction_failures(context.job_dir)
         return DatasetResult(
             job_id=context.job.id,
             backend=self.name,
@@ -404,10 +405,49 @@ class EvalScopeBackend:
             status="completed",
             primary_metric=primary,
             metrics=metrics,
-            counts=ResultCounts(planned=context.plan.total, completed=num, scored=num),
+            counts=ResultCounts(
+                planned=context.plan.total,
+                completed=num,
+                scored=num,
+                failed=failed,
+            ),
             duration_seconds=run.duration_seconds,
             artifacts=artifacts,
         )
+
+    @staticmethod
+    def _prediction_failures(job_dir: Path) -> int:
+        """Count EvalScope records that wrapped an inference exception as output.
+
+        BFCL catches provider errors and serializes them into an assistant message,
+        so its report still counts the sample and the outer task still succeeds.
+        Audit the retained predictions to keep those infrastructure failures visible
+        in the normalized result instead of silently treating them as model mistakes.
+        """
+        failures = 0
+        for path in (job_dir / "predictions").glob("**/*.jsonl"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    record = json.loads(line)
+                    output = record.get("model_output") or {}
+                    if output.get("error") is not None:
+                        failures += 1
+                        continue
+                    choices = output.get("choices") or []
+                    content = choices[0]["message"]["content"] if choices else None
+                    wrapped = json.loads(content) if isinstance(content, str) else None
+                    if (
+                        isinstance(wrapped, dict)
+                        and {
+                            "error",
+                            "error_message",
+                        }
+                        <= wrapped.keys()
+                    ):
+                        failures += 1
+                except (json.JSONDecodeError, KeyError, TypeError, OSError):
+                    continue
+        return failures
 
     def _report_dict(self, context: RunContext, raw: Any) -> dict[str, Any]:
         if isinstance(raw, dict):

@@ -16,9 +16,9 @@ inference focus directly. This origin does not establish a separate formal long 
 The canonical filename extension reserved for future NInfer native model artifacts is
 **`.ninfer`**, in lowercase and including the leading dot.
 
-These two spellings are fixed inputs to the later container design and project migration. Changing
-either one requires an explicit revision of this decision rather than an incidental rename in an
-implementation plan.
+These two spellings are fixed inputs to the accepted container design and the future project
+migration. Changing either one requires an explicit revision of this decision rather than an
+incidental rename in an implementation plan.
 
 ## Canonical usage
 
@@ -43,8 +43,8 @@ encode or guarantee:
 - integrity, authenticity, or successful validation;
 - any particular container structure.
 
-The later format specification must define the relevant semantics and validation rules. It must not
-infer them from the extension alone.
+The accepted [`ninfer-container-format.md`](ninfer-container-format.md) defines the relevant
+semantics and validation rules without inferring them from the extension alone.
 
 ## Relationship to the current implementation
 
@@ -55,7 +55,8 @@ This decision does not rename or modify the implemented system. Until a separate
 - current binaries, C++ APIs, namespaces, tools, reports, and command examples retain their existing
   names;
 - current q5090 v4.2 artifacts retain the `.qus` suffix;
-- `.ninfer` is not a current documented or normative format designation;
+- `.ninfer` is not a current implemented runtime input; its accepted v1 contract remains pending
+  implementation;
 - [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md) remains the only normative
   contract for the currently implemented artifact format.
 
@@ -67,27 +68,28 @@ alias.
 Existing future-facing plans may still contain candidate names such as `QUS packed-container v5`,
 future `.qus` filenames, or QUS-derived wire strings. Those passages predate this decision and do
 not override `NInfer` or the `.ninfer` extension. They are deliberately not replaced mechanically:
-the later container design will decide its own formal name and wire identifiers while treating this
-document as its naming input.
+the accepted [`ninfer-container-format.md`](ninfer-container-format.md) owns the future container
+name, wire identifiers, and model/container boundary while treating this document as its naming
+input.
 
 ## Deferred decisions
 
-The following remain explicitly undecided:
+Container-format questions formerly deferred here are now governed by
+[`ninfer-container-format.md`](ninfer-container-format.md). The following naming and migration
+questions remain explicitly undecided:
 
 | Subject | Required follow-up |
 |---|---|
 | Whether `NInfer` needs a formal long form or expansion | Decide separately if the public identity requires one. |
-| Formal artifact/container format name | Decide with the container boundary and authority model. |
-| Magic, framing, byte order, versioning, records, and sections | Define in the future format specification. |
-| Model, checkpoint, packing, and execution identities | Define from first principles in the future container design. |
-| `q5090` in the future system | Decide during packing and runtime-boundary design. |
+| Remaining `q5090` implementation names and code | Decide during the implementation migration; `.ninfer` v1 has no q5090-style target-profile field. |
 | `.qus` compatibility and cutover | Define in a separate migration and compatibility decision. |
-| Uppercase or alternate suffix handling | Define reader behavior in the future format specification. |
+| Uppercase or alternate suffix handling | Define CLI/path policy during implementation; filename spelling is not a v1 byte-parsing input. |
 | Artifact basename, sidecars, manifests, and MIME type | Define only if those contracts are needed. |
 | Repository, binary, namespace, include, CLI, and service renaming | Define and inventory in the migration plan. |
 
-In particular, this document does not approve a container ABI, a version number, a magic string, a
-profile hierarchy, or a compatibility policy.
+This naming document itself does not approve a container ABI, version, magic string, model identity,
+or compatibility policy. The separate container specification now owns the first four subjects;
+migration compatibility remains undecided.
 
 ## Rationale
 
@@ -105,6 +107,6 @@ domain-name, or package-registry registration; any public-release clearance is a
 
 ## Constraint on follow-up work
 
-The future container design and project-migration plan must cite this document and treat `NInfer`
-and `.ninfer` as accepted inputs. They must state their own authority and must resolve the deferred
+The container design cites this document and treats `NInfer` and `.ninfer` as accepted inputs. The
+remaining project-migration plan must do the same, state its own authority, and resolve the remaining
 subjects above without silently expanding the scope of this naming decision.

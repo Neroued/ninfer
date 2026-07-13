@@ -31,6 +31,7 @@ These documents have deliberately separate responsibilities:
 | [`ninfer-naming.md`](ninfer-naming.md) | future project identity `NInfer` and future artifact filename extension `.ninfer` only; no current runtime, container, ABI, or migration authority |
 | [`ninfer-project-positioning.md`](ninfer-project-positioning.md) | accepted NInfer mission, target-selection policy, workload, performance priorities, product boundary, and non-goals; no implementation or format authority |
 | [`ninfer-tensor-formats.md`](ninfer-tensor-formats.md) | accepted closed registry and logical semantics for future NInfer direct and grouped-quantized persistent tensor formats; no container, physical layout, checkpoint assignment, kernel, or runtime-state authority |
+| [`ninfer-container-format.md`](ninfer-container-format.md) | accepted future `.ninfer` v1 typed object directory, model/container boundary, canonical file geometry, loading validation, and evolution rules; no model-specific inventory, conversion recipe, layout, implementation, or migration authority |
 
 The current system documentation above remains authoritative until the corresponding migration is
 implemented. A pending decision must not be read as an already available command, API, or file

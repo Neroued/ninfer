@@ -252,13 +252,13 @@ spelling for the signed 8-bit weight path. The different leading letter does not
 quantization or a generic family distinction beyond the exact rules in this document.
 
 All seven names are identifiers, not a grammar. A parser must compare against registered names or
-future container identifiers; it must not accept an unknown combination by splitting a name into
-components. Abbreviations such as `Q4`, `Q5`, `Q6`, `W8G32`, and `INT32` may be used in explanatory
-prose only. Artifact metadata must use the canonical identity selected by the future container
-contract.
+the exact numeric IDs assigned by the container; it must not accept an unknown combination by
+splitting a name into components. Abbreviations such as `Q4`, `Q5`, `Q6`, `W8G32`, and `INT32` may
+be used in explanatory prose only.
 
-Numeric wire identifiers are intentionally not allocated here. Their width, namespace, and version
-rules belong to the `.ninfer` container specification.
+This document does not allocate wire identifiers. Their width, namespace, and versioned mapping are
+defined by [`ninfer-container-format.md`](ninfer-container-format.md), which maps `.ninfer` v1 tensor
+records to these canonical identities.
 
 ## 4. Grouped quantized tensor model
 
@@ -546,7 +546,7 @@ meaning.
 
 ### 8.2 Container and layout
 
-The future container and each registered storage layout must:
+The `.ninfer` container and each registered storage layout must:
 
 - identify the numeric format unambiguously;
 - preserve logical shape separately from any physical padded extent;
@@ -593,10 +593,10 @@ not alter the persistent format and must not be needed to decode an artifact ind
 
 There is no mandatory generic unpack-to-dense fallback. If NInfer has not implemented the exact
 combination required by a selected target, conversion or loading fails explicitly rather than
-changing formats or selecting a slower compatibility path. A declared, registered layout conversion
-implemented by the selected model/runtime may exist; whether NInfer permits one, keeps a second
-resident copy, or requires a kernel-ready persistent layout is a later container/runtime decision.
-An undeclared compatibility repack is not a fallback.
+changing formats or selecting a slower compatibility path. The `.ninfer` v1 container requires the
+converter to emit the final registered persistent layout and does not permit load-time persistent
+weight repacking or a generic dense compatibility copy. A future container/runtime revision may make
+a different explicit decision without changing the numeric meanings in this document.
 
 ## 9. Checkpoint and model boundary
 
@@ -690,9 +690,9 @@ artifacts are regenerated. The project does not keep aliases, fallback readers, 
 or compatibility shims solely to preserve a project-owned historical format.
 
 Removing implementation support does not permit old artifacts to be decoded under a different
-meaning. A retired canonical name, and any wire identifier later assigned to it within a container
-namespace, is not reused for another meaning. Historical evidence may retain the old definition,
-while the current registry lists only what the current NInfer product owns.
+meaning. A retired canonical name and its assigned container wire identifier are not reused for
+another meaning. Historical evidence may retain the old definition, while the current registry
+lists only what the current NInfer product owns.
 
 ## 12. Required conformance evidence
 
@@ -725,11 +725,12 @@ Numerical kernel tests additionally state their activation rounding boundary, ac
 precision, output tolerance, and real target shapes. Every materialized storage layout separately
 tests its own padding and alignment contract.
 
-## 13. Consequences for later design
+## 13. Consequences for container and model design
 
-This decision leaves the `.ninfer` container free to choose a durable directory, metadata model,
-integrity mechanism, sharding policy, and one or more versioned physical layouts. It does not leave
-the following questions open:
+This decision left directory, metadata, integrity, sharding, and physical-layout choices to the
+container contract. The accepted `.ninfer` v1 contract now defines its typed directory and chooses no
+in-band integrity or sharding while continuing to reference separately registered physical layouts.
+This numeric-format decision does not leave the following questions open:
 
 - persistent low-bit weights use only the four registered scheme identities until an explicit
   admission changes the registry;
@@ -743,7 +744,7 @@ the following questions open:
 - the container, checkpoint recipe, compute profile, and runtime-state codecs remain separate
   contracts.
 
-The later container specification must reference these definitions rather than restating or
+The `.ninfer` container specification references these definitions rather than restating or
 specializing them for one model. A model-specific numeric recipe may select and combine the formats,
 but it cannot redefine them. This is the boundary that allows NInfer to add deeply optimized
 checkpoints without turning the core tensor representation into either a Qwen3.6-27B artifact or an

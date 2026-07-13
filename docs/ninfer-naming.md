@@ -69,8 +69,8 @@ Existing future-facing plans may still contain candidate names such as `QUS pack
 future `.qus` filenames, or QUS-derived wire strings. Those passages predate this decision and do
 not override `NInfer` or the `.ninfer` extension. They are deliberately not replaced mechanically:
 the accepted [`ninfer-container-format.md`](ninfer-container-format.md) owns the future container
-name, wire identifiers, and model/container boundary while treating this document as its naming
-input.
+name, JSON identifier namespaces, and model/container boundary while treating this document as its
+naming input.
 
 ## Deferred decisions
 

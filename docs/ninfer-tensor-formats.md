@@ -6,7 +6,7 @@
 > NInfer. It defines the logical words of the direct scalar formats, the numerical meaning and
 > canonical reference encoder of the grouped quantized-weight formats, conformance rules, and the
 > boundary between a numeric format and the container, storage layout, checkpoint recipe, operator,
-> kernel, and runtime state. It does not define the `.ninfer` container, wire identifiers, byte
+> kernel, and runtime state. It does not define the `.ninfer` container, JSON schema, byte
 > packing, tensor assignment for any checkpoint, kernel implementation, activation quantization, or
 > runtime-state codecs.
 >
@@ -251,14 +251,13 @@ Q4G64_F16S
 spelling for the signed 8-bit weight path. The different leading letter does not imply activation
 quantization or a generic family distinction beyond the exact rules in this document.
 
-All seven names are identifiers, not a grammar. A parser must compare against registered names or
-the exact numeric IDs assigned by the container; it must not accept an unknown combination by
-splitting a name into components. Abbreviations such as `Q4`, `Q5`, `Q6`, `W8G32`, and `INT32` may
-be used in explanatory prose only.
+All seven names are identifiers, not a grammar. A parser must compare a name against this closed
+registry; it must not accept an unknown combination by splitting a name into components.
+Abbreviations such as `Q4`, `Q5`, `Q6`, `W8G32`, and `INT32` may be used in explanatory prose only.
 
-This document does not allocate wire identifiers. Their width, namespace, and versioned mapping are
-defined by [`ninfer-container-format.md`](ninfer-container-format.md), which maps `.ninfer` v1 tensor
-records to these canonical identities.
+A container representation must resolve its stored identity to exactly one of these canonical names
+without constructing or reinterpreting a format. The container contract owns how that identity is
+serialized.
 
 ## 4. Grouped quantized tensor model
 
@@ -558,8 +557,8 @@ The `.ninfer` container and each registered storage layout must:
 - define where complete validation occurs before a kernel is allowed to assume valid input.
 
 The container must not embed an open-ended `(bits, group_size, scale_dtype)` constructor that makes
-unregistered combinations valid. It may map compact wire values to the closed canonical identities,
-but that mapping belongs to the container version and is not defined here.
+unregistered combinations valid. Its representation resolves to one closed canonical identity;
+that representation belongs to the container contract.
 
 ### 8.3 Loader and verifier
 
@@ -593,10 +592,9 @@ not alter the persistent format and must not be needed to decode an artifact ind
 
 There is no mandatory generic unpack-to-dense fallback. If NInfer has not implemented the exact
 combination required by a selected target, conversion or loading fails explicitly rather than
-changing formats or selecting a slower compatibility path. The `.ninfer` v1 container requires the
-converter to emit the final registered persistent layout and does not permit load-time persistent
-weight repacking or a generic dense compatibility copy. A future container/runtime revision may make
-a different explicit decision without changing the numeric meanings in this document.
+changing formats or selecting a slower compatibility path. Whether a container/runtime permits
+load-time persistent repacking is outside this numeric-format contract and cannot change the numeric
+meanings defined here.
 
 ## 9. Checkpoint and model boundary
 
@@ -690,9 +688,9 @@ artifacts are regenerated. The project does not keep aliases, fallback readers, 
 or compatibility shims solely to preserve a project-owned historical format.
 
 Removing implementation support does not permit old artifacts to be decoded under a different
-meaning. A retired canonical name and its assigned container wire identifier are not reused for
-another meaning. Historical evidence may retain the old definition, while the current registry
-lists only what the current NInfer product owns.
+meaning. A retired canonical name is not reused or reinterpreted for another meaning. Historical
+evidence may retain the old definition, while the current registry lists only what the current
+NInfer product owns.
 
 ## 12. Required conformance evidence
 
@@ -727,10 +725,9 @@ tests its own padding and alignment contract.
 
 ## 13. Consequences for container and model design
 
-This decision left directory, metadata, integrity, sharding, and physical-layout choices to the
-container contract. The accepted `.ninfer` v1 contract now defines its typed directory and chooses no
-in-band integrity or sharding while continuing to reference separately registered physical layouts.
-This numeric-format decision does not leave the following questions open:
+This decision leaves directory, metadata encoding, integrity, sharding, and physical-layout choices
+to the container and layout contracts. This numeric-format decision does not leave the following
+questions open:
 
 - persistent low-bit weights use only the four registered scheme identities until an explicit
   admission changes the registry;

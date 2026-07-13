@@ -1946,6 +1946,12 @@ move-only handles. `PreparedPrompt`'s public envelope is opaque; concrete prepar
 `LoadedModel`, `Program`, target checkpoint facts, tensors, and device sampling controls remain
 internal.
 
+For future engine source and build identities, lowercase `ninfer` is fixed here as the public
+include-directory name and C++ root namespace, and as the stem of the internal component targets in
+Section 19.7. This does not choose the repository directory, final user-facing executable names,
+distribution package, environment-variable prefix, or service identifier; those remain migration
+decisions under [`ninfer-naming.md`](ninfer-naming.md).
+
 Each target's `export/` root is a scoped internal interface visible only to target composition; it is
 not installed. Its `impl/` root is private to that exact target's CMake target. A standalone facade
 compile using only `export/` plus declared lower contract include roots must succeed, which prevents
@@ -2406,7 +2412,8 @@ It deliberately leaves these later decisions open:
 - detailed common tensor/arena/materializer class implementations;
 - exact CUDA kernels, graph partitions, and workspace schedules;
 - CLI and serving API migration;
-- migration sequencing and deletion of QUS compatibility surfaces;
+- migration sequencing and deletion of current QUS surfaces—not `.qus` loader compatibility, which
+  the accepted container contract already excludes;
 - the future continuous-batching scheduler and its memory policy.
 
 Those decisions may refine implementation beneath this seam. They must not reintroduce a generic

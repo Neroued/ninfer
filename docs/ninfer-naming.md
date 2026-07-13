@@ -27,10 +27,15 @@ incidental rename in an implementation plan.
 | Project display name | `NInfer` | Preserve this capitalization in titles, prose, and public identity. |
 | Future artifact extension | `.ninfer` | Use the exact lowercase extension, including the leading dot. |
 
-No binary name, C++ namespace, include path, package name, environment-variable prefix, service
-identifier, repository directory, or executable target is assigned by this document. Their future
-spellings, including any bare lowercase project identifier, must be chosen as part of the migration
-design; they are not implied by the `.ninfer` extension.
+This document does not derive code identifiers from the display name or extension. The subsequently
+accepted [`ninfer-engine-architecture.md`](ninfer-engine-architecture.md) independently fixes
+`include/ninfer/` as the future public include root, `ninfer` as the future C++ root namespace, and
+the `ninfer`/`ninfer_*` stem for its internal component targets. Those are engine source/build
+decisions, not meanings carried by `.ninfer`.
+
+The repository directory, final executable names, distribution package name,
+environment-variable prefix, and service identifier remain unassigned. Their spellings and cutover
+belong to the migration design.
 
 The `.ninfer` extension is a naming decision, not a description of bytes. By itself it does not
 encode or guarantee:
@@ -75,14 +80,16 @@ questions remain explicitly undecided:
 |---|---|
 | Whether `NInfer` needs a formal long form or expansion | Decide separately if the public identity requires one. |
 | Remaining `q5090` implementation names and code | Decide during the implementation migration; `.ninfer` v1 has no q5090-style target-profile field. |
-| `.qus` compatibility and cutover | Define in a separate migration and compatibility decision. |
+| `.qus` conversion and cutover | Loader compatibility is already excluded by the v1 container contract. Define artifact regeneration, cutover timing, and old QUS deletion in the migration plan. |
 | Uppercase or alternate suffix handling | Define CLI/path policy during implementation; filename spelling is not a v1 byte-parsing input. |
 | Artifact basename, sidecars, manifests, and MIME type | Define only if those contracts are needed. |
-| Repository, binary, namespace, include, CLI, and service renaming | Define and inventory in the migration plan. |
+| Repository, final executables, distribution package, environment variables, CLI branding, and service renaming | Define and inventory in the migration plan. Source include/namespace/component identities are already governed by the engine architecture. |
 
 This naming document itself does not approve a container ABI, version, magic string, model identity,
-or compatibility policy. The separate container specification now owns the first four subjects;
-migration compatibility remains undecided.
+or loader compatibility policy. The container specification owns the v1 bytes and excludes a
+`.qus` reader; the engine architecture owns its future source/build identities. The migration still
+owns when those accepted decisions replace the current QUS product and how old artifacts and code
+are regenerated or removed.
 
 ## Rationale
 
@@ -100,6 +107,7 @@ domain-name, or package-registry registration; any public-release clearance is a
 
 ## Constraint on follow-up work
 
-The container design cites this document and treats `NInfer` and `.ninfer` as accepted inputs. The
-remaining project-migration plan must do the same, state its own authority, and resolve the remaining
-subjects above without silently expanding the scope of this naming decision.
+The container and engine designs cite this document and treat `NInfer` and `.ninfer` as accepted
+inputs. The remaining project-migration plan must preserve their accepted authority boundaries,
+resolve only the remaining subjects above, and must not reintroduce `.qus` loader compatibility or
+rename the engine's fixed source identities incidentally.

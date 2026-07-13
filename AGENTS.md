@@ -70,6 +70,28 @@ documents to be read for every task.
 Documents under `docs/archive/` are historical evidence. They may explain why a decision was made,
 but they do not define current behavior.
 
+## Discussion and Authorization Gate
+
+Discussion and alignment with the user are a required phase of work, not an optional courtesy.
+
+Before beginning any non-trivial task, establish the intended outcome, scope and non-goals, unresolved
+behavior or interface details, relevant risks and trade-offs, acceptance criteria, and the required
+verification. If any of these has material ambiguity, pause and discuss it with the user and obtain
+explicit approval before implementation. Do not edit files, run state-changing commands, build, run
+broad tests, profile, install dependencies, generate artifacts, launch services, or perform external
+operations while waiting. Minimal read-only inspection is allowed only when necessary to frame the
+discussion; it must not turn into implementation or an open-ended investigation. Silence, general
+repository access, or a vague request to “handle” something is not approval.
+
+Direct execution is allowed when the user gives an explicit, sufficiently scoped instruction with no
+material unresolved decisions, or when the requested change is clearly small, low-risk, and
+unambiguous (for example, a specified typo, wording, or formatting correction). If new ambiguity,
+scope expansion, risk, or conflicting evidence appears, stop and return to discussion before
+proceeding. Approval for one action does not authorize adjacent changes or expensive operations.
+
+After discussion and before acting, summarize the agreed goal, scope, and verification. Do not infer
+permission from a proposed plan or from the user’s approval of a different action.
+
 ## Compatibility Policy
 
 Project-owned interfaces do not preserve backward compatibility. This includes C++ APIs, CLIs,

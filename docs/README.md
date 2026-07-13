@@ -24,6 +24,17 @@ These documents have deliberately separate responsibilities:
 - public C++ headers, not a hand-maintained catalog, enumerate the current operator API;
 - executable `--help` output is the option-level CLI contract.
 
+## Accepted decisions pending implementation
+
+| Document | Authority |
+|---|---|
+| [`ninfer-naming.md`](ninfer-naming.md) | future project identity `NInfer` and future artifact filename extension `.ninfer` only; no current runtime, container, ABI, or migration authority |
+| [`ninfer-project-positioning.md`](ninfer-project-positioning.md) | accepted NInfer mission, target-selection policy, workload, performance priorities, product boundary, and non-goals; no implementation or format authority |
+
+The current system documentation above remains authoritative until the corresponding migration is
+implemented. A pending decision must not be read as an already available command, API, or file
+format.
+
 ## Component guides
 
 Operational documentation stays next to the code it describes:

@@ -4,6 +4,12 @@ A from-scratch C++/CUDA inference engine specialized for **Qwen3.6-27B** on one
 **NVIDIA RTX 5090**. The runtime is built for one user, one sequence, and one GPU; it is not a
 general-purpose model runtime or compatibility layer.
 
+> The elevated project has accepted the future name **NInfer** and the future artifact extension
+> **`.ninfer`**. This naming decision is not yet implemented; the repository, binaries, APIs, and
+> current `.qus` commands below remain unchanged. See
+> [`docs/ninfer-naming.md`](docs/ninfer-naming.md) and
+> [`docs/ninfer-project-positioning.md`](docs/ninfer-project-positioning.md).
+
 The model schedule is hand-written, the CUDA kernels are specialized for the fixed model shapes,
 and the offline converter produces one self-contained q5090 v4.2 artifact. The C++ runtime loads
 that artifact directly without runtime repacking or a second weight format.

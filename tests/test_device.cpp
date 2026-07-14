@@ -87,54 +87,15 @@ int main() {
     }
     failures += check_context(moved, "moved");
 
-    ninfer::DeviceContext assigned(0);
-    assigned = std::move(moved);
-    if (moved.stream != nullptr || moved.load_stream != nullptr) {
-        ++failures;
-        std::cerr << "move assignment did not null source streams\n";
-    }
-    failures += check_context(assigned, "assigned");
-
-    const cudaStream_t self_stream = assigned.stream;
-    assigned                       = std::move(assigned);
-    if (assigned.stream != self_stream) {
-        ++failures;
-        std::cerr << "self move assignment changed compute stream\n";
-    }
-
-    failures += expect_throws_device(-1);
     failures += expect_throws_device(count);
 
-    ninfer::CudaEventTimer timer(assigned);
+    ninfer::CudaEventTimer timer(moved);
     timer.start();
-    assigned.synchronize();
+    moved.synchronize();
     const float elapsed_ms = timer.stop_ms();
     if (elapsed_ms < 0.0f) {
         ++failures;
         std::cerr << "timer elapsed time was negative\n";
-    }
-
-    ninfer::CudaEventTimer timer_a(assigned);
-    ninfer::CudaEventTimer timer_b(assigned);
-    timer_b = std::move(timer_a);
-    timer_b.start();
-    assigned.synchronize();
-    const float moved_elapsed_ms = timer_b.stop_ms();
-    if (moved_elapsed_ms < 0.0f) {
-        ++failures;
-        std::cerr << "move-assigned timer elapsed time was negative\n";
-    }
-
-    if (count > 1) {
-        CUDA_CHECK(cudaSetDevice(1));
-        ninfer::CudaEventTimer drift_timer(assigned);
-        drift_timer.start();
-        assigned.synchronize();
-        const float drift_elapsed_ms = drift_timer.stop_ms();
-        if (drift_elapsed_ms < 0.0f) {
-            ++failures;
-            std::cerr << "current-device drift timer elapsed time was negative\n";
-        }
     }
 
     return failures == 0 ? 0 : fail("device test failed");

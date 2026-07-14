@@ -37,44 +37,40 @@ def test_recipe_exactly_covers_inventory() -> None:
     )
 
 
-def test_representative_recipe_structure() -> None:
-    query_key = recipe.RECIPES_BY_NAME["text/layers/3/attention/query_key"].expression
-    assert isinstance(query_key, recipe.Concat)
-    assert recipe.expression_shape(query_key) == (7168, 5120)
-    assert isinstance(query_key.sources[0], recipe.Reshape)
-    query_slice = query_key.sources[0].source
-    assert isinstance(query_slice, recipe.Slice)
-    assert (query_slice.axis, query_slice.begin, query_slice.end) == (1, 0, 256)
+def test_fused_mtp_attention_recipe_materializes_runtime_row_order() -> None:
+    q_name = "mtp.layers.0.self_attn.q_proj.weight"
+    k_name = "mtp.layers.0.self_attn.k_proj.weight"
+    v_name = "mtp.layers.0.self_attn.v_proj.weight"
 
-    gate_value = recipe.RECIPES_BY_NAME["text/layers/3/attention/gate_value"].expression
-    assert isinstance(gate_value, recipe.Concat)
-    gate_slice = gate_value.sources[0].source
-    assert isinstance(gate_slice, recipe.Slice)
-    assert (gate_slice.axis, gate_slice.begin, gate_slice.end) == (1, 256, 512)
-
-    mtp = recipe.RECIPES_BY_NAME[
-        "mtp/layer/attention/query_key_gate_value"
-    ].expression
-    assert isinstance(mtp, recipe.Concat)
-    assert tuple(recipe.expression_shape(part)[0] for part in mtp.sources) == (
-        6144,
-        1024,
-        6144,
-        1024,
+    # The transform is dtype-independent. Byte markers keep this real-shape fixture compact.
+    q_source = (
+        torch.arange(12288, dtype=torch.int64)
+        .remainder(251)
+        .to(torch.uint8)
+        .view(-1, 1)
+        .expand(-1, 5120)
+    )
+    k_source = torch.full((1024, 1), 251, dtype=torch.uint8).expand(-1, 5120)
+    v_source = torch.full((1024, 1), 252, dtype=torch.uint8).expand(-1, 5120)
+    fused = recipe.materialize_recipe(
+        recipe.RECIPES_BY_NAME["mtp/layer/attention/query_key_gate_value"],
+        TensorReader({q_name: q_source, k_name: k_source, v_name: v_source}),
     )
 
-    draft_ids = recipe.RECIPES_BY_NAME["text/draft_head_token_ids"].expression
-    assert isinstance(draft_ids, recipe.DraftHeadTokenIds)
-    assert draft_ids.ranking_path.endswith("ranking.train.counts.i64")
-    assert draft_ids.tokenizer_resource == "frontend/tokenizer_config.json"
-    assert (draft_ids.vocab_rows, draft_ids.tokenizer_id_count, draft_ids.rows) == (
-        248320,
-        248077,
-        131072,
-    )
-    draft_rows = recipe.RECIPES_BY_NAME["text/draft_head"].expression
-    assert isinstance(draft_rows, recipe.GatherRows)
-    assert draft_rows.token_ids_object == "text/draft_head_token_ids"
+    query_rows = torch.cat(
+        [torch.arange(head * 512, head * 512 + 256) for head in range(24)]
+    ).remainder(251).to(torch.uint8)
+    gate_rows = torch.cat(
+        [torch.arange(head * 512 + 256, head * 512 + 512) for head in range(24)]
+    ).remainder(251).to(torch.uint8)
+
+    assert fused.shape == (14336, 5120)
+    assert torch.equal(fused[:6144, 0], query_rows)
+    assert torch.equal(fused[:6144, -1], query_rows)
+    assert torch.all(fused[6144:7168, 0] == 251)
+    assert torch.equal(fused[7168:13312, 0], gate_rows)
+    assert torch.equal(fused[7168:13312, -1], gate_rows)
+    assert torch.all(fused[13312:, 0] == 252)
 
 
 def test_representative_transforms_materialize_without_full_weights() -> None:

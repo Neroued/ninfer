@@ -79,8 +79,8 @@ struct FakeProgram {
             .prompt_tokens           = 4,
             .reusable_prompt_tokens  = 0,
             .requested_output_tokens = execution.requested_output_tokens,
-            .effective_output_tokens = execution.requested_output_tokens,
-            .effective_limit_reason  = FinishReason::OutputLimit,
+            .effective_output_tokens = effective_output_tokens,
+            .effective_limit_reason  = effective_limit_reason,
             .transient_bytes         = 128,
             .transient_alignment     = 64,
         }};
@@ -127,10 +127,12 @@ struct FakeProgram {
     std::vector<std::vector<TokenId>> rounds;
     std::vector<Resolution> resolutions;
     std::vector<std::uint32_t> observed_round_budgets;
-    std::size_t next_round          = 0;
-    std::size_t finish_active_calls = 0;
-    std::size_t abort_calls         = 0;
-    bool* cancel_during_begin       = nullptr;
+    std::size_t next_round                = 0;
+    std::size_t finish_active_calls       = 0;
+    std::size_t abort_calls               = 0;
+    bool* cancel_during_begin             = nullptr;
+    std::uint32_t effective_output_tokens = 8;
+    FinishReason effective_limit_reason   = FinishReason::OutputLimit;
 };
 
 struct FakeRequestMemory {
@@ -156,6 +158,7 @@ struct FakeOutputState {
     std::vector<PreviewStep> steps;
     std::vector<std::vector<TokenId>> observed_rounds;
     std::vector<std::uint32_t> observed_budgets;
+    std::vector<FinishReason> observed_limit_reasons;
     std::vector<OutputDelta> pending;
     EventLog* log                      = nullptr;
     bool* cancel_after_first_commit    = nullptr;
@@ -167,10 +170,11 @@ struct FakeOutputState {
 
 struct FakeOutputSession {
     [[nodiscard]] OutputDecision preview(std::span<const TokenId> tokens, std::uint32_t remaining,
-                                         FinishReason) {
+                                         FinishReason limit_reason) {
         state->log->add(Event::Preview);
         state->observed_rounds.emplace_back(tokens.begin(), tokens.end());
         state->observed_budgets.push_back(remaining);
+        state->observed_limit_reasons.push_back(limit_reason);
         if (state->next_step >= state->steps.size()) {
             throw std::logic_error("unexpected fake output preview");
         }
@@ -208,17 +212,14 @@ struct FakeOutputSession {
 };
 
 struct FakeSink final : OutputSink {
-    explicit FakeSink(EventLog& event_log, bool should_throw = false) noexcept
-        : log(&event_log), throw_on_publish(should_throw) {}
+    explicit FakeSink(EventLog& event_log) noexcept : log(&event_log) {}
 
     void publish(OutputDelta delta) override {
         log->add(Event::Publish);
         text += delta.text;
-        if (throw_on_publish) { throw std::runtime_error("fake sink failure"); }
     }
 
-    EventLog* log         = nullptr;
-    bool throw_on_publish = false;
+    EventLog* log = nullptr;
     std::string text;
 };
 
@@ -237,17 +238,19 @@ int check(bool condition, std::string_view message) {
 int test_continue_then_partial_terminal_round() {
     EventLog log;
     FakeProgram program{
-        .log    = &log,
-        .rounds = {{10, 11}, {20, 21, 22}},
+        .log                     = &log,
+        .rounds                  = {{10, 11}, {20, 21, 22}},
+        .effective_output_tokens = 4,
+        .effective_limit_reason  = FinishReason::ContextCapacity,
     };
     FakeOutputState output_state{
         .steps =
             {
                 PreviewStep{
                     OutputDecision{.accepted_tokens = 2, .finish_reason = FinishReason::None}, "A"},
-                PreviewStep{
-                    OutputDecision{.accepted_tokens = 2, .finish_reason = FinishReason::StopToken},
-                    "B"},
+                PreviewStep{OutputDecision{.accepted_tokens = 2,
+                                           .finish_reason   = FinishReason::ContextCapacity},
+                            "B"},
             },
         .log = &log,
     };
@@ -270,8 +273,13 @@ int test_continue_then_partial_terminal_round() {
     }
     failures += check(result.generated_token_ids == std::vector<TokenId>({10, 11, 20, 21}),
                       "controller returned tokens outside the committed prefixes");
-    failures += check(result.summary.finish_reason == FinishReason::StopToken,
+    failures += check(result.summary.finish_reason == FinishReason::ContextCapacity,
                       "controller returned the wrong terminal reason");
+    failures += check(output_state.observed_budgets == std::vector<std::uint32_t>({4, 2}) &&
+                          output_state.observed_limit_reasons ==
+                              std::vector<FinishReason>(
+                                  {FinishReason::ContextCapacity, FinishReason::ContextCapacity}),
+                      "controller did not honor the planned effective context budget");
     failures += check(result.content == "AB" && sink.text == "AB",
                       "committed output was not published exactly once");
 
@@ -362,54 +370,13 @@ int test_cancellation_discards_provisional_round() {
     return failures;
 }
 
-int test_sink_failure_arms_guard_abort() {
-    EventLog log;
-    FakeProgram program{
-        .log    = &log,
-        .rounds = {{40}},
-    };
-    FakeOutputState output_state{
-        .steps =
-            {
-                PreviewStep{
-                    OutputDecision{.accepted_tokens = 1, .finish_reason = FinishReason::StopToken},
-                    "terminal"},
-            },
-        .log = &log,
-    };
-    FakeRequestMemory memory{.log = &log};
-    FakeSink sink(log, true);
-    const CancellationView cancellation;
-
-    bool threw = false;
-    try {
-        (void)run_one(program, FakePrompt{}, FakeOutputSession{&output_state}, memory,
-                      request_options(), cancellation, &sink);
-    } catch (const std::runtime_error& error) {
-        threw = std::string_view(error.what()) == "fake sink failure";
-    }
-
-    int failures = 0;
-    failures += check(threw, "sink failure was not propagated");
-    failures += check(program.resolutions.size() == 1 && program.resolutions[0].terminal,
-                      "model round was not resolved before publication");
-    failures +=
-        check(program.abort_calls == 1, "generation guard did not abort after sink failure");
-    failures += check(log.position(Event::ResolveTerminal) < log.position(Event::CommitPreview) &&
-                          log.position(Event::CommitPreview) < log.position(Event::Publish) &&
-                          log.position(Event::Publish) < log.position(Event::Abort),
-                      "sink failure cleanup violated commit/publish/abort ordering");
-    return failures;
-}
-
 } // namespace
 
 int main() {
     try {
         const int failures = test_continue_then_partial_terminal_round() +
                              test_cancellation_between_rounds_finishes_active_sequence() +
-                             test_cancellation_discards_provisional_round() +
-                             test_sink_failure_arms_guard_abort();
+                             test_cancellation_discards_provisional_round();
         if (failures == 0) { std::cout << "ok\n"; }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

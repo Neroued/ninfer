@@ -110,15 +110,18 @@ int test_parse_parts_and_flatten() {
     return failures;
 }
 
-int test_parse_image_in_translate() {
+int test_parse_media_in_translate() {
     const Json body = {
         {"model", "m"},
         {"messages",
          Json::array({Json{
              {"role", "user"},
              {"content",
-              Json::array({Json{{"type", "image_url"},
-                                {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}})}}})}};
+              Json::array(
+                  {Json{{"type", "image_url"},
+                        {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}},
+                   Json{{"type", "video_url"},
+                        {"video_url", Json{{"url", "https://example.test/clip.mp4"}}}}})}}})}};
     const GenerationRequest req      = parse_chat_completion_request(body, default_limits());
     const ninfer::PromptInput prompt = translate(req);
     int failures                     = 0;
@@ -130,6 +133,14 @@ int test_parse_image_in_translate() {
     failures += check(prompt.messages[0].parts[0].kind == ninfer::MessagePartKind::Media &&
                           prompt.messages[0].parts[0].media.kind == ninfer::MediaKind::Image,
                       "image translated to structured chat part");
+    failures += check(req.messages[0].content[1].kind == ContentKind::Video,
+                      "video content kind preserved");
+    failures += check(req.messages[0].content[1].source.kind ==
+                          ninfer::product::media_acquire::SourceKind::Url,
+                      "video URL source preserved");
+    failures += check(prompt.messages[0].parts[1].kind == ninfer::MessagePartKind::Media &&
+                          prompt.messages[0].parts[1].media.kind == ninfer::MediaKind::Video,
+                      "video translated to structured chat part");
     return failures;
 }
 
@@ -229,12 +240,16 @@ int test_parse_function_tools_and_choices() {
                       "tool definition json carried");
     failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "default tool choice is auto");
     failures += check(req.uses_tools(), "tools enabled by default");
+    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+                      "active tools preserve special tokens in Engine output");
 
     Json none           = base;
     none["tool_choice"] = "none";
     req                 = parse_chat_completion_request(none, default_limits());
     failures += check(req.tool_choice.mode == ToolChoiceMode::None, "tool_choice none parsed");
     failures += check(!req.uses_tools(), "tool_choice none disables tools");
+    failures += check(!to_request_options(req, default_server()).output.preserve_special_tokens,
+                      "disabled tools do not preserve special tokens");
 
     Json required           = base;
     required["tool_choice"] = "required";
@@ -282,6 +297,8 @@ int test_parse_tool_history_messages() {
     failures += check(req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
     failures +=
         check(req.messages[2].content.at(0).text == R"({"temp":20})", "tool content parsed");
+    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+                      "tool history preserves special tokens in Engine output");
 
     Json bad_args                                                     = body;
     bad_args["messages"][1]["tool_calls"][0]["function"]["arguments"] = R"(["Paris"])";
@@ -301,6 +318,12 @@ int test_parse_stop_and_max_tokens() {
     failures += check(req.stop_strings.size() == 2, "two stop strings");
     failures += check(req.stop_strings[0] == "</s>", "stop string 0");
     failures += check(req.max_tokens == 42 && req.max_tokens_set, "max_completion_tokens alias");
+    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    failures += check(options.execution.requested_output_tokens == 42,
+                      "max_completion_tokens reaches Engine options");
+    failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "</s>" &&
+                          options.stop.strings[1].text == "STOP",
+                      "stop strings reach Engine options");
 
     Json single = {{"model", "m"},
                    {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
@@ -328,6 +351,11 @@ int test_parse_sampling_carried() {
     failures +=
         check(req.sampling.logit_bias.count(5) == 1 && req.sampling.logit_bias.at(5) == -1.5,
               "logit_bias carried");
+    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    failures +=
+        check(options.execution.sampling.temperature == 0.7F, "temperature reaches Engine options");
+    failures += check(options.execution.sampling.top_p == 0.9F, "top_p reaches Engine options");
+    failures += check(options.execution.sampling.seed == 123u, "seed reaches Engine options");
     return failures;
 }
 
@@ -511,7 +539,7 @@ int main() {
     failures += test_parse_string_content();
     failures += test_parse_parts_and_flatten();
     failures += test_developer_role_mapped();
-    failures += test_parse_image_in_translate();
+    failures += test_parse_media_in_translate();
     failures += test_reject_unsupported();
     failures += test_parse_function_tools_and_choices();
     failures += test_parse_tool_history_messages();

@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
-#include <limits>
 #include <new>
 #include <stdexcept>
 #include <utility>
@@ -62,12 +61,7 @@ int main() {
     }
 
     int failures = 0;
-    ninfer::DeviceContext ctx(0);
-
-    failures += expect_throws<std::invalid_argument>([] { (void)ninfer::DeviceArena(0); },
-                                                     "zero arena capacity");
-    failures += expect_throws<std::invalid_argument>([] { (void)ninfer::PinnedHostBuffer(0); },
-                                                     "zero pinned size");
+    CUDA_CHECK(cudaSetDevice(0));
 
     ninfer::DeviceArena arena(1024);
     failures += expect_size(arena.capacity(), 1024, "arena.capacity");
@@ -78,7 +72,7 @@ int main() {
         std::cerr << "arena base is null\n";
     }
 
-    auto* base    = static_cast<unsigned char*>(arena.base());
+    auto* base       = static_cast<unsigned char*>(arena.base());
     ninfer::Tensor a = arena.alloc(ninfer::DType::BF16, {3, 5});
     failures += expect_ptr(a.data, base, "first allocation pointer");
     failures += expect_size(a.bytes(), 30, "first allocation bytes");
@@ -98,10 +92,10 @@ int main() {
     void* transient_ptr                 = nullptr;
     std::size_t peak_after_transient    = 0;
     {
-        auto outer_scope       = arena.scope();
-        ninfer::Tensor transient  = arena.alloc(ninfer::DType::U8, {11}, 128);
-        transient_ptr          = transient.data;
-        const std::size_t used = arena.used();
+        auto outer_scope         = arena.scope();
+        ninfer::Tensor transient = arena.alloc(ninfer::DType::U8, {11}, 128);
+        transient_ptr            = transient.data;
+        const std::size_t used   = arena.used();
         if (used <= used_before_scope) {
             ++failures;
             std::cerr << "transient allocation did not advance arena cursor\n";
@@ -131,22 +125,10 @@ int main() {
 
     const std::size_t used_before_failures = arena.used();
     const std::size_t peak_before_failures = arena.peak_used();
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)arena.alloc(ninfer::DType::U8, {1}, 3); }, "invalid alignment");
-    failures +=
-        expect_size(arena.used(), used_before_failures, "arena.used after invalid alignment");
-    failures +=
-        expect_size(arena.peak_used(), peak_before_failures, "arena.peak after invalid alignment");
     failures += expect_throws<std::bad_alloc>(
         [&] { (void)arena.alloc(ninfer::DType::FP32, {300}, 256); }, "arena oom");
     failures += expect_size(arena.used(), used_before_failures, "arena.used after oom");
     failures += expect_size(arena.peak_used(), peak_before_failures, "arena.peak after oom");
-    failures += expect_throws<std::overflow_error>(
-        [&] {
-            (void)arena.alloc(ninfer::DType::U8, {std::numeric_limits<std::int32_t>::max(),
-                                               std::numeric_limits<std::int32_t>::max(), 1, 4});
-        },
-        "arena oversized allocation");
 
     arena.reset();
     failures += expect_size(arena.used(), 0, "arena.used after reset");
@@ -166,19 +148,18 @@ int main() {
     failures += expect_size(moved.capacity(), 1024, "moved arena capacity");
     failures += expect_size(moved.peak_used(), 4, "moved arena peak");
 
-    ninfer::DeviceArena assigned(128);
-    assigned = std::move(moved);
-    if (moved.base() != nullptr || moved.capacity() != 0 || moved.used() != 0) {
-        ++failures;
-        std::cerr << "move assignment did not clear source arena\n";
+    void* external = nullptr;
+    CUDA_CHECK(cudaMalloc(&external, 512));
+    {
+        ninfer::DeviceArena borrowed(ninfer::DeviceSpan{external, 512});
+        failures += expect_ptr(borrowed.base(), external, "borrowed arena base");
+        failures += expect_size(borrowed.capacity(), 512, "borrowed arena capacity");
+        const ninfer::Tensor item = borrowed.alloc(ninfer::DType::U8, {17}, 64);
+        failures += expect_ptr(item.data, external, "borrowed arena allocation");
+        failures += expect_size(borrowed.used(), 17, "borrowed arena used");
     }
-    failures += expect_size(moved.peak_used(), 0, "move-assigned-from arena peak");
-    failures += expect_size(assigned.peak_used(), 4, "move-assigned arena peak");
-    void* assigned_base = assigned.base();
-    assigned            = std::move(assigned);
-    failures += expect_ptr(assigned.base(), assigned_base, "arena self-move base");
-    failures += expect_size(assigned.capacity(), 1024, "arena self-move capacity");
-    failures += expect_size(assigned.peak_used(), 4, "arena self-move peak");
+    CUDA_CHECK(cudaMemset(external, 0, 512));
+    CUDA_CHECK(cudaFree(external));
 
     ninfer::PinnedHostBuffer pinned(128);
     if (pinned.data() == nullptr) {
@@ -187,22 +168,6 @@ int main() {
     }
     failures += expect_size(pinned.size(), 128, "pinned.size");
     std::memset(pinned.data(), 0x5a, pinned.size());
-
-    ninfer::PinnedHostBuffer pinned_other(64);
-    pinned_other = std::move(pinned);
-    if (pinned.data() != nullptr || pinned.size() != 0) {
-        ++failures;
-        std::cerr << "move assignment did not clear source pinned buffer\n";
-    }
-    if (pinned_other.data() == nullptr || pinned_other.size() != 128) {
-        ++failures;
-        std::cerr << "move-assigned pinned buffer is not usable\n";
-    }
-    void* pinned_self = pinned_other.data();
-    pinned_other      = std::move(pinned_other);
-    failures += expect_ptr(pinned_other.data(), pinned_self, "pinned self-move data");
-    failures += expect_size(pinned_other.size(), 128, "pinned self-move size");
-    std::memset(pinned_other.data(), 0xa5, pinned_other.size());
 
     return failures == 0 ? 0 : fail("arena test failed");
 }

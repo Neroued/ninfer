@@ -239,6 +239,8 @@ int test_tools_and_choice() {
     failures += check(req.tools[0].name == "get_weather", "tool name parsed");
     failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "auto -> Auto");
     failures += check(req.uses_tools(), "uses_tools true");
+    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+                      "active tools preserve special tokens in Engine output");
     // definition_json must be a normalized OpenAI function-tool object for the
     // Qwen <tools> renderer.
     const Json def = Json::parse(req.tools[0].definition_json);
@@ -350,6 +352,16 @@ int test_thinking_and_sampling() {
     failures += check(req.stop_strings.size() == 2 && req.stop_strings[0] == "STOP",
                       "stop_sequences parsed");
     failures += check(req.enable_thinking.has_value() && *req.enable_thinking, "thinking enabled");
+    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    failures +=
+        check(options.execution.requested_output_tokens == 8, "max_tokens reaches Engine options");
+    failures += check(options.execution.sampling.temperature == 0.3F &&
+                          options.execution.sampling.top_p == 0.8F &&
+                          options.execution.sampling.top_k == 40,
+                      "sampling reaches Engine options");
+    failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "STOP" &&
+                          options.stop.strings[1].text == "END",
+                      "stop_sequences reach Engine options");
 
     Json disabled                = body;
     disabled["thinking"]         = Json{{"type", "disabled"}};

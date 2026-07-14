@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -16,6 +17,89 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     return options;
+}
+
+std::vector<std::uint8_t> gradient_ppm() {
+    std::vector<std::uint8_t> ppm;
+    const std::string header = "P6\n64 64\n255\n";
+    ppm.insert(ppm.end(), header.begin(), header.end());
+    for (int index = 0; index < 64 * 64; ++index) {
+        ppm.push_back(static_cast<std::uint8_t>(index & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 3) & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 7) & 0xff));
+    }
+    return ppm;
+}
+
+ninfer::PromptInput chinese_chat(bool enable_thinking) {
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "你好，简单介绍一下你自己。", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = enable_thinking;
+    return input;
+}
+
+int exercise_registered_frontend(const ninfer::Engine& engine) {
+    if (engine.count_tokens(chinese_chat(true)) != 16) {
+        std::cerr << "registered tokenizer/chat template changed the thinking prompt golden\n";
+        return 1;
+    }
+    if (engine.count_tokens(chinese_chat(false)) != 18) {
+        std::cerr << "registered tokenizer/chat template changed the no-thinking prompt golden\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_partial_mtp_terminal(ninfer::Engine& engine,
+                                  const std::vector<ninfer::TokenId>& prompt,
+                                  const ninfer::GenerationResult& baseline) {
+    if (baseline.generated_token_ids.size() < 2 || baseline.speculative.rounds != 1 ||
+        baseline.speculative.accepted_tokens == 0) {
+        std::cerr << "baseline did not expose a multi-token first MTP round\n";
+        return 1;
+    }
+    const ninfer::TokenId stop = baseline.generated_token_ids[1];
+    if (stop == baseline.generated_token_ids[0]) {
+        std::cerr << "baseline repeats its first token before the MTP stop boundary\n";
+        return 1;
+    }
+
+    ninfer::RequestOptions options;
+    options.execution.requested_output_tokens = 5;
+    options.execution.sampling.temperature    = 0.0F;
+    options.execution.allow_prefix_reuse      = false;
+    options.stop.include_model_defaults       = false;
+    options.stop.token_ids.push_back(stop);
+    const ninfer::GenerationResult stopped =
+        engine.generate(engine.prepare_tokens(prompt), options);
+    if (stopped.finish_reason != ninfer::FinishReason::StopToken ||
+        stopped.generated_token_ids.size() != 2 ||
+        stopped.generated_token_ids[0] != baseline.generated_token_ids[0] ||
+        stopped.generated_token_ids[1] != stop) {
+        std::cerr << "custom stop did not terminate inside the first MTP round\n";
+        return 1;
+    }
+
+    std::vector<ninfer::TokenId> continuation = prompt;
+    continuation.insert(continuation.end(), stopped.generated_token_ids.begin(),
+                        stopped.generated_token_ids.end());
+    continuation.push_back(198);
+    ninfer::RequestOptions probe;
+    probe.execution.requested_output_tokens = 1;
+    probe.execution.sampling.temperature    = 0.0F;
+    probe.execution.allow_prefix_reuse      = true;
+    probe.stop.include_model_defaults       = false;
+    const ninfer::GenerationResult after =
+        engine.generate(engine.prepare_tokens(std::move(continuation)), probe);
+    if (after.reused_prompt_tokens != 0) {
+        std::cerr << "strict-prefix MTP terminal left provisional Program state reusable\n";
+        return 1;
+    }
+    return 0;
 }
 
 int exercise_prefix(ninfer::Engine& engine) {
@@ -69,6 +153,40 @@ int exercise_prefix(ninfer::Engine& engine) {
         return 1;
     }
 
+    if (const int result = exercise_partial_mtp_terminal(engine, prompt, first); result != 0) {
+        return result;
+    }
+
+    return 0;
+}
+
+int exercise_vision(ninfer::Engine& engine) {
+    ninfer::MessagePart image;
+    image.kind              = ninfer::MessagePartKind::Media;
+    image.media.kind        = ninfer::MediaKind::Image;
+    image.media.bytes       = gradient_ppm();
+    image.media.media_type  = "image/x-portable-pixmap";
+    image.media.source_name = "inline.ppm";
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(std::move(image));
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "What is visible?", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+
+    ninfer::RequestOptions options;
+    options.execution.requested_output_tokens = 1;
+    options.execution.sampling.temperature    = 0.0F;
+    options.stop.include_model_defaults       = false;
+    const ninfer::GenerationResult result =
+        engine.generate(engine.prepare(std::move(input)), options);
+    if (!result.prompt.has_media || result.generated_token_ids.size() != 1 ||
+        result.finish_reason != ninfer::FinishReason::OutputLimit) {
+        std::cerr << "real Vision request did not complete through the public Engine\n";
+        return 1;
+    }
     return 0;
 }
 
@@ -77,13 +195,13 @@ int verify_loaded_product(const ninfer::Engine& engine) {
     if (load.target != "qwen3_6_27b_rtx5090" || load.tensor_count != 1166 ||
         load.resource_count != 6 || load.host_to_device_bytes == 0 ||
         load.artifact_bytes_read < load.host_to_device_bytes) {
-        std::cerr << "second Engine construction has an incomplete load summary\n";
+        std::cerr << "Engine construction has an incomplete load summary\n";
         return 1;
     }
     const ninfer::MemorySummary memory = engine.memory_summary();
     if (memory.weights.capacity_bytes == 0 ||
         memory.weights.used_bytes != memory.weights.capacity_bytes) {
-        std::cerr << "second Engine construction has incomplete materialized backing\n";
+        std::cerr << "Engine construction has incomplete materialized backing\n";
         return 1;
     }
     return 0;
@@ -95,20 +213,14 @@ int main() {
     const char* artifact = std::getenv("NINFER_QWEN3_6_27B_WEIGHTS");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_QWEN3_6_27B_WEIGHTS is not set\n";
-        return 0;
+        return 77;
     }
 
-    {
-        ninfer::Engine engine(engine_options(artifact));
-        if (const int result = exercise_prefix(engine); result != 0) { return result; }
-    }
-
-    // The second construction happens only after the first Engine, Program, loaded resources,
-    // weight arena, and DeviceContext have all been destroyed in this process.
-    {
-        const ninfer::Engine engine(engine_options(artifact));
-        if (const int result = verify_loaded_product(engine); result != 0) { return result; }
-    }
+    ninfer::Engine engine(engine_options(artifact));
+    if (const int result = verify_loaded_product(engine); result != 0) { return result; }
+    if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }
+    if (const int result = exercise_prefix(engine); result != 0) { return result; }
+    if (const int result = exercise_vision(engine); result != 0) { return result; }
     std::cout << "ok\n";
     return 0;
 }

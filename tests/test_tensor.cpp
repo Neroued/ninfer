@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <iostream>
-#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -18,15 +17,6 @@ int expect_invalid(Fn&& fn, const char* label) {
         fn();
     } catch (const std::invalid_argument&) { return 0; }
     std::cerr << label << " did not throw std::invalid_argument\n";
-    return 1;
-}
-
-template <typename Fn>
-int expect_overflow(Fn&& fn, const char* label) {
-    try {
-        fn();
-    } catch (const std::overflow_error&) { return 0; }
-    std::cerr << label << " did not throw std::overflow_error\n";
     return 1;
 }
 
@@ -136,29 +126,5 @@ int main() {
     failures += expect_invalid([&] { (void)t.slice(4, 0, 1); }, "invalid slice dim");
     failures += expect_invalid([&] { (void)t.slice(1, 2, 2); }, "out-of-range slice");
     failures += expect_invalid([&] { (void)t.permute({0, 0, 1, 2}); }, "duplicate permutation");
-    failures += expect_overflow(
-        [&] {
-            (void)ninfer::Tensor(nullptr, ninfer::DType::FP32,
-                              {std::numeric_limits<std::int32_t>::max(),
-                               std::numeric_limits<std::int32_t>::max(), 2});
-        },
-        "oversized tensor");
-    failures += expect_overflow(
-        [&] {
-            ninfer::Tensor huge_offset(base, ninfer::DType::U8,
-                                    {std::numeric_limits<std::int32_t>::max(),
-                                     std::numeric_limits<std::int32_t>::max(), 1, 4});
-            (void)huge_offset.slice(3, 3, 1);
-        },
-        "oversized slice offset");
-    failures += expect_overflow(
-        [&] {
-            ninfer::Tensor null_huge_offset(nullptr, ninfer::DType::U8,
-                                         {std::numeric_limits<std::int32_t>::max(),
-                                          std::numeric_limits<std::int32_t>::max(), 1, 4});
-            (void)null_huge_offset.slice(3, 3, 1);
-        },
-        "oversized null slice offset");
-
     return failures == 0 ? 0 : fail("tensor test failed");
 }

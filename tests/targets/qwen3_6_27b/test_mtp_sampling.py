@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 
-from tools.reference.qwen3_6_27b_rtx5090.mtp import MtpStats, truncate_at_stop
 from tools.reference.qwen3_6_27b_rtx5090.sampling import (
     Sampler,
     SamplingConfig,
@@ -75,22 +74,3 @@ def test_sampler_ignores_physical_padding_rows() -> None:
 
     assert token == 1
     assert sampler.counts.tolist() == [0, 1, 0]
-
-
-def test_mtp_stats_track_round_prefix_and_fallback() -> None:
-    stats = MtpStats()
-    stats.record_round(drafted=4, accepted=2)
-    stats.record_round(drafted=3, accepted=3)
-    stats.record_fallback()
-
-    assert stats.rounds == 2
-    assert stats.draft_tokens == 7
-    assert stats.accepted_tokens == 5
-    assert stats.fallback_steps == 1
-    assert stats.accepted_per_pos == [2, 2, 1, 0, 0]
-
-
-def test_stop_token_truncates_the_rest_of_a_round() -> None:
-    assert truncate_at_stop([7, 8, 9, 10], {9}) == [7, 8, 9]
-    assert truncate_at_stop([7, 8], {9}) == [7, 8]
-    assert truncate_at_stop([7, 8], None) == [7, 8]

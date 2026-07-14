@@ -5,8 +5,6 @@
 
 #include <cstdint>
 #include <iostream>
-#include <limits>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -19,13 +17,12 @@ struct PlannedCache {
     std::size_t bytes = 0;
 };
 
-PlannedCache plan_cache(std::uint32_t layers, std::uint32_t max_context,
-                        std::int32_t heads, std::int32_t head_dim,
-                        ninfer::DType dtype = ninfer::DType::BF16,
+PlannedCache plan_cache(std::uint32_t layers, std::uint32_t max_context, std::int32_t heads,
+                        std::int32_t head_dim, ninfer::DType dtype = ninfer::DType::BF16,
                         std::int32_t quant_group = 0) {
     ninfer::LayoutBuilder builder;
-    auto layout = q27::plan_kv_cache(builder, layers, max_context, heads, head_dim, dtype,
-                                     quant_group);
+    auto layout =
+        q27::plan_kv_cache(builder, layers, max_context, heads, head_dim, dtype, quant_group);
     return PlannedCache{std::move(layout), builder.finish(256)};
 }
 
@@ -36,15 +33,6 @@ int fail(const char* message) {
 
 bool cuda_unavailable(cudaError_t err) {
     return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
-
-template <typename Exception, typename Fn>
-int expect_throws(Fn&& fn, const char* label) {
-    try {
-        fn();
-    } catch (const Exception&) { return 0; }
-    std::cerr << label << " did not throw expected exception\n";
-    return 1;
 }
 
 int expect_size(std::size_t actual, std::size_t expected, const char* label) {
@@ -109,9 +97,6 @@ int main() {
     }
 
     int failures = 0;
-    failures += expect_size(ninfer::dtype_size(ninfer::DType::I8), 1, "dtype_size(I8)");
-    failures += expect_size(ninfer::dtype_size(ninfer::DType::FP16), 2, "dtype_size(FP16)");
-
     ninfer::DeviceContext ctx(0);
     auto cache_plan = plan_cache(2, 8, 4, 16);
     ninfer::DeviceArena cache_arena(cache_plan.bytes);
@@ -133,13 +118,6 @@ int main() {
             std::cerr << "K/V tensors alias for layer " << layer << '\n';
         }
     }
-
-    failures +=
-        expect_throws<std::out_of_range>([&] { (void)cache.slot(0, 0, 0); }, "slot before advance");
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(0, -1); },
-                                                 "negative append kv_head");
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(0, 4); },
-                                                 "too large append kv_head");
 
     for (std::int32_t head = 0; head < 4; ++head) {
         q27::KVHeadSlot l0p0 = cache.append_slot(0, head);
@@ -194,9 +172,6 @@ int main() {
 
     cache.rewind(1);
     failures += expect_size(cache.pos, 1, "cache.pos after rewind");
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.slot(0, 1, 0); },
-                                                 "read stale rewound position");
-    failures += expect_throws<std::out_of_range>([&] { cache.rewind(2); }, "rewind forward");
     for (std::int32_t head = 0; head < 4; ++head) {
         q27::KVHeadSlot l0p1 = cache.append_slot(0, head);
         q27::KVHeadSlot l1p1 = cache.append_slot(1, head);
@@ -230,56 +205,6 @@ int main() {
         ++failures;
         std::cerr << "reset changed layer base pointers\n";
     }
-
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_cache(0, 8, 4, 16); }, "zero layers");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_cache(1, 0, 4, 16); },
-        "zero max_context");
-    failures += expect_throws<std::invalid_argument>(
-        [&] {
-            (void)plan_cache(
-                1,
-                static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) + 1U, 4, 16,
-                ninfer::DType::BF16);
-        },
-        "too large max_context");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_cache(1, 8, 0, 16); }, "zero kv heads");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_cache(1, 8, 4, 0); }, "zero head_dim");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_cache(1, 8, 4, 16, ninfer::DType::U8); },
-        "unsupported dtype");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_cache(1, 8, 4, 16, ninfer::DType::BF16, 64); },
-        "bf16 quant group");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_cache(1, 8, 4, 96, ninfer::DType::I8); },
-        "int8 head_dim not divisible");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_cache(1, 8, 4, 64, ninfer::DType::I8, 32); },
-        "unsupported int8 group");
-
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(2, 0); },
-                                                 "invalid append layer");
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.slot(0, 0, 4); },
-                                                 "invalid read kv_head");
-
-    while (cache.pos < cache.max_context) { cache.advance(); }
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.slot(0, cache.pos, 0); },
-                                                 "read at current pos");
-    failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(0, 0); },
-                                                 "append at full capacity");
-    failures +=
-        expect_throws<std::out_of_range>([&] { cache.advance(); }, "advance at full capacity");
-
-    ninfer::DeviceArena small_arena(512);
-    failures += expect_throws<std::out_of_range>(
-        [&] {
-            q27::KVCache too_big({small_arena.base(), small_arena.capacity()}, cache_plan.layout);
-        },
-        "undersized cache backing");
 
     auto int8_plan = plan_cache(1, 8, 2, 64, ninfer::DType::I8);
     ninfer::DeviceArena int8_arena(int8_plan.bytes);

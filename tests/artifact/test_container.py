@@ -80,8 +80,13 @@ def _write_raw(path, metadata: dict[str, object], payload: bytes = b"") -> None:
     )
 
 
-def test_reader_rejects_schema_drift_and_overlapping_spans(tmp_path):
+def test_reader_rejects_invalid_framing_schema_and_geometry(tmp_path):
     path = tmp_path / "invalid.ninfer"
+
+    path.write_bytes(PREFIX.pack(MAGIC, 100) + b"{}")
+    with pytest.raises(ArtifactError, match="beyond the file"):
+        Artifact.open(path)
+
     root = {
         "model_id": "test-model",
         "objects": [
@@ -110,13 +115,6 @@ def test_reader_rejects_schema_drift_and_overlapping_spans(tmp_path):
     root["source_recipe"] = "must not enter the container"
     _write_raw(path, root, b"\x00" * 4)
     with pytest.raises(ArtifactError, match="exactly"):
-        Artifact.open(path)
-
-
-def test_reader_rejects_truncated_json_and_layout_size_mismatch(tmp_path):
-    path = tmp_path / "truncated.ninfer"
-    path.write_bytes(PREFIX.pack(MAGIC, 100) + b"{}")
-    with pytest.raises(ArtifactError, match="beyond the file"):
         Artifact.open(path)
 
     root = {

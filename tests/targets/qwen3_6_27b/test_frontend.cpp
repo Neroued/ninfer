@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -46,22 +47,38 @@ FrontendResources resources() {
             {"added_tokens",
              nlohmann::json::array(
                  {added(1, "helloST"), added(2, "OPtail"), added(3, "thought</thi"),
-                  added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(30, "user\n"),
-                  added(31, "assistant\n"), added(32, "\n"), added(248045, "<|im_start|>", true),
-                  added(248046, "<|im_end|>", true), added(248053, "<|vision_start|>", true),
-                  added(248054, "<|vision_end|>", true), added(248056, "<|image_pad|>", true),
-                  added(248057, "<|video_pad|>", true), added(248068, "<think>"),
-                  added(248069, "</think>")})}}
+                  added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(7, "<0.0 seconds>"),
+                  added(30, "user\n"), added(31, "assistant\n"), added(32, "\n"),
+                  added(248045, "<|im_start|>", true), added(248046, "<|im_end|>", true),
+                  added(248053, "<|vision_start|>", true), added(248054, "<|vision_end|>", true),
+                  added(248056, "<|image_pad|>", true), added(248057, "<|video_pad|>", true),
+                  added(248068, "<think>"), added(248069, "</think>")})}}
             .dump();
     result.tokenizer_config_json  = R"({"add_bos_token":false,"add_prefix_space":false})";
     result.chat_template_jinja    = "enable_thinking <|im_start|> <|vision_start|> vision_start";
     result.generation_config_json = R"({"eos_token_id":[6]})";
     result.preprocessor_config_json =
-        R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"rescale_factor":0.00392156862745098,"size":{"shortest_edge":65536,"longest_edge":16777216}})";
+        R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"rescale_factor":0.00392156862745098,"size":{"shortest_edge":4096,"longest_edge":16777216}})";
     result.video_preprocessor_config_json =
         R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"rescale_factor":0.00392156862745098,"size":{"shortest_edge":4096,"longest_edge":25165824},"fps":2,"min_frames":4,"max_frames":768})";
     return result;
 }
+
+std::vector<std::uint8_t> gradient_ppm() {
+    std::vector<std::uint8_t> ppm;
+    const std::string header = "P6\n64 64\n255\n";
+    for (const char byte : header) {
+        ppm.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+    }
+    for (int index = 0; index < 64 * 64; ++index) {
+        ppm.push_back(static_cast<std::uint8_t>(index & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 3) & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 7) & 0xff));
+    }
+    return ppm;
+}
+
+bool near(float actual, float expected) { return std::abs(actual - expected) < 1.0e-6F; }
 
 std::string channel_text(const PublishedOutput& output, ninfer::OutputChannel channel) {
     std::string result;
@@ -91,20 +108,10 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                   text_data.position_axis(2).back() == 8,
               "text frontend did not construct axis-major positions");
 
-    std::vector<std::uint8_t> ppm;
-    const std::string header = "P6\n32 32\n255\n";
-    for (const char byte : header) {
-        ppm.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
-    }
-    for (int index = 0; index < 32 * 32; ++index) {
-        ppm.push_back(static_cast<std::uint8_t>(index & 0xff));
-        ppm.push_back(static_cast<std::uint8_t>((index * 3) & 0xff));
-        ppm.push_back(static_cast<std::uint8_t>((index * 7) & 0xff));
-    }
     ninfer::MessagePart image;
     image.kind              = ninfer::MessagePartKind::Media;
     image.media.kind        = ninfer::MediaKind::Image;
-    image.media.bytes       = std::move(ppm);
+    image.media.bytes       = gradient_ppm();
     image.media.media_type  = "image/x-portable-pixmap";
     image.media.source_name = "inline.ppm";
     ninfer::ChatMessage image_message;
@@ -118,19 +125,73 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                       "image frontend did not retain one Vision item");
     if (!prepared_data.vision_items.empty()) {
         const auto& item = prepared_data.vision_items.front();
-        failures += check(item.grid.temporal == 1 && item.grid.height == 16 &&
-                              item.grid.width == 16 && item.patch_count == 256 &&
-                              item.token_spans.size() == 1 && item.token_spans.front().count == 64,
+        failures += check(item.grid.temporal == 1 && item.grid.height == 4 &&
+                              item.grid.width == 4 && item.patch_count == 16 &&
+                              item.token_spans.size() == 1 && item.token_spans.front().count == 4,
                           "image frontend grid/patch/placeholder geometry is incorrect");
+        if (!item.token_spans.empty()) {
+            const std::size_t span = item.token_spans.front().begin;
+            failures += check(
+                prepared_data.position_axis(0)[span] == prepared_data.position_axis(1)[span] &&
+                    prepared_data.position_axis(1)[span] == prepared_data.position_axis(2)[span] &&
+                    prepared_data.position_axis(1)[span + 2] ==
+                        prepared_data.position_axis(1)[span] + 1 &&
+                    prepared_data.position_axis(2)[span + 1] ==
+                        prepared_data.position_axis(2)[span] + 1,
+                "image frontend MRoPE positions are incorrect");
+        }
     }
     failures += check(
-        prepared_data.patches.size() == 256 * 1536 && prepared_data.prepare.raw_patches == 256 &&
-            prepared_data.prepare.vision_tokens == 64 && !prepared_data.identity.reusable,
+        prepared_data.patches.size() == 16 * 1536 && prepared_data.prepare.raw_patches == 16 &&
+            prepared_data.prepare.vision_tokens == 4 && !prepared_data.identity.reusable,
         "image frontend did not own the expected patch payload and identity");
+    if (prepared_data.patches.size() == 16 * 1536) {
+        failures += check(near(prepared_data.patches[0], -1.0F) &&
+                              near(prepared_data.patches[1], 1.0F / 127.5F - 1.0F) &&
+                              near(prepared_data.patches[256], -1.0F) &&
+                              near(prepared_data.patches[1536], 16.0F / 127.5F - 1.0F),
+                          "image frontend patch normalization/order is incorrect");
+    }
     failures +=
         check(ninfer::targets::qwen3_6_27b_rtx5090::detail::schedule::vision_workspace_bytes(
                   prepared_data) > 0,
               "image frontend metadata did not produce a Vision workspace plan");
+    return failures;
+}
+
+int test_video_prepare(const Frontend& frontend) {
+    ninfer::MessagePart video;
+    video.kind              = ninfer::MessagePartKind::Media;
+    video.media.kind        = ninfer::MediaKind::Video;
+    video.media.bytes       = gradient_ppm();
+    video.media.media_type  = "image/x-portable-pixmap";
+    video.media.source_name = "single-frame.ppm";
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(std::move(video));
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+
+    auto prepared             = frontend.prepare(std::move(input));
+    const auto& prepared_data = FrontendFactory::inspect(prepared);
+    int failures = check(prepared_data.vision_items.size() == 1 && prepared_data.has_media(),
+                         "video frontend did not retain one Vision item");
+    if (!prepared_data.vision_items.empty()) {
+        const auto& item = prepared_data.vision_items.front();
+        failures += check(
+            item.modality == ninfer::targets::qwen3_6_27b_rtx5090::detail::PromptModality::Video &&
+                item.grid.temporal == 1 && item.grid.height == 4 && item.grid.width == 4 &&
+                item.patch_count == 16 && item.timestamps.size() == 1 &&
+                item.timestamps.front() == 0.0 && item.token_spans.size() == 1 &&
+                item.token_spans.front().count == 4,
+            "video frontend temporal/grid/placeholder metadata is incorrect");
+    }
+    failures +=
+        check(prepared_data.patches.size() == 16 * 1536 &&
+                  near(prepared_data.patches[0], prepared_data.patches[256]) &&
+                  prepared_data.prepare.raw_patches == 16 &&
+                  prepared_data.prepare.vision_tokens == 4 && !prepared_data.identity.reusable,
+              "video frontend did not duplicate the odd temporal frame correctly");
     return failures;
 }
 
@@ -175,6 +236,30 @@ int test_same_token_stop_priority(const Frontend& frontend) {
     const auto output = session.commit_preview();
     failures += check(output.empty(),
                       "same-token stops did not prefer the earliest byte and declaration order");
+    return failures;
+}
+
+int test_terminal_flush(const Frontend& frontend) {
+    auto prompt = frontend.prepare_tokens({0});
+    ninfer::StopPolicy stop;
+    stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+    auto session = frontend.make_output_session(prompt, stop);
+
+    const auto first_decision =
+        session.preview(std::array<ninfer::TokenId, 1>{1}, 2, ninfer::FinishReason::OutputLimit);
+    int failures     = check(first_decision.accepted_tokens == 1 && !first_decision.finished(),
+                             "terminal flush setup unexpectedly finished");
+    const auto first = session.commit_preview();
+    failures += check(channel_text(first, ninfer::OutputChannel::Content) == "hello",
+                      "terminal flush setup did not retain the possible stop suffix");
+
+    const auto terminal = session.preview_terminal(ninfer::FinishReason::Cancelled);
+    failures += check(terminal.accepted_tokens == 0 &&
+                          terminal.finish_reason == ninfer::FinishReason::Cancelled,
+                      "between-round terminal preview returned the wrong decision");
+    const auto flushed = session.commit_preview();
+    failures += check(channel_text(flushed, ninfer::OutputChannel::Content) == "ST",
+                      "between-round terminal preview lost the pending stop suffix");
     return failures;
 }
 
@@ -248,8 +333,10 @@ int main() {
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
     failures += test_text_and_image_prepare(frontend);
+    failures += test_video_prepare(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);
+    failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     return failures == 0 ? 0 : 1;

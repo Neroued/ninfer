@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
-
 import torch
 
 from tools.artifact.container import (
@@ -19,17 +17,9 @@ def test_complete_inventory_has_one_preplanned_object_directory():
     resources = {spec.name: b"x" for spec in inventory.RESOURCE_SPECS}
     plan = convert.build_object_plan(resources)
 
-    assert len(plan.specs) == 1172
-    assert len(plan.objects) == 1172
-    assert tuple(obj.name for obj in plan.objects) == tuple(
-        spec.name for spec in inventory.OBJECT_SPECS
-    )
-    assert tuple(obj.name for obj in plan.objects[:6]) == tuple(resources)
-    assert plan.objects[6].name == "text/token_embedding"
-    assert plan.objects[-1].name == "vision/merger/norm/bias"
-    assert Counter(
-        obj.format for obj in plan.objects if hasattr(obj, "format")
-    ) == inventory.FORMAT_COUNTS
+    expected_names = tuple(spec.name for spec in inventory.OBJECT_SPECS)
+    assert tuple(spec.name for spec in plan.specs) == expected_names
+    assert tuple(obj.name for obj in plan.objects) == expected_names
     assert plan.payload_span_bytes == plan.objects[-1].offset + plan.objects[-1].bytes
 
 

@@ -31,11 +31,12 @@ endfunction()
 # Artifact framing and model-independent runtime contracts.
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
-  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_artifact_materialization_test
+  SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
-ninfer_add_test(ninfer_weight_test       SOURCES test_weight.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
@@ -56,6 +57,7 @@ ninfer_add_test(ninfer_qwen3_6_27b_frontend_test
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # Product protocol contracts.
 ninfer_add_test(ninfer_openai_schema_test

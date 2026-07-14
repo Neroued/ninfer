@@ -7,19 +7,20 @@ benchmark-report, and external protocol behavior. Repository verification princi
 
 ## Organization
 
-- `artifact/` — Python container, registered layout, quantization, resource, converter-inventory,
-  and source-verifier behavior;
+- `artifact/` — Python container, registered layout, quantization, and resource behavior;
 - `kernels/` — independent numerical checks at real supported shapes, plus the shared row-split
   packing helper;
-- `targets/qwen3_6_27b/` — registered artifact recipe/bindings/reference behavior, target Frontend,
-  multimodal/MTP behavior, and the opt-in real-Engine prefix test;
-- `test_ninfer_artifact_reader.cpp` — C++ framing/directory/geometry and Python-written fixture
-  agreement;
+- `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
+  bindings, reference behavior, target Frontend, multimodal/MTP behavior, and the opt-in real-Engine
+  prefix test;
+- `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
+  geometry behavior against a self-contained C++ fixture;
 - `test_generation_controller.cpp` — accepted-prefix, cancellation, publication ordering, and
   request-abort behavior in the common generated-token loop;
 - `test_openai_schema.cpp`, `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current
   protocol translation and tool-call behavior;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v8 reports;
+- `test_bench_matrix.py` — schema-v8 report consumption by the Python matrix summarizer;
 - device/tensor/arena tests — reusable lower-component behavior; KV/GDN tests exercise the exact
   target-owned state implementations.
 
@@ -28,7 +29,8 @@ Tests are grouped by observable risk, not by mirroring every source file or clas
 ## Build and run
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a \
+  -DPython3_EXECUTABLE=/home/neroued/miniconda3/envs/py311/bin/python
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
@@ -40,20 +42,49 @@ cmake --build build -j --target ninfer_sampling_test
 ctest --test-dir build -R ninfer_sampling_test --output-on-failure
 ```
 
-Run the native Python suites with the project Python environment, for example:
+Run the native Python suites with the project Python environment:
 
 ```bash
-python -m pytest tests/artifact tests/targets/qwen3_6_27b
+/home/neroued/miniconda3/envs/py311/bin/python -m pytest \
+  tests/artifact tests/targets/qwen3_6_27b tests/test_bench_matrix.py
 ```
 
-The real prefix/MTP integration test is opt-in because it loads the full artifact:
+The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
+`out/qwen3_6_27b_rtx5090.ninfer`. They report a pytest skip when neither path provides the real
+artifact; the remaining Python target tests still run.
+
+The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
+runs the real engine:
 
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b_rtx5090.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
 ```
 
-Without that variable the test reports a skip and exits successfully.
+Without that variable CTest marks the C++ integration test as skipped.
+
+The capability-evaluation coordinator has its own environment and unittest entry point:
+
+```bash
+PYTHONPATH=eval eval/.venv/bin/python -m unittest discover \
+  -s eval/tests -p 'test_*.py'
+```
+
+Run the serving contract manually after starting a resident server in another terminal:
+
+```bash
+./build/apps/ninfer-serve out/qwen3_6_27b_rtx5090.ninfer \
+  --host 127.0.0.1 --port 18080 --model-id qwen3.6-27b
+```
+
+```bash
+/home/neroued/miniconda3/envs/py311/bin/python -m tools.smoke.serve_contract \
+  --base-url http://127.0.0.1:18080 --model qwen3.6-27b
+```
+
+This smoke check is intentionally not a CTest: it needs the real artifact, a supported GPU, and a
+server process that remains alive while the client exercises OpenAI, Anthropic, streaming, and
+multimodal requests.
 
 ## What belongs here
 

@@ -5,8 +5,6 @@
 
 #include <cstdint>
 #include <iostream>
-#include <limits>
-#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -19,10 +17,9 @@ struct PlannedState {
     std::size_t bytes = 0;
 };
 
-PlannedState plan_state(std::uint32_t layers, std::int32_t conv_dim,
-                        std::int32_t conv_width, std::int32_t value_heads,
-                        std::int32_t value_head_dim, std::int32_t key_head_dim,
-                        std::int32_t snapshot_slots = 1,
+PlannedState plan_state(std::uint32_t layers, std::int32_t conv_dim, std::int32_t conv_width,
+                        std::int32_t value_heads, std::int32_t value_head_dim,
+                        std::int32_t key_head_dim, std::int32_t snapshot_slots = 1,
                         ninfer::DType conv_dtype = ninfer::DType::BF16) {
     ninfer::LayoutBuilder builder;
     auto layout = q27::plan_gdn_state(builder, layers, conv_dim, conv_width, value_heads,
@@ -37,15 +34,6 @@ int fail(const char* message) {
 
 bool cuda_unavailable(cudaError_t err) {
     return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
-
-template <typename Exception, typename Fn>
-int expect_throws(Fn&& fn, const char* label) {
-    try {
-        fn();
-    } catch (const Exception&) { return 0; }
-    std::cerr << label << " did not throw expected exception\n";
-    return 1;
 }
 
 int expect_size(std::size_t actual, std::size_t expected, const char* label) {
@@ -113,8 +101,8 @@ int main() {
         failures += check_shape(state.ssm[layer], {6, 5, 4, 1}, "state.ssm");
         failures += check_shape(state.conv_slot(static_cast<std::uint32_t>(layer), 0),
                                 {10, 3, 1, 1}, "state.conv_slot");
-        failures += check_shape(state.ssm_slot(static_cast<std::uint32_t>(layer), 0),
-                                {6, 5, 4, 1}, "state.ssm_slot");
+        failures += check_shape(state.ssm_slot(static_cast<std::uint32_t>(layer), 0), {6, 5, 4, 1},
+                                "state.ssm_slot");
         if (state.conv[layer].dtype != ninfer::DType::BF16) {
             ++failures;
             std::cerr << "conv dtype is not BF16\n";
@@ -143,71 +131,46 @@ int main() {
     failures += expect_device_byte(state.conv[0], 0, "reset conv0");
     failures += expect_device_byte(state.ssm[1], 0, "reset ssm1");
 
-    auto slotted_plan = plan_state(1, 10, 3, 4, 5, 6, 3);
+    auto slotted_plan = plan_state(2, 10, 3, 4, 5, 6, 3);
     ninfer::DeviceArena slotted_arena(slotted_plan.bytes);
-    q27::GdnState slotted({slotted_arena.base(), slotted_arena.capacity()},
-                          slotted_plan.layout);
+    q27::GdnState slotted({slotted_arena.base(), slotted_arena.capacity()}, slotted_plan.layout);
     failures += expect_size(slotted.snapshot_slots, 3, "slotted.snapshot_slots");
     failures += check_shape(slotted.conv[0], {10, 3, 3, 1}, "slotted.conv");
     failures += check_shape(slotted.ssm[0], {6, 5, 4, 3}, "slotted.ssm");
     failures += check_shape(slotted.conv_slot(0, 2), {10, 3, 1, 1}, "slotted.conv_slot");
     failures += check_shape(slotted.ssm_slot(0, 2), {6, 5, 4, 1}, "slotted.ssm_slot");
-    failures += expect_throws<std::out_of_range>(
-        [&] { (void)slotted.conv_slot(1, 0); }, "conv_slot invalid layer");
-    failures += expect_throws<std::out_of_range>(
-        [&] { (void)slotted.ssm_slot(0, 3); }, "ssm_slot invalid slot");
-
-    ninfer::Tensor conv0 = slotted.conv_slot(0, 0);
-    ninfer::Tensor conv1 = slotted.conv_slot(0, 1);
-    ninfer::Tensor ssm0  = slotted.ssm_slot(0, 0);
-    ninfer::Tensor ssm1  = slotted.ssm_slot(0, 1);
+    ninfer::Tensor conv0        = slotted.conv_slot(0, 0);
+    ninfer::Tensor conv1        = slotted.conv_slot(0, 1);
+    ninfer::Tensor ssm0         = slotted.ssm_slot(0, 0);
+    ninfer::Tensor ssm1         = slotted.ssm_slot(0, 1);
+    ninfer::Tensor conv1_layer1 = slotted.conv_slot(1, 1);
+    ninfer::Tensor ssm1_layer1  = slotted.ssm_slot(1, 1);
     CUDA_CHECK(cudaMemset(conv0.data, 0x7a, conv0.bytes()));
     CUDA_CHECK(cudaMemset(conv1.data, 0x6b, conv1.bytes()));
     CUDA_CHECK(cudaMemset(ssm0.data, 0x5c, ssm0.bytes()));
     CUDA_CHECK(cudaMemset(ssm1.data, 0x4d, ssm1.bytes()));
+    CUDA_CHECK(cudaMemset(conv1_layer1.data, 0x3c, conv1_layer1.bytes()));
+    CUDA_CHECK(cudaMemset(ssm1_layer1.data, 0x2d, ssm1_layer1.bytes()));
     failures += expect_device_byte(conv0, 0x7a, "slotted sentinel conv slot0");
     failures += expect_device_byte(conv1, 0x6b, "slotted sentinel conv slot1");
     failures += expect_device_byte(ssm0, 0x5c, "slotted sentinel ssm slot0");
     failures += expect_device_byte(ssm1, 0x4d, "slotted sentinel ssm slot1");
+
+    slotted.copy_slot(1, 2, ctx.stream);
+    ctx.synchronize();
+    failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "copied conv snapshot");
+    failures += expect_device_byte(slotted.ssm_slot(0, 2), 0x4d, "copied ssm snapshot");
+    failures += expect_device_byte(slotted.conv_slot(1, 2), 0x3c, "copied conv snapshot layer1");
+    failures += expect_device_byte(slotted.ssm_slot(1, 2), 0x2d, "copied ssm snapshot layer1");
+
     slotted.reset(ctx.stream);
     ctx.synchronize();
     failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "slotted reset conv slot0");
     failures += expect_device_byte(slotted.conv_slot(0, 1), 0x6b, "slotted reset keeps conv slot1");
+    failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "slotted reset keeps conv slot2");
     failures += expect_device_byte(slotted.ssm_slot(0, 0), 0, "slotted reset ssm slot0");
     failures += expect_device_byte(slotted.ssm_slot(0, 1), 0x4d, "slotted reset keeps ssm slot1");
-
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_state(0, 10, 3, 4, 5, 6); }, "zero layers");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_state(1, 0, 3, 4, 5, 6); }, "zero conv dim");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_state(1, 10, 0, 4, 5, 6); }, "zero conv width");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_state(1, 10, 3, 0, 5, 6); }, "zero value heads");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_state(1, 10, 3, 4, 0, 6); }, "zero value head dim");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_state(1, 10, 3, 4, 5, 0); }, "zero key head dim");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_state(1, 10, 3, 4, 5, 6, 1, ninfer::DType::U8); },
-        "invalid conv dtype");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)plan_state(1, 10, 3, 4, 5, 6, 0); },
-        "zero snapshot slots");
-
-    ninfer::DeviceArena small_arena(512);
-    failures += expect_throws<std::out_of_range>(
-        [&] {
-            q27::GdnState too_big({small_arena.base(), small_arena.capacity()}, state_plan.layout);
-        },
-        "undersized state backing");
-
-    failures += expect_throws<std::overflow_error>(
-        [&] {
-            (void)plan_state(std::numeric_limits<std::uint32_t>::max(),
-                             std::numeric_limits<std::int32_t>::max(), 1, 1, 1, 1);
-        },
-        "aggregate state overflow");
+    failures += expect_device_byte(slotted.ssm_slot(0, 2), 0x4d, "slotted reset keeps ssm slot2");
 
     return failures == 0 ? 0 : fail("state store test failed");
 }

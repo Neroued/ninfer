@@ -1,4 +1,4 @@
-"""Compare the native C++ preprocessor against the Hugging Face oracle."""
+"""Compare the current C++ preprocessor against the artifact-backed frontend."""
 
 from __future__ import annotations
 
@@ -10,14 +10,16 @@ from pathlib import Path
 
 import numpy as np
 
-from tools.q5090.ref.multimodal import Processor, load_messages
+from tools.reference.qwen3_6_27b_rtx5090.bindings import ArtifactBinding
+from tools.reference.qwen3_6_27b_rtx5090.frontend import Frontend
+from tools.reference.qwen3_6_27b_rtx5090.multimodal import load_messages
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cpp", default="build/src/ninfer-preprocess")
-    parser.add_argument("--weights", required=True)
-    parser.add_argument("--processor", required=True)
+    parser.add_argument("--engine-weights", required=True, help="current Engine .qus artifact")
+    parser.add_argument("--artifact", required=True, help="native .ninfer artifact")
     parser.add_argument("--messages", required=True)
     parser.add_argument("--no-thinking", action="store_true")
     parser.add_argument("--output")
@@ -30,14 +32,21 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="ninfer-preprocess-parity-") as directory:
         metadata = Path(directory) / "cpp.json"
         patches = Path(directory) / "cpp.f32"
-        command = [args.cpp, args.weights, args.messages, str(metadata), str(patches)]
+        command = [
+            args.cpp,
+            args.engine_weights,
+            args.messages,
+            str(metadata),
+            str(patches),
+        ]
         if not thinking:
             command.append("--no-thinking")
         subprocess.run(command, check=True)
         cpp = json.loads(metadata.read_text(encoding="utf-8"))
         cpp_patches = np.fromfile(patches, dtype=np.float32).reshape(cpp["patch_shape"])
 
-    hf = Processor(args.processor).process(load_messages(args.messages), thinking=thinking)
+    with ArtifactBinding.open(args.artifact) as binding:
+        hf = Frontend(binding).process(load_messages(args.messages), thinking=thinking)
     hf_patches = []
     if hf.pixel_values is not None:
         hf_patches.append(hf.pixel_values.numpy())

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tools.q5090.ref.config import CFG
+from tools.reference.qwen3_6_27b_rtx5090.config import CFG
 
 
 def load_manifest(root: Path) -> dict:

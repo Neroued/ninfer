@@ -1,4 +1,4 @@
-"""Compare q5090 Vision activations with the source BF16 Hugging Face vision tower."""
+"""Compare native artifact Vision activations with the source BF16 vision tower."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from tools.q5090.ref import RefModel
-from tools.q5090.ref.multimodal import Processor, load_messages
+from tools.reference.qwen3_6_27b_rtx5090 import RefModel
+from tools.reference.qwen3_6_27b_rtx5090.frontend import Frontend
+from tools.reference.qwen3_6_27b_rtx5090.multimodal import load_messages
 
 
 CAPTURE_LAYERS = {0, 13, 26}
@@ -60,30 +61,31 @@ def main() -> None:
     parser.add_argument("--messages", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output")
-    parser.add_argument("--q5090-dump")
+    parser.add_argument("--ninfer-dump")
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
     device = torch.device(args.device)
     model_dir = Path(args.model_dir)
-    processor = Processor(model_dir)
-    batch = processor.process(load_messages(args.messages), thinking=args.thinking)
-    q5090_captures: dict[str, torch.Tensor] = {}
+    ninfer_captures: dict[str, torch.Tensor] = {}
     with RefModel(args.weights, device=device, compile_codec=True) as model, torch.inference_mode():
-        q5090_output = model.encode_vision(
+        batch = Frontend(model.binding).process(
+            load_messages(args.messages), thinking=args.thinking
+        )
+        ninfer_output = model.encode_vision(
             batch,
             compile_codec=True,
-            tap=lambda name, value: q5090_captures.__setitem__(
+            tap=lambda name, value: ninfer_captures.__setitem__(
                 name, value.detach().to(device="cpu", dtype=torch.bfloat16)
             ),
         )
-        q5090_captures["merger"] = torch.cat(
+        ninfer_captures["merger"] = torch.cat(
             [
                 value
-                for value in (q5090_output.image_embeddings, q5090_output.video_embeddings)
+                for value in (ninfer_output.image_embeddings, ninfer_output.video_embeddings)
                 if value is not None
             ]
         ).detach().to(device="cpu", dtype=torch.bfloat16)
-        vision_stats = q5090_output.stats
+        vision_stats = ninfer_output.stats
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -114,11 +116,11 @@ def main() -> None:
         handle.remove()
 
     comparisons = {
-        name: metrics(q5090_captures[name], hf_captures[name])
+        name: metrics(ninfer_captures[name], hf_captures[name])
         for name in ("block_00", "block_13", "block_26", "merger")
     }
     report = {
-        "format": "q5090_vision_bf16_comparison_v1",
+        "format": "ninfer_vision_bf16_comparison_v1",
         "weights": str(Path(args.weights).resolve()),
         "model_dir": str(model_dir.resolve()),
         "image_grid_thw": None if batch.image_grid_thw is None else batch.image_grid_thw.tolist(),
@@ -132,12 +134,12 @@ def main() -> None:
         },
         "comparisons": comparisons,
     }
-    if args.q5090_dump:
-        root = Path(args.q5090_dump)
+    if args.ninfer_dump:
+        root = Path(args.ninfer_dump)
         root.mkdir(parents=True, exist_ok=True)
         records = []
         for short_name in ("patch_embed", "block_00", "block_13", "block_26", "merger"):
-            value = q5090_captures[short_name].float().contiguous()
+            value = ninfer_captures[short_name].float().contiguous()
             file_name = f"{short_name}.f32"
             value.numpy().tofile(root / file_name)
             records.append(
@@ -157,7 +159,7 @@ def main() -> None:
             json.dumps(
                 {
                     "format": "ninfer_activation_dump_v1",
-                    "runtime": "python-q5090",
+                    "runtime": "python-ninfer",
                     "tensors": records,
                 },
                 indent=2,

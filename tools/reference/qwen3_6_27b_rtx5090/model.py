@@ -710,6 +710,27 @@ class RefModel:
             token = round_output[-1]
         return output
 
+    def continue_generation(
+        self,
+        token: int,
+        max_new_tokens: int,
+        *,
+        stop_token_ids: set[int] | None = None,
+        sampler: Callable[[torch.Tensor], int] | None = None,
+        tap=None,
+    ) -> list[int]:
+        """Continue from the first sampled token after an explicit prefill."""
+
+        if max_new_tokens <= 0:
+            return []
+        return self._continue_generation(
+            token,
+            max_new_tokens,
+            stop_token_ids=stop_token_ids,
+            sampler=sampler,
+            tap=tap,
+        )
+
     def generate(
         self,
         prompt: Iterable[int],
@@ -730,7 +751,7 @@ class RefModel:
         self.vision_stats = None
         self.prepare(len(prompt) + max_new_tokens, compile_codec=compile_codec)
         token = self.prefill(prompt, sampler=sampler, tap=tap)
-        return self._continue_generation(
+        return self.continue_generation(
             token,
             max_new_tokens,
             stop_token_ids=stop_token_ids,
@@ -757,7 +778,7 @@ class RefModel:
             compile_codec = max_new_tokens >= COMPILED_CODEC_MIN_TOKENS
         self.prepare(batch.prompt_length + max_new_tokens, compile_codec=compile_codec)
         token = self.prefill_multimodal(batch, vision, sampler=sampler, tap=tap)
-        return self._continue_generation(
+        return self.continue_generation(
             token,
             max_new_tokens,
             stop_token_ids=stop_token_ids,

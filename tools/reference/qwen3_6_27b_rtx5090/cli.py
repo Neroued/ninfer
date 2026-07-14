@@ -33,7 +33,9 @@ class Timings:
     load: float
     preprocess: float
     vision: float
-    generation: float
+    prepare: float
+    prefill: float
+    decode: float
 
 
 def parse_ids(text: str) -> list[int]:
@@ -212,13 +214,13 @@ def _print_result(
             f"accepted={stats.accepted_tokens} acceptance={acceptance:.4f} "
             f"accepted_per_pos={stats.accepted_per_pos[:model.mtp_draft_tokens]}"
         )
-    generated_tps = (
-        len(generated) / timings.generation if timings.generation > 0.0 else 0.0
-    )
+    decode_tokens = max(0, len(generated) - 1)
+    decode_tps = decode_tokens / timings.decode if timings.decode > 0.0 else 0.0
     print(
         f"TIMING: load={timings.load:.3f}s preprocess={timings.preprocess:.3f}s "
-        f"vision={timings.vision:.3f}s generation={timings.generation:.3f}s "
-        f"generated_tokens={len(generated)} generated_tps={generated_tps:.3f}"
+        f"vision={timings.vision:.3f}s prepare={timings.prepare:.3f}s "
+        f"prefill={timings.prefill:.3f}s decode={timings.decode:.3f}s "
+        f"decode_tokens={decode_tokens} decode_tps={decode_tps:.3f}"
     )
     if model is not None and model.device.type == "cuda":
         print(
@@ -267,7 +269,7 @@ def _frontend_only(
             generated=(),
             generated_text="",
             stop_reason="disabled",
-            timings=Timings(load_seconds, preprocess_seconds, 0.0, 0.0),
+            timings=Timings(load_seconds, preprocess_seconds, 0.0, 0.0, 0.0, 0.0),
             sampler=None,
             model=None,
             vision_stats=None,
@@ -329,33 +331,50 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         sampler = None
         generated: list[int] = []
-        generation_seconds = 0.0
+        prepare_seconds = 0.0
+        prefill_seconds = 0.0
+        decode_seconds = 0.0
         if args.decode > 0:
             try:
                 sampler = Sampler(_sampling_config(frontend, args), CFG.vocab, model.device)
             except ValueError as exc:
                 parser.error(str(exc))
-            generation_started = time.perf_counter()
+            prepare_started = time.perf_counter()
+            model.prepare(
+                len(prompt.token_ids) + args.decode,
+                compile_codec=compile_codec,
+            )
+            _synchronize(model.device)
+            prepare_seconds = time.perf_counter() - prepare_started
+
+            prefill_started = time.perf_counter()
             if vision_output is not None:
                 assert prompt.batch is not None
-                generated = model.generate_multimodal(
+                token = model.prefill_multimodal(
                     prompt.batch,
                     vision_output,
-                    args.decode,
-                    stop_token_ids=stops,
                     sampler=sampler,
                     tap=tap,
                 )
             else:
-                generated = model.generate(
+                token = model.prefill(
                     prompt.token_ids,
-                    args.decode,
-                    stop_token_ids=stops,
                     sampler=sampler,
                     tap=tap,
                 )
             _synchronize(model.device)
-            generation_seconds = time.perf_counter() - generation_started
+            prefill_seconds = time.perf_counter() - prefill_started
+
+            decode_started = time.perf_counter()
+            generated = model.continue_generation(
+                token,
+                args.decode,
+                stop_token_ids=stops,
+                sampler=sampler,
+                tap=tap,
+            )
+            _synchronize(model.device)
+            decode_seconds = time.perf_counter() - decode_started
 
         generated_text = frontend.decode(generated, skip_special_tokens=True)
         stop_reason = (
@@ -374,7 +393,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 load_seconds,
                 preprocess_seconds,
                 vision_seconds,
-                generation_seconds,
+                prepare_seconds,
+                prefill_seconds,
+                decode_seconds,
             ),
             sampler=sampler,
             model=model,

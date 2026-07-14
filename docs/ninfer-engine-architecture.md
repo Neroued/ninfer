@@ -20,6 +20,11 @@
 > [`qwen3.6-35b-a3b-architecture.md`](qwen3.6-35b-a3b-architecture.md). The currently delivered NInfer
 > engine remains governed by [`design.md`](design.md) until the corresponding migration is complete.
 
+The native `.ninfer` converter, Python artifact layer, narrow C++ reader, 27B binder/verifier, and
+complete Python Text/Vision/MTP reference already exist. They are the implemented artifact and
+correctness foundation for this design. The target packages, `Program`, common generation
+controller, and C++ Engine cutover defined below remain pending.
+
 ## 1. Decision
 
 NInfer is built around **compiled exact-target programs**, not a generic model `forward()` API.
@@ -1539,10 +1544,11 @@ Vision scratch can be released only after both Text and MTP consumers no longer 
 columns. The resident identity includes media/composed-embedding identity, so a text-token match
 alone never authorizes multimodal reuse.
 
-This requires a real correction, not only ownership movement. The current 27B MTP prefill rebuilds
-shifted inputs through raw token embedding lookup; for an image/video placeholder it must instead
-carry the corresponding Vision-merger composed column into MTP. Multimodal Text/MTP block parity is
-a migration gate.
+This requires a real correction in the current legacy C++ path, not only ownership movement. That
+path rebuilds shifted MTP inputs through raw token embedding lookup; for an image/video placeholder
+it must instead carry the corresponding Vision-merger composed column into MTP. The native Python
+reference already implements the corrected composed-embedding lookahead and is the oracle for the
+C++ migration gate.
 
 ### 16.4 Decode round
 
@@ -1811,9 +1817,10 @@ apps/
 └── serve/
 
 tools/
-├── convert/common/                      generic container/format writing machinery
+├── artifact/                            generic .ninfer read/write/layout/inspection machinery
+├── convert/common/                      generic checkpoint-reading/quantization helpers
 ├── convert/<target_key>/                conversion-time source mapping and recipe
-├── inspect/                             generic artifact inspection
+├── reference/<target_key>/              complete target-private Python correctness reference
 └── parity/<target_key>/                 independent target/reference diagnostics
 
 bench/
@@ -1827,7 +1834,9 @@ tests/                                   grouped by observable risk, not a sourc
 └── serve/
 ```
 
-The top-level roots, one-directory-per-exact-target rule, physical `export/` versus `impl/` split,
+The `tools/` portion of this tree is already implemented for the 27B target. The C++ target/runtime
+portion remains the migration destination. The top-level roots, one-directory-per-exact-target rule,
+physical `export/` versus `impl/` split,
 target responsibility partitions, `package.h` choke point, and dependency directions are normative.
 The shown leaf-header split is a canonical starting arrangement, not a requirement to create empty
 files or keep a one-class-per-file shape. Files may split or merge inside one owner when their

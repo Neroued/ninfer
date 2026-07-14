@@ -7,8 +7,13 @@
 > [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md); the exact 35B-A3B source profile is
 > described separately in
 > [`qwen3.6-35b-a3b-architecture.md`](qwen3.6-35b-a3b-architecture.md). The packed artifact contract
-> belongs in
-> [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md).
+> for the current C++ Engine belongs in
+> [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md). The implemented native artifact
+> and Python-reference route is governed by
+> [`ninfer-container-format.md`](ninfer-container-format.md) and
+> [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md). The accepted multi-target C++
+> Engine remains pending and is defined separately by
+> [`ninfer-engine-architecture.md`](ninfer-engine-architecture.md).
 
 ## 1. Purpose
 
@@ -41,7 +46,10 @@ and target-selection policy are governed by
 - greedy and sampled generation;
 - BF16 or INT8 KV cache;
 - command-line generation, OpenAI Chat Completions, and Anthropic Messages;
-- offline q5090 conversion plus Python reference/diagnostic tooling;
+- offline q5090 conversion plus Python reference/diagnostic tooling for the current `.qus` Engine
+  route;
+- native `.ninfer` conversion, Python and narrow C++ readers, target verification, and a complete
+  Python Text/Vision/MTP reference;
 - real-weight and per-operator benchmarking.
 
 ### Deliberately unsupported by the current implementation
@@ -50,7 +58,7 @@ and target-selection policy are governed by
 - batching or concurrent GPU execution;
 - tensor/pipeline parallelism and multi-GPU inference;
 - dynamic computation graphs or runtime model discovery;
-- runtime weight repacking or alternate weight loaders;
+- runtime weight repacking or alternate weight loaders in the current C++ Engine;
 - compatibility parsing for retired q5090 formats;
 - server-side tool execution or constrained JSON decoding;
 - a qualified 128K/256K operating point without explicit memory, numerical, and performance
@@ -67,15 +75,19 @@ and target-selection policy are governed by
 | Text frontend | `include/ninfer/text`, `src/text` | tokenizer, chat template, CLI translation, output decoding |
 | Media frontend | `include/ninfer/media`, `src/media`, model processor | local/remote media acquisition, decode, resize, normalization, patch construction, budgets |
 | Serving | `include/ninfer/serve`, `src/serve` | HTTP transport, OpenAI/Anthropic schemas, request translation, streaming, tool-call parsing |
-| Offline tools | `tools/q5090_convert`, `tools/q5090`, `tools/parity` | artifact production, Python reference, structural/numerical diagnostics |
+| Current `.qus` tools | `tools/q5090_convert`, `tools/q5090`, legacy files in `tools/parity` | q5090 artifact production, Python reader/codec, and current-Engine structural/numerical diagnostics |
+| Native artifact tools | `tools/artifact`, `tools/convert`, `tools/reference`, target directories in `tools/parity` | `.ninfer` framing/layouts, registered conversion and verification, complete target-private Python reference and diagnostics |
 | Measurement | `bench`, `tools/bench` | real-weight throughput, per-operator benchmarks, corpus tooling, report schemas |
 
 The layer names L0/L1/L2 describe the inference core. Runtime and frontends are explicit peers above
 that core, not hidden responsibilities of the model card.
 
-## 4. Fixed artifact boundary
+## 4. Artifact boundaries
 
-The offline converter is the only path from the source BF16 checkpoint to runtime weights:
+### 4.1 Current C++ Engine route
+
+The q5090 offline converter is the only path from the source BF16 checkpoint to weights consumed by
+the current C++ Engine:
 
 ```text
 HF safetensors + tokenizer assets
@@ -100,6 +112,31 @@ module payloads. Quantized weights remain packed on device; CUDA kernels decode 
 
 The runtime accepts only the active v4.2 contract. Retired format documents are historical and do
 not imply parser or converter compatibility.
+
+### 4.2 Native artifact and Python reference route
+
+The native route is implemented independently of q5090:
+
+```text
+HF safetensors + frontend resources
+              │
+              ▼
+tools.convert.qwen3_6_27b_rtx5090
+              │
+              ▼
+one qwen3_6_27b_rtx5090.ninfer artifact + descriptive conversion report
+              │
+              ├── tools.artifact reader/inspector
+              ├── narrow C++ directory reader
+              ├── target verifier and immutable Python binding
+              └── tools.reference.qwen3_6_27b_rtx5090 Text/Vision/MTP execution
+```
+
+The complete Python reference performs text and multimodal prefill/decode, full or shortlisted MTP
+proposals, sequential target verification, and speculative sampling directly from `.ninfer`. It does
+not read the source BF16 checkpoint during inference. This route is the correctness oracle for the
+native artifact contract; the current C++ Engine still accepts only `.qus`, and the multi-target
+Engine cutover remains future work.
 
 ## 5. Core layering
 
@@ -310,5 +347,6 @@ claims after the implementation, artifact, or measurement contract changes.
 | CUDA implementations | `src/kernels` |
 | CLI and text frontend | `include/ninfer/text`, `src/text`, `src/main.cpp` |
 | HTTP serving | `include/ninfer/serve`, `src/serve` |
-| converter/reference | `tools/q5090_convert`, `tools/q5090` |
+| current `.qus` converter/reference | `tools/q5090_convert`, `tools/q5090`, `tools/parity` |
+| native `.ninfer` reader/converter/reference | `tools/artifact`, `tools/convert/qwen3_6_27b_rtx5090`, `tools/reference/qwen3_6_27b_rtx5090` |
 | measurement | `bench`, `tools/bench` |

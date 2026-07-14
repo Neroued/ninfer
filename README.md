@@ -15,9 +15,11 @@ capability or a large-scale-serving goal.
 
 For the current target, the model schedule is hand-written, CUDA kernels are specialized for fixed
 shapes, and the offline converter produces one self-contained q5090 v4.2 `.qus` artifact. The
-runtime loads it directly without runtime repacking. The native `.ninfer` artifact toolchain is
-under implementation, while the new multi-target C++ engine architecture is not implemented yet.
-The Qwen3.6-35B-A3B document is a model reference, not a claim of runtime support.
+current C++ Engine loads that artifact directly without runtime repacking. In parallel, the native
+`.ninfer` converter, Python and narrow C++ readers, verifier, and complete Python Text/Vision/MTP
+reference are implemented. `.ninfer` is not yet a C++ Engine input: the new multi-target C++ engine
+architecture remains future work. The Qwen3.6-35B-A3B document is a model reference, not a claim of
+runtime support.
 
 ## Current capabilities
 
@@ -34,8 +36,10 @@ The current implementation includes:
 - text and structured multimodal CLI input;
 - OpenAI Chat Completions and Anthropic Messages HTTP endpoints, including streaming and
   best-effort function tool calling;
-- a Python q5090 reference model, converter, structural verifier, numerical diagnostics, and
-  real-weight/per-operator benchmarks;
+- the current q5090 converter, legacy Python reader/codec, parity diagnostics, and
+  real-weight/per-operator benchmarks used by the `.qus` Engine route;
+- a native `.ninfer` converter, generic Python reader/inspector, narrow C++ reader, target verifier,
+  and complete Python Text/Vision/MTP reference with text, image, video, and speculative generation;
 - a configurable capability-evaluation coordinator for local or online OpenAI-compatible targets,
   with EvalScope adapters, progress, persistent logs, resume, and normalized reports.
 
@@ -53,7 +57,8 @@ setting and are not an implied 128K/256K qualification claim.
 | Workload | one sequence, batch size 1 |
 | Primary metric | single-stream decode tokens/second |
 | Secondary metric | prefill throughput and time to first token |
-| Artifact | `q5090_w4g64_mixed_v4_2` |
+| Current C++ Engine artifact | `q5090_w4g64_mixed_v4_2` (`.qus`) |
+| Native reference artifact | `qwen3_6_27b_rtx5090.ninfer` |
 | Activations | BF16 |
 | KV cache | BF16 or INT8 |
 
@@ -82,7 +87,9 @@ The main binaries are:
 Use `ninfer`, `ninfer-serve`, and benchmark `--help` output as the authoritative option reference.
 The two diagnostic executables print their usage when required positional arguments are missing.
 
-## Build a q5090 artifact
+## Build artifacts
+
+### Current C++ Engine artifact
 
 Conversion is offline and requires the original BF16 checkpoint and tokenizer assets:
 
@@ -101,7 +108,39 @@ The artifact contains packed Text, MTP, Vision, optional draft-head weights, plu
 [`tools/q5090_convert/README.md`](tools/q5090_convert/README.md) for conversion and verification
 details.
 
-## Run the CLI
+### Native `.ninfer` artifact and Python reference
+
+The native converter reads the same BF16 checkpoint directly and emits the complete registered
+Text, draft-head, MTP, Vision, and frontend object inventory:
+
+```bash
+python -m tools.convert.qwen3_6_27b_rtx5090.convert \
+  --model /path/to/Qwen3.6-27B/base-hf-bf16 \
+  --out out/qwen3_6_27b_rtx5090.ninfer
+
+python -m tools.artifact.inspect \
+  out/qwen3_6_27b_rtx5090.ninfer --objects
+
+python -m tools.convert.qwen3_6_27b_rtx5090.verify \
+  out/qwen3_6_27b_rtx5090.ninfer \
+  --model /path/to/Qwen3.6-27B/base-hf-bf16
+```
+
+The complete Python reference consumes only the resulting `.ninfer` artifact at inference time. It
+uses the embedded frontend resources through the existing Hugging Face libraries and supports Text,
+image/video Vision, full and shortlisted MTP proposal heads, and speculative generation:
+
+```bash
+python -m tools.reference.qwen3_6_27b_rtx5090.cli \
+  --weights out/qwen3_6_27b_rtx5090.ninfer \
+  --prompt "用三句话解释 prefill 和 decode 的区别。" \
+  --decode 128 --mtp-draft-tokens 3
+```
+
+Use `--messages messages.json` for structured text/image/video input. This Python path is the
+correctness reference for the native artifact route; it is not the new C++ Engine implementation.
+
+## Run the current C++ CLI
 
 Text prompt:
 
@@ -161,19 +200,18 @@ Those records are descriptive evidence, not a fixed-worktree or byte-reproducibi
 ```text
 BF16 checkpoint + tokenizer
           │
-          ▼
-offline converter ───────────────► q5090 v4.2 artifact
-                                          │
-                                          ▼
-L0 storage/state ─► L1 CUDA operators ─► L2 Text/MTP/Vision schedules
-                                                   │
-                                                   ▼
-                                      Engine + CUDA Graph runtime
-                                                   │
-                          ┌────────────────────────┴──────────────────────┐
-                          ▼                                               ▼
-                 text/media frontend                              CLI / HTTP serving
+          ├── q5090 converter ──► q5090 v4.2 .qus ──► current C++ Engine
+          │                                              │
+          │                              CUDA Text/MTP/Vision + CLI/server
+          │
+          └── native converter ─► .ninfer v1 ─────────► complete Python reference
+                                     │                    Text/Vision/MTP
+                                     ├── Python reader/inspector/verifier
+                                     └── narrow C++ reader (not Engine integration)
 ```
+
+The accepted multi-target C++ architecture will eventually replace the first route's q5090 loader
+with compiled exact-target packages over `.ninfer`; that Engine migration is not implemented yet.
 
 - **L0** owns devices, arenas, tensors, q5090 loading, KV cache, and recurrent state.
 - **L1** owns public operator contracts, dispatch, CUDA launchers, and specialized kernels.
@@ -203,9 +241,10 @@ Start at [`docs/README.md`](docs/README.md). The active project documents are:
 - [`docs/ninfer-tensor-formats.md`](docs/ninfer-tensor-formats.md),
   [`docs/ninfer-storage-layouts.md`](docs/ninfer-storage-layouts.md),
   [`docs/ninfer-container-format.md`](docs/ninfer-container-format.md),
-  [`docs/qwen3.6-27b-ninfer-artifact.md`](docs/qwen3.6-27b-ninfer-artifact.md), and
-  [`docs/ninfer-engine-architecture.md`](docs/ninfer-engine-architecture.md) — accepted NInfer
-  storage, artifact, and future-engine designs under implementation.
+  and [`docs/qwen3.6-27b-ninfer-artifact.md`](docs/qwen3.6-27b-ninfer-artifact.md) — the implemented
+  native artifact contracts used by the converter, readers, verifier, and Python reference;
+- [`docs/ninfer-engine-architecture.md`](docs/ninfer-engine-architecture.md) — the accepted
+  multi-target C++ Engine design, still pending implementation.
 
 Completed plans, retired formats, implementation reports, and profiler evidence live under
 [`docs/archive/`](docs/archive/). Archived documents are historical records, not current design

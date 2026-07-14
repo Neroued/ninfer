@@ -1,6 +1,7 @@
 # NInfer Persistent Storage Layouts
 
-> Status: accepted on 2026-07-14, implementation in progress.
+> Status: accepted and implemented by the native Python writer/reader, converter, verifier, binder,
+> and narrow C++ reader on 2026-07-14. These layouts are not yet consumed by the current C++ Engine.
 >
 > Authority: this document registers the first two persistent tensor layouts and the first required-
 > resource encoding used by `.ninfer` artifacts. It defines their supported numeric formats, file

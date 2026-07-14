@@ -4,7 +4,11 @@
 >
 > The fixed dimensions are encoded in `include/ninfer/model/config.h`. This document describes the
 > Text decoder, MTP model, Vision tower, multimodal positions, numerics, and persistent state. It does
-> not define the q5090 byte layout or CUDA implementation policy.
+> not define either artifact byte layout or CUDA implementation policy. The current C++ Engine's
+> q5090 assignment is defined by
+> [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md); the implemented native
+> `.ninfer` assignment and binding contract are defined by
+> [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md).
 
 ## 1. Model identity
 
@@ -353,4 +357,11 @@ changes its fixed allocation.
 | MTP accept/commit helpers | `src/model/mtp_ops.h`, `src/kernels/kernel/mtp_round.cuh` |
 | GQA cache | `include/ninfer/core/kv_cache.h` |
 | GDN state | `include/ninfer/core/state_store.h` |
-| artifact tensor assignment | [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md) |
+| current C++ `.qus` tensor assignment | [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md) |
+| native `.ninfer` tensor assignment and binding | [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md), `tools/reference/qwen3_6_27b_rtx5090/bindings.py` |
+| native `.ninfer` converter and verifier | `tools/convert/qwen3_6_27b_rtx5090` |
+| complete Python Text/Vision/MTP reference | `tools/reference/qwen3_6_27b_rtx5090` |
+
+The Python reference is the complete executable oracle for the native artifact route. The C++
+sources above remain the currently delivered `.qus` Engine implementation; they have not yet been
+reorganized into the accepted multi-target Engine architecture or switched to `.ninfer` loading.

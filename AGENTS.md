@@ -28,10 +28,13 @@ general-purpose runtime, compatibility layer, or model zoo.
   floating-point and probabilistic computation. Tests must protect supported functionality or
   realistic regressions and justify their maintenance cost.
 
-The current implemented target is Qwen3.6-27B on one RTX 5090. It includes the fixed Text decoder,
-MTP speculative decoding, native Vision, the q5090 v4.2 `.qus` artifact, command-line generation,
-and OpenAI/Anthropic serving. The current workload is one user, one active request, and one GPU;
-limited continuous batching and additional qualified targets are future work, not current behavior.
+The current implemented target is Qwen3.6-27B on one RTX 5090. The delivered C++ Engine includes
+fixed Text, MTP, native Vision, command-line generation, and OpenAI/Anthropic serving over the q5090
+v4.2 `.qus` artifact. In parallel, native `.ninfer` conversion, Python and narrow C++ readers,
+target binding/verification, and the complete Text/Vision/MTP Python reference are implemented. The
+multi-target C++ Engine has not yet replaced the `.qus` route. The current workload is one user, one
+active request, and one GPU; limited continuous batching and additional qualified targets are future
+work, not current behavior.
 
 ## Local Environment
 
@@ -42,8 +45,10 @@ Use these canonical paths on the current development machine:
 | repository | `/home/neroued/ninfer` |
 | Python 3.11 | `/home/neroued/miniconda3/envs/py311/bin/python` |
 | BF16 source model | `/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16` |
-| current q5090 artifact | `out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus` |
-| artifact manifest | `out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus.manifest.json` |
+| current C++ Engine artifact | `out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus` |
+| current C++ Engine manifest | `out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus.manifest.json` |
+| native reference artifact | `out/qwen3_6_27b_rtx5090.ninfer` |
+| native conversion report | `out/qwen3_6_27b_rtx5090.ninfer.conversion.json` |
 | CMake build | `build/` |
 | local profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
 | hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
@@ -52,10 +57,11 @@ For Python work, invoke the canonical interpreter explicitly. Do not use an arbi
 `python` or `pip`, and do not install or upgrade dependencies unless the task requires it.
 
 `out/` contains old experimental artifacts. Never choose an artifact by glob, modification time, or
-an unqualified “latest” name. Use the v4.2 path above unless the task explicitly names another file.
-Retained v1/v2/v3/v4/v4.1 artifacts are historical diagnostics, not valid current runtime inputs.
+an unqualified “latest” name. Use the v4.2 `.qus` path for current C++ Engine work and the `.ninfer`
+path for native converter, reader, verifier, binder, and Python-reference work. Retained
+v1/v2/v3/v4/v4.1 artifacts are historical diagnostics, not valid current runtime inputs.
 
-The model, q5090 artifact, and profiler outputs are large local prerequisites. If one is missing,
+The model, selected artifact, and profiler outputs are large local prerequisites. If one is missing,
 report it clearly; do not download a model, regenerate a large artifact, or launch a long profile
 unless that work is in scope. Files under `out/` and `profiles/` are normally local and uncommitted.
 
@@ -65,6 +71,7 @@ Useful shell variables:
 PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
 MODEL=/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16
 WEIGHTS=out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus
+NINFER_WEIGHTS=out/qwen3_6_27b_rtx5090.ninfer
 ```
 
 ## Sources of Truth
@@ -81,17 +88,20 @@ Use the smallest relevant current source:
   semantics;
 - `docs/qwen3.6-35b-a3b-architecture.md` — exact 35B-A3B source-checkpoint Text/MoE/MTP/Vision
   mathematics and state semantics; runtime support is defined elsewhere;
-- `docs/q5090_packed_file_format_v4.md` — the only normative q5090 artifact contract;
+- `docs/ninfer-tensor-formats.md`, `docs/ninfer-storage-layouts.md`, and
+  `docs/ninfer-container-format.md` — native `.ninfer` numeric, layout, and framing contracts;
+- `docs/qwen3.6-27b-ninfer-artifact.md` — native 27B object inventory, conversion, and binding
+  contract;
+- `docs/q5090_packed_file_format_v4.md` — current C++ Engine `.qus` ABI;
+- `docs/ninfer-engine-architecture.md` — accepted but not-yet-implemented multi-target Engine;
 - `docs/kernel-development.md` — kernel layering and correctness/performance workflow;
 - `docs/serving.md` — CLI, sampling, multimodal, OpenAI, and Anthropic behavior;
 - public headers under `include/ninfer/` — current C++ API;
 - executable `--help` output — exact current command options.
 
-`docs/ninfer-tensor-formats.md`, `docs/ninfer-storage-layouts.md`,
-`docs/ninfer-container-format.md`, `docs/qwen3.6-27b-ninfer-artifact.md`, and
-`docs/ninfer-engine-architecture.md` are accepted designs under implementation. They govern work on
-those migrations but do not by themselves describe currently available C++ Engine inputs, APIs, or
-runtime behavior.
+The native tensor-format, storage-layout, container, and 27B artifact contracts are implemented by
+the `.ninfer` converter/readers/verifier/binder and complete Python reference. The Engine
+architecture remains pending and does not describe currently available C++ Engine APIs or inputs.
 
 For current `.qus` converter/parser/layout work, read the q5090 specification. For `.ninfer` work,
 read the tensor-format, storage-layout, container, and corresponding model-artifact specifications.
@@ -173,7 +183,7 @@ call it an independent oracle.
 
 Treat these as high-risk boundaries:
 
-- q5090 code/scale decode and tensor assignment;
+- q5090 and `.ninfer` code/scale decode, object ranges, tensor assignment, and typed binding;
 - BF16 rounding and fusion order;
 - zero-centered versus plain RMSNorm;
 - FP32 GDN gates and recurrent state;
@@ -210,8 +220,9 @@ implementation shape, or preserve compatibility are not allowed.
    - Use real project shapes where applicable.
    - Include stress or edge cases that can expose the targeted wrong math.
 2. Binary and file-format contracts.
-   - Cover q5090 parser, pack/unpack, manifest, CRC, shape, dtype, layout, and loading boundaries.
-   - Reject malformed or dangerous input that could load wrong weights or corrupt runtime state.
+   - Cover the applicable q5090 or `.ninfer` framing, object ranges, pack/unpack, shape, dtype,
+     layout, and loading boundaries.
+   - Reject contract violations that could load the wrong bytes or corrupt runtime state.
 3. Real CLI and report/schema contracts.
    - Cover benchmark reports, tokenizer tools, fixtures, and externally consumed JSON/protocol fields.
    - Validate user-visible or downstream-consumed behavior.
@@ -251,9 +262,10 @@ The stable active documentation set is defined by `docs/README.md`. New stable r
 integrated into an existing authoritative document whenever possible. Do not create parallel
 `final`, `v2`, `updated`, or `new-design` documents for the same current subject.
 
-Only the active q5090 specification may be called the normative artifact contract. Public headers,
-not a hand-maintained operator catalog, enumerate C++ APIs. Executable `--help`, not a copied flag
-list, enumerates command options.
+The q5090 specification is authoritative only for the current C++ Engine's `.qus` ABI. The native
+numeric-format, storage-layout, container, and model-artifact documents are authoritative for their
+respective `.ninfer` layers. Public headers, not a hand-maintained operator catalog, enumerate C++
+APIs. Executable `--help`, not a copied flag list, enumerates command options.
 
 Complex active work may temporarily create `docs/plans/YYYY-MM-DD-topic.md`. A plan must be moved
 under the appropriate `docs/archive/` era when the work is completed, abandoned, or superseded,
@@ -314,6 +326,7 @@ Run the smallest verification set that proves the changed behavior:
 | C++ API/runtime | affected build targets and affected tests |
 | Python tooling | `py_compile` and affected Python tests |
 | q5090 converter/parser/layout | format tests, verifier, malformed-input checks, and real artifact when needed |
+| `.ninfer` converter/reader/binder | affected format/target tests, verifier, and one real artifact when needed |
 | CUDA numerical behavior | oracle tests at real shapes |
 | CUDA memory/lifetime | affected execution plus `compute-sanitizer` when available |
 | kernel performance | microbenchmark, NCU, and relevant `ninfer_bench` comparison |

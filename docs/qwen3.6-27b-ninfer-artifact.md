@@ -1,6 +1,8 @@
 # Qwen3.6-27B NInfer Artifact Contract and Conversion Recipe
 
-> Status: accepted on 2026-07-14, implementation in progress.
+> Status: accepted and implemented by the target converter, verifier, typed binder, and complete
+> Text/Vision/MTP/multimodal Python reference on 2026-07-14. The current C++ Engine has not yet
+> adopted this artifact contract.
 >
 > Authority: this document defines the complete `.ninfer` persistent-object contract for the
 > exact `qwen3.6-27b` checkpoint and, separately, the recipe that converts the selected Hugging
@@ -661,11 +663,11 @@ operations, converter arguments, or conversion sidecar fields. Conversely, the c
 reader does not know any name, shape, layer count, view, alias, token ID, or completeness rule in
 this document.
 
-## 16. Completion evidence for this contract
+## 16. Implemented evidence for this contract
 
-Implementation of this contract is complete only when one real converter plan and one independent
-target binder both derive the inventory above and agree through an emitted artifact. Relevant
-evidence is:
+The target converter in `tools/convert/qwen3_6_27b_rtx5090/` and the independent binder in
+`tools/reference/qwen3_6_27b_rtx5090/` derive this inventory and agree through a real emitted
+artifact. The verifier and reference path have established:
 
 - 1166 tensor objects and six frontend resources;
 - component counts `819 + 2 + 12 + 333`;

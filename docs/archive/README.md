@@ -12,16 +12,17 @@ Use the active documentation index at [`../README.md`](../README.md) for current
   pre-optimization gate.
 - [`optimization-era/`](optimization-era/) — subsequent linear, attention, MTP, INT8 KV, q5090,
   serving, and Vision design/implementation work through the v4.2-native runtime.
-- [`ninfer-foundation/`](ninfer-foundation/) — the completed project-identity cutover from QUS to
-  NInfer, including its implementation plan and verification record.
+- [`ninfer-foundation/`](ninfer-foundation/) — the completed project-identity cutover and first
+  native `.ninfer` converter/reference foundation, including implementation plans and evidence.
 
 ## Archive rules
 
 - Status labels inside archived files describe their original moment in time.
 - Archived documents are not maintained when source paths, commands, APIs, or artifact formats
   change.
-- Retired q5090 specifications do not imply runtime compatibility; the current runtime accepts only
-  the format named by the active q5090 specification.
+- Retired q5090 specifications do not imply compatibility; the current C++ Engine accepts only the
+  `.qus` format named by the active q5090 specification. Native Python reference inference uses the
+  separately specified `.ninfer` route.
 - Historical benchmark numbers are meaningful only with their recorded commit, artifact, command,
   hardware, and profiler context.
 - Active documents may link here for rationale or provenance, but not to outsource a normative

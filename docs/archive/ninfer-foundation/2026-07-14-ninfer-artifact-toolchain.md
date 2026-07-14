@@ -2,6 +2,11 @@
 
 Status: approved for implementation on 2026-07-14
 
+Completed on 2026-07-14. The native `.ninfer` Python writer/reader/inspector, narrow C++ reader,
+Qwen3.6-27B converter/verifier/binder, and complete Text/Vision/MTP/multimodal Python reference were
+implemented. The current C++ Engine intentionally remains on `.qus` until its separate multi-target
+migration.
+
 ## Goal
 
 Build the first complete NInfer-native artifact path around the existing Qwen3.6-27B RTX 5090

@@ -1,6 +1,8 @@
 # NInfer Artifact Container Version 1
 
-> Status: accepted on 2026-07-14, implementation in progress.
+> Status: accepted and implemented by the native Python writer/reader/inspector, converter,
+> verifier, target binder, and narrow C++ reader on 2026-07-14. The current C++ Engine has not yet
+> cut over from `.qus`.
 >
 > Authority: this document defines the common `.ninfer` version-1 framing, embedded-JSON object
 > directory, payload geometry, registries, and the boundary between the generic reader and a
@@ -366,6 +368,10 @@ A field enters the common schema only when the finished artifact cannot be locat
 correctly without carrying it.
 
 ## 11. Required implementation evidence
+
+The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b_rtx5090/`,
+`tools/reference/qwen3_6_27b_rtx5090/`, and `src/artifact/` satisfies this layer. These checks remain
+the compact conformance set for later changes; they do not imply C++ Engine execution support.
 
 Permanent verification is limited to contracts whose regression would load the wrong bytes:
 

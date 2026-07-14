@@ -10,7 +10,7 @@ plans, retired formats, dated design investigations, and benchmark evidence belo
 | Document | Authority |
 |---|---|
 | [`../README.md`](../README.md) | project capabilities, build, and quick-start commands |
-| [`ninfer-naming.md`](ninfer-naming.md) | canonical project name, `.ninfer` filename extension reserved for future native artifacts, and naming-cutover status; no source/API, container, or ABI authority |
+| [`ninfer-naming.md`](ninfer-naming.md) | canonical project name, native `.ninfer` filename extension, and naming-cutover status; no source/API, container, or ABI authority |
 | [`ninfer-project-positioning.md`](ninfer-project-positioning.md) | current project mission, exact-target selection policy, workload, performance priorities, product boundary, and non-goals; no implementation or format authority |
 | [`design.md`](design.md) | current implemented system boundaries, component ownership, runtime flows, and supported scope |
 | [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md) | fixed model dimensions, math, Text/MTP/Vision schedules, and state semantics |
@@ -28,18 +28,20 @@ These documents have deliberately separate responsibilities:
 - public C++ headers, not a hand-maintained catalog, enumerate the current operator API;
 - executable `--help` output is the option-level CLI contract.
 
-## Accepted decisions pending implementation
+## Accepted decisions under implementation
 
 | Document | Authority |
 |---|---|
 | [`ninfer-tensor-formats.md`](ninfer-tensor-formats.md) | accepted closed registry and logical semantics for future NInfer direct and grouped-quantized persistent tensor formats; no container, physical layout, checkpoint assignment, kernel implementation/dispatch, or runtime-state-codec authority |
-| [`ninfer-container-format.md`](ninfer-container-format.md) | accepted future `.ninfer` v1 16-byte framing and strict embedded-JSON object directory, model/container boundary, canonical file geometry, loading validation, and evolution rules; no model-specific inventory, conversion recipe, layout, implementation, or migration authority |
+| [`ninfer-storage-layouts.md`](ninfer-storage-layouts.md) | registered `contiguous-le-v1`, `row-split-k128-v1`, and `raw-bytes-v1` persistent-byte contracts; no checkpoint assignment, conversion recipe, or kernel authority |
+| [`ninfer-container-format.md`](ninfer-container-format.md) | `.ninfer` v1 16-byte framing, closed embedded-JSON object directory, payload geometry, registries, and model/container boundary; no model-specific inventory, conversion recipe, model execution, or Engine-construction authority |
+| [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md) | complete `qwen3.6-27b` `.ninfer` object inventory, storage signatures, logical views, frontend resources, source-checkpoint transforms, and binder obligations |
 | [`ninfer-engine-architecture.md`](ninfer-engine-architecture.md) | accepted future NInfer core engine and source-organization boundary: compiled exact-target packages, load-time construction, ownership and memory lifetimes, checkpoint frontends, one-request program state, transactional generated-token rounds, repository/build dependency direction, and common-versus-target-private interfaces; no current implementation, model math, format details, serving protocol, migration plan, or future scheduler authority |
 
-The current implementation documents above remain authoritative until the corresponding engine,
-tensor-format, or container migration is implemented. A pending decision must not be read as an
-already available command, API, or file format. In particular, the project is now named NInfer,
-but q5090 v4.2 `.qus` remains the only implemented artifact route.
+The current implementation documents above remain authoritative until the corresponding migration
+is complete. An accepted or in-progress design must not be read as an already available C++ runtime
+command or API. In particular, q5090 v4.2 `.qus` remains the only implemented Engine artifact
+route while the native `.ninfer` converter, readers, and Python reference path are built.
 
 ## Component guides
 

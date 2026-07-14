@@ -1,10 +1,10 @@
 # NInfer Project And Artifact-Extension Naming Decision
 
 > Status: accepted on 2026-07-13; project-identity migration implemented on 2026-07-14. The
-> `.ninfer` artifact route remains pending implementation.
+> `.ninfer` artifact route is under implementation.
 >
-> Authority: this document defines only the project name and the filename extension reserved for
-> future native model artifacts. It is not an artifact-format specification, container design,
+> Authority: this document defines only the project name and the filename extension for native
+> model artifacts. It is not an artifact-format specification, container design,
 > ABI contract, or migration plan.
 
 ## Decision
@@ -14,8 +14,8 @@ The canonical name of the elevated project is **NInfer**.
 The name is read as **N + Infer**. `N` connects the project to Neroued, while `Infer` states its
 inference focus directly. This origin does not establish a separate formal long form.
 
-The canonical filename extension reserved for future NInfer native model artifacts is
-**`.ninfer`**, in lowercase and including the leading dot.
+The canonical filename extension for NInfer native model artifacts is **`.ninfer`**, in lowercase
+and including the leading dot.
 
 These two spellings are fixed inputs to the accepted container design and project identity.
 Changing either one requires an explicit revision of this decision rather than an incidental rename
@@ -57,7 +57,7 @@ The project identity migration is complete:
 - current binaries, C++ APIs, namespaces, tools, reports, and command examples use the implemented
   NInfer identities;
 - current q5090 v4.2 artifacts retain the `.qus` suffix;
-- `.ninfer` is not a current runtime input; its accepted v1 contract remains pending implementation;
+- `.ninfer` is not a current C++ runtime input; its accepted v1 toolchain is under implementation;
 - [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md) remains the only normative
   contract for the currently implemented artifact format;
 - the accepted multi-target engine architecture remains pending and does not turn documented
@@ -68,17 +68,17 @@ NInfer format. A loader that happens not to inspect filename extensions still in
 under the current q5090 v4.2 contract; that behavior does not establish a `.ninfer` compatibility
 alias.
 
-## Deferred decisions
+## Implementation status and deferred decisions
 
 Container-format questions formerly deferred here are now governed by
 [`ninfer-container-format.md`](ninfer-container-format.md). The following naming and migration
-questions remain explicitly undecided or pending implementation:
+items are either fixed by the artifact-toolchain plan or remain explicitly deferred:
 
 | Subject | Required follow-up |
 |---|---|
 | Whether `NInfer` needs a formal long form or expansion | Decide separately if the public identity requires one. |
-| Remaining `q5090` implementation names and code | Decide during the container implementation; `.ninfer` v1 has no q5090-style target-profile field. |
-| `.qus` conversion and cutover | Loader compatibility is already excluded by the v1 container contract. Define artifact regeneration and cutover timing with the container implementation. |
+| Remaining `q5090` implementation names and code | New `.ninfer` converter/reference code uses the exact-target key `qwen3_6_27b_rtx5090`; current q5090 C++ names remain only until the separate Engine cutover. |
+| `.qus` conversion and cutover | The new converter reads the BF16 checkpoint directly and does not convert `.qus`; current C++ `.qus` loading remains until the separate Engine migration removes it. |
 | Uppercase or alternate suffix handling | Define CLI/path policy during implementation; filename spelling is not a v1 byte-parsing input. |
 | Artifact basename, sidecars, manifests, and MIME type | Define only if those contracts are needed. |
 | Distribution package, registry, MIME, and service identifiers not yet exposed by the project | Define only when such a public contract is introduced. |

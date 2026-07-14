@@ -15,9 +15,9 @@ capability or a large-scale-serving goal.
 
 For the current target, the model schedule is hand-written, CUDA kernels are specialized for fixed
 shapes, and the offline converter produces one self-contained q5090 v4.2 `.qus` artifact. The
-runtime loads it directly without runtime repacking. The accepted `.ninfer` container and the new
-multi-target engine architecture are not implemented yet. The Qwen3.6-35B-A3B document is a model
-reference, not a claim of runtime support.
+runtime loads it directly without runtime repacking. The native `.ninfer` artifact toolchain is
+under implementation, while the new multi-target C++ engine architecture is not implemented yet.
+The Qwen3.6-35B-A3B document is a model reference, not a claim of runtime support.
 
 ## Current capabilities
 
@@ -151,8 +151,9 @@ the server does not execute tools or provide constrained JSON decoding. See
 ```
 
 `ninfer_bench` reports prefill and decode separately and can emit table, JSON, or CSV output.
-Performance claims require a reproducible command, q5090 identity, git state, profiler evidence for
-the changed kernels, and before/after real-weight benchmark reports. See
+Performance reports record the command, q5090 identity, relevant git state, profiler evidence for
+the changed kernels, and before/after real-weight results so the measurements can be interpreted.
+Those records are descriptive evidence, not a fixed-worktree or byte-reproducibility gate. See
 [`bench/README.md`](bench/README.md).
 
 ## Architecture
@@ -195,14 +196,16 @@ Start at [`docs/README.md`](docs/README.md). The active project documents are:
   artifact ABI;
 - [`docs/kernel-development.md`](docs/kernel-development.md) — kernel layering and verification;
 - [`docs/serving.md`](docs/serving.md) — CLI, sampling, multimodal, and HTTP behavior;
-- [`docs/ninfer-naming.md`](docs/ninfer-naming.md) — canonical project name, reserved
-  not-yet-implemented `.ninfer` extension, and naming-cutover status;
+- [`docs/ninfer-naming.md`](docs/ninfer-naming.md) — canonical project name, `.ninfer` extension,
+  and naming-cutover status;
 - [`docs/ninfer-project-positioning.md`](docs/ninfer-project-positioning.md) — project mission,
   target-selection policy, performance priorities, and non-goals;
 - [`docs/ninfer-tensor-formats.md`](docs/ninfer-tensor-formats.md),
-  [`docs/ninfer-container-format.md`](docs/ninfer-container-format.md), and
-  [`docs/ninfer-engine-architecture.md`](docs/ninfer-engine-architecture.md) — accepted designs
-  pending implementation.
+  [`docs/ninfer-storage-layouts.md`](docs/ninfer-storage-layouts.md),
+  [`docs/ninfer-container-format.md`](docs/ninfer-container-format.md),
+  [`docs/qwen3.6-27b-ninfer-artifact.md`](docs/qwen3.6-27b-ninfer-artifact.md), and
+  [`docs/ninfer-engine-architecture.md`](docs/ninfer-engine-architecture.md) — accepted NInfer
+  storage, artifact, and future-engine designs under implementation.
 
 Completed plans, retired formats, implementation reports, and profiler evidence live under
 [`docs/archive/`](docs/archive/). Archived documents are historical records, not current design

@@ -73,8 +73,7 @@ Use the smallest relevant current source:
 
 - `README.md` — capabilities, build, and quick-start commands;
 - `docs/README.md` — active documentation map and authority boundaries;
-- `docs/ninfer-naming.md` — canonical project name, reserved `.ninfer` extension, and cutover
-  status;
+- `docs/ninfer-naming.md` — canonical project name, native `.ninfer` extension, and cutover status;
 - `docs/ninfer-project-positioning.md` — project mission, target-selection policy, workload,
   priorities, and non-goals;
 - `docs/design.md` — system ownership, runtime flows, and supported scope;
@@ -88,14 +87,17 @@ Use the smallest relevant current source:
 - public headers under `include/ninfer/` — current C++ API;
 - executable `--help` output — exact current command options.
 
-`docs/ninfer-tensor-formats.md`, `docs/ninfer-container-format.md`, and
-`docs/ninfer-engine-architecture.md` are accepted designs pending implementation. They govern work
-on those migrations but do not describe currently available bytes, APIs, or runtime behavior.
+`docs/ninfer-tensor-formats.md`, `docs/ninfer-storage-layouts.md`,
+`docs/ninfer-container-format.md`, `docs/qwen3.6-27b-ninfer-artifact.md`, and
+`docs/ninfer-engine-architecture.md` are accepted designs under implementation. They govern work on
+those migrations but do not by themselves describe currently available C++ Engine inputs, APIs, or
+runtime behavior.
 
-Read the q5090 specification before converter/parser/layout work; the system design and model
-reference before model/runtime/MTP/Vision work; the kernel guide and relevant model section before
-CUDA work; and the serving guide before schema/sampling/protocol work. Do not require unrelated
-documents to be read for every task.
+For current `.qus` converter/parser/layout work, read the q5090 specification. For `.ninfer` work,
+read the tensor-format, storage-layout, container, and corresponding model-artifact specifications.
+Read the system design and model reference before model/runtime/MTP/Vision work; the kernel guide
+and relevant model section before CUDA work; and the serving guide before schema/sampling/protocol
+work. Do not require unrelated documents to be read for every task.
 
 Documents under `docs/archive/` are historical evidence. They may explain why a decision was made,
 but they do not define current behavior.

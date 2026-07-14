@@ -383,43 +383,36 @@ Adding a package requires, in one coherent change:
 
 Recognition of a related family config is not support and must not be used as a fallback.
 
-## 6. Artifact loading and atomic target construction
+## 6. Artifact loading and target construction
 
 ### 6.1 Load pipeline
 
-The load pipeline is strictly ordered:
+The load pipeline has this dependency order:
 
 ```text
-open one descriptor and establish one immutable-file load transaction
-  -> validate v1 prefix, bounded JSON, schema, and complete payload geometry
+read and validate the v1 object directory
   -> observe actual device and select one compiled target package
   -> target plan_load consumes the complete object directory
   -> validate inventory, roles, shapes, formats, layouts, encodings, and consumers
-  -> establish bounded payload/resource validators
-  -> compute all checked host/device placement plans
+  -> compute host/device placement plans
   -> allocate and materialize persistent objects
-  -> complete every required host/device payload-content and resource validation
-  -> synchronize or otherwise prove all asynchronous load work complete
+  -> establish required payload-content and resource invariants
   -> allocate one never-reused ProductCookie for this construction attempt
   -> construct LoadedModel at its final heap address, move in backing, then form typed bindings
   -> construct LoadedProduct around that stable model and then construct Frontend from it
   -> plan sequence memory against post-load device capacity
   -> construct RequestMemory
-  -> allocate unpublished TargetInstance at its final address with cookie/loaded/request memory
+  -> allocate TargetInstance at its final address with cookie/loaded/request memory
   -> construct and install Program as the last member; warm/capture required graphs
-  -> release directory/name index and complete checked artifact-transaction teardown
-  -> atomically install the complete TargetInstance by a no-fail ActiveTarget ownership move
+  -> release directory/name index and make the complete TargetInstance active
 ```
 
-Neither `LoadedProduct` nor another target subobject may become reachable through `Engine` before
-the final installation step. On any failure, temporary descriptors, allocations, resources, graph
-objects, and asynchronous work are quiesced and destroyed without publishing a partial target.
-The Program is never constructed as an external local and later assembled around owners it already
-references: its `LoadedModel`, request memory, target instance, and device context are all at their
-final addresses first. Program construction is the final potentially throwing target-construction
-step. Checked descriptor close/transaction teardown also completes before publication. The final
-variant installation moves only a `std::unique_ptr` through alternatives whose ownership moves are
-`noexcept`; after that commit point no load action may turn success into failure.
+An active target is complete: its loaded product, request memory, and Program already exist. The
+Program is never constructed as an external local and later assembled around owners it already
+references; its `LoadedModel`, request memory, target instance, and device context are at their
+final addresses first. Ordinary RAII owns temporary construction state. This architecture does not
+require an immutable-file transaction, a special atomic-publication protocol, or failure-injection
+machinery for the project-managed local artifact workflow.
 
 ### 6.2 `ArtifactBinder`
 
@@ -450,8 +443,8 @@ coalescing, resource decode/construction destinations, and payload validators. `
 target-private value mapping consumed objects to typed roles and checked views after materialization.
 
 Neither part contains raw pointers/references into `ArtifactBinder`, a JSON DOM/string, or a
-temporary name index. Stable numeric object handles may refer to the still-live load transaction,
-but all such handles are consumed before that transaction ends.
+temporary name index. Stable numeric object handles may refer to the reader while construction is in
+progress, but all such handles are consumed before the reader is released.
 
 It is not stored in the artifact, not serialized, and not retained as a runtime execution recipe.
 
@@ -460,15 +453,9 @@ which owns every final device arena, retained pinned/host allocation, and decode
 needed by binding. It executes checked allocations, reads, and copies. It never changes a
 persistent tensor representation, guesses a layout, chooses a kernel, or synthesizes a missing
 object. File offsets are not device offsets. Validators that need payload bytes may stream before
-allocation or operate on materialized host/device data; every structural and target-consumer check
-that does not need those bytes must already have succeeded, and no result is published until all
-content validation is complete. Destruction after submitted asynchronous work first synchronizes or
-otherwise proves that no operation can touch released staging/destination storage.
-
-`MaterializedArtifact` and every load-transaction guard have `noexcept` destructors. Recoverable
-errors are reported only after their outstanding work has been explicitly quiesced. A device error
-encountered while emergency cleanup is trying to establish that condition follows the process-fatal
-device policy in Section 12.2; cleanup never throws a second exception during unwinding.
+allocation or operate on materialized host/device data. Construction keeps staging and destination
+storage alive for the operations that use them; the exact read/copy implementation is not an
+architectural protocol.
 
 ### 6.4 Typed loaded bindings
 
@@ -491,9 +478,10 @@ compiled target code after validation, never by overlapping artifact spans.
 
 ### 6.5 Persistent resources
 
-Tokenizer data and other required resources are parsed into immutable, owned host objects before
-publication. They remain owned by `LoadedProduct`; callers receive references or frontend services,
-not a one-shot ownership transfer. Runtime inference does not reopen the artifact or source model.
+Tokenizer data and other required resources become immutable, owned host objects during
+construction. They remain owned by `LoadedProduct`; callers receive references or frontend
+services, not a one-shot ownership transfer. Runtime inference does not reopen the artifact or
+source model.
 
 ## 7. Memory planning and lifetime classes
 
@@ -519,9 +507,9 @@ lifetime decision.
 
 CUDA-driver graph-executable allocations are not fake entries in this layout because NInfer does
 not control their offsets. `SequencePlan` reserves an explicit target/toolchain allowance, then
-Program construction captures graphs and verifies actual free/used memory before publication. A
-capture that exceeds the planned capacity fails target construction; it does not silently shrink
-context after publication.
+Program construction captures graphs and verifies actual free/used memory before target activation.
+A capture that exceeds the planned capacity fails target construction; it does not silently shrink
+context after activation.
 
 ### 7.2 Lifetime classes
 
@@ -2276,9 +2264,9 @@ An implementation conforming to this architecture satisfies all of the following
 2. **No artifact program:** JSON names objects but cannot define role mapping, slot/view instructions,
    model execution, kernels, or hardware policy.
 3. **Complete binding:** every artifact object is consumed exactly once as an inventory entry, every
-   required role is satisfied, and every unexpected object is rejected before publication.
-4. **Atomic load:** no partial `TargetInstance` is reachable; artifact names and file access leave
-   the inference path after publication.
+   required role is satisfied, and every unexpected object is rejected before target activation.
+4. **Cold-load boundary:** an active `TargetInstance` is complete; artifact names and file access
+   leave the inference path after construction.
 5. **Typed hot path:** execution reaches persistent resources through target-typed bindings.
 6. **Single owner:** one non-movable program owns all mutable state for the one resident sequence.
 7. **Single active request:** no second begin and no second unresolved round are possible.
@@ -2319,13 +2307,9 @@ registered target:
 
 ### 23.1 Construction
 
-- malformed, missing, unexpected, wrong-shape, wrong-format/layout, and wrong-GPU artifacts fail
-  before publication;
-- load failure cannot expose partial resources or leave asynchronous use-after-free;
-- frontend/program/graph construction failure cannot expose a weights-only target;
-- failure injection through model/frontend/request-memory/program construction and checked
-  artifact teardown preserves dependency destruction order and never crosses the no-fail install
-  point;
+- missing, unexpected, wrong-shape, wrong-format/layout, and wrong-GPU artifacts are rejected before
+  target execution;
+- the active target contains its loaded resources, frontend, request memory, and Program;
 - typed bindings cover the exact complete selected inventory;
 - every typed view still names its intended backing after construction, proving that no bound
   self/subobject reference was invalidated by a move;
@@ -2408,8 +2392,10 @@ It deliberately leaves these later decisions open:
 
 - exact public API methods and the final split among leaf headers under `include/ninfer/`;
 - target-private leaf-file splitting within the fixed ownership directories in Section 19;
-- exact registered `model_id`, layout, and resource-encoding strings;
-- per-model conversion specifications and object inventories;
+- additional model, layout, and resource-encoding registrations beyond the initial identities
+  governed by the container, storage-layout, and model-artifact specifications;
+- conversion specifications and object inventories for additional models beyond the registered
+  Qwen3.6-27B target;
 - detailed common tensor/arena/materializer class implementations;
 - exact CUDA kernels, graph partitions, and workspace schedules;
 - CLI and serving API migration;

@@ -2,7 +2,7 @@
 
 > Status: current model and runtime-semantics reference.
 >
-> The fixed dimensions are encoded in `include/qus/model/config.h`. This document describes the
+> The fixed dimensions are encoded in `include/ninfer/model/config.h`. This document describes the
 > Text decoder, MTP model, Vision tower, multimodal positions, numerics, and persistent state. It does
 > not define the q5090 byte layout or CUDA implementation policy.
 
@@ -345,12 +345,12 @@ changes its fixed allocation.
 
 | Model concern | Source |
 |---|---|
-| dimensions and layer mapping | `include/qus/model/config.h` |
-| Text/MTP weights and schedule | `include/qus/model/model.h`, `src/model/qwen3_6_27b.cpp` |
-| Vision weights and schedule | `include/qus/model/vision.h`, `src/model/qwen3_6_vision.cpp` |
-| multimodal processor | `include/qus/model/processor.h`, `src/model/processor.cpp` |
+| dimensions and layer mapping | `include/ninfer/model/config.h` |
+| Text/MTP weights and schedule | `include/ninfer/model/model.h`, `src/model/qwen3_6_27b.cpp` |
+| Vision weights and schedule | `include/ninfer/model/vision.h`, `src/model/qwen3_6_vision.cpp` |
+| multimodal processor | `include/ninfer/model/processor.h`, `src/model/processor.cpp` |
 | multimodal position/control helpers | `src/model/position.*`, `src/model/vision_ops.*` |
 | MTP accept/commit helpers | `src/model/mtp_ops.h`, `src/kernels/kernel/mtp_round.cuh` |
-| GQA cache | `include/qus/core/kv_cache.h` |
-| GDN state | `include/qus/core/state_store.h` |
+| GQA cache | `include/ninfer/core/kv_cache.h` |
+| GDN state | `include/ninfer/core/state_store.h` |
 | artifact tensor assignment | [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md) |

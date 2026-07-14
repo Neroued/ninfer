@@ -1,4 +1,4 @@
-# QUS Packed Artifact Format `q5090_w4g64_mixed_v4_2` (binary spec)
+# NInfer Packed Artifact Format `q5090_w4g64_mixed_v4_2` (binary spec)
 
 > Status: current and normative artifact contract. The converter, verifier, Python reader, C++
 > parser/loader, and CUDA consumers all target this exact format.

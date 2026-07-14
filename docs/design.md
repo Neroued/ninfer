@@ -12,7 +12,8 @@
 
 ## 1. Purpose
 
-qwen3.6-ultraspeed is a from-scratch C++/CUDA inference engine for one fixed deployment:
+The currently implemented NInfer system is a from-scratch C++/CUDA inference engine for one fixed
+deployment:
 
 - Qwen3.6-27B;
 - one RTX 5090 (`sm_120a`, 32 GB);
@@ -20,13 +21,15 @@ qwen3.6-ultraspeed is a from-scratch C++/CUDA inference engine for one fixed dep
 - BF16 activations with offline-packed low-bit weights;
 - maximum single-stream decode throughput, with prefill/TTFT as the secondary target.
 
-The fixed target is an architectural constraint, not a starting point for a generic runtime. The
-project deliberately uses compile-time dimensions, hand-written model schedules, model-shape CUDA
-kernels, a single artifact ABI, and direct frontends.
+For this implementation, the fixed target is an architectural constraint, not a generic-runtime
+starting point. It deliberately uses compile-time dimensions, hand-written model schedules,
+model-shape CUDA kernels, a single artifact ABI, and direct frontends. The broader project mission
+and target-selection policy are governed by
+[`ninfer-project-positioning.md`](ninfer-project-positioning.md).
 
 ## 2. Scope
 
-### Supported
+### Supported by the current implementation
 
 - text, image, and video chat input;
 - native tokenization, chat templates, media decoding/preprocessing, Vision inference, and Text
@@ -41,7 +44,7 @@ kernels, a single artifact ABI, and direct frontends.
 - offline q5090 conversion plus Python reference/diagnostic tooling;
 - real-weight and per-operator benchmarking.
 
-### Deliberately unsupported
+### Deliberately unsupported by the current implementation
 
 - models other than the fixed Qwen3.6-27B checkpoint architecture;
 - batching or concurrent GPU execution;
@@ -57,13 +60,13 @@ kernels, a single artifact ABI, and direct frontends.
 
 | Component | Paths | Owns |
 |---|---|---|
-| L0 infrastructure | `include/qus/core`, `src/core` | device/stream setup, tensors, arenas, q5090 parsing/loading, KV cache, GDN state |
-| L1 operators | `include/qus/kernels`, `src/kernels` | mathematical operator APIs, dispatch, launchers, specialized CUDA kernels |
-| L2 model | `include/qus/model`, `src/model` | frozen dimensions, weight binding, Text/MTP/Vision schedules, model-private CUDA helpers |
-| Runtime | `include/qus/runtime`, `src/runtime` | resource lifetime, Engine API, prefix reuse, eager/graph execution, MTP rounds, sampling state |
-| Text frontend | `include/qus/text`, `src/text` | tokenizer, chat template, CLI translation, output decoding |
-| Media frontend | `include/qus/media`, `src/media`, model processor | local/remote media acquisition, decode, resize, normalization, patch construction, budgets |
-| Serving | `include/qus/serve`, `src/serve` | HTTP transport, OpenAI/Anthropic schemas, request translation, streaming, tool-call parsing |
+| L0 infrastructure | `include/ninfer/core`, `src/core` | device/stream setup, tensors, arenas, q5090 parsing/loading, KV cache, GDN state |
+| L1 operators | `include/ninfer/kernels`, `src/kernels` | mathematical operator APIs, dispatch, launchers, specialized CUDA kernels |
+| L2 model | `include/ninfer/model`, `src/model` | frozen dimensions, weight binding, Text/MTP/Vision schedules, model-private CUDA helpers |
+| Runtime | `include/ninfer/runtime`, `src/runtime` | resource lifetime, Engine API, prefix reuse, eager/graph execution, MTP rounds, sampling state |
+| Text frontend | `include/ninfer/text`, `src/text` | tokenizer, chat template, CLI translation, output decoding |
+| Media frontend | `include/ninfer/media`, `src/media`, model processor | local/remote media acquisition, decode, resize, normalization, patch construction, budgets |
+| Serving | `include/ninfer/serve`, `src/serve` | HTTP transport, OpenAI/Anthropic schemas, request translation, streaming, tool-call parsing |
 | Offline tools | `tools/q5090_convert`, `tools/q5090`, `tools/parity` | artifact production, Python reference, structural/numerical diagnostics |
 | Measurement | `bench`, `tools/bench` | real-weight throughput, per-operator benchmarks, corpus tooling, report schemas |
 
@@ -116,7 +119,7 @@ No hot-path operator performs hidden device allocation, filesystem access, or ru
 
 ### 5.2 L1: operators and CUDA specialization
 
-Public headers under `include/qus/kernels/` define mathematical contracts. Implementations follow
+Public headers under `include/ninfer/kernels/` define mathematical contracts. Implementations follow
 the normal path:
 
 ```text
@@ -286,7 +289,7 @@ smallest evidence that covers their risk:
 - numerical or behavior checks for the affected operator;
 - per-operator benchmark and NCU evidence for kernel changes;
 - NSYS for full inference, launch gaps, CPU/GPU overlap, and phase breakdown;
-- before/after `qus_bench` reports for relevant prefill/decode matrices;
+- before/after `ninfer_bench` reports for relevant prefill/decode matrices;
 - `compute-sanitizer` when memory access or lifetime is at risk.
 
 Historical profiles live in the archive. They are not silently promoted to current performance
@@ -296,16 +299,16 @@ claims after the implementation, artifact, or measurement contract changes.
 
 | Concern | Primary implementation |
 |---|---|
-| fixed dimensions | `include/qus/model/config.h` |
-| Text/MTP schedule and binding | `include/qus/model/model.h`, `src/model/qwen3_6_27b.cpp` |
-| Vision schedule | `include/qus/model/vision.h`, `src/model/qwen3_6_vision.cpp` |
-| multimodal processor | `include/qus/model/processor.h`, `src/model/processor.cpp`, `src/media` |
-| Engine and prefix reuse | `include/qus/runtime/engine.h`, `src/runtime/engine.cpp` |
-| graph capture/replay | `include/qus/runtime/decode_graph.h`, `src/runtime/decode_graph.cpp` |
-| q5090 parser/loader | `include/qus/core/weight_store*.h`, `src/core/weight_store*.cpp` |
-| public operators | `include/qus/kernels` |
+| fixed dimensions | `include/ninfer/model/config.h` |
+| Text/MTP schedule and binding | `include/ninfer/model/model.h`, `src/model/qwen3_6_27b.cpp` |
+| Vision schedule | `include/ninfer/model/vision.h`, `src/model/qwen3_6_vision.cpp` |
+| multimodal processor | `include/ninfer/model/processor.h`, `src/model/processor.cpp`, `src/media` |
+| Engine and prefix reuse | `include/ninfer/runtime/engine.h`, `src/runtime/engine.cpp` |
+| graph capture/replay | `include/ninfer/runtime/decode_graph.h`, `src/runtime/decode_graph.cpp` |
+| q5090 parser/loader | `include/ninfer/core/weight_store*.h`, `src/core/weight_store*.cpp` |
+| public operators | `include/ninfer/kernels` |
 | CUDA implementations | `src/kernels` |
-| CLI and text frontend | `include/qus/text`, `src/text`, `src/main.cpp` |
-| HTTP serving | `include/qus/serve`, `src/serve` |
+| CLI and text frontend | `include/ninfer/text`, `src/text`, `src/main.cpp` |
+| HTTP serving | `include/ninfer/serve`, `src/serve` |
 | converter/reference | `tools/q5090_convert`, `tools/q5090` |
 | measurement | `bench`, `tools/bench` |

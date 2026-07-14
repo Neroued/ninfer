@@ -1,18 +1,23 @@
-# qwen3.6-ultraspeed
+# NInfer
 
-A from-scratch C++/CUDA inference engine specialized for **Qwen3.6-27B** on one
-**NVIDIA RTX 5090**. The runtime is built for one user, one sequence, and one GPU; it is not a
-general-purpose model runtime or compatibility layer.
+> Selected checkpoints. Selected GPUs. Maximum single-GPU inference performance.
 
-> The elevated project has accepted the future name **NInfer** and the future artifact extension
-> **`.ninfer`**. This naming decision is not yet implemented; the repository, binaries, APIs, and
-> current `.qus` commands below remain unchanged. See
-> [`docs/ninfer-naming.md`](docs/ninfer-naming.md) and
-> [`docs/ninfer-project-positioning.md`](docs/ninfer-project-positioning.md).
+NInfer is a from-scratch C++/CUDA inference engine for users who want the highest practical local
+inference performance from one GPU. It deliberately supports a small, explicitly selected set of
+exact model checkpoints and GPU targets. Each supported pair is implemented and optimized as a
+concrete target; NInfer is not a generic model runtime, compatibility layer, or model zoo.
 
-The model schedule is hand-written, the CUDA kernels are specialized for the fixed model shapes,
-and the offline converter produces one self-contained q5090 v4.2 artifact. The C++ runtime loads
-that artifact directly without runtime repacking or a second weight format.
+The current delivered target is exactly **Qwen3.6-27B on one NVIDIA RTX 5090**. It serves one active
+request on one GPU and prioritizes decode efficiency, then prefill throughput and time to first
+token, while using single-machine KV-cache policy to push useful context capacity toward the
+checkpoint's native limit. Limited continuous batching is a future direction, not a current
+capability or a large-scale-serving goal.
+
+For the current target, the model schedule is hand-written, CUDA kernels are specialized for fixed
+shapes, and the offline converter produces one self-contained q5090 v4.2 `.qus` artifact. The
+runtime loads it directly without runtime repacking. The accepted `.ninfer` container and the new
+multi-target engine architecture are not implemented yet. The Qwen3.6-35B-A3B document is a model
+reference, not a claim of runtime support.
 
 ## Current capabilities
 
@@ -34,10 +39,10 @@ The current implementation includes:
 - a configurable capability-evaluation coordinator for local or online OpenAI-compatible targets,
   with EvalScope adapters, progress, persistent logs, resume, and normalized reports.
 
-The project does not support other models, batching, multi-GPU inference, or old q5090 formats.
-Context capacity is configured at process start and bounded by GPU memory. The CLI defaults to
-2,048 tokens and the server defaults to 8,192; larger contexts require an explicit setting and are
-not an implied 128K/256K qualification claim.
+The current implementation does not support other checkpoints, batching, multi-GPU inference, or
+old q5090 formats. Context capacity is configured at process start and bounded by GPU memory. The
+CLI defaults to 2,048 tokens and the server defaults to 8,192; larger contexts require an explicit
+setting and are not an implied 128K/256K qualification claim.
 
 ## Fixed target
 
@@ -59,7 +64,7 @@ PkgConfig, FFmpeg 6 development libraries (`libavformat`, `libavcodec`, `libavut
 and libcurl 7.85 or newer.
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a
 cmake --build build -j
 ```
 
@@ -67,14 +72,15 @@ The main binaries are:
 
 | Binary | Purpose |
 |---|---|
-| `build/src/qus` | text or multimodal generation CLI |
-| `build/src/qus-serve` | OpenAI/Anthropic-compatible HTTP server |
-| `build/src/qus-preprocess` | native multimodal preprocessing diagnostic |
-| `build/src/qus-vision-dump` | Vision activation dump |
-| `build/bench/qus_bench` | real-weight prefill/decode benchmark |
-| `build/bench/qus_*_bench` | per-operator CUDA benchmarks |
+| `build/src/ninfer` | text or multimodal generation CLI |
+| `build/src/ninfer-serve` | OpenAI/Anthropic-compatible HTTP server |
+| `build/src/ninfer-preprocess` | native multimodal preprocessing diagnostic |
+| `build/src/ninfer-vision-dump` | Vision activation dump |
+| `build/bench/ninfer_bench` | real-weight prefill/decode benchmark |
+| `build/bench/ninfer_*_bench` | per-operator CUDA benchmarks |
 
-Use each binary's `--help` output as the authoritative option reference.
+Use `ninfer`, `ninfer-serve`, and benchmark `--help` output as the authoritative option reference.
+The two diagnostic executables print their usage when required positional arguments are missing.
 
 ## Build a q5090 artifact
 
@@ -100,7 +106,7 @@ details.
 Text prompt:
 
 ```bash
-./build/src/qus out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+./build/src/ninfer out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
   --prompt "用三句话解释 prefill 和 decode 的区别。" \
   --max-new 128
 ```
@@ -108,7 +114,7 @@ Text prompt:
 Structured text/image/video messages:
 
 ```bash
-./build/src/qus out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+./build/src/ninfer out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
   --messages messages.json --no-thinking --max-new 256
 ```
 
@@ -119,7 +125,7 @@ CUDA Graph decode is enabled by default. Enable MTP with `--mtp-draft-tokens N`,
 ## Run the server
 
 ```bash
-./build/src/qus-serve out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+./build/src/ninfer-serve out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
   --host 127.0.0.1 --port 8080 --max-context 8192
 ```
 
@@ -139,12 +145,12 @@ the server does not execute tools or provide constrained JSON decoding. See
 ## Benchmark
 
 ```bash
-./build/bench/qus_bench \
+./build/bench/ninfer_bench \
   --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
   -p 512,2048 -n 128 -pg 2048,128 -r 5 --warmup 1
 ```
 
-`qus_bench` reports prefill and decode separately and can emit table, JSON, or CSV output.
+`ninfer_bench` reports prefill and decode separately and can emit table, JSON, or CSV output.
 Performance claims require a reproducible command, q5090 identity, git state, profiler evidence for
 the changed kernels, and before/after real-weight benchmark reports. See
 [`bench/README.md`](bench/README.md).
@@ -188,7 +194,15 @@ Start at [`docs/README.md`](docs/README.md). The active project documents are:
 - [`docs/q5090_packed_file_format_v4.md`](docs/q5090_packed_file_format_v4.md) — canonical v4.2
   artifact ABI;
 - [`docs/kernel-development.md`](docs/kernel-development.md) — kernel layering and verification;
-- [`docs/serving.md`](docs/serving.md) — CLI, sampling, multimodal, and HTTP behavior.
+- [`docs/serving.md`](docs/serving.md) — CLI, sampling, multimodal, and HTTP behavior;
+- [`docs/ninfer-naming.md`](docs/ninfer-naming.md) — canonical project name, reserved
+  not-yet-implemented `.ninfer` extension, and naming-cutover status;
+- [`docs/ninfer-project-positioning.md`](docs/ninfer-project-positioning.md) — project mission,
+  target-selection policy, performance priorities, and non-goals;
+- [`docs/ninfer-tensor-formats.md`](docs/ninfer-tensor-formats.md),
+  [`docs/ninfer-container-format.md`](docs/ninfer-container-format.md), and
+  [`docs/ninfer-engine-architecture.md`](docs/ninfer-engine-architecture.md) — accepted designs
+  pending implementation.
 
 Completed plans, retired formats, implementation reports, and profiler evidence live under
 [`docs/archive/`](docs/archive/). Archived documents are historical records, not current design

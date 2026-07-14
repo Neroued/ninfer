@@ -1,11 +1,11 @@
 # tools/bench
 
-Offline helper for the `qus_bench` throughput tool. Correctness/parity tooling lives separately
+Offline helper for the `ninfer_bench` throughput tool. Correctness/parity tooling lives separately
 under [`tools/parity`](../parity).
 
 ## Corpus baker
 
-`qus_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
+`ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
 committed corpus, so the corpus must be real, in-distribution text (not random tokens) and at
 least as long as the largest prefill you want to run. `make_bench_corpus.py` bakes that corpus
 offline with a local Hugging Face Qwen3.6 tokenizer.
@@ -39,7 +39,7 @@ pip install -r tools/bench/requirements.txt
 ```
 
 The tokenizer is loaded locally only; the tool never downloads from the network. Pass
-`--tokenizer-path` or set `QUS_TOKENIZER_PATH`.
+`--tokenizer-path` or set `NINFER_TOKENIZER_PATH`.
 
 ## Regenerate / check
 
@@ -54,8 +54,8 @@ python3 tools/bench/make_bench_corpus.py \
   --tokenizer-path /path/to/local/Qwen3.6-27B/tokenizer \
   --tokens 131072 --source-text /path/to/book.txt
 
-# Verify the committed .ids + manifest agree (hash + token count only; no tokenizer or source
-# needed, so a corpus baked from a downloaded source stays CI-verifiable).
+# Verify the committed .ids + manifest agree (NInfer identity/schema, hash, and token count only;
+# no tokenizer or source needed, so a corpus baked from a downloaded source stays CI-verifiable).
 python3 tools/bench/make_bench_corpus.py --check
 ```
 
@@ -64,23 +64,23 @@ optionally use `--source-text`) to benchmark longer prefills, memory permitting.
 
 ## Current-state performance matrix
 
-`run_qus_bench_matrix.py` runs the layered current-state `qus_bench` matrix and stores all raw
+`run_ninfer_bench_matrix.py` runs the layered current-state `ninfer_bench` matrix and stores all raw
 reports under ignored `profiles/bench/`. The matrix treats `--mtp-draft-tokens 3` as the primary
 MTP hypothesis, keeps `k=0` and `k=5` as controls, and sweeps `k=0..5` on representative
 context-decode cases.
 
 ```bash
 # Inspect commands without running the model.
-python3 tools/bench/run_qus_bench_matrix.py --preset core --dry-run
+python3 tools/bench/run_ninfer_bench_matrix.py --preset core --dry-run
 
-# Main current-state run. Builds qus_bench first, writes JSON reports and summary.csv.
-python3 tools/bench/run_qus_bench_matrix.py --preset core
+# Main current-state run. Builds ninfer_bench first, writes JSON reports and summary.csv.
+python3 tools/bench/run_ninfer_bench_matrix.py --preset core
 
 # Longer run that adds 32k/64k prompt and context-decode points.
-python3 tools/bench/run_qus_bench_matrix.py --preset full
+python3 tools/bench/run_ninfer_bench_matrix.py --preset full
 
 # Run only the MTP draft-window sweep.
-python3 tools/bench/run_qus_bench_matrix.py --preset full --suite mtp_sweep
+python3 tools/bench/run_ninfer_bench_matrix.py --preset full --suite mtp_sweep
 ```
 
 Default outputs:

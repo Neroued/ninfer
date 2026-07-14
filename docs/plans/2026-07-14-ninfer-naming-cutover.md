@@ -1,6 +1,6 @@
 # NInfer Naming Cutover Implementation Plan
 
-Status: accepted; implementation not started
+Status: implementation in progress; Phases 0-3 complete
 
 ## 1. Goal
 
@@ -279,9 +279,23 @@ sha256sum "$WEIGHTS" \
   > /home/neroued/backups/ninfer-pre-cutover-artifact.sha256
 
 test ! -e cmake-build-qus-baseline
-cmake -S . -B cmake-build-qus-baseline -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B cmake-build-qus-baseline -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=120a
 cmake --build cmake-build-qus-baseline -j
-ctest --test-dir cmake-build-qus-baseline --output-on-failure
+test "$(ctest --test-dir cmake-build-qus-baseline -N \
+  | awk '/Total Tests:/ {print $3}')" = 54
+ctest --test-dir cmake-build-qus-baseline --output-on-failure \
+  -E '^qus_engine_mtp_e2e_test$'
+if ctest --test-dir cmake-build-qus-baseline --output-on-failure \
+    -R '^qus_engine_mtp_e2e_test$' 2>&1 \
+    | tee /home/neroued/backups/ninfer-pre-cutover-known-mtp-failure.log; then
+  echo 'known baseline MTP test unexpectedly passed' >&2
+  exit 1
+fi
+rg -q 'partial reuse turn 2 parity differs \(mtp-off\)' \
+  /home/neroued/backups/ninfer-pre-cutover-known-mtp-failure.log
+rg -q 'partial reuse turn 2 parity differs \(mtp-on\)' \
+  /home/neroued/backups/ninfer-pre-cutover-known-mtp-failure.log
 
 ./cmake-build-qus-baseline/src/qus "$WEIGHTS" \
   --prompt '用一句话解释 prefill。' --no-thinking --greedy --max-new 16 \
@@ -293,6 +307,18 @@ git switch -c refactor/ninfer-naming
 
 `gh repo view Neroued/ninfer` is expected to fail while the destination is unused; success is a stop
 condition requiring investigation. Do not choose a different repository name implicitly.
+
+Execution established two pre-existing baseline facts that the remaining gates must preserve rather
+than conceal. A clean configure must pass `CMAKE_CUDA_ARCHITECTURES=120a`; the current top-level
+CMake ordering otherwise lets CMake cache architecture `75` before the project default is applied.
+Also, 53 of 54 CTest entries pass, while `qus_engine_mtp_e2e_test` reproducibly fails only its
+partial-reuse turn-2 parity checks for both MTP-off and MTP-on. Fixing either issue is outside this
+identity-only change. Every later CTest gate therefore runs all other entries to success, runs the
+renamed MTP entry separately, and requires the same two failure markers.
+
+The Phase 0 execution baseline, after this plan itself landed, is
+`98e2c459daea408665a2d6882d8d3401367a00d8`. The verified bundle, old `master`, artifact evidence,
+and deterministic CLI evidence were captured against that commit.
 
 ### Completion gate
 
@@ -330,9 +356,26 @@ refactor(naming): switch runtime identity to ninfer
 ### Verification
 
 ```bash
-cmake -S . -B cmake-build-ninfer-rename -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B cmake-build-ninfer-rename -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=120a
 cmake --build cmake-build-ninfer-rename -j
-ctest --test-dir cmake-build-ninfer-rename --output-on-failure
+test "$(ctest --test-dir cmake-build-ninfer-rename -N \
+  | awk '/Total Tests:/ {print $3}')" = 54
+ctest --test-dir cmake-build-ninfer-rename --output-on-failure \
+  -E '^ninfer_engine_mtp_e2e_test$'
+(
+  set -euo pipefail
+  if ctest --test-dir cmake-build-ninfer-rename --output-on-failure \
+      -R '^ninfer_engine_mtp_e2e_test$' 2>&1 \
+      | tee /home/neroued/backups/ninfer-phase1-known-mtp-failure.log; then
+    echo 'known baseline MTP test unexpectedly passed' >&2
+    exit 1
+  fi
+  rg -q 'partial reuse turn 2 parity differs \(mtp-off\)' \
+    /home/neroued/backups/ninfer-phase1-known-mtp-failure.log
+  rg -q 'partial reuse turn 2 parity differs \(mtp-on\)' \
+    /home/neroued/backups/ninfer-phase1-known-mtp-failure.log
+)
 
 test -x cmake-build-ninfer-rename/src/ninfer
 test -x cmake-build-ninfer-rename/src/ninfer-serve
@@ -533,7 +576,23 @@ git log --oneline "$BASE"..HEAD
 
 ```bash
 cmake --build cmake-build-ninfer-rename -j
-ctest --test-dir cmake-build-ninfer-rename --output-on-failure
+test "$(ctest --test-dir cmake-build-ninfer-rename -N \
+  | awk '/Total Tests:/ {print $3}')" = 54
+ctest --test-dir cmake-build-ninfer-rename --output-on-failure \
+  -E '^ninfer_engine_mtp_e2e_test$'
+(
+  set -euo pipefail
+  if ctest --test-dir cmake-build-ninfer-rename --output-on-failure \
+      -R '^ninfer_engine_mtp_e2e_test$' 2>&1 \
+      | tee /home/neroued/backups/ninfer-final-known-mtp-failure.log; then
+    echo 'known baseline MTP test unexpectedly passed' >&2
+    exit 1
+  fi
+  rg -q 'partial reuse turn 2 parity differs \(mtp-off\)' \
+    /home/neroued/backups/ninfer-final-known-mtp-failure.log
+  rg -q 'partial reuse turn 2 parity differs \(mtp-on\)' \
+    /home/neroued/backups/ninfer-final-known-mtp-failure.log
+)
 
 PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
 PYTHONPATH=eval "$PYTHON" -m py_compile \
@@ -554,7 +613,8 @@ git status --short
 ```
 
 NSYS and NCU are not required because this change does not alter performance implementation. A
-deterministic real-artifact smoke, complete build/tests, and diff review are the proportional
+deterministic real-artifact smoke, complete execution of the CTest inventory with the one known
+entry reproducing the same two recorded failure markers, and diff review are the proportional
 behavior-equivalence evidence.
 
 ### Merge gate
@@ -564,8 +624,16 @@ behavior-equivalence evidence.
 - the worktree is clean;
 - no GitHub or local-directory cutover has occurred yet.
 
-Merge or fast-forward the complete branch into `master`, push through the old GitHub identity, and
-require the pushed SHA to equal local `master` before proceeding.
+Fast-forward the complete branch into `master`, push through the old GitHub identity, and require
+the pushed SHA to equal local `master` before proceeding:
+
+```bash
+git switch master
+git merge --ff-only refactor/ninfer-naming
+git push origin master
+git fetch --prune origin
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
+```
 
 ## 15. Phase 5 — Rename the existing GitHub repository
 
@@ -596,9 +664,9 @@ Rename the existing repository object; do not create or transfer a second reposi
 ```bash
 (
   set -euo pipefail
-  gh api --method PATCH repos/Neroued/qwen3.6-ultraspeed -f name=ninfer
-  gh repo edit Neroued/ninfer \
-    --description 'High-performance single-GPU inference for selected model checkpoints and GPUs.'
+  gh api --method PATCH repos/Neroued/qwen3.6-ultraspeed \
+    -f name=ninfer \
+    -f description='High-performance single-GPU inference for selected model checkpoints and GPUs.'
 )
 ```
 
@@ -621,15 +689,16 @@ High-performance single-GPU inference for selected model checkpoints and GPUs.
     'High-performance single-GPU inference for selected model checkpoints and GPUs.'
 
   NEW_HEAD=$(git ls-remote https://github.com/Neroued/ninfer.git refs/heads/master | cut -f1)
-  OLD_HEAD=$(git ls-remote https://github.com/Neroued/qwen3.6-ultraspeed.git \
-    refs/heads/master | cut -f1)
-  test "$NEW_HEAD" = "$OLD_HEAD"
   test "$NEW_HEAD" = "$(git rev-parse HEAD)"
 
   git remote set-url origin https://github.com/Neroued/ninfer.git
   git fetch --prune origin
   test "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)"
   git push --dry-run origin master
+
+  OLD_HEAD=$(git ls-remote https://github.com/Neroued/qwen3.6-ultraspeed.git \
+    refs/heads/master | cut -f1)
+  test "$OLD_HEAD" = "$NEW_HEAD"
   git remote -v
 )
 ```
@@ -728,7 +797,8 @@ eval/.venv/bin/python -m pip freeze --all \
 diff -u /home/neroued/backups/ninfer-pre-cutover-eval-requirements.txt \
         /home/neroued/backups/ninfer-post-cutover-eval-requirements.txt
 eval/.venv/bin/python -m pip check
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=120a
 cmake --build build -j
 )
 ```
@@ -761,7 +831,22 @@ diff -u /home/neroued/backups/ninfer-pre-cutover-artifact.stat \
 
 ```bash
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+test "$(ctest --test-dir build -N | awk '/Total Tests:/ {print $3}')" = 54
+ctest --test-dir build --output-on-failure \
+  -E '^ninfer_engine_mtp_e2e_test$'
+(
+  set -euo pipefail
+  if ctest --test-dir build --output-on-failure \
+      -R '^ninfer_engine_mtp_e2e_test$' 2>&1 \
+      | tee /home/neroued/backups/ninfer-new-path-known-mtp-failure.log; then
+    echo 'known baseline MTP test unexpectedly passed' >&2
+    exit 1
+  fi
+  rg -q 'partial reuse turn 2 parity differs \(mtp-off\)' \
+    /home/neroued/backups/ninfer-new-path-known-mtp-failure.log
+  rg -q 'partial reuse turn 2 parity differs \(mtp-on\)' \
+    /home/neroued/backups/ninfer-new-path-known-mtp-failure.log
+)
 
 PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
 PYTHONPATH=eval "$PYTHON" -m py_compile \
@@ -789,11 +874,13 @@ Repeat the active Markdown-link and stale-reference audit from Phase 3 at the ne
 ignored configuration for the retired absolute path and either rebuild the derived owner or remove
 the stale cache; do not patch generated CMake or virtual-environment files in place.
 
-### Cleanup
+### Cleanup deferred until final review
 
-After the new-path gate passes, remove all three temporary old build directories and the temporary
-virtual-environment directory. They are recovery material, not supported compatibility paths.
-Retain the Git bundle and baseline evidence until the complete naming goal is closed.
+Keep all three temporary old build directories and the temporary virtual-environment directory
+through the independent Phase 8 review. After its findings are resolved and before the archival
+commit, remove those four recovery directories. They are recovery material, not supported
+compatibility paths. Retain the Git bundle and baseline evidence until the complete naming goal is
+closed.
 
 ## 18. Rollback and recovery
 
@@ -858,8 +945,9 @@ The naming cutover is complete only when all of the following are true:
 - q5090 v4.2 `.qus` files are byte-identical, validate successfully, and load through the renamed
   executable;
 - deterministic real-artifact output matches the pre-cutover baseline;
-- a clean build, full CTest suite, Python compile/tests, schema/report checks, documentation audit,
-  and CLI/serve/benchmark smoke pass from `/home/neroued/ninfer`;
+- a clean build, all 53 baseline-passing CTest entries, Python compile/tests, schema/report checks,
+  documentation audit, and CLI/serve/benchmark smoke pass from `/home/neroued/ninfer`, while the
+  one known MTP entry reproduces the same two recorded parity-failure markers;
 - GitHub repository ID, node ID, default branch, HEAD, and relevant settings survive the in-place
   rename;
 - after the archival commit, `origin` uses the new URL, local `master` equals `origin/master`, and

@@ -4,12 +4,14 @@
 
 These rules apply to the entire repository.
 
-This project is a from-scratch C++/CUDA inference engine specialized for Qwen3.6-27B on one RTX
-5090. The supported system includes the fixed Text decoder, MTP speculative decoding, native Vision,
-the q5090 v4.2 artifact, command-line generation, and OpenAI/Anthropic serving.
+NInfer is a from-scratch C++/CUDA inference engine that pursues maximum single-GPU inference
+performance for a small set of explicitly selected exact checkpoints and GPU targets. It is not a
+general-purpose runtime, compatibility layer, or model zoo.
 
-The target workload is one user, one active sequence, and one GPU. This is not a general-purpose
-runtime, compatibility layer, model zoo, batching framework, or multi-GPU system.
+The current implemented target is Qwen3.6-27B on one RTX 5090. It includes the fixed Text decoder,
+MTP speculative decoding, native Vision, the q5090 v4.2 `.qus` artifact, command-line generation,
+and OpenAI/Anthropic serving. The current workload is one user, one active request, and one GPU;
+limited continuous batching and additional qualified targets are future work, not current behavior.
 
 ## Local Environment
 
@@ -17,7 +19,7 @@ Use these canonical paths on the current development machine:
 
 | Purpose | Path |
 |---|---|
-| repository | `/home/neroued/qwen3.6-ultraspeed` |
+| repository | `/home/neroued/ninfer` |
 | Python 3.11 | `/home/neroued/miniconda3/envs/py311/bin/python` |
 | BF16 source model | `/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16` |
 | current q5090 artifact | `out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus` |
@@ -51,6 +53,10 @@ Use the smallest relevant current source:
 
 - `README.md` — capabilities, build, and quick-start commands;
 - `docs/README.md` — active documentation map and authority boundaries;
+- `docs/ninfer-naming.md` — canonical project name, reserved `.ninfer` extension, and cutover
+  status;
+- `docs/ninfer-project-positioning.md` — project mission, target-selection policy, workload,
+  priorities, and non-goals;
 - `docs/design.md` — system ownership, runtime flows, and supported scope;
 - `docs/qwen3.6-27b-architecture.md` — implemented 27B Text/MTP/Vision mathematics and state
   semantics;
@@ -59,8 +65,12 @@ Use the smallest relevant current source:
 - `docs/q5090_packed_file_format_v4.md` — the only normative q5090 artifact contract;
 - `docs/kernel-development.md` — kernel layering and correctness/performance workflow;
 - `docs/serving.md` — CLI, sampling, multimodal, OpenAI, and Anthropic behavior;
-- public headers under `include/qus/` — current C++ API;
+- public headers under `include/ninfer/` — current C++ API;
 - executable `--help` output — exact current command options.
+
+`docs/ninfer-tensor-formats.md`, `docs/ninfer-container-format.md`, and
+`docs/ninfer-engine-architecture.md` are accepted designs pending implementation. They govern work
+on those migrations but do not describe currently available bytes, APIs, or runtime behavior.
 
 Read the q5090 specification before converter/parser/layout work; the system design and model
 reference before model/runtime/MTP/Vision work; the kernel guide and relevant model section before
@@ -158,7 +168,7 @@ For performance work:
   overlap;
 - use NCU after a specific hot kernel has been identified;
 - do not use an isolated microbenchmark improvement as proof of end-to-end speed;
-- protect numerical behavior and the relevant `qus_bench` path together;
+- protect numerical behavior and the relevant `ninfer_bench` path together;
 - record the git commit, dirty state, GPU/CUDA, artifact identity, complete command, test matrix, and
   before/after reports for any performance claim.
 
@@ -284,8 +294,8 @@ Run the smallest verification set that proves the changed behavior:
 | q5090 converter/parser/layout | format tests, verifier, malformed-input checks, and real artifact when needed |
 | CUDA numerical behavior | oracle tests at real shapes |
 | CUDA memory/lifetime | affected execution plus `compute-sanitizer` when available |
-| kernel performance | microbenchmark, NCU, and relevant `qus_bench` comparison |
-| full inference performance | NSYS and before/after `qus_bench` |
+| kernel performance | microbenchmark, NCU, and relevant `ninfer_bench` comparison |
+| full inference performance | NSYS and before/after `ninfer_bench` |
 | CLI/report/schema | real command/output or affected schema tests |
 | serving | OpenAI/Anthropic schema tests and observable response behavior |
 

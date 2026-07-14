@@ -3,7 +3,7 @@
 > Status: current L1 source-layout and verification guide.
 >
 > Repository-wide testing policy remains in [`../AGENTS.md`](../AGENTS.md). Public headers under
-> `include/qus/kernels/` are the authoritative operator catalog.
+> `include/ninfer/kernels/` are the authoritative operator catalog.
 
 ## 1. L1 responsibility
 
@@ -24,7 +24,7 @@ or model-specific accept/commit bookkeeping.
 Most operators use three layers:
 
 ```text
-include/qus/kernels/<op>.h       public mathematical contract
+include/ninfer/kernels/<op>.h       public mathematical contract
             │
             ▼
 src/kernels/wrapper/<op>.cpp     validation, views, dispatch, public symbol
@@ -145,7 +145,7 @@ one-off threshold.
 
 ## 8. Per-operator benchmarks
 
-`bench/qus_<op>_bench` binaries run real Qwen3.6 shapes and isolate one kernel family. They are
+`build/bench/ninfer_<op>_bench` binaries run real Qwen3.6 shapes and isolate one kernel family. They are
 profiling entrypoints, not correctness tests and not sufficient evidence for end-to-end speed.
 
 A useful microbenchmark must state:
@@ -187,7 +187,7 @@ Use Nsight Systems for full-inference questions:
 - graph capture/replay behavior;
 - MTP proposal/verify/accept round cost;
 - memcpy and media/host overhead;
-- whether a microbenchmark win matters in `qus_bench`.
+- whether a microbenchmark win matters in `ninfer_bench`.
 
 NVTX ranges should identify stable user-meaningful phases. Do not add ranges solely to encode a
 temporary implementation layout.
@@ -201,7 +201,7 @@ Kernel optimization completion normally requires:
 3. run the relevant per-operator benchmark;
 4. collect NCU when the claim concerns kernel efficiency;
 5. collect NSYS when the claim concerns full inference or launch behavior;
-6. compare before/after `qus_bench` on the relevant prompt/decode matrix;
+6. compare before/after `ninfer_bench` on the relevant prompt/decode matrix;
 7. run `compute-sanitizer` when indexing, shared memory, state slots, or arena lifetime changed.
 
 Published results must record the command, git commit, worktree state, GPU/toolchain, artifact

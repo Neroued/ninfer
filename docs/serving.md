@@ -10,8 +10,8 @@
 The project exposes two generation frontends over the same tokenizer, processor, Engine, sampler,
 and token-stream decoder:
 
-- `qus` accepts one text prompt or one structured messages file and streams decoded text to stdout;
-- `qus-serve` keeps one Engine resident and exposes OpenAI- and Anthropic-compatible HTTP endpoints.
+- `ninfer` accepts one text prompt or one structured messages file and streams decoded text to stdout;
+- `ninfer-serve` keeps one Engine resident and exposes OpenAI- and Anthropic-compatible HTTP endpoints.
 
 Both use the tokenizer and generation configuration embedded in the q5090 artifact. Neither accepts
 a separate runtime tokenizer directory.
@@ -21,13 +21,13 @@ a separate runtime tokenizer directory.
 Text input:
 
 ```bash
-./build/src/qus MODEL.qus --prompt "你好" --max-new 128
+./build/src/ninfer MODEL.qus --prompt "你好" --max-new 128
 ```
 
 Multimodal input:
 
 ```bash
-./build/src/qus MODEL.qus --messages messages.json --no-thinking --max-new 256
+./build/src/ninfer MODEL.qus --messages messages.json --no-thinking --max-new 256
 ```
 
 The CLI requires exactly one of `--prompt` or `--messages`. It writes generated text to stdout and
@@ -49,7 +49,7 @@ and must be a nonzero multiple of 128.
 ## 3. Server
 
 ```bash
-./build/src/qus-serve MODEL.qus --host 127.0.0.1 --port 8080
+./build/src/ninfer-serve MODEL.qus --host 127.0.0.1 --port 8080
 ```
 
 The server exposes:

@@ -1,29 +1,29 @@
 # Benchmarks
 
-This directory contains benchmark binaries. `qus_bench` is the real-weight throughput tool; the
-`qus_<op>_bench` binaries are per-kernel microbenchmarks. Correctness and per-layer parity are NOT
+This directory contains benchmark binaries. `ninfer_bench` is the real-weight throughput tool; the
+`ninfer_<op>_bench` binaries are per-kernel microbenchmarks. Correctness and per-layer parity are NOT
 handled here; they live under [`tools/parity`](../tools/parity).
 
 ## Benchmark types
 
-Per-op benchmarks are the `qus_<op>_bench` binaries. They run one kernel family at Qwen3.6-27B
+Per-op benchmarks are the `ninfer_<op>_bench` binaries. They run one kernel family at Qwen3.6-27B
 shapes and are the entry point for ncu/nsys analysis. Their stdout numbers are convenience
-readouts; optimization claims require profiler evidence plus before/after `qus_bench` reports.
+readouts; optimization claims require profiler evidence plus before/after `ninfer_bench` reports.
 
-`qus_bench` is the real-weight throughput benchmark, modeled on `llama-bench`. It drives
+`ninfer_bench` is the real-weight throughput benchmark, modeled on `llama-bench`. It drives
 `Engine::load()`, `Engine::prefill()`, and `Engine::decode_step()` directly and measures prefill
 (`pp`) and decode (`tg`) throughput separately.
 
 ## Build
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j --target qus_bench
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a
+cmake --build build -j --target ninfer_bench
 ```
 
 ## Meaningful token corpus
 
-`qus_bench` reads token ids only; it has no tokenizer dependency. Prefill of an exact length `P`
+`ninfer_bench` reads token ids only; it has no tokenizer dependency. Prefill of an exact length `P`
 is the first `P` ids of a committed, meaningful corpus:
 
 ```text
@@ -39,7 +39,7 @@ permitting).
 ## Test model
 
 Three test kinds, each measured independently over `repetitions` timed runs (plus discarded
-`warmup` runs). When CUDA graph decode is enabled and the matrix contains decode work, `qus_bench`
+`warmup` runs). When CUDA graph decode is enabled and the matrix contains decode work, `ninfer_bench`
 also primes the decode graph once before timed repetitions so small `tg` cases do not include graph
 capture in their measured time.
 
@@ -64,7 +64,7 @@ it also leaves capacity for graph priming. A `--max-ctx` smaller than a test nee
 ## CLI
 
 ```text
-qus_bench --weights <q5090-path>
+ninfer_bench --weights <q5090-path>
           [--corpus <ids-path>]              # default: bench/fixtures/bench_corpus.ids
           [-p, --n-prompt <list>]            # pp tests, e.g. 512 or 128,512,2048
           [-n, --n-gen <list>]               # tg tests, e.g. 128
@@ -83,12 +83,12 @@ qus_bench --weights <q5090-path>
 ```
 
 With no `-p/-n/-pg`, the default matrix is `pp512` and `tg128`. Progress lines are written to
-`stderr` with the `[qus_bench]` prefix and are not part of the output artifact.
+`stderr` with the `[ninfer_bench]` prefix and are not part of the output artifact.
 
 Example:
 
 ```bash
-./build/bench/qus_bench \
+./build/bench/ninfer_bench \
   --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
   -p 512,2048 -n 128 -pg 2048,128 -r 5 --warmup 1
 ```
@@ -106,13 +106,13 @@ The default workspace arena is derived from `--prefill-chunk`, not prompt length
 `workspace_peak_bytes` should stay flat as prompt length grows at a fixed prefill chunk. Use
 `--work-bytes` only as an explicit experiment override.
 
-JSON shape (`schema_version: 6`, `artifact_type: "qus_bench_report"`):
+JSON shape (`schema_version: 7`, `artifact_type: "ninfer_bench_report"`):
 
 ```json
 {
-  "schema_version": 6,
-  "artifact_type": "qus_bench_report",
-  "tool": "qus_bench",
+  "schema_version": 7,
+  "artifact_type": "ninfer_bench_report",
+  "tool": "ninfer_bench",
   "command": "",
   "git_commit": "",
   "worktree_dirty": false,
@@ -174,5 +174,5 @@ profiles/nsys/
 ## Performance claims
 
 A valid performance claim needs both local per-op/profiler evidence for the touched kernel family
-and before/after `qus_bench` reports for the relevant test matrix. Any published number must state
+and before/after `ninfer_bench` reports for the relevant test matrix. Any published number must state
 the command, artifact path, git commit, q5090 identity, and dirty/clean worktree state.

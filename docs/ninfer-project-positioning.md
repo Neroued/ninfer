@@ -8,9 +8,8 @@
 > repository structure, APIs, migration work, or implementation strategy. Those subjects belong to
 > their own documents.
 >
-> The project name is defined separately by [`ninfer-naming.md`](ninfer-naming.md). This document is
-> an accepted direction for the elevated project, not a claim that the current repository has
-> already completed that transition.
+> The project name is defined separately by [`ninfer-naming.md`](ninfer-naming.md). This document
+> neither defines nor reports implementation or migration status.
 
 ## 1. Purpose
 

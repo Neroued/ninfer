@@ -7,18 +7,18 @@
 > single-request program contract, decode-round transaction, sequence-state invariants, and the
 > division between common infrastructure and target-private implementation. It also defines the
 > future repository/source ownership, internal header visibility, target-package layout, and build
-> dependency direction that enforce those boundaries. It does not define the current QUS
-> implementation, model mathematics, persistent tensor numeric semantics, `.ninfer` binary framing,
-> model-specific object inventories or layouts, conversion recipes, serving protocols, repository
-> migration steps, or future concurrent scheduling.
+> dependency direction that enforce those boundaries. It does not define the currently delivered
+> engine implementation, model mathematics, persistent tensor numeric semantics, `.ninfer` binary
+> framing, model-specific object inventories or layouts, conversion recipes, serving protocols,
+> repository migration steps, or future concurrent scheduling.
 >
 > Project purpose comes from [`ninfer-project-positioning.md`](ninfer-project-positioning.md).
 > Persistent numeric formats come from [`ninfer-tensor-formats.md`](ninfer-tensor-formats.md), and
 > artifact framing and metadata come from
 > [`ninfer-container-format.md`](ninfer-container-format.md). Exact Qwen3.6 checkpoint mathematics
 > remain in [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md) and
-> [`qwen3.6-35b-a3b-architecture.md`](qwen3.6-35b-a3b-architecture.md). The currently implemented QUS
-> system remains governed by [`design.md`](design.md) until the corresponding migration is complete.
+> [`qwen3.6-35b-a3b-architecture.md`](qwen3.6-35b-a3b-architecture.md). The currently delivered NInfer
+> engine remains governed by [`design.md`](design.md) until the corresponding migration is complete.
 
 ## 1. Decision
 
@@ -1498,8 +1498,8 @@ Prefill/decode/MTP hot paths contain no:
 ## 16. Concrete fit: Qwen3.6-27B
 
 This section maps the existing implementation into the contract and identifies corrections required
-before it can conform. It does not claim that current QUS already satisfies the new invariants, and
-it does not make old QUS types part of NInfer.
+before it can conform. It does not claim that the current implementation already satisfies the new
+invariants, and it does not make existing implementation types part of the future engine contract.
 
 ### 16.1 Loaded product
 
@@ -1948,9 +1948,10 @@ internal.
 
 For future engine source and build identities, lowercase `ninfer` is fixed here as the public
 include-directory name and C++ root namespace, and as the stem of the internal component targets in
-Section 19.7. This does not choose the repository directory, final user-facing executable names,
-distribution package, environment-variable prefix, or service identifier; those remain migration
-decisions under [`ninfer-naming.md`](ninfer-naming.md).
+Section 19.7. The repository directory, user-facing executable names, and environment-variable
+prefix already use their implemented NInfer identities, but remain outside this architecture's
+authority; the source tree and executable `--help` define their exact current surfaces. A future
+distribution package or new service identifier must be named only if such a contract is introduced.
 
 Each target's `export/` root is a scoped internal interface visible only to target composition; it is
 not installed. Its `impl/` root is private to that exact target's CMake target. A standalone facade
@@ -2064,7 +2065,7 @@ Files split because ownership, lifetime, dependency direction, compilation langu
 verification changes—not merely because a line threshold was crossed. A helper used by one
 translation unit remains in its anonymous namespace instead of creating another shared header.
 
-### 19.9 Current QUS ownership correction
+### 19.9 Current implementation ownership correction
 
 The following is an ownership mapping, not a migration sequence and not a compatibility promise:
 
@@ -2084,7 +2085,7 @@ The following is an ownership mapping, not a migration sequence and not a compat
 | generic KV allocation pieces | core only when their API is model-neutral; cursor/commit/composite semantics stay in Program |
 | `GdnState`, fixed-shape MTP/GQA/position/Vision helpers, and kernels importing model constants | target state/schedule/kernels until two targets prove a shared operator |
 | `FileTap` and filesystem tensor dumps inside production model headers | parity/diagnostic tool targets |
-| one `qus_core` built by recursive glob | explicit lower libraries, independent target object libraries, and closed registry link |
+| one `ninfer_core` built by recursive glob | explicit lower libraries, independent target object libraries, and closed registry link |
 
 After this split, common `Engine` contains no Qwen dimension, GDN/MTP/MoE/Vision field, target cache
 formula, or model-card setter protocol. The former card is not renamed: immutable binding becomes
@@ -2412,7 +2413,7 @@ It deliberately leaves these later decisions open:
 - detailed common tensor/arena/materializer class implementations;
 - exact CUDA kernels, graph partitions, and workspace schedules;
 - CLI and serving API migration;
-- migration sequencing and deletion of current QUS surfaces—not `.qus` loader compatibility, which
+- migration sequencing and replacement of current legacy engine surfaces—not `.qus` loader compatibility, which
   the accepted container contract already excludes;
 - the future continuous-batching scheduler and its memory policy.
 

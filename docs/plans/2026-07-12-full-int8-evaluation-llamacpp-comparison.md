@@ -1,10 +1,10 @@
-# QUS INT8 Full Evaluation and llama.cpp Comparison Plan
+# NInfer INT8 Full Evaluation and llama.cpp Comparison Plan
 
 Status: proposed, not started
 
 ## Goal
 
-Measure the current QUS INT8 service on the complete AIME25, AIME26, and GPQA-Diamond datasets and
+Measure the current NInfer INT8 service on the complete AIME25, AIME26, and GPQA-Diamond datasets and
 on every BFCL-v4 subset except Web Search, then compare it with the local llama.cpp mainline service
 on the same RTX 5090. The final report must separate capability, single-request latency, service
 throughput, speculative-decoding behavior, memory, and energy instead of collapsing them into one
@@ -12,7 +12,7 @@ score.
 
 ## Non-goals
 
-- This is not a pure runtime comparison with bit-identical weights. QUS uses q5090 mixed W4G64
+- This is not a pure runtime comparison with bit-identical weights. NInfer uses q5090 mixed W4G64
   (effective text 4.8716 bpw, W8G32 MTP, shortlisted Q4 draft head); llama.cpp uses GGUF Q4_K_M
   with its embedded MTP head. Capability differences are therefore end-to-end artifact plus runtime
   differences.
@@ -29,7 +29,7 @@ score.
 - GPU: NVIDIA RTX 5090, 32,607 MiB, driver 591.86.
 - CPU: Ryzen 9 9950X3D, 16 cores / 32 threads; host RAM 93 GiB.
 - Free filesystem space: approximately 417 GiB.
-- QUS source: `/home/neroued/qwen3.6-ultraspeed`, commit
+- NInfer source: `/home/neroued/ninfer`, commit
   `154ad5534f3c01d997d22be69319356eb35708d9`, currently dirty because the evaluation framework is
   uncommitted. The manifest must record the dirty diff identity.
 - llama.cpp source: `/home/neroued/llama.cpp-mainline`, commit
@@ -40,7 +40,7 @@ score.
 
 ### Artifacts
 
-- QUS: `out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus`, 17,505,990,144 bytes.
+- NInfer: `out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus`, 17,505,990,144 bytes.
 - llama.cpp:
   `/home/neroued/models/llm/qwen/Qwen3.6-27B/gguf-q4_k_m-mtp/Qwen3.6-27B-Q4_K_M-mtp.gguf`,
   16,998,723,232 bytes, SHA-256
@@ -86,32 +86,32 @@ Use one benchmark contract for both endpoints:
 - sample retention `all`.
 
 The 65,000 reasoning budget is intentional: the prior 16,384-token failures completed correctly at
-19,556 and 33,317 tokens under QUS INT8. Prompt plus output must remain below the 65,536 per-slot
+19,556 and 33,317 tokens under NInfer INT8. Prompt plus output must remain below the 65,536 per-slot
 context.
 
 llama.cpp has extra samplers enabled by default. Disable min-p, DRY, XTC, typical-p, adaptive
 sampling, and repeat penalty. Set `repeat-last-n=-1` so presence/frequency penalties see the full
 generated history. Configure the sampler order as `penalties;temperature;top_k;top_p` to be as close
-as possible to QUS. The implementations still need not produce identical sampled sequences.
+as possible to NInfer. The implementations still need not produce identical sampled sequences.
 
 ### KV comparison contract
 
-- QUS uses `--kv-dtype int8`.
+- NInfer uses `--kv-dtype int8`.
 - llama.cpp uses `-ctk q8_0 -ctv q8_0`; its MTP context also uses q8_0 K/V.
 - These are both 8-bit KV modes but not a promise of identical quantization mathematics. Record the
   difference in the final report.
 
 ### Two performance lanes
 
-1. **Latency lane:** QUS concurrency 1 versus llama.cpp `-np 1`. This is the apples-to-apples
+1. **Latency lane:** NInfer concurrency 1 versus llama.cpp `-np 1`. This is the apples-to-apples
    single-active-sequence comparison.
-2. **Capacity lane:** QUS concurrency 1 versus the highest validated llama.cpp slot count from
+2. **Capacity lane:** NInfer concurrency 1 versus the highest validated llama.cpp slot count from
    `N in {2, 4}`. This measures service throughput. It must not be presented as a single-request
    kernel speedup.
 
 Full capability inference for llama.cpp may use the selected capacity-lane concurrency after a
 determinism gate. A fixed representative workload must also be run at `-np 1` so latency and decode
-speed remain comparable with QUS.
+speed remain comparable with NInfer.
 
 ## Phase 1: Freeze and build
 
@@ -143,11 +143,11 @@ Verification:
 
 ## Phase 2: Define reproducible server launchers
 
-### QUS
+### NInfer
 
 ```bash
-cd /home/neroued/qwen3.6-ultraspeed
-build/src/qus-serve \
+cd /home/neroued/ninfer
+build/src/ninfer-serve \
   out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
   --host 127.0.0.1 --port 18080 --model-id qwen3.6-27b \
   --max-context 65536 --prefill-chunk 1024 \
@@ -158,7 +158,7 @@ build/src/qus-serve \
   --presence-penalty 1.0 --frequency-penalty 0.0 --seed 42
 ```
 
-QUS remains concurrency 1. Capture stdout/stderr to a run-owned server log because each request log
+NInfer remains concurrency 1. Capture stdout/stderr to a run-owned server log because each request log
 contains prompt/generated tokens, TTFT, prefill rate, decode rate, wall time, MTP tokens per round,
 and acceptance percentage.
 
@@ -203,7 +203,7 @@ Before any long run, execute these gates against each server:
 
 1. Health and model listing.
 2. Token-count parity on ten saved messages: plain AIME, GPQA, single tool call, parallel tool call,
-   and multi-turn tool history. Use QUS count-tokens behavior and llama.cpp
+   and multi-turn tool history. Use NInfer count-tokens behavior and llama.cpp
    `/v1/chat/completions/input_tokens` or `/apply-template` plus `/tokenize`.
 3. Confirm thinking is returned separately as `reasoning_content` and final text remains in
    `content`.
@@ -217,15 +217,16 @@ Before any long run, execute these gates against each server:
 Exact validation entry points:
 
 ```bash
-cd /home/neroued/qwen3.6-ultraspeed
-PYTHONPATH=eval eval/.venv/bin/python -m qus_eval validate \
-  --config eval/configs/full-compare.yaml --suite qus_smoke --check-runtime
-PYTHONPATH=eval eval/.venv/bin/python -m qus_eval run \
-  --config eval/configs/full-compare.yaml --suite qus_smoke
+cd /home/neroued/ninfer
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval validate \
+  --config eval/configs/full-compare.yaml --suite ninfer_smoke --check-runtime
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
+  --config eval/configs/full-compare.yaml --suite ninfer_smoke
 ```
 
-Use the corresponding `llama_smoke` suite after switching servers. A gate failure stops the run;
-do not consume thousands of samples while the chat template or tool parser is mismatched.
+Use `llama_latency_smoke` after switching to the one-slot llama server, then
+`llama_capacity_smoke` for the candidate concurrent server. A gate failure stops the run; do not
+consume thousands of samples while the chat template or tool parser is mismatched.
 
 ## Phase 4: Select llama.cpp concurrency
 
@@ -254,7 +255,7 @@ If N=4 fails any condition, use N=2. If N=2 fails, use N=1.
 
 ## Phase 5: Evaluation configuration
 
-Add `eval/configs/full-compare.yaml` with separate QUS and llama targets/suites. Keep
+Add `eval/configs/full-compare.yaml` with separate NInfer and llama targets/suites. Keep
 `runtime.max_parallel_jobs: 1`; concurrency is inside each EvalScope job via the target capacity.
 
 Reasoning jobs:
@@ -309,7 +310,7 @@ backend_args:
 
 Target capacities:
 
-- QUS: `max_concurrency: 1`;
+- NInfer: `max_concurrency: 1`;
 - llama latency suite: `max_concurrency: 1`;
 - llama capacity/full suite: selected N.
 
@@ -349,35 +350,35 @@ nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,temperat
   --format=csv,noheader,nounits -l 1
 ```
 
-Poll llama.cpp `/metrics` and `/slots` during its run. Preserve QUS request logs and llama.cpp
+Poll llama.cpp `/metrics` and `/slots` during its run. Preserve NInfer request logs and llama.cpp
 server logs. Because EvalScope normalizes responses, add raw-wire capture or a redacted request-log
 sidecar if engine-specific response timing/MTP fields would otherwise be discarded.
 
 ## Phase 7: Full execution order
 
 1. Pre-cache datasets and BFCL memory dependencies without a model server.
-2. Run QUS full reasoning: 258 samples, concurrency 1.
+2. Run NInfer full reasoning: 258 samples, concurrency 1.
 3. Run llama full reasoning at selected N.
-4. Run the fixed latency workload with llama N=1 and QUS N=1, three repetitions each, alternating
+4. Run the fixed latency workload with llama N=1 and NInfer N=1, three repetitions each, alternating
    engine order after warmup.
-5. Run QUS BFCL-v4 no-web, 4,906 samples, concurrency 1.
+5. Run NInfer BFCL-v4 no-web, 4,906 samples, concurrency 1.
 6. Run llama BFCL-v4 no-web at selected safe N.
-7. Resume only through `qus_eval resume`; never change a run's effective config.
+7. Resume only through `ninfer_eval resume`; never change a run's effective config.
 8. Generate and independently review the paired comparison report.
 
 Commands after each server is ready:
 
 ```bash
-PYTHONPATH=eval eval/.venv/bin/python -m qus_eval run \
-  --config eval/configs/full-compare.yaml --suite qus_reasoning_full
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
+  --config eval/configs/full-compare.yaml --suite ninfer_reasoning_full
 
-PYTHONPATH=eval eval/.venv/bin/python -m qus_eval run \
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/full-compare.yaml --suite llama_reasoning_full
 
-PYTHONPATH=eval eval/.venv/bin/python -m qus_eval run \
-  --config eval/configs/full-compare.yaml --suite qus_bfcl_no_web
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
+  --config eval/configs/full-compare.yaml --suite ninfer_bfcl_no_web
 
-PYTHONPATH=eval eval/.venv/bin/python -m qus_eval run \
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/full-compare.yaml --suite llama_bfcl_no_web
 ```
 
@@ -389,8 +390,8 @@ wall time.
 
 Initial planning range on this machine:
 
-- QUS full reasoning: approximately 4-8 hours;
-- QUS BFCL no-web: approximately 6-12 hours because multi-turn/memory samples expand to many model
+- NInfer full reasoning: approximately 4-8 hours;
+- NInfer BFCL no-web: approximately 6-12 hours because multi-turn/memory samples expand to many model
   calls;
 - llama.cpp may reduce wall time through N=2 or N=4, but only the pilot can establish scaling;
 - allow a continuous 18-24 hour window for all full runs, retries, switching servers, and review;
@@ -401,12 +402,12 @@ Initial planning range on this machine:
 The final report has four distinct tables:
 
 1. **Capability:** same-item scores and deltas by dataset/subset.
-2. **Single-stream efficiency:** QUS C=1 versus llama C=1.
-3. **Service capacity:** QUS C=1 versus llama selected N, including N and per-slot context in every
+2. **Single-stream efficiency:** NInfer C=1 versus llama C=1.
+3. **Service capacity:** NInfer C=1 versus llama selected N, including N and per-slot context in every
    row.
 4. **Resource cost:** artifact size, load time, peak VRAM, power/energy, and host RAM.
 
-For each accuracy delta, include the number of QUS-only correct, llama-only correct, both correct,
+For each accuracy delta, include the number of NInfer-only correct, llama-only correct, both correct,
 and both wrong samples. Inspect a stratified set of disagreements and all truncations/protocol
 errors. Do not attribute score differences solely to the runtime because the quantized artifacts
 are different.
@@ -437,9 +438,9 @@ are different.
 
 ```bash
 PYTHONPATH=eval eval/.venv/bin/python -m unittest discover -s eval/tests -p 'test_*.py'
-PYTHONPATH=eval eval/.venv/bin/python -m qus_eval validate \
-  --config eval/configs/full-compare.yaml --suite qus_reasoning_full --check-runtime
-PYTHONPATH=eval eval/.venv/bin/python -m qus_eval validate \
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval validate \
+  --config eval/configs/full-compare.yaml --suite ninfer_reasoning_full --check-runtime
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval validate \
   --config eval/configs/full-compare.yaml --suite llama_reasoning_full --check-runtime
 git diff --check
 ```

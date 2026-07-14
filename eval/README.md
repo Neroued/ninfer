@@ -53,7 +53,7 @@ Concurrency has two levels:
 - optional job `max_concurrency` caps how many target slots one job may reserve.
 
 For EvalScope, the granted job slots become `eval_batch_size`. Multiple jobs sharing a target can
-never reserve more slots than the target capacity. Set the local `qus-serve` target to one; set a
+never reserve more slots than the target capacity. Set the local `ninfer-serve` target to one; set a
 larger explicit value for an online service that supports it.
 
 Portable generation settings live under `generation`. Evaluator-specific controls live under
@@ -70,14 +70,14 @@ export PYTHONPATH="$PWD/eval"
 Validate configuration and installed runtime dependencies:
 
 ```bash
-eval/.venv/bin/python -m qus_eval validate \
+eval/.venv/bin/python -m ninfer_eval validate \
   --config eval/configs/capability-suite.yaml --suite smoke
 ```
 
 Show expected work without making model requests:
 
 ```bash
-eval/.venv/bin/python -m qus_eval plan \
+eval/.venv/bin/python -m ninfer_eval plan \
   --config eval/configs/capability-suite.yaml --suite reasoning
 ```
 
@@ -87,24 +87,24 @@ packages.
 Run the network-free coordinator check:
 
 ```bash
-eval/.venv/bin/python -m qus_eval run \
+eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/mock-suite.yaml --suite all
 ```
 
 Run the small real-endpoint matrix before a formal evaluation:
 
 ```bash
-eval/.venv/bin/python -m qus_eval run \
+eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/capability-suite.yaml --suite smoke
 ```
 
 Then run the full reasoning and BFCL suites independently:
 
 ```bash
-eval/.venv/bin/python -m qus_eval run \
+eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/capability-suite.yaml --suite reasoning
 
-SERPAPI_API_KEY=... eval/.venv/bin/python -m qus_eval run \
+SERPAPI_API_KEY=... eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/capability-suite.yaml --suite bfcl_full
 ```
 
@@ -115,9 +115,9 @@ model, which the example explicitly acknowledges with `allow_network_downloads: 
 Inspect and resume a run:
 
 ```bash
-eval/.venv/bin/python -m qus_eval status --run eval/runs/<run-id>
-eval/.venv/bin/python -m qus_eval resume --run eval/runs/<run-id>
-eval/.venv/bin/python -m qus_eval summarize --run eval/runs/<run-id>
+eval/.venv/bin/python -m ninfer_eval status --run eval/runs/<run-id>
+eval/.venv/bin/python -m ninfer_eval resume --run eval/runs/<run-id>
+eval/.venv/bin/python -m ninfer_eval summarize --run eval/runs/<run-id>
 ```
 
 Resume rejects a changed effective configuration or backend version. Completed jobs are skipped;
@@ -174,7 +174,7 @@ An ordinary EvalScope dataset needs only another configured job:
 ```
 
 An evaluator that does not use EvalScope implements the four-method backend protocol in
-`qus_eval/backends/base.py`, registers one stable name in `backends/registry.py`, retains its raw
+`ninfer_eval/backends/base.py`, registers one stable name in `backends/registry.py`, retains its raw
 artifacts, and returns the normalized `DatasetResult`. The coordinator and summary writer do not
 need benchmark-specific changes.
 
@@ -192,8 +192,8 @@ need benchmark-specific changes.
 ## Verification
 
 ```bash
-PYTHONPATH=eval eval/.venv/bin/python -m py_compile $(rg --files eval/qus_eval -g '*.py')
+PYTHONPATH=eval eval/.venv/bin/python -m py_compile $(rg --files eval/ninfer_eval -g '*.py')
 PYTHONPATH=eval eval/.venv/bin/python -m unittest discover -s eval/tests -p 'test_*.py'
-PYTHONPATH=eval eval/.venv/bin/python -m qus_eval run \
+PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
   --config eval/configs/mock-suite.yaml --suite all
 ```

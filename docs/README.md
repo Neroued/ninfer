@@ -1,15 +1,18 @@
 # Documentation
 
-This directory contains the small set of documents that describe the current qwen3.6-ultraspeed
-system. Active documents are maintained against the current source tree. Completed plans, retired
-formats, dated design investigations, and benchmark evidence belong under [`archive/`](archive/).
+This directory contains the small set of documents that describe the current NInfer project and
+implemented system. Active documents are maintained against the current source tree. Completed
+plans, retired formats, dated design investigations, and benchmark evidence belong under
+[`archive/`](archive/).
 
 ## Start here
 
 | Document | Authority |
 |---|---|
 | [`../README.md`](../README.md) | project capabilities, build, and quick-start commands |
-| [`design.md`](design.md) | system boundaries, component ownership, runtime flows, and supported scope |
+| [`ninfer-naming.md`](ninfer-naming.md) | canonical project name, `.ninfer` filename extension reserved for future native artifacts, and naming-cutover status; no source/API, container, or ABI authority |
+| [`ninfer-project-positioning.md`](ninfer-project-positioning.md) | current project mission, exact-target selection policy, workload, performance priorities, product boundary, and non-goals; no implementation or format authority |
+| [`design.md`](design.md) | current implemented system boundaries, component ownership, runtime flows, and supported scope |
 | [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md) | fixed model dimensions, math, Text/MTP/Vision schedules, and state semantics |
 | [`qwen3.6-35b-a3b-architecture.md`](qwen3.6-35b-a3b-architecture.md) | exact 35B-A3B source-checkpoint dimensions, hybrid Text/MoE/MTP/Vision math, and state semantics; not runtime-support status |
 | [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md) | normative q5090 v4.2 binary and tensor-assignment contract |
@@ -29,15 +32,14 @@ These documents have deliberately separate responsibilities:
 
 | Document | Authority |
 |---|---|
-| [`ninfer-naming.md`](ninfer-naming.md) | future project identity `NInfer` and future artifact filename extension `.ninfer` only; no current runtime, container, ABI, or migration authority |
-| [`ninfer-project-positioning.md`](ninfer-project-positioning.md) | accepted NInfer mission, target-selection policy, workload, performance priorities, product boundary, and non-goals; no implementation or format authority |
 | [`ninfer-tensor-formats.md`](ninfer-tensor-formats.md) | accepted closed registry and logical semantics for future NInfer direct and grouped-quantized persistent tensor formats; no container, physical layout, checkpoint assignment, kernel implementation/dispatch, or runtime-state-codec authority |
 | [`ninfer-container-format.md`](ninfer-container-format.md) | accepted future `.ninfer` v1 16-byte framing and strict embedded-JSON object directory, model/container boundary, canonical file geometry, loading validation, and evolution rules; no model-specific inventory, conversion recipe, layout, implementation, or migration authority |
 | [`ninfer-engine-architecture.md`](ninfer-engine-architecture.md) | accepted future NInfer core engine and source-organization boundary: compiled exact-target packages, load-time construction, ownership and memory lifetimes, checkpoint frontends, one-request program state, transactional generated-token rounds, repository/build dependency direction, and common-versus-target-private interfaces; no current implementation, model math, format details, serving protocol, migration plan, or future scheduler authority |
 
-The current system documentation above remains authoritative until the corresponding migration is
-implemented. A pending decision must not be read as an already available command, API, or file
-format.
+The current implementation documents above remain authoritative until the corresponding engine,
+tensor-format, or container migration is implemented. A pending decision must not be read as an
+already available command, API, or file format. In particular, the project is now named NInfer,
+but q5090 v4.2 `.qus` remains the only implemented artifact route.
 
 ## Component guides
 
@@ -47,7 +49,7 @@ Operational documentation stays next to the code it describes:
 - [`../tests/README.md`](../tests/README.md) — current test organization and intended risk coverage;
 - [`../tools/bench/README.md`](../tools/bench/README.md) — benchmark corpus and matrix tooling;
 - [`../tools/q5090/README.md`](../tools/q5090/README.md) — Python reference and diagnostics;
-- [`../tools/q5090_convert/README.md`](../tools/q5090_convert/README.md) — converter and verifier.
+- [`../tools/q5090_convert/README.md`](../tools/q5090_convert/README.md) — converter and verifier;
 - [`../eval/README.md`](../eval/README.md) — configurable capability evaluation, progress, logs,
   resume, and normalized reports.
 

@@ -1,15 +1,15 @@
-// qus::kernels - l2norm launcher: grid/block/stream configuration + kernel launch.
+// ninfer::kernels - l2norm launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/l2norm.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/l2norm.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void l2norm_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
     constexpr int kBlock = 512;
@@ -29,4 +29,4 @@ void l2norm_launch(const Tensor& x, float eps, Tensor& out, cudaStream_t stream)
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

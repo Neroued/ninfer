@@ -6,13 +6,13 @@
 
 #include "kernels/common/math.h"
 #include "kernels/linear/reference/linear_generic.h" // launch declaration
-#include "qus/core/device.h"                          // CUDA_CHECK
+#include "ninfer/core/device.h"                          // CUDA_CHECK
 
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 constexpr int kRowsPerBlockDefault = 8;
@@ -184,4 +184,4 @@ void linear_rowsplit_gemm_smallt_launch(const Tensor& x, const Weight& w, Tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

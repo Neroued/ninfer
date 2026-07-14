@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - split-KV GQA small-T attention, int8 KV-cache partial kernel.
+// ninfer::kernels - split-KV GQA small-T attention, int8 KV-cache partial kernel.
 // Historical design: docs/archive/optimization-era/2026-07-08-gqa-decode-int8-kernel-redesign.md.
 //
 //   * QK runs on native m16n8k32.s8 tensor cores. Q is quantized on-chip to int8
@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 // Store one int8 code into a d-contiguous-as-b16 swizzled tile so the same
 // gqa_small_t_tc_swz / ldmatrix path that serves bf16 tiles serves the int8 tile.
@@ -271,9 +271,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int key = tile_k0 + key_l;
             if (key < split_end) {
                 const std::int64_t off = gqa_kv_quant_scale_index(kv_head, 0, key, padded_context);
-                qus::kernels::cp_async<8>(&k_scale_s[key_l * Groups],
+                ninfer::kernels::cp_async<8>(&k_scale_s[key_l * Groups],
                                                              &cache_k_scale[off]);
-                qus::kernels::cp_async<8>(&v_scale_s[key_l * Groups],
+                ninfer::kernels::cp_async<8>(&v_scale_s[key_l * Groups],
                                                              &cache_v_scale[off]);
             }
         }
@@ -286,17 +286,17 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             if (key < split_end) {
                 const std::int64_t off = gqa_kv_quant_code_index(kv_head, d, key, padded_context);
                 std::int8_t* dst       = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
-                qus::kernels::cp_async<16>(dst, &cache_k_i8[off]);
-                qus::kernels::cp_async<16>(&v_i8[key_l * D + d],
+                ninfer::kernels::cp_async<16>(dst, &cache_k_i8[off]);
+                ninfer::kernels::cp_async<16>(&v_i8[key_l * D + d],
                                                               &cache_v_i8[off]);
             }
         }
-        qus::kernels::cp_commit();
+        ninfer::kernels::cp_commit();
     };
 
     const int key_blocks = div_up(split_end - split_start, Bc);
     issue_kv_tile(split_start);
-    qus::kernels::cp_wait<0>();
+    ninfer::kernels::cp_wait<0>();
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
@@ -505,7 +505,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                                                  pf[1], pf[2], pf[3], vf[0], vf[1]);
             }
         }
-        if (has_next) { qus::kernels::cp_wait<0>(); }
+        if (has_next) { ninfer::kernels::cp_wait<0>(); }
         __syncthreads();
     }
 
@@ -555,4 +555,4 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

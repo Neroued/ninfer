@@ -1,13 +1,13 @@
-#include "qus/core/state_store.h"
+#include "ninfer/core/state_store.h"
 
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <limits>
 #include <new>
 #include <stdexcept>
 #include <string>
 
-namespace qus {
+namespace ninfer {
 namespace {
 
 std::size_t checked_mul_size(std::size_t a, std::size_t b) {
@@ -146,4 +146,4 @@ void GdnState::reset(cudaStream_t stream) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
-} // namespace qus
+} // namespace ninfer

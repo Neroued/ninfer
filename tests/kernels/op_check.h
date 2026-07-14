@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 
-namespace qus::test {
+namespace ninfer::test {
 
 struct Tolerance {
     double atol;            // additive floor of the per-element bound
@@ -159,4 +159,4 @@ inline void print_diff(const char* label, const DiffStats& s, const Tolerance& t
     std::printf("\n");
 }
 
-} // namespace qus::test
+} // namespace ninfer::test

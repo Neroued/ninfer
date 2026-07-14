@@ -1,5 +1,5 @@
-// qus::kernels - argmax wrapper: public api validation and launcher dispatch.
-#include "qus/kernels/argmax.h"
+// ninfer::kernels - argmax wrapper: public api validation and launcher dispatch.
+#include "ninfer/kernels/argmax.h"
 
 #include "kernels/launcher/argmax.h"  // detail::argmax_launch
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -69,4 +69,4 @@ void argmax(const Tensor& logits, Tensor& out, cudaStream_t stream) {
     detail::argmax_launch(logits, out, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

@@ -1,8 +1,8 @@
-#include "qus/kernels/gated_delta_rule.h"
+#include "ninfer/kernels/gated_delta_rule.h"
 
 #include "kernels/common/math.h"
 #include "kernels/launcher/gated_delta_rule.h"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cmath>
 #include <cstddef>
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 constexpr std::int32_t kS         = 128;
@@ -204,4 +204,4 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

@@ -1,11 +1,11 @@
 #include "kernels/launcher/vision_attention.h"
 
 #include "kernels/kernel/vision_attention.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 std::int64_t stride_elements(const Tensor& tensor, int dim) {
@@ -40,4 +40,4 @@ void vision_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

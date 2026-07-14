@@ -1,16 +1,16 @@
-// qus::kernels — silu_mul launcher: grid/block/stream configuration + kernel launch.
+// ninfer::kernels — silu_mul launcher: grid/block/stream configuration + kernel launch.
 // The only translation unit that includes this op's kernel header.
 // See docs/kernel-development.md §2.
 #include "kernels/launcher/silu_and_mul.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/silu_and_mul.cuh"
-#include "qus/core/device.h"  // CUDA_CHECK
+#include "ninfer/core/device.h"  // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 bool can_use_dim0_split_fast_path(const Tensor& gate, const Tensor& up, const Tensor& out) {
@@ -86,4 +86,4 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

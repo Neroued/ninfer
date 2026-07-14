@@ -2,13 +2,13 @@
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/gelu.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void gelu_launch(Tensor& x, GeluMode mode, cudaStream_t stream) {
     constexpr int block  = 256;
@@ -42,4 +42,4 @@ void gelu_launch(Tensor& x, GeluMode mode, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

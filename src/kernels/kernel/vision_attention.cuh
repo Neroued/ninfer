@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kVisionAttentionHeadDim   = 72;
 inline constexpr int kVisionAttentionHeads     = 16;
@@ -368,4 +368,4 @@ __launch_bounds__(kVisionAttentionThreads, 2) __global__ void vision_attention_f
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

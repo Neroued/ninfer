@@ -2,13 +2,13 @@
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/add_bias.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void add_bias_launch(const Tensor& bias, Tensor& x, cudaStream_t stream) {
     constexpr int block     = 256;
@@ -37,4 +37,4 @@ void add_bias_launch(const Tensor& bias, Tensor& x, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

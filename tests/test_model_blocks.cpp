@@ -1,11 +1,11 @@
-#include "qus/core/arena.h"
-#include "qus/core/device.h"
-#include "qus/core/kv_cache.h"
-#include "qus/core/state_store.h"
-#include "qus/core/weight_store.h"
-#include "qus/core/weight_store_parser.h"
-#include "qus/model/config.h"
-#include "qus/model/model.h"
+#include "ninfer/core/arena.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/kv_cache.h"
+#include "ninfer/core/state_store.h"
+#include "ninfer/core/weight_store.h"
+#include "ninfer/core/weight_store_parser.h"
+#include "ninfer/model/config.h"
+#include "ninfer/model/model.h"
 #include "kernels/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -32,31 +32,31 @@ int fail(const std::string& message) {
 }
 
 std::filesystem::path make_fixture() {
-    const auto path = std::filesystem::temp_directory_path() / "qus_q5090_model_blocks_fixture.qus";
+    const auto path = std::filesystem::temp_directory_path() / "ninfer_q5090_model_blocks_fixture.qus";
     const std::filesystem::path script =
-        std::filesystem::path(QUS_SOURCE_DIR) / "tests/fixtures/make_q5090_fixture.py";
+        std::filesystem::path(NINFER_SOURCE_DIR) / "tests/fixtures/make_q5090_fixture.py";
     const std::string command = "python3 \"" + script.string() +
                                 "\" --profile model-blocks --out \"" + path.string() + "\"";
     if (std::system(command.c_str()) != 0) { throw std::runtime_error("fixture generator failed"); }
     return path;
 }
 
-void fill_hidden(qus::Tensor& x, int T) {
-    std::vector<float> host(static_cast<std::size_t>(qus::model::kCfg.hidden) * T);
-    qus::test::fill_uniform(host, 1234u + static_cast<std::uint32_t>(T), -0.25f, 0.25f);
-    qus::test::round_to_bf16(host);
+void fill_hidden(ninfer::Tensor& x, int T) {
+    std::vector<float> host(static_cast<std::size_t>(ninfer::model::kCfg.hidden) * T);
+    ninfer::test::fill_uniform(host, 1234u + static_cast<std::uint32_t>(T), -0.25f, 0.25f);
+    ninfer::test::round_to_bf16(host);
     std::vector<std::uint16_t> bf16(host.size());
-    for (std::size_t i = 0; i < host.size(); ++i) { bf16[i] = qus::test::f32_to_bf16(host[i]); }
+    for (std::size_t i = 0; i < host.size(); ++i) { bf16[i] = ninfer::test::f32_to_bf16(host[i]); }
     CUDA_CHECK(cudaMemcpy(x.data, bf16.data(), bf16.size() * sizeof(std::uint16_t),
                           cudaMemcpyHostToDevice));
 }
 
-int expect_finite_hidden(const qus::Tensor& x, const char* label) {
-    std::vector<std::uint16_t> bits(static_cast<std::size_t>(qus::model::kCfg.hidden) * x.ne[1]);
+int expect_finite_hidden(const ninfer::Tensor& x, const char* label) {
+    std::vector<std::uint16_t> bits(static_cast<std::size_t>(ninfer::model::kCfg.hidden) * x.ne[1]);
     CUDA_CHECK(cudaMemcpy(bits.data(), x.data, bits.size() * sizeof(std::uint16_t),
                           cudaMemcpyDeviceToHost));
     for (std::size_t i = 0; i < bits.size(); ++i) {
-        const float value = qus::test::bf16_to_f32(bits[i]);
+        const float value = ninfer::test::bf16_to_f32(bits[i]);
         if (!std::isfinite(value)) {
             return fail(std::string(label) + " produced non-finite value at " + std::to_string(i));
         }
@@ -64,45 +64,45 @@ int expect_finite_hidden(const qus::Tensor& x, const char* label) {
     return 0;
 }
 
-void set_positions(qus::model::StepState& io, qus::test::DBuf& pos, int T) {
+void set_positions(ninfer::model::StepState& io, ninfer::test::DBuf& pos, int T) {
     std::vector<int> host(static_cast<std::size_t>(T));
-    qus::test::fill_iota_i32(host);
-    pos         = qus::test::to_device_i32(host);
-    io.pos      = qus::Tensor(pos.p, qus::DType::I32, {T});
+    ninfer::test::fill_iota_i32(host);
+    pos         = ninfer::test::to_device_i32(host);
+    io.pos      = ninfer::Tensor(pos.p, ninfer::DType::I32, {T});
     io.rope_pos = io.pos;
 }
 
-qus::model::StepState make_step_state(qus::DeviceArena& arena, int window_cols, int prefill_chunk) {
+ninfer::model::StepState make_step_state(ninfer::DeviceArena& arena, int window_cols, int prefill_chunk) {
     const int draft_cols = std::max(1, window_cols - 1);
-    return qus::model::StepState{
-        arena.alloc(qus::DType::I32, {1}),
-        arena.alloc(qus::DType::I32, {1}),
-        arena.alloc(qus::DType::I32, {1}),
-        arena.alloc(qus::DType::I32, {1}),
-        arena.alloc(qus::DType::BF16, {qus::model::kCfg.vocab, window_cols}),
-        arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, window_cols}),
-        arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, prefill_chunk}),
-        arena.alloc(qus::DType::I32, {window_cols}),
-        arena.alloc(qus::DType::I32, {draft_cols}),
-        arena.alloc(qus::DType::I32, {window_cols}),
-        arena.alloc(qus::DType::I32, {1}),
-        arena.alloc(qus::DType::I32, {window_cols}),
-        arena.alloc(qus::DType::I32, {window_cols}),
-        arena.alloc(qus::DType::I32, {window_cols}),
-        arena.alloc(qus::DType::I32, {1}),
-        arena.alloc(qus::DType::I32, {1}),
-        arena.alloc(qus::DType::I32, {1}),
-        arena.alloc(qus::DType::I32, {1}),
-        arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, 1}),
-        arena.alloc(qus::DType::I64, {qus::model::kStepStatsCounters}),
+    return ninfer::model::StepState{
+        arena.alloc(ninfer::DType::I32, {1}),
+        arena.alloc(ninfer::DType::I32, {1}),
+        arena.alloc(ninfer::DType::I32, {1}),
+        arena.alloc(ninfer::DType::I32, {1}),
+        arena.alloc(ninfer::DType::BF16, {ninfer::model::kCfg.vocab, window_cols}),
+        arena.alloc(ninfer::DType::BF16, {ninfer::model::kCfg.hidden, window_cols}),
+        arena.alloc(ninfer::DType::BF16, {ninfer::model::kCfg.hidden, prefill_chunk}),
+        arena.alloc(ninfer::DType::I32, {window_cols}),
+        arena.alloc(ninfer::DType::I32, {draft_cols}),
+        arena.alloc(ninfer::DType::I32, {window_cols}),
+        arena.alloc(ninfer::DType::I32, {1}),
+        arena.alloc(ninfer::DType::I32, {window_cols}),
+        arena.alloc(ninfer::DType::I32, {window_cols}),
+        arena.alloc(ninfer::DType::I32, {window_cols}),
+        arena.alloc(ninfer::DType::I32, {1}),
+        arena.alloc(ninfer::DType::I32, {1}),
+        arena.alloc(ninfer::DType::I32, {1}),
+        arena.alloc(ninfer::DType::I32, {1}),
+        arena.alloc(ninfer::DType::BF16, {ninfer::model::kCfg.hidden, 1}),
+        arena.alloc(ninfer::DType::I64, {ninfer::model::kStepStatsCounters}),
     };
 }
 
-qus::Weight invalid_dense_weight(std::int32_t n, std::int32_t k) {
-    qus::Weight w{};
-    w.qtype             = qus::QType::BF16_CTRL;
-    w.layout            = qus::QuantLayout::Contiguous;
-    w.q5090_scale_dtype = qus::ScaleDType::None;
+ninfer::Weight invalid_dense_weight(std::int32_t n, std::int32_t k) {
+    ninfer::Weight w{};
+    w.qtype             = ninfer::QType::BF16_CTRL;
+    w.layout            = ninfer::QuantLayout::Contiguous;
+    w.q5090_scale_dtype = ninfer::ScaleDType::None;
     w.n                 = n;
     w.k                 = k;
     w.ndim              = 2;
@@ -113,25 +113,25 @@ qus::Weight invalid_dense_weight(std::int32_t n, std::int32_t k) {
     return w;
 }
 
-int fused_prefill_uses_gate_up(qus::model::Qwen3_6_27B& card, const qus::model::FullLayerW& full,
-                               qus::WorkspaceArena& work, qus::DeviceArena& x_arena) {
+int fused_prefill_uses_gate_up(ninfer::model::Qwen3_6_27B& card, const ninfer::model::FullLayerW& full,
+                               ninfer::WorkspaceArena& work, ninfer::DeviceArena& x_arena) {
     constexpr int T = 32;
 
     work.reset();
     x_arena.reset();
-    qus::Tensor x = x_arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, T});
+    ninfer::Tensor x = x_arena.alloc(ninfer::DType::BF16, {ninfer::model::kCfg.hidden, T});
     fill_hidden(x, T);
 
-    qus::Weight bad_gate =
-        invalid_dense_weight(qus::model::kCfg.intermediate, qus::model::kCfg.hidden);
-    qus::Weight bad_up =
-        invalid_dense_weight(qus::model::kCfg.intermediate, qus::model::kCfg.hidden);
-    qus::model::MlpW fused_mlp = full.mlp;
+    ninfer::Weight bad_gate =
+        invalid_dense_weight(ninfer::model::kCfg.intermediate, ninfer::model::kCfg.hidden);
+    ninfer::Weight bad_up =
+        invalid_dense_weight(ninfer::model::kCfg.intermediate, ninfer::model::kCfg.hidden);
+    ninfer::model::MlpW fused_mlp = full.mlp;
     fused_mlp.gate             = &bad_gate;
     fused_mlp.up               = &bad_up;
 
     try {
-        card.test_mlp_tail(full.post_attn_norm, fused_mlp, x, qus::model::Phase::Prefill);
+        card.test_mlp_tail(full.post_attn_norm, fused_mlp, x, ninfer::model::Phase::Prefill);
         CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {
         return fail(std::string("prefill T=32 fused_mlp_tail: unexpected exception: ") + e.what());
@@ -144,12 +144,12 @@ int fused_prefill_uses_gate_up(qus::model::Qwen3_6_27B& card, const qus::model::
     return failures;
 }
 
-int run_case(qus::model::Qwen3_6_27B& card, const qus::model::FullLayerW& full,
-             const qus::model::GdnLayerW& gdn, qus::WorkspaceArena& work, qus::DeviceArena& x_arena,
-             qus::KVCache& kv, qus::GdnState& state, qus::model::StepState& io,
-             qus::model::Phase phase, int T, const char* label) {
+int run_case(ninfer::model::Qwen3_6_27B& card, const ninfer::model::FullLayerW& full,
+             const ninfer::model::GdnLayerW& gdn, ninfer::WorkspaceArena& work, ninfer::DeviceArena& x_arena,
+             ninfer::KVCache& kv, ninfer::GdnState& state, ninfer::model::StepState& io,
+             ninfer::model::Phase phase, int T, const char* label) {
     int failures = 0;
-    qus::test::DBuf pos(4);
+    ninfer::test::DBuf pos(4);
     set_positions(io, pos, T);
 
     auto run_one = [&](const char* suffix, auto&& fn) {
@@ -159,7 +159,7 @@ int run_case(qus::model::Qwen3_6_27B& card, const qus::model::FullLayerW& full,
         state.reset();
         CUDA_CHECK(
             cudaMemsetAsync(io.gdn_initial_slot.data, 0, io.gdn_initial_slot.bytes(), nullptr));
-        qus::Tensor x = x_arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, T});
+        ninfer::Tensor x = x_arena.alloc(ninfer::DType::BF16, {ninfer::model::kCfg.hidden, T});
         fill_hidden(x, T);
         try {
             fn(x);
@@ -169,7 +169,7 @@ int run_case(qus::model::Qwen3_6_27B& card, const qus::model::FullLayerW& full,
                 fail(std::string(label) + " " + suffix + ": unexpected exception: " + e.what());
             return;
         }
-        if (x.ne[0] != qus::model::kCfg.hidden || x.ne[1] != T) {
+        if (x.ne[0] != ninfer::model::kCfg.hidden || x.ne[1] != T) {
             failures += fail(std::string(label) + " " + suffix + ": output shape changed");
         }
         failures += expect_finite_hidden(x, (std::string(label) + " " + suffix).c_str());
@@ -182,22 +182,22 @@ int run_case(qus::model::Qwen3_6_27B& card, const qus::model::FullLayerW& full,
         }
     };
 
-    run_one("attn_mix", [&](qus::Tensor& x) { card.test_attn_mix(full, x, 0, phase); });
-    run_one("gdn_mix", [&](qus::Tensor& x) { card.test_gdn_mix(gdn, x, 0, phase); });
+    run_one("attn_mix", [&](ninfer::Tensor& x) { card.test_attn_mix(full, x, 0, phase); });
+    run_one("gdn_mix", [&](ninfer::Tensor& x) { card.test_gdn_mix(gdn, x, 0, phase); });
     run_one("full_mlp_tail",
-            [&](qus::Tensor& x) { card.test_mlp_tail(full.post_attn_norm, full.mlp, x, phase); });
+            [&](ninfer::Tensor& x) { card.test_mlp_tail(full.post_attn_norm, full.mlp, x, phase); });
     run_one("gdn_mlp_tail",
-            [&](qus::Tensor& x) { card.test_mlp_tail(gdn.post_attn_norm, gdn.mlp, x, phase); });
+            [&](ninfer::Tensor& x) { card.test_mlp_tail(gdn.post_attn_norm, gdn.mlp, x, phase); });
     return failures;
 }
 
 int schedule_mapping_smoke() {
     int failures = 0;
-    for (int layer = 0; layer < qus::model::kCfg.n_layers; ++layer) {
-        const auto got  = qus::model::Qwen3_6_27B::test_schedule_entry(layer);
-        const bool full = qus::model::ModelConfig::is_full(layer);
-        const int index = full ? qus::model::ModelConfig::full_idx(layer)
-                               : qus::model::ModelConfig::gdn_idx(layer);
+    for (int layer = 0; layer < ninfer::model::kCfg.n_layers; ++layer) {
+        const auto got  = ninfer::model::Qwen3_6_27B::test_schedule_entry(layer);
+        const bool full = ninfer::model::ModelConfig::is_full(layer);
+        const int index = full ? ninfer::model::ModelConfig::full_idx(layer)
+                               : ninfer::model::ModelConfig::gdn_idx(layer);
         if (got.is_full != full || got.index != index) {
             failures += fail("schedule mapping mismatch at layer " + std::to_string(layer));
         }
@@ -205,18 +205,18 @@ int schedule_mapping_smoke() {
     return failures;
 }
 
-bool all_bytes_equal(const qus::Tensor& t, std::uint8_t value) {
+bool all_bytes_equal(const ninfer::Tensor& t, std::uint8_t value) {
     std::vector<std::uint8_t> bytes(t.bytes());
     CUDA_CHECK(cudaMemcpy(bytes.data(), t.data, bytes.size(), cudaMemcpyDeviceToHost));
     return std::all_of(bytes.begin(), bytes.end(), [&](std::uint8_t got) { return got == value; });
 }
 
-int verify_gdn_snapshot_slots(qus::model::Qwen3_6_27B& card, const qus::model::GdnLayerW& gdn,
-                              qus::WorkspaceArena& work, qus::DeviceArena& x_arena,
-                              qus::KVCache& kv, qus::GdnState& state, qus::model::StepState& io) {
+int verify_gdn_snapshot_slots(ninfer::model::Qwen3_6_27B& card, const ninfer::model::GdnLayerW& gdn,
+                              ninfer::WorkspaceArena& work, ninfer::DeviceArena& x_arena,
+                              ninfer::KVCache& kv, ninfer::GdnState& state, ninfer::model::StepState& io) {
     constexpr int T = 3;
     int failures    = 0;
-    qus::test::DBuf pos(4);
+    ninfer::test::DBuf pos(4);
     set_positions(io, pos, T);
 
     work.reset();
@@ -227,18 +227,18 @@ int verify_gdn_snapshot_slots(qus::model::Qwen3_6_27B& card, const qus::model::G
     state.reset();
     CUDA_CHECK(cudaMemsetAsync(io.gdn_initial_slot.data, 0, io.gdn_initial_slot.bytes(), nullptr));
 
-    qus::Tensor x = x_arena.alloc(qus::DType::BF16, {qus::model::kCfg.hidden, T});
+    ninfer::Tensor x = x_arena.alloc(ninfer::DType::BF16, {ninfer::model::kCfg.hidden, T});
     fill_hidden(x, T);
     try {
-        card.test_gdn_mix(gdn, x, 0, qus::model::Phase::Verify);
+        card.test_gdn_mix(gdn, x, 0, ninfer::model::Phase::Verify);
         CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {
         return fail(std::string("verify gdn snapshot slots: unexpected exception: ") + e.what());
     }
 
     for (int slot = 0; slot < T; ++slot) {
-        const qus::Tensor conv_slot = state.conv_slot(0, slot);
-        const qus::Tensor ssm_slot  = state.ssm_slot(0, slot);
+        const ninfer::Tensor conv_slot = state.conv_slot(0, slot);
+        const ninfer::Tensor ssm_slot  = state.ssm_slot(0, slot);
         failures +=
             all_bytes_equal(conv_slot, 0xA5)
                 ? fail("verify gdn snapshot conv slot " + std::to_string(slot) + " was not written")
@@ -258,12 +258,12 @@ int verify_gdn_snapshot_slots(qus::model::Qwen3_6_27B& card, const qus::model::G
 // exact primitive behind the engine's partial prefix reuse (chunk-cap snapshot at the assistant-
 // content boundary + KV rewind + slot restore), exercised here on the real GDN layer without the
 // full model or engine.
-int gdn_boundary_snapshot_parity(qus::model::Qwen3_6_27B& card, const qus::model::GdnLayerW& gdn,
-                                 qus::WorkspaceArena& work, qus::DeviceArena& x_arena,
-                                 qus::GdnState& state) {
+int gdn_boundary_snapshot_parity(ninfer::model::Qwen3_6_27B& card, const ninfer::model::GdnLayerW& gdn,
+                                 ninfer::WorkspaceArena& work, ninfer::DeviceArena& x_arena,
+                                 ninfer::GdnState& state) {
     constexpr int L                  = 8;
     constexpr int B                  = 3; // deliberately not a multiple of the GDN kernel chunk
-    const int hidden                 = qus::model::kCfg.hidden;
+    const int hidden                 = ninfer::model::kCfg.hidden;
     const std::int32_t boundary_slot = state.snapshot_slots - 1;
     if (boundary_slot < 1) {
         return fail("gdn boundary parity needs at least two GDN snapshot slots");
@@ -271,17 +271,17 @@ int gdn_boundary_snapshot_parity(qus::model::Qwen3_6_27B& card, const qus::model
 
     // Shared input tokens, column-major [hidden, L]; column t is a contiguous hidden-length block.
     std::vector<float> host(static_cast<std::size_t>(hidden) * L);
-    qus::test::fill_uniform(host, 4242u, -0.25f, 0.25f);
-    qus::test::round_to_bf16(host);
+    ninfer::test::fill_uniform(host, 4242u, -0.25f, 0.25f);
+    ninfer::test::round_to_bf16(host);
     std::vector<std::uint16_t> in_bits(host.size());
-    for (std::size_t i = 0; i < host.size(); ++i) { in_bits[i] = qus::test::f32_to_bf16(host[i]); }
+    for (std::size_t i = 0; i < host.size(); ++i) { in_bits[i] = ninfer::test::f32_to_bf16(host[i]); }
 
-    const auto upload = [&](qus::Tensor& x, int col0, int cols) {
+    const auto upload = [&](ninfer::Tensor& x, int col0, int cols) {
         CUDA_CHECK(cudaMemcpy(x.data, in_bits.data() + static_cast<std::size_t>(col0) * hidden,
                               static_cast<std::size_t>(cols) * hidden * sizeof(std::uint16_t),
                               cudaMemcpyHostToDevice));
     };
-    const auto download = [&](const qus::Tensor& x, int cols) {
+    const auto download = [&](const ninfer::Tensor& x, int cols) {
         std::vector<std::uint16_t> out(static_cast<std::size_t>(cols) * hidden);
         CUDA_CHECK(cudaMemcpy(out.data(), x.data, out.size() * sizeof(std::uint16_t),
                               cudaMemcpyDeviceToHost));
@@ -292,10 +292,10 @@ int gdn_boundary_snapshot_parity(qus::model::Qwen3_6_27B& card, const qus::model
     work.reset();
     x_arena.reset();
     state.reset();
-    qus::Tensor x_ref = x_arena.alloc(qus::DType::BF16, {hidden, L});
+    ninfer::Tensor x_ref = x_arena.alloc(ninfer::DType::BF16, {hidden, L});
     upload(x_ref, 0, L);
     try {
-        card.test_gdn_mix(gdn, x_ref, 0, qus::model::Phase::Prefill);
+        card.test_gdn_mix(gdn, x_ref, 0, ninfer::model::Phase::Prefill);
         CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {
         return fail(std::string("gdn boundary parity reference: unexpected exception: ") +
@@ -309,19 +309,19 @@ int gdn_boundary_snapshot_parity(qus::model::Qwen3_6_27B& card, const qus::model
     work.reset();
     x_arena.reset();
     state.reset();
-    qus::Tensor x_head = x_arena.alloc(qus::DType::BF16, {hidden, B});
-    qus::Tensor x_tail = x_arena.alloc(qus::DType::BF16, {hidden, L - B});
+    ninfer::Tensor x_head = x_arena.alloc(ninfer::DType::BF16, {hidden, B});
+    ninfer::Tensor x_tail = x_arena.alloc(ninfer::DType::BF16, {hidden, L - B});
     upload(x_head, 0, B);
     upload(x_tail, B, L - B);
     try {
-        card.test_gdn_mix(gdn, x_head, 0, qus::model::Phase::Prefill);
+        card.test_gdn_mix(gdn, x_head, 0, ninfer::model::Phase::Prefill);
         CUDA_CHECK(cudaDeviceSynchronize());
         state.copy_slot(0, boundary_slot);
         CUDA_CHECK(cudaDeviceSynchronize());
         state.reset();
         state.copy_slot(boundary_slot, 0);
         CUDA_CHECK(cudaDeviceSynchronize());
-        card.test_gdn_mix(gdn, x_tail, 0, qus::model::Phase::Prefill);
+        card.test_gdn_mix(gdn, x_tail, 0, ninfer::model::Phase::Prefill);
         CUDA_CHECK(cudaDeviceSynchronize());
     } catch (const std::exception& e) {
         return fail(std::string("gdn boundary parity split: unexpected exception: ") + e.what());
@@ -359,7 +359,7 @@ int main() {
         return 0;
     }
 
-    qus::DeviceContext ctx(0);
+    ninfer::DeviceContext ctx(0);
     if (ctx.total_vram() < (3ULL * 1024ULL * 1024ULL * 1024ULL)) {
         std::cout << "SKIP: model block smoke needs at least 3 GiB VRAM\n";
         return 0;
@@ -368,31 +368,31 @@ int main() {
     int failures = schedule_mapping_smoke();
 
     const std::filesystem::path fixture_path = make_fixture();
-    qus::DeviceArena cache_arena(768ULL * 1024ULL * 1024ULL);
-    qus::WorkspaceArena workspace(128ULL * 1024ULL * 1024ULL);
-    qus::DeviceArena x_arena(8ULL * 1024ULL * 1024ULL);
-    qus::DeviceArena io_arena(16ULL * 1024ULL * 1024ULL);
+    ninfer::DeviceArena cache_arena(768ULL * 1024ULL * 1024ULL);
+    ninfer::WorkspaceArena workspace(128ULL * 1024ULL * 1024ULL);
+    ninfer::DeviceArena x_arena(8ULL * 1024ULL * 1024ULL);
+    ninfer::DeviceArena io_arena(16ULL * 1024ULL * 1024ULL);
 
-    qus::WeightStore store;
+    ninfer::WeightStore store;
     store.load(fixture_path.c_str(), ctx);
 
-    qus::KVCache kv(cache_arena, qus::model::kCfg.n_full(), 4, qus::model::kCfg.n_kv,
-                    qus::model::kCfg.head_dim);
-    qus::GdnState state(cache_arena, qus::model::kCfg.n_gdn(), qus::model::kCfg.conv_dim,
-                        qus::model::kCfg.gdn_conv_state_width, qus::model::kCfg.gdn_v_heads,
-                        qus::model::kCfg.gdn_v_dim, qus::model::kCfg.gdn_k_dim, 3);
-    qus::model::StepState io = make_step_state(io_arena, 3, 512);
+    ninfer::KVCache kv(cache_arena, ninfer::model::kCfg.n_full(), 4, ninfer::model::kCfg.n_kv,
+                    ninfer::model::kCfg.head_dim);
+    ninfer::GdnState state(cache_arena, ninfer::model::kCfg.n_gdn(), ninfer::model::kCfg.conv_dim,
+                        ninfer::model::kCfg.gdn_conv_state_width, ninfer::model::kCfg.gdn_v_heads,
+                        ninfer::model::kCfg.gdn_v_dim, ninfer::model::kCfg.gdn_k_dim, 3);
+    ninfer::model::StepState io = make_step_state(io_arena, 3, 512);
 
-    qus::model::Qwen3_6_27B card(ctx, store, workspace, kv, state, io, 512);
-    const qus::model::FullLayerW& full = card.full_layer(0);
-    const qus::model::GdnLayerW& gdn   = card.gdn_layer(0);
+    ninfer::model::Qwen3_6_27B card(ctx, store, workspace, kv, state, io, 512);
+    const ninfer::model::FullLayerW& full = card.full_layer(0);
+    const ninfer::model::GdnLayerW& gdn   = card.gdn_layer(0);
 
     failures += run_case(card, full, gdn, workspace, x_arena, kv, state, io,
-                         qus::model::Phase::Decode, 1, "decode T=1");
+                         ninfer::model::Phase::Decode, 1, "decode T=1");
     failures += run_case(card, full, gdn, workspace, x_arena, kv, state, io,
-                         qus::model::Phase::Prefill, 4, "prefill T=4");
+                         ninfer::model::Phase::Prefill, 4, "prefill T=4");
     failures += run_case(card, full, gdn, workspace, x_arena, kv, state, io,
-                         qus::model::Phase::Verify, 3, "verify T=3");
+                         ninfer::model::Phase::Verify, 3, "verify T=3");
     failures += verify_gdn_snapshot_slots(card, gdn, workspace, x_arena, kv, state, io);
     failures += gdn_boundary_snapshot_parity(card, gdn, workspace, x_arena, state);
     failures += fused_prefill_uses_gate_up(card, full, workspace, x_arena);

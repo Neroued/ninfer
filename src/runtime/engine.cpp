@@ -1,8 +1,8 @@
-#include "qus/runtime/engine.h"
+#include "ninfer/runtime/engine.h"
 
 #include "model/mtp_ops.h"
 
-#include "qus/model/config.h"
+#include "ninfer/model/config.h"
 
 #include <cuda_runtime.h>
 
@@ -12,7 +12,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace qus {
+namespace ninfer {
 namespace {
 
 void validate_token_ids(std::span<const int> ids, std::string_view label) {
@@ -1107,4 +1107,4 @@ std::vector<int> Engine::generate(std::span<const int> prompt, int max_new_token
     return out;
 }
 
-} // namespace qus
+} // namespace ninfer

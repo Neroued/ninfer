@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels — silu_mul kernel: out = silu(gate) * up, elementwise.
+// ninfer::kernels — silu_mul kernel: out = silu(gate) * up, elementwise.
 // silu(x) = x / (1 + e^-x), computed exactly in fp32 (NOT a polynomial fit).
 // Vectorized over bf16 pairs; included only by its launcher. See
 // docs/kernel-development.md §6 (no math approximation).
@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kSiluAndMulPairsPerThread = 4;
 
@@ -123,4 +123,4 @@ __launch_bounds__(256) __global__
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

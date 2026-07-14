@@ -1,7 +1,7 @@
 // Correctness + coverage for l2norm, against the frozen op-test standard
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges, composite tolerance bf16_reduction.
-#include "qus/kernels/l2norm.h"
+#include "ninfer/kernels/l2norm.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -11,8 +11,8 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 static void cpu_l2norm(const std::vector<float>& x, float eps, std::int32_t d,
                        std::int64_t rows, std::vector<double>& o) {

@@ -1,15 +1,15 @@
 // Cold-cache per-op GEMV measurement rig for current q5090 ROW_SPLIT low-bit
-// linears. This is measurement-only: it dispatches through qus::kernels::linear
+// linears. This is measurement-only: it dispatches through ninfer::kernels::linear
 // so the current registered ROW_SPLIT plan remains the measured implementation.
 //
 // Examples:
-//   ./build/bench/qus_linear_op_bench --all-targets --csv-out profiles/ncu/linear-baseline.csv
-//   ./build/bench/qus_linear_op_bench --shape MlpGateUp34816x5120 --qtype Q4 --repeat 200
+//   ./build/bench/ninfer_linear_op_bench --all-targets --csv-out profiles/ncu/linear-baseline.csv
+//   ./build/bench/ninfer_linear_op_bench --shape MlpGateUp34816x5120 --qtype Q4 --repeat 200
 
-#include "qus/kernels/linear.h"
-#include "qus/kernels/linear_pair.h"
-#include "qus/core/device.h"
-#include "qus_bench_common.h"
+#include "ninfer/kernels/linear.h"
+#include "ninfer/kernels/linear_pair.h"
+#include "ninfer/core/device.h"
+#include "ninfer_bench_common.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -29,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-using namespace qus;
+using namespace ninfer;
 
 namespace {
 
@@ -606,7 +606,7 @@ DeviceBuffer make_bf16_device(std::uint64_t n) {
     std::vector<std::uint16_t> h(static_cast<std::size_t>(n));
     for (std::uint64_t i = 0; i < n; ++i) {
         h[static_cast<std::size_t>(i)] =
-            qus::bench::f32_to_bf16(0.5f - static_cast<float>(i % 251ULL) / 250.0f);
+            ninfer::bench::f32_to_bf16(0.5f - static_cast<float>(i % 251ULL) / 250.0f);
     }
     DeviceBuffer d(n * 2ULL);
     CUDA_CHECK(cudaMemcpy(d.p, h.data(), d.bytes, cudaMemcpyHostToDevice));
@@ -890,7 +890,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "qus_linear_op_bench: %s\n", e.what());
+        std::fprintf(stderr, "ninfer_linear_op_bench: %s\n", e.what());
         usage(argv[0]);
         return 2;
     }

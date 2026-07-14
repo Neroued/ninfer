@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 inline constexpr int kDenseGdnHeads       = 48;
 inline constexpr int kDenseGdnHidden      = 5120;
@@ -118,7 +118,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
 #pragma unroll
     for (int stage = 0; stage < kDenseGdnStages; ++stage) {
         if (stage < kTilesPerSplit) { stage_load(stage, kt_begin + stage); }
-        qus::kernels::cp_commit();
+        ninfer::kernels::cp_commit();
     }
 
     // ldmatrix fragment lane offsets. A is [M,K], while the token-major x tile
@@ -133,7 +133,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
 #pragma unroll 1
     for (int it = 0; it < kTilesPerSplit; ++it) {
         const int stage = it & 1;
-        qus::kernels::cp_wait<kDenseGdnStages - 1>();
+        ninfer::kernels::cp_wait<kDenseGdnStages - 1>();
         __syncthreads();
 
 #pragma unroll
@@ -175,7 +175,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
         __syncthreads();
         const int next = it + kDenseGdnStages;
         if (next < kTilesPerSplit) { stage_load(stage, kt_begin + next); }
-        qus::kernels::cp_commit();
+        ninfer::kernels::cp_commit();
     }
 
 #pragma unroll
@@ -248,4 +248,4 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
     }
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

@@ -1,14 +1,14 @@
 #pragma once
 
-#include "qus/core/tensor.h"
-#include "qus/model/processor.h"
+#include "ninfer/core/tensor.h"
+#include "ninfer/model/processor.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <vector>
 
-namespace qus::model::detail {
+namespace ninfer::model::detail {
 
 struct VisionControl {
     // Tensor layouts after upload: [P,2], [segments+1], [V], [4,P], [4,P].
@@ -23,4 +23,4 @@ VisionControl build_vision_control(const ProcessedInput& input);
 
 void vision_f32_to_bf16(const Tensor& src, Tensor& dst, cudaStream_t stream);
 
-} // namespace qus::model::detail
+} // namespace ninfer::model::detail

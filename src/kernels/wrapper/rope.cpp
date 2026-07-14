@@ -1,4 +1,4 @@
-#include "qus/kernels/rope.h"
+#include "ninfer/kernels/rope.h"
 
 #include "kernels/launcher/rope.h"
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 constexpr std::int32_t kTextHeadDim = 256;
@@ -160,4 +160,4 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaS
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

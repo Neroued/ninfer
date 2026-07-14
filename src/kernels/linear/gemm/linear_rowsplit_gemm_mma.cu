@@ -5,13 +5,13 @@
 
 #include "kernels/common/math.h"
 #include "kernels/linear/reference/linear_generic.h" // launch declaration
-#include "qus/core/device.h"                         // CUDA_CHECK
+#include "ninfer/core/device.h"                         // CUDA_CHECK
 
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 template <class Codec, class Cfg, bool Residual = false>
@@ -107,4 +107,4 @@ void linear_rowsplit_gemm_mma_residual_q5_launch(const Tensor& x, const Weight& 
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

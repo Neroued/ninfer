@@ -1,12 +1,12 @@
 #include "model/mtp_ops.h"
 
 #include "kernels/launcher/mtp_round.h"
-#include "qus/model/model.h"
+#include "ninfer/model/model.h"
 
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 void require_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
@@ -146,4 +146,4 @@ void mtp_set_gdn_initial_slot_from_accepted(const Tensor& accepted, Tensor& gdn_
     detail::mtp_set_gdn_initial_slot_from_accepted_launch(accepted, gdn_initial_slot, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

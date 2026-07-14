@@ -1,4 +1,4 @@
-#include "qus/core/weight_store.h"
+#include "ninfer/core/weight_store.h"
 
 #include <cuda_runtime.h>
 
@@ -21,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-namespace qus {
+namespace ninfer {
 namespace {
 
 constexpr std::uint64_t kHeaderBytes   = 4096;
@@ -1071,4 +1071,4 @@ void WeightStore::clear() noexcept {
     loaded_payload_bytes_ = 0;
 }
 
-} // namespace qus
+} // namespace ninfer

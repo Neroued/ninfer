@@ -2,16 +2,16 @@
 // (hidden_size = 5120). This binary is the ncu/nsys target; the GB/s it prints
 // is informational only -- the gate is ncu sustained DRAM % (see
 // docs/kernel-development.md §8).
-//   ./qus_rmsnorm_bench [--decode] [--prefill]   (default: both)
-#include "qus/kernels/rmsnorm.h"
-#include "qus_bench_common.h"
+//   ./ninfer_rmsnorm_bench [--decode] [--prefill]   (default: both)
+#include "ninfer/kernels/rmsnorm.h"
+#include "ninfer_bench_common.h"
 
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 static DBuf make_varied_bf16(std::size_t n, std::uint32_t seed) {
     std::vector<std::uint16_t> h(n);

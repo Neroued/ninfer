@@ -1,15 +1,15 @@
-// qus::kernels - rope launcher: grid/block/stream configuration + kernel launch.
+// ninfer::kernels - rope launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/rope.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/rope.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
@@ -113,4 +113,4 @@ void rope_nd_single_launch(const Tensor& positions, int rotary_dim, float theta,
     rope_nd_common_launch(positions, rotary_dim, theta, &x, nullptr, stream);
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

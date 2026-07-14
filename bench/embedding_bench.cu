@@ -1,18 +1,18 @@
 // Performance bench for embedding Q6 ROW_SPLIT at the real Qwen3.6
 // embedding shape. The printed GB/s is informational only; the gate is ncu
 // sustained DRAM percent (see docs/kernel-development.md §8).
-//   ./qus_embed_gather_bench [--decode] [--t64|--prefill]   (default: both)
-#include "qus/kernels/embedding.h"
-#include "qus/core/device.h"
-#include "qus_bench_common.h"
+//   ./ninfer_embed_gather_bench [--decode] [--t64|--prefill]   (default: both)
+#include "ninfer/kernels/embedding.h"
+#include "ninfer/core/device.h"
+#include "ninfer_bench_common.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 namespace {
 

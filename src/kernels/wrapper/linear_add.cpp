@@ -1,15 +1,15 @@
-#include "qus/kernels/linear_add.h"
+#include "ninfer/kernels/linear_add.h"
 
 #include "kernels/linear/reference/linear_generic.h"
 #include "kernels/linear/gemv/linear_rowsplit_gemv_mlp_down.cuh"
 #include "kernels/linear/gemv/linear_rowsplit_gemv_out_6144.cuh"
-#include "qus/kernels/linear.h"
-#include "qus/kernels/residual_add.h"
+#include "ninfer/kernels/linear.h"
+#include "ninfer/kernels/residual_add.h"
 
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 void require_tensor(const Tensor& t, DType dtype, std::int32_t n0, std::int32_t columns,
@@ -61,4 +61,4 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
     residual_add(linear_out, residual_out, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

@@ -1,4 +1,4 @@
-#include "qus/model/config.h"
+#include "ninfer/model/config.h"
 
 #include <cmath>
 #include <iostream>
@@ -12,10 +12,10 @@ constexpr bool nearly_equal(float a, float b, float tol = 1.0e-7f) {
 } // namespace
 
 int main() {
-    using qus::model::ModelConfig;
-    using qus::model::kAttnScale;
-    using qus::model::kCfg;
-    using qus::model::kGdnScale;
+    using ninfer::model::ModelConfig;
+    using ninfer::model::kAttnScale;
+    using ninfer::model::kCfg;
+    using ninfer::model::kGdnScale;
 
     static_assert(kCfg.hidden == 5120);
     static_assert(kCfg.n_layers == 64);

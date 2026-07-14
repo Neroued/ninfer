@@ -1,4 +1,4 @@
-#include "qus/kernels/gelu.h"
+#include "ninfer/kernels/gelu.h"
 
 #include "kernels/launcher/gelu.h"
 
@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 void gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
     if (x.dtype != DType::BF16) { throw std::invalid_argument("gelu: x must be BF16"); }
@@ -24,4 +24,4 @@ void gelu(Tensor& x, GeluMode mode, cudaStream_t stream) {
     detail::gelu_launch(x, mode, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

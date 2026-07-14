@@ -1,11 +1,11 @@
-// qus::kernels - sample wrapper: public api validation and dispatch.
-#include "qus/kernels/sampling.h"
+// ninfer::kernels - sample wrapper: public api validation and dispatch.
+#include "ninfer/kernels/sampling.h"
 
 #include "kernels/launcher/sampling.h" // detail::sample_column_launch
 
 #include <stdexcept>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 void sample(const Tensor& logits, Tensor& out, const SamplingConfig* config,
             const std::int32_t* pos_base, std::int32_t purpose, cudaStream_t stream) {
@@ -34,4 +34,4 @@ void sample(const Tensor& logits, Tensor& out, const SamplingConfig* config,
     detail::sample_column_launch(logits, out, config, pos_base, purpose, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

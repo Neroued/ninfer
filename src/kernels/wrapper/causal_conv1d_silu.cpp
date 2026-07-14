@@ -1,5 +1,5 @@
-// qus::kernels - causal_conv1d wrapper: public api validation and launcher dispatch.
-#include "qus/kernels/causal_conv1d_silu.h"
+// ninfer::kernels - causal_conv1d wrapper: public api validation and launcher dispatch.
+#include "ninfer/kernels/causal_conv1d_silu.h"
 
 #include "kernels/launcher/causal_conv1d.h" // detail::causal_conv1d_*_launch
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -188,4 +188,4 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                                    stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

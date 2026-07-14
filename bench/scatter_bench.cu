@@ -1,12 +1,12 @@
-#include "qus/kernels/scatter.h"
-#include "qus_bench_common.h"
+#include "ninfer/kernels/scatter.h"
+#include "ninfer_bench_common.h"
 
 #include <cstdio>
 #include <numeric>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 int main() {
     int devices = 0;

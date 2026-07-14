@@ -1,16 +1,16 @@
-// qus::kernels - residual_add launcher: grid/block/stream configuration + kernel launch.
+// ninfer::kernels - residual_add launcher: grid/block/stream configuration + kernel launch.
 // The only translation unit that includes this op's kernel header.
 // See docs/kernel-development.md §2.
 #include "kernels/launcher/residual_add.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/residual_add.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     const std::int64_t n  = x.numel();
@@ -36,4 +36,4 @@ void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

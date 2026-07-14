@@ -1,13 +1,13 @@
 #pragma once
 
-// qus::kernels - shared device-side sampling primitives (no __global__ symbols,
+// ninfer::kernels - shared device-side sampling primitives (no __global__ symbols,
 // so this header can be included by multiple translation units). Holds the
 // counter-based RNG, the candidate ordering, and the block-collaborative
 // truncated-distribution builder used by both sample and the MTP
 // rejection-sampling accept kernel.
 
 #include "kernels/common/math.h"
-#include "qus/kernels/sampling.h"
+#include "ninfer/kernels/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>
 
@@ -16,7 +16,7 @@
 #include <cstdint>
 #include <math_constants.h>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kSamplerBlock         = 256;
 inline constexpr int kSamplerTileItems     = 256;
@@ -362,4 +362,4 @@ __device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, c
     return picked;
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

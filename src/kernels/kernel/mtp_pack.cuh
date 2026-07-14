@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kMtpHiddenRows = 5120;
 inline constexpr int kMtpFcRows     = 10240;
@@ -56,5 +56,5 @@ __global__ void mtp_split_attn_in_kernel(const __nv_bfloat16* attn_in, __nv_bflo
     v[static_cast<std::int64_t>(token) * kMtpKvRows + local] = value;
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels
 

@@ -1,6 +1,6 @@
 #include "kernels/linear/plan/linear_plan.h"
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 LinearFormat classify_format(const Weight& w) {
     using L = QuantLayout;
@@ -227,4 +227,4 @@ std::string plan_id_string(LinearPlanKey key, const LinearPlan& plan) {
            regime_name(key.regime) + "." + policy_name(plan.policy);
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

@@ -1,4 +1,4 @@
-#include "qus/text/chat_template.h"
+#include "ninfer/text/chat_template.h"
 
 #include <nlohmann/json.hpp>
 
@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace qus::text {
+namespace ninfer::text {
 namespace {
 
 using Json = nlohmann::json;
@@ -522,4 +522,4 @@ std::string render_qwen_chat(const std::vector<ChatMessage>& messages, ChatRende
     return rendered;
 }
 
-} // namespace qus::text
+} // namespace ninfer::text

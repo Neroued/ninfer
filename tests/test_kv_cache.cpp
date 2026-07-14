@@ -1,5 +1,5 @@
-#include "qus/core/device.h"
-#include "qus/core/kv_cache.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/kv_cache.h"
 
 #include <cuda_runtime.h>
 
@@ -35,7 +35,7 @@ int expect_size(std::size_t actual, std::size_t expected, const char* label) {
     return 1;
 }
 
-int check_shape(const qus::Tensor& t, const std::int32_t (&expected)[4], const char* label) {
+int check_shape(const ninfer::Tensor& t, const std::int32_t (&expected)[4], const char* label) {
     int failures = 0;
     for (int i = 0; i < 4; ++i) {
         if (t.ne[i] != expected[i]) {
@@ -47,19 +47,19 @@ int check_shape(const qus::Tensor& t, const std::int32_t (&expected)[4], const c
     return failures;
 }
 
-int fill_slot(const qus::KVHeadSlot& slot, unsigned char k_value, unsigned char v_value) {
+int fill_slot(const ninfer::KVHeadSlot& slot, unsigned char k_value, unsigned char v_value) {
     CUDA_CHECK(cudaMemset(slot.k.data, k_value, slot.k.bytes()));
     CUDA_CHECK(cudaMemset(slot.v.data, v_value, slot.v.bytes()));
     return 0;
 }
 
-int fill_scales(const qus::KVHeadSlot& slot, unsigned char k_value, unsigned char v_value) {
+int fill_scales(const ninfer::KVHeadSlot& slot, unsigned char k_value, unsigned char v_value) {
     CUDA_CHECK(cudaMemset(slot.k_scale.data, k_value, slot.k_scale.bytes()));
     CUDA_CHECK(cudaMemset(slot.v_scale.data, v_value, slot.v_scale.bytes()));
     return 0;
 }
 
-int expect_device_bytes(const qus::Tensor& tensor, unsigned char expected, const char* label) {
+int expect_device_bytes(const ninfer::Tensor& tensor, unsigned char expected, const char* label) {
     std::vector<unsigned char> host(tensor.bytes());
     CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
     for (unsigned char value : host) {
@@ -91,12 +91,12 @@ int main() {
     }
 
     int failures = 0;
-    failures += expect_size(qus::dtype_size(qus::DType::I8), 1, "dtype_size(I8)");
-    failures += expect_size(qus::dtype_size(qus::DType::FP16), 2, "dtype_size(FP16)");
+    failures += expect_size(ninfer::dtype_size(ninfer::DType::I8), 1, "dtype_size(I8)");
+    failures += expect_size(ninfer::dtype_size(ninfer::DType::FP16), 2, "dtype_size(FP16)");
 
-    qus::DeviceContext ctx(0);
-    qus::DeviceArena cache_arena(65536);
-    qus::KVCache cache(cache_arena, 2, 8, 4, 16, qus::DType::BF16);
+    ninfer::DeviceContext ctx(0);
+    ninfer::DeviceArena cache_arena(65536);
+    ninfer::KVCache cache(cache_arena, 2, 8, 4, 16, ninfer::DType::BF16);
 
     failures += expect_size(cache.layer_count(), 2, "cache.layer_count");
     failures += expect_size(cache.pos, 0, "cache.pos initial");
@@ -123,8 +123,8 @@ int main() {
                                                  "too large append kv_head");
 
     for (std::int32_t head = 0; head < 4; ++head) {
-        qus::KVHeadSlot l0p0 = cache.append_slot(0, head);
-        qus::KVHeadSlot l1p0 = cache.append_slot(1, head);
+        ninfer::KVHeadSlot l0p0 = cache.append_slot(0, head);
+        ninfer::KVHeadSlot l1p0 = cache.append_slot(1, head);
         failures += check_shape(l0p0.k, {16, 1, 1, 1}, "l0p0.k");
         failures += check_shape(l0p0.v, {16, 1, 1, 1}, "l0p0.v");
         if (l0p0.k_scale.data != nullptr || l0p0.v_scale.data != nullptr) {
@@ -148,12 +148,12 @@ int main() {
         failures += expect_device_bytes(cache.slot(1, 0, head).v,
                                         static_cast<unsigned char>(0x40 + head), "layer1 pos0 V");
     }
-    qus::Tensor l0p0_flat = cache.slot(0, 0, 0).k.reshape({16});
+    ninfer::Tensor l0p0_flat = cache.slot(0, 0, 0).k.reshape({16});
     failures += check_shape(l0p0_flat, {16, 1, 1, 1}, "l0p0_flat");
 
     for (std::int32_t head = 0; head < 4; ++head) {
-        qus::KVHeadSlot l0p1 = cache.append_slot(0, head);
-        qus::KVHeadSlot l1p1 = cache.append_slot(1, head);
+        ninfer::KVHeadSlot l0p1 = cache.append_slot(0, head);
+        ninfer::KVHeadSlot l1p1 = cache.append_slot(1, head);
         failures += fill_slot(l0p1, static_cast<unsigned char>(0x50 + head),
                               static_cast<unsigned char>(0x60 + head));
         failures += fill_slot(l1p1, static_cast<unsigned char>(0x70 + head),
@@ -179,8 +179,8 @@ int main() {
                                                  "read stale rewound position");
     failures += expect_throws<std::out_of_range>([&] { cache.rewind(2); }, "rewind forward");
     for (std::int32_t head = 0; head < 4; ++head) {
-        qus::KVHeadSlot l0p1 = cache.append_slot(0, head);
-        qus::KVHeadSlot l1p1 = cache.append_slot(1, head);
+        ninfer::KVHeadSlot l0p1 = cache.append_slot(0, head);
+        ninfer::KVHeadSlot l1p1 = cache.append_slot(1, head);
         failures += fill_slot(l0p1, static_cast<unsigned char>(0x90 + head),
                               static_cast<unsigned char>(0xa0 + head));
         failures += fill_slot(l1p1, static_cast<unsigned char>(0xb0 + head),
@@ -213,33 +213,33 @@ int main() {
     }
 
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::KVCache invalid(cache_arena, 0, 8, 4, 16, qus::DType::BF16); }, "zero layers");
+        [&] { ninfer::KVCache invalid(cache_arena, 0, 8, 4, 16, ninfer::DType::BF16); }, "zero layers");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::KVCache invalid(cache_arena, 1, 0, 4, 16, qus::DType::BF16); },
+        [&] { ninfer::KVCache invalid(cache_arena, 1, 0, 4, 16, ninfer::DType::BF16); },
         "zero max_context");
     failures += expect_throws<std::invalid_argument>(
         [&] {
-            qus::KVCache invalid(
+            ninfer::KVCache invalid(
                 cache_arena, 1,
                 static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) + 1U, 4, 16,
-                qus::DType::BF16);
+                ninfer::DType::BF16);
         },
         "too large max_context");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::KVCache invalid(cache_arena, 1, 8, 0, 16, qus::DType::BF16); }, "zero kv heads");
+        [&] { ninfer::KVCache invalid(cache_arena, 1, 8, 0, 16, ninfer::DType::BF16); }, "zero kv heads");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::KVCache invalid(cache_arena, 1, 8, 4, 0, qus::DType::BF16); }, "zero head_dim");
+        [&] { ninfer::KVCache invalid(cache_arena, 1, 8, 4, 0, ninfer::DType::BF16); }, "zero head_dim");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::KVCache invalid(cache_arena, 1, 8, 4, 16, qus::DType::U8); },
+        [&] { ninfer::KVCache invalid(cache_arena, 1, 8, 4, 16, ninfer::DType::U8); },
         "unsupported dtype");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::KVCache invalid(cache_arena, 1, 8, 4, 16, qus::DType::BF16, 64); },
+        [&] { ninfer::KVCache invalid(cache_arena, 1, 8, 4, 16, ninfer::DType::BF16, 64); },
         "bf16 quant group");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::KVCache invalid(cache_arena, 1, 8, 4, 96, qus::DType::I8); },
+        [&] { ninfer::KVCache invalid(cache_arena, 1, 8, 4, 96, ninfer::DType::I8); },
         "int8 head_dim not divisible");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::KVCache invalid(cache_arena, 1, 8, 4, 64, qus::DType::I8, 32); },
+        [&] { ninfer::KVCache invalid(cache_arena, 1, 8, 4, 64, ninfer::DType::I8, 32); },
         "unsupported int8 group");
 
     failures += expect_throws<std::out_of_range>([&] { (void)cache.append_slot(2, 0); },
@@ -255,17 +255,17 @@ int main() {
     failures +=
         expect_throws<std::out_of_range>([&] { cache.advance(); }, "advance at full capacity");
 
-    qus::DeviceArena small_arena(512);
+    ninfer::DeviceArena small_arena(512);
     const std::size_t before_used = small_arena.used();
     failures += expect_throws<std::bad_alloc>(
-        [&] { qus::KVCache too_big(small_arena, 2, 8, 4, 16, qus::DType::BF16); },
+        [&] { ninfer::KVCache too_big(small_arena, 2, 8, 4, 16, ninfer::DType::BF16); },
         "undersized cache arena");
     failures += expect_size(small_arena.used(), before_used, "small arena used after failed cache");
 
-    qus::DeviceArena int8_arena(65536);
-    qus::KVCache int8_cache(int8_arena, 1, 8, 2, 64, qus::DType::I8);
+    ninfer::DeviceArena int8_arena(65536);
+    ninfer::KVCache int8_cache(int8_arena, 1, 8, 2, 64, ninfer::DType::I8);
     failures += expect_size(int8_cache.layer_count(), 1, "int8 layer_count");
-    failures += expect_size(int8_cache.quant_group, qus::kKvQuantGroup, "int8 quant_group");
+    failures += expect_size(int8_cache.quant_group, ninfer::kKvQuantGroup, "int8 quant_group");
     failures += expect_size(int8_cache.k.size(), 1, "int8 k.size");
     failures += expect_size(int8_cache.v.size(), 1, "int8 v.size");
     failures += expect_size(int8_cache.k_scale.size(), 1, "int8 k_scale.size");
@@ -274,17 +274,17 @@ int main() {
     failures += check_shape(int8_cache.v[0], {64, 128, 2, 1}, "int8 v");
     failures += check_shape(int8_cache.k_scale[0], {1, 128, 2, 1}, "int8 k_scale");
     failures += check_shape(int8_cache.v_scale[0], {1, 128, 2, 1}, "int8 v_scale");
-    if (int8_cache.k[0].dtype != qus::DType::I8 || int8_cache.v[0].dtype != qus::DType::I8) {
+    if (int8_cache.k[0].dtype != ninfer::DType::I8 || int8_cache.v[0].dtype != ninfer::DType::I8) {
         ++failures;
         std::cerr << "int8 code plane dtype mismatch\n";
     }
-    if (int8_cache.k_scale[0].dtype != qus::DType::FP16 ||
-        int8_cache.v_scale[0].dtype != qus::DType::FP16) {
+    if (int8_cache.k_scale[0].dtype != ninfer::DType::FP16 ||
+        int8_cache.v_scale[0].dtype != ninfer::DType::FP16) {
         ++failures;
         std::cerr << "int8 scale plane dtype mismatch\n";
     }
     for (std::int32_t head = 0; head < 2; ++head) {
-        qus::KVHeadSlot slot = int8_cache.append_slot(0, head);
+        ninfer::KVHeadSlot slot = int8_cache.append_slot(0, head);
         failures += check_shape(slot.k, {64, 1, 1, 1}, "int8 slot.k");
         failures += check_shape(slot.v, {64, 1, 1, 1}, "int8 slot.v");
         failures += check_shape(slot.k_scale, {1, 1, 1, 1}, "int8 slot.k_scale");
@@ -296,7 +296,7 @@ int main() {
     }
     int8_cache.advance();
     for (std::int32_t head = 0; head < 2; ++head) {
-        const qus::KVHeadSlot slot = int8_cache.slot(0, 0, head);
+        const ninfer::KVHeadSlot slot = int8_cache.slot(0, 0, head);
         failures +=
             expect_device_bytes(slot.k, static_cast<unsigned char>(0x11 + head), "int8 slot K");
         failures +=

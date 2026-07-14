@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - rmsnorm kernel. One CUDA block handles one row, reducing over ne[0].
+// ninfer::kernels - rmsnorm kernel. One CUDA block handles one row, reducing over ne[0].
 
 #include "kernels/common/math.cuh"
 #include "kernels/common/warp.cuh"
@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 __launch_bounds__(256) __global__
     void rmsnorm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* z,
@@ -100,4 +100,4 @@ __launch_bounds__(512) __global__
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

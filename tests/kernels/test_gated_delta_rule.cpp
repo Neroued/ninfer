@@ -1,5 +1,5 @@
-#include "qus/kernels/gated_delta_rule.h"
-#include "qus/core/state_store.h"
+#include "ninfer/kernels/gated_delta_rule.h"
+#include "ninfer/core/state_store.h"
 #include "kernels/gdn_ref.h"
 #include "kernels/op_tester.h"
 
@@ -15,8 +15,8 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels::detail - generic dense linear kernels. Dense q5090 payloads are raw row-major
+// ninfer::kernels::detail - generic dense linear kernels. Dense q5090 payloads are raw row-major
 // [N,K], so K is the fastest varying weight dimension. The dense GEMM path is intentionally simple
 // and masked; dense control weights are correctness-only.
 
@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 constexpr int kDenseGemvThreads   = 256;
@@ -167,4 +167,4 @@ __global__ void linear_generic_dense_gemm_kernel(const __nv_bfloat16* x, const v
     out[row + static_cast<std::int64_t>(n) * col] = __float2bfloat16(acc);
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

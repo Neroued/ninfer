@@ -2,7 +2,7 @@
 
 #include "kernels/common/math.h"
 
-// qus::kernels - embedding kernels. Dense copies BF16 rows; Q6 decodes
+// ninfer::kernels - embedding kernels. Dense copies BF16 rows; Q6 decodes
 // ROW_SPLIT nibble, high, and scale planes.
 
 #include <cuda_bf16.h>
@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr std::int32_t kEmbedGatherQ6Group = 64;
 inline constexpr std::int32_t kEmbedGatherQ6NibbleBpr = 32;
@@ -105,4 +105,4 @@ __global__ void embed_gather_q6_grouped_kernel(const std::int32_t* ids,
     out[out_idx] = __float2bfloat16(static_cast<float>(code) * scale);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

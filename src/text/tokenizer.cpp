@@ -1,4 +1,4 @@
-#include "qus/text/tokenizer.h"
+#include "ninfer/text/tokenizer.h"
 
 #include "text/unicode.h"
 
@@ -17,7 +17,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace qus::text {
+namespace ninfer::text {
 namespace {
 
 using Json    = nlohmann::json;
@@ -686,4 +686,4 @@ std::string TokenStreamDecoder::finish() {
     return text;
 }
 
-} // namespace qus::text
+} // namespace ninfer::text

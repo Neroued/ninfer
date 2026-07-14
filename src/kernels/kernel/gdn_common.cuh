@@ -16,16 +16,16 @@
 #    include "kernels/common/memory.cuh"
 #    include "kernels/common/warp.cuh"
 #    include <cuda_bf16.h>
-#    define QUS_KERNELS_HOST_DEVICE __host__ __device__
+#    define NINFER_KERNELS_HOST_DEVICE __host__ __device__
 #else
-#    define QUS_KERNELS_HOST_DEVICE
+#    define NINFER_KERNELS_HOST_DEVICE
 #endif
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline uint3 init_fastdiv_values(std::uint64_t d64) {
     if (d64 == 0 || d64 > static_cast<std::uint64_t>(0xffffffffu)) {
-        std::fprintf(stderr, "qus::kernels::init_fastdiv_values: invalid divisor %llu\n",
+        std::fprintf(stderr, "ninfer::kernels::init_fastdiv_values: invalid divisor %llu\n",
                      static_cast<unsigned long long>(d64));
         std::abort();
     }
@@ -175,9 +175,9 @@ struct head_map {
         return head_map{H_qk_, H_v_, init_fastdiv_values(static_cast<std::uint64_t>(G))};
     }
 
-    QUS_KERNELS_HOST_DEVICE int group_size() const { return H_v / H_qk; }
+    NINFER_KERNELS_HOST_DEVICE int group_size() const { return H_v / H_qk; }
 
-    QUS_KERNELS_HOST_DEVICE int qk_head(int h_v) const {
+    NINFER_KERNELS_HOST_DEVICE int qk_head(int h_v) const {
 #if defined(__CUDA_ARCH__)
         return static_cast<int>(fastdiv(static_cast<std::uint32_t>(h_v), group_magic));
 #else
@@ -185,9 +185,9 @@ struct head_map {
 #endif
     }
 
-    QUS_KERNELS_HOST_DEVICE int cta_h_v(int cta_h) const { return cta_h; }
+    NINFER_KERNELS_HOST_DEVICE int cta_h_v(int cta_h) const { return cta_h; }
 };
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels
 
-#undef QUS_KERNELS_HOST_DEVICE
+#undef NINFER_KERNELS_HOST_DEVICE

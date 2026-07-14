@@ -1,7 +1,7 @@
 // Correctness + coverage for rope, against the frozen op-test standard
 // (docs/kernel-development.md): fp64 golden from bf16-rounded q/k,
 // positions read from device, composite tolerance bf16_elementwise.
-#include "qus/kernels/rope.h"
+#include "ninfer/kernels/rope.h"
 #include "kernels/op_tester.h"
 
 #include <algorithm>
@@ -13,8 +13,8 @@
 #include <string>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

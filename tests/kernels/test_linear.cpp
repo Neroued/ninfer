@@ -1,14 +1,14 @@
 // Correctness + coverage for linear dense BF16/FP32, against the frozen
 // op-test standard (docs/kernel-development.md): fp64 golden W @ x from
 // bf16-rounded inputs and weights, composite tolerance linear_bf16.
-#include "qus/kernels/linear.h"
-#include "qus/kernels/attn_input_proj.h"
-#include "qus/kernels/gdn_input_proj.h"
-#include "qus/kernels/linear_add.h"
-#include "qus/kernels/linear_pair.h"
-#include "qus/kernels/linear_swiglu.h"
-#include "qus/kernels/residual_add.h"
-#include "qus/kernels/silu_mul.h"
+#include "ninfer/kernels/linear.h"
+#include "ninfer/kernels/attn_input_proj.h"
+#include "ninfer/kernels/gdn_input_proj.h"
+#include "ninfer/kernels/linear_add.h"
+#include "ninfer/kernels/linear_pair.h"
+#include "ninfer/kernels/linear_swiglu.h"
+#include "ninfer/kernels/residual_add.h"
+#include "ninfer/kernels/silu_mul.h"
 #include "kernels/op_tester.h"
 #include "kernels/q5090_pack.h"
 
@@ -23,8 +23,8 @@
 #include <utility>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

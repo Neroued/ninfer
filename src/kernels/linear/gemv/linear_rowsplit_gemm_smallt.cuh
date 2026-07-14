@@ -50,7 +50,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 // Per-codec slab traits + dequant. A slab is 1024 K-values:
 //   nibble/code bytes : 32 B per group  -> kNibU4 uint4 per slab
@@ -550,4 +550,4 @@ __global__ void linear_rowsplit_gemm_smallt_kernel(
     }
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

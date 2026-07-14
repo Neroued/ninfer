@@ -2,14 +2,14 @@
 // (intermediate = 17408). This binary is the ncu/nsys target; the GB/s it
 // prints is informational only -- the gate is ncu sustained DRAM %% (see
 // docs/kernel-development.md §8).
-//   ./qus_silu_and_mul_bench [--decode] [--prefill]   (default: both)
-#include "qus/kernels/silu_mul.h"
-#include "qus_bench_common.h"
+//   ./ninfer_silu_and_mul_bench [--decode] [--prefill]   (default: both)
+#include "ninfer/kernels/silu_mul.h"
+#include "ninfer_bench_common.h"
 
 #include <cstring>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 static void run(int n, const char* tag) {
     DBuf g   = make_bf16(static_cast<std::size_t>(n));

@@ -5,9 +5,9 @@
 // count_tokens body, and Anthropic error body. This is the schema boundary
 // consumed by Claude Code / other Anthropic clients.
 
-#include "qus/serve/anthropic_schema.h"
-#include "qus/serve/request.h"
-#include "qus/serve/translate.h"
+#include "ninfer/serve/anthropic_schema.h"
+#include "ninfer/serve/request.h"
+#include "ninfer/serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
@@ -18,7 +18,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using namespace qus::serve;
+using namespace ninfer::serve;
 
 int fail(const std::string& message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -190,7 +190,7 @@ int test_parse_image() {
                       "Anthropic image kind preserved");
     failures += check(req.messages[0].content[0].source.value == "data:image/png;base64,AA==",
                       "Anthropic base64 converted to data URI");
-    failures += check(messages[0].parts[0].kind == qus::text::ChatPartKind::Image,
+    failures += check(messages[0].parts[0].kind == ninfer::text::ChatPartKind::Image,
                       "Anthropic image translated to structured chat part");
     return failures;
 }
@@ -301,7 +301,7 @@ int test_tool_use_result_roundtrip() {
                       "tool_result image carried");
     const auto messages = to_chat_messages(req);
     failures += check(messages[2].parts.size() == 2 &&
-                          messages[2].parts[1].kind == qus::text::ChatPartKind::Image,
+                          messages[2].parts[1].kind == ninfer::text::ChatPartKind::Image,
                       "tool_result image translated to structured chat");
     failures += check(req.has_tool_history(), "tool history detected");
     return failures;
@@ -344,17 +344,17 @@ int test_thinking_and_sampling() {
 
 int test_stop_reason_mapping() {
     int failures = 0;
-    failures += check(std::string(messages_stop_reason(qus::text::FinishReason::Length, false)) ==
+    failures += check(std::string(messages_stop_reason(ninfer::text::FinishReason::Length, false)) ==
                           "max_tokens",
                       "length -> max_tokens");
     failures +=
-        check(std::string(messages_stop_reason(qus::text::FinishReason::Stop, false)) == "end_turn",
+        check(std::string(messages_stop_reason(ninfer::text::FinishReason::Stop, false)) == "end_turn",
               "stop -> end_turn");
     failures += check(
-        std::string(messages_stop_reason(qus::text::FinishReason::Cancelled, false)) == "end_turn",
+        std::string(messages_stop_reason(ninfer::text::FinishReason::Cancelled, false)) == "end_turn",
         "cancelled -> end_turn");
     failures +=
-        check(std::string(messages_stop_reason(qus::text::FinishReason::Stop, true)) == "tool_use",
+        check(std::string(messages_stop_reason(ninfer::text::FinishReason::Stop, true)) == "tool_use",
               "tool calls -> tool_use");
     return failures;
 }

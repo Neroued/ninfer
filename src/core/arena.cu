@@ -1,4 +1,4 @@
-#include "qus/core/arena.h"
+#include "ninfer/core/arena.h"
 
 #include <cuda_runtime.h>
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus {
+namespace ninfer {
 namespace {
 
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
@@ -188,4 +188,4 @@ void* PinnedHostBuffer::data() const noexcept { return data_; }
 
 std::size_t PinnedHostBuffer::size() const noexcept { return size_; }
 
-} // namespace qus
+} // namespace ninfer

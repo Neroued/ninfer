@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - l2norm kernel. One warp handles one row, reducing over ne[0].
+// ninfer::kernels - l2norm kernel. One warp handles one row, reducing over ne[0].
 
 #include "kernels/common/warp.cuh"
 
@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 __launch_bounds__(512) __global__ void l2norm_kernel(const __nv_bfloat16* x, __nv_bfloat16* out,
                                                       std::int32_t d, std::int64_t rows,
@@ -68,4 +68,4 @@ __launch_bounds__(512) __global__ void l2norm_kernel(const __nv_bfloat16* x, __n
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

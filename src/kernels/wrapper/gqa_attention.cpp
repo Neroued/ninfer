@@ -1,5 +1,5 @@
-// qus::kernels - gqa_attention wrapper: public api validation and phase dispatch.
-#include "qus/kernels/gqa_attention.h"
+// ninfer::kernels - gqa_attention wrapper: public api validation and phase dispatch.
+#include "ninfer/kernels/gqa_attention.h"
 
 #include "kernels/launcher/gqa_attention.h"
 #include "model/gqa_prompt_ops.h"
@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 constexpr std::int32_t kHeadDim = 256;
@@ -213,4 +213,4 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, kv, layer, out, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

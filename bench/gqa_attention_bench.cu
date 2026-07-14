@@ -2,16 +2,16 @@
 // Prefill reports useful causal attention FLOP/s against the RTX 5090
 // bf16/FP32-accumulate dense tensor-core roofline. Correctness is covered by
 // tests/kernels/test_gqa_attention.cpp.
-//   ./qus_gqa_attention_bench --decode
-//   ./qus_gqa_attention_bench --decode --decode-pos 2882 --profile-once --cold-cache
-//   ./qus_gqa_attention_bench --append-small-t --tokens 6 --context 32768
-//   ./qus_gqa_attention_bench --copy-ceiling --tokens 1 --context 32768
-//   ./qus_gqa_attention_bench --append-prompt-baseline --tokens 1024 --context 0,8192,32768
-//   ./qus_gqa_attention_bench --prefill --tokens 4096
-//   ./qus_gqa_attention_bench --prefill --tokens 4096 --expect-tflops-pct-min 80
-#include "qus/core/device.h"
-#include "qus/kernels/gqa_attention.h"
-#include "qus_bench_common.h"
+//   ./ninfer_gqa_attention_bench --decode
+//   ./ninfer_gqa_attention_bench --decode --decode-pos 2882 --profile-once --cold-cache
+//   ./ninfer_gqa_attention_bench --append-small-t --tokens 6 --context 32768
+//   ./ninfer_gqa_attention_bench --copy-ceiling --tokens 1 --context 32768
+//   ./ninfer_gqa_attention_bench --append-prompt-baseline --tokens 1024 --context 0,8192,32768
+//   ./ninfer_gqa_attention_bench --prefill --tokens 4096
+//   ./ninfer_gqa_attention_bench --prefill --tokens 4096 --expect-tflops-pct-min 80
+#include "ninfer/core/device.h"
+#include "ninfer/kernels/gqa_attention.h"
+#include "ninfer_bench_common.h"
 #include "../src/kernels/launcher/gqa_attention.h"
 
 #include <cuda_runtime.h>
@@ -32,9 +32,9 @@
 #include <string_view>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
-using qus::kernels::detail::kGqaDecodeSplits;
+using namespace ninfer;
+using namespace ninfer::bench;
+using ninfer::kernels::detail::kGqaDecodeSplits;
 
 namespace {
 
@@ -1135,19 +1135,19 @@ struct Options {
 void fail_usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: qus_gqa_attention_bench [--prefill] [--tokens T[,T...]] "
+                 "usage: ninfer_gqa_attention_bench [--prefill] [--tokens T[,T...]] "
                  "[--kv-dtype bf16|int8] "
                  "[--expect-tflops-pct-min PCT] [--csv-out path] [--json-out path]\n"
-                 "       qus_gqa_attention_bench --prefill --tokens 4096 --profile-once\n"
-                 "       qus_gqa_attention_bench --append-small-t --tokens T --context N "
+                 "       ninfer_gqa_attention_bench --prefill --tokens 4096 --profile-once\n"
+                 "       ninfer_gqa_attention_bench --append-small-t --tokens T --context N "
                  "[--kv-dtype bf16|int8] [--profile-once] [--cold-cache]\n"
-                 "       qus_gqa_attention_bench --append-prompt-baseline --tokens T[,T...] "
+                 "       ninfer_gqa_attention_bench --append-prompt-baseline --tokens T[,T...] "
                  "--context N[,N...] [--kv-dtype bf16|int8] [--csv-out path] [--json-out path]\n"
-                 "       qus_gqa_attention_bench --append-prompt-attention-only --tokens T[,T...] "
+                 "       ninfer_gqa_attention_bench --append-prompt-attention-only --tokens T[,T...] "
                  "--context N[,N...] [--kv-dtype bf16|int8]\n"
-                 "       qus_gqa_attention_bench --copy-ceiling --tokens T --context N "
+                 "       ninfer_gqa_attention_bench --copy-ceiling --tokens T --context N "
                  "[--kv-dtype bf16|int8]\n"
-                 "       qus_gqa_attention_bench --decode [--decode-pos N] [--profile-once] "
+                 "       ninfer_gqa_attention_bench --decode [--decode-pos N] [--profile-once] "
                  "[--cold-cache] [--round-robin-layers 16] [--kv-dtype bf16|int8]\n",
                  message);
     std::exit(2);

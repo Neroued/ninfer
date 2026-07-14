@@ -1,8 +1,8 @@
 // Performance bench for the Qwen3.6-27B fused GDN in_a/in_b prefill path:
 // two dense BF16 [48,5120] projections fused with gdn_gating.
-//   ./qus_gdn_in_ab_prefill_bench -p 128,256,512,1024,2048,4096,8192,16384
-#include "qus/kernels/gdn_gating_proj.h"
-#include "qus_bench_common.h"
+//   ./ninfer_gdn_in_ab_prefill_bench -p 128,256,512,1024,2048,4096,8192,16384
+#include "ninfer/kernels/gdn_gating_proj.h"
+#include "ninfer_bench_common.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -11,8 +11,8 @@
 #include <string>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 namespace {
 

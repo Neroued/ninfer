@@ -1,4 +1,4 @@
-#include "qus/text/text_runner.h"
+#include "ninfer/text/text_runner.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -20,36 +20,36 @@ std::string minimal_tokenizer_json() {
     return R"({"model":{"type":"BPE","vocab":{"a":0,"b":1}},"added_tokens":[]})";
 }
 
-qus::text::QwenTokenizer make_tokenizer_with_stop_ids(const std::vector<int>& ids) {
+ninfer::text::QwenTokenizer make_tokenizer_with_stop_ids(const std::vector<int>& ids) {
     std::string config = R"({"eos_token_id":[)";
     for (std::size_t i = 0; i < ids.size(); ++i) {
         if (i != 0) { config += ","; }
         config += std::to_string(ids[i]);
     }
     config += "]}";
-    qus::Q5090TokenizerBundle bundle;
+    ninfer::Q5090TokenizerBundle bundle;
     bundle.tokenizer_json         = minimal_tokenizer_json();
     bundle.merges_txt             = "#version: 0.2\n";
     bundle.generation_config_json = std::move(config);
-    return qus::text::QwenTokenizer(std::move(bundle));
+    return ninfer::text::QwenTokenizer(std::move(bundle));
 }
 
-bool throws_invalid_argument_for_negative_override(const qus::text::QwenTokenizer& tokenizer) {
+bool throws_invalid_argument_for_negative_override(const ninfer::text::QwenTokenizer& tokenizer) {
     try {
-        (void)qus::text::resolve_stop_token_ids(tokenizer, {4, -1});
+        (void)ninfer::text::resolve_stop_token_ids(tokenizer, {4, -1});
     } catch (const std::invalid_argument&) { return true; }
     return false;
 }
 
 int test_resolve_stop_token_ids() {
-    const qus::text::QwenTokenizer tokenizer = make_tokenizer_with_stop_ids({248046, 248044});
+    const ninfer::text::QwenTokenizer tokenizer = make_tokenizer_with_stop_ids({248046, 248044});
 
     int failures = 0;
     failures +=
-        check(qus::text::resolve_stop_token_ids(tokenizer, {}) == std::vector<int>{248046, 248044},
+        check(ninfer::text::resolve_stop_token_ids(tokenizer, {}) == std::vector<int>{248046, 248044},
               "empty stop id overrides did not use tokenizer defaults");
     failures +=
-        check(qus::text::resolve_stop_token_ids(tokenizer, {9, 9, 8}) == std::vector<int>{9, 8},
+        check(ninfer::text::resolve_stop_token_ids(tokenizer, {9, 9, 8}) == std::vector<int>{9, 8},
               "stop id overrides were not deduplicated in first-occurrence order");
     failures += check(throws_invalid_argument_for_negative_override(tokenizer),
                       "negative stop id override did not throw invalid_argument");
@@ -57,40 +57,40 @@ int test_resolve_stop_token_ids() {
 }
 
 int test_decode_stop_trimming_modes() {
-    const qus::text::QwenTokenizer tokenizer = make_tokenizer_with_stop_ids({1});
+    const ninfer::text::QwenTokenizer tokenizer = make_tokenizer_with_stop_ids({1});
     const std::vector<int> generated{0, 1};
 
     int failures = 0;
-    failures += check(tokenizer.decode(generated, qus::text::DecodeOptions{false, {}}) == "ab",
+    failures += check(tokenizer.decode(generated, ninfer::text::DecodeOptions{false, {}}) == "ab",
                       "raw decode did not preserve terminal stop id");
-    failures += check(tokenizer.decode(generated, qus::text::DecodeOptions{true, {1}}) == "a",
+    failures += check(tokenizer.decode(generated, ninfer::text::DecodeOptions{true, {1}}) == "a",
                       "clean decode did not trim terminal stop id");
     return failures;
 }
 
 int test_stream_callback_api_can_capture_chunks() {
-    qus::text::TextGenerationOptions options;
+    ninfer::text::TextGenerationOptions options;
     std::vector<std::string> pieces;
-    std::vector<qus::text::TextChannel> channels;
-    options.stream_callback = [&](const qus::text::TextStreamChunk& chunk) {
+    std::vector<ninfer::text::TextChannel> channels;
+    options.stream_callback = [&](const ninfer::text::TextStreamChunk& chunk) {
         pieces.push_back(chunk.text);
         channels.push_back(chunk.channel);
     };
 
     options.stream_callback(
-        qus::text::TextStreamChunk{.text = "why", .channel = qus::text::TextChannel::Reasoning});
+        ninfer::text::TextStreamChunk{.text = "why", .channel = ninfer::text::TextChannel::Reasoning});
     options.stream_callback(
-        qus::text::TextStreamChunk{.text = "hi", .channel = qus::text::TextChannel::Content});
+        ninfer::text::TextStreamChunk{.text = "hi", .channel = ninfer::text::TextChannel::Content});
 
     int failures = 0;
     failures += check(pieces == std::vector<std::string>{"why", "hi"},
                       "stream callback did not capture text chunks");
     failures +=
-        check(channels == std::vector<qus::text::TextChannel>{qus::text::TextChannel::Reasoning,
-                                                              qus::text::TextChannel::Content},
+        check(channels == std::vector<ninfer::text::TextChannel>{ninfer::text::TextChannel::Reasoning,
+                                                              ninfer::text::TextChannel::Content},
               "stream callback did not capture channels");
 
-    qus::text::TextGenerationResult result;
+    ninfer::text::TextGenerationResult result;
     result.timings.render_tokenize_seconds = 0.25;
     result.timings.prefill_seconds         = 1.0;
     result.timings.decode_seconds          = 2.0;

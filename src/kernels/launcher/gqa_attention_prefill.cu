@@ -1,15 +1,15 @@
-// qus::kernels - gqa_attention prompt-scale launcher: fill k/v at device
+// ninfer::kernels - gqa_attention prompt-scale launcher: fill k/v at device
 // positions then launch causal attention over absolute cached history.
 #include "kernels/launcher/gqa_attention.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/gqa_attention_prefill_bf16.cuh"
 #include "kernels/kernel/gqa_attention_prefill_i8.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
                                            KVCache& kv, int layer, Tensor& out,
@@ -103,4 +103,4 @@ void gqa_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor&
     gqa_attention_prompt_attention_launch(q, positions, scale, kv, layer, out, stream);
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

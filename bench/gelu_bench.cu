@@ -1,10 +1,10 @@
-#include "qus/kernels/gelu.h"
-#include "qus_bench_common.h"
+#include "ninfer/kernels/gelu.h"
+#include "ninfer_bench_common.h"
 
 #include <cstdio>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 int main(int argc, char** argv) {
     int devices = 0;

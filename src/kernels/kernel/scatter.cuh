@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 __global__ void scatter_bf16x2_kernel(const __nv_bfloat162* src, const std::int32_t* indices,
                                       __nv_bfloat162* dst, std::int32_t pairs,
@@ -40,4 +40,4 @@ __global__ void scatter_scalar_kernel(const __nv_bfloat16* src, const std::int32
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

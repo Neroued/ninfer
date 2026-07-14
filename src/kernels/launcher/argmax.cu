@@ -1,13 +1,13 @@
-// qus::kernels - argmax launcher: grid/block/stream configuration + kernel launch.
+// ninfer::kernels - argmax launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/argmax.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/argmax.cuh"
-#include "qus/core/device.h"  // CUDA_CHECK
+#include "ninfer/core/device.h"  // CUDA_CHECK
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void argmax_launch(const Tensor& logits, Tensor& out, cudaStream_t stream) {
     const std::int32_t vocab = logits.ne[0];
@@ -33,4 +33,4 @@ void argmax_launch(const Tensor& logits, Tensor& out, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

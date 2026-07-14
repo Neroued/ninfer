@@ -1,4 +1,4 @@
-#include "qus/kernels/layer_norm.h"
+#include "ninfer/kernels/layer_norm.h"
 
 #include "kernels/launcher/layer_norm.h"
 
@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t checked_numel(const Tensor& t) {
@@ -62,4 +62,4 @@ void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias, float
     detail::layer_norm_launch(x, weight, bias, eps, out, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

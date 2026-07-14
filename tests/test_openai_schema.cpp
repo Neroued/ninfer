@@ -3,9 +3,9 @@
 // serialization shapes, and finish_reason mapping. This is the schema boundary
 // consumed by external OpenAI clients.
 
-#include "qus/serve/openai_schema.h"
-#include "qus/serve/request.h"
-#include "qus/serve/translate.h"
+#include "ninfer/serve/openai_schema.h"
+#include "ninfer/serve/request.h"
+#include "ninfer/serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
@@ -16,7 +16,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using namespace qus::serve;
+using namespace ninfer::serve;
 
 int fail(const std::string& message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -101,9 +101,9 @@ int test_parse_image_in_translate() {
     int failures                = 0;
     failures += check(req.messages[0].content[0].kind == ContentKind::Image,
                       "image content kind preserved");
-    failures += check(req.messages[0].content[0].source.kind == qus::media::SourceKind::Data,
+    failures += check(req.messages[0].content[0].source.kind == ninfer::media::SourceKind::Data,
                       "image data URI source preserved");
-    failures += check(messages[0].parts[0].kind == qus::text::ChatPartKind::Image,
+    failures += check(messages[0].parts[0].kind == ninfer::text::ChatPartKind::Image,
                       "image translated to structured chat part");
     return failures;
 }
@@ -467,11 +467,11 @@ int test_models_and_error() {
 
 int test_finish_reason_wire() {
     int failures = 0;
-    failures += check(std::string(finish_reason_wire(qus::text::FinishReason::Stop)) == "stop",
+    failures += check(std::string(finish_reason_wire(ninfer::text::FinishReason::Stop)) == "stop",
                       "stop wire");
-    failures += check(std::string(finish_reason_wire(qus::text::FinishReason::Length)) == "length",
+    failures += check(std::string(finish_reason_wire(ninfer::text::FinishReason::Length)) == "length",
                       "length wire");
-    failures += check(std::string(finish_reason_wire(qus::text::FinishReason::Cancelled)) == "stop",
+    failures += check(std::string(finish_reason_wire(ninfer::text::FinishReason::Cancelled)) == "stop",
                       "cancelled maps to stop");
     return failures;
 }

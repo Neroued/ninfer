@@ -1,15 +1,15 @@
 // Observable serving contract for fitting an explicit/default output upper
 // bound into the model context after chat-template tokenization.
 
-#include "qus/serve/generation_service.h"
-#include "qus/serve/request_log.h"
+#include "ninfer/serve/generation_service.h"
+#include "ninfer/serve/request_log.h"
 
 #include <iostream>
 #include <string>
 
 namespace {
 
-using namespace qus::serve;
+using namespace ninfer::serve;
 
 int fail(const std::string& message) {
     std::cerr << "FAIL: " << message << '\n';
@@ -47,7 +47,7 @@ int test_context_output_budget() {
 }
 
 int test_clamped_request_log() {
-    qus::kernels::SamplingConfig sampling;
+    ninfer::kernels::SamplingConfig sampling;
     const std::string line =
         format_request_start(7, false, 1, 65000, 64991, true, 0, ToolChoice{}, false, sampling);
     int failures = 0;

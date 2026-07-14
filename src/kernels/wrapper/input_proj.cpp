@@ -1,16 +1,16 @@
-#include "qus/kernels/attn_input_proj.h"
-#include "qus/kernels/gdn_input_proj.h"
+#include "ninfer/kernels/attn_input_proj.h"
+#include "ninfer/kernels/gdn_input_proj.h"
 
-#include "qus/kernels/linear.h"
+#include "ninfer/kernels/linear.h"
 
 #include "kernels/linear/reference/linear_generic.h"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t columns,
@@ -95,4 +95,4 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& v_we
     detail::linear_rowsplit_gdn_input_grouped_mma_launch(x, qk_weight, v_weight, qkv, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

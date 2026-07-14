@@ -2,11 +2,11 @@
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/gated_delta_rule_recurrent.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void gated_delta_rule_recurrent_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                        const Tensor& g, const Tensor& beta, float scale,
@@ -98,4 +98,4 @@ void gated_delta_rule_recurrent_snapshot_bf16_launch(const Tensor& q, const Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

@@ -1,13 +1,13 @@
 #include "kernels/linear/gemm/linear_rowsplit_w8g32_gemm_mma.cuh"
 
 #include "kernels/common/math.h"
-#include "qus/core/device.h"
-#include "qus/core/tensor.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/tensor.h"
 
 #include <cstdint>
 #include <stdexcept>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 template <class Cfg>
@@ -50,4 +50,4 @@ void linear_rowsplit_w8g32_gemm_mma_launch(const Tensor& x, const Weight& w, Ten
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

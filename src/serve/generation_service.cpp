@@ -1,7 +1,7 @@
-#include "qus/serve/generation_service.h"
+#include "ninfer/serve/generation_service.h"
 
-#include "qus/serve/tool_call_parser.h"
-#include "qus/serve/translate.h"
+#include "ninfer/serve/tool_call_parser.h"
+#include "ninfer/serve/translate.h"
 
 #include <algorithm>
 #include <chrono>
@@ -12,24 +12,24 @@
 #include <string>
 #include <utility>
 
-namespace qus::serve {
+namespace ninfer::serve {
 namespace {
 
-[[noreturn]] void throw_processor_error(const qus::model::ProcessorError& exception) {
+[[noreturn]] void throw_processor_error(const ninfer::model::ProcessorError& exception) {
     ApiError error;
     error.type    = "invalid_request_error";
     error.param   = "messages";
     error.message = exception.what();
     switch (exception.kind()) {
-    case qus::model::ProcessorErrorKind::BudgetExceeded:
+    case ninfer::model::ProcessorErrorKind::BudgetExceeded:
         error.status = 413;
         error.code   = "media_budget_exceeded";
         break;
-    case qus::model::ProcessorErrorKind::RemoteUnavailable:
+    case ninfer::model::ProcessorErrorKind::RemoteUnavailable:
         error.status = 502;
         error.code   = "media_fetch_failed";
         break;
-    case qus::model::ProcessorErrorKind::RemoteTimeout:
+    case ninfer::model::ProcessorErrorKind::RemoteTimeout:
         error.status = 504;
         error.code   = "media_fetch_timeout";
         break;
@@ -131,7 +131,7 @@ ContextOutputBudget resolve_context_output_budget(std::size_t prompt_tokens,
 GenerationService::GenerationService(ServeOptions options) : options_(std::move(options)) {
     caps_.sampling = true; // the engine now honors SamplingParams (temperature 0 == greedy)
 
-    qus::EngineOptions engine_options;
+    ninfer::EngineOptions engine_options;
     engine_options.device            = options_.device;
     engine_options.max_ctx           = options_.max_context;
     engine_options.prefill_chunk     = options_.prefill_chunk;
@@ -139,35 +139,35 @@ GenerationService::GenerationService(ServeOptions options) : options_(std::move(
     engine_options.kv_dtype          = options_.kv_dtype;
     engine_options.use_cuda_graph    = options_.use_cuda_graph;
     engine_options.use_lm_head_draft = options_.use_lm_head_draft;
-    engine_                          = std::make_unique<qus::Engine>(engine_options);
+    engine_                          = std::make_unique<ninfer::Engine>(engine_options);
     engine_->load(options_.weights_path);
-    tokenizer_ = std::make_unique<qus::text::QwenTokenizer>(engine_->take_tokenizer_bundle());
+    tokenizer_ = std::make_unique<ninfer::text::QwenTokenizer>(engine_->take_tokenizer_bundle());
     engine_->set_stop_token_ids(tokenizer_->default_stop_token_ids());
 }
 
-qus::EngineMemoryStats GenerationService::memory_stats() const { return engine_->memory_stats(); }
+ninfer::EngineMemoryStats GenerationService::memory_stats() const { return engine_->memory_stats(); }
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
     PreparedRequest prepared;
-    const std::vector<qus::text::ChatMessage> messages = to_chat_messages(req);
+    const std::vector<ninfer::text::ChatMessage> messages = to_chat_messages(req);
     prepared.options                                   = to_generation_options(req, options_);
     prepared.stop_strings                              = req.stop_strings;
     prepared.include_usage                             = req.include_usage;
     prepared.tool_capable                              = req.uses_tools() || req.has_tool_history();
 
-    qus::text::ChatRenderOptions render_options = prepared.options.render_options;
+    ninfer::text::ChatRenderOptions render_options = prepared.options.render_options;
     render_options.enable_thinking              = prepared.options.enable_thinking;
     const auto render_start                     = std::chrono::steady_clock::now();
     std::vector<int> ids;
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
-                    [](const qus::text::ChatMessage& message) { return message.has_media(); });
+                    [](const ninfer::text::ChatMessage& message) { return message.has_media(); });
     if (has_media) {
         prepared.media_permit = std::unique_lock<std::mutex>(media_mutex_);
         try {
-            qus::model::Processor processor(*tokenizer_);
+            ninfer::model::Processor processor(*tokenizer_);
             prepared.multimodal.emplace(processor.process(messages, render_options));
-        } catch (const qus::model::ProcessorError& exception) {
+        } catch (const ninfer::model::ProcessorError& exception) {
             throw_processor_error(exception);
         } catch (const std::invalid_argument& exception) {
             ApiError error;
@@ -180,7 +180,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
         }
         ids = prepared.multimodal->input_ids;
     } else {
-        const std::string prompt = qus::text::render_qwen_chat(messages, render_options);
+        const std::string prompt = ninfer::text::render_qwen_chat(messages, render_options);
         ids                      = tokenizer_->encode(prompt);
     }
     prepared.render_tokenize_seconds =
@@ -190,7 +190,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
     // final
     // `<|im_start|>assistant\n` header (before the generation-prompt opener the template appended).
     const std::uint32_t opener =
-        qus::text::generation_prompt_opener_tokens(*tokenizer_, render_options);
+        ninfer::text::generation_prompt_opener_tokens(*tokenizer_, render_options);
     prepared.content_boundary = opener <= ids.size()
                                     ? static_cast<std::uint32_t>(ids.size()) - opener
                                     : static_cast<std::uint32_t>(ids.size());
@@ -203,19 +203,19 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& req) const {
 }
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& req) const {
-    const std::vector<qus::text::ChatMessage> messages = to_chat_messages(req);
-    qus::text::TextGenerationOptions options           = to_generation_options(req, options_);
-    qus::text::ChatRenderOptions render_options        = options.render_options;
+    const std::vector<ninfer::text::ChatMessage> messages = to_chat_messages(req);
+    ninfer::text::TextGenerationOptions options           = to_generation_options(req, options_);
+    ninfer::text::ChatRenderOptions render_options        = options.render_options;
     render_options.enable_thinking                     = options.enable_thinking;
     if (std::any_of(messages.begin(), messages.end(),
-                    [](const qus::text::ChatMessage& message) { return message.has_media(); })) {
+                    [](const ninfer::text::ChatMessage& message) { return message.has_media(); })) {
         std::unique_lock<std::mutex> media_permit(media_mutex_);
         try {
-            qus::model::ProcessorOptions processor_options;
+            ninfer::model::ProcessorOptions processor_options;
             processor_options.max_prompt_tokens = std::numeric_limits<std::size_t>::max();
-            qus::model::Processor processor(*tokenizer_, processor_options);
+            ninfer::model::Processor processor(*tokenizer_, processor_options);
             return static_cast<int>(processor.process(messages, render_options).input_ids.size());
-        } catch (const qus::model::ProcessorError& exception) {
+        } catch (const ninfer::model::ProcessorError& exception) {
             throw_processor_error(exception);
         } catch (const std::invalid_argument& exception) {
             ApiError error;
@@ -227,15 +227,15 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& req) const {
             throw ApiException(std::move(error));
         }
     }
-    const std::string prompt = qus::text::render_qwen_chat(messages, render_options);
+    const std::string prompt = ninfer::text::render_qwen_chat(messages, render_options);
     return static_cast<int>(tokenizer_->encode(prompt).size());
 }
 
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink) {
     std::lock_guard<std::mutex> lock(engine_mutex_);
 
-    qus::text::TextGenerationRunner runner(*tokenizer_, *engine_);
-    qus::text::TextGenerationOptions opt = prepared.options;
+    ninfer::text::TextGenerationRunner runner(*tokenizer_, *engine_);
+    ninfer::text::TextGenerationOptions opt = prepared.options;
 
     // The runner already splits the <think> block from the answer and tags each
     // delta with its channel; stop strings apply to the answer channel only.
@@ -244,8 +244,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     std::string streamed_answer;
 
     if (sink != nullptr) {
-        opt.stream_callback = [&](const qus::text::TextStreamChunk& chunk) {
-            if (chunk.channel == qus::text::TextChannel::Reasoning) {
+        opt.stream_callback = [&](const ninfer::text::TextStreamChunk& chunk) {
+            if (chunk.channel == ninfer::text::TextChannel::Reasoning) {
                 if (sink->on_reasoning) { sink->on_reasoning(chunk.text); }
                 return;
             }
@@ -270,7 +270,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     engine_->reset_mtp_stats();
     // The prompt was already rendered + tokenized in prepare(); reuse those ids so
     // the chat template renders exactly once per request.
-    const qus::text::TextGenerationResult result =
+    const ninfer::text::TextGenerationResult result =
         prepared.multimodal ? runner.generate(*prepared.multimodal, opt, prepared.content_boundary,
                                               [&] {
                                                   if (prepared.media_permit.owns_lock()) {
@@ -279,7 +279,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                                               })
                             : runner.generate(std::span<const int>(prepared.prompt_token_ids), opt,
                                               prepared.content_boundary);
-    const qus::EngineMtpStats mtp = engine_->mtp_stats();
+    const ninfer::EngineMtpStats mtp = engine_->mtp_stats();
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                   = static_cast<int>(result.prompt_token_ids.size());
@@ -305,7 +305,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                 }
             }
         }
-        outcome.finish_reason = stop_matched ? qus::text::FinishReason::Stop : result.finish_reason;
+        outcome.finish_reason = stop_matched ? ninfer::text::FinishReason::Stop : result.finish_reason;
         if (prepared.tool_capable) {
             ParsedToolCallOutput parsed = parse_qwen_tool_call_output(streamed_answer);
             outcome.text                = std::move(parsed.content);
@@ -323,7 +323,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         } else {
             outcome.text = std::move(answer);
         }
-        outcome.finish_reason = r.stopped ? qus::text::FinishReason::Stop : result.finish_reason;
+        outcome.finish_reason = r.stopped ? ninfer::text::FinishReason::Stop : result.finish_reason;
     }
     return outcome;
 }
@@ -345,4 +345,4 @@ void GenerationService::warmup() {
     }
 }
 
-} // namespace qus::serve
+} // namespace ninfer::serve

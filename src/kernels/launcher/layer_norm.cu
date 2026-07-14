@@ -1,13 +1,13 @@
 #include "kernels/launcher/layer_norm.h"
 
 #include "kernels/kernel/layer_norm.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void layer_norm_launch(const Tensor& x, const Tensor& weight, const Tensor& bias, float eps,
                        Tensor& out, cudaStream_t stream) {
@@ -40,4 +40,4 @@ void layer_norm_launch(const Tensor& x, const Tensor& weight, const Tensor& bias
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

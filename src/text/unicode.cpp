@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <stdexcept>
 
-namespace qus::text::unicode_internal {
+namespace ninfer::text::unicode_internal {
 namespace {
 
 bool is_ascii_whitespace(std::int32_t codepoint) noexcept {
@@ -104,4 +104,4 @@ bool is_whitespace(std::int32_t codepoint) noexcept {
     }
 }
 
-} // namespace qus::text::unicode_internal
+} // namespace ninfer::text::unicode_internal

@@ -16,8 +16,8 @@
 #include <system_error>
 #include <vector>
 
-#ifndef QUS_SOURCE_DIR
-#    error "QUS_SOURCE_DIR must be defined for qus_q5090_pack_golden_test"
+#ifndef NINFER_SOURCE_DIR
+#    error "NINFER_SOURCE_DIR must be defined for ninfer_q5090_pack_golden_test"
 #endif
 
 namespace {
@@ -124,7 +124,7 @@ std::vector<std::uint8_t> read_bytes(const std::filesystem::path& path) {
 int run_converter(const std::filesystem::path& script, std::string_view qtype_name,
                   const std::filesystem::path& out_path) {
     const std::string command = "python3 " + shell_quote(script.string()) + " " +
-                                shell_quote(QUS_SOURCE_DIR) + " " + shell_quote(qtype_name) + " " +
+                                shell_quote(NINFER_SOURCE_DIR) + " " + shell_quote(qtype_name) + " " +
                                 shell_quote(out_path.string());
     const int rc = std::system(command.c_str());
     if (rc != 0) {
@@ -153,7 +153,7 @@ int compare_payload(std::string_view label, const std::vector<std::uint8_t>& act
 }
 
 struct Case {
-    qus::QType qtype;
+    ninfer::QType qtype;
     const char* python_name;
     const char* label;
 };
@@ -169,7 +169,7 @@ void touch_cuda_runtime_for_sanitizer() {
 int main() {
     touch_cuda_runtime_for_sanitizer();
 
-    const std::filesystem::path script_path = unique_temp_path("qus_q5090_pack_golden_", ".py");
+    const std::filesystem::path script_path = unique_temp_path("ninfer_q5090_pack_golden_", ".py");
     std::error_code cleanup_error;
 
     try {
@@ -177,18 +177,18 @@ int main() {
         const std::vector<float> source = known_matrix();
 
         int failures = 0;
-        for (const Case& test_case : {Case{qus::QType::Q4G64_F16S, "q4", "Q4G64_F16S"},
-                                      Case{qus::QType::Q5G64_F16S, "q5", "Q5G64_F16S"},
-                                      Case{qus::QType::Q6G64_F16S, "q6", "Q6G64_F16S"},
-                                      Case{qus::QType::W8G32_F16S, "w8g32",
+        for (const Case& test_case : {Case{ninfer::QType::Q4G64_F16S, "q4", "Q4G64_F16S"},
+                                      Case{ninfer::QType::Q5G64_F16S, "q5", "Q5G64_F16S"},
+                                      Case{ninfer::QType::Q6G64_F16S, "q6", "Q6G64_F16S"},
+                                      Case{ninfer::QType::W8G32_F16S, "w8g32",
                                            "W8G32_F16S"}}) {
             const std::filesystem::path payload_path = unique_temp_path(
-                "qus_q5090_pack_golden_" + std::string(test_case.python_name) + "_", ".bin");
+                "ninfer_q5090_pack_golden_" + std::string(test_case.python_name) + "_", ".bin");
             int case_failures = run_converter(script_path, test_case.python_name, payload_path);
             if (case_failures == 0) {
                 const std::vector<std::uint8_t> expected = read_bytes(payload_path);
-                const qus::test::q5090::PackedWeight actual =
-                    qus::test::q5090::pack_row_split_lowbit(source, kN, kK, test_case.qtype);
+                const ninfer::test::q5090::PackedWeight actual =
+                    ninfer::test::q5090::pack_row_split_lowbit(source, kN, kK, test_case.qtype);
                 case_failures += compare_payload(test_case.label, actual.payload, expected);
             }
             failures += case_failures;

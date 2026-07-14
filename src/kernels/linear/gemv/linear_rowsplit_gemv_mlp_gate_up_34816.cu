@@ -3,7 +3,7 @@
 #include "kernels/common/math.cuh"
 #include "kernels/common/memory.cuh"
 #include "kernels/common/warp.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 constexpr int kN = 34816;
@@ -243,4 +243,4 @@ void linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_launch(const Tensor& x, cons
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

@@ -7,7 +7,7 @@
 
 #include "kernels/linear/gemm/linear_rowsplit_q4_gate_up_silu_gemm_mma.cuh"
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 template <class Cfg, bool FullTiles>
 __global__
@@ -155,12 +155,12 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         if (s < NKT) { stage_load(s, s); }
-        qus::kernels::cp_commit();
+        ninfer::kernels::cp_commit();
     }
 
     for (int it = 0; it < NKT; ++it) {
         const int stage = it % S;
-        qus::kernels::cp_wait<S - 1>();
+        ninfer::kernels::cp_wait<S - 1>();
         __syncthreads();
         dequant_to_As(stage, it);
         __syncthreads();
@@ -197,7 +197,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
         __syncthreads();
         const int next = it + S;
         if (next < NKT) { stage_load(stage, next); }
-        qus::kernels::cp_commit();
+        ninfer::kernels::cp_commit();
     }
 
 #pragma unroll
@@ -233,4 +233,4 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
     }
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

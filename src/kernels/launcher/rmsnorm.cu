@@ -1,14 +1,14 @@
-// qus::kernels - rmsnorm launcher: grid/block/stream configuration + kernel launch.
+// ninfer::kernels - rmsnorm launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/rmsnorm.h"
 
 #include "kernels/kernel/rmsnorm.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
                     const Tensor* z, Tensor& out, cudaStream_t stream) {
@@ -39,4 +39,4 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

@@ -1,7 +1,7 @@
 #include "kernels/linear/gemv/linear_rowsplit_gemv_gdn_in_vz_6144.cuh"
 
 #include "kernels/linear/gemv/linear_rowsplit_gemv_q5_core.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <cuda_bf16.h>
 
@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 constexpr int kN            = 6144;
@@ -44,4 +44,4 @@ void linear_rowsplit_gemv_gdn_in_vz_6144_q5_launch(const Tensor& x, const Weight
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

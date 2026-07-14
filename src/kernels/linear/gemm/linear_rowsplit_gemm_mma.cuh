@@ -34,7 +34,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 // High-plane bytes per (row, 64-group) for each codec (0 = no high plane). Used
 // to size the staged shared quant buffers; the dequant math itself stays in
@@ -335,12 +335,12 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
 #pragma unroll
     for (int s = 0; s < S; ++s) {
         if (s < NKT) { stage_load(s, s); }
-        qus::kernels::cp_commit();
+        ninfer::kernels::cp_commit();
     }
 
     for (int it = 0; it < NKT; ++it) {
         const int stage = it % S;
-        qus::kernels::cp_wait<S - 1>();
+        ninfer::kernels::cp_wait<S - 1>();
         __syncthreads();
 
         dequant_to_As(stage, it);
@@ -405,7 +405,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
         __syncthreads();
 
         if (itp < NKT) { stage_load(stage, itp); }
-        qus::kernels::cp_commit();
+        ninfer::kernels::cp_commit();
     }
 
     // Epilogue: C lane layout c0={gid,2lid} c1={gid,2lid+1} c2={gid+8,2lid} c3={gid+8,2lid+1}.
@@ -448,4 +448,4 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
     }
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

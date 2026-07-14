@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace qus::test::gdn_ref {
+namespace ninfer::test::gdn_ref {
 
 struct Inputs {
     std::int64_t S    = 0;
@@ -432,4 +432,4 @@ inline void forward_chunked(const float* q, const float* k, const float* v, cons
                       out + T_full * H_v * S, state_out, S, H_qk, H_v, tail, B, scale);
 }
 
-} // namespace qus::test::gdn_ref
+} // namespace ninfer::test::gdn_ref

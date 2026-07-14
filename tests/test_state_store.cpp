@@ -1,5 +1,5 @@
-#include "qus/core/device.h"
-#include "qus/core/state_store.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/state_store.h"
 
 #include <cuda_runtime.h>
 
@@ -35,7 +35,7 @@ int expect_size(std::size_t actual, std::size_t expected, const char* label) {
     return 1;
 }
 
-int check_shape(const qus::Tensor& t, const std::int32_t (&expected)[4], const char* label) {
+int check_shape(const ninfer::Tensor& t, const std::int32_t (&expected)[4], const char* label) {
     int failures = 0;
     for (int i = 0; i < 4; ++i) {
         if (t.ne[i] != expected[i]) {
@@ -47,7 +47,7 @@ int check_shape(const qus::Tensor& t, const std::int32_t (&expected)[4], const c
     return failures;
 }
 
-int expect_device_byte(const qus::Tensor& tensor, unsigned char expected, const char* label) {
+int expect_device_byte(const ninfer::Tensor& tensor, unsigned char expected, const char* label) {
     std::vector<unsigned char> host(tensor.bytes());
     CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost));
     for (unsigned char value : host) {
@@ -79,9 +79,9 @@ int main() {
     }
 
     int failures = 0;
-    qus::DeviceContext ctx(0);
-    qus::DeviceArena cache_arena(16384);
-    qus::GdnState state(cache_arena, 3, 10, 3, 4, 5, 6, qus::DType::BF16);
+    ninfer::DeviceContext ctx(0);
+    ninfer::DeviceArena cache_arena(16384);
+    ninfer::GdnState state(cache_arena, 3, 10, 3, 4, 5, 6, ninfer::DType::BF16);
 
     failures += expect_size(state.layer_count(), 3, "state.layer_count");
     failures += expect_size(state.conv.size(), 3, "state.conv.size");
@@ -95,11 +95,11 @@ int main() {
                                 {10, 3, 1, 1}, "state.conv_slot");
         failures += check_shape(state.ssm_slot(static_cast<std::uint32_t>(layer), 0),
                                 {6, 5, 4, 1}, "state.ssm_slot");
-        if (state.conv[layer].dtype != qus::DType::BF16) {
+        if (state.conv[layer].dtype != ninfer::DType::BF16) {
             ++failures;
             std::cerr << "conv dtype is not BF16\n";
         }
-        if (state.ssm[layer].dtype != qus::DType::FP32) {
+        if (state.ssm[layer].dtype != ninfer::DType::FP32) {
             ++failures;
             std::cerr << "ssm dtype is not FP32\n";
         }
@@ -123,8 +123,8 @@ int main() {
     failures += expect_device_byte(state.conv[0], 0, "reset conv0");
     failures += expect_device_byte(state.ssm[1], 0, "reset ssm1");
 
-    qus::DeviceArena slotted_arena(16384);
-    qus::GdnState slotted(slotted_arena, 1, 10, 3, 4, 5, 6, 3, qus::DType::BF16);
+    ninfer::DeviceArena slotted_arena(16384);
+    ninfer::GdnState slotted(slotted_arena, 1, 10, 3, 4, 5, 6, 3, ninfer::DType::BF16);
     failures += expect_size(slotted.snapshot_slots, 3, "slotted.snapshot_slots");
     failures += check_shape(slotted.conv[0], {10, 3, 3, 1}, "slotted.conv");
     failures += check_shape(slotted.ssm[0], {6, 5, 4, 3}, "slotted.ssm");
@@ -135,10 +135,10 @@ int main() {
     failures += expect_throws<std::out_of_range>(
         [&] { (void)slotted.ssm_slot(0, 3); }, "ssm_slot invalid slot");
 
-    qus::Tensor conv0 = slotted.conv_slot(0, 0);
-    qus::Tensor conv1 = slotted.conv_slot(0, 1);
-    qus::Tensor ssm0  = slotted.ssm_slot(0, 0);
-    qus::Tensor ssm1  = slotted.ssm_slot(0, 1);
+    ninfer::Tensor conv0 = slotted.conv_slot(0, 0);
+    ninfer::Tensor conv1 = slotted.conv_slot(0, 1);
+    ninfer::Tensor ssm0  = slotted.ssm_slot(0, 0);
+    ninfer::Tensor ssm1  = slotted.ssm_slot(0, 1);
     CUDA_CHECK(cudaMemset(conv0.data, 0x7a, conv0.bytes()));
     CUDA_CHECK(cudaMemset(conv1.data, 0x6b, conv1.bytes()));
     CUDA_CHECK(cudaMemset(ssm0.data, 0x5c, ssm0.bytes()));
@@ -155,35 +155,35 @@ int main() {
     failures += expect_device_byte(slotted.ssm_slot(0, 1), 0x4d, "slotted reset keeps ssm slot1");
 
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::GdnState invalid(cache_arena, 0, 10, 3, 4, 5, 6); }, "zero layers");
+        [&] { ninfer::GdnState invalid(cache_arena, 0, 10, 3, 4, 5, 6); }, "zero layers");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::GdnState invalid(cache_arena, 1, 0, 3, 4, 5, 6); }, "zero conv dim");
+        [&] { ninfer::GdnState invalid(cache_arena, 1, 0, 3, 4, 5, 6); }, "zero conv dim");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::GdnState invalid(cache_arena, 1, 10, 0, 4, 5, 6); }, "zero conv width");
+        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 0, 4, 5, 6); }, "zero conv width");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::GdnState invalid(cache_arena, 1, 10, 3, 0, 5, 6); }, "zero value heads");
+        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 0, 5, 6); }, "zero value heads");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::GdnState invalid(cache_arena, 1, 10, 3, 4, 0, 6); }, "zero value head dim");
+        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 4, 0, 6); }, "zero value head dim");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 0); }, "zero key head dim");
+        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 0); }, "zero key head dim");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 6, qus::DType::U8); },
+        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 6, ninfer::DType::U8); },
         "invalid conv dtype");
     failures += expect_throws<std::invalid_argument>(
-        [&] { qus::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 6, 0); },
+        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 6, 0); },
         "zero snapshot slots");
 
-    qus::DeviceArena small_arena(512);
+    ninfer::DeviceArena small_arena(512);
     const std::size_t small_before = small_arena.used();
     failures += expect_throws<std::bad_alloc>(
-        [&] { qus::GdnState too_big(small_arena, 3, 10, 3, 4, 5, 6); }, "undersized state arena");
+        [&] { ninfer::GdnState too_big(small_arena, 3, 10, 3, 4, 5, 6); }, "undersized state arena");
     failures += expect_size(small_arena.used(), small_before, "small arena used after failure");
 
-    qus::DeviceArena overflow_arena(1024);
+    ninfer::DeviceArena overflow_arena(1024);
     const std::size_t overflow_before = overflow_arena.used();
     failures += expect_throws<std::overflow_error>(
         [&] {
-            qus::GdnState overflow(overflow_arena, std::numeric_limits<std::uint32_t>::max(),
+            ninfer::GdnState overflow(overflow_arena, std::numeric_limits<std::uint32_t>::max(),
                                    std::numeric_limits<std::int32_t>::max(), 1, 1, 1, 1);
         },
         "aggregate state overflow");

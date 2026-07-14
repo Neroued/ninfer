@@ -8,13 +8,13 @@
 #include <cstdint>
 #include <cstdio>
 
-#define QUS_GDN_PROPAGATE(expr)                                                                    \
+#define NINFER_GDN_PROPAGATE(expr)                                                                    \
     do {                                                                                           \
-        const cudaError_t qus_gdn_err = (expr);                                                    \
-        if (qus_gdn_err != cudaSuccess) { return qus_gdn_err; }                                    \
+        const cudaError_t ninfer_gdn_err = (expr);                                                    \
+        if (ninfer_gdn_err != cudaSuccess) { return ninfer_gdn_err; }                                    \
     } while (0)
 
-namespace qus::kernels::detail::gdn_chunked {
+namespace ninfer::kernels::detail::gdn_chunked {
 
 inline constexpr std::int64_t kChunkSize      = 64;
 inline constexpr std::int64_t kSubChunkSize   = 16;
@@ -39,7 +39,7 @@ struct workspace_layout {
 inline std::int64_t reserve(std::int64_t& cursor, std::int64_t bytes) {
     if (bytes == 0) { return cursor; }
     const std::int64_t off = cursor;
-    cursor                 = qus::kernels::align_up<kWorkspaceAlign>(off + bytes);
+    cursor                 = ninfer::kernels::align_up<kWorkspaceAlign>(off + bytes);
     return off;
 }
 
@@ -154,7 +154,7 @@ struct bh_decode_t {
         return r;
     }
 
-    static __device__ __forceinline__ bh_decode_t of(int bh, qus::kernels::head_map qk_map) {
+    static __device__ __forceinline__ bh_decode_t of(int bh, ninfer::kernels::head_map qk_map) {
         bh_decode_t r{};
         const int H_v   = qk_map.H_v;
         r.b             = bh / H_v;
@@ -201,12 +201,12 @@ struct stage_validator {
                          static_cast<long long>(B));
             return cudaErrorInvalidValue;
         }
-        if (!qus::kernels::is_supported_gdn_head_dim(S)) {
+        if (!ninfer::kernels::is_supported_gdn_head_dim(S)) {
             std::fprintf(stderr, "%s: unsupported S=%lld (allowed: 16, 32, 64, 128)\n", name,
                          static_cast<long long>(S));
             return cudaErrorInvalidValue;
         }
-        if (require_h_qk && !qus::kernels::are_gdn_head_counts_valid(H_qk, H_v)) {
+        if (require_h_qk && !ninfer::kernels::are_gdn_head_counts_valid(H_qk, H_v)) {
             std::fprintf(stderr,
                          "%s: invalid head counts H_qk=%lld H_v=%lld "
                          "(need H_qk >= 1, H_v >= H_qk, H_v %% H_qk == 0)\n",
@@ -248,16 +248,16 @@ struct stage_validator {
     }
 };
 
-} // namespace qus::kernels::detail::gdn_chunked
+} // namespace ninfer::kernels::detail::gdn_chunked
 
-namespace qus::kernels::detail::gdn_prepare_wy_wu {
+namespace ninfer::kernels::detail::gdn_prepare_wy_wu {
 cudaError_t launch_prepare_wy_wu(const gdn_chunked::prepare_wy_wu_config& cfg);
-} // namespace qus::kernels::detail::gdn_prepare_wy_wu
+} // namespace ninfer::kernels::detail::gdn_prepare_wy_wu
 
-namespace qus::kernels::detail::gdn_state_passing {
+namespace ninfer::kernels::detail::gdn_state_passing {
 cudaError_t launch_state_passing(const gdn_chunked::state_passing_config& cfg);
-} // namespace qus::kernels::detail::gdn_state_passing
+} // namespace ninfer::kernels::detail::gdn_state_passing
 
-namespace qus::kernels::detail::gdn_chunk_output {
+namespace ninfer::kernels::detail::gdn_chunk_output {
 cudaError_t launch_chunk_output(const gdn_chunked::chunk_output_config& cfg);
-} // namespace qus::kernels::detail::gdn_chunk_output
+} // namespace ninfer::kernels::detail::gdn_chunk_output

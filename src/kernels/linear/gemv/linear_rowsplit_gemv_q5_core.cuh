@@ -28,7 +28,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 // Issue the cp.async copies for one 16-group tile into a shared buffer slot, then
 // commit them as one pipeline group. Every lane commits (even lanes that issue
@@ -304,4 +304,4 @@ inline void launch_q5_rowsplit_gemv_dual(const __nv_bfloat16* x, const std::uint
                                              scales1, out0, out1);
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

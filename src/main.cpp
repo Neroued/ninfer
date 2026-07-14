@@ -1,9 +1,9 @@
-#include "qus/kernels/sampling.h"
-#include "qus/runtime/engine.h"
-#include "qus/text/chat_template.h"
-#include "qus/text/cli.h"
-#include "qus/text/text_runner.h"
-#include "qus/text/tokenizer.h"
+#include "ninfer/kernels/sampling.h"
+#include "ninfer/runtime/engine.h"
+#include "ninfer/text/chat_template.h"
+#include "ninfer/text/cli.h"
+#include "ninfer/text/text_runner.h"
+#include "ninfer/text/tokenizer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -53,7 +53,7 @@ std::string format_per_round(double value) {
     return out.str();
 }
 
-std::string format_mtp_acceptance_length(const qus::EngineMtpStats& stats) {
+std::string format_mtp_acceptance_length(const ninfer::EngineMtpStats& stats) {
     if (stats.rounds <= 0) { return "n/a"; }
     return format_per_round(1.0 + static_cast<double>(stats.accepted_tokens) /
                                       static_cast<double>(stats.rounds));
@@ -74,47 +74,47 @@ std::string format_bytes(std::uint64_t bytes) {
     return out.str();
 }
 
-std::string format_arena_used(const qus::ArenaMemoryStats& stats) {
+std::string format_arena_used(const ninfer::ArenaMemoryStats& stats) {
     if (!stats.present) { return "n/a"; }
     return format_bytes(static_cast<std::uint64_t>(stats.used_bytes)) + " / " +
            format_bytes(static_cast<std::uint64_t>(stats.capacity_bytes));
 }
 
-std::string format_arena_peak(const qus::ArenaMemoryStats& stats) {
+std::string format_arena_peak(const ninfer::ArenaMemoryStats& stats) {
     if (!stats.present) { return "n/a"; }
     return format_bytes(static_cast<std::uint64_t>(stats.peak_used_bytes)) + " / " +
            format_bytes(static_cast<std::uint64_t>(stats.capacity_bytes));
 }
 
-std::string format_kv_dtype(qus::DType dtype) {
+std::string format_kv_dtype(ninfer::DType dtype) {
     switch (dtype) {
-    case qus::DType::BF16:
+    case ninfer::DType::BF16:
         return "bf16";
-    case qus::DType::I8:
+    case ninfer::DType::I8:
         return "int8";
     default:
         return "unknown";
     }
 }
 
-std::string format_selected_modules(const qus::Q5090LoadStats& stats) {
-    auto name = [](qus::ModuleKind module) -> std::string_view {
+std::string format_selected_modules(const ninfer::Q5090LoadStats& stats) {
+    auto name = [](ninfer::ModuleKind module) -> std::string_view {
         switch (module) {
-        case qus::ModuleKind::TextCore:
+        case ninfer::ModuleKind::TextCore:
             return "TEXT_CORE";
-        case qus::ModuleKind::MtpDraft:
+        case ninfer::ModuleKind::MtpDraft:
             return "MTP_DRAFT";
-        case qus::ModuleKind::VisionEncoder:
+        case ninfer::ModuleKind::VisionEncoder:
             return "VISION_ENCODER";
-        case qus::ModuleKind::LmHeadDraft:
+        case ninfer::ModuleKind::LmHeadDraft:
             return "LM_HEAD_DRAFT";
         }
         return "UNKNOWN";
     };
     std::string out;
-    for (qus::ModuleKind kind : {qus::ModuleKind::TextCore, qus::ModuleKind::LmHeadDraft,
-                                 qus::ModuleKind::MtpDraft, qus::ModuleKind::VisionEncoder}) {
-        const qus::Q5090ModuleLoadStats& module = stats.modules[static_cast<std::size_t>(kind)];
+    for (ninfer::ModuleKind kind : {ninfer::ModuleKind::TextCore, ninfer::ModuleKind::LmHeadDraft,
+                                 ninfer::ModuleKind::MtpDraft, ninfer::ModuleKind::VisionEncoder}) {
+        const ninfer::Q5090ModuleLoadStats& module = stats.modules[static_cast<std::size_t>(kind)];
         if (!module.selected) { continue; }
         if (!out.empty()) { out += ','; }
         out += name(module.module);
@@ -150,7 +150,7 @@ void print_metric(std::string_view label, std::string_view value) {
     std::cerr << std::left << std::setw(10) << "summary" << std::setw(24) << label << value << '\n';
 }
 
-std::string format_sampling(const qus::kernels::SamplingConfig& cfg) {
+std::string format_sampling(const ninfer::kernels::SamplingConfig& cfg) {
     if (cfg.temperature <= 0.0f) { return "greedy (temperature 0)"; }
     std::ostringstream out;
     out << std::fixed << std::setprecision(2) << "temp=" << cfg.temperature
@@ -169,15 +169,15 @@ struct ProgressState {
 
 int main(int argc, char** argv) {
     try {
-        const qus::text::CliOptions cli = qus::text::parse_cli(argc, argv);
+        const ninfer::text::CliOptions cli = ninfer::text::parse_cli(argc, argv);
         if (cli.help_requested) {
-            std::cout << qus::text::usage_text(argv[0]);
+            std::cout << ninfer::text::usage_text(argv[0]);
             return 0;
         }
 
         std::cerr << "phase     detail                    elapsed/progress\n";
         std::map<std::string, ProgressState> progress_states;
-        qus::Q5090Progress progress;
+        ninfer::Q5090Progress progress;
         progress.min_interval_bytes = 1024ULL * 1024ULL * 1024ULL;
         progress.callback = [&](std::string_view phase, std::uint64_t done, std::uint64_t total) {
             const std::string key(phase);
@@ -192,7 +192,7 @@ int main(int argc, char** argv) {
                            std::chrono::duration<double>(now - it->second.start).count());
         };
 
-        qus::EngineOptions engine_options;
+        ninfer::EngineOptions engine_options;
         engine_options.device            = cli.device;
         engine_options.max_ctx           = cli.max_context;
         engine_options.prefill_chunk     = cli.prefill_chunk;
@@ -202,30 +202,30 @@ int main(int argc, char** argv) {
         engine_options.use_cuda_graph    = cli.use_cuda_graph;
         engine_options.use_lm_head_draft = cli.use_lm_head_draft;
         engine_options.stop_token_ids    = cli.stop_token_ids;
-        qus::Engine engine(engine_options);
+        ninfer::Engine engine(engine_options);
 
         const auto engine_load_start = Clock::now();
         engine.load(cli.weights_path);
         print_stage("load", "engine total",
                     std::chrono::duration<double>(Clock::now() - engine_load_start).count());
 
-        qus::text::QwenTokenizer tokenizer(engine.take_tokenizer_bundle());
+        ninfer::text::QwenTokenizer tokenizer(engine.take_tokenizer_bundle());
         const std::vector<int> stop_token_ids =
-            qus::text::resolve_stop_token_ids(tokenizer, cli.stop_token_ids);
+            ninfer::text::resolve_stop_token_ids(tokenizer, cli.stop_token_ids);
         engine.set_stop_token_ids(stop_token_ids);
 
-        const std::vector<qus::text::ChatMessage> messages =
-            cli.messages_path.empty() ? qus::text::messages_from_prompt(cli.prompt)
-                                      : qus::text::read_messages_json(cli.messages_path);
-        qus::text::TextGenerationOptions generation_options;
+        const std::vector<ninfer::text::ChatMessage> messages =
+            cli.messages_path.empty() ? ninfer::text::messages_from_prompt(cli.prompt)
+                                      : ninfer::text::read_messages_json(cli.messages_path);
+        ninfer::text::TextGenerationOptions generation_options;
         generation_options.max_new_tokens  = cli.max_new;
-        generation_options.raw_output      = cli.output_mode == qus::text::OutputMode::Raw;
+        generation_options.raw_output      = cli.output_mode == ninfer::text::OutputMode::Raw;
         generation_options.enable_thinking = cli.enable_thinking;
         generation_options.stop_token_ids  = stop_token_ids;
         // Default to Qwen3 thinking sampling so the CLI matches real usage and
         // does not fall into greedy repetition; --greedy leaves the config at
         // temperature 0 (exact argmax) for deterministic parity runs.
-        qus::kernels::SamplingConfig sampling; // default is greedy (temperature 0)
+        ninfer::kernels::SamplingConfig sampling; // default is greedy (temperature 0)
         if (!cli.greedy) {
             sampling.temperature       = cli.temperature;
             sampling.top_p             = cli.top_p;
@@ -236,10 +236,10 @@ int main(int argc, char** argv) {
         }
         generation_options.sampling = sampling;
         // Answer content streams to stdout; the <think> reasoning streams to stderr
-        // so `qus ... > out.txt` captures only the answer, matching how the CLI
+        // so `ninfer ... > out.txt` captures only the answer, matching how the CLI
         // already routes diagnostics.
-        generation_options.stream_callback = [](const qus::text::TextStreamChunk& chunk) {
-            if (chunk.channel == qus::text::TextChannel::Reasoning) {
+        generation_options.stream_callback = [](const ninfer::text::TextStreamChunk& chunk) {
+            if (chunk.channel == ninfer::text::TextChannel::Reasoning) {
                 std::cerr << chunk.text;
                 std::cerr.flush();
             } else {
@@ -248,9 +248,9 @@ int main(int argc, char** argv) {
             }
         };
 
-        qus::text::TextGenerationRunner runner(tokenizer, engine);
+        ninfer::text::TextGenerationRunner runner(tokenizer, engine);
 
-        const qus::text::TextGenerationResult result =
+        const ninfer::text::TextGenerationResult result =
             runner.generate(messages, generation_options);
 
         if (result.text.empty() || result.text.back() != '\n') { std::cout << '\n'; }
@@ -292,7 +292,7 @@ int main(int argc, char** argv) {
         print_metric("throughput (overall)",
                      format_tok_s(static_cast<double>(generated_tokens), seconds));
 
-        const qus::EngineMemoryStats memory = engine.memory_stats();
+        const ninfer::EngineMemoryStats memory = engine.memory_stats();
         const std::uint64_t reserved_bytes =
             static_cast<std::uint64_t>(memory.weights.capacity_bytes) +
             static_cast<std::uint64_t>(memory.cache.capacity_bytes) +
@@ -304,13 +304,13 @@ int main(int argc, char** argv) {
                      format_bytes(static_cast<std::uint64_t>(memory.kv_cache_payload_bytes)));
         print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
         print_metric("gpu reserved total", format_bytes(reserved_bytes));
-        const qus::Q5090LoadStats& load = engine.q5090_load_stats();
+        const ninfer::Q5090LoadStats& load = engine.q5090_load_stats();
         print_metric("weight modules", format_selected_modules(load));
         print_metric("artifact file read", format_bytes(load.total_file_read_bytes));
         print_metric("weight H2D", format_bytes(load.h2d_bytes));
         print_metric("pinned staging peak", format_bytes(load.host_peak_staging_bytes));
 
-        const qus::EngineMtpStats mtp = engine.mtp_stats();
+        const ninfer::EngineMtpStats mtp = engine.mtp_stats();
         if (mtp.enabled) {
             print_metric("mtp draft window", std::to_string(mtp.k));
             print_metric("mtp drafted tokens", std::to_string(mtp.draft_tokens));
@@ -320,7 +320,7 @@ int main(int argc, char** argv) {
         }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';
-        std::cerr << qus::text::usage_text(argv[0]);
+        std::cerr << ninfer::text::usage_text(argv[0]);
         return 1;
     }
 

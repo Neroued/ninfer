@@ -1,5 +1,5 @@
-// qus::kernels - l2norm wrapper: public api validation and launcher dispatch.
-#include "qus/kernels/l2norm.h"
+// ninfer::kernels - l2norm wrapper: public api validation and launcher dispatch.
+#include "ninfer/kernels/l2norm.h"
 
 #include "kernels/launcher/l2norm.h" // detail::l2norm_launch
 
@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -71,4 +71,4 @@ void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
     detail::l2norm_launch(x, eps, out, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

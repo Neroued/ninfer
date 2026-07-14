@@ -1,6 +1,6 @@
 #include "model/mtp_ops.h"
-#include "qus/kernels/sampling.h"
-#include "qus/model/model.h"
+#include "ninfer/kernels/sampling.h"
+#include "ninfer/model/model.h"
 #include "kernels/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -13,8 +13,8 @@
 #include <string>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

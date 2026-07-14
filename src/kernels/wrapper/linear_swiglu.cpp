@@ -1,13 +1,13 @@
-#include "qus/kernels/linear_swiglu.h"
+#include "ninfer/kernels/linear_swiglu.h"
 
 #include "kernels/linear/reference/linear_generic.h"
 #include "kernels/linear/gemv/linear_rowsplit_gemv_mlp_gate_up_34816.cuh"
-#include "qus/kernels/linear.h"
-#include "qus/kernels/silu_mul.h"
+#include "ninfer/kernels/linear.h"
+#include "ninfer/kernels/silu_mul.h"
 
 #include <stdexcept>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream) {
@@ -53,4 +53,4 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
     silu_mul(gate_up.slice(0, 0, 17408), gate_up.slice(0, 17408, 17408), out, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

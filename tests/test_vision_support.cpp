@@ -1,14 +1,14 @@
 #include "model/vision_ops.h"
 #include "model/position.h"
 #include "kernels/op_tester.h"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdint>
 #include <iostream>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 int main() {
     if (cuda_unavailable()) {

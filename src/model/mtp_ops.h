@@ -2,12 +2,12 @@
 
 // Model-private fixed-shape MTP data movement and round-state helpers.
 
-#include "qus/core/tensor.h"
-#include "qus/kernels/sampling.h"
+#include "ninfer/core/tensor.h"
+#include "ninfer/kernels/sampling.h"
 
 #include <cuda_runtime.h>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, Tensor& out,
                        cudaStream_t stream);
@@ -33,4 +33,4 @@ void mtp_reset_gdn_initial_slot(Tensor& gdn_initial_slot, cudaStream_t stream);
 void mtp_set_gdn_initial_slot_from_accepted(const Tensor& accepted, Tensor& gdn_initial_slot,
                                             cudaStream_t stream);
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

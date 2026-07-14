@@ -1,4 +1,4 @@
-#include "qus/kernels/gdn_gating_proj.h"
+#include "ninfer/kernels/gdn_gating_proj.h"
 
 #include "kernels/common/math.h"
 #include "kernels/linear/gemv/linear_dense_gdn_in_ab_48.cuh"
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 void require_dense_bf16(const Weight& w, const char* name) {
@@ -68,4 +68,4 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
         x, a_weight, b_weight, A_log, dt_bias, workspace.data, workspace.bytes(), g, beta, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

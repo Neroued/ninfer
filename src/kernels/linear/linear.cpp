@@ -1,5 +1,5 @@
-#include "qus/kernels/linear.h"
-#include "qus/kernels/linear_pair.h"
+#include "ninfer/kernels/linear.h"
+#include "ninfer/kernels/linear_pair.h"
 
 #include "kernels/common/math.h"
 #include "kernels/linear/plan/linear_plan.h"
@@ -12,14 +12,14 @@
 #include "kernels/linear/gemv/linear_rowsplit_gemv_out_6144.cuh"
 #include "kernels/linear/gemv/linear_rowsplit_gemv_proj_6144.cuh"
 #include "kernels/linear/reference/linear_generic.h"
-#include "qus/core/weight.h" // as_dense
+#include "ninfer/core/weight.h" // as_dense
 
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -410,4 +410,4 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     linear(x, second_weight, second_out, ws, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

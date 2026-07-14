@@ -14,7 +14,7 @@
 //   failures += verify("op n=...", from_device_bf16(dout, n), ref,
 //                      Tolerance::bf16_elementwise());
 
-#include "qus/core/tensor.h"   // qus::DType, qus::Tensor (for op call sites)
+#include "ninfer/core/tensor.h"   // ninfer::DType, ninfer::Tensor (for op call sites)
 #include "kernels/op_check.h"
 
 #include <cuda_runtime.h>
@@ -26,7 +26,7 @@
 #include <random>
 #include <vector>
 
-namespace qus::test {
+namespace ninfer::test {
 
 // --- environment ------------------------------------------------------------
 inline bool cuda_unavailable() {
@@ -151,4 +151,4 @@ inline int verify(const char* label, const std::vector<double>& got,
     return ok ? 0 : 1;
 }
 
-} // namespace qus::test
+} // namespace ninfer::test

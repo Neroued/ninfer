@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::model::detail {
+namespace ninfer::model::detail {
 namespace {
 
 constexpr int kMerge        = 2;
@@ -141,4 +141,4 @@ VisionControl build_vision_control(const ProcessedInput& input) {
     return out;
 }
 
-} // namespace qus::model::detail
+} // namespace ninfer::model::detail

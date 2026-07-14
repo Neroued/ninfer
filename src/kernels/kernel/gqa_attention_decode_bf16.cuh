@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - split-KV GQA small-T attention, BF16 KV-cache partial kernel.
+// ninfer::kernels - split-KV GQA small-T attention, BF16 KV-cache partial kernel.
 // Standalone from the int8 kernel (gqa_attention_decode_i8.cuh): shared scaffolding
 // lives in gqa_attention_decode.cuh, but the body/append/load are not shared so the
 // bf16 path can be tuned independently. Processes one KV head, one query-head
@@ -13,7 +13,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 template <int TokenTile, int WarpsPerCta>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
@@ -180,20 +180,20 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 const bool from_new = new_token >= 0 && new_token < tokens && key >= first_pos;
                 if (from_new) {
                     const std::int64_t off = gqa_kv_new_index(kv_head, d, new_token);
-                    qus::kernels::cp_async<16>(k_dst, &k_new[off]);
-                    qus::kernels::cp_async<16>(v_dst, &v_new[off]);
+                    ninfer::kernels::cp_async<16>(k_dst, &k_new[off]);
+                    ninfer::kernels::cp_async<16>(v_dst, &v_new[off]);
                 } else {
                     const std::int64_t off = gqa_cache_index(kv_head, d, key, padded_context);
-                    qus::kernels::cp_async<16>(k_dst, &cache_k[off]);
-                    qus::kernels::cp_async<16>(v_dst, &cache_v[off]);
+                    ninfer::kernels::cp_async<16>(k_dst, &cache_k[off]);
+                    ninfer::kernels::cp_async<16>(v_dst, &cache_v[off]);
                 }
             } else {
                 store_vec(k_dst, make_int4(0, 0, 0, 0));
                 store_vec(v_dst, make_int4(0, 0, 0, 0));
             }
         }
-        qus::kernels::cp_commit();
-        qus::kernels::cp_wait<0>();
+        ninfer::kernels::cp_commit();
+        ninfer::kernels::cp_wait<0>();
         __syncthreads();
 
         float score[QKNt][4];
@@ -374,4 +374,4 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

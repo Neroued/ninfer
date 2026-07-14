@@ -1,7 +1,7 @@
 // Correctness + coverage for residual_add, against the frozen op-test standard
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges, composite tolerance bf16_elementwise.
-#include "qus/kernels/residual_add.h"
+#include "ninfer/kernels/residual_add.h"
 #include "kernels/op_tester.h"
 
 #include <cstdint>
@@ -9,8 +9,8 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 // fp64 reference: x[i] = double(x[i]) + double(y[i]).
 static void cpu_residual_add(const std::vector<float>& y, const std::vector<float>& x,

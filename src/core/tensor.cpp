@@ -1,10 +1,10 @@
-#include "qus/core/tensor.h"
+#include "ninfer/core/tensor.h"
 
 #include <array>
 #include <limits>
 #include <stdexcept>
 
-namespace qus {
+namespace ninfer {
 namespace {
 
 std::int64_t checked_mul_i64(std::int64_t a, std::int64_t b) {
@@ -146,4 +146,4 @@ Tensor Tensor::permute(std::initializer_list<int> order) const {
     return out;
 }
 
-} // namespace qus
+} // namespace ninfer

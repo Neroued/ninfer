@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

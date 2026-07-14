@@ -1,6 +1,6 @@
-#include "qus/text/cli.h"
+#include "ninfer/text/cli.h"
 
-#include "qus/model/config.h"
+#include "ninfer/model/config.h"
 
 #include <exception>
 #include <iostream>
@@ -17,12 +17,12 @@ int fail(const char* message) {
 
 int check(bool condition, const char* message) { return condition ? 0 : fail(message); }
 
-qus::text::CliOptions parse(std::vector<const char*> args) {
-    return qus::text::parse_cli(static_cast<int>(args.size()), const_cast<char**>(args.data()));
+ninfer::text::CliOptions parse(std::vector<const char*> args) {
+    return ninfer::text::parse_cli(static_cast<int>(args.size()), const_cast<char**>(args.data()));
 }
 
 int test_prompt_mode_defaults() {
-    const qus::text::CliOptions options = parse({"qwen-text", "weights.qus", "--prompt", "hello"});
+    const ninfer::text::CliOptions options = parse({"qwen-text", "weights.qus", "--prompt", "hello"});
 
     int failures = 0;
     failures += check(!options.help_requested, "prompt mode: help requested");
@@ -31,12 +31,12 @@ int test_prompt_mode_defaults() {
     failures += check(options.messages_path.empty(), "prompt mode: messages path not empty");
     failures += check(options.max_new == 128, "prompt mode: max-new default mismatch");
     failures += check(options.max_context == 2048, "prompt mode: max-context default mismatch");
-    failures += check(options.prefill_chunk == qus::model::kDefaultPrefillChunk,
+    failures += check(options.prefill_chunk == ninfer::model::kDefaultPrefillChunk,
                       "prompt mode: prefill-chunk default mismatch");
     failures += check(options.device == 0, "prompt mode: device default mismatch");
     failures +=
-        check(options.kv_dtype == qus::DType::BF16, "prompt mode: kv dtype default mismatch");
-    failures += check(options.output_mode == qus::text::OutputMode::Clean,
+        check(options.kv_dtype == ninfer::DType::BF16, "prompt mode: kv dtype default mismatch");
+    failures += check(options.output_mode == ninfer::text::OutputMode::Clean,
                       "prompt mode: output mode default mismatch");
     failures += check(!options.print_token_ids, "prompt mode: print-token-ids default mismatch");
     failures += check(options.stop_token_ids.empty(), "prompt mode: stop token ids not empty");
@@ -44,7 +44,7 @@ int test_prompt_mode_defaults() {
 }
 
 int test_messages_mode_options() {
-    const qus::text::CliOptions options = parse({"qwen-text",          "weights.qus",
+    const ninfer::text::CliOptions options = parse({"qwen-text",          "weights.qus",
                                                  "--messages",         "messages.json",
                                                  "--max-new",          "16",
                                                  "--max-context",      "4096",
@@ -65,9 +65,9 @@ int test_messages_mode_options() {
     failures += check(options.max_context == 4096, "messages mode: max-context mismatch");
     failures += check(options.prefill_chunk == 128, "messages mode: prefill-chunk mismatch");
     failures += check(options.device == 1, "messages mode: device mismatch");
-    failures += check(options.kv_dtype == qus::DType::I8, "messages mode: kv dtype mismatch");
+    failures += check(options.kv_dtype == ninfer::DType::I8, "messages mode: kv dtype mismatch");
     failures += check(options.mtp_draft_tokens == 5, "messages mode: mtp draft tokens mismatch");
-    failures += check(options.output_mode == qus::text::OutputMode::Raw,
+    failures += check(options.output_mode == ninfer::text::OutputMode::Raw,
                       "messages mode: output mode mismatch");
     failures += check(options.print_token_ids, "messages mode: print-token-ids mismatch");
     failures +=
@@ -82,7 +82,7 @@ int test_messages_mode_options() {
 }
 
 int test_usage_documents_streaming_output_boundary() {
-    const std::string usage = qus::text::usage_text("qus");
+    const std::string usage = ninfer::text::usage_text("ninfer");
 
     int failures = 0;
     failures += check(usage.find("streams decoded text to stdout") != std::string::npos,

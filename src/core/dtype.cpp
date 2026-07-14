@@ -1,8 +1,8 @@
-#include "qus/core/dtype.h"
+#include "ninfer/core/dtype.h"
 
 #include <stdexcept>
 
-namespace qus {
+namespace ninfer {
 
 std::size_t dtype_size(DType dtype) {
     switch (dtype) {
@@ -24,4 +24,4 @@ std::size_t dtype_size(DType dtype) {
     throw std::invalid_argument("invalid DType");
 }
 
-} // namespace qus
+} // namespace ninfer

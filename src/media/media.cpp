@@ -35,7 +35,7 @@ extern "C" {
 #include <utility>
 #include <vector>
 
-namespace qus::media::internal {
+namespace ninfer::media::internal {
 namespace {
 
 std::string av_error(int code) {
@@ -225,7 +225,7 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
                          static_cast<curl_off_t>(policy.max_bytes));
         curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write);
         curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &buffer);
-        curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "qus/vision");
+        curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "ninfer/vision");
         const CURLcode code = curl_easy_perform(curl.get());
         if (code != CURLE_OK) {
             if (code == CURLE_OPERATION_TIMEDOUT) {
@@ -767,4 +767,4 @@ Video decode_video(const Source& source, const Policy& policy, double target_fps
     return out;
 }
 
-} // namespace qus::media::internal
+} // namespace ninfer::media::internal

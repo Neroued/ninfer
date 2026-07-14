@@ -1,7 +1,7 @@
 // Correctness + coverage for argmax, against the frozen op-test standard
 // (docs/kernel-development.md): exact i32 index match from bf16-rounded
 // logits, with lowest-index tie-break and no tolerance preset.
-#include "qus/kernels/argmax.h"
+#include "ninfer/kernels/argmax.h"
 #include "kernels/op_tester.h"
 
 #include <cstdint>
@@ -10,8 +10,8 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 static void cpu_argmax(const std::vector<float>& logits, int vocab, int t_count,
                        std::vector<int>& out) {

@@ -1,4 +1,4 @@
-#include "qus/kernels/add_bias.h"
+#include "ninfer/kernels/add_bias.h"
 
 #include "kernels/launcher/add_bias.h"
 
@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t checked_numel(const Tensor& t) {
@@ -43,4 +43,4 @@ void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
     detail::add_bias_launch(bias, x, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

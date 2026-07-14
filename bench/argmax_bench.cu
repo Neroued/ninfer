@@ -1,17 +1,17 @@
 // Performance bench for argmax over the real Qwen3.6 vocabulary decode shape.
 // The printed GB/s is informational only; the gate is ncu sustained DRAM %
 // (see docs/kernel-development.md §8).
-//   ./qus_argmax_bench [--decode]   (default: decode)
-#include "qus/kernels/argmax.h"
-#include "qus/core/device.h"
-#include "qus_bench_common.h"
+//   ./ninfer_argmax_bench [--decode]   (default: decode)
+#include "ninfer/kernels/argmax.h"
+#include "ninfer/core/device.h"
+#include "ninfer_bench_common.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 namespace {
 

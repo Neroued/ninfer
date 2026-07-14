@@ -1,10 +1,10 @@
-#include "qus/serve/translate.h"
+#include "ninfer/serve/translate.h"
 
-#include "qus/serve/openai_schema.h"
+#include "ninfer/serve/openai_schema.h"
 
 #include <random>
 
-namespace qus::serve {
+namespace ninfer::serve {
 namespace {
 
 // A fresh 64-bit seed for requests that omit `seed` and where the operator did
@@ -18,9 +18,9 @@ std::uint64_t random_seed() {
 // fields fall back to the Qwen3 thinking defaults the server was configured with.
 // --greedy forces exact argmax (temperature 0) regardless of the request. The
 // engine fills token_counts for the penalty path itself, so it stays null here.
-qus::kernels::SamplingConfig resolve_sampling(const SamplingParams& req,
+ninfer::kernels::SamplingConfig resolve_sampling(const SamplingParams& req,
                                               const ServeOptions& server) {
-    qus::kernels::SamplingConfig cfg; // default is greedy (temperature 0)
+    ninfer::kernels::SamplingConfig cfg; // default is greedy (temperature 0)
     if (server.greedy) { return cfg; }
     cfg.temperature = static_cast<float>(req.temperature.value_or(server.sampling_temperature));
     cfg.top_p       = static_cast<float>(req.top_p.value_or(server.sampling_top_p));
@@ -59,8 +59,8 @@ std::vector<std::string> effective_tool_jsons(const GenerationRequest& req) {
 
 } // namespace
 
-std::vector<qus::text::ChatMessage> to_chat_messages(const GenerationRequest& req) {
-    std::vector<qus::text::ChatMessage> out;
+std::vector<ninfer::text::ChatMessage> to_chat_messages(const GenerationRequest& req) {
+    std::vector<ninfer::text::ChatMessage> out;
     out.reserve(req.messages.size());
     for (const ChatTurn& turn : req.messages) {
         // OpenAI's newer schema uses `developer` for instruction messages; the Qwen
@@ -73,18 +73,18 @@ std::vector<qus::text::ChatMessage> to_chat_messages(const GenerationRequest& re
             error.code    = "unsupported_role";
             throw ApiException(std::move(error));
         }
-        std::vector<qus::text::ChatPart> parts;
+        std::vector<ninfer::text::ChatPart> parts;
         for (const ContentPart& part : turn.content) {
             if (part.kind == ContentKind::Text) {
                 if (!parts.empty() && !part.text.empty() &&
-                    parts.back().kind == qus::text::ChatPartKind::Text) {
-                    parts.push_back(qus::text::ChatPart::text_part("\n"));
+                    parts.back().kind == ninfer::text::ChatPartKind::Text) {
+                    parts.push_back(ninfer::text::ChatPart::text_part("\n"));
                 }
-                parts.push_back(qus::text::ChatPart::text_part(part.text));
+                parts.push_back(ninfer::text::ChatPart::text_part(part.text));
             } else if (part.kind == ContentKind::Image) {
-                parts.push_back(qus::text::ChatPart::image(part.source));
+                parts.push_back(ninfer::text::ChatPart::image(part.source));
             } else if (part.kind == ContentKind::Video) {
-                parts.push_back(qus::text::ChatPart::video(part.source));
+                parts.push_back(ninfer::text::ChatPart::video(part.source));
             } else {
                 ApiError error;
                 error.message = "content type '" + part.type_raw + "' is not supported";
@@ -93,7 +93,7 @@ std::vector<qus::text::ChatMessage> to_chat_messages(const GenerationRequest& re
                 throw ApiException(std::move(error));
             }
         }
-        qus::text::ChatMessage message;
+        ninfer::text::ChatMessage message;
         message.role              = std::move(role);
         message.parts             = std::move(parts);
         message.reasoning_content = turn.reasoning_content;
@@ -101,16 +101,16 @@ std::vector<qus::text::ChatMessage> to_chat_messages(const GenerationRequest& re
         message.tool_calls.reserve(turn.tool_calls.size());
         for (const ToolCall& call : turn.tool_calls) {
             message.tool_calls.push_back(
-                qus::text::ToolCall{call.id, call.name, call.arguments_json});
+                ninfer::text::ToolCall{call.id, call.name, call.arguments_json});
         }
         out.push_back(std::move(message));
     }
     return out;
 }
 
-qus::text::TextGenerationOptions to_generation_options(const GenerationRequest& req,
+ninfer::text::TextGenerationOptions to_generation_options(const GenerationRequest& req,
                                                        const ServeOptions& server) {
-    qus::text::TextGenerationOptions options;
+    ninfer::text::TextGenerationOptions options;
     options.max_new_tokens                 = req.max_tokens;
     options.raw_output                     = false;
     options.enable_thinking                = req.enable_thinking.value_or(server.enable_thinking);
@@ -122,15 +122,15 @@ qus::text::TextGenerationOptions to_generation_options(const GenerationRequest& 
     return options;
 }
 
-const char* finish_reason_wire(qus::text::FinishReason reason) {
+const char* finish_reason_wire(ninfer::text::FinishReason reason) {
     switch (reason) {
-    case qus::text::FinishReason::Length:
+    case ninfer::text::FinishReason::Length:
         return "length";
-    case qus::text::FinishReason::Stop:
-    case qus::text::FinishReason::Cancelled:
+    case ninfer::text::FinishReason::Stop:
+    case ninfer::text::FinishReason::Cancelled:
     default:
         return "stop";
     }
 }
 
-} // namespace qus::serve
+} // namespace ninfer::serve

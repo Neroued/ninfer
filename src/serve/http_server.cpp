@@ -1,9 +1,9 @@
-#include "qus/serve/http_server.h"
+#include "ninfer/serve/http_server.h"
 
-#include "qus/serve/anthropic_schema.h"
-#include "qus/serve/openai_schema.h"
-#include "qus/serve/request_log.h"
-#include "qus/serve/translate.h"
+#include "ninfer/serve/anthropic_schema.h"
+#include "ninfer/serve/openai_schema.h"
+#include "ninfer/serve/request_log.h"
+#include "ninfer/serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
@@ -19,7 +19,7 @@
 #include <thread>
 #include <utility>
 
-namespace qus::serve {
+namespace ninfer::serve {
 namespace {
 
 // Unbounded, non-blocking-producer SSE event queue. The producer (generation
@@ -112,7 +112,7 @@ HttpServer::HttpServer(GenerationService& service, ServeOptions options)
 
 void HttpServer::log_line(const std::string& line) {
     std::lock_guard<std::mutex> lock(log_mutex_);
-    std::cerr << "qus-serve: " << line << '\n';
+    std::cerr << "ninfer-serve: " << line << '\n';
 }
 
 void HttpServer::register_routes() {
@@ -616,4 +616,4 @@ bool HttpServer::listen() { return server_.listen(options_.host, options_.port);
 
 void HttpServer::stop() { server_.stop(); }
 
-} // namespace qus::serve
+} // namespace ninfer::serve

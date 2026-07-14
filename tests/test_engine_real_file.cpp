@@ -1,4 +1,4 @@
-#include "qus/runtime/engine.h"
+#include "ninfer/runtime/engine.h"
 
 #include <cuda_runtime.h>
 
@@ -44,7 +44,7 @@ bool enough_free_memory(std::size_t bytes) {
     return true;
 }
 
-void print_stats(const char* label, const qus::EngineMemoryStats& stats) {
+void print_stats(const char* label, const ninfer::EngineMemoryStats& stats) {
     std::cout << "ENGINE_REAL " << label << " loaded_payload=" << stats.q5090_loaded_payload_bytes
               << " weight_capacity=" << stats.weights.capacity_bytes
               << " weight_used=" << stats.weights.used_bytes
@@ -52,22 +52,22 @@ void print_stats(const char* label, const qus::EngineMemoryStats& stats) {
               << " quant_count=" << stats.q5090_quant_count << '\n';
 }
 
-qus::EngineMemoryStats load_real_engine(const std::filesystem::path& weights_path,
+ninfer::EngineMemoryStats load_real_engine(const std::filesystem::path& weights_path,
                                         int mtp_draft_tokens) {
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.device           = 0;
     options.max_ctx          = 128;
     options.work_bytes       = 64ULL * kMiB;
     options.mtp_draft_tokens = mtp_draft_tokens;
 
-    qus::Engine engine(options);
+    ninfer::Engine engine(options);
     engine.load(weights_path.string());
-    const qus::EngineMemoryStats stats = engine.memory_stats();
+    const ninfer::EngineMemoryStats stats = engine.memory_stats();
     cudaDeviceSynchronize();
     return stats;
 }
 
-int expect_stats(const qus::EngineMemoryStats& stats, std::size_t expected_loaded_payload,
+int expect_stats(const ninfer::EngineMemoryStats& stats, std::size_t expected_loaded_payload,
                  std::size_t expected_weight_capacity, const char* label) {
     int failures = 0;
     failures += stats.loaded ? 0 : fail(std::string(label) + " did not report loaded");
@@ -93,14 +93,14 @@ int expect_stats(const qus::EngineMemoryStats& stats, std::size_t expected_loade
 int expect_k5_8192_memory_budget(const std::filesystem::path& weights_path) {
     if (!enough_free_memory(24ULL * kGiB)) { return 0; }
 
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.device           = 0;
     options.max_ctx          = 8192;
     options.mtp_draft_tokens = 5;
 
-    qus::Engine engine(options);
+    ninfer::Engine engine(options);
     engine.load(weights_path.string());
-    const qus::EngineMemoryStats stats = engine.memory_stats();
+    const ninfer::EngineMemoryStats stats = engine.memory_stats();
     cudaDeviceSynchronize();
 
     const std::size_t total_capacity =
@@ -129,7 +129,7 @@ int expect_k5_8192_memory_budget(const std::filesystem::path& weights_path) {
 
 struct GenerateRun {
     std::vector<int> tokens;
-    qus::EngineMtpStats mtp;
+    ninfer::EngineMtpStats mtp;
 };
 
 GenerateRun generate_real_run(const std::filesystem::path& weights_path, int mtp_draft_tokens,
@@ -137,7 +137,7 @@ GenerateRun generate_real_run(const std::filesystem::path& weights_path, int mtp
                               std::vector<int> stop_token_ids = {},
                               std::vector<int> prompt         = std::vector<int>{1},
                               bool use_lm_head_draft          = false) {
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.device            = 0;
     options.max_ctx           = max_ctx;
     options.mtp_draft_tokens  = mtp_draft_tokens;
@@ -145,7 +145,7 @@ GenerateRun generate_real_run(const std::filesystem::path& weights_path, int mtp
     options.stop_token_ids    = std::move(stop_token_ids);
     options.use_lm_head_draft = use_lm_head_draft;
 
-    qus::Engine engine(options);
+    ninfer::Engine engine(options);
     engine.load(weights_path.string());
     GenerateRun out;
     out.tokens = engine.generate(prompt, max_new_tokens);
@@ -160,14 +160,14 @@ int expect_lm_head_draft_parity(const std::filesystem::path& weights_path) {
     failures += draft.tokens == full.tokens ? 0 : fail("LM_HEAD_DRAFT changed verified output");
     failures += draft.mtp.rounds > 0 ? 0 : fail("LM_HEAD_DRAFT parity did not run MTP rounds");
 
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.device            = 0;
     options.max_ctx           = 32;
     options.mtp_draft_tokens  = 3;
     options.use_lm_head_draft = true;
-    qus::Engine engine(options);
+    ninfer::Engine engine(options);
     engine.load(weights_path.string());
-    const qus::EngineMemoryStats stats = engine.memory_stats();
+    const ninfer::EngineMemoryStats stats = engine.memory_stats();
     failures += stats.q5090_loaded_payload_bytes == kTextPayloadBytes + kMtpPayloadBytes +
                                                         kDraftPayloadBytes + kVisionPayloadBytes
                     ? 0
@@ -177,11 +177,11 @@ int expect_lm_head_draft_parity(const std::filesystem::path& weights_path) {
         failures += fail("Engine accepted a negative prompt token id");
     } catch (const std::invalid_argument&) {}
     try {
-        (void)engine.prefill(std::vector<int>{qus::model::kCfg.vocab});
+        (void)engine.prefill(std::vector<int>{ninfer::model::kCfg.vocab});
         failures += fail("Engine accepted a prompt token id at vocab_size");
     } catch (const std::invalid_argument&) {}
     try {
-        engine.set_stop_token_ids({qus::model::kCfg.vocab});
+        engine.set_stop_token_ids({ninfer::model::kCfg.vocab});
         failures += fail("Engine accepted a stop token id at vocab_size");
     } catch (const std::invalid_argument&) {}
     return failures;
@@ -205,7 +205,7 @@ int expect_mtp_rounds_across_k(const std::filesystem::path& weights_path) {
     int failures          = 0;
     constexpr int kMaxNew = 3;
 
-    for (int k = 1; k <= qus::model::kMaxMtpDraftTokens; ++k) {
+    for (int k = 1; k <= ninfer::model::kMaxMtpDraftTokens; ++k) {
         const GenerateRun batched = generate_real_run(weights_path, k, kMaxNew);
         failures += batched.tokens.size() == static_cast<std::size_t>(kMaxNew)
                         ? 0
@@ -267,20 +267,20 @@ int expect_near_full_prefill_uses_decode_fallback(const std::filesystem::path& w
 }
 
 int expect_generate_discards_pending_overshoot(const std::filesystem::path& weights_path) {
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.device           = 0;
     options.max_ctx          = 128;
     options.mtp_draft_tokens = 5;
     options.use_cuda_graph   = false;
 
-    qus::Engine engine(options);
+    ninfer::Engine engine(options);
     engine.load(weights_path.string());
     const std::vector<int> generated = engine.generate(foundation_prompt_ids(), 2);
     if (generated.size() != 2) { return fail("MTP generate did not truncate to max_new=2"); }
 
-    const qus::EngineMtpStats after_generate = engine.mtp_stats();
+    const ninfer::EngineMtpStats after_generate = engine.mtp_stats();
     (void)engine.decode_step();
-    const qus::EngineMtpStats after_next_step = engine.mtp_stats();
+    const ninfer::EngineMtpStats after_next_step = engine.mtp_stats();
 
     return after_next_step.rounds > after_generate.rounds ||
                    after_next_step.fallback_steps > after_generate.fallback_steps
@@ -291,7 +291,7 @@ int expect_generate_discards_pending_overshoot(const std::filesystem::path& weig
 } // namespace
 
 int main() {
-    const std::filesystem::path root(QUS_SOURCE_DIR);
+    const std::filesystem::path root(NINFER_SOURCE_DIR);
     const std::filesystem::path weights_path = root / "out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus";
     if (!std::filesystem::exists(weights_path)) {
         std::cout << "SKIP: real q5090 file not present\n";
@@ -315,13 +315,13 @@ int main() {
 
     int failures = 0;
     {
-        const qus::EngineMemoryStats stats = load_real_engine(weights_path, 0);
+        const ninfer::EngineMemoryStats stats = load_real_engine(weights_path, 0);
         print_stats("mtp=0", stats);
         failures += expect_stats(stats, kTextPayloadBytes + kVisionPayloadBytes,
                                  kTextPayloadBytes + kVisionPayloadBytes, "mtp=0");
     }
     {
-        const qus::EngineMemoryStats stats = load_real_engine(weights_path, 1);
+        const ninfer::EngineMemoryStats stats = load_real_engine(weights_path, 1);
         print_stats("mtp=1", stats);
         failures +=
             expect_stats(stats, kTextPayloadBytes + kMtpPayloadBytes + kVisionPayloadBytes,

@@ -1,17 +1,17 @@
 // Performance bench for linear at real Qwen3.6 shapes. Dense in_a/in_b use
 // [48,5120]; low-bit decode uses real Qwen3.6 GEMV shapes. The printed GB/s is
 // informational only; ncu is the performance evidence.
-//   ./qus_linear_bench [--decode] [--prefill] [--bf16] [--fp32] [--q4] [--q5] [--q6] [--stress]
-#include "qus/kernels/linear.h"
-#include "qus_bench_common.h"
+//   ./ninfer_linear_bench [--decode] [--prefill] [--bf16] [--fp32] [--q4] [--q5] [--q6] [--stress]
+#include "ninfer/kernels/linear.h"
+#include "ninfer_bench_common.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 namespace {
 

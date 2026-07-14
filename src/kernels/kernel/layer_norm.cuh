@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 struct LayerNormMoments {
     float mean;
@@ -180,4 +180,4 @@ __global__ void layer_norm_kernel(const __nv_bfloat16* x, const __nv_bfloat16* w
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

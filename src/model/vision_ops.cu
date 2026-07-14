@@ -1,7 +1,7 @@
 #include "model/vision_ops.h"
 
 #include "kernels/common/math.h"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cuda_bf16.h>
 
@@ -10,7 +10,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace qus::model::detail {
+namespace ninfer::model::detail {
 namespace {
 
 __global__ void vision_f32_to_bf16_kernel(const float* src, __nv_bfloat16* dst, std::int64_t n) {
@@ -43,4 +43,4 @@ void vision_f32_to_bf16(const Tensor& src, Tensor& dst, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::model::detail
+} // namespace ninfer::model::detail

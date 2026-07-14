@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - causal_conv1d kernel: depthwise causal k=4 with fused SiLU.
+// ninfer::kernels - causal_conv1d kernel: depthwise causal k=4 with fused SiLU.
 // SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation.
 
 #include "kernels/common/math.cuh"
@@ -10,7 +10,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 __device__ __forceinline__ void causal_conv1d_acc_pair(__nv_bfloat162 w, __nv_bfloat162 x,
                                                        float& acc0, float& acc1) {
@@ -193,4 +193,4 @@ __global__ void causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x,
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

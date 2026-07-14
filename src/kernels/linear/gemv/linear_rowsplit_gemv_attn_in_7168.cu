@@ -4,7 +4,7 @@
 #include "kernels/common/memory.cuh"
 #include "kernels/common/warp.cuh"
 #include "kernels/linear/gemv/linear_rowsplit_gemv_q5_core.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 constexpr int kN              = 7168;
@@ -144,4 +144,4 @@ void linear_rowsplit_gemv_attn_in_7168_q5_launch(const Tensor& x, const Weight& 
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

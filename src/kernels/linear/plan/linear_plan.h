@@ -1,11 +1,11 @@
 #pragma once
 
-#include "qus/core/tensor.h"   // QType, QuantLayout, Weight
+#include "ninfer/core/tensor.h"   // QType, QuantLayout, Weight
 
 #include <cstdint>
 #include <string>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 enum class LinearFormat {
     Q4G64_RowSplit,
@@ -82,4 +82,4 @@ const char* regime_name(LinearRegime r);
 const char* policy_name(LinearPolicyId p);
 std::string plan_id_string(LinearPlanKey key, const LinearPlan& plan);
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

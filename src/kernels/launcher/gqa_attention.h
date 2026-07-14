@@ -1,15 +1,15 @@
 #pragma once
 
-// qus::kernels::detail - private launch prototypes for gqa_attention policies.
+// ninfer::kernels::detail - private launch prototypes for gqa_attention policies.
 
-#include "qus/core/kv_cache.h"
-#include "qus/core/tensor.h"
+#include "ninfer/core/kv_cache.h"
+#include "ninfer/core/tensor.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 // Four KV heads × 85 splits = 340 CTAs, matching two CTA slots per SM on RTX 5090.
 inline constexpr int kGqaDecodeSplits = 85;
@@ -37,4 +37,4 @@ void gqa_attention_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                           Tensor* partial_acc, Tensor* partial_m, Tensor* partial_l, Tensor& out,
                           cudaStream_t stream);
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

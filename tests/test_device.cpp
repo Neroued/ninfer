@@ -1,4 +1,4 @@
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cuda_runtime.h>
 
@@ -19,13 +19,13 @@ bool cuda_unavailable(cudaError_t err) {
 
 int expect_throws_device(int device_id) {
     try {
-        qus::DeviceContext invalid(device_id);
+        ninfer::DeviceContext invalid(device_id);
     } catch (const std::runtime_error&) { return 0; }
     std::cerr << "DeviceContext(" << device_id << ") did not throw\n";
     return 1;
 }
 
-int check_context(const qus::DeviceContext& ctx, const char* label) {
+int check_context(const ninfer::DeviceContext& ctx, const char* label) {
     int failures = 0;
     if (ctx.stream == nullptr) {
         std::cerr << label << " compute stream is null\n";
@@ -66,7 +66,7 @@ int main() {
 
     int failures = 0;
 
-    qus::DeviceContext ctx(0);
+    ninfer::DeviceContext ctx(0);
     if (ctx.device != 0) {
         ++failures;
         std::cerr << "ctx.device expected 0, got " << ctx.device << '\n';
@@ -76,7 +76,7 @@ int main() {
     ctx.synchronize();
 
     const cudaStream_t original_stream = ctx.stream;
-    qus::DeviceContext moved(std::move(ctx));
+    ninfer::DeviceContext moved(std::move(ctx));
     if (ctx.stream != nullptr || ctx.load_stream != nullptr) {
         ++failures;
         std::cerr << "move construction did not null source streams\n";
@@ -87,7 +87,7 @@ int main() {
     }
     failures += check_context(moved, "moved");
 
-    qus::DeviceContext assigned(0);
+    ninfer::DeviceContext assigned(0);
     assigned = std::move(moved);
     if (moved.stream != nullptr || moved.load_stream != nullptr) {
         ++failures;
@@ -105,7 +105,7 @@ int main() {
     failures += expect_throws_device(-1);
     failures += expect_throws_device(count);
 
-    qus::CudaEventTimer timer(assigned);
+    ninfer::CudaEventTimer timer(assigned);
     timer.start();
     assigned.synchronize();
     const float elapsed_ms = timer.stop_ms();
@@ -114,8 +114,8 @@ int main() {
         std::cerr << "timer elapsed time was negative\n";
     }
 
-    qus::CudaEventTimer timer_a(assigned);
-    qus::CudaEventTimer timer_b(assigned);
+    ninfer::CudaEventTimer timer_a(assigned);
+    ninfer::CudaEventTimer timer_b(assigned);
     timer_b = std::move(timer_a);
     timer_b.start();
     assigned.synchronize();
@@ -127,7 +127,7 @@ int main() {
 
     if (count > 1) {
         CUDA_CHECK(cudaSetDevice(1));
-        qus::CudaEventTimer drift_timer(assigned);
+        ninfer::CudaEventTimer drift_timer(assigned);
         drift_timer.start();
         assigned.synchronize();
         const float drift_elapsed_ms = drift_timer.stop_ms();

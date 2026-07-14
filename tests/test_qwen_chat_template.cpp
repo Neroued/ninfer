@@ -1,4 +1,4 @@
-#include "qus/text/chat_template.h"
+#include "ninfer/text/chat_template.h"
 
 #include <nlohmann/json.hpp>
 
@@ -15,8 +15,8 @@
 namespace {
 
 std::filesystem::path repo_file(std::string_view relative) {
-#ifdef QUS_SOURCE_DIR
-    return std::filesystem::path(QUS_SOURCE_DIR) / relative;
+#ifdef NINFER_SOURCE_DIR
+    return std::filesystem::path(NINFER_SOURCE_DIR) / relative;
 #else
     return std::filesystem::current_path() / relative;
 #endif
@@ -29,10 +29,10 @@ int fail(const char* message) {
 
 int check(bool condition, const char* message) { return condition ? 0 : fail(message); }
 
-qus::text::ChatMessage text_message(std::string role, std::string text) {
-    qus::text::ChatMessage message;
+ninfer::text::ChatMessage text_message(std::string role, std::string text) {
+    ninfer::text::ChatMessage message;
     message.role = std::move(role);
-    message.parts.push_back(qus::text::ChatPart::text_part(std::move(text)));
+    message.parts.push_back(ninfer::text::ChatPart::text_part(std::move(text)));
     return message;
 }
 
@@ -54,7 +54,7 @@ struct TempDir {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
         for (int i = 0; i < 16; ++i) {
             path = std::filesystem::temp_directory_path() /
-                   ("qus_chat_template_" + std::to_string(stamp) + "_" + std::to_string(i));
+                   ("ninfer_chat_template_" + std::to_string(stamp) + "_" + std::to_string(i));
             if (std::filesystem::create_directory(path)) { return; }
         }
         throw std::runtime_error("failed to create unique chat template temp directory");
@@ -81,17 +81,17 @@ struct TempJson {
 
 int test_prompt_renders_qwen_chat() {
     // Default is thinking-ON, matching the Qwen3.6 template's default prompt.
-    const std::vector<qus::text::ChatMessage> messages = qus::text::messages_from_prompt("你好");
-    const std::string rendered                         = qus::text::render_qwen_chat(messages);
+    const std::vector<ninfer::text::ChatMessage> messages = ninfer::text::messages_from_prompt("你好");
+    const std::string rendered                         = ninfer::text::render_qwen_chat(messages);
     return check(rendered == "<|im_start|>user\n你好<|im_end|>\n"
                              "<|im_start|>assistant\n<think>\n",
                  "prompt render mismatch");
 }
 
 int test_prompt_renders_no_thinking_prefix() {
-    const std::vector<qus::text::ChatMessage> messages = qus::text::messages_from_prompt("你好");
-    const std::string rendered                         = qus::text::render_qwen_chat(
-        messages, qus::text::ChatRenderOptions{.enable_thinking = false});
+    const std::vector<ninfer::text::ChatMessage> messages = ninfer::text::messages_from_prompt("你好");
+    const std::string rendered                         = ninfer::text::render_qwen_chat(
+        messages, ninfer::text::ChatRenderOptions{.enable_thinking = false});
     return check(rendered == "<|im_start|>user\n你好<|im_end|>\n"
                              "<|im_start|>assistant\n<think>\n\n</think>\n\n",
                  "no-thinking prompt render mismatch");
@@ -101,8 +101,8 @@ int test_json_messages_render_prefixes() {
     const TempJson json(
         "messages.json",
         R"([{"role":"system","content":"be direct"},{"role":"user","content":"hi"}])");
-    const std::vector<qus::text::ChatMessage> messages = qus::text::read_messages_json(json.path);
-    const std::string rendered                         = qus::text::render_qwen_chat(messages);
+    const std::vector<ninfer::text::ChatMessage> messages = ninfer::text::read_messages_json(json.path);
+    const std::string rendered                         = ninfer::text::render_qwen_chat(messages);
 
     int failures = 0;
     failures += check(rendered.find("<|im_start|>system\nbe direct<|im_end|>\n") == 0,
@@ -115,14 +115,14 @@ int test_json_messages_render_prefixes() {
 }
 
 int test_tool_system_block_merges_system_content() {
-    std::vector<qus::text::ChatMessage> messages;
+    std::vector<ninfer::text::ChatMessage> messages;
     messages.push_back(text_message("system", "be direct"));
     messages.push_back(text_message("user", "weather?"));
 
-    qus::text::ChatRenderOptions options;
+    ninfer::text::ChatRenderOptions options;
     options.tool_jsons.push_back(
         R"({"function":{"description":"Fetch weather","name":"get_weather","parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false},"type":"function"})");
-    const std::string rendered = qus::text::render_qwen_chat(messages, options);
+    const std::string rendered = ninfer::text::render_qwen_chat(messages, options);
 
     int failures = 0;
     failures +=
@@ -142,15 +142,15 @@ int test_tool_system_block_merges_system_content() {
 }
 
 int test_assistant_tool_call_history_renders_qwen_xml() {
-    std::vector<qus::text::ChatMessage> messages;
+    std::vector<ninfer::text::ChatMessage> messages;
     messages.push_back(text_message("user", "weather?"));
-    qus::text::ChatMessage assistant;
+    ninfer::text::ChatMessage assistant;
     assistant.role = "assistant";
     assistant.tool_calls.push_back(
-        qus::text::ToolCall{"call_1", "get_weather", R"({"city":"Paris","days":2})"});
+        ninfer::text::ToolCall{"call_1", "get_weather", R"({"city":"Paris","days":2})"});
     messages.push_back(std::move(assistant));
 
-    const std::string rendered = qus::text::render_qwen_chat(messages);
+    const std::string rendered = ninfer::text::render_qwen_chat(messages);
     int failures               = 0;
     // The tool-call turn is after the last user query, so the (empty) think block
     // is kept ahead of the <tool_call> XML, matching the official template.
@@ -167,20 +167,20 @@ int test_assistant_tool_call_history_renders_qwen_xml() {
 }
 
 int test_tool_role_renders_tool_response() {
-    std::vector<qus::text::ChatMessage> messages;
+    std::vector<ninfer::text::ChatMessage> messages;
     messages.push_back(text_message("user", "weather?"));
-    qus::text::ChatMessage assistant;
+    ninfer::text::ChatMessage assistant;
     assistant.role = "assistant";
     assistant.tool_calls.push_back(
-        qus::text::ToolCall{"call_1", "get_weather", R"({"city":"Paris"})"});
+        ninfer::text::ToolCall{"call_1", "get_weather", R"({"city":"Paris"})"});
     messages.push_back(std::move(assistant));
-    qus::text::ChatMessage tool;
+    ninfer::text::ChatMessage tool;
     tool.role         = "tool";
     tool.tool_call_id = "call_1";
-    tool.parts.push_back(qus::text::ChatPart::text_part(R"({"temp":20})"));
+    tool.parts.push_back(ninfer::text::ChatPart::text_part(R"({"temp":20})"));
     messages.push_back(std::move(tool));
 
-    const std::string rendered = qus::text::render_qwen_chat(messages);
+    const std::string rendered = ninfer::text::render_qwen_chat(messages);
     return check(rendered.find("<|im_start|>user\n<tool_response>\n"
                                R"({"temp":20})"
                                "\n</tool_response><|im_end|>\n") != std::string::npos,
@@ -190,26 +190,26 @@ int test_tool_role_renders_tool_response() {
 int test_rejections() {
     int failures = 0;
     failures +=
-        expect_invalid([]() { (void)qus::text::render_qwen_chat({}); }, "empty render messages");
+        expect_invalid([]() { (void)ninfer::text::render_qwen_chat({}); }, "empty render messages");
     {
         const TempJson json(
-            "qus_chat_multimodal.json",
+            "ninfer_chat_multimodal.json",
             R"({"messages":[{"role":"user","content":[{"type":"image","image":"test.png"},{"type":"text","text":"hi"},{"type":"video","video":"test.mp4"}]}]})");
-        const auto messages = qus::text::read_messages_json(json.path);
+        const auto messages = ninfer::text::read_messages_json(json.path);
         failures += check(messages.size() == 1 && messages[0].parts.size() == 3 &&
-                              messages[0].parts[0].kind == qus::text::ChatPartKind::Image &&
-                              messages[0].parts[2].kind == qus::text::ChatPartKind::Video,
+                              messages[0].parts[0].kind == ninfer::text::ChatPartKind::Image &&
+                              messages[0].parts[2].kind == ninfer::text::ChatPartKind::Video,
                           "structured multimodal content parse mismatch");
-        failures += check(qus::text::render_qwen_chat(messages).find(
+        failures += check(ninfer::text::render_qwen_chat(messages).find(
                               "<|vision_start|><|image_pad|><|vision_end|>hi"
                               "<|vision_start|><|video_pad|><|vision_end|>") != std::string::npos,
                           "structured multimodal content render mismatch");
     }
     failures += expect_invalid(
         []() {
-            const TempJson json("qus_chat_tool_calls.json",
+            const TempJson json("ninfer_chat_tool_calls.json",
                                 R"([{"role":"assistant","content":"hi","tool_calls":[]}])");
-            (void)qus::text::read_messages_json(json.path);
+            (void)ninfer::text::read_messages_json(json.path);
         },
         "assistant tool calls");
     return failures;
@@ -229,30 +229,30 @@ int test_hf_golden_render_parity() {
     int failures                 = 0;
     for (const auto& item : fixture.at("message_cases")) {
         const std::string name = item.at("name").get<std::string>();
-        std::vector<qus::text::ChatMessage> messages;
+        std::vector<ninfer::text::ChatMessage> messages;
         for (const auto& msg : item.at("messages")) {
-            qus::text::ChatMessage cm;
+            ninfer::text::ChatMessage cm;
             cm.role = msg.at("role").get<std::string>();
             cm.parts.push_back(
-                qus::text::ChatPart::text_part(msg.at("content").get<std::string>()));
+                ninfer::text::ChatPart::text_part(msg.at("content").get<std::string>()));
             if (msg.contains("reasoning_content")) {
                 cm.reasoning_content = msg.at("reasoning_content").get<std::string>();
             }
             if (msg.contains("tool_calls")) {
                 for (const auto& tc : msg.at("tool_calls")) {
                     cm.tool_calls.push_back(
-                        qus::text::ToolCall{"", tc.at("name").get<std::string>(),
+                        ninfer::text::ToolCall{"", tc.at("name").get<std::string>(),
                                             tc.at("arguments_json").get<std::string>()});
                 }
             }
             messages.push_back(std::move(cm));
         }
-        qus::text::ChatRenderOptions options;
+        ninfer::text::ChatRenderOptions options;
         options.enable_thinking   = item.at("enable_thinking").get<bool>();
         options.preserve_thinking = item.at("preserve_thinking").get<bool>();
         options.tool_jsons        = item.at("tool_jsons").get<std::vector<std::string>>();
 
-        const std::string actual   = qus::text::render_qwen_chat(messages, options);
+        const std::string actual   = ninfer::text::render_qwen_chat(messages, options);
         const std::string expected = item.at("rendered").get<std::string>();
         if (actual != expected) {
             std::cerr << "golden render parity mismatch for " << name << "\nexpected: " << expected

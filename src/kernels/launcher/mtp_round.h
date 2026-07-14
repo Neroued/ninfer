@@ -1,11 +1,11 @@
 #pragma once
 
-#include "qus/core/tensor.h"
-#include "qus/kernels/sampling.h"
+#include "ninfer/core/tensor.h"
+#include "ninfer/kernels/sampling.h"
 
 #include <cuda_runtime.h>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void mtp_prepare_verify_inputs_launch(const Tensor& token, const Tensor& drafts,
                                       const Tensor& length, Tensor& window_base,
@@ -37,4 +37,4 @@ void mtp_reset_gdn_initial_slot_launch(Tensor& gdn_initial_slot, cudaStream_t st
 void mtp_set_gdn_initial_slot_from_accepted_launch(const Tensor& accepted, Tensor& gdn_initial_slot,
                                                    cudaStream_t stream);
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

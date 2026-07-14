@@ -5,7 +5,7 @@
 // fp16-round per-row/group scales, signed two's-complement low nibbles,
 // optional high-bit codes, and a separate scale plane.
 
-#include "qus/core/tensor.h"
+#include "ninfer/core/tensor.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,7 +15,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace qus::test::q5090 {
+namespace ninfer::test::q5090 {
 namespace detail {
 
 inline std::int32_t align_up(std::int32_t x, std::int32_t m) { return ((x + m - 1) / m) * m; }
@@ -378,4 +378,4 @@ inline PackedWeight pack_w8g32_row_split(const std::vector<float>& source, std::
     return pack_row_split_lowbit(source, n, k, QType::W8G32_F16S);
 }
 
-} // namespace qus::test::q5090
+} // namespace ninfer::test::q5090

@@ -1,6 +1,6 @@
-#include "qus/kernels/add_bias.h"
-#include "qus/kernels/gelu.h"
-#include "qus/kernels/scatter.h"
+#include "ninfer/kernels/add_bias.h"
+#include "ninfer/kernels/gelu.h"
+#include "ninfer/kernels/scatter.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -8,8 +8,8 @@
 #include <iostream>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

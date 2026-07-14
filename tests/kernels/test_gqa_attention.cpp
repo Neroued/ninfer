@@ -2,9 +2,9 @@
 // op-test standard (docs/kernel-development.md): fp64 golden from
 // bf16-rounded q/k/v/cache inputs, device scalar pos for decode, composite
 // tolerance attention_bf16.
-#include "qus/core/arena.h"
-#include "qus/core/kv_cache.h"
-#include "qus/kernels/gqa_attention.h"
+#include "ninfer/core/arena.h"
+#include "ninfer/core/kv_cache.h"
+#include "ninfer/kernels/gqa_attention.h"
 #include "model/gqa_prompt_ops.h"
 #include "kernels/op_tester.h"
 
@@ -21,8 +21,8 @@
 #include <string>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

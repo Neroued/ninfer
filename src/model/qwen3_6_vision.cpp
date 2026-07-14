@@ -1,16 +1,16 @@
-#include "qus/model/vision.h"
+#include "ninfer/model/vision.h"
 
 #include "model/vision_ops.h"
-#include "qus/core/device.h"
-#include "qus/core/weight_store_parser.h"
-#include "qus/kernels/add_bias.h"
-#include "qus/kernels/gelu.h"
-#include "qus/kernels/layer_norm.h"
-#include "qus/kernels/linear.h"
-#include "qus/kernels/residual_add.h"
-#include "qus/kernels/rope.h"
-#include "qus/kernels/vision_attention.h"
-#include "qus/kernels/vision_pos_embed.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/weight_store_parser.h"
+#include "ninfer/kernels/add_bias.h"
+#include "ninfer/kernels/gelu.h"
+#include "ninfer/kernels/layer_norm.h"
+#include "ninfer/kernels/linear.h"
+#include "ninfer/kernels/residual_add.h"
+#include "ninfer/kernels/rope.h"
+#include "ninfer/kernels/vision_attention.h"
+#include "ninfer/kernels/vision_pos_embed.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::model {
+namespace ninfer::model {
 namespace {
 
 constexpr ModuleKind kVision = ModuleKind::VisionEncoder;
@@ -265,4 +265,4 @@ Tensor Qwen3_6_Vision::encode(const ProcessedInput& input, WorkspaceArena& works
     return output;
 }
 
-} // namespace qus::model
+} // namespace ninfer::model

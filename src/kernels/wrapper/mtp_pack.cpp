@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 void require_bf16_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
@@ -71,4 +71,4 @@ void mtp_split_attn_in(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate
     detail::mtp_split_attn_in_launch(attn_in, q, k, gate, v, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

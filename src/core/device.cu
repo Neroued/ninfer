@@ -1,11 +1,11 @@
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
 
-namespace qus {
+namespace ninfer {
 namespace {
 
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
@@ -181,4 +181,4 @@ float CudaEventTimer::stop_ms() {
     return ms;
 }
 
-} // namespace qus
+} // namespace ninfer

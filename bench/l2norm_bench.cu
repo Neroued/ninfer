@@ -2,14 +2,14 @@
 // ([head_dim, heads, T] = [128,16,T]). This binary is the ncu/nsys target;
 // the GB/s it prints is informational only -- the gate is ncu sustained DRAM %
 // (see docs/kernel-development.md §8).
-//   ./qus_l2norm_bench [--decode] [--prefill]   (default: both)
-#include "qus/kernels/l2norm.h"
-#include "qus_bench_common.h"
+//   ./ninfer_l2norm_bench [--decode] [--prefill]   (default: both)
+#include "ninfer/kernels/l2norm.h"
+#include "ninfer_bench_common.h"
 
 #include <cstring>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 static void run(int t, const char* tag) {
     constexpr int kHeadDim = 128;

@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - gdn_gating kernel: elementwise GDN gate prep over [48,T].
+// ninfer::kernels - gdn_gating kernel: elementwise GDN gate prep over [48,T].
 // Transcendentals use fp32 CUDA math functions, not polynomial approximations.
 
 #include "kernels/common/math.cuh"
@@ -10,7 +10,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b,
                                   const float* A_log, const float* dt_bias, float* g,
@@ -28,4 +28,4 @@ __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

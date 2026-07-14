@@ -2,18 +2,18 @@
 // shape ([C,T] = [10240,T], depthwise width 4). This binary is the ncu target;
 // the GB/s it prints is informational only -- the gate is ncu sustained DRAM %
 // (see docs/kernel-development.md §8).
-//   ./qus_causal_conv1d_silu_bench [--decode] [--prefill]   (default: both)
-#include "qus/kernels/causal_conv1d_silu.h"
-#include "qus/core/device.h"
-#include "qus_bench_common.h"
+//   ./ninfer_causal_conv1d_silu_bench [--decode] [--prefill]   (default: both)
+#include "ninfer/kernels/causal_conv1d_silu.h"
+#include "ninfer/core/device.h"
+#include "ninfer_bench_common.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 namespace {
 

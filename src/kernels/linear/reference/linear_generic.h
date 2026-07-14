@@ -1,11 +1,11 @@
 #pragma once
 
 #include "kernels/linear/plan/linear_plan.h" // LinearFormat
-#include "qus/core/tensor.h"
+#include "ninfer/core/tensor.h"
 
 #include <cuda_runtime.h>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 // Low-bit (Q4/Q5/Q6/W8G32): launcher selects the codec by fmt. w carries
 // payload/qdata/qhigh + padded_shape. The small-T streaming GEMM is the universal
@@ -39,4 +39,4 @@ void linear_generic_dense_gemv_launch(const Tensor& x, const Tensor& weight, Ten
 void linear_generic_dense_gemm_launch(const Tensor& x, const Tensor& weight, Tensor& out,
                                       cudaStream_t stream);
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

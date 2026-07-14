@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kGqaPrefillHeadDim   = 256;
 inline constexpr int kGqaPrefillQHeads    = 24;
@@ -51,4 +51,4 @@ __device__ __forceinline__ unsigned gqa_prefill_swz_addr(unsigned lane_base, uns
     return lane_base + ((ck | as) ^ r);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

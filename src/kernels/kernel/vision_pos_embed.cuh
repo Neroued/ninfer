@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 template <int Block>
 __launch_bounds__(Block) __global__
@@ -70,4 +70,4 @@ __global__ void vision_pos_embed_add_kernel(const __nv_bfloat16* table, const st
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

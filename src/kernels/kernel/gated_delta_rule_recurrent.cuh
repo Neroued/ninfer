@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kGdnDvPerWarp = 4;
 inline constexpr int kGdnNumWarps  = 4;
@@ -274,4 +274,4 @@ __global__ void __launch_bounds__(kWarpSize* kGdnNumWarps, 2)
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

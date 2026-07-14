@@ -1,4 +1,4 @@
-#include "qus/runtime/engine.h"
+#include "ninfer/runtime/engine.h"
 
 #include <cstddef>
 #include <iostream>
@@ -27,7 +27,7 @@ int expect_u32(std::uint32_t actual, std::uint32_t expected, std::string_view la
     return 1;
 }
 
-int expect_absent(const qus::ArenaMemoryStats& stats, std::string_view label) {
+int expect_absent(const ninfer::ArenaMemoryStats& stats, std::string_view label) {
     int failures = 0;
     failures += !stats.present ? 0 : fail(std::string(label) + " present");
     failures += expect_size(stats.capacity_bytes, 0, std::string(label) + " capacity");
@@ -37,20 +37,20 @@ int expect_absent(const qus::ArenaMemoryStats& stats, std::string_view label) {
 }
 
 int test_unloaded_stats_do_not_need_cuda() {
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.device      = 7;
     options.max_ctx     = 123;
     options.cache_bytes = 8192;
     options.work_bytes  = 16ULL * kMiB;
 
-    qus::Engine engine(options);
+    ninfer::Engine engine(options);
     int failures                       = 0;
-    const qus::EngineMemoryStats stats = engine.memory_stats();
+    const ninfer::EngineMemoryStats stats = engine.memory_stats();
     failures += !stats.loaded ? 0 : fail("unloaded stats reported loaded");
     failures += stats.device == 7 ? 0 : fail("unloaded stats device mismatch");
     failures += expect_u32(stats.max_context, 123, "unloaded stats max_context");
     failures += expect_u32(stats.position, 0, "unloaded stats position");
-    failures += stats.kv_dtype == qus::DType::BF16 ? 0 : fail("unloaded kv dtype mismatch");
+    failures += stats.kv_dtype == ninfer::DType::BF16 ? 0 : fail("unloaded kv dtype mismatch");
     failures += expect_size(stats.kv_quant_group, 0, "unloaded kv quant group");
     failures += expect_size(stats.kv_cache_payload_bytes, 0, "unloaded kv payload");
     failures += expect_absent(stats.weights, "unloaded weights");
@@ -61,28 +61,28 @@ int test_unloaded_stats_do_not_need_cuda() {
     failures += expect_size(stats.q5090_quant_count, 0, "unloaded quant count");
 
     engine.reset_memory_peaks();
-    const qus::EngineMemoryStats after_reset = engine.memory_stats();
+    const ninfer::EngineMemoryStats after_reset = engine.memory_stats();
     failures += expect_absent(after_reset.weights, "unloaded weights after reset");
     failures += expect_absent(after_reset.cache, "unloaded cache after reset");
     failures += expect_absent(after_reset.workspace, "unloaded workspace after reset");
     try {
-        qus::EngineOptions bad_options;
+        ninfer::EngineOptions bad_options;
         bad_options.mtp_draft_tokens = -1;
-        qus::Engine bad_engine(bad_options);
+        ninfer::Engine bad_engine(bad_options);
         (void)bad_engine;
         failures += fail("negative mtp_draft_tokens did not throw");
     } catch (const std::invalid_argument&) {}
     try {
-        qus::EngineOptions bad_options;
-        bad_options.mtp_draft_tokens = qus::model::kMaxMtpDraftTokens + 1;
-        qus::Engine bad_engine(bad_options);
+        ninfer::EngineOptions bad_options;
+        bad_options.mtp_draft_tokens = ninfer::model::kMaxMtpDraftTokens + 1;
+        ninfer::Engine bad_engine(bad_options);
         (void)bad_engine;
         failures += fail("too large mtp_draft_tokens did not throw");
     } catch (const std::invalid_argument&) {}
     try {
-        qus::EngineOptions bad_options;
-        bad_options.stop_token_ids = {qus::model::kCfg.vocab};
-        qus::Engine bad_engine(bad_options);
+        ninfer::EngineOptions bad_options;
+        bad_options.stop_token_ids = {ninfer::model::kCfg.vocab};
+        ninfer::Engine bad_engine(bad_options);
         (void)bad_engine;
         failures += fail("reserved stop token id did not throw before load");
     } catch (const std::invalid_argument&) {}
@@ -93,6 +93,6 @@ int test_unloaded_stats_do_not_need_cuda() {
 
 int main() {
     const int failures = test_unloaded_stats_do_not_need_cuda();
-    // Loaded accounting is covered by qus_engine_real_file_test with the canonical artifact.
+    // Loaded accounting is covered by ninfer_engine_real_file_test with the canonical artifact.
     return failures == 0 ? 0 : fail("engine memory stats test failed");
 }

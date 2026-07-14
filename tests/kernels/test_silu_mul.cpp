@@ -2,7 +2,7 @@
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges (incl. a large-magnitude stress case that rejects any
 // polynomial/"fast" silu approximation), composite tolerance bf16_elementwise.
-#include "qus/kernels/silu_mul.h"
+#include "ninfer/kernels/silu_mul.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -11,8 +11,8 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 // fp64 reference: silu(x) = x / (1 + e^-x), then * up.
 static void cpu_silu_and_mul(const std::vector<float>& g, const std::vector<float>& u,

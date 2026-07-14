@@ -1,10 +1,10 @@
-#include "qus/kernels/layer_norm.h"
-#include "qus_bench_common.h"
+#include "ninfer/kernels/layer_norm.h"
+#include "ninfer_bench_common.h"
 
 #include <cstdio>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 int main() {
     int devices = 0;

@@ -1,4 +1,4 @@
-#include "qus/core/weight_store_parser.h"
+#include "ninfer/core/weight_store_parser.h"
 
 #include <algorithm>
 #include <array>
@@ -10,7 +10,7 @@
 #include <tuple>
 #include <vector>
 
-namespace qus {
+namespace ninfer {
 namespace {
 
 constexpr std::array<std::byte, 16> kMagic = {
@@ -1170,4 +1170,4 @@ ParsedQ5090File parse_q5090_file(std::span<const std::byte> file, Q5090Progress*
     return parsed;
 }
 
-} // namespace qus
+} // namespace ninfer

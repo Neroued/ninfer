@@ -2,7 +2,7 @@
 
 #include "kernels/common/memory.cuh"
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
@@ -71,4 +71,4 @@ __device__ __forceinline__ void mma_tf32(float& c0, float& c1, float& c2, float&
                   __float_as_uint(a3), __float_as_uint(b0), __float_as_uint(b1));
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

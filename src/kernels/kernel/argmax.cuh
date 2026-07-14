@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - argmax kernel. One CUDA block handles one column and reduces
+// ninfer::kernels - argmax kernel. One CUDA block handles one column and reduces
 // over vocab; equal values keep the lowest vocab index.
 
 #include <cuda_bf16.h>
@@ -8,7 +8,7 @@
 #include <climits>
 #include <math_constants.h>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kArgmaxBlock = 256;
 inline constexpr int kArgmaxItemsPerThread = 1;
@@ -120,4 +120,4 @@ __launch_bounds__(kArgmaxBlock) __global__ void argmax_tiled_atomic_kernel(
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

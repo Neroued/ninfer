@@ -1,16 +1,16 @@
-// qus::kernels - sigmoid_mul launcher: grid/block/stream configuration + kernel launch.
+// ninfer::kernels - sigmoid_mul launcher: grid/block/stream configuration + kernel launch.
 // The only translation unit that includes this op's kernel header.
 // See docs/kernel-development.md §2.
 #include "kernels/launcher/sigmoid_gate_mul.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/sigmoid_gate_mul.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream) {
     const std::int64_t n = x.numel();
@@ -36,4 +36,4 @@ void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream)
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

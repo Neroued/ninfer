@@ -1,16 +1,16 @@
-// qus::kernels - embedding wrapper: public api validation and qtype dispatch.
-#include "qus/kernels/embedding.h"
+// ninfer::kernels - embedding wrapper: public api validation and qtype dispatch.
+#include "ninfer/kernels/embedding.h"
 
 #include "kernels/common/math.h"
 #include "kernels/launcher/embed_gather.h" // detail::embed_gather_*_launch
-#include "qus/core/weight.h"
+#include "ninfer/core/weight.h"
 
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -176,4 +176,4 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

@@ -1,7 +1,7 @@
-// qus::kernels - sigmoid_mul wrapper: implements the public api, validates parameters,
+// ninfer::kernels - sigmoid_mul wrapper: implements the public api, validates parameters,
 // and dispatches to the launcher. Host-compiled; never includes the kernel header.
 // See docs/kernel-development.md §2.
-#include "qus/kernels/sigmoid_mul.h"
+#include "ninfer/kernels/sigmoid_mul.h"
 
 #include "kernels/launcher/sigmoid_gate_mul.h" // detail::sigmoid_gate_mul_launch
 
@@ -9,7 +9,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t) {
@@ -49,4 +49,4 @@ void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
     detail::sigmoid_gate_mul_launch(gate, x, stream); // single variant -> direct dispatch
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

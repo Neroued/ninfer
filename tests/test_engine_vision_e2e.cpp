@@ -1,7 +1,7 @@
-#include "qus/model/processor.h"
-#include "qus/runtime/engine.h"
-#include "qus/text/chat_template.h"
-#include "qus/text/tokenizer.h"
+#include "ninfer/model/processor.h"
+#include "ninfer/runtime/engine.h"
+#include "ninfer/text/chat_template.h"
+#include "ninfer/text/tokenizer.h"
 
 #include <cuda_runtime.h>
 
@@ -23,7 +23,7 @@ class TempDir {
 public:
     TempDir() {
         path = std::filesystem::temp_directory_path() /
-               ("qus_vision_e2e_" + std::to_string(::getpid()));
+               ("ninfer_vision_e2e_" + std::to_string(::getpid()));
         std::filesystem::create_directories(path);
     }
 
@@ -42,20 +42,20 @@ void write_color(const std::filesystem::path& path, int width, int height,
     }
 }
 
-qus::model::ProcessedInput prepare(const qus::model::Processor& processor,
+ninfer::model::ProcessedInput prepare(const ninfer::model::Processor& processor,
                                    const std::filesystem::path& image) {
-    qus::text::ChatMessage message;
+    ninfer::text::ChatMessage message;
     message.role = "user";
-    message.parts.push_back(qus::text::ChatPart::image(qus::media::Source{
-        qus::media::SourceKind::Path, image.string(), "image/x-portable-pixmap"}));
-    message.parts.push_back(qus::text::ChatPart::text_part("图片是什么颜色？只回答颜色。"));
-    qus::text::ChatRenderOptions render;
+    message.parts.push_back(ninfer::text::ChatPart::image(ninfer::media::Source{
+        ninfer::media::SourceKind::Path, image.string(), "image/x-portable-pixmap"}));
+    message.parts.push_back(ninfer::text::ChatPart::text_part("图片是什么颜色？只回答颜色。"));
+    ninfer::text::ChatRenderOptions render;
     render.enable_thinking = false;
     return processor.process({message}, render);
 }
 
-std::vector<int> generate(qus::Engine& engine, qus::text::QwenTokenizer& tokenizer,
-                          const qus::model::ProcessedInput& input) {
+std::vector<int> generate(ninfer::Engine& engine, ninfer::text::QwenTokenizer& tokenizer,
+                          const ninfer::model::ProcessedInput& input) {
     std::vector<int> tokens;
     tokens.push_back(engine.prefill(input));
     const std::vector<int> stops = tokenizer.default_stop_token_ids();
@@ -77,25 +77,25 @@ struct SequenceResult {
 SequenceResult run_sequence(const std::filesystem::path& weights,
                             const std::filesystem::path& red_path,
                             const std::filesystem::path& blue_path, bool use_cuda_graph) {
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.max_ctx          = 256;
     options.mtp_draft_tokens = 2;
     options.use_cuda_graph   = use_cuda_graph;
-    qus::Engine engine(options);
+    ninfer::Engine engine(options);
     engine.load(weights.string());
-    qus::text::QwenTokenizer tokenizer(engine.take_tokenizer_bundle());
+    ninfer::text::QwenTokenizer tokenizer(engine.take_tokenizer_bundle());
     engine.set_stop_token_ids(tokenizer.default_stop_token_ids());
-    qus::model::ProcessorOptions processor_options;
+    ninfer::model::ProcessorOptions processor_options;
     processor_options.image_min_pixels = 64 * 64;
     processor_options.image_max_pixels = 128 * 64;
-    qus::model::Processor processor(tokenizer, processor_options);
-    const qus::model::ProcessedInput red_input  = prepare(processor, red_path);
-    const qus::model::ProcessedInput blue_input = prepare(processor, blue_path);
+    ninfer::model::Processor processor(tokenizer, processor_options);
+    const ninfer::model::ProcessedInput red_input  = prepare(processor, red_path);
+    const ninfer::model::ProcessedInput blue_input = prepare(processor, blue_path);
 
     SequenceResult result;
     result.tokens.push_back(engine.generate(std::vector<int>{1}, 4));
     result.tokens.push_back(generate(engine, tokenizer, red_input));
-    qus::model::ProcessedInput invalid = red_input;
+    ninfer::model::ProcessedInput invalid = red_input;
     invalid.positions.pop_back();
     try {
         (void)engine.prefill(invalid);
@@ -125,7 +125,7 @@ SequenceResult run_sequence(const std::filesystem::path& weights,
 
 int main() {
     const std::filesystem::path weights =
-        std::filesystem::path(QUS_SOURCE_DIR) / "out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus";
+        std::filesystem::path(NINFER_SOURCE_DIR) / "out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus";
     if (!std::filesystem::exists(weights)) {
         std::cout << "SKIP: real q5090 file not present\n";
         return 0;

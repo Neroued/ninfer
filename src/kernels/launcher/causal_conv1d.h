@@ -1,12 +1,12 @@
 #pragma once
 
-// qus::kernels::detail - private launch prototypes for causal_conv1d.
+// ninfer::kernels::detail - private launch prototypes for causal_conv1d.
 
-#include "qus/core/tensor.h"
+#include "ninfer/core/tensor.h"
 
 #include <cuda_runtime.h>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
                                   const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
@@ -17,4 +17,4 @@ void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weigh
                                             Tensor& conv_states, const Tensor& initial_slot,
                                             Tensor& out, cudaStream_t stream);
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

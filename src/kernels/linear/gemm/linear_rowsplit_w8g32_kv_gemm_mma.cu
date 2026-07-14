@@ -1,12 +1,12 @@
 #include "kernels/linear/gemm/linear_rowsplit_w8g32_kv_gemm_mma.cuh"
 
 #include "kernels/common/math.h"
-#include "qus/core/device.h"
-#include "qus/core/tensor.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/tensor.h"
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void linear_rowsplit_w8g32_kv_gemm_mma_launch(const Tensor& x, const Weight& k_weight,
                                               const Weight& v_weight, Tensor& k_out, Tensor& v_out,
@@ -37,4 +37,4 @@ void linear_rowsplit_w8g32_kv_gemm_mma_launch(const Tensor& x, const Weight& k_w
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

@@ -16,7 +16,7 @@
 
 #include <cstdio>
 
-namespace qus::kernels::detail::gdn_state_passing {
+namespace ninfer::kernels::detail::gdn_state_passing {
 
 namespace {
 
@@ -26,14 +26,14 @@ using gdn_chunked::MMA_N;
 using gdn_chunked::MMA_K;
 using gdn_chunked::bh_decode_t;
 using gdn_chunked::zero_frag;
-using qus::kernels::SmemTile;
-using qus::kernels::mma_tf32;
-using qus::kernels::mma_tf32_bits;
-using qus::kernels::ldmatrix_x4;
-using qus::kernels::ldmatrix_x2;
-using qus::kernels::smem_addr;
-using qus::kernels::exp2_approx;
-using qus::kernels::RCP_LN2_F;
+using ninfer::kernels::SmemTile;
+using ninfer::kernels::mma_tf32;
+using ninfer::kernels::mma_tf32_bits;
+using ninfer::kernels::ldmatrix_x4;
+using ninfer::kernels::ldmatrix_x2;
+using ninfer::kernels::smem_addr;
+using ninfer::kernels::exp2_approx;
+using ninfer::kernels::RCP_LN2_F;
 
 static_assert(gdn_chunked::kChunkSize == 64, "stage_state_passing: kChunkSize must be 64");
 
@@ -89,7 +89,7 @@ struct kernel_dims<128> {
     static constexpr int DT_TILES_PER_BLOCK = 4;
     static constexpr int BT_SPLITS          = 2;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS; // 8
-    static constexpr int THREADS            = N_WARPS * qus::kernels::kWarpSize;
+    static constexpr int THREADS            = N_WARPS * ninfer::kernels::kWarpSize;
     static constexpr int W_HALVES           = 1;
     static constexpr int K_HALVES           = 1;
 };
@@ -101,7 +101,7 @@ struct kernel_dims<64> {
     static constexpr int DT_TILES_PER_BLOCK = 2;
     static constexpr int BT_SPLITS          = 4;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS;
-    static constexpr int THREADS            = N_WARPS * qus::kernels::kWarpSize;
+    static constexpr int THREADS            = N_WARPS * ninfer::kernels::kWarpSize;
     static constexpr int W_HALVES           = 2;
     static constexpr int K_HALVES           = 2;
 };
@@ -113,7 +113,7 @@ struct kernel_dims<32> {
     static constexpr int DT_TILES_PER_BLOCK = 2;
     static constexpr int BT_SPLITS          = 2;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS;
-    static constexpr int THREADS            = N_WARPS * qus::kernels::kWarpSize;
+    static constexpr int THREADS            = N_WARPS * ninfer::kernels::kWarpSize;
     static constexpr int W_HALVES           = 2;
     static constexpr int K_HALVES           = 2;
 };
@@ -125,7 +125,7 @@ struct kernel_dims<16> {
     static constexpr int DT_TILES_PER_BLOCK = 2;
     static constexpr int BT_SPLITS          = 1;
     static constexpr int N_WARPS            = DT_TILES_PER_BLOCK * BT_SPLITS;
-    static constexpr int THREADS            = N_WARPS * qus::kernels::kWarpSize;
+    static constexpr int THREADS            = N_WARPS * ninfer::kernels::kWarpSize;
     // S=16 W half stride would be 8 -- SmemTile requires >= 16. Load full W.
     static constexpr int W_HALVES = 1;
     static constexpr int K_HALVES = 2;
@@ -161,7 +161,7 @@ struct smem_layout {
 // ---------------------------------------------------------------------------
 // SnapView<STRIDE>: custom swizzle for snap_smem (transposed h[d][k] layout).
 // Different from SmemTile<32>'s default swizzle to keep the 4-d-row scatter
-// conflict-free. Do NOT merge with qus::kernels::SmemTile.
+// conflict-free. Do NOT merge with ninfer::kernels::SmemTile.
 //
 // STRIDE=64 case (S=128 wide-block design): with row*64/4=row*16 mod 32, even
 // rows start at bank 0, odd rows at bank 16. For the 4-d-row scatter (d takes
@@ -212,7 +212,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                                   __nv_bfloat16* __restrict__ v_new,
                                   __nv_bfloat16* __restrict__ h_chunk, float* state_out,
                                   int64_t T, int64_t H_v,
-                                  qus::kernels::head_map qk_map,
+                                  ninfer::kernels::head_map qk_map,
                                   // Token-axis stride for k (in floats).
                                   // Caller passes the materialised value
                                   // (launcher handles 0 -> H_qk * S).
@@ -282,7 +282,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
     //   grid.x = bhd in [0, B*H_v*D_STRIPS).
     //   warp = dt_idx * BT_SPLITS + s_idx.
     const int tid    = threadIdx.x;
-    const auto lanes = qus::kernels::mma_lane_t::decode(tid);
+    const auto lanes = ninfer::kernels::mma_lane_t::decode(tid);
     const int warp   = lanes.warp;
     const int lane_g = lanes.lane_g;
     const int lane_t = lanes.lane_t;
@@ -350,12 +350,12 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
     {
         const int64_t ce0_64 = BT; // chunk_0 end = BT
         const int cl0        = (ce0_64 < T) ? (int)ce0_64 : (int)T;
-        qus::kernels::issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
+        ninfer::kernels::issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
             W_view, W_in + W_block_base, W_stride, cl0, tid);
-        qus::kernels::issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
+        ninfer::kernels::issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
             U_view, U_in + W_block_base + d_off, W_stride, cl0, tid);
         const int cl_k0 = (cl0 < K_LOAD_ROWS) ? cl0 : K_LOAD_ROWS;
-        qus::kernels::issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(
+        ninfer::kernels::issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(
             k_view, k_in + k_block_base, k_stride, cl_k0, tid);
     }
 
@@ -432,7 +432,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
         for (int half = 0; half < W_HALVES; ++half) {
             if (half >= 1) {
                 __syncthreads(); // gates prev half's mma reads of W_smem
-                qus::kernels::issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
+                ninfer::kernels::issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
                     W_view, W_in + W_base + (int64_t)(half * W_STRIDE), W_stride, cl, tid);
                 __syncthreads();
             }
@@ -555,7 +555,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
         // arriving W, not the *prior* read of the outgoing W).
         if (chunk + 1 < NT) {
             __syncthreads();
-            qus::kernels::issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
+            ninfer::kernels::issue_load_bf16_to_float_vec4<BT, W_STRIDE, THREADS_K>(
                 W_view, W_in + W_base_next, W_stride, cl_next, tid);
         }
 
@@ -694,7 +694,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
 
             const int64_t k_base_h1 = k_base + (int64_t)K_LOAD_ROWS * k_stride;
             const int cl_kh1        = (cl > K_LOAD_ROWS) ? (cl - K_LOAD_ROWS) : 0;
-            qus::kernels::issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(
+            ninfer::kernels::issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(
                 k_view, k_in + k_base_h1, k_stride, cl_kh1, tid);
             __syncthreads();
 
@@ -732,9 +732,9 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
         // Cross-chunk load: chunk t+1 U/k are converted synchronously into
         // shared memory.
         if (chunk + 1 < NT) {
-            qus::kernels::issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
+            ninfer::kernels::issue_load_bf16_to_float_vec4<BT, N_STRIP_PER_BLOCK, THREADS_K>(
                 U_view, U_in + W_base_next + d_off, W_stride, cl_next, tid);
-            qus::kernels::issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(
+            ninfer::kernels::issue_load_bf16_to_float_vec4<K_LOAD_ROWS, S, THREADS_K>(
                 k_view, k_in + k_base_next, k_stride, cl_k_next, tid);
         }
 
@@ -765,7 +765,7 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
 
 template <int S>
 cudaError_t launch_typed(const gdn_chunked::state_passing_config& cfg,
-                         qus::kernels::head_map qk_map, int NT) {
+                         ninfer::kernels::head_map qk_map, int NT) {
     using D                  = kernel_dims<S>;
     constexpr int smem_bytes = smem_layout<S>::SMEM_FLOATS * (int)sizeof(float);
 
@@ -789,15 +789,15 @@ cudaError_t launch_typed(const gdn_chunked::state_passing_config& cfg,
 
 cudaError_t launch_state_passing(const gdn_chunked::state_passing_config& cfg) {
     gdn_chunked::stage_validator v{"launch_state_passing", cfg.S, cfg.H_qk, cfg.H_v, cfg.L, cfg.B};
-    QUS_GDN_PROPAGATE(v.check_shape());
-    QUS_GDN_PROPAGATE(v.check_gdn_full_chunks());
+    NINFER_GDN_PROPAGATE(v.check_shape());
+    NINFER_GDN_PROPAGATE(v.check_gdn_full_chunks());
     if (cfg.W == nullptr || cfg.U == nullptr || cfg.k == nullptr || cfg.g_cumsum == nullptr ||
         cfg.state_in == nullptr || cfg.v_new == nullptr || cfg.h_chunk == nullptr ||
         cfg.state_out == nullptr) {
         return cudaErrorInvalidValue;
     }
 
-    const auto qk_map = qus::kernels::head_map::of((int)cfg.H_qk, (int)cfg.H_v);
+    const auto qk_map = ninfer::kernels::head_map::of((int)cfg.H_qk, (int)cfg.H_v);
     const int64_t NT  = div_up(cfg.L, static_cast<int64_t>(BT));
 
     // grid_x = B * H_v * D_STRIPS depends on S; check inside each case.
@@ -807,20 +807,20 @@ cudaError_t launch_state_passing(const gdn_chunked::state_passing_config& cfg) {
 
     switch (cfg.S) {
     case 16:
-        QUS_GDN_PROPAGATE(check_grid_for(kernel_dims<16>::D_STRIPS));
+        NINFER_GDN_PROPAGATE(check_grid_for(kernel_dims<16>::D_STRIPS));
         return launch_typed<16>(cfg, qk_map, (int)NT);
     case 32:
-        QUS_GDN_PROPAGATE(check_grid_for(kernel_dims<32>::D_STRIPS));
+        NINFER_GDN_PROPAGATE(check_grid_for(kernel_dims<32>::D_STRIPS));
         return launch_typed<32>(cfg, qk_map, (int)NT);
     case 64:
-        QUS_GDN_PROPAGATE(check_grid_for(kernel_dims<64>::D_STRIPS));
+        NINFER_GDN_PROPAGATE(check_grid_for(kernel_dims<64>::D_STRIPS));
         return launch_typed<64>(cfg, qk_map, (int)NT);
     case 128:
-        QUS_GDN_PROPAGATE(check_grid_for(kernel_dims<128>::D_STRIPS));
+        NINFER_GDN_PROPAGATE(check_grid_for(kernel_dims<128>::D_STRIPS));
         return launch_typed<128>(cfg, qk_map, (int)NT);
     default:
         return cudaErrorInvalidValue; // check_shape already filtered
     }
 }
 
-} // namespace qus::kernels::detail::gdn_state_passing
+} // namespace ninfer::kernels::detail::gdn_state_passing

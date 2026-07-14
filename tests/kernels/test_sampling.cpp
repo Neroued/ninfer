@@ -2,7 +2,7 @@
 // exactly (bf16-rounded logits, lowest-index tie-break), and the sampling path
 // must respect top-k/top-p/min-p truncation, be reproducible under a fixed
 // seed, and match the softmax distribution it claims to draw from.
-#include "qus/kernels/sampling.h"
+#include "ninfer/kernels/sampling.h"
 #include "kernels/op_tester.h"
 
 #include <algorithm>
@@ -12,8 +12,8 @@
 #include <numeric>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

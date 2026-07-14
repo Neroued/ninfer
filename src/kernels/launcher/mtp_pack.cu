@@ -2,12 +2,12 @@
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/mtp_pack.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <algorithm>
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void mtp_pack_fc_input_launch(const Tensor& embedding_norm, const Tensor& hidden_norm, Tensor& out,
                               cudaStream_t stream) {
@@ -36,4 +36,4 @@ void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tenso
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

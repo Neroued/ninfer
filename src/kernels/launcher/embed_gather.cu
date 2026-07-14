@@ -1,14 +1,14 @@
-// qus::kernels - embedding launcher: variant grid/block/stream setup.
+// ninfer::kernels - embedding launcher: variant grid/block/stream setup.
 #include "kernels/launcher/embed_gather.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/embed_gather.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 constexpr int kBlock = 128;
@@ -62,4 +62,4 @@ void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

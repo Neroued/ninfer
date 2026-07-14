@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - residual_add kernel: x += y, elementwise in place.
+// ninfer::kernels - residual_add kernel: x += y, elementwise in place.
 // Vectorized over bf16 pairs; included only by its launcher. See
 // docs/kernel-development.md §6.
 
@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kResidualAddPairsPerThread = 4;
 
@@ -64,4 +64,4 @@ __launch_bounds__(256) __global__
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

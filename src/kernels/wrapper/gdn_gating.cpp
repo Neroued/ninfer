@@ -1,5 +1,5 @@
-// qus::kernels - gdn_gating wrapper: public api validation and launcher dispatch.
-#include "qus/kernels/gdn_gating.h"
+// ninfer::kernels - gdn_gating wrapper: public api validation and launcher dispatch.
+#include "ninfer/kernels/gdn_gating.h"
 
 #include "kernels/launcher/gdn_gating.h" // detail::gdn_gating_launch
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -99,4 +99,4 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     detail::gdn_gating_launch(a, b, A_log, dt_bias, g, beta, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

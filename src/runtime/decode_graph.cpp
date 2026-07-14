@@ -1,10 +1,10 @@
-#include "qus/runtime/decode_graph.h"
+#include "ninfer/runtime/decode_graph.h"
 
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdio>
 
-namespace qus {
+namespace ninfer {
 namespace {
 
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
@@ -97,4 +97,4 @@ void DecodeGraph::reset() noexcept {
     destroy_graph(graph_);
 }
 
-} // namespace qus
+} // namespace ninfer

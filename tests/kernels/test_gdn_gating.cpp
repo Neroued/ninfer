@@ -2,9 +2,9 @@
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // GDN gate ranges including the softplus guard, composite tolerance
 // fp32_transcendental.
-#include "qus/kernels/gdn_gating.h"
-#include "qus/kernels/gdn_gating_proj.h"
-#include "qus/core/arena.h"
+#include "ninfer/kernels/gdn_gating.h"
+#include "ninfer/kernels/gdn_gating_proj.h"
+#include "ninfer/core/arena.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -15,8 +15,8 @@
 #include <string>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 static void cpu_gdn_gating(const std::vector<float>& a, const std::vector<float>& b,
                            const std::vector<float>& A_log, const std::vector<float>& dt_bias,

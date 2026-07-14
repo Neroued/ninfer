@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kMtpRoundAcceptedPerPosOffset = 4;
 inline constexpr int kMtpRoundAcceptedPerPosLimit  = 5;
@@ -448,4 +448,4 @@ __global__ void mtp_set_gdn_initial_slot_from_accepted_kernel(const std::int32_t
     *gdn_initial_slot = *accepted;
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

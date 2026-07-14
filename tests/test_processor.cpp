@@ -1,4 +1,4 @@
-#include "qus/model/processor.h"
+#include "ninfer/model/processor.h"
 
 #include <nlohmann/json.hpp>
 
@@ -32,7 +32,7 @@ struct TempDir {
 
     TempDir() {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        path = std::filesystem::temp_directory_path() / ("qus_processor_" + std::to_string(stamp));
+        path = std::filesystem::temp_directory_path() / ("ninfer_processor_" + std::to_string(stamp));
         if (!std::filesystem::create_directory(path)) {
             throw std::runtime_error("failed to create processor temp directory");
         }
@@ -41,7 +41,7 @@ struct TempDir {
     ~TempDir() { std::filesystem::remove_all(path); }
 };
 
-qus::Q5090TokenizerBundle tokenizer_bundle() {
+ninfer::Q5090TokenizerBundle tokenizer_bundle() {
     nlohmann::json vocab = {
         {"u", 0},  {"s", 1},  {"e", 2},  {"r", 3},  {"x", 4},  {"Ċ", 5},  {"Ġ", 6},  {"a", 7},
         {"i", 8},  {"t", 9},  {"n", 10}, {"k", 11}, {"v", 12}, {"d", 13}, {"o", 14}, {"c", 15},
@@ -65,7 +65,7 @@ qus::Q5090TokenizerBundle tokenizer_bundle() {
         added(248068, "<think>"),
         added(248069, "</think>"),
     });
-    qus::Q5090TokenizerBundle bundle;
+    ninfer::Q5090TokenizerBundle bundle;
     bundle.tokenizer_json = nlohmann::json{
         {"model", {{"type", "BPE"}, {"vocab", vocab}}},
         {"added_tokens",
@@ -90,8 +90,8 @@ std::filesystem::path write_ppm(const std::filesystem::path& dir) {
     return path;
 }
 
-qus::media::Source path_source(const std::filesystem::path& path) {
-    return qus::media::Source{qus::media::SourceKind::Path, path.string(),
+ninfer::media::Source path_source(const std::filesystem::path& path) {
+    return ninfer::media::Source{ninfer::media::SourceKind::Path, path.string(),
                               "image/x-portable-pixmap"};
 }
 
@@ -113,11 +113,11 @@ std::string base64(const std::vector<std::uint8_t>& bytes) {
     return out;
 }
 
-qus::media::Source data_source(const std::filesystem::path& path) {
+ninfer::media::Source data_source(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     const std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(in)),
                                           std::istreambuf_iterator<char>());
-    return qus::media::Source{qus::media::SourceKind::Data,
+    return ninfer::media::Source{ninfer::media::SourceKind::Data,
                               "data:image/x-portable-pixmap;base64," + base64(bytes),
                               "image/x-portable-pixmap"};
 }
@@ -192,18 +192,18 @@ private:
 };
 
 int test_image_patch_layout_and_mrope(const std::filesystem::path& image_path) {
-    qus::text::QwenTokenizer tokenizer(tokenizer_bundle());
-    qus::model::ProcessorOptions options;
+    ninfer::text::QwenTokenizer tokenizer(tokenizer_bundle());
+    ninfer::model::ProcessorOptions options;
     options.image_min_pixels = 64 * 64;
     options.image_max_pixels = 64 * 64;
-    qus::model::Processor processor(tokenizer, options);
-    qus::text::ChatMessage message;
+    ninfer::model::Processor processor(tokenizer, options);
+    ninfer::text::ChatMessage message;
     message.role = "user";
-    message.parts.push_back(qus::text::ChatPart::image(path_source(image_path)));
-    message.parts.push_back(qus::text::ChatPart::text_part("x"));
-    qus::text::ChatRenderOptions render;
+    message.parts.push_back(ninfer::text::ChatPart::image(path_source(image_path)));
+    message.parts.push_back(ninfer::text::ChatPart::text_part("x"));
+    ninfer::text::ChatRenderOptions render;
     render.enable_thinking                 = false;
-    const qus::model::ProcessedInput input = processor.process({message}, render);
+    const ninfer::model::ProcessedInput input = processor.process({message}, render);
 
     int failures = 0;
     failures += check(input.vision_items.size() == 1, "image item count mismatch");
@@ -238,17 +238,17 @@ int test_image_patch_layout_and_mrope(const std::filesystem::path& image_path) {
 }
 
 int test_video_prompt_and_temporal_duplication(const std::filesystem::path& image_path) {
-    qus::text::QwenTokenizer tokenizer(tokenizer_bundle());
-    qus::model::ProcessorOptions options;
+    ninfer::text::QwenTokenizer tokenizer(tokenizer_bundle());
+    ninfer::model::ProcessorOptions options;
     options.video_min_pixels = 64 * 64;
     options.video_max_pixels = 64 * 64 * 2;
-    qus::model::Processor processor(tokenizer, options);
-    qus::text::ChatMessage message;
+    ninfer::model::Processor processor(tokenizer, options);
+    ninfer::text::ChatMessage message;
     message.role = "user";
-    message.parts.push_back(qus::text::ChatPart::video(path_source(image_path)));
-    qus::text::ChatRenderOptions render;
+    message.parts.push_back(ninfer::text::ChatPart::video(path_source(image_path)));
+    ninfer::text::ChatRenderOptions render;
     render.enable_thinking                 = false;
-    const qus::model::ProcessedInput input = processor.process({message}, render);
+    const ninfer::model::ProcessedInput input = processor.process({message}, render);
     int failures                           = 0;
     failures += check(input.vision_items[0].grid.t == 1 &&
                           input.vision_items[0].timestamps == std::vector<double>{0.0},
@@ -261,46 +261,46 @@ int test_video_prompt_and_temporal_duplication(const std::filesystem::path& imag
 }
 
 int test_attention_budget_rejection(const std::filesystem::path& image_path) {
-    qus::text::QwenTokenizer tokenizer(tokenizer_bundle());
-    qus::model::ProcessorOptions options;
+    ninfer::text::QwenTokenizer tokenizer(tokenizer_bundle());
+    ninfer::model::ProcessorOptions options;
     options.image_min_pixels    = 64 * 64;
     options.image_max_pixels    = 64 * 64;
     options.max_attention_pairs = 255;
-    qus::model::Processor processor(tokenizer, options);
-    qus::text::ChatMessage message;
+    ninfer::model::Processor processor(tokenizer, options);
+    ninfer::text::ChatMessage message;
     message.role = "user";
-    message.parts.push_back(qus::text::ChatPart::image(path_source(image_path)));
+    message.parts.push_back(ninfer::text::ChatPart::image(path_source(image_path)));
     try {
         (void)processor.process({message});
-    } catch (const qus::model::ProcessorError& error) {
-        return check(error.kind() == qus::model::ProcessorErrorKind::BudgetExceeded,
+    } catch (const ninfer::model::ProcessorError& error) {
+        return check(error.kind() == ninfer::model::ProcessorErrorKind::BudgetExceeded,
                      "vision attention budget used the wrong error category");
     }
     return check(false, "vision attention budget was not enforced");
 }
 
 int test_mixed_media_order(const std::filesystem::path& image_path) {
-    qus::text::QwenTokenizer tokenizer(tokenizer_bundle());
-    qus::model::ProcessorOptions options;
+    ninfer::text::QwenTokenizer tokenizer(tokenizer_bundle());
+    ninfer::model::ProcessorOptions options;
     options.image_min_pixels = 64 * 64;
     options.image_max_pixels = 64 * 64;
     options.video_min_pixels = 64 * 64;
     options.video_max_pixels = 64 * 64 * 2;
-    qus::model::Processor processor(tokenizer, options);
-    qus::text::ChatMessage message;
+    ninfer::model::Processor processor(tokenizer, options);
+    ninfer::text::ChatMessage message;
     message.role  = "user";
-    message.parts = {qus::text::ChatPart::image(path_source(image_path)),
-                     qus::text::ChatPart::text_part("x"),
-                     qus::text::ChatPart::video(path_source(image_path)),
-                     qus::text::ChatPart::image(path_source(image_path))};
-    qus::text::ChatRenderOptions render;
+    message.parts = {ninfer::text::ChatPart::image(path_source(image_path)),
+                     ninfer::text::ChatPart::text_part("x"),
+                     ninfer::text::ChatPart::video(path_source(image_path)),
+                     ninfer::text::ChatPart::image(path_source(image_path))};
+    ninfer::text::ChatRenderOptions render;
     render.enable_thinking                 = false;
-    const qus::model::ProcessedInput input = processor.process({message}, render);
+    const ninfer::model::ProcessedInput input = processor.process({message}, render);
     int failures                           = 0;
     failures += check(input.vision_items.size() == 3 &&
-                          input.vision_items[0].modality == qus::model::Modality::Image &&
-                          input.vision_items[1].modality == qus::model::Modality::Video &&
-                          input.vision_items[2].modality == qus::model::Modality::Image,
+                          input.vision_items[0].modality == ninfer::model::Modality::Image &&
+                          input.vision_items[1].modality == ninfer::model::Modality::Video &&
+                          input.vision_items[2].modality == ninfer::model::Modality::Image,
                       "mixed media item order mismatch");
     failures +=
         check(input.vision_items[0].patch_begin == 0 && input.vision_items[1].patch_begin == 16 &&
@@ -314,23 +314,23 @@ int test_mixed_media_order(const std::filesystem::path& image_path) {
 }
 
 int test_data_uri_and_private_url(const std::filesystem::path& image_path) {
-    qus::text::QwenTokenizer tokenizer(tokenizer_bundle());
-    qus::model::ProcessorOptions options;
+    ninfer::text::QwenTokenizer tokenizer(tokenizer_bundle());
+    ninfer::model::ProcessorOptions options;
     options.image_min_pixels = 64 * 64;
     options.image_max_pixels = 64 * 64;
-    qus::model::Processor processor(tokenizer, options);
-    qus::text::ChatMessage data_message;
+    ninfer::model::Processor processor(tokenizer, options);
+    ninfer::text::ChatMessage data_message;
     data_message.role = "user";
-    data_message.parts.push_back(qus::text::ChatPart::image(data_source(image_path)));
-    const qus::model::ProcessedInput data = processor.process({data_message});
+    data_message.parts.push_back(ninfer::text::ChatPart::image(data_source(image_path)));
+    const ninfer::model::ProcessedInput data = processor.process({data_message});
     int failures                          = 0;
     failures += check(data.stats.raw_patches == 16 && data.patches.front() == -1.0f,
                       "base64 data URI preprocessing mismatch");
 
-    qus::text::ChatMessage private_message;
+    ninfer::text::ChatMessage private_message;
     private_message.role = "user";
-    private_message.parts.push_back(qus::text::ChatPart::image(
-        qus::media::Source{qus::media::SourceKind::Url, "http://127.0.0.1/image.png", {}}));
+    private_message.parts.push_back(ninfer::text::ChatPart::image(
+        ninfer::media::Source{ninfer::media::SourceKind::Url, "http://127.0.0.1/image.png", {}}));
     try {
         (void)processor.process({private_message});
         failures += check(false, "private-network media URL was accepted");
@@ -340,17 +340,17 @@ int test_data_uri_and_private_url(const std::filesystem::path& image_path) {
 
 int test_http_media(const std::filesystem::path& image_path) {
     HttpFixture fixture(image_path);
-    qus::text::QwenTokenizer tokenizer(tokenizer_bundle());
-    qus::model::ProcessorOptions options;
+    ninfer::text::QwenTokenizer tokenizer(tokenizer_bundle());
+    ninfer::model::ProcessorOptions options;
     options.image_min_pixels      = 64 * 64;
     options.image_max_pixels      = 64 * 64;
     options.allow_private_network = true;
-    qus::model::Processor processor(tokenizer, options);
-    qus::text::ChatMessage message;
+    ninfer::model::Processor processor(tokenizer, options);
+    ninfer::text::ChatMessage message;
     message.role = "user";
-    message.parts.push_back(qus::text::ChatPart::image(
-        qus::media::Source{qus::media::SourceKind::Url, fixture.url(), "image/x-portable-pixmap"}));
-    const qus::model::ProcessedInput input = processor.process({message});
+    message.parts.push_back(ninfer::text::ChatPart::image(
+        ninfer::media::Source{ninfer::media::SourceKind::Url, fixture.url(), "image/x-portable-pixmap"}));
+    const ninfer::model::ProcessedInput input = processor.process({message});
     return check(input.stats.raw_patches == 16 && input.patches.front() == -1.0f,
                  "HTTP media preprocessing mismatch");
 }

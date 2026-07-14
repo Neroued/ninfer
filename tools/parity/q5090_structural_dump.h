@@ -1,7 +1,7 @@
 #pragma once
 
-#include "qus/core/weight_store_parser.h"
-#include "qus/model/config.h"
+#include "ninfer/core/weight_store_parser.h"
+#include "ninfer/model/config.h"
 
 #include "nlohmann/json.hpp"
 
@@ -21,7 +21,7 @@
 #include <string_view>
 #include <vector>
 
-namespace qus::parity {
+namespace ninfer::parity {
 namespace detail {
 
 using Json = nlohmann::json;
@@ -516,4 +516,4 @@ inline int structural_dump_main(int argc, char** argv) {
     }
 }
 
-} // namespace qus::parity
+} // namespace ninfer::parity

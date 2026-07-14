@@ -2,7 +2,7 @@
 
 #include <cuda_runtime.h>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kWarpSize          = 32;
 inline constexpr unsigned kFullWarpMask = 0xffffffffu;
@@ -56,4 +56,4 @@ __device__ __forceinline__ float block_reduce_sum(float x, float* sums) {
     return x;
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

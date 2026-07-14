@@ -1,4 +1,4 @@
-#include "qus/serve/tool_call_parser.h"
+#include "ninfer/serve/tool_call_parser.h"
 
 #include <nlohmann/json.hpp>
 
@@ -8,7 +8,7 @@
 #include <random>
 #include <string_view>
 
-namespace qus::serve {
+namespace ninfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -140,4 +140,4 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text) {
     return out;
 }
 
-} // namespace qus::serve
+} // namespace ninfer::serve

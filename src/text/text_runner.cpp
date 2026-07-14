@@ -1,6 +1,6 @@
-#include "qus/text/text_runner.h"
+#include "ninfer/text/text_runner.h"
 
-#include "qus/core/nvtx_range.h"
+#include "ninfer/core/nvtx_range.h"
 
 #include <algorithm>
 #include <cctype>
@@ -11,7 +11,7 @@
 #include <string>
 #include <utility>
 
-namespace qus::text {
+namespace ninfer::text {
 namespace {
 
 constexpr const char* kThinkClose = "</think>";
@@ -96,7 +96,7 @@ private:
 
 } // namespace
 
-TextGenerationRunner::TextGenerationRunner(QwenTokenizer& tokenizer, qus::Engine& engine)
+TextGenerationRunner::TextGenerationRunner(QwenTokenizer& tokenizer, ninfer::Engine& engine)
     : tokenizer_(tokenizer), engine_(engine) {}
 
 TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessage>& messages,
@@ -110,8 +110,8 @@ TextGenerationResult TextGenerationRunner::generate(const std::vector<ChatMessag
         std::any_of(messages.begin(), messages.end(),
                     [](const ChatMessage& message) { return message.has_media(); });
     if (has_media) {
-        qus::model::Processor processor(tokenizer_);
-        qus::model::ProcessedInput input = processor.process(messages, render_options);
+        ninfer::model::Processor processor(tokenizer_);
+        ninfer::model::ProcessedInput input = processor.process(messages, render_options);
         const std::uint32_t opener = generation_prompt_opener_tokens(tokenizer_, render_options);
         const std::uint32_t content_boundary =
             opener <= input.input_ids.size()
@@ -144,7 +144,7 @@ TextGenerationResult TextGenerationRunner::generate(std::span<const int> prompt_
                       0.0, content_boundary);
 }
 
-TextGenerationResult TextGenerationRunner::generate(qus::model::ProcessedInput& input,
+TextGenerationResult TextGenerationRunner::generate(ninfer::model::ProcessedInput& input,
                                                     const TextGenerationOptions& options,
                                                     std::uint32_t content_boundary,
                                                     std::function<void()> on_prefill_complete) {
@@ -156,7 +156,7 @@ TextGenerationResult TextGenerationRunner::run_tokens(std::vector<int> prompt_to
                                                       const TextGenerationOptions& options,
                                                       double render_tokenize_seconds,
                                                       std::uint32_t content_boundary,
-                                                      qus::model::ProcessedInput* multimodal,
+                                                      ninfer::model::ProcessedInput* multimodal,
                                                       std::function<void()> on_prefill_complete) {
     using Clock = std::chrono::steady_clock;
 
@@ -232,7 +232,7 @@ TextGenerationResult TextGenerationRunner::run_tokens(std::vector<int> prompt_to
             // request sets it explicitly, so config never leaks between requests on a
             // shared engine; the default is greedy (temperature 0 == exact argmax).
             engine_.set_sampling(options.sampling);
-            const NvtxRange range("qus.prefill");
+            const NvtxRange range("ninfer.prefill");
             // Engine-level prefix caching: reuse the resident KV + GDN state when this request
             // extends the previous turn's token sequence, prefilling only the new suffix.
             token = multimodal != nullptr
@@ -252,7 +252,7 @@ TextGenerationResult TextGenerationRunner::run_tokens(std::vector<int> prompt_to
     } else {
         generated_token_ids.push_back(token);
         emit_stream_text(token);
-        const NvtxRange range("qus.decode");
+        const NvtxRange range("ninfer.decode");
         if (is_stop(token)) {
             finish_reason = FinishReason::Stop;
         } else {
@@ -328,4 +328,4 @@ std::vector<int> resolve_stop_token_ids(const QwenTokenizer& tokenizer,
     return resolved;
 }
 
-} // namespace qus::text
+} // namespace ninfer::text

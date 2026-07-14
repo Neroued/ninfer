@@ -1,9 +1,9 @@
-// qus::kernels - causal_conv1d launcher: grid/block/stream configuration + kernel launch.
+// ninfer::kernels - causal_conv1d launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/causal_conv1d.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/causal_conv1d.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 int grid_for(std::int64_t n, int block, const char* label) {
@@ -104,4 +104,4 @@ void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weigh
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

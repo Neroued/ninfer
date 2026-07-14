@@ -1,12 +1,12 @@
 // Kernel-level benchmark for Qwen3.6 sampler candidate selection at the real
 // decode shape. The reported GB/s uses the intended one-pass payload:
 // BF16 logits once, plus i32 token_counts once when penalties are active.
-#include "qus/core/device.h"
-#include "qus/core/tensor.h"
-#include "qus/kernels/argmax.h"
-#include "qus/kernels/sampling.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/tensor.h"
+#include "ninfer/kernels/argmax.h"
+#include "ninfer/kernels/sampling.h"
 #include "model/mtp_ops.h"
-#include "qus_bench_common.h"
+#include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -18,8 +18,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 namespace {
 
@@ -66,7 +66,7 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--cols") {
             options.cols = parse_int(need_value("--cols"), "--cols");
         } else if (arg == "-h" || arg == "--help") {
-            usage(argc > 0 ? argv[0] : "qus_sampling_select_bench");
+            usage(argc > 0 ? argv[0] : "ninfer_sampling_select_bench");
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));

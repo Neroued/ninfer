@@ -1,5 +1,5 @@
-#include "qus/text/chat_template.h"
-#include "qus/text/tokenizer.h"
+#include "ninfer/text/chat_template.h"
+#include "ninfer/text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -16,8 +16,8 @@
 namespace {
 
 std::filesystem::path repo_file(std::string_view relative) {
-#ifdef QUS_SOURCE_DIR
-    return std::filesystem::path(QUS_SOURCE_DIR) / relative;
+#ifdef NINFER_SOURCE_DIR
+    return std::filesystem::path(NINFER_SOURCE_DIR) / relative;
 #else
     return std::filesystem::current_path() / relative;
 #endif
@@ -46,7 +46,7 @@ struct TempDir {
         const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
         for (int i = 0; i < 16; ++i) {
             path = std::filesystem::temp_directory_path() /
-                   ("qus_tokenizer_" + std::to_string(stamp) + "_" + std::to_string(i));
+                   ("ninfer_tokenizer_" + std::to_string(stamp) + "_" + std::to_string(i));
             if (std::filesystem::create_directory(path)) { return; }
         }
         throw std::runtime_error("failed to create tokenizer temp directory");
@@ -67,8 +67,8 @@ std::string read_file(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-qus::Q5090TokenizerBundle test_bundle_from_dir(const std::filesystem::path& dir) {
-    qus::Q5090TokenizerBundle bundle;
+ninfer::Q5090TokenizerBundle test_bundle_from_dir(const std::filesystem::path& dir) {
+    ninfer::Q5090TokenizerBundle bundle;
     bundle.tokenizer_json = read_file(dir / "tokenizer.json");
     bundle.merges_txt = std::filesystem::exists(dir / "merges.txt") ? read_file(dir / "merges.txt")
                                                                     : "#version: 0.2\n";
@@ -99,7 +99,7 @@ std::string minimal_tokenizer_json(
 
 bool throws_invalid_containing(const std::filesystem::path& dir, std::string_view expected) {
     try {
-        (void)qus::text::QwenTokenizer(test_bundle_from_dir(dir));
+        (void)ninfer::text::QwenTokenizer(test_bundle_from_dir(dir));
     } catch (const std::invalid_argument& ex) {
         const std::string message = ex.what();
         return message.find(expected) != std::string::npos &&
@@ -111,7 +111,7 @@ bool throws_invalid_containing(const std::filesystem::path& dir, std::string_vie
 bool throws_generation_invalid_containing(const std::filesystem::path& dir,
                                           std::string_view expected) {
     try {
-        (void)qus::text::QwenTokenizer(test_bundle_from_dir(dir));
+        (void)ninfer::text::QwenTokenizer(test_bundle_from_dir(dir));
     } catch (const std::invalid_argument& ex) {
         const std::string message = ex.what();
         return message.find(expected) != std::string::npos &&
@@ -124,7 +124,7 @@ bool throws_invalid_with_file_containing(const std::filesystem::path& dir,
                                          const std::filesystem::path& file,
                                          std::string_view expected) {
     try {
-        (void)qus::text::QwenTokenizer(test_bundle_from_dir(dir));
+        (void)ninfer::text::QwenTokenizer(test_bundle_from_dir(dir));
     } catch (const std::invalid_argument& ex) {
         const std::string message = ex.what();
         return message.find(expected) != std::string::npos &&
@@ -133,7 +133,7 @@ bool throws_invalid_with_file_containing(const std::filesystem::path& dir,
     return false;
 }
 
-bool decode_throws_out_of_range_containing(const qus::text::QwenTokenizer& tokenizer,
+bool decode_throws_out_of_range_containing(const ninfer::text::QwenTokenizer& tokenizer,
                                            const std::vector<int>& ids, std::string_view expected) {
     try {
         (void)tokenizer.decode(ids);
@@ -143,7 +143,7 @@ bool decode_throws_out_of_range_containing(const qus::text::QwenTokenizer& token
     return false;
 }
 
-bool decode_throws_invalid_containing(const qus::text::QwenTokenizer& tokenizer,
+bool decode_throws_invalid_containing(const ninfer::text::QwenTokenizer& tokenizer,
                                       const std::vector<int>& ids, std::string_view expected) {
     try {
         (void)tokenizer.decode(ids);
@@ -158,7 +158,7 @@ int test_valid_minimal_metadata() {
     write_tokenizer_json(dir.path, minimal_tokenizer_json(R"({"a":0,"b":1})"));
     write_generation_config_json(dir.path, R"({"eos_token_id":[4,5]})");
 
-    const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+    const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
     int failures = 0;
     failures += check(tokenizer.default_stop_token_ids() == std::vector<int>{4, 5},
@@ -309,7 +309,7 @@ int test_load_real_tokenizer_metadata() {
         return 0;
     }
 
-    const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(tokenizer_dir));
+    const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(tokenizer_dir));
 
     int failures = 0;
     failures += check(tokenizer.default_stop_token_ids() == std::vector<int>{248046, 248044},
@@ -317,7 +317,7 @@ int test_load_real_tokenizer_metadata() {
 
     bool found_im_start = false;
     bool found_think    = false;
-    for (const qus::text::AddedToken& token : tokenizer.added_tokens()) {
+    for (const ninfer::text::AddedToken& token : tokenizer.added_tokens()) {
         if (token.id == 248045) {
             found_im_start = token.content == "<|im_start|>" && token.special;
         }
@@ -335,27 +335,27 @@ int test_minimal_added_token_encode_decode() {
         minimal_tokenizer_json(
             R"({"!":0,"A":1})",
             R"([{"id":2,"content":"<|im_start|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},{"id":3,"content":"<|im_end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},{"id":4,"content":"<think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},{"id":5,"content":"</think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}])"));
-    const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+    const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
     const std::vector<int> ids = tokenizer.encode("<|im_start|><|im_end|><think></think>");
     int failures               = 0;
     failures += check(ids == std::vector<int>{2, 3, 4, 5}, "minimal added token ids mismatch");
 
-    const std::string raw = tokenizer.decode(ids, qus::text::DecodeOptions{false, {}});
+    const std::string raw = tokenizer.decode(ids, ninfer::text::DecodeOptions{false, {}});
     failures +=
         check(raw == "<|im_start|><|im_end|><think></think>", "minimal raw decode mismatch");
 
-    const std::string clean = tokenizer.decode(ids, qus::text::DecodeOptions{true, {}});
+    const std::string clean = tokenizer.decode(ids, ninfer::text::DecodeOptions{true, {}});
     failures += check(clean == "<think></think>", "minimal clean decode mismatch");
 
     const std::vector<int> with_stop{4, 5, 3};
     const std::string stop_trimmed =
-        tokenizer.decode(with_stop, qus::text::DecodeOptions{false, {3}});
+        tokenizer.decode(with_stop, ninfer::text::DecodeOptions{false, {3}});
     failures += check(stop_trimmed == "<think></think>", "minimal terminal stop decode mismatch");
 
     const std::vector<int> with_interior_stop{3, 4, 3};
     const std::string interior_stop_preserved =
-        tokenizer.decode(with_interior_stop, qus::text::DecodeOptions{false, {3}});
+        tokenizer.decode(with_interior_stop, ninfer::text::DecodeOptions{false, {3}});
     failures += check(interior_stop_preserved == "<|im_end|><think>",
                       "minimal interior stop decode mismatch");
     return failures;
@@ -368,7 +368,7 @@ int test_byte_level_vocab_decode() {
         minimal_tokenizer_json(
             R"({"Ġ":0,"Ċ":1,"Ã©":2,"€":3})",
             R"([{"id":4,"content":"<extra>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}])"));
-    const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+    const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
     int failures = 0;
     failures += check(tokenizer.decode(std::vector<int>{0}) == " ", "space byte decode mismatch");
@@ -387,7 +387,7 @@ int test_decode_rejects_reconstructed_invalid_utf8() {
         minimal_tokenizer_json(
             R"({"Ã":0})",
             R"([{"id":1,"content":"<extra>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}])"));
-    const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+    const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
     return check(decode_throws_invalid_containing(tokenizer, {0}, "valid UTF-8"),
                  "decode returned reconstructed invalid UTF-8");
@@ -432,7 +432,7 @@ int test_local_bpe_split_merge_cases() {
                                         "Ġ Caf\n"
                                         "ĠCaf Ã©\n");
 
-    const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+    const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
     int failures = 0;
     failures += check(tokenizer.encode("can't") == std::vector<int>{6, 7},
@@ -465,9 +465,9 @@ int test_stream_decoder_buffers_incomplete_utf8() {
         minimal_tokenizer_json(
             R"({"ä":0,"½":1,"ł":2,"!":3})",
             R"([{"id":4,"content":"<extra>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}])"));
-    const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+    const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
-    qus::text::TokenStreamDecoder stream(tokenizer, qus::text::DecodeOptions{false, {}});
+    ninfer::text::TokenStreamDecoder stream(tokenizer, ninfer::text::DecodeOptions{false, {}});
 
     int failures = 0;
     failures += check(stream.append(0).empty(), "stream emitted partial first UTF-8 byte");
@@ -485,11 +485,11 @@ int test_stream_decoder_stop_and_special_modes() {
         minimal_tokenizer_json(
             R"({"!":0})",
             R"([{"id":1,"content":"<|im_start|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},{"id":2,"content":"<|im_end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},{"id":3,"content":"<think>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}])"));
-    const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+    const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
     int failures = 0;
     {
-        qus::text::TokenStreamDecoder clean(tokenizer, qus::text::DecodeOptions{true, {2}});
+        ninfer::text::TokenStreamDecoder clean(tokenizer, ninfer::text::DecodeOptions{true, {2}});
         failures += check(clean.append(1).empty(), "clean stream emitted special start token");
         failures += check(clean.append(3) == "<think>", "clean stream skipped non-special token");
         failures += check(clean.append(2).empty(), "clean stream emitted terminal stop token");
@@ -497,7 +497,7 @@ int test_stream_decoder_stop_and_special_modes() {
         failures += check(clean.finish().empty(), "clean stream finish returned unexpected text");
     }
     {
-        qus::text::TokenStreamDecoder raw(tokenizer, qus::text::DecodeOptions{false, {}});
+        ninfer::text::TokenStreamDecoder raw(tokenizer, ninfer::text::DecodeOptions{false, {}});
         failures += check(raw.append(2) == "<|im_end|>", "raw stream skipped stop token content");
         failures += check(!raw.stopped(), "raw stream marked stop without stop ids");
         failures += check(raw.finish().empty(), "raw stream finish returned unexpected text");
@@ -514,7 +514,7 @@ int test_added_token_same_position_first_loaded_wins() {
             minimal_tokenizer_json(
                 R"({"!":0})",
                 R"([{"id":1,"content":"<tag>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},{"id":2,"content":"<tag>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}])"));
-        const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+        const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
         failures += check(tokenizer.encode("<tag>") == std::vector<int>{1},
                           "same-position added token tie did not choose first loaded token");
@@ -527,7 +527,7 @@ int test_added_token_same_position_first_loaded_wins() {
                 R"({"x":0})",
                 R"([{"id":1,"content":"<tag>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false},{"id":2,"content":"<tag>x","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}])"));
         write_file(dir.path / "merges.txt", "#version: 0.2\n");
-        const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+        const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
         failures +=
             check(tokenizer.encode("<tag>x") == std::vector<int>{1, 0},
@@ -588,7 +588,7 @@ int test_decode_rejects_sparse_invalid_id() {
         minimal_tokenizer_json(
             R"({"":0})",
             R"([{"id":5,"content":"<extra>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}])"));
-    const qus::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
+    const ninfer::text::QwenTokenizer tokenizer(test_bundle_from_dir(dir.path));
 
     int failures = 0;
     failures += check(tokenizer.decode(std::vector<int>{0}).empty(),
@@ -605,14 +605,14 @@ int test_added_token_encode_decode() {
         std::cout << "skipping added token test: local tokenizer not present\n";
         return 0;
     }
-    const qus::text::QwenTokenizer tok(test_bundle_from_dir(tokenizer_path));
+    const ninfer::text::QwenTokenizer tok(test_bundle_from_dir(tokenizer_path));
     const std::vector<int> ids = tok.encode("<|im_start|><|im_end|><think></think>");
     if (ids != std::vector<int>{248045, 248046, 248068, 248069}) {
         return fail("added token ids mismatch");
     }
-    const std::string raw = tok.decode(ids, qus::text::DecodeOptions{false, {}});
+    const std::string raw = tok.decode(ids, ninfer::text::DecodeOptions{false, {}});
     if (raw != "<|im_start|><|im_end|><think></think>") { return fail("raw decode mismatch"); }
-    const std::string clean = tok.decode(ids, qus::text::DecodeOptions{true, {}});
+    const std::string clean = tok.decode(ids, ninfer::text::DecodeOptions{true, {}});
     if (clean != "<think></think>") { return fail("clean decode mismatch"); }
     return 0;
 }
@@ -627,7 +627,7 @@ int test_hf_golden_text_cases() {
     const auto fixture_path = repo_file("tests/fixtures/text/qwen36_text_golden.json");
     std::ifstream in(fixture_path);
     const auto fixture = nlohmann::json::parse(in);
-    const qus::text::QwenTokenizer tok(test_bundle_from_dir(tokenizer_path));
+    const ninfer::text::QwenTokenizer tok(test_bundle_from_dir(tokenizer_path));
     for (const auto& item : fixture.at("text_cases")) {
         const std::string name          = item.at("name").get<std::string>();
         const std::string text          = item.at("text").get<std::string>();
@@ -639,7 +639,7 @@ int test_hf_golden_text_cases() {
             print_ids("actual", actual);
             return 1;
         }
-        const std::string raw = tok.decode(expected, qus::text::DecodeOptions{false, {}});
+        const std::string raw = tok.decode(expected, ninfer::text::DecodeOptions{false, {}});
         if (raw != item.at("raw_decoded").get<std::string>()) {
             std::cerr << "golden raw decode mismatch for " << name << '\n';
             return 1;
@@ -658,31 +658,31 @@ int test_hf_golden_message_cases() {
     const auto fixture_path = repo_file("tests/fixtures/text/qwen36_text_golden.json");
     std::ifstream in(fixture_path);
     const auto fixture = nlohmann::json::parse(in);
-    const qus::text::QwenTokenizer tok(test_bundle_from_dir(tokenizer_path));
+    const ninfer::text::QwenTokenizer tok(test_bundle_from_dir(tokenizer_path));
     for (const auto& item : fixture.at("message_cases")) {
-        std::vector<qus::text::ChatMessage> messages;
+        std::vector<ninfer::text::ChatMessage> messages;
         for (const auto& msg : item.at("messages")) {
-            qus::text::ChatMessage cm;
+            ninfer::text::ChatMessage cm;
             cm.role = msg.at("role").get<std::string>();
             cm.parts.push_back(
-                qus::text::ChatPart::text_part(msg.at("content").get<std::string>()));
+                ninfer::text::ChatPart::text_part(msg.at("content").get<std::string>()));
             if (msg.contains("reasoning_content")) {
                 cm.reasoning_content = msg.at("reasoning_content").get<std::string>();
             }
             if (msg.contains("tool_calls")) {
                 for (const auto& tc : msg.at("tool_calls")) {
                     cm.tool_calls.push_back(
-                        qus::text::ToolCall{"", tc.at("name").get<std::string>(),
+                        ninfer::text::ToolCall{"", tc.at("name").get<std::string>(),
                                             tc.at("arguments_json").get<std::string>()});
                 }
             }
             messages.push_back(std::move(cm));
         }
-        qus::text::ChatRenderOptions options;
+        ninfer::text::ChatRenderOptions options;
         options.enable_thinking    = item.at("enable_thinking").get<bool>();
         options.preserve_thinking  = item.at("preserve_thinking").get<bool>();
         options.tool_jsons         = item.at("tool_jsons").get<std::vector<std::string>>();
-        const std::string rendered = qus::text::render_qwen_chat(messages, options);
+        const std::string rendered = ninfer::text::render_qwen_chat(messages, options);
         if (rendered != item.at("rendered").get<std::string>()) {
             std::cerr << "rendered prompt mismatch for " << item.at("name").get<std::string>()
                       << '\n';

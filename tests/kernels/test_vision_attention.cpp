@@ -1,4 +1,4 @@
-#include "qus/kernels/vision_attention.h"
+#include "ninfer/kernels/vision_attention.h"
 #include "kernels/op_tester.h"
 
 #include <algorithm>
@@ -8,8 +8,8 @@
 #include <iostream>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

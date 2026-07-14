@@ -1,10 +1,10 @@
 // Performance bench for partial NeoX RoPE at the real Qwen3.6-27B attention
 // q/k shapes. The printed GB/s is informational only; the gate is ncu sustained
 // DRAM % (see docs/kernel-development.md §8).
-//   ./qus_rope_bench [--decode] [--prefill]   (default: both)
-#include "qus/kernels/rope.h"
-#include "qus/core/device.h"
-#include "qus_bench_common.h"
+//   ./ninfer_rope_bench [--decode] [--prefill]   (default: both)
+#include "ninfer/kernels/rope.h"
+#include "ninfer/core/device.h"
+#include "ninfer_bench_common.h"
 
 #include <cuda_bf16.h>
 
@@ -14,8 +14,8 @@
 #include <limits>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 namespace {
 

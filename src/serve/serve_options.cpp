@@ -1,4 +1,4 @@
-#include "qus/serve/serve_options.h"
+#include "ninfer/serve/serve_options.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::serve {
+namespace ninfer::serve {
 namespace {
 
 int parse_nonnegative_int(const char* text, const char* label) {
@@ -170,4 +170,4 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     return options;
 }
 
-} // namespace qus::serve
+} // namespace ninfer::serve

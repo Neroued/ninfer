@@ -3,7 +3,7 @@
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 enum class Cache { ca, cg };
 
@@ -86,4 +86,4 @@ __device__ __forceinline__ void pipe_wait() {
     __pipeline_wait_prior(Groups);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

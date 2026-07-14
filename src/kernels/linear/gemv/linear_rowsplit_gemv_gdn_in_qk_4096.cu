@@ -3,7 +3,7 @@
 #include "kernels/common/math.h"
 #include "kernels/common/memory.cuh"
 #include "kernels/common/warp.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 constexpr int kN = 4096;
@@ -109,4 +109,4 @@ void linear_rowsplit_gemv_gdn_in_qk_4096_q4_launch(const Tensor& x, const Weight
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

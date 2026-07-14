@@ -1,6 +1,6 @@
-#include "qus/core/weight_store_parser.h"
-#include "qus/core/weight_store.h"
-#include "qus/text/tokenizer.h"
+#include "ninfer/core/weight_store_parser.h"
+#include "ninfer/core/weight_store.h"
+#include "ninfer/text/tokenizer.h"
 
 #include <array>
 #include <cstddef>
@@ -74,9 +74,9 @@ void write_u64(std::vector<std::byte>& bytes, std::uint64_t offset, std::uint64_
 
 std::filesystem::path make_fixture(std::string_view profile = "default") {
     const auto path = std::filesystem::temp_directory_path() /
-                      ("qus_q5090_parser_fixture_" + std::string(profile) + ".qus");
+                      ("ninfer_q5090_parser_fixture_" + std::string(profile) + ".qus");
     const std::filesystem::path script =
-        std::filesystem::path(QUS_SOURCE_DIR) / "tests/fixtures/make_q5090_fixture.py";
+        std::filesystem::path(NINFER_SOURCE_DIR) / "tests/fixtures/make_q5090_fixture.py";
     std::string command = "python3 \"" + script.string() + "\" --out \"" + path.string() + "\"";
     if (profile != "default") { command += " --profile " + std::string(profile); }
     const int rc = std::system(command.c_str());
@@ -84,17 +84,17 @@ std::filesystem::path make_fixture(std::string_view profile = "default") {
     return path;
 }
 
-const qus::ParsedQ5090Tensor& find_tensor(const qus::ParsedQ5090File& parsed,
+const ninfer::ParsedQ5090Tensor& find_tensor(const ninfer::ParsedQ5090File& parsed,
                                           std::string_view name) {
-    for (const qus::ParsedQ5090Tensor& tensor : parsed.tensors) {
+    for (const ninfer::ParsedQ5090Tensor& tensor : parsed.tensors) {
         if (tensor.name == name) { return tensor; }
     }
     throw std::runtime_error("tensor not found in parsed fixture");
 }
 
-const qus::ParsedQ5090Segment& find_segment(const qus::ParsedQ5090File& parsed,
+const ninfer::ParsedQ5090Segment& find_segment(const ninfer::ParsedQ5090File& parsed,
                                             std::string_view name) {
-    for (const qus::ParsedQ5090Segment& segment : parsed.segments) {
+    for (const ninfer::ParsedQ5090Segment& segment : parsed.segments) {
         if (segment.name == name) { return segment; }
     }
     throw std::runtime_error("segment not found in parsed fixture");
@@ -106,14 +106,14 @@ int expect_parse_throws(const std::vector<std::byte>& valid, std::string_view la
     std::vector<std::byte> bytes = valid;
     mutate(bytes);
     try {
-        (void)qus::parse_q5090_file(bytes);
+        (void)ninfer::parse_q5090_file(bytes);
     } catch (const std::exception&) { return 0; }
     std::cerr << label << " did not throw\n";
     return 1;
 }
 
 int check_valid_parse(const std::vector<std::byte>& bytes) {
-    const qus::ParsedQ5090File parsed = qus::parse_q5090_file(bytes);
+    const ninfer::ParsedQ5090File parsed = ninfer::parse_q5090_file(bytes);
     int failures                      = 0;
     failures += parsed.header.tensor_count == 20 ? 0 : fail("tensor_count mismatch");
     failures += parsed.header.module_count == 3 ? 0 : fail("module_count mismatch");
@@ -134,7 +134,7 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
     failures += parsed.tokenizer.generation_config_json == "{\"eos_token_id\":[0]}\n"
                     ? 0
                     : fail("embedded generation_config.json mismatch");
-    const qus::text::QwenTokenizer tokenizer(parsed.tokenizer);
+    const ninfer::text::QwenTokenizer tokenizer(parsed.tokenizer);
     failures += tokenizer.encode("a") == std::vector<int>{0}
                     ? 0
                     : fail("embedded artifact tokenizer encode mismatch");
@@ -142,38 +142,38 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
                     ? 0
                     : fail("embedded artifact tokenizer stop ids mismatch");
 
-    failures += parsed.modules[0].module_kind == qus::ModuleKind::TextCore
+    failures += parsed.modules[0].module_kind == ninfer::ModuleKind::TextCore
                     ? 0
                     : fail("TEXT module mismatch");
     failures +=
         parsed.modules[0].tensor_index_begin == 0 && parsed.modules[0].tensor_index_count == 6
             ? 0
             : fail("TEXT module range mismatch");
-    failures += parsed.modules[1].module_kind == qus::ModuleKind::MtpDraft
+    failures += parsed.modules[1].module_kind == ninfer::ModuleKind::MtpDraft
                     ? 0
                     : fail("MTP module mismatch");
     failures += parsed.modules[1].tensor_index_count == 12 ? 0 : fail("MTP module range mismatch");
-    failures += parsed.modules[2].module_kind == qus::ModuleKind::VisionEncoder
+    failures += parsed.modules[2].module_kind == ninfer::ModuleKind::VisionEncoder
                     ? 0
                     : fail("VISION module mismatch");
 
     const auto& embed = find_tensor(parsed, "model.language_model.embed_tokens.weight");
-    failures += embed.qtype == qus::QType::Q6G64_F16S ? 0 : fail("embed qtype mismatch");
-    failures += embed.layout == qus::QuantLayout::RowSplit ? 0 : fail("embed layout mismatch");
-    failures += embed.module_kind == qus::ModuleKind::TextCore ? 0 : fail("embed module mismatch");
+    failures += embed.qtype == ninfer::QType::Q6G64_F16S ? 0 : fail("embed qtype mismatch");
+    failures += embed.layout == ninfer::QuantLayout::RowSplit ? 0 : fail("embed layout mismatch");
+    failures += embed.module_kind == ninfer::ModuleKind::TextCore ? 0 : fail("embed module mismatch");
     failures +=
         embed.shape == std::array<std::uint32_t, 4>{3, 5, 1, 1} ? 0 : fail("embed shape mismatch");
     failures += embed.padded_shape == std::array<std::uint32_t, 4>{3, 128, 1, 1}
                     ? 0
                     : fail("embed padded mismatch");
     failures += embed.group_size == 64 ? 0 : fail("embed group mismatch");
-    failures += embed.scale_dtype == qus::ScaleDType::FP16 ? 0 : fail("embed scale dtype mismatch");
+    failures += embed.scale_dtype == ninfer::ScaleDType::FP16 ? 0 : fail("embed scale dtype mismatch");
     failures += embed.payload_bytes == 524 ? 0 : fail("embed payload bytes mismatch");
     failures += embed.nibble_plane_bytes == 192 ? 0 : fail("embed nibble bytes mismatch");
     failures += embed.high_plane_bytes == 96 ? 0 : fail("embed high bytes mismatch");
     failures += embed.scale_plane_bytes == 12 ? 0 : fail("embed scale bytes mismatch");
     failures += embed.segment_count == 1 ? 0 : fail("embed segment count mismatch");
-    failures += embed.name_hash == qus::q5090_fnv1a64(embed.name) ? 0 : fail("embed hash mismatch");
+    failures += embed.name_hash == ninfer::q5090_fnv1a64(embed.name) ? 0 : fail("embed hash mismatch");
     const auto& embed_segment = find_segment(parsed, "model.language_model.embed_tokens.weight");
     failures += embed_segment.row_begin == 0 && embed_segment.row_count == 3
                     ? 0
@@ -181,7 +181,7 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
 
     const auto& gateup = find_tensor(parsed, "layers.0.mlp.gateup");
     failures += gateup.segment_count == 2 ? 0 : fail("gateup segment count mismatch");
-    failures += gateup.source_kind == static_cast<std::uint32_t>(qus::SourceKind::Other)
+    failures += gateup.source_kind == static_cast<std::uint32_t>(ninfer::SourceKind::Other)
                     ? 0
                     : fail("gateup source kind mismatch");
     const auto& gate = find_segment(parsed, "layers.0.mlp.gate_proj.weight");
@@ -213,9 +213,9 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
     failures += mtp_mlp_fusion.shared_k == 8 ? 0 : fail("mtp mlp fusion shared_k mismatch");
 
     const auto& mtp = find_tensor(parsed, "mtp.fc.weight");
-    failures += mtp.qtype == qus::QType::W8G32_F16S ? 0 : fail("mtp qtype mismatch");
-    failures += mtp.layout == qus::QuantLayout::RowSplit ? 0 : fail("mtp layout mismatch");
-    failures += mtp.module_kind == qus::ModuleKind::MtpDraft ? 0 : fail("mtp module mismatch");
+    failures += mtp.qtype == ninfer::QType::W8G32_F16S ? 0 : fail("mtp qtype mismatch");
+    failures += mtp.layout == ninfer::QuantLayout::RowSplit ? 0 : fail("mtp layout mismatch");
+    failures += mtp.module_kind == ninfer::ModuleKind::MtpDraft ? 0 : fail("mtp module mismatch");
     failures +=
         mtp.shape == std::array<std::uint32_t, 4>{8, 16, 1, 1} ? 0 : fail("mtp shape mismatch");
     failures += mtp.padded_shape == std::array<std::uint32_t, 4>{8, 128, 1, 1}
@@ -228,9 +228,9 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
     failures += mtp.scale_plane_bytes == 64 ? 0 : fail("mtp scale bytes mismatch");
 
     const auto& mtp_attn = find_tensor(parsed, "mtp.layers.0.attn_in.w8");
-    failures += mtp_attn.qtype == qus::QType::W8G32_F16S ? 0 : fail("mtp attn qtype mismatch");
+    failures += mtp_attn.qtype == ninfer::QType::W8G32_F16S ? 0 : fail("mtp attn qtype mismatch");
     failures += mtp_attn.segment_count == 4 ? 0 : fail("mtp attn segment count mismatch");
-    failures += mtp_attn.source_kind == static_cast<std::uint32_t>(qus::SourceKind::Other)
+    failures += mtp_attn.source_kind == static_cast<std::uint32_t>(ninfer::SourceKind::Other)
                     ? 0
                     : fail("mtp attn source kind mismatch");
     const auto& mtp_attn_gate = find_segment(parsed, "mtp.layers.0.self_attn.q_proj.gate");
@@ -239,19 +239,19 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
                     : fail("mtp attn gate segment mismatch");
 
     const auto& mtp_mlp = find_tensor(parsed, "mtp.layers.0.mlp.gateup.w8");
-    failures += mtp_mlp.qtype == qus::QType::W8G32_F16S ? 0 : fail("mtp mlp qtype mismatch");
+    failures += mtp_mlp.qtype == ninfer::QType::W8G32_F16S ? 0 : fail("mtp mlp qtype mismatch");
     failures += mtp_mlp.segment_count == 2 ? 0 : fail("mtp mlp segment count mismatch");
 
     const auto& fp32 = find_tensor(parsed, "layers.0.linear_attn.A_log");
-    failures += fp32.qtype == qus::QType::FP32_CTRL ? 0 : fail("fp32 qtype mismatch");
-    failures += fp32.layout == qus::QuantLayout::Contiguous ? 0 : fail("fp32 layout mismatch");
-    failures += fp32.scale_dtype == qus::ScaleDType::None ? 0 : fail("fp32 scale dtype mismatch");
+    failures += fp32.qtype == ninfer::QType::FP32_CTRL ? 0 : fail("fp32 qtype mismatch");
+    failures += fp32.layout == ninfer::QuantLayout::Contiguous ? 0 : fail("fp32 layout mismatch");
+    failures += fp32.scale_dtype == ninfer::ScaleDType::None ? 0 : fail("fp32 scale dtype mismatch");
     failures += fp32.payload_bytes == 12 ? 0 : fail("fp32 payload bytes mismatch");
 
     const auto& vision = find_tensor(parsed, "model.visual.patch_embed.proj.weight");
     failures +=
-        vision.module_kind == qus::ModuleKind::VisionEncoder ? 0 : fail("vision module mismatch");
-    failures += vision.source_kind == static_cast<std::uint32_t>(qus::SourceKind::VisPatchEmbed)
+        vision.module_kind == ninfer::ModuleKind::VisionEncoder ? 0 : fail("vision module mismatch");
+    failures += vision.source_kind == static_cast<std::uint32_t>(ninfer::SourceKind::VisPatchEmbed)
                     ? 0
                     : fail("vision source kind mismatch");
     return failures;
@@ -260,14 +260,14 @@ int check_valid_parse(const std::vector<std::byte>& bytes) {
 int check_model_bind_conv1d_parse() {
     const std::filesystem::path fixture_path = make_fixture("model-bind");
     const std::vector<std::byte> bytes       = read_file(fixture_path);
-    const qus::ParsedQ5090File parsed        = qus::parse_q5090_file(bytes);
+    const ninfer::ParsedQ5090File parsed        = ninfer::parse_q5090_file(bytes);
     const auto& conv = find_tensor(parsed, "layers.0.linear_attn.conv1d.weight");
 
     int failures = 0;
-    failures += conv.qtype == qus::QType::BF16_CTRL ? 0 : fail("conv1d qtype mismatch");
-    failures += conv.layout == qus::QuantLayout::Contiguous ? 0 : fail("conv1d layout mismatch");
-    failures += conv.module_kind == qus::ModuleKind::TextCore ? 0 : fail("conv1d module mismatch");
-    failures += conv.source_kind == static_cast<std::uint32_t>(qus::SourceKind::GdnConv1d)
+    failures += conv.qtype == ninfer::QType::BF16_CTRL ? 0 : fail("conv1d qtype mismatch");
+    failures += conv.layout == ninfer::QuantLayout::Contiguous ? 0 : fail("conv1d layout mismatch");
+    failures += conv.module_kind == ninfer::ModuleKind::TextCore ? 0 : fail("conv1d module mismatch");
+    failures += conv.source_kind == static_cast<std::uint32_t>(ninfer::SourceKind::GdnConv1d)
                     ? 0
                     : fail("conv1d source kind mismatch");
     failures += conv.shape == std::array<std::uint32_t, 4>{10240, 4, 1, 1}
@@ -288,24 +288,24 @@ int check_draft_head_parse() {
     // sets LM_HEAD_DRAFT_PRESENT, and both draft blocks report the expected schema.
     const std::filesystem::path good_path = make_fixture("draft-head");
     const std::vector<std::byte> good     = read_file(good_path);
-    const qus::ParsedQ5090File parsed     = qus::parse_q5090_file(good);
+    const ninfer::ParsedQ5090File parsed     = ninfer::parse_q5090_file(good);
 
     failures += (parsed.header.flags & (1U << 4)) != 0
                     ? 0
                     : fail("draft-head LM_HEAD_DRAFT_PRESENT flag not set");
     failures += parsed.modules.size() == 4 ? 0 : fail("draft module count mismatch");
-    failures += parsed.modules[1].module_kind == qus::ModuleKind::LmHeadDraft
+    failures += parsed.modules[1].module_kind == ninfer::ModuleKind::LmHeadDraft
                     ? 0
                     : fail("draft ModuleRecord kind mismatch");
 
     const auto& weights = find_tensor(parsed, "lm_head_draft");
-    failures += weights.qtype == qus::QType::Q4G64_F16S ? 0 : fail("draft weights qtype mismatch");
+    failures += weights.qtype == ninfer::QType::Q4G64_F16S ? 0 : fail("draft weights qtype mismatch");
     failures +=
-        weights.layout == qus::QuantLayout::RowSplit ? 0 : fail("draft weights layout mismatch");
-    failures += weights.module_kind == qus::ModuleKind::LmHeadDraft
+        weights.layout == ninfer::QuantLayout::RowSplit ? 0 : fail("draft weights layout mismatch");
+    failures += weights.module_kind == ninfer::ModuleKind::LmHeadDraft
                     ? 0
                     : fail("draft weights module mismatch");
-    failures += weights.source_kind == static_cast<std::uint32_t>(qus::SourceKind::LmHeadDraft)
+    failures += weights.source_kind == static_cast<std::uint32_t>(ninfer::SourceKind::LmHeadDraft)
                     ? 0
                     : fail("draft weights source kind mismatch");
     failures += weights.shape == std::array<std::uint32_t, 4>{131072, 5120, 1, 1}
@@ -313,11 +313,11 @@ int check_draft_head_parse() {
                     : fail("draft weights fixed v4.2 shape mismatch");
 
     const auto& idmap = find_tensor(parsed, "lm_head_draft.idmap");
-    failures += idmap.qtype == qus::QType::I32_CTRL ? 0 : fail("draft idmap qtype mismatch");
+    failures += idmap.qtype == ninfer::QType::I32_CTRL ? 0 : fail("draft idmap qtype mismatch");
     failures +=
-        idmap.layout == qus::QuantLayout::Contiguous ? 0 : fail("draft idmap layout mismatch");
+        idmap.layout == ninfer::QuantLayout::Contiguous ? 0 : fail("draft idmap layout mismatch");
     failures += idmap.ndim == 1 ? 0 : fail("draft idmap ndim mismatch");
-    failures += idmap.source_kind == static_cast<std::uint32_t>(qus::SourceKind::LmHeadDraftIdmap)
+    failures += idmap.source_kind == static_cast<std::uint32_t>(ninfer::SourceKind::LmHeadDraftIdmap)
                     ? 0
                     : fail("draft idmap source kind mismatch");
     failures += idmap.shape[0] == 131072 ? 0 : fail("draft idmap length mismatch");
@@ -341,21 +341,21 @@ int check_draft_head_parse() {
 int check_header_first_prepare(const std::filesystem::path& valid_path,
                                const std::vector<std::byte>& valid) {
     int failures = 0;
-    qus::WeightStore prepared;
+    ninfer::WeightStore prepared;
     prepared.prepare(valid_path.c_str());
-    const qus::Q5090LoadPlan& plan = prepared.load_plan();
+    const ninfer::Q5090LoadPlan& plan = prepared.load_plan();
     failures += plan.modules.size() == 1 ? 0 : fail("CPU-only plan selected wrong module count");
-    failures += plan.modules[0].module == qus::ModuleKind::TextCore
+    failures += plan.modules[0].module == ninfer::ModuleKind::TextCore
                     ? 0
                     : fail("CPU-only plan did not select TEXT_CORE");
     failures += plan.tensors.size() == 6 ? 0 : fail("CPU-only plan tensor count mismatch");
     failures += plan.file_read_bytes == read_u64(valid, 96) + plan.modules[0].file_bytes
                     ? 0
                     : fail("CPU-only plan file byte count mismatch");
-    failures += prepared.module_arena(qus::ModuleKind::TextCore) == nullptr
+    failures += prepared.module_arena(ninfer::ModuleKind::TextCore) == nullptr
                     ? 0
                     : fail("CPU-only prepare allocated a device arena");
-    const qus::Q5090LoadStats& good_stats = prepared.load_stats();
+    const ninfer::Q5090LoadStats& good_stats = prepared.load_stats();
     failures += good_stats.header_read_bytes == kHeaderSize
                     ? 0
                     : fail("CPU-only prepare header byte count mismatch");
@@ -366,14 +366,14 @@ int check_header_first_prepare(const std::filesystem::path& valid_path,
     std::vector<std::byte> bad = valid;
     write_u32(bad, 16, 99);
     const auto bad_path =
-        std::filesystem::temp_directory_path() / "qus_q5090_header_first_bad_version.qus";
+        std::filesystem::temp_directory_path() / "ninfer_q5090_header_first_bad_version.qus";
     write_file(bad_path, bad);
-    qus::WeightStore rejected;
+    ninfer::WeightStore rejected;
     try {
         rejected.prepare(bad_path.c_str());
         failures += fail("header-first bad version did not throw");
     } catch (const std::runtime_error&) {
-        failures += rejected.module_arena(qus::ModuleKind::TextCore) == nullptr
+        failures += rejected.module_arena(ninfer::ModuleKind::TextCore) == nullptr
                         ? 0
                         : fail("bad version allocated a device arena");
     }
@@ -408,7 +408,7 @@ int main() {
     const std::uint64_t second_module       = module_offset + kModuleRecordSize;
     const std::uint64_t gate_segment        = segment_offset + kSegmentRecordSize;
     const std::uint64_t up_segment          = segment_offset + 2 * kSegmentRecordSize;
-    const qus::ParsedQ5090File parsed_valid = qus::parse_q5090_file(valid);
+    const ninfer::ParsedQ5090File parsed_valid = ninfer::parse_q5090_file(valid);
     const auto& mtp_attn                    = find_tensor(parsed_valid, "mtp.layers.0.attn_in.w8");
     const std::uint32_t mtp_attn_n          = mtp_attn.shape[0];
     const std::uint64_t mtp_attn_segments =

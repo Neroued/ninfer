@@ -1,16 +1,16 @@
-#include "qus/serve/request_log.h"
+#include "ninfer/serve/request_log.h"
 
 #include <iomanip>
 #include <sstream>
 
-namespace qus::serve {
+namespace ninfer::serve {
 namespace {
 
-const char* finish_reason_name(qus::text::FinishReason reason) {
+const char* finish_reason_name(ninfer::text::FinishReason reason) {
     switch (reason) {
-        case qus::text::FinishReason::Stop: return "stop";
-        case qus::text::FinishReason::Length: return "length";
-        case qus::text::FinishReason::Cancelled: return "cancelled";
+        case ninfer::text::FinishReason::Stop: return "stop";
+        case ninfer::text::FinishReason::Length: return "length";
+        case ninfer::text::FinishReason::Cancelled: return "cancelled";
     }
     return "unknown";
 }
@@ -47,7 +47,7 @@ std::string seconds_str(double seconds) {
 }
 
 // Compact resolved-sampler summary. temperature <= 0 is the exact-argmax path.
-std::string sampler_str(const qus::kernels::SamplingConfig& s) {
+std::string sampler_str(const ninfer::kernels::SamplingConfig& s) {
     if (s.temperature <= 0.0f) { return "greedy"; }
     std::ostringstream out;
     out << std::fixed << std::setprecision(2) << "temp=" << s.temperature
@@ -84,7 +84,7 @@ std::string format_request_start(std::uint64_t id, bool stream, std::size_t n_me
                                  int requested_max_tokens, int effective_max_tokens,
                                  bool client_set, std::size_t n_tools,
                                  const ToolChoice& tool_choice, bool has_tool_history,
-                                 const qus::kernels::SamplingConfig& sampling) {
+                                 const ninfer::kernels::SamplingConfig& sampling) {
     std::ostringstream out;
     out << "[req " << id << "] chat " << (stream ? "stream" : "non-stream")
         << " msgs=" << n_messages << " max_tokens=" << requested_max_tokens;
@@ -125,4 +125,4 @@ std::string format_request_error(std::uint64_t id, const std::string& message) {
     return out.str();
 }
 
-} // namespace qus::serve
+} // namespace ninfer::serve

@@ -1,10 +1,10 @@
-#include "qus/kernels/scatter.h"
+#include "ninfer/kernels/scatter.h"
 
 #include "kernels/launcher/scatter.h"
 
 #include <stdexcept>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
     if (src.dtype != DType::BF16 || dst.dtype != DType::BF16 || indices.dtype != DType::I32) {
@@ -28,4 +28,4 @@ void scatter(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t
     detail::scatter_launch(src, indices, dst, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

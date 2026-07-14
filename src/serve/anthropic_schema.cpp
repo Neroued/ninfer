@@ -1,4 +1,4 @@
-#include "qus/serve/anthropic_schema.h"
+#include "ninfer/serve/anthropic_schema.h"
 
 #include <array>
 #include <cctype>
@@ -8,7 +8,7 @@
 #include <string>
 #include <utility>
 
-namespace qus::serve {
+namespace ninfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -94,25 +94,25 @@ std::string require_string_field(const Json& block, const char* field, const cha
     return block.at(field).get<std::string>();
 }
 
-qus::media::Source parse_image_source(const Json& block) {
+ninfer::media::Source parse_image_source(const Json& block) {
     if (!block.contains("source") || !block.at("source").is_object()) {
         bad_request("image block must contain a source object", "messages");
     }
     const Json& source     = block.at("source");
     const std::string type = require_string_field(source, "type", "image source");
-    qus::media::Source out;
+    ninfer::media::Source out;
     if (type == "base64") {
         out.media_type         = require_string_field(source, "media_type", "base64 image source");
         const std::string data = require_string_field(source, "data", "base64 image source");
         if (data.empty()) { bad_request("base64 image data must not be empty", "messages"); }
-        out.kind  = qus::media::SourceKind::Data;
+        out.kind  = ninfer::media::SourceKind::Data;
         out.value = "data:" + out.media_type + ";base64," + data;
     } else if (type == "url") {
         out.value = require_string_field(source, "url", "URL image source");
         if (!out.value.starts_with("http://") && !out.value.starts_with("https://")) {
             bad_request("image URL must use HTTP(S)", "messages");
         }
-        out.kind = qus::media::SourceKind::Url;
+        out.kind = ninfer::media::SourceKind::Url;
     } else {
         bad_request("unsupported image source type: " + type, "messages");
     }
@@ -472,13 +472,13 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     return out;
 }
 
-const char* messages_stop_reason(qus::text::FinishReason reason, bool has_tool_calls) {
+const char* messages_stop_reason(ninfer::text::FinishReason reason, bool has_tool_calls) {
     if (has_tool_calls) { return "tool_use"; }
     switch (reason) {
-    case qus::text::FinishReason::Length:
+    case ninfer::text::FinishReason::Length:
         return "max_tokens";
-    case qus::text::FinishReason::Stop:
-    case qus::text::FinishReason::Cancelled:
+    case ninfer::text::FinishReason::Stop:
+    case ninfer::text::FinishReason::Cancelled:
     default:
         return "end_turn";
     }
@@ -608,4 +608,4 @@ std::string new_message_id() {
     return "msg_" + std::string(buf.data());
 }
 
-} // namespace qus::serve
+} // namespace ninfer::serve

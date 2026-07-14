@@ -1,4 +1,4 @@
-#include "qus/serve/openai_schema.h"
+#include "ninfer/serve/openai_schema.h"
 
 #include <array>
 #include <cctype>
@@ -7,7 +7,7 @@
 #include <random>
 #include <string>
 
-namespace qus::serve {
+namespace ninfer::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -73,7 +73,7 @@ bool has_tool_named(const GenerationRequest& req, const std::string& name) {
     return false;
 }
 
-qus::media::Source parse_media_url(const Json& part, const char* field) {
+ninfer::media::Source parse_media_url(const Json& part, const char* field) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
     }
@@ -88,12 +88,12 @@ qus::media::Source parse_media_url(const Json& part, const char* field) {
                     "messages");
     }
     if (url.empty()) { bad_request(std::string(field) + " URL must not be empty", "messages"); }
-    qus::media::Source source;
+    ninfer::media::Source source;
     source.value = std::move(url);
     if (source.value.starts_with("data:")) {
-        source.kind = qus::media::SourceKind::Data;
+        source.kind = ninfer::media::SourceKind::Data;
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = qus::media::SourceKind::Url;
+        source.kind = ninfer::media::SourceKind::Url;
     } else {
         bad_request(std::string(field) + " must use HTTP(S) or a data URI", "messages");
     }
@@ -634,4 +634,4 @@ std::int64_t unix_time_now() {
         .count();
 }
 
-} // namespace qus::serve
+} // namespace ninfer::serve

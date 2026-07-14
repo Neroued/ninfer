@@ -1,33 +1,33 @@
-#include "qus/model/model.h"
+#include "ninfer/model/model.h"
 
 #include "model/position.h"
 #include "model/gqa_prompt_ops.h"
 #include "model/mtp_ops.h"
 #include "model/vision_ops.h"
-#include "qus/core/device.h"
-#include "qus/core/weight_store_parser.h"
-#include "qus/kernels/argmax.h"
-#include "qus/kernels/attn_input_proj.h"
-#include "qus/kernels/causal_conv1d_silu.h"
-#include "qus/kernels/embedding.h"
-#include "qus/kernels/gated_delta_rule.h"
-#include "qus/kernels/gated_rmsnorm.h"
-#include "qus/kernels/gdn_gating.h"
-#include "qus/kernels/gdn_gating_proj.h"
-#include "qus/kernels/gdn_input_proj.h"
-#include "qus/kernels/gqa_attention.h"
-#include "qus/kernels/l2norm.h"
-#include "qus/kernels/linear.h"
-#include "qus/kernels/linear_add.h"
-#include "qus/kernels/linear_pair.h"
-#include "qus/kernels/linear_swiglu.h"
-#include "qus/kernels/residual_add.h"
-#include "qus/kernels/rmsnorm.h"
-#include "qus/kernels/rope.h"
-#include "qus/kernels/sampling.h"
-#include "qus/kernels/scatter.h"
-#include "qus/kernels/sigmoid_mul.h"
-#include "qus/kernels/silu_mul.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/weight_store_parser.h"
+#include "ninfer/kernels/argmax.h"
+#include "ninfer/kernels/attn_input_proj.h"
+#include "ninfer/kernels/causal_conv1d_silu.h"
+#include "ninfer/kernels/embedding.h"
+#include "ninfer/kernels/gated_delta_rule.h"
+#include "ninfer/kernels/gated_rmsnorm.h"
+#include "ninfer/kernels/gdn_gating.h"
+#include "ninfer/kernels/gdn_gating_proj.h"
+#include "ninfer/kernels/gdn_input_proj.h"
+#include "ninfer/kernels/gqa_attention.h"
+#include "ninfer/kernels/l2norm.h"
+#include "ninfer/kernels/linear.h"
+#include "ninfer/kernels/linear_add.h"
+#include "ninfer/kernels/linear_pair.h"
+#include "ninfer/kernels/linear_swiglu.h"
+#include "ninfer/kernels/residual_add.h"
+#include "ninfer/kernels/rmsnorm.h"
+#include "ninfer/kernels/rope.h"
+#include "ninfer/kernels/sampling.h"
+#include "ninfer/kernels/scatter.h"
+#include "ninfer/kernels/sigmoid_mul.h"
+#include "ninfer/kernels/silu_mul.h"
 
 #include <cuda_runtime.h>
 
@@ -43,7 +43,7 @@
 #include <utility>
 #include <vector>
 
-namespace qus::model {
+namespace ninfer::model {
 namespace {
 
 constexpr ModuleKind kText               = ModuleKind::TextCore;
@@ -1307,4 +1307,4 @@ void Qwen3_6_27B::decode_step_erased(void* tap, TapCallback callback) {
     kv_.advance();
 }
 
-} // namespace qus::model
+} // namespace ninfer::model

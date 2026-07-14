@@ -1,5 +1,5 @@
-#include "qus/core/arena.h"
-#include "qus/core/device.h"
+#include "ninfer/core/arena.h"
+#include "ninfer/core/device.h"
 
 #include <cuda_runtime.h>
 
@@ -62,14 +62,14 @@ int main() {
     }
 
     int failures = 0;
-    qus::DeviceContext ctx(0);
+    ninfer::DeviceContext ctx(0);
 
-    failures += expect_throws<std::invalid_argument>([] { (void)qus::DeviceArena(0); },
+    failures += expect_throws<std::invalid_argument>([] { (void)ninfer::DeviceArena(0); },
                                                      "zero arena capacity");
-    failures += expect_throws<std::invalid_argument>([] { (void)qus::PinnedHostBuffer(0); },
+    failures += expect_throws<std::invalid_argument>([] { (void)ninfer::PinnedHostBuffer(0); },
                                                      "zero pinned size");
 
-    qus::DeviceArena arena(1024);
+    ninfer::DeviceArena arena(1024);
     failures += expect_size(arena.capacity(), 1024, "arena.capacity");
     failures += expect_size(arena.used(), 0, "arena.used initial");
     failures += expect_size(arena.peak_used(), 0, "arena.peak initial");
@@ -79,13 +79,13 @@ int main() {
     }
 
     auto* base    = static_cast<unsigned char*>(arena.base());
-    qus::Tensor a = arena.alloc(qus::DType::BF16, {3, 5});
+    ninfer::Tensor a = arena.alloc(ninfer::DType::BF16, {3, 5});
     failures += expect_ptr(a.data, base, "first allocation pointer");
     failures += expect_size(a.bytes(), 30, "first allocation bytes");
     failures += expect_size(arena.used(), 30, "arena.used after first allocation");
     failures += expect_size(arena.peak_used(), 30, "arena.peak after first allocation");
 
-    qus::Tensor b = arena.alloc(qus::DType::U8, {17}, 64);
+    ninfer::Tensor b = arena.alloc(ninfer::DType::U8, {17}, 64);
     failures += expect_ptr(b.data, base + 64, "second allocation pointer");
     if (reinterpret_cast<std::uintptr_t>(b.data) % 64 != 0) {
         ++failures;
@@ -99,7 +99,7 @@ int main() {
     std::size_t peak_after_transient    = 0;
     {
         auto outer_scope       = arena.scope();
-        qus::Tensor transient  = arena.alloc(qus::DType::U8, {11}, 128);
+        ninfer::Tensor transient  = arena.alloc(ninfer::DType::U8, {11}, 128);
         transient_ptr          = transient.data;
         const std::size_t used = arena.used();
         if (used <= used_before_scope) {
@@ -108,21 +108,21 @@ int main() {
         }
         {
             auto inner_scope = arena.scope();
-            (void)arena.alloc(qus::DType::U8, {7}, 64);
+            (void)arena.alloc(ninfer::DType::U8, {7}, 64);
         }
         failures += expect_size(arena.used(), used, "arena.used after nested scope");
         peak_after_transient = arena.peak_used();
     }
     failures += expect_size(arena.peak_used(), peak_after_transient, "arena.peak after scope exit");
     failures += expect_size(arena.used(), used_before_scope, "arena.used after scope exit");
-    qus::Tensor reused = arena.alloc(qus::DType::U8, {5}, 128);
+    ninfer::Tensor reused = arena.alloc(ninfer::DType::U8, {5}, 128);
     failures += expect_ptr(reused.data, transient_ptr, "allocation after scope pointer");
 
     const std::size_t used_before_exception_scope = arena.used();
     failures += expect_throws<std::runtime_error>(
         [&] {
             auto exception_scope = arena.scope();
-            (void)arena.alloc(qus::DType::U8, {9}, 64);
+            (void)arena.alloc(ninfer::DType::U8, {9}, 64);
             throw std::runtime_error("scope unwind");
         },
         "arena scope exception");
@@ -132,18 +132,18 @@ int main() {
     const std::size_t used_before_failures = arena.used();
     const std::size_t peak_before_failures = arena.peak_used();
     failures += expect_throws<std::invalid_argument>(
-        [&] { (void)arena.alloc(qus::DType::U8, {1}, 3); }, "invalid alignment");
+        [&] { (void)arena.alloc(ninfer::DType::U8, {1}, 3); }, "invalid alignment");
     failures +=
         expect_size(arena.used(), used_before_failures, "arena.used after invalid alignment");
     failures +=
         expect_size(arena.peak_used(), peak_before_failures, "arena.peak after invalid alignment");
     failures += expect_throws<std::bad_alloc>(
-        [&] { (void)arena.alloc(qus::DType::FP32, {300}, 256); }, "arena oom");
+        [&] { (void)arena.alloc(ninfer::DType::FP32, {300}, 256); }, "arena oom");
     failures += expect_size(arena.used(), used_before_failures, "arena.used after oom");
     failures += expect_size(arena.peak_used(), peak_before_failures, "arena.peak after oom");
     failures += expect_throws<std::overflow_error>(
         [&] {
-            (void)arena.alloc(qus::DType::U8, {std::numeric_limits<std::int32_t>::max(),
+            (void)arena.alloc(ninfer::DType::U8, {std::numeric_limits<std::int32_t>::max(),
                                                std::numeric_limits<std::int32_t>::max(), 1, 4});
         },
         "arena oversized allocation");
@@ -153,11 +153,11 @@ int main() {
     failures += expect_size(arena.peak_used(), peak_before_failures, "arena.peak after reset");
     arena.reset_peak();
     failures += expect_size(arena.peak_used(), 0, "arena.peak after reset_peak on empty arena");
-    qus::Tensor c = arena.alloc(qus::DType::U8, {4});
+    ninfer::Tensor c = arena.alloc(ninfer::DType::U8, {4});
     failures += expect_ptr(c.data, base, "allocation after reset pointer");
     failures += expect_size(arena.peak_used(), 4, "arena.peak after reset allocation");
 
-    qus::DeviceArena moved(std::move(arena));
+    ninfer::DeviceArena moved(std::move(arena));
     if (arena.base() != nullptr || arena.capacity() != 0 || arena.used() != 0) {
         ++failures;
         std::cerr << "move construction did not clear source arena\n";
@@ -166,7 +166,7 @@ int main() {
     failures += expect_size(moved.capacity(), 1024, "moved arena capacity");
     failures += expect_size(moved.peak_used(), 4, "moved arena peak");
 
-    qus::DeviceArena assigned(128);
+    ninfer::DeviceArena assigned(128);
     assigned = std::move(moved);
     if (moved.base() != nullptr || moved.capacity() != 0 || moved.used() != 0) {
         ++failures;
@@ -180,7 +180,7 @@ int main() {
     failures += expect_size(assigned.capacity(), 1024, "arena self-move capacity");
     failures += expect_size(assigned.peak_used(), 4, "arena self-move peak");
 
-    qus::PinnedHostBuffer pinned(128);
+    ninfer::PinnedHostBuffer pinned(128);
     if (pinned.data() == nullptr) {
         ++failures;
         std::cerr << "pinned data is null\n";
@@ -188,7 +188,7 @@ int main() {
     failures += expect_size(pinned.size(), 128, "pinned.size");
     std::memset(pinned.data(), 0x5a, pinned.size());
 
-    qus::PinnedHostBuffer pinned_other(64);
+    ninfer::PinnedHostBuffer pinned_other(64);
     pinned_other = std::move(pinned);
     if (pinned.data() != nullptr || pinned.size() != 0) {
         ++failures;

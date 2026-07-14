@@ -19,7 +19,7 @@
 
 #include "kernels/kernel/gqa_attention_prefill_common.cuh"
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 __global__ void gqa_attention_prefill_fill_bf16_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
@@ -199,19 +199,19 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
     const float scale_l2 = scale * Log2E;
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
-    qus::kernels::cp_commit();
+    ninfer::kernels::cp_commit();
     gqa_prefill_stage_kv(k_s, cache_k, kv_head, 0, max_query_abs, padded_context, tid);
-    qus::kernels::cp_commit();
+    ninfer::kernels::cp_commit();
 
     for (int kb = 0; kb < n_block_max; ++kb) {
         const int k0 = kb * Bc;
 
-        qus::kernels::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
+        ninfer::kernels::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
         // Overlap V(kb) load against the QK MMA below.
         gqa_prefill_stage_kv(v_s, cache_v, kv_head, k0, max_query_abs, padded_context, tid);
-        qus::kernels::cp_commit();
+        ninfer::kernels::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
         // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
@@ -369,14 +369,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
             acc[n][3] *= alpha1;
         }
 
-        qus::kernels::cp_wait<0>(); // V(kb) landed; QK done reading k_s
+        ninfer::kernels::cp_wait<0>(); // V(kb) landed; QK done reading k_s
         __syncthreads();
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
         if (kb + 1 < n_block_max) {
             gqa_prefill_stage_kv(k_s, cache_k, kv_head, (kb + 1) * Bc, max_query_abs,
                                  padded_context, tid);
-            qus::kernels::cp_commit();
+            ninfer::kernels::cp_commit();
         }
 
         // O += P V, contracting over the Bc keys. The (k, n) iteration space is
@@ -438,4 +438,4 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

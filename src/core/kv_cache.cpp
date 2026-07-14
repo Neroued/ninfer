@@ -1,10 +1,10 @@
-#include "qus/core/kv_cache.h"
+#include "ninfer/core/kv_cache.h"
 
 #include <limits>
 #include <new>
 #include <stdexcept>
 
-namespace qus {
+namespace ninfer {
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
@@ -198,4 +198,4 @@ void KVCache::rewind(std::uint32_t position) {
 
 void KVCache::reset() noexcept { pos = 0; }
 
-} // namespace qus
+} // namespace ninfer

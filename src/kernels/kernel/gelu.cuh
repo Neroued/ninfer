@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kGeluPairsPerThread = 4;
 
@@ -50,4 +50,4 @@ __global__ void gelu_kernel(__nv_bfloat16* x, std::int64_t n) {
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

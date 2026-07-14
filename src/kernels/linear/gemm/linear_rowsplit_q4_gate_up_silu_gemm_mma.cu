@@ -1,9 +1,9 @@
 #include "kernels/linear/gemm/linear_rowsplit_q4_gate_up_silu_gemm_mma_folded.cuh"
 
 #include "kernels/common/math.h"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 using GateUpCfg = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
@@ -41,4 +41,4 @@ void linear_rowsplit_q4_gate_up_silu_gemm_mma_launch(const Tensor& x, const Weig
     launch_folded(x, weight, out, stream);
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

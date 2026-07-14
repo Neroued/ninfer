@@ -1,7 +1,7 @@
-#include "qus/core/weight_store_parser.h"
-#include "qus/model/processor.h"
-#include "qus/text/chat_template.h"
-#include "qus/text/tokenizer.h"
+#include "ninfer/core/weight_store_parser.h"
+#include "ninfer/model/processor.h"
+#include "ninfer/text/chat_template.h"
+#include "ninfer/text/tokenizer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -28,12 +28,12 @@ std::vector<std::byte> read_prefix(const std::filesystem::path& path, std::size_
     return out;
 }
 
-qus::Q5090TokenizerBundle load_tokenizer(const std::filesystem::path& path) {
+ninfer::Q5090TokenizerBundle load_tokenizer(const std::filesystem::path& path) {
     const std::uint64_t size                  = std::filesystem::file_size(path);
     const std::vector<std::byte> header_bytes = read_prefix(path, 4096);
-    const qus::ParsedQ5090Header header       = qus::parse_q5090_header(header_bytes, size);
+    const ninfer::ParsedQ5090Header header       = ninfer::parse_q5090_header(header_bytes, size);
     const std::vector<std::byte> metadata     = read_prefix(path, header.payload_offset);
-    qus::ParsedQ5090File parsed               = qus::parse_q5090_catalog(metadata, size);
+    ninfer::ParsedQ5090File parsed               = ninfer::parse_q5090_catalog(metadata, size);
     return std::move(parsed.tokenizer);
 }
 
@@ -78,13 +78,13 @@ int main(int argc, char** argv) {
             }
         }
 
-        qus::text::QwenTokenizer tokenizer(load_tokenizer(weights));
-        const std::vector<qus::text::ChatMessage> messages =
-            qus::text::read_messages_json(messages_path);
-        qus::model::Processor processor(tokenizer);
-        qus::text::ChatRenderOptions render;
+        ninfer::text::QwenTokenizer tokenizer(load_tokenizer(weights));
+        const std::vector<ninfer::text::ChatMessage> messages =
+            ninfer::text::read_messages_json(messages_path);
+        ninfer::model::Processor processor(tokenizer);
+        ninfer::text::ChatRenderOptions render;
         render.enable_thinking           = thinking;
-        qus::model::ProcessedInput input = processor.process(messages, render);
+        ninfer::model::ProcessedInput input = processor.process(messages, render);
 
         nlohmann::json json;
         json["input_ids"]   = input.input_ids;
@@ -106,13 +106,13 @@ int main(int argc, char** argv) {
             {"patch_bytes", input.stats.patch_bytes},
         };
         json["vision_items"] = nlohmann::json::array();
-        for (const qus::model::VisionItem& item : input.vision_items) {
+        for (const ninfer::model::VisionItem& item : input.vision_items) {
             nlohmann::json spans = nlohmann::json::array();
-            for (const qus::model::TokenSpan& span : item.token_spans) {
+            for (const ninfer::model::TokenSpan& span : item.token_spans) {
                 spans.push_back({span.begin, span.count});
             }
             json["vision_items"].push_back({
-                {"modality", item.modality == qus::model::Modality::Image ? "image" : "video"},
+                {"modality", item.modality == ninfer::model::Modality::Image ? "image" : "video"},
                 {"grid", {item.grid.t, item.grid.h, item.grid.w}},
                 {"patch_begin", item.patch_begin},
                 {"patch_count", item.patch_count},

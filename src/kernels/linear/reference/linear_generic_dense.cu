@@ -1,16 +1,16 @@
-// qus::kernels::detail - generic dense linear GEMV/GEMM launchers.
+// ninfer::kernels::detail - generic dense linear GEMV/GEMM launchers.
 #include "kernels/linear/reference/linear_generic.h"
 
 #include "kernels/common/math.h"
 #include "kernels/linear/reference/linear_generic_dense.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 int checked_grid(std::int64_t blocks) {
@@ -77,4 +77,4 @@ void linear_generic_dense_gemm_launch(const Tensor& x, const Tensor& weight, Ten
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

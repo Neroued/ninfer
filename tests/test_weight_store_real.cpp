@@ -1,7 +1,7 @@
-#include "qus/core/arena.h"
-#include "qus/core/device.h"
-#include "qus/core/weight_store.h"
-#include "qus/core/weight_store_parser.h"
+#include "ninfer/core/arena.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/weight_store.h"
+#include "ninfer/core/weight_store_parser.h"
 
 #include "../third_party/nlohmann/json.hpp"
 
@@ -76,7 +76,7 @@ private:
 
 class ProgressThrottle {
 public:
-    explicit ProgressThrottle(qus::Q5090Progress* progress) : progress_(progress) {}
+    explicit ProgressThrottle(ninfer::Q5090Progress* progress) : progress_(progress) {}
 
     void report(std::string_view phase, std::uint64_t done, std::uint64_t total,
                 bool force = false) {
@@ -87,12 +87,12 @@ public:
     }
 
 private:
-    qus::Q5090Progress* progress_ = nullptr;
+    ninfer::Q5090Progress* progress_ = nullptr;
     std::uint64_t last_done_      = 0;
 };
 
 std::vector<std::byte> read_binary(const std::filesystem::path& path,
-                                   qus::Q5090Progress* progress) {
+                                   ninfer::Q5090Progress* progress) {
     std::ifstream in(path, std::ios::binary);
     if (!in) { throw std::runtime_error("failed to open real q5090 file"); }
     in.seekg(0, std::ios::end);
@@ -285,7 +285,7 @@ int expect_manifest_fields(const Json& manifest, std::uint64_t file_size) {
     return failures;
 }
 
-int expect_inventory(const qus::ParsedQ5090File& parsed, std::uint64_t file_size) {
+int expect_inventory(const ninfer::ParsedQ5090File& parsed, std::uint64_t file_size) {
     int failures = 0;
     failures += parsed.header.tensor_count == 1166 ? 0 : fail("real tensor_count mismatch");
     failures += parsed.header.module_count == 4 ? 0 : fail("real module_count mismatch");
@@ -300,13 +300,13 @@ int expect_inventory(const qus::ParsedQ5090File& parsed, std::uint64_t file_size
     failures += parsed.header.payload_offset + parsed.header.payload_bytes == file_size
                     ? 0
                     : fail("real file size mismatch");
-    failures += parsed.modules[0].module_kind == qus::ModuleKind::TextCore
+    failures += parsed.modules[0].module_kind == ninfer::ModuleKind::TextCore
                     ? 0
                     : fail("real TEXT module mismatch");
     failures += parsed.modules[0].tensor_index_count == 819 ? 0 : fail("real TEXT count mismatch");
     failures +=
         parsed.modules[0].payload_bytes == 16378329088ULL ? 0 : fail("real TEXT payload mismatch");
-    failures += parsed.modules[1].module_kind == qus::ModuleKind::LmHeadDraft
+    failures += parsed.modules[1].module_kind == ninfer::ModuleKind::LmHeadDraft
                     ? 0
                     : fail("real LM_HEAD_DRAFT module mismatch");
     failures +=
@@ -314,13 +314,13 @@ int expect_inventory(const qus::ParsedQ5090File& parsed, std::uint64_t file_size
     failures += parsed.modules[1].payload_bytes == 357040128ULL
                     ? 0
                     : fail("real LM_HEAD_DRAFT payload mismatch");
-    failures += parsed.modules[2].module_kind == qus::ModuleKind::MtpDraft
+    failures += parsed.modules[2].module_kind == ninfer::ModuleKind::MtpDraft
                     ? 0
                     : fail("real MTP module mismatch");
     failures += parsed.modules[2].tensor_index_count == 12 ? 0 : fail("real MTP count mismatch");
     failures +=
         parsed.modules[2].payload_bytes == 451267584ULL ? 0 : fail("real MTP payload mismatch");
-    failures += parsed.modules[3].module_kind == qus::ModuleKind::VisionEncoder
+    failures += parsed.modules[3].module_kind == ninfer::ModuleKind::VisionEncoder
                     ? 0
                     : fail("real VISION module mismatch");
     failures +=
@@ -346,24 +346,24 @@ bool enough_free_memory(std::uint64_t bytes) {
     return true;
 }
 
-int expect_fused_weight(const qus::WeightStore& store, std::uint16_t group_id,
-                        std::uint16_t fusion_index, std::uint32_t source_layer, qus::QType qtype,
-                        std::int32_t n, qus::SourceKind first_segment, const char* label) {
-    const qus::Weight* fused =
-        store.qfused(qus::ModuleKind::TextCore, group_id, fusion_index, source_layer);
-    const qus::Weight* first = store.qweight(
-        qus::ModuleKind::TextCore, static_cast<std::uint32_t>(first_segment), source_layer);
+int expect_fused_weight(const ninfer::WeightStore& store, std::uint16_t group_id,
+                        std::uint16_t fusion_index, std::uint32_t source_layer, ninfer::QType qtype,
+                        std::int32_t n, ninfer::SourceKind first_segment, const char* label) {
+    const ninfer::Weight* fused =
+        store.qfused(ninfer::ModuleKind::TextCore, group_id, fusion_index, source_layer);
+    const ninfer::Weight* first = store.qweight(
+        ninfer::ModuleKind::TextCore, static_cast<std::uint32_t>(first_segment), source_layer);
     int failures = 0;
     failures += fused != nullptr ? 0 : fail(std::string(label) + " fused missing");
     failures += first != nullptr ? 0 : fail(std::string(label) + " first segment missing");
     if (fused == nullptr || first == nullptr) { return failures; }
     failures += fused->qtype == qtype ? 0 : fail(std::string(label) + " qtype mismatch");
-    failures += fused->layout == qus::QuantLayout::RowSplit
+    failures += fused->layout == ninfer::QuantLayout::RowSplit
                     ? 0
                     : fail(std::string(label) + " layout mismatch");
     failures += fused->n == n ? 0 : fail(std::string(label) + " n mismatch");
     failures += fused->k == 5120 ? 0 : fail(std::string(label) + " k mismatch");
-    failures += fused->source_kind == static_cast<std::uint32_t>(qus::SourceKind::Other)
+    failures += fused->source_kind == static_cast<std::uint32_t>(ninfer::SourceKind::Other)
                     ? 0
                     : fail(std::string(label) + " source_kind mismatch");
     failures += fused->source_layer == source_layer
@@ -375,7 +375,7 @@ int expect_fused_weight(const qus::WeightStore& store, std::uint16_t group_id,
     failures += fused->scales == first->scales
                     ? 0
                     : fail(std::string(label) + " scales first-segment mismatch");
-    if (qtype == qus::QType::Q5G64_F16S || qtype == qus::QType::Q6G64_F16S) {
+    if (qtype == ninfer::QType::Q5G64_F16S || qtype == ninfer::QType::Q6G64_F16S) {
         failures += fused->qhigh == first->qhigh
                         ? 0
                         : fail(std::string(label) + " qhigh first-segment mismatch");
@@ -391,35 +391,35 @@ int expect_fused_weight(const qus::WeightStore& store, std::uint16_t group_id,
     return failures;
 }
 
-int expect_real_fused_contract(const qus::WeightStore& store) {
+int expect_real_fused_contract(const ninfer::WeightStore& store) {
     int failures = 0;
-    failures += expect_fused_weight(store, /*MLP_GATEUP*/ 3, 0, 0, qus::QType::Q4G64_F16S, 34816,
-                                    qus::SourceKind::MlpGate, "mlp.gate_up");
-    failures += expect_fused_weight(store, /*ATTN_IN*/ 1, 0, 3, qus::QType::Q4G64_F16S, 7168,
-                                    qus::SourceKind::AttnQ, "attn.qkv.q4");
-    failures += expect_fused_weight(store, /*ATTN_IN*/ 1, 1, 3, qus::QType::Q5G64_F16S, 7168,
-                                    qus::SourceKind::AttnGate, "attn.gatev.q5");
-    failures += expect_fused_weight(store, /*GDN_IN*/ 2, 0, 0, qus::QType::Q4G64_F16S, 4096,
-                                    qus::SourceKind::GdnInProjQ, "gdn.in_qk.q4");
-    failures += store.qfused(qus::ModuleKind::TextCore, 0, 0, 3) == nullptr
+    failures += expect_fused_weight(store, /*MLP_GATEUP*/ 3, 0, 0, ninfer::QType::Q4G64_F16S, 34816,
+                                    ninfer::SourceKind::MlpGate, "mlp.gate_up");
+    failures += expect_fused_weight(store, /*ATTN_IN*/ 1, 0, 3, ninfer::QType::Q4G64_F16S, 7168,
+                                    ninfer::SourceKind::AttnQ, "attn.qkv.q4");
+    failures += expect_fused_weight(store, /*ATTN_IN*/ 1, 1, 3, ninfer::QType::Q5G64_F16S, 7168,
+                                    ninfer::SourceKind::AttnGate, "attn.gatev.q5");
+    failures += expect_fused_weight(store, /*GDN_IN*/ 2, 0, 0, ninfer::QType::Q4G64_F16S, 4096,
+                                    ninfer::SourceKind::GdnInProjQ, "gdn.in_qk.q4");
+    failures += store.qfused(ninfer::ModuleKind::TextCore, 0, 0, 3) == nullptr
                     ? 0
                     : fail("standalone o_proj should not have fused record");
-    failures += store.qfused(qus::ModuleKind::TextCore, 0, 0, 0) == nullptr
+    failures += store.qfused(ninfer::ModuleKind::TextCore, 0, 0, 0) == nullptr
                     ? 0
                     : fail("standalone mlp.down should not have fused record");
     return failures;
 }
 
-int expect_real_draft_head(const qus::WeightStore& store) {
+int expect_real_draft_head(const ninfer::WeightStore& store) {
     int failures = 0;
-    const qus::Weight* draft =
-        store.qweight(qus::ModuleKind::LmHeadDraft,
-                      static_cast<std::uint32_t>(qus::SourceKind::LmHeadDraft), qus::kQ5090NoLayer);
+    const ninfer::Weight* draft =
+        store.qweight(ninfer::ModuleKind::LmHeadDraft,
+                      static_cast<std::uint32_t>(ninfer::SourceKind::LmHeadDraft), ninfer::kQ5090NoLayer);
     failures += draft != nullptr ? 0 : fail("real draft head weight missing");
     if (draft != nullptr) {
         failures +=
-            draft->qtype == qus::QType::Q4G64_F16S ? 0 : fail("real draft head qtype mismatch");
-        failures += draft->layout == qus::QuantLayout::RowSplit
+            draft->qtype == ninfer::QType::Q4G64_F16S ? 0 : fail("real draft head qtype mismatch");
+        failures += draft->layout == ninfer::QuantLayout::RowSplit
                         ? 0
                         : fail("real draft head layout mismatch");
         failures += draft->n == 131072 ? 0 : fail("real draft head n mismatch");
@@ -427,47 +427,47 @@ int expect_real_draft_head(const qus::WeightStore& store) {
         failures += draft->qhigh == nullptr ? 0 : fail("real draft head qhigh non-null");
         failures += draft->high_plane_bytes == 0 ? 0 : fail("real draft head high plane nonzero");
     }
-    const qus::Tensor* idmap = store.tensor(
-        qus::ModuleKind::LmHeadDraft, static_cast<std::uint32_t>(qus::SourceKind::LmHeadDraftIdmap),
-        qus::kQ5090NoLayer);
+    const ninfer::Tensor* idmap = store.tensor(
+        ninfer::ModuleKind::LmHeadDraft, static_cast<std::uint32_t>(ninfer::SourceKind::LmHeadDraftIdmap),
+        ninfer::kQ5090NoLayer);
     failures += idmap != nullptr ? 0 : fail("real draft head idmap missing");
     if (idmap != nullptr) {
         failures +=
-            idmap->dtype == qus::DType::I32 ? 0 : fail("real draft head idmap dtype mismatch");
+            idmap->dtype == ninfer::DType::I32 ? 0 : fail("real draft head idmap dtype mismatch");
         failures += idmap->ne[0] == 131072 ? 0 : fail("real draft head idmap length mismatch");
     }
     return failures;
 }
 
 int run_default_load(const std::filesystem::path& file_path, std::uint64_t text_payload_bytes,
-                     qus::Q5090Progress* progress) {
+                     ninfer::Q5090Progress* progress) {
     if (!enough_free_memory(text_payload_bytes + kGiB)) { return 0; }
-    qus::DeviceContext ctx(0);
-    qus::WeightStore store;
-    qus::LoadOptions options;
+    ninfer::DeviceContext ctx(0);
+    ninfer::WeightStore store;
+    ninfer::LoadOptions options;
     options.progress = progress;
     store.load(file_path.c_str(), ctx, options);
     int failures = 0;
-    failures += store.module_loaded(qus::ModuleKind::TextCore) ? 0 : fail("real TEXT not loaded");
+    failures += store.module_loaded(ninfer::ModuleKind::TextCore) ? 0 : fail("real TEXT not loaded");
     failures +=
-        !store.module_loaded(qus::ModuleKind::MtpDraft) ? 0 : fail("real MTP loaded by default");
-    failures += !store.module_loaded(qus::ModuleKind::VisionEncoder)
+        !store.module_loaded(ninfer::ModuleKind::MtpDraft) ? 0 : fail("real MTP loaded by default");
+    failures += !store.module_loaded(ninfer::ModuleKind::VisionEncoder)
                     ? 0
                     : fail("real VISION loaded by default");
     failures += store.tensor_count() == 1166 ? 0 : fail("real store tensor_count mismatch");
     failures +=
         store.loaded_payload_bytes() == text_payload_bytes ? 0 : fail("real loaded bytes mismatch");
-    const qus::DeviceArena* text_arena = store.module_arena(qus::ModuleKind::TextCore);
+    const ninfer::DeviceArena* text_arena = store.module_arena(ninfer::ModuleKind::TextCore);
     failures += text_arena != nullptr && text_arena->capacity() == text_payload_bytes &&
                         text_arena->used() == text_payload_bytes
                     ? 0
                     : fail("real TEXT exact arena mismatch");
-    failures += store.module_arena(qus::ModuleKind::MtpDraft) == nullptr &&
-                        store.module_arena(qus::ModuleKind::LmHeadDraft) == nullptr &&
-                        store.module_arena(qus::ModuleKind::VisionEncoder) == nullptr
+    failures += store.module_arena(ninfer::ModuleKind::MtpDraft) == nullptr &&
+                        store.module_arena(ninfer::ModuleKind::LmHeadDraft) == nullptr &&
+                        store.module_arena(ninfer::ModuleKind::VisionEncoder) == nullptr
                     ? 0
                     : fail("real default load allocated an unselected module arena");
-    const qus::Q5090LoadStats& load_stats = store.load_stats();
+    const ninfer::Q5090LoadStats& load_stats = store.load_stats();
     failures += load_stats.h2d_bytes == text_payload_bytes
                     ? 0
                     : fail("real default H2D byte count mismatch");
@@ -479,9 +479,9 @@ int run_default_load(const std::filesystem::path& file_path, std::uint64_t text_
                     ? 0
                     : fail("real default pinned staging stats mismatch");
     failures += expect_real_fused_contract(store);
-    failures += store.qweight(qus::ModuleKind::LmHeadDraft,
-                              static_cast<std::uint32_t>(qus::SourceKind::LmHeadDraft),
-                              qus::kQ5090NoLayer) == nullptr
+    failures += store.qweight(ninfer::ModuleKind::LmHeadDraft,
+                              static_cast<std::uint32_t>(ninfer::SourceKind::LmHeadDraft),
+                              ninfer::kQ5090NoLayer) == nullptr
                     ? 0
                     : fail("real LM_HEAD_DRAFT loaded by default");
     return failures;
@@ -489,19 +489,19 @@ int run_default_load(const std::filesystem::path& file_path, std::uint64_t text_
 
 int run_draft_load(const std::filesystem::path& file_path, std::uint64_t text_payload_bytes,
                    std::uint64_t draft_payload_bytes, std::uint64_t mtp_payload_bytes,
-                   qus::Q5090Progress* progress) {
+                   ninfer::Q5090Progress* progress) {
     if (!enough_free_memory(text_payload_bytes + draft_payload_bytes + mtp_payload_bytes + kGiB)) {
         return 0;
     }
-    qus::DeviceContext ctx(0);
-    qus::LoadOptions options;
+    ninfer::DeviceContext ctx(0);
+    ninfer::LoadOptions options;
     options.load_mtp           = true;
     options.load_lm_head_draft = true;
     options.progress           = progress;
-    qus::WeightStore store;
+    ninfer::WeightStore store;
     store.load(file_path.c_str(), ctx, options);
     int failures = 0;
-    failures += store.module_loaded(qus::ModuleKind::LmHeadDraft)
+    failures += store.module_loaded(ninfer::ModuleKind::LmHeadDraft)
                     ? 0
                     : fail("real LM_HEAD_DRAFT not loaded");
     failures +=
@@ -513,21 +513,21 @@ int run_draft_load(const std::filesystem::path& file_path, std::uint64_t text_pa
 }
 
 int run_mtp_load(const std::filesystem::path& file_path, std::uint64_t text_payload_bytes,
-                 std::uint64_t mtp_payload_bytes, qus::Q5090Progress* progress) {
+                 std::uint64_t mtp_payload_bytes, ninfer::Q5090Progress* progress) {
     const std::uint64_t needed = text_payload_bytes + mtp_payload_bytes + kGiB;
     if (!enough_free_memory(needed)) { return 0; }
-    qus::DeviceContext ctx(0);
-    qus::LoadOptions options;
+    ninfer::DeviceContext ctx(0);
+    ninfer::LoadOptions options;
     options.load_mtp = true;
     options.progress = progress;
-    qus::WeightStore store;
+    ninfer::WeightStore store;
     store.load(file_path.c_str(), ctx, options);
     store.require_mtp_module_expectations();
     int failures = 0;
     failures +=
-        store.module_loaded(qus::ModuleKind::TextCore) ? 0 : fail("real TEXT not loaded with MTP");
-    failures += store.module_loaded(qus::ModuleKind::MtpDraft) ? 0 : fail("real MTP not loaded");
-    failures += !store.module_loaded(qus::ModuleKind::VisionEncoder)
+        store.module_loaded(ninfer::ModuleKind::TextCore) ? 0 : fail("real TEXT not loaded with MTP");
+    failures += store.module_loaded(ninfer::ModuleKind::MtpDraft) ? 0 : fail("real MTP not loaded");
+    failures += !store.module_loaded(ninfer::ModuleKind::VisionEncoder)
                     ? 0
                     : fail("real VISION loaded with MTP");
     failures += store.loaded_payload_bytes() == text_payload_bytes + mtp_payload_bytes
@@ -537,22 +537,22 @@ int run_mtp_load(const std::filesystem::path& file_path, std::uint64_t text_payl
 }
 
 int run_vision_load(const std::filesystem::path& file_path, std::uint64_t text_payload_bytes,
-                    std::uint64_t vision_payload_bytes, qus::Q5090Progress* progress) {
+                    std::uint64_t vision_payload_bytes, ninfer::Q5090Progress* progress) {
     if (!enough_free_memory(text_payload_bytes + vision_payload_bytes + kGiB)) { return 0; }
-    qus::DeviceContext ctx(0);
-    qus::LoadOptions options;
+    ninfer::DeviceContext ctx(0);
+    ninfer::LoadOptions options;
     options.load_vision = true;
     options.progress    = progress;
-    qus::WeightStore store;
+    ninfer::WeightStore store;
     store.load(file_path.c_str(), ctx, options);
     int failures = 0;
     failures +=
-        store.module_loaded(qus::ModuleKind::VisionEncoder) ? 0 : fail("real VISION not loaded");
-    failures += store.module_arena(qus::ModuleKind::VisionEncoder) != nullptr
+        store.module_loaded(ninfer::ModuleKind::VisionEncoder) ? 0 : fail("real VISION not loaded");
+    failures += store.module_arena(ninfer::ModuleKind::VisionEncoder) != nullptr
                     ? 0
                     : fail("real VISION arena missing");
-    failures += store.module_arena(qus::ModuleKind::MtpDraft) == nullptr &&
-                        store.module_arena(qus::ModuleKind::LmHeadDraft) == nullptr
+    failures += store.module_arena(ninfer::ModuleKind::MtpDraft) == nullptr &&
+                        store.module_arena(ninfer::ModuleKind::LmHeadDraft) == nullptr
                     ? 0
                     : fail("real VISION load allocated unselected optional arenas");
     failures += store.loaded_payload_bytes() == text_payload_bytes + vision_payload_bytes
@@ -564,7 +564,7 @@ int run_vision_load(const std::filesystem::path& file_path, std::uint64_t text_p
 } // namespace
 
 int main() {
-    const std::filesystem::path root(QUS_SOURCE_DIR);
+    const std::filesystem::path root(NINFER_SOURCE_DIR);
     const std::filesystem::path file_path = root / "out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus";
     const std::filesystem::path manifest_path =
         root / "out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus.manifest.json";
@@ -578,14 +578,14 @@ int main() {
     failures += expect_manifest_fields(read_manifest_json(manifest_path), manifest_file_size);
 
     ProgressPrinter printer;
-    qus::Q5090Progress progress;
+    ninfer::Q5090Progress progress;
     progress.min_interval_bytes = 512ULL * 1024ULL * 1024ULL;
     progress.callback           = [&printer](std::string_view phase, std::uint64_t done,
                                    std::uint64_t total) { printer(phase, done, total); };
 
     std::vector<std::byte> bytes      = read_binary(file_path, &progress);
     const std::uint64_t file_size     = bytes.size();
-    const qus::ParsedQ5090File parsed = qus::parse_q5090_file(bytes, &progress);
+    const ninfer::ParsedQ5090File parsed = ninfer::parse_q5090_file(bytes, &progress);
     failures += expect_inventory(parsed, file_size);
     const std::uint64_t text_payload_bytes   = parsed.modules[0].payload_bytes;
     const std::uint64_t draft_payload_bytes  = parsed.modules[1].payload_bytes;

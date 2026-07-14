@@ -1,4 +1,4 @@
-#include "qus/model/model.h"
+#include "ninfer/model/model.h"
 #include <cuda_runtime_api.h>
 
 #include <array>
@@ -20,7 +20,7 @@ namespace {
 struct MemoryTap {
     static constexpr bool enabled = true;
 
-    void operator()(qus::model::TapId, int, qus::model::Phase, const qus::Tensor&, cudaStream_t) {}
+    void operator()(ninfer::model::TapId, int, ninfer::model::Phase, const ninfer::Tensor&, cudaStream_t) {}
 };
 
 class CudaStream {
@@ -163,7 +163,7 @@ int test_file_tap_output_files() {
 
     CUDA_CHECK(cudaSetDevice(0));
 
-    TempDir out_dir("qus_runtime_tap_behavior");
+    TempDir out_dir("ninfer_runtime_tap_behavior");
 
     const std::array<float, 3> expected{1.0f, -2.5f, 3.25f};
     CudaStream stream;
@@ -171,14 +171,14 @@ int test_file_tap_output_files() {
     CUDA_CHECK(cudaMemcpyAsync(device.get(), expected.data(), expected.size() * sizeof(float),
                                cudaMemcpyHostToDevice, stream.get()));
 
-    qus::Tensor tensor(device.get(), qus::DType::FP32,
+    ninfer::Tensor tensor(device.get(), ninfer::DType::FP32,
                        {static_cast<std::int32_t>(expected.size())});
-    qus::model::FileTap tap(out_dir.path());
-    tap(qus::model::TapId::AfterEmbed, -1, qus::model::Phase::Prefill, tensor, stream.get());
-    tap(qus::model::TapId::AfterMixer, 7, qus::model::Phase::Prefill, tensor, stream.get());
-    tap(qus::model::TapId::AfterMlp, 12, qus::model::Phase::Prefill, tensor, stream.get());
-    tap(qus::model::TapId::AfterFinalNorm, -1, qus::model::Phase::Decode, tensor, stream.get());
-    tap(qus::model::TapId::AfterLogits, -1, qus::model::Phase::Decode, tensor, stream.get());
+    ninfer::model::FileTap tap(out_dir.path());
+    tap(ninfer::model::TapId::AfterEmbed, -1, ninfer::model::Phase::Prefill, tensor, stream.get());
+    tap(ninfer::model::TapId::AfterMixer, 7, ninfer::model::Phase::Prefill, tensor, stream.get());
+    tap(ninfer::model::TapId::AfterMlp, 12, ninfer::model::Phase::Prefill, tensor, stream.get());
+    tap(ninfer::model::TapId::AfterFinalNorm, -1, ninfer::model::Phase::Decode, tensor, stream.get());
+    tap(ninfer::model::TapId::AfterLogits, -1, ninfer::model::Phase::Decode, tensor, stream.get());
 
     int failures = 0;
     failures +=
@@ -200,7 +200,7 @@ int test_file_tap_output_files() {
 
 } // namespace
 
-static_assert(requires(qus::model::Qwen3_6_27B& card, std::span<const int> ids, MemoryTap& tap) {
+static_assert(requires(ninfer::model::Qwen3_6_27B& card, std::span<const int> ids, MemoryTap& tap) {
     card.prefill(ids, tap);
     card.decode_step(tap);
 });

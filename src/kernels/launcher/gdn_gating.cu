@@ -1,14 +1,14 @@
-// qus::kernels - gdn_gating launcher: grid/block/stream configuration + kernel launch.
+// ninfer::kernels - gdn_gating launcher: grid/block/stream configuration + kernel launch.
 #include "kernels/launcher/gdn_gating.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/gdn_gating.cuh"
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log,
                        const Tensor& dt_bias, Tensor& g, Tensor& beta, cudaStream_t stream) {
@@ -24,4 +24,4 @@ void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

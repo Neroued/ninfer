@@ -2,12 +2,12 @@
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/mtp_round.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <algorithm>
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void mtp_prepare_verify_inputs_launch(const Tensor& token, const Tensor& drafts,
                                       const Tensor& length, Tensor& window_base,
@@ -120,4 +120,4 @@ void mtp_set_gdn_initial_slot_from_accepted_launch(const Tensor& accepted, Tenso
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

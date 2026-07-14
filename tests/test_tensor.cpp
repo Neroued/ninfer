@@ -1,4 +1,4 @@
-#include "qus/core/tensor.h"
+#include "ninfer/core/tensor.h"
 
 #include <cstdint>
 #include <iostream>
@@ -42,7 +42,7 @@ int expect_size(std::size_t actual, std::size_t expected, const char* label) {
     return 1;
 }
 
-int check_shape(const qus::Tensor& t, const std::int32_t (&expected)[4], const char* label) {
+int check_shape(const ninfer::Tensor& t, const std::int32_t (&expected)[4], const char* label) {
     int failures = 0;
     for (int i = 0; i < 4; ++i) {
         if (t.ne[i] != expected[i]) {
@@ -54,7 +54,7 @@ int check_shape(const qus::Tensor& t, const std::int32_t (&expected)[4], const c
     return failures;
 }
 
-int check_strides(const qus::Tensor& t, const std::int64_t (&expected)[4], const char* label) {
+int check_strides(const ninfer::Tensor& t, const std::int64_t (&expected)[4], const char* label) {
     int failures = 0;
     for (int i = 0; i < 4; ++i) {
         if (t.nb[i] != expected[i]) {
@@ -73,7 +73,7 @@ int main() {
     auto* base                             = storage;
     int failures                           = 0;
 
-    qus::Tensor t(base, qus::DType::BF16, {2, 3, 4});
+    ninfer::Tensor t(base, ninfer::DType::BF16, {2, 3, 4});
     failures += check_shape(t, {2, 3, 4, 1}, "t");
     failures += check_strides(t, {2, 4, 12, 48}, "t");
     failures += expect_i64(t.numel(), 24, "t.numel");
@@ -83,7 +83,7 @@ int main() {
         std::cerr << "t expected contiguous\n";
     }
 
-    qus::Tensor viewed = t.view({4, 6});
+    ninfer::Tensor viewed = t.view({4, 6});
     if (viewed.data != base) {
         ++failures;
         std::cerr << "view changed data pointer\n";
@@ -97,7 +97,7 @@ int main() {
     }
     failures += expect_invalid([&] { (void)t.view({5, 5}); }, "mismatched view");
 
-    qus::Tensor sliced = t.slice(1, 1, 2);
+    ninfer::Tensor sliced = t.slice(1, 1, 2);
     if (sliced.data != base + 4) {
         ++failures;
         std::cerr << "slice did not advance by dim-1 stride\n";
@@ -109,7 +109,7 @@ int main() {
         std::cerr << "sliced expected non-contiguous\n";
     }
 
-    qus::Tensor permuted = t.permute({2, 1, 0, 3});
+    ninfer::Tensor permuted = t.permute({2, 1, 0, 3});
     if (permuted.data != base) {
         ++failures;
         std::cerr << "permute changed data pointer\n";
@@ -121,7 +121,7 @@ int main() {
         std::cerr << "permuted expected non-contiguous\n";
     }
 
-    qus::Tensor reshaped = t.reshape({6, 4});
+    ninfer::Tensor reshaped = t.reshape({6, 4});
     if (reshaped.data != base) {
         ++failures;
         std::cerr << "reshape changed data pointer\n";
@@ -131,21 +131,21 @@ int main() {
     failures += expect_i64(reshaped.numel(), 24, "reshaped.numel");
 
     failures += expect_invalid([&] { (void)sliced.reshape({4, 4}); }, "non-contiguous reshape");
-    failures += expect_invalid([&] { (void)qus::Tensor(base, qus::DType::BF16, {2, 0}); },
+    failures += expect_invalid([&] { (void)ninfer::Tensor(base, ninfer::DType::BF16, {2, 0}); },
                                "zero dimension");
     failures += expect_invalid([&] { (void)t.slice(4, 0, 1); }, "invalid slice dim");
     failures += expect_invalid([&] { (void)t.slice(1, 2, 2); }, "out-of-range slice");
     failures += expect_invalid([&] { (void)t.permute({0, 0, 1, 2}); }, "duplicate permutation");
     failures += expect_overflow(
         [&] {
-            (void)qus::Tensor(nullptr, qus::DType::FP32,
+            (void)ninfer::Tensor(nullptr, ninfer::DType::FP32,
                               {std::numeric_limits<std::int32_t>::max(),
                                std::numeric_limits<std::int32_t>::max(), 2});
         },
         "oversized tensor");
     failures += expect_overflow(
         [&] {
-            qus::Tensor huge_offset(base, qus::DType::U8,
+            ninfer::Tensor huge_offset(base, ninfer::DType::U8,
                                     {std::numeric_limits<std::int32_t>::max(),
                                      std::numeric_limits<std::int32_t>::max(), 1, 4});
             (void)huge_offset.slice(3, 3, 1);
@@ -153,7 +153,7 @@ int main() {
         "oversized slice offset");
     failures += expect_overflow(
         [&] {
-            qus::Tensor null_huge_offset(nullptr, qus::DType::U8,
+            ninfer::Tensor null_huge_offset(nullptr, ninfer::DType::U8,
                                          {std::numeric_limits<std::int32_t>::max(),
                                           std::numeric_limits<std::int32_t>::max(), 1, 4});
             (void)null_huge_offset.slice(3, 3, 1);

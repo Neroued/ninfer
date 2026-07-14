@@ -1,11 +1,11 @@
-// qus::kernels::detail - sample launch. One block per logits column.
+// ninfer::kernels::detail - sample launch. One block per logits column.
 #include "kernels/launcher/sampling.h"
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/sampling.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void sample_column_launch(const Tensor& logits, Tensor& out, const SamplingConfig* config,
                           const std::int32_t* pos_base, std::int32_t purpose,
@@ -36,4 +36,4 @@ void sample_column_launch(const Tensor& logits, Tensor& out, const SamplingConfi
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

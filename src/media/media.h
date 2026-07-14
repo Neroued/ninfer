@@ -1,6 +1,6 @@
 #pragma once
 
-#include "qus/media/source.h"
+#include "ninfer/media/source.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace qus::media::internal {
+namespace ninfer::media::internal {
 
 enum class ErrorKind {
     BudgetExceeded,
@@ -63,4 +63,4 @@ Image decode_image(const Source& source, const Policy& policy);
 Video decode_video(const Source& source, const Policy& policy, double target_fps, int min_frames,
                    int max_frames);
 
-} // namespace qus::media::internal
+} // namespace ninfer::media::internal

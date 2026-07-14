@@ -18,7 +18,7 @@
 #include <cstdio>
 #include <utility>
 
-namespace qus::kernels::detail::gdn_prepare_wy_wu {
+namespace ninfer::kernels::detail::gdn_prepare_wy_wu {
 
 namespace {
 
@@ -29,8 +29,8 @@ using gdn_chunked::MMA_N;
 using gdn_chunked::MMA_K;
 using gdn_chunked::bh_decode_t;
 using gdn_chunked::zero_frag;
-using qus::kernels::SmemTile;
-using qus::kernels::mma_tf32;
+using ninfer::kernels::SmemTile;
+using ninfer::kernels::mma_tf32;
 
 static_assert(gdn_chunked::kChunkSize == 64,
               "stage_prepare_wy_wu: kChunkSize must be 64 (kernel hard-codes "
@@ -38,7 +38,7 @@ static_assert(gdn_chunked::kChunkSize == 64,
 
 constexpr int N_SUB     = BT / BC;                           // 4
 constexpr int N_WARPS   = N_SUB;                             // 4 warps
-constexpr int THREADS   = N_WARPS * qus::kernels::kWarpSize; // 128
+constexpr int THREADS   = N_WARPS * ninfer::kernels::kWarpSize; // 128
 constexpr int N_K_TILES = BT / MMA_K;                        // 8 (recompute_wu)
 
 static_assert(MMA_M == BC, "kernel assumes MMA m == BC");
@@ -214,7 +214,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
                          const __nv_bfloat16* __restrict__ v_in, const float* __restrict__ g_in,
                          const float* __restrict__ beta_in, __nv_bfloat16* __restrict__ W,
                          __nv_bfloat16* __restrict__ U, float* __restrict__ g_cumsum_out, int64_t T,
-                         int64_t H_v, qus::kernels::head_map qk_map,
+                         int64_t H_v, ninfer::kernels::head_map qk_map,
                          // Token-axis strides (in floats) for k / v. Caller
                          // passes materialised values (launch_typed handles
                          // 0 -> packed defaults H_qk*S / H_v*S).
@@ -245,7 +245,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
     SmemTile<S> VK_view{VK_smem};      // recompute_wu Phase A..D
 
     const int tid    = threadIdx.x;
-    const auto lanes = qus::kernels::mma_lane_t::decode(tid);
+    const auto lanes = ninfer::kernels::mma_lane_t::decode(tid);
     const int lane   = lanes.lane;
     const int warp   = lanes.warp;
     const int lane_g = lanes.lane_g;
@@ -258,7 +258,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
     const int b   = bh.b;
     const int h_v = bh.h_v;
 
-    const auto cb    = qus::kernels::chunk_bounds_t::of(chunk, T, BT);
+    const auto cb    = ninfer::kernels::chunk_bounds_t::of(chunk, T, BT);
     const int64_t cs = cb.cs;
     const int cl     = cb.cl;
 
@@ -293,7 +293,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
         // Hillis-Steele inclusive scan over per-lane partials (a + bv).
         float partial = a + bv;
 #pragma unroll
-        for (int o = 1; o < qus::kernels::kWarpSize; o <<= 1) {
+        for (int o = 1; o < ninfer::kernels::kWarpSize; o <<= 1) {
             const float n = __shfl_up_sync(0xffffffffu, partial, o);
             if (lane >= o) partial += n;
         }
@@ -365,7 +365,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
             const int col4 = v - row * VEC_PER_ROW_CHUNK;
             float4 val     = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             if (row < cl) {
-                val = qus::kernels::load_bf16_vec4_as_float4(
+                val = ninfer::kernels::load_bf16_vec4_as_float4(
                     k_in + k_base + (int64_t)row * k_stride_t + chunk_col + col4 * 4);
             }
             K_view.vec4_at(row, col4 * 4) = val;
@@ -532,7 +532,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
         const int64_t row_base =
             (int64_t)b * T * v_stride_t + (int64_t)cs * v_stride_t + (int64_t)h_v * S;
         const int64_t row_stride = v_stride_t;
-        qus::kernels::issue_load_bf16_to_float_vec4<BT, S, THREADS>(VK_view, v_in + row_base,
+        ninfer::kernels::issue_load_bf16_to_float_vec4<BT, S, THREADS>(VK_view, v_in + row_base,
                                                                     row_stride, cl, tid);
     }
 
@@ -697,7 +697,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
     {
         const int64_t row_base =
             ((int64_t)b * T + cs) * k_stride_t + (int64_t)qk_map.qk_head(h_v) * S;
-        qus::kernels::issue_load_bf16_to_float_vec4<BT, S, THREADS>(VK_view, k_in + row_base,
+        ninfer::kernels::issue_load_bf16_to_float_vec4<BT, S, THREADS>(VK_view, k_in + row_base,
                                                                     k_stride_t, cl, tid);
     }
     __syncthreads();
@@ -708,7 +708,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
 
 template <int S>
 cudaError_t launch_typed(const gdn_chunked::prepare_wy_wu_config& cfg, dim3 grid, dim3 block,
-                         qus::kernels::head_map qk_map) {
+                         ninfer::kernels::head_map qk_map) {
     constexpr int smem_bytes = kernel_dims<S>::SMEM_FLOATS * (int)sizeof(float);
 
     cudaError_t err = cudaFuncSetAttribute(prepare_wy_wu_gdn_kernel<S>,
@@ -732,17 +732,17 @@ cudaError_t launch_typed(const gdn_chunked::prepare_wy_wu_config& cfg, dim3 grid
 
 cudaError_t launch_prepare_wy_wu(const gdn_chunked::prepare_wy_wu_config& cfg) {
     gdn_chunked::stage_validator v{"launch_prepare_wy_wu", cfg.S, cfg.H_qk, cfg.H_v, cfg.L, cfg.B};
-    QUS_GDN_PROPAGATE(v.check_shape());
-    QUS_GDN_PROPAGATE(v.check_gdn_full_chunks());
+    NINFER_GDN_PROPAGATE(v.check_shape());
+    NINFER_GDN_PROPAGATE(v.check_gdn_full_chunks());
     if (cfg.k == nullptr || cfg.v == nullptr || cfg.g_in == nullptr || cfg.beta == nullptr ||
         cfg.W == nullptr || cfg.U == nullptr || cfg.g_cumsum_out == nullptr) {
         return cudaErrorInvalidValue;
     }
 
-    const auto qk_map = qus::kernels::head_map::of((int)cfg.H_qk, (int)cfg.H_v);
+    const auto qk_map = ninfer::kernels::head_map::of((int)cfg.H_qk, (int)cfg.H_v);
     const int64_t NT  = div_up(cfg.L, static_cast<int64_t>(BT));
     const int64_t bh  = cfg.B * cfg.H_v;
-    QUS_GDN_PROPAGATE(v.check_grid(NT, bh));
+    NINFER_GDN_PROPAGATE(v.check_grid(NT, bh));
 
     const dim3 grid((unsigned)NT, (unsigned)bh, 1);
     const dim3 block(THREADS, 1, 1);
@@ -761,4 +761,4 @@ cudaError_t launch_prepare_wy_wu(const gdn_chunked::prepare_wy_wu_config& cfg) {
     }
 }
 
-} // namespace qus::kernels::detail::gdn_prepare_wy_wu
+} // namespace ninfer::kernels::detail::gdn_prepare_wy_wu

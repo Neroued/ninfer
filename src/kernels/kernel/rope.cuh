@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - partial NeoX RoPE kernel over q and k, in place.
+// ninfer::kernels - partial NeoX RoPE kernel over q and k, in place.
 // One block handles one token. It computes the token's rotary coefficients once
 // per pair, then reuses them across q and k heads. The final q/k values are
 // copied back in vector chunks so the kernel's HBM traffic matches the in-place
@@ -11,7 +11,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kRopeHeadDim = 256;
 
@@ -189,4 +189,4 @@ __launch_bounds__(256) __global__
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

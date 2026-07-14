@@ -1,4 +1,4 @@
-#include "qus/model/processor.h"
+#include "ninfer/model/processor.h"
 
 #include "media/media.h"
 
@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace qus::model {
+namespace ninfer::model {
 namespace {
 
 constexpr int kPatch                    = 16;
@@ -600,4 +600,4 @@ ProcessedInput Processor::process(const std::vector<text::ChatMessage>& messages
     return output;
 }
 
-} // namespace qus::model
+} // namespace ninfer::model

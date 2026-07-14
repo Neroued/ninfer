@@ -2,7 +2,7 @@
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges (incl. a large-magnitude stress case), composite tolerance
 // bf16_elementwise.
-#include "qus/kernels/sigmoid_mul.h"
+#include "ninfer/kernels/sigmoid_mul.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -11,8 +11,8 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 // fp64 reference: x[i] = double(x[i]) * sigmoid(double(gate[i])).
 static void cpu_sigmoid_gate_mul(const std::vector<float>& gate, const std::vector<float>& x,

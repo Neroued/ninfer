@@ -1,11 +1,11 @@
 #include "kernels/linear/gemm/linear_rowsplit_grouped_input_gemm_mma.cuh"
 
 #include "kernels/common/math.h"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 RowsplitGroupedJob make_job(const Weight& weight, Tensor& out, std::int32_t out_ld,
@@ -73,4 +73,4 @@ void linear_rowsplit_gdn_input_grouped_mma_launch(const Tensor& x, const Weight&
                    make_job(v_weight, qkv, qkv.ne[0], qk_weight.n, true), empty, empty, stream);
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

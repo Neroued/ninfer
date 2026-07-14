@@ -1,14 +1,14 @@
 #include "kernels/launcher/gated_delta_rule.h"
 
 #include "kernels/kernel/gdn_chunked_common.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cuda_bf16.h>
 #include <cstddef>
 #include <cstdint>
 #include <new>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 constexpr std::int64_t kS   = 128;
@@ -91,4 +91,4 @@ void gated_delta_rule_chunked_launch(const Tensor& q, const Tensor& k, const Ten
     CUDA_CHECK(gdn_chunk_output::launch_chunk_output(output));
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

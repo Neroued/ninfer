@@ -1,4 +1,4 @@
-#include "qus/kernels/layer_norm.h"
+#include "ninfer/kernels/layer_norm.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -6,8 +6,8 @@
 #include <iostream>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

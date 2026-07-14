@@ -1,4 +1,4 @@
-#include "qus/runtime/engine.h"
+#include "ninfer/runtime/engine.h"
 
 #include <cuda_runtime.h>
 
@@ -44,7 +44,7 @@ bool enough_free_memory(std::size_t bytes) {
 }
 
 std::filesystem::path real_weights_path() {
-    const std::filesystem::path root(QUS_SOURCE_DIR);
+    const std::filesystem::path root(NINFER_SOURCE_DIR);
     return root / "out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus";
 }
 
@@ -64,13 +64,13 @@ std::vector<int> foundation_prompt_ids() {
 
 struct Run {
     std::vector<int> tokens;
-    qus::EngineMtpStats mtp;
+    ninfer::EngineMtpStats mtp;
 };
 
-Run generate(const std::filesystem::path& weights, qus::EngineOptions options,
+Run generate(const std::filesystem::path& weights, ninfer::EngineOptions options,
              const std::vector<int>& prompt, int max_new_tokens) {
     options.device = 0;
-    qus::Engine engine(options);
+    ninfer::Engine engine(options);
     engine.load(weights.string());
     Run out;
     out.tokens = engine.generate(prompt, max_new_tokens);
@@ -79,7 +79,7 @@ Run generate(const std::filesystem::path& weights, qus::EngineOptions options,
 }
 
 int scenario_batched(const std::filesystem::path& weights) {
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.max_ctx          = 128;
     options.mtp_draft_tokens = 5;
     options.use_cuda_graph   = false;
@@ -95,7 +95,7 @@ int scenario_batched(const std::filesystem::path& weights) {
 }
 
 int scenario_capacity_fallback(const std::filesystem::path& weights) {
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.max_ctx          = 8;
     options.mtp_draft_tokens = 5;
     options.use_cuda_graph   = false;
@@ -110,7 +110,7 @@ int scenario_capacity_fallback(const std::filesystem::path& weights) {
 
 int scenario_fallback_after_accept(const std::filesystem::path& weights) {
     const std::vector<int> prompt = foundation_prompt_ids();
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.max_ctx          = static_cast<std::uint32_t>(prompt.size() + 10);
     options.mtp_draft_tokens = 5;
     options.use_cuda_graph   = false;
@@ -129,14 +129,14 @@ int scenario_fallback_after_accept(const std::filesystem::path& weights) {
 }
 
 int scenario_stop_truncation(const std::filesystem::path& weights) {
-    qus::EngineOptions probe_options;
+    ninfer::EngineOptions probe_options;
     probe_options.max_ctx          = 32;
     probe_options.mtp_draft_tokens = 5;
     probe_options.use_cuda_graph   = false;
     const Run probe                = generate(weights, probe_options, {1}, 3);
     if (probe.tokens.size() < 2) { return fail("stop probe token count mismatch"); }
 
-    qus::EngineOptions options;
+    ninfer::EngineOptions options;
     options.max_ctx          = 32;
     options.mtp_draft_tokens = 5;
     options.use_cuda_graph   = false;
@@ -154,7 +154,7 @@ int scenario_stop_truncation(const std::filesystem::path& weights) {
 
 // Drives one conversation turn to completion with greedy decode, honoring stop tokens the same way
 // the text runner does. When use_cache is true it goes through the engine-level prefix cache.
-std::vector<int> drive_turn(qus::Engine& engine, const std::vector<int>& prompt, int max_new,
+std::vector<int> drive_turn(ninfer::Engine& engine, const std::vector<int>& prompt, int max_new,
                             const std::vector<int>& stop_ids, bool use_cache) {
     std::vector<int> out;
     if (max_new <= 0) { return out; }
@@ -190,7 +190,7 @@ int scenario_multiturn_prefix_cache(const std::filesystem::path& weights) {
 
         // Probe the natural greedy continuation to pick a real token as the stop id, so turn 1
         // ends on a committed stop rather than a mid-round max-token cut.
-        qus::EngineOptions probe_opt;
+        ninfer::EngineOptions probe_opt;
         probe_opt.max_ctx          = 256;
         probe_opt.mtp_draft_tokens = mtp;
         probe_opt.use_cuda_graph   = false;
@@ -200,11 +200,11 @@ int scenario_multiturn_prefix_cache(const std::filesystem::path& weights) {
             continue;
         }
 
-        qus::EngineOptions options = probe_opt;
+        ninfer::EngineOptions options = probe_opt;
         options.stop_token_ids     = {probe.tokens[3]};
 
         // Baseline: full re-prefill each turn (cache OFF).
-        qus::Engine base(options);
+        ninfer::Engine base(options);
         base.load(weights.string());
         const std::vector<int> g1 = drive_turn(base, p1, kTurnNew, options.stop_token_ids, false);
         std::vector<int> p2       = p1;
@@ -213,7 +213,7 @@ int scenario_multiturn_prefix_cache(const std::filesystem::path& weights) {
         const std::vector<int> g2 = drive_turn(base, p2, kTurnNew, options.stop_token_ids, false);
 
         // Cached: one resident engine reuses the prefix across turns (cache ON).
-        qus::Engine cached(options);
+        ninfer::Engine cached(options);
         cached.load(weights.string());
         const std::vector<int> c1 = drive_turn(cached, p1, kTurnNew, options.stop_token_ids, true);
         std::vector<int> p2c      = p1;
@@ -243,7 +243,7 @@ int scenario_partial_reuse_parity(const std::filesystem::path& weights) {
     } // divergent suffix after the shared prefix
     constexpr int kNew = 8;
 
-    const auto run_from = [&](qus::Engine& eng, const std::vector<int>& prompt, bool cache,
+    const auto run_from = [&](ninfer::Engine& eng, const std::vector<int>& prompt, bool cache,
                               std::uint32_t cb) {
         std::vector<int> out;
         int tok = cache ? eng.prefill_cached(prompt, cb) : eng.prefill(prompt);
@@ -255,20 +255,20 @@ int scenario_partial_reuse_parity(const std::filesystem::path& weights) {
     int failures = 0;
     for (int mtp : {0, 3}) {
         const std::string tag = mtp > 0 ? "mtp-on" : "mtp-off";
-        qus::EngineOptions options;
+        ninfer::EngineOptions options;
         options.max_ctx          = 256;
         options.mtp_draft_tokens = mtp;
         options.use_cuda_graph   = false;
 
         // Cache OFF: independent full prefills (prefill() resets state between turns).
-        qus::Engine base(options);
+        ninfer::Engine base(options);
         base.load(weights.string());
         const std::vector<int> g1_off = run_from(base, p1, false, 0);
         const std::vector<int> g2_off = run_from(base, p2, false, 0);
 
         // Cache ON: turn 1 caps a chunk at `boundary` and snapshots GDN there; turn 2 reuses that
         // boundary via branch-2 rewind and re-prefills only the divergent suffix.
-        qus::Engine cached(options);
+        ninfer::Engine cached(options);
         cached.load(weights.string());
         const std::vector<int> g1_on = run_from(cached, p1, true, boundary);
         const std::vector<int> g2_on =
@@ -290,13 +290,13 @@ int scenario_partial_reuse_parity(const std::filesystem::path& weights) {
 int scenario_graph_parity(const std::filesystem::path& weights) {
     const std::vector<int> prompt = foundation_prompt_ids();
 
-    qus::EngineOptions eager;
+    ninfer::EngineOptions eager;
     eager.max_ctx          = 256;
     eager.mtp_draft_tokens = 5;
     eager.use_cuda_graph   = false;
     const Run a            = generate(weights, eager, prompt, 24);
 
-    qus::EngineOptions graph;
+    ninfer::EngineOptions graph;
     graph.max_ctx          = 256;
     graph.mtp_draft_tokens = 5;
     graph.use_cuda_graph   = true;
@@ -320,14 +320,14 @@ int scenario_prefill_chunk_parity(const std::filesystem::path& weights) {
                       seed.begin() + static_cast<std::ptrdiff_t>(std::min(remaining, seed.size())));
     }
 
-    qus::EngineOptions chunked;
+    ninfer::EngineOptions chunked;
     chunked.max_ctx          = 384;
     chunked.prefill_chunk    = 128;
     chunked.mtp_draft_tokens = 3;
     chunked.use_cuda_graph   = false;
     const Run a              = generate(weights, chunked, prompt, 8);
 
-    qus::EngineOptions single = chunked;
+    ninfer::EngineOptions single = chunked;
     single.prefill_chunk      = 512;
     const Run b               = generate(weights, single, prompt, 8);
 
@@ -363,7 +363,7 @@ int run_scenario(std::string_view scenario, const std::filesystem::path& weights
 
 int main(int argc, char** argv) {
     if (argc > 2) {
-        std::cerr << "usage: qus_engine_mtp_e2e_test "
+        std::cerr << "usage: ninfer_engine_mtp_e2e_test "
                      "<batched|capacity_fallback|fallback_after_accept|stop_truncation|"
                      "multiturn_prefix_cache|partial_reuse_parity|graph_parity|"
                      "prefill_chunk_parity>\n";

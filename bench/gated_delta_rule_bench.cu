@@ -1,20 +1,20 @@
 // Performance bench for gated_delta_rule at the real Qwen3.6-27B GDN shapes.
 //
 // Default keeps the original decode behavior:
-//   ./qus_gated_delta_rule_bench
-//   ./qus_gated_delta_rule_bench --decode --kernel-only
+//   ./ninfer_gated_delta_rule_bench
+//   ./ninfer_gated_delta_rule_bench --decode --kernel-only
 //
 // Chunked prefill is explicit:
-//   ./qus_gated_delta_rule_bench --prefill
-//   ./qus_gated_delta_rule_bench --prefill --kernel-only
-//   ./qus_gated_delta_rule_bench --prefill --sweep --csv
+//   ./ninfer_gated_delta_rule_bench --prefill
+//   ./ninfer_gated_delta_rule_bench --prefill --kernel-only
+//   ./ninfer_gated_delta_rule_bench --prefill --sweep --csv
 //
 // The public-wrapper chunked row includes WorkspaceArena scratch. The
 // kernel-only row times the detail chunked launcher with preallocated
 // workspace, matching ~/chunked_gdn/bench_chunked's allocation policy.
-#include "qus/kernels/gated_delta_rule.h"
+#include "ninfer/kernels/gated_delta_rule.h"
 #include "kernels/launcher/gated_delta_rule.h"
-#include "qus_bench_common.h"
+#include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -28,8 +28,8 @@
 #include <string>
 #include <vector>
 
-using namespace qus;
-using namespace qus::bench;
+using namespace ninfer;
+using namespace ninfer::bench;
 
 namespace {
 

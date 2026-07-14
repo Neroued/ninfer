@@ -1,10 +1,10 @@
-#include "qus/kernels/vision_pos_embed.h"
+#include "ninfer/kernels/vision_pos_embed.h"
 
 #include "kernels/launcher/vision_pos_embed.h"
 
 #include <stdexcept>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tensor& weights,
                           Tensor& x, cudaStream_t stream) {
@@ -35,4 +35,4 @@ void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tens
     detail::vision_pos_embed_add_launch(table, indices, weights, x, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

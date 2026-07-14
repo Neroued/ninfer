@@ -5,7 +5,7 @@
 #include "kernels/common/warp.cuh"
 #include "kernels/linear/gemm/linear_dense_gdn_in_ab_gemm_mma.cuh"
 
-#include "qus/core/device.h" // CUDA_CHECK
+#include "ninfer/core/device.h" // CUDA_CHECK
 
 #include <cuda_bf16.h>
 
@@ -15,7 +15,7 @@
 #include <string>
 #include <type_traits>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 namespace {
 
 constexpr int kN       = 48;
@@ -332,4 +332,4 @@ void linear_dense_gdn_in_ab_gated_48_launch(const Tensor& x, const Weight& a_wei
     }
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

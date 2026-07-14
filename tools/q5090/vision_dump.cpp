@@ -1,9 +1,9 @@
-#include "qus/core/device.h"
-#include "qus/core/weight_store.h"
-#include "qus/model/processor.h"
-#include "qus/model/vision.h"
-#include "qus/text/chat_template.h"
-#include "qus/text/tokenizer.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/weight_store.h"
+#include "ninfer/model/processor.h"
+#include "ninfer/model/vision.h"
+#include "ninfer/text/chat_template.h"
+#include "ninfer/text/tokenizer.h"
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
@@ -32,16 +32,16 @@ struct DumpContext {
     Json records = Json::array();
 };
 
-void dump_tensor(void* opaque, qus::model::VisionTapId id, int layer, const qus::Tensor& tensor,
+void dump_tensor(void* opaque, ninfer::model::VisionTapId id, int layer, const ninfer::Tensor& tensor,
                  cudaStream_t stream) {
-    if (id == qus::model::VisionTapId::Block && layer != 0 && layer != 13 && layer != 26) {
+    if (id == ninfer::model::VisionTapId::Block && layer != 0 && layer != 13 && layer != 26) {
         return;
     }
     auto& context = *static_cast<DumpContext*>(opaque);
     std::string name;
-    if (id == qus::model::VisionTapId::PatchEmbed) {
+    if (id == ninfer::model::VisionTapId::PatchEmbed) {
         name = "vision/patch_embed";
-    } else if (id == qus::model::VisionTapId::Block) {
+    } else if (id == ninfer::model::VisionTapId::Block) {
         char buffer[32];
         std::snprintf(buffer, sizeof(buffer), "vision/block_%02d", layer);
         name = buffer;
@@ -81,19 +81,19 @@ int main(int argc, char** argv) {
     try {
         const std::filesystem::path out_dir = argv[3];
         std::filesystem::create_directories(out_dir);
-        qus::WeightStore weights;
-        qus::LoadOptions load_options;
+        ninfer::WeightStore weights;
+        ninfer::LoadOptions load_options;
         load_options.load_vision = true;
-        qus::DeviceContext context;
+        ninfer::DeviceContext context;
         weights.load(argv[1], context, load_options);
-        qus::text::QwenTokenizer tokenizer(weights.take_tokenizer_bundle());
-        qus::model::Processor processor(tokenizer);
-        qus::text::ChatRenderOptions render_options;
+        ninfer::text::QwenTokenizer tokenizer(weights.take_tokenizer_bundle());
+        ninfer::model::Processor processor(tokenizer);
+        ninfer::text::ChatRenderOptions render_options;
         render_options.enable_thinking         = argc != 5;
-        const auto messages                    = qus::text::read_messages_json(argv[2]);
-        const qus::model::ProcessedInput input = processor.process(messages, render_options);
-        qus::WorkspaceArena workspace(qus::model::Qwen3_6_Vision::workspace_bytes(input));
-        qus::model::Qwen3_6_Vision vision(context, weights);
+        const auto messages                    = ninfer::text::read_messages_json(argv[2]);
+        const ninfer::model::ProcessedInput input = processor.process(messages, render_options);
+        ninfer::WorkspaceArena workspace(ninfer::model::Qwen3_6_Vision::workspace_bytes(input));
+        ninfer::model::Qwen3_6_Vision vision(context, weights);
         DumpContext dump{out_dir};
         (void)vision.encode(input, workspace, &dump, dump_tensor);
         context.synchronize();

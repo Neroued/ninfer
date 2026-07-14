@@ -1,10 +1,10 @@
-#include "qus/text/cli.h"
+#include "ninfer/text/cli.h"
 
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
-namespace qus::text {
+namespace ninfer::text {
 namespace {
 
 int parse_nonnegative_int(const char* text, const char* label) {
@@ -153,4 +153,4 @@ CliOptions parse_cli(int argc, char** argv) {
     return options;
 }
 
-} // namespace qus::text
+} // namespace ninfer::text

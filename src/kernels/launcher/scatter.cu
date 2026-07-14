@@ -1,11 +1,11 @@
 #include "kernels/launcher/scatter.h"
 
 #include "kernels/kernel/scatter.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaStream_t stream) {
     constexpr int block = 256;
@@ -25,4 +25,4 @@ void scatter_launch(const Tensor& src, const Tensor& indices, Tensor& dst, cudaS
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 __device__ __forceinline__ float codec_load_scale_f16(const std::uint8_t* scales,
                                                       std::int64_t group_index) {
@@ -252,4 +252,4 @@ struct W8G32Codec {
     }
 };
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

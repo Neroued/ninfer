@@ -1,6 +1,6 @@
-// qus::kernels - rmsnorm wrapper: public api validation and launcher dispatch.
-#include "qus/kernels/rmsnorm.h"
-#include "qus/kernels/gated_rmsnorm.h"
+// ninfer::kernels - rmsnorm wrapper: public api validation and launcher dispatch.
+#include "ninfer/kernels/rmsnorm.h"
+#include "ninfer/kernels/gated_rmsnorm.h"
 
 #include "kernels/launcher/rmsnorm.h" // detail::rmsnorm_launch
 
@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -98,4 +98,4 @@ void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float
     rmsnorm_impl(x, weight, eps, false, &z, out, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

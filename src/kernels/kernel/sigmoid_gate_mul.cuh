@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - sigmoid_mul kernel: x *= sigmoid(gate), elementwise in place.
+// ninfer::kernels - sigmoid_mul kernel: x *= sigmoid(gate), elementwise in place.
 // sigmoid(x) = 1 / (1 + e^-x), computed in fp32 with expf (NOT a polynomial fit).
 // Vectorized over bf16 pairs; included only by its launcher. See
 // docs/kernel-development.md §6.
@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kSigmoidGateMulPairsPerThread = 4;
 
@@ -67,4 +67,4 @@ __launch_bounds__(256) __global__
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

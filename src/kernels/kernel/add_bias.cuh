@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kAddBiasPairsPerThread = 4;
 
@@ -41,4 +41,4 @@ __global__ void add_bias_kernel(const __nv_bfloat16* bias, __nv_bfloat16* x, std
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

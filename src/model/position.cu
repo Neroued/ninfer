@@ -1,13 +1,13 @@
 #include "model/position.h"
 
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
-namespace qus::model::detail {
+namespace ninfer::model::detail {
 namespace {
 
 constexpr int kBlock = 256;
@@ -105,4 +105,4 @@ void advance_pos(Tensor& pos, cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::model::detail
+} // namespace ninfer::model::detail

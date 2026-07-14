@@ -1,8 +1,8 @@
 // Correctness + coverage for rmsnorm, against the frozen op-test standard
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges, composite tolerance bf16_reduction.
-#include "qus/kernels/rmsnorm.h"
-#include "qus/kernels/gated_rmsnorm.h"
+#include "ninfer/kernels/rmsnorm.h"
+#include "ninfer/kernels/gated_rmsnorm.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -11,8 +11,8 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 static void cpu_rmsnorm(const std::vector<float>& x, const std::vector<float>& weight, float eps,
                         bool unit_offset, const std::vector<float>* z, std::int32_t d,

@@ -1,13 +1,13 @@
-// qus::kernels — silu_mul wrapper: implements the public api, validates parameters, and
+// ninfer::kernels — silu_mul wrapper: implements the public api, validates parameters, and
 // dispatches to the launcher. Host-compiled; never includes the kernel header.
 // See docs/kernel-development.md §2.
-#include "qus/kernels/silu_mul.h"
+#include "ninfer/kernels/silu_mul.h"
 
 #include "kernels/launcher/silu_and_mul.h" // detail::silu_and_mul_launch
 
 #include <stdexcept>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
     if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
@@ -27,4 +27,4 @@ void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t st
     detail::silu_and_mul_launch(gate, up, out, stream); // single variant -> direct dispatch
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

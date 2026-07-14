@@ -1,4 +1,4 @@
-#include "qus/kernels/vision_attention.h"
+#include "ninfer/kernels/vision_attention.h"
 
 #include "kernels/launcher/vision_attention.h"
 
@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 namespace {
 
 constexpr std::int32_t kHeadDim = 72;
@@ -59,4 +59,4 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
     detail::vision_attention_launch(q, k, v, cu_seqlens, tiles_ptr, out, stream);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

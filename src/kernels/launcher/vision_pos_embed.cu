@@ -2,13 +2,13 @@
 
 #include "kernels/common/math.h"
 #include "kernels/kernel/vision_pos_embed.cuh"
-#include "qus/core/device.h"
+#include "ninfer/core/device.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 
-namespace qus::kernels::detail {
+namespace ninfer::kernels::detail {
 
 void vision_pos_embed_add_launch(const Tensor& table, const Tensor& indices, const Tensor& weights,
                                  Tensor& x, cudaStream_t stream) {
@@ -37,4 +37,4 @@ void vision_pos_embed_add_launch(const Tensor& table, const Tensor& indices, con
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace qus::kernels::detail
+} // namespace ninfer::kernels::detail

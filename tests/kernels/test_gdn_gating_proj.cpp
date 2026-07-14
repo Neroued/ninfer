@@ -1,7 +1,7 @@
 // Correctness coverage for the fused GDN in_a/in_b prefill path at Qwen3.6-27B
 // shapes: two dense BF16 [48,5120] projections fused with gdn_gating.
-#include "qus/kernels/gdn_gating_proj.h"
-#include "qus/core/arena.h"
+#include "ninfer/kernels/gdn_gating_proj.h"
+#include "ninfer/core/arena.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -10,8 +10,8 @@
 #include <string>
 #include <vector>
 
-using namespace qus;
-using namespace qus::test;
+using namespace ninfer;
+using namespace ninfer::test;
 
 namespace {
 

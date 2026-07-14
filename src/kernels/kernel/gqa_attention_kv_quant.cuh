@@ -1,6 +1,6 @@
 #pragma once
 
-// qus::kernels - signed int8, per-token group-wise KV cache codec (shared device
+// ninfer::kernels - signed int8, per-token group-wise KV cache codec (shared device
 // helpers). Quantization (append) and dequantization (stage) are FUSED into the
 // GQA attention kernels themselves (decode partial kernel, prefill fill/attention);
 // this header only provides the index math, the vectorized dequant, and the scalar
@@ -15,7 +15,7 @@
 
 #include <cstdint>
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 inline constexpr int kGqaKvQuantHeadDim = 256;
 inline constexpr int kGqaKvQuantKVHeads = 4;
@@ -87,4 +87,4 @@ __device__ __forceinline__ int4 gqa_kv_dequant_i8x8(const std::int8_t* __restric
     return gqa_kv_dequant_i8x8_from(&cache[code_off], s);
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

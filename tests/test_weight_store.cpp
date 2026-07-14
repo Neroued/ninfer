@@ -1,7 +1,7 @@
-#include "qus/core/arena.h"
-#include "qus/core/device.h"
-#include "qus/core/weight_store.h"
-#include "qus/core/weight_store_parser.h"
+#include "ninfer/core/arena.h"
+#include "ninfer/core/device.h"
+#include "ninfer/core/weight_store.h"
+#include "ninfer/core/weight_store_parser.h"
 
 #include <cuda_runtime.h>
 
@@ -33,9 +33,9 @@ int fail(std::string_view message) {
 }
 
 std::filesystem::path make_fixture() {
-    const auto path = std::filesystem::temp_directory_path() / "qus_q5090_weight_store_fixture.qus";
+    const auto path = std::filesystem::temp_directory_path() / "ninfer_q5090_weight_store_fixture.qus";
     const std::filesystem::path script =
-        std::filesystem::path(QUS_SOURCE_DIR) / "tests/fixtures/make_q5090_fixture.py";
+        std::filesystem::path(NINFER_SOURCE_DIR) / "tests/fixtures/make_q5090_fixture.py";
     const std::string command =
         "python3 \"" + script.string() + "\" --out \"" + path.string() + "\"";
     if (std::system(command.c_str()) != 0) { throw std::runtime_error("fixture generator failed"); }
@@ -70,23 +70,23 @@ void write_u32(std::vector<std::byte>& bytes, std::uint64_t offset, std::uint32_
     std::memcpy(bytes.data() + offset, &value, sizeof(value));
 }
 
-const qus::ParsedQ5090Tensor& find_tensor(const qus::ParsedQ5090File& parsed,
+const ninfer::ParsedQ5090Tensor& find_tensor(const ninfer::ParsedQ5090File& parsed,
                                           std::string_view name) {
-    for (const qus::ParsedQ5090Tensor& tensor : parsed.tensors) {
+    for (const ninfer::ParsedQ5090Tensor& tensor : parsed.tensors) {
         if (tensor.name == name) { return tensor; }
     }
     throw std::runtime_error("tensor not found");
 }
 
-const qus::ParsedQ5090Segment& find_segment(const qus::ParsedQ5090File& parsed,
+const ninfer::ParsedQ5090Segment& find_segment(const ninfer::ParsedQ5090File& parsed,
                                             std::string_view name) {
-    for (const qus::ParsedQ5090Segment& segment : parsed.segments) {
+    for (const ninfer::ParsedQ5090Segment& segment : parsed.segments) {
         if (segment.name == name) { return segment; }
     }
     throw std::runtime_error("segment not found");
 }
 
-std::size_t find_segment_index(const qus::ParsedQ5090File& parsed, std::string_view name) {
+std::size_t find_segment_index(const ninfer::ParsedQ5090File& parsed, std::string_view name) {
     for (std::size_t i = 0; i < parsed.segments.size(); ++i) {
         if (parsed.segments[i].name == name) { return i; }
     }
@@ -97,34 +97,34 @@ std::uint64_t align_up_u64(std::uint64_t value, std::uint64_t align) {
     return ((value + align - 1) / align) * align;
 }
 
-std::uint64_t nibble_bytes_per_group(qus::QType qtype) {
+std::uint64_t nibble_bytes_per_group(ninfer::QType qtype) {
     switch (qtype) {
-    case qus::QType::Q4G64_F16S:
-    case qus::QType::Q5G64_F16S:
-    case qus::QType::Q6G64_F16S:
-    case qus::QType::W8G32_F16S:
+    case ninfer::QType::Q4G64_F16S:
+    case ninfer::QType::Q5G64_F16S:
+    case ninfer::QType::Q6G64_F16S:
+    case ninfer::QType::W8G32_F16S:
         return 32;
     default:
         throw std::runtime_error("unexpected row-split qtype");
     }
 }
 
-std::uint64_t high_bytes_per_group(qus::QType qtype) {
+std::uint64_t high_bytes_per_group(ninfer::QType qtype) {
     switch (qtype) {
-    case qus::QType::Q4G64_F16S:
-    case qus::QType::W8G32_F16S:
+    case ninfer::QType::Q4G64_F16S:
+    case ninfer::QType::W8G32_F16S:
         return 0;
-    case qus::QType::Q5G64_F16S:
+    case ninfer::QType::Q5G64_F16S:
         return 8;
-    case qus::QType::Q6G64_F16S:
+    case ninfer::QType::Q6G64_F16S:
         return 16;
     default:
         throw std::runtime_error("unexpected row-split qtype");
     }
 }
 
-int expect_plane_offsets(const qus::Weight& weight, const qus::ParsedQ5090Tensor& tensor,
-                         const qus::ParsedQ5090Segment& segment, std::string_view label) {
+int expect_plane_offsets(const ninfer::Weight& weight, const ninfer::ParsedQ5090Tensor& tensor,
+                         const ninfer::ParsedQ5090Segment& segment, std::string_view label) {
     if (weight.payload == nullptr) { return fail(std::string(label) + " payload null"); }
     const std::uint64_t groups     = tensor.padded_shape[1] / tensor.group_size;
     const std::uint64_t nibble_row = groups * nibble_bytes_per_group(tensor.qtype);
@@ -154,7 +154,7 @@ int expect_plane_offsets(const qus::Weight& weight, const qus::ParsedQ5090Tensor
 }
 
 std::vector<std::byte> payload_bytes(const std::vector<std::byte>& file,
-                                     const qus::ParsedQ5090Tensor& tensor) {
+                                     const ninfer::ParsedQ5090Tensor& tensor) {
     const auto begin = file.begin() + static_cast<std::ptrdiff_t>(tensor.payload_offset);
     const auto end   = begin + static_cast<std::ptrdiff_t>(tensor.payload_bytes);
     return std::vector<std::byte>(begin, end);
@@ -176,8 +176,8 @@ int expect_device_bytes(const void* device, const std::vector<std::byte>& expect
     return 0;
 }
 
-std::uint32_t segment_row_sum(const qus::ParsedQ5090File& parsed,
-                              const qus::ParsedQ5090Tensor& tensor) {
+std::uint32_t segment_row_sum(const ninfer::ParsedQ5090File& parsed,
+                              const ninfer::ParsedQ5090Tensor& tensor) {
     std::uint32_t rows = 0;
     for (std::uint32_t i = 0; i < tensor.segment_count; ++i) {
         rows += parsed.segments[static_cast<std::size_t>(tensor.segment_begin + i)].row_count;
@@ -185,16 +185,16 @@ std::uint32_t segment_row_sum(const qus::ParsedQ5090File& parsed,
     return rows;
 }
 
-int expect_counts(const qus::WeightStore& store, std::size_t quant_count,
+int expect_counts(const ninfer::WeightStore& store, std::size_t quant_count,
                   std::uint64_t loaded_bytes) {
     int failures = 0;
     failures += store.tensor_count() == 20 ? 0 : fail("tensor_count mismatch");
     failures += store.quant_count() == quant_count ? 0 : fail("quant_count mismatch");
     failures +=
-        store.module_tensor_count(qus::ModuleKind::TextCore) == 6 ? 0 : fail("TEXT count mismatch");
+        store.module_tensor_count(ninfer::ModuleKind::TextCore) == 6 ? 0 : fail("TEXT count mismatch");
     failures +=
-        store.module_tensor_count(qus::ModuleKind::MtpDraft) == 12 ? 0 : fail("MTP count mismatch");
-    failures += store.module_tensor_count(qus::ModuleKind::VisionEncoder) == 2
+        store.module_tensor_count(ninfer::ModuleKind::MtpDraft) == 12 ? 0 : fail("MTP count mismatch");
+    failures += store.module_tensor_count(ninfer::ModuleKind::VisionEncoder) == 2
                     ? 0
                     : fail("VISION count mismatch");
     failures +=
@@ -202,17 +202,17 @@ int expect_counts(const qus::WeightStore& store, std::size_t quant_count,
     return failures;
 }
 
-int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ5090File& parsed,
+int expect_default_text_load(const ninfer::WeightStore& store, const ninfer::ParsedQ5090File& parsed,
                              const std::vector<std::byte>& file) {
     int failures = 0;
     failures += expect_counts(store, 5, parsed.modules[0].payload_bytes);
-    failures += store.module_loaded(qus::ModuleKind::TextCore) ? 0 : fail("TEXT not loaded");
-    failures += !store.module_loaded(qus::ModuleKind::MtpDraft) ? 0 : fail("MTP loaded by default");
+    failures += store.module_loaded(ninfer::ModuleKind::TextCore) ? 0 : fail("TEXT not loaded");
+    failures += !store.module_loaded(ninfer::ModuleKind::MtpDraft) ? 0 : fail("MTP loaded by default");
     failures +=
-        !store.module_loaded(qus::ModuleKind::VisionEncoder) ? 0 : fail("VISION loaded by default");
+        !store.module_loaded(ninfer::ModuleKind::VisionEncoder) ? 0 : fail("VISION loaded by default");
 
     const auto& text_q             = find_tensor(parsed, "layers.0.mlp.down_proj.weight");
-    const qus::Weight* text_weight = store.qweight("layers.0.mlp.down_proj.weight");
+    const ninfer::Weight* text_weight = store.qweight("layers.0.mlp.down_proj.weight");
     failures += text_weight != nullptr ? 0 : fail("missing text quant weight");
     if (text_weight != nullptr) {
         failures += text_weight->payload != nullptr ? 0 : fail("text quant payload is null");
@@ -220,7 +220,7 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
                         ? 0
                         : fail("text payload bytes mismatch");
         failures +=
-            text_weight->layout == qus::QuantLayout::RowSplit ? 0 : fail("text layout mismatch");
+            text_weight->layout == ninfer::QuantLayout::RowSplit ? 0 : fail("text layout mismatch");
         failures += text_weight->qhigh != nullptr ? 0 : fail("text qhigh null");
         failures += text_weight->scales != nullptr ? 0 : fail("text scales null");
         failures += expect_plane_offsets(*text_weight, text_q,
@@ -230,8 +230,8 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
             expect_device_bytes(text_weight->payload, payload_bytes(file, text_q), "text qweight");
     }
 
-    const qus::Weight* gate = store.qweight("layers.0.mlp.gate_proj.weight");
-    const qus::Weight* up   = store.qweight("layers.0.mlp.up_proj.weight");
+    const ninfer::Weight* gate = store.qweight("layers.0.mlp.gate_proj.weight");
+    const ninfer::Weight* up   = store.qweight("layers.0.mlp.up_proj.weight");
     failures += gate != nullptr ? 0 : fail("missing fused gate segment");
     failures += up != nullptr ? 0 : fail("missing fused up segment");
     if (gate != nullptr && up != nullptr) {
@@ -251,15 +251,15 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
                                  find_segment(parsed, "layers.0.mlp.up_proj.weight"), "up segment");
     }
     const auto& gateup_tensor = find_tensor(parsed, "layers.0.mlp.gateup");
-    const qus::Weight* gateup = store.qfused(qus::ModuleKind::TextCore, /*MLP_GATEUP*/ 3, 0, 0);
+    const ninfer::Weight* gateup = store.qfused(ninfer::ModuleKind::TextCore, /*MLP_GATEUP*/ 3, 0, 0);
     failures += gateup != nullptr ? 0 : fail("missing fused gate/up block");
     if (gateup != nullptr && gate != nullptr) {
         failures += gateup->n == static_cast<std::int32_t>(segment_row_sum(parsed, gateup_tensor))
                         ? 0
                         : fail("fused gate/up row sum mismatch");
         failures += gateup->k == 7 ? 0 : fail("fused gate/up K mismatch");
-        failures += gateup->qtype == qus::QType::Q4G64_F16S ? 0 : fail("fused gate/up qtype");
-        failures += gateup->source_kind == static_cast<std::uint32_t>(qus::SourceKind::Other)
+        failures += gateup->qtype == ninfer::QType::Q4G64_F16S ? 0 : fail("fused gate/up qtype");
+        failures += gateup->source_kind == static_cast<std::uint32_t>(ninfer::SourceKind::Other)
                         ? 0
                         : fail("fused gate/up source_kind");
         failures +=
@@ -269,7 +269,7 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
     }
 
     const auto& text_tensor_meta   = find_tensor(parsed, "layers.0.input_layernorm.weight");
-    const qus::Tensor* text_tensor = store.tensor("layers.0.input_layernorm.weight");
+    const ninfer::Tensor* text_tensor = store.tensor("layers.0.input_layernorm.weight");
     failures += text_tensor != nullptr ? 0 : fail("missing text tensor");
     if (text_tensor != nullptr) {
         failures += text_tensor->data != nullptr ? 0 : fail("text tensor payload is null");
@@ -277,8 +277,8 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
                                         "text tensor");
     }
 
-    const qus::Weight* by_source = store.qweight(
-        qus::ModuleKind::TextCore, static_cast<std::uint32_t>(qus::SourceKind::MlpDown), 0);
+    const ninfer::Weight* by_source = store.qweight(
+        ninfer::ModuleKind::TextCore, static_cast<std::uint32_t>(ninfer::SourceKind::MlpDown), 0);
     failures += by_source == text_weight ? 0 : fail("source lookup mismatch");
 
     failures += store.qweight("mtp.fc.weight") == nullptr
@@ -290,11 +290,11 @@ int expect_default_text_load(const qus::WeightStore& store, const qus::ParsedQ50
     return failures;
 }
 
-int expect_module_payload(const qus::WeightStore& store, const qus::ParsedQ5090File& parsed,
+int expect_module_payload(const ninfer::WeightStore& store, const ninfer::ParsedQ5090File& parsed,
                           const std::vector<std::byte>& file, std::string_view name,
                           bool should_be_loaded) {
-    const qus::ParsedQ5090Tensor& meta = find_tensor(parsed, name);
-    const qus::Weight* weight          = store.qweight(name);
+    const ninfer::ParsedQ5090Tensor& meta = find_tensor(parsed, name);
+    const ninfer::Weight* weight          = store.qweight(name);
     if (!should_be_loaded) {
         return weight == nullptr ? 0 : fail("unselected quant descriptor was published");
     }
@@ -310,24 +310,24 @@ int expect_module_payload(const qus::WeightStore& store, const qus::ParsedQ5090F
 }
 
 int expect_mtp_expectations_reject_swapped_attn_segments(const std::vector<std::byte>& valid,
-                                                         const qus::ParsedQ5090File& parsed,
-                                                         qus::DeviceContext& ctx) {
+                                                         const ninfer::ParsedQ5090File& parsed,
+                                                         ninfer::DeviceContext& ctx) {
     std::vector<std::byte> bad         = valid;
     const std::uint64_t segment_offset = read_u64(bad, 200);
     const std::size_t k_index = find_segment_index(parsed, "mtp.layers.0.self_attn.k_proj.weight");
     const std::size_t gate_index = find_segment_index(parsed, "mtp.layers.0.self_attn.q_proj.gate");
     write_u32(bad, segment_offset + k_index * kSegmentRecordSize,
-              static_cast<std::uint32_t>(qus::SourceKind::AttnGate));
+              static_cast<std::uint32_t>(ninfer::SourceKind::AttnGate));
     write_u32(bad, segment_offset + gate_index * kSegmentRecordSize,
-              static_cast<std::uint32_t>(qus::SourceKind::AttnK));
+              static_cast<std::uint32_t>(ninfer::SourceKind::AttnK));
 
     const auto path =
-        std::filesystem::temp_directory_path() / "qus_q5090_bad_mtp_attn_segments.qus";
+        std::filesystem::temp_directory_path() / "ninfer_q5090_bad_mtp_attn_segments.qus";
     write_file(path, bad);
 
-    qus::LoadOptions options;
+    ninfer::LoadOptions options;
     options.load_mtp = true;
-    qus::WeightStore store;
+    ninfer::WeightStore store;
     store.load(path.c_str(), ctx, options);
     try {
         store.require_mtp_module_expectations();
@@ -365,13 +365,13 @@ int main() {
     int failures                             = 0;
     const std::filesystem::path fixture_path = make_fixture();
     const std::vector<std::byte> file        = read_file(fixture_path);
-    const qus::ParsedQ5090File parsed        = qus::parse_q5090_file(file);
-    qus::DeviceContext ctx(0);
+    const ninfer::ParsedQ5090File parsed        = ninfer::parse_q5090_file(file);
+    ninfer::DeviceContext ctx(0);
 
-    qus::WeightStore default_store;
+    ninfer::WeightStore default_store;
     default_store.load(fixture_path.c_str(), ctx);
     failures += expect_default_text_load(default_store, parsed, file);
-    const qus::DeviceArena* default_arena = default_store.module_arena(qus::ModuleKind::TextCore);
+    const ninfer::DeviceArena* default_arena = default_store.module_arena(ninfer::ModuleKind::TextCore);
     failures += default_arena != nullptr ? 0 : fail("default TEXT arena missing");
     failures +=
         default_arena != nullptr && default_arena->used() == default_store.loaded_payload_bytes()
@@ -390,28 +390,28 @@ int main() {
     default_store.clear();
     failures += default_store.tensor_count() == 0 ? 0 : fail("clear tensor_count mismatch");
     failures += default_store.quant_count() == 0 ? 0 : fail("clear quant_count mismatch");
-    failures += default_store.qfused(qus::ModuleKind::TextCore, 3, 0, 0) == nullptr
+    failures += default_store.qfused(ninfer::ModuleKind::TextCore, 3, 0, 0) == nullptr
                     ? 0
                     : fail("clear fused lookup mismatch");
     failures += default_store.loaded_payload_bytes() == 0 ? 0 : fail("clear loaded bytes mismatch");
-    failures += !default_store.module_loaded(qus::ModuleKind::TextCore)
+    failures += !default_store.module_loaded(ninfer::ModuleKind::TextCore)
                     ? 0
                     : fail("clear TEXT module still loaded");
 
-    qus::LoadOptions mtp_options;
+    ninfer::LoadOptions mtp_options;
     mtp_options.load_mtp = true;
-    qus::WeightStore mtp_store;
+    ninfer::WeightStore mtp_store;
     mtp_store.load(fixture_path.c_str(), ctx, mtp_options);
     mtp_store.require_mtp_module_expectations();
-    failures += mtp_store.module_loaded(qus::ModuleKind::MtpDraft) ? 0 : fail("MTP not loaded");
-    failures += !mtp_store.module_loaded(qus::ModuleKind::VisionEncoder)
+    failures += mtp_store.module_loaded(ninfer::ModuleKind::MtpDraft) ? 0 : fail("MTP not loaded");
+    failures += !mtp_store.module_loaded(ninfer::ModuleKind::VisionEncoder)
                     ? 0
                     : fail("VISION loaded with MTP");
     failures += expect_module_payload(mtp_store, parsed, file, "mtp.fc.weight", true);
-    const qus::Weight* mtp_attn = mtp_store.qfused(qus::ModuleKind::MtpDraft, /*ATTN_IN*/ 1, 0, 0);
+    const ninfer::Weight* mtp_attn = mtp_store.qfused(ninfer::ModuleKind::MtpDraft, /*ATTN_IN*/ 1, 0, 0);
     failures += mtp_attn != nullptr ? 0 : fail("missing MTP attn fused block");
     if (mtp_attn != nullptr) {
-        failures += mtp_attn->qtype == qus::QType::W8G32_F16S ? 0 : fail("MTP attn qtype");
+        failures += mtp_attn->qtype == ninfer::QType::W8G32_F16S ? 0 : fail("MTP attn qtype");
         failures += mtp_attn->group_size == 32 ? 0 : fail("MTP attn group_size");
         failures += mtp_attn->qhigh == nullptr ? 0 : fail("MTP attn qhigh");
         failures += mtp_attn->high_plane_bytes == 0 ? 0 : fail("MTP attn high_plane_bytes");
@@ -419,29 +419,29 @@ int main() {
     failures += expect_module_payload(mtp_store, parsed, file,
                                       "model.visual.patch_embed.proj.weight", false);
 
-    qus::LoadOptions vision_options;
+    ninfer::LoadOptions vision_options;
     vision_options.load_vision = true;
-    qus::WeightStore vision_store;
+    ninfer::WeightStore vision_store;
     vision_store.load(fixture_path.c_str(), ctx, vision_options);
     failures +=
-        vision_store.module_loaded(qus::ModuleKind::VisionEncoder) ? 0 : fail("VISION not loaded");
+        vision_store.module_loaded(ninfer::ModuleKind::VisionEncoder) ? 0 : fail("VISION not loaded");
     failures +=
-        !vision_store.module_loaded(qus::ModuleKind::MtpDraft) ? 0 : fail("MTP loaded with VISION");
+        !vision_store.module_loaded(ninfer::ModuleKind::MtpDraft) ? 0 : fail("MTP loaded with VISION");
     failures += expect_module_payload(vision_store, parsed, file, "mtp.fc.weight", false);
     failures += expect_module_payload(vision_store, parsed, file,
                                       "model.visual.patch_embed.proj.weight", true);
 
-    qus::LoadOptions all_options;
+    ninfer::LoadOptions all_options;
     all_options.load_mtp    = true;
     all_options.load_vision = true;
-    qus::WeightStore all_store;
+    ninfer::WeightStore all_store;
     all_store.load(fixture_path.c_str(), ctx, all_options);
     all_store.require_mtp_module_expectations();
     failures +=
-        all_store.module_loaded(qus::ModuleKind::TextCore) ? 0 : fail("TEXT not loaded with all");
+        all_store.module_loaded(ninfer::ModuleKind::TextCore) ? 0 : fail("TEXT not loaded with all");
     failures +=
-        all_store.module_loaded(qus::ModuleKind::MtpDraft) ? 0 : fail("MTP not loaded with all");
-    failures += all_store.module_loaded(qus::ModuleKind::VisionEncoder)
+        all_store.module_loaded(ninfer::ModuleKind::MtpDraft) ? 0 : fail("MTP not loaded with all");
+    failures += all_store.module_loaded(ninfer::ModuleKind::VisionEncoder)
                     ? 0
                     : fail("VISION not loaded with all");
     failures += expect_module_payload(all_store, parsed, file, "mtp.fc.weight", true);
@@ -449,8 +449,8 @@ int main() {
                                       "model.visual.patch_embed.proj.weight", true);
     failures += expect_mtp_expectations_reject_swapped_attn_segments(file, parsed, ctx);
 
-    qus::WeightStore callback_failure_store;
-    qus::Q5090Progress throwing_progress;
+    ninfer::WeightStore callback_failure_store;
+    ninfer::Q5090Progress throwing_progress;
     throwing_progress.min_interval_bytes = 1;
     throwing_progress.callback = [](std::string_view phase, std::uint64_t done, std::uint64_t) {
         if (phase == "upload selected payloads" && done > 0) {
@@ -459,12 +459,12 @@ int main() {
     };
     failures += expect_throws<std::runtime_error>(
         [&] {
-            qus::LoadOptions options;
+            ninfer::LoadOptions options;
             options.progress = &throwing_progress;
             callback_failure_store.load(fixture_path.c_str(), ctx, options);
         },
         "upload callback failure");
-    failures += callback_failure_store.module_arena(qus::ModuleKind::TextCore) == nullptr &&
+    failures += callback_failure_store.module_arena(ninfer::ModuleKind::TextCore) == nullptr &&
                         callback_failure_store.qweight("layers.0.mlp.down_proj.weight") == nullptr
                     ? 0
                     : fail("failed upload published resident state");
@@ -472,16 +472,16 @@ int main() {
                     ? 0
                     : fail("failed upload stage was not recorded");
 
-    qus::WeightStore split_progress_store;
+    ninfer::WeightStore split_progress_store;
     int upload_progress_calls = 0;
     {
-        qus::Q5090Progress short_lived_progress;
+        ninfer::Q5090Progress short_lived_progress;
         short_lived_progress.min_interval_bytes = 1;
         short_lived_progress.callback           = [&](std::string_view phase, std::uint64_t done,
                                             std::uint64_t) {
             if (phase == "upload selected payloads" && done > 0) { ++upload_progress_calls; }
         };
-        qus::LoadOptions options;
+        ninfer::LoadOptions options;
         options.progress = &short_lived_progress;
         split_progress_store.prepare(fixture_path.c_str(), options);
     }
@@ -492,18 +492,18 @@ int main() {
 
     failures += expect_throws<std::invalid_argument>(
         [&] {
-            qus::LoadOptions options;
+            ninfer::LoadOptions options;
             options.load_lm_head_draft = true;
-            qus::WeightStore store;
+            ninfer::WeightStore store;
             store.prepare(fixture_path.c_str(), options);
         },
         "draft residency without MTP");
 
     failures += expect_throws<std::runtime_error>(
         [&] {
-            qus::LoadOptions options;
+            ninfer::LoadOptions options;
             options.required_text_tensors.push_back("missing.text.tensor");
-            qus::WeightStore store;
+            ninfer::WeightStore store;
             store.prepare(fixture_path.c_str(), options);
         },
         "missing required text tensor");

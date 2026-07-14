@@ -1,13 +1,13 @@
 #pragma once
 
-// qus::kernels - sample kernel. One CUDA block handles one logits column
+// ninfer::kernels - sample kernel. One CUDA block handles one logits column
 // and reduces over vocab. The greedy branch (temperature <= 0) is an exact
 // argmax with lowest-index tie-break; the sampling branch builds the truncated
 // target distribution and draws a token with a stateless counter-based RNG.
 
 #include "kernels/kernel/sampling_device.cuh"
 
-namespace qus::kernels {
+namespace ninfer::kernels {
 
 __launch_bounds__(kSamplerBlock) __global__ void sample_column_kernel(
     const __nv_bfloat16* logits, std::int32_t* out, const SamplingConfig* cfg_ptr,
@@ -241,4 +241,4 @@ __launch_bounds__(kSamplerBlock) __global__ void sampling_group_finalize_sample_
     }
 }
 
-} // namespace qus::kernels
+} // namespace ninfer::kernels

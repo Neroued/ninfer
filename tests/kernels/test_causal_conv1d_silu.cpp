@@ -1,7 +1,7 @@
 // Correctness + coverage for causal_conv1d, against the frozen op-test
 // standard (docs/kernel-development.md): fp64 golden from bf16-rounded
 // inputs, honest [-8,8] ranges, composite tolerance bf16_reduction.
-#include "ninfer/kernels/causal_conv1d_silu.h"
+#include "kernels/causal_conv1d/causal_conv1d_silu.h"
 #include "kernels/op_tester.h"
 
 #include <algorithm>

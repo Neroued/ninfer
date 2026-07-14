@@ -1,265 +1,279 @@
-# Runtime and Serving Behavior
+# NInfer CLI and HTTP Serving
 
-> Status: current user-visible generation and protocol behavior.
+> Status: current user-visible behavior after the NInfer engine cutover.
 >
-> Executable `--help` output is authoritative for option spelling and defaults. This document
-> describes semantics shared by the CLI and HTTP service.
+> Authority: this document defines the two product applications, their command-line options, the
+> OpenAI- and Anthropic-compatible HTTP surfaces, and the mapping from those surfaces to the public
+> `ninfer::Engine` API. It does not define the `.ninfer` container, model mathematics, target-private
+> execution, or conversion.
+>
+> Executable `--help` output remains authoritative for exact option spelling.
 
-## 1. Frontends
+## 1. Product boundary
 
-The project exposes two generation frontends over the same tokenizer, processor, Engine, sampler,
-and token-stream decoder:
+NInfer exposes two applications over the same public engine:
 
-- `ninfer` accepts one text prompt or one structured messages file and streams decoded text to stdout;
-- `ninfer-serve` keeps one Engine resident and exposes OpenAI- and Anthropic-compatible HTTP endpoints.
+- `apps/ninfer` is the local one-shot CLI;
+- `apps/ninfer-serve` keeps one engine resident and exposes HTTP endpoints.
 
-Both use the tokenizer and generation configuration embedded in the q5090 artifact. Neither accepts
-a separate runtime tokenizer directory.
+With the default CMake layout, the corresponding binaries are `build/apps/ninfer` and
+`build/apps/ninfer-serve`. Both take one `.ninfer` artifact as their first positional argument;
+there are no separate model or tokenizer path arguments.
 
-## 2. CLI
+The product-to-engine route is deliberately small:
+
+```text
+CLI text/messages or HTTP request
+    -> product parsing and media acquisition
+    -> owning PromptInput
+    -> Engine::prepare(...)
+    -> Engine::generate(..., OutputSink, CancellationView)
+
+Anthropic count_tokens request
+    -> product parsing and media acquisition
+    -> owning PromptInput
+    -> Engine::count_tokens(...)
+```
+
+The applications own command-line and protocol schemas, model aliases, media source acquisition,
+HTTP streaming, usage objects, and protocol error shapes. `Engine` owns artifact dispatch, the
+registered checkpoint frontend, prompt rendering and tokenization, media preprocessing, context
+capacity, prefix reuse, target execution, MTP, stop handling, reasoning/content decoding, and final
+generation accounting.
+
+`prepare` returns an owning `PreparedPrompt` and rejects a prompt that already exceeds the configured
+engine context. `generate` consumes that prompt and a `RequestOptions`; it fits the requested output
+budget to the remaining target capacity. `count_tokens` follows the registered checkpoint frontend,
+including chat-template and media-token expansion, but does not start GPU generation or apply the
+generation context limit.
+
+One `Engine` has one resident sequence program. Calls to `generate` are serialized inside the
+engine; the current HTTP transport can serve streaming connections, but it does not continuously
+batch their model execution.
+
+## 2. Local CLI
 
 Text input:
 
 ```bash
-./build/src/ninfer MODEL.qus --prompt "你好" --max-new 128
+./build/apps/ninfer model.ninfer --prompt "你好" --max-new 128
 ```
 
-Multimodal input:
+Structured chat and multimodal input:
 
 ```bash
-./build/src/ninfer MODEL.qus --messages messages.json --no-thinking --max-new 256
+./build/apps/ninfer model.ninfer \
+  --messages messages.json \
+  --max-context 8192 \
+  --max-new 256
 ```
 
-The CLI requires exactly one of `--prompt` or `--messages`. It writes generated text to stdout and
-progress/timing information to stderr. Clean output is the default; diagnostic modes can emit raw
-template output or token ids.
+Exactly one of `--prompt` and `--messages` is required. A messages file may be either a nonempty
+message array or an object containing `messages` and an optional `tools` array. Supported roles are
+`system`, `developer`, `user`, `assistant`, and `tool`. Ordered content parts may contain text,
+images, and videos; media sources may be local paths, HTTP(S) URLs, or base64 data URIs.
 
-Relevant execution choices include:
+Answer content is streamed to stdout. Reasoning, loading progress, timings, throughput, memory
+statistics, and MTP statistics go to stderr. This keeps stdout usable as generated output.
 
-- `--max-context N` and `--prefill-chunk N`;
-- `--kv-dtype bf16|int8`;
-- `--mtp-draft-tokens 0..5` and `--lm-head-draft`;
-- `--no-cuda-graph`;
-- `--no-thinking`;
-- sampler fields or `--greedy`.
+### 2.1 CLI options
 
-The CLI defaults to a 2,048-token context and 128 generated tokens. Prefill chunk defaults to 1,024
-and must be a nonzero multiple of 128.
+| Option | Meaning | Default |
+|---|---|---:|
+| `--prompt TEXT` | one plain user prompt | mutually exclusive with `--messages` |
+| `--messages FILE` | structured messages JSON | mutually exclusive with `--prompt` |
+| `--max-context N` | engine context capacity | `2048` |
+| `--prefill-chunk N` | text-prefill chunk, a positive multiple of 128 | `1024` |
+| `--max-new N` | requested output-token limit | `128` |
+| `--device N` | CUDA device index | `0` |
+| `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
+| `--mtp-draft-tokens N` | MTP draft window, `0..5` | `0` |
+| `--lm-head-draft` | use the optimized proposal head; requires MTP | off |
+| `--no-cuda-graph` | disable CUDA Graph execution | graphs on |
+| `--no-thinking` | disable thinking in prompt rendering | thinking on |
+| `--temperature F` | sampling temperature in `[0,2]` | `0.6` |
+| `--top-p F` | nucleus threshold in `[0,1]` | `0.95` |
+| `--top-k N` | nonnegative top-k value | `20` |
+| `--min-p F` | min-p threshold in `[0,1]` | `0` |
+| `--presence-penalty F` | presence penalty in `[-2,2]` | `1.0` |
+| `--frequency-penalty F` | frequency penalty in `[-2,2]` | `0` |
+| `--seed N` | nonnegative 64-bit sampling seed | `0` |
+| `--greedy` | replace sampling options with exact argmax | off |
+| `--stop-token-id N` | add a stop token; repeatable | none |
+| `--stop TEXT` | add a content-channel stop string; repeatable | none |
+| `--reasoning-stop TEXT` | add a reasoning-channel stop string; repeatable | none |
+| `--raw-output` | return the frontend's raw output stream | off |
+| `--print-token-ids` | print generated token ids in diagnostics | off |
 
-## 3. Server
+Artifact-defined default stop tokens remain active when CLI stop conditions are added. A matched
+stop string is withheld from output.
+
+## 3. HTTP server
 
 ```bash
-./build/src/ninfer-serve MODEL.qus --host 127.0.0.1 --port 8080
+./build/apps/ninfer-serve model.ninfer \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --model-id qwen3.6-27b
 ```
 
-The server exposes:
+The server loads and warms one `Engine`, then exposes:
 
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
-| `GET /v1/models` | configured model listing |
-| `GET /v1/models/{id}` | configured model lookup |
-| `POST /v1/chat/completions` | OpenAI-style generation |
-| `POST /v1/messages` | Anthropic-style generation |
-| `POST /v1/messages/count_tokens` | expanded prompt token count |
+| `GET /v1/models` | configured OpenAI model alias |
+| `GET /v1/models/{id}` | lookup of that alias |
+| `POST /v1/chat/completions` | OpenAI-style chat generation |
+| `POST /v1/messages` | Anthropic-style message generation |
+| `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 
-The server defaults to `127.0.0.1:8080`, model id `qwen3.6-27b`, and an 8,192-token context. If a
-request omits its output limit, the default is `min(max_context / 2, 8192)`, floored at one token.
-`--default-max-tokens` overrides that derived value.
+### 3.1 Server options
 
-An explicit or default output limit is an upper bound, not a reservation. After rendering and
-tokenizing the prompt, the server reduces the effective output limit to the remaining KV capacity
-when necessary. A prompt that itself exceeds `max_context` is rejected; an otherwise valid request
-continues with the reduced limit and reports a length stop if it exhausts that capacity
-(`finish_reason: "length"` for OpenAI and `stop_reason: "max_tokens"` for Anthropic). The request
-start log records both requested and effective limits when this context clamp occurs.
+| Option | Meaning | Default |
+|---|---|---:|
+| `--host H` | listen address | `127.0.0.1` |
+| `--port N` | listen port | `8080` |
+| `--api-key KEY` | require the configured bearer or `x-api-key` value | unset |
+| `--model-id ID` | alias reported by the OpenAI model endpoints | `qwen3.6-27b` |
+| `--max-context N` | engine context capacity | `8192` |
+| `--prefill-chunk N` | text-prefill chunk, a positive multiple of 128 | `1024` |
+| `--device N` | CUDA device index | `0` |
+| `--max-request-mib N` | maximum HTTP body before JSON parsing | `384` |
+| `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
+| `--mtp-draft-tokens N` | MTP draft window, accepted target range `0..5` | `0` |
+| `--lm-head-draft` | use the optimized proposal head; requires MTP | off |
+| `--default-max-tokens N` | output limit when a request omits one | `8192` |
+| `--no-cuda-graph` | disable CUDA Graph execution | graphs on |
+| `--no-thinking` | make thinking disabled by default | thinking on |
+| `--cors` | emit permissive browser CORS headers | off |
+| `--temperature F` | default temperature in `[0,2]` | `0.6` |
+| `--top-p F` | default top-p in `[0,1]` | `0.95` |
+| `--top-k N` | default nonnegative top-k | `20` |
+| `--presence-penalty F` | default presence penalty in `[-2,2]` | `1.0` |
+| `--frequency-penalty F` | default frequency penalty in `[-2,2]` | `0` |
+| `--seed N` | default nonnegative 64-bit seed | fresh seed per request when unset |
+| `--greedy` | force exact argmax for every request | off |
 
-An API key is optional. When configured, requests must authenticate with the supported bearer-key
-surface. Permissive browser CORS is opt-in. The request body limit defaults to 384 MiB and is checked
-before JSON parsing; `--max-request-mib` can lower it.
-
-One Engine owns one mutable sequence state. Generation runs under the Engine lock, so request
-threads and streaming workers do not interleave GPU inference. Memory-heavy media preprocessing is
-also admitted one request at a time.
+`--default-max-tokens` is independent of `--max-context`: it is the protocol fallback, while
+`Engine::generate` computes the effective output budget from the prepared prompt and actual context
+capacity. A request can therefore finish earlier with a capacity stop.
 
 ## 4. OpenAI Chat Completions
 
-`POST /v1/chat/completions` supports:
+`POST /v1/chat/completions` requires the request `model` to equal `--model-id`; a different alias
+returns `model_not_found`. The endpoint supports:
 
-- system, developer, user, assistant, and tool history after translation to the Qwen template;
-- string content or ordered content-part arrays;
-- `image_url` and `video_url` content parts;
-- non-streaming responses and SSE streaming;
-- `max_completion_tokens` or `max_tokens`;
-- `stop` as a string or string array;
-- `temperature`, `top_p`, `top_k`, presence/frequency penalties, and `seed`;
+- `system`, `developer`, `user`, `assistant`, and `tool` history;
+- string content and ordered content-part arrays;
+- `image_url` and `video_url` parts using HTTP(S) or data URLs;
+- `max_completion_tokens` or the legacy `max_tokens` spelling;
+- `stop` as one string or an array of strings;
+- `temperature`, `top_p`, `top_k`, presence/frequency penalties, and a nonnegative `seed`;
+- `n: 1`, text response format, non-streaming responses, and SSE streaming;
 - `stream_options.include_usage`;
-- function tools and assistant `tool_calls` history;
-- the project extension controlling thinking mode.
+- function tools, `tool_choice`, assistant `tool_calls`, and tool-result messages;
+- the `enable_thinking` extension.
 
-OpenAI image/video URLs may be direct URL strings or objects containing `url`. `data:` URLs are
-decoded locally. Unsupported content kinds such as input audio are rejected rather than silently
-dropped.
+Non-streaming responses always include prompt, completion, and total-token usage. Reasoning is
+returned separately as `message.reasoning_content`; answer text remains in `message.content`.
 
-Non-streaming thinking output is returned as `message.reasoning_content`, while the answer remains
-in `message.content`. Streaming uses separate `reasoning_content` and `content` deltas, followed by a
-final finish-reason chunk and `[DONE]`.
+A stream begins with the assistant-role chunk. It then emits separate `reasoning_content` and
+`content` deltas, a final finish-reason chunk, and `[DONE]`. When
+`stream_options.include_usage` is true, ordinary chunks carry `usage: null` and a final chunk with
+an empty `choices` array carries the completed usage counts.
+
+Output-limit and context-capacity finishes map to `finish_reason: "length"`; model/default stop
+tokens and request stop strings map to `"stop"`. A parsed function call maps to `"tool_calls"`.
 
 ## 5. Anthropic Messages
 
-`POST /v1/messages` supports:
+`POST /v1/messages` requires a nonempty `model` string but treats it as a protocol label: the
+server echoes it instead of using it to select the loaded target. The endpoint supports:
 
 - top-level `system` text or text-block arrays;
-- user and assistant text content;
-- user image blocks with base64 or URL sources;
-- assistant `thinking`, `text`, and `tool_use` blocks;
-- user `tool_result` blocks, including text and image result content;
-- `thinking.type` values such as `disabled`, `enabled`, and `adaptive`;
+- `user`, `assistant`, and in-array `system` messages;
+- user text and image blocks with base64 or HTTP(S) URL sources;
+- assistant `thinking`, `text`, and `tool_use` history;
+- `tool_result` blocks containing text or images;
+- `thinking.type`, where `disabled` turns thinking off and other values turn it on;
 - `max_tokens`, `stop_sequences`, `temperature`, `top_p`, and `top_k`;
-- non-streaming responses and Anthropic-style SSE events.
+- client-defined tools and Anthropic tool choices;
+- non-streaming responses and Anthropic SSE events.
 
-System-role messages found inside the message array are folded into the leading system text. This
-supports clients such as Claude Code that inject system reminders between turns even though the Qwen
-chat template only honors a leading system section.
+System-role messages inside the message array are folded into the leading system text. Generated
+reasoning, answer text, and parsed tools become `thinking`, `text`, and `tool_use` content blocks in
+that order.
 
-Non-streaming responses contain, in order, an optional thinking block, optional text block, and tool
-use blocks. Streaming emits the corresponding content-block start/delta/stop events and finishes
-with message-delta/message-stop events. Tool output sets the Anthropic stop reason to `tool_use`.
+Streaming uses `message_start`, content-block start/delta/stop, `message_delta`, and
+`message_stop` events. Input usage is reported in `message_start`; the final `message_delta` reports
+output usage. Output-limit and context-capacity finishes map to `stop_reason: "max_tokens"`, ordinary
+stops map to `"end_turn"`, and parsed tools map to `"tool_use"`.
 
-`POST /v1/messages/count_tokens` runs the same schema translation, chat template, media-placeholder
-expansion, and tokenizer path used by generation, then returns the expanded input-token count.
+`POST /v1/messages/count_tokens` runs the same protocol translation and registered checkpoint
+frontend as generation. Its `input_tokens` therefore includes chat-template tokens and expanded
+media tokens. It does not execute the model and does not reject a count merely because it is larger
+than the configured generation context.
 
-## 6. Thinking and output channels
+## 6. Sampling, stopping, and MTP
 
-Thinking mode is enabled by default to match the Qwen3.6 chat template. `--no-thinking` disables it
-for the CLI or sets the server default off; a supported request field may override the server
-default.
+The shared server defaults are temperature `0.6`, top-p `0.95`, top-k `20`, presence penalty `1.0`,
+and frequency penalty `0`. Omitted request fields inherit these values. OpenAI may also provide a
+seed; Anthropic has no seed or penalty fields, so those retain server defaults. If neither the
+request nor server specifies a seed, the server chooses a fresh seed for that request.
 
-The token stream decoder separates an initial `<think>...</think>` channel from answer text. Stop
-strings apply to the answer channel, not hidden reasoning. Incremental decoding holds back enough
-bytes to match a stop string spanning token boundaries, and the matched stop text is not emitted.
+Temperature zero selects exact argmax. CLI `--greedy` and server `--greedy` select the same path;
+the server form overrides request sampling fields. Min-p is exposed only by the CLI.
 
-Default stop-token ids come from the artifact's embedded `generation_config.json`. The CLI may add
-explicit stop ids; protocol requests may add decoded stop strings.
+MTP is disabled at draft window zero and enabled by `--mtp-draft-tokens 1..5`. It is an engine
+execution choice, not a protocol feature: output channels, stops, usage, and finish reasons remain
+the same. `--lm-head-draft` changes only the proposal head and requires a nonzero draft window.
 
-## 7. Sampling
+The frontend contributes model-default stop tokens. Callers may add stop token ids and channel-aware
+stop strings through `RequestOptions`; the HTTP adapters add their `stop` or `stop_sequences` values
+as content-channel strings. The engine performs incremental matching across token boundaries and
+does not publish the matched string.
 
-The default sampler follows the Qwen thinking recommendation:
+## 7. Media ownership
 
-| Field | Default |
-|---|---:|
-| temperature | 0.6 |
-| top-p | 0.95 |
-| top-k | 20 |
-| presence penalty | 1.0 |
-| frequency penalty | 0.0 |
+Paths and URLs are product inputs, not engine inputs. Before calling `Engine::prepare` or
+`Engine::count_tokens`, the CLI or server resolves every media source into an owning `OwnedMedia`
+byte buffer. The resulting `PromptInput` has no dependency on a temporary download, request-body
+view, or caller-owned memory.
 
-The sampler performs penalties, temperature scaling, top-k, top-p, optional internal min-p, and a
-counter-based random draw. The random counter is keyed by seed, absolute position, and sampling
-purpose so target and draft sites have deterministic independent streams for a fixed request.
+The registered checkpoint frontend decodes and preprocesses those bytes, places image/video tokens
+in message order, and computes the expanded prompt length. Generation performs Vision work during
+prompt processing and then continues text decoding from the target's prepared state.
 
-The implementation keeps at most 20 candidates. `top_k` values in `1..20` are honored; `top_k <= 0`
-or `top_k > 20` selects 20. Top-p is then applied inside that candidate set. The current CLI and HTTP
-schemas do not expose min-p, so it remains disabled there.
+The CLI accepts files, HTTP(S), and data URIs for images and videos. OpenAI accepts HTTP(S) and data
+URLs for image/video parts. Anthropic accepts base64 and HTTP(S) image sources. Unsupported content
+types are rejected rather than silently removed.
 
-OpenAI requests may set all documented sampler fields. Anthropic requests may set temperature,
-top-p, and top-k; that API has no presence/frequency penalty or seed fields. Omitted fields inherit
-the server defaults. If neither request nor server pins a seed, the server generates a fresh one per
-request.
+## 8. Function tools
 
-## 8. Greedy mode
+The HTTP server renders client tool definitions into the checkpoint chat template and parses
+generated tool-call blocks after generation. It never executes a tool. Clients execute returned
+calls and send tool results in a later request.
 
-`temperature <= 0` selects an exact argmax bypass with lowest-index tie breaking. It does not pass
-through the truncated sampling distribution.
+OpenAI supports function tools and `tool_choice` values `none`, `auto`, `required`, or a named
+function. Anthropic supports client tools with an `input_schema` and choices `none`, `auto`, `any`,
+or a named tool. Both protocols preserve assistant call history and tool-result history.
 
-- CLI `--greedy` forces this path;
-- server `--greedy` overrides request sampler fields;
-- an OpenAI request with `temperature: 0` selects the same path.
+Tool generation is best effort, not constrained decoding. Strict JSON Schema enforcement,
+deprecated OpenAI `functions`/`function_call`, built-in server tools, and server-side tool execution
+are not implemented. While a tool-capable request is streaming, answer-channel output is buffered
+until the final parser decides whether it is ordinary text or tool-call syntax; reasoning may still
+stream immediately.
 
-Use greedy mode for deterministic numerical diagnostics. It is not the recommended default for
-normal thinking responses because long greedy thinking can enter repetitive loops.
+## 9. Errors, cancellation, and accounting
 
-## 9. MTP and sampling correctness
+Protocol-schema and sampling validation failures are client errors. A prepared prompt beyond the
+engine context is returned as `context_length_exceeded` before an HTTP stream starts. An output
+request larger than the remaining context is accepted and ends at capacity with the protocol finish
+reason described above. Disconnecting an SSE client requests cancellation at the engine's supported
+execution boundary.
 
-MTP is disabled unless `--mtp-draft-tokens N` is nonzero. The maximum is five. Draft preparation,
-target verification, accept/commit, and fallback all use the resolved request sampler.
-
-Greedy verification accepts a proposal prefix while each draft equals the target argmax. Sampled
-verification uses proposal/target distributions and rejection correction so speculative execution
-preserves the target distribution. The full target `lm_head` is always used for target decisions.
-
-`--lm-head-draft` replaces only proposal-site projection with the embedded shortlisted Q4 head. It
-can alter proposals and acceptance rate, but not which distribution the target model emits.
-
-Both one-token decode and complete MTP rounds use CUDA Graphs by default. Sampling configuration is
-stored at a stable device address, so per-request values do not invalidate graph capture.
-
-## 10. Multimodal input
-
-Structured messages preserve text/image/video part order. The native processor supports local files,
-allowed remote URLs, and data URLs where the protocol schema provides them. Remote access rejects
-private-network targets by default and applies connect, total-time, and redirect limits.
-
-Default processor budgets include:
-
-- at most 16 media items;
-- at most 256 MiB of fetched media data;
-- approximately 1M pixels per image and 4M sampled pixels per video;
-- at most 768 sampled video frames and 600 seconds source duration;
-- at most 131,072 raw patches, 32,768 merged Vision tokens, and a bounded attention-work estimate;
-- at most 32,768 expanded prompt tokens before the Engine's configured context check.
-
-These are preprocessing safety limits, not a promise that every maximum-sized combination fits GPU
-memory. The configured Engine context and available device memory remain final constraints.
-
-Vision executes once during prefill. Generated tokens use the saved MRoPE offset and no longer touch
-the Vision tower.
-
-## 11. Function tool calling
-
-The server implements best-effort function calling by rendering tools into the Qwen chat template
-and parsing generated `<tool_call>` blocks. The client is responsible for executing tools and sending
-results in a later request.
-
-Supported OpenAI tool behavior includes:
-
-- `tools` entries with `type: "function"`;
-- `tool_choice` absent, `none`, `auto`, `required`, or a named function choice;
-- assistant messages containing `tool_calls`;
-- tool-result messages with role `tool`;
-- non-streaming `message.tool_calls`;
-- streaming `delta.tool_calls`.
-
-Supported Anthropic behavior maps function definitions to `tools`, assistant calls to `tool_use`,
-and results to `tool_result`.
-
-The following are not supported:
-
-- strict JSON Schema or constrained decoding;
-- a guarantee that `required` or named choice produces a valid tool call;
-- deprecated OpenAI `functions` / `function_call`;
-- custom/built-in tool types, namespaces, or allowed-tool subsets;
-- server-side tool execution.
-
-Malformed or incomplete generated tool blocks may remain ordinary text. This is an intentional
-best-effort surface, not a strict tool protocol.
-
-## 12. Prefix reuse and request isolation
-
-For compatible text conversations, the service retains a logical token mirror and can reuse an exact
-prefix or a saved assistant-content boundary. Thinking-stripped follow-up turns can therefore avoid
-recomputing the stable prefix when the rendered tokens still match.
-
-Prefix reuse falls back to full prefill when identity, boundary, context, state, or modality makes
-reuse unsafe. Multimodal resident state is not reused by the text-prefix mechanism. Every request
-refreshes sampler configuration and token-count penalties before generation.
-
-## 13. Errors and limits
-
-Schema validation failures return protocol-shaped client errors. Generation is rejected when the
-expanded prompt plus requested output budget exceeds configured context. Media budget, remote
-fetch, decode, and timeout failures are translated to request errors rather than CUDA failures.
-
-Client disconnect during streaming cancels the sink and stops emitting; it is represented as a
-normal stopped stream rather than corrupting the resident Engine. The next request still passes
-through the normal prefix-safety checks.
+Usage is based on the prepared prompt's expanded token count and the engine's accepted generated
+token ids. It is the same accounting source for non-streaming responses, streaming responses, and
+server request logs. Stop tokens can therefore count as generated tokens even when their decoded
+text is withheld from the published answer.

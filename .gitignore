@@ -1,5 +1,6 @@
 # Build
 build/
+build-*/
 cmake-build-*/
 *.o
 *.obj

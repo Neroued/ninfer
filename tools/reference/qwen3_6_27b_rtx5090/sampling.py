@@ -76,10 +76,10 @@ class TruncatedDistribution:
 
 
 class Sampler:
-    def __init__(self, config: SamplingConfig, vocab: int, device: torch.device):
+    def __init__(self, config: SamplingConfig, token_domain: int, device: torch.device):
         config.validate()
         self.config = config
-        self.counts = torch.zeros(vocab, dtype=torch.int32, device=device)
+        self.counts = torch.zeros(token_domain, dtype=torch.int32, device=device)
         self.generator = torch.Generator(device=device).manual_seed(config.seed)
 
     def distribution(
@@ -88,8 +88,9 @@ class Sampler:
         """Build one target distribution without committing occurrence counts."""
 
         logits = logits.flatten()
-        if logits.numel() != self.counts.numel():
-            raise ValueError("logit vocabulary does not match sampler vocabulary")
+        if logits.numel() < self.counts.numel():
+            raise ValueError("logits have fewer rows than the sampler token domain")
+        logits = logits[: self.counts.numel()]
         cfg = self.config
         if cfg.temperature <= 0.0:
             token = torch.argmax(logits).reshape(1)

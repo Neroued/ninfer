@@ -20,7 +20,7 @@ eval/.venv/bin/python -m pip install -r eval/requirements.txt
 
 The pinned initial stack is EvalScope 1.9.0, `bfcl-eval==2025.10.27.1`, and the BFCL runtime
 dependency `soundfile==0.14.0`. Dataset and model caches remain owned by their upstream libraries.
-Installing dependencies does not download the Qwen model or create a q5090 artifact.
+Installing dependencies does not download the Qwen model or create a `.ninfer` artifact.
 
 ## Configuration
 

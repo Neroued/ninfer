@@ -1,9 +1,11 @@
-#include "ninfer/serve/openai_schema.h"
+#include "serve/openai_schema.h"
 
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <string>
 
@@ -44,7 +46,29 @@ std::optional<int> get_int(const Json& obj, const char* key) {
     if (!obj.at(key).is_number_integer()) {
         bad_request(std::string(key) + " must be an integer", key);
     }
-    return obj.at(key).get<int>();
+    if (obj.at(key).is_number_unsigned()) {
+        const std::uint64_t value = obj.at(key).get<std::uint64_t>();
+        if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            bad_request(std::string(key) + " is out of range", key);
+        }
+        return static_cast<int>(value);
+    }
+    const std::int64_t value = obj.at(key).get<std::int64_t>();
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        bad_request(std::string(key) + " is out of range", key);
+    }
+    return static_cast<int>(value);
+}
+
+std::optional<std::uint64_t> get_u64(const Json& obj, const char* key) {
+    if (!obj.contains(key) || obj.at(key).is_null()) { return std::nullopt; }
+    if (!obj.at(key).is_number_integer()) {
+        bad_request(std::string(key) + " must be a nonnegative integer", key);
+    }
+    if (obj.at(key).is_number_unsigned()) { return obj.at(key).get<std::uint64_t>(); }
+    const std::int64_t value = obj.at(key).get<std::int64_t>();
+    if (value < 0) { bad_request(std::string(key) + " must be nonnegative", key); }
+    return static_cast<std::uint64_t>(value);
 }
 
 bool is_valid_function_name(const std::string& name) {
@@ -73,7 +97,7 @@ bool has_tool_named(const GenerationRequest& req, const std::string& name) {
     return false;
 }
 
-ninfer::media::Source parse_media_url(const Json& part, const char* field) {
+ninfer::product::media_acquire::Source parse_media_url(const Json& part, const char* field) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
     }
@@ -88,12 +112,12 @@ ninfer::media::Source parse_media_url(const Json& part, const char* field) {
                     "messages");
     }
     if (url.empty()) { bad_request(std::string(field) + " URL must not be empty", "messages"); }
-    ninfer::media::Source source;
+    ninfer::product::media_acquire::Source source;
     source.value = std::move(url);
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::media::SourceKind::Data;
+        source.kind = ninfer::product::media_acquire::SourceKind::Data;
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::media::SourceKind::Url;
+        source.kind = ninfer::product::media_acquire::SourceKind::Url;
     } else {
         bad_request(std::string(field) + " must use HTTP(S) or a data URI", "messages");
     }
@@ -375,9 +399,7 @@ void parse_sampling(const Json& body, GenerationRequest& out) {
     s.top_k             = get_int(body, "top_k");
     s.presence_penalty  = get_number(body, "presence_penalty");
     s.frequency_penalty = get_number(body, "frequency_penalty");
-    if (const std::optional<int> seed = get_int(body, "seed")) {
-        s.seed = static_cast<std::uint64_t>(*seed);
-    }
+    s.seed              = get_u64(body, "seed");
     if (body.contains("logit_bias") && !body.at("logit_bias").is_null()) {
         const Json& bias = body.at("logit_bias");
         if (!bias.is_object()) { bad_request("logit_bias must be an object", "logit_bias"); }
@@ -599,11 +621,11 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
 std::string make_models_list(const std::string& model_id, std::int64_t created) {
-    const Json payload = {
-        {"object", "list"},
-        {"data",
-         Json::array({Json{
-             {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "ninfer"}}})}};
+    const Json payload = {{"object", "list"},
+                          {"data", Json::array({Json{{"id", model_id},
+                                                     {"object", "model"},
+                                                     {"created", created},
+                                                     {"owned_by", "ninfer"}}})}};
     return payload.dump();
 }
 

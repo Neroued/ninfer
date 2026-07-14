@@ -1,352 +1,315 @@
-# System Design
+# NInfer System Design
 
-> Status: current system architecture.
->
-> This document defines repository boundaries, ownership, runtime flows, and supported scope. The
-> implemented model mathematics belong in
-> [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md); the exact 35B-A3B source profile is
-> described separately in
-> [`qwen3.6-35b-a3b-architecture.md`](qwen3.6-35b-a3b-architecture.md). The packed artifact contract
-> for the current C++ Engine belongs in
-> [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md). The implemented native artifact
-> and Python-reference route is governed by
-> [`ninfer-container-format.md`](ninfer-container-format.md) and
-> [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md). The accepted multi-target C++
-> Engine remains pending and is defined separately by
-> [`ninfer-engine-architecture.md`](ninfer-engine-architecture.md).
+This document describes the implemented C++ product boundary and repository ownership. Model
+mathematics are defined by the model architecture documents. Persistent numeric formats, layouts,
+container framing, and the Qwen3.6-27B object inventory are defined by their dedicated artifact
+documents.
 
-## 1. Purpose
+## 1. Product scope
 
-The currently implemented NInfer system is a from-scratch C++/CUDA inference engine for one fixed
-deployment:
+NInfer is a high-performance local inference engine for a small set of compiled exact
+checkpoint/GPU targets. The currently registered product is:
 
-- Qwen3.6-27B;
-- one RTX 5090 (`sm_120a`, 32 GB);
-- one user and one active sequence;
-- BF16 activations with offline-packed low-bit weights;
-- maximum single-stream decode throughput, with prefill/TTFT as the secondary target.
+```text
+checkpoint: Qwen3.6-27B
+device:     NVIDIA RTX 5090 (sm_120a)
+target key: qwen3_6_27b_rtx5090
+artifact:   qwen3_6_27b_rtx5090.ninfer
+execution:  one resident sequence, one active request
+```
 
-For this implementation, the fixed target is an architectural constraint, not a generic-runtime
-starting point. It deliberately uses compile-time dimensions, hand-written model schedules,
-model-shape CUDA kernels, a single artifact ABI, and direct frontends. The broader project mission
-and target-selection policy are governed by
-[`ninfer-project-positioning.md`](ninfer-project-positioning.md).
+The target implements Text, image/video Vision, MTP, BF16/INT8 KV, sampling, prefix reuse, eager
+decode, and CUDA Graph decode. Another checkpoint or GPU becomes supported only through another
+explicit target package and registry entry.
 
-## 2. Scope
+Continuous batching, request preemption, multi-GPU execution, offload, and distributed serving are
+outside the current implementation.
 
-### Supported by the current implementation
+## 2. System boundary
 
-- text, image, and video chat input;
-- native tokenization, chat templates, media decoding/preprocessing, Vision inference, and Text
-  inference;
-- chunked prefill and autoregressive decode;
-- eager and CUDA Graph decode;
-- optional one-layer MTP speculative decoding with up to five draft tokens per round;
-- optional shortlisted Q4 draft `lm_head` for proposal sites;
-- greedy and sampled generation;
-- BF16 or INT8 KV cache;
-- command-line generation, OpenAI Chat Completions, and Anthropic Messages;
-- offline q5090 conversion plus Python reference/diagnostic tooling for the current `.qus` Engine
-  route;
-- native `.ninfer` conversion, Python and narrow C++ readers, target verification, and a complete
-  Python Text/Vision/MTP reference;
-- real-weight and per-operator benchmarking.
+The product route is one vertical path:
 
-### Deliberately unsupported by the current implementation
+```text
+source BF16 checkpoint
+  -> target-specific offline converter
+  -> .ninfer artifact
+  -> generic reader / binder / materializer
+  -> selected compiled target package
+       immutable LoadedModel
+       immutable Frontend
+       reusable request memory
+       one mutable non-movable Program
+  -> common generated-token controller
+  -> opaque public Engine
+       CLI / server / benchmark
+```
 
-- models other than the fixed Qwen3.6-27B checkpoint architecture;
-- batching or concurrent GPU execution;
-- tensor/pipeline parallelism and multi-GPU inference;
-- dynamic computation graphs or runtime model discovery;
-- runtime weight repacking or alternate weight loaders in the current C++ Engine;
-- compatibility parsing for retired q5090 formats;
-- server-side tool execution or constrained JSON decoding;
-- a qualified 128K/256K operating point without explicit memory, numerical, and performance
-  evidence.
+There is no runtime interpretation of a model graph and no family-level execution fallback. The
+artifact describes persistent objects; compiled target code defines their semantic binding and all
+execution behavior.
 
-## 3. Component ownership
+## 3. Components and ownership
 
-| Component | Paths | Owns |
+| Component | Source | Ownership |
 |---|---|---|
-| L0 infrastructure | `include/ninfer/core`, `src/core` | device/stream setup, tensors, arenas, q5090 parsing/loading, KV cache, GDN state |
-| L1 operators | `include/ninfer/kernels`, `src/kernels` | mathematical operator APIs, dispatch, launchers, specialized CUDA kernels |
-| L2 model | `include/ninfer/model`, `src/model` | frozen dimensions, weight binding, Text/MTP/Vision schedules, model-private CUDA helpers |
-| Runtime | `include/ninfer/runtime`, `src/runtime` | resource lifetime, Engine API, prefix reuse, eager/graph execution, MTP rounds, sampling state |
-| Text frontend | `include/ninfer/text`, `src/text` | tokenizer, chat template, CLI translation, output decoding |
-| Media frontend | `include/ninfer/media`, `src/media`, model processor | local/remote media acquisition, decode, resize, normalization, patch construction, budgets |
-| Serving | `include/ninfer/serve`, `src/serve` | HTTP transport, OpenAI/Anthropic schemas, request translation, streaming, tool-call parsing |
-| Current `.qus` tools | `tools/q5090_convert`, `tools/q5090`, legacy files in `tools/parity` | q5090 artifact production, Python reader/codec, and current-Engine structural/numerical diagnostics |
-| Native artifact tools | `tools/artifact`, `tools/convert`, `tools/reference`, target directories in `tools/parity` | `.ninfer` framing/layouts, registered conversion and verification, complete target-private Python reference and diagnostics |
-| Measurement | `bench`, `tools/bench` | real-weight throughput, per-operator benchmarks, corpus tooling, report schemas |
+| Base mechanisms | `src/core`, selected `src/runtime` primitives | device/stream, tensor views, checked layouts, arenas, graph wrapper, public host-type definitions, request memory |
+| Artifact | `src/artifact` | `.ninfer` framing and directory parsing, object matching, range/geometry checks, binding records, direct final materialization |
+| Shared kernels | `src/kernels` | checkpoint-independent mathematical operators, launch policy, and CUDA implementations that are genuinely reused |
+| Neutral text/media decode | `src/text`, `src/media/decode` | Unicode primitives and image/video decoding over owning bytes |
+| Product media acquisition | `src/product/media_acquire` | local-path, HTTP(S), and data-URI acquisition into owning media values |
+| Product prompt input | `src/product/prompt_input` | shared JSON/message parsing into owning public prompt values for product tools |
+| Exact target | `src/targets/qwen3_6_27b_rtx5090` | storage profile, load bindings, frontend, sequence/request plans, Program state, fixed Text/Vision/MTP schedules, target-only kernels/graph policy, target diagnostics |
+| Registry | `src/targets/registry.*` | closed target selection and complete target construction |
+| Product runtime | `src/runtime` | generated-token budget/stop/cancel transaction, publication, public Engine PIMPL, target lifetime |
+| Serving | `src/serve` | OpenAI/Anthropic schemas, translation, streaming, usage, request logs, and HTTP transport |
+| Apps | `apps/cli`, `apps/serve` | command parsing, product input acquisition, and executable entry points |
+| Offline tools | `tools/artifact`, `tools/convert`, `tools/reference`, `tools/parity` | artifact tooling, target conversion, independent Python reference, and numerical diagnostics |
 
-The layer names L0/L1/L2 describe the inference core. Runtime and frontends are explicit peers above
-that core, not hidden responsibilities of the model card.
+The central placement rule is simple:
 
-## 4. Artifact boundaries
+- generic byte/device/lifetime mechanisms belong below targets;
+- a complete checkpoint-independent mathematical operator may belong in shared kernels;
+- anything whose invariant names the checkpoint, GPU, fixed schedule, Vision composition, MTP
+  alignment, prefix repair, or graph shape belongs to the exact target;
+- stop/output-budget/cancellation/publication policy belongs to common runtime;
+- schemas, URLs/files, protocol translation, and transport belong to product/serve code.
 
-### 4.1 Current C++ Engine route
+Small duplication between exact targets is preferable to a false family abstraction.
 
-The q5090 offline converter is the only path from the source BF16 checkpoint to weights consumed by
-the current C++ Engine:
+## 4. Public C++ API
 
-```text
-HF safetensors + tokenizer assets
-              │
-              ▼
-tools.q5090_convert: quantize + slice + fuse + pack + verify
-              │
-              ▼
-one q5090 v4.2 .qus artifact + diagnostic sidecar manifest
-```
-
-The artifact contains four logical module kinds:
-
-- `TEXT_CORE` — embeddings, 64 decoder layers, final norm, and full `lm_head`;
-- `MTP_DRAFT` — the one-layer MTP module;
-- `VISION_ENCODER` — patch embedding, 27 Vision blocks, and merger;
-- `LM_HEAD_DRAFT` — optional Q4 shortlisted proposal head and vocab-id map.
-
-It also embeds the three CPU tokenizer assets. `WeightStore` validates the 4 KiB header before CUDA
-initialization, reads the bounded metadata/tokenizer prefix, and selectively uploads requested
-module payloads. Quantized weights remain packed on device; CUDA kernels decode them while computing.
-
-The runtime accepts only the active v4.2 contract. Retired format documents are historical and do
-not imply parser or converter compatibility.
-
-### 4.2 Native artifact and Python reference route
-
-The native route is implemented independently of q5090:
+The installed product surface consists of:
 
 ```text
-HF safetensors + frontend resources
-              │
-              ▼
-tools.convert.qwen3_6_27b_rtx5090
-              │
-              ▼
-one qwen3_6_27b_rtx5090.ninfer artifact + descriptive conversion report
-              │
-              ├── tools.artifact reader/inspector
-              ├── narrow C++ directory reader
-              ├── target verifier and immutable Python binding
-              └── tools.reference.qwen3_6_27b_rtx5090 Text/Vision/MTP execution
+include/ninfer/engine.h
+include/ninfer/types.h
 ```
 
-The complete Python reference performs text and multimodal prefill/decode, full or shortlisted MTP
-proposals, sequential target verification, and speculative sampling directly from `.ninfer`. It does
-not read the source BF16 checkpoint during inference. This route is the correctness oracle for the
-native artifact contract; the current C++ Engine still accepts only `.qus`, and the multi-target
-Engine cutover remains future work.
+`Engine` is a PIMPL owner. Public request/configuration/result types are host-owning values. The API
+does not expose CUDA objects, tensor views, artifact descriptors, target classes, or mutable
+sequence state.
 
-## 5. Core layering
+The main operations are:
 
-### 5.1 L0: storage and lifetime
+```cpp
+Engine(EngineOptions);
+PreparedPrompt prepare(PromptInput) const;
+PreparedPrompt prepare_tokens(std::vector<TokenId>, bool) const;
+std::uint32_t count_tokens(PromptInput) const;
+GenerationResult generate(PreparedPrompt, RequestOptions, OutputSink*, CancellationView);
+LoadSummary load_summary() const;
+MemorySummary memory_summary() const;
+```
 
-L0 types expose bytes, shapes, and state without knowing model semantics:
+`PreparedPrompt` is opaque, move-only, and tied to the Engine that created it. Preparation may run
+outside the GPU execution critical section. `generate` serializes access to the single Program.
 
-- `DeviceContext` owns the CUDA device and stream;
-- `DeviceArena` owns long-lived device allocations;
-- `WorkspaceArena` is a mark/rewind bump allocator for transient tensors;
-- `WeightStore` owns validated catalog metadata and resident module payloads;
-- `KVCache` owns GQA K/V planes and logical position;
-- `GdnState` owns convolution and FP32 recurrent state slots;
-- `Tensor` and `Weight` describe dense/control storage and packed quantized views.
+## 5. Load and target construction
 
-No hot-path operator performs hidden device allocation, filesystem access, or runtime repacking.
+Engine construction performs the complete load before publishing a usable object:
 
-### 5.2 L1: operators and CUDA specialization
+1. create the selected `DeviceContext` and observe the actual GPU;
+2. parse the `.ninfer` prefix and embedded object directory;
+3. match `(model_id, actual GPU, complete registered storage profile)` against the closed registry;
+4. let the selected target consume every required tensor and frontend resource through
+   `ArtifactBinder`;
+5. materialize tensors directly into their final backing and retain required host resources;
+6. construct heap-stable immutable `LoadedModel` bindings;
+7. construct the target Frontend from retained resources;
+8. plan sequence capacity and request work from the configured context/KV/graph/MTP options;
+9. construct reusable request memory and the non-movable Program at stable addresses;
+10. finish target initialization and release reader directory/name/staging state.
 
-Public headers under `include/ninfer/kernels/` define mathematical contracts. Implementations follow
-the normal path:
+The current target requires the exact registered model inventory and RTX 5090. Selection is cold
+construction logic; the generation loop contains no model-name or layout-string dispatch.
+
+`LoadSummary` reports the selected target, load/upload time, file and H2D bytes, staging peak, and
+object counts.
+
+## 6. Lifetime model
+
+The long-lived product objects have one ownership order:
 
 ```text
-public wrapper → private launcher → CUDA kernel
+DeviceContext
+  -> LoadedModel and Frontend
+  -> RequestMemory
+  -> Program
 ```
 
-The linear family has a larger private subtree because codec, shape policy, GEMV, GEMM, and dense
-reference paths are independently specialized. Dispatch keys are limited to facts that change the
-implementation: qtype/layout, real `(N,K)` shape, token-count regime, state form, and KV dtype.
+Destruction is the reverse: Program, request memory, loaded resources, then device context. This
+keeps graph inputs, target bindings, and stream-owned work valid until their final user is gone.
 
-Fused public operators are used only when fusion changes the useful contract, such as shared-input
-projections, projection-plus-SwiGLU, or projection-plus-residual. Model-only bookkeeping kernels stay
-under `src/model` rather than becoming reusable L1 APIs.
+Memory is divided by lifetime:
 
-See [`kernel-development.md`](kernel-development.md) for the source layout and verification rules.
+| Lifetime | Owner | Examples |
+|---|---|---|
+| loaded immutable | `LoadedModel` | materialized weights, lookup tables, frontend resources |
+| sequence persistent | `Program` | Text/MTP KV, GDN state, token ledger, prefix checkpoint |
+| graph stable | `Program` | graph inputs/outputs, scalar controls, host mirrors |
+| request active | `Program` | sampling counters/RNG and active-request controls |
+| request transient | `RequestMemory` | Vision and other request-planned scratch |
 
-### 5.3 L2: fixed schedules
+`MemorySummary` exposes weights, sequence, workspace, KV payload, configured capacity, and storage
+mode without exposing internal allocators.
 
-`Qwen3_6_27B` binds catalog entries to fixed per-layer structs once during construction. Its hot
-path then issues straight-line operator calls for the 64-layer Text decoder and MTP module without
-name lookup or virtual dispatch.
+## 7. Target Frontend
 
-`Qwen3_6_Vision` similarly binds the fixed 27-layer Vision tower. It runs before multimodal text
-prefill and returns merged `[5120,V]` BF16 embeddings that remain valid in the Vision workspace until
-the text prompt consumes them.
+The Qwen target Frontend owns checkpoint-specific input and output semantics:
 
-The model layer owns computation order and model-specific state semantics. It does not own physical
-arenas, HTTP behavior, or kernel selection policy.
+- tokenizer and chat-template resources embedded in the artifact;
+- message/tool rendering and thinking controls;
+- image/video placeholder expansion, patch construction, token types, and three-axis positions;
+- opaque owning target `PreparedPrompt` values;
+- output token decoding, UTF-8 buffering, reasoning/content channel state, and model default stops.
 
-## 6. Load and resource lifecycle
+Apps and serving acquire media into owning bytes. The target receives those bytes and performs
+checkpoint-specific preprocessing. It has no HTTP or filesystem policy.
 
-`Engine::load()` performs one bounded setup sequence:
+`Engine::prepare` returns a public opaque envelope containing the target prepared value, summary,
+preparation time, and product identity. `Engine::prepare_tokens` supplies the equivalent raw-token
+route for parity and repeatable benchmarks. `count_tokens` uses the same Frontend rendering and
+preprocessing rules without executing the model.
 
-1. validate options, including prefill-chunk alignment, KV dtype, and MTP draft count;
-2. parse the q5090 header/catalog/tokenizer assets;
-3. allocate persistent weight, cache/state, workspace, and Vision resources;
-4. upload `TEXT_CORE` and `VISION_ENCODER`, plus MTP/draft modules when requested;
-5. construct and bind Text/MTP and Vision model objects;
-6. initialize stable device-resident step and sampling buffers.
+## 8. Program
 
-Default workspace capacity is a function of the configured prefill chunk, not total prompt length.
-The prompt is processed in aligned chunks, and block-scoped workspace marks are rewound between
-mixer and MLP phases. KV/state capacity is a function of configured context, KV dtype, and whether
-MTP state is enabled.
+The target `Program` is the sole mutable owner of sequence execution. It contains:
 
-## 7. Text request flow
+- Text and MTP KV caches;
+- GDN recurrent/convolution state and slots;
+- logical token ledger and execution frontier;
+- sampling configuration, occurrence counters, and RNG state;
+- prefix checkpoint and restoration state;
+- prefill/decode/MTP/Vision workspaces;
+- stable buffers and captured CUDA Graphs.
+
+The common runtime sees only coarse target operations:
 
 ```text
-prompt/messages
-    │
-    ▼
-chat template → embedded tokenizer → token ids
-    │
-    ▼
-Engine prefill (chunked) → first sampled token
-    │
-    ▼
-decode step/round → token stream decoder → stdout or HTTP stream
+plan_request(prepared prompt, execution options)
+begin(prepared prompt, plan, transient region) -> first PendingRound
+decode_round(round budget)                     -> PendingRound
+finish / abort
+summaries
 ```
 
-Text prefill resets the active sequence unless the runtime selects an explicit prefix-reuse path.
-The final prompt column is normalized and projected by the full `lm_head`; the first generated token
-is selected by the configured sampler. Subsequent calls continue from resident KV/GDN state.
+The fixed Text, Vision, and MTP functions under `impl/schedule` are private pieces of Program
+execution. They do not introduce another long-lived sequence owner.
 
-The server can reuse a stable text prefix across turns. `prefill_cached()` compares the requested
-tokens with the resident logical-token mirror and chooses one of three behaviors:
+Program state moves among Empty, Resident, Active, PendingRound, and Invalid. At most one generated
+round is unresolved. Planning is read-only; allocation/growth happens before begin; hot-path rounds
+reuse Program-owned addresses.
 
-- append an exact resident prefix;
-- restore the saved assistant-content boundary and append from there;
-- perform a full reset prefill when reuse is unsafe.
+## 9. Generated-token transaction
 
-Multimodal resident prefixes are not reused through this text-only mechanism.
+The common controller owns the only product generation loop. The begin token and every later
+ordinary or MTP round use the same transaction:
 
-## 8. Multimodal request flow
+1. Program returns a `PendingRound` over target-licensed token candidates;
+2. the target output session stages decoding and stop candidates without mutation;
+3. common budget/stop/cancellation policy chooses the exact accepted prefix;
+4. Program and output decoder commit the same prefix;
+5. output deltas are published only after both commits;
+6. generation continues or finishes with a coherent resident/invalid disposition.
+
+This keeps KV/GDN/MTP state, logical tokens, decoded bytes, usage accounting, and streamed output on
+one accepted-token boundary. CLI and server do not implement their own token loops.
+
+`GenerationResult` reports generated IDs, content/reasoning text, finish reason, reused prompt
+tokens, phase timings, and speculative statistics.
+
+## 10. Prefix reuse and context
+
+Program owns prefix eligibility and restoration. Text prompts may reuse a resident execution
+frontier or a target checkpoint boundary when identity, tokens, state, and MTP preparation agree.
+Multimodal prompts currently take the fresh route. Callers may disable reuse through
+`ExecutionOptions`.
+
+The target request plan determines effective output capacity from the prepared prompt and Program
+state. CLI/server code does not duplicate target context formulas. An Engine rejects a prepared
+prompt that already exceeds its configured capacity; an output request may finish with
+`ContextCapacity` when the target plan shortens it.
+
+## 11. Text, Vision, and MTP execution
+
+The target schedules preserve the model architecture document:
+
+- text prefill is chunked at the configured multiple-of-128 chunk size;
+- multimodal preparation runs Vision, merges visual tokens, injects embeddings, and then executes
+  the composed text sequence;
+- ordinary decode advances one licensed token;
+- MTP prepares a proposal at the active frontier, verifies up to the selected draft window, and
+  commits only the controller-approved prefix;
+- the optimized proposal head is selected with `ProposalHead::Optimized` / `--lm-head-draft`;
+- BF16 and INT8 group-64 KV are target-planned storage choices;
+- CUDA Graph capture/replay is target-private and uses Program-lifetime stable addresses.
+
+Detailed layer equations and tensor dimensions remain in
+[`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md).
+
+## 12. Product entry points
+
+All product entry points use the public Engine:
+
+- `apps/cli` translates command-line text/messages/media into `PromptInput`, prepares, generates,
+  and prints deltas/summaries;
+- `apps/serve` and `src/serve` translate OpenAI/Anthropic requests, prepare/count/generate, and map
+  public summaries into protocol responses;
+- `bench/ninfer_bench` uses `prepare_tokens` plus `generate` and reports public load, memory, timing,
+  and speculative values.
+
+The target-private `ninfer-qwen3_6_27b-dump` diagnostic links the target package directly for
+bounded activation manifests. It is not a public Engine method.
+
+## 13. Build graph
+
+CMake uses explicit source lists and component targets:
 
 ```text
-structured messages
-    │
-    ├─ chat template/tokenizer ──────────────► expanded text ids and placeholders
-    │
-    └─ media fetch/decode/resize/normalize ─► [P,1536] FP32 patches
-                                                │
-                                                ▼
-                                    27-layer Vision + merger
-                                                │
-                                                ▼
-                                    [5120,V] visual embeddings
-                                                │
-                                                ▼
-                         scatter into text embeddings + three-axis MRoPE
-                                                │
-                                                ▼
-                                      ordinary Text prefill/decode
+ninfer_core
+ninfer_artifact
+  -> ninfer_core
+ninfer_kernels
+  -> ninfer_core
+ninfer_text
+ninfer_media_decode
+ninfer_media_acquire
+ninfer_product_prompt_input
+  -> ninfer_media_acquire
+ninfer_qwen3_6_27b_rtx5090
+  -> ninfer_artifact + ninfer_kernels + ninfer_text + ninfer_media_decode
+ninfer_engine
+  -> target package + common runtime
+ninfer_serve
+  -> ninfer_engine + ninfer_media_acquire + protocol/transport
+apps / benchmark / diagnostic
 ```
 
-The processor produces token types, axis-major temporal/height/width positions, `rope_delta`, Vision
-grids, timestamps, scatter spans, and the patch buffer. It enforces byte, decoded-pixel, patch,
-Vision-token, attention-work, duration, and item-count budgets before expensive execution.
+The registry is the composition boundary that sees the target package. Lower components do not
+discover target directories or import target semantics. Adding a target requires an explicit CMake
+entry and explicit closed-registry entry.
 
-Vision runs only for prefill. Decode continues exclusively through Text state using the resulting
-MRoPE offset.
+## 14. Verification boundary
 
-## 9. Decode paths
+Permanent checks are organized by observable risk:
 
-### 9.1 Ordinary decode
+- `.ninfer` framing, numeric formats, layouts, resources, binding, and real target inventory;
+- shared operator numerical behavior at real shapes;
+- target Frontend behavior, Program state/prefix transactions, Text/Vision/MTP parity, and a real
+  artifact smoke path;
+- OpenAI/Anthropic schema and tool-call behavior;
+- benchmark CLI/report contracts and real performance evidence.
 
-With MTP disabled, one logical decode step consumes the current token, advances all Text layers,
-projects the new hidden state through the full `lm_head`, samples the next token, and updates the
-position/state buffers.
+Performance acceptance uses the product benchmark and profiler evidence for affected kernels. Unit
+tests do not define throughput requirements or duplicate the generation loop.
 
-CUDA Graph execution is enabled by default. Stable device addresses and fixed step shapes allow the
-runtime to warm the eager path, capture the record path, and replay it on later steps. Disabling
-graphs changes execution mechanics, not model semantics.
+## 15. Current limits
 
-### 9.2 MTP speculative decode
+- one compiled checkpoint/GPU target;
+- one active request and no continuous batching;
+- one GPU;
+- no runtime model graph, dynamic target discovery, or plugin ABI;
+- no family-level checkpoint compatibility;
+- no general offload or distributed execution.
 
-With `mtp_draft_tokens = k`, a round:
-
-1. prepares up to `k` proposals with the one-layer MTP model;
-2. evaluates the target model over the candidate window;
-3. samples/compares the target distribution at each position;
-4. accepts the valid prefix and commits the matching KV/GDN snapshot slot;
-5. falls back to a normal target token when the proposal prefix ends or is rejected.
-
-The target model always decides emitted tokens. The optional shortlisted `lm_head` is used only at
-MTP proposal sites, so it can change acceptance and speed but not the target distribution. Both the
-ordinary one-token path and the complete MTP round have eager and captured execution forms.
-
-## 10. Sampling and output
-
-Sampling configuration lives in stable device-resident storage so graph replay can read new request
-values without changing captured addresses. Temperature zero is an exact greedy bypass. Nonzero
-temperature uses the supported top-k/top-p/min-p and penalty semantics described in
-[`serving.md`](serving.md).
-
-Token selection happens on device. The runtime synchronizes and returns caller-visible tokens at the
-Engine boundary, where CLI/server code applies stop-token handling and incremental UTF-8 decoding.
-
-## 11. Precision and state
-
-The main precision policy is:
-
-- Q4/Q5/Q6 or W8G32 packed weights according to the active q5090 tensor assignment;
-- BF16 activations and most persistent dense parameters;
-- FP32 GDN recurrent state and control tensors where required by the model;
-- BF16 or group-quantized INT8 GQA/MTP KV storage;
-- FP32 accumulation where operator numerics require it.
-
-The `Weight` handle is the precision seam: qtype/layout are data, while the model schedule invokes a
-stable operator contract. Structural model flexibility is intentionally not a seam.
-
-Persistent state is divided by lifetime:
-
-- weights: process lifetime;
-- KV/GDN/MTP state: active sequence lifetime;
-- step/sampling buffers: Engine lifetime with stable addresses;
-- Vision workspace: one multimodal prefill;
-- Text workspace: block/chunk scoped with arena rewind;
-- frontend request/media buffers: request lifetime.
-
-## 12. Performance method
-
-The primary objective is caller-visible single-stream decode throughput. The weight-bandwidth
-roofline is a design anchor, not a published performance result. Optimizations are accepted using the
-smallest evidence that covers their risk:
-
-- numerical or behavior checks for the affected operator;
-- per-operator benchmark and NCU evidence for kernel changes;
-- NSYS for full inference, launch gaps, CPU/GPU overlap, and phase breakdown;
-- before/after `ninfer_bench` reports for relevant prefill/decode matrices;
-- `compute-sanitizer` when memory access or lifetime is at risk.
-
-Historical profiles live in the archive. They are not silently promoted to current performance
-claims after the implementation, artifact, or measurement contract changes.
-
-## 13. Source map
-
-| Concern | Primary implementation |
-|---|---|
-| fixed dimensions | `include/ninfer/model/config.h` |
-| Text/MTP schedule and binding | `include/ninfer/model/model.h`, `src/model/qwen3_6_27b.cpp` |
-| Vision schedule | `include/ninfer/model/vision.h`, `src/model/qwen3_6_vision.cpp` |
-| multimodal processor | `include/ninfer/model/processor.h`, `src/model/processor.cpp`, `src/media` |
-| Engine and prefix reuse | `include/ninfer/runtime/engine.h`, `src/runtime/engine.cpp` |
-| graph capture/replay | `include/ninfer/runtime/decode_graph.h`, `src/runtime/decode_graph.cpp` |
-| q5090 parser/loader | `include/ninfer/core/weight_store*.h`, `src/core/weight_store*.cpp` |
-| public operators | `include/ninfer/kernels` |
-| CUDA implementations | `src/kernels` |
-| CLI and text frontend | `include/ninfer/text`, `src/text`, `src/main.cpp` |
-| HTTP serving | `include/ninfer/serve`, `src/serve` |
-| current `.qus` converter/reference | `tools/q5090_convert`, `tools/q5090`, `tools/parity` |
-| native `.ninfer` reader/converter/reference | `tools/artifact`, `tools/convert/qwen3_6_27b_rtx5090`, `tools/reference/qwen3_6_27b_rtx5090` |
-| measurement | `bench`, `tools/bench` |
+These limits are product boundaries, not placeholders in the public API.

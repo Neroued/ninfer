@@ -1,8 +1,8 @@
 // Correctness + coverage for rmsnorm, against the frozen op-test standard
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges, composite tolerance bf16_reduction.
-#include "ninfer/kernels/rmsnorm.h"
-#include "ninfer/kernels/gated_rmsnorm.h"
+#include "kernels/rmsnorm/rmsnorm.h"
+#include "kernels/rmsnorm/gated_rmsnorm.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>

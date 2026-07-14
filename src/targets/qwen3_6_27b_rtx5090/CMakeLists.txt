@@ -1,0 +1,68 @@
+add_library(ninfer_qwen3_6_27b_rtx5090 STATIC
+  impl/package.cpp
+  impl/diagnostic/activation_dump_access.cpp
+  impl/frontend/chat_template.cpp
+  impl/frontend/frontend.cpp
+  impl/frontend/processor.cpp
+  impl/frontend/tokenizer.cpp
+  impl/kernels/gqa_attention/decode.cu
+  impl/kernels/gqa_attention/gqa_attention.cpp
+  impl/kernels/gqa_attention/prefill.cu
+  impl/kernels/input_projection/grouped_input_gemm.cu
+  impl/kernels/input_projection/input_projection.cpp
+  impl/kernels/gdn_gating/gdn_gating.cpp
+  impl/kernels/gdn_gating/gdn_gating_proj.cpp
+  impl/kernels/gdn_gating/launch.cu
+  impl/kernels/linear/gemm/linear_rowsplit_gemm_mma.cu
+  impl/kernels/linear/gemm/linear_rowsplit_w8g32_gemm_mma.cu
+  impl/kernels/linear/gemm/linear_rowsplit_w8g32_kv_gemm_mma.cu
+  impl/kernels/linear/gemv/linear_dense_gdn_in_ab_48.cu
+  impl/kernels/linear/gemv/linear_rowsplit_gemm_smallt.cu
+  impl/kernels/linear/gemv/linear_rowsplit_gemv_attn_in_7168.cu
+  impl/kernels/linear/gemv/linear_rowsplit_gemv_gdn_in_qk_4096.cu
+  impl/kernels/linear/gemv/linear_rowsplit_gemv_gdn_in_vz_6144.cu
+  impl/kernels/linear/gemv/linear_rowsplit_gemv_lm_head.cu
+  impl/kernels/linear/gemv/linear_rowsplit_gemv_mlp_down.cu
+  impl/kernels/linear/gemv/linear_rowsplit_gemv_mlp_gate_up_34816.cu
+  impl/kernels/linear/gemv/linear_rowsplit_gemv_out_6144.cu
+  impl/kernels/linear/gemv/linear_rowsplit_gemv_proj_6144.cu
+  impl/kernels/linear/linear.cpp
+  impl/kernels/linear/plan/linear_plan.cpp
+  impl/kernels/linear/reference/linear_generic_dense.cu
+  impl/kernels/linear_add/linear_add.cpp
+  impl/kernels/linear_swiglu/gemm.cu
+  impl/kernels/linear_swiglu/linear_swiglu.cpp
+  impl/kernels/mtp/pack.cpp
+  impl/kernels/mtp/pack_launch.cu
+  impl/kernels/mtp/round.cpp
+  impl/kernels/mtp/round_launch.cu
+  impl/kernels/rope/rope.cpp
+  impl/kernels/rope/launch.cu
+  impl/kernels/sampling/sampling.cpp
+  impl/kernels/sampling/launch.cu
+  impl/kernels/vision_attention/vision_attention.cpp
+  impl/kernels/vision_attention/launch.cu
+  impl/kernels/vision_pos_embed/vision_pos_embed.cpp
+  impl/kernels/vision_pos_embed/launch.cu
+  impl/load/bindings.cpp
+  impl/program/layouts.cpp
+  impl/program/program.cpp
+  impl/program/request_plan.cpp
+  impl/schedule/mtp.cpp
+  impl/schedule/position_ops.cu
+  impl/schedule/text_context.cpp
+  impl/schedule/text_prefill.cpp
+  impl/schedule/vision.cpp
+  impl/schedule/vision_context.cpp
+  impl/schedule/vision_control.cpp
+  impl/schedule/vision_convert.cu
+  impl/state/kv_cache.cpp
+  impl/state/state_store.cpp)
+
+ninfer_internal_includes(ninfer_qwen3_6_27b_rtx5090)
+target_include_directories(ninfer_qwen3_6_27b_rtx5090
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/impl
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/export>)
+ninfer_cuda_archive(ninfer_qwen3_6_27b_rtx5090)
+target_link_libraries(ninfer_qwen3_6_27b_rtx5090
+  PRIVATE ninfer_artifact ninfer_kernels ninfer_text ninfer_media_decode)

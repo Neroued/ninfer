@@ -1,4 +1,4 @@
-#include "ninfer/core/device.h"
+#include "core/device.h"
 
 #include <cuda_runtime.h>
 

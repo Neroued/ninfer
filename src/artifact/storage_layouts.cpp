@@ -132,20 +132,38 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
         throw ArtifactError("row-split-k128-v1 requires a positive rank-two shape");
     }
 
-    const auto geometry       = quant_geometry(format);
-    const auto n              = shape[0];
-    const auto k_pad          = align_up(shape[1], kKAlignment, "padded K");
-    const auto groups_per_row = k_pad / geometry.group_size;
-    const auto groups         = checked_mul(n, groups_per_row, "physical group count");
-    const auto base_bytes =
-        checked_mul(groups, geometry.base_bytes_per_group, "base plane bytes");
-    const auto high_bytes =
-        checked_mul(groups, geometry.high_bytes_per_group, "high plane bytes");
-    const auto scale_bytes = checked_mul(groups, 2, "scale plane bytes");
-    const auto high_offset = align_up(base_bytes, kTensorAlignment, "high plane offset");
-    const auto aligned_high = align_up(high_bytes, kTensorAlignment, "scale plane alignment");
-    const auto scale_offset = checked_add(high_offset, aligned_high, "scale plane offset");
-    return checked_add(scale_offset, scale_bytes, "tensor encoded size");
+    return row_split_geometry(format, shape).encoded_bytes;
+}
+
+RowSplitGeometry row_split_geometry(NumericFormat format,
+                                    std::span<const std::uint64_t> shape) {
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
+        throw ArtifactError("row-split-k128-v1 requires a positive rank-two shape");
+    }
+    const auto format_geometry = quant_geometry(format);
+    RowSplitGeometry out;
+    out.rows = shape[0];
+    out.columns = shape[1];
+    out.padded_columns = align_up(shape[1], kKAlignment, "padded K");
+    out.group_size = format_geometry.group_size;
+    out.groups_per_row = out.padded_columns / out.group_size;
+    out.low_bytes_per_group = format_geometry.base_bytes_per_group;
+    out.high_bytes_per_group = format_geometry.high_bytes_per_group;
+    const auto groups = checked_mul(out.rows, out.groups_per_row, "physical group count");
+    out.low_plane_bytes =
+        checked_mul(groups, out.low_bytes_per_group, "base plane bytes");
+    out.high_plane_bytes =
+        checked_mul(groups, out.high_bytes_per_group, "high plane bytes");
+    out.scale_plane_bytes = checked_mul(groups, 2, "scale plane bytes");
+    out.high_plane_offset =
+        align_up(out.low_plane_bytes, kTensorAlignment, "high plane offset");
+    const auto aligned_high =
+        align_up(out.high_plane_bytes, kTensorAlignment, "scale plane alignment");
+    out.scale_plane_offset =
+        checked_add(out.high_plane_offset, aligned_high, "scale plane offset");
+    out.encoded_bytes =
+        checked_add(out.scale_plane_offset, out.scale_plane_bytes, "tensor encoded size");
+    return out;
 }
 
 } // namespace ninfer::artifact

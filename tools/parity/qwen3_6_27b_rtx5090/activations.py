@@ -1,9 +1,10 @@
-"""Compare two structured activation dumps without imposing token equality."""
+"""Gate two structured activation dumps without imposing final-token equality."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from pathlib import Path
 
@@ -12,8 +13,22 @@ import numpy as np
 from tools.reference.qwen3_6_27b_rtx5090.config import CFG
 
 
+# Reviewed cross-runtime rules for the same quantized artifact. They cover every layer-level Text
+# tap emitted by both implementations and deliberately do not depend on layer number or run output.
+TOLERANCE_RULES: tuple[tuple[str, float, float], ...] = (
+    (r"embed", 0.01, 0.9999),
+    (r"layer_[0-9]{2}/mixer", 0.25, 0.94),
+    (r"layer_[0-9]{2}/mlp", 0.25, 0.94),
+    (r"final_norm", 0.25, 0.94),
+    (r"logits", 0.35, 0.90),
+)
+
+
 def load_manifest(root: Path) -> dict:
-    with (root / "manifest.json").open("r", encoding="utf-8") as file:
+    path = root / "manifest.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"missing activation manifest: {path}")
+    with path.open("r", encoding="utf-8") as file:
         manifest = json.load(file)
     if manifest.get("format") != "ninfer_activation_dump_v1":
         raise ValueError(f"{root}: unsupported activation dump format")
@@ -41,48 +56,44 @@ def records(manifest: dict, phase: str | None = None) -> dict[tuple, dict]:
 
 
 def load_records(root: Path, phase: str) -> dict[tuple, dict]:
-    manifest_path = root / "manifest.json"
-    if manifest_path.exists():
-        return records(load_manifest(root), phase)
-    # C++ FileTap currently writes one flat phase/step without a manifest.
-    # Infer only the stable layer-level contract; op-level dumps require a
-    # manifest because their shapes are not derivable from filenames.
-    out = {}
-    patterns = {
-        "embed.f32": "embed",
-        "final_norm.f32": "final_norm",
-        "logits.f32": "logits",
-    }
-    for path in sorted(root.glob("*.f32")):
-        name = patterns.get(path.name)
-        if name is None:
-            match = re.fullmatch(r"layer_(\d{2})_(mixer|mlp)\.f32", path.name)
-            if match:
-                name = f"layer_{int(match.group(1)):02d}/{match.group(2)}"
-        if name is None:
-            raise ValueError(f"{root}: cannot infer legacy C++ tap {path.name}")
-        elements = path.stat().st_size // np.dtype(np.float32).itemsize
-        width = CFG.vocab if name == "logits" else CFG.hidden
-        if elements % width:
-            raise ValueError(f"{path}: file size is not divisible by inferred width {width}")
-        shape = [elements // width, width]
-        key = (phase, 0, 0, name)
-        out[key] = {"file": path.name, "shape": shape}
-    if not out:
-        raise ValueError(f"{root}: no activation dump files")
-    return out
+    return records(load_manifest(root), phase)
 
 
-def metrics(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
-    diff = a.astype(np.float64) - b.astype(np.float64)
-    max_abs = float(np.max(np.abs(diff), initial=0.0))
+def tolerance(name: str) -> dict[str, float] | None:
+    for pattern, max_relative_rmse, min_cosine in TOLERANCE_RULES:
+        if re.fullmatch(pattern, name):
+            return {
+                "max_relative_rmse": max_relative_rmse,
+                "min_cosine": min_cosine,
+            }
+    return None
+
+
+def metrics(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
+    af = a.astype(np.float64)
+    bf = b.astype(np.float64)
+    diff = af - bf
     rms = float(np.sqrt(np.mean(diff * diff))) if diff.size else 0.0
-    an = float(np.linalg.norm(a.astype(np.float64)))
-    bn = float(np.linalg.norm(b.astype(np.float64)))
-    cosine = 1.0 if an == 0 and bn == 0 else 0.0 if an == 0 or bn == 0 else float(
-        np.dot(a.astype(np.float64), b.astype(np.float64)) / (an * bn)
+    reference_rms = float(np.sqrt(np.mean(af * af))) if af.size else 0.0
+    if reference_rms == 0.0:
+        relative_rmse = 0.0 if rms == 0.0 else math.inf
+    else:
+        relative_rmse = rms / reference_rms
+    an = float(np.linalg.norm(af))
+    bn = float(np.linalg.norm(bf))
+    cosine = (
+        1.0
+        if an == 0.0 and bn == 0.0
+        else 0.0
+        if an == 0.0 or bn == 0.0
+        else float(np.dot(af, bf) / (an * bn))
     )
-    return max_abs, rms, cosine
+    return {
+        "max_abs": float(np.max(np.abs(diff), initial=0.0)),
+        "rms": rms,
+        "relative_rmse": relative_rmse,
+        "cosine": cosine,
+    }
 
 
 def compare(
@@ -94,48 +105,96 @@ def compare(
 ) -> list[dict]:
     ref = load_records(reference, reference_phase)
     got = load_records(candidate, candidate_phase)
-    report = []
-    for key in sorted(ref.keys() | got.keys()):
-        if key not in ref or key not in got:
-            report.append(
-                {
-                    "key": key,
-                    "status": "missing",
-                    "side": "reference" if key not in ref else "candidate",
-                }
-            )
-            continue
-        ra, rb = ref[key], got[key]
-        if ra["shape"] != rb["shape"]:
-            report.append(
-                {
-                    "key": key,
-                    "status": "shape",
-                    "reference": ra["shape"],
-                    "candidate": rb["shape"],
-                }
-            )
-            continue
-        a = np.fromfile(reference / ra["file"], dtype=np.float32)
-        b = np.fromfile(candidate / rb["file"], dtype=np.float32)
-        if a.size != b.size:
-            report.append(
-                {
-                    "key": key,
-                    "status": "size",
-                    "reference": int(a.size),
-                    "candidate": int(b.size),
-                }
-            )
-            continue
-        max_abs, rms, cosine = metrics(a, b)
+    report: list[dict] = []
+    if not ref:
         report.append(
             {
-                "key": key,
-                "status": "ok",
-                "max_abs": max_abs,
-                "rms": rms,
-                "cosine": cosine,
+                "key": [reference_phase, 0, 0, "*"],
+                "status": "missing_phase",
+                "side": "reference",
+            }
+        )
+    if not got:
+        report.append(
+            {
+                "key": [candidate_phase, 0, 0, "*"],
+                "status": "missing_phase",
+                "side": "candidate",
+            }
+        )
+    if not ref or not got:
+        return report
+
+    for key in sorted(ref.keys() | got.keys()):
+        display_key = list(key)
+        if key not in ref:
+            report.append({"key": display_key, "status": "unexpected"})
+            continue
+        if key not in got:
+            report.append({"key": display_key, "status": "missing"})
+            continue
+        expected_record, actual_record = ref[key], got[key]
+        if expected_record["shape"] != actual_record["shape"]:
+            report.append(
+                {
+                    "key": display_key,
+                    "status": "shape",
+                    "reference": expected_record["shape"],
+                    "candidate": actual_record["shape"],
+                }
+            )
+            continue
+        expected_path = reference / expected_record["file"]
+        actual_path = candidate / actual_record["file"]
+        missing_files = [
+            side
+            for side, path in (("reference", expected_path), ("candidate", actual_path))
+            if not path.is_file()
+        ]
+        if missing_files:
+            report.append(
+                {"key": display_key, "status": "missing_file", "side": missing_files}
+            )
+            continue
+        expected = np.fromfile(expected_path, dtype=np.float32)
+        actual = np.fromfile(actual_path, dtype=np.float32)
+        elements = math.prod(expected_record["shape"])
+        if expected.size != elements or actual.size != elements:
+            report.append(
+                {
+                    "key": display_key,
+                    "status": "size",
+                    "shape_elements": elements,
+                    "reference": int(expected.size),
+                    "candidate": int(actual.size),
+                }
+            )
+            continue
+        if not np.isfinite(expected).all() or not np.isfinite(actual).all():
+            report.append(
+                {
+                    "key": display_key,
+                    "status": "non_finite",
+                    "reference": int((~np.isfinite(expected)).sum()),
+                    "candidate": int((~np.isfinite(actual)).sum()),
+                }
+            )
+            continue
+        rule = tolerance(key[3])
+        if rule is None:
+            report.append({"key": display_key, "status": "missing_tolerance"})
+            continue
+        measured = metrics(expected, actual)
+        passed = (
+            measured["relative_rmse"] <= rule["max_relative_rmse"]
+            and measured["cosine"] >= rule["min_cosine"]
+        )
+        report.append(
+            {
+                "key": display_key,
+                "status": "ok" if passed else "tolerance",
+                **measured,
+                "tolerance": rule,
             }
         )
     return report
@@ -155,17 +214,22 @@ def main() -> None:
         reference_phase=args.reference_phase,
         candidate_phase=args.candidate_phase,
     )
+    passed = bool(report) and all(item["status"] == "ok" for item in report)
     for item in report:
         key = "/".join(map(str, item["key"]))
         if item["status"] == "ok":
             print(
-                f"{key}: max_abs={item['max_abs']:.7g} "
-                f"rms={item['rms']:.7g} cosine={item['cosine']:.9f}"
+                f"{key}: max_abs={item['max_abs']:.7g} rms={item['rms']:.7g} "
+                f"relative_rmse={item['relative_rmse']:.7g} cosine={item['cosine']:.9f}"
             )
         else:
             print(f"{key}: {item['status']} {item}")
     if args.json:
-        Path(args.json).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        output = Path(args.json)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if not passed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

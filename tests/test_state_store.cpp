@@ -1,5 +1,5 @@
-#include "ninfer/core/device.h"
-#include "ninfer/core/state_store.h"
+#include "core/device.h"
+#include "targets/qwen3_6_27b_rtx5090/impl/state/state_store.h"
 
 #include <cuda_runtime.h>
 
@@ -7,9 +7,28 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
+
+namespace q27 = ninfer::targets::qwen3_6_27b_rtx5090::detail;
+
+struct PlannedState {
+    q27::GdnStateLayout layout;
+    std::size_t bytes = 0;
+};
+
+PlannedState plan_state(std::uint32_t layers, std::int32_t conv_dim,
+                        std::int32_t conv_width, std::int32_t value_heads,
+                        std::int32_t value_head_dim, std::int32_t key_head_dim,
+                        std::int32_t snapshot_slots = 1,
+                        ninfer::DType conv_dtype = ninfer::DType::BF16) {
+    ninfer::LayoutBuilder builder;
+    auto layout = q27::plan_gdn_state(builder, layers, conv_dim, conv_width, value_heads,
+                                      value_head_dim, key_head_dim, snapshot_slots, conv_dtype);
+    return PlannedState{std::move(layout), builder.finish(256)};
+}
 
 int fail(const char* message) {
     std::cerr << message << '\n';
@@ -80,8 +99,9 @@ int main() {
 
     int failures = 0;
     ninfer::DeviceContext ctx(0);
-    ninfer::DeviceArena cache_arena(16384);
-    ninfer::GdnState state(cache_arena, 3, 10, 3, 4, 5, 6, ninfer::DType::BF16);
+    auto state_plan = plan_state(3, 10, 3, 4, 5, 6);
+    ninfer::DeviceArena cache_arena(state_plan.bytes);
+    q27::GdnState state({cache_arena.base(), cache_arena.capacity()}, state_plan.layout);
 
     failures += expect_size(state.layer_count(), 3, "state.layer_count");
     failures += expect_size(state.conv.size(), 3, "state.conv.size");
@@ -123,8 +143,10 @@ int main() {
     failures += expect_device_byte(state.conv[0], 0, "reset conv0");
     failures += expect_device_byte(state.ssm[1], 0, "reset ssm1");
 
-    ninfer::DeviceArena slotted_arena(16384);
-    ninfer::GdnState slotted(slotted_arena, 1, 10, 3, 4, 5, 6, 3, ninfer::DType::BF16);
+    auto slotted_plan = plan_state(1, 10, 3, 4, 5, 6, 3);
+    ninfer::DeviceArena slotted_arena(slotted_plan.bytes);
+    q27::GdnState slotted({slotted_arena.base(), slotted_arena.capacity()},
+                          slotted_plan.layout);
     failures += expect_size(slotted.snapshot_slots, 3, "slotted.snapshot_slots");
     failures += check_shape(slotted.conv[0], {10, 3, 3, 1}, "slotted.conv");
     failures += check_shape(slotted.ssm[0], {6, 5, 4, 3}, "slotted.ssm");
@@ -155,40 +177,37 @@ int main() {
     failures += expect_device_byte(slotted.ssm_slot(0, 1), 0x4d, "slotted reset keeps ssm slot1");
 
     failures += expect_throws<std::invalid_argument>(
-        [&] { ninfer::GdnState invalid(cache_arena, 0, 10, 3, 4, 5, 6); }, "zero layers");
+        [&] { (void)plan_state(0, 10, 3, 4, 5, 6); }, "zero layers");
     failures += expect_throws<std::invalid_argument>(
-        [&] { ninfer::GdnState invalid(cache_arena, 1, 0, 3, 4, 5, 6); }, "zero conv dim");
+        [&] { (void)plan_state(1, 0, 3, 4, 5, 6); }, "zero conv dim");
     failures += expect_throws<std::invalid_argument>(
-        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 0, 4, 5, 6); }, "zero conv width");
+        [&] { (void)plan_state(1, 10, 0, 4, 5, 6); }, "zero conv width");
     failures += expect_throws<std::invalid_argument>(
-        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 0, 5, 6); }, "zero value heads");
+        [&] { (void)plan_state(1, 10, 3, 0, 5, 6); }, "zero value heads");
     failures += expect_throws<std::invalid_argument>(
-        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 4, 0, 6); }, "zero value head dim");
+        [&] { (void)plan_state(1, 10, 3, 4, 0, 6); }, "zero value head dim");
     failures += expect_throws<std::invalid_argument>(
-        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 0); }, "zero key head dim");
+        [&] { (void)plan_state(1, 10, 3, 4, 5, 0); }, "zero key head dim");
     failures += expect_throws<std::invalid_argument>(
-        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 6, ninfer::DType::U8); },
+        [&] { (void)plan_state(1, 10, 3, 4, 5, 6, 1, ninfer::DType::U8); },
         "invalid conv dtype");
     failures += expect_throws<std::invalid_argument>(
-        [&] { ninfer::GdnState invalid(cache_arena, 1, 10, 3, 4, 5, 6, 0); },
+        [&] { (void)plan_state(1, 10, 3, 4, 5, 6, 0); },
         "zero snapshot slots");
 
     ninfer::DeviceArena small_arena(512);
-    const std::size_t small_before = small_arena.used();
-    failures += expect_throws<std::bad_alloc>(
-        [&] { ninfer::GdnState too_big(small_arena, 3, 10, 3, 4, 5, 6); }, "undersized state arena");
-    failures += expect_size(small_arena.used(), small_before, "small arena used after failure");
+    failures += expect_throws<std::out_of_range>(
+        [&] {
+            q27::GdnState too_big({small_arena.base(), small_arena.capacity()}, state_plan.layout);
+        },
+        "undersized state backing");
 
-    ninfer::DeviceArena overflow_arena(1024);
-    const std::size_t overflow_before = overflow_arena.used();
     failures += expect_throws<std::overflow_error>(
         [&] {
-            ninfer::GdnState overflow(overflow_arena, std::numeric_limits<std::uint32_t>::max(),
-                                   std::numeric_limits<std::int32_t>::max(), 1, 1, 1, 1);
+            (void)plan_state(std::numeric_limits<std::uint32_t>::max(),
+                             std::numeric_limits<std::int32_t>::max(), 1, 1, 1, 1);
         },
         "aggregate state overflow");
-    failures +=
-        expect_size(overflow_arena.used(), overflow_before, "overflow arena used after failure");
 
     return failures == 0 ? 0 : fail("state store test failed");
 }

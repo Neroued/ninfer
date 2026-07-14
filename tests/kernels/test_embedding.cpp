@@ -1,7 +1,7 @@
 // Correctness + coverage for embedding, against the frozen op-test standard
 // (docs/kernel-development.md): fp64 golden from bf16-rounded dense inputs,
 // exact Q6 ROW_SPLIT dequant reference, composite tolerance bf16_elementwise.
-#include "ninfer/kernels/embedding.h"
+#include "kernels/embedding/embedding.h"
 #include "kernels/op_tester.h"
 
 #include <algorithm>
@@ -205,7 +205,6 @@ static Weight dense_weight(void* data, std::int32_t d = kD) {
     Weight w{};
     w.qtype             = QType::BF16_CTRL;
     w.layout            = QuantLayout::Contiguous;
-    w.q5090_scale_dtype = ScaleDType::None;
     w.payload           = data;
     w.payload_bytes     = static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(d) * 2u;
     w.qdata             = data;
@@ -236,7 +235,7 @@ static Weight q6_weight(void* payload, std::int32_t d = kD) {
     Weight w{};
     w.qtype             = QType::Q6G64_F16S;
     w.layout            = QuantLayout::RowSplit;
-    w.q5090_scale_dtype = ScaleDType::FP16;
+    w.scale_dtype       = DType::FP16;
     w.payload           = payload;
     w.payload_bytes     = scale_plane_offset + scale_plane_bytes;
     w.high_plane_bytes  = high_plane_bytes;

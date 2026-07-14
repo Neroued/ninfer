@@ -1,24 +1,21 @@
 # Qwen3.6-27B NInfer Artifact Contract and Conversion Recipe
 
-> Status: accepted and implemented by the target converter, verifier, typed binder, and complete
-> Text/Vision/MTP/multimodal Python reference on 2026-07-14. The current C++ Engine has not yet
-> adopted this artifact contract.
+> Status: accepted and implemented by the target converter, verifier, Python reference, production
+> C++ binder/materializer, closed target package, and C++ Engine.
 >
 > Authority: this document defines the complete `.ninfer` persistent-object contract for the
 > exact `qwen3.6-27b` checkpoint and, separately, the recipe that converts the selected Hugging
 > Face BF16 checkpoint into those objects. It is the authority for the target's object names,
 > shapes, formats, layouts, logical views, frontend resources, source transforms, and binding
 > obligations. It does not redefine the common container, numeric formats, storage-layout bytes,
-> model mathematics, Python reference schedule, or the current C++ Engine.
+> model mathematics, Python reference schedule, or Engine execution policy.
 >
 > Common framing and JSON fields are defined by
 > [`ninfer-container-format.md`](ninfer-container-format.md). Numeric meanings are defined by
 > [`ninfer-tensor-formats.md`](ninfer-tensor-formats.md), and physical byte packing is defined by
 > [`ninfer-storage-layouts.md`](ninfer-storage-layouts.md). Text, MTP, Vision, and state mathematics
-> are defined by [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md). The legacy `.qus`
-> artifact remains governed by [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md)
-> until its runtime is replaced; none of its module, source-kind, segment, or fusion records are
-> inherited by this contract.
+> are defined by [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md). No removed legacy
+> module, source-kind, segment, or fusion record is inherited by this contract.
 
 ## 1. Decision and boundary
 

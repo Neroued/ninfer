@@ -1,7 +1,7 @@
 // Correctness + coverage for rope, against the frozen op-test standard
 // (docs/kernel-development.md): fp64 golden from bf16-rounded q/k,
 // positions read from device, composite tolerance bf16_elementwise.
-#include "ninfer/kernels/rope.h"
+#include "targets/qwen3_6_27b_rtx5090/impl/kernels/rope/rope.h"
 #include "kernels/op_tester.h"
 
 #include <algorithm>

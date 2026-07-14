@@ -3,12 +3,13 @@
 // serialization shapes, and finish_reason mapping. This is the schema boundary
 // consumed by external OpenAI clients.
 
-#include "ninfer/serve/openai_schema.h"
-#include "ninfer/serve/request.h"
-#include "ninfer/serve/translate.h"
+#include "serve/openai_schema.h"
+#include "serve/request.h"
+#include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -37,8 +38,30 @@ bool throws_api(const std::function<void()>& f) {
 RequestLimits default_limits() {
     RequestLimits limits;
     limits.default_max_tokens = 512;
-    limits.max_context        = 8192;
     return limits;
+}
+
+ServeOptions default_server() { return ServeOptions{}; }
+
+ninfer::OwnedMedia fake_media(const ContentPart& part) {
+    ninfer::OwnedMedia media;
+    media.kind =
+        part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
+    media.bytes.push_back(0);
+    media.media_type = part.source.media_type;
+    return media;
+}
+
+ninfer::PromptInput translate(const GenerationRequest& req) {
+    return to_prompt_input(req, default_server(), fake_media);
+}
+
+std::string joined_text(const ninfer::ChatMessage& message) {
+    std::string text;
+    for (const ninfer::MessagePart& part : message.parts) {
+        if (part.kind == ninfer::MessagePartKind::Text) { text += part.text; }
+    }
+    return text;
 }
 
 // Strip "data: " prefix and trailing blank line from an SSE event, returning the
@@ -81,9 +104,9 @@ int test_parse_parts_and_flatten() {
                                                     Json{{"type", "text"}, {"text", "b"}}})}}})}};
     const GenerationRequest req = parse_chat_completion_request(body, default_limits());
     failures += check(req.messages[0].content.size() == 2, "two content parts");
-    const auto messages = to_chat_messages(req);
-    failures += check(messages.size() == 1, "flattened to one message");
-    failures += check(messages[0].rendered_content() == "a\nb", "text parts joined");
+    const ninfer::PromptInput prompt = translate(req);
+    failures += check(prompt.messages.size() == 1, "flattened to one message");
+    failures += check(joined_text(prompt.messages[0]) == "a\nb", "text parts joined");
     return failures;
 }
 
@@ -96,14 +119,16 @@ int test_parse_image_in_translate() {
              {"content",
               Json::array({Json{{"type", "image_url"},
                                 {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}})}}})}};
-    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    const auto messages         = to_chat_messages(req);
-    int failures                = 0;
+    const GenerationRequest req      = parse_chat_completion_request(body, default_limits());
+    const ninfer::PromptInput prompt = translate(req);
+    int failures                     = 0;
     failures += check(req.messages[0].content[0].kind == ContentKind::Image,
                       "image content kind preserved");
-    failures += check(req.messages[0].content[0].source.kind == ninfer::media::SourceKind::Data,
+    failures += check(req.messages[0].content[0].source.kind ==
+                          ninfer::product::media_acquire::SourceKind::Data,
                       "image data URI source preserved");
-    failures += check(messages[0].parts[0].kind == ninfer::text::ChatPartKind::Image,
+    failures += check(prompt.messages[0].parts[0].kind == ninfer::MessagePartKind::Media &&
+                          prompt.messages[0].parts[0].media.kind == ninfer::MediaKind::Image,
                       "image translated to structured chat part");
     return failures;
 }
@@ -113,11 +138,11 @@ int test_developer_role_mapped() {
         {"model", "m"},
         {"messages", Json::array({Json{{"role", "developer"}, {"content", "be terse"}},
                                   Json{{"role", "user"}, {"content", "hi"}}})}};
-    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    const auto messages         = to_chat_messages(req);
-    int failures                = 0;
-    failures += check(messages.size() == 2, "developer + user parsed");
-    failures += check(messages[0].role == "system", "developer role mapped to system");
+    const GenerationRequest req      = parse_chat_completion_request(body, default_limits());
+    const ninfer::PromptInput prompt = translate(req);
+    int failures                     = 0;
+    failures += check(prompt.messages.size() == 2, "developer + user parsed");
+    failures += check(prompt.messages[0].role == "system", "developer role mapped to system");
     return failures;
 }
 
@@ -448,8 +473,7 @@ int test_models_and_error() {
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
-    failures += check(list.at("data").at(0).at("owned_by") == "ninfer",
-                      "models list owner");
+    failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
 
     const Json one = Json::parse(make_model_object("qwen3.6-27b", 1));
     failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
@@ -470,11 +494,12 @@ int test_models_and_error() {
 
 int test_finish_reason_wire() {
     int failures = 0;
-    failures += check(std::string(finish_reason_wire(ninfer::text::FinishReason::Stop)) == "stop",
-                      "stop wire");
-    failures += check(std::string(finish_reason_wire(ninfer::text::FinishReason::Length)) == "length",
-                      "length wire");
-    failures += check(std::string(finish_reason_wire(ninfer::text::FinishReason::Cancelled)) == "stop",
+    failures += check(std::string(finish_reason_wire(ninfer::FinishReason::StopToken)) == "stop",
+                      "stop token wire");
+    failures +=
+        check(std::string(finish_reason_wire(ninfer::FinishReason::OutputLimit)) == "length",
+              "output limit wire");
+    failures += check(std::string(finish_reason_wire(ninfer::FinishReason::Cancelled)) == "stop",
                       "cancelled maps to stop");
     return failures;
 }

@@ -1,7 +1,7 @@
 // Correctness + coverage for argmax, against the frozen op-test standard
 // (docs/kernel-development.md): exact i32 index match from bf16-rounded
 // logits, with lowest-index tie-break and no tolerance preset.
-#include "ninfer/kernels/argmax.h"
+#include "kernels/argmax/argmax.h"
 #include "kernels/op_tester.h"
 
 #include <cstdint>
@@ -86,10 +86,33 @@ static int one_shape(const char* tag, int vocab, int t_count, std::uint32_t seed
     Tensor tlogits(dlogits.p, DType::BF16, {vocab, t_count});
     Tensor tout(dout.p, DType::I32, {t_count});
 
-    kernels::argmax(tlogits, tout, nullptr);
+    kernels::argmax(tlogits, tout, vocab, nullptr);
     cudaDeviceSynchronize();
 
     return verify_i32(tag, from_device_i32(dout, static_cast<std::size_t>(t_count)), ref);
+}
+
+static int physical_stride_and_valid_rows() {
+    constexpr int physical_rows = 248320;
+    constexpr int valid_rows    = 248077;
+    constexpr int cols          = 3;
+    const std::vector<int> ref{17, 123456, valid_rows - 1};
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * cols, -10.0f);
+    for (int col = 0; col < cols; ++col) {
+        const std::size_t base = static_cast<std::size_t>(col) * physical_rows;
+        logits[base + ref[static_cast<std::size_t>(col)]] = 20.0f + col;
+        logits[base + valid_rows]                         = 100.0f + col;
+        logits[base + physical_rows - 1]                  = 200.0f + col;
+    }
+    round_to_bf16(logits);
+
+    DBuf dlogits = to_device_bf16(logits);
+    DBuf dout    = to_device_i32(std::vector<int>(cols, -1));
+    Tensor tlogits(dlogits.p, DType::BF16, {physical_rows, cols});
+    Tensor tout(dout.p, DType::I32, {cols});
+    kernels::argmax(tlogits, tout, valid_rows, nullptr);
+    cudaDeviceSynchronize();
+    return verify_i32("argmax physical stride + valid rows", from_device_i32(dout, cols), ref);
 }
 
 template <typename Fn>
@@ -133,44 +156,44 @@ static int validation_checks() {
     f += expect_invalid("argmax validation logits dtype", [&] {
         Tensor bad = logits;
         bad.dtype = DType::FP32;
-        kernels::argmax(bad, out, nullptr);
+        kernels::argmax(bad, out, 2, nullptr);
     });
     f += expect_invalid("argmax validation out dtype", [&] {
         Tensor bad = out;
         bad.dtype = DType::BF16;
-        kernels::argmax(logits, bad, nullptr);
+        kernels::argmax(logits, bad, 2, nullptr);
     });
     f += expect_invalid("argmax validation out shape", [&] {
         Tensor bad(dout.p, DType::I32, {3});
-        kernels::argmax(logits, bad, nullptr);
+        kernels::argmax(logits, bad, 2, nullptr);
     });
     f += expect_invalid("argmax validation logits rank", [&] {
         Tensor bad(dlogits.p, DType::BF16, {2, 2, 2});
-        kernels::argmax(bad, out, nullptr);
+        kernels::argmax(bad, out, 2, nullptr);
     });
     f += expect_invalid("argmax validation out rank", [&] {
         Tensor bad(dout.p, DType::I32, {2, 2});
-        kernels::argmax(logits, bad, nullptr);
+        kernels::argmax(logits, bad, 2, nullptr);
     });
     f += expect_invalid("argmax validation logits contiguous", [&] {
         Tensor bad = logits;
         bad.nb[0] = 4;
-        kernels::argmax(bad, out, nullptr);
+        kernels::argmax(bad, out, 2, nullptr);
     });
     f += expect_invalid("argmax validation out contiguous", [&] {
         Tensor bad = out;
         bad.nb[0] = 8;
-        kernels::argmax(logits, bad, nullptr);
+        kernels::argmax(logits, bad, 2, nullptr);
     });
     f += expect_invalid("argmax validation null data", [&] {
         Tensor null_logits(nullptr, DType::BF16, {2, 1});
         Tensor null_out(nullptr, DType::I32, {1});
-        kernels::argmax(null_logits, null_out, nullptr);
+        kernels::argmax(null_logits, null_out, 2, nullptr);
     });
     f += expect_invalid("argmax validation negative dim", [&] {
         Tensor bad = logits;
         bad.ne[0] = -1;
-        kernels::argmax(bad, out, nullptr);
+        kernels::argmax(bad, out, 2, nullptr);
     });
     f += expect_invalid("argmax validation zero vocab", [&] {
         Tensor zero_logits(nullptr, DType::BF16, {1});
@@ -178,7 +201,13 @@ static int validation_checks() {
         zero_logits.ne[0] = 0;
         zero_logits.ne[1] = 0;
         zero_out.ne[0] = 0;
-        kernels::argmax(zero_logits, zero_out, nullptr);
+        kernels::argmax(zero_logits, zero_out, 1, nullptr);
+    });
+    f += expect_invalid("argmax validation zero valid rows", [&] {
+        kernels::argmax(logits, out, 0, nullptr);
+    });
+    f += expect_invalid("argmax validation valid rows exceeds physical rows", [&] {
+        kernels::argmax(logits, out, 3, nullptr);
     });
     f += expect_overflow("argmax validation overflow", [&] {
         Tensor huge_logits(nullptr, DType::BF16, {1});
@@ -187,7 +216,7 @@ static int validation_checks() {
             huge_logits.ne[d] = std::numeric_limits<std::int32_t>::max();
             huge_out.ne[d] = std::numeric_limits<std::int32_t>::max();
         }
-        kernels::argmax(huge_logits, huge_out, nullptr);
+        kernels::argmax(huge_logits, huge_out, 1, nullptr);
     });
 
     try {
@@ -201,7 +230,7 @@ static int validation_checks() {
         zero_out.ne[1] = 1;
         zero_out.ne[2] = 1;
         zero_out.ne[3] = 1;
-        kernels::argmax(zero_logits, zero_out, nullptr);
+        kernels::argmax(zero_logits, zero_out, 7, nullptr);
     } catch (const std::exception& e) {
         std::cerr << "argmax validation zero T: expected no throw, got " << e.what() << '\n';
         ++f;
@@ -218,6 +247,7 @@ int main() {
 
     int f = 0;
     f += validation_checks();
+    f += physical_stride_and_valid_rows();
 
     for (std::uint32_t seed : {1u, 7u, 99u}) {
         f += one_shape("argmax [1,1]", 1, 1, seed);

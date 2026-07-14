@@ -1,6 +1,6 @@
-#include "ninfer/serve/serve_options.h"
+#include "serve/serve_options.h"
 
-#include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -30,33 +30,31 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
 }
 
 std::uint64_t parse_u64(const char* text, const char* label) {
+    if (text == nullptr || *text == '\0' || *text == '-') {
+        throw std::invalid_argument(std::string("invalid ") + label + ": " +
+                                    (text == nullptr ? "" : text));
+    }
+    errno                           = 0;
     char* end                      = nullptr;
     const unsigned long long value = std::strtoull(text, &end, 10);
-    if (end == text || *end != '\0') {
+    if (errno == ERANGE || end == text || *end != '\0') {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<std::uint64_t>(value);
 }
 
-DType parse_kv_dtype(const char* text) {
+KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
-    if (value == "bf16") { return DType::BF16; }
-    if (value == "int8") { return DType::I8; }
+    if (value == "bf16") { return KvCacheStorage::BFloat16; }
+    if (value == "int8") { return KvCacheStorage::Int8Group64; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
 } // namespace
 
-int derive_default_max_tokens(std::uint32_t max_context) {
-    const std::uint32_t half = max_context / 2;
-    const std::uint32_t capped =
-        std::min(half, static_cast<std::uint32_t>(kDefaultMaxTokensCeiling));
-    return std::max<int>(1, static_cast<int>(capped));
-}
-
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <weights.qus> [--host H] [--port N] [--api-key KEY] "
+           " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
            "[--max-request-mib N] "
            "[--kv-dtype bf16|int8] [--mtp-draft-tokens N] [--default-max-tokens N] "
@@ -65,13 +63,13 @@ std::string serve_usage_text(const char* argv0) {
            "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves an OpenAI-compatible Chat Completions endpoint\n"
-           "       --default-max-tokens defaults to min(max_context/2, " +
-           std::to_string(kDefaultMaxTokensCeiling) +
-           ") when omitted\n"
+           "       --default-max-tokens defaults to " +
+           std::to_string(kDefaultMaxTokens) +
+           " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
            "top-k 20, presence-penalty 1.0); a request may override any field.\n"
-           "       --greedy forces temperature 0 (exact argmax) for determinism/parity.\n";
+           "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -81,8 +79,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.help_requested = true;
         return options;
     }
-    if (argc < 2) { throw std::invalid_argument("weights path is required"); }
-    options.weights_path = argv[1];
+    if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
+    options.artifact_path = argv[1];
     for (int i = 2; i < argc; ++i) {
         const std::string arg    = argv[i];
         const auto require_value = [&](const char* flag) -> const char* {
@@ -113,7 +111,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
-            options.kv_dtype = parse_kv_dtype(require_value("--kv-dtype"));
+            options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--mtp-draft-tokens") {
             options.mtp_draft_tokens =
                 parse_nonnegative_int(require_value("--mtp-draft-tokens"), "mtp-draft-tokens");
@@ -124,7 +122,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--lm-head-draft") {
-            options.use_lm_head_draft = true;
+            options.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--cors") {
@@ -157,15 +155,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % model::kPrefillChunkAlignment != 0) {
+    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");
         }
-    } else {
-        options.default_max_tokens = derive_default_max_tokens(options.max_context);
     }
     return options;
 }

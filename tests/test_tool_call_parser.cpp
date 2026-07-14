@@ -1,4 +1,4 @@
-#include "ninfer/serve/tool_call_parser.h"
+#include "serve/tool_call_parser.h"
 
 #include <nlohmann/json.hpp>
 

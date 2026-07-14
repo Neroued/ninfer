@@ -14,7 +14,7 @@
 //   failures += verify("op n=...", from_device_bf16(dout, n), ref,
 //                      Tolerance::bf16_elementwise());
 
-#include "ninfer/core/tensor.h"   // ninfer::DType, ninfer::Tensor (for op call sites)
+#include "core/tensor.h"   // ninfer::DType, ninfer::Tensor (for op call sites)
 #include "kernels/op_check.h"
 
 #include <cuda_runtime.h>

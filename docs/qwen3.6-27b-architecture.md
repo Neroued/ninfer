@@ -2,12 +2,10 @@
 
 > Status: current model and runtime-semantics reference.
 >
-> The fixed dimensions are encoded in `include/ninfer/model/config.h`. This document describes the
+> The fixed dimensions are encoded in the registered target's private `impl/config.h`. This document describes the
 > Text decoder, MTP model, Vision tower, multimodal positions, numerics, and persistent state. It does
-> not define either artifact byte layout or CUDA implementation policy. The current C++ Engine's
-> q5090 assignment is defined by
-> [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md); the implemented native
-> `.ninfer` assignment and binding contract are defined by
+> not define either artifact byte layout or CUDA implementation policy. The product `.ninfer`
+> assignment and binding contract are defined by
 > [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md).
 
 ## 1. Model identity
@@ -110,9 +108,9 @@ h = RMSNorm(x, post_attention_norm, unit_offset=true)
 x = x + down_proj(SiLU(gate_proj(h)) * up_proj(h))
 ```
 
-The q5090 artifact may store projection groups in fused blocks and L1 may fuse projection,
-activation, or residual work. Those are storage/execution choices; the mathematical result remains
-the schedule above.
+The registered `.ninfer` target stores some projection groups as fused logical views, and its
+private kernels may fuse projection, activation, or residual work. Those are storage/execution
+choices; the mathematical result remains the schedule above.
 
 All ordinary layer norms and Q/K norms use zero-centered weights: the effective scale is `(1+w)`.
 The GDN internal gated norm is a plain ones-initialized RMSNorm and does not use the unit offset.
@@ -338,7 +336,7 @@ remain consistent.
 | MTP KV | 1 layer × context × 4 heads × 256 | active sequence when MTP enabled |
 | GDN conv | 48 layers × 10240 × 3, plus slots | active sequence |
 | GDN recurrent | 48 layers × 48 heads × 128 × 128 FP32, plus slots | active sequence |
-| Text step buffers | token, positions, logits, verify/draft/sampling tensors | Engine lifetime |
+| Text step buffers | token, positions, logits, verify/draft/sampling tensors | Program lifetime |
 | Vision workspace | patch/control/intermediate/merger tensors | one multimodal prefill |
 | Text workspace | chunk/block temporaries | arena scope |
 
@@ -349,19 +347,16 @@ changes its fixed allocation.
 
 | Model concern | Source |
 |---|---|
-| dimensions and layer mapping | `include/ninfer/model/config.h` |
-| Text/MTP weights and schedule | `include/ninfer/model/model.h`, `src/model/qwen3_6_27b.cpp` |
-| Vision weights and schedule | `include/ninfer/model/vision.h`, `src/model/qwen3_6_vision.cpp` |
-| multimodal processor | `include/ninfer/model/processor.h`, `src/model/processor.cpp` |
-| multimodal position/control helpers | `src/model/position.*`, `src/model/vision_ops.*` |
-| MTP accept/commit helpers | `src/model/mtp_ops.h`, `src/kernels/kernel/mtp_round.cuh` |
-| GQA cache | `include/ninfer/core/kv_cache.h` |
-| GDN state | `include/ninfer/core/state_store.h` |
-| current C++ `.qus` tensor assignment | [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md) |
-| native `.ninfer` tensor assignment and binding | [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md), `tools/reference/qwen3_6_27b_rtx5090/bindings.py` |
+| dimensions and layer mapping | `src/targets/qwen3_6_27b_rtx5090/impl/config.h` |
+| immutable Text/MTP/Vision bindings | `src/targets/qwen3_6_27b_rtx5090/impl/load/` |
+| Text/MTP/Vision execution and state | `src/targets/qwen3_6_27b_rtx5090/impl/program/`, `impl/schedule/` |
+| tokenizer, template, multimodal processing, output decoder | `src/targets/qwen3_6_27b_rtx5090/impl/frontend/` |
+| shared mathematical operators | `src/kernels/` |
+| GQA cache and GDN state implementations | `src/targets/qwen3_6_27b_rtx5090/impl/state/` |
+| `.ninfer` tensor assignment and binding | [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md), `tools/reference/qwen3_6_27b_rtx5090/bindings.py` |
 | native `.ninfer` converter and verifier | `tools/convert/qwen3_6_27b_rtx5090` |
 | complete Python Text/Vision/MTP reference | `tools/reference/qwen3_6_27b_rtx5090` |
 
-The Python reference is the complete executable oracle for the native artifact route. The C++
-sources above remain the currently delivered `.qus` Engine implementation; they have not yet been
-reorganized into the accepted multi-target Engine architecture or switched to `.ninfer` loading.
+The Python reference is the independent executable oracle for the artifact route. The C++ target
+implements the same complete Text/Vision/MTP product over `.ninfer` through the closed Engine
+architecture.

@@ -1,8 +1,10 @@
-#include "ninfer/serve/anthropic_schema.h"
+#include "serve/anthropic_schema.h"
 
 #include <array>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <random>
 #include <string>
@@ -45,7 +47,18 @@ std::optional<int> get_int(const Json& obj, const char* key) {
     if (!obj.at(key).is_number_integer()) {
         bad_request(std::string(key) + " must be an integer", key);
     }
-    return obj.at(key).get<int>();
+    if (obj.at(key).is_number_unsigned()) {
+        const std::uint64_t value = obj.at(key).get<std::uint64_t>();
+        if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            bad_request(std::string(key) + " is out of range", key);
+        }
+        return static_cast<int>(value);
+    }
+    const std::int64_t value = obj.at(key).get<std::int64_t>();
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        bad_request(std::string(key) + " is out of range", key);
+    }
+    return static_cast<int>(value);
 }
 
 bool is_valid_function_name(const std::string& name) {
@@ -94,25 +107,25 @@ std::string require_string_field(const Json& block, const char* field, const cha
     return block.at(field).get<std::string>();
 }
 
-ninfer::media::Source parse_image_source(const Json& block) {
+ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
     if (!block.contains("source") || !block.at("source").is_object()) {
         bad_request("image block must contain a source object", "messages");
     }
     const Json& source     = block.at("source");
     const std::string type = require_string_field(source, "type", "image source");
-    ninfer::media::Source out;
+    ninfer::product::media_acquire::Source out;
     if (type == "base64") {
         out.media_type         = require_string_field(source, "media_type", "base64 image source");
         const std::string data = require_string_field(source, "data", "base64 image source");
         if (data.empty()) { bad_request("base64 image data must not be empty", "messages"); }
-        out.kind  = ninfer::media::SourceKind::Data;
+        out.kind  = ninfer::product::media_acquire::SourceKind::Data;
         out.value = "data:" + out.media_type + ";base64," + data;
     } else if (type == "url") {
         out.value = require_string_field(source, "url", "URL image source");
         if (!out.value.starts_with("http://") && !out.value.starts_with("https://")) {
             bad_request("image URL must use HTTP(S)", "messages");
         }
-        out.kind = ninfer::media::SourceKind::Url;
+        out.kind = ninfer::product::media_acquire::SourceKind::Url;
     } else {
         bad_request("unsupported image source type: " + type, "messages");
     }
@@ -472,16 +485,19 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     return out;
 }
 
-const char* messages_stop_reason(ninfer::text::FinishReason reason, bool has_tool_calls) {
+const char* messages_stop_reason(ninfer::FinishReason reason, bool has_tool_calls) {
     if (has_tool_calls) { return "tool_use"; }
     switch (reason) {
-    case ninfer::text::FinishReason::Length:
+    case ninfer::FinishReason::OutputLimit:
+    case ninfer::FinishReason::ContextCapacity:
         return "max_tokens";
-    case ninfer::text::FinishReason::Stop:
-    case ninfer::text::FinishReason::Cancelled:
-    default:
+    case ninfer::FinishReason::None:
+    case ninfer::FinishReason::StopToken:
+    case ninfer::FinishReason::StopString:
+    case ninfer::FinishReason::Cancelled:
         return "end_turn";
     }
+    return "end_turn";
 }
 
 std::string make_messages_response(const std::string& id, const std::string& model,

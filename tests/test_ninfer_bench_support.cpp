@@ -1,19 +1,17 @@
 #include "ninfer_bench_support.h"
 
-#include "ninfer/core/kv_cache.h"
-
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -26,7 +24,7 @@ int fail(std::string_view message) {
     return 1;
 }
 
-int expect_bool(bool value, std::string_view label) { return value ? 0 : fail(label); }
+int expect(bool value, std::string_view label) { return value ? 0 : fail(label); }
 
 int expect_u32(std::uint32_t actual, std::uint32_t expected, std::string_view label) {
     if (actual == expected) { return 0; }
@@ -34,19 +32,13 @@ int expect_u32(std::uint32_t actual, std::uint32_t expected, std::string_view la
     return 1;
 }
 
-int expect_size(std::size_t actual, std::size_t expected, std::string_view label) {
-    if (actual == expected) { return 0; }
-    std::cerr << label << " expected " << expected << ", got " << actual << '\n';
-    return 1;
-}
-
-int expect_string(const std::string& actual, std::string_view expected, std::string_view label) {
+int expect_string(std::string_view actual, std::string_view expected, std::string_view label) {
     if (actual == expected) { return 0; }
     std::cerr << label << " expected `" << expected << "`, got `" << actual << "`\n";
     return 1;
 }
 
-int expect_double_near(double actual, double expected, std::string_view label) {
+int expect_near(double actual, double expected, std::string_view label) {
     if (std::abs(actual - expected) < 1e-6) { return 0; }
     std::cerr << label << " expected " << expected << ", got " << actual << '\n';
     return 1;
@@ -57,444 +49,287 @@ int expect_throws(Fn&& fn, std::string_view label) {
     try {
         fn();
     } catch (const Exception&) { return 0; }
-    std::cerr << label << " did not throw\n";
-    return 1;
+    return fail(std::string(label) + " did not throw");
 }
 
-std::filesystem::path temp_file(std::string_view stem, std::string_view contents) {
-    const auto path = std::filesystem::temp_directory_path() / std::string(stem);
-    std::ofstream out(path);
-    if (!out) { throw std::runtime_error("failed to create temp file"); }
-    out << contents;
-    return path;
-}
-
-qb::BenchOptions parse_args_for_test(std::vector<std::string> args) {
+qb::BenchOptions parse_for_test(std::vector<std::string> arguments) {
     std::vector<char*> argv;
-    argv.reserve(args.size());
-    for (std::string& arg : args) { argv.push_back(arg.data()); }
+    argv.reserve(arguments.size());
+    for (std::string& argument : arguments) { argv.push_back(argument.data()); }
     return qb::parse_args(static_cast<int>(argv.size()), argv.data());
 }
 
-int test_expand_tests_defaults_and_labels() {
-    int failures = 0;
-    qb::BenchOptions defaults;
-    defaults.weights_path                          = "w.qus";
-    const std::vector<qb::BenchTest> default_tests = qb::expand_tests(defaults);
-    failures += expect_size(default_tests.size(), 2, "default test count");
-    failures += expect_string(default_tests[0].label, "pp512", "default prefill label");
-    failures += expect_string(default_tests[1].label, "tg128", "default decode label");
+int test_cli_contract() {
+    int failures                  = 0;
+    const qb::BenchOptions parsed = parse_for_test({
+        "ninfer_bench",
+        "--weights",
+        "model.ninfer",
+        "-p",
+        "128,512",
+        "-n",
+        "64",
+        "-pg",
+        "2048,128",
+        "-r",
+        "3",
+        "--warmup",
+        "2",
+        "--max-ctx",
+        "4096",
+        "--prefill-chunk",
+        "128",
+        "--kv-dtype",
+        "int8",
+        "--mtp-draft-tokens",
+        "5",
+        "--lm-head-draft",
+        "--device",
+        "1",
+        "--no-cuda-graph",
+        "--output",
+        "json",
+        "--output-file",
+        "report.json",
+    });
 
-    qb::BenchOptions options;
-    options.n_prompt                       = {128, 2048};
-    options.n_gen                          = {64};
-    options.prompt_gen                     = {{2048, 128}};
-    const std::vector<qb::BenchTest> tests = qb::expand_tests(options);
-    failures += expect_size(tests.size(), 4, "expanded test count");
-    failures += expect_string(tests[0].label, "pp128", "prefill label 0");
-    failures += expect_string(tests[1].label, "pp2048", "prefill label 1");
-    failures += expect_string(tests[2].label, "tg64", "decode label");
-    failures += expect_string(tests[3].label, "pp2048+tg128", "combined label");
-    failures += expect_bool(tests[0].kind == qb::TestKind::Prefill, "prefill kind");
-    failures += expect_bool(tests[2].kind == qb::TestKind::Decode, "decode kind");
-    failures += expect_bool(tests[3].kind == qb::TestKind::PrefillDecode, "combined kind");
+    failures += expect_string(parsed.artifact_path, "model.ninfer", "artifact path");
+    failures += expect(parsed.n_prompt == std::vector<int>({128, 512}), "prompt list");
+    failures += expect(parsed.n_gen == std::vector<int>({64}), "generation list");
+    failures += expect(parsed.prompt_gen == std::vector<std::pair<int, int>>({{2048, 128}}),
+                       "combined list");
+    failures += expect(parsed.repetitions == 3 && parsed.warmup == 2, "repetition settings");
+    failures += expect(parsed.max_context == std::optional<std::uint32_t>(4096), "max context");
+    failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
+    failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
+    failures += expect(parsed.mtp_draft_tokens == 5, "MTP window");
+    failures +=
+        expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
+    failures += expect(parsed.device == 1 && !parsed.use_cuda_graph, "device and graph settings");
+    failures +=
+        expect(parsed.output == qb::OutputFormat::Json && parsed.output_file == "report.json",
+               "output settings");
+
+    const auto defaults = qb::expand_tests(qb::BenchOptions{});
+    failures +=
+        expect(defaults.size() == 2 && defaults[0].label == "pp512" && defaults[1].label == "tg128",
+               "default pp/tg matrix");
+    failures += expect(qb::usage_text("ninfer_bench").find("artifact.ninfer") != std::string::npos,
+                       "help names native artifact");
+    failures += expect(parse_for_test({"ninfer_bench", "--help"}).help_requested, "help flag");
+
+    failures += expect_throws<std::invalid_argument>([] { (void)parse_for_test({"ninfer_bench"}); },
+                                                     "missing artifact");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--lm-head-draft"});
+        },
+        "optimized head without MTP");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test(
+                {"ninfer_bench", "--weights", "model.ninfer", "--mtp-draft-tokens", "6"});
+        },
+        "unsupported MTP window");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test(
+                {"ninfer_bench", "--weights", "model.ninfer", "--prefill-chunk", "129"});
+        },
+        "misaligned prefill chunk");
+    failures += expect_throws<std::invalid_argument>(
+        [] {
+            (void)parse_for_test(
+                {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
+        },
+        "unsupported KV storage");
     return failures;
 }
 
-int test_required_context_and_max_ctx() {
+int test_measurement_contract() {
     int failures = 0;
     const qb::BenchTest pp{qb::TestKind::Prefill, 512, 0, "pp512"};
     const qb::BenchTest tg{qb::TestKind::Decode, 0, 128, "tg128"};
-    const qb::BenchTest pgt{qb::TestKind::PrefillDecode, 2048, 128, "pp2048+tg128"};
-    failures += expect_u32(pp.required_context(0), 512, "pp required context");
-    failures +=
-        expect_u32(tg.required_context(0), 128 + qb::kDecodeSeedTokens, "tg required context");
-    failures += expect_u32(pgt.required_context(0), 2176, "pp+tg required context");
-    failures += expect_u32(pp.required_context(5), 516, "mtp pp required context");
-    failures += expect_u32(tg.required_context(5), 139, "mtp tg required context");
-    failures += expect_u32(pgt.required_context(5), 2186, "mtp pp+tg required context");
+    const qb::BenchTest combined{qb::TestKind::PrefillDecode, 2048, 128, "pp2048+tg128"};
 
-    const std::vector<qb::BenchTest> tests = {pp, tg, pgt};
+    failures += expect_u32(pp.requested_output_tokens(), 1, "pp begin output");
+    failures += expect_u32(tg.requested_output_tokens(), 129, "tg begin plus G outputs");
     failures +=
-        expect_u32(qb::resolve_max_ctx(tests, std::nullopt, 0, false), 2176, "auto max_ctx");
+        expect_u32(combined.requested_output_tokens(), 129, "combined begin plus G outputs");
+    failures += expect_u32(pp.required_context(0), 512, "pp context");
+    failures += expect_u32(pp.required_context(5), 522, "MTP pp context");
+    failures += expect_u32(tg.required_context(0), 129, "tg context");
+    failures += expect_u32(tg.required_context(5), 139, "MTP tg context");
+    failures += expect_u32(combined.required_context(5), 2186, "MTP combined context");
+    failures += expect_u32(qb::decode_graph_prime_output_tokens(5), 13, "MTP graph-prime outputs");
     failures +=
-        expect_u32(qb::resolve_max_ctx(tests, std::nullopt, 5, false), 2186, "mtp auto max_ctx");
-    failures += expect_u32(qb::resolve_max_ctx(tests, std::optional<std::uint32_t>(4096), 5, true),
-                           4096, "override max_ctx honored");
+        expect_u32(qb::decode_graph_prime_required_context(5), 23, "MTP graph-prime context");
+
+    const std::vector<qb::BenchTest> matrix = {pp, tg, combined};
+    failures +=
+        expect_u32(qb::resolve_max_context(matrix, std::nullopt, 5, true), 2186, "auto context");
+    failures +=
+        expect_u32(qb::resolve_max_context(matrix, std::optional<std::uint32_t>(4096), 5, true),
+                   4096, "explicit context");
     failures += expect_throws<std::invalid_argument>(
-        [&] { (void)qb::resolve_max_ctx(tests, std::optional<std::uint32_t>(2000), 0, false); },
-        "override below requirement throws");
-    const std::vector<qb::BenchTest> tiny_decode = {
-        qb::BenchTest{qb::TestKind::Decode, 0, 1, "tg1"}};
-    failures += expect_u32(qb::resolve_max_ctx(tiny_decode, std::nullopt, 5, false), 12,
-                           "mtp eager tiny decode max_ctx");
-    failures += expect_u32(qb::resolve_max_ctx(tiny_decode, std::nullopt, 5, true), 17,
-                           "mtp graph tiny decode max_ctx primes round graph");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)qb::resolve_max_ctx(tiny_decode, std::optional<std::uint32_t>(12), 5, true); },
-        "graph override below prime requirement throws");
+        [&] { (void)qb::resolve_max_context(matrix, std::optional<std::uint32_t>(2048), 5, true); },
+        "undersized context");
     return failures;
 }
 
-int test_corpus_load_and_slice() {
-    int failures               = 0;
-    const auto ok              = temp_file("ninfer_bench_corpus_ok.ids", "10 11 12\n13\t14\n15\n");
-    const std::vector<int> ids = qb::load_corpus_ids(ok.string());
-    failures += expect_size(ids.size(), 6, "corpus size");
-    failures += expect_bool(ids[0] == 10 && ids[5] == 15, "corpus values");
-
-    const std::vector<int> slice = qb::prompt_slice(ids, 3);
-    failures += expect_size(slice.size(), 3, "slice size");
-    failures +=
-        expect_bool(slice[0] == 10 && slice[1] == 11 && slice[2] == 12, "slice exact prefix");
-
-    failures += expect_throws<std::invalid_argument>([&] { (void)qb::prompt_slice(ids, 7); },
-                                                     "slice beyond corpus throws");
-    failures += expect_throws<std::invalid_argument>([&] { (void)qb::prompt_slice(ids, 0); },
-                                                     "slice zero throws");
-
-    const auto empty = temp_file("ninfer_bench_corpus_empty.ids", "\n \t");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)qb::load_corpus_ids(empty.string()); }, "empty corpus throws");
-    const auto negative = temp_file("ninfer_bench_corpus_negative.ids", "1 -2 3");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)qb::load_corpus_ids(negative.string()); }, "negative id throws");
-    const auto nondigit = temp_file("ninfer_bench_corpus_nondigit.ids", "1 a 3");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)qb::load_corpus_ids(nondigit.string()); }, "non-digit id throws");
-    return failures;
+ninfer::GenerationTimings timings(double prepare, double prefill, double decode, double total) {
+    return {.prepare_seconds = prepare,
+            .vision_seconds  = 0.0,
+            .prefill_seconds = prefill,
+            .decode_seconds  = decode,
+            .total_seconds   = total};
 }
 
-int test_validate_prompt_lengths() {
-    int failures                           = 0;
-    const std::vector<qb::BenchTest> tests = {
-        qb::BenchTest{qb::TestKind::Prefill, 50, 0, "pp50"},
-        qb::BenchTest{qb::TestKind::PrefillDecode, 80, 20, "pp80+tg20"}};
-    qb::validate_prompt_lengths(tests, 100); // ok
-
-    failures += expect_throws<std::invalid_argument>(
-        [&] { qb::validate_prompt_lengths(tests, 60); }, "prefill exceeding corpus throws");
-    failures += expect_throws<std::invalid_argument>(
-        [&] {
-            const std::vector<qb::BenchTest> decode_only = {
-                qb::BenchTest{qb::TestKind::Decode, 0, 8, "tg8"}};
-            qb::validate_prompt_lengths(decode_only, 0);
-        },
-        "empty corpus for decode throws");
-    return failures;
-}
-
-int test_parse_args() {
-    int failures                  = 0;
-    const qb::BenchOptions parsed = parse_args_for_test({"ninfer_bench",
-                                                         "--weights",
-                                                         "w.qus",
-                                                         "-p",
-                                                         "128,512",
-                                                         "-n",
-                                                         "64",
-                                                         "-pg",
-                                                         "2048,128",
-                                                         "-r",
-                                                         "3",
-                                                         "--warmup",
-                                                         "2",
-                                                         "--max-ctx",
-                                                         "4096",
-                                                         "--prefill-chunk",
-                                                         "128",
-                                                         "--kv-dtype",
-                                                         "int8",
-                                                         "--mtp-draft-tokens",
-                                                         "5",
-                                                         "--lm-head-draft",
-                                                         "-o",
-                                                         "json",
-                                                         "--no-cuda-graph"});
-    failures += expect_string(parsed.weights_path, "w.qus", "weights path");
-    failures += expect_size(parsed.n_prompt.size(), 2, "n_prompt list size");
-    failures +=
-        expect_bool(parsed.n_prompt[0] == 128 && parsed.n_prompt[1] == 512, "n_prompt values");
-    failures += expect_size(parsed.n_gen.size(), 1, "n_gen list size");
-    failures += expect_size(parsed.prompt_gen.size(), 1, "prompt_gen size");
-    failures +=
-        expect_bool(parsed.prompt_gen[0].first == 2048 && parsed.prompt_gen[0].second == 128,
-                    "prompt_gen values");
-    failures += expect_bool(parsed.repetitions == 3, "repetitions parsed");
-    failures += expect_bool(parsed.warmup == 2, "warmup parsed");
-    failures +=
-        expect_bool(parsed.max_ctx.has_value() && *parsed.max_ctx == 4096, "max_ctx parsed");
-    failures += expect_bool(parsed.prefill_chunk == 128, "prefill_chunk parsed");
-    failures += expect_bool(parsed.kv_dtype == ninfer::DType::I8, "kv_dtype parsed");
-    failures += expect_bool(parsed.mtp_draft_tokens == 5, "mtp draft tokens parsed");
-    failures += expect_bool(parsed.use_lm_head_draft, "lm-head-draft parsed");
-    failures += expect_bool(parsed.output == qb::OutputFormat::Json, "output json parsed");
-    failures += expect_bool(!parsed.use_cuda_graph, "no-cuda-graph parsed");
-
-    const qb::BenchOptions help = parse_args_for_test({"ninfer_bench", "--help"});
-    failures += expect_bool(help.help_requested, "help flag");
-
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)parse_args_for_test({"ninfer_bench"}); }, "missing weights throws");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)parse_args_for_test({"ninfer_bench", "--weights", "w.qus", "--unknown"}); },
-        "unknown arg throws");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)parse_args_for_test({"ninfer_bench", "--weights", "w.qus", "-o", "yaml"}); },
-        "bad output format throws");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)parse_args_for_test({"ninfer_bench", "--weights", "w.qus", "--lm-head-draft"}); },
-        "lm-head-draft without MTP throws");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)parse_args_for_test({"ninfer_bench", "--weights", "w.qus", "-p", "512,0"}); },
-        "non-positive n_prompt throws");
-    failures += expect_throws<std::invalid_argument>(
-        [&] { (void)parse_args_for_test({"ninfer_bench", "--weights", "w.qus", "-pg", "2048"}); },
-        "malformed prompt-gen throws");
-    failures += expect_throws<std::invalid_argument>(
-        [&] {
-            (void)parse_args_for_test(
-                {"ninfer_bench", "--weights", "w.qus", "--prefill-chunk", "129"});
-        },
-        "non-128 prefill chunk throws");
-    failures += expect_throws<std::invalid_argument>(
-        [&] {
-            (void)parse_args_for_test(
-                {"ninfer_bench", "--weights", "w.qus", "--mtp-draft-tokens", "6"});
-        },
-        "too many mtp draft tokens throws");
-    failures += expect_throws<std::invalid_argument>(
-        [&] {
-            (void)parse_args_for_test({"ninfer_bench", "--weights", "w.qus", "--kv-dtype", "fp8"});
-        },
-        "bad kv dtype throws");
-    return failures;
-}
-
-int test_stats() {
-    int failures          = 0;
-    const qb::Stats three = qb::compute_stats({1.0, 2.0, 3.0});
-    failures += expect_double_near(three.mean, 2.0, "stats mean");
-    failures += expect_double_near(three.stddev, 1.0, "stats sample stddev");
-    failures += expect_bool(three.count == 3, "stats count");
-
-    const qb::Stats single = qb::compute_stats({5.0});
-    failures += expect_double_near(single.mean, 5.0, "single stats mean");
-    failures += expect_double_near(single.stddev, 0.0, "single stats stddev zero");
-    return failures;
+ninfer::SpeculativeStats speculative(std::uint64_t rounds, std::uint64_t drafted,
+                                     std::uint64_t accepted, std::uint64_t fallback,
+                                     std::vector<std::uint64_t> per_position) {
+    return {.enabled               = true,
+            .draft_window          = 5,
+            .rounds                = rounds,
+            .drafted_tokens        = drafted,
+            .accepted_tokens       = accepted,
+            .fallback_steps        = fallback,
+            .accepted_per_position = std::move(per_position)};
 }
 
 std::vector<qb::TestResult> sample_results() {
     qb::TestResult pp;
-    pp.test                 = qb::BenchTest{qb::TestKind::Prefill, 512, 0, "pp512"};
-    pp.reps                 = {qb::RepTiming{0.5, 0.0}, qb::RepTiming{0.25, 0.0}};
-    pp.reps[0].mtp          = qb::BenchMtpStats{true, 5, 10, 4, 2, 1, {2, 1, 1, 0, 0}};
-    pp.reps[1].mtp          = qb::BenchMtpStats{true, 5, 5, 2, 1, 0, {1, 1, 0, 0, 0}};
-    pp.workspace_peak_bytes = 5368709120ULL; // 5 GiB
+    pp.test = {qb::TestKind::Prefill, 512, 0, "pp512"};
+    pp.reps = {{timings(0.01, 0.5, 0.0, 0.52), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1},
+               {timings(0.02, 0.25, 0.0, 0.28), speculative(0, 0, 0, 0, {0, 0, 0, 0, 0}), 1}};
+    pp.workspace_peak_bytes = 5ULL * 1024ULL * 1024ULL * 1024ULL;
 
     qb::TestResult tg;
-    tg.test                 = qb::BenchTest{qb::TestKind::Decode, 0, 3, "tg3"};
-    tg.reps                 = {qb::RepTiming{0.0, 0.5}, qb::RepTiming{0.0, 1.0}};
-    tg.reps[0].mtp          = qb::BenchMtpStats{true, 5, 5, 5, 1, 0, {1, 1, 1, 1, 1}};
-    tg.reps[1].mtp          = qb::BenchMtpStats{true, 5, 0, 0, 0, 3, {0, 0, 0, 0, 0}};
-    tg.workspace_peak_bytes = 1048576ULL; // 1 MiB
-    return {pp, tg};
+    tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
+    tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4},
+               {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4}};
+    tg.workspace_peak_bytes = 1024ULL * 1024ULL;
+    return {std::move(pp), std::move(tg)};
 }
 
-int test_format_json_schema() {
-    int failures = 0;
+qb::BenchEnvironment sample_environment() {
     qb::BenchEnvironment env;
-    env.gpu_name                 = "test gpu";
-    env.git_commit               = "abc";
-    env.max_ctx                  = 640;
-    env.decode_path              = "cuda_graph";
-    env.repetitions              = 2;
-    env.prefill_chunk            = ninfer::model::kDefaultPrefillChunk;
-    env.kv_dtype                 = "int8";
-    env.kv_quant_group           = ninfer::kKvQuantGroup;
-    env.kv_cache_payload_bytes   = 123456;
-    env.mtp_draft_tokens         = 5;
-    env.use_lm_head_draft        = true;
-    env.q5090_h2d_bytes          = 1000;
-    env.q5090_resident_bytes     = 900;
-    env.q5090_resident_modules   = {"TEXT_CORE", "MTP_DRAFT", "LM_HEAD_DRAFT"};
-    env.decode_graph_requested   = true;
-    env.decode_graph_primed      = true;
-    env.decode_graph_prime_steps = 7;
-    env.corpus_path              = "bench/fixtures/bench_corpus.ids";
-    env.corpus_tokens            = 10241;
-    env.weights_path             = "w.qus";
+    env.gpu_name                         = "RTX 5090";
+    env.cuda_runtime_version             = "13.1";
+    env.cuda_driver_version              = "590.1";
+    env.device_id                        = 0;
+    env.artifact_path                    = "model.ninfer";
+    env.artifact_file_size_bytes         = 17500000000ULL;
+    env.load                             = {.target               = "qwen3_6_27b_rtx5090",
+                                            .load_seconds         = 2.5,
+                                            .upload_seconds       = 2.0,
+                                            .artifact_bytes_read  = 17500000000ULL,
+                                            .host_to_device_bytes = 17400000000ULL,
+                                            .peak_staging_bytes   = 134217728ULL,
+                                            .tensor_count         = 1166,
+                                            .resource_count       = 6};
+    env.memory.device                    = 0;
+    env.memory.max_context               = 4096;
+    env.memory.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
+    env.memory.weights                   = {17400000000ULL, 17400000000ULL, 17400000000ULL};
+    env.memory.sequence                  = {2000000000ULL, 1900000000ULL, 1900000000ULL};
+    env.memory.workspace                 = {100000000ULL, 0, 0};
+    env.memory.kv_payload_bytes          = 123456ULL;
+    env.max_context                      = 4096;
+    env.prefill_chunk                    = 1024;
+    env.kv_cache                         = ninfer::KvCacheStorage::Int8Group64;
+    env.mtp_draft_tokens                 = 5;
+    env.proposal_head                    = ninfer::ProposalHead::Optimized;
+    env.use_cuda_graph                   = true;
+    env.decode_graph_primed              = true;
+    env.decode_graph_prime_output_tokens = 13;
+    env.repetitions                      = 2;
+    env.warmup                           = 1;
+    env.corpus_path                      = "bench/fixtures/bench_corpus.ids";
+    env.corpus_tokens                    = 65536;
+    return env;
+}
 
-    const std::string json_text =
-        qb::format_json(env, "ninfer_bench --weights w.qus", sample_results());
+int test_report_contract() {
+    int failures                   = 0;
+    const qb::BenchEnvironment env = sample_environment();
+    const auto results             = sample_results();
     Json report;
     try {
-        report = Json::parse(json_text);
-    } catch (const nlohmann::json::exception& e) {
-        return fail(std::string("format_json produced invalid JSON: ") + e.what());
+        report = Json::parse(qb::format_json(
+            env, "ninfer_bench --weights model.ninfer --mtp-draft-tokens 5", results));
+    } catch (const nlohmann::json::exception& error) {
+        return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
-    failures += expect_bool(report.at("schema_version").get<int>() == 7, "json schema version");
-    failures += expect_string(report.at("artifact_type").get<std::string>(), "ninfer_bench_report",
-                              "json artifact type");
-    failures += expect_string(report.at("tool").get<std::string>(), "ninfer_bench", "json tool");
-    failures += expect_bool(report.at("config").at("prefill_chunk").get<int>() ==
-                                static_cast<int>(ninfer::model::kDefaultPrefillChunk),
-                            "json config prefill_chunk");
-    failures += expect_string(report.at("config").at("kv_dtype").get<std::string>(), "int8",
-                              "json config kv_dtype");
-    failures +=
-        expect_bool(report.at("config").at("kv_quant_group").get<int>() == ninfer::kKvQuantGroup,
-                    "json config kv_quant_group");
-    failures += expect_bool(report.at("config").at("kv_cache_payload_bytes").get<std::uint64_t>() ==
-                                123456ULL,
-                            "json config kv payload");
-    failures += expect_bool(report.at("config").at("mtp_draft_tokens").get<int>() == 5,
-                            "json config mtp_draft_tokens");
-    failures += expect_bool(report.at("config").at("lm_head_draft").get<bool>(),
-                            "json config lm_head_draft");
-    failures += expect_bool(report.at("weights").at("h2d_bytes").get<std::uint64_t>() == 1000,
-                            "json weights h2d bytes");
-    failures += expect_bool(report.at("weights").at("resident_modules").size() == 3,
-                            "json weights resident modules");
-    failures +=
-        expect_bool(report.at("config").at("decode_graph_prime").at("requested").get<bool>(),
-                    "json graph prime requested");
-    failures += expect_bool(report.at("config").at("decode_graph_prime").at("primed").get<bool>(),
-                            "json graph prime primed");
-    failures +=
-        expect_bool(report.at("config").at("decode_graph_prime").at("decode_steps").get<int>() == 7,
-                    "json graph prime decode steps");
-    const Json& tests = report.at("tests");
-    failures += expect_bool(tests.is_array() && tests.size() == 2, "json tests array");
 
-    const Json& pp = tests.at(0);
-    failures += expect_string(pp.at("label").get<std::string>(), "pp512", "json pp label");
-    failures += expect_string(pp.at("kind").get<std::string>(), "pp", "json pp kind");
-    failures += expect_bool(pp.at("n_gen").get<int>() == 0, "json pp n_gen");
-    // 512 / 0.5 = 1024, 512 / 0.25 = 2048, mean 1536.
-    failures += expect_double_near(pp.at("prefill_tok_s_mean").get<double>(), 1536.0,
-                                   "json pp prefill mean");
+    failures += expect(report.at("schema_version") == 8, "report schema v8");
+    failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
+    failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
+    failures += expect(report.at("load").at("target") == "qwen3_6_27b_rtx5090", "load target");
     failures +=
-        expect_bool(pp.at("decode_output_tok_s_mean").is_null(), "json pp decode output null");
-    failures +=
-        expect_bool(pp.at("decode_engine_tok_s_mean").is_null(), "json pp decode engine null");
-    failures += expect_bool(pp.at("workspace_peak_bytes").get<std::uint64_t>() == 5368709120ULL,
-                            "json pp workspace peak");
-    failures += expect_bool(pp.at("mtp").at("enabled").get<bool>(), "json pp mtp enabled");
-    failures += expect_bool(pp.at("mtp").at("k").get<int>() == 5, "json pp mtp k");
-    failures +=
-        expect_bool(pp.at("mtp").at("draft_tokens").get<int>() == 15, "json pp mtp draft tokens");
-    failures += expect_bool(pp.at("mtp").at("accepted_tokens").get<int>() == 6,
-                            "json pp mtp accepted tokens");
-    failures += expect_double_near(pp.at("mtp").at("acceptance_rate").get<double>(), 0.4,
-                                   "json pp mtp acceptance rate");
-    failures += expect_double_near(pp.at("mtp").at("acceptance_length").get<double>(), 3.0,
-                                   "json pp mtp acceptance length");
-    failures += expect_bool(pp.at("mtp").at("rounds").get<int>() == 3, "json pp mtp rounds");
-    failures += expect_bool(pp.at("mtp").at("fallback_steps").get<int>() == 1,
-                            "json pp mtp fallback steps");
-    failures += expect_bool(pp.at("mtp").at("accepted_per_pos").is_array() &&
-                                pp.at("mtp").at("accepted_per_pos").size() == 5,
-                            "json pp mtp accepted per pos");
-    failures += expect_bool(pp.at("mtp").at("accepted_per_pos").at(0).get<int>() == 3,
-                            "json pp mtp accepted per pos 0");
-    failures += expect_bool(pp.at("reps").is_array() && pp.at("reps").size() == 2, "json pp reps");
+        expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
+    failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
+    failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
+                       "workspace capacity");
+    failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
+    failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
+    failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
+                       "graph prime output count");
 
-    const Json& tg = tests.at(1);
-    failures += expect_string(tg.at("kind").get<std::string>(), "tg", "json tg kind");
+    const Json& pp = report.at("tests").at(0);
     failures +=
-        expect_bool(!tg.contains("decode_tok_s_mean"), "json removed ambiguous decode mean");
-    // output: 3 / 0.5 = 6, 3 / 1.0 = 3, mean 4.5.
-    failures += expect_double_near(tg.at("decode_output_tok_s_mean").get<double>(), 4.5,
-                                   "json tg decode output mean");
-    // engine-produced: (1 round + 5 accepted) / 0.5 = 12, 3 fallbacks / 1.0 = 3, mean 7.5.
-    failures += expect_double_near(tg.at("decode_engine_tok_s_mean").get<double>(), 7.5,
-                                   "json tg decode engine mean");
-    failures += expect_bool(tg.at("prefill_tok_s_mean").is_null(), "json tg prefill null");
-    failures += expect_bool(tg.at("reps").at(0).at("decode_output_tokens").get<int>() == 3,
-                            "json rep output tokens");
-    failures += expect_bool(tg.at("reps").at(0).at("decode_engine_tokens").get<int>() == 6,
-                            "json rep engine tokens");
-    failures += expect_double_near(tg.at("reps").at(0).at("decode_output_tok_s").get<double>(), 6.0,
-                                   "json rep output rate");
-    failures += expect_double_near(tg.at("reps").at(0).at("decode_engine_tok_s").get<double>(),
-                                   12.0, "json rep engine rate");
-    failures += expect_bool(tg.at("reps").at(0).at("mtp").at("rounds").get<int>() == 1,
-                            "json rep mtp rounds");
+        expect(pp.at("kind") == "pp" && pp.at("requested_output_tokens") == 1, "pp request shape");
+    failures += expect_near(pp.at("prefill_tok_s_mean").get<double>(), 1536.0, "pp throughput");
+    failures += expect(pp.at("decode_output_tok_s_mean").is_null(), "pp decode is null");
+    failures += expect(pp.at("workspace_peak_bytes") == 5ULL * 1024ULL * 1024ULL * 1024ULL,
+                       "pp workspace peak");
+
+    const Json& tg = report.at("tests").at(1);
+    failures +=
+        expect(tg.at("kind") == "tg" && tg.at("requested_output_tokens") == 4, "tg request shape");
+    failures += expect_near(tg.at("decode_output_tok_s_mean").get<double>(), 4.5,
+                            "decode output throughput");
+    failures += expect_near(tg.at("decode_engine_tok_s_mean").get<double>(), 7.5,
+                            "decode engine throughput");
+    failures += expect(tg.at("speculative").at("rounds") == 1, "speculative rounds");
+    failures += expect(tg.at("speculative").at("fallback_steps") == 3, "speculative fallbacks");
+    failures += expect_near(tg.at("speculative").at("acceptance_rate").get<double>(), 1.0,
+                            "speculative acceptance");
+    failures += expect(tg.at("speculative").at("accepted_per_position").size() == 5,
+                       "per-position acceptance");
+    failures +=
+        expect(tg.at("reps").at(0).at("generated_output_tokens") == 4, "rep generated tokens");
+    failures += expect(tg.at("reps").at(0).at("decode_engine_tokens") == 6, "rep engine tokens");
+    failures += expect_near(tg.at("reps").at(0).at("timings").at("decode_seconds").get<double>(),
+                            0.5, "rep GenerationTimings");
+    failures += expect(tg.at("reps").at(0).at("speculative").at("drafted_tokens") == 5,
+                       "rep SpeculativeStats");
     return failures;
 }
 
-int test_format_table_and_csv() {
-    int failures                              = 0;
-    const std::vector<qb::TestResult> results = sample_results();
-    qb::BenchEnvironment env;
-    env.decode_path            = "cuda_graph";
-    env.prefill_chunk          = ninfer::model::kDefaultPrefillChunk;
-    env.kv_dtype               = "int8";
-    env.kv_quant_group         = ninfer::kKvQuantGroup;
-    env.kv_cache_payload_bytes = 123456;
-    env.mtp_draft_tokens       = 0;
-    env.use_lm_head_draft      = false;
-    const std::string table    = qb::format_table(env, results);
-    failures += expect_bool(table.find("pp512") != std::string::npos, "table has pp512");
-    failures += expect_bool(table.find("tg3") != std::string::npos, "table has tg3");
-    failures += expect_bool(table.find("prefill t/s") != std::string::npos, "table has header");
-    failures += expect_bool(table.find("decode out t/s") != std::string::npos,
-                            "table has output decode header");
-    failures += expect_bool(table.find("decode eng t/s") != std::string::npos,
-                            "table has engine decode header");
-    failures += expect_bool(
-        table.find("prefill_chunk=" + std::to_string(ninfer::model::kDefaultPrefillChunk)) !=
-            std::string::npos,
-        "table has prefill_chunk config");
-    failures += expect_bool(table.find("mtp_k=0") != std::string::npos, "table has mtp config");
-    failures += expect_bool(table.find("lm_head_draft=false") != std::string::npos,
-                            "table has lm-head-draft config");
-    failures += expect_bool(table.find("kv_dtype=int8") != std::string::npos, "table has kv dtype");
-    failures += expect_bool(table.find("kv_payload=") != std::string::npos, "table has kv payload");
-    failures += expect_bool(table.find("graph_prime=n/a") != std::string::npos,
-                            "table has graph prime config");
-    failures += expect_bool(table.find("work peak") != std::string::npos, "table has work peak");
-    failures += expect_bool(table.find("mtp acc") != std::string::npos, "table has mtp acc");
-    failures += expect_bool(table.find("GiB") != std::string::npos, "table shows GiB peak");
-
+int test_human_and_csv_reports() {
+    int failures                   = 0;
+    const qb::BenchEnvironment env = sample_environment();
+    const auto results             = sample_results();
+    const std::string table        = qb::format_table(env, results);
+    failures += expect(table.find("qwen3_6_27b_rtx5090") != std::string::npos, "table target");
+    failures += expect(table.find("model.ninfer") != std::string::npos, "table artifact");
     failures +=
-        expect_string(qb::decode_path_name(true, 0), "cuda_graph", "decode path cuda graph");
-    failures += expect_string(qb::decode_path_name(false, 0), "eager", "decode path eager");
-    failures += expect_string(qb::decode_path_name(true, 5), "mtp_cuda_graph",
-                              "decode path mtp cuda graph");
-    failures += expect_string(qb::decode_path_name(false, 5), "mtp_eager", "decode path mtp eager");
+        expect(table.find("proposal_head=optimized") != std::string::npos, "table proposal head");
+    failures +=
+        expect(table.find("decode eng t/s") != std::string::npos, "table engine throughput");
+    failures += expect(table.find("work peak") != std::string::npos, "table workspace peak");
 
     const std::string csv = qb::format_csv(env, results);
-    failures += expect_bool(csv.find("label,kind,n_prompt") == 0, "csv header first");
-    failures +=
-        expect_bool(csv.find("prefill_chunk") != std::string::npos, "csv has prefill_chunk");
-    failures += expect_bool(csv.find("kv_dtype") != std::string::npos, "csv has kv_dtype");
-    failures += expect_bool(csv.find("kv_cache_payload_bytes") != std::string::npos,
-                            "csv has kv cache payload");
-    failures +=
-        expect_bool(csv.find("mtp_draft_tokens") != std::string::npos, "csv has mtp_draft_tokens");
-    failures +=
-        expect_bool(csv.find("lm_head_draft") != std::string::npos, "csv has lm_head_draft");
-    failures += expect_bool(csv.find("decode_graph_primed") != std::string::npos,
-                            "csv has graph prime flag");
-    failures += expect_bool(csv.find("decode_graph_prime_steps") != std::string::npos,
-                            "csv has graph prime steps");
-    failures += expect_bool(csv.find("mtp_acceptance_rate") != std::string::npos,
-                            "csv has mtp_acceptance_rate");
-    failures += expect_bool(csv.find("decode_output_tok_s_mean") != std::string::npos,
-                            "csv has output decode rate");
-    failures += expect_bool(csv.find("decode_engine_tok_s_mean") != std::string::npos,
-                            "csv has engine decode rate");
-    failures += expect_bool(csv.find("decode_tok_s_mean") == std::string::npos,
-                            "csv removed ambiguous decode rate");
-    failures += expect_bool(csv.find("workspace_peak_bytes") != std::string::npos,
-                            "csv has workspace_peak_bytes");
-    std::size_t lines = 0;
-    for (const char c : csv) {
-        if (c == '\n') { ++lines; }
+    failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,target"), "CSV identity columns");
+    for (const std::string_view field :
+         {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes", "workspace_peak_bytes",
+          "spec_acceptance_rate", "decode_output_tok_s_mean", "decode_engine_tok_s_mean",
+          "total_seconds_mean"}) {
+        failures += expect(csv.find(field) != std::string::npos,
+                           std::string("CSV field ") + std::string(field));
     }
-    failures += expect_size(lines, 3, "csv line count (header + 2 rows)");
+    failures += expect(std::count(csv.begin(), csv.end(), '\n') == 3, "CSV header plus two rows");
     return failures;
 }
 
@@ -502,13 +337,9 @@ int test_format_table_and_csv() {
 
 int main() {
     int failures = 0;
-    failures += test_expand_tests_defaults_and_labels();
-    failures += test_required_context_and_max_ctx();
-    failures += test_corpus_load_and_slice();
-    failures += test_validate_prompt_lengths();
-    failures += test_parse_args();
-    failures += test_stats();
-    failures += test_format_json_schema();
-    failures += test_format_table_and_csv();
-    return failures == 0 ? 0 : fail("ninfer_bench support test failed");
+    failures += test_cli_contract();
+    failures += test_measurement_contract();
+    failures += test_report_contract();
+    failures += test_human_and_csv_reports();
+    return failures == 0 ? 0 : fail("ninfer_bench support contract failed");
 }

@@ -2,7 +2,7 @@
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges (incl. a large-magnitude stress case that rejects any
 // polynomial/"fast" silu approximation), composite tolerance bf16_elementwise.
-#include "ninfer/kernels/silu_mul.h"
+#include "kernels/silu_mul/silu_mul.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>

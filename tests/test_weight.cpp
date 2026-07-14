@@ -1,4 +1,4 @@
-#include "ninfer/core/weight.h"
+#include "core/weight.h"
 
 #include <cstdint>
 #include <iostream>
@@ -65,9 +65,7 @@ int test_weight_from_dense() {
     failures += (w.layout == ninfer::QuantLayout::Contiguous)
                     ? 0
                     : fail("weight_from_dense: layout not Contiguous");
-    failures += (w.q5090_scale_dtype == ninfer::ScaleDType::None)
-                    ? 0
-                    : fail("weight_from_dense: scale dtype not None");
+    failures += (w.scales == nullptr) ? 0 : fail("weight_from_dense: unexpected scale plane");
     failures += (w.qdata == &blob) ? 0 : fail("weight_from_dense: qdata mismatch");
     failures += check_i64(static_cast<std::int64_t>(w.payload_bytes),
                           static_cast<std::int64_t>(t.bytes()), "weight_from_dense payload_bytes");

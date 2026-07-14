@@ -2,7 +2,7 @@
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges (incl. a large-magnitude stress case), composite tolerance
 // bf16_elementwise.
-#include "ninfer/kernels/sigmoid_mul.h"
+#include "kernels/sigmoid_mul/sigmoid_mul.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>

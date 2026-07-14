@@ -2,7 +2,7 @@
 // exactly (bf16-rounded logits, lowest-index tie-break), and the sampling path
 // must respect top-k/top-p/min-p truncation, be reproducible under a fixed
 // seed, and match the softmax distribution it claims to draw from.
-#include "ninfer/kernels/sampling.h"
+#include "targets/qwen3_6_27b_rtx5090/impl/kernels/sampling/sampling.h"
 #include "kernels/op_tester.h"
 
 #include <algorithm>
@@ -70,8 +70,8 @@ std::vector<int> sample_many(const std::vector<float>& base, int cols,
     DeviceConfig dcfg(cfg);
     Tensor tlogits(dlogits.p, DType::BF16, {vocab, cols});
     Tensor tout(dout.p, DType::I32, {cols});
-    kernels::sample(tlogits, tout, dcfg.ptr(), static_cast<const std::int32_t*>(dpos.p), purpose,
-                    nullptr);
+    kernels::sample(tlogits, tout, vocab, dcfg.ptr(),
+                    static_cast<const std::int32_t*>(dpos.p), purpose, nullptr);
     cudaDeviceSynchronize();
     return from_device_i32(dout, static_cast<std::size_t>(cols));
 }
@@ -97,8 +97,8 @@ std::vector<int> sample_many_batched(const std::vector<float>& base, int total, 
         const int batch = std::min(cols, total - produced);
         const int pos   = pos_start + produced;
         cudaMemcpy(dpos.p, &pos, sizeof(pos), cudaMemcpyHostToDevice);
-        kernels::sample(tlogits, tout, dcfg.ptr(), static_cast<const std::int32_t*>(dpos.p),
-                        purpose, nullptr);
+        kernels::sample(tlogits, tout, vocab, dcfg.ptr(),
+                        static_cast<const std::int32_t*>(dpos.p), purpose, nullptr);
         cudaMemcpyAsync(static_cast<std::int32_t*>(dcollect.p) + produced, dout.p,
                         static_cast<std::size_t>(batch) * sizeof(std::int32_t),
                         cudaMemcpyDeviceToDevice, nullptr);
@@ -145,8 +145,9 @@ int greedy_matches_argmax(const char* tag, int vocab, int cols, std::uint32_t se
     DeviceConfig dcfg(cfg);
     Tensor tlogits(dlogits.p, DType::BF16, {vocab, cols});
     Tensor tout(dout.p, DType::I32, {cols});
-    kernels::sample(tlogits, tout, dcfg.ptr(), static_cast<const std::int32_t*>(dpos.p),
-                    kernels::kSamplePurposeDecode, nullptr);
+    kernels::sample(tlogits, tout, vocab, dcfg.ptr(),
+                    static_cast<const std::int32_t*>(dpos.p), kernels::kSamplePurposeDecode,
+                    nullptr);
     cudaDeviceSynchronize();
     std::vector<int> got = from_device_i32(dout, static_cast<std::size_t>(cols));
 
@@ -158,6 +159,46 @@ int greedy_matches_argmax(const char* tag, int vocab, int cols, std::uint32_t se
         }
     }
     std::cout << "    " << tag << " greedy==argmax\n";
+    return 0;
+}
+
+int physical_stride_and_token_domain(int cols, bool stochastic) {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * cols, -20.0f);
+    std::vector<int> expected(static_cast<std::size_t>(cols));
+    for (int col = 0; col < cols; ++col) {
+        const int best         = (17 + col * 7919) % token_domain;
+        const std::size_t base = static_cast<std::size_t>(col) * physical_rows;
+        expected[static_cast<std::size_t>(col)] = best;
+        logits[base + best]                      = 20.0f + col;
+        logits[base + token_domain]              = 100.0f + col;
+        logits[base + physical_rows - 1]         = 200.0f + col;
+    }
+    round_to_bf16(logits);
+
+    DBuf dlogits = to_device_bf16(logits);
+    DBuf dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(cols), -1));
+    DBuf dpos    = device_pos(0);
+    kernels::SamplingConfig cfg;
+    cfg.temperature = stochastic ? 1.0f : 0.0f;
+    cfg.top_k       = 1;
+    DeviceConfig dcfg(cfg);
+    Tensor tlogits(dlogits.p, DType::BF16, {physical_rows, cols});
+    Tensor tout(dout.p, DType::I32, {cols});
+    kernels::sample(tlogits, tout, token_domain, dcfg.ptr(),
+                    static_cast<const std::int32_t*>(dpos.p),
+                    kernels::kSamplePurposeDecode, nullptr);
+    cudaDeviceSynchronize();
+    const std::vector<int> got = from_device_i32(dout, static_cast<std::size_t>(cols));
+    if (got != expected) {
+        std::cerr << "physical_stride_and_token_domain: "
+                  << (stochastic ? "top-k" : "greedy") << " mismatch for cols=" << cols
+                  << '\n';
+        return 1;
+    }
+    std::cout << "    sample physical stride + token domain cols=" << cols << ' '
+              << (stochastic ? "top-k" : "greedy") << " ok\n";
     return 0;
 }
 
@@ -540,6 +581,10 @@ int main() {
         f += greedy_matches_argmax("sample [257,3]", 257, 3, seed);
         f += greedy_matches_argmax("sample [248320,1]", 248320, 1, seed);
     }
+    f += physical_stride_and_token_domain(1, false);
+    f += physical_stride_and_token_domain(1, true);
+    f += physical_stride_and_token_domain(3, false);
+    f += physical_stride_and_token_domain(3, true);
     f += top_k_subset();
     f += top_p_subset();
     f += min_p_subset();

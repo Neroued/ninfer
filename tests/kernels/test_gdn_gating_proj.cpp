@@ -1,7 +1,7 @@
 // Correctness coverage for the fused GDN in_a/in_b prefill path at Qwen3.6-27B
 // shapes: two dense BF16 [48,5120] projections fused with gdn_gating.
-#include "ninfer/kernels/gdn_gating_proj.h"
-#include "ninfer/core/arena.h"
+#include "targets/qwen3_6_27b_rtx5090/impl/kernels/gdn_gating/gdn_gating_proj.h"
+#include "core/arena.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>
@@ -22,7 +22,6 @@ Weight dense_bf16_weight(void* data) {
     Weight w{};
     w.qtype             = QType::BF16_CTRL;
     w.layout            = QuantLayout::Contiguous;
-    w.q5090_scale_dtype = ScaleDType::None;
     w.payload           = data;
     w.payload_bytes =
         static_cast<std::uint64_t>(kHeads) * static_cast<std::uint64_t>(kHidden) * 2ULL;

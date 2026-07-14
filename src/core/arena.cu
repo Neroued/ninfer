@@ -1,4 +1,4 @@
-#include "ninfer/core/arena.h"
+#include "core/arena.h"
 
 #include <cuda_runtime.h>
 
@@ -81,41 +81,51 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
     off_  = 0;
 }
 
-DeviceArena::~DeviceArena() { free_device(base_); }
+DeviceArena::DeviceArena(DeviceSpan storage)
+    : base_(storage.data), cap_(storage.bytes), owns_(false) {
+    if (base_ == nullptr || cap_ == 0) {
+        throw std::invalid_argument("borrowed DeviceArena storage must be non-empty");
+    }
+}
+
+DeviceArena::~DeviceArena() {
+    if (owns_) { free_device(base_); }
+}
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
-    : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_) {
+    : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
+      owns_(other.owns_) {
     other.base_ = nullptr;
     other.cap_  = 0;
     other.off_  = 0;
     other.peak_ = 0;
+    other.owns_ = true;
 }
 
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     if (this == &other) { return *this; }
 
-    free_device(base_);
+    if (owns_) { free_device(base_); }
     base_ = other.base_;
     cap_  = other.cap_;
     off_  = other.off_;
     peak_ = other.peak_;
+    owns_ = other.owns_;
 
     other.base_ = nullptr;
     other.cap_  = 0;
     other.off_  = 0;
     other.peak_ = 0;
+    other.owns_ = true;
     return *this;
 }
 
-Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape,
-                          std::size_t align) {
+DeviceSpan DeviceArena::alloc_bytes(std::size_t bytes, std::size_t align) {
     if (base_ == nullptr) { throw std::runtime_error("DeviceArena has no backing allocation"); }
     if (!is_power_of_two(align)) {
         throw std::invalid_argument("arena alignment must be a nonzero power of two");
     }
-
-    Tensor view(nullptr, dtype, shape);
-    const std::size_t bytes = view.bytes();
+    if (bytes == 0) { throw std::invalid_argument("arena allocation must be nonzero"); }
 
     const std::uintptr_t base_addr           = reinterpret_cast<std::uintptr_t>(base_);
     const std::uintptr_t current_addr        = checked_add_uintptr(base_addr, off_);
@@ -134,7 +144,14 @@ Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape
     auto* ptr = static_cast<unsigned char*>(base_) + aligned_offset;
     off_      = end;
     if (off_ > peak_) { peak_ = off_; }
-    return Tensor(ptr, dtype, shape);
+    return DeviceSpan{ptr, bytes};
+}
+
+Tensor DeviceArena::alloc(DType dtype, std::initializer_list<std::int32_t> shape,
+                          std::size_t align) {
+    Tensor view(nullptr, dtype, shape);
+    const DeviceSpan storage = alloc_bytes(view.bytes(), align);
+    return Tensor(storage.data, dtype, shape);
 }
 
 DeviceArena::Scope DeviceArena::scope() noexcept { return Scope(*this); }

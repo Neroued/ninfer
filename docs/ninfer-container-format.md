@@ -1,20 +1,18 @@
 # NInfer Artifact Container Version 1
 
 > Status: accepted and implemented by the native Python writer/reader/inspector, converter,
-> verifier, target binder, and narrow C++ reader on 2026-07-14. The current C++ Engine has not yet
-> cut over from `.qus`.
+> verifier, production C++ reader/binder/materializer, registered target, and C++ Engine.
 >
 > Authority: this document defines the common `.ninfer` version-1 framing, embedded-JSON object
 > directory, payload geometry, registries, and the boundary between the generic reader and a
 > registered model binder. It does not define a model inventory, source-checkpoint conversion
-> recipe, tensor-layout bytes, model mathematics, kernel, GPU policy, or the current C++ Engine.
+> recipe, tensor-layout bytes, model mathematics, kernel, GPU policy, or Engine execution.
 >
 > Project naming comes from [`ninfer-naming.md`](ninfer-naming.md), numeric formats from
 > [`ninfer-tensor-formats.md`](ninfer-tensor-formats.md), and registered storage layouts from
 > [`ninfer-storage-layouts.md`](ninfer-storage-layouts.md). The first model-specific contract is
-> [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md). The currently implemented C++
-> Engine continues to consume q5090 v4.2 `.qus` artifacts under
-> [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md) until its separate migration.
+> [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md). `.ninfer` is the only product
+> artifact route; removed legacy formats are not aliases or fallbacks.
 
 ## 1. Decision
 

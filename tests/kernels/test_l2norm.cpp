@@ -1,7 +1,7 @@
 // Correctness + coverage for l2norm, against the frozen op-test standard
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges, composite tolerance bf16_reduction.
-#include "ninfer/kernels/l2norm.h"
+#include "kernels/l2norm/l2norm.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>

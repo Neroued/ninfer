@@ -1,113 +1,76 @@
-# NInfer Project And Artifact-Extension Naming Decision
+# NInfer Project and Artifact Naming Decision
 
-> Status: accepted on 2026-07-13; project-identity migration and the first native `.ninfer`
-> converter/reference route were implemented on 2026-07-14. C++ Engine cutover remains pending.
+> Status: accepted and implemented.
 >
-> Authority: this document defines only the project name and the filename extension for native
-> model artifacts. It is not an artifact-format specification, container design,
-> ABI contract, or migration plan.
+> Authority: this document defines only the project name and native artifact filename extension. It
+> does not define artifact bytes, model inventory, runtime support, or source architecture.
 
 ## Decision
 
-The canonical name of the elevated project is **NInfer**.
+The canonical project name is **NInfer**.
 
 The name is read as **N + Infer**. `N` connects the project to Neroued, while `Infer` states its
-inference focus directly. This origin does not establish a separate formal long form.
+inference focus directly. It has no separate formal long form.
 
-The canonical filename extension for NInfer native model artifacts is **`.ninfer`**, in lowercase
-and including the leading dot.
-
-These two spellings are fixed inputs to the accepted container design and project identity.
-Changing either one requires an explicit revision of this decision rather than an incidental rename
-in implementation work.
-
-## Canonical usage
+The canonical filename extension for NInfer model artifacts is **`.ninfer`**, lowercase and
+including the leading dot.
 
 | Context | Canonical form | Rule |
 |---|---|---|
-| Project display name | `NInfer` | Preserve this capitalization in titles, prose, and public identity. |
-| Native artifact extension | `.ninfer` | Use the exact lowercase extension, including the leading dot. |
+| Project display name | `NInfer` | Preserve this capitalization in titles and prose. |
+| Native artifact extension | `.ninfer` | Use the exact lowercase extension. |
 
-This document does not derive code identifiers from the display name or extension. The current
-source tree uses `include/ninfer/`, the `ninfer` C++ root namespace, `ninfer`/`ninfer-*` executables,
-`ninfer_*` internal targets, and the `NINFER_*` environment-variable prefix. Those are implemented
-source/build identities, not meanings carried by `.ninfer`; the accepted
-[`ninfer-engine-architecture.md`](ninfer-engine-architecture.md) independently governs the future
-engine source boundary.
+Changing either spelling requires an explicit revision of this decision.
 
-The `.ninfer` extension is a naming decision, not a description of bytes. By itself it does not
-encode or guarantee:
+## Implemented identities
 
-- a format or ABI version;
-- a model architecture, checkpoint, or serving identity;
-- a tensor inventory, quantization policy, physical layout, or packing scheme;
-- a hardware target or runtime implementation;
-- compatibility with a particular NInfer binary;
-- integrity, authenticity, or successful validation;
-- any particular container structure.
+The current repository consistently uses:
 
-The accepted [`ninfer-container-format.md`](ninfer-container-format.md) defines the relevant
-semantics and validation rules without inferring them from the extension alone.
+- `NInfer` as the project display name;
+- `.ninfer` for runtime model artifacts;
+- `ninfer` as the C++ root namespace and primary executable name;
+- `include/ninfer/` for the installed product API;
+- `ninfer-*` and `ninfer_*` for executable and internal CMake target names;
+- `NINFER_*` for product environment variables;
+- exact target keys such as `qwen3_6_27b_rtx5090` for compiled checkpoint/GPU packages and
+  target-keyed offline tools.
 
-## Relationship to the current implementation
+The currently registered runtime consumes `qwen3_6_27b_rtx5090.ninfer`. Converter, reference,
+parity, C++ Engine, CLI, server, benchmark, and diagnostic paths all use the NInfer identity.
 
-The project identity migration is complete:
+## Extension boundary
 
-- the repository and product are named NInfer;
-- current binaries, C++ APIs, namespaces, tools, reports, and command examples use the implemented
-  NInfer identities;
-- current q5090 v4.2 C++ Engine artifacts retain the `.qus` suffix;
-- native `.ninfer` conversion, generic Python reading/inspection, a narrow C++ reader, the 27B
-  binder/verifier, and complete Python Text/Vision/MTP reference inference are implemented;
-- `.ninfer` is not yet a current C++ Engine input;
-- [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md) remains authoritative for the
-  current C++ `.qus` route, while the native format documents govern `.ninfer`;
-- the accepted multi-target engine architecture remains pending and does not turn documented
-  checkpoints into runtime support.
+The `.ninfer` suffix names the project artifact class; it does not itself encode:
 
-Renaming an existing `.qus` file to `.ninfer` is not conversion and does not make its bytes a valid
-native NInfer artifact. A loader that happens not to inspect filename extensions still interprets
-those bytes under the current q5090 v4.2 contract; that behavior does not establish a `.ninfer`
-compatibility alias.
+- a container version or byte layout;
+- a checkpoint architecture or tensor inventory;
+- a quantization recipe or storage layout;
+- a hardware target or runtime compatibility decision;
+- a serving model ID.
 
-## Implementation status and deferred decisions
+Those meanings are defined by the container, numeric-format, storage-layout, exact-target artifact,
+and compiled registry contracts. In particular, runtime support follows the complete artifact
+metadata/object signature plus the actual GPU and registered target package, not the filename stem.
 
-Container-format questions formerly deferred here are now governed by
-[`ninfer-container-format.md`](ninfer-container-format.md). The following naming and migration
-items are either fixed by the artifact-toolchain plan or remain explicitly deferred:
+## Related authority
 
-| Subject | Required follow-up |
-|---|---|
-| Whether `NInfer` needs a formal long form or expansion | Decide separately if the public identity requires one. |
-| Remaining `q5090` implementation names and code | New `.ninfer` converter/reference code uses the exact-target key `qwen3_6_27b_rtx5090`; current q5090 C++ names remain only until the separate Engine cutover. |
-| `.qus` conversion and cutover | The new converter reads the BF16 checkpoint directly and does not convert `.qus`; current C++ `.qus` loading remains until the separate Engine migration removes it. |
-| Uppercase or alternate suffix handling | The native reference CLI requires `.ninfer`; the v1 byte reader does not infer framing from a suffix. |
-| Artifact basename, sidecars, manifests, and MIME type | The converter writes a descriptive `.conversion.json` sidecar, but no basename, MIME, or sidecar is part of the artifact contract. |
-| Distribution package, registry, MIME, and service identifiers not yet exposed by the project | Define only when such a public contract is introduced. |
-
-This naming document itself does not approve a container ABI, version, magic string, model identity,
-or loader compatibility policy. The container specification owns the implemented v1 bytes and
-excludes a `.qus` reader; the engine architecture owns the pending C++ source/build cutover. The
-existing converter-generated `.ninfer` artifact does not need redesign or regeneration merely
-because that later Engine migration begins.
+- [`ninfer-container-format.md`](ninfer-container-format.md) defines `.ninfer` v1 bytes and object
+  directory semantics.
+- [`ninfer-tensor-formats.md`](ninfer-tensor-formats.md) and
+  [`ninfer-storage-layouts.md`](ninfer-storage-layouts.md) define registered persistent formats and
+  layouts.
+- [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md) defines the registered 27B
+  inventory and conversion/binding obligations.
+- [`ninfer-engine-architecture.md`](ninfer-engine-architecture.md) defines target selection and the
+  source/runtime ownership boundary.
 
 ## Rationale
 
-- `NInfer` makes inference visible in the name instead of tying the project identity to one model.
-- The initial `N` preserves a concise connection to Neroued without placing the full ID in every
-  identifier.
-- The name is short, readable, and suitable for a project that can qualify more than one explicitly
-  supported architecture.
-- `.ninfer` aligns the external file extension with the project identity without carrying the
-  former project abbreviation into the native format by default.
+- `NInfer` makes inference visible instead of tying the project identity to one model.
+- The initial `N` preserves a concise connection to Neroued.
+- The name remains short and readable as more exact targets are separately qualified.
+- `.ninfer` aligns the external artifact name with the project identity without encoding a specific
+  checkpoint or GPU in the extension itself.
 
-These are naming goals, not promises about supported models, GPUs, container capabilities, or the
-scope of the eventual runtime. This repository decision also does not constitute trademark,
-domain-name, or package-registry registration; any public-release clearance is a separate gate.
-
-## Constraint on follow-up work
-
-The container and engine designs cite this document and treat `NInfer` and `.ninfer` as accepted
-inputs. Follow-up implementation must preserve their authority boundaries, resolve only the
-remaining subjects above, and must not reintroduce `.qus` loader compatibility or rename the
-engine's fixed source identities incidentally.
+Future package, registry, MIME, or service identifiers should be named only when the project exposes
+such a contract. They are not implied by this decision.

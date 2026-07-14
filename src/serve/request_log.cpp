@@ -1,4 +1,4 @@
-#include "ninfer/serve/request_log.h"
+#include "serve/request_log.h"
 
 #include <iomanip>
 #include <sstream>
@@ -6,25 +6,34 @@
 namespace ninfer::serve {
 namespace {
 
-const char* finish_reason_name(ninfer::text::FinishReason reason) {
+const char* finish_reason_name(ninfer::FinishReason reason) {
     switch (reason) {
-        case ninfer::text::FinishReason::Stop: return "stop";
-        case ninfer::text::FinishReason::Length: return "length";
-        case ninfer::text::FinishReason::Cancelled: return "cancelled";
+    case ninfer::FinishReason::None:
+        return "none";
+    case ninfer::FinishReason::OutputLimit:
+        return "output_limit";
+    case ninfer::FinishReason::ContextCapacity:
+        return "context_capacity";
+    case ninfer::FinishReason::StopToken:
+        return "stop_token";
+    case ninfer::FinishReason::StopString:
+        return "stop_string";
+    case ninfer::FinishReason::Cancelled:
+        return "cancelled";
     }
     return "unknown";
 }
 
 std::string tool_choice_name(const ToolChoice& choice) {
     switch (choice.mode) {
-        case ToolChoiceMode::Auto:
-            return "auto";
-        case ToolChoiceMode::None:
-            return "none";
-        case ToolChoiceMode::Required:
-            return "required";
-        case ToolChoiceMode::Named:
-            return choice.name.empty() ? "named" : choice.name;
+    case ToolChoiceMode::Auto:
+        return "auto";
+    case ToolChoiceMode::None:
+        return "none";
+    case ToolChoiceMode::Required:
+        return "required";
+    case ToolChoiceMode::Named:
+        return choice.name.empty() ? "named" : choice.name;
     }
     return "unknown";
 }
@@ -47,11 +56,11 @@ std::string seconds_str(double seconds) {
 }
 
 // Compact resolved-sampler summary. temperature <= 0 is the exact-argmax path.
-std::string sampler_str(const ninfer::kernels::SamplingConfig& s) {
+std::string sampler_str(const ninfer::SamplingParameters& s) {
     if (s.temperature <= 0.0f) { return "greedy"; }
     std::ostringstream out;
-    out << std::fixed << std::setprecision(2) << "temp=" << s.temperature
-        << " top_p=" << s.top_p << " top_k=" << s.top_k;
+    out << std::fixed << std::setprecision(2) << "temp=" << s.temperature << " top_p=" << s.top_p
+        << " top_k=" << s.top_k;
     if (s.min_p > 0.0f) { out << " min_p=" << s.min_p; }
     if (s.presence_penalty != 0.0f) { out << " pres=" << s.presence_penalty; }
     if (s.frequency_penalty != 0.0f) { out << " freq=" << s.frequency_penalty; }
@@ -81,16 +90,12 @@ std::string mtp_str(const GenerationMetrics& m) {
 } // namespace
 
 std::string format_request_start(std::uint64_t id, bool stream, std::size_t n_messages,
-                                 int requested_max_tokens, int effective_max_tokens,
-                                 bool client_set, std::size_t n_tools,
+                                 int requested_max_tokens, bool client_set, std::size_t n_tools,
                                  const ToolChoice& tool_choice, bool has_tool_history,
-                                 const ninfer::kernels::SamplingConfig& sampling) {
+                                 const ninfer::SamplingParameters& sampling) {
     std::ostringstream out;
     out << "[req " << id << "] chat " << (stream ? "stream" : "non-stream")
         << " msgs=" << n_messages << " max_tokens=" << requested_max_tokens;
-    if (effective_max_tokens != requested_max_tokens) {
-        out << " effective_max_tokens=" << effective_max_tokens << " (context clamp)";
-    }
     out << ' ' << (client_set ? "(client)" : "(server default)") << " tools=" << n_tools
         << " tool_choice=" << tool_choice_name(tool_choice)
         << " tool_history=" << (has_tool_history ? "yes" : "no") << " sampler=["
@@ -100,19 +105,18 @@ std::string format_request_start(std::uint64_t id, bool stream, std::size_t n_me
 
 std::string format_request_done(std::uint64_t id, const GenerationOutcome& outcome) {
     const GenerationMetrics& m = outcome.metrics;
-    const double ttft_ms = (m.render_tokenize_seconds + m.prefill_seconds) * 1000.0;
+    const double ttft_ms = (m.prepare_seconds + m.vision_seconds + m.prefill_seconds) * 1000.0;
     // Prefill emits the first token; the remaining (gen - 1) come from decode.
-    const double decode_tokens = outcome.completion_tokens > 0
-                                     ? static_cast<double>(outcome.completion_tokens - 1)
-                                     : 0.0;
+    const double decode_tokens =
+        outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
 
     std::ostringstream out;
     out << "[req " << id << "] done finish="
         << (outcome.tool_calls.empty() ? finish_reason_name(outcome.finish_reason) : "tool_calls");
     if (!outcome.tool_calls.empty()) { out << " tool_calls=" << outcome.tool_calls.size(); }
     out << " prompt=" << outcome.prompt_tokens << " gen=" << outcome.completion_tokens
-        << " cache=" << m.prefix_cache_hit_tokens
-        << " ttft=" << std::fixed << std::setprecision(0) << ttft_ms << "ms"
+        << " cache=" << m.prefix_cache_hit_tokens << " ttft=" << std::fixed << std::setprecision(0)
+        << ttft_ms << "ms"
         << " prefill=" << rate(static_cast<double>(outcome.prompt_tokens), m.prefill_seconds)
         << " decode=" << rate(decode_tokens, m.decode_seconds)
         << " wall=" << seconds_str(m.total_seconds) << " mtp=" << mtp_str(m);

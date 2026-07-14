@@ -1,5 +1,5 @@
-#include "ninfer/core/arena.h"
-#include "ninfer/core/device.h"
+#include "core/arena.h"
+#include "core/device.h"
 
 #include <cuda_runtime.h>
 

@@ -14,7 +14,7 @@ Outputs (committed):
 
 ```text
 bench/fixtures/bench_corpus.ids            whitespace-separated decimal token ids (exactly --tokens)
-bench/fixtures/bench_corpus.manifest.json  tokenizer id, token count, ids sha256, source
+bench/fixtures/bench_corpus.manifest.json  tokenizer id, token count, and source description
 ```
 
 Content sources:
@@ -54,26 +54,33 @@ python3 tools/bench/make_bench_corpus.py \
   --tokenizer-path /path/to/local/Qwen3.6-27B/tokenizer \
   --tokens 131072 --source-text /path/to/book.txt
 
-# Verify the committed .ids + manifest agree (NInfer identity/schema, hash, and token count only;
-# no tokenizer or source needed, so a corpus baked from a downloaded source stays CI-verifiable).
+# Check that the committed .ids and its descriptive manifest agree; no tokenizer or source needed.
 python3 tools/bench/make_bench_corpus.py --check
 ```
 
 `--tokens` is the exact committed corpus size and the ceiling on prefill length; increase it (and
 optionally use `--source-text`) to benchmark longer prefills, memory permitting.
 
-## Current-state performance matrix
+## NInfer performance matrix
 
-`run_ninfer_bench_matrix.py` runs the layered current-state `ninfer_bench` matrix and stores all raw
-reports under ignored `profiles/bench/`. The matrix treats `--mtp-draft-tokens 3` as the primary
-MTP hypothesis, keeps `k=0` and `k=5` as controls, and sweeps `k=0..5` on representative
-context-decode cases.
+`run_ninfer_bench_matrix.py` runs the layered public-Engine `ninfer_bench` matrix against the native
+`.ninfer` artifact and stores its local reports under `profiles/bench/`. Its defaults are:
+
+```text
+artifact: out/qwen3_6_27b_rtx5090.ninfer
+binary:   build/bench/ninfer_bench
+corpus:   bench/fixtures/bench_corpus.ids
+```
+
+The matrix treats MTP `k=3` with the optimized proposal head as the primary path, keeps `k=0` and
+`k=5` as controls, and sweeps `k=0..5` on representative context-decode cases. Decode-bearing cases
+cover CUDA Graph and eager execution; prefill-only cases vary prompt length and prefill chunk.
 
 ```bash
 # Inspect commands without running the model.
 python3 tools/bench/run_ninfer_bench_matrix.py --preset core --dry-run
 
-# Main current-state run. Builds ninfer_bench first, writes JSON reports and summary.csv.
+# Main run. Builds build/bench/ninfer_bench first, then writes JSON and summary.csv.
 python3 tools/bench/run_ninfer_bench_matrix.py --preset core
 
 # Longer run that adds 32k/64k prompt and context-decode points.
@@ -86,7 +93,7 @@ python3 tools/bench/run_ninfer_bench_matrix.py --preset full --suite mtp_sweep
 Default outputs:
 
 ```text
-profiles/bench/current-state-<preset>-<timestamp>/
+profiles/bench/ninfer-<preset>-<timestamp>/
   commands.sh
   manifest.json
   json/<suite>/<case>.json
@@ -96,4 +103,11 @@ profiles/bench/current-state-<preset>-<timestamp>/
 ```
 
 Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and `--preset smoke`
-for a minimal script/runner check.
+for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
+building it.
+
+Each raw report must be `ninfer_bench_report` schema v8. The flattened summary carries native names
+from the report: selected target and artifact, load/read/upload/staging values, Engine memory arenas
+and KV payload, configured proposal head and graph mode, phase timings and throughput, and
+speculative rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the
+commands and selected local inputs; it does not make repository state part of report validity.

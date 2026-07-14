@@ -5,12 +5,13 @@
 // count_tokens body, and Anthropic error body. This is the schema boundary
 // consumed by Claude Code / other Anthropic clients.
 
-#include "ninfer/serve/anthropic_schema.h"
-#include "ninfer/serve/request.h"
-#include "ninfer/serve/translate.h"
+#include "serve/anthropic_schema.h"
+#include "serve/request.h"
+#include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -39,8 +40,30 @@ bool throws_api(const std::function<void()>& f) {
 RequestLimits default_limits() {
     RequestLimits limits;
     limits.default_max_tokens = 512;
-    limits.max_context        = 8192;
     return limits;
+}
+
+ServeOptions default_server() { return ServeOptions{}; }
+
+ninfer::OwnedMedia fake_media(const ContentPart& part) {
+    ninfer::OwnedMedia media;
+    media.kind =
+        part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
+    media.bytes.push_back(0);
+    media.media_type = part.source.media_type;
+    return media;
+}
+
+ninfer::PromptInput translate(const GenerationRequest& req) {
+    return to_prompt_input(req, default_server(), fake_media);
+}
+
+std::string joined_text(const ninfer::ChatMessage& message) {
+    std::string text;
+    for (const ninfer::MessagePart& part : message.parts) {
+        if (part.kind == ninfer::MessagePartKind::Text) { text += part.text; }
+    }
+    return text;
 }
 
 // Parse an Anthropic SSE event ("event: <type>\ndata: <json>\n\n") into its JSON
@@ -94,9 +117,9 @@ int test_parse_system_array_and_blocks() {
     const GenerationRequest req = parse_messages_request(body, default_limits());
     failures += check(req.messages[0].role == "system", "system first");
     failures += check(req.messages[0].content[0].text == "a\nb", "system blocks joined");
-    const auto messages = to_chat_messages(req);
-    failures += check(messages.size() == 2, "flattened system + user");
-    failures += check(messages[1].rendered_content() == "x\ny", "user blocks joined");
+    const ninfer::PromptInput prompt = translate(req);
+    failures += check(prompt.messages.size() == 2, "flattened system + user");
+    failures += check(joined_text(prompt.messages[1]) == "x\ny", "user blocks joined");
     return failures;
 }
 
@@ -183,14 +206,15 @@ int test_parse_image() {
                                                        {"source", Json{{"type", "base64"},
                                                                        {"media_type", "image/png"},
                                                                        {"data", "AA=="}}}}})}}})}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
-    const auto messages         = to_chat_messages(req);
-    int failures                = 0;
+    const GenerationRequest req      = parse_messages_request(body, default_limits());
+    const ninfer::PromptInput prompt = translate(req);
+    int failures                     = 0;
     failures += check(req.messages[0].content[0].kind == ContentKind::Image,
                       "Anthropic image kind preserved");
     failures += check(req.messages[0].content[0].source.value == "data:image/png;base64,AA==",
                       "Anthropic base64 converted to data URI");
-    failures += check(messages[0].parts[0].kind == ninfer::text::ChatPartKind::Image,
+    failures += check(prompt.messages[0].parts[0].kind == ninfer::MessagePartKind::Media &&
+                          prompt.messages[0].parts[0].media.kind == ninfer::MediaKind::Image,
                       "Anthropic image translated to structured chat part");
     return failures;
 }
@@ -299,9 +323,10 @@ int test_tool_use_result_roundtrip() {
     failures += check(req.messages[2].content.size() == 2 &&
                           req.messages[2].content[1].kind == ContentKind::Image,
                       "tool_result image carried");
-    const auto messages = to_chat_messages(req);
-    failures += check(messages[2].parts.size() == 2 &&
-                          messages[2].parts[1].kind == ninfer::text::ChatPartKind::Image,
+    const ninfer::PromptInput prompt = translate(req);
+    failures += check(prompt.messages[2].parts.size() == 2 &&
+                          prompt.messages[2].parts[1].kind == ninfer::MessagePartKind::Media &&
+                          prompt.messages[2].parts[1].media.kind == ninfer::MediaKind::Image,
                       "tool_result image translated to structured chat");
     failures += check(req.has_tool_history(), "tool history detected");
     return failures;
@@ -344,18 +369,18 @@ int test_thinking_and_sampling() {
 
 int test_stop_reason_mapping() {
     int failures = 0;
-    failures += check(std::string(messages_stop_reason(ninfer::text::FinishReason::Length, false)) ==
+    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::OutputLimit, false)) ==
                           "max_tokens",
-                      "length -> max_tokens");
-    failures +=
-        check(std::string(messages_stop_reason(ninfer::text::FinishReason::Stop, false)) == "end_turn",
-              "stop -> end_turn");
-    failures += check(
-        std::string(messages_stop_reason(ninfer::text::FinishReason::Cancelled, false)) == "end_turn",
-        "cancelled -> end_turn");
-    failures +=
-        check(std::string(messages_stop_reason(ninfer::text::FinishReason::Stop, true)) == "tool_use",
-              "tool calls -> tool_use");
+                      "output limit -> max_tokens");
+    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::StopToken, false)) ==
+                          "end_turn",
+                      "stop token -> end_turn");
+    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::Cancelled, false)) ==
+                          "end_turn",
+                      "cancelled -> end_turn");
+    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::StopString, true)) ==
+                          "tool_use",
+                      "tool calls -> tool_use");
     return failures;
 }
 

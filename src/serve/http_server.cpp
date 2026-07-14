@@ -1,9 +1,9 @@
-#include "ninfer/serve/http_server.h"
+#include "serve/http_server.h"
 
-#include "ninfer/serve/anthropic_schema.h"
-#include "ninfer/serve/openai_schema.h"
-#include "ninfer/serve/request_log.h"
-#include "ninfer/serve/translate.h"
+#include "serve/anthropic_schema.h"
+#include "serve/openai_schema.h"
+#include "serve/request_log.h"
+#include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
@@ -239,7 +239,6 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        limits.max_context        = options_.max_context;
         request                   = parse_chat_completion_request(body, limits);
         if (request.model != options_.model_id) {
             ApiError error;
@@ -261,9 +260,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     const std::uint64_t req_id = ++request_seq_;
     log_line(format_request_start(req_id, request.stream, request.messages.size(),
-                                  request.max_tokens, prepared.options.max_new_tokens,
-                                  request.max_tokens_set, request.tools.size(), request.tool_choice,
-                                  request.has_tool_history(), prepared.options.sampling));
+                                  request.max_tokens, request.max_tokens_set, request.tools.size(),
+                                  request.tool_choice, request.has_tool_history(),
+                                  prepared.options.execution.sampling));
 
     if (!request.stream) {
         try {
@@ -399,7 +398,6 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     try {
         RequestLimits limits;
         limits.default_max_tokens       = options_.default_max_tokens;
-        limits.max_context              = options_.max_context;
         const GenerationRequest request = parse_messages_request(body, limits);
         const int input_tokens          = service_.count_prompt_tokens(request);
         res.set_content(make_count_tokens_response(input_tokens), "application/json");
@@ -431,7 +429,6 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        limits.max_context        = options_.max_context;
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
         // Claude model names) and echoes it back; it never 404s on model id.
         request  = parse_messages_request(body, limits);
@@ -454,9 +451,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     const std::uint64_t req_id = ++request_seq_;
     log_line(format_request_start(req_id, request.stream, request.messages.size(),
-                                  request.max_tokens, prepared.options.max_new_tokens,
-                                  request.max_tokens_set, request.tools.size(), request.tool_choice,
-                                  request.has_tool_history(), prepared.options.sampling));
+                                  request.max_tokens, request.max_tokens_set, request.tools.size(),
+                                  request.tool_choice, request.has_tool_history(),
+                                  prepared.options.execution.sampling));
 
     if (!request.stream) {
         try {

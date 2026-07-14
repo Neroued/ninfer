@@ -1,136 +1,181 @@
-#include "ninfer/serve/translate.h"
+#include "serve/translate.h"
 
-#include "ninfer/serve/openai_schema.h"
-
+#include <cmath>
+#include <cstdint>
 #include <random>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
 
-// A fresh 64-bit seed for requests that omit `seed` and where the operator did
-// not pin one with --seed, so successive regenerations of the same prompt differ.
 std::uint64_t random_seed() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
     return rng();
 }
 
-// Resolve the effective sampler: request fields override server defaults; omitted
-// fields fall back to the Qwen3 thinking defaults the server was configured with.
-// --greedy forces exact argmax (temperature 0) regardless of the request. The
-// engine fills token_counts for the penalty path itself, so it stays null here.
-ninfer::kernels::SamplingConfig resolve_sampling(const SamplingParams& req,
-                                              const ServeOptions& server) {
-    ninfer::kernels::SamplingConfig cfg; // default is greedy (temperature 0)
-    if (server.greedy) { return cfg; }
-    cfg.temperature = static_cast<float>(req.temperature.value_or(server.sampling_temperature));
-    cfg.top_p       = static_cast<float>(req.top_p.value_or(server.sampling_top_p));
-    cfg.top_k       = req.top_k.value_or(server.sampling_top_k);
-    cfg.min_p       = 0.0f;
-    cfg.presence_penalty =
-        static_cast<float>(req.presence_penalty.value_or(server.sampling_presence_penalty));
-    cfg.frequency_penalty =
-        static_cast<float>(req.frequency_penalty.value_or(server.sampling_frequency_penalty));
-    if (req.seed.has_value()) {
-        cfg.seed = *req.seed;
-    } else if (server.sampling_seed.has_value()) {
-        cfg.seed = *server.sampling_seed;
-    } else {
-        cfg.seed = random_seed();
-    }
-    return cfg;
+[[noreturn]] void invalid_sampling(std::string message, std::string param) {
+    ApiError error;
+    error.message = std::move(message);
+    error.param   = std::move(param);
+    throw ApiException(std::move(error));
 }
 
-std::vector<std::string> effective_tool_jsons(const GenerationRequest& req) {
-    std::vector<std::string> out;
-    if (!req.uses_tools()) { return out; }
-    if (req.tool_choice.mode == ToolChoiceMode::Named) {
-        for (const ToolDefinition& tool : req.tools) {
-            if (tool.name == req.tool_choice.name) {
-                out.push_back(tool.definition_json);
-                return out;
+ninfer::SamplingParameters resolve_sampling(const SamplingParams& request,
+                                            const ServeOptions& server) {
+    ninfer::SamplingParameters sampling;
+    sampling.temperature =
+        static_cast<float>(request.temperature.value_or(server.sampling_temperature));
+    sampling.top_p = static_cast<float>(request.top_p.value_or(server.sampling_top_p));
+    sampling.top_k = request.top_k.value_or(server.sampling_top_k);
+    sampling.presence_penalty =
+        static_cast<float>(request.presence_penalty.value_or(server.sampling_presence_penalty));
+    sampling.frequency_penalty =
+        static_cast<float>(request.frequency_penalty.value_or(server.sampling_frequency_penalty));
+    sampling.seed = request.seed.value_or(server.sampling_seed.value_or(random_seed()));
+
+    if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
+        !std::isfinite(sampling.min_p) || !std::isfinite(sampling.presence_penalty) ||
+        !std::isfinite(sampling.frequency_penalty)) {
+        invalid_sampling("sampling parameters must be finite", "sampling");
+    }
+    if (sampling.temperature < 0.0F || sampling.temperature > 2.0F) {
+        invalid_sampling("temperature must be in [0,2]", "temperature");
+    }
+    if (sampling.top_p < 0.0F || sampling.top_p > 1.0F) {
+        invalid_sampling("top_p must be in [0,1]", "top_p");
+    }
+    if (sampling.top_k < 0) { invalid_sampling("top_k must be nonnegative", "top_k"); }
+    if (sampling.presence_penalty < -2.0F || sampling.presence_penalty > 2.0F) {
+        invalid_sampling("presence_penalty must be in [-2,2]", "presence_penalty");
+    }
+    if (sampling.frequency_penalty < -2.0F || sampling.frequency_penalty > 2.0F) {
+        invalid_sampling("frequency_penalty must be in [-2,2]", "frequency_penalty");
+    }
+    if (server.greedy) { sampling.temperature = 0.0F; }
+    return sampling;
+}
+
+std::vector<std::string> effective_tool_jsons(const GenerationRequest& request) {
+    std::vector<std::string> tools;
+    if (!request.uses_tools()) { return tools; }
+    if (request.tool_choice.mode == ToolChoiceMode::Named) {
+        for (const ToolDefinition& tool : request.tools) {
+            if (tool.name == request.tool_choice.name) {
+                tools.push_back(tool.definition_json);
+                break;
             }
         }
-        return out;
+        return tools;
     }
-    out.reserve(req.tools.size());
-    for (const ToolDefinition& tool : req.tools) { out.push_back(tool.definition_json); }
-    return out;
+    tools.reserve(request.tools.size());
+    for (const ToolDefinition& tool : request.tools) { tools.push_back(tool.definition_json); }
+    return tools;
+}
+
+std::string normalized_role(const std::string& role) {
+    if (role == "developer") { return "system"; }
+    if (role == "system" || role == "user" || role == "assistant" || role == "tool") {
+        return role;
+    }
+    ApiError error;
+    error.message = "unsupported role: " + role;
+    error.param   = "messages";
+    error.code    = "unsupported_role";
+    throw ApiException(std::move(error));
 }
 
 } // namespace
 
-std::vector<ninfer::text::ChatMessage> to_chat_messages(const GenerationRequest& req) {
-    std::vector<ninfer::text::ChatMessage> out;
-    out.reserve(req.messages.size());
-    for (const ChatTurn& turn : req.messages) {
-        // OpenAI's newer schema uses `developer` for instruction messages; the Qwen
-        // template has no such role, so fold it into `system`.
-        std::string role = turn.role == "developer" ? "system" : turn.role;
-        if (role != "system" && role != "user" && role != "assistant" && role != "tool") {
-            ApiError error;
-            error.message = "unsupported role: " + turn.role;
-            error.param   = "messages";
-            error.code    = "unsupported_role";
-            throw ApiException(std::move(error));
-        }
-        std::vector<ninfer::text::ChatPart> parts;
-        for (const ContentPart& part : turn.content) {
-            if (part.kind == ContentKind::Text) {
-                if (!parts.empty() && !part.text.empty() &&
-                    parts.back().kind == ninfer::text::ChatPartKind::Text) {
-                    parts.push_back(ninfer::text::ChatPart::text_part("\n"));
-                }
-                parts.push_back(ninfer::text::ChatPart::text_part(part.text));
-            } else if (part.kind == ContentKind::Image) {
-                parts.push_back(ninfer::text::ChatPart::image(part.source));
-            } else if (part.kind == ContentKind::Video) {
-                parts.push_back(ninfer::text::ChatPart::video(part.source));
-            } else {
-                ApiError error;
-                error.message = "content type '" + part.type_raw + "' is not supported";
-                error.param   = "messages";
-                error.code    = "modality_not_supported";
-                throw ApiException(std::move(error));
-            }
-        }
-        ninfer::text::ChatMessage message;
-        message.role              = std::move(role);
-        message.parts             = std::move(parts);
+ninfer::PromptInput to_prompt_input(const GenerationRequest& request, const ServeOptions& server,
+                                    const MediaAcquirer& acquire_media) {
+    ninfer::PromptInput input;
+    input.messages.reserve(request.messages.size());
+    for (const ChatTurn& turn : request.messages) {
+        ninfer::ChatMessage message;
+        message.role              = normalized_role(turn.role);
         message.reasoning_content = turn.reasoning_content;
         message.tool_call_id      = turn.tool_call_id;
         message.tool_calls.reserve(turn.tool_calls.size());
         for (const ToolCall& call : turn.tool_calls) {
-            message.tool_calls.push_back(
-                ninfer::text::ToolCall{call.id, call.name, call.arguments_json});
+            message.tool_calls.push_back(ninfer::ToolCall{call.id, call.name, call.arguments_json});
         }
-        out.push_back(std::move(message));
+
+        for (const ContentPart& part : turn.content) {
+            if (part.kind == ContentKind::Text) {
+                if (!message.parts.empty() && !part.text.empty() &&
+                    message.parts.back().kind == ninfer::MessagePartKind::Text) {
+                    ninfer::MessagePart newline;
+                    newline.text = "\n";
+                    message.parts.push_back(std::move(newline));
+                }
+                ninfer::MessagePart text;
+                text.text = part.text;
+                message.parts.push_back(std::move(text));
+                continue;
+            }
+            if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) {
+                if (!acquire_media) {
+                    throw std::logic_error("media acquisition callback is not configured");
+                }
+                ninfer::MessagePart media;
+                media.kind  = ninfer::MessagePartKind::Media;
+                media.media = acquire_media(part);
+                message.parts.push_back(std::move(media));
+                continue;
+            }
+
+            ApiError error;
+            error.message = "content type '" + part.type_raw + "' is not supported";
+            error.param   = "messages";
+            error.code    = "modality_not_supported";
+            throw ApiException(std::move(error));
+        }
+        input.messages.push_back(std::move(message));
     }
-    return out;
+
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = request.enable_thinking.value_or(server.enable_thinking);
+    input.options.preserve_thinking     = false;
+    input.options.add_vision_id         = false;
+    input.options.tool_jsons            = effective_tool_jsons(request);
+    return input;
 }
 
-ninfer::text::TextGenerationOptions to_generation_options(const GenerationRequest& req,
-                                                       const ServeOptions& server) {
-    ninfer::text::TextGenerationOptions options;
-    options.max_new_tokens                 = req.max_tokens;
-    options.raw_output                     = false;
-    options.enable_thinking                = req.enable_thinking.value_or(server.enable_thinking);
-    options.preserve_special_tokens        = req.uses_tools() || req.has_tool_history();
-    options.render_options.tool_jsons      = effective_tool_jsons(req);
-    options.render_options.enable_thinking = options.enable_thinking;
-    options.stop_token_ids.clear(); // runner resolves tokenizer default stop ids
-    options.sampling = resolve_sampling(req.sampling, server);
+ninfer::RequestOptions to_request_options(const GenerationRequest& request,
+                                          const ServeOptions& server) {
+    ninfer::RequestOptions options;
+    options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
+    options.execution.allow_prefix_reuse      = true;
+    options.execution.sampling                = resolve_sampling(request.sampling, server);
+    options.output.raw                        = false;
+    options.output.preserve_special_tokens    = request.uses_tools() || request.has_tool_history();
+    options.stop.strings.reserve(request.stop_strings.size());
+    for (const std::string& stop : request.stop_strings) {
+        if (!stop.empty()) {
+            options.stop.strings.push_back(
+                ninfer::StopString{.text              = stop,
+                                   .channel           = ninfer::OutputChannel::Content,
+                                   .include_in_output = false});
+        }
+    }
     return options;
 }
 
-const char* finish_reason_wire(ninfer::text::FinishReason reason) {
+const char* finish_reason_wire(ninfer::FinishReason reason) {
     switch (reason) {
-    case ninfer::text::FinishReason::Length:
+    case ninfer::FinishReason::OutputLimit:
+    case ninfer::FinishReason::ContextCapacity:
         return "length";
-    case ninfer::text::FinishReason::Stop:
-    case ninfer::text::FinishReason::Cancelled:
-    default:
+    case ninfer::FinishReason::None:
+    case ninfer::FinishReason::StopToken:
+    case ninfer::FinishReason::StopString:
+    case ninfer::FinishReason::Cancelled:
         return "stop";
     }
+    return "stop";
 }
 
 } // namespace ninfer::serve

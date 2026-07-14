@@ -1,4 +1,4 @@
-#include "ninfer/core/tensor.h"
+#include "core/tensor.h"
 
 #include <array>
 #include <limits>

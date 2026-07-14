@@ -15,7 +15,9 @@ commands, paths, schemas, or project identity compatible with NInfer.
   cutover plan and evidence record.
 - [`2026-07-14-ninfer-artifact-toolchain.md`](2026-07-14-ninfer-artifact-toolchain.md) — completed
   `.ninfer` converter/reader/verifier/binder and complete Python reference migration plan.
+- [`2026-07-14-ninfer-engine-atomic-cutover.md`](2026-07-14-ninfer-engine-atomic-cutover.md) — atomic
+  replacement of the `.qus` product route by the registered `.ninfer` C++ Engine target.
 
-The preserved `.qus` references describe the q5090 v4.2 artifact that still feeds the current C++
-Engine. The native `.ninfer` toolchain and Python reference are implemented, while C++ Engine
-execution over `.ninfer` remains a later migration.
+The preserved `.qus` references describe the retired q5090 v4.2 route. The current C++ Engine and
+Python reference both consume the registered `.ninfer` artifact; archived `.qus` material is
+provenance only.

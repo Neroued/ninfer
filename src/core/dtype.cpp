@@ -1,4 +1,4 @@
-#include "ninfer/core/dtype.h"
+#include "core/dtype.h"
 
 #include <stdexcept>
 

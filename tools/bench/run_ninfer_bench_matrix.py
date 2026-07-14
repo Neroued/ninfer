@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the current-state ninfer_bench performance matrix.
+"""Run the native NInfer product performance matrix.
 
 The matrix is intentionally layered instead of fully factorial:
 
@@ -9,9 +9,9 @@ The matrix is intentionally layered instead of fully factorial:
 * CUDA graph is compared only for decode-bearing tests.
 * Prefill-only tests sweep length and chunk size, but not graph on/off.
 
-Raw ninfer_bench reports stay under profiles/bench and are ignored by git. This
-script writes a manifest, exact commands, per-case logs, raw JSON reports, and a
-flat summary CSV/JSON that is easy to compare across runs.
+Raw ninfer_bench reports stay under profiles/bench. This script writes a
+descriptive manifest, exact commands, per-case logs, raw JSON reports, and a flat
+summary CSV/JSON that is easy to compare across runs.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from typing import Any, Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BENCH = REPO_ROOT / "build/bench/ninfer_bench"
-DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus"
+DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b_rtx5090.ninfer"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
 PREFILL_LENGTHS_CORE = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 7
+REPORT_SCHEMA_VERSION = 8
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -63,31 +63,17 @@ def pair_list(values: Iterable[tuple[int, int]]) -> str:
     return ";".join(f"{p},{g}" for p, g in values)
 
 
+def mtp_args(k: int) -> tuple[str, ...]:
+    args = ("--mtp-draft-tokens", str(k))
+    return (*args, "--lm-head-draft") if k > 0 else args
+
+
 def shell_join(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(str(part)) for part in command)
 
 
 def utc_stamp() -> str:
     return dt.datetime.now(dt.UTC).strftime("%Y%m%d-%H%M%S")
-
-
-def git_capture(args: Sequence[str]) -> str:
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=REPO_ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return ""
-    return result.stdout.strip()
-
-
-def git_dirty() -> bool:
-    return bool(git_capture(["status", "--porcelain"]))
 
 
 def count_corpus_tokens(path: Path) -> int:
@@ -108,12 +94,12 @@ def add_repetition_args(
 def build_cases(preset: str) -> list[BenchCase]:
     if preset == "smoke":
         return [
-            BenchCase("prefill_length", "prefill_p128_k0", ("-p", "128", "--mtp-draft-tokens", "0"), 1, 0),
-            BenchCase("pure_decode", "tg8_k3_graph", ("-n", "8", "--mtp-draft-tokens", "3"), 1, 0),
+            BenchCase("prefill_length", "prefill_p128_k0", ("-p", "128", *mtp_args(0)), 1, 0),
+            BenchCase("pure_decode", "tg8_k3_graph", ("-n", "8", *mtp_args(3)), 1, 0),
             BenchCase(
                 "context_decode",
                 "ctx_p128_g8_k3_graph",
-                ("-pg", "128,8", "--max-ctx", "256", "--mtp-draft-tokens", "3"),
+                ("-pg", "128,8", "--max-ctx", "256", *mtp_args(3)),
                 1,
                 0,
             ),
@@ -131,7 +117,7 @@ def build_cases(preset: str) -> list[BenchCase]:
             BenchCase(
                 "prefill_length",
                 f"prefill_lengths_k{k}",
-                ("-p", csv_list(prefill_lengths), "--mtp-draft-tokens", str(k)),
+                ("-p", csv_list(prefill_lengths), *mtp_args(k)),
                 3,
                 1,
                 "prefill length curve",
@@ -149,8 +135,7 @@ def build_cases(preset: str) -> list[BenchCase]:
                         "8192",
                         "--prefill-chunk",
                         str(chunk),
-                        "--mtp-draft-tokens",
-                        str(k),
+                        *mtp_args(k),
                     ),
                     3,
                     1,
@@ -161,7 +146,7 @@ def build_cases(preset: str) -> list[BenchCase]:
     for k in PRIMARY_KS:
         for graph in (True, False):
             graph_suffix = "graph" if graph else "eager"
-            args = ["-n", csv_list(PURE_DECODE_GENS), "--mtp-draft-tokens", str(k)]
+            args = ["-n", csv_list(PURE_DECODE_GENS), *mtp_args(k)]
             if not graph:
                 args.append("--no-cuda-graph")
             cases.append(
@@ -178,7 +163,7 @@ def build_cases(preset: str) -> list[BenchCase]:
     for k in PRIMARY_KS:
         for graph in (True, False):
             graph_suffix = "graph" if graph else "eager"
-            args = ["-pg", pair_list(context_pairs), "--mtp-draft-tokens", str(k)]
+            args = ["-pg", pair_list(context_pairs), *mtp_args(k)]
             if not graph:
                 args.append("--no-cuda-graph")
             cases.append(
@@ -197,7 +182,7 @@ def build_cases(preset: str) -> list[BenchCase]:
             BenchCase(
                 "mtp_sweep",
                 f"mtp_sweep_k{k}_graph",
-                ("-pg", pair_list(sweep_pairs), "--mtp-draft-tokens", str(k)),
+                ("-pg", pair_list(sweep_pairs), *mtp_args(k)),
                 3,
                 1,
                 "primary MTP draft-window sweep",
@@ -212,8 +197,7 @@ def build_cases(preset: str) -> list[BenchCase]:
                 f"{prompt},12",
                 "--max-ctx",
                 "8192",
-                "--mtp-draft-tokens",
-                str(k),
+                *mtp_args(k),
             ]
             if not graph:
                 args.append("--no-cuda-graph")
@@ -224,7 +208,7 @@ def build_cases(preset: str) -> list[BenchCase]:
                     tuple(args),
                     3,
                     1,
-                    "near max_ctx fallback stress",
+                    "near-capacity fallback stress",
                 )
             )
 
@@ -280,43 +264,67 @@ def load_bench_report(report_path: Path) -> dict[str, Any]:
 def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
     report = load_bench_report(report_path)
     config = report.get("config", {})
+    load = report.get("load", {})
+    memory = report.get("memory", {})
+    weights_memory = memory.get("weights", {})
+    sequence_memory = memory.get("sequence", {})
+    workspace_memory = memory.get("workspace", {})
     rows = []
     for test in report.get("tests", []):
-        mtp = test.get("mtp", {})
+        speculative = test.get("speculative", {})
         row = {
             "suite": case.suite,
             "case": case.name,
-            "artifact": str(report_path),
+            "report": str(report_path),
             "label": test.get("label"),
             "kind": test.get("kind"),
             "n_prompt": test.get("n_prompt"),
             "n_gen": test.get("n_gen"),
-            "max_ctx": config.get("max_ctx"),
+            "requested_output_tokens": test.get("requested_output_tokens"),
+            "target": load.get("target"),
+            "artifact_path": report.get("artifact", {}).get("path"),
+            "max_context": config.get("max_context"),
             "prefill_chunk": config.get("prefill_chunk"),
+            "kv_cache": config.get("kv_cache"),
             "mtp_draft_tokens": config.get("mtp_draft_tokens"),
+            "proposal_head": config.get("proposal_head"),
             "decode_path": config.get("decode_path"),
             "decode_graph_primed": config.get("decode_graph_prime", {}).get("primed"),
-            "decode_graph_prime_steps": config.get("decode_graph_prime", {}).get("decode_steps"),
+            "decode_graph_prime_output_tokens": config.get("decode_graph_prime", {}).get(
+                "output_tokens"
+            ),
             "repetitions": config.get("repetitions"),
             "warmup": config.get("warmup"),
+            "load_seconds": load.get("load_seconds"),
+            "upload_seconds": load.get("upload_seconds"),
+            "artifact_bytes_read": load.get("artifact_bytes_read"),
+            "host_to_device_bytes": load.get("host_to_device_bytes"),
+            "peak_staging_bytes": load.get("peak_staging_bytes"),
+            "kv_payload_bytes": memory.get("kv_payload_bytes"),
+            "weights_capacity_bytes": weights_memory.get("capacity_bytes"),
+            "sequence_capacity_bytes": sequence_memory.get("capacity_bytes"),
+            "workspace_capacity_bytes": workspace_memory.get("capacity_bytes"),
+            "workspace_peak_bytes": test.get("workspace_peak_bytes"),
             "prefill_tok_s_mean": test.get("prefill_tok_s_mean"),
             "prefill_tok_s_stddev": test.get("prefill_tok_s_stddev"),
             "decode_output_tok_s_mean": test.get("decode_output_tok_s_mean"),
             "decode_output_tok_s_stddev": test.get("decode_output_tok_s_stddev"),
             "decode_engine_tok_s_mean": test.get("decode_engine_tok_s_mean"),
             "decode_engine_tok_s_stddev": test.get("decode_engine_tok_s_stddev"),
-            "prefill_time_s_mean": test.get("prefill_time_s_mean"),
-            "decode_time_s_mean": test.get("decode_time_s_mean"),
-            "workspace_peak_bytes": test.get("workspace_peak_bytes"),
-            "mtp_acceptance_rate": mtp.get("acceptance_rate"),
-            "mtp_acceptance_length": mtp.get("acceptance_length"),
-            "mtp_rounds": mtp.get("rounds"),
-            "mtp_fallback_steps": mtp.get("fallback_steps"),
-            "mtp_accepted_per_pos": json.dumps(mtp.get("accepted_per_pos", []), separators=(",", ":")),
-            "git_commit": report.get("git_commit"),
-            "worktree_dirty": report.get("worktree_dirty"),
+            "prepare_seconds_mean": test.get("prepare_seconds_mean"),
+            "prefill_seconds_mean": test.get("prefill_seconds_mean"),
+            "decode_seconds_mean": test.get("decode_seconds_mean"),
+            "total_seconds_mean": test.get("total_seconds_mean"),
+            "spec_acceptance_rate": speculative.get("acceptance_rate"),
+            "spec_acceptance_length": speculative.get("acceptance_length"),
+            "spec_rounds": speculative.get("rounds"),
+            "spec_drafted_tokens": speculative.get("drafted_tokens"),
+            "spec_accepted_tokens": speculative.get("accepted_tokens"),
+            "spec_fallback_steps": speculative.get("fallback_steps"),
+            "spec_accepted_per_position": json.dumps(
+                speculative.get("accepted_per_position", []), separators=(",", ":")
+            ),
             "gpu_name": report.get("environment", {}).get("gpu_name"),
-            "weights_path": report.get("weights", {}).get("path"),
         }
         rows.append(row)
     return rows
@@ -358,15 +366,14 @@ def write_manifest(
 ) -> None:
     manifest = {
         "artifact_type": "ninfer_bench_matrix_run",
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
         "preset": args.preset,
         "primary_mtp_draft_tokens": 3,
+        "primary_proposal_head": "optimized",
         "repo_root": str(REPO_ROOT),
-        "git_commit": git_capture(["rev-parse", "HEAD"]),
-        "worktree_dirty_at_start": git_dirty(),
         "bench": str(args.bench),
-        "weights": str(args.weights),
+        "artifact": str(args.weights),
         "corpus": str(args.corpus),
         "corpus_tokens": count_corpus_tokens(args.corpus),
         "dry_run": args.dry_run,
@@ -374,9 +381,9 @@ def write_manifest(
         "case_count": len(cases),
         "commands": list(commands),
         "notes": [
-            "k=3 is treated as the primary MTP hypothesis.",
+            "k=3 with the optimized proposal head is the primary MTP path.",
             "Use context_decode and mtp_sweep rows for MTP efficiency decisions.",
-            "pure_decode tg rows use a one-token seed and do not measure long-context attention.",
+            "tg rows use a one-token seed and report G decode tokens after the begin token.",
         ],
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -386,7 +393,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preset", choices=("smoke", "core", "full"), default="core")
     parser.add_argument("--bench", type=Path, default=DEFAULT_BENCH)
-    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
+    parser.add_argument(
+        "--weights", type=Path, default=DEFAULT_WEIGHTS, help=".ninfer artifact passed to the bench"
+    )
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--device", type=int, default=0)
@@ -396,7 +405,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=None, help="override all case warmup repetitions")
     parser.add_argument("--dry-run", action="store_true", help="write commands but do not execute")
     parser.add_argument("--resume", action="store_true", help="skip cases with an existing valid JSON report")
-    parser.add_argument("--no-build", action="store_true", help="do not build ninfer_bench before running")
+    parser.add_argument(
+        "--no-build", action="store_true", help="do not build build/bench/ninfer_bench"
+    )
     return parser.parse_args(argv)
 
 
@@ -429,7 +440,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     out_dir = args.output_dir
     if out_dir is None:
-        out_dir = REPO_ROOT / "profiles/bench" / f"current-state-{args.preset}-{utc_stamp()}"
+        out_dir = REPO_ROOT / "profiles/bench" / f"ninfer-{args.preset}-{utc_stamp()}"
     out_dir = out_dir.expanduser().resolve()
     json_dir = out_dir / "json"
     log_dir = out_dir / "logs"
@@ -437,7 +448,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
 
     command_records: list[dict[str, Any]] = []
-    commands_sh: list[str] = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
+    commands_sh: list[str] = []
     for case in cases:
         report_path = json_dir / case.suite / f"{case.name}.json"
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -466,7 +477,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
         commands_sh.append(shell_join(command))
-    (out_dir / "commands.sh").write_text("\n\n".join(commands_sh) + "\n", encoding="utf-8")
+    commands_text = "#!/usr/bin/env bash\nset -euo pipefail\n\n" + "\n\n".join(commands_sh) + "\n"
+    (out_dir / "commands.sh").write_text(commands_text, encoding="utf-8")
     write_manifest(out_dir, args, cases, command_records)
 
     if args.dry_run:

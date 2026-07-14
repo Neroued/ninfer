@@ -1,8 +1,7 @@
 # NInfer Persistent Tensor Numeric Formats
 
-> Status: accepted on 2026-07-13 and implemented by the native `.ninfer` writer/reader,
-> quantizer, converter, verifier, and Python reference path on 2026-07-14. It is not the current
-> C++ Engine's `.qus` numeric ABI.
+> Status: accepted on 2026-07-13 and implemented by the `.ninfer` writer/reader, quantizer,
+> converter, verifier, Python reference, production C++ binder/materializer, and Engine.
 >
 > Authority: this document defines the closed set of persistent numeric tensor formats accepted by
 > NInfer. It defines the logical words of the direct scalar formats, the numerical meaning and
@@ -12,9 +11,8 @@
 > packing, tensor assignment for any checkpoint, kernel implementation, activation quantization, or
 > runtime-state codecs.
 >
-> The current C++ Engine's q5090 v4.2 artifact remains governed only by
-> [`q5090_packed_file_format_v4.md`](q5090_packed_file_format_v4.md). This document governs the seven
-> logical formats used by native `.ninfer` artifacts; it does not revise or alias `.qus`.
+> This document governs the seven logical formats used by product `.ninfer` artifacts. Removed
+> legacy formats are not revised, aliased, or accepted by this registry.
 
 ## 1. Decision
 
@@ -432,7 +430,7 @@ existing full-group reciprocal-multiply path while defining the more general log
 behavior in Section 4. Direct division during code selection is not interchangeable with it at
 rounding boundaries.
 
-The current q5090 converter is provenance for that full-group arithmetic order, not automatically a
+The former q5090 converter is provenance for that full-group arithmetic order, not automatically a
 conforming implementation of this complete profile: the NInfer implementation must additionally
 enforce the non-finite, overflow, logical-rank, and partial-group rules in this document.
 

@@ -336,7 +336,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         decode_seconds = 0.0
         if args.decode > 0:
             try:
-                sampler = Sampler(_sampling_config(frontend, args), CFG.vocab, model.device)
+                sampler = Sampler(
+                    _sampling_config(frontend, args), CFG.token_domain, model.device
+                )
             except ValueError as exc:
                 parser.error(str(exc))
             prepare_started = time.perf_counter()

@@ -1,4 +1,4 @@
-#include "ninfer/kernels/vision_attention.h"
+#include "targets/qwen3_6_27b_rtx5090/impl/kernels/vision_attention/vision_attention.h"
 #include "kernels/op_tester.h"
 
 #include <algorithm>

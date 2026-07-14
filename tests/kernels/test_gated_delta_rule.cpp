@@ -1,5 +1,4 @@
-#include "ninfer/kernels/gated_delta_rule.h"
-#include "ninfer/core/state_store.h"
+#include "kernels/gated_delta_rule/gated_delta_rule.h"
 #include "kernels/gdn_ref.h"
 #include "kernels/op_tester.h"
 
@@ -10,7 +9,6 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
-#include <optional>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -408,7 +406,7 @@ GpuResult run_chunked_gpu_split(const gdn_ref::Inputs& in, int split) {
     return {from_device_bf16(dout, in.v.size()), from_device_f32(dstate, in.state.size())};
 }
 
-int recurrent_case(int T, std::uint32_t seed, bool stress_g, bool use_gdn_state = false) {
+int recurrent_case(int T, std::uint32_t seed, bool stress_g) {
     const auto in      = make_inputs(T, seed, stress_g);
     const double scale = 1.0 / std::sqrt(static_cast<double>(S));
     std::vector<double> ref_out(static_cast<std::size_t>(B * T * H_v * S));
@@ -434,15 +432,6 @@ int recurrent_case(int T, std::uint32_t seed, bool stress_g, bool use_gdn_state 
     WorkspaceArena ws(chunked_arena_bytes(T));
 
     Tensor tstate(dstate.p, DType::FP32, {S, S, H_v});
-    std::optional<DeviceArena> state_arena;
-    std::optional<GdnState> gdn_state;
-    if (use_gdn_state) {
-        state_arena.emplace(4 * 1024 * 1024);
-        gdn_state.emplace(*state_arena, 1, 1, 1, H_v, S, S);
-        cudaMemcpy(gdn_state->ssm[0].data, in.state.data(), in.state.size() * sizeof(float),
-                   cudaMemcpyHostToDevice);
-        tstate = gdn_state->ssm[0];
-    }
 
     kernels::gated_delta_rule(tq, tk, tv, tg, tbeta, static_cast<float>(scale), ws, tstate, tout,
                               nullptr);
@@ -453,16 +442,7 @@ int recurrent_case(int T, std::uint32_t seed, bool stress_g, bool use_gdn_state 
     int failures = 0;
     failures += verify((tag + " out").c_str(), from_device_bf16(dout, ref_out.size()), ref_out,
                        Tolerance::gdn_output_bf16());
-    std::vector<double> got_state;
-    if (use_gdn_state) {
-        std::vector<float> state_f32(ref_state.size());
-        cudaMemcpy(state_f32.data(), gdn_state->ssm[0].data, state_f32.size() * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-        got_state.resize(state_f32.size());
-        for (std::size_t i = 0; i < state_f32.size(); ++i) { got_state[i] = state_f32[i]; }
-    } else {
-        got_state = from_device_f32(dstate, ref_state.size());
-    }
+    const std::vector<double> got_state = from_device_f32(dstate, ref_state.size());
     failures += verify((tag + " state").c_str(), got_state, ref_state, Tolerance::gdn_state_fp32());
     return failures;
 }
@@ -728,7 +708,7 @@ int main() {
     }
     failures += recurrent_case(1, 3027u, true);
     failures += recurrent_case(7, 3033u, true);
-    failures += recurrent_case(2, 4028u, false, true);
+    failures += recurrent_case(2, 4028u, false);
     for (std::uint32_t seed : {7028u, 8128u}) {
         for (int T : {1, 2, 3, 4, 5, 6}) {
             failures +=

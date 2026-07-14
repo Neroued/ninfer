@@ -1,4 +1,4 @@
-#include "ninfer/kernels/vision_pos_embed.h"
+#include "targets/qwen3_6_27b_rtx5090/impl/kernels/vision_pos_embed/vision_pos_embed.h"
 #include "kernels/op_tester.h"
 
 #include <cstdint>

@@ -1,4 +1,4 @@
-#include "ninfer/kernels/layer_norm.h"
+#include "kernels/layer_norm/layer_norm.h"
 #include "kernels/op_tester.h"
 
 #include <cmath>

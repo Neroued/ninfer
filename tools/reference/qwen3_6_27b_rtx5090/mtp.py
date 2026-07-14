@@ -98,7 +98,11 @@ def forward(
     )
     out = rmsnorm(x, model.weight(mtp_weights.final_norm))
     token = (
-        int(torch.argmax(model.logits_last(out, draft=model.draft_head)).item())
+        int(
+            torch.argmax(
+                model.logits_last(out, draft=model.draft_head)[: CFG.token_domain]
+            ).item()
+        )
         if sample
         else None
     )

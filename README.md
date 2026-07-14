@@ -3,64 +3,53 @@
 > Selected checkpoints. Selected GPUs. Maximum single-GPU inference performance.
 
 NInfer is a from-scratch C++/CUDA inference engine for users who want the highest practical local
-inference performance from one GPU. It deliberately supports a small, explicitly selected set of
-exact model checkpoints and GPU targets. Each supported pair is implemented and optimized as a
-concrete target; NInfer is not a generic model runtime, compatibility layer, or model zoo.
+inference performance from one GPU. It supports a small, explicitly registered set of exact model
+checkpoints and GPU targets. Each pair is implemented as a concrete compiled target; NInfer is not
+a generic model runtime, compatibility layer, or model zoo.
 
-The current delivered target is exactly **Qwen3.6-27B on one NVIDIA RTX 5090**. It serves one active
-request on one GPU and prioritizes decode efficiency, then prefill throughput and time to first
-token, while using single-machine KV-cache policy to push useful context capacity toward the
-checkpoint's native limit. Limited continuous batching is a future direction, not a current
-capability or a large-scale-serving goal.
+The currently registered target is exactly **Qwen3.6-27B on NVIDIA RTX 5090**. The current runtime
+owns one resident sequence and executes one active request at a time. Decode efficiency is the
+primary goal, followed by prefill throughput and time to first token. Limited continuous batching
+is a future direction, not a current capability or a large-scale-serving goal.
 
-For the current target, the model schedule is hand-written, CUDA kernels are specialized for fixed
-shapes, and the offline converter produces one self-contained q5090 v4.2 `.qus` artifact. The
-current C++ Engine loads that artifact directly without runtime repacking. In parallel, the native
-`.ninfer` converter, Python and narrow C++ readers, verifier, and complete Python Text/Vision/MTP
-reference are implemented. `.ninfer` is not yet a C++ Engine input: the new multi-target C++ engine
-architecture remains future work. The Qwen3.6-35B-A3B document is a model reference, not a claim of
-runtime support.
+## Capabilities
 
-## Current capabilities
+The delivered target includes:
 
-The current implementation includes:
-
-- the complete 64-layer hybrid text decoder: 48 Gated-DeltaNet layers and 16 GQA layers;
-- the one-layer MTP draft model with eager and CUDA Graph speculative decode rounds;
-- the 27-layer Vision tower, patch merger, native image/video preprocessing, embedding injection,
-  and three-axis MRoPE;
-- chunked prefill and single-token decode with shape-specialized CUDA kernels;
-- BF16 and INT8 KV-cache storage;
-- greedy decoding and Qwen thinking-oriented sampling;
-- an optional frequency-shortlisted Q4 draft `lm_head` for faster MTP proposals;
+- the complete 64-layer hybrid Text decoder: 48 Gated-DeltaNet layers and 16 GQA layers;
+- the one-layer MTP draft model, full and optimized proposal heads, and eager or CUDA Graph decode;
+- the 27-layer Vision tower, patch merger, image/video preprocessing, embedding injection, and
+  three-axis MRoPE;
+- chunked prefill, single-token decode, and target-shaped CUDA kernels;
+- BF16 and INT8 group-64 KV-cache storage;
+- greedy decoding and configurable temperature/top-k/top-p/min-p/penalty sampling;
+- prefix reuse for compatible text requests;
 - text and structured multimodal CLI input;
-- OpenAI Chat Completions and Anthropic Messages HTTP endpoints, including streaming and
-  best-effort function tool calling;
-- the current q5090 converter, legacy Python reader/codec, parity diagnostics, and
-  real-weight/per-operator benchmarks used by the `.qus` Engine route;
-- a native `.ninfer` converter, generic Python reader/inspector, narrow C++ reader, target verifier,
-  and complete Python Text/Vision/MTP reference with text, image, video, and speculative generation;
-- a configurable capability-evaluation coordinator for local or online OpenAI-compatible targets,
-  with EvalScope adapters, progress, persistent logs, resume, and normalized reports.
+- OpenAI Chat Completions and Anthropic Messages endpoints, including streaming, token counting,
+  usage reporting, reasoning/content channels, and prompt-and-parse tool calls;
+- a public opaque C++ `Engine` API used by the CLI, server, and real-weight benchmark;
+- the native `.ninfer` converter, inspector, verifier, Python Text/Vision/MTP reference, and
+  target-private parity diagnostics.
 
-The current implementation does not support other checkpoints, batching, multi-GPU inference, or
-old q5090 formats. Context capacity is configured at process start and bounded by GPU memory. The
-CLI defaults to 2,048 tokens and the server defaults to 8,192; larger contexts require an explicit
-setting and are not an implied 128K/256K qualification claim.
+NInfer does not currently support another checkpoint, another GPU, concurrent request execution,
+multi-GPU execution, or distributed serving. Context capacity is selected when the Engine is
+constructed and is bounded by the configured KV format and available GPU memory.
 
-## Fixed target
+## Registered target
 
-| Item | Target |
+| Item | Current value |
 |---|---|
 | Model | Qwen3.6-27B (`qwen3_5` checkpoint architecture) |
 | GPU | RTX 5090, Blackwell, `sm_120a`, 32 GB |
-| Workload | one sequence, batch size 1 |
-| Primary metric | single-stream decode tokens/second |
-| Secondary metric | prefill throughput and time to first token |
-| Current C++ Engine artifact | `q5090_w4g64_mixed_v4_2` (`.qus`) |
-| Native reference artifact | `qwen3_6_27b_rtx5090.ninfer` |
+| Runtime target key | `qwen3_6_27b_rtx5090` |
+| Artifact | `qwen3_6_27b_rtx5090.ninfer` |
+| Workload | one resident sequence, one active request |
 | Activations | BF16 |
-| KV cache | BF16 or INT8 |
+| KV cache | BF16 or INT8 group-64 |
+| Primary metric | single-stream decode tokens/second |
+
+The Qwen3.6-35B-A3B architecture document is a model reference. It is not a registered runtime
+target.
 
 ## Build
 
@@ -73,45 +62,21 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a
 cmake --build build -j
 ```
 
-The main binaries are:
+The main products are:
 
-| Binary | Purpose |
+| Product | Purpose |
 |---|---|
-| `build/src/ninfer` | text or multimodal generation CLI |
-| `build/src/ninfer-serve` | OpenAI/Anthropic-compatible HTTP server |
-| `build/src/ninfer-preprocess` | native multimodal preprocessing diagnostic |
-| `build/src/ninfer-vision-dump` | Vision activation dump |
-| `build/bench/ninfer_bench` | real-weight prefill/decode benchmark |
-| `build/bench/ninfer_*_bench` | per-operator CUDA benchmarks |
+| `build/apps/ninfer` | text and multimodal generation CLI |
+| `build/apps/ninfer-serve` | OpenAI/Anthropic-compatible HTTP server |
+| `build/bench/ninfer_bench` | public-Engine prefill/decode benchmark |
+| `build/bench/ninfer_*_bench` | CUDA operator microbenchmarks |
+| `build/tools/ninfer-qwen3_6_27b-dump` | target-private activation diagnostic |
 
-Use `ninfer`, `ninfer-serve`, and benchmark `--help` output as the authoritative option reference.
-The two diagnostic executables print their usage when required positional arguments are missing.
+Executable `--help` output is the exact option reference.
 
-## Build artifacts
+## Create the `.ninfer` artifact
 
-### Current C++ Engine artifact
-
-Conversion is offline and requires the original BF16 checkpoint and tokenizer assets:
-
-```bash
-python -m tools.q5090_convert.convert \
-  --model /path/to/Qwen3.6-27B/base-hf-bf16 \
-  --tokenizer /path/to/Qwen3.6-27B/base-hf-bf16 \
-  --out out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus
-
-python -m tools.q5090_convert.verify \
-  out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus --quick
-```
-
-The artifact contains packed Text, MTP, Vision, optional draft-head weights, plus
-`tokenizer.json`, `merges.txt`, and `generation_config.json`. See
-[`tools/q5090_convert/README.md`](tools/q5090_convert/README.md) for conversion and verification
-details.
-
-### Native `.ninfer` artifact and Python reference
-
-The native converter reads the same BF16 checkpoint directly and emits the complete registered
-Text, draft-head, MTP, Vision, and frontend object inventory:
+Conversion is offline and reads the original BF16 checkpoint directly:
 
 ```bash
 python -m tools.convert.qwen3_6_27b_rtx5090.convert \
@@ -126,26 +91,25 @@ python -m tools.convert.qwen3_6_27b_rtx5090.verify \
   --model /path/to/Qwen3.6-27B/base-hf-bf16
 ```
 
-The complete Python reference consumes only the resulting `.ninfer` artifact at inference time. It
-uses the embedded frontend resources through the existing Hugging Face libraries and supports Text,
-image/video Vision, full and shortlisted MTP proposal heads, and speculative generation:
+The artifact contains the complete registered Text, MTP, Vision, draft-head, tokenizer, template,
+and generation-resource inventory. The C++ Engine and Python reference both consume this artifact;
+the source checkpoint is not accessed during inference.
+
+The complete Python correctness reference is available independently:
 
 ```bash
-python -m tools.reference.qwen3_6_27b_rtx5090.cli \
+python -m tools.reference.qwen3_6_27b_rtx5090 \
   --weights out/qwen3_6_27b_rtx5090.ninfer \
   --prompt "用三句话解释 prefill 和 decode 的区别。" \
   --decode 128 --mtp-draft-tokens 3
 ```
 
-Use `--messages messages.json` for structured text/image/video input. This Python path is the
-correctness reference for the native artifact route; it is not the new C++ Engine implementation.
-
-## Run the current C++ CLI
+## Run the CLI
 
 Text prompt:
 
 ```bash
-./build/src/ninfer out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+./build/apps/ninfer out/qwen3_6_27b_rtx5090.ninfer \
   --prompt "用三句话解释 prefill 和 decode 的区别。" \
   --max-new 128
 ```
@@ -153,18 +117,21 @@ Text prompt:
 Structured text/image/video messages:
 
 ```bash
-./build/src/ninfer out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+./build/apps/ninfer out/qwen3_6_27b_rtx5090.ninfer \
   --messages messages.json --no-thinking --max-new 256
 ```
 
 CUDA Graph decode is enabled by default. Enable MTP with `--mtp-draft-tokens N`, where `N` is in
-`1..5`; add `--lm-head-draft` to use the embedded shortlisted proposal head. Use
-`--kv-dtype int8` for INT8 KV storage and `--greedy` for deterministic argmax diagnostics.
+`1..5`; add `--lm-head-draft` to select the optimized proposal head. Use `--kv-dtype int8` for INT8
+KV storage, `--greedy` for argmax decoding, and `--max-context` to choose the Engine capacity.
+
+Media message parts accept local paths, HTTP(S) URLs, and base64 data URIs. The CLI acquires the
+bytes before the target Frontend performs checkpoint-specific image/video preparation.
 
 ## Run the server
 
 ```bash
-./build/src/ninfer-serve out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
+./build/apps/ninfer-serve out/qwen3_6_27b_rtx5090.ninfer \
   --host 127.0.0.1 --port 8080 --max-context 8192
 ```
 
@@ -176,76 +143,84 @@ The server exposes:
 - `POST /v1/messages`;
 - `POST /v1/messages/count_tokens`.
 
-The request body limit defaults to 384 MiB and is enforced before JSON parsing. Media-heavy
-preprocessing is admitted one request at a time. Function tool calling is prompt-and-parse based;
-the server does not execute tools or provide constrained JSON decoding. See
-[`docs/serving.md`](docs/serving.md) for request and generation semantics.
+See [`docs/serving.md`](docs/serving.md) for protocol, streaming, sampling, multimodal, and tool-call
+behavior.
 
 ## Benchmark
 
 ```bash
 ./build/bench/ninfer_bench \
-  --weights out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus \
-  -p 512,2048 -n 128 -pg 2048,128 -r 5 --warmup 1
+  --weights out/qwen3_6_27b_rtx5090.ninfer \
+  -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-`ninfer_bench` reports prefill and decode separately and can emit table, JSON, or CSV output.
-Performance reports record the command, q5090 identity, relevant git state, profiler evidence for
-the changed kernels, and before/after real-weight results so the measurements can be interpreted.
-Those records are descriptive evidence, not a fixed-worktree or byte-reproducibility gate. See
-[`bench/README.md`](bench/README.md).
+`ninfer_bench` drives the same public Engine route as the CLI and server. It reports prefill and
+decode separately, supports BF16/INT8 KV and ordinary/MTP graph or eager modes, and emits table,
+JSON, or CSV. See [`bench/README.md`](bench/README.md).
+
+## Public Engine
+
+The installed product surface is [`include/ninfer/engine.h`](include/ninfer/engine.h) plus owning
+host values in [`include/ninfer/types.h`](include/ninfer/types.h). `Engine` constructs one selected
+target from an `EngineOptions` value and `.ninfer` path. Requests follow one route:
+
+```text
+Engine::prepare(...) or prepare_tokens(...)
+  -> opaque PreparedPrompt
+  -> Engine::generate(...)
+  -> GenerationResult + optional OutputSink deltas
+```
+
+Target selection, artifact binding, CUDA state, `LoadedModel`, `Frontend`, and `Program` remain
+internal. The public API exposes load, memory, timing, and speculative summaries, not target phase
+methods or mutable model state.
 
 ## Architecture
 
 ```text
-BF16 checkpoint + tokenizer
-          │
-          ├── q5090 converter ──► q5090 v4.2 .qus ──► current C++ Engine
-          │                                              │
-          │                              CUDA Text/MTP/Vision + CLI/server
-          │
-          └── native converter ─► .ninfer v1 ─────────► complete Python reference
-                                     │                    Text/Vision/MTP
-                                     ├── Python reader/inspector/verifier
-                                     └── narrow C++ reader (not Engine integration)
+BF16 checkpoint
+  -> target converter
+  -> qwen3_6_27b_rtx5090.ninfer
+  -> ArtifactReader / ArtifactBinder / Materializer
+  -> closed qwen3_6_27b_rtx5090 target package
+       immutable LoadedModel + Frontend + one mutable Program
+  -> common generated-token controller
+  -> public Engine
+       CLI / server / benchmark
 ```
 
-The accepted multi-target C++ architecture will eventually replace the first route's q5090 loader
-with compiled exact-target packages over `.ninfer`; that Engine migration is not implemented yet.
+The source and build boundaries are explicit:
 
-- **L0** owns devices, arenas, tensors, q5090 loading, KV cache, and recurrent state.
-- **L1** owns public operator contracts, dispatch, CUDA launchers, and specialized kernels.
-- **L2** owns the fixed Qwen3.6 Text, MTP, and Vision schedules and weight bindings.
-- **Runtime** owns resource lifetimes, prefix reuse, sampling state, eager/CUDA Graph execution,
-  and MTP rounds.
-- **Frontends and serving** own tokenization, chat templates, media processing, request translation,
-  streaming, and protocol behavior.
+- `src/core`, `src/artifact`, and `src/kernels` own reusable mechanisms;
+- `src/text` and `src/media/decode` own checkpoint-neutral Unicode and media decoding;
+- `src/product/media_acquire` owns path, URL, and data-URI acquisition for product entry points;
+- `src/product/prompt_input` owns the shared CLI/diagnostic message-input adapter;
+- `src/targets/qwen3_6_27b_rtx5090` owns exact checkpoint/GPU load, frontend, state, schedules, and
+  target-only kernels/graph policy;
+- `src/runtime` owns common request contracts, generation policy, and the public
+  Engine implementation;
+- `src/serve` owns HTTP schemas, translation, streaming, and transport;
+- `apps/cli` and `apps/serve` are thin product entry points;
+- `tools/convert`, `tools/reference`, and `tools/parity` are target-keyed offline tools.
 
 ## Documentation
 
-Start at [`docs/README.md`](docs/README.md). The active project documents are:
+Start at [`docs/README.md`](docs/README.md). Important active documents include:
 
-- [`docs/design.md`](docs/design.md) — current system design and ownership boundaries;
-- [`docs/qwen3.6-27b-architecture.md`](docs/qwen3.6-27b-architecture.md) — fixed model, MTP, and
-  Vision computation reference;
-- [`docs/qwen3.6-35b-a3b-architecture.md`](docs/qwen3.6-35b-a3b-architecture.md) — exact 35B-A3B
-  source-checkpoint Text/MoE/MTP/Vision reference (not current runtime-support status);
-- [`docs/q5090_packed_file_format_v4.md`](docs/q5090_packed_file_format_v4.md) — canonical v4.2
-  artifact ABI;
-- [`docs/kernel-development.md`](docs/kernel-development.md) — kernel layering and verification;
-- [`docs/serving.md`](docs/serving.md) — CLI, sampling, multimodal, and HTTP behavior;
-- [`docs/ninfer-naming.md`](docs/ninfer-naming.md) — canonical project name, `.ninfer` extension,
-  and naming-cutover status;
-- [`docs/ninfer-project-positioning.md`](docs/ninfer-project-positioning.md) — project mission,
-  target-selection policy, performance priorities, and non-goals;
-- [`docs/ninfer-tensor-formats.md`](docs/ninfer-tensor-formats.md),
-  [`docs/ninfer-storage-layouts.md`](docs/ninfer-storage-layouts.md),
-  [`docs/ninfer-container-format.md`](docs/ninfer-container-format.md),
-  and [`docs/qwen3.6-27b-ninfer-artifact.md`](docs/qwen3.6-27b-ninfer-artifact.md) — the implemented
-  native artifact contracts used by the converter, readers, verifier, and Python reference;
-- [`docs/ninfer-engine-architecture.md`](docs/ninfer-engine-architecture.md) — the accepted
-  multi-target C++ Engine design, still pending implementation.
+- [`docs/ninfer-project-positioning.md`](docs/ninfer-project-positioning.md) — mission, target
+  selection, workload, priorities, and non-goals;
+- [`docs/design.md`](docs/design.md) — implemented ownership and runtime flow;
+- [`docs/ninfer-engine-architecture.md`](docs/ninfer-engine-architecture.md) — detailed Engine,
+  target-package, lifetime, and source-boundary decisions;
+- [`docs/ninfer-container-format.md`](docs/ninfer-container-format.md),
+  [`docs/ninfer-storage-layouts.md`](docs/ninfer-storage-layouts.md), and
+  [`docs/ninfer-tensor-formats.md`](docs/ninfer-tensor-formats.md) — native artifact contracts;
+- [`docs/qwen3.6-27b-ninfer-artifact.md`](docs/qwen3.6-27b-ninfer-artifact.md) — registered object
+  inventory, source transforms, and binding obligations;
+- [`docs/qwen3.6-27b-architecture.md`](docs/qwen3.6-27b-architecture.md) — Text/MTP/Vision model math;
+- [`docs/kernel-development.md`](docs/kernel-development.md) — operator ownership and performance
+  workflow;
+- [`docs/serving.md`](docs/serving.md) — CLI and HTTP behavior.
 
-Completed plans, retired formats, implementation reports, and profiler evidence live under
-[`docs/archive/`](docs/archive/). Archived documents are historical records, not current design
-entrypoints.
+Completed plans, retired implementations, and dated evidence belong under
+[`docs/archive/`](docs/archive/); they do not define the current product.

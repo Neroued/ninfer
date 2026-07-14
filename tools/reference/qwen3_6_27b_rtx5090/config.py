@@ -11,6 +11,7 @@ class ModelConfig:
     layers: int = 64
     intermediate: int = 17408
     vocab: int = 248320
+    token_domain: int = 248077
     q_heads: int = 24
     kv_heads: int = 4
     head_dim: int = 256

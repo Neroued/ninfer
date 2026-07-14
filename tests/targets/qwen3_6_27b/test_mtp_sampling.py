@@ -19,7 +19,7 @@ def test_provisional_penalty_does_not_commit_counts() -> None:
             presence_penalty=2.0,
             frequency_penalty=0.0,
         ),
-        vocab=3,
+        token_domain=3,
         device=torch.device("cpu"),
     )
     logits = torch.tensor([2.0, 1.0, 0.0])
@@ -36,7 +36,7 @@ def test_provisional_penalty_does_not_commit_counts() -> None:
 def test_greedy_call_is_argmax_and_commits_only_selected_token() -> None:
     sampler = Sampler(
         SamplingConfig(temperature=0.0, presence_penalty=2.0),
-        vocab=4,
+        token_domain=4,
         device=torch.device("cpu"),
     )
     sampler.commit([3, 3])
@@ -53,7 +53,7 @@ def test_one_hot_draft_acceptance_and_rejection_residual() -> None:
     )
     sampler = Sampler(
         SamplingConfig(temperature=1.0),
-        vocab=16,
+        token_domain=16,
         device=torch.device("cpu"),
     )
 
@@ -63,6 +63,18 @@ def test_one_hot_draft_acceptance_and_rejection_residual() -> None:
     assert sampler.sample_distribution(distribution, exclude=11, uniform=0.49) == 10
     assert sampler.sample_distribution(distribution, exclude=11, uniform=0.51) == 12
     assert sampler.counts.tolist() == [0] * 16
+
+
+def test_sampler_ignores_physical_padding_rows() -> None:
+    sampler = Sampler(
+        SamplingConfig(temperature=0.0),
+        token_domain=3,
+        device=torch.device("cpu"),
+    )
+    token = sampler(torch.tensor([1.0, 5.0, 2.0, 100.0, 200.0]))
+
+    assert token == 1
+    assert sampler.counts.tolist() == [0, 1, 0]
 
 
 def test_mtp_stats_track_round_prefix_and_fallback() -> None:

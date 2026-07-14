@@ -1,8 +1,8 @@
 # Qwen3.6-27B RTX 5090 Python reference
 
 This is the complete target-private Text, Vision, MTP, sampling, state, and weight-residency
-reference over a native `.ninfer` artifact. It retains the previous reference computation and
-performance mechanisms while replacing the q5090 v4.2 file boundary with typed artifact bindings.
+reference over a native `.ninfer` artifact. It uses typed artifact bindings and remains independent
+from the C++ Engine implementation.
 
 It does not need the original Hugging Face checkpoint at inference time. `Frontend` materializes the
 tokenizer, chat template, generation defaults, and image/video processor resources embedded in the
@@ -42,5 +42,5 @@ codec. Vision decodes large matrices one at a time and releases its weight store
 preparation. Multimodal MTP uses the composed Vision embedding for the shifted input, including at
 prefill chunk boundaries.
 
-Target-specific numerical and current-Engine parity commands live in
+Target-specific numerical and C++ Engine parity commands live in
 `tools/parity/qwen3_6_27b_rtx5090/`.

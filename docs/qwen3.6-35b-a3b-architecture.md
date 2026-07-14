@@ -5,8 +5,8 @@
 > This document describes the exact BF16 checkpoint at
 > `/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16`: Text, sparse
 > MoE, MTP, Vision, multimodal positions, numerics, and persistent state. Runtime support remains
-> defined by [`design.md`](design.md) and the project README. This document does not define a q5090
-> artifact layout, claim that the current runtime can load this checkpoint, or qualify the advertised
+> defined by [`design.md`](design.md) and the project README. This document does not define a
+> `.ninfer` artifact contract, claim that the current runtime can load this checkpoint, or qualify the advertised
 > extended million-token mode.
 
 ## 1. Model identity

@@ -295,7 +295,11 @@ class RefModel:
 
         assert last_hidden is not None
         logits = self.logits_last(last_hidden)
-        target = sampler(logits) if sampler is not None else int(torch.argmax(logits).item())
+        target = (
+            sampler(logits)
+            if sampler is not None
+            else int(torch.argmax(logits[: CFG.token_domain]).item())
+        )
         self.last_hidden = last_hidden
         if self.mtp_enabled:
             mtp_hidden, draft = self.mtp_forward(
@@ -401,7 +405,11 @@ class RefModel:
 
         assert last_hidden is not None and last_positions is not None
         logits = self.logits_last(last_hidden)
-        target = sampler(logits) if sampler is not None else int(torch.argmax(logits).item())
+        target = (
+            sampler(logits)
+            if sampler is not None
+            else int(torch.argmax(logits[: CFG.token_domain]).item())
+        )
         self.last_hidden = last_hidden
         if self.mtp_enabled:
             mtp_hidden, draft = self.mtp_forward(
@@ -457,7 +465,11 @@ class RefModel:
         logits = self.logits_last(hidden)
         self.last_hidden = hidden
         self._tap(tap, "logits", logits, phase="decode", step=step, chunk=0, position=start)
-        target = sampler(logits) if sampler is not None else int(torch.argmax(logits).item())
+        target = (
+            sampler(logits)
+            if sampler is not None
+            else int(torch.argmax(logits[: CFG.token_domain]).item())
+        )
         if self.mtp_enabled and update_mtp:
             mtp_hidden, self.last_draft = self.mtp_forward(
                 [target], hidden, positions, start=state.mtp_kv.length
@@ -516,7 +528,7 @@ class RefModel:
 
     @staticmethod
     def _greedy(logits: torch.Tensor) -> int:
-        return int(torch.argmax(logits).item())
+        return int(torch.argmax(logits[: CFG.token_domain]).item())
 
     def _verify_choice(
         self,

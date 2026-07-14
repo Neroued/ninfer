@@ -1,221 +1,199 @@
 # Kernel Development
 
-> Status: current L1 source-layout and verification guide.
->
-> Repository-wide testing policy remains in [`../AGENTS.md`](../AGENTS.md). Public headers under
-> `include/ninfer/kernels/` are the authoritative operator catalog.
+This guide defines the implemented shared-operator and target-private CUDA boundary. Repository-wide
+engineering and verification principles remain in [`../AGENTS.md`](../AGENTS.md).
 
-## 1. L1 responsibility
+## 1. Ownership
 
-L1 translates mathematical operator contracts into shape-specialized CUDA execution. It owns:
+Shared kernel code translates a complete mathematical operator contract into efficient CUDA
+execution. It owns:
 
-- the public operator surface;
-- validation and dispatch at that surface;
-- private host launchers;
+- host-side dtype/shape/layout validation;
+- finite dispatch over supported representations and real shape regimes;
+- private launch policy;
 - reusable CUDA primitives and kernels;
-- the linear codec/GEMV/GEMM policy;
+- linear codec/GEMV/GEMM policy;
 - numerical operator tests and per-operator benchmarks.
 
-L1 does not own model layer order, q5090 file parsing, persistent state allocation, HTTP behavior,
-or model-specific accept/commit bookkeeping.
+Shared kernels do not own artifact parsing, model layer order, sequence lifetime, prefix state,
+CUDA Graph lifetime, MTP commit policy, user-visible stops, or serving behavior.
 
-## 2. Normal source path
+A fused or fixed-shape operation whose full invariant is true only for one checkpoint/GPU remains
+under that target's `impl/`. Similar names are not enough to promote code into shared kernels.
 
-Most operators use three layers:
+## 2. Source boundary
+
+Current shared operators are built explicitly from `src/kernels`. Host contracts and dispatch are
+kept next to their CUDA implementation by complete operator:
 
 ```text
-include/ninfer/kernels/<op>.h       public mathematical contract
-            │
-            ▼
-src/kernels/wrapper/<op>.cpp     validation, views, dispatch, public symbol
-            │
-            ▼
-src/kernels/launcher/<op>.*      private launch policy and CUDA entry
-            │
-            ▼
-src/kernels/kernel/<op>.cuh      device implementation
+src/kernels/
+├── <shared-operator>/
+│   ├── <operator>.h           mathematical contract and host entry
+│   ├── <operator>.cpp         validation and finite implementation selection
+│   ├── launch.h               private launcher declaration
+│   ├── launch.cu              CUDA launch and device entry
+│   └── detail.cuh             optional device-only implementation material
+├── linear/                    low-bit codec, plans, GEMV/GEMM, and fallbacks
+└── common/                    narrow math, memory, MMA, and warp primitives
 ```
 
-Shared low-level primitives live under `src/kernels/common/`. They may provide memory, math, MMA,
-or warp helpers, but must not grow a second public operator API.
+The exact file count may be smaller, but the language and ownership rules are stable:
 
-Keep the wrapper thin. It may validate dtype/shape/layout, choose a launcher, construct zero-copy
-views, and sequence a documented fallback. It must not allocate persistent storage, parse weights,
-or contain a hidden model schedule.
+- host-visible declarations describe mathematical semantics, not block/warp/tiling strategy;
+- `.cpp` files own host validation and finite dispatch;
+- `.cu` files own CUDA launches and `__global__` definitions;
+- `.cuh` files contain device-only implementation material;
+- callers provide outputs, workspaces, state views, and streams;
+- a kernel never allocates sequence state or controls a generated-token transaction.
 
-## 3. Public contracts
+Kernel headers are internal development contracts. The installed product API is only the opaque
+Engine and owning host values.
 
-Public APIs describe mathematical work, not CUDA mechanics. Names such as block size, split count,
-codec implementation, shared-memory staging, or MMA policy stay private unless callers must provide
-different semantic inputs.
+## 3. Shared versus target-private
 
-Public fused operators are justified when they expose a useful semantic contract, for example:
+An operation belongs in shared kernels only when its complete contract is independent of a target's
+layer schedule and state machine. Current examples include RMSNorm, RoPE, attention primitives,
+GDN mathematical primitives, sampling, and low-bit linear operations.
 
-- two projections sharing an input;
-- projection plus residual accumulation;
-- gate/up projection plus SwiGLU;
-- grouped attention or GDN input projections;
-- state snapshot variants required by MTP verification.
+The Qwen3.6-27B target retains:
 
-Do not add a public operator merely to expose a benchmark-only kernel experiment. Benchmark private
-launchers through an existing boundary or promote the behavior only after it becomes a real runtime
-contract.
+- fixed Text/Vision/MTP call order and fusion decisions;
+- target-specific graph shapes and stable I/O buffers;
+- KV/GDN/MTP frontier alignment and prefix repair;
+- exact-checkpoint proposal/verification composition;
+- any helper whose dimensions or semantics are only valid for this target.
 
-## 4. Linear subtree
+A shared operator may receive target-selected dimensions and explicit state views. It must not
+import target headers merely to discover those values.
 
-Low-bit linear work has its own private structure:
+## 4. Linear storage and dispatch
+
+Low-bit linear work consumes registered `.ninfer` tensor views directly:
 
 ```text
 src/kernels/linear/
 ├── codec/       Q4/Q5/Q6/W8G32 device decode
-├── gemv/        T=1 and small-T shape-specialized kernels
-├── gemm/        large-T tensor-core and fused projection kernels
+├── gemv/        T=1 and small-T specialized kernels
+├── gemm/        larger-T tensor-core and fused projection kernels
 ├── plan/        finite dispatch classification
 ├── reference/   correct generic/dense fallbacks
-└── linear.cpp   public `linear` dispatch integration
+└── linear.cpp   integration
 ```
 
-The dispatch plan may use only implementation-relevant facts already present at runtime:
+Dispatch may use only facts needed by the implementation:
 
-- qtype and layout;
-- exact `(N,K)` shape or a finite shape family;
+- numeric format and registered storage layout;
+- exact `(N,K)` or a finite real shape family;
 - T regime;
-- documented fusion group;
-- dense/control versus packed representation.
+- semantic fusion group;
+- dense/control versus grouped-quantized representation.
 
-Do not add model names, source tensor names, arbitrary string registries, or hypothetical future
-hardware axes. A new specialized path must retain a correct fallback for supported current shapes,
-not for retired formats or unrelated models.
-
-Quantized kernels consume the canonical q5090 planes directly. Runtime repacking, decoded
-long-lived BF16 weight copies, and hidden device allocation are not allowed.
+It does not dispatch on source checkpoint tensor names or arbitrary runtime strings. Persistent
+runtime repacking, hidden long-lived decoded weight copies, and hidden device allocation are not
+part of the inference path.
 
 ## 5. State and workspace
 
-Operators fall into three lifetime classes:
+Operators fall into three forms:
 
-- stateless output operators write caller-provided tensors;
-- workspace operators receive `WorkspaceArena&` explicitly and release allocations at the caller's
-  scope boundary;
-- stateful operators receive explicit KV/GDN state objects or tensors.
+- stateless operators write caller-provided outputs;
+- workspace operators receive explicit arena/tensor storage scoped by the caller;
+- stateful operators receive explicit KV/GDN state or tensor views.
 
-No operator owns sequence lifetime. Snapshot-capable GDN/conv operators receive their slot selector
-explicitly because snapshot semantics are part of the call contract.
+Program owns sequence and graph lifetime. Snapshot-capable recurrent operations receive their slot
+or boundary inputs explicitly. Workspace requirements derive from the real operator shape or
+configured prefill chunk so the target can plan memory before execution.
 
-Workspace requirements must depend on real operator shape or configured prefill chunk, not silently
-on the total context. Callers must be able to size arenas before execution.
+## 6. Numerical contracts
 
-## 6. Numerical implementation rules
+The oracle comes from model semantics after the documented input-rounding boundary, not from a copy
+of the CUDA algorithm.
 
-The oracle is defined from model semantics after the documented input rounding. Tests must not copy
-the CUDA algorithm and call that an oracle.
+Important current invariants include:
 
-Important invariants include:
-
-- BF16 public activations with explicitly chosen accumulation precision;
-- zero-centered `(1+w)` RMSNorm where the model requires it;
-- plain gated RMSNorm for the GDN internal norm;
+- BF16 public activations with explicitly selected accumulation precision;
+- zero-centered `(1+w)` RMSNorm where required;
+- plain gated RMSNorm for the GDN internal normalization;
 - exact partial/MRoPE indexing;
 - causal attention and correct KV append order;
 - FP32 GDN gate and recurrent-state behavior;
-- dequantization from q5090 codes/scales without a second layout;
-- deterministic lowest-index tie handling for exact argmax;
-- target-distribution correctness for sampled MTP verification.
+- direct dequantization from registered codes/scales;
+- lowest-index tie behavior for exact argmax;
+- correct sampling and MTP verification distributions.
 
-Fast math, approximate activation formulas, reduced accumulation, or fused rounding changes are
-allowed only when the operator's numerical contract and real downstream tolerance justify them.
+Fast math, approximate activations, reduced accumulation, or changed fused rounding are acceptable
+only when the operator contract and end-to-end numerical evidence support them.
 
-## 7. Correctness tests
+## 7. Correctness verification
 
-Tests are added only for risks allowed by `AGENTS.md`. For kernel work, the normal acceptable forms
-are:
+Add a permanent kernel test when it protects a concrete supported risk, commonly:
 
-- numerical comparison to an FP64/FP32 mathematical oracle using BF16-rounded inputs;
-- exact integer/code/metadata checks for artifact and KV quantization boundaries;
-- real model shapes, plus stress/edge cases that can expose the targeted failure;
-- repeated execution or sanitizer-backed coverage for memory/lifetime risks;
-- a reproduced observable bug regression.
+- comparison to an independent FP64/FP32 mathematical oracle with BF16-rounded inputs;
+- exact code/scale/metadata checks at a registered storage or KV boundary;
+- the real model shapes plus an edge case that can expose the changed indexing or dispatch;
+- a reproduced numerical or state bug.
 
-Avoid source scanning, call-order assertions, symbol-name tests, trivial enum/getter coverage, and
-tests that preserve retired behavior.
-
-The common numerical helpers under `tests/kernels/` provide established error summaries and
-tolerance presets. A new test should reuse them when their contract matches, not invent a looser
-one-off threshold.
+Use the established helpers in `tests/kernels` when their tolerance contract matches. Do not add
+source scans, call-order tests, symbol-name checks, trivial configuration tests, or checks for
+retired behavior.
 
 ## 8. Per-operator benchmarks
 
-`build/bench/ninfer_<op>_bench` binaries run real Qwen3.6 shapes and isolate one kernel family. They are
-profiling entrypoints, not correctness tests and not sufficient evidence for end-to-end speed.
+`build/bench/ninfer_<op>_bench` binaries isolate one operator at real Qwen3.6 shapes. They
+are profiling entry points, not correctness tests and not sufficient end-to-end evidence.
 
-A useful microbenchmark must state:
+A useful result states:
 
-- exact shape, dtype, layout, and T regime;
+- exact shape, format/layout, and T regime;
 - warmup and measurement method;
-- whether weights/data are cold or cache-resident;
-- bytes and FLOPs used for derived rates;
-- the kernel/launcher path actually exercised.
+- relevant cache conditions;
+- bytes/FLOPs used for derived rates;
+- the actual dispatch/launcher path.
 
-Convenience GB/s printed by a benchmark is not an optimization gate by itself. Cache effects,
-instruction pressure, occupancy, launch overhead, and tensor-core utilization must be interpreted
-with profiler evidence.
+Convenience GB/s is descriptive. Cache behavior, occupancy, instruction pressure, launch overhead,
+and tensor-core utilization require the profiler evidence relevant to the change.
 
-## 9. NCU workflow
+## 9. NCU and NSYS
 
-Use Nsight Compute after NSYS or benchmark evidence identifies a specific hot kernel. Collect only
-the metrics needed to answer the current question, commonly:
+Use Nsight Compute after a benchmark or Nsight Systems trace identifies a specific kernel question.
+Collect the metrics needed to answer that question, such as occupancy, DRAM/L2 traffic, SM/tensor
+throughput, instruction mix, warp stalls, source/SASS correlation, or roofline position.
 
-- achieved occupancy and active warps;
-- DRAM/L2 throughput and sector behavior;
-- SM and tensor-pipe throughput;
-- instruction mix;
-- warp stall reasons;
-- source/SASS correlation;
-- roofline position.
+Use Nsight Systems for full-request questions:
 
-Compare identical shapes and cache conditions before and after. An isolated kernel improvement is
-not accepted if it changes numerical behavior outside tolerance or regresses the real inference
-path.
+- prefill/decode/Vision phase time;
+- CPU launch gaps and synchronization;
+- CUDA Graph capture/replay;
+- MTP proposal/verify/accept cost;
+- copies and host/media overhead;
+- whether a microbenchmark improvement affects `ninfer_bench`.
 
-## 10. NSYS workflow
+NVTX ranges identify stable inference phases rather than temporary file/function layout.
 
-Use Nsight Systems for full-inference questions:
+## 10. End-to-end acceptance
 
-- prefill versus decode phase time;
-- CUDA API and kernel launch gaps;
-- CPU/GPU synchronization;
-- graph capture/replay behavior;
-- MTP proposal/verify/accept round cost;
-- memcpy and media/host overhead;
-- whether a microbenchmark win matters in `ninfer_bench`.
+Verification should match the change:
 
-NVTX ranges should identify stable user-meaningful phases. Do not add ranges solely to encode a
-temporary implementation layout.
+1. build the affected component and exact target;
+2. run the numerical or behavior checks covering the changed risk;
+3. measure the relevant operator when a kernel path changed;
+4. collect NCU/NSYS when the performance claim requires those observations;
+5. compare the public-Engine `ninfer_bench` path on the relevant ordinary/MTP and prompt/decode
+   cases;
+6. use a memory checker when changed indexing, shared memory, or lifetime makes it useful.
 
-## 11. End-to-end acceptance
+Record the command, target/artifact, GPU/toolchain, relevant settings, and emitted reports needed to
+interpret a local result. Raw profiler and benchmark outputs stay under `profiles/`; completed
+written investigations belong in the documentation archive.
 
-Kernel optimization completion normally requires:
+## 11. Review checklist
 
-1. build the affected targets;
-2. run existing numerical/behavior tests covering the changed risk;
-3. run the relevant per-operator benchmark;
-4. collect NCU when the claim concerns kernel efficiency;
-5. collect NSYS when the claim concerns full inference or launch behavior;
-6. compare before/after `ninfer_bench` on the relevant prompt/decode matrix;
-7. run `compute-sanitizer` when indexing, shared memory, state slots, or arena lifetime changed.
-
-Published results must record the command, git commit, worktree state, GPU/toolchain, artifact
-identity, and benchmark report. Raw reports belong under ignored `profiles/`; historical written
-summaries belong in the documentation archive after the work is complete.
-
-## 12. Review checklist
-
-- Does the public API express semantics rather than one kernel strategy?
-- Is dispatch limited to real current shapes and representations?
-- Does the implementation consume q5090 directly without hidden allocation/repack?
-- Are workspace and persistent-state lifetimes explicit?
-- Is the numerical oracle independent of the CUDA algorithm?
-- Does verification cover the real risk and real model shapes?
-- Is profiler evidence collected under matching conditions?
-- Does the change improve or preserve the relevant end-to-end path?
-- Have completed tuning notes and plans been archived instead of becoming active design documents?
+- Does the interface express mathematical semantics rather than one CUDA strategy?
+- Is the code genuinely shared, or should it remain target-private?
+- Is dispatch limited to current registered representations and real shapes?
+- Does the kernel consume `.ninfer` views directly without hidden allocation or repacking?
+- Are workspace, state, and stream lifetimes explicit?
+- Is the oracle independent of the CUDA implementation?
+- Does verification cover the actual changed risk?
+- Does the change improve or preserve the relevant product route?

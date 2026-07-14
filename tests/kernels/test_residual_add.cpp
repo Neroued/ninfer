@@ -1,7 +1,7 @@
 // Correctness + coverage for residual_add, against the frozen op-test standard
 // (docs/kernel-development.md): fp64 golden from bf16-rounded inputs, honest
 // input ranges, composite tolerance bf16_elementwise.
-#include "ninfer/kernels/residual_add.h"
+#include "kernels/residual_add/residual_add.h"
 #include "kernels/op_tester.h"
 
 #include <cstdint>

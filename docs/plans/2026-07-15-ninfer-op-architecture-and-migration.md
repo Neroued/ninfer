@@ -638,10 +638,10 @@ headers are intentional NInfer additions:
 
 | Header | Contracts |
 |---|---|
-| `cast.h` | registered elementwise casts, initially FP32 -> BF16 |
+| `cast.h` | registered elementwise casts, initially `cast_fp32_to_bf16` |
 | `mtp_pack.h` | MTP FC-input packing and attention-field splitting |
 | `mtp_round.h` | verification-input construction, acceptance/resampling, shifted ids, hidden gather, token remap |
-| `position.h` | I32 position iota/fill and scalar-offset vector mapping |
+| `position.h` | `fill_i32_positions` and `offset_i32_positions` |
 | `scalar.h` | finite typed scalar set/assignment/increment state transformations |
 
 A header may group closely related Ops; the catalog is not one header per C++ function. New names do
@@ -657,6 +657,31 @@ void increment_i64_scalar(Tensor& scalar, cudaStream_t stream);
 ```
 
 It is not a tensor expression framework or general copy API.
+
+The new cast and position contracts have these exact entry points:
+
+```cpp
+void cast_fp32_to_bf16(
+    const Tensor& source, Tensor& destination, cudaStream_t stream);
+void fill_i32_positions(
+    Tensor& positions, std::int32_t start, cudaStream_t stream);
+void offset_i32_positions(
+    const Tensor& source, const Tensor& delta, Tensor& destination, cudaStream_t stream);
+```
+
+`scatter.h` additionally owns the existing strided channel-block extraction as a logical slicing
+Op rather than a raw transfer:
+
+```cpp
+void extract_bf16_columns(
+    const Tensor& source, std::int32_t source_column,
+    Tensor& destination, cudaStream_t stream);
+```
+
+For rank-2 logical matrices, it defines
+`destination[row, column] = source[row, source_column + column]` over the full destination extent.
+Its implementation may use `cudaMemcpy2DAsync`, but callers do not supply byte pitches or a copy
+kind.
 
 ## 9. Classification of the current implementation
 
@@ -712,14 +737,20 @@ After the migration, the target has no `impl/kernels/` directory.
 | `position_ops.cu`: position fill/iota | `position.h` Op and central implementation |
 | `position_ops.cu`: position vector offset | `position.h` Op and central implementation |
 | `position_ops.cu`: set/advance scalar | `scalar.h` Ops and central implementation |
-| `position_ops.cu`: host pointer -> device I32 upload | target host transfer helper; no Op |
+| `position_ops.cu`: host pointer -> device I32 upload | local helper in `text_context.cpp`; no Op |
 | `vision_convert.cu`: FP32 -> BF16 | generic `cast.h` Op and central implementation |
 | `schedule/mtp.cpp`: Tensor -> Tensor I32 scalar assignment | `assign_i32_scalar` Op |
+| `text_context.cpp`: strided BF16 channel block extraction | `extract_bf16_columns` in `scatter.h` |
 | `text_context.cpp`: `scatter_shifted_visual_embeddings` | target schedule composition over `scatter` Op |
 | `vision_control.cpp` | target host/model composition |
 
 The target finishes with no `__global__` implementation. It may retain CUDA runtime transfers in
 host schedule code.
+
+`impl/schedule/ops.h` is deleted rather than retained as a second Op facade. The shifted-visual
+composition declaration moves to `impl/schedule/visual_scatter.h`. After their device operations
+move centrally, `position_ops.cu` and `vision_convert.cu` are deleted; the sole H2D I32 upload helper
+is kept local to `text_context.cpp`.
 
 ### 9.4 MTP function ledger
 
@@ -806,6 +837,9 @@ simultaneously removes:
 - target `impl/state/kv_cache.cpp` after the core move;
 - device implementations moved out of `position_ops.cu` and `vision_convert.cu`.
 
+The explicit `ninfer_core` source list simultaneously adds `core/kv_cache.cpp`; moving the file
+without adding its new link owner is not a complete cutover.
+
 Target host schedule, load, frontend, Program, diagnostics, and retained state files remain.
 
 The switch also updates:
@@ -836,6 +870,12 @@ Current target tests are split by the new definition:
 | `test_vision_elementwise.cpp` | add-bias/GELU/scatter cases to Ops; shifted-media composition remains target test |
 | `tests/test_kv_cache.cpp` | core test using `ninfer::KVCache`, links `ninfer_core` only |
 
+Add `tests/ops/test_cast.cpp` with one minimal numerical case for `cast_fp32_to_bf16`, and
+`tests/ops/test_position.cpp` with cases for both position entry points. These are required because
+the current suite does not independently cover the schedule-local device transformations being
+promoted into Op contracts. Scalar transitions remain covered through the decoupled MTP round
+cases.
+
 The MTP round test removes dependencies on target `TextConfig` and target statistics constants by
 using semantic values local to the Op test or deriving them from tensor shapes. This proves the Op
 contract rather than the target package.
@@ -845,14 +885,17 @@ under the temporary semantic test directory relink only to `ninfer_ops`/core.
 
 ### 12.2 Benchmarks
 
-`bench/kernels/` moves to `bench/ops/`. Pure GQA and sampling-selection microbenchmarks currently
-under the target benchmark directory also move to `bench/ops/` and link `ninfer_ops`.
+`bench/kernels/` moves to `bench/ops/`. The GQA implementation-stage profiler and pure
+sampling-selection microbenchmark currently under the target benchmark directory also move to
+`bench/ops/` and link `ninfer_ops`.
 
-GQA benchmark dependencies are cleaned at the semantic boundary:
+The GQA benchmark intentionally remains an implementation-level benchmark: it may invoke private
+central launchers to isolate append/prefill/decode stages. Its dependencies are cleaned at the
+ownership boundary:
 
 - KV cache uses the core type;
-- registered quant group and implementation-specific split counts are benchmark-local when needed;
-- the benchmark does not include a private launcher header merely to obtain a constant.
+- the launcher and its implementation constants move together under `src/ops`;
+- target config/KV headers are removed.
 
 The public Engine end-to-end benchmark and target MTP-round benchmark remain under the target
 benchmark directory because they exercise Program/model composition.
@@ -912,7 +955,8 @@ execution order, not a sequence of supported intermediate designs.
    target mathematical implementations into `src/ops/{wrapper,launcher,kernel,common,linear}`. Do
    not create a restored `src/kernels` intermediate state.
 5. **Move schedule device transformations.** Centralize position/scalar/cast Ops, preserve the H2D
-   host upload, and leave shifted-media composition in the target.
+   host upload, centralize strided BF16 extraction, move the shifted-media declaration to its
+   schedule-specific header, and delete the emptied schedule CUDA/facade files.
 6. **Switch namespace and includes.** Change the semantic namespace to `ninfer::ops` and all call
    sites/includes in one source state. Preserve genuine kernel implementation names.
 7. **Close workspace planning gaps.** Move existing sizing queries and add only the three queries in
@@ -1011,6 +1055,8 @@ Completion deletes:
 - old `ninfer::kernels` semantic namespace/call sites;
 - `tests/kernels/` and `bench/kernels/`;
 - target-only Op-test/Op-benchmark CMake helpers;
+- target `impl/schedule/ops.h`, `position_ops.cu`, and `vision_convert.cu` after their final owners
+  are established;
 - `docs/kernel-development.md` after its direct rename;
 - forwarding headers, namespace aliases, CMake aliases, symlinks, or compatibility includes for
   any deleted path;
@@ -1143,6 +1189,9 @@ Review corrections already incorporated include:
 - distinguishing typed scalar assignment from raw byte transfer and forbidding aliased assignment;
 - stating explicitly that KV cursor methods are core mechanisms, not scalar Ops;
 - preventing historical private linear backend names from becoming model-role dispatch inputs.
+- classifying strided BF16 block extraction as a typed slicing Op, and fixing the final APIs,
+  schedule-file deletion ledger, KV link owner, new Op tests, and GQA implementation benchmark
+  treatment found by the implementation-level source audit.
 
 The review establishes that this is an executable migration plan for the current tree. It does not
 authorize implementation; user approval remains the gate.

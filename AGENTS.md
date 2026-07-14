@@ -8,6 +8,26 @@ NInfer is a from-scratch C++/CUDA inference engine that pursues maximum single-G
 performance for a small set of explicitly selected exact checkpoints and GPU targets. It is not a
 general-purpose runtime, compatibility layer, or model zoo.
 
+## Project Engineering Principles
+
+- NInfer is a local, single-owner inference engine that deeply optimizes explicitly registered
+  model checkpoints for selected hardware. It is not a general-purpose, multi-tenant, or
+  untrusted-artifact platform. Treat the registered inputs and project-managed workflow as trusted.
+- Follow the declared product scope. Do not silently turn speculative concerns, implementation
+  preferences, or possible future scenarios into project requirements. New cross-cutting
+  constraints must solve a concrete in-scope problem and be discussed before adoption.
+- Prioritize functional correctness, inference performance, architectural clarity, and low
+  maintenance cost. Generality, defensive hardening, formal completeness, and test coverage are
+  not goals by themselves.
+- Preserve useful provenance about how an artifact was produced, but keep provenance separate from
+  validity and reproducibility requirements. Recorded information is descriptive unless an explicit
+  contract says otherwise; do not default to fixed hashes, clean-worktree requirements,
+  byte-identical artifacts, or exact probabilistic outputs.
+- Verification must match the semantic contract and its real value: use exact comparison for
+  exactly defined formats and transformations, and appropriate numerical or behavioral criteria for
+  floating-point and probabilistic computation. Tests must protect supported functionality or
+  realistic regressions and justify their maintenance cost.
+
 The current implemented target is Qwen3.6-27B on one RTX 5090. It includes the fixed Text decoder,
 MTP speculative decoding, native Vision, the q5090 v4.2 `.qus` artifact, command-line generation,
 and OpenAI/Anthropic serving. The current workload is one user, one active request, and one GPU;

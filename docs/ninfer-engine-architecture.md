@@ -1,6 +1,6 @@
 # NInfer Core Engine Architecture
 
-> Status: accepted and implemented for `qwen3_6_27b_rtx5090` on 2026-07-14.
+> Status: accepted and implemented for the registered `qwen3_6_27b_rtx5090` target.
 >
 > Authority: this document defines the NInfer core engine boundary, exact-target registration
 > and dispatch, load-time construction, memory ownership, checkpoint frontend boundary,
@@ -60,13 +60,13 @@ The central shape is:
 ```text
 Engine
 ├── DeviceContext
-├── ArtifactReader + Materializer
+├── artifact::Reader + binder/materializer
 ├── LoadedProduct                         loaded-Engine lifetime, immutable after construction
 │   ├── exact-checkpoint Frontend
 │   ├── typed persistent resources
 │   ├── typed device weights
 │   └── exact checkpoint × GPU implementation
-├── SingleRequestProgram                  exactly one resident/active sequence
+├── Program                               exactly one resident/active sequence
 │   ├── target Text/MTP caches
 │   ├── target recurrent state
 │   ├── sampling state and stable outputs
@@ -93,7 +93,7 @@ This architecture covers:
 
 - one process-local loaded product;
 - one selected GPU;
-- one `SingleRequestProgram` with at most one active request;
+- one `Program` with at most one active request;
 - an optionally reusable resident sequence between successive local requests;
 - exact-checkpoint native Text, Vision, MTP, recurrent, and sampling behavior as applicable;
 - synchronous GPU ownership even when transport and preparation run on other CPU threads;
@@ -249,24 +249,22 @@ objects still require matching real invariants before extracting a shared family
 
 ### 5.1 Registry key
 
-After generic artifact validation, NInfer first selects one closed target selector with:
+After generic artifact validation, the registry follows this closed sequence:
 
 ```text
-(artifact.model_id, actual selected device identity and capabilities)
+artifact.model_id -> compiled package alternative -> package preflight on the actual device
 ```
 
-The artifact does not carry a GPU selector. The device is observed locally, and the selected target
-selector matches the complete canonical object signature set against its compiled storage profiles.
-Exactly one match selects the concrete package type. Zero or multiple matches are hard errors before
-payload-sized allocation.
+The artifact does not carry a GPU selector. The registry matches `model_id` to one explicitly
+compiled package, then that package checks the observed device and options. Its binder consumes the
+complete directory and validates every canonical name, kind, shape, format/layout or resource
+encoding before payload-sized allocation. Offsets and object-array order are not package keys beyond
+the generic container geometry rules.
 
-The storage-profile match uses existing container fields—canonical name/kind/shape/format/layout or
-resource encoding—and never invents a profile field in JSON. Offsets, byte order in the object array,
-and other nonsemantic file placement do not affect the match. The selected package then performs the
-full binder validation and device-consumer check.
-
-An unknown model, wrong GPU, unavailable device capability, ambiguous profile, or unsupported
-storage combination is a load error before payload-sized allocation.
+The current registry has one alternative. Adding another target extends the same explicit selection
+sequence; it does not introduce a separate runtime profile object or a profile field in JSON. An
+unknown model, wrong GPU, unavailable device capability, or unsupported storage signature is a load
+error before payload-sized allocation.
 
 ### 5.2 Internal static package contract
 
@@ -276,11 +274,8 @@ shape; concrete helper names may vary only where the same ownership and call ord
 ```cpp
 struct SomeExactCheckpointRtx5090 {
     static constexpr std::string_view model_id;
-    static constexpr DeviceClass device_class;
-    static constexpr StorageProfile storage_profile;
 
     struct LoadPlan;
-    struct BindingPlan;
     struct LoadedModel;
     struct Frontend;
     struct PreparedPrompt;
@@ -289,19 +284,19 @@ struct SomeExactCheckpointRtx5090 {
     struct RequestPlan;
     class Program;
 
-    static LoadPlan plan_load(ArtifactBinder&, const DeviceInfo&);
+    static void preflight(DeviceContext&, const EngineOptions&);
+    static LoadPlan plan_load(artifact::Binder&);
 
     static std::unique_ptr<LoadedModel> construct_loaded_model(
-        BindingPlan&&,
-        MaterializedArtifact&&,
-        DeviceContext&);
+        LoadPlan&&,
+        artifact::MaterializedArtifact&&);
 
     static Frontend make_frontend(const LoadedModel&);
 
     static SequencePlan plan_sequence(
         const LoadedModel&,
         DeviceContext&,
-        std::uint32_t requested_context);
+        const EngineOptions&);
 
     static std::unique_ptr<Program> create_program(
         const LoadedModel&,
@@ -319,11 +314,12 @@ behind an opaque implementation owned by the target library. Central Op implemen
 remains behind the Op contracts. Section 19 defines the corresponding
 export/implementation split.
 
-`plan_load` consumes and validates the complete artifact directory. It does not receive feature or
-quality toggles: one package represents the one current complete product route.
-`construct_loaded_model` may run only after every selected payload and resource is valid and
-materialized. It allocates the final heap-stable `LoadedModel`, moves the backing into that object,
-and forms typed views only after every subobject they may reference is at its final address. It must
+`preflight` performs cheap target-owned device and option checks. `plan_load` consumes and validates
+the complete artifact directory. It does not receive feature or quality toggles: one package
+represents the one current complete product route. `construct_loaded_model` may run only after every
+selected object is structurally validated and materialized. It allocates the final heap-stable
+`LoadedModel`, moves the backing into that object, and forms typed views only after every subobject
+they may reference is at its final address. It must
 not return a by-value self-referential aggregate or move an already-bound object into the returned
 allocation. `plan_sequence` computes all target-state and stable-workspace requirements against the
 post-load device capacity without mutating the loaded model. `create_program` performs the one-time
@@ -369,9 +365,9 @@ movable owner or descriptor subobject, and `LoadedProduct` constructs `frontend`
 loaded resources without depending on aggregate moves. `Engine::Impl` similarly declares
 `DeviceContext` before `ActiveTarget`, so the complete target dies before its device/stream owner.
 
-Every concrete storage profile is an alternative of the same outer closed sum type; there is no
-inner layout tag or string dispatch in `LoadedModel`/`Program`. Shared source templates may generate
-multiple alternatives without changing this rule.
+Every compiled exact target is an alternative of the same outer closed sum type; there is no inner
+layout tag or string dispatch in `LoadedModel`/`Program`. A package's accepted storage signature is
+part of its binder contract, not a second runtime alternative inside the package.
 
 The registry constructs one variant alternative. Generation performs one `std::visit` around the
 complete target-templated generation loop. It does not visit or make a virtual call once per layer
@@ -402,14 +398,14 @@ The load pipeline has this dependency order:
 
 ```text
 read and validate the v1 object directory
-  -> observe actual device and select one compiled target package
+  -> select one compiled package by model_id and preflight the actual device/options
   -> target plan_load consumes the complete object directory
-  -> validate inventory, roles, shapes, formats, layouts, encodings, and consumers
-  -> compute host/device placement plans
+  -> validate inventory, roles, shapes, formats, layouts, encodings, consumers, and cheap
+     target-specific payload invariants
+  -> compute host/device materialization and target-private binding plans
   -> allocate and materialize persistent objects
-  -> establish required payload-content and resource invariants
   -> construct LoadedModel at its final heap address, move in backing, then form typed bindings
-  -> construct LoadedProduct around that stable model and then construct Frontend from it
+  -> construct LoadedProduct around that stable model and construct Frontend from retained resources
   -> plan sequence memory against post-load device capacity
   -> construct RequestMemory
   -> allocate TargetInstance at its final address with loaded/request memory
@@ -422,9 +418,9 @@ Program is never constructed as an external local and later assembled around own
 references; its `LoadedModel`, request memory, target instance, and device context are at their
 final addresses first. Ordinary RAII owns temporary construction state.
 
-### 6.2 `ArtifactBinder`
+### 6.2 `artifact::Binder`
 
-`ArtifactBinder` is a cold-path checked view over the parsed directory. It provides lookup by
+`artifact::Binder` is a cold-path checked view over the parsed directory. It provides lookup by
 canonical name, exact kind/shape/storage validation, checked view construction, and consumption
 tracking. It does not interpret layer schedules.
 
@@ -436,34 +432,34 @@ The binder exists only during construction. Artifact strings do not select behav
 
 ### 6.3 `LoadPlan` and materialization
 
-`LoadPlan` is a target-generated, move-only construction object with two explicit parts:
+`LoadPlan` is a target-generated, move-only construction object. Its private implementation owns two
+parts:
 
 ```cpp
-struct Target::LoadPlan {
-    CommonMaterializationPlan materialization;
-    Target::BindingPlan bindings;
+struct TargetPrivateArtifactLoadPlan {
+    BindingPlan bindings;
+    artifact::MaterializationPlan materialization;
 };
 ```
 
-`CommonMaterializationPlan` is a complete value contract the generic materializer can execute. It
-contains checked artifact object handles, final backing regions/alignment, copy spans and legal
-coalescing, resource decode/construction destinations, and payload validators. `BindingPlan` is the
-target-private value mapping consumed objects to typed roles and checked views after materialization.
+The facade exposes only `LoadPlan::materialization()`. `artifact::MaterializationPlan` is the value
+contract the generic materializer executes: object count, device-arena capacity, device object
+handles with final offsets/byte lengths/alignment, and host-retained resource handles. `BindingPlan`
+is target-private and maps the consumed object handles to typed roles used after materialization.
 
-Neither part contains raw pointers/references into `ArtifactBinder`, a JSON DOM/string, or a
+Neither part contains raw pointers/references into `artifact::Binder`, a JSON DOM/string, or a
 temporary name index. Stable numeric object handles may refer to the reader while construction is in
 progress, but all such handles are consumed before the reader is released.
 
 It is not stored in the artifact, not serialized, and not retained as a runtime execution recipe.
 
-The generic materializer consumes `CommonMaterializationPlan` and returns `MaterializedArtifact`,
-which owns every final device arena, retained pinned/host allocation, and decoded resource backing
-needed by binding. It executes checked allocations, reads, and copies. It never changes a
-persistent tensor representation, guesses a layout, chooses a kernel, or synthesizes a missing
-object. File offsets are not device offsets. Validators that need payload bytes may stream before
-allocation or operate on materialized host/device data. Construction keeps staging and destination
-storage alive for the operations that use them; the exact read/copy implementation is not an
-architectural protocol.
+The generic materializer consumes `artifact::MaterializationPlan` and returns
+`artifact::MaterializedArtifact`, which owns the final device arena and retained raw resource bytes.
+It allocates each planned device region at its declared final arena offset, copies tensor payloads,
+and retains selected resources on the host. It never changes a persistent tensor representation,
+decodes target resources, guesses a layout, chooses a kernel, or synthesizes a missing object. File
+offsets are not device offsets. Construction keeps staging and destination storage alive for the
+operations that use them; the exact read/copy implementation is not an architectural protocol.
 
 ### 6.4 Typed loaded bindings
 
@@ -478,7 +474,7 @@ as a full-attention layer binding.
 transitively owns every byte and parsed resource reachable from its bindings. A view may point into
 a move-stable allocation owned by the model or into one of the model's final subobjects; it may not
 point into a source owner or descriptor array that was later moved. No published binding may refer
-to `LoadPlan`, `ArtifactBinder`, JSON, the name index, the file mapping/descriptor, or load-only
+to `LoadPlan`, `artifact::Binder`, JSON, the name index, the file mapping/descriptor, or load-only
 staging storage.
 
 One stored object may supply multiple checked model views or tied roles. Such aliasing is created by
@@ -878,7 +874,7 @@ fatal invariant, not a recoverable exception after model/decoder commit.
 The output matrix row count, tokenizer-addressable ID count, valid sampled-token domain, and stop-ID
 domain are distinct checkpoint facts. A common `vocab_size` field must not collapse them.
 
-## 10. `SingleRequestProgram` contract
+## 10. `Program` contract
 
 ### 10.1 Required coarse operations
 
@@ -1525,7 +1521,7 @@ Validation against 248320 matrix rows alone is not sufficient.
 
 ### 16.5 Public product fit
 
-The installed API exposes owning input/result values and the model-neutral operations
+The public API exposes owning input/result values and the model-neutral operations
 `Engine::prepare`, `Engine::prepare_tokens`, `Engine::generate`, `Engine::count_tokens`, and summary
 queries. Target phase methods, checkpoint memory formulas, caches, and Op-facing sampling state
 remain internal. CLI, server, and product benchmarks use this same public route.
@@ -1699,9 +1695,9 @@ The implemented source tree follows this ownership shape:
 ```text
 include/
 └── ninfer/
-    ├── engine.h                         installed Engine PIMPL API
-    ├── types.h                          installed owning host values/opaque prepared prompt
-    └── ops/                             repository-internal semantic Op contracts; not installed
+    ├── engine.h                         public Engine PIMPL API
+    ├── types.h                          public owning host values/opaque prepared prompt
+    └── ops/                             repository-internal semantic Op contracts; not public API
 
 src/
 ├── core/                                device/stream, tensor/view, layout, arena, graph/KV/transfer
@@ -1747,9 +1743,12 @@ tools/
 ├── artifact/                            generic .ninfer read/write/layout/inspection machinery
 ├── convert/common/                      generic checkpoint-reading/quantization helpers
 ├── convert/qwen3_6_27b_rtx5090/         source mapping and conversion recipe
-├── reference/qwen3_6_27b_rtx5090/       complete target-private Python reference
+├── reference/qwen3_6_27b_rtx5090/       artifact-native Text/Vision/MTP Python reference
 ├── parity/qwen3_6_27b_rtx5090/          independent target/reference diagnostics
-└── qwen3_6_27b_dump/                    C++ target activation dump
+├── qwen3_6_27b_dump/                    C++ target activation dump
+├── bench/                               corpus generation and performance orchestration
+├── smoke/                               resident-server product smoke client
+└── freq_corpus/                         registered draft-head frequency input and records
 
 bench/                                   public Engine benchmark plus operator microbenchmarks
 
@@ -1769,18 +1768,18 @@ uses fewer translation units:
 
 | Area | Owns | Must not own |
 |---|---|---|
-| `export/.../package.h` | the package tag and narrow facade types used by the registry/controller | installed product API, target implementation includes, protocol behavior, or a second execution owner |
+| `export/.../package.h` | the package tag and narrow facade types used by the registry/controller | public product API, target implementation includes, protocol behavior, or a second execution owner |
 | `impl/package.cpp` | facade definitions and private construction bridge | a second public/composition surface |
 | `impl/config.h` | exact compiled semantic facts needed by this package, including dimensions, topology, token domains, and native limits | artifact offsets, conversion provenance, request state, user policy |
-| `impl/load/` | `StorageProfile`, `LoadPlan`, `BindingPlan`, typed immutable weight/resource structures, and direct final-address `LoadedModel` construction | sequence state, generation policy, runtime lookup after publication |
+| `impl/load/` | target-private binding plan, typed immutable weight/resource structures, and direct final-address `LoadedModel` construction behind the facade `LoadPlan` | sequence state, generation policy, runtime lookup after publication |
 | `impl/frontend/` | owning `PreparedPrompt`, tokenizer/template, checkpoint media/position preparation, `OutputSession`, and decoder state | network/file acquisition, CUDA state, Program or graph ownership |
 | `impl/program/` | `SequencePlan`, `RequestPlan`, layouts, the sole mutable `Program`, core KV instances, recurrent/MTP/sampler state, prefix ledger, graph ownership, and round resolution | user callbacks, protocol schemas, artifact name lookup |
 | `impl/state/` | target-specific recurrent/state representations bound by Program layouts | common runtime policy, mathematical Op implementations, request publication, or a second state owner |
 | `impl/schedule/` | target-private definitions of Program's fixed Text/Vision/MTP/MoE execution methods | mathematical Op implementations, another long-lived execution owner, or an API callable by product code |
 
-`export/package.h` is an internal build interface, not an installed product API. It is the registry
+`export/package.h` is an internal build interface, not a public product API. It is the registry
 and whole-loop controller's target composition point. Target implementation types remain beneath the
-target directory and are not reachable from installed product headers. Once a Program call enters
+target directory and are not reachable from public product headers. Once a Program call enters
 `impl/`, its fixed layer schedule uses direct target-private state and calls repository-internal Op
 contracts with explicit execution views and semantic parameters.
 
@@ -1799,7 +1798,9 @@ advance.
 In the following graph, `A -> B` means A may depend on B:
 
 ```text
-serve / apps -> public include/ninfer API + media acquisition
+serve -> public include/ninfer API + media acquisition
+apps -> public include/ninfer API + product prompt input
+product prompt input -> media acquisition
 media acquisition -> public owning media values + platform/network facilities
 runtime engine -> target composition + runtime generation + core
 target registry -> generation controller + each target export/package.h
@@ -1813,15 +1814,15 @@ core -> standard library + selected platform/toolchain APIs
 
 The following restrictions make that graph enforceable:
 
-- installed product headers do not include CUDA, tensor, artifact, Op, kernel, or target-private
+- public product headers do not include CUDA, tensor, artifact, Op, kernel, or target-private
   types; repository-internal `include/ninfer/ops/` contracts may include required L0/CUDA host types;
 - `core`, `artifact`, `ops`, neutral `text`, and `media/decode` never include a target header;
 - a target never includes `Engine`, `GenerationController`, serving/transport code, or another
   target, and never links product media acquisition;
 - the explicit registry is the common runtime composition point for concrete target exports;
-- Program's facade and implementation may consume the target's owning `PreparedPrompt` value but
-  have no dependency on `Frontend` or `OutputDecoder`; frontend implementation has no dependency on
-  Program implementation;
+- Program may consume the target-private prepared-prompt data contract, but it does not call
+  `Frontend` or `OutputSession` services; frontend implementation has no dependency on Program
+  implementation;
 - an Op implementation or launcher never imports a target/Program merely to obtain dimensions or
   state; the target passes explicit views and semantic parameters, while exact shape remains a valid
   wrapper dispatch predicate;
@@ -1848,7 +1849,7 @@ snake-case identifier. It is a build identity, never a runtime-discovered path o
 
 ### 19.5 Public and internal header rules
 
-Only `include/ninfer/engine.h` and `include/ninfer/types.h` are installed product headers. `Engine`
+Only `include/ninfer/engine.h` and `include/ninfer/types.h` form the public product header surface. `Engine`
 uses PIMPL, so adding or replacing a target does not place a CUDA, target, artifact, or Op header in
 the public dependency graph. Public types are owning host values, explicitly bounded host views, or
 opaque move-only handles. `PreparedPrompt`'s public envelope is opaque; concrete prepared values,
@@ -1860,12 +1861,13 @@ include-directory name and C++ root namespace, and as the stem of the internal c
 Section 19.7. The repository directory and user-facing executables use their NInfer identities; the
 source tree and executable `--help` define their exact current surfaces.
 
-Each target's `export/` directory is a scoped internal composition interface and is not installed.
+Each target's `export/` directory is a scoped internal composition interface and is not part of the
+public product header surface.
 Its `impl/` directory remains private to that exact target; neither path is part of the user-facing
 C++ API.
 
 Repository-internal mathematical Op headers live under `include/ninfer/ops/`; they are development
-contracts, not product ABI or installed headers. Op benchmarks and numerical tests gain access by
+contracts, not product ABI or public product headers. Op benchmarks and numerical tests gain access by
 linking `ninfer_ops` and its internal include path.
 
 Production headers are not reshaped by testing macros. Diagnostics that require file output,
@@ -1914,10 +1916,11 @@ ninfer_ops                         -> ninfer_core
 ninfer_text                        -> host Unicode mechanism
 ninfer_media_decode                -> host codec mechanism
 ninfer_media_acquire               -> host network/filesystem mechanism
+ninfer_product_prompt_input        -> media_acquire
 ninfer_qwen3_6_27b_rtx5090         -> artifact + ops + text + media_decode
 ninfer_engine                      -> explicit target + artifact + core
 ninfer_serve                       -> engine + media_acquire
-apps/ninfer                        -> engine + media_acquire
+apps/ninfer                        -> engine + product_prompt_input
 apps/ninfer-serve                  -> serve
 ```
 
@@ -1987,84 +1990,16 @@ Common `Engine` contains no Qwen dimension, GDN/MTP/MoE/Vision field, target cac
 target-private setter protocol. Immutable binding is `LoadedModel`, mutable execution is `Program`,
 input/output semantics are `Frontend`, and fixed computations are Program-private schedules.
 
-## 20. Comparison with local reference engines
+## 20. Design provenance from reference engines
 
-This architecture was checked against the local source snapshots below. They are design evidence,
-not dependencies and not normative authorities:
+The boundary was informed by local vLLM, llama.cpp, and SGLang source study. That research provided
+useful evidence for processed-frontier tracking, stable graph inputs, target-owned composite state,
+explicit model implementations, accepted-length-aware stop handling, and separating generic loading
+mechanisms from model-specific binding. External file paths and commit snapshots are intentionally
+not part of this active contract: the sections above and the current NInfer source tree are the
+authority.
 
-| Project | Local snapshot used | Relevant evidence |
-|---|---|---|
-| vLLM | `~/vllm` at `93e3bc8f30b1e135b88a2ffc7f219e3428d39293` | computed-token frontier, accepted/rejected speculative normalization, stable input batches, graph buffers, multimodal preparation |
-| llama.cpp | `~/llama.cpp-mainline` at `e920c523e3b8a0163fe498af5bf90df35ff51d25` | explicit architecture/model implementations, batch-local memory context and mutation boundary, hybrid attention/recurrent memory composition |
-| SGLang | `~/sglang` at `be9791071a36c582f7db09adf60a2374736bb920` | accepted-length-aware stop handling, post-verification recurrent-state commit, stable graph inputs, cost of generalized forward-mode surfaces |
-
-### 20.1 vLLM: frontier normalization and stable batches
-
-In `vllm/v1/core/sched/scheduler.py`, requests track `num_computed_tokens` rather than requiring a
-universal public prefill/decode model. After speculative output, rejected speculative positions are
-removed from computed progress before later scheduling. A full prefix-cache hit also backs off one
-token so the final token can be recomputed to produce the next sample. These are independent evidence
-for an explicit processed frontier and for normalizing provisional work to the accepted logical
-prefix.
-
-The legacy `vllm/v1/worker/gpu_input_batch.py` and experimental V2
-`vllm/v1/worker/gpu/input_batch.py` both separate stable GPU input buffers from round descriptions;
-the runners also prepare multimodal inputs before model execution. NInfer adopts stable graph
-bindings and explicit accepted progress. It does not adopt request maps, paged multi-sequence KV,
-continuous-batching scheduler output, or the large general-purpose runner because those solve a
-different workload.
-
-The generic loader sources under `vllm/model_executor/model_loader/` leave final weight assignment
-to the concrete model, while reusable layer APIs and CUDA code have their own trees. That supports
-NInfer's generic materializer versus target binder split and separate central Op implementation layer.
-NInfer does not adopt vLLM's model-class registry, hook/ABC surface, or generalized runner/model-state
-protocol; its exact package and build entry are static.
-
-### 20.2 llama.cpp: target-owned composite memory
-
-`src/llama-memory.h` separates memory from a per-batch memory context and states that mutation occurs
-through the context's `apply()` boundary. Hybrid contexts compose attention and recurrent memory.
-`src/llama-context.cpp` initializes that context before processing a batch and handles application/
-failure explicitly. This supports treating KV, recurrent state, and their mutation as one target
-transaction instead of independent common cursors.
-
-The explicit Qwen model sources under `src/models/`, including Qwen3.5 dense/MoE implementations,
-bind model-specific tensors and build model-specific graphs. NInfer similarly uses an explicit closed
-target registry. It does not adopt llama.cpp's broad architecture enum, runtime graph construction,
-optional-tensor/config variants, generic multi-sequence batch API, or virtual memory hierarchy. An
-exact NInfer package can express the same principle with concrete types and compile-time scheduling.
-
-The same snapshot also shows the cost of a broad central composition surface: declarations collect
-in `src/models/models.h`, architecture switching remains in `src/llama-model.cpp`, and model source
-discovery uses a CMake glob. NInfer takes the explicit per-model implementation lesson but replaces
-central special cases and implicit discovery with one package export, an explicit source list, and a
-closed registry.
-
-### 20.3 SGLang: batch stop positions and verified recurrent commit
-
-`python/sglang/srt/managers/schedule_batch.py` carries `new_accepted_len` into stop-string/token
-handling and records the exact finished prefix when a multi-token speculative result contains a
-stop. `python/sglang/srt/speculative/eagle_worker_v2.py` commits Mamba/recurrent states after target
-verification. In the examined flow, recurrent/KV state for the full accepted run is committed before
-later CPU stop trimming; output `finished_len` does not prove that model state was normalized to that
-shorter stop prefix. SGLang therefore separately demonstrates accepted-length-aware output trimming
-and target-owned full-run recurrent commit. It is evidence that NInfer must keep these concerns
-explicit, not evidence that a reusable partial-prefix Resident is automatically available.
-
-Conversely, `python/sglang/srt/model_executor/forward_batch_info.py` exposes a large `ForwardMode`
-space including extend, decode, target verify, split prefill, and draft modes, while its generalized
-runner coordinates many scheduling and parallelism variants. Those modes are necessary for SGLang's
-scope but would leak model/scheduler phases into NInfer's core contract. NInfer keeps them private
-inside one exact target's `begin` and `decode_round`.
-
-SGLang's `python/sglang/srt/models/qwen3_5.py`, generalized `model_runner.py`, and layer code that
-imports runner state demonstrate another organizational failure mode for NInfer: a concrete model
-file can absorb loading, forward modes, platform policy, graph state, and execution context while a
-nominal lower layer depends back on the runner. The exact NInfer package is allowed to be specialized,
-but immutable load, mutable Program, frontend, and central Op implementation ownership remain
-distinct, and the build DAG forbids that reverse dependency.
-
-### 20.4 Adopted and deliberately rejected lessons
+The resulting decisions are:
 
 | Concern | NInfer decision |
 |---|---|
@@ -2205,7 +2140,7 @@ An implementation conforming to this architecture satisfies all of the following
     through the explicit registry, `ActiveTarget`, and target `export/package.h` facade.
 25. **Explicit product build:** source lists and the registered target set are explicit; recursive
     globbing, auto-registration, plugin discovery, and family fallback cannot change the product.
-26. **Opaque public API:** installed headers expose no CUDA, tensor, artifact, Op, kernel, or target
+26. **Opaque public API:** public headers expose no CUDA, tensor, artifact, Op, kernel, or target
     type.
 27. **Acquisition stays above target execution:** exact target execution consumes owning media and
     does not perform URL/filesystem acquisition.
@@ -2257,14 +2192,17 @@ registered target:
 
 ### 23.4 End-to-end target fit
 
-- 27B Text, image/video multimodal, composed MTP inputs, sampling, and prefix reuse execute through
-  only the coarse controller contract;
-- 35B GDN/full-attention/MoE, image, video, multiple-media positions/`rope_delta`, Vision/MTP
-  composed alignment, and prefix state fit without adding phase or expert fields to common APIs;
+- the registered 27B target executes Text, image/video multimodal input, composed MTP inputs,
+  sampling, and prefix reuse through only the coarse controller contract;
 - output row padding and tokenizer-addressable ID boundaries cannot emit undecodable IDs;
 - greedy and non-greedy MTP verification are checked against their mathematical oracle, including
   proposal/target `q/p` acceptance and correction required to preserve the target distribution;
 - useful decode/prefill/context results are measured through the complete product path.
+
+A future 35B-A3B target must, before registration, demonstrate that its GDN/full-attention/MoE,
+image/video and multiple-media `rope_delta`, Vision/MTP alignment, and prefix state fit this boundary
+without adding phase or expert fields to common APIs. This is an admission requirement and design-fit
+claim, not evidence that a 35B runtime target is already implemented.
 
 ### 23.5 Source and build boundaries
 

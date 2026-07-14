@@ -29,7 +29,8 @@ The current repository consistently uses:
 - `NInfer` as the project display name;
 - `.ninfer` for runtime model artifacts;
 - `ninfer` as the C++ root namespace and primary executable name;
-- `include/ninfer/` for the installed product API;
+- `include/ninfer/engine.h` and `include/ninfer/types.h` for the public product API;
+- `include/ninfer/ops/` for repository-internal Op contracts, not public product API;
 - `ninfer-*` and `ninfer_*` for executable and internal CMake target names;
 - `NINFER_*` for product environment variables;
 - exact target keys such as `qwen3_6_27b_rtx5090` for compiled checkpoint/GPU packages and

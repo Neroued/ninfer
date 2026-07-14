@@ -46,7 +46,7 @@ exact checkpoint inventory, source recipe, draft-head construction, and source v
 
 ## Python reference and parity
 
-Run complete artifact-native Text, Vision, and MTP inference:
+Run artifact-native Text, Vision, and MTP inference:
 
 ```bash
 /home/neroued/miniconda3/envs/py311/bin/python \

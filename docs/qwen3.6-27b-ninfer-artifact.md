@@ -97,14 +97,14 @@ integers.
 
 ### 3.1 Naming rules
 
-The names in this section are exact artifact binding names. They are not Hugging Face source names
-and are not aliases for the legacy q5090 names.
+The names in this section are exact artifact binding names. They are not Hugging Face source names.
 
 - `text/` owns the token embedding, 64 Text layers, final norm, full output head, and draft head.
 - `mtp/` owns the one-layer MTP-specific persistent weights. Its shared embedding and full head are
   logical aliases to `text/` objects and are not stored twice.
 - `vision/` owns the complete Vision tower and merger.
-- `frontend/` owns the six raw files consumed by existing Hugging Face libraries.
+- `frontend/` owns the six raw checkpoint resources consumed by the native C++ Frontend and the
+  independent Python reference.
 - Numeric-format spellings do not appear in object names. The JSON `format` member is authoritative.
 - Names identify physical stored objects. Q/K, gate/value, gate/up, and other row views in Section 8
   are not additional JSON objects.
@@ -131,24 +131,26 @@ inspection.
 The artifact contains exactly these six resource objects. All use `raw-bytes-v1` and preserve the
 source file bytes without an internal archive or filename header.
 
-| Order | Object name | Encoding | Materialized filename | Consumer |
+| Order | Object name | Encoding | Source filename | Runtime meaning |
 |---:|---|---|---|---|
-| 0 | `frontend/tokenizer.json` | `raw-bytes-v1` | `tokenizer.json` | `AutoTokenizer` / processor tokenizer |
-| 1 | `frontend/tokenizer_config.json` | `raw-bytes-v1` | `tokenizer_config.json` | tokenizer class and special-token configuration |
-| 2 | `frontend/chat_template.jinja` | `raw-bytes-v1` | `chat_template.jinja` | library `apply_chat_template` |
-| 3 | `frontend/generation_config.json` | `raw-bytes-v1` | `generation_config.json` | `GenerationConfig`, including default stop IDs |
-| 4 | `frontend/preprocessor_config.json` | `raw-bytes-v1` | `preprocessor_config.json` | image processor construction |
-| 5 | `frontend/video_preprocessor_config.json` | `raw-bytes-v1` | `video_preprocessor_config.json` | video processor construction |
+| 0 | `frontend/tokenizer.json` | `raw-bytes-v1` | `tokenizer.json` | BPE vocabulary, merges, added tokens, and token bytes |
+| 1 | `frontend/tokenizer_config.json` | `raw-bytes-v1` | `tokenizer_config.json` | tokenizer prefix and special-token configuration |
+| 2 | `frontend/chat_template.jinja` | `raw-bytes-v1` | `chat_template.jinja` | registered Qwen template identity and semantics |
+| 3 | `frontend/generation_config.json` | `raw-bytes-v1` | `generation_config.json` | model-default stop token IDs |
+| 4 | `frontend/preprocessor_config.json` | `raw-bytes-v1` | `preprocessor_config.json` | image resize, normalization, and patch limits |
+| 5 | `frontend/video_preprocessor_config.json` | `raw-bytes-v1` | `video_preprocessor_config.json` | video sampling, resize, normalization, and frame limits |
 
 `vocab.json`, `merges.txt`, `added_tokens.json`, and `special_tokens_map.json` are not objects in
-this route. The six-file directory has been verified locally with `AutoProcessor`, `AutoTokenizer`,
-`GenerationConfig`, and `apply_chat_template`; copying redundant alternate tokenizer inputs would
-not add a runtime capability.
+this route because `tokenizer.json` already contains the registered tokenizer data.
 
-The binder/frontend materializes these six payloads under the fixed filenames above and asks the
-installed libraries to load them locally. NInfer does not implement the BPE tokenizer, Qwen chat
-template, image preprocessing, or video preprocessing itself. The model-specific MRoPE positions
-and `rope_delta` remain execution semantics rather than frontend resource contents.
+The C++ binder retains these payloads as owned strings and constructs the target-private native
+tokenizer, template renderer, and image/video processor directly from them; it does not create a
+temporary checkpoint directory. The independent Python reference may materialize the six source
+filenames in a temporary directory and consume them through Transformers. The native route validates
+the registered tokenizer domain, required Vision tokens, template identity, and processor
+configuration; the Python route validates the tokenizer domain, Vision tokens, and required library
+processor inputs. MRoPE positions and `rope_delta` are derived prepared-prompt values rather than
+resource contents.
 
 ## 5. Text and draft-head tensor inventory
 
@@ -206,10 +208,8 @@ For every other layer `l` in `0..63`, emit these fourteen objects in table order
 | 13 | `text/layers/{l}/mlp/down` | `[5120,17408]` | `Q5G64_F16S` | `row-split-k128-v1` |
 
 The convolution shape is intentionally `[tap,channel] = [4,10240]`. Its bytes are tap-major, so
-this is the honest stored shape. The legacy q5090 entry described the same bytes as
-`[10240,4,1]`, even though consumers first reinterpreted the flat payload as `[4,10240]` and then
-transposed it. The NInfer artifact does not preserve that metadata accident. A channel-major
-`[10240,4]` consumer view is `stored.transpose(0,1)`; it is not a plain contiguous reshape.
+this is the stored shape. A channel-major `[10240,4]` consumer view is
+`stored.transpose(0,1)`; it is not a plain contiguous reshape.
 
 ### 5.4 Optimized draft head
 
@@ -642,16 +642,16 @@ Qwen3.6-27B binder must perform exactly the model-specific work below.
 5. Build the fixed row views and aliases in Section 8. These views are derived once during binding;
    Text/MTP/Vision hot paths do not perform artifact-name lookups.
 6. Treat each `[4,10240]` GDN convolution as tap-major and form the consumer's channel-major
-   transpose explicitly. Never reinterpret it as the old misleading contiguous shape.
+   transpose explicitly.
 7. Require 131072 unique draft-head IDs in `0..248076` and bind row `i` to its corresponding mapped
    vocabulary ID.
 8. Bind MTP to the shared Text embedding and full head, plus the mandatory optimized draft head,
    while keeping MTP KV/state separate at execution time.
 9. Build the complete 27-layer Vision and merger bindings; Vision cannot be omitted merely because
    the current request is text-only.
-10. Retain the six frontend resource payloads for the loaded-reference lifetime, materialize their
-    fixed filenames, and construct `AutoProcessor`, its tokenizer, and `GenerationConfig` locally.
-    Verify the tokenizer domain and required special IDs before generation.
+10. Retain the six frontend resource payloads for the loaded-model lifetime and construct the
+    target-private native Frontend from them. Verify the tokenizer domain, required special IDs,
+    template identity, and processor configuration before generation.
 11. Reject a partially bound product. Text, MTP, Vision, draft head, and frontend resources become
     usable together only after the complete binding succeeds.
 
@@ -671,10 +671,11 @@ artifact. The verifier and reference path have established:
 - numeric counts `582 BF16`, `96 FP32`, `1 I32`, `183 Q4`, `294 Q5`, `3 Q6`, and `7 W8`;
 - layout counts `679 contiguous-le-v1` and `487 row-split-k128-v1`;
 - all 1199 referenced BF16 source tensors present with expected shapes;
-- the six-file frontend directory loadable by the selected Hugging Face library paths;
+- the six resources consumable by both the native C++ Frontend and the selected Hugging Face
+  library path used by the Python reference;
 - complete Text, image/video Vision, MTP, and combined multimodal reference execution from the
   resulting `.ninfer` artifact.
 
 These are structural, numerical, and behavioral checks of the selected route. They do not require
-the `.ninfer` file to match a `.qus` file byte-for-byte, fix a file hash, reproduce a probabilistic
-token stream exactly, or produce identical bytes on another machine or later conversion run.
+a fixed file hash, byte-identical regeneration, or exact reproduction of a probabilistic token
+stream.

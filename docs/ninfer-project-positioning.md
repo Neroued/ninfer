@@ -1,6 +1,6 @@
 # NInfer Project Positioning
 
-> Status: accepted on 2026-07-13.
+> Status: accepted.
 >
 > Authority: this document defines why NInfer exists, whom it serves, the targets and workloads it
 > chooses, the outcomes it optimizes, and the boundaries that preserve that purpose. It does not

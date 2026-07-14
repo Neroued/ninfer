@@ -95,7 +95,8 @@ The artifact contains the complete registered Text, MTP, Vision, draft-head, tok
 and generation-resource inventory. The C++ Engine and Python reference both consume this artifact;
 the source checkpoint is not accessed during inference.
 
-The complete Python correctness reference is available independently:
+The independent artifact-native Python Text/Vision/MTP correctness reference is available
+separately:
 
 ```bash
 python -m tools.reference.qwen3_6_27b_rtx5090 \
@@ -160,7 +161,7 @@ JSON, or CSV. See [`bench/README.md`](bench/README.md).
 
 ## Public Engine
 
-The installed product surface is [`include/ninfer/engine.h`](include/ninfer/engine.h) plus owning
+The public product surface is [`include/ninfer/engine.h`](include/ninfer/engine.h) plus owning
 host values in [`include/ninfer/types.h`](include/ninfer/types.h). `Engine` constructs one selected
 target from an `EngineOptions` value and `.ninfer` path. Requests follow one route:
 
@@ -181,7 +182,7 @@ methods or mutable model state.
 BF16 checkpoint
   -> target converter
   -> qwen3_6_27b_rtx5090.ninfer
-  -> ArtifactReader / ArtifactBinder / Materializer
+  -> artifact reader / binder / materializer
   -> closed qwen3_6_27b_rtx5090 target package
        immutable LoadedModel + Frontend + one mutable Program
        fixed schedules compose repository-internal Ops

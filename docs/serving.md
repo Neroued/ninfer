@@ -1,6 +1,6 @@
 # NInfer CLI and HTTP Serving
 
-> Status: current user-visible behavior after the NInfer engine cutover.
+> Status: current implemented CLI and HTTP behavior.
 >
 > Authority: this document defines the two product applications, their command-line options, the
 > OpenAI- and Anthropic-compatible HTTP surfaces, and the mapping from those surfaces to the public
@@ -13,8 +13,8 @@
 
 NInfer exposes two applications over the same public engine:
 
-- `apps/ninfer` is the local one-shot CLI;
-- `apps/ninfer-serve` keeps one engine resident and exposes HTTP endpoints.
+- `apps/cli` builds the local one-shot `ninfer` CLI;
+- `apps/serve` builds `ninfer-serve`, which keeps one engine resident and exposes HTTP endpoints.
 
 With the default CMake layout, the corresponding binaries are `build/apps/ninfer` and
 `build/apps/ninfer-serve`. Both take one `.ninfer` artifact as their first positional argument;

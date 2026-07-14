@@ -30,7 +30,8 @@ layout, or Vision tower is a different model implementation rather than a runtim
 | hidden size | 5120 |
 | decoder layers | 64 |
 | intermediate size | 17408 |
-| vocabulary | 248320 |
+| output/embedding matrix rows | 248320 |
+| tokenizer-addressable token IDs | 248077 (`0..248076`) |
 | full-attention interval | 4 |
 | full-attention layers | 16 |
 | Gated-DeltaNet layers | 48 |
@@ -259,7 +260,7 @@ back to the one-token target path when a complete safe round does not fit.
 
 The native processor accepts structured text/image/video message parts. For each media item it:
 
-1. reads a local path or allowed remote source;
+1. consumes media bytes already acquired by the CLI or serving layer;
 2. decodes the image or samples video frames;
 3. chooses dimensions aligned to the 32-pixel merge factor;
 4. bicubic-resizes and normalizes RGB values;
@@ -356,8 +357,8 @@ changes its fixed allocation.
 | GDN state implementation and target-owned state policy | `src/targets/qwen3_6_27b_rtx5090/impl/state/`, `impl/program/` |
 | `.ninfer` tensor assignment and binding | [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md), `tools/reference/qwen3_6_27b_rtx5090/bindings.py` |
 | native `.ninfer` converter and verifier | `tools/convert/qwen3_6_27b_rtx5090` |
-| complete Python Text/Vision/MTP reference | `tools/reference/qwen3_6_27b_rtx5090` |
+| artifact-native Python Text/Vision/MTP reference | `tools/reference/qwen3_6_27b_rtx5090` |
 
-The Python reference is the independent executable oracle for the artifact route. The C++ target
-implements the same complete Text/Vision/MTP product over `.ninfer` through the closed Engine
-architecture.
+The Python reference is an independent executable oracle for model and artifact-path numerics; it
+is not a second implementation of every CLI, serving, or sampler option. The C++ target implements
+the complete Text/Vision/MTP product over `.ninfer` through the closed Engine architecture.

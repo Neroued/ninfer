@@ -202,9 +202,9 @@ encoded size. It is not a GPU or kernel name. The model contract owns which regi
 is accepted for each role and which actual device implementation can consume it.
 
 `model_id` identifies exact checkpoint-native semantics, not a GPU, converter revision, one
-quantization run, physical object order, or artifact instance. Target selection additionally uses
-the actual device and the model contract's complete storage signatures; no GPU/profile field is
-added to JSON.
+quantization run, physical object order, or artifact instance. It selects a candidate compiled
+package; that package must then accept the actual device and the model contract's complete storage
+signatures. No GPU/profile field is added to JSON.
 
 ## 5. Payload geometry
 
@@ -286,14 +286,23 @@ with model-private loops rather than duplicating a flat JSON table in C++.
 
 ### 6.3 Payload-content validation
 
-Persistent numeric and layout contracts still apply to actual bytes. Direct words, grouped codes,
-binary16 scales, physical padding, and model-role value restrictions are validated by the layout,
-target verifier, or target loading path before a consumer relies on those invariants. The common
-directory parser does not duplicate those numeric checks.
+Persistent numeric and layout contracts still apply to the bytes produced by the project-owned
+converter. Responsibility is deliberately split across the local pipeline:
 
-How a future Engine allocates, uploads, owns, or publishes a loaded product is outside the container
-ABI. A Python reference may keep an mmap open and stream rows; a C++ target may materialize packed
-device spans. Both consume the same validated directory and layout bytes.
+- the converter and quantizer establish code, scale, direct-word, and padding invariants while the
+  layout codec preserves the already selected words in the registered byte layout;
+- the offline target verifier checks directory geometry, exact target assignments, and representative
+  source-to-artifact values;
+- the C++ reader and binder check directory geometry and the exact target storage signature, plus
+  cheap target-specific value invariants that are needed during binding.
+
+The runtime does not rescan every scale, code, direct word, or padding byte before upload. Such a scan
+would duplicate work in a trusted, project-owned conversion path without improving the model binding
+contract. The common directory parser therefore owns structural decoding only.
+
+How the Engine allocates, uploads, owns, or publishes a loaded product is outside the container ABI.
+A Python reference may keep an mmap open and stream rows; a C++ target may materialize packed device
+spans. Both consume the same directory and registered layout bytes.
 
 ## 7. Writing an artifact
 
@@ -368,21 +377,17 @@ correctly without carrying it.
 ## 11. Required implementation evidence
 
 The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b_rtx5090/`,
-`tools/reference/qwen3_6_27b_rtx5090/`, and `src/artifact/` satisfies this layer. These checks remain
-the compact conformance set for later changes; they do not imply C++ Engine execution support.
+`tools/reference/qwen3_6_27b_rtx5090/`, and `src/artifact/` satisfies this layer. The compact evidence
+retained for later changes is:
 
-Permanent verification is limited to contracts whose regression would load the wrong bytes:
-
-- one small artifact containing all seven numeric formats and one raw resource;
-- exact magic and little-endian `json_bytes`, including truncated/out-of-file metadata;
-- closed root/tensor/resource fields and JSON types;
-- duplicate object names and unknown format/layout/encoding identities;
-- offset alignment, overlap, file bounds, and layout-derived size mismatch;
-- exact direct-word and Q4/Q5/Q6/W8 code/scale layout round trips;
-- Python writer to Python reader/inspector;
-- Python writer to the narrow C++ reader;
+- Python version-1 round trips for all seven numeric formats and a raw resource;
+- representative framing, schema, offset/alignment, overlap, bounds, and encoded-size failures;
+- exact representative direct-word and Q4/Q5/Q6/W8 code/scale layout round trips;
+- an independently constructed C++ version-1 fixture covering object identities, payload spans,
+  encoded sizes, and alignment;
 - the Qwen3.6-27B binder's complete 1172-object inventory and logical views;
-- inspection, source probes, and reference inference on one real converter-generated artifact.
+- inspection, representative source probes, Python reference inference, and Engine loading on a real
+  converter-generated artifact where those paths are exercised.
 
 This contract does not require canonical-JSON spelling tests, arbitrary malformed-input matrices,
 fuzz/resource-exhaustion campaigns, failure injection, interrupted-publication tests, full-file

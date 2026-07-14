@@ -58,7 +58,7 @@ execution behavior.
 | Neutral text/media decode | `src/text`, `src/media/decode` | Unicode primitives and image/video decoding over owning bytes |
 | Product media acquisition | `src/product/media_acquire` | local-path, HTTP(S), and data-URI acquisition into owning media values |
 | Product prompt input | `src/product/prompt_input` | shared JSON/message parsing into owning public prompt values for product tools |
-| Exact target | `src/targets/qwen3_6_27b_rtx5090` | storage profile, load bindings, frontend, sequence/request plans, Program state, fixed Text/Vision/MTP schedules, graph/lifecycle policy, target diagnostics |
+| Exact target | `src/targets/qwen3_6_27b_rtx5090` | registered storage signature, load bindings, frontend, sequence/request plans, Program state, fixed Text/Vision/MTP schedules, graph/lifecycle policy, target diagnostics |
 | Registry | `src/targets/registry.*` | closed target selection and complete target construction |
 | Product runtime | `src/runtime` | generated-token budget, round resolution, cancellation, publication, public Engine PIMPL, target lifetime |
 | Serving | `src/serve` | OpenAI/Anthropic schemas, translation, streaming, usage, request logs, and HTTP transport |
@@ -82,7 +82,7 @@ exact targets is preferable to a false family abstraction.
 
 ## 4. Public C++ API
 
-The installed product surface consists of:
+The public product surface consists of:
 
 ```text
 include/ninfer/engine.h
@@ -100,7 +100,7 @@ Engine(EngineOptions);
 PreparedPrompt prepare(PromptInput) const;
 PreparedPrompt prepare_tokens(std::vector<TokenId>, bool) const;
 std::uint32_t count_tokens(PromptInput) const;
-GenerationResult generate(PreparedPrompt, RequestOptions, OutputSink*, CancellationView);
+GenerationResult generate(PreparedPrompt, RequestOptions, OutputSink*, const CancellationView&);
 LoadSummary load_summary() const;
 MemorySummary memory_summary() const;
 ```
@@ -116,9 +116,9 @@ Engine construction performs the complete load before publishing a usable object
 
 1. create the selected `DeviceContext` and observe the actual GPU;
 2. parse the `.ninfer` prefix and embedded object directory;
-3. match `(model_id, actual GPU, complete registered storage profile)` against the closed registry;
+3. select the compiled package by `model_id` and let it preflight the actual GPU and options;
 4. let the selected target consume every required tensor and frontend resource through
-   `ArtifactBinder`;
+   `artifact::Binder`, validating its complete registered storage signature;
 5. materialize tensors directly into their final backing and retain required host resources;
 6. construct heap-stable immutable `LoadedModel` bindings;
 7. construct the target Frontend from retained resources;
@@ -271,8 +271,8 @@ All product entry points use the public Engine:
   and prints deltas/summaries;
 - `apps/serve` and `src/serve` translate OpenAI/Anthropic requests, prepare/count/generate, and map
   public summaries into protocol responses;
-- `bench/ninfer_bench` uses `prepare_tokens` plus `generate` and reports public load, memory, timing,
-  and speculative values.
+- `build/bench/ninfer_bench`, implemented under `bench/targets/qwen3_6_27b_rtx5090/`, uses
+  `prepare_tokens` plus `generate` and reports public load, memory, timing, and speculative values.
 
 The target-private `ninfer-qwen3_6_27b-dump` diagnostic links the target package directly for
 bounded activation manifests. It is not a public Engine method.

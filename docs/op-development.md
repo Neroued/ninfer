@@ -178,7 +178,7 @@ include/ninfer/ops/<family>.h
 namespace ninfer::ops
 ```
 
-They are execution-layer interfaces, not installed product ABI. A header may group closely related
+They are execution-layer interfaces, not public product ABI. A header may group closely related
 operations or overloads. Do not create an empty family header merely to force one function per
 file.
 

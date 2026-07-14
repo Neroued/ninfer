@@ -11,9 +11,9 @@
 
 ## 1. Model identity
 
-Qwen3.6-35B-A3B is the first open-weight Qwen3.6 checkpoint. Qwen announced it on 2026-04-15 and
-made the weights available on Hugging Face and ModelScope on 2026-04-16. It is a post-trained native
-multimodal sparse-MoE model with three checkpoint components:
+Qwen3.6-35B-A3B is the first open-weight Qwen3.6 checkpoint. Qwen announced and open-sourced it on
+2026-04-15, with weights distributed through Hugging Face and ModelScope. It is a post-trained
+native multimodal sparse-MoE model with three checkpoint components:
 
 - a 40-layer hybrid Text decoder with a sparse MoE in every layer;
 - a one-layer MTP draft model whose decoder block also contains sparse MoE;
@@ -664,8 +664,10 @@ This reference was cross-checked on 2026-07-13 against the following independent
 | independent Text/MTP recurrence graph | `~/llama.cpp-mainline` commit `07d937828636e305bc0cfe738b288f9ab05ff748`, especially `src/models/qwen35moe.cpp` and `src/models/delta-net-base.cpp` |
 | Vision and processor semantics | vLLM `qwen3_vl.py` / `qwen2_5_vl.py`, llama.cpp `tools/mtmd/models/qwen3vl.cpp`, and local processor configs |
 
-For reproducibility, the local `config.json` SHA-256 is
+As descriptive provenance for the checkpoint inspected by this reference, the local `config.json`
+SHA-256 is
 `93a4693fa9d8392fbfccd4b3c9873f4bfdcb14fdede978b123d07d19675efe99`, and the local
 `model.safetensors.index.json` SHA-256 is
 `41b9356101ebf8e7519e150dc811f80c4226e727301fbb032b890f006ed0be83`. The index and all shard
-headers agree exactly: no missing, extra, duplicate, or mis-sharded tensor was found.
+headers agree exactly: no missing, extra, duplicate, or mis-sharded tensor was found. These hashes
+identify that inspection input; they are not runtime validity gates or regeneration requirements.

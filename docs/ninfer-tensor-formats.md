@@ -1,6 +1,6 @@
 # NInfer Persistent Tensor Numeric Formats
 
-> Status: accepted on 2026-07-13 and implemented by the `.ninfer` writer/reader, quantizer,
+> Status: accepted and implemented by the `.ninfer` writer/reader, quantizer,
 > converter, verifier, Python reference, production C++ binder/materializer, and Engine.
 >
 > Authority: this document defines the closed set of persistent numeric tensor formats accepted by
@@ -48,10 +48,9 @@ layout, shape, checkpoint, or GPU can consume it.
 
 The design deliberately preserves the currently used group sizes. Q4, Q5, and Q6 share one G64
 group geometry, allowing their converter, codec, and kernel structures to share the same grouping
-model. W8 retains the single implemented G32 geometry. The current q5090 assignments provide the
-historical implementation evidence for these choices; they do not become NInfer model assignments
-through this registry. These are accepted project geometries, not claims that G64 or G32 is
-universally optimal.
+model. W8 retains the single implemented G32 geometry. The registered Qwen3.6-27B target provides
+the current implementation evidence for these choices. These are accepted project geometries, not
+claims that G64 or G32 is universally optimal.
 
 NInfer does not undertake an independent model-quality research campaign to qualify formats or
 checkpoint recipes. Quantization quality decisions rely on credible evidence from model publishers,
@@ -62,7 +61,7 @@ not substitute for, or claim to be, an independent model-quality study.
 
 ## 2. Terms and ownership
 
-Several concerns that were combined by the q5090 artifact must be separate in NInfer.
+The registry keeps the following concerns separate.
 
 ### 2.1 Persistent numeric format
 
@@ -101,7 +100,7 @@ scales of a scheme. Scale selection, rounding order, calibration, clipping, and 
 belong here.
 
 NInfer defines one canonical quantization encoder profile in Section 7. That encoder provides a
-reproducible baseline and an independent artifact oracle. A checkpoint-specific process may use another
+defined baseline and an independent artifact oracle. A checkpoint-specific process may use another
 documented encoder to produce the same scheme—for example, an upstream error-optimized recipe—but
 that does not create a new quantization scheme if the resulting persistent codes and scales obey the
 same logical contract. Encoder provenance must not be confused with decoder semantics.
@@ -135,9 +134,10 @@ among other things:
 - endianness and any layout-specific validation metadata.
 
 One format may have more than one deliberately supported layout, but every layout must decode to
-exactly the same direct words or logical codes and scales. The current q5090 `CONTIGUOUS` and
-`ROW_SPLIT` layouts, low/high-bit runs, byte order, 128-element K padding, and alignment rules are
-properties of the current artifact; none is inherited as part of these seven NInfer formats.
+exactly the same direct words or logical codes and scales. The currently registered layouts are
+`contiguous-le-v1` for direct words and `row-split-k128-v1` for grouped formats. Their byte order,
+plane packing, 128-element K padding, and alignment rules belong to the layout registry, not to these
+seven numeric formats.
 
 ### 2.7 Compute profile and kernel support
 
@@ -231,9 +231,10 @@ including rounding for FP32-to-BF16 and range/integrality checks for any convers
 producer must not silently wrap, truncate, or saturate a value merely because the destination word
 has a fixed width.
 
-The direct format does not encode a model role. The historical names `BF16_CTRL`, `FP32_CTRL`, and
-`I32_CTRL` are not NInfer formats and receive no aliases. Control parameters, ordinary weights,
-norms, indexes, and maps use a direct format plus a separate model-assignment role.
+The direct format does not encode a model role. `BF16_CTRL`, `FP32_CTRL`, and `I32_CTRL` are internal
+execution `QType` names, not persistent NInfer format identities, and receive no aliases in the
+artifact registry. Control parameters, ordinary weights, norms, indexes, and maps use a direct
+format plus a separate model-assignment role.
 
 ### 3.2 Grouped quantized-weight identities
 
@@ -289,9 +290,10 @@ The logical scale tensor therefore has shape:
 
 This definition does not assign meanings such as output channel, expert, adapter, or convolution
 axis to the leading dimensions. A checkpoint adapter owns any reshape or transpose needed to place
-the intended quantization axis last before encoding. The abstract reference codec supports this
-logical rank and tail model; a concrete storage layout or kernel may accept only an explicit subset
-of ranks and shapes without weakening the scheme definition.
+the intended quantization axis last before encoding. It is an abstract scheme definition. The
+currently implemented `row-split-k128-v1` layout and canonical producer accept only positive rank-two
+matrices `[N,K]`; supporting a higher-rank physical tensor requires an explicitly registered layout
+and implementation, or a model recipe that defines a semantics-preserving rank-two reshape.
 
 ### 4.2 Final partial group
 
@@ -343,15 +345,14 @@ logical word and signed value must be exactly those defined here.
 ### 5.2 W8
 
 `W8G32_F16S` uses an 8-bit two's-complement signed code with the deliberately restricted interval
-`[-127, 127]`. The byte pattern `0x80`, which would represent `-128`, is invalid and reserved. It
-must be rejected at the artifact-validation boundary and must never reach a kernel as weight data.
+`[-127, 127]`. The byte pattern `0x80`, which would represent `-128`, is outside the valid artifact
+language. The project-owned quantizer must never emit it; decoding semantics are defined only for a
+valid code stream.
 
 This restriction is part of the scheme, not an encoder preference. A kernel may use a native
-signed-byte load after the loader or verifier has established conformance, but that implementation
-convenience does not make `-128` legal. Unlike Q4, Q5, and Q6, for which every logical code word is
-valid, W8 validation must examine or equivalently prove the validity of the code stream. The
-one-time validation cost may be fused with artifact loading or device transfer; accepting that cost
-is a deliberate consequence of reserving `0x80`.
+signed-byte load because the registered conversion path establishes the code invariant; that
+implementation convenience does not make `-128` legal. The trusted local runtime does not rescan
+the complete W8 payload solely to prove an invariant already established by its producer.
 
 ## 6. Scale and reconstruction semantics
 
@@ -413,26 +414,25 @@ as the exact `.ninfer` artifact size.
 
 The apparently finer W8 group is intentional. Q4, Q5, and Q6 retain one shared G64 grouping model
 across their existing converter, codec, and kernel paths, while W8G32 is the one current W8
-geometry. The model roles that motivated it belong to historical q5090 provenance and future
-checkpoint recipes, not to the scheme definition. Its 16-bit scale contributes 0.5 bit per weight
-at G32, while the scale contributes 0.25 bit per weight to Q4 at G64; both are 6.25% of their code
-payload. This cost calculation explains why the finer W8 grouping is affordable. It is not
-independent quality evidence or a claim that G32 is universally optimal.
+geometry used by the registered Qwen3.6-27B recipe. The assignment of that geometry to model roles
+belongs to checkpoint recipes, not to the scheme definition. Its 16-bit scale contributes 0.5 bit
+per weight at G32, while the scale contributes 0.25 bit per weight to Q4 at G64; both are 6.25% of
+their code payload. This cost calculation explains why the finer W8 grouping is affordable. It is
+not independent quality evidence or a claim that G32 is universally optimal.
 
 ## 7. Canonical reference encoder
 
 ### 7.1 Purpose and input boundary
 
 The canonical profile identity is `MAXABS_F16_RECIP_RNE_V1`. NInfer owns exactly one current
-canonical profile for reproducibility, converter parity, and artifact verification. It is a
-per-row, per-group symmetric maximum-absolute-value encoder. It freezes the arithmetic order of the
-existing full-group reciprocal-multiply path while defining the more general logical rank and tail
-behavior in Section 4. Direct division during code selection is not interchangeable with it at
-rounding boundaries.
+canonical profile for conversion consistency, converter parity, and artifact verification. It is a
+per-row, per-group symmetric maximum-absolute-value encoder. It fixes the arithmetic order used by
+the registered converter. Direct division during code selection is not interchangeable with its
+reciprocal-multiply order at rounding boundaries.
 
-The former q5090 converter is provenance for that full-group arithmetic order, not automatically a
-conforming implementation of this complete profile: the NInfer implementation must additionally
-enforce the non-finite, overflow, logical-rank, and partial-group rules in this document.
+The current implementation applies this profile to positive rank-two matrices, rejects non-finite
+source values and unrepresentable scales, and defines physical tail padding through
+`row-split-k128-v1`.
 
 The checkpoint adapter supplies a logical tensor in the shape and axis convention of Section 4.
 Each source value is converted to IEEE-754 binary32 using round-to-nearest, ties-to-even before group
@@ -551,36 +551,30 @@ The `.ninfer` container and each registered storage layout must:
 - reconstruct every direct logical word exactly;
 - for grouped formats, make the number and ownership of logical groups unambiguous and reconstruct
   every logical code and binary16 scale without inference from a kernel implementation;
-- define its canonical physical-padding contents and validation rules, if it materializes padding;
+- define its canonical physical-padding contents and producer responsibilities, if it materializes
+  padding;
 - reject unknown formats and unsupported format/layout combinations;
-- define where complete validation occurs before a kernel is allowed to assume valid input.
+- define the structural checks needed to locate and decode the payload.
 
 The container must not embed an open-ended `(bits, group_size, scale_dtype)` constructor that makes
 unregistered combinations valid. Its representation resolves to one closed canonical identity;
 that representation belongs to the container contract.
 
-### 8.3 Loader and verifier
+### 8.3 Verifier, loader, and binder
 
-Before persistent data reaches a kernel or model consumer, the artifact-validation boundary must
-establish at least:
+The project-owned converter and quantizer establish the value invariants in Sections 3 through 7
+while writing the artifact: direct-word preservation, legal codes and scales, and canonical physical
+padding. The layout codec preserves those already selected words. The offline checkpoint verifier
+checks the complete target inventory and representative source-to-artifact values.
 
-- numeric-format identity is known;
-- logical and physical extents satisfy the selected layout;
-- direct payloads reconstruct the required number of complete logical words;
-- tensor-specific direct-value restrictions from the checkpoint recipe hold;
-- for grouped formats, every scale is valid under Section 6.1;
-- for grouped formats, a positive-zero scale has only zero logical codes;
-- for grouped formats, every code is in range and W8 never contains `0x80`;
-- logical partial groups satisfy Section 4.2 and physical padding satisfies its storage layout;
-- the selected storage layout is semantically valid for the numeric format.
+The runtime reader establishes numeric-format identity, layout compatibility, logical and physical
+extents, encoded size, alignment, and payload bounds. The model binder then establishes the exact
+format/layout/consumer/shape/compute-profile/GPU whitelist and any cheap role-specific invariant it
+needs directly. The generic parser does not own that target support matrix.
 
-Integrity metadata such as checksums does not replace semantic validation. Conversely, the hot
-kernel need not repeatedly scan trusted weights after this boundary has established the invariant.
-
-After generic artifact and layout validation, the model-binding integration layer must separately
-establish that the exact format/layout/consumer/shape/compute-profile/GPU combination is on its
-closed support whitelist. The generic container parser does not own the model or kernel support
-matrix.
+The runtime intentionally does not scan every code, scale, direct word, or padding byte of a locally
+generated artifact before upload. Consumers may rely on the registered producer's value contract;
+codec and operator tests independently protect the representation and numerical interpretation.
 
 ### 8.4 Kernel and operator
 
@@ -610,8 +604,9 @@ document must separately define, for every persisted source tensor or derived te
 
 Those facts may differ between exact checkpoints in the same family. Dense attention, MoE experts,
 MTP predictors, vision towers, embeddings, and output heads receive no automatic assignment from
-their role names. Rank-3 support in Section 4 makes expert banks representable; it does not decide
-expert routing, expert ordering, or which expert weights should be quantized.
+their role names. Section 4 defines how a higher-rank expert bank would be grouped numerically, but
+the current row-split storage implementation remains rank two; a future MoE recipe must explicitly
+register its physical layout or define the reshape used by its compiled target.
 
 Similarly, a format's presence in a `.ninfer` artifact does not prove runtime support. The selected
 model implementation must bind that tensor to a supported model consumer or operator path on the
@@ -641,8 +636,8 @@ in llama.cpp, TensorRT-LLM, vLLM, a model release, or a hardware library is rese
 it does not create a NInfer registry entry, loader branch, conversion option, or kernel obligation.
 
 Binary16 remains the scale component denoted by `F16S`; that use does not imply a direct `FP16`
-format. Names such as the current `BF16_CTRL`, `FP32_CTRL`, and `I32_CTRL` combine type with a model
-role and are not carried into this registry.
+format. The internal execution names `BF16_CTRL`, `FP32_CTRL`, and `I32_CTRL` are not persistent
+registry identities.
 
 ## 11. Admission and retirement
 
@@ -657,7 +652,7 @@ The proposal must provide:
 
 - the exact checkpoint tensors that need the format;
 - the exact logical-word or code/scale representation and reconstruction oracle;
-- any required source conversion or a reproducible quantization encoder;
+- any required source conversion or a defined quantization encoder;
 - for a lossy format, cited credible upstream/public evidence or implementation precedent supporting
   acceptable quality for that checkpoint;
 - the intended persistent layout and validation strategy;
@@ -693,34 +688,24 @@ NInfer product owns.
 
 ## 12. Required conformance evidence
 
-Implementation of this document must be protected at the representation boundary, not by tests that
-scan enum spellings or private kernel layout. Independent codec and validation evidence must cover:
+Implementation of this document is protected at the representation boundary, not by tests that scan
+enum spellings or private kernel layout. The retained codec and encoder evidence covers:
 
-- bit-exact direct round trips for BF16 and FP32 signed zeros, subnormals, `+1`, `-1`, maximum finite
-  values, infinities, and distinct NaN payloads;
-- bit-exact direct round trips for the I32 minimum, maximum, `-1`, and zero words;
-- rejection of an undeclared cross-type conversion, silent integer wrap, truncation, or saturation;
-- positive-zero and negative-zero source values in an all-zero group;
-- nonzero groups whose raw scale underflows binary16 and therefore uses `0x0001`;
-- binary32-to-binary16 scale rounding boundaries;
-- positive and negative ties-to-even during code selection;
-- Q4, Q5, Q6, and W8 values that reach both legal interval ends;
-- rejection of W8 code `-128`;
-- rejection of negative, negative-zero, infinite, and NaN scales;
-- rejection of a positive-zero scale paired with a nonzero code;
-- validity of a positive scale paired with all-zero codes;
-- final partial groups, independently of any storage-layout padding policy;
-- rank-3 rows whose adjacent experts have very different magnitudes;
-- a vector that distinguishes reciprocal-multiply from direct division;
-- rejection of non-finite source values and binary16 scale overflow by the canonical encoder.
+- exact representative BF16, FP32, and I32 word round trips, including signed zeros, subnormals, NaN
+  payload bits, and integer extrema, plus rejection of implicit cross-type encoding;
+- Q4, Q5, Q6, and W8 plane bit order, legal interval endpoints, encoded-size geometry, partial-K zero
+  padding, consecutive row views, and arbitrary row gathers;
+- canonical binary16 scale rounding, reciprocal-multiply rather than direct division, positive and
+  negative ties-to-even, minimum-subnormal rescue, and rejection of non-finite or overflowing source
+  groups;
+- canonical quantization followed by exact stored code/scale decode for a partially populated group.
 
 For direct formats, the independent decode oracle is the abstract logical word in Section 3. For
 grouped formats, it is the binary32 reconstruction in Section 6.2. The canonical quantization encode
 oracle is a bit-level host/software implementation of the ordered algorithm in Section 7; production
 converters require parity against it rather than defining the oracle through their own arithmetic.
-Numerical kernel tests additionally state their activation rounding boundary, accumulation
-precision, output tolerance, and real target shapes. Every materialized storage layout separately
-tests its own padding and alignment contract.
+Numerical operator tests separately protect the combinations used by the registered target, including
+their activation rounding boundary, accumulation precision, output tolerance, and real target shapes.
 
 ## 13. Consequences for container and model design
 

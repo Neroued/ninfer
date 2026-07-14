@@ -728,7 +728,7 @@ int main() {
         return 0;
     }
 
-    if (std::getenv("QUS_LINEAR_TEST_W8G32_ONLY") != nullptr) {
+    if (std::getenv("NINFER_LINEAR_TEST_W8G32_ONLY") != nullptr) {
         int f = 0;
         f += one_quant_shape(QType::W8G32_F16S, 64, 256, {128}, 119u);
         f += one_quant_shape(QType::W8G32_F16S, 70, 130, {17}, 121u);
@@ -736,7 +736,7 @@ int main() {
         std::cout << (f ? "FAIL" : "OK") << " linear W8G32 focused correctness\n";
         return f ? 1 : 0;
     }
-    if (std::getenv("QUS_LINEAR_TEST_PREFILL_FUSIONS_ONLY") != nullptr) {
+    if (std::getenv("NINFER_LINEAR_TEST_PREFILL_FUSIONS_ONLY") != nullptr) {
         const int f = prefill_fusion_correctness();
         std::cout << (f ? "FAIL" : "OK") << " linear prefill fusion correctness\n";
         return f ? 1 : 0;

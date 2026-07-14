@@ -135,7 +135,7 @@ def metrics_from_result(tokens: int, context: int, mode: str, result: dict[str, 
     }
 
 
-def load_qus_csv(path: str) -> dict[tuple[int, int], dict[str, str]]:
+def load_ninfer_csv(path: str) -> dict[tuple[int, int], dict[str, str]]:
     if not path:
         return {}
     out: dict[tuple[int, int], dict[str, str]] = {}
@@ -145,18 +145,18 @@ def load_qus_csv(path: str) -> dict[tuple[int, int], dict[str, str]]:
     return out
 
 
-def attach_qus_comparison(rows: list[dict], qus_rows: dict[tuple[int, int], dict[str, str]]) -> None:
+def attach_ninfer_comparison(rows: list[dict], ninfer_rows: dict[tuple[int, int], dict[str, str]]) -> None:
     for row in rows:
-        qus = qus_rows.get((int(row["T"]), int(row["context"])))
-        if qus is None:
+        ninfer = ninfer_rows.get((int(row["T"]), int(row["context"])))
+        if ninfer is None:
             continue
-        qus_ms = float(qus["ms"])
-        qus_tflops = float(qus["tflops"])
-        row["qus_ms"] = qus_ms
-        row["qus_tflops"] = qus_tflops
-        row["flash_vs_qus_speedup"] = qus_ms / float(row["ms"]) if float(row["ms"]) > 0.0 else None
-        row["flash_vs_qus_tflops_ratio"] = (
-            float(row["tflops"]) / qus_tflops if qus_tflops > 0.0 else None
+        ninfer_ms = float(ninfer["ms"])
+        ninfer_tflops = float(ninfer["tflops"])
+        row["ninfer_ms"] = ninfer_ms
+        row["ninfer_tflops"] = ninfer_tflops
+        row["flash_vs_ninfer_speedup"] = ninfer_ms / float(row["ms"]) if float(row["ms"]) > 0.0 else None
+        row["flash_vs_ninfer_tflops_ratio"] = (
+            float(row["tflops"]) / ninfer_tflops if ninfer_tflops > 0.0 else None
         )
 
 
@@ -185,7 +185,7 @@ def write_json(path: str, rows: list[dict], metadata: dict) -> None:
     p.write_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "artifact_type": "flash_attn_gqa_append_prompt_bench",
                 **metadata,
                 "results": rows,
@@ -367,7 +367,7 @@ def main() -> int:
     )
     parser.add_argument("--csv-out", default="")
     parser.add_argument("--json-out", default="")
-    parser.add_argument("--qus-csv", default="", help="optional qus_gqa_attention_bench CSV to merge")
+    parser.add_argument("--ninfer-csv", default="", help="optional ninfer_gqa_attention_bench CSV to merge")
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
 
@@ -515,7 +515,7 @@ def main() -> int:
                     f"tc={row['tflops_pct']:6.2f}% ns/key={row['ns_per_key_query']:6.3f}"
                 )
 
-    attach_qus_comparison(rows, load_qus_csv(args.qus_csv))
+    attach_ninfer_comparison(rows, load_ninfer_csv(args.ninfer_csv))
     metadata = {
         "torch_version": torch.__version__,
         "torch_cuda": torch.version.cuda,

@@ -15,7 +15,7 @@ from tools.q5090.ref.config import CFG
 def load_manifest(root: Path) -> dict:
     with (root / "manifest.json").open("r", encoding="utf-8") as file:
         manifest = json.load(file)
-    if manifest.get("format") != "qus_activation_dump_v1":
+    if manifest.get("format") != "ninfer_activation_dump_v1":
         raise ValueError(f"{root}: unsupported activation dump format")
     return manifest
 

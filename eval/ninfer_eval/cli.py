@@ -25,7 +25,7 @@ EXIT_CANCELLED = 6
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="qus-eval", description="Run repository-local model capability evaluations"
+        prog="ninfer-eval", description="Run repository-local model capability evaluations"
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

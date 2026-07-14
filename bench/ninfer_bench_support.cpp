@@ -680,7 +680,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
     out << "{\n"
         << "  \"schema_version\": " << kSchemaVersion << ",\n"
         << "  \"artifact_type\": \"" << kArtifactType << "\",\n"
-        << "  \"tool\": \"qus_bench\",\n"
+        << "  \"tool\": \"ninfer_bench\",\n"
         << "  \"command\": \"" << json_escape(command) << "\",\n"
         << "  \"git_commit\": \"" << json_escape(env.git_commit) << "\",\n"
         << "  \"worktree_dirty\": " << (env.worktree_dirty ? "true" : "false") << ",\n"

@@ -333,9 +333,10 @@ int test_format_json_schema() {
     } catch (const nlohmann::json::exception& e) {
         return fail(std::string("format_json produced invalid JSON: ") + e.what());
     }
-    failures += expect_bool(report.at("schema_version").get<int>() == 6, "json schema version");
-    failures += expect_string(report.at("artifact_type").get<std::string>(), "qus_bench_report",
+    failures += expect_bool(report.at("schema_version").get<int>() == 7, "json schema version");
+    failures += expect_string(report.at("artifact_type").get<std::string>(), "ninfer_bench_report",
                               "json artifact type");
+    failures += expect_string(report.at("tool").get<std::string>(), "ninfer_bench", "json tool");
     failures += expect_bool(report.at("config").at("prefill_chunk").get<int>() ==
                                 static_cast<int>(ninfer::model::kDefaultPrefillChunk),
                             "json config prefill_chunk");

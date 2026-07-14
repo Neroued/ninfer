@@ -1,5 +1,5 @@
 {
-  "artifact_type": "qus_bench_corpus",
+  "artifact_type": "ninfer_bench_corpus",
   "schema_version": 1,
   "tokenizer_source": "local_hf",
   "tokenizer_model_id": "Qwen/Qwen3.6-27B",

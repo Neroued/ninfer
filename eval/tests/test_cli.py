@@ -4,7 +4,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-from qus_eval.cli import EXIT_CONFIG, main
+from ninfer_eval.cli import EXIT_CONFIG, main
 
 
 class CliTest(unittest.TestCase):

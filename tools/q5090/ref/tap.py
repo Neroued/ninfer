@@ -80,7 +80,7 @@ class FileTap:
 
     def close(self, **metadata) -> None:
         manifest = {
-            "format": "qus_activation_dump_v1",
+            "format": "ninfer_activation_dump_v1",
             **metadata,
             "tensors": [record.__dict__ for record in self.records],
         }

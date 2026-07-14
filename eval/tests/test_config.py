@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from qus_eval.config import ConfigError, load_config
-from qus_eval.secrets import resolve_target
+from ninfer_eval.config import ConfigError, load_config
+from ninfer_eval.secrets import resolve_target
 
 BASE = """
 schema_version: 1

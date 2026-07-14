@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the current-state qus_bench performance matrix.
+"""Run the current-state ninfer_bench performance matrix.
 
 The matrix is intentionally layered instead of fully factorial:
 
@@ -9,7 +9,7 @@ The matrix is intentionally layered instead of fully factorial:
 * CUDA graph is compared only for decode-bearing tests.
 * Prefill-only tests sweep length and chunk size, but not graph on/off.
 
-Raw qus_bench reports stay under profiles/bench and are ignored by git. This
+Raw ninfer_bench reports stay under profiles/bench and are ignored by git. This
 script writes a manifest, exact commands, per-case logs, raw JSON reports, and a
 flat summary CSV/JSON that is easy to compare across runs.
 """
@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_BENCH = REPO_ROOT / "build/bench/qus_bench"
+DEFAULT_BENCH = REPO_ROOT / "build/bench/ninfer_bench"
 DEFAULT_WEIGHTS = REPO_ROOT / "out/qwen3_6_27b.q5090_w4g64_mixed_v4_2.qus"
 DEFAULT_CORPUS = REPO_ROOT / "bench/fixtures/bench_corpus.ids"
 
@@ -40,6 +40,9 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
+REPORT_SCHEMA_VERSION = 7
+REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
+REPORT_TOOL = "ninfer_bench"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -255,8 +258,27 @@ def max_prompt_in_cases(cases: Sequence[BenchCase]) -> int:
     return max_prompt
 
 
-def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
+def load_bench_report(report_path: Path) -> dict[str, Any]:
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(report, dict):
+        raise ValueError("benchmark report root must be an object")
+    identity = (
+        report.get("schema_version"),
+        report.get("artifact_type"),
+        report.get("tool"),
+    )
+    expected = (REPORT_SCHEMA_VERSION, REPORT_ARTIFACT_TYPE, REPORT_TOOL)
+    if identity != expected:
+        raise ValueError(
+            "unsupported benchmark report identity: "
+            f"schema_version={identity[0]!r}, artifact_type={identity[1]!r}, "
+            f"tool={identity[2]!r}; expected {expected!r}"
+        )
+    return report
+
+
+def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
+    report = load_bench_report(report_path)
     config = report.get("config", {})
     rows = []
     for test in report.get("tests", []):
@@ -335,7 +357,7 @@ def write_manifest(
     commands: Sequence[dict[str, Any]],
 ) -> None:
     manifest = {
-        "artifact_type": "qus_bench_matrix_run",
+        "artifact_type": "ninfer_bench_matrix_run",
         "schema_version": 1,
         "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
         "preset": args.preset,
@@ -374,7 +396,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=None, help="override all case warmup repetitions")
     parser.add_argument("--dry-run", action="store_true", help="write commands but do not execute")
     parser.add_argument("--resume", action="store_true", help="skip cases with an existing valid JSON report")
-    parser.add_argument("--no-build", action="store_true", help="do not build qus_bench before running")
+    parser.add_argument("--no-build", action="store_true", help="do not build ninfer_bench before running")
     return parser.parse_args(argv)
 
 
@@ -457,7 +479,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         build_stdout = log_dir / "build.stdout.txt"
         build_stderr = log_dir / "build.stderr.txt"
         rc = run_command(
-            ["cmake", "--build", "build", "-j", "--target", "qus_bench"],
+            ["cmake", "--build", "build", "-j", "--target", "ninfer_bench"],
             build_stdout,
             build_stderr,
         )
@@ -484,10 +506,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         report_path = Path(record["report"])
         if args.resume and report_path.is_file():
             try:
-                json.loads(report_path.read_text(encoding="utf-8"))
+                load_bench_report(report_path)
                 print(f"[{index}/{len(cases)}] skip {case.name} (existing report)")
                 continue
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, OSError, TypeError, ValueError):
                 pass
 
         stdout_path = log_dir / f"{case.suite}.{case.name}.stdout.txt"

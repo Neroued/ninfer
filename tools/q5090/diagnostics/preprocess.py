@@ -15,7 +15,7 @@ from tools.q5090.ref.multimodal import Processor, load_messages
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cpp", default="build/src/qus-preprocess")
+    parser.add_argument("--cpp", default="build/src/ninfer-preprocess")
     parser.add_argument("--weights", required=True)
     parser.add_argument("--processor", required=True)
     parser.add_argument("--messages", required=True)
@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     thinking = not args.no_thinking
-    with tempfile.TemporaryDirectory(prefix="qus-preprocess-parity-") as directory:
+    with tempfile.TemporaryDirectory(prefix="ninfer-preprocess-parity-") as directory:
         metadata = Path(directory) / "cpp.json"
         patches = Path(directory) / "cpp.f32"
         command = [args.cpp, args.weights, args.messages, str(metadata), str(patches)]

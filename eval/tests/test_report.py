@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from qus_eval.result import DatasetResult, ResultCounts, write_summary
+from ninfer_eval.result import DatasetResult, ResultCounts, write_summary
 
 
 class ReportTest(unittest.TestCase):

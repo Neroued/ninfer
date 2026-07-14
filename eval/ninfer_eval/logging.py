@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def create_run_logger(run_dir: Path, debug: bool = False) -> logging.Logger:
-    logger = logging.getLogger(f"qus_eval.{run_dir.name}")
+    logger = logging.getLogger(f"ninfer_eval.{run_dir.name}")
     logger.setLevel(logging.DEBUG if debug else logging.INFO)
     logger.propagate = False
     logger.handlers.clear()

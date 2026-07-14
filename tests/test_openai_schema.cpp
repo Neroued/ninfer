@@ -448,9 +448,12 @@ int test_models_and_error() {
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
+    failures += check(list.at("data").at(0).at("owned_by") == "ninfer",
+                      "models list owner");
 
     const Json one = Json::parse(make_model_object("qwen3.6-27b", 1));
     failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
+    failures += check(one.at("owned_by") == "ninfer", "model owner");
 
     ApiError error;
     error.status   = 400;

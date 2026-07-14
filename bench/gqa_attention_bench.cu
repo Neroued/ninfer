@@ -968,7 +968,7 @@ std::string format_prefill_json(const std::vector<PrefillMetrics>& results,
     std::ostringstream out;
     out << "{\n"
         << "  \"schema_version\": 1,\n"
-        << "  \"artifact_type\": \"qus_gqa_attention_prefill_bench\",\n"
+        << "  \"artifact_type\": \"ninfer_gqa_attention_prefill_bench\",\n"
         << "  \"tc_peak_tflops\": " << json_number(kDenseTcPeakTflops) << ",\n"
         << "  \"dram_peak_gbps\": " << json_number(kDramPeakGBs) << ",\n"
         << "  \"flops_definition\": \"useful_causal_2*d*Hq*T*(T+1)\",\n"
@@ -1038,7 +1038,7 @@ std::string format_append_prompt_json(const std::vector<AppendPromptMetrics>& re
     std::ostringstream out;
     out << "{\n"
         << "  \"schema_version\": 2,\n"
-        << "  \"artifact_type\": \"qus_gqa_attention_append_prompt_bench\",\n"
+        << "  \"artifact_type\": \"ninfer_gqa_attention_append_prompt_bench\",\n"
         << "  \"tc_peak_tflops\": " << json_number(kDenseTcPeakTflops) << ",\n"
         << "  \"dram_peak_gbps\": " << json_number(kDramPeakGBs) << ",\n"
         << "  \"q_block\": " << kPromptQBlock << ",\n"

@@ -156,7 +156,7 @@ def main() -> None:
         (root / "manifest.json").write_text(
             json.dumps(
                 {
-                    "format": "qus_activation_dump_v1",
+                    "format": "ninfer_activation_dump_v1",
                     "runtime": "python-q5090",
                     "tensors": records,
                 },

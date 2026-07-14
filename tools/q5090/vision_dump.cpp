@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
         DumpContext dump{out_dir};
         (void)vision.encode(input, workspace, &dump, dump_tensor);
         context.synchronize();
-        Json manifest{{"format", "qus_activation_dump_v1"},
+        Json manifest{{"format", "ninfer_activation_dump_v1"},
                       {"runtime", "cpp"},
                       {"raw_patches", input.stats.raw_patches},
                       {"vision_tokens", input.stats.vision_tokens},

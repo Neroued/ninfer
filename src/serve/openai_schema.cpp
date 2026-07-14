@@ -603,13 +603,13 @@ std::string make_models_list(const std::string& model_id, std::int64_t created) 
         {"object", "list"},
         {"data",
          Json::array({Json{
-             {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "qus"}}})}};
+             {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "ninfer"}}})}};
     return payload.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created) {
     const Json payload = {
-        {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "qus"}};
+        {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "ninfer"}};
     return payload.dump();
 }
 

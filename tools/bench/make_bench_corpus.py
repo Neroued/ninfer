@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Bake the qus_bench meaningful-token corpus.
+"""Bake the ninfer_bench meaningful-token corpus.
 
-qus_bench slices the first P token ids of this corpus to build a prefill of an exact
+ninfer_bench slices the first P token ids of this corpus to build a prefill of an exact
 length P, so the corpus must be real, in-distribution text (not random/dummy tokens) and at
 least as long as the largest prefill you want to benchmark.
 
@@ -139,10 +139,10 @@ def rotate(paragraphs: Sequence[str], by: int) -> list[str]:
 
 
 def resolve_tokenizer_path(cli_path: str | None) -> Path:
-    raw = cli_path or os.environ.get("QUS_TOKENIZER_PATH")
+    raw = cli_path or os.environ.get("NINFER_TOKENIZER_PATH")
     if not raw:
         raise SystemExit(
-            "tokenizer path required; pass --tokenizer-path or set QUS_TOKENIZER_PATH"
+            "tokenizer path required; pass --tokenizer-path or set NINFER_TOKENIZER_PATH"
         )
     path = Path(raw).expanduser().resolve()
     if not path.is_dir():
@@ -231,7 +231,7 @@ def build_manifest(
     ids: Sequence[int], ids_text: str, tokens: int, source_provenance: list[dict[str, str]]
 ) -> dict[str, Any]:
     return {
-        "artifact_type": "qus_bench_corpus",
+        "artifact_type": "ninfer_bench_corpus",
         "schema_version": 1,
         "tokenizer_source": "local_hf",
         "tokenizer_model_id": TOKENIZER_MODEL_ID,
@@ -271,6 +271,19 @@ def check_outputs(out_path: Path, manifest_path: Path) -> int:
     ids_text = out_path.read_text(encoding="utf-8")
     ids = parse_ids_text(ids_text)
     failures = 0
+    if manifest.get("artifact_type") != "ninfer_bench_corpus":
+        print(
+            "artifact_type mismatch: "
+            f"{manifest.get('artifact_type')!r} != 'ninfer_bench_corpus'",
+            file=sys.stderr,
+        )
+        failures += 1
+    if manifest.get("schema_version") != 1:
+        print(
+            f"schema_version mismatch: {manifest.get('schema_version')!r} != 1",
+            file=sys.stderr,
+        )
+        failures += 1
     actual_sha = sha256_text(ids_text)
     if actual_sha != manifest.get("ids_sha256"):
         print(f"ids_sha256 mismatch: {actual_sha} != {manifest.get('ids_sha256')}", file=sys.stderr)

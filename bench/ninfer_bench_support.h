@@ -18,8 +18,8 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                  = 6;
-inline constexpr std::string_view kArtifactType      = "qus_bench_report";
+inline constexpr int kSchemaVersion                  = 7;
+inline constexpr std::string_view kArtifactType      = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath = "bench/fixtures/bench_corpus.ids";
 // Seed tokens prefilled (untimed) before a pure decode (tg) test so the model has a valid
 // context to decode from. Kept tiny so tg measures near-peak decode throughput.

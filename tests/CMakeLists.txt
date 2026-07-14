@@ -14,6 +14,17 @@ endfunction()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
+add_executable(ninfer_artifact_reader_test
+  test_ninfer_artifact_reader.cpp
+  ${PROJECT_SOURCE_DIR}/src/artifact/reader.cpp
+  ${PROJECT_SOURCE_DIR}/src/artifact/storage_layouts.cpp)
+target_include_directories(ninfer_artifact_reader_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party)
+target_compile_definitions(ninfer_artifact_reader_test PRIVATE
+  NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+add_test(NAME ninfer_artifact_reader_test COMMAND ninfer_artifact_reader_test)
+
 ninfer_add_test(ninfer_device_test                 SOURCES test_device.cpp)
 ninfer_add_test(ninfer_tensor_test                 SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_weight_test                 SOURCES test_weight.cpp)

@@ -5,7 +5,6 @@
 #include "runtime/generation/generation_budget.h"
 #include "runtime/generation/generation_guard.h"
 #include "runtime/generation/output_publisher.h"
-#include "runtime/generation/output_resolution.h"
 
 #include <chrono>
 #include <cstdint>
@@ -35,7 +34,6 @@ ControllerResult run_one(Program& program, PreparedPrompt prompt, OutputSession 
     const auto total_start = Clock::now();
 
     ControllerResult result;
-    result.summary.committed_output_tokens = 0;
     OutputPublisher publisher(sink);
 
     const auto finish_without_execution = [&](FinishReason reason) {
@@ -63,55 +61,44 @@ ControllerResult run_one(Program& program, PreparedPrompt prompt, OutputSession 
     result.generated_token_ids.reserve(plan_summary.effective_output_tokens);
     GenerationGuard guard(program);
 
-    const auto finish_result = [&](FinishReason reason,
-                                   std::optional<FinishDisposition> disposition) {
-        result.summary.committed_output_tokens =
-            static_cast<std::uint32_t>(result.generated_token_ids.size());
+    const auto finish_result = [&](FinishReason reason) {
         result.summary.finish_reason = reason;
-        result.summary.sequence      = disposition;
         result.content               = publisher.take_content();
         result.reasoning             = publisher.take_reasoning();
         result.total_seconds = std::chrono::duration<double>(Clock::now() - total_start).count();
         return std::move(result);
     };
 
-    const auto resolve_and_publish = [&](auto pending) -> std::optional<ControllerResult> {
+    const auto resolve_and_publish = [&](GeneratedRound round) -> std::optional<ControllerResult> {
         if (cancellation.requested()) {
-            auto staged = output.stage_terminal(FinishReason::Cancelled);
-            const OutputResolution resolution =
-                terminal_resolution(staged, FinishReason::Cancelled);
-            auto decoder_commit = output.prepare_commit(std::move(staged), resolution);
-            std::move(pending).discard();
-            auto deltas = output.commit(std::move(decoder_commit));
+            (void)output.preview_terminal(FinishReason::Cancelled);
+            program.abort_request();
+            auto deltas = output.commit_preview();
             publisher.publish(std::move(deltas));
-            return finish_result(FinishReason::Cancelled, FinishDisposition::Invalid);
+            return finish_result(FinishReason::Cancelled);
         }
 
-        const std::span<const TokenId> tokens = pending.tokens();
-        auto staged                           = output.stage(tokens);
-        const OutputResolution resolution     = decide_resolution(staged, tokens, budget);
-        auto decoder_commit = output.prepare_commit(std::move(staged), resolution);
+        const std::span<const TokenId> tokens = round.tokens;
+        const OutputDecision decision =
+            output.preview(tokens, budget.remaining(), budget.limit_reason());
 
         result.generated_token_ids.insert(
             result.generated_token_ids.end(), tokens.begin(),
-            tokens.begin() + static_cast<std::ptrdiff_t>(resolution.committed_tokens));
+            tokens.begin() + static_cast<std::ptrdiff_t>(decision.accepted_tokens));
 
-        std::optional<FinishDisposition> disposition;
-        if (resolution.continuation == RoundContinuation::Continue) {
-            if (resolution.committed_tokens != tokens.size()) {
+        if (!decision.finished()) {
+            if (decision.accepted_tokens != tokens.size()) {
                 throw std::logic_error("a continuing round must commit every licensed token");
             }
-            std::move(pending).commit_all();
-        } else {
-            disposition = std::move(pending).commit_prefix_and_finish(resolution.committed_tokens);
         }
+        program.resolve_pending(decision.accepted_tokens, decision.finished());
 
-        auto deltas = output.commit(std::move(decoder_commit));
-        budget.commit(resolution.committed_tokens);
+        auto deltas = output.commit_preview();
+        budget.commit(decision.accepted_tokens);
         publisher.publish(std::move(deltas));
 
-        if (resolution.continuation == RoundContinuation::Finish) {
-            return finish_result(resolution.finish_reason, disposition);
+        if (decision.finished()) {
+            return finish_result(decision.finish_reason);
         }
         return std::nullopt;
     };
@@ -123,28 +110,25 @@ ControllerResult run_one(Program& program, PreparedPrompt prompt, OutputSession 
     result.prefill_seconds = std::chrono::duration<double>(Clock::now() - prefill_start).count();
     result.summary.begin   = first.summary;
     guard.arm();
-    if (auto done = resolve_and_publish(std::move(first.round))) {
+    if (auto done = resolve_and_publish(first.round)) {
         guard.complete();
         return std::move(*done);
     }
 
     while (budget.remaining() != 0) {
         if (cancellation.requested()) {
-            auto staged = output.stage_terminal(FinishReason::Cancelled);
-            const OutputResolution resolution =
-                terminal_resolution(staged, FinishReason::Cancelled);
-            auto decoder_commit = output.prepare_commit(std::move(staged), resolution);
+            (void)output.preview_terminal(FinishReason::Cancelled);
             program.finish_active();
-            auto deltas = output.commit(std::move(decoder_commit));
+            auto deltas = output.commit_preview();
             publisher.publish(std::move(deltas));
             guard.complete();
-            return finish_result(FinishReason::Cancelled, FinishDisposition::Resident);
+            return finish_result(FinishReason::Cancelled);
         }
 
         const auto decode_start = Clock::now();
         auto round              = program.decode_round(budget.round_budget());
         result.decode_seconds += std::chrono::duration<double>(Clock::now() - decode_start).count();
-        if (auto done = resolve_and_publish(std::move(round))) {
+        if (auto done = resolve_and_publish(round)) {
             guard.complete();
             return std::move(*done);
         }

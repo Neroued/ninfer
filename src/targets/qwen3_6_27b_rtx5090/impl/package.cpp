@@ -42,27 +42,27 @@ RequestPlan Program::plan_request(const PreparedPrompt& prompt,
     return impl_->plan_request(*prompt.data_, options);
 }
 
-runtime::BeginRound<Program> Program::begin(PreparedPrompt&& prompt, RequestPlan&& plan,
-                                            runtime::TransientRegion transient) {
+runtime::BeginResult Program::begin(PreparedPrompt&& prompt, RequestPlan&& plan,
+                                    runtime::TransientRegion transient) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     auto data = std::move(prompt.data_);
-    return impl_->begin(*this, std::move(*data), std::move(plan), transient);
+    return impl_->begin(std::move(*data), std::move(plan), transient);
 }
 
-runtime::PendingRound<Program> Program::decode_round(runtime::RoundBudget budget) {
-    return impl_->decode_round(*this, budget);
+runtime::GeneratedRound Program::decode_round(runtime::RoundBudget budget) {
+    return impl_->decode_round(budget);
+}
+
+void Program::resolve_pending(std::uint32_t accepted_tokens, bool terminal) {
+    impl_->resolve_pending(accepted_tokens, terminal);
 }
 
 void Program::finish_active() { impl_->finish_active(); }
 
-void Program::abort_active() noexcept { impl_->abort_active(); }
+void Program::abort_request() noexcept { impl_->abort_request(); }
 
-void Program::clear_resident() noexcept { impl_->clear_resident(); }
-
-runtime::ProgramState Program::state() const noexcept { return impl_->lifecycle; }
-
-runtime::SequenceSummary Program::sequence_summary() const noexcept {
-    return impl_->sequence_summary();
+std::uint32_t Program::materialized_tokens() const noexcept {
+    return impl_->materialized_tokens();
 }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
@@ -74,23 +74,6 @@ GenerationTimings Program::generation_timings() const noexcept {
 }
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
-
-bool Program::is_live_thunk(const Program& owner, std::uint64_t round_epoch) noexcept {
-    return owner.impl_->is_live(round_epoch);
-}
-
-void Program::commit_all_thunk(Program& owner, std::uint64_t round_epoch) {
-    owner.impl_->commit_all(round_epoch);
-}
-
-runtime::FinishDisposition Program::finish_thunk(Program& owner, std::uint64_t round_epoch,
-                                                 std::size_t count) {
-    return owner.impl_->commit_prefix_and_finish(round_epoch, count);
-}
-
-void Program::discard_thunk(Program& owner, std::uint64_t round_epoch) noexcept {
-    owner.impl_->discard(round_epoch);
-}
 
 } // namespace ninfer::targets::qwen3_6_27b_rtx5090::detail
 

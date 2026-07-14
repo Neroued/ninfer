@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
-#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -62,21 +61,6 @@ FrontendResources resources() {
     result.video_preprocessor_config_json =
         R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"rescale_factor":0.00392156862745098,"size":{"shortest_edge":4096,"longest_edge":25165824},"fps":2,"min_frames":4,"max_frames":768})";
     return result;
-}
-
-PublishedOutput resolve(ninfer::targets::qwen3_6_27b_rtx5090::detail::OutputSession& session,
-                        ninfer::targets::qwen3_6_27b_rtx5090::detail::StagedText staged,
-                        std::uint32_t count, ninfer::runtime::RoundContinuation continuation,
-                        ninfer::FinishReason reason,
-                        std::optional<ninfer::runtime::StagedChoiceId> selected = std::nullopt) {
-    const ninfer::runtime::StagedChoiceId choice =
-        selected.value_or(staged.choice_for(count, continuation, reason));
-    auto plan = session.prepare_commit(
-        std::move(staged), ninfer::runtime::OutputResolution{.committed_tokens = count,
-                                                             .continuation     = continuation,
-                                                             .finish_reason    = reason,
-                                                             .staged_choice    = choice});
-    return session.commit(std::move(plan));
 }
 
 std::string channel_text(const PublishedOutput& output, ninfer::OutputChannel channel) {
@@ -143,10 +127,10 @@ int test_text_and_image_prepare(const Frontend& frontend) {
         prepared_data.patches.size() == 256 * 1536 && prepared_data.prepare.raw_patches == 256 &&
             prepared_data.prepare.vision_tokens == 64 && !prepared_data.identity.reusable,
         "image frontend did not own the expected patch payload and identity");
-    failures += check(
-        ninfer::targets::qwen3_6_27b_rtx5090::detail::schedule::vision_workspace_bytes(
-            prepared_data) > 0,
-        "image frontend metadata did not produce a Vision workspace plan");
+    failures +=
+        check(ninfer::targets::qwen3_6_27b_rtx5090::detail::schedule::vision_workspace_bytes(
+                  prepared_data) > 0,
+              "image frontend metadata did not produce a Vision workspace plan");
     return failures;
 }
 
@@ -156,30 +140,41 @@ int test_cross_round_stop(const Frontend& frontend) {
     stop.strings.push_back(ninfer::StopString{.text = "STOP"});
     auto session = frontend.make_output_session(prompt, stop);
 
-    const auto first =
-        resolve(session, session.stage(std::array<ninfer::TokenId, 1>{1}), 1,
-                ninfer::runtime::RoundContinuation::Continue, ninfer::FinishReason::None);
-    int failures = check(channel_text(first, ninfer::OutputChannel::Content) == "hello",
-                         "cross-round stop did not retain the ambiguous suffix");
+    const auto first_decision =
+        session.preview(std::array<ninfer::TokenId, 1>{1}, 2, ninfer::FinishReason::OutputLimit);
+    int failures     = check(first_decision.accepted_tokens == 1 && !first_decision.finished(),
+                             "cross-round stop ended before the stop string was complete");
+    const auto first = session.commit_preview();
+    failures += check(channel_text(first, ninfer::OutputChannel::Content) == "hello",
+                      "cross-round stop did not retain the ambiguous suffix");
 
-    auto staged = session.stage(std::array<ninfer::TokenId, 1>{2});
-    std::optional<ninfer::runtime::StagedChoiceId> stop_choice;
-    for (const auto& candidate : staged.candidates()) {
-        if (candidate.finish_reason == ninfer::FinishReason::StopString) {
-            stop_choice = candidate.id;
-            failures +=
-                check(candidate.committed_tokens == 1 && candidate.decoded_byte_cut_order == 5,
-                      "stop-string candidate did not map to the exact token/byte cut");
-            break;
-        }
-    }
-    failures += check(stop_choice.has_value(), "cross-round stop candidate was not staged");
-    if (stop_choice.has_value()) {
-        const auto second =
-            resolve(session, std::move(staged), 1, ninfer::runtime::RoundContinuation::Finish,
-                    ninfer::FinishReason::StopString, stop_choice);
-        failures += check(second.empty(), "stop marker or same-token suffix leaked to output");
-    }
+    const auto second_decision =
+        session.preview(std::array<ninfer::TokenId, 1>{2}, 1, ninfer::FinishReason::OutputLimit);
+    failures += check(second_decision.accepted_tokens == 1 &&
+                          second_decision.finish_reason == ninfer::FinishReason::StopString,
+                      "cross-round stop did not select the exact terminal token prefix");
+    const auto second = session.commit_preview();
+    failures += check(second.empty(), "stop marker or same-token suffix leaked to output");
+    return failures;
+}
+
+int test_same_token_stop_priority(const Frontend& frontend) {
+    auto prompt = frontend.prepare_tokens({0});
+    ninfer::StopPolicy stop;
+    stop.strings = {
+        ninfer::StopString{.text = "tail", .include_in_output = true},
+        ninfer::StopString{.text = "OPtail"},
+        ninfer::StopString{.text = "OP", .include_in_output = true},
+    };
+    auto session = frontend.make_output_session(prompt, stop);
+    const auto decision =
+        session.preview(std::array<ninfer::TokenId, 1>{2}, 2, ninfer::FinishReason::OutputLimit);
+    int failures      = check(decision.accepted_tokens == 1 &&
+                                  decision.finish_reason == ninfer::FinishReason::StopString,
+                              "same-token stop strings did not select a terminal prefix");
+    const auto output = session.commit_preview();
+    failures += check(output.empty(),
+                      "same-token stops did not prefer the earliest byte and declaration order");
     return failures;
 }
 
@@ -188,45 +183,59 @@ int test_reasoning_split(const Frontend& frontend) {
     FrontendFactory::inspect(prompt).starts_in_reasoning = true;
     auto session                                         = frontend.make_output_session(prompt, {});
     const std::array<ninfer::TokenId, 2> tokens{3, 4};
-    const auto output =
-        resolve(session, session.stage(tokens), 2, ninfer::runtime::RoundContinuation::Finish,
-                ninfer::FinishReason::OutputLimit);
-    int failures = check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
-                         "reasoning channel did not remove the close marker");
+    const auto decision = session.preview(tokens, 2, ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.accepted_tokens == 2 &&
+                                    decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                                "reasoning output did not finish at the requested token limit");
+    const auto output   = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
+                      "reasoning channel did not remove the close marker");
     failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
                       "content channel did not strip the post-thinking separator");
     return failures;
 }
 
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
-    auto prompt  = frontend.prepare_tokens({0});
-    auto session = frontend.make_output_session(prompt, {});
-    int failures = 0;
+    auto prompt             = frontend.prepare_tokens({0});
+    auto session            = frontend.make_output_session(prompt, {});
+    int failures            = 0;
+    std::uint32_t remaining = 4;
     for (const ninfer::TokenId token : {10, 11}) {
-        const auto output =
-            resolve(session, session.stage(std::array<ninfer::TokenId, 1>{token}), 1,
-                    ninfer::runtime::RoundContinuation::Continue, ninfer::FinishReason::None);
+        const auto decision = session.preview(std::array<ninfer::TokenId, 1>{token}, remaining,
+                                              ninfer::FinishReason::OutputLimit);
+        failures += check(decision.accepted_tokens == 1 && !decision.finished(),
+                          "partial UTF-8 token unexpectedly ended generation");
+        const auto output = session.commit_preview();
+        remaining -= decision.accepted_tokens;
         failures += check(output.empty(), "partial UTF-8 codepoint was published");
     }
-    const auto complete =
-        resolve(session, session.stage(std::array<ninfer::TokenId, 1>{12}), 1,
-                ninfer::runtime::RoundContinuation::Continue, ninfer::FinishReason::None);
+    const auto complete_decision = session.preview(std::array<ninfer::TokenId, 1>{12}, remaining,
+                                                   ninfer::FinishReason::OutputLimit);
+    failures += check(complete_decision.accepted_tokens == 1 && !complete_decision.finished(),
+                      "complete UTF-8 token unexpectedly ended generation");
+    const auto complete = session.commit_preview();
     failures += check(channel_text(complete, ninfer::OutputChannel::Content) == "中",
                       "UTF-8 codepoint was not published when complete");
 
-    auto eos_prompt  = frontend.prepare_tokens({0});
-    auto eos_session = frontend.make_output_session(eos_prompt, {});
-    const auto eos =
-        resolve(eos_session, eos_session.stage(std::array<ninfer::TokenId, 1>{6}), 1,
-                ninfer::runtime::RoundContinuation::Finish, ninfer::FinishReason::StopToken);
+    auto eos_prompt         = frontend.prepare_tokens({0});
+    auto eos_session        = frontend.make_output_session(eos_prompt, {});
+    const auto eos_decision = eos_session.preview(std::array<ninfer::TokenId, 1>{6}, 2,
+                                                  ninfer::FinishReason::OutputLimit);
+    failures += check(eos_decision.accepted_tokens == 1 &&
+                          eos_decision.finish_reason == ninfer::FinishReason::StopToken,
+                      "default EOS token did not end generation");
+    const auto eos = eos_session.commit_preview();
     failures += check(eos.empty(), "default EOS token was published");
 
     auto raw_prompt  = frontend.prepare_tokens({0});
     auto raw_session = frontend.make_output_session(
         raw_prompt, {}, ninfer::OutputOptions{.raw = true, .preserve_special_tokens = false});
-    const auto raw_eos =
-        resolve(raw_session, raw_session.stage(std::array<ninfer::TokenId, 1>{6}), 1,
-                ninfer::runtime::RoundContinuation::Finish, ninfer::FinishReason::StopToken);
+    const auto raw_eos_decision = raw_session.preview(std::array<ninfer::TokenId, 1>{6}, 2,
+                                                      ninfer::FinishReason::OutputLimit);
+    failures += check(raw_eos_decision.accepted_tokens == 1 &&
+                          raw_eos_decision.finish_reason == ninfer::FinishReason::StopToken,
+                      "raw EOS token did not end generation");
+    const auto raw_eos = raw_session.commit_preview();
     failures += check(channel_text(raw_eos, ninfer::OutputChannel::Content) == "<eos>",
                       "raw output did not preserve the terminal special token");
     return failures;
@@ -240,6 +249,7 @@ int main() {
     int failures                  = 0;
     failures += test_text_and_image_prepare(frontend);
     failures += test_cross_round_stop(frontend);
+    failures += test_same_token_stop_priority(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     return failures == 0 ? 0 : 1;

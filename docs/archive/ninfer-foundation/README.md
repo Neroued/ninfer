@@ -17,6 +17,8 @@ commands, paths, schemas, or project identity compatible with NInfer.
   `.ninfer` converter/reader/verifier/binder and complete Python reference migration plan.
 - [`2026-07-14-ninfer-engine-atomic-cutover.md`](2026-07-14-ninfer-engine-atomic-cutover.md) — atomic
   replacement of the `.qus` product route by the registered `.ninfer` C++ Engine target.
+- [`2026-07-14-generation-transaction-simplification.md`](2026-07-14-generation-transaction-simplification.md)
+  — replacement of the layered round/candidate protocols by direct exact-prefix resolution.
 
 The preserved `.qus` references describe the retired q5090 v4.2 route. The current C++ Engine and
 Python reference both consume the registered `.ninfer` artifact; archived `.qus` material is

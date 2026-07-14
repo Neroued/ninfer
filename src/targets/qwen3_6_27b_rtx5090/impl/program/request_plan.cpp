@@ -60,8 +60,7 @@ const runtime::RequestPlanSummary& RequestPlan::summary() const noexcept {
 
 RequestPlan Program::Impl::plan_request(const PreparedPromptData& prompt,
                                         const ExecutionOptions& options) const {
-    if (lifecycle == runtime::ProgramState::Active ||
-        lifecycle == runtime::ProgramState::PendingRound) {
+    if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Pending) {
         throw std::logic_error("cannot plan a request while Program is active or pending");
     }
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
@@ -86,7 +85,6 @@ RequestPlan Program::Impl::plan_request(const PreparedPromptData& prompt,
     validate_sampling(options.sampling);
 
     auto plan                             = std::make_unique<RequestPlan::Impl>();
-    plan->expected_epoch                  = epoch;
     plan->multimodal                      = prompt.has_media();
     plan->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
     plan->summary.requested_output_tokens = options.requested_output_tokens;
@@ -104,7 +102,7 @@ RequestPlan Program::Impl::plan_request(const PreparedPromptData& prompt,
 
     const std::span<const TokenId> incoming(prompt.token_ids);
     if (options.allow_prefix_reuse && prompt.identity.reusable && !prompt.has_media() &&
-        lifecycle == runtime::ProgramState::Resident && !resident_multimodal) {
+        lifecycle == Lifecycle::Resident && !resident_multimodal) {
         if (E != 0 && matches_prefix(incoming, ledger, E)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = E;

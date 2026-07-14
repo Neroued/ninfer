@@ -60,7 +60,7 @@ execution behavior.
 | Product prompt input | `src/product/prompt_input` | shared JSON/message parsing into owning public prompt values for product tools |
 | Exact target | `src/targets/qwen3_6_27b_rtx5090` | storage profile, load bindings, frontend, sequence/request plans, Program state, fixed Text/Vision/MTP schedules, target-only kernels/graph policy, target diagnostics |
 | Registry | `src/targets/registry.*` | closed target selection and complete target construction |
-| Product runtime | `src/runtime` | generated-token budget/stop/cancel transaction, publication, public Engine PIMPL, target lifetime |
+| Product runtime | `src/runtime` | generated-token budget, round resolution, cancellation, publication, public Engine PIMPL, target lifetime |
 | Serving | `src/serve` | OpenAI/Anthropic schemas, translation, streaming, usage, request logs, and HTTP transport |
 | Apps | `apps/cli`, `apps/serve` | command parsing, product input acquisition, and executable entry points |
 | Offline tools | `tools/artifact`, `tools/convert`, `tools/reference`, `tools/parity` | artifact tooling, target conversion, independent Python reference, and numerical diagnostics |
@@ -101,8 +101,10 @@ LoadSummary load_summary() const;
 MemorySummary memory_summary() const;
 ```
 
-`PreparedPrompt` is opaque, move-only, and tied to the Engine that created it. Preparation may run
-outside the GPU execution critical section. `generate` serializes access to the single Program.
+`PreparedPrompt` is opaque, move-only, and tagged by its closed target-variant alternative. A
+prepared value may be consumed by another Engine instance of the same exact target; a different
+target alternative is rejected before planning. Preparation may run outside the GPU execution
+critical section. `generate` serializes access to the single Program.
 
 ## 5. Load and target construction
 
@@ -167,8 +169,9 @@ Apps and serving acquire media into owning bytes. The target receives those byte
 checkpoint-specific preprocessing. It has no HTTP or filesystem policy.
 
 `Engine::prepare` returns a public opaque envelope containing the target prepared value, summary,
-preparation time, and product identity. `Engine::prepare_tokens` supplies the equivalent raw-token
-route for parity and repeatable benchmarks. `count_tokens` uses the same Frontend rendering and
+and preparation time. The closed prepared-value variant alone identifies its exact target type.
+`Engine::prepare_tokens` supplies the equivalent raw-token route
+for parity and repeatable benchmarks. `count_tokens` uses the same Frontend rendering and
 preprocessing rules without executing the model.
 
 ## 8. Program
@@ -187,33 +190,42 @@ The common runtime sees only coarse target operations:
 
 ```text
 plan_request(prepared prompt, execution options)
-begin(prepared prompt, plan, transient region) -> first PendingRound
-decode_round(round budget)                     -> PendingRound
-finish / abort
-summaries
+begin(prepared prompt, plan, transient region) -> BeginResult + first GeneratedRound
+decode_round(round budget)                     -> GeneratedRound
+resolve_pending(accepted count, terminal)
+finish_active / abort_request
 ```
 
 The fixed Text, Vision, and MTP functions under `impl/schedule` are private pieces of Program
 execution. They do not introduce another long-lived sequence owner.
 
-Program state moves among Empty, Resident, Active, PendingRound, and Invalid. At most one generated
-round is unresolved. Planning is read-only; allocation/growth happens before begin; hot-path rounds
-reuse Program-owned addresses.
+The target-private Program lifecycle moves among Empty, Resident, Active, Pending, and Invalid. At
+most one generated round is unresolved. `GeneratedRound` is only a synchronous span over
+Program-owned stable token storage; the pending lifecycle remains in Program rather than in an
+owning RAII handle. Planning is read-only; allocation/growth happens before begin; model execution
+reuses Program-owned addresses.
 
-## 9. Generated-token transaction
+## 9. Generated-token resolution
 
 The common controller owns the only product generation loop. The begin token and every later
-ordinary or MTP round use the same transaction:
+ordinary or MTP round use the same resolution sequence:
 
-1. Program returns a `PendingRound` over target-licensed token candidates;
-2. the target output session stages decoding and stop candidates without mutation;
-3. common budget/stop/cancellation policy chooses the exact accepted prefix;
-4. Program and output decoder commit the same prefix;
-5. output deltas are published only after both commits;
-6. generation continues or finishes with a coherent resident/invalid disposition.
+1. Program returns a `GeneratedRound`, a synchronous view over target-licensed tokens while its
+   target-private state remains Pending;
+2. the target `OutputSession` previews decoding into reusable request-local scratch and returns one
+   `OutputDecision` containing the exact accepted prefix and finish reason;
+3. Program resolves that same accepted count through `resolve_pending`;
+4. `OutputSession::commit_preview()` commits the selected decoder state, and the budget charges the
+   same count;
+5. output deltas are published only after those internal commits;
+6. `GenerationGuard` calls `abort_request()` on any escaping exception so failed provisional or
+   publication state cannot be reused.
 
 This keeps KV/GDN/MTP state, logical tokens, decoded bytes, usage accounting, and streamed output on
-one accepted-token boundary. CLI and server do not implement their own token loops.
+one accepted-token boundary. The output decoder scans for one real outcome rather than constructing
+a candidate lattice, and the round path has no separate staged/commit-plan transaction PIMPL. This
+does not make a blanket claim that all string/vector work in output decoding is allocation free. CLI
+and server do not implement their own token loops.
 
 `GenerationResult` reports generated IDs, content/reasoning text, finish reason, reused prompt
 tokens, phase timings, and speculative statistics.

@@ -15,13 +15,10 @@ namespace ninfer {
 class PreparedPrompt::Impl {
 public:
     template <class Prepared>
-    Impl(runtime::ProductCookie product_cookie, PromptSummary prompt_summary,
-         double frontend_seconds, Prepared prepared)
-        : cookie(product_cookie), summary(std::move(prompt_summary)),
-          prepare_seconds(frontend_seconds),
+    Impl(PromptSummary prompt_summary, double frontend_seconds, Prepared prepared)
+        : summary(std::move(prompt_summary)), prepare_seconds(frontend_seconds),
           value(std::in_place_type<Prepared>, std::move(prepared)) {}
 
-    runtime::ProductCookie cookie = 0;
     PromptSummary summary;
     double prepare_seconds = 0.0;
     targets::PreparedValue value;
@@ -81,7 +78,7 @@ PreparedPrompt Engine::prepare(PromptInput input) const {
             }
             const double seconds = prepared.prepare_seconds();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                target_ptr->cookie, info, seconds, std::move(prepared)));
+                info, seconds, std::move(prepared)));
         },
         impl_->active);
 }
@@ -100,7 +97,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
             }
             const double seconds = prepared.prepare_seconds();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                target_ptr->cookie, info, seconds, std::move(prepared)));
+                info, seconds, std::move(prepared)));
         },
         impl_->active);
 }
@@ -124,9 +121,6 @@ GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options,
     return std::visit(
         [&](auto& target_ptr) -> GenerationResult {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            if (prompt.impl_->cookie != target_ptr->cookie) {
-                throw std::invalid_argument("PreparedPrompt belongs to a different Engine");
-            }
             using Instance = std::remove_reference_t<decltype(*target_ptr)>;
             using Prepared = typename Instance::Package::PreparedPrompt;
             auto* target_prompt = std::get_if<Prepared>(&prompt.impl_->value);

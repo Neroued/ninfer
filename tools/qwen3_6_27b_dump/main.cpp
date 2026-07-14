@@ -476,27 +476,26 @@ int run(const Options& options) {
     std::string stop_reason = "length";
     try {
         auto first = program->begin(std::move(prompt), std::move(request_plan), transient.region());
-        const auto tokens         = first.round.tokens();
+        const auto tokens         = first.round.tokens;
         const std::uint32_t count = terminal_count(tokens, options.stop_ids, options.decode);
         generated.insert(generated.end(), tokens.begin(),
                          tokens.begin() + static_cast<std::ptrdiff_t>(count));
         const bool stopped = is_stop(generated.back(), options.stop_ids);
         if (stopped || generated.size() == options.decode) {
             stop_reason = stopped ? "stop_token" : "length";
-            (void)std::move(first.round).commit_prefix_and_finish(count);
+            program->resolve_pending(count, true);
         } else {
-            std::move(first.round).commit_all();
+            program->resolve_pending(count, false);
         }
 
         while (generated.size() < options.decode && !is_stop(generated.back(), options.stop_ids)) {
-            const auto sequence = program->sequence_summary();
             writer.set_decode_context(static_cast<std::uint32_t>(generated.size() - 1),
-                                      sequence.materialized_tokens);
+                                      program->materialized_tokens());
             const std::uint32_t remaining =
                 options.decode - static_cast<std::uint32_t>(generated.size());
             auto round = program->decode_round(
                 ninfer::runtime::RoundBudget{.generated_tokens_remaining = remaining});
-            const auto tokens          = round.tokens();
+            const auto tokens          = round.tokens;
             const std::uint32_t count  = terminal_count(tokens, options.stop_ids, remaining);
             const bool stopped         = is_stop(tokens[count - 1], options.stop_ids);
             const bool terminal_length = generated.size() + count == options.decode;
@@ -504,12 +503,13 @@ int run(const Options& options) {
                              tokens.begin() + static_cast<std::ptrdiff_t>(count));
             if (stopped || terminal_length) {
                 stop_reason = stopped ? "stop_token" : "length";
-                (void)std::move(round).commit_prefix_and_finish(count);
+                program->resolve_pending(count, true);
             } else {
-                std::move(round).commit_all();
+                program->resolve_pending(count, false);
             }
         }
     } catch (...) {
+        program->abort_request();
         detail::ActivationDumpAccess::detach(*program);
         throw;
     }

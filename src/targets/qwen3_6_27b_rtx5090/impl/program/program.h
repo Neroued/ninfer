@@ -28,7 +28,6 @@ enum class ReusePath : std::uint8_t {
 
 struct RequestPlan::Impl {
     runtime::RequestPlanSummary summary;
-    std::uint64_t expected_epoch = 0;
     ReusePath reuse              = ReusePath::FullReset;
     std::uint32_t reuse_base     = 0;
     bool needs_mtp_bridge        = false;
@@ -46,14 +45,19 @@ enum class PendingKind : std::uint8_t {
 };
 
 struct PendingCandidate {
-    PendingKind kind                = PendingKind::None;
-    std::uint64_t epoch             = 0;
-    std::uint32_t base_E            = 0;
-    std::uint32_t base_S            = 0;
-    std::uint32_t prompt_tokens     = 0;
-    std::uint32_t produced          = 0;
-    std::uint32_t accepted_drafts   = 0;
-    std::int32_t resulting_gdn_slot = 0;
+    PendingKind kind            = PendingKind::None;
+    std::uint32_t base_E        = 0;
+    std::uint32_t base_S        = 0;
+    std::uint32_t prompt_tokens = 0;
+    std::uint32_t produced      = 0;
+};
+
+enum class Lifecycle : std::uint8_t {
+    Empty,
+    Active,
+    Pending,
+    Resident,
+    Invalid,
 };
 
 struct PrefixCheckpoint {
@@ -70,23 +74,16 @@ public:
 
     [[nodiscard]] RequestPlan plan_request(const PreparedPromptData& prompt,
                                            const ExecutionOptions& options) const;
-    [[nodiscard]] runtime::BeginRound<Program> begin(Program& owner, PreparedPromptData&& prompt,
-                                                     RequestPlan&& plan,
-                                                     runtime::TransientRegion transient);
-    [[nodiscard]] runtime::PendingRound<Program> decode_round(Program& owner,
-                                                              runtime::RoundBudget budget);
+    [[nodiscard]] runtime::BeginResult begin(PreparedPromptData&& prompt, RequestPlan&& plan,
+                                             runtime::TransientRegion transient);
+    [[nodiscard]] runtime::GeneratedRound decode_round(runtime::RoundBudget budget);
 
-    [[nodiscard]] bool is_live(std::uint64_t round_epoch) const noexcept;
-    void commit_all(std::uint64_t round_epoch);
-    runtime::FinishDisposition commit_prefix_and_finish(std::uint64_t round_epoch,
-                                                        std::size_t count);
-    void discard(std::uint64_t round_epoch) noexcept;
+    void resolve_pending(std::uint32_t accepted_tokens, bool terminal);
 
     void finish_active();
-    void abort_active() noexcept;
-    void clear_resident() noexcept;
+    void abort_request() noexcept;
 
-    [[nodiscard]] runtime::SequenceSummary sequence_summary() const noexcept;
+    [[nodiscard]] std::uint32_t materialized_tokens() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats() const;
 
@@ -126,10 +123,9 @@ public:
     std::int32_t* host_count = nullptr;
     TokenId* host_tokens     = nullptr;
 
-    runtime::ProgramState lifecycle = runtime::ProgramState::Empty;
-    std::uint64_t epoch             = 1;
-    std::uint32_t E                 = 0;
-    std::uint32_t S                 = 0;
+    Lifecycle lifecycle = Lifecycle::Empty;
+    std::uint32_t E      = 0;
+    std::uint32_t S      = 0;
     std::vector<TokenId> ledger;
     std::int32_t rope_delta        = 0;
     std::int32_t current_gdn_slot  = 0;
@@ -145,7 +141,6 @@ public:
     schedule::VisionTapCallback diagnostic_vision_tap = nullptr;
 
 private:
-    void advance_epoch() noexcept;
     void make_invalid() noexcept;
     void ordered_reset();
     void prepare_graphs();
@@ -154,7 +149,6 @@ private:
     void copy_tail(const Tensor& source);
     void copy_round_token();
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
-    [[nodiscard]] runtime::PendingRound<Program> pending_handle(Program& owner, std::size_t count);
 };
 
 } // namespace ninfer::targets::qwen3_6_27b_rtx5090::detail

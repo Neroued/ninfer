@@ -101,8 +101,8 @@ RoundMeasurement measure_round(target::Package::Program& program, ninfer::Device
     auto round = program.decode_round(
         ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1});
     const float milliseconds     = timer.stop_ms();
-    const std::uint32_t licensed = static_cast<std::uint32_t>(round.tokens().size());
-    std::move(round).commit_all();
+    const std::uint32_t licensed = static_cast<std::uint32_t>(round.tokens.size());
+    program.resolve_pending(licensed, false);
     return RoundMeasurement{.milliseconds = milliseconds, .licensed_tokens = licensed};
 }
 
@@ -153,7 +153,7 @@ int run(const Options& options) {
                           request_plan.summary().transient_alignment);
     auto first =
         program->begin(std::move(prompt), std::move(request_plan), request_memory.region());
-    std::move(first.round).commit_all();
+    program->resolve_pending(static_cast<std::uint32_t>(first.round.tokens.size()), false);
 
     const std::uint64_t rounds_before = program->speculative_stats().rounds;
     for (int iteration = 0; iteration < options.warmup; ++iteration) {

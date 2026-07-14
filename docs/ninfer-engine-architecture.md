@@ -48,7 +48,7 @@ The stable boundary has three principal parts:
    exposes begin, transactional decode-round resolution, finish, and invalidation operations.
 
 The common generation controller is compiled around this contract. It owns output limits, stop
-conditions, cancellation, output staging, and publication. It does not own model caches, recurrent
+conditions, cancellation, output preview/commit ordering, and publication. It does not own model caches, recurrent
 state, speculative details, model positions, or model-specific memory arithmetic.
 
 The central shape is:
@@ -73,7 +73,7 @@ Engine
 └── GenerationController                  one active request
     ├── output budget and stop policy
     ├── cancellation
-    ├── transactional output decoder
+    ├── output preview/commit
     └── publication/streaming
 ```
 
@@ -116,7 +116,7 @@ Future continuous batching is an important possible project phase, but it is a d
 architecture that must be designed for real high-performance batching. It must re-prove, per
 sequence, exact-target ownership, accepted-token/publication consistency, and the
 logical-versus-materialized relation at every resumable/reusable boundary. It may replace the
-singleton `Program`/`PendingRound` API, add internal states, and hold work for many sequences at once.
+singleton `Program`/`GeneratedRound` API, add internal states, and hold work for many sequences at once.
 That future does not justify adding request IDs, batch slots, page tables, schedulable phases, or
 concurrency locks to the current single-request contract.
 
@@ -219,7 +219,7 @@ The common generation controller owns:
 - requested output-token limit and the target-approved effective limit;
 - caller-provided and frontend-default stop token/string handling;
 - cancellation at defined round boundaries;
-- transactional staging of decoded text from a returned token batch;
+- non-mutating preview of decoded text from a returned token batch;
 - resolving a decode round before publishing corresponding output;
 - publication to the CLI, local server, or another product adapter;
 - final user-visible token/text accounting.
@@ -342,7 +342,6 @@ struct LoadedProduct {
 
 template<class Target>
 struct TargetInstance {
-    ProductCookie cookie;
     std::unique_ptr<LoadedProduct<Target>> loaded;
     RequestMemory request_memory;
     std::unique_ptr<typename Target::Program> program;
@@ -353,9 +352,9 @@ using ActiveTarget = std::variant<
     std::unique_ptr<TargetInstance<TargetB>>>;
 ```
 
-Each `TargetInstance<T>` contains its non-reused load-instance cookie, an immutable heap-stable
-`LoadedProduct<T>`, separate reusable request memory, and its one `T::Program` in that declaration
-order. C++ reverse destruction therefore destroys Program first, request memory second, and loaded
+Each `TargetInstance<T>` contains an immutable heap-stable `LoadedProduct<T>`, separate reusable
+request memory, and its one `T::Program` in that declaration order. C++ reverse destruction therefore
+destroys Program first, request memory second, and loaded
 resources last. `LoadedModel` is itself a stable heap object: target binding forms no reference to a
 movable owner or descriptor subobject, and `LoadedProduct` constructs `frontend` from the final
 `*model` only after installing that owner. The program and frontend may then refer to immutable
@@ -401,12 +400,11 @@ read and validate the v1 object directory
   -> compute host/device placement plans
   -> allocate and materialize persistent objects
   -> establish required payload-content and resource invariants
-  -> allocate one never-reused ProductCookie for this construction attempt
   -> construct LoadedModel at its final heap address, move in backing, then form typed bindings
   -> construct LoadedProduct around that stable model and then construct Frontend from it
   -> plan sequence memory against post-load device capacity
   -> construct RequestMemory
-  -> allocate TargetInstance at its final address with cookie/loaded/request memory
+  -> allocate TargetInstance at its final address with loaded/request memory
   -> construct and install Program as the last member; warm/capture required graphs
   -> release directory/name index and make the complete TargetInstance active
 ```
@@ -567,8 +565,8 @@ auto first = program.begin(
 prefix-reuse path, required media workspace, effective output capacity, or other precomputed
 decisions as owning values and checked indices. It may not borrow from `PreparedPrompt`,
 `RequestMemory`, a temporary descriptor, or mutable Program storage; `begin` receives the real
-owners directly. If any decision depends on resident state, the plan records the program's sequence
-epoch. `begin` rejects a stale epoch rather than applying a plan to changed state.
+owners directly. In the current serialized one-request route, planning and `begin` run under the
+same Engine generation lock, so no common plan-version protocol is required.
 
 Every target-private plan provides a const `summary()` returning the common
 `RequestPlanSummary`. The controller copies that bounded value before moving the plan into `begin`;
@@ -580,14 +578,17 @@ must complete or safely cancel every asynchronous read/use of the moved `Prepare
 `TransientRegion` before returning or propagating. Program stores no pointer/view into either input,
 and no CUDA Graph captures the transient region. The prompt may be destroyed and the region may be
 reset/reused immediately after either outcome. A device failure that prevents safe quiescence
-follows Section 12.2 instead of returning a recoverable exception. Output decoder staging lives in
+follows Section 12.2 instead of returning a recoverable exception. Output decoder preview scratch lives in
 its separate owning CPU session.
 
-### 7.5 No hidden inference-path allocation
+### 7.5 Stable model-execution storage
 
-After a request begins, ordinary decode and MTP rounds perform no heap allocation, filesystem access,
+After a request begins, ordinary decode and MTP model execution perform no filesystem access,
 artifact-name lookup, device allocation, or graph-address change. Returned token storage is a fixed
-program-owned host buffer. Model-private workspaces are planned or bounded before execution.
+Program-owned host buffer, and model-private workspaces are planned or bounded before execution. The
+round protocol has no explicit per-round transaction PIMPL or candidate-lattice allocation. This is
+not a blanket claim that request-local output decoding and publication perform no string/vector
+allocation.
 
 ## 8. Checkpoint frontend and prepared prompts
 
@@ -603,7 +604,7 @@ The frontend belongs to the loaded exact checkpoint. It owns:
 - checkpoint-native position construction;
 - assistant-content or other prefix-checkpoint hints;
 - validation of tokenizer-addressable input IDs;
-- creation of a transactional output decoder.
+- creation of a request-local output preview/decoder session.
 
 Protocol schemas and network fetching remain outside the target. The frontend receives owning
 product input/media and produces checkpoint-native data.
@@ -642,24 +643,15 @@ different modalities, positions, prompt identity, or no prefix hint at all.
 
 Common code sees a move-only opaque envelope conceptually carrying:
 
-- a value-semantic `ProductCookie` generated uniquely for this load instance;
 - a small common `PromptSummary`, including prompt token count;
 - one alternative of the closed variant of opaque target-typed prepared values.
 
-A prompt produced for one loaded product cannot be submitted to another, even if `model_id` happens
-to match. `ProductCookie` is never a raw address: it is a checked, process-wide non-reused
-load-generation value owned authoritatively by `TargetInstance`. Its allocator is safe across
-concurrent Engine construction and never reissues a value within the process. The cookie is
-allocated before that construction attempt's loaded objects, consumed even if construction later
-fails, and published only as the cookie field of the complete ActiveTarget. Exhaustion fails
-construction rather than wrapping. Engine preparation copies that field into the envelope;
-submission compares it against the currently visited `target.cookie`.
-
-The closed prepared-value variant's alternative is the target tag; there is no second integer or
-string dispatch field that can drift from it. Inside the already selected `TargetInstance<T>`
-visitor, common code checks the cookie and performs one `get_if<T::PreparedPrompt>`/move. There is no
-second cross-product visit and no hot-path type lookup. Every check occurs before `plan_request` and
-sequence mutation.
+The closed prepared-value variant's alternative is the target tag; there is no second integer,
+load-instance identity, or string dispatch field that can drift from it. A prepared value may be
+consumed by another Engine instance of the same exact target package because it owns its complete
+checkpoint-native input. A different target alternative is rejected by one
+`get_if<T::PreparedPrompt>` before `plan_request` and sequence mutation. The receiving Program still
+validates the token domain, prompt geometry, metadata, and its configured capacity.
 
 ### 8.3 Ownership and concurrency of preparation
 
@@ -674,65 +666,57 @@ execution. `begin` consumes the prompt; it may release large media storage only 
 asynchronous reads from that storage are complete or safely cancelled. The same guarantee holds
 when `begin` exits by a recoverable exception.
 
-### 8.4 Output decoder transaction
+### 8.4 Output preview and commit
 
-The frontend creates a request-local output session containing the resolved frontend-default plus
-caller stop policy and a decoder. The session owns all state it needs after the prepared prompt is
-moved into `begin`; it never borrows prompt storage.
+The frontend creates a request-local `OutputSession` containing the resolved frontend-default plus
+caller stop policy and decoder state. The session owns all state it needs after the prepared prompt
+is moved into `begin`; it never borrows prompt storage.
 
-The decoder uses a staging API equivalent to:
+The session uses a compact API equivalent to:
 
 ```cpp
-class OutputDecoder {
+class OutputSession {
 public:
-    StagedText stage(std::span<const TokenId> tokens, const StopPolicy&) const;
-    StagedText stage_terminal(FinishReason) const;
-    DecoderCommitPlan prepare_commit(
-        StagedText&&,
-        const OutputResolution&) const;
-    PublishedOutput commit(DecoderCommitPlan&&) noexcept;
+    OutputDecision preview(
+        std::span<const TokenId> tokens,
+        std::uint32_t budget_remaining,
+        FinishReason limit_reason);
+    OutputDecision preview_terminal(FinishReason reason);
+    PublishedOutput commit_preview() noexcept;
 };
 ```
 
-`stage` may inspect UTF-8 boundaries, tokenizer state, and stop strings but does not mutate committed
-decoder state and does not invoke a user callback. The staged object contains precomputed decoder
-states and token-to-byte boundaries for the possible accepted-token prefixes. `stage_terminal`
-stages a flush with no new token for cancellation or another terminal decision between rounds.
+`preview` may inspect UTF-8 boundaries, tokenizer state, stop tokens/strings, and the current budget,
+but it does not mutate committed decoder state and does not invoke a user callback. `OutputSession`
+owns reusable request-local scratch for one prospective next `DecoderState` and the selected owning
+output deltas. It scans the returned token batch and retains only the one real outcome rather than
+constructing a lattice of Continue, budget, stop-token, and stop-string candidates.
 
-`StagedText` exposes bounded immutable candidate summaries to the controller: issued
-`StagedChoiceId`, committed-token count, finish reason, channel domain, decoded byte-cut ordering,
-and resolved stop declaration order. Decoder-private next states and byte buffers remain opaque.
-This is enough for the deterministic selection in Section 13.4 without exposing tokenizer internals.
-
-`OutputResolution` records the exact accepted logical-token count, Continue versus Finish, terminal
-reason, and an opaque candidate selected from that exact `StagedText`. `prepare_commit` validates the
-selection and constructs the complete next decoder state and owning output deltas without mutating
-the decoder. It is the final fallible state-preparation step and runs before model resolution. After
-the Program has resolved the same token count, decoder `commit` and generation-budget bookkeeping
-perform only no-fail swaps/moves and checked arithmetic. Decoder `commit` is `noexcept` and
-allocation-free. The later ownership-transferring `publish` call is the sole allowed synchronous
-failure after state resolution, with the invalidation consequence defined below.
+`OutputDecision` contains only the exact accepted logical-token count and `FinishReason`; `None`
+means Continue. After Program resolves the same count, `commit_preview()` swaps the preview state
+into the committed decoder and transfers the selected deltas. It is `noexcept`.
+`preview_terminal` prepares a zero-token terminal flush for cancellation at a controller boundary.
+A preview must be committed before another preview is made.
 
 The decoder therefore advances by exactly the accepted logical-token prefix even when published
 text differs. This is required because one MTP round can return several tokens and a stop string may
 end inside that batch.
 
-The staged result maps a textual stop back to an exact token prefix. If the stop begins or ends
-inside one token's decoded byte contribution, that token is still included in the model-committed
-prefix while the resolved stop policy may withhold the stop bytes from published text. A stop
-spanning token boundaries retains enough uncommitted decoder tail to identify the same exact token
-count. Byte trimming and token-state commit are therefore related but not falsely treated as the
-same index.
+The preview maps a textual stop back to an exact token prefix. If the stop begins or ends inside one
+token's decoded byte contribution, that token is still included in the model-committed prefix while
+the resolved stop policy may withhold the stop bytes from published text. A stop spanning token
+boundaries retains enough uncommitted decoder tail to identify the same exact token count. Byte
+trimming and token-state commit are therefore related but not falsely treated as the same index.
 
-On Continue, the commit plan publishes only bytes that cannot still become the prefix of a
+On Continue, the selected preview publishes only bytes that cannot still become the prefix of a
 cross-round stop string and retains the ambiguous tail. On Finish, it flushes that tail except for
 bytes intentionally withheld by the selected stop policy. The same accepted token count can
-therefore produce different safe publication at Continue and Finish; the continuation flag is
-mandatory.
+therefore produce different safe publication at Continue and Finish; `FinishReason::None` versus a
+terminal reason records that distinction.
 
 `PublishedOutput` is an ordered owning sequence of channel-tagged byte deltas, at minimum
 `Reasoning` and `Content`. Checkpoint-native thinking markers, channel transitions, incremental UTF-8,
-and stop matching are handled while staging. A resolved stop string declares its matching channel
+and stop matching are handled while previewing. A resolved stop string declares its matching channel
 domain; ordinary caller stop strings default to Content unless the product surface explicitly asks
 for another domain. Serving-specific tool parsing remains outside this decoder contract.
 
@@ -741,15 +725,16 @@ Publication consumes that ownership through a contract equivalent to
 into storage it owns, but it may never retain a borrowed view into the argument. Normal return is
 the controller's publication completion point: every delta has been accepted into sink-owned
 lifetime. A synchronous exception means acceptance failed, possibly after an externally visible
-prefix; the batch is not retried and the generation call fails. An asynchronous adapter may define
-successful ownership-transferring enqueue as acceptance, in which case a later socket/client
-failure belongs to that adapter and is not retroactively reported as this generation's publication
-failure. This contract separates payload lifetime and controller completion from physical network
-delivery.
+prefix; the batch is not retried and the generation call fails. `GenerationGuard` then prevents the
+Program sequence from being reused. An asynchronous adapter may define successful
+ownership-transferring enqueue as acceptance, in which case a later socket/client failure belongs to
+that adapter and is not retroactively reported as this generation's publication failure.
 
-The implementation may use a small checkpoint/copy of decoder state instead of literal objects with
-these names. The observable requirements—stage without publication, commit an exact prefix, and
-preserve byte-correct streaming—are mandatory.
+The round protocol has no separate staged-candidate object, candidate ID/lattice, or decoder commit
+plan, and therefore no explicit per-round transaction PIMPL allocation. This is not a blanket claim
+that token decoding, strings, vectors, or publication are allocation-free. The observable
+requirements—preview without committed-state mutation or publication, commit the same exact prefix
+as Program, and preserve byte-correct streaming—are mandatory.
 
 ## 9. Common request values and summaries
 
@@ -786,11 +771,6 @@ struct RequestOptions {
     OutputOptions output;
 };
 
-enum class RoundContinuation : std::uint8_t {
-    Continue,
-    Finish,
-};
-
 enum class FinishReason : std::uint8_t {
     None,
     OutputLimit,
@@ -800,15 +780,15 @@ enum class FinishReason : std::uint8_t {
     Cancelled,
 };
 
-struct StagedChoiceId {
-    std::uint32_t value; // opaque; meaningful only with the StagedText that issued it
+struct OutputDecision {
+    std::uint32_t accepted_tokens;
+    FinishReason finish_reason; // None means Continue
+
+    bool finished() const noexcept { return finish_reason != FinishReason::None; }
 };
 
-struct OutputResolution {
-    std::uint32_t committed_tokens; // 1..round size, or 0 only for stage_terminal()
-    RoundContinuation continuation;
-    FinishReason finish_reason;    // None iff continuation == Continue
-    StagedChoiceId staged_choice;   // valid only for the exact StagedText being prepared
+struct GeneratedRound {
+    std::span<const TokenId> tokens;
 };
 ```
 
@@ -848,15 +828,19 @@ struct BeginSummary {
 
 struct GenerationSummary {
     std::optional<BeginSummary> begin; // absent when no begin occurred
-    std::uint32_t committed_output_tokens;
     FinishReason finish_reason;
-    std::optional<FinishDisposition> sequence; // Resident/Invalid after a begun request
+};
+
+struct BeginResult {
+    BeginSummary summary;
+    GeneratedRound round;
 };
 ```
 
-`begin` returns `BeginRound<Program>`, a move-only pair of `BeginSummary` and a one-token
-`PendingRound<Program>`. The first output is therefore staged and resolved through the same contract
-as every later batch; it is not accepted merely because prefill succeeded.
+`begin` returns `BeginResult`, containing `BeginSummary` and a one-token `GeneratedRound`. The first
+output is therefore previewed and resolved through the same contract as every later batch; it is not
+accepted merely because prefill succeeded. `GeneratedRound` contains no owner, callback, generation
+counter, destructor action, or allocation; Program privately remains Pending until resolution.
 
 Summary invariants are `reusable_prompt_tokens <= prompt_tokens` and
 `effective_output_tokens <= requested_output_tokens`. For a nonzero request,
@@ -879,7 +863,7 @@ is a terminal decision carrying that recorded reason and resolving the current r
 If a nonzero request has zero target-approved capacity, the controller does not call `begin` and
 returns the same `ContextCapacity` reason.
 
-Resolution selection proves `committed_tokens <= remaining` before Program mutation.
+Preview selection proves `accepted_tokens <= remaining` before Program mutation.
 `GenerationBudget::commit` and `round_budget` are then `noexcept`; a violated bound is an internal
 fatal invariant, not a recoverable exception after model/decoder commit.
 
@@ -894,21 +878,6 @@ For a package `T`, its program provides the following target-typed operations to
 controller:
 
 ```cpp
-enum class ProgramState : std::uint8_t {
-    Empty,
-    Active,
-    PendingRound,
-    Resident,
-    Invalid,
-};
-
-struct SequenceSummary {
-    ProgramState state;
-    std::uint64_t epoch;
-    std::uint32_t materialized_tokens; // E
-    std::uint32_t logical_tokens;      // S
-};
-
 class T::Program {
 public:
     ~Program() noexcept;
@@ -921,25 +890,25 @@ public:
         const PreparedPrompt&,
         const ExecutionOptions&) const;
 
-    BeginRound<Program> begin(
+    BeginResult begin(
         PreparedPrompt&&,
         RequestPlan&&,
         TransientRegion);
 
-    PendingRound<Program> decode_round(RoundBudget);
+    GeneratedRound decode_round(RoundBudget);
 
+    void resolve_pending(std::uint32_t accepted_tokens, bool terminal);
     void finish_active();
-    void abort_active() noexcept;
-    void clear_resident() noexcept;
+    void abort_request() noexcept;
 
-    ProgramState state() const noexcept;
-    SequenceSummary sequence_summary() const noexcept;
+    std::uint32_t materialized_tokens() const noexcept; // narrow diagnostic query
 };
 ```
 
-`SequenceSummary` is diagnostic committed state, not a mutation interface. `Empty`, `PendingRound`,
-and `Invalid` report zero counts because none exposes a reusable resolved logical identity;
-provisional progress is hidden. Section 11 defines valid Active and Resident count relationships.
+The lifecycle state and `E`/`S` counters are target-private. Common code receives only the token
+view and calls the coarse resolution operations; it does not inspect or mutate target state. The
+narrow `materialized_tokens()` query exists for target diagnostics rather than controller policy.
+Section 11 defines the required Active and Resident relationships.
 
 `T::RequestPlan` is required to expose `const RequestPlanSummary& summary() const noexcept`. No
 other part of its representation is common.
@@ -963,14 +932,15 @@ it may:
 - sample the first target token from target logits;
 - complete shifted MTP alignment/prefill using that sampled token and establish the first proposal.
 
-On success, it returns `BeginRound<Program>` containing exactly one target-licensed token and enters
-`PendingRound`. All prompt input reads are complete before control returns. The prepared prompt,
-prefill state, and sampled token are not yet a reusable logical sequence: the controller must stage
-the token and consume the handle with the same Continue/Finish/discard rules as every later round.
+On success, it returns `BeginResult` containing exactly one target-licensed token and privately
+enters Pending. All prompt input reads are complete before control returns. The prepared prompt,
+prefill state, and sampled token are not yet a reusable logical sequence: the controller must preview
+the token and call `resolve_pending` with the same Continue/Finish rules as every later round.
 
-`commit_all` on the begin round establishes `Active` with `E = P` and `S = P + 1`.
-`commit_prefix_and_finish(1)` establishes a terminal Resident or Invalid result. Destruction/discard
-invalidates the candidate sequence. There is no first-token exception to transactional output.
+Continuing with the begin token establishes `Active` with `E = P` and `S = P + 1`. Terminal
+resolution establishes a Resident result when the target can represent the exact prefix, otherwise
+the target may make it non-reusable. `abort_request()` invalidates unresolved provisional work. There
+is no first-token exception to exact-prefix resolution.
 
 On a host-side validation or logical execution failure, `begin` publishes no new resident identity
 and leaves the program either at its unchanged pre-begin resident state when the target can prove no
@@ -992,9 +962,11 @@ normally ordinary decode. A program never relies on the controller silently drop
 
 ### 10.4 Stable token return storage
 
-`PendingRound::tokens()` is a span over program-owned fixed-capacity host memory. Its contents remain
-valid until that round is resolved. A target may use pinned host memory and one synchronized count/
-token transfer per round. It does not allocate and return `std::vector<int>` on every decode step.
+`GeneratedRound::tokens` is a synchronous span over Program-owned fixed-capacity host memory. Its
+contents remain valid until the current controller iteration resolves that round. It must not be
+stored past `resolve_pending` or `abort_request`. A target may use pinned host memory and one
+synchronized count/token transfer per round. It does not allocate and return `std::vector<int>` on
+every decode step.
 
 Only target-licensed output tokens appear in the span. Unverified proposals, rejected drafts, padded
 slots, and model-internal row indexes never escape as candidate output.
@@ -1003,27 +975,25 @@ slots, and model-internal row indexes never escape as candidate output.
 
 The common controller relies on these exact failure guarantees:
 
-- `plan_request` is read-only; success or exception leaves Program state/epoch unchanged;
+- `plan_request` is read-only; success or exception leaves Program lifecycle and sequence unchanged;
 - `begin` follows Section 10.2, never exposes a partial new identity, and before propagating any
   recoverable exception it quiesces or safely cancels all asynchronous access to its moved
   `PreparedPrompt` and `TransientRegion` inputs;
-- `decode_round` enters `PendingRound` only when all licensed output is ready; any recoverable
-  exception after mutation but before returning a handle leaves Program `Invalid` and leaves no
+- `decode_round` enters target-private Pending only when all licensed output is ready; any recoverable
+  exception after mutation but before returning a round leaves Program `Invalid` and leaves no
   untracked asynchronous access;
-- a resolution method marks its handle resolved only after its full Active/Resident/Invalid
-  postcondition holds; if it throws, the still-unresolved handle destructor invalidates the owner;
-- `finish_active` succeeds in Resident and leaves Invalid on a recoverable exception;
+- `resolve_pending` accepts `1 <= accepted_tokens <= produced`; Continue additionally requires the
+  complete returned batch and establishes Active, while terminal resolution establishes Resident or
+  a non-reusable state for that exact prefix;
+- `finish_active` changes Active to Resident; a precondition violation changes no state;
+- `abort_request` makes any Active, Pending, or Resident sequence non-reusable and is `noexcept`;
 - process-fatal device faults follow Section 12.2 instead of pretending to satisfy recovery.
 
-`abort_active()` and `clear_resident()` are `noexcept` host-reachability operations only. They advance
-the epoch and make device state unreachable; they do not launch, synchronize, allocate, or attempt
-rollback. A later begin performs the target's ordered full device reset.
-
-`PendingRound::~PendingRound()` and `Program::~Program()` are `noexcept`. Moving a handle makes the
-source inert. `tokens()` is valid only on the live unresolved handle with the matching owner/round
-epoch; misuse is an internal programming error and must never touch a newer round. Engine teardown
-quiesces its target stream while DeviceContext is still alive, then destroys Program, RequestMemory,
-LoadedProduct, and finally DeviceContext in the order established in Section 5.3.
+`abort_request()` is a host-reachability operation only. It makes device state unreachable for reuse;
+it does not launch, synchronize, allocate, or claim rollback. A later begin performs the target's
+ordered full device reset. `Program::~Program()` is `noexcept`. Engine teardown quiesces its target
+stream while DeviceContext is still alive, then destroys Program, RequestMemory, LoadedProduct, and
+finally DeviceContext in the order established in Section 5.3.
 
 ## 11. Sequence state and frontier invariants
 
@@ -1086,8 +1056,8 @@ Such a round materializes the old frontier plus the first `n - 1` returned token
 last returned token as the new frontier. Thus accepting all `n` logical outputs still does not mean
 all `n` have already been written as target KV/recurrent positions.
 
-The target may execute provisional work beyond these values inside an unresolved `PendingRound`,
-but that state is neither reusable nor observable through `SequenceSummary` as committed progress.
+The target may execute provisional work beyond these values while privately Pending, but that state
+is neither reusable nor exposed to common code as committed progress.
 
 ### 11.2 Resident state after finish
 
@@ -1119,14 +1089,13 @@ no cursor, checkpoint, proposal, or identity may reach any suffix beyond `S_f`.
 No cache cursor, recurrent slot, MTP cache, host token mirror, position state, or prefix checkpoint
 beyond the committed logical sequence may be reachable after finish.
 
-### 11.3 Sequence epoch
+### 11.3 Serialized request planning
 
-Every reset, invalidation, successful begin, round resolution, finish, or resident-prefix change
-advances a monotonic host sequence epoch. Request plans and prefix matches that depend on resident
-state record this epoch. An epoch is a local stale-plan/handle guard, not a public request ID and not
-a concurrency scheduler.
-The fixed-width counter is incremented with checked arithmetic. It never wraps: exhaustion makes the
-current TargetInstance unusable and requires reconstruction.
+The current Engine holds one generation lock across `plan_request`, `begin`, all rounds, and finish.
+There is therefore no common sequence-generation counter, plan token, or round-handle lifetime
+protocol. Prefix eligibility is re-established by the target from its current resident ledger during
+that serialized operation. Future continuous batching must define its own sequence-slot identity and
+lifetime rules rather than preserving an unused single-request generation counter.
 
 ### 11.4 Prefix reuse
 
@@ -1149,38 +1118,28 @@ reuse attempt cannot fall through with partially rewound state.
 
 ### 12.1 States
 
-The common lifecycle is:
+The required target-private lifecycle is:
 
 ```text
-Empty ─────────────── begin success ──────────────> PendingRound
-Resident ──────────── begin success ──────────────> PendingRound
-Invalid ── full-reset begin success ──────────────> PendingRound
+Empty ─────────────── begin success ──────────────> Pending
+Resident ──────────── begin success ──────────────> Pending
+Invalid ── full-reset begin success ──────────────> Pending
 
-Active ────────────── decode_round ───────────────> PendingRound
-PendingRound ──────── commit_all ─────────────────> Active
-PendingRound ──────── commit_prefix_and_finish ───> Resident or Invalid
-PendingRound ──────── discard / unresolved dtor ──> Invalid
+Active ────────────── decode_round ───────────────> Pending
+Pending ── resolve_pending(full, Continue) ───────> Active
+Pending ── resolve_pending(prefix, terminal) ─────> Resident or Invalid
 
 Active ────────────── finish_active ──────────────> Resident
-Active ────────────── abort_active ───────────────> Invalid
-Resident/Invalid ──── clear_resident ─────────────> Empty
+Active/Pending/Resident ── abort_request ─────────> Invalid
 ```
 
-Only one pending round may exist. `decode_round` is illegal outside `Active`; `begin` is illegal
-while active or pending; `finish_active` is illegal while a round is pending.
+Only one pending round may exist. Pending is a target-private lifecycle state, not a common handle.
+`decode_round` is illegal outside `Active`; `begin` is illegal while active or pending;
+`finish_active` is illegal while a round is pending.
 
 `Invalid` means host logic must not select the current device state for reuse. A later `begin` may
 recover only through a target-defined full reset. It does not imply that arbitrary CUDA failures are
 recoverable.
-
-`FinishDisposition` is the small common result of terminal round resolution:
-
-```cpp
-enum class FinishDisposition {
-    Resident, // exact accepted logical prefix is coherent and may be considered for reuse
-    Invalid,  // output is valid, but no current sequence state may be reused
-};
-```
 
 ### 12.2 CUDA fault policy
 
@@ -1193,58 +1152,44 @@ If NInfer later adopts recoverable device faults, it must add a distinct `Faulte
 that proves stream and allocation validity. It must not overload `Invalid` with unsupported CUDA
 recovery.
 
-## 13. Transactional generated-token rounds
+## 13. Generated-token round resolution
 
-### 13.1 `PendingRound`
+### 13.1 `GeneratedRound`
 
-`begin` returns a one-token handle inside `BeginRound`; `decode_round` returns the same move-only RAII
-handle directly. Every handle is bound to its owner program:
+`begin` returns a one-token `GeneratedRound` inside `BeginResult`; `decode_round` returns the same
+small value directly:
 
 ```cpp
-template<class Owner>
-class PendingRound {
-public:
-    PendingRound(const PendingRound&) = delete;
-    PendingRound& operator=(const PendingRound&) = delete;
-    PendingRound(PendingRound&&) noexcept;
-
-    std::span<const TokenId> tokens() const noexcept;
-
-    void commit_all() &&;
-    FinishDisposition commit_prefix_and_finish(std::size_t count) &&;
-    void discard() && noexcept;
-
-    ~PendingRound() noexcept;
-};
-
-template<class Owner>
-struct BeginRound {
-    BeginSummary summary;
-    PendingRound<Owner> round;
+struct GeneratedRound {
+    std::span<const TokenId> tokens;
 };
 ```
 
-Exactly one resolution action is permitted:
+It is a synchronous view into Program-owned stable host storage. It never escapes the current
+controller iteration and has no owner pointer, callback table, generation counter, destructor
+action, or dynamic allocation. Program itself records that exactly one round is Pending.
 
-- `commit_all()` commits the entire returned batch to the logical sequence, normalizes the model
-  execution frontier according to Section 11, and makes the program ready for another round;
-- `commit_prefix_and_finish(m)` adopts exactly `1 <= m <= tokens().size()` returned logical tokens
-  and finishes the request at that prefix. It returns whether an exact reusable `Resident` state was
-  constructed or the sequence had to become `Invalid`; published text may be empty or shorter;
-- `discard()` makes the sequence `Invalid` without claiming rollback.
+The controller resolves that state through:
 
-Resolution methods are rvalue-qualified so a handle is consumed syntactically as well as logically.
-The handle carries its owner and round epoch; a moved-from or stale handle cannot resolve another
-round. It never escapes the internal generation controller, and its owner program outlives it.
+```cpp
+void Program::resolve_pending(std::uint32_t accepted_tokens, bool terminal);
+```
 
-Destroying an unresolved handle is equivalent to `discard()`. The destructor performs no CUDA
-launch, synchronization, allocation, or throwing operation; it only invalidates host reachability.
-A debug build should additionally diagnose an unresolved destructor after invalidation.
+Exactly two successful outcomes are permitted:
+
+- Continue accepts the complete returned batch, normalizes the model execution frontier according
+  to Section 11, and establishes Active for another round;
+- terminal resolution adopts exactly `1 <= accepted_tokens <= tokens.size()` logical tokens and
+  finishes at that prefix. The target establishes Resident when it can represent that exact prefix,
+  otherwise it makes the sequence non-reusable.
+
+An unresolved or failed request is handled by the request-level `GenerationGuard`, which calls
+`abort_request()`; there is no independent round-handle destructor protocol.
 
 ### 13.2 Why arbitrary continuation is forbidden
 
-The interface intentionally has no `commit(m)` that continues generation, no `commit(0)`, and no
-`rollback()`.
+The interface intentionally forbids continuing from a strict prefix of a returned batch and has no
+universal `rollback()`.
 
 A speculative target may prepare the next proposal state only for its complete accepted outcome.
 An intermediate returned token can be target-licensed for output while lacking the MTP, recurrent,
@@ -1252,17 +1197,15 @@ or cache state needed to continue as if the suffix had never happened. Similarly
 state may not exist for every mutable component. Claiming arbitrary continuation would either be
 false or force expensive universal snapshots into every target.
 
-The only required partial action ends the request. The target can then canonicalize exactly the
-accepted logical prefix, select a verified per-token recurrent snapshot, rewind a
-position-addressed cache,
-or retain an allowed final pending token without promising continuation through an unsupported
-intermediate proposal state. If it cannot construct and prove that exact state, it still accepts the
-licensed logical token prefix but returns `Invalid`; no prefix from that round is subsequently
-reusable.
+The only partial-prefix action is terminal. The target can canonicalize exactly the accepted logical
+prefix, select a verified per-token recurrent snapshot, rewind a position-addressed cache, or retain
+an allowed final frontier token without promising continuation through an unsupported intermediate
+proposal state. If it cannot construct and prove that exact resident state, it still accepts the
+licensed output prefix for this result but makes the sequence non-reusable.
 
 ### 13.3 Provisional state
 
-During `PendingRound`, target-private state may include:
+While Program is Pending, target-private state may include:
 
 - verification KV entries and recurrent snapshots;
 - accepted-count and target-token buffers;
@@ -1271,13 +1214,12 @@ During `PendingRound`, target-private state may include:
 - a next-round proposal prepared for the complete outcome;
 - graph control scalars and provisional cursor values.
 
-None of it is common API. `commit_all` normalizes every component to the full returned logical batch,
-leaving its last token as the new unprocessed frontier. It does not claim that every returned token
-has a corresponding materialized KV entry. `commit_prefix_and_finish` either normalizes exactly the
-accepted logical prefix and makes all later state unreachable, or invalidates reuse. `discard`
-invalidates the entire resident identity.
+None of it is common API. Full Continue normalizes every component to the complete returned logical
+batch, leaving its last token as the new unprocessed frontier. Terminal resolution either normalizes
+the exact accepted prefix and makes all later state unreachable, or invalidates reuse.
+`abort_request()` invalidates the entire resident identity without claiming rollback.
 
-Sampler storage is physically Program-resident but logically Active-request state. `commit_all`
+Sampler storage is physically Program-resident but logically active-request state. Full Continue
 commits exactly the returned logical tokens. Finish retires sampler state; the next begin always
 initializes it from the new `ExecutionOptions`. A target may therefore avoid repairing suffix-only
 penalty counters on terminal partial finish, but it may never continue with or expose those counters
@@ -1287,44 +1229,37 @@ as active/resident semantics.
 
 For a returned batch, the controller:
 
-1. stages tokenizer/channel decoding and all stop candidates without mutation;
-2. selects one `OutputResolution` containing the exact accepted logical-token prefix `m`;
-3. prepares the no-fail decoder commit and owning channel deltas;
-4. consumes the Program handle with `commit_all()` for Continue, or
-   `commit_prefix_and_finish(m)` for Finish;
-5. commits the decoder with the same resolution using its `noexcept` commit plan;
-6. charges `m` against the generated-token budget;
-7. only then publishes the prepared output deltas.
+1. asks `OutputSession::preview` to decode into scratch and select one `OutputDecision` without
+   mutating committed decoder state;
+2. calls `Program::resolve_pending(m, terminal)` with the same exact accepted token count `m`;
+3. commits the decoder preview through `commit_preview()`;
+4. charges `m` against the generated-token budget;
+5. only then publishes the owning output deltas.
 
 `m` counts model-logical generated tokens and is always at least one for a returned round. It
 includes a terminating EOS/stop token and the token containing a stop-string byte boundary, even if
 that token contributes zero published bytes. Published byte count and accepted token count are not
 interchangeable.
 
-Resolution selection is deterministic. It chooses the earliest accepted-token boundary among the
-effective budget limit, stop token, and staged stop-string candidates. At the same token boundary,
-the earliest decoded byte cut wins; therefore a string cut that would otherwise leak bytes wins over
-a token-only finish. Equal string cuts use resolved `StopPolicy` declaration order. If no textual
-cut wins, StopToken precedes the budget's recorded `effective_limit_reason` for the reported reason.
-`OutputLimit` versus `ContextCapacity` is already fixed by the RequestPlan rule in Section 9.2,
-including the equality case; `decide_resolution` never reconstructs it from counters.
-`staged_choice` identifies the corresponding candidate inside that exact staged object; it is never
-reused across stages.
+Preview selection is deterministic and scans token boundaries in order. At one boundary, a matching
+stop string wins over a stop token and the budget limit; among stop strings, earliest decoded byte
+cut wins and equal cuts use resolved `StopPolicy` declaration order. Stop token wins over the budget
+limit at the same boundary. The budget limit is considered only for the complete returned batch and
+uses the `effective_limit_reason` fixed by RequestPlan; `OutputLimit` versus `ContextCapacity` is not
+reconstructed from counters.
 
 Cancellation is sampled at controller boundaries. Before `begin`, cancellation returns with no model
-work. Before a later round, the controller stages a terminal decoder flush, calls `finish_active`,
-commits the decoder with `{0, Finish, Cancelled}`, publishes the flush, and retains the coherent
-Resident result. If cancellation becomes visible while `begin` or `decode_round` is executing, the
-returned round is discarded, the sequence becomes Invalid, and only the previously committed
-decoder tail is terminally flushed; none of the new round tokens are accepted or published. A signal
-arriving after resolution is observed at the next boundary. This is the single current policy, not a
-per-target choice.
+work. Between committed rounds, the controller calls `preview_terminal(Cancelled)`,
+`finish_active()`, commits and publishes the decoder flush, and retains the coherent Resident prefix.
+If cancellation becomes visible after `begin` or `decode_round` produced provisional work, the
+controller previews only a terminal flush, calls `abort_request()`, commits and publishes that flush,
+and accepts none of the new round tokens. A signal arriving after resolution is observed at the next
+boundary. This is the single current policy, not a per-target choice.
 
-If `publish` throws after model commit, the model state is not rolled back. The controller reports
-the publication failure, and `GenerationGuard` makes the generated sequence unreachable for reuse
-even if a coherent state had existed immediately before publication. Bytes already accepted by a
-partially failing sink cannot be retracted; the generation call still fails and the sequence is not
-reused.
+If preview or `publish` throws, the model state is not rolled back. The controller reports the
+failure, and the still-armed `GenerationGuard` calls `abort_request()` so the generated sequence is
+not offered for prefix reuse. Bytes already accepted by a partially failing sink cannot be
+retracted; the batch is not retried.
 
 ## 14. Common generation loop
 
@@ -1360,44 +1295,32 @@ GenerationSummary run_one(
         plan_summary.effective_output_tokens,
         plan_summary.effective_limit_reason);
 
-    GenerationGuard guard(*target.program, Disarmed);
+    GenerationGuard guard(*target.program); // initially disarmed
     std::optional<BeginSummary> begin_summary;
 
-    const auto resolve_and_publish = [&](auto&& pending)
+    const auto resolve_and_publish = [&](GeneratedRound round)
         -> std::optional<GenerationSummary> {
         if (cancellation.requested()) {
-            auto staged = output.decoder.stage_terminal(FinishReason::Cancelled);
-            const auto resolution = output.cancelled_resolution(staged);
-            auto decoder_commit = output.decoder.prepare_commit(
-                std::move(staged), resolution);
-            std::move(pending).discard();
-            auto deltas = output.decoder.commit(std::move(decoder_commit));
+            output.preview_terminal(FinishReason::Cancelled);
+            target.program->abort_request();
+            auto deltas = output.commit_preview();
             publish(sink, std::move(deltas));
-            return finish_summary(
-                *begin_summary, FinishDisposition::Invalid, resolution.finish_reason);
+            return finish_summary(*begin_summary, FinishReason::Cancelled);
         }
 
-        auto staged = output.decoder.stage(pending.tokens(), output.stop_policy);
-        const auto resolution = decide_resolution(staged, pending.tokens(), budget);
-        auto decoder_commit = output.decoder.prepare_commit(
-            std::move(staged), resolution);
-
-        std::optional<FinishDisposition> disposition;
-        if (resolution.continuation == RoundContinuation::Continue) {
-            require(resolution.committed_tokens == pending.tokens().size());
-            std::move(pending).commit_all();
-        } else {
-            disposition = std::move(pending).commit_prefix_and_finish(
-                resolution.committed_tokens);
+        const auto decision = output.preview(
+            round.tokens, budget.remaining(), budget.limit_reason());
+        if (!decision.finished()) {
+            require(decision.accepted_tokens == round.tokens.size());
         }
-
-        auto deltas = output.decoder.commit(std::move(decoder_commit));
-        budget.commit(resolution.committed_tokens);
+        target.program->resolve_pending(
+            decision.accepted_tokens, decision.finished());
+        auto deltas = output.commit_preview();
+        budget.commit(decision.accepted_tokens);
         publish(sink, std::move(deltas));
 
-        if (resolution.continuation == RoundContinuation::Finish) {
-            return finish_summary(
-                *begin_summary, *disposition, resolution.finish_reason);
+        if (decision.finished()) {
+            return finish_summary(*begin_summary, decision.finish_reason);
         }
         return std::nullopt;
     };
@@ -1409,27 +1332,23 @@ GenerationSummary run_one(
         std::move(prompt), std::move(plan), target.request_memory.region());
     begin_summary = first.summary;
     guard.arm();
-    if (auto done = resolve_and_publish(std::move(first.round))) {
+    if (auto done = resolve_and_publish(first.round)) {
         guard.complete();
         return *done;
     }
 
     while (budget.remaining() != 0) {
         if (cancellation.requested()) {
-            auto staged = output.decoder.stage_terminal(FinishReason::Cancelled);
-            const auto resolution = output.cancelled_resolution(staged);
-            auto decoder_commit = output.decoder.prepare_commit(
-                std::move(staged), resolution);
+            output.preview_terminal(FinishReason::Cancelled);
             target.program->finish_active();
-            auto deltas = output.decoder.commit(std::move(decoder_commit));
+            auto deltas = output.commit_preview();
             publish(sink, std::move(deltas));
             guard.complete();
-            return finish_summary(
-                *begin_summary, FinishDisposition::Resident, FinishReason::Cancelled);
+            return finish_summary(*begin_summary, FinishReason::Cancelled);
         }
 
         auto round = target.program->decode_round(budget.round_budget());
-        if (auto done = resolve_and_publish(std::move(round))) {
+        if (auto done = resolve_and_publish(round)) {
             guard.complete();
             return *done;
         }
@@ -1441,15 +1360,15 @@ GenerationSummary run_one(
 
 This pseudocode fixes ownership and ordering, not exact public names. The begin round and every later
 round use the same resolver. Their only structural difference is the begin summary and the work the
-target performed before constructing the handle.
+target performed before returning the token view.
 
 `GenerationGuard` is an internal scope guard, not a public request object. It is constructed
 disarmed before `begin` so begin failure preserves that operation's own postcondition, then armed
-only after a handle exists. Because the handle is constructed later, stack unwinding destroys and
-invalidates it before the guard runs. Until `complete()`, the guard makes any remaining Active
-sequence Invalid and clears any just-finished Resident identity. These guard actions are host-only
-and `noexcept`; the next `begin` performs the target's real full reset. Consequently no generation
-state containing output that failed to publish is offered for prefix reuse.
+only after a first round exists. Until `complete()`, its destructor calls `abort_request()` and makes
+any Pending, Active, or just-finished Resident sequence non-reusable. The action is host-only and
+`noexcept`; the next `begin` performs the target's real full reset. The guard remains armed through
+decoder commit and publication, so output that failed during preview or publication is never offered
+for prefix reuse.
 
 The loop has no branch on Text versus Vision, dense versus MoE, attention versus GDN, ordinary
 versus MTP, or exact checkpoint identity. Those branches occur within the selected package.
@@ -1488,9 +1407,13 @@ Prefill/decode/MTP hot paths contain no:
 - runtime persistent repack or quantization;
 - target registry lookup;
 - per-layer polymorphic dispatch;
-- per-round heap or device allocation;
+- per-round device allocation or explicit transaction-PIMPL/candidate-lattice allocation;
 - hidden synchronization caused by movable or temporary graph buffers;
 - serving callback from inside model execution.
+
+Request-local output decoding and publication may still grow ordinary strings/vectors; this rule is
+about stable model execution and the removed per-round transaction objects, not a universal
+host-allocation guarantee.
 
 ## 16. Concrete fit: Qwen3.6-27B
 
@@ -1526,7 +1449,7 @@ They are one ownership unit because only the 27B target can state their cross-co
 ### 16.3 Fresh and reused begin
 
 For text, `begin` chooses full reset, append continuation, or an exact boundary restore based on the
-prepared prompt and resident epoch. Boundary selection and GDN snapshot scheduling are one target
+prepared prompt and current resident ledger. Boundary selection and GDN snapshot scheduling are one target
 operation; there is no out-of-band setter whose value can be cleared by a later reset.
 
 For multimodal input, one `begin` covers:
@@ -1556,15 +1479,14 @@ acceptance, GDN slot selection, MTP proposal preparation, and next-round state c
 returns only `[accepted target-licensed drafts..., target correction/bonus]` through the fixed output
 buffer.
 
-A batch is inspected and resolved as one `PendingRound`, which prevents the controller from exposing
-one token at a time while silently retaining an unresolved speculative suffix.
+A batch is returned as one `GeneratedRound` and resolved once through `resolve_pending`, which
+prevents the controller from exposing one token at a time while silently retaining an unresolved
+speculative suffix.
 
-If a stop occurs on an intermediate returned draft, `commit_prefix_and_finish` may preserve a
-resident prefix only by rewinding/canonicalizing full-attention KV, selecting the matching GDN
-snapshot, fixing Text/MTP positions and frontier controls, normalizing any sampler/occurrence state
-that remains relevant, and making later draft and proposal state unreachable. If the 27B target
-cannot prove all of those conditions, it invalidates the resident sequence. It never promises that
-generation can continue from an arbitrary intermediate MTP proposal state.
+The current 27B target deliberately makes a terminal strict prefix of an MTP batch non-reusable. It
+accepts that logical output prefix for the user-visible result, but calls the target-private invalid
+path instead of implementing KV/GDN/MTP repair for an uncommon terminal event. It never promises
+that generation can continue from an arbitrary intermediate MTP proposal state.
 
 For the 27B MTP result `[accepted drafts..., correction/bonus]`, let `n = accepted_drafts + 1`.
 The required resolved states are:
@@ -1572,11 +1494,10 @@ The required resolved states are:
 | Resolution | Materialized `E_f` | Logical `S_f` | 27B state consequence |
 |---|---:|---:|---|
 | full Continue of `n` | `E + n` | `E + n + 1` | final correction/bonus is the new frontier |
-| terminal `m < n`, Resident | `E + m + 1` | `E + m + 1` | state is canonical through the stopped draft; select GDN snapshot `m` |
+| terminal `m < n` | not exposed | not exposed | `Invalid`; exact output prefix is returned but no sequence identity is reusable |
 | terminal `m = n`, Resident | `E + n` | `E + n + 1` | final correction/bonus remains the frontier |
-| any terminal result not exactly repairable | `0` | `0` | `Invalid`; no prefix identity is reachable |
 
-Advertising either Resident form also requires agreement among the host KV cursor, device Text
+Advertising the Resident form requires agreement among the host KV cursor, device Text
 position, decode RoPE position (`rope_pos = text_pos + rope_delta` for this target), GDN initial slot,
 logical token mirror, MTP KV/carry/proposal
 reachability, graph control scalars, and any still-active sampler state. Repairing only the host KV
@@ -1675,7 +1596,7 @@ Despite different internal layers, both targets can:
 
 - consume a target-typed prepared prompt;
 - plan memory and effective output capacity before mutation;
-- return one first-token `PendingRound` from `begin`;
+- return one first-token `GeneratedRound` from `begin`;
 - return only licensed tokens in a bounded decode round;
 - commit the full round, finish at an accepted logical prefix, or invalidate;
 - maintain the same `E`/`S` frontier invariant;
@@ -1995,8 +1916,8 @@ Place a new value or function by the complete invariant it must maintain:
    `kernels` only after real cross-target proof;
 3. any invariant naming a checkpoint dimension, Vision composition, GDN/MoE state, MTP alignment,
    prefix repair, exact graph, or selected-GPU policy belongs to the exact target package;
-4. stop/output-budget/cancellation policy, decoder transaction ordering, and publication belong to
-   runtime generation; checkpoint token-to-text/channel staging and its mutable decoder state remain
+4. stop/output-budget/cancellation policy, decoder preview/commit ordering, and publication belong to
+   runtime generation; checkpoint token-to-text/channel preview and its mutable decoder state remain
    in the target frontend's `OutputSession`;
 5. schemas, network/filesystem acquisition, and transport behavior belong to
    serve/product code and are not target dependencies.
@@ -2020,7 +1941,7 @@ translation unit remains in its anonymous namespace instead of creating another 
 | tokenizer, template, media preprocessing, owning prepared prompt, and output decoding | target `impl/frontend/` |
 | KV/GDN/MTP state, stable graph buffers, sampling state, prefix ledger, and request plans | target `Program` under `impl/program/` |
 | fixed Text, Vision, and MTP execution order | target-private `impl/schedule/` |
-| output budget, stopping, cancellation, transactional publication, and common summaries | runtime generation and public `Engine` implementation |
+| output budget, stopping, cancellation, exact-prefix publication ordering, and common summaries | runtime generation and public `Engine` implementation |
 | device/tensor/layout/arena/graph primitives | `ninfer_core` |
 | complete mathematical operators shared by the registered target | `ninfer_kernels` |
 | checkpoint-neutral Unicode and image/video decoding | `ninfer_text` and `ninfer_media_decode` |
@@ -2167,8 +2088,8 @@ valid paths behind one contract.
 ### 21.6 Public one-token phase API plus a hidden speculative queue
 
 Returning one token while retaining the rest of a speculative batch hides unresolved state and makes
-mid-batch stops ambiguous. The controller receives the complete licensed batch as `PendingRound` and
-resolves it once.
+mid-batch stops ambiguous. The controller receives the complete licensed batch as `GeneratedRound`
+and resolves Program once with the selected exact prefix.
 
 ### 21.7 Arbitrary round rollback
 
@@ -2230,14 +2151,16 @@ An implementation conforming to this architecture satisfies all of the following
 12. **Frontier correctness:** every resolved Active state satisfies `S = E + 1`; Resident satisfies
     `E <= S <= E + 1`, and all states obey the planned `C_exec` bounds.
 13. **Licensed output:** every returned token is valid target output, never an unverified proposal.
-14. **One round transaction:** a round is fully committed, prefix-finished, or invalidated exactly
-    once.
-15. **No false rollback:** discard never claims restoration; arbitrary partial continuation is absent.
+14. **One round resolution:** Program resolves a returned round once as full Continue or terminal
+    exact prefix; failure makes the request non-reusable.
+15. **No false rollback:** `abort_request` never claims restoration; arbitrary partial continuation is absent.
 16. **Accepted-prefix reuse:** no state beyond the accepted logical sequence is reachable after finish.
-17. **Stage before publish:** stop/output decisions and model resolution precede user callbacks.
+17. **Preview before publish:** stop/output decisions and model resolution precede user callbacks.
 18. **Exact decoder commit:** tokenizer state advances by the same token prefix committed to Program.
 19. **Target capacity:** common code does not derive model context/output formulas or token domains.
-20. **Allocation-free rounds:** steady decode and MTP perform no heap/device allocation or file I/O.
+20. **Stable model execution:** steady decode and MTP perform no device allocation or file I/O, use
+    Program-owned token/workspace storage, and introduce no per-round transaction PIMPL or candidate
+    lattice. This does not prohibit ordinary output string/vector growth.
 21. **No silent degradation:** unsupported layout, hardware, capacity, or native component fails
     instead of choosing an unregistered fallback.
 22. **Physical target ownership:** every checkpoint/GPU invariant lives in its exact target package;
@@ -2270,13 +2193,13 @@ registered target:
 ### 23.2 Prompt and memory lifetime
 
 - text and native multimodal prepared prompts own every asynchronous input;
-- prepared-prompt product cookies reject cross-load and stale-envelope submission before planning;
+- prepared prompts for the same exact target alternative may cross Engine instances; a different
+  target alternative is rejected before planning;
 - moving the prepared prompt and request plan into `begin` cannot invalidate a plan-borrowed
   pointer because RequestPlan contains no such borrow;
 - large/dynamic prefill workspace cannot move graph-stable buffers;
 - successful and recoverably failing `begin` paths leave no asynchronous access to destroyed prompt
   storage or reusable `TransientRegion` memory;
-- request-plan epoch mismatch fails before mutation;
 - maximum planned context and representative media inputs fit or fail deterministically.
 
 ### 23.3 State transitions
@@ -2287,7 +2210,8 @@ registered target:
 - stop at every returned MTP position satisfies the exact frontier/canonical equations in Section
   11.2 and leaves that accepted logical prefix reusable or explicitly Invalid;
 - cancellation before and after a round never advertises provisional state;
-- an unresolved `PendingRound` destructor invalidates without CUDA work;
+- an exception with provisional or committed-but-unpublished work leaves `GenerationGuard` armed and
+  makes the Program sequence non-reusable without CUDA rollback;
 - prefix append, explicit checkpoint restore, and full reset preserve KV/recurrent/MTP consistency;
 - cross-round stop strings, UTF-8 tails, reasoning/content transitions, token stops, output limits,
   and cancellation keep Program token count, decoder state, and published bytes consistent;
@@ -2333,7 +2257,7 @@ container object directory
   -> compiled exact-target binder/load plan
   -> immutable loaded product
   -> one non-movable target program
-  -> transactional target-licensed-token rounds
+  -> target-licensed `GeneratedRound` views and exact-prefix resolution
   -> common output controller
 ```
 

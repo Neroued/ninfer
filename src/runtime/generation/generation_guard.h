@@ -8,7 +8,7 @@ public:
     explicit GenerationGuard(Program& program) noexcept : program_(&program) {}
 
     ~GenerationGuard() noexcept {
-        if (armed_) { program_->abort_active(); }
+        if (armed_) { program_->abort_request(); }
     }
 
     GenerationGuard(const GenerationGuard&)            = delete;

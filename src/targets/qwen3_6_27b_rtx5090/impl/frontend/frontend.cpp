@@ -384,12 +384,22 @@ struct DecoderState {
 };
 
 struct StopMatch {
+    bool found                     = false;
     std::uint32_t committed_tokens  = 0;
-    OutputChannel channel           = OutputChannel::Content;
     std::uint64_t byte_cut          = 0;
     std::uint32_t declaration_order = 0;
     PublishedOutput output;
 };
+
+bool stop_match_precedes(std::uint32_t committed_tokens, std::uint64_t byte_cut,
+                         std::uint32_t declaration_order, const StopMatch& current) noexcept {
+    if (!current.found) { return true; }
+    if (committed_tokens != current.committed_tokens) {
+        return committed_tokens < current.committed_tokens;
+    }
+    if (byte_cut != current.byte_cut) { return byte_cut < current.byte_cut; }
+    return declaration_order < current.declaration_order;
+}
 
 std::size_t stop_hold_size(std::string_view text, OutputChannel channel, const StopPolicy& policy) {
     std::size_t hold = 0;
@@ -402,28 +412,32 @@ std::size_t stop_hold_size(std::string_view text, OutputChannel channel, const S
 
 void feed_channel(DecoderState& state, OutputChannel channel, std::string_view text,
                   const StopPolicy& policy, PublishedOutput& emitted,
-                  std::uint32_t committed_tokens, std::vector<StopMatch>& matches) {
+                  std::uint32_t committed_tokens, StopMatch* best_match) {
     if (text.empty()) { return; }
     std::string combined          = state.stop_pending[channel_index(channel)];
     const std::size_t old_pending = combined.size();
     combined.append(text);
     const std::uint64_t combined_start = state.decoded_bytes - old_pending;
 
-    for (std::size_t declaration = 0; declaration < policy.strings.size(); ++declaration) {
-        const StopString& stop = policy.strings[declaration];
-        if (stop.channel != channel) { continue; }
-        const std::size_t found = combined.find(stop.text);
-        if (found == std::string::npos) { continue; }
-        PublishedOutput candidate = emitted;
-        append_delta(candidate, channel, combined.substr(0, found));
-        if (stop.include_in_output) { append_delta(candidate, channel, stop.text); }
-        matches.push_back(StopMatch{
-            .committed_tokens  = committed_tokens,
-            .channel           = channel,
-            .byte_cut          = combined_start + found,
-            .declaration_order = static_cast<std::uint32_t>(declaration),
-            .output            = std::move(candidate),
-        });
+    if (best_match != nullptr) {
+        for (std::size_t declaration = 0; declaration < policy.strings.size(); ++declaration) {
+            const StopString& stop = policy.strings[declaration];
+            if (stop.channel != channel) { continue; }
+            const std::size_t found = combined.find(stop.text);
+            if (found == std::string::npos) { continue; }
+            const std::uint64_t byte_cut = combined_start + found;
+            const auto order             = static_cast<std::uint32_t>(declaration);
+            if (!stop_match_precedes(committed_tokens, byte_cut, order, *best_match)) { continue; }
+
+            PublishedOutput candidate = emitted;
+            append_delta(candidate, channel, combined.substr(0, found));
+            if (stop.include_in_output) { append_delta(candidate, channel, stop.text); }
+            *best_match = StopMatch{.found             = true,
+                                    .committed_tokens  = committed_tokens,
+                                    .byte_cut          = byte_cut,
+                                    .declaration_order = order,
+                                    .output            = std::move(candidate)};
+        }
     }
 
     const std::size_t hold = stop_hold_size(combined, channel, policy);
@@ -440,7 +454,7 @@ void close_channel(DecoderState& state, OutputChannel channel, PublishedOutput& 
 
 void feed_content(DecoderState& state, std::string text, const StopPolicy& policy,
                   PublishedOutput& emitted, std::uint32_t committed_tokens,
-                  std::vector<StopMatch>& matches) {
+                  StopMatch* best_match) {
     if (state.strip_content_leading) {
         std::size_t begin = 0;
         while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
@@ -449,14 +463,15 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
         text.erase(0, begin);
         if (!text.empty()) { state.strip_content_leading = false; }
     }
-    feed_channel(state, OutputChannel::Content, text, policy, emitted, committed_tokens, matches);
+    feed_channel(state, OutputChannel::Content, text, policy, emitted, committed_tokens,
+                 best_match);
 }
 
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
-                       std::vector<StopMatch>& matches) {
+                       StopMatch* best_match) {
     if (!state.in_reasoning) {
-        feed_content(state, std::string(text), policy, emitted, committed_tokens, matches);
+        feed_content(state, std::string(text), policy, emitted, committed_tokens, best_match);
         return;
     }
 
@@ -465,13 +480,13 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     if (marker != std::string::npos) {
         feed_channel(state, OutputChannel::Reasoning,
                      std::string_view(state.think_marker_pending).substr(0, marker), policy,
-                     emitted, committed_tokens, matches);
+                     emitted, committed_tokens, best_match);
         close_channel(state, OutputChannel::Reasoning, emitted);
         std::string content = state.think_marker_pending.substr(marker + kThinkClose.size());
         state.think_marker_pending.clear();
         state.in_reasoning          = false;
         state.strip_content_leading = true;
-        feed_content(state, std::move(content), policy, emitted, committed_tokens, matches);
+        feed_content(state, std::move(content), policy, emitted, committed_tokens, best_match);
         return;
     }
 
@@ -479,34 +494,33 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
     const std::size_t safe = state.think_marker_pending.size() - hold;
     feed_channel(state, OutputChannel::Reasoning,
                  std::string_view(state.think_marker_pending).substr(0, safe), policy, emitted,
-                 committed_tokens, matches);
+                 committed_tokens, best_match);
     state.think_marker_pending.erase(0, safe);
 }
 
 void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& policy,
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
-                      std::vector<StopMatch>& matches) {
+                      StopMatch* best_match) {
     state.utf8_pending += bytes;
     const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
     if (valid == 0) { return; }
     const std::string text = state.utf8_pending.substr(0, valid);
     state.utf8_pending.erase(0, valid);
-    feed_decoded_text(state, text, policy, emitted, committed_tokens, matches);
+    feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 
 void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput& emitted,
                  std::uint32_t committed_tokens) {
-    std::vector<StopMatch> ignored;
     if (!state.utf8_pending.empty()) {
         // A token budget can end between byte-level tokens of one code point.
         // Publish the standard replacement character rather than an invalid
         // UTF-8 suffix; the logical token prefix remains exact.
         state.utf8_pending.clear();
-        feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, ignored);
+        feed_decoded_text(state, "\xef\xbf\xbd", policy, emitted, committed_tokens, nullptr);
     }
     if (state.in_reasoning) {
         feed_channel(state, OutputChannel::Reasoning, state.think_marker_pending, policy, emitted,
-                     committed_tokens, ignored);
+                     committed_tokens, nullptr);
         state.think_marker_pending.clear();
         close_channel(state, OutputChannel::Reasoning, emitted);
     } else {
@@ -549,35 +563,6 @@ public:
     StopPolicy defaults;
 };
 
-struct DecoderCandidate {
-    StagedCandidateSummary summary;
-    DecoderState next;
-    PublishedOutput output;
-};
-
-class StagedText::Impl {
-public:
-    std::uint64_t epoch = 0;
-    std::vector<DecoderCandidate> choices;
-    std::vector<StagedCandidateSummary> summaries;
-
-    void add(DecoderCandidate choice) {
-        if (choices.size() >= std::numeric_limits<std::uint32_t>::max()) {
-            throw std::overflow_error("too many staged decoder choices");
-        }
-        choice.summary.id.value = static_cast<std::uint32_t>(choices.size() + 1);
-        summaries.push_back(choice.summary);
-        choices.push_back(std::move(choice));
-    }
-};
-
-class DecoderCommitPlan::Impl {
-public:
-    std::uint64_t epoch = 0;
-    DecoderState next;
-    PublishedOutput output;
-};
-
 class OutputSession::Impl {
 public:
     Impl(std::shared_ptr<const fi::Tokenizer> tokenizer_, StopPolicy policy_, OutputOptions output,
@@ -591,7 +576,9 @@ public:
     StopPolicy policy;
     bool preserve_special = false;
     DecoderState state;
-    std::uint64_t epoch = 1;
+    DecoderState preview_state;
+    PublishedOutput preview_output;
+    bool preview_ready = false;
 };
 
 std::span<const std::int32_t> PreparedPromptData::position_axis(int axis) const {
@@ -623,45 +610,6 @@ double PreparedPrompt::prepare_seconds() const noexcept {
 
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 
-StagedText::StagedText() noexcept                        = default;
-StagedText::~StagedText()                                = default;
-StagedText::StagedText(StagedText&&) noexcept            = default;
-StagedText& StagedText::operator=(StagedText&&) noexcept = default;
-
-StagedText::StagedText(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
-
-std::span<const StagedCandidateSummary> StagedText::candidates() const noexcept {
-    return impl_ != nullptr ? std::span<const StagedCandidateSummary>(impl_->summaries)
-                            : std::span<const StagedCandidateSummary>{};
-}
-
-runtime::StagedChoiceId StagedText::choice_for(std::uint32_t committed_tokens,
-                                               runtime::RoundContinuation continuation,
-                                               FinishReason reason) const {
-    if (impl_ == nullptr) { throw std::logic_error("staged text is empty"); }
-    std::optional<runtime::StagedChoiceId> found;
-    for (const StagedCandidateSummary& choice : impl_->summaries) {
-        if (choice.committed_tokens == committed_tokens && choice.continuation == continuation &&
-            choice.finish_reason == reason) {
-            if (found.has_value()) {
-                throw std::logic_error(
-                    "staged resolution has multiple textual choices; select its candidate id");
-            }
-            found = choice.id;
-        }
-    }
-    if (!found.has_value()) { throw std::out_of_range("staged resolution has no decoder choice"); }
-    return *found;
-}
-
-DecoderCommitPlan::DecoderCommitPlan() noexcept                               = default;
-DecoderCommitPlan::~DecoderCommitPlan()                                       = default;
-DecoderCommitPlan::DecoderCommitPlan(DecoderCommitPlan&&) noexcept            = default;
-DecoderCommitPlan& DecoderCommitPlan::operator=(DecoderCommitPlan&&) noexcept = default;
-
-DecoderCommitPlan::DecoderCommitPlan(std::unique_ptr<Impl> impl) noexcept
-    : impl_(std::move(impl)) {}
-
 OutputSession::OutputSession() noexcept                           = default;
 OutputSession::~OutputSession()                                   = default;
 OutputSession::OutputSession(OutputSession&&) noexcept            = default;
@@ -669,190 +617,101 @@ OutputSession& OutputSession::operator=(OutputSession&&) noexcept = default;
 
 OutputSession::OutputSession(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
-const StopPolicy& OutputSession::stop_policy() const noexcept {
-    static const StopPolicy empty;
-    return impl_ != nullptr ? impl_->policy : empty;
-}
-
-bool OutputSession::is_stop_token(TokenId token) const noexcept {
-    if (impl_ == nullptr) { return false; }
-    return std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
-           impl_->policy.token_ids.end();
-}
-
-StagedText OutputSession::stage(std::span<const TokenId> tokens) const {
+runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
+                                               std::uint32_t budget_remaining,
+                                               FinishReason limit_reason) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
+    if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
     if (tokens.empty()) {
-        throw std::invalid_argument("cannot stage an empty generated-token round");
+        throw std::invalid_argument("cannot preview an empty generated-token round");
     }
-    if (tokens.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::invalid_argument("generated-token round is too large");
+    if (tokens.size() > budget_remaining) {
+        throw std::invalid_argument("generated-token round exceeds the remaining budget");
+    }
+    if (limit_reason != FinishReason::OutputLimit &&
+        limit_reason != FinishReason::ContextCapacity) {
+        throw std::invalid_argument("generated-token budget has an invalid limit reason");
     }
 
-    auto staged        = std::make_unique<StagedText::Impl>();
-    staged->epoch      = impl_->epoch;
-    DecoderState state = impl_->state;
-    PublishedOutput emitted;
+    impl_->preview_state = impl_->state;
+    impl_->preview_output.clear();
+
+    const auto complete = [&](std::uint32_t count, FinishReason reason) {
+        impl_->preview_ready = true;
+        return runtime::OutputDecision{.accepted_tokens = count, .finish_reason = reason};
+    };
 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
-        const std::uint32_t count           = static_cast<std::uint32_t>(index + 1);
-        const DecoderState before_state     = state;
-        const PublishedOutput before_output = emitted;
-        std::vector<StopMatch> matches;
-
-        const TokenId token = tokens[index];
+        const std::uint32_t count = static_cast<std::uint32_t>(index + 1);
+        const TokenId token       = tokens[index];
         if (!impl_->tokenizer->is_valid_token(token)) {
             throw std::out_of_range("generated token is outside the checkpoint vocabulary: " +
                                     std::to_string(token));
         }
+
+        const bool stop_token =
+            std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
+            impl_->policy.token_ids.end();
+        DecoderState before_state;
+        PublishedOutput before_output;
+        if (stop_token && !impl_->policy.publish_stop_token) {
+            before_state  = impl_->preview_state;
+            before_output = impl_->preview_output;
+        }
+
+        StopMatch match;
         const std::string bytes =
             impl_->tokenizer->decode_token_bytes(token, !impl_->preserve_special);
-        feed_token_bytes(state, bytes, impl_->policy, emitted, count, matches);
+        feed_token_bytes(impl_->preview_state, bytes, impl_->policy, impl_->preview_output, count,
+                         &match);
 
-        staged->add(DecoderCandidate{
-            .summary =
-                StagedCandidateSummary{
-                    .id                     = {},
-                    .committed_tokens       = count,
-                    .continuation           = runtime::RoundContinuation::Continue,
-                    .finish_reason          = FinishReason::None,
-                    .decoded_byte_cut_order = std::numeric_limits<std::uint64_t>::max(),
-                },
-            .next   = state,
-            .output = emitted,
-        });
-
-        for (const FinishReason reason :
-             {FinishReason::OutputLimit, FinishReason::ContextCapacity}) {
-            DecoderState finished  = state;
-            PublishedOutput output = emitted;
-            terminalize(finished, impl_->policy, output, count);
-            staged->add(DecoderCandidate{
-                .summary =
-                    StagedCandidateSummary{
-                        .id                     = {},
-                        .committed_tokens       = count,
-                        .continuation           = runtime::RoundContinuation::Finish,
-                        .finish_reason          = reason,
-                        .decoded_byte_cut_order = std::numeric_limits<std::uint64_t>::max(),
-                    },
-                .next   = std::move(finished),
-                .output = std::move(output),
-            });
+        if (match.found) {
+            impl_->preview_state  = terminal_state(std::move(impl_->preview_state));
+            impl_->preview_output = std::move(match.output);
+            return complete(match.committed_tokens, FinishReason::StopString);
         }
 
-        if (is_stop_token(token)) {
-            DecoderState finished  = impl_->policy.publish_stop_token ? state : before_state;
-            PublishedOutput output = impl_->policy.publish_stop_token ? emitted : before_output;
-            terminalize(finished, impl_->policy, output, count);
-            staged->add(DecoderCandidate{
-                .summary =
-                    StagedCandidateSummary{
-                        .id                     = {},
-                        .committed_tokens       = count,
-                        .continuation           = runtime::RoundContinuation::Finish,
-                        .finish_reason          = FinishReason::StopToken,
-                        .decoded_byte_cut_order = std::numeric_limits<std::uint64_t>::max(),
-                    },
-                .next   = std::move(finished),
-                .output = std::move(output),
-            });
-        }
-
-        for (StopMatch& match : matches) {
-            staged->add(DecoderCandidate{
-                .summary =
-                    StagedCandidateSummary{
-                        .id                     = {},
-                        .committed_tokens       = match.committed_tokens,
-                        .continuation           = runtime::RoundContinuation::Finish,
-                        .finish_reason          = FinishReason::StopString,
-                        .channel                = match.channel,
-                        .decoded_byte_cut_order = match.byte_cut,
-                        .declaration_order      = match.declaration_order,
-                    },
-                .next   = terminal_state(state),
-                .output = std::move(match.output),
-            });
+        if (stop_token) {
+            if (!impl_->policy.publish_stop_token) {
+                impl_->preview_state  = std::move(before_state);
+                impl_->preview_output = std::move(before_output);
+            }
+            terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+            return complete(count, FinishReason::StopToken);
         }
     }
-    return StagedText(std::move(staged));
+
+    const auto count = static_cast<std::uint32_t>(tokens.size());
+    if (tokens.size() == budget_remaining) {
+        terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+        return complete(count, limit_reason);
+    }
+    return complete(count, FinishReason::None);
 }
 
-StagedText OutputSession::stage_terminal(FinishReason reason) const {
+runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
+    if (impl_->preview_ready) { throw std::logic_error("output session already has a preview"); }
     if (reason == FinishReason::None || reason == FinishReason::StopString ||
         reason == FinishReason::StopToken) {
         throw std::invalid_argument("invalid between-round terminal decoder reason");
     }
-    auto staged           = std::make_unique<StagedText::Impl>();
-    staged->epoch         = impl_->epoch;
-    DecoderState finished = impl_->state;
-    PublishedOutput output;
-    terminalize(finished, impl_->policy, output, 0);
-    staged->add(DecoderCandidate{
-        .summary =
-            StagedCandidateSummary{
-                .id                     = {},
-                .committed_tokens       = 0,
-                .continuation           = runtime::RoundContinuation::Finish,
-                .finish_reason          = reason,
-                .decoded_byte_cut_order = std::numeric_limits<std::uint64_t>::max(),
-            },
-        .next   = std::move(finished),
-        .output = std::move(output),
-    });
-    return StagedText(std::move(staged));
+    impl_->preview_state = impl_->state;
+    impl_->preview_output.clear();
+    terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
+    impl_->preview_ready = true;
+    return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
-DecoderCommitPlan OutputSession::prepare_commit(StagedText&& staged,
-                                                const runtime::OutputResolution& resolution) const {
-    if (impl_ == nullptr || staged.impl_ == nullptr) {
-        throw std::logic_error("cannot prepare an empty decoder transaction");
-    }
-    if (staged.impl_->epoch != impl_->epoch) {
-        throw std::logic_error("staged decoder transaction is stale");
-    }
-    if (resolution.staged_choice.value == 0 ||
-        resolution.staged_choice.value > staged.impl_->choices.size()) {
-        throw std::out_of_range("decoder choice id is outside the staged transaction");
-    }
-    const std::size_t index  = resolution.staged_choice.value - 1;
-    DecoderCandidate& choice = staged.impl_->choices[index];
-    if (choice.summary.committed_tokens != resolution.committed_tokens ||
-        choice.summary.continuation != resolution.continuation ||
-        choice.summary.finish_reason != resolution.finish_reason) {
-        throw std::invalid_argument("output resolution does not match its staged decoder choice");
-    }
-    if (resolution.continuation == runtime::RoundContinuation::Continue &&
-        resolution.finish_reason != FinishReason::None) {
-        throw std::invalid_argument("continuing output resolution must not have a finish reason");
-    }
-    if (resolution.continuation == runtime::RoundContinuation::Finish &&
-        resolution.finish_reason == FinishReason::None) {
-        throw std::invalid_argument("terminal output resolution requires a finish reason");
-    }
-
-    auto plan    = std::make_unique<DecoderCommitPlan::Impl>();
-    plan->epoch  = impl_->epoch;
-    plan->next   = std::move(choice.next);
-    plan->output = std::move(choice.output);
-    staged.impl_.reset();
-    return DecoderCommitPlan(std::move(plan));
-}
-
-PublishedOutput OutputSession::commit(DecoderCommitPlan&& plan) noexcept {
-    if (impl_ == nullptr || plan.impl_ == nullptr || plan.impl_->epoch != impl_->epoch) {
-        std::terminate();
-    }
+PublishedOutput OutputSession::commit_preview() noexcept {
+    if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
-    swap(impl_->state, plan.impl_->next);
-    ++impl_->epoch;
+    swap(impl_->state, impl_->preview_state);
     PublishedOutput output;
-    output.swap(plan.impl_->output);
-    plan.impl_.reset();
+    output.swap(impl_->preview_output);
+    impl_->preview_ready = false;
     return output;
 }
 

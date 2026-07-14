@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 
 namespace ninfer::runtime {
 
@@ -17,40 +18,13 @@ using ::ninfer::StopPolicy;
 using ::ninfer::StopString;
 using ::ninfer::TokenId;
 
-enum class RoundContinuation : std::uint8_t {
-    Continue,
-    Finish,
-};
+struct OutputDecision {
+    std::uint32_t accepted_tokens = 0;
+    FinishReason finish_reason    = FinishReason::None;
 
-struct StagedChoiceId {
-    std::uint32_t value = 0;
-};
-
-struct OutputResolution {
-    std::uint32_t committed_tokens = 0;
-    RoundContinuation continuation = RoundContinuation::Continue;
-    FinishReason finish_reason     = FinishReason::None;
-    StagedChoiceId staged_choice;
-};
-
-enum class FinishDisposition : std::uint8_t {
-    Resident,
-    Invalid,
-};
-
-enum class ProgramState : std::uint8_t {
-    Empty,
-    Active,
-    PendingRound,
-    Resident,
-    Invalid,
-};
-
-struct SequenceSummary {
-    ProgramState state                = ProgramState::Empty;
-    std::uint64_t epoch               = 0;
-    std::uint32_t materialized_tokens = 0;
-    std::uint32_t logical_tokens      = 0;
+    [[nodiscard]] bool finished() const noexcept {
+        return finish_reason != FinishReason::None;
+    }
 };
 
 struct RequestPlanSummary {
@@ -68,11 +42,18 @@ struct BeginSummary {
     std::uint32_t reused_prompt_tokens = 0;
 };
 
+struct GeneratedRound {
+    std::span<const TokenId> tokens;
+};
+
+struct BeginResult {
+    BeginSummary summary;
+    GeneratedRound round;
+};
+
 struct GenerationSummary {
     std::optional<BeginSummary> begin;
-    std::uint32_t committed_output_tokens = 0;
-    FinishReason finish_reason            = FinishReason::None;
-    std::optional<FinishDisposition> sequence;
+    FinishReason finish_reason = FinishReason::None;
 };
 
 struct RoundBudget {

@@ -120,12 +120,8 @@ Program::Impl::~Impl() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
-void Program::Impl::advance_epoch() noexcept {
-    if (epoch != std::numeric_limits<std::uint64_t>::max()) { ++epoch; }
-}
-
 void Program::Impl::make_invalid() noexcept {
-    lifecycle = runtime::ProgramState::Invalid;
+    lifecycle = Lifecycle::Invalid;
     E         = 0;
     S         = 0;
     ledger.clear();
@@ -267,21 +263,11 @@ void Program::Impl::validate_licensed_tokens(std::span<const TokenId> tokens) co
     }
 }
 
-runtime::PendingRound<Program> Program::Impl::pending_handle(Program& owner, std::size_t count) {
-    using Handle = runtime::PendingRound<Program>;
-    return Handle(owner, epoch, std::span<const TokenId>(host_tokens, count),
-                  typename Handle::Callbacks{&Program::is_live_thunk, &Program::commit_all_thunk,
-                                             &Program::finish_thunk, &Program::discard_thunk});
-}
-
-runtime::BeginRound<Program> Program::Impl::begin(Program& owner, PreparedPromptData&& prompt,
-                                                  RequestPlan&& request_plan,
-                                                  runtime::TransientRegion transient) {
+runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPlan&& request_plan,
+                                          runtime::TransientRegion transient) {
     if (request_plan.impl_ == nullptr) { throw std::invalid_argument("request plan is empty"); }
     const RequestPlan::Impl& plan = *request_plan.impl_;
-    if (plan.expected_epoch != epoch) { throw std::logic_error("request plan epoch is stale"); }
-    if (lifecycle == runtime::ProgramState::Active ||
-        lifecycle == runtime::ProgramState::PendingRound) {
+    if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Pending) {
         throw std::logic_error("begin requires Empty, Resident, or Invalid Program state");
     }
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -294,8 +280,7 @@ runtime::BeginRound<Program> Program::Impl::begin(Program& owner, PreparedPrompt
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
     if (plan.reuse != ReusePath::FullReset) {
-        if (lifecycle != runtime::ProgramState::Resident ||
-            !prefix_matches(prompt, ledger, plan.reuse_base)) {
+        if (lifecycle != Lifecycle::Resident || !prefix_matches(prompt, ledger, plan.reuse_base)) {
             throw std::logic_error("planned resident prefix is no longer reusable");
         }
         if (plan.reuse == ReusePath::RestoreBoundary &&
@@ -313,8 +298,7 @@ runtime::BeginRound<Program> Program::Impl::begin(Program& owner, PreparedPrompt
 
     // From here on, the old identity is deliberately unreachable. Any failure takes the Program
     // to Invalid rather than attempting a mixed restore/reset fallback.
-    lifecycle = runtime::ProgramState::Invalid;
-    advance_epoch();
+    lifecycle = Lifecycle::Invalid;
     try {
         if (plan.reuse == ReusePath::FullReset) {
             ordered_reset();
@@ -455,36 +439,33 @@ runtime::BeginRound<Program> Program::Impl::begin(Program& owner, PreparedPrompt
             boundary.mtp_prefix_valid = mtp_prepared;
         }
 
-        pending   = PendingCandidate{.kind               = PendingKind::Begin,
-                                     .base_E             = 0,
-                                     .base_S             = 0,
-                                     .prompt_tokens      = prompt_tokens,
-                                     .produced           = 1,
-                                     .accepted_drafts    = 0,
-                                     .resulting_gdn_slot = 0};
-        lifecycle = runtime::ProgramState::PendingRound;
-        advance_epoch();
-        pending.epoch = epoch;
+        pending   = PendingCandidate{.kind          = PendingKind::Begin,
+                                     .base_E        = 0,
+                                     .base_S        = 0,
+                                     .prompt_tokens = prompt_tokens,
+                                     .produced      = 1};
+        lifecycle = Lifecycle::Pending;
         timings.prefill_seconds =
             std::max(timings.prefill_seconds,
                      std::chrono::duration<double>(Clock::now() - begin_start).count() -
                          timings.vision_seconds);
-        return runtime::BeginRound<Program>(
-            runtime::BeginSummary{.prompt_tokens = prompt_tokens, .reused_prompt_tokens = base},
-            pending_handle(owner, 1));
+        return runtime::BeginResult{
+            .summary = runtime::BeginSummary{.prompt_tokens        = prompt_tokens,
+                                             .reused_prompt_tokens = base},
+            .round   = runtime::GeneratedRound{
+                  .tokens = std::span<const TokenId>(host_tokens, 1)},
+        };
     } catch (...) {
         try {
             device.synchronize();
         } catch (...) {}
         make_invalid();
-        advance_epoch();
         throw;
     }
 }
 
-runtime::PendingRound<Program> Program::Impl::decode_round(Program& owner,
-                                                           runtime::RoundBudget budget) {
-    if (lifecycle != runtime::ProgramState::Active) {
+runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget) {
+    if (lifecycle != Lifecycle::Active) {
         throw std::logic_error("decode_round requires Active Program state");
     }
     if (budget.generated_tokens_remaining == 0) {
@@ -574,68 +555,39 @@ runtime::PendingRound<Program> Program::Impl::decode_round(Program& owner,
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, produced));
         ledger.insert(ledger.end(), host_tokens, host_tokens + produced);
-        pending   = PendingCandidate{.kind               = kind,
-                                     .base_E             = base_E,
-                                     .base_S             = base_S,
-                                     .prompt_tokens      = 0,
-                                     .produced           = produced,
-                                     .accepted_drafts    = accepted,
-                                     .resulting_gdn_slot = static_cast<std::int32_t>(accepted)};
-        lifecycle = runtime::ProgramState::PendingRound;
-        advance_epoch();
-        pending.epoch = epoch;
-        return pending_handle(owner, produced);
+        pending   = PendingCandidate{.kind          = kind,
+                                     .base_E        = base_E,
+                                     .base_S        = base_S,
+                                     .prompt_tokens = 0,
+                                     .produced      = produced};
+        lifecycle = Lifecycle::Pending;
+        return runtime::GeneratedRound{
+            .tokens = std::span<const TokenId>(host_tokens, produced)};
     } catch (...) {
         try {
             device.synchronize();
         } catch (...) {}
         make_invalid();
-        advance_epoch();
         throw;
     }
 }
 
-bool Program::Impl::is_live(std::uint64_t round_epoch) const noexcept {
-    return lifecycle == runtime::ProgramState::PendingRound && pending.epoch == round_epoch &&
-           epoch == round_epoch;
-}
-
-void Program::Impl::commit_all(std::uint64_t round_epoch) {
-    if (!is_live(round_epoch)) { throw std::logic_error("pending round epoch is stale"); }
-    switch (pending.kind) {
-    case PendingKind::Begin:
-        E = pending.prompt_tokens;
-        S = pending.prompt_tokens + 1;
-        break;
-    case PendingKind::Ordinary:
-    case PendingKind::Mtp:
-        E = pending.base_E + pending.produced;
-        S = pending.base_S + pending.produced;
-        break;
-    case PendingKind::None:
-        throw std::logic_error("pending round has no candidate");
+void Program::Impl::resolve_pending(std::uint32_t accepted_tokens, bool terminal) {
+    if (lifecycle != Lifecycle::Pending) {
+        throw std::logic_error("resolve_pending requires a pending generated round");
     }
-    if (S != E + 1 || ledger.size() != S) {
-        throw std::logic_error("committed round did not establish an Active frontier");
+    if (accepted_tokens == 0 || accepted_tokens > pending.produced) {
+        throw std::out_of_range("accepted prefix is outside the pending generated round");
     }
-    lifecycle = runtime::ProgramState::Active;
-    pending   = {};
-    advance_epoch();
-}
-
-runtime::FinishDisposition Program::Impl::commit_prefix_and_finish(std::uint64_t round_epoch,
-                                                                   std::size_t count) {
-    if (!is_live(round_epoch)) { throw std::logic_error("pending round epoch is stale"); }
-    if (count == 0 || count > pending.produced) {
-        throw std::out_of_range("terminal committed prefix is outside pending round");
+    if (!terminal && accepted_tokens != pending.produced) {
+        throw std::logic_error("a continuing round must accept every licensed token");
     }
-    if (pending.kind == PendingKind::Mtp && count < pending.produced) {
+    if (terminal && pending.kind == PendingKind::Mtp && accepted_tokens < pending.produced) {
         make_invalid();
-        advance_epoch();
-        return runtime::FinishDisposition::Invalid;
+        return;
     }
-    if (count != pending.produced) {
-        throw std::logic_error("non-MTP terminal round must commit its only token");
+    if (accepted_tokens != pending.produced) {
+        throw std::logic_error("a non-MTP terminal round must accept its only token");
     }
 
     switch (pending.kind) {
@@ -649,59 +601,31 @@ runtime::FinishDisposition Program::Impl::commit_prefix_and_finish(std::uint64_t
         S = pending.base_S + pending.produced;
         break;
     case PendingKind::None:
-        throw std::logic_error("pending round has no candidate");
+        throw std::logic_error("pending generated round has no candidate");
     }
     if (S != E + 1 || ledger.size() != S) {
-        throw std::logic_error("terminal round did not establish a frontier Resident state");
+        throw std::logic_error("resolved round did not establish a valid frontier");
     }
-    lifecycle = runtime::ProgramState::Resident;
+    lifecycle = terminal ? Lifecycle::Resident : Lifecycle::Active;
     pending   = {};
-    advance_epoch();
-    return runtime::FinishDisposition::Resident;
-}
-
-void Program::Impl::discard(std::uint64_t round_epoch) noexcept {
-    if (!is_live(round_epoch)) { return; }
-    make_invalid();
-    advance_epoch();
 }
 
 void Program::Impl::finish_active() {
-    if (lifecycle != runtime::ProgramState::Active) {
+    if (lifecycle != Lifecycle::Active) {
         throw std::logic_error("finish_active requires Active Program state");
     }
-    lifecycle = runtime::ProgramState::Resident;
-    advance_epoch();
+    lifecycle = Lifecycle::Resident;
 }
 
-void Program::Impl::abort_active() noexcept {
-    if (lifecycle == runtime::ProgramState::Empty || lifecycle == runtime::ProgramState::Invalid) {
+void Program::Impl::abort_request() noexcept {
+    if (lifecycle == Lifecycle::Empty || lifecycle == Lifecycle::Invalid) {
         return;
     }
     make_invalid();
-    advance_epoch();
 }
 
-void Program::Impl::clear_resident() noexcept {
-    if (lifecycle != runtime::ProgramState::Resident &&
-        lifecycle != runtime::ProgramState::Invalid) {
-        return;
-    }
-    make_invalid();
-    lifecycle = runtime::ProgramState::Empty;
-    advance_epoch();
-}
-
-runtime::SequenceSummary Program::Impl::sequence_summary() const noexcept {
-    runtime::SequenceSummary out;
-    out.state = lifecycle;
-    out.epoch = epoch;
-    if (lifecycle == runtime::ProgramState::Active ||
-        lifecycle == runtime::ProgramState::Resident) {
-        out.materialized_tokens = E;
-        out.logical_tokens      = S;
-    }
-    return out;
+std::uint32_t Program::Impl::materialized_tokens() const noexcept {
+    return lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Resident ? E : 0;
 }
 
 MemorySummary Program::Impl::memory_summary() const noexcept {

@@ -15,8 +15,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
   multimodal/MTP behavior, and the opt-in real-Engine prefix test;
 - `test_ninfer_artifact_reader.cpp` — C++ framing/directory/geometry and Python-written fixture
   agreement;
-- `test_output_resolution.cpp` and `test_runtime_pending_round.cpp` — generated-token transaction
-  and pending-handle semantics;
+- `test_generation_controller.cpp` — accepted-prefix, cancellation, publication ordering, and
+  request-abort behavior in the common generated-token loop;
 - `test_openai_schema.cpp`, `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current
   protocol translation and tool-call behavior;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v8 reports;

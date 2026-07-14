@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "runtime/engine/product_cookie.h"
 #include "runtime/engine/request_memory.h"
 #include <ninfer/targets/qwen3_6_27b_rtx5090/package.h>
 
@@ -31,14 +30,12 @@ struct LoadedQwen3_6_27BRtx5090 {
 struct Qwen3_6_27BRtx5090Instance {
     using Package = Qwen3_6_27BRtx5090;
 
-    runtime::ProductCookie cookie;
     std::unique_ptr<LoadedQwen3_6_27BRtx5090> loaded;
     runtime::RequestMemory request_memory;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_27BRtx5090::Program> program;
 
-    Qwen3_6_27BRtx5090Instance(runtime::ProductCookie product_cookie,
-                               std::unique_ptr<LoadedQwen3_6_27BRtx5090> stable_loaded,
+    Qwen3_6_27BRtx5090Instance(std::unique_ptr<LoadedQwen3_6_27BRtx5090> stable_loaded,
                                Qwen3_6_27BRtx5090::SequencePlan sequence_plan,
                                DeviceContext& device);
     ~Qwen3_6_27BRtx5090Instance();

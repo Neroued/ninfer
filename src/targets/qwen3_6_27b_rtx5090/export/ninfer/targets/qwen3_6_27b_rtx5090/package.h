@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "runtime/contract/pending_round.h"
+#include "runtime/contract/types.h"
 #include "runtime/contract/transient_region.h"
 
 #include <cstddef>
@@ -91,57 +91,6 @@ private:
     friend class Program;
 };
 
-struct StagedCandidateSummary {
-    runtime::StagedChoiceId id;
-    std::uint32_t committed_tokens          = 0;
-    runtime::RoundContinuation continuation = runtime::RoundContinuation::Continue;
-    FinishReason finish_reason              = FinishReason::None;
-    OutputChannel channel                   = OutputChannel::Content;
-    std::uint64_t decoded_byte_cut_order    = 0;
-    std::uint32_t declaration_order         = 0;
-};
-
-class StagedText {
-public:
-    StagedText() noexcept;
-    ~StagedText();
-    StagedText(StagedText&&) noexcept;
-    StagedText& operator=(StagedText&&) noexcept;
-
-    StagedText(const StagedText&)            = delete;
-    StagedText& operator=(const StagedText&) = delete;
-
-    [[nodiscard]] std::span<const StagedCandidateSummary> candidates() const noexcept;
-    [[nodiscard]] runtime::StagedChoiceId choice_for(std::uint32_t committed_tokens,
-                                                     runtime::RoundContinuation continuation,
-                                                     FinishReason reason) const;
-
-private:
-    class Impl;
-    explicit StagedText(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
-
-    friend class OutputSession;
-};
-
-class DecoderCommitPlan {
-public:
-    DecoderCommitPlan() noexcept;
-    ~DecoderCommitPlan();
-    DecoderCommitPlan(DecoderCommitPlan&&) noexcept;
-    DecoderCommitPlan& operator=(DecoderCommitPlan&&) noexcept;
-
-    DecoderCommitPlan(const DecoderCommitPlan&)            = delete;
-    DecoderCommitPlan& operator=(const DecoderCommitPlan&) = delete;
-
-private:
-    class Impl;
-    explicit DecoderCommitPlan(std::unique_ptr<Impl> impl) noexcept;
-    std::unique_ptr<Impl> impl_;
-
-    friend class OutputSession;
-};
-
 using PublishedOutput = std::vector<OutputDelta>;
 
 class OutputSession {
@@ -154,13 +103,11 @@ public:
     OutputSession(const OutputSession&)            = delete;
     OutputSession& operator=(const OutputSession&) = delete;
 
-    [[nodiscard]] const StopPolicy& stop_policy() const noexcept;
-    [[nodiscard]] bool is_stop_token(TokenId token) const noexcept;
-    [[nodiscard]] StagedText stage(std::span<const TokenId> tokens) const;
-    [[nodiscard]] StagedText stage_terminal(FinishReason reason) const;
-    [[nodiscard]] DecoderCommitPlan
-    prepare_commit(StagedText&& staged, const runtime::OutputResolution& resolution) const;
-    [[nodiscard]] PublishedOutput commit(DecoderCommitPlan&& plan) noexcept;
+    [[nodiscard]] runtime::OutputDecision preview(std::span<const TokenId> tokens,
+                                                  std::uint32_t budget_remaining,
+                                                  FinishReason limit_reason);
+    [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
+    [[nodiscard]] PublishedOutput commit_preview() noexcept;
 
 private:
     class Impl;
@@ -247,16 +194,15 @@ public:
 
     [[nodiscard]] RequestPlan plan_request(const PreparedPrompt& prompt,
                                            const ExecutionOptions& options) const;
-    [[nodiscard]] runtime::BeginRound<Program> begin(PreparedPrompt&& prompt, RequestPlan&& plan,
-                                                     runtime::TransientRegion transient);
-    [[nodiscard]] runtime::PendingRound<Program> decode_round(runtime::RoundBudget budget);
+    [[nodiscard]] runtime::BeginResult begin(PreparedPrompt&& prompt, RequestPlan&& plan,
+                                             runtime::TransientRegion transient);
+    [[nodiscard]] runtime::GeneratedRound decode_round(runtime::RoundBudget budget);
 
+    void resolve_pending(std::uint32_t accepted_tokens, bool terminal);
     void finish_active();
-    void abort_active() noexcept;
-    void clear_resident() noexcept;
+    void abort_request() noexcept;
 
-    [[nodiscard]] runtime::ProgramState state() const noexcept;
-    [[nodiscard]] runtime::SequenceSummary sequence_summary() const noexcept;
+    [[nodiscard]] std::uint32_t materialized_tokens() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats() const;
     [[nodiscard]] GenerationTimings generation_timings() const noexcept;
@@ -265,12 +211,6 @@ public:
 private:
     class Impl;
     explicit Program(std::unique_ptr<Impl> impl) noexcept;
-
-    static bool is_live_thunk(const Program&, std::uint64_t round_epoch) noexcept;
-    static void commit_all_thunk(Program&, std::uint64_t round_epoch);
-    static runtime::FinishDisposition finish_thunk(Program&, std::uint64_t round_epoch,
-                                                   std::size_t count);
-    static void discard_thunk(Program&, std::uint64_t round_epoch) noexcept;
 
     std::unique_ptr<Impl> impl_;
 

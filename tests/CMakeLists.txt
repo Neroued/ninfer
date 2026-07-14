@@ -43,8 +43,7 @@ ninfer_add_test(ninfer_kv_cache_test
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_qwen3_6_27b_rtx5090 ninfer_core)
-ninfer_add_test(ninfer_output_resolution_test SOURCES test_output_resolution.cpp)
-ninfer_add_test(ninfer_runtime_pending_round_test SOURCES test_runtime_pending_round.cpp)
+ninfer_add_test(ninfer_generation_controller_test SOURCES test_generation_controller.cpp)
 ninfer_add_test(ninfer_row_split_pack_golden_test
   SOURCES test_row_split_pack_golden.cpp
   NEEDS_SOURCE_DIR

@@ -9,38 +9,53 @@
 using namespace ninfer;
 using namespace ninfer::test;
 
+namespace {
+
+int position_case(int count, int start, int delta_value, bool in_place) {
+    DBuf filled(static_cast<std::size_t>(count) * sizeof(int));
+    Tensor filled_tensor(filled.p, DType::I32, {count});
+    ops::fill_i32_positions(filled_tensor, start, nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<int> expected_filled(count);
+    for (int i = 0; i < count; ++i) { expected_filled[static_cast<std::size_t>(i)] = start + i; }
+    if (from_device_i32(filled, count) != expected_filled) {
+        std::cerr << "position fill mismatch count=" << count << '\n';
+        return 1;
+    }
+
+    DBuf delta = to_device_i32({delta_value});
+    DBuf offset(static_cast<std::size_t>(count) * sizeof(int));
+    Tensor delta_tensor(delta.p, DType::I32, {1});
+    Tensor offset_tensor(offset.p, DType::I32, {count});
+    Tensor& destination = in_place ? filled_tensor : offset_tensor;
+    ops::offset_i32_positions(filled_tensor, delta_tensor, destination, nullptr);
+    cudaDeviceSynchronize();
+
+    std::vector<int> expected_offset(count);
+    for (int i = 0; i < count; ++i) {
+        expected_offset[static_cast<std::size_t>(i)] = start + delta_value + i;
+    }
+    const auto got = from_device_i32(in_place ? filled : offset, count);
+    if (got != expected_offset) {
+        std::cerr << "position offset mismatch count=" << count << " in_place=" << in_place << '\n';
+        return 1;
+    }
+    return 0;
+}
+
+} // namespace
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 0;
     }
 
-    constexpr int count = 9;
-    DBuf filled(static_cast<std::size_t>(count) * sizeof(int));
-    Tensor filled_tensor(filled.p, DType::I32, {count});
-    ops::fill_i32_positions(filled_tensor, 17, nullptr);
-
-    DBuf delta = to_device_i32({-5});
-    DBuf offset(static_cast<std::size_t>(count) * sizeof(int));
-    Tensor delta_tensor(delta.p, DType::I32, {1});
-    Tensor offset_tensor(offset.p, DType::I32, {count});
-    ops::offset_i32_positions(filled_tensor, delta_tensor, offset_tensor, nullptr);
-    cudaDeviceSynchronize();
-
-    std::vector<int> expected_filled(count);
-    std::vector<int> expected_offset(count);
-    for (int i = 0; i < count; ++i) {
-        expected_filled[static_cast<std::size_t>(i)] = 17 + i;
-        expected_offset[static_cast<std::size_t>(i)] = 12 + i;
-    }
-    if (from_device_i32(filled, count) != expected_filled) {
-        std::cerr << "fill_i32_positions mismatch\n";
-        return 1;
-    }
-    if (from_device_i32(offset, count) != expected_offset) {
-        std::cerr << "offset_i32_positions mismatch\n";
-        return 1;
-    }
-    std::cout << "OK position Ops\n";
-    return 0;
+    int failures = 0;
+    failures += position_case(1, 17, -5, false);
+    failures += position_case(6, 23, 9, true);
+    failures += position_case(1024, 131072, -17, false);
+    std::cout << (failures ? "FAIL" : "OK") << " position Ops\n";
+    return failures ? 1 : 0;
 }

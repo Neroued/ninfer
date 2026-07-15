@@ -52,9 +52,8 @@ int expect_bits(const std::string& label, const std::vector<std::uint16_t>& got,
     return 0;
 }
 
-int one_pack_case(int T) {
-    constexpr int hidden       = 5120;
-    constexpr int out_rows     = 10240;
+int one_pack_case(int hidden, int T) {
+    const int out_rows         = 2 * hidden;
     const std::size_t hidden_n = static_cast<std::size_t>(hidden) * T;
     const std::size_t out_n    = static_cast<std::size_t>(out_rows) * T;
     const auto emb             = pattern(hidden_n, 17u + static_cast<std::uint32_t>(T));
@@ -77,8 +76,8 @@ int one_pack_case(int T) {
     Tensor tout(dout.p, DType::BF16, {out_rows, T});
     ops::mtp_pack_fc_input(temb, thid, tout, nullptr);
     cudaDeviceSynchronize();
-    return expect_bits("mtp_pack_fc_input T=" + std::to_string(T), from_device_bits(dout, out_n),
-                       expected);
+    return expect_bits("mtp_pack_fc_input D=" + std::to_string(hidden) + " T=" + std::to_string(T),
+                       from_device_bits(dout, out_n), expected);
 }
 
 int one_split_case(int T) {
@@ -149,9 +148,10 @@ int main() {
     }
     int failures = 0;
     for (int T : {1, 2, 6, 17, 1024}) {
-        failures += one_pack_case(T);
+        failures += one_pack_case(5120, T);
         failures += one_split_case(T);
     }
+    for (int T : {1, 6}) { failures += one_pack_case(2048, T); }
     failures += validation_case();
     std::cout << (failures ? "FAIL" : "OK") << " mtp_pack correctness\n";
     return failures ? 1 : 0;

@@ -12,13 +12,12 @@ namespace ninfer::ops::detail {
 void mtp_pack_fc_input_launch(const Tensor& embedding_norm, const Tensor& hidden_norm, Tensor& out,
                               cudaStream_t stream) {
     constexpr int kBlock = 256;
-    const std::int64_t n = static_cast<std::int64_t>(embedding_norm.ne[0]) * embedding_norm.ne[1];
-    const int grid =
-        static_cast<int>(std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock))));
+    const dim3 grid(static_cast<unsigned int>(div_up(embedding_norm.ne[0], kBlock)),
+                    static_cast<unsigned int>(embedding_norm.ne[1]));
     mtp_pack_fc_input_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(embedding_norm.data),
         static_cast<const __nv_bfloat16*>(hidden_norm.data), static_cast<__nv_bfloat16*>(out.data),
-        embedding_norm.ne[1]);
+        embedding_norm.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 

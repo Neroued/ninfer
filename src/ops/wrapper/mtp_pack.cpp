@@ -34,11 +34,13 @@ void mtp_pack_fc_input(const Tensor& embedding_norm, const Tensor& hidden_norm, 
     require_bf16_contiguous_nonnull(embedding_norm, op, "embedding_norm");
     require_bf16_contiguous_nonnull(hidden_norm, op, "hidden_norm");
     require_bf16_contiguous_nonnull(out, op, "out");
+    const std::int32_t rows   = embedding_norm.ne[0];
     const std::int32_t tokens = embedding_norm.ne[1];
+    if (rows <= 0) { throw std::invalid_argument("mtp_pack_fc_input: D must be positive"); }
     if (tokens <= 0) { throw std::invalid_argument("mtp_pack_fc_input: T must be positive"); }
-    require_shape(embedding_norm, 5120, tokens, op, "embedding_norm");
-    require_shape(hidden_norm, 5120, tokens, op, "hidden_norm");
-    require_shape(out, 10240, tokens, op, "out");
+    require_shape(embedding_norm, rows, tokens, op, "embedding_norm");
+    require_shape(hidden_norm, rows, tokens, op, "hidden_norm");
+    require_shape(out, 2 * rows, tokens, op, "out");
 
     detail::mtp_pack_fc_input_launch(embedding_norm, hidden_norm, out, stream);
 }

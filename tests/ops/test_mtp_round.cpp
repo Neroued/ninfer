@@ -16,7 +16,6 @@
 using namespace ninfer;
 using namespace ninfer::test;
 constexpr int kStepStatsCounters = 9;
-constexpr int kHiddenRows        = 5120;
 
 namespace {
 
@@ -268,8 +267,7 @@ int shifted_all_accept_case() {
                      {41, 42, 43, 44, 45, 99});
 }
 
-int gather_case() {
-    constexpr int rows = kHiddenRows;
+int gather_case(int rows) {
     constexpr int cols = 6;
     std::vector<std::uint16_t> hidden(static_cast<std::size_t>(rows) * cols);
     for (int col = 0; col < cols; ++col) {
@@ -292,7 +290,21 @@ int gather_case() {
     ops::mtp_gather_hidden_row(hidden_tensor, accepted, out, nullptr);
     cudaDeviceSynchronize();
 
-    return expect_eq("gather hidden", from_device_u16(d_out, rows), expected);
+    return expect_eq("gather hidden D=" + std::to_string(rows), from_device_u16(d_out, rows),
+                     expected);
+}
+
+int remap_case() {
+    constexpr int count  = 131072;
+    constexpr int source = 100003;
+    std::vector<std::int32_t> id_map(count);
+    for (int i = 0; i < count; ++i) { id_map[static_cast<std::size_t>(i)] = count - 1 - i; }
+    auto d_map   = to_device_i32(id_map);
+    auto d_draft = to_device_i32({source});
+    Tensor draft(d_draft.p, DType::I32, {1});
+    ops::mtp_remap_draft_token(draft, static_cast<const std::int32_t*>(d_map.p), count, nullptr);
+    cudaDeviceSynchronize();
+    return expect_eq("remap draft token", from_device_i32(d_draft, 1), {count - 1 - source});
 }
 
 int increment_case() {
@@ -999,7 +1011,9 @@ int main() {
     failures += exact_k_matrix_case();
     failures += shifted_case();
     failures += shifted_all_accept_case();
-    failures += gather_case();
+    failures += gather_case(5120);
+    failures += gather_case(2048);
+    failures += remap_case();
     failures += increment_case();
     failures += fallback_count_case();
     failures += gdn_initial_slot_case();

@@ -42,6 +42,13 @@ A generic/reference CUDA path, Python implementation, correctness test, benchmar
 retained results, or evidence for another shape does not establish support. Stage-level reuse
 inside `SparseMoeAdd` also does not make the closed Op partially supported.
 
+The bounded control/copy rows I4, I5, and I7-I12 are the explicit exception to standalone
+roofline qualification. Their complete registered work is at most six MTP columns or 1024 I32
+positions, and their performance concern is launch topology and future fusion rather than a
+shape-specific kernel algorithm. For these rows, **Supported** means that the exact domain selects
+a direct device implementation and is covered by exact correctness checks; no separate timing
+report is required.
+
 ### 1.2 Logical notation and types
 
 NInfer's matrix convention is used throughout:
@@ -140,15 +147,15 @@ weights is not another supported route.
 | I1 | FP32-to-BF16 cast, `[1536,P]` -> `[1536,P]` | `dst[k,p]=BF16(src[k,p])` without changing logical indices. | Vision patch ingress | **Adapt existing.** The exact semantic Op exists without retained roofline qualification. |
 | I2 | Embedding row gather; W8 table `[248320,2048]`, ids `[T]` -> BF16 `[2048,T]` | `out[:,t]=table[ids[t],:]^T`. | Text and MTP share the same table | **Adapt existing.** Current high-performance gather covers the 27B dense/Q6 domains, not W8 K=2048. |
 | I3 | Column scatter; BF16 visual `[2048,V]`, I32 indices `[V]`, destination `[2048,T]` | `dst[:,indices[j]]=visual[:,j]`; all other columns remain unchanged. | Multimodal Text/MTP prefill | **Adapt existing.** The optimized path and evidence are for destination width 5120. |
-| I4 | Sequential I32 fill, `[T]` | `positions[t]=start+t`. | Text-only positions and verification windows | **Adapt existing.** Semantic Op exists; no retained exact-route performance qualification. |
-| I5 | I32 position offset, source/destination `[T]`, scalar delta | `destination[t]=source[t]+delta`. | Scalar decode after multimodal prefill | **Adapt existing.** Semantic Op exists; no retained qualification. |
+| I4 | Sequential I32 fill, `[T]` | `positions[t]=start+t`. | Text-only positions and verification windows | **Supported for the complete target domain.** The dimension-driven device Op covers scalar, verification, and `T=1024` position vectors directly. |
+| I5 | I32 position offset, source/destination `[T]`, scalar delta | `destination[t]=source[t]+delta`. | Scalar decode after multimodal prefill | **Supported for the complete target domain.** The same direct device route covers distinct and in-place destination storage. |
 | I6 | Four-corner gather, weighted interpolation, and add; BF16 table `[1152,2304]`, I32 indices `[4,P]`, FP32 weights `[4,P]`, BF16 x `[1152,P]` | `x[:,p]'=x[:,p]+sum_c weights[c,p]*table[:,indices[c,p]]`. | Vision stem | **Adapt existing.** A fixed-width optimized kernel exists, but its retained report does not establish a roofline. |
-| I7 | MTP concat pack; two BF16 inputs `[2048,T]` -> `[4096,T]` | Rows `0:2048` copy embedding-norm output and rows `2048:4096` copy hidden-norm output. | MTP stem | **Adapt existing.** Current fixed path is 5120+5120. |
-| I8 | Prepare verification ids/positions; I32 token scalar, drafts `[K]`, length scalar -> I32 ids/positions `[K+1]` and `window_base` scalar, `K<=5` | `ids[0]=token`, `ids[i+1]=drafts[i]`, `positions[i]=length+i`, and `window_base=length`. | MTP verification | **Adapt existing.** Exact semantic Op exists without retained qualification. |
-| I9 | Prepare shifted MTP ids; verify ids `[K+1]`, accepted scalar A, output token -> shifted `[K+1]` | `shifted[i]=verify_ids[i+1]` for `i<K`, then `shifted[A]=token`; slot K changes only when `A=K`. | MTP rebuild | **Adapt existing.** Exact semantic Op exists without retained qualification. |
-| I10 | Indexed hidden-column gather; hidden `[2048,K+1]`, accepted scalar A -> `[2048,1]` | `out[:,0]=hidden[:,A]`. | MTP continuation | **Adapt existing.** Dimension-generic Op exists; width 2048 is unqualified. |
-| I11 | Draft-token remap; I32 scalar and map `[131072]` | `draft'=id_map[draft]`. | Optimized MTP proposal | **Adapt existing.** Exact semantic Op exists without retained qualification. |
-| I12 | Typed scalar assignment/increment; I32 or I64 scalar | `dst'=value`, `dst'=src`, or `dst'=dst+1`, as selected by the semantic entry point. | Token, length, position, and MTP control state | **Adapt existing.** Exact semantic Ops exist without retained equivalent performance qualification. |
+| I7 | MTP concat pack; two BF16 inputs `[2048,T]` -> `[4096,T]` | Rows `0:2048` copy embedding-norm output and rows `2048:4096` copy hidden-norm output. | MTP stem | **Supported for the complete target domain.** The dimension-driven single device launch packs `[D,T]+[D,T]` into `[2D,T]` and covers the exact `D=2048`, `T<=6` route while preserving `D=5120` for 27B. |
+| I8 | Prepare verification ids/positions; I32 token scalar, drafts `[K]`, length scalar -> I32 ids/positions `[K+1]` and `window_base` scalar, `K<=5` | `ids[0]=token`, `ids[i+1]=drafts[i]`, `positions[i]=length+i`, and `window_base=length`. | MTP verification | **Supported for the complete target domain.** One direct device launch writes the scalar and both complete `K+1` vectors for `K<=5`. |
+| I9 | Prepare shifted MTP ids; verify ids `[K+1]`, accepted scalar A, output token -> shifted `[K+1]` | `shifted[i]=verify_ids[i+1]` for `i<K`, then `shifted[A]=token`; slot K changes only when `A=K`. | MTP rebuild | **Supported for the complete target domain.** The direct device Op covers partial and full acceptance at exact `K=5`. |
+| I10 | Indexed hidden-column gather; hidden `[2048,K+1]`, accepted scalar A -> `[2048,1]` | `out[:,0]=hidden[:,A]`. | MTP continuation | **Supported for the complete target domain.** The dimension-driven device gather exactly copies the selected `D=2048` BF16 column. |
+| I11 | Draft-token remap; I32 scalar and map `[131072]` | `draft'=id_map[draft]`. | Optimized MTP proposal | **Supported for the complete target domain.** The direct device lookup covers the exact 131072-entry map. |
+| I12 | Typed scalar assignment/increment; I32 or I64 scalar | `dst'=value`, `dst'=src`, or `dst'=dst+1`, as selected by the semantic entry point. | Token, length, position, and MTP control state | **Supported for the complete target domain.** The typed scalar entry points perform the declared device-resident transitions directly and are CUDA Graph compatible. |
 
 Q/K/V row splits, head reshapes, the Vision 2x2 merge-major `[1152,P] -> [4608,V]`
 reinterpretation, and shortlist row naming are zero-work views when their documented storage

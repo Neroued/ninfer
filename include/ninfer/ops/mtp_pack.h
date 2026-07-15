@@ -10,11 +10,12 @@ namespace ninfer::ops {
  * Op: mtp_pack_fc_input
  *
  * Math / indexing:
- *   out[0:5120, t] = embedding_norm[:, t]
- *   out[5120:10240, t] = hidden_norm[:, t]
+ *   out[0:D, t] = embedding_norm[:, t]
+ *   out[D:2D, t] = hidden_norm[:, t]
  *
  * Logical shapes:
- *   BF16 embedding_norm and hidden_norm [5120,T], out [10240,T], contiguous.
+ *   BF16 embedding_norm and hidden_norm [D,T], out [2D,T], contiguous. The registered domains are
+ *   D=5120 for Qwen3.6-27B and D=2048 for Qwen3.6-35B-A3B.
  *
  * Numeric:
  *   Exact BF16 element copies; no arithmetic or conversion.

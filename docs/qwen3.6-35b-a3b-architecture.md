@@ -8,7 +8,9 @@
 > defined by [`design.md`](design.md) and the project README. This document does not define a
 > `.ninfer` artifact contract, claim that the current runtime can load this checkpoint, or qualify
 > the advertised extended million-token mode. The accepted future-target artifact and quantization
-> specification is [`qwen3.6-35b-a3b-ninfer-artifact.md`](qwen3.6-35b-a3b-ninfer-artifact.md).
+> specification is [`qwen3.6-35b-a3b-ninfer-artifact.md`](qwen3.6-35b-a3b-ninfer-artifact.md), and
+> the strict current operator-support matrix is
+> [`qwen3.6-35b-a3b-operator-inventory.md`](qwen3.6-35b-a3b-operator-inventory.md).
 
 ## 1. Model identity
 

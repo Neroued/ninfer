@@ -23,6 +23,7 @@ constexpr std::int32_t kVocab       = 16;
 constexpr std::int32_t kD           = 128;
 constexpr std::int32_t kQwenHiddenD = 5120;
 constexpr std::int32_t kGroup       = 64;
+constexpr std::int32_t kW8Group     = 32;
 constexpr std::int32_t kNibbleBpr   = 32;
 constexpr std::int32_t kHighBpr     = 16;
 
@@ -31,6 +32,13 @@ static std::int32_t groups_for_d(std::int32_t d) {
         throw std::invalid_argument("embedding test d must be positive and divisible by 64");
     }
     return d / kGroup;
+}
+
+static std::int32_t w8_groups_for_d(std::int32_t d) {
+    if (d <= 0 || d % 128 != 0) {
+        throw std::invalid_argument("embedding W8 test d must be positive and divisible by 128");
+    }
+    return d / kW8Group;
 }
 
 static std::size_t align_up_size(std::size_t x, std::size_t m) { return ((x + m - 1) / m) * m; }
@@ -189,6 +197,46 @@ static std::vector<std::uint8_t> encode_q6_row_split(const std::vector<float>& s
     return payload;
 }
 
+static std::vector<std::uint8_t> encode_w8_row_split(const std::vector<float>& src, std::int32_t d,
+                                                     std::vector<float>& deq) {
+    const std::int32_t kg = w8_groups_for_d(d);
+    const std::size_t code_plane_bytes =
+        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kW8Group;
+    const std::size_t scale_plane_offset = align_up_size(code_plane_bytes, 256);
+    const std::size_t scale_plane_bytes =
+        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * 2u;
+    std::vector<std::uint8_t> payload(scale_plane_offset + scale_plane_bytes);
+    deq.assign(src.size(), 0.0f);
+    for (std::int32_t row = 0; row < kVocab; ++row) {
+        for (std::int32_t g = 0; g < kg; ++g) {
+            const std::size_t base = static_cast<std::size_t>(row) * d + g * kW8Group;
+            float maxabs           = 0.0f;
+            for (std::int32_t i = 0; i < kW8Group; ++i) {
+                maxabs = std::max(maxabs, std::abs(src[base + i]));
+            }
+
+            std::uint16_t scale_h = f32_to_f16(maxabs / 127.0f);
+            if (scale_h == 0 && maxabs > 0.0f) { scale_h = 0x0001u; }
+            const float scale             = f16_to_f32(scale_h);
+            const std::size_t group_index = static_cast<std::size_t>(row) * kg + g;
+            for (std::int32_t i = 0; i < kW8Group; ++i) {
+                int q = 0;
+                if (scale > 0.0f) {
+                    q = static_cast<int>(std::nearbyint(src[base + i] / scale));
+                    q = std::clamp(q, -127, 127);
+                }
+                payload[group_index * kW8Group + i] =
+                    static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
+                deq[base + i] = static_cast<float>(q) * scale;
+            }
+            const std::size_t scale_off = scale_plane_offset + group_index * 2;
+            payload[scale_off + 0]      = static_cast<std::uint8_t>(scale_h & 0xffu);
+            payload[scale_off + 1]      = static_cast<std::uint8_t>(scale_h >> 8);
+        }
+    }
+    return payload;
+}
+
 static void cpu_gather(const std::vector<float>& table, const std::vector<int>& ids, std::int32_t d,
                        std::vector<double>& out) {
     out.assign(static_cast<std::size_t>(d) * ids.size(), 0.0);
@@ -256,6 +304,37 @@ static Weight q6_weight(void* payload, std::int32_t d = kD) {
     return w;
 }
 
+static Weight w8_weight(void* payload, std::int32_t d = kD) {
+    const std::int32_t kg = w8_groups_for_d(d);
+    const std::uint64_t code_plane_bytes =
+        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * kW8Group;
+    const std::uint64_t scale_plane_offset = ((code_plane_bytes + 255ULL) / 256ULL) * 256ULL;
+    const std::uint64_t scale_plane_bytes =
+        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * 2ULL;
+    Weight w{};
+    w.qtype            = QType::W8G32_F16S;
+    w.layout           = QuantLayout::RowSplit;
+    w.scale_dtype      = DType::FP16;
+    w.payload          = payload;
+    w.payload_bytes    = scale_plane_offset + scale_plane_bytes;
+    w.high_plane_bytes = 0;
+    if (payload != nullptr) {
+        w.qdata  = payload;
+        w.qhigh  = nullptr;
+        w.scales = static_cast<std::uint8_t*>(payload) + scale_plane_offset;
+    }
+    w.group_size      = kW8Group;
+    w.group           = kW8Group;
+    w.ndim            = 2;
+    w.shape[0]        = kVocab;
+    w.shape[1]        = d;
+    w.padded_shape[0] = kVocab;
+    w.padded_shape[1] = d;
+    w.n               = kVocab;
+    w.k               = d;
+    return w;
+}
+
 static int one_dense_shape(std::int32_t T, std::int32_t d) {
     std::vector<float> src = make_source_table(d);
     round_to_bf16(src);
@@ -300,6 +379,31 @@ static int one_q6_shape(std::int32_t T, std::int32_t d) {
 
     return verify(
         (std::string("embedding q6 d=") + std::to_string(d) + " T=" + std::to_string(T)).c_str(),
+        from_device_bf16(dout, static_cast<std::size_t>(d) * T), ref,
+        Tolerance::bf16_elementwise());
+}
+
+static int one_w8_shape(std::int32_t T, std::int32_t d) {
+    const std::vector<float> src = make_source_table(d);
+    std::vector<float> deq;
+    std::vector<std::uint8_t> payload = encode_w8_row_split(src, d, deq);
+    const std::vector<int> ids        = ids_for_T(T);
+
+    std::vector<double> ref;
+    cpu_gather(deq, ids, d, ref);
+
+    DBuf dtable(payload.size());
+    cudaMemcpy(dtable.p, payload.data(), payload.size(), cudaMemcpyHostToDevice);
+    DBuf dids = to_device_i32(ids);
+    DBuf dout(static_cast<std::size_t>(d) * T * 2u);
+    cudaMemset(dout.p, 0x7d, dout.bytes);
+    Tensor tids(dids.p, DType::I32, {T});
+    Tensor tout(dout.p, DType::BF16, {d, T});
+    ops::embedding(tids, w8_weight(dtable.p, d), tout, nullptr);
+    cudaDeviceSynchronize();
+
+    return verify(
+        (std::string("embedding w8 d=") + std::to_string(d) + " T=" + std::to_string(T)).c_str(),
         from_device_bf16(dout, static_cast<std::size_t>(d) * T), ref,
         Tolerance::bf16_elementwise());
 }
@@ -444,6 +548,8 @@ int main() {
     }
     f += one_dense_shape(5, kQwenHiddenD);
     f += one_q6_shape(5, kQwenHiddenD);
+    f += one_w8_shape(4, kD);
+    for (std::int32_t T : {1, 2, 3, 4, 5, 6, 1024}) { f += one_w8_shape(T, 2048); }
 
     std::cout << (f ? "FAIL" : "OK") << " embedding correctness\n";
     return f ? 1 : 0;

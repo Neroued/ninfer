@@ -12,5 +12,7 @@ void embed_gather_dense_launch(const Tensor& ids, const Tensor& table, Tensor& o
                                cudaStream_t stream);
 void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,
                             cudaStream_t stream);
+void embed_gather_w8_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                            cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

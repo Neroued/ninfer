@@ -15,7 +15,8 @@ void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
                               const Tensor& drafts, Tensor& length, Tensor& token,
                               Tensor& sampled_out, Tensor& num_sampled, Tensor& accepted,
                               Tensor& ar_pos, Tensor& stats, std::int32_t token_domain,
-                              const SamplingConfig* config, cudaStream_t stream);
+                              const SamplingConfig* config, DeviceSpan workspace,
+                              cudaStream_t stream);
 
 void mtp_prepare_shifted_ids_launch(const Tensor& verify_ids, const Tensor& token,
                                     const Tensor& accepted, Tensor& shifted_ids,

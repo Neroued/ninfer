@@ -1,7 +1,9 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/tensor.h"
 
+#include <cstddef>
 #include <cstdint>
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -30,6 +32,10 @@ struct SamplingConfig {
     std::int32_t* token_counts = nullptr; // device [token_domain] i32, or null
 };
 
+// Caller-owned transient storage for the registered multi-block candidate path.
+// Returns zero for shapes that use the single-block fallback.
+[[nodiscard]] std::size_t sampling_workspace_bytes(std::int32_t token_domain, std::int32_t columns);
+
 /**
  * Produces one token id per logits column. `logits` is contiguous BF16 [physical_rows,T], `out`
  * is contiguous I32 [T], and only rows v in [0,token_domain) participate.
@@ -56,10 +62,11 @@ struct SamplingConfig {
  * uses counter-based RNG key (config->seed,*pos_base+t,purpose), without mutable RNG state. In the
  * positive-temperature branch the selected token atomically increments token_counts when it is
  * non-null. `out` must not overlap logits, config, pos_base, or token_counts. The Op writes all of
- * out, uses no caller workspace, and has no other persistent state side effect.
+ * out, uses caller-owned transient storage reported by sampling_workspace_bytes(), and has no
+ * other persistent state side effect.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* config, const std::int32_t* pos_base, std::int32_t purpose,
-            cudaStream_t stream);
+            WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

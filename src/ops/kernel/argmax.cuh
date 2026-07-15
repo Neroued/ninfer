@@ -1,7 +1,10 @@
 #pragma once
 
-// ninfer::ops - argmax kernel. One CUDA block handles one column and reduces
-// over vocab; equal values keep the lowest vocab index.
+// Implements: include/ninfer/ops/argmax.h
+// Match: contiguous BF16 [physical_rows,C], valid_rows <= physical_rows, with
+// the tuned route qualified for the 248077-row and 131072-row vocabularies.
+// Algorithm assumptions: one 512-thread CTA reduces each 512-row tile and an
+// atomic winner selects the exact value/lower-id maximum per column.
 
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -10,7 +13,11 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kArgmaxBlock          = 256;
+// The registered vocabularies need enough resident warps for a single-column
+// decision. On RTX 5090, 512 threads gives the full-vocab grid 485 CTAs, almost
+// exactly one three-CTA/SM wave, while halving the atomic contenders of the old
+// 256-thread route.
+inline constexpr int kArgmaxBlock          = 512;
 inline constexpr int kArgmaxItemsPerThread = 1;
 
 __device__ __forceinline__ bool argmax_better(float value, std::int32_t index, float best_value,
@@ -31,8 +38,8 @@ __device__ __forceinline__ void argmax_warp_reduce(float& value, std::int32_t& i
 }
 
 __device__ __forceinline__ void argmax_block_reduce(float& value, std::int32_t& index) {
-    __shared__ float warp_values[8];
-    __shared__ std::int32_t warp_indices[8];
+    __shared__ float warp_values[16];
+    __shared__ std::int32_t warp_indices[16];
 
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -64,8 +71,8 @@ __launch_bounds__(kArgmaxBlock) __global__
         }
     }
 
-    __shared__ float values[256];
-    __shared__ std::int32_t indices[256];
+    __shared__ float values[kArgmaxBlock];
+    __shared__ std::int32_t indices[kArgmaxBlock];
     values[threadIdx.x]  = best_value;
     indices[threadIdx.x] = best_index;
     __syncthreads();

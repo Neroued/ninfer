@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace ninfer;
@@ -90,11 +91,11 @@ static int one_shape(const char* tag, int vocab, int t_count, std::uint32_t seed
     return verify_i32(tag, from_device_i32(dout, static_cast<std::size_t>(t_count)), ref);
 }
 
-static int physical_stride_and_valid_rows() {
+static int physical_stride_and_valid_rows(int cols) {
     constexpr int physical_rows = 248320;
     constexpr int valid_rows    = 248077;
-    constexpr int cols          = 3;
-    const std::vector<int> ref{17, 123456, valid_rows - 1};
+    const std::vector<int> all_ref{17, 7919, 65537, 123456, 200003, valid_rows - 1};
+    const std::vector<int> ref(all_ref.begin(), all_ref.begin() + cols);
     std::vector<float> logits(static_cast<std::size_t>(physical_rows) * cols, -10.0f);
     for (int col = 0; col < cols; ++col) {
         const std::size_t base = static_cast<std::size_t>(col) * physical_rows;
@@ -110,7 +111,25 @@ static int physical_stride_and_valid_rows() {
     Tensor tout(dout.p, DType::I32, {cols});
     ops::argmax(tlogits, tout, valid_rows, nullptr);
     cudaDeviceSynchronize();
-    return verify_i32("argmax physical stride + valid rows", from_device_i32(dout, cols), ref);
+    const std::string label = "argmax physical stride + valid rows C=" + std::to_string(cols);
+    return verify_i32(label.c_str(), from_device_i32(dout, cols), ref);
+}
+
+static int shortlist_shape() {
+    constexpr int rows = 131072;
+    std::vector<float> logits(rows, -10.0f);
+    constexpr int expected = 65537;
+    logits[expected]       = 20.0f;
+    logits[rows - 1]       = 20.0f;
+    round_to_bf16(logits);
+
+    DBuf dlogits = to_device_bf16(logits);
+    DBuf dout    = to_device_i32({-1});
+    Tensor tlogits(dlogits.p, DType::BF16, {rows, 1});
+    Tensor tout(dout.p, DType::I32, {1});
+    ops::argmax(tlogits, tout, rows, nullptr);
+    cudaDeviceSynchronize();
+    return verify_i32("argmax shortlist [131072,1]", from_device_i32(dout, 1), {expected});
 }
 
 template <typename Fn>
@@ -239,7 +258,8 @@ int main() {
 
     int f = 0;
     f += validation_checks();
-    f += physical_stride_and_valid_rows();
+    for (int cols = 1; cols <= 6; ++cols) { f += physical_stride_and_valid_rows(cols); }
+    f += shortlist_shape();
 
     for (std::uint32_t seed : {1u, 7u, 99u}) {
         f += one_shape("argmax [1,1]", 1, 1, seed);
@@ -247,7 +267,10 @@ int main() {
         f += one_shape("argmax [257,1]", 257, 1, seed);
         f += one_shape("argmax [257,3]", 257, 3, seed);
         f += one_shape("argmax [248320,1]", 248320, 1, seed);
-        f += one_shape("argmax [248320,3]", 248320, 3, seed);
+    }
+    for (int cols = 2; cols <= 6; ++cols) {
+        const std::string tag = "argmax [248320," + std::to_string(cols) + "]";
+        f += one_shape(tag.c_str(), 248320, cols, 100u + static_cast<std::uint32_t>(cols));
     }
 
     std::cout << (f ? "FAIL" : "OK") << " argmax correctness\n";

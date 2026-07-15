@@ -1029,7 +1029,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                 if (sampling_config_ != nullptr) {
                     ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_,
                                 static_cast<const std::int32_t*>(io_.pos.data),
-                                ops::kSamplePurposePrefill, s);
+                                ops::kSamplePurposePrefill, work_, s);
                 } else {
                     ops::argmax(logits, io_.token, kCfg.token_domain, s);
                 }

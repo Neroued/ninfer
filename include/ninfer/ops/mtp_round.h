@@ -17,8 +17,8 @@ namespace ninfer::ops {
  *   positions[i] = length + i for 0 <= i <= K.
  *
  * Logical shapes:
- *   All tensors are contiguous I32. token/length/window_base are scalars, drafts is [K], and
- *   verify_ids/positions are [K+1]. Inputs and outputs do not overlap.
+ *   All tensors are contiguous I32. token/length/window_base are scalars, drafts is [K] with
+ *   1<=K<=5, and verify_ids/positions are [K+1]. Inputs and outputs do not overlap.
  *
  * Effects:
  *   Writes window_base and the full verify_ids and positions vectors.
@@ -45,8 +45,9 @@ void mtp_prepare_verify_inputs(const Tensor& token, const Tensor& drafts, const 
  *   All Tensor storage is contiguous. target_tokens and sampled_out are I32 [K+1], drafts is I32
  *   [K], logits is BF16 [physical_rows,C] with C>=K+1, length/token/num_sampled/accepted/ar_pos
  *   are I32 scalars, and stats is I64 with at least 4+min(K,5) elements. token_domain is in
- *   [1,physical_rows]. config points to one device-resident SamplingConfig. Tensor arguments,
- *   config, and config->token_counts do not overlap except for the explicitly mutated objects.
+ *   [1,physical_rows], with 1<=K<=5. config points to one device-resident SamplingConfig. Tensor
+ *   arguments, config, and config->token_counts do not overlap except for the explicitly mutated
+ *   objects.
  *
  * Numeric:
  *   Sampling filtering, penalties, normalization, and RNG semantics are those of sampling.h.
@@ -61,13 +62,13 @@ void mtp_prepare_verify_inputs(const Tensor& token, const Tensor& drafts, const 
  *   update token_counts. Inputs, logits, and drafts remain unchanged.
  *
  * Workspace:
- *   Uses only implementation-owned fixed device scratch selected by the registered sampling path;
- *   no caller workspace.
+ *   Caller-owned transient storage reported by sampling_workspace_bytes(token_domain,K+1).
  */
 void mtp_accept_tokens(const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
                        Tensor& length, Tensor& token, Tensor& sampled_out, Tensor& num_sampled,
                        Tensor& accepted, Tensor& ar_pos, Tensor& stats, std::int32_t token_domain,
-                       const SamplingConfig* config, cudaStream_t stream);
+                       const SamplingConfig* config, WorkspaceArena& workspace,
+                       cudaStream_t stream);
 
 /**
  * Op: mtp_prepare_shifted_ids

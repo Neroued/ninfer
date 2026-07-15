@@ -1,4 +1,7 @@
-// ninfer::ops - argmax launcher: grid/block/stream configuration + kernel launch.
+// Implements: include/ninfer/ops/argmax.h
+// Match: validated contiguous BF16 logits and I32 output.
+// Algorithm assumptions: one tile uses a direct reduction; larger domains use
+// zero-initialized atomic winners across 512-row tiles.
 #include "ops/launcher/argmax.h"
 
 #include "ops/common/math.h"

@@ -77,6 +77,29 @@ cmake --build build -j --target ninfer_qwen3_6_27b_mtp_round_bench
   --artifact out/qwen3_6_27b_rtx5090.ninfer
 ```
 
+## Token-decision Op benchmarks
+
+The G1 benchmark covers the Qwen3.6-35B full physical vocabulary with 248077 valid rows at
+`C=1..6`, plus the 131072-row shortlist. Its `--control` route reads the same rotating payload and
+uses the same launch grid without computing argmax, which provides the fixed-work comparison used
+by the retained qualification report:
+
+```bash
+cmake --build build -j --target ninfer_argmax_bench ninfer_sampling_select_bench
+./build/bench/ninfer_argmax_bench
+./build/bench/ninfer_argmax_bench --control
+```
+
+The G2/G3 benchmark uses physical rows 248320, valid token domain 248077, optional occurrence
+counts, and every MTP window `K=1..5`. With no arguments it runs the full greedy/stochastic matrix;
+individual routes are suitable for Nsight Compute capture:
+
+```bash
+./build/bench/ninfer_sampling_select_bench --matrix
+./build/bench/ninfer_sampling_select_bench --sample --mode stochastic --top-k 20
+./build/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 20
+```
+
 ## Reports
 
 Table, JSON, and CSV reports all identify the selected target, artifact, Engine configuration,

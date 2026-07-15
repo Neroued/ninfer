@@ -234,6 +234,7 @@ std::size_t workspace_bytes(const SequencePlan::Impl& plan) {
     {
         auto final_scope = prefill.scope();
         matrix(prefill, DType::BF16, TextConfig::hidden, 1);
+        prefill.alloc_bytes(ops::sampling_workspace_bytes(TextConfig::token_domain, 1));
     }
 
     WorkspaceLayoutBuilder verify;
@@ -285,7 +286,12 @@ std::size_t workspace_bytes(const SequencePlan::Impl& plan) {
         }
     }
 
-    return std::max({prefill.peak_bytes(), verify.peak_bytes(), mtp.peak_bytes()});
+    WorkspaceLayoutBuilder decision;
+    decision.alloc_bytes(
+        ops::sampling_workspace_bytes(TextConfig::token_domain, std::max(1, verify_tokens)));
+
+    return std::max(
+        {prefill.peak_bytes(), verify.peak_bytes(), mtp.peak_bytes(), decision.peak_bytes()});
 }
 
 } // namespace

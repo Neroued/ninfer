@@ -36,6 +36,12 @@ const ops::SamplingConfig* config_ptr(const DBuf& d) {
     return static_cast<const ops::SamplingConfig*>(d.p);
 }
 
+WorkspaceArena& test_sampling_workspace() {
+    static WorkspaceArena workspace(
+        std::max<std::size_t>(256, ops::sampling_workspace_bytes(248077, 6)));
+    return workspace;
+}
+
 // Zero logits buffer [vocab, cols]; unused by the greedy accept branch but
 // required by the wrapper's shape validation.
 DBuf zero_logits(int vocab, int cols) {
@@ -130,7 +136,7 @@ int accept_partial_case() {
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {kStepStatsCounters});
     ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted, ar_pos,
-                           stats, 16, config_ptr(d_cfg), nullptr);
+                           stats, 16, config_ptr(d_cfg), test_sampling_workspace(), nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -171,7 +177,7 @@ int accept_all_reject_case() {
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {kStepStatsCounters});
     ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted, ar_pos,
-                           stats, 16, config_ptr(d_cfg), nullptr);
+                           stats, 16, config_ptr(d_cfg), test_sampling_workspace(), nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -212,7 +218,7 @@ int accept_all_case() {
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {kStepStatsCounters});
     ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted, ar_pos,
-                           stats, 16, config_ptr(d_cfg), nullptr);
+                           stats, 16, config_ptr(d_cfg), test_sampling_workspace(), nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -393,7 +399,8 @@ int reject_sampling_distribution_case() {
         cudaMemcpyAsync(d_scratch.p, static_cast<const std::int32_t*>(d_lengths.p) + r,
                         sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
         ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                               ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
+                               ar_pos, stats, vocab, config_ptr(d_cfg), test_sampling_workspace(),
+                               nullptr);
         cudaMemcpyAsync(static_cast<std::int32_t*>(d_collect.p) + r, d_sampled.p,
                         sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
     }
@@ -460,7 +467,8 @@ int reject_sampling_reproducible_case() {
         auto d_length = to_device_i32({10});
         Tensor length(d_length.p, DType::I32, {1});
         ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                               ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
+                               ar_pos, stats, vocab, config_ptr(d_cfg), test_sampling_workspace(),
+                               nullptr);
         cudaDeviceSynchronize();
         std::vector<int> out = from_device_i32(d_sampled, k + 1);
         out.push_back(from_device_i32(d_num, 1)[0]);
@@ -478,10 +486,11 @@ int reject_sampling_reproducible_case() {
 }
 
 int reject_sampling_real_shape_distribution_case() {
-    constexpr int k     = 1;
-    constexpr int vocab = 248320;
-    const int ids[]     = {17, 7919, 65537, 200003};
-    const float vals[]  = {3.0f, 2.0f, 1.0f, 0.0f};
+    constexpr int k            = 1;
+    constexpr int vocab        = 248320;
+    constexpr int token_domain = 248077;
+    const int ids[]            = {17, 7919, 65537, 200003};
+    const float vals[]         = {3.0f, 2.0f, 1.0f, 0.0f};
     std::vector<float> logits_h(static_cast<std::size_t>(vocab) * (k + 1), -20.0f);
     for (int col = 0; col <= k; ++col) {
         for (int i = 0; i < 4; ++i) {
@@ -537,7 +546,8 @@ int reject_sampling_real_shape_distribution_case() {
         cudaMemcpyAsync(d_scratch.p, static_cast<const std::int32_t*>(d_lengths.p) + r,
                         sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
         ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                               ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
+                               ar_pos, stats, token_domain, config_ptr(d_cfg),
+                               test_sampling_workspace(), nullptr);
         cudaMemcpyAsync(static_cast<std::int32_t*>(d_collect.p) + r, d_sampled.p,
                         sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
     }
@@ -577,10 +587,11 @@ int reject_sampling_real_shape_distribution_case() {
 std::vector<int> run_real_shape_mtp_sequence(const std::vector<float>& logits_h,
                                              const std::vector<int>& drafts_h,
                                              ops::SamplingConfig cfg, int rounds) {
-    constexpr int vocab = 248320;
-    const int k         = static_cast<int>(drafts_h.size());
-    DBuf d_logits       = to_device_bf16(logits_h);
-    DBuf d_counts(static_cast<std::size_t>(vocab) * sizeof(std::int32_t));
+    constexpr int vocab        = 248320;
+    constexpr int token_domain = 248077;
+    const int k                = static_cast<int>(drafts_h.size());
+    DBuf d_logits              = to_device_bf16(logits_h);
+    DBuf d_counts(static_cast<std::size_t>(token_domain) * sizeof(std::int32_t));
     cudaMemset(d_counts.p, 0, d_counts.bytes);
     cfg.token_counts = static_cast<std::int32_t*>(d_counts.p);
     DBuf d_cfg       = to_device_config(cfg);
@@ -611,7 +622,8 @@ std::vector<int> run_real_shape_mtp_sequence(const std::vector<float>& logits_h,
         const int len = 1000 + r;
         cudaMemcpy(d_length.p, &len, sizeof(len), cudaMemcpyHostToDevice);
         ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                               ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
+                               ar_pos, stats, token_domain, config_ptr(d_cfg),
+                               test_sampling_workspace(), nullptr);
         std::int32_t* out = static_cast<std::int32_t*>(d_collect.p) + r * (k + 2);
         cudaMemcpyAsync(out, d_sampled.p, static_cast<std::size_t>(k + 1) * sizeof(std::int32_t),
                         cudaMemcpyDeviceToDevice, nullptr);
@@ -678,18 +690,23 @@ int validation_case() {
 // accepted}.
 std::vector<int> run_one_mtp_round(const std::vector<float>& logits_h, int vocab, int k,
                                    const std::vector<int>& drafts_h, ops::SamplingConfig cfg,
-                                   int length, int token_domain = -1) {
+                                   int length, int token_domain = -1,
+                                   const std::vector<int>& target_tokens_h = {},
+                                   bool with_counts                        = true) {
     if (token_domain < 0) { token_domain = vocab; }
     DBuf d_logits = to_device_bf16(logits_h);
     DBuf d_counts(static_cast<std::size_t>(token_domain) * sizeof(std::int32_t));
     cudaMemset(d_counts.p, 0, d_counts.bytes);
-    cfg.token_counts = static_cast<std::int32_t*>(d_counts.p);
+    cfg.token_counts = with_counts ? static_cast<std::int32_t*>(d_counts.p) : nullptr;
     DBuf d_cfg       = to_device_config(cfg);
 
-    auto d_targets = to_device_i32(std::vector<int>(static_cast<std::size_t>(k + 1), 0));
-    auto d_drafts  = to_device_i32(drafts_h);
-    auto d_token   = to_device_i32({-1});
-    auto d_length  = to_device_i32({length});
+    const std::vector<int> targets_h = target_tokens_h.empty()
+                                           ? std::vector<int>(static_cast<std::size_t>(k + 1), 0)
+                                           : target_tokens_h;
+    auto d_targets                   = to_device_i32(targets_h);
+    auto d_drafts                    = to_device_i32(drafts_h);
+    auto d_token                     = to_device_i32({-1});
+    auto d_length                    = to_device_i32({length});
     DBuf d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
     DBuf d_num(sizeof(std::int32_t));
     DBuf d_accepted(sizeof(std::int32_t));
@@ -708,13 +725,69 @@ std::vector<int> run_one_mtp_round(const std::vector<float>& logits_h, int vocab
     Tensor stats(d_stats.p, DType::I64, {kStepStatsCounters});
 
     ops::mtp_accept_tokens(targets, logits, drafts, length_t, token, sampled, num, accepted, ar_pos,
-                           stats, token_domain, config_ptr(d_cfg), nullptr);
+                           stats, token_domain, config_ptr(d_cfg), test_sampling_workspace(),
+                           nullptr);
     cudaDeviceSynchronize();
 
     std::vector<int> out = from_device_i32(d_sampled, k + 1);
     out.push_back(from_device_i32(d_num, 1)[0]);
     out.push_back(from_device_i32(d_accepted, 1)[0]);
     return out;
+}
+
+int exact_k_matrix_case() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    int failures                = 0;
+
+    for (int k = 1; k <= 5; ++k) {
+        std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
+        std::vector<int> targets(static_cast<std::size_t>(k + 1));
+        std::vector<int> drafts(static_cast<std::size_t>(k));
+        for (int col = 0; col <= k; ++col) {
+            const int id                           = (17 + col * 7919) % token_domain;
+            targets[static_cast<std::size_t>(col)] = id;
+            if (col < k) { drafts[static_cast<std::size_t>(col)] = id; }
+            const std::size_t base      = static_cast<std::size_t>(col) * physical_rows;
+            logits[base + id]           = 20.0f;
+            logits[base + token_domain] = 100.0f;
+        }
+        round_to_bf16(logits);
+
+        ops::SamplingConfig stochastic;
+        stochastic.temperature               = 1.0f;
+        stochastic.top_k                     = 1;
+        stochastic.seed                      = 20260716u + static_cast<unsigned long long>(k);
+        std::vector<int> stochastic_expected = drafts;
+        stochastic_expected.push_back(targets.back());
+        stochastic_expected.push_back(k + 1);
+        stochastic_expected.push_back(k);
+        failures += expect_eq(
+            "MTP exact stochastic K=" + std::to_string(k),
+            run_one_mtp_round(logits, physical_rows, k, drafts, stochastic, 100, token_domain),
+            stochastic_expected);
+
+        const int mismatch             = k / 2;
+        std::vector<int> greedy_drafts = drafts;
+        greedy_drafts[static_cast<std::size_t>(mismatch)] =
+            (greedy_drafts[static_cast<std::size_t>(mismatch)] + 1) % token_domain;
+        std::vector<int> greedy_expected(static_cast<std::size_t>(k + 1), 0);
+        for (int i = 0; i < mismatch; ++i) {
+            greedy_expected[static_cast<std::size_t>(i)] =
+                greedy_drafts[static_cast<std::size_t>(i)];
+        }
+        greedy_expected[static_cast<std::size_t>(mismatch)] =
+            targets[static_cast<std::size_t>(mismatch)];
+        greedy_expected.push_back(mismatch + 1);
+        greedy_expected.push_back(mismatch);
+        ops::SamplingConfig greedy;
+        failures += expect_eq("MTP exact greedy K=" + std::to_string(k),
+                              run_one_mtp_round(logits, physical_rows, k, greedy_drafts, greedy,
+                                                100, token_domain, targets, false),
+                              greedy_expected);
+    }
+    if (failures == 0) { std::cout << "    exact MTP K=1..5 greedy/stochastic matrix ok\n"; }
+    return failures;
 }
 
 int physical_stride_and_token_domain_case() {
@@ -846,6 +919,10 @@ int overlay_presence_case() {
                                   got, expected);
         }
     }
+    cfg.seed = 13;
+    failures +=
+        expect_eq("overlay presence with null committed counts",
+                  run_one_mtp_round(logits, vocab, k, drafts, cfg, 9, -1, {}, false), expected);
     if (failures == 0) { std::cout << "    overlay presence-penalty ok\n"; }
     return failures;
 }
@@ -854,10 +931,11 @@ int overlay_presence_case() {
 // where per-column distributions are built in parallel by the partial/group
 // kernels. Exercises the overlay applied inside mtp_sampling_partial_topk_kernel.
 int overlay_frequency_repeat_real_shape_case() {
-    constexpr int vocab = 248320;
-    constexpr int k     = 3;
-    constexpr int A     = 17;
-    constexpr int B     = 7919;
+    constexpr int vocab        = 248320;
+    constexpr int token_domain = 248077;
+    constexpr int k            = 3;
+    constexpr int A            = 17;
+    constexpr int B            = 7919;
     std::vector<float> logits(static_cast<std::size_t>(vocab) * (k + 1), -20.0f);
     auto set = [&](int col, int id, float v) {
         logits[static_cast<std::size_t>(col) * vocab + id] = v;
@@ -882,8 +960,9 @@ int overlay_frequency_repeat_real_shape_case() {
     int failures = 0;
     for (std::uint64_t seed : {3ull, 88ull, 123457ull}) {
         for (int L : {0, 1000, 250000}) {
-            cfg.seed             = seed;
-            std::vector<int> got = run_one_mtp_round(logits, vocab, k, drafts, cfg, L);
+            cfg.seed = seed;
+            std::vector<int> got =
+                run_one_mtp_round(logits, vocab, k, drafts, cfg, L, token_domain);
             failures += expect_eq("overlay frequency real-shape (seed=" + std::to_string(seed) +
                                       " L=" + std::to_string(L) + ")",
                                   got, expected);
@@ -917,6 +996,7 @@ int main() {
     failures += overlay_presence_case();
     failures += overlay_frequency_repeat_real_shape_case();
     failures += physical_stride_and_token_domain_case();
+    failures += exact_k_matrix_case();
     failures += shifted_case();
     failures += shifted_all_accept_case();
     failures += gather_case();

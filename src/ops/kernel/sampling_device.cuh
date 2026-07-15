@@ -1,12 +1,12 @@
 #pragma once
 
-// ninfer::ops - shared device-side sampling primitives (no __global__ symbols,
-// so this header can be included by multiple translation units). Holds the
-// counter-based RNG, the candidate ordering, and the block-collaborative
-// truncated-distribution builder used by both sample and the MTP
-// rejection-sampling accept kernel.
+// Shared implementation primitives for include/ninfer/ops/sampling.h and
+// include/ninfer/ops/mtp_round.h. The ordering key is exact for finite BF16
+// logits (including numeric-zero ties); candidate storage is bounded by the
+// semantic top-20 cap and all global staging is supplied by the caller.
 
 #include "ops/common/math.h"
+#include "ops/common/sampling_workspace.h"
 #include "ninfer/ops/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>
@@ -18,63 +18,37 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kSamplerBlock               = 256;
-inline constexpr int kSamplerTileItems           = 256;
-inline constexpr int kSamplerItemsPerThread      = 3;
-inline constexpr int kSamplerPartialTileItems    = kSamplerBlock * kSamplerItemsPerThread;
-inline constexpr int kSamplerGroupItemsPerThread = 2;
-inline constexpr int kSamplerGroupTileItems      = kSamplerBlock * kSamplerGroupItemsPerThread;
-inline constexpr int kSamplerPartialsPerGroup    = 20;
-inline constexpr int kSamplerFastCandidates      = 20;
-// Effective per-column candidate cap. The multi-block partial/group merge tiles
-// are sized for this cap, so the sampler clamps top_k to it: top_k <= 0 or a
-// larger top_k both collapse to this cap.
-inline constexpr int kSamplerCandidateCap         = kSamplerFastCandidates;
-inline constexpr int kSamplerScratchColumns       = 8;
-inline constexpr int kSamplerScratchPartialBlocks = 1024;
-
-// One group merge sorts a single kSamplerGroupTileItems-wide tile. It must hold
-// one group's inputs (kSamplerPartialsPerGroup * cap); the final stage's
-// group_count * cap is enforced per launch by sampler_multiblock_ok().
-static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTileItems,
-              "group merge tile must hold one group's candidates");
-
-// Number of group blocks needed to merge `partial_blocks` partials.
-__host__ __device__ inline int sampler_group_count(int partial_blocks) {
-    return div_up(partial_blocks, kSamplerPartialsPerGroup);
-}
-
-// True when the fixed sampler scratch and merge tiles can represent this launch.
-// The launcher and the single-block kernels share this predicate so the
-// single-block fallback and the scratch path never both claim the same shape.
-__host__ __device__ inline bool sampler_multiblock_ok(int vocab, int cols, int partial_blocks,
-                                                      int group_count) {
-    return vocab > kSamplerTileItems && cols <= kSamplerScratchColumns &&
-           partial_blocks <= kSamplerScratchPartialBlocks &&
-           (partial_blocks + group_count) <= kSamplerScratchPartialBlocks &&
-           (group_count * kSamplerCandidateCap) <= kSamplerGroupTileItems;
-}
-
-static __device__ unsigned long long sampling_partial_key[kSamplerScratchColumns *
-                                                          kSamplerScratchPartialBlocks *
-                                                          kSamplerCandidateCap];
-static __device__ int sampling_dist_idx[kSamplerScratchColumns * kSamplerCandidateCap];
-static __device__ float sampling_dist_prob[kSamplerScratchColumns * kSamplerCandidateCap];
-static __device__ int sampling_dist_support[kSamplerScratchColumns];
-static __device__ int sampling_mtp_finalize_init;
-static __device__ int sampling_mtp_finalize_count;
-static __device__ int sampling_group_done[kSamplerScratchColumns];
-
-using SamplingPartialMergeSort =
+using SamplingPartialSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread>;
-using SamplingGroupMergeSort =
-    cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerGroupItemsPerThread>;
+using SamplingGroupSort =
+    cub::BlockMergeSort<unsigned long long, kSamplerGroupBlock, kSamplerGroupItemsPerThread>;
 
 struct SamplingKeyGreater {
     __device__ __forceinline__ bool operator()(unsigned long long a, unsigned long long b) const {
         return a > b;
     }
 };
+
+__device__ inline unsigned long long sampling_block_max_key(unsigned long long key,
+                                                            unsigned long long* warp_keys) {
+    constexpr unsigned int kMask = 0xffffffffu;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const unsigned long long other = __shfl_down_sync(kMask, key, offset);
+        if (other > key) { key = other; }
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) { warp_keys[warp] = key; }
+    __syncthreads();
+    key = (warp == 0 && lane < (blockDim.x >> 5)) ? warp_keys[lane] : 0ull;
+    if (warp == 0) {
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const unsigned long long other = __shfl_down_sync(kMask, key, offset);
+            if (other > key) { key = other; }
+        }
+    }
+    return key;
+}
 
 __device__ __forceinline__ unsigned long long sampling_splitmix64(unsigned long long x) {
     x += 0x9E3779B97F4A7C15ull;
@@ -109,6 +83,9 @@ __device__ __forceinline__ bool sampling_worse_than(float v, int i, float pv, in
 }
 
 __device__ __forceinline__ unsigned int sampling_ordered_float(float v) {
+    // Numeric equality, including +0 == -0, must reach the token-id tie break.
+    // Canonicalizing zero prevents the IEEE sign bit from ranking +0 above -0.
+    if (v == 0.0f) { v = 0.0f; }
     const unsigned int bits = __float_as_uint(v);
     return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
 }
@@ -140,8 +117,9 @@ __device__ __forceinline__ int sampling_candidate_cap(const SamplingConfig& cfg,
     return cap;
 }
 
-__device__ __forceinline__ int sampling_partial_offset(int col, int partial, int j) {
-    return ((col * kSamplerScratchPartialBlocks + partial) * kSamplerCandidateCap) + j;
+__device__ __forceinline__ int sampling_partial_offset(const SamplingWorkspace& workspace, int col,
+                                                       int partial, int j) {
+    return ((col * workspace.partial_stride + partial) * kSamplerCandidateCap) + j;
 }
 
 __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
@@ -160,14 +138,13 @@ __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
     float x = raw;
-    if (c.token_counts != nullptr) {
-        int cnt = c.token_counts[v];
-        for (int j = 0; j < overlay_len; ++j) {
-            if (overlay[j] == v) { ++cnt; }
-        }
-        if (cnt > 0) { x -= c.presence_penalty; }
-        if (c.frequency_penalty != 0.0f) { x -= c.frequency_penalty * static_cast<float>(cnt); }
+    if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
+    int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
+    for (int j = 0; j < overlay_len; ++j) {
+        if (overlay[j] == v) { ++cnt; }
     }
+    if (cnt > 0) { x -= c.presence_penalty; }
+    if (c.frequency_penalty != 0.0f) { x -= c.frequency_penalty * static_cast<float>(cnt); }
     return x;
 }
 
@@ -276,9 +253,9 @@ sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, s
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
 }
 
-// Single-block fallback for large columns when the fixed sampler scratch cannot
-// represent the launch. It still reads each vocab entry once and keeps a bounded
-// per-thread top-20, so the old top_k*vocab global reread pattern is gone.
+// Single-block fallback for large columns when the finite multi-block workspace
+// route cannot represent the launch. It still reads each vocab entry once and
+// keeps a bounded per-thread top-20, so it avoids a top_k*vocab global reread.
 __device__ inline void sampling_build_truncated_block_fast(
     const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
     float* merge_val, int* merge_idx, float* cand_val, int* cand_idx, float* prob, int* n_support,

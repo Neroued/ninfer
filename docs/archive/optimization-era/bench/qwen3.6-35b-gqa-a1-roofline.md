@@ -12,8 +12,9 @@ Environment: NVIDIA GeForce RTX 5090, driver 591.86, CUDA 13.1, `sm_120a`, Nsigh
 event medians after benchmark warmup. NCU uses one selected launch and application replay for the
 stateful small-T kernel.
 
-This report qualifies A1 only. Standalone KV append A2 has not received independent performance
-qualification. Cached-only A3 has a known small-T dispatch gap recorded at the end of this report.
+This report qualifies A1 only. Standalone KV append A2 is qualified in its
+[separate report](qwen3.6-35b-gqa-a2-roofline.md). Cached-only A3 has a known small-T dispatch gap
+recorded at the end of this report.
 
 ## Final implementation
 
@@ -25,7 +26,7 @@ qualification. Cached-only A3 has a known small-T dispatch gap recorded at the e
   operation implementation but compile independently for each registered geometry.
 - INT8 T=5 uses three query row tiles for group 8. Its 24/12/6-warp launch tiers were measured
   separately; the 12-warp route is retained through a 4096-token window.
-- Small-T workspace is transient: 2.76 MiB at T=1 and 16.56 MiB at T=6. Prompt attention uses no
+- Small-T workspace is transient: 1.35 MiB at T=1 and 8.09 MiB at T=6. Prompt attention uses no
   split workspace.
 
 ## Correctness and 27B preservation
@@ -153,10 +154,7 @@ Retained reports:
 - `profiles/ncu/qwen3_6_35b_gqa_decode_t6_c261120_bf16__basic.ncu-rep`
 - `profiles/ncu/qwen3_6_35b_gqa_decode_t6_c261120_int8__basic.ncu-rep`
 
-## Deliberately unqualified split contracts
-
-A2 uses the exact two-head BF16 copy and INT8-G64 quantizing append kernels and passes operation
-parity, but no standalone roofline capture was retained in this pass. It remains Adapt existing.
+## Remaining unqualified split contract
 
 A3 prompt T=1024 is efficient, but its current `T<=6` route uses the prompt attention launcher
 instead of split-KV. At `L=261120`, BF16 cached-only T=1/T=6 measures 15.094/15.405 ms and INT8

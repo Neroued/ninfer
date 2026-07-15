@@ -8,6 +8,8 @@
 //       --context 0,128,512,2048,8192,32768,131072,261120
 //   ./ninfer_gqa_attention_bench --append-small-t --geometry 35b --tokens 1,2,3,4,5,6 \
 //       --context 0,128,512,2048,8192,32768,131072,261120
+//   ./ninfer_gqa_attention_bench --kv-append --geometry 35b --tokens 1,2,3,4,5,6,1024 \
+//       --context 0,128,512,2048,8192,32768,131072,261120
 // Add --kv-dtype int8 to measure the INT8-G64 KV route.
 //   ./ninfer_gqa_attention_bench --decode --geometry 35b
 //   ./ninfer_gqa_attention_bench --decode --geometry 35b --decode-pos 2882 --profile-once \
@@ -212,6 +214,43 @@ DecodeBytes append_small_t_bytes(std::int32_t tokens, std::int32_t context, DTyp
     return bytes;
 }
 
+struct KvAppendBytes {
+    std::size_t input_read  = 0;
+    std::size_t cache_write = 0;
+    std::size_t total       = 0;
+};
+
+KvAppendBytes kv_append_bytes(std::int32_t tokens, DType kv_dtype) {
+    const auto token_count = static_cast<std::size_t>(tokens);
+    KvAppendBytes bytes;
+    bytes.input_read  = static_cast<std::size_t>(static_cast<double>(token_count * kKVHeads) *
+                                                 kv_input_pair_bytes_per_head());
+    bytes.cache_write = static_cast<std::size_t>(static_cast<double>(token_count * kKVHeads) *
+                                                 kv_cache_pair_bytes_per_head(kv_dtype));
+    bytes.total       = bytes.input_read + bytes.cache_write;
+    return bytes;
+}
+
+std::int32_t kv_append_ctas(std::int32_t tokens, DType kv_dtype) {
+    if (kv_dtype == DType::I8) {
+        constexpr std::int32_t kWarpsPerCta = 8;
+        return ceil_div_i32(tokens * kKVHeads * (kHeadDim / kBenchKvQuantGroup), kWarpsPerCta);
+    }
+    constexpr std::int32_t kThreadsPerCta = 256;
+    constexpr std::int32_t kVecElems      = 8;
+    return ceil_div_i32(tokens * kKVHeads * (kHeadDim / kVecElems), kThreadsPerCta);
+}
+
+const char* kv_append_ncu_kernel_regex(DType dtype) {
+    return dtype == DType::I8 ? "gqa_attention_prefill_fill_i8_kernel"
+                              : "gqa_attention_prefill_fill_bf16_kernel";
+}
+
+const char* kv_append_control_ncu_kernel_regex(DType dtype) {
+    return dtype == DType::I8 ? "bench_kv_append_i8_payload_control_kernel"
+                              : "bench_kv_append_bf16_control_kernel";
+}
+
 std::int32_t append_prompt_q_blocks(std::int32_t tokens) {
     return ceil_div_i32(tokens, kPromptQBlock);
 }
@@ -344,6 +383,32 @@ __global__ void bench_stream_copy_kernel(const uint4* src, uint4* dst, std::size
     const std::size_t start = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
     const std::size_t step  = blockDim.x * static_cast<std::size_t>(gridDim.x);
     for (std::size_t i = start; i < words; i += step) { dst[i] = src[i]; }
+}
+
+__global__ void bench_kv_append_bf16_control_kernel(const uint4* k, const uint4* v, uint4* cache_k,
+                                                    uint4* cache_v, std::size_t vectors) {
+    const std::size_t idx = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    if (idx >= vectors) { return; }
+    cache_k[idx] = k[idx];
+    cache_v[idx] = v[idx];
+}
+
+__global__ void bench_kv_append_i8_payload_control_kernel(
+    const std::uint32_t* k, const std::uint32_t* v, std::uint16_t* cache_k, std::uint16_t* cache_v,
+    std::uint16_t* scale_k, std::uint16_t* scale_v, std::size_t groups) {
+    const std::size_t group = blockIdx.x * 8u + threadIdx.x / 32u;
+    const std::size_t lane  = threadIdx.x % 32u;
+    if (group >= groups) { return; }
+
+    const std::size_t pair = group * 32u + lane;
+    const std::uint32_t pk = k[pair];
+    const std::uint32_t pv = v[pair];
+    cache_k[pair]          = static_cast<std::uint16_t>((pk & 0xffu) | ((pk >> 8u) & 0xff00u));
+    cache_v[pair]          = static_cast<std::uint16_t>((pv & 0xffu) | ((pv >> 8u) & 0xff00u));
+    if (lane == 0u) {
+        scale_k[group] = 0x3c00u;
+        scale_v[group] = 0x3c00u;
+    }
 }
 
 void touch_cold_cache(DBuf& buf, cudaStream_t stream) {
@@ -503,6 +568,62 @@ struct PrefillTimingOptions {
     int repeat      = 10;
     int min_time_ms = 0;
 };
+
+struct KvAppendMetrics {
+    std::int32_t tokens               = 0;
+    std::int32_t context              = 0;
+    DType kv_dtype                    = DType::BF16;
+    std::int32_t ctas                 = 0;
+    int runs                          = 0;
+    int inner_iters                   = 1;
+    std::size_t input_read_bytes      = 0;
+    std::size_t cache_write_bytes     = 0;
+    std::size_t total_bytes           = 0;
+    double median_us                  = 0.0;
+    double min_us                     = 0.0;
+    double p95_us                     = 0.0;
+    double mean_us                    = 0.0;
+    double total_gbps                 = 0.0;
+    double bandwidth_pct              = 0.0;
+    double control_median_us          = 0.0;
+    double control_interval_ratio_pct = 0.0;
+};
+
+KvAppendMetrics kv_append_metrics_from_result(std::int32_t tokens, std::int32_t context,
+                                              DType kv_dtype, const Result& r) {
+    const KvAppendBytes bytes = kv_append_bytes(tokens, kv_dtype);
+    KvAppendMetrics m;
+    m.tokens            = tokens;
+    m.context           = context;
+    m.kv_dtype          = kv_dtype;
+    m.ctas              = kv_append_ctas(tokens, kv_dtype);
+    m.runs              = r.n_runs;
+    m.inner_iters       = r.inner_iters;
+    m.input_read_bytes  = bytes.input_read;
+    m.cache_write_bytes = bytes.cache_write;
+    m.total_bytes       = bytes.total;
+    m.median_us         = r.median_us;
+    m.min_us            = r.min_us;
+    m.p95_us            = r.p95_us;
+    m.mean_us           = r.mean_us;
+    const double sec    = r.median_us * 1.0e-6;
+    if (sec > 0.0) { m.total_gbps = static_cast<double>(bytes.total) / sec / 1.0e9; }
+    m.bandwidth_pct = m.total_gbps / kDramPeakGBs * 100.0;
+    return m;
+}
+
+void print_kv_append_result(const KvAppendMetrics& m, const char* suffix = "") {
+    constexpr double kKiB = 1024.0;
+    std::printf("gqa_kv_append T=%-4d C=%-7d kv=%s median=%8.2f us  min=%8.2f us  "
+                "p95=%8.2f us  payload=%8.1f GB/s (%5.2f%% of %.0f)  "
+                "control=%8.2f us interval_ratio=%6.2f%%  read=%.2f KiB write=%.2f KiB "
+                "total=%.2f KiB  CTAs=%d runs=%d inner=%d%s\n",
+                m.tokens, m.context, kv_dtype_name(m.kv_dtype), m.median_us, m.min_us, m.p95_us,
+                m.total_gbps, m.bandwidth_pct, kDramPeakGBs, m.control_median_us,
+                m.control_interval_ratio_pct, static_cast<double>(m.input_read_bytes) / kKiB,
+                static_cast<double>(m.cache_write_bytes) / kKiB,
+                static_cast<double>(m.total_bytes) / kKiB, m.ctas, m.runs, m.inner_iters, suffix);
+}
 
 AppendPromptMetrics append_prompt_metrics_from_result(std::int32_t tokens, std::int32_t context,
                                                       DType kv_dtype, const Result& r) {
@@ -720,6 +841,104 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
                     ? static_cast<double>(bytes.total) / static_cast<double>(bytes.useful_kv)
                     : 0.0,
                 small_t_ncu_kernel_regex(kv.dtype));
+}
+
+void launch_kv_append_control(DType kv_dtype, const DBuf& k, const DBuf& v, DBuf& control_k,
+                              DBuf& control_v, std::int32_t tokens, cudaStream_t stream) {
+    constexpr int kBlock = 256;
+    const int grid       = kv_append_ctas(tokens, kv_dtype);
+    if (kv_dtype == DType::I8) {
+        const std::size_t groups =
+            static_cast<std::size_t>(tokens) * kKVHeads * (kHeadDim / kBenchKvQuantGroup);
+        const std::size_t code_pairs = static_cast<std::size_t>(tokens) * kKVHeads * kHeadDim / 2u;
+        auto* control_k_data         = static_cast<std::uint16_t*>(control_k.p);
+        auto* control_v_data         = static_cast<std::uint16_t*>(control_v.p);
+        bench_kv_append_i8_payload_control_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const std::uint32_t*>(k.p), static_cast<const std::uint32_t*>(v.p),
+            control_k_data, control_v_data, control_k_data + code_pairs,
+            control_v_data + code_pairs, groups);
+    } else {
+        const std::size_t vectors = k.bytes / sizeof(uint4);
+        bench_kv_append_bf16_control_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const uint4*>(k.p), static_cast<const uint4*>(v.p),
+            static_cast<uint4*>(control_k.p), static_cast<uint4*>(control_v.p), vectors);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+KvAppendMetrics run_kv_append(KVCache& kv, std::int32_t tokens, std::int32_t context,
+                              const PrefillTimingOptions& timing) {
+    const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
+                            static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
+    DBuf k   = make_bf16(kvn);
+    DBuf v   = make_bf16(kvn);
+    DBuf pos = make_i32_sequence(context, tokens);
+    const std::size_t control_bytes =
+        kv.dtype == DType::I8 ? kv_append_bytes(tokens, kv.dtype).cache_write / 2u : k.bytes;
+    DBuf control_k = make_zeros(control_bytes);
+    DBuf control_v = make_zeros(control_bytes);
+    Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tpos(pos.p, DType::I32, {tokens});
+
+    const KvAppendBytes bytes = kv_append_bytes(tokens, kv.dtype);
+    const Result r = bench_loop([&](cudaStream_t s) { ops::gqa_kv_append(tk, tv, tpos, kv, 0, s); },
+                                static_cast<double>(bytes.total), timing.warmup, timing.repeat,
+                                timing.min_time_ms);
+    const Result control = bench_loop(
+        [&](cudaStream_t s) {
+            launch_kv_append_control(kv.dtype, k, v, control_k, control_v, tokens, s);
+        },
+        static_cast<double>(bytes.total), timing.warmup, timing.repeat, timing.min_time_ms);
+    KvAppendMetrics metrics   = kv_append_metrics_from_result(tokens, context, kv.dtype, r);
+    metrics.control_median_us = control.median_us;
+    metrics.control_interval_ratio_pct =
+        r.median_us > 0.0 ? control.median_us / r.median_us * 100.0 : 0.0;
+    print_kv_append_result(metrics);
+    return metrics;
+}
+
+void run_kv_append_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t context,
+                                DBuf* cold_cache) {
+    const std::size_t kvn = static_cast<std::size_t>(kHeadDim) *
+                            static_cast<std::size_t>(kKVHeads) * static_cast<std::size_t>(tokens);
+    DBuf k   = make_bf16(kvn);
+    DBuf v   = make_bf16(kvn);
+    DBuf pos = make_i32_sequence(context, tokens);
+    const std::size_t control_bytes =
+        kv.dtype == DType::I8 ? kv_append_bytes(tokens, kv.dtype).cache_write / 2u : k.bytes;
+    DBuf control_k = make_zeros(control_bytes);
+    DBuf control_v = make_zeros(control_bytes);
+    Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
+    Tensor tpos(pos.p, DType::I32, {tokens});
+    const KvAppendBytes bytes = kv_append_bytes(tokens, kv.dtype);
+
+    cudaStream_t stream = nullptr;
+    if (cold_cache != nullptr) {
+        const Result r = bench_cold_cache_loop(
+            [&](cudaStream_t s) { ops::gqa_kv_append(tk, tv, tpos, kv, 0, s); }, *cold_cache,
+            static_cast<double>(bytes.total));
+        const KvAppendMetrics metrics = kv_append_metrics_from_result(tokens, context, kv.dtype, r);
+        print_kv_append_result(metrics, " cold_cache");
+        std::printf("PROFILE_COLD_METADATA mode=kv-append T=%d context=%d kv_dtype=%s CTAs=%d "
+                    "cold_cache_bytes=%zu input_read_bytes=%zu cache_write_bytes=%zu "
+                    "total_modeled_bytes=%zu repeats=%d ncu_kernel_regex='%s'\n",
+                    tokens, context, kv_dtype_name(kv.dtype), metrics.ctas, cold_cache->bytes,
+                    bytes.input_read, bytes.cache_write, bytes.total, r.n_runs,
+                    kv_append_ncu_kernel_regex(kv.dtype));
+        return;
+    }
+
+    ops::gqa_kv_append(tk, tv, tpos, kv, 0, stream);
+    launch_kv_append_control(kv.dtype, k, v, control_k, control_v, tokens, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::printf("PROFILE_ONCE mode=kv-append T=%d context=%d kv_dtype=%s CTAs=%d "
+                "input_read_bytes=%zu cache_write_bytes=%zu total_model_bytes=%zu "
+                "ncu_kernel_regex='%s' control_ncu_kernel_regex='%s'\n",
+                tokens, context, kv_dtype_name(kv.dtype), kv_append_ctas(tokens, kv.dtype),
+                bytes.input_read, bytes.cache_write, bytes.total,
+                kv_append_ncu_kernel_regex(kv.dtype), kv_append_control_ncu_kernel_regex(kv.dtype));
 }
 
 void run_copy_ceiling(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
@@ -959,6 +1178,64 @@ std::string json_number(double value) {
     return out.str();
 }
 
+std::string format_kv_append_csv(const std::vector<KvAppendMetrics>& results) {
+    std::ostringstream out;
+    out << "T,context,kv_dtype,ctas,input_read_bytes,cache_write_bytes,total_bytes,"
+           "median_us,min_us,p95_us,mean_us,total_gbps,bandwidth_pct,control_median_us,"
+           "control_interval_ratio_pct,runs,inner_iters\n";
+    for (const KvAppendMetrics& m : results) {
+        out << m.tokens << ',' << m.context << ',' << kv_dtype_name(m.kv_dtype) << ',' << m.ctas
+            << ',' << m.input_read_bytes << ',' << m.cache_write_bytes << ',' << m.total_bytes
+            << ',' << json_number(m.median_us) << ',' << json_number(m.min_us) << ','
+            << json_number(m.p95_us) << ',' << json_number(m.mean_us) << ','
+            << json_number(m.total_gbps) << ',' << json_number(m.bandwidth_pct) << ','
+            << json_number(m.control_median_us) << ',' << json_number(m.control_interval_ratio_pct)
+            << ',' << m.runs << ',' << m.inner_iters << '\n';
+    }
+    return out.str();
+}
+
+std::string format_kv_append_json(const std::vector<KvAppendMetrics>& results,
+                                  const PrefillTimingOptions& timing) {
+    std::ostringstream out;
+    out << "{\n"
+        << "  \"schema_version\": 1,\n"
+        << "  \"artifact_type\": \"ninfer_gqa_kv_append_bench\",\n"
+        << "  \"geometry\": \"" << kGeometryName << "\",\n"
+        << "  \"q_heads\": " << kQHeads << ",\n"
+        << "  \"kv_heads\": " << kKVHeads << ",\n"
+        << "  \"head_dim\": " << kHeadDim << ",\n"
+        << "  \"dram_peak_gbps\": " << json_number(kDramPeakGBs) << ",\n"
+        << "  \"bytes_definition\": \"BF16 K/V input reads plus encoded K/V cache writes; "
+           "control-position traffic excluded\",\n"
+        << "  \"control_definition\": \"same-grid, same-payload K/V transfer; the INT8 "
+           "control packs bytes and writes scales but omits absmax, scaling, and rounding\",\n"
+        << "  \"timing\": {\"warmup\": " << timing.warmup << ", \"repeat\": " << timing.repeat
+        << ", \"min_time_ms\": " << timing.min_time_ms << "},\n"
+        << "  \"results\": [\n";
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        const KvAppendMetrics& m = results[i];
+        out << "    {\"T\": " << m.tokens << ", \"context\": " << m.context << ", \"kv_dtype\": \""
+            << kv_dtype_name(m.kv_dtype) << "\", \"ctas\": " << m.ctas
+            << ", \"input_read_bytes\": " << m.input_read_bytes
+            << ", \"cache_write_bytes\": " << m.cache_write_bytes
+            << ", \"total_bytes\": " << m.total_bytes
+            << ", \"median_us\": " << json_number(m.median_us)
+            << ", \"min_us\": " << json_number(m.min_us)
+            << ", \"p95_us\": " << json_number(m.p95_us)
+            << ", \"mean_us\": " << json_number(m.mean_us)
+            << ", \"total_gbps\": " << json_number(m.total_gbps)
+            << ", \"bandwidth_pct\": " << json_number(m.bandwidth_pct)
+            << ", \"control_median_us\": " << json_number(m.control_median_us)
+            << ", \"control_interval_ratio_pct\": " << json_number(m.control_interval_ratio_pct)
+            << ", \"runs\": " << m.runs << ", \"inner_iters\": " << m.inner_iters << "}"
+            << (i + 1 < results.size() ? "," : "") << "\n";
+    }
+    out << "  ]\n"
+        << "}\n";
+    return out.str();
+}
+
 std::string format_prefill_csv(const std::vector<PrefillMetrics>& results) {
     std::ostringstream out;
     out << "T,kv_dtype,ms,tflops,tflops_pct,gbps_model,gbps_model_pct,gbps_dram,gbps_dram_pct,"
@@ -1129,6 +1406,7 @@ struct Options {
     bool decode                      = false;
     bool prefill                     = false;
     bool append_small_t              = false;
+    bool kv_append                   = false;
     bool append_prompt_baseline      = false;
     bool append_prompt_attention     = false;
     bool copy_ceiling                = false;
@@ -1160,6 +1438,9 @@ void fail_usage(const char* message) {
         "       ninfer_gqa_attention_bench --append-small-t --tokens T[,T...] "
         "--context N[,N...] [--geometry 27b|35b] [--kv-dtype bf16|int8] "
         "[--profile-once] [--cold-cache]\n"
+        "       ninfer_gqa_attention_bench --kv-append --tokens T[,T...] "
+        "--context N[,N...] [--geometry 27b|35b] [--kv-dtype bf16|int8] "
+        "[--profile-once] [--cold-cache] [--csv-out path] [--json-out path]\n"
         "       ninfer_gqa_attention_bench --append-prompt-baseline --tokens T[,T...] "
         "--context N[,N...] [--geometry 27b|35b] [--kv-dtype bf16|int8] "
         "[--csv-out path] [--json-out path]\n"
@@ -1242,6 +1523,8 @@ Options parse_options(int argc, char** argv) {
             opt.prefill = true;
         } else if (!std::strcmp(argv[i], "--append-small-t")) {
             opt.append_small_t = true;
+        } else if (!std::strcmp(argv[i], "--kv-append")) {
+            opt.kv_append = true;
         } else if (!std::strcmp(argv[i], "--append-prompt-baseline")) {
             opt.append_prompt_baseline = true;
         } else if (!std::strcmp(argv[i], "--append-prompt-attention-only")) {
@@ -1308,8 +1591,8 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
-    if (!opt.decode && !opt.prefill && !opt.append_small_t && !opt.append_prompt_baseline &&
-        !opt.append_prompt_attention && !opt.copy_ceiling) {
+    if (!opt.decode && !opt.prefill && !opt.append_small_t && !opt.kv_append &&
+        !opt.append_prompt_baseline && !opt.append_prompt_attention && !opt.copy_ceiling) {
         opt.prefill = true;
     }
     if (opt.prefill && opt.tokens.empty()) {
@@ -1320,6 +1603,7 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (opt.append_small_t && opt.tokens.empty()) { opt.tokens = {1}; }
+    if (opt.kv_append && opt.tokens.empty()) { opt.tokens = {1, 2, 3, 4, 5, 6, 1024}; }
     if ((opt.append_prompt_baseline || opt.append_prompt_attention) && opt.tokens.empty()) {
         opt.tokens = {1024};
     }
@@ -1334,11 +1618,18 @@ Options parse_options(int argc, char** argv) {
             }
         }
     }
+    if (opt.kv_append) {
+        for (const std::int32_t tokens : opt.tokens) {
+            if (tokens <= 0 || tokens > 1024) {
+                fail_usage("--kv-append supports T values in [1,1024]");
+            }
+        }
+    }
     if (opt.copy_ceiling && (opt.tokens[0] <= 0 || opt.tokens[0] > 6)) {
         fail_usage("--copy-ceiling currently supports T in [1,6]");
     }
-    if ((opt.append_small_t || opt.append_prompt_baseline || opt.append_prompt_attention ||
-         opt.copy_ceiling) &&
+    if ((opt.append_small_t || opt.kv_append || opt.append_prompt_baseline ||
+         opt.append_prompt_attention || opt.copy_ceiling) &&
         !opt.context_set) {
         fail_usage("append/copy modes require --context");
     }
@@ -1348,7 +1639,7 @@ Options parse_options(int argc, char** argv) {
     if ((opt.append_prompt_baseline || opt.append_prompt_attention) && opt.contexts.empty()) {
         fail_usage("--append-prompt modes require --context");
     }
-    if (opt.append_small_t || opt.copy_ceiling || opt.append_prompt_baseline ||
+    if (opt.append_small_t || opt.kv_append || opt.copy_ceiling || opt.append_prompt_baseline ||
         opt.append_prompt_attention) {
         for (const std::int32_t tokens : opt.tokens) {
             for (const std::int32_t context : opt.contexts) {
@@ -1359,7 +1650,8 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (static_cast<int>(opt.decode) + static_cast<int>(opt.prefill) +
-            static_cast<int>(opt.append_small_t) + static_cast<int>(opt.append_prompt_baseline) +
+            static_cast<int>(opt.append_small_t) + static_cast<int>(opt.kv_append) +
+            static_cast<int>(opt.append_prompt_baseline) +
             static_cast<int>(opt.append_prompt_attention) + static_cast<int>(opt.copy_ceiling) >
         1) {
         fail_usage("select exactly one benchmark mode");
@@ -1372,6 +1664,7 @@ Options parse_options(int argc, char** argv) {
     }
     if (opt.profile_once && static_cast<int>(opt.decode) + static_cast<int>(opt.prefill) +
                                     static_cast<int>(opt.append_small_t) +
+                                    static_cast<int>(opt.kv_append) +
                                     static_cast<int>(opt.append_prompt_baseline) +
                                     static_cast<int>(opt.append_prompt_attention) >
                                 1) {
@@ -1384,11 +1677,17 @@ Options parse_options(int argc, char** argv) {
         (opt.tokens.size() != 1u || opt.contexts.size() != 1u)) {
         fail_usage("--append-small-t --profile-once requires one T and one context");
     }
+    if (opt.profile_once && opt.kv_append &&
+        (opt.tokens.size() != 1u || opt.contexts.size() != 1u)) {
+        fail_usage("--kv-append --profile-once requires one T and one context");
+    }
     if (opt.profile_once && opt.decode && opt.round_robin_layers != 1u) {
         fail_usage("--profile-once cannot be combined with --round-robin-layers");
     }
-    if (opt.cold_cache && (!opt.profile_once || (!opt.decode && !opt.append_small_t))) {
-        fail_usage("--cold-cache is only valid with decode or append-small-t --profile-once");
+    if (opt.cold_cache &&
+        (!opt.profile_once || (!opt.decode && !opt.append_small_t && !opt.kv_append))) {
+        fail_usage(
+            "--cold-cache is only valid with decode, append-small-t, or kv-append --profile-once");
     }
     if (opt.profile_once && opt.copy_ceiling) {
         fail_usage("--copy-ceiling does not support --profile-once");
@@ -1448,8 +1747,8 @@ int main(int argc, char** argv) {
         max_context = std::max(max_context, pos + 1);
     }
     for (const std::int32_t tokens : opt.tokens) { max_context = std::max(max_context, tokens); }
-    if (opt.append_small_t || opt.append_prompt_baseline || opt.append_prompt_attention ||
-        opt.copy_ceiling) {
+    if (opt.append_small_t || opt.kv_append || opt.append_prompt_baseline ||
+        opt.append_prompt_attention || opt.copy_ceiling) {
         for (const std::int32_t tokens : opt.tokens) {
             for (const std::int32_t context : opt.contexts) {
                 max_context = std::max(max_context, context + tokens);
@@ -1511,6 +1810,23 @@ int main(int argc, char** argv) {
                     run_append_small_t(kv, tokens, context);
                 }
             }
+        }
+    }
+    if (opt.kv_append) {
+        if (opt.profile_once) {
+            DBuf cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
+            run_kv_append_profile_once(kv, opt.tokens[0], opt.context,
+                                       opt.cold_cache ? &cold_cache : nullptr);
+        } else {
+            std::vector<KvAppendMetrics> results;
+            results.reserve(opt.tokens.size() * opt.contexts.size());
+            for (const std::int32_t tokens : opt.tokens) {
+                for (const std::int32_t context : opt.contexts) {
+                    results.push_back(run_kv_append(kv, tokens, context, opt.prefill_timing));
+                }
+            }
+            write_text_file(opt.csv_out, format_kv_append_csv(results));
+            write_text_file(opt.json_out, format_kv_append_json(results, opt.prefill_timing));
         }
     }
     if (opt.append_prompt_baseline) {

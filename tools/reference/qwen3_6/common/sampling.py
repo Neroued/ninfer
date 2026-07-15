@@ -1,4 +1,4 @@
-"""Small PyTorch sampler for usable reference-model text generation."""
+"""Small PyTorch sampler shared by Qwen3.6 reference targets."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Qwen3.6-27B reference schedule over a native NInfer artifact."""
+"""Qwen3.6-35B-A3B reference schedule over a native NInfer artifact."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from tools.reference.qwen3_6.common.sampling import Sampler
 from tools.reference.qwen3_6.common.tap import NullTap
 
 from . import mtp as mtp_schedule
-from .bindings import ArtifactBinding, WeightObject
+from .bindings import ArtifactBinding, RowAddressable, WeightObject
 from .config import CFG
 from .ops import attention, linear, rmsnorm
 from .state import ModelState, StateSnapshot
@@ -22,7 +22,7 @@ from .vision import VisionEncoder, VisionOutput, VisionStats
 from .weights import WeightStore
 
 
-COMPILED_CODEC_MIN_TOKENS = 12
+COMPILED_CODEC_MIN_TOKENS = 1
 
 
 @dataclass
@@ -34,7 +34,7 @@ class ModelSnapshot:
 
 
 class RefModel:
-    """Complete fixed Text/MTP compute path for the registered 27B target."""
+    """Complete fixed Text/MoE/MTP compute path for the 35B-A3B artifact target."""
 
     def __init__(
         self,
@@ -85,7 +85,7 @@ class RefModel:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
         if capacity > CFG.max_position_embeddings:
-            raise ValueError("capacity exceeds the registered maximum context")
+            raise ValueError("capacity exceeds the artifact profile's maximum context")
         self.weights = None
         self.state = None
         self.last_hidden = None
@@ -153,13 +153,43 @@ class RefModel:
             raise RuntimeError("call prepare(), prefill(), or generate() before model operations")
         return self.weights, self.state
 
-    def weight(self, value: WeightObject) -> torch.Tensor:
+    def weight(
+        self,
+        value: WeightObject,
+        *,
+        small_t: bool = False,
+    ) -> torch.Tensor:
         weights, _ = self._ready()
-        return weights.tensor(value)
+        return weights.tensor(
+            value,
+            dequant_dtype=torch.float32 if small_t else torch.bfloat16,
+        )
 
-    def block_weight(self, value: WeightObject) -> torch.Tensor:
+    def block_weight(
+        self,
+        value: WeightObject,
+        *,
+        small_t: bool = False,
+    ) -> torch.Tensor:
         weights, _ = self._ready()
-        return weights.tensor(value)
+        return weights.tensor(
+            value,
+            dequant_dtype=torch.float32 if small_t else torch.bfloat16,
+        )
+
+    def rows(
+        self,
+        value: RowAddressable,
+        rows: Iterable[int] | torch.Tensor,
+        *,
+        small_t: bool = False,
+    ) -> torch.Tensor:
+        weights, _ = self._ready()
+        return weights.rows(
+            value,
+            rows,
+            dequant_dtype=torch.float32 if small_t else torch.bfloat16,
+        )
 
     def _positions(self, start: int, count: int) -> torch.Tensor:
         _, state = self._ready()
@@ -219,7 +249,11 @@ class RefModel:
         last = hidden[-1:].to(torch.bfloat16)
         if draft:
             head = self.binding.text.draft_head
-            logits = linear(last, weights.tensor(head.weight))[0]
+            logits = linear(
+                last,
+                weights.tensor(head.weight, dequant_dtype=torch.float32),
+                small_t=True,
+            )[0]
             ids = weights.tensor(head.token_ids).long()
             full = torch.full((CFG.vocab,), -torch.inf, device=self.device, dtype=torch.float32)
             full[ids] = logits.float()
@@ -227,10 +261,17 @@ class RefModel:
 
         head = self.binding.text.output_head
         if weights.representation(head) == "decoded":
-            return (last @ weights.tensor(head).t())[0]
+            return linear(
+                last,
+                weights.tensor(head, dequant_dtype=torch.float32),
+                small_t=True,
+            )[0]
         logits = torch.empty(CFG.vocab, device=self.device, dtype=torch.bfloat16)
-        for row0, row1, weight in weights.chunks(head):
-            logits[row0:row1] = (last @ weight.t())[0]
+        for row0, row1, weight in weights.chunks(
+            head,
+            dequant_dtype=torch.float32,
+        ):
+            logits[row0:row1] = linear(last, weight, small_t=True)[0]
         return logits
 
     def prefill(
@@ -291,6 +332,7 @@ class RefModel:
                         last_hidden[:known],
                         positions[:known],
                         start=state.mtp_kv.length,
+                        small_t=False,
                         sample=False,
                     )
 
@@ -308,6 +350,7 @@ class RefModel:
                 last_hidden[-1:],
                 torch.tensor([state.position - 1], device=self.device, dtype=torch.int32),
                 start=state.mtp_kv.length,
+                small_t=True,
             )
             self.last_mtp_hidden = mtp_hidden[-1:]
             self.last_draft = draft
@@ -400,6 +443,7 @@ class RefModel:
                         last_hidden[:known],
                         positions[..., :known],
                         start=state.mtp_kv.length,
+                        small_t=False,
                         sample=False,
                         input_embeddings=span[1 : known + 1],
                     )
@@ -418,6 +462,7 @@ class RefModel:
                 last_hidden[-1:],
                 last_positions[..., -1:],
                 start=state.mtp_kv.length,
+                small_t=True,
             )
             self.last_mtp_hidden = mtp_hidden[-1:]
             self.last_draft = draft
@@ -473,7 +518,11 @@ class RefModel:
         )
         if self.mtp_enabled and update_mtp:
             mtp_hidden, self.last_draft = self.mtp_forward(
-                [target], hidden, positions, start=state.mtp_kv.length
+                [target],
+                hidden,
+                positions,
+                start=state.mtp_kv.length,
+                small_t=True,
             )
             self.last_mtp_hidden = mtp_hidden[-1:]
         return target, hidden, logits
@@ -522,6 +571,7 @@ class RefModel:
                 hidden,
                 self._positions(start, 1),
                 start=start,
+                small_t=True,
             )
             assert draft is not None
             drafts.append(draft)
@@ -634,6 +684,7 @@ class RefModel:
             torch.cat(target_hiddens, dim=0),
             self._positions(baseline, len(outputs)),
             start=baseline,
+            small_t=True,
             sample=(len(outputs) < remaining_budget and not stopped),
         )
         self.last_mtp_hidden = rebuild_hidden[-1:]
@@ -660,6 +711,7 @@ class RefModel:
         positions: torch.Tensor,
         *,
         start: int,
+        small_t: bool,
         sample: bool = True,
         input_embeddings: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int | None]:
@@ -669,6 +721,7 @@ class RefModel:
             hidden,
             positions,
             start=start,
+            small_t=small_t,
             sample=sample,
             input_embeddings=input_embeddings,
         )

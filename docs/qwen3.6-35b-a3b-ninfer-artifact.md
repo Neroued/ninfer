@@ -3,8 +3,9 @@
 > Status: accepted implementation specification for the future
 > `qwen3_6_35b_a3b_rtx5090` target. The target-private converter, inventory, source recipe, and
 > conversion preflight implement this contract and have completed a real end-to-end conversion
-> with the fixed 27B-measured shortlist. No binder, runtime target package, verifier, artifact-native
-> reference model, or Engine route currently exists.
+> with the fixed 27B-measured shortlist. The complete artifact-native Python Text/MoE/Vision/MTP
+> reference implements the target's typed binding and execution semantics. No C++ binder, runtime
+> target package, source verifier, or Engine route currently exists.
 >
 > Authority: this document defines the complete `.ninfer` persistent-object contract for
 > the exact Qwen3.6-35B-A3B checkpoint and the recipe that converts the selected Hugging Face BF16

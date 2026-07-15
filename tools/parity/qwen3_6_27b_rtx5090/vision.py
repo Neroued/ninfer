@@ -9,9 +9,9 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
+from tools.reference.qwen3_6.common.frontend import Frontend
+from tools.reference.qwen3_6.common.multimodal import load_messages
 from tools.reference.qwen3_6_27b_rtx5090 import RefModel
-from tools.reference.qwen3_6_27b_rtx5090.frontend import Frontend
-from tools.reference.qwen3_6_27b_rtx5090.multimodal import load_messages
 
 
 CAPTURE_LAYERS = {0, 13, 26}

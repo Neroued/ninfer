@@ -9,7 +9,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from .config import VISION_CFG
+from .vision_ops import VISION_SPATIAL_MERGE
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +108,7 @@ def _vision_position_ids(
     start: int, grid: Sequence[int], device: torch.device
 ) -> torch.Tensor:
     t, h, w = (int(value) for value in grid)
-    merge = VISION_CFG.spatial_merge
+    merge = VISION_SPATIAL_MERGE
     if t <= 0 or h <= 0 or w <= 0 or h % merge or w % merge:
         raise ValueError(f"invalid vision grid {tuple(grid)}")
     gh, gw = h // merge, w // merge
@@ -163,8 +163,8 @@ def build_mrope_positions(
                 label = "image" if modality == 1 else "video"
                 raise ValueError(f"more {label} placeholder runs than grid entries") from exc
             consumed[modality] += 1
-            expected = int(grid[0]) * (int(grid[1]) // VISION_CFG.spatial_merge) * (
-                int(grid[2]) // VISION_CFG.spatial_merge
+            expected = int(grid[0]) * (int(grid[1]) // VISION_SPATIAL_MERGE) * (
+                int(grid[2]) // VISION_SPATIAL_MERGE
             )
             if length != expected:
                 label = "image" if modality == 1 else "video"
@@ -173,7 +173,7 @@ def build_mrope_positions(
                     f"for grid {grid}"
                 )
             parts.append(_vision_position_ids(current, grid, device))
-            current += max(int(grid[1]), int(grid[2])) // VISION_CFG.spatial_merge
+            current += max(int(grid[1]), int(grid[2])) // VISION_SPATIAL_MERGE
         begin = end
 
     for modality, label in ((1, "image"), (2, "video")):

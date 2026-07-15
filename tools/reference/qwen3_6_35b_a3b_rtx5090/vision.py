@@ -1,4 +1,4 @@
-"""Fixed Qwen3.6-27B vision-tower schedule over a native NInfer artifact."""
+"""Fixed Qwen3.6-35B-A3B vision-tower schedule over a native NInfer artifact."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ class VisionOutput:
 
 
 class VisionEncoder:
-    """Run one request while streaming each large vision matrix exactly once."""
+    """Encode media sequentially with item-bounded GPU activation lifetime."""
 
     def __init__(
         self,
@@ -123,55 +123,63 @@ class VisionEncoder:
             )
         return estimate
 
-    def encode(
-        self,
-        pixel_values: torch.Tensor | None,
-        image_grid_thw: torch.Tensor | None,
-        pixel_values_videos: torch.Tensor | None,
-        video_grid_thw: torch.Tensor | None,
-        *,
-        tap: Callable[[str, torch.Tensor], None] | None = None,
-    ) -> VisionOutput:
-        pixels = [value for value in (pixel_values, pixel_values_videos) if value is not None]
-        grids = [value for value in (image_grid_thw, video_grid_thw) if value is not None]
-        if not pixels or not grids:
-            raise ValueError("vision encode requires image or video pixels and matching grids")
-        if len(pixels) != len(grids):
-            raise ValueError("vision pixels/grid modality mismatch")
-        combined_pixels = torch.cat(pixels, dim=0)
-        combined_grid = torch.cat(grids, dim=0).to(device=self.device, dtype=torch.long)
-        if combined_pixels.shape != (
-            int(combined_grid.prod(-1).sum()),
-            VISION_CFG.patch_dim,
-        ):
+    @staticmethod
+    def _item_slices(
+        pixels: torch.Tensor | None,
+        grid_thw: torch.Tensor | None,
+        modality: str,
+    ) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
+        if pixels is None and grid_thw is None:
+            return []
+        if pixels is None or grid_thw is None:
+            raise ValueError(f"{modality} pixels and grid must be provided together")
+        if pixels.ndim != 2 or pixels.shape[1] != VISION_CFG.patch_dim:
             raise ValueError(
-                f"processor pixels have shape {tuple(combined_pixels.shape)}, expected "
-                f"[{int(combined_grid.prod(-1).sum())},{VISION_CFG.patch_dim}]"
+                f"{modality} pixels have shape {tuple(pixels.shape)}, expected "
+                f"[patches,{VISION_CFG.patch_dim}]"
             )
 
-        image_patches, image_tokens, image_pairs = self._grid_stats(image_grid_thw)
-        video_patches, video_tokens, video_pairs = self._grid_stats(video_grid_thw)
-        raw_patches = image_patches + video_patches
-        llm_tokens = image_tokens + video_tokens
-        attention_pairs = image_pairs + video_pairs
-        estimate = self._validate_budget(raw_patches, attention_pairs)
-        if self.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(self.device)
+        items: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+        offset = 0
+        for index, (t, h, w) in enumerate(grid_thw.tolist()):
+            patches = int(t) * int(h) * int(w)
+            end = offset + patches
+            items.append(
+                (
+                    f"{modality}_{index:03d}",
+                    pixels[offset:end],
+                    grid_thw[index : index + 1],
+                )
+            )
+            offset = end
+        if offset != pixels.shape[0]:
+            raise ValueError(
+                f"{modality} grid describes {offset} patches, got {pixels.shape[0]}"
+            )
+        return items
 
+    def _encode_item(
+        self,
+        pixels: torch.Tensor,
+        grid_thw: torch.Tensor,
+        name: str,
+        tap: Callable[[str, torch.Tensor], None] | None,
+    ) -> torch.Tensor:
         vision = self.binding.vision
-        started = time.perf_counter()
-        x = combined_pixels.to(device=self.device, dtype=torch.bfloat16)
+        grid = grid_thw.to(device=self.device, dtype=torch.long)
+        _, llm_tokens, _ = self._grid_stats(grid_thw)
+        x = pixels.to(device=self.device, dtype=torch.bfloat16)
         weight = self._weight(vision.patch_embedding)
         x = add_bias(linear(x, weight), self._weight(vision.patch_embedding_bias))
         del weight
         position = interpolate_position_embedding(
-            self._weight(vision.position_embedding), combined_grid
+            self._weight(vision.position_embedding), grid
         )
         x = residual_add(x, position)
-        pos_ids = vision_position_ids(combined_grid)
-        cu_seqlens = vision_cu_seqlens(combined_grid)
+        pos_ids = vision_position_ids(grid)
+        cu_seqlens = vision_cu_seqlens(grid)
         if tap:
-            tap("patch_embed", x)
+            tap(f"{name}/patch_embed", x)
 
         for layer in vision.layers:
             h = layer_norm(
@@ -211,7 +219,7 @@ class VisionEncoder:
             del weight
             x = residual_add(x, h)
             if tap and layer.index in {0, 13, 26}:
-                tap(f"block_{layer.index:02d}", x)
+                tap(f"{name}/block_{layer.index:02d}", x)
 
         merger = vision.merger
         x = layer_norm(
@@ -229,17 +237,54 @@ class VisionEncoder:
         x = add_bias(linear(x, weight), self._weight(merger.fc2_bias))
         del weight
         if tap:
-            tap("merger", x)
+            tap(f"{name}/merger", x)
         if x.shape != (llm_tokens, VISION_CFG.out_hidden):
             raise RuntimeError(
-                f"vision merger returned {tuple(x.shape)}, expected "
+                f"{name} vision merger returned {tuple(x.shape)}, expected "
                 f"({llm_tokens},{VISION_CFG.out_hidden})"
             )
+        return x.to(device="cpu", dtype=torch.bfloat16)
+
+    def encode(
+        self,
+        pixel_values: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+        pixel_values_videos: torch.Tensor | None,
+        video_grid_thw: torch.Tensor | None,
+        *,
+        tap: Callable[[str, torch.Tensor], None] | None = None,
+    ) -> VisionOutput:
+        image_items = self._item_slices(pixel_values, image_grid_thw, "image")
+        video_items = self._item_slices(
+            pixel_values_videos, video_grid_thw, "video"
+        )
+        items = image_items + video_items
+        if not items:
+            raise ValueError("vision encode requires image or video pixels and matching grids")
+
+        item_stats = [self._grid_stats(grid) for _, _, grid in items]
+        raw_patches = sum(item[0] for item in item_stats)
+        llm_tokens = sum(item[1] for item in item_stats)
+        attention_pairs = sum(item[2] for item in item_stats)
+        max_item_patches = max(item[0] for item in item_stats)
+        estimate = self._validate_budget(max_item_patches, attention_pairs)
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+        started = time.perf_counter()
+        image_outputs = [
+            self._encode_item(pixels, grid, name, tap)
+            for name, pixels, grid in image_items
+        ]
+        video_outputs = [
+            self._encode_item(pixels, grid, name, tap)
+            for name, pixels, grid in video_items
+        ]
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
-        image_embeddings = x[:image_tokens] if image_tokens else None
-        video_embeddings = x[image_tokens:] if video_tokens else None
+        image_embeddings = torch.cat(image_outputs) if image_outputs else None
+        video_embeddings = torch.cat(video_outputs) if video_outputs else None
         elapsed = time.perf_counter() - started
         peak = (
             torch.cuda.max_memory_allocated(self.device)
@@ -247,8 +292,8 @@ class VisionEncoder:
             else 0
         )
         stats = VisionStats(
-            images=0 if image_grid_thw is None else int(image_grid_thw.shape[0]),
-            videos=0 if video_grid_thw is None else int(video_grid_thw.shape[0]),
+            images=len(image_items),
+            videos=len(video_items),
             raw_patches=raw_patches,
             llm_tokens=llm_tokens,
             attention_pairs=attention_pairs,

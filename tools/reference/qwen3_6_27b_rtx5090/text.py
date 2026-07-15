@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from tools.reference.qwen3_6.common.tap import NullTap
+
 from .config import CFG
 from .ops import (
     apply_rope,
@@ -17,7 +19,6 @@ from .ops import (
     sigmoid_mul,
     silu_mul,
 )
-from .tap import NullTap
 
 
 def attention_mixer(model, layer, x, positions, start, tap, context) -> torch.Tensor:

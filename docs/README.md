@@ -32,8 +32,8 @@ defined by `include/ninfer/engine.h` and `include/ninfer/types.h`.
 The common contracts and 27B artifact contract are implemented by the generic artifact
 reader/writer/inspector, the registered 27B converter and verifier, the C++ artifact
 reader/binder/materializer, the compiled target package, and the Python correctness reference. The
-35B-A3B contract is an accepted design authority for future implementation; it does not register a
-current product target.
+35B-A3B converter and artifact-native Python correctness reference implement the accepted future
+target's storage and model semantics; they do not register a current product target.
 
 ## Model computation references
 
@@ -79,8 +79,12 @@ target-private types.
   conversion leaves shared without sibling-target imports;
 - [`../tools/convert/qwen3_6_35b_a3b_rtx5090/`](../tools/convert/qwen3_6_35b_a3b_rtx5090/) — accepted
   future-target 35B-A3B converter, inventory, recipe, and preflight; not a registered Engine route;
+- [`../tools/reference/qwen3_6/common/`](../tools/reference/qwen3_6/common/) — narrow Qwen3.6-family
+  frontend, multimodal, sampling, activation-tap, and Vision-operator leaves;
 - [`../tools/reference/qwen3_6_27b_rtx5090/`](../tools/reference/qwen3_6_27b_rtx5090/) — complete
-  artifact-native Python Text/Vision/MTP reference;
+  artifact-native Python Text/Vision/MTP reference for the registered target;
+- [`../tools/reference/qwen3_6_35b_a3b_rtx5090/`](../tools/reference/qwen3_6_35b_a3b_rtx5090/) —
+  complete artifact-native Python Text/MoE/Vision/MTP reference for future target bring-up;
 - [`../tools/parity/qwen3_6_27b_rtx5090/`](../tools/parity/qwen3_6_27b_rtx5090/) — target-specific
   Text activation, source-BF16 Vision, and combined frontend/Vision/MTP comparison tools;
 - [`../eval/README.md`](../eval/README.md) — optional local capability-evaluation coordinator.

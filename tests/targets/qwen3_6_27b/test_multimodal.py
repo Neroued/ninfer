@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from tools.reference.qwen3_6_27b_rtx5090.multimodal import (
+from tools.reference.qwen3_6.common.multimodal import (
     MultimodalBatch,
     build_mrope_positions,
 )

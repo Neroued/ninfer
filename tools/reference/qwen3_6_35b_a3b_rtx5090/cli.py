@@ -1,4 +1,4 @@
-"""Command-line reference inference for the Qwen3.6-27B NInfer target."""
+"""Command-line reference inference for the Qwen3.6-35B-A3B NInfer artifact."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def parse_bytes(text: str | None) -> int | None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--weights", required=True, help="Qwen3.6-27B .ninfer artifact")
+    parser.add_argument("--weights", required=True, help="Qwen3.6-35B-A3B .ninfer artifact")
     prompt = parser.add_mutually_exclusive_group(required=True)
     prompt.add_argument("--prompt", help="single user message rendered by the artifact template")
     prompt.add_argument("--ids", help="comma/space-separated prompt token IDs")

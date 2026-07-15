@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from tools.reference.qwen3_6_27b_rtx5090.sampling import (
+from tools.reference.qwen3_6.common.sampling import (
     Sampler,
     SamplingConfig,
     TruncatedDistribution,

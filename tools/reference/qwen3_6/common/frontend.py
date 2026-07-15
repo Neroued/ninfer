@@ -1,4 +1,4 @@
-"""Library-backed Qwen3.6 frontend loaded from the artifact resources."""
+"""Library-backed Qwen3.6 frontend loaded from artifact resources."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from pathlib import Path
 from types import MethodType
 from typing import Any, Iterable
 
-from .bindings import ArtifactBinding, BoundResource
 from .multimodal import MultimodalBatch, batch_from_processor_output
 
 
@@ -43,7 +42,7 @@ def _fetch_videos_opencv(_processor, video_or_videos, sample_indices_fn=None):
 class Frontend:
     """Processor, tokenizer, template, and generation defaults for one artifact."""
 
-    def __init__(self, binding: ArtifactBinding):
+    def __init__(self, binding: Any):
         try:
             from transformers import AutoProcessor, GenerationConfig
             from transformers.utils import is_torchcodec_available
@@ -53,7 +52,7 @@ class Frontend:
             ) from exc
 
         resources = binding.frontend
-        files: tuple[tuple[str, BoundResource], ...] = (
+        files: tuple[tuple[str, Any], ...] = (
             ("tokenizer.json", resources.tokenizer_json),
             ("tokenizer_config.json", resources.tokenizer_config_json),
             ("chat_template.jinja", resources.chat_template_jinja),

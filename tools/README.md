@@ -18,7 +18,7 @@ bring-up, but it does not register a runtime target or advertise 35B product sup
 | Bring up the future 35B-A3B artifact | [`convert/qwen3_6_35b_a3b_rtx5090/`](convert/qwen3_6_35b_a3b_rtx5090/) |
 | Inspect an artifact directory | [`artifact/inspect.py`](artifact/inspect.py) |
 | Verify an artifact against the BF16 checkpoint | [`convert/qwen3_6_27b_rtx5090/verify.py`](convert/qwen3_6_27b_rtx5090/verify.py) |
-| Run independent Python inference | [`reference/qwen3_6_27b_rtx5090/README.md`](reference/qwen3_6_27b_rtx5090/README.md) |
+| Run independent Python inference | [`reference/qwen3_6_27b_rtx5090/README.md`](reference/qwen3_6_27b_rtx5090/README.md) or [`reference/qwen3_6_35b_a3b_rtx5090/README.md`](reference/qwen3_6_35b_a3b_rtx5090/README.md) |
 | Compare Python, C++, and source-model activations | [`parity/qwen3_6_27b_rtx5090/README.md`](parity/qwen3_6_27b_rtx5090/README.md) |
 | Run the end-to-end performance matrix | [`bench/README.md`](bench/README.md) |
 | Exercise a resident OpenAI/Anthropic server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
@@ -78,6 +78,21 @@ The reference is an independent correctness implementation, not the C++ runtime 
 Install its dependencies from
 [`reference/qwen3_6_27b_rtx5090/requirements.txt`](reference/qwen3_6_27b_rtx5090/requirements.txt).
 
+The accepted 35B-A3B artifact has its own complete Text/MoE/Vision/MTP reference without
+registering a second Engine target:
+
+```bash
+/home/neroued/miniconda3/envs/py311/bin/python \
+  -m tools.reference.qwen3_6_35b_a3b_rtx5090 \
+  --weights out/qwen3_6_35b_a3b_rtx5090.ninfer \
+  --prompt "Explain sparse MoE routing briefly." \
+  --decode 128 --mtp-draft-tokens 3
+```
+
+Both references depend inward on `reference/qwen3_6/common/` leaves. Their exact artifact
+bindings, weight residency, state, layer schedules, RefModel lifecycles, and CLIs remain separate;
+neither target imports its sibling.
+
 For activation comparisons, build `ninfer-qwen3_6_27b-dump` and follow the target parity guide:
 
 ```bash
@@ -125,7 +140,9 @@ tools/
 ├── convert/qwen3_6/common/            narrow Qwen3.6-family conversion leaves
 ├── convert/qwen3_6_27b_rtx5090/      exact-target converter, inventory, recipe, and verifier
 ├── convert/qwen3_6_35b_a3b_rtx5090/  future-target converter, inventory, and source recipe
-├── reference/qwen3_6_27b_rtx5090/    independent artifact-native Python reference
+├── reference/qwen3_6/common/          narrow family-invariant reference leaves
+├── reference/qwen3_6_27b_rtx5090/    registered-target artifact-native Python reference
+├── reference/qwen3_6_35b_a3b_rtx5090/ future-target artifact-native Python reference
 ├── parity/qwen3_6_27b_rtx5090/       target numerical comparison tools
 ├── qwen3_6_27b_dump/                 C++ target activation diagnostic
 ├── bench/                            corpus generation and performance orchestration

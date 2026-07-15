@@ -1,4 +1,4 @@
-"""Structured activation taps for cross-runtime diagnostics."""
+"""Structured activation taps for Qwen3.6 cross-runtime diagnostics."""
 
 from __future__ import annotations
 

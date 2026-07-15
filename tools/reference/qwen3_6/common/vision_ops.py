@@ -7,8 +7,16 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
-from .config import VISION_CFG
-from .ops import bf16
+VISION_HEADS = 16
+VISION_HEAD_DIM = 72
+VISION_SPATIAL_MERGE = 2
+VISION_POSITION_SIDE = 48
+VISION_ROPE_THETA = 10000.0
+VISION_NORM_EPS = 1.0e-6
+
+
+def bf16(x: torch.Tensor) -> torch.Tensor:
+    return x.to(torch.bfloat16)
 
 
 def layer_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -17,7 +25,7 @@ def layer_norm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> tor
         (x.shape[-1],),
         weight.to(device=x.device, dtype=x.dtype),
         bias.to(device=x.device, dtype=x.dtype),
-        VISION_CFG.norm_eps,
+        VISION_NORM_EPS,
     ).to(torch.bfloat16)
 
 
@@ -30,7 +38,7 @@ def gelu(x: torch.Tensor, *, approximate: bool) -> torch.Tensor:
 
 
 def vision_position_ids(grid_thw: torch.Tensor) -> torch.Tensor:
-    merge = VISION_CFG.spatial_merge
+    merge = VISION_SPATIAL_MERGE
     device = grid_thw.device
     parts: list[torch.Tensor] = []
     for t, h, w in grid_thw.tolist():
@@ -51,8 +59,8 @@ def vision_cu_seqlens(grid_thw: torch.Tensor) -> torch.Tensor:
 
 
 def bilinear_indices_and_weights(grid_thw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    side = VISION_CFG.position_side
-    merge = VISION_CFG.spatial_merge
+    side = VISION_POSITION_SIDE
+    merge = VISION_SPATIAL_MERGE
     device = grid_thw.device
     index_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
     weight_parts: list[list[torch.Tensor]] = [[] for _ in range(4)]
@@ -98,9 +106,9 @@ def interpolate_position_embedding(table: torch.Tensor, grid_thw: torch.Tensor) 
 @lru_cache(maxsize=16)
 def _vision_inv_freq(device_type: str, device_index: int | None) -> torch.Tensor:
     device = torch.device(device_type, device_index)
-    dim = VISION_CFG.head_dim // 2
+    dim = VISION_HEAD_DIM // 2
     values = torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-    return 1.0 / (VISION_CFG.rope_theta ** (values / dim))
+    return 1.0 / (VISION_ROPE_THETA ** (values / dim))
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -159,12 +167,12 @@ def vision_attention(
 
         def heads(x: torch.Tensor) -> torch.Tensor:
             return x[begin:end].reshape(
-                batch, length, VISION_CFG.heads, VISION_CFG.head_dim
+                batch, length, VISION_HEADS, VISION_HEAD_DIM
             ).transpose(1, 2)
 
         attended = _sdpa(heads(q), heads(k), heads(v))
         out[begin:end] = attended.transpose(1, 2).reshape(
-            end - begin, VISION_CFG.heads, VISION_CFG.head_dim
+            end - begin, VISION_HEADS, VISION_HEAD_DIM
         )
         segment = run_end
     return bf16(out)

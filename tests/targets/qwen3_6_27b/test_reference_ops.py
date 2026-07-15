@@ -15,7 +15,7 @@ from tools.reference.qwen3_6_27b_rtx5090.ops import (
     gated_delta_rule,
 )
 from tools.reference.qwen3_6_27b_rtx5090.state import KVCache
-from tools.reference.qwen3_6_27b_rtx5090.vision_ops import vision_attention
+from tools.reference.qwen3_6.common.vision_ops import vision_attention
 
 
 def test_causal_conv_matches_direct_channel_major_math() -> None:

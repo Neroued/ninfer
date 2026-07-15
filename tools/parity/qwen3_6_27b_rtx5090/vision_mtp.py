@@ -12,10 +12,10 @@ from typing import Any
 import numpy as np
 import torch
 
+from tools.reference.qwen3_6.common.frontend import Frontend
+from tools.reference.qwen3_6.common.multimodal import load_messages
+from tools.reference.qwen3_6.common.tap import FileTap
 from tools.reference.qwen3_6_27b_rtx5090 import RefModel
-from tools.reference.qwen3_6_27b_rtx5090.frontend import Frontend
-from tools.reference.qwen3_6_27b_rtx5090.multimodal import load_messages
-from tools.reference.qwen3_6_27b_rtx5090.tap import FileTap
 
 
 # These are cross-runtime tolerances for the same quantized artifact, not comparisons with BF16.

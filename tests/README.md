@@ -13,6 +13,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
   bindings, reference behavior, target Frontend, multimodal/MTP behavior, and the opt-in real-Engine
   prefix test;
+- `targets/qwen3_6_35b_a3b/` — future-target converter contracts plus the artifact-native MoE
+  oracle, typed binding, selected-expert row access, and 256K INT8 reference-memory calculation;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
 - `test_generation_controller.cpp` — accepted-prefix, cancellation, publication ordering, and
@@ -46,12 +48,15 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 /home/neroued/miniconda3/envs/py311/bin/python -m pytest \
-  tests/artifact tests/targets/qwen3_6_27b tests/test_bench_matrix.py
+  tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
+  tests/test_bench_matrix.py
 ```
 
 The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
 `out/qwen3_6_27b_rtx5090.ninfer`. They report a pytest skip when neither path provides the real
-artifact; the remaining Python target tests still run.
+artifact. The 35B-A3B reference binding test follows the same rule with
+`NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b_rtx5090.ninfer`. The remaining Python
+target tests still run without either artifact.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:

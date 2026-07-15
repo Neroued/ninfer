@@ -37,8 +37,7 @@ int main() {
     Tensor tw(dw.p, DType::FP32, {4, patches});
     const double bytes  = n * 12.0 + patches * 32.0;
     const Result result = bench_loop(
-        [&](cudaStream_t stream) { ops::vision_pos_embed_add(ttable, ti, tw, tx, stream); },
-        bytes);
+        [&](cudaStream_t stream) { ops::vision_pos_embed_add(ttable, ti, tw, tx, stream); }, bytes);
     print_result("vision_pos_embed [1152,4096]", result);
     return 0;
 }

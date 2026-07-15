@@ -179,14 +179,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const float vv1         = __bfloat162float(v_new[src1]);
         float kamax             = fmaxf(fabsf(kv0), fabsf(kv1));
         float vamax             = fmaxf(fabsf(vv0), fabsf(vv1));
-        kamax = warp_max(kamax, FullMask);
-        vamax = warp_max(vamax, FullMask);
-        const __half ksh  = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
-        const __half vsh  = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
-        const float ks    = __half2float(ksh);
-        const float vs    = __half2float(vsh);
-        const float k_inv = ks > 0.0f ? 1.0f / ks : 0.0f;
-        const float v_inv = vs > 0.0f ? 1.0f / vs : 0.0f;
+        kamax                   = warp_max(kamax, FullMask);
+        vamax                   = warp_max(vamax, FullMask);
+        const __half ksh        = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
+        const __half vsh        = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
+        const float ks          = __half2float(ksh);
+        const float vs          = __half2float(vsh);
+        const float k_inv       = ks > 0.0f ? 1.0f / ks : 0.0f;
+        const float v_inv       = vs > 0.0f ? 1.0f / vs : 0.0f;
         cache_k_i8[gqa_kv_quant_code_index(kv_head, d0, position, padded_context)] =
             gqa_kv_quant_code(kv0, k_inv);
         cache_k_i8[gqa_kv_quant_code_index(kv_head, d1, position, padded_context)] =
@@ -216,10 +216,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         int q_head    = 0;
         int token     = 0;
         gqa_small_t_tc_row_to_qt(row, TokenTile, kv_head, q_head, token);
-        const float x0 = __bfloat162float(q[gqa_q_index(q_head, d0, token)]);
-        const float x1 = __bfloat162float(q[gqa_q_index(q_head, d1, token)]);
-        float amax     = fmaxf(fabsf(x0), fabsf(x1));
-        amax = warp_max(amax, FullMask);
+        const float x0  = __bfloat162float(q[gqa_q_index(q_head, d0, token)]);
+        const float x1  = __bfloat162float(q[gqa_q_index(q_head, d1, token)]);
+        float amax      = fmaxf(fabsf(x0), fabsf(x1));
+        amax            = warp_max(amax, FullMask);
         const float qs  = amax > 0.0f ? amax / 127.0f : 0.0f;
         const float inv = qs > 0.0f ? 1.0f / qs : 0.0f;
         gqa_small_t_i8_store_swz(q_i8, row, d0, DB16, gqa_kv_quant_code(x0, inv));
@@ -271,10 +271,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int key = tile_k0 + key_l;
             if (key < split_end) {
                 const std::int64_t off = gqa_kv_quant_scale_index(kv_head, 0, key, padded_context);
-                ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups],
-                                                             &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups],
-                                                             &cache_v_scale[off]);
+                ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
+                ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
             }
         }
 #pragma unroll 1
@@ -287,8 +285,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const std::int64_t off = gqa_kv_quant_code_index(kv_head, d, key, padded_context);
                 std::int8_t* dst       = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
                 ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                ninfer::ops::cp_async<16>(&v_i8[key_l * D + d],
-                                                              &cache_v_i8[off]);
+                ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
             }
         }
         ninfer::ops::cp_commit();
@@ -325,9 +322,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     const int acol = k * 16 + a_coloff;
                     ldmatrix_x4(
                         af[kk][0], af[kk][1], af[kk][2], af[kk][3],
-                        smem_addr(
-                            &q_b16[(producer_row_base + a_rowoff) * DB16 +
-                                   gqa_small_t_tc_swz(producer_row_base + a_rowoff, acol)]));
+                        smem_addr(&q_b16[(producer_row_base + a_rowoff) * DB16 +
+                                         gqa_small_t_tc_swz(producer_row_base + a_rowoff, acol)]));
                 }
 
 #pragma unroll
@@ -341,10 +337,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         unsigned bf[2];
                         ldmatrix_x2(
                             bf[0], bf[1],
-                            smem_addr(
-                                &k_b16[brow * DB16 + gqa_small_t_tc_swz(brow, bcol)]));
-                        mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1],
-                                                       af[kk][2], af[kk][3], bf[0], bf[1]);
+                            smem_addr(&k_b16[brow * DB16 + gqa_small_t_tc_swz(brow, bcol)]));
+                        mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
+                               bf[1]);
                     }
                     const int keya = nt * 8 + 2 * lid;
                     const int keyb = keya + 1;
@@ -493,16 +488,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int pcol = k * 16 + a_coloff;
                 ldmatrix_x4(
                     pf[0], pf[1], pf[2], pf[3],
-                    smem_addr(
-                        &p_consumer[a_rowoff * Bc + gqa_small_t_tc_swz32(a_rowoff, pcol)]));
+                    smem_addr(&p_consumer[a_rowoff * Bc + gqa_small_t_tc_swz32(a_rowoff, pcol)]));
                 unsigned vf[2];
                 const int vrow = k * 16 + b_koff + b_rin;
                 const int vcol = global_n * 8;
-                ldmatrix_x2_t(
-                    vf[0], vf[1],
-                    smem_addr(&v_bf16[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0],
-                                                 pf[1], pf[2], pf[3], vf[0], vf[1]);
+                ldmatrix_x2_t(vf[0], vf[1],
+                              smem_addr(&v_bf16[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
+                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
+                         vf[0], vf[1]);
             }
         }
         if (has_next) { ninfer::ops::cp_wait<0>(); }
@@ -541,16 +534,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             int token  = 0;
             gqa_small_t_tc_row_to_qt(row0, TokenTile, kv_head, q_head, token);
             const std::int64_t dst = gqa_partial_acc_index(q_head, d0, token, split, TokenTile);
-            *reinterpret_cast<unsigned*>(&partial_acc[dst]) =
-                pack_bf16x2(acc[n][0], acc[n][1]);
+            *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][0], acc[n][1]);
         }
         if (row1 < RowCount) {
             int q_head = 0;
             int token  = 0;
             gqa_small_t_tc_row_to_qt(row1, TokenTile, kv_head, q_head, token);
             const std::int64_t dst = gqa_partial_acc_index(q_head, d0, token, split, TokenTile);
-            *reinterpret_cast<unsigned*>(&partial_acc[dst]) =
-                pack_bf16x2(acc[n][2], acc[n][3]);
+            *reinterpret_cast<unsigned*>(&partial_acc[dst]) = pack_bf16x2(acc[n][2], acc[n][3]);
         }
     }
 }

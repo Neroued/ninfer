@@ -33,8 +33,7 @@ void linear_rowsplit_gemv_gdn_in_vz_6144_q5_launch(const Tensor& x, const Weight
     require_shape(z_weight, "z_weight");
 
     launch_q5_rowsplit_gemv_dual<kN, kK, kRowsPerBlock, kStages, /*kStageX=*/true>(
-        static_cast<const __nv_bfloat16*>(x.data),
-        static_cast<const std::uint8_t*>(v_weight.qdata),
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(v_weight.qdata),
         static_cast<const std::uint8_t*>(v_weight.qhigh),
         static_cast<const std::uint8_t*>(v_weight.scales),
         static_cast<const std::uint8_t*>(z_weight.qdata),

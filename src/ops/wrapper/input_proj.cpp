@@ -26,8 +26,8 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t column
 void require_rowsplit(const Weight& weight, QType qtype, std::int32_t n, std::int32_t k,
                       const char* label) {
     if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
-        weight.scale_dtype != DType::FP16 || weight.group_size != 64 ||
-        weight.group != 64 || weight.n != n || weight.k != k || weight.padded_shape[0] != n ||
+        weight.scale_dtype != DType::FP16 || weight.group_size != 64 || weight.group != 64 ||
+        weight.n != n || weight.k != k || weight.padded_shape[0] != n ||
         weight.padded_shape[1] != k || weight.qdata == nullptr || weight.scales == nullptr ||
         (qtype == QType::Q5G64_F16S && weight.qhigh == nullptr)) {
         throw std::invalid_argument(std::string("linear grouped input: invalid ") + label);
@@ -42,7 +42,7 @@ std::size_t gdn_input_proj_workspace_bytes(std::int32_t qk_rows, std::int32_t va
         throw std::invalid_argument("gdn_input_proj_workspace_bytes: dimensions must be positive");
     }
     if (tokens > 16) { return 0; }
-    const std::size_t qk_bytes = Tensor(nullptr, DType::BF16, {qk_rows, tokens}).bytes();
+    const std::size_t qk_bytes    = Tensor(nullptr, DType::BF16, {qk_rows, tokens}).bytes();
     const std::size_t value_bytes = Tensor(nullptr, DType::BF16, {value_rows, tokens}).bytes();
     if (qk_bytes > std::numeric_limits<std::size_t>::max() - value_bytes) {
         throw std::overflow_error("gdn_input_proj_workspace_bytes: size overflow");

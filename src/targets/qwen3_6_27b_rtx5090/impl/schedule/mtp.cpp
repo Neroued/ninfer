@@ -57,7 +57,9 @@ void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor
 template <class Body>
 void run_prepared(State& state, DecodeGraph* graph, Body&& body) {
     if (graph != nullptr) {
-        if (!graph->ready()) { throw std::logic_error("decode graph was not prepared at load time"); }
+        if (!graph->ready()) {
+            throw std::logic_error("decode graph was not prepared at load time");
+        }
         graph->launch(state.device.stream);
     } else {
         body();
@@ -87,8 +89,8 @@ auto ordinary_body(State& state, bool align_mtp) {
 
         Tensor logits = state.io.logits.slice(1, 0, 1);
         ops::sample(logits, state.io.token, TextConfig::token_domain, state.sampling,
-                        static_cast<const std::int32_t*>(state.io.pos.data),
-                        ops::kSamplePurposeDecode, state.device.stream);
+                    static_cast<const std::int32_t*>(state.io.pos.data), ops::kSamplePurposeDecode,
+                    state.device.stream);
 
         if (align_mtp) {
             Tensor hidden     = state.io.verify_hidden.slice(1, 0, 1);
@@ -120,19 +122,18 @@ auto mtp_body(State& state, std::uint32_t k) {
         configure_text_card(card, state);
 
         ops::mtp_prepare_verify_inputs(state.io.token, state.io.drafts, state.io.pos,
-                                           state.io.window_base, state.io.verify_ids,
-                                           state.io.positions, state.device.stream);
+                                       state.io.window_base, state.io.verify_ids,
+                                       state.io.positions, state.device.stream);
         target_verify(card, state, state.io.verify_ids, state.io.positions);
         ops::mtp_accept_tokens(
             state.io.target_tokens, state.io.logits, state.io.drafts, state.io.pos, state.io.token,
             state.io.sampled_out, state.io.num_sampled, state.io.accepted, state.io.ar_pos,
             state.io.stats, TextConfig::token_domain, state.sampling, state.device.stream);
-        ops::assign_i32_scalar(state.io.accepted, state.io.gdn_initial_slot,
-                               state.device.stream);
+        ops::assign_i32_scalar(state.io.accepted, state.io.gdn_initial_slot, state.device.stream);
 
         const int columns = static_cast<int>(k) + 1;
         ops::mtp_prepare_shifted_ids(state.io.verify_ids, state.io.token, state.io.accepted,
-                                         state.io.shifted_ids, state.device.stream);
+                                     state.io.shifted_ids, state.device.stream);
         Tensor mtp_hidden = state.io.prefill_hidden.slice(1, 0, columns);
         card.mtp_forward_batch(state.io.shifted_ids, state.io.verify_hidden, state.io.positions,
                                mtp_hidden, -1, nullptr, nullptr);

@@ -10,12 +10,12 @@
 
 namespace ninfer::ops::detail {
 
-void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log,
-                       const Tensor& dt_bias, Tensor& g, Tensor& beta, cudaStream_t stream) {
+void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
+                       Tensor& g, Tensor& beta, cudaStream_t stream) {
     const std::int64_t n = g.numel();
     constexpr int kBlock = 256;
-    const int grid = static_cast<int>(std::max<std::int64_t>(
-        1, div_up(n, static_cast<std::int64_t>(kBlock))));
+    const int grid =
+        static_cast<int>(std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock))));
 
     gdn_gating_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(a.data), static_cast<const __nv_bfloat16*>(b.data),

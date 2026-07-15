@@ -47,24 +47,24 @@ DBuf make_ids(std::int32_t t) {
 
 Weight q6_weight(void* payload) {
     Weight w{};
-    w.payload           = payload;
-    w.payload_bytes     = kPayloadBytes;
-    w.high_plane_bytes  = kHighPlaneBytes;
-    w.qtype             = QType::Q6G64_F16S;
-    w.layout            = QuantLayout::RowSplit;
-    w.scale_dtype       = DType::FP16;
-    w.group_size        = kGroup;
-    w.shape[0]          = kVocab;
-    w.shape[1]          = kD;
-    w.padded_shape[0]   = kVocab;
-    w.padded_shape[1]   = kDPad;
-    w.ndim              = 2;
-    w.qdata             = payload;
-    w.qhigh             = static_cast<std::uint8_t*>(payload) + kHighPlaneOffset;
-    w.scales            = static_cast<std::uint8_t*>(payload) + kScalePlaneOffset;
-    w.n                 = kVocab;
-    w.k                 = kD;
-    w.group             = kGroup;
+    w.payload          = payload;
+    w.payload_bytes    = kPayloadBytes;
+    w.high_plane_bytes = kHighPlaneBytes;
+    w.qtype            = QType::Q6G64_F16S;
+    w.layout           = QuantLayout::RowSplit;
+    w.scale_dtype      = DType::FP16;
+    w.group_size       = kGroup;
+    w.shape[0]         = kVocab;
+    w.shape[1]         = kD;
+    w.padded_shape[0]  = kVocab;
+    w.padded_shape[1]  = kDPad;
+    w.ndim             = 2;
+    w.qdata            = payload;
+    w.qhigh            = static_cast<std::uint8_t*>(payload) + kHighPlaneOffset;
+    w.scales           = static_cast<std::uint8_t*>(payload) + kScalePlaneOffset;
+    w.n                = kVocab;
+    w.k                = kD;
+    w.group            = kGroup;
     return w;
 }
 

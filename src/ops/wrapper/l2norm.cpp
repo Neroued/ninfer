@@ -35,9 +35,7 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
 
 void require_same_shape(const Tensor& a, const Tensor& b) {
     for (int d = 0; d < 4; ++d) {
-        if (a.ne[d] != b.ne[d]) {
-            throw std::invalid_argument("l2norm: x/out shapes must match");
-        }
+        if (a.ne[d] != b.ne[d]) { throw std::invalid_argument("l2norm: x/out shapes must match"); }
     }
 }
 
@@ -52,7 +50,7 @@ void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
     }
 
     const std::int64_t n = numel_allow_zero(x, "x");
-    (void) numel_allow_zero(out, "out");
+    (void)numel_allow_zero(out, "out");
     require_same_shape(x, out);
     if (n == 0) { return; }
 

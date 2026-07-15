@@ -231,7 +231,7 @@ static int snapshot_chain_equivalence(std::uint32_t seed, std::int32_t T, float 
     Tensor tinitial_slot(dinitial_slot.p, DType::I32, {1});
     Tensor tout_snapshot(dout_snapshot.p, DType::BF16, {C, T});
     ops::causal_conv1d_silu_snapshot(tx_snapshot, tw_snapshot, ts_snapshot, tinitial_slot,
-                                         tout_snapshot, nullptr);
+                                     tout_snapshot, nullptr);
     cudaDeviceSynchronize();
 
     DBuf dx_decode = to_device_bf16(x), dw_decode = to_device_bf16(weight),
@@ -297,7 +297,7 @@ static int selected_slot_snapshot_equivalence(std::uint32_t seed, std::int32_t T
     Tensor tinitial_slot(dinitial_slot.p, DType::I32, {1});
     Tensor tout_snapshot(dout_snapshot.p, DType::BF16, {C, T});
     ops::causal_conv1d_silu_snapshot(tx_snapshot, tw_snapshot, ts_snapshot, tinitial_slot,
-                                         tout_snapshot, nullptr);
+                                     tout_snapshot, nullptr);
     cudaDeviceSynchronize();
 
     DBuf dx_decode = to_device_bf16(x), dw_decode = to_device_bf16(weight),

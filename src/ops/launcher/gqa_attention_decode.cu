@@ -169,7 +169,7 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
 
     // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
     // geometry inside launch_tc_partial_i8.
-#define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                    \
+#define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
     do {                                                                                           \
         if (kv.dtype == DType::I8) {                                                               \
             launch_tc_partial_i8<(TOKENS)>(q, k, v, pos, scale, kv, layer, padded_context,         \

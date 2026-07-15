@@ -53,7 +53,7 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
                                                    __nv_bfloat16* out, std::int32_t C,
                                                    std::int32_t T) {
     const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
-    const std::int64_t c_blocks = div_up(C2, static_cast<std::int64_t>(blockDim.x));
+    const std::int64_t c_blocks  = div_up(C2, static_cast<std::int64_t>(blockDim.x));
     const std::int64_t block     = static_cast<std::int64_t>(blockIdx.x);
     const std::int32_t t         = static_cast<std::int32_t>(block / c_blocks);
     const std::int64_t pair_base = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x;
@@ -80,8 +80,7 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
     causal_conv1d_acc_pair(weight2[C2 + p], x1, acc0, acc1);
     causal_conv1d_acc_pair(weight2[2 * C2 + p], x2v, acc0, acc1);
     causal_conv1d_acc_pair(weight2[3 * C2 + p], x3, acc0, acc1);
-    out2[out_idx] =
-        __floats2bfloat162_rn(silu(acc0), silu(acc1));
+    out2[out_idx] = __floats2bfloat162_rn(silu(acc0), silu(acc1));
 }
 
 // Writes the trailing width-3 conv window after consuming the T input columns.
@@ -149,20 +148,17 @@ __global__ void causal_conv1d_decode_kernel(const __nv_bfloat16* x, const __nv_b
     }
 }
 
-__global__ void causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x,
-                                                       const __nv_bfloat16* weight,
-                                                       __nv_bfloat16* conv_states,
-                                                       const std::int32_t* initial_slot,
-                                                       __nv_bfloat16* out, std::int32_t C,
-                                                       std::int32_t T, std::int32_t slots,
-                                                       std::int64_t slot_stride) {
-    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
-    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
-    const std::int64_t C64    = static_cast<std::int64_t>(C);
-    const std::int32_t slot = *initial_slot;
+__global__ void
+causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                       __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
+                                       __nv_bfloat16* out, std::int32_t C, std::int32_t T,
+                                       std::int32_t slots, std::int64_t slot_stride) {
+    const std::int64_t start     = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride    = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    const std::int64_t C64       = static_cast<std::int64_t>(C);
+    const std::int32_t slot      = *initial_slot;
     const std::int32_t safe_slot = (slot >= 0 && slot < slots) ? slot : 0;
-    const __nv_bfloat16* init =
-        conv_states + static_cast<std::int64_t>(safe_slot) * slot_stride;
+    const __nv_bfloat16* init    = conv_states + static_cast<std::int64_t>(safe_slot) * slot_stride;
 
     for (std::int64_t c64 = start; c64 < C64; c64 += stride) {
         const std::int32_t c = static_cast<std::int32_t>(c64);

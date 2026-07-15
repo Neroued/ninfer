@@ -16,8 +16,8 @@ namespace ninfer::ops {
  * Returns two contiguous BF16 temporary matrices, [qk_rows,tokens] and
  * [value_rows,tokens], for 1<=tokens<=16; returns zero for tokens>16.
  */
-[[nodiscard]] std::size_t gdn_input_proj_workspace_bytes(
-    std::int32_t qk_rows, std::int32_t value_rows, std::int32_t tokens);
+[[nodiscard]] std::size_t
+gdn_input_proj_workspace_bytes(std::int32_t qk_rows, std::int32_t value_rows, std::int32_t tokens);
 
 /**
  * Op: gdn_input_proj

@@ -97,9 +97,7 @@ ControllerResult run_one(Program& program, PreparedPrompt prompt, OutputSession 
         budget.commit(decision.accepted_tokens);
         publisher.publish(std::move(deltas));
 
-        if (decision.finished()) {
-            return finish_result(decision.finish_reason);
-        }
+        if (decision.finished()) { return finish_result(decision.finish_reason); }
         return std::nullopt;
     };
 

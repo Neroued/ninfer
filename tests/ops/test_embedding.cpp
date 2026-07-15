@@ -203,21 +203,21 @@ static void cpu_gather(const std::vector<float>& table, const std::vector<int>& 
 
 static Weight dense_weight(void* data, std::int32_t d = kD) {
     Weight w{};
-    w.qtype             = QType::BF16_CTRL;
-    w.layout            = QuantLayout::Contiguous;
-    w.payload           = data;
-    w.payload_bytes     = static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(d) * 2u;
-    w.qdata             = data;
-    w.scales            = nullptr;
-    w.group_size        = 0;
-    w.group             = 0;
-    w.ndim              = 2;
-    w.shape[0]          = kVocab;
-    w.shape[1]          = d;
-    w.padded_shape[0]   = kVocab;
-    w.padded_shape[1]   = d;
-    w.n                 = kVocab;
-    w.k                 = d;
+    w.qtype           = QType::BF16_CTRL;
+    w.layout          = QuantLayout::Contiguous;
+    w.payload         = data;
+    w.payload_bytes   = static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(d) * 2u;
+    w.qdata           = data;
+    w.scales          = nullptr;
+    w.group_size      = 0;
+    w.group           = 0;
+    w.ndim            = 2;
+    w.shape[0]        = kVocab;
+    w.shape[1]        = d;
+    w.padded_shape[0] = kVocab;
+    w.padded_shape[1] = d;
+    w.n               = kVocab;
+    w.k               = d;
     return w;
 }
 
@@ -233,12 +233,12 @@ static Weight q6_weight(void* payload, std::int32_t d = kD) {
     const std::uint64_t scale_plane_bytes =
         static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * 2ULL;
     Weight w{};
-    w.qtype             = QType::Q6G64_F16S;
-    w.layout            = QuantLayout::RowSplit;
-    w.scale_dtype       = DType::FP16;
-    w.payload           = payload;
-    w.payload_bytes     = scale_plane_offset + scale_plane_bytes;
-    w.high_plane_bytes  = high_plane_bytes;
+    w.qtype            = QType::Q6G64_F16S;
+    w.layout           = QuantLayout::RowSplit;
+    w.scale_dtype      = DType::FP16;
+    w.payload          = payload;
+    w.payload_bytes    = scale_plane_offset + scale_plane_bytes;
+    w.high_plane_bytes = high_plane_bytes;
     if (payload != nullptr) {
         w.qdata  = payload;
         w.qhigh  = static_cast<std::uint8_t*>(payload) + high_plane_offset;

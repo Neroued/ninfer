@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/tensor.h"   // QType, QuantLayout, Weight
+#include "core/tensor.h" // QType, QuantLayout, Weight
 
 #include <cstdint>
 #include <string>
@@ -55,21 +55,21 @@ enum class LinearPolicyId {
 
 struct LinearPlanKey {
     LinearFormat format;
-    ShapeFamily  shape;
+    ShapeFamily shape;
     LinearRegime regime;
 };
 
 struct LinearPlan {
     LinearBackendKind backend;
-    LinearPolicyId    policy;
-    const char*       plan_id;           // stable coarse identity (policy granularity in Phase 1)
-    bool              uses_tensor_cores;  // derived metadata, reports only
+    LinearPolicyId policy;
+    const char* plan_id;    // stable coarse identity (policy granularity in Phase 1)
+    bool uses_tensor_cores; // derived metadata, reports only
 };
 
 // Host classification. classify_format returns GenericUnsupported for any (qtype, layout) the
 // wrapper does not accept; the wrapper validation rejects those before dispatch.
 LinearFormat classify_format(const Weight& w);
-ShapeFamily  classify_shape(std::int32_t n, std::int32_t k);
+ShapeFamily classify_shape(std::int32_t n, std::int32_t k);
 LinearRegime classify_regime(LinearFormat fmt, ShapeFamily shape, std::int32_t t);
 
 // Phase 1 registry: every key resolves to a Generic (reference) plan.

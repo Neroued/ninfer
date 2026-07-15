@@ -28,11 +28,11 @@ enum class ReusePath : std::uint8_t {
 
 struct RequestPlan::Impl {
     runtime::RequestPlanSummary summary;
-    ReusePath reuse              = ReusePath::FullReset;
-    std::uint32_t reuse_base     = 0;
-    bool needs_mtp_bridge        = false;
-    bool prepare_mtp             = false;
-    bool multimodal              = false;
+    ReusePath reuse          = ReusePath::FullReset;
+    std::uint32_t reuse_base = 0;
+    bool needs_mtp_bridge    = false;
+    bool prepare_mtp         = false;
+    bool multimodal          = false;
     std::optional<std::uint32_t> snapshot_boundary;
     ops::SamplingConfig sampling;
 };
@@ -124,8 +124,8 @@ public:
     TokenId* host_tokens     = nullptr;
 
     Lifecycle lifecycle = Lifecycle::Empty;
-    std::uint32_t E      = 0;
-    std::uint32_t S      = 0;
+    std::uint32_t E     = 0;
+    std::uint32_t S     = 0;
     std::vector<TokenId> ledger;
     std::int32_t rope_delta        = 0;
     std::int32_t current_gdn_slot  = 0;

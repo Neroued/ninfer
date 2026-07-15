@@ -29,8 +29,7 @@ Modality legacy_modality(PromptModality modality) {
     throw std::logic_error("unknown prompt modality");
 }
 
-VisionItem convert_vision_item(
-    ninfer::targets::qwen3_6_27b_rtx5090::detail::VisionItem item) {
+VisionItem convert_vision_item(ninfer::targets::qwen3_6_27b_rtx5090::detail::VisionItem item) {
     VisionItem converted;
     converted.modality    = legacy_modality(item.modality);
     converted.grid        = VisionGrid{item.grid.temporal, item.grid.height, item.grid.width};

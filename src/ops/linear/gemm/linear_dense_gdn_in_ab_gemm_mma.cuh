@@ -143,10 +143,9 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
             for (int ni = 0; ni < kNFragments; ++ni) {
                 const int xrow = warp * kWarpN + ni * 8 + x_rin;
                 const int xcol = ki * 16 + x_koff;
-                ldmatrix_x2(
-                    xf[ni][0], xf[ni][1],
-                    smem_addr(&xs[stage * kDenseGdnBlockN * kDenseGdnBlockK +
-                                       xrow * kDenseGdnBlockK + dense_gdn_swizzle(xrow, xcol)]));
+                ldmatrix_x2(xf[ni][0], xf[ni][1],
+                            smem_addr(&xs[stage * kDenseGdnBlockN * kDenseGdnBlockK +
+                                          xrow * kDenseGdnBlockK + dense_gdn_swizzle(xrow, xcol)]));
             }
 #pragma unroll
             for (int mi = 0; mi < kDenseGdnMFragments; ++mi) {
@@ -155,19 +154,17 @@ __global__ __launch_bounds__(Warps * 32, 1) void linear_dense_gdn_in_ab_gemm_mma
                 const int acol         = ki * 16 + a_coloff;
                 const int weight_stage = stage * kDenseGdnBlockM * kDenseGdnBlockK;
                 ldmatrix_x4(af[0], af[1], af[2], af[3],
-                                 smem_addr(&aws[weight_stage + arow * kDenseGdnBlockK +
-                                                     dense_gdn_swizzle(arow, acol)]));
+                            smem_addr(&aws[weight_stage + arow * kDenseGdnBlockK +
+                                           dense_gdn_swizzle(arow, acol)]));
                 ldmatrix_x4(bf[0], bf[1], bf[2], bf[3],
-                                 smem_addr(&bws[weight_stage + arow * kDenseGdnBlockK +
-                                                     dense_gdn_swizzle(arow, acol)]));
+                            smem_addr(&bws[weight_stage + arow * kDenseGdnBlockK +
+                                           dense_gdn_swizzle(arow, acol)]));
 #pragma unroll
                 for (int ni = 0; ni < kNFragments; ++ni) {
-                    mma_bf16(a_acc[mi][ni][0], a_acc[mi][ni][1], a_acc[mi][ni][2],
-                                           a_acc[mi][ni][3], af[0], af[1], af[2], af[3], xf[ni][0],
-                                           xf[ni][1]);
-                    mma_bf16(b_acc[mi][ni][0], b_acc[mi][ni][1], b_acc[mi][ni][2],
-                                           b_acc[mi][ni][3], bf[0], bf[1], bf[2], bf[3], xf[ni][0],
-                                           xf[ni][1]);
+                    mma_bf16(a_acc[mi][ni][0], a_acc[mi][ni][1], a_acc[mi][ni][2], a_acc[mi][ni][3],
+                             af[0], af[1], af[2], af[3], xf[ni][0], xf[ni][1]);
+                    mma_bf16(b_acc[mi][ni][0], b_acc[mi][ni][1], b_acc[mi][ni][2], b_acc[mi][ni][3],
+                             bf[0], bf[1], bf[2], bf[3], xf[ni][0], xf[ni][1]);
                 }
             }
         }

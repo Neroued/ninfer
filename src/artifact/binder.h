@@ -15,8 +15,8 @@ struct ObjectHandle {
 
 struct DeviceMaterialization {
     ObjectHandle object;
-    std::uint64_t offset = 0;
-    std::uint64_t bytes = 0;
+    std::uint64_t offset    = 0;
+    std::uint64_t bytes     = 0;
     std::uint64_t alignment = 0;
 };
 
@@ -25,7 +25,7 @@ struct HostMaterialization {
 };
 
 struct MaterializationPlan {
-    std::size_t object_count = 0;
+    std::size_t object_count            = 0;
     std::uint64_t device_capacity_bytes = 0;
     std::vector<DeviceMaterialization> device_objects;
     std::vector<HostMaterialization> host_objects;
@@ -35,8 +35,7 @@ class Binder {
 public:
     explicit Binder(const Reader& reader);
 
-    ObjectHandle require_tensor(std::string_view name, NumericFormat format,
-                                StorageLayout layout,
+    ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
                                 std::span<const std::uint64_t> shape);
     ObjectHandle require_resource(std::string_view name, ResourceEncoding encoding);
 

@@ -20,6 +20,7 @@ public:
     Slot() : buffer(kSlotBytes) {
         CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     }
+
     ~Slot() {
         if (pending) { (void)cudaEventSynchronize(event); }
         if (event != nullptr) { (void)cudaEventDestroy(event); }
@@ -34,7 +35,7 @@ public:
 
     PinnedHostBuffer buffer;
     cudaEvent_t event = nullptr;
-    bool pending = false;
+    bool pending      = false;
 };
 
 } // namespace
@@ -68,47 +69,43 @@ DeviceArena& MaterializedArtifact::device_arena() {
 }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
-                                 DeviceContext& device,
-                                 LoadProgress* progress) {
+                                 DeviceContext& device, LoadProgress* progress) {
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
     const std::uint64_t capacity = plan.device_capacity_bytes;
     if (capacity == 0 || capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
         throw ArtifactError("artifact tensor backing size is invalid");
     }
-    out.device_arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
+    out.device_arena_     = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
     out.stats_.file_bytes = reader.file_bytes();
     out.stats_.device_capacity_bytes = capacity;
-    out.stats_.peak_staging_bytes = kSlotBytes * kSlotCount;
-    out.stats_.tensor_count = plan.device_objects.size();
-    out.stats_.resource_count = plan.host_objects.size();
+    out.stats_.peak_staging_bytes    = kSlotBytes * kSlotCount;
+    out.stats_.tensor_count          = plan.device_objects.size();
+    out.stats_.resource_count        = plan.host_objects.size();
 
     for (const HostMaterialization& placement : plan.host_objects) {
-        auto& resource = out.objects_.at(placement.object.index).resource;
+        auto& resource            = out.objects_.at(placement.object.index).resource;
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
         resource.assign(payload.data.begin(), payload.data.end());
         out.stats_.retained_resource_bytes += resource.size();
     }
 
     Slot slots[kSlotCount];
-    std::size_t next_slot = 0;
-    std::uint64_t copied = 0;
+    std::size_t next_slot       = 0;
+    std::uint64_t copied        = 0;
     std::uint64_t last_reported = 0;
-    std::uint64_t total = 0;
-    for (const DeviceMaterialization& placement : plan.device_objects) {
-        total += placement.bytes;
-    }
+    std::uint64_t total         = 0;
+    for (const DeviceMaterialization& placement : plan.device_objects) { total += placement.bytes; }
     const auto start = std::chrono::steady_clock::now();
 
     for (const DeviceMaterialization& placement : plan.device_objects) {
-        const PayloadSpan payload =
-            reader.payload(reader.objects().at(placement.object.index));
-        DeviceSpan storage = out.device_arena_->alloc_bytes(
-            static_cast<std::size_t>(placement.bytes),
-            static_cast<std::size_t>(placement.alignment));
-        const auto actual_offset = static_cast<std::uint64_t>(
-            static_cast<std::byte*>(storage.data) -
-            static_cast<std::byte*>(out.device_arena_->base()));
+        const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+        DeviceSpan storage =
+            out.device_arena_->alloc_bytes(static_cast<std::size_t>(placement.bytes),
+                                           static_cast<std::size_t>(placement.alignment));
+        const auto actual_offset =
+            static_cast<std::uint64_t>(static_cast<std::byte*>(storage.data) -
+                                       static_cast<std::byte*>(out.device_arena_->base()));
         if (actual_offset != placement.offset || payload.data.size() != placement.bytes) {
             throw ArtifactError("materialization plan does not match artifact payload");
         }
@@ -118,12 +115,11 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         while (offset < payload.data.size()) {
             Slot& slot = slots[next_slot++ % kSlotCount];
             slot.wait();
-            const std::size_t amount =
-                std::min(kSlotBytes, payload.data.size() - offset);
+            const std::size_t amount = std::min(kSlotBytes, payload.data.size() - offset);
             std::memcpy(slot.buffer.data(), payload.data.data() + offset, amount);
-            CUDA_CHECK(cudaMemcpyAsync(
-                static_cast<std::byte*>(storage.data) + offset, slot.buffer.data(), amount,
-                cudaMemcpyHostToDevice, device.load_stream));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(storage.data) + offset,
+                                       slot.buffer.data(), amount, cudaMemcpyHostToDevice,
+                                       device.load_stream));
             CUDA_CHECK(cudaEventRecord(slot.event, device.load_stream));
             slot.pending = true;
             offset += amount;

@@ -15,22 +15,23 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kN              = 7168;
-constexpr int kK              = 5120;
-constexpr int kProjRows       = 6144;
-constexpr int kGroupK         = 64;
-constexpr int kGroups         = kK / kGroupK;
-constexpr int kQ4WarpsPerRow  = 4;
+constexpr int kN               = 7168;
+constexpr int kK               = 5120;
+constexpr int kProjRows        = 6144;
+constexpr int kGroupK          = 64;
+constexpr int kGroups          = kK / kGroupK;
+constexpr int kQ4WarpsPerRow   = 4;
 constexpr int kQ4GroupsPerWarp = kGroups / kQ4WarpsPerRow;
-constexpr int kQ4BlockThreads = kQ4WarpsPerRow * 32;
-constexpr int kQ4ProjBlocks   = kProjRows / kQ4WarpsPerRow;
+constexpr int kQ4BlockThreads  = kQ4WarpsPerRow * 32;
+constexpr int kQ4ProjBlocks    = kProjRows / kQ4WarpsPerRow;
 constexpr int kQ4BytesPerGroup = 32;
 
 // Q4 attention-in GEMV: 6144 "proj" rows use one warp per row (8 warps/block), the
 // remaining 1024 rows use a 4-way split-K block. Byte-load path retained as-is.
-__global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
+__global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(const __nv_bfloat16* __restrict__ x,
+                                                            const std::uint8_t* __restrict__ codes,
+                                                            const std::uint8_t* __restrict__ scales,
+                                                            __nv_bfloat16* __restrict__ out) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
@@ -44,7 +45,7 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
         float acc = 0.0f;
 #pragma unroll 1
         for (int tile = 0; tile < kGroups; tile += 32) {
-            const int tile_count = (kGroups - tile) < 32 ? (kGroups - tile) : 32;
+            const int tile_count          = (kGroups - tile) < 32 ? (kGroups - tile) : 32;
             std::uint16_t lane_scale_bits = 0;
             if (lane < tile_count) {
                 lane_scale_bits = load_vec<std::uint16_t>(scale_row + (tile + lane) * 2);
@@ -53,18 +54,18 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
 #pragma unroll
             for (int tile_group = 0; tile_group < 32; ++tile_group) {
                 if (tile_group >= tile_count) { break; }
-                const int group = tile + tile_group;
+                const int group       = tile + tile_group;
                 const auto scale_bits = static_cast<std::uint16_t>(
                     __shfl_sync(0xffffffffu, lane_scale_bits, tile_group));
                 const float scale = __half2float(__ushort_as_half(scale_bits));
 
                 const std::uint8_t packed = code_row[group * kQ4BytesPerGroup + lane];
-                const int q0 = sign_extend<4>(packed & 0x0f);
-                const int q1 = sign_extend<4>(packed >> 4);
-                const int k0 = group * kGroupK + lane * 2;
-                const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
-                acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
-                acc = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
+                const int q0              = sign_extend<4>(packed & 0x0f);
+                const int q1              = sign_extend<4>(packed >> 4);
+                const int k0              = group * kGroupK + lane * 2;
+                const float2 xv           = __bfloat1622float2(x2[k0 >> 1]);
+                acc                       = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
+                acc                       = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
             }
         }
 
@@ -81,7 +82,7 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
     __shared__ float partials[kQ4WarpsPerRow];
     const int group_begin = warp * kQ4GroupsPerWarp;
-    float acc = 0.0f;
+    float acc             = 0.0f;
 
     std::uint16_t lane_scale_bits = 0;
     if (lane < kQ4GroupsPerWarp) {
@@ -96,12 +97,12 @@ __global__ void linear_rowsplit_gemv_attn_in_7168_q4_kernel(
         const float scale = __half2float(__ushort_as_half(scale_bits));
 
         const std::uint8_t packed = code_row[group * kQ4BytesPerGroup + lane];
-        const int q0 = sign_extend<4>(packed & 0x0f);
-        const int q1 = sign_extend<4>(packed >> 4);
-        const int k0 = group * kGroupK + lane * 2;
-        const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
-        acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
-        acc = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
+        const int q0              = sign_extend<4>(packed & 0x0f);
+        const int q1              = sign_extend<4>(packed >> 4);
+        const int k0              = group * kGroupK + lane * 2;
+        const float2 xv           = __bfloat1622float2(x2[k0 >> 1]);
+        acc                       = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
+        acc                       = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
     }
 
     acc = warp_reduce_sum(acc);

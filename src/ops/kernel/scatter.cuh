@@ -24,8 +24,7 @@ __global__ void scatter_bf16x2_kernel(const __nv_bfloat162* src, const std::int3
 }
 
 __global__ void scatter_scalar_kernel(const __nv_bfloat16* src, const std::int32_t* indices,
-                                      __nv_bfloat16* dst, std::int32_t d,
-                                      std::int32_t columns) {
+                                      __nv_bfloat16* dst, std::int32_t d, std::int32_t columns) {
     const std::int32_t src_col = static_cast<std::int32_t>(blockIdx.x);
     __shared__ std::int32_t dst_col;
     if (threadIdx.x == 0) { dst_col = indices[src_col]; }

@@ -315,12 +315,12 @@ private:
     Tensor* boundary_hidden_output_         = nullptr;
     bool mtp_prompt_prepared_               = false;
 
-    const Weight* embed_                            = nullptr;
-    const Tensor* final_norm_                       = nullptr;
-    const Weight* lm_head_                          = nullptr;
-    const Weight* lm_head_draft_                    = nullptr;
-    const std::int32_t* lm_head_draft_ids_          = nullptr;
-    int lm_head_draft_n_                            = 0;
+    const Weight* embed_                        = nullptr;
+    const Tensor* final_norm_                   = nullptr;
+    const Weight* lm_head_                      = nullptr;
+    const Weight* lm_head_draft_                = nullptr;
+    const std::int32_t* lm_head_draft_ids_      = nullptr;
+    int lm_head_draft_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     MtpW mtp_;
     std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};

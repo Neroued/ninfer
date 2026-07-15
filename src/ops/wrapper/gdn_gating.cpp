@@ -41,8 +41,7 @@ void require_gate_shape(const Tensor& t, const char* label) {
 
 void require_vector48_shape(const Tensor& t, const char* label) {
     if (t.ne[0] != 48 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
-        throw std::invalid_argument(std::string("gdn_gating: ") + label +
-                                    " must have shape [48]");
+        throw std::invalid_argument(std::string("gdn_gating: ") + label + " must have shape [48]");
     }
 }
 
@@ -70,11 +69,11 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     }
 
     const std::int64_t n = numel_allow_zero(a, "a");
-    (void) numel_allow_zero(b, "b");
-    (void) numel_allow_zero(A_log, "A_log");
-    (void) numel_allow_zero(dt_bias, "dt_bias");
-    (void) numel_allow_zero(g, "g");
-    (void) numel_allow_zero(beta, "beta");
+    (void)numel_allow_zero(b, "b");
+    (void)numel_allow_zero(A_log, "A_log");
+    (void)numel_allow_zero(dt_bias, "dt_bias");
+    (void)numel_allow_zero(g, "g");
+    (void)numel_allow_zero(beta, "beta");
 
     require_gate_shape(a, "a");
     require_gate_shape(b, "b");
@@ -91,8 +90,8 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
         !dt_bias.is_contiguous() || !g.is_contiguous() || !beta.is_contiguous()) {
         throw std::invalid_argument("gdn_gating: all tensors must be contiguous");
     }
-    if (a.data == nullptr || b.data == nullptr || A_log.data == nullptr || dt_bias.data == nullptr ||
-        g.data == nullptr || beta.data == nullptr) {
+    if (a.data == nullptr || b.data == nullptr || A_log.data == nullptr ||
+        dt_bias.data == nullptr || g.data == nullptr || beta.data == nullptr) {
         throw std::invalid_argument("gdn_gating: all tensor data pointers must be non-null");
     }
 

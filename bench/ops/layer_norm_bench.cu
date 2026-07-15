@@ -23,9 +23,9 @@ int main() {
     Tensor tw(weight.p, DType::BF16, {d});
     Tensor tb(bias.p, DType::BF16, {d});
     Tensor tout(out.p, DType::BF16, {d, patches});
-    const Result result = bench_loop(
-        [&](cudaStream_t stream) { ops::layer_norm(tx, tw, tb, 1.0e-6f, tout, stream); },
-        n * 4.0 + d * 4.0);
+    const Result result =
+        bench_loop([&](cudaStream_t stream) { ops::layer_norm(tx, tw, tb, 1.0e-6f, tout, stream); },
+                   n * 4.0 + d * 4.0);
     print_result("layer_norm [1152,4096]", result);
     return 0;
 }

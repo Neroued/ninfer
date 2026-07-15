@@ -63,7 +63,7 @@ Program::Impl::Impl(const LoadedModelData& model_in, const SequencePlan::Impl& p
       work(plan.workspace_bytes),
       round_host((static_cast<std::size_t>(mtp_k) + 2ULL) * sizeof(std::int32_t)) {
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
-    text_kv = std::make_unique<KVCache>(backing, plan.persistent.text_kv);
+    text_kv                  = std::make_unique<KVCache>(backing, plan.persistent.text_kv);
     if (plan.persistent.mtp_kv) {
         mtp_kv = std::make_unique<KVCache>(backing, *plan.persistent.mtp_kv);
     }
@@ -164,12 +164,11 @@ void Program::Impl::prepare_graphs() {
     CUDA_CHECK(cudaMemGetInfo(&free_before, &total_bytes));
 
     const auto clear_stable_controls = [&] {
-        const Tensor controls[] = {io.token,       io.pos,          io.rope_pos,
-                                   io.rope_delta,  io.target_tokens, io.drafts,
-                                   io.sampled_out, io.num_sampled,   io.verify_ids,
-                                   io.shifted_ids, io.positions,     io.window_base,
-                                   io.accepted,    io.gdn_initial_slot,
-                                   io.ar_pos,      io.stats};
+        const Tensor controls[] = {
+            io.token,     io.pos,         io.rope_pos,    io.rope_delta,       io.target_tokens,
+            io.drafts,    io.sampled_out, io.num_sampled, io.verify_ids,       io.shifted_ids,
+            io.positions, io.window_base, io.accepted,    io.gdn_initial_slot, io.ar_pos,
+            io.stats};
         for (const Tensor& tensor : controls) {
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
@@ -450,10 +449,9 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
                      std::chrono::duration<double>(Clock::now() - begin_start).count() -
                          timings.vision_seconds);
         return runtime::BeginResult{
-            .summary = runtime::BeginSummary{.prompt_tokens        = prompt_tokens,
-                                             .reused_prompt_tokens = base},
-            .round   = runtime::GeneratedRound{
-                  .tokens = std::span<const TokenId>(host_tokens, 1)},
+            .summary =
+                runtime::BeginSummary{.prompt_tokens = prompt_tokens, .reused_prompt_tokens = base},
+            .round = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
         };
     } catch (...) {
         try {
@@ -506,11 +504,10 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
         std::uint32_t accepted = 0;
         PendingKind kind       = PendingKind::Ordinary;
         if (use_mtp) {
-            DecodeGraph* graph = use_cuda_graph && diagnostic_text_tap == nullptr ? &mtp_graph
-                                                                                  : nullptr;
+            DecodeGraph* graph =
+                use_cuda_graph && diagnostic_text_tap == nullptr ? &mtp_graph : nullptr;
             schedule::mtp_round(schedule_state, mtp_k, graph);
-            ops::mtp_gather_hidden_row(io.verify_hidden, io.accepted, tail_hidden,
-                                           device.stream);
+            ops::mtp_gather_hidden_row(io.verify_hidden, io.accepted, tail_hidden, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(host_count, io.num_sampled.data, sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, device.stream));
             CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.sampled_out.data,
@@ -535,7 +532,7 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
             tail_hidden_valid = true;
         } else {
             const bool align_mtp = mtp_kv != nullptr && mtp_materialized == base_E;
-            DecodeGraph* graph = nullptr;
+            DecodeGraph* graph   = nullptr;
             if (use_cuda_graph && diagnostic_text_tap == nullptr) {
                 graph = align_mtp ? &ordinary_aligned_graph : &ordinary_graph;
             }
@@ -561,8 +558,7 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
                                      .prompt_tokens = 0,
                                      .produced      = produced};
         lifecycle = Lifecycle::Pending;
-        return runtime::GeneratedRound{
-            .tokens = std::span<const TokenId>(host_tokens, produced)};
+        return runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, produced)};
     } catch (...) {
         try {
             device.synchronize();
@@ -618,9 +614,7 @@ void Program::Impl::finish_active() {
 }
 
 void Program::Impl::abort_request() noexcept {
-    if (lifecycle == Lifecycle::Empty || lifecycle == Lifecycle::Invalid) {
-        return;
-    }
+    if (lifecycle == Lifecycle::Empty || lifecycle == Lifecycle::Invalid) { return; }
     make_invalid();
 }
 

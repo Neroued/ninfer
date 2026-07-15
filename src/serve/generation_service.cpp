@@ -148,8 +148,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request) con
             request, options_, [](const ContentPart& part) { return acquire_media(part); });
         prepared.prompt = engine_->prepare(std::move(input));
     } catch (const ApiException&) { throw; } catch (const std::invalid_argument& exception) {
-        if (std::string_view(exception.what()).find("context capacity") !=
-            std::string_view::npos) {
+        if (std::string_view(exception.what()).find("context capacity") != std::string_view::npos) {
             throw_context_error(exception);
         }
         throw_invalid_input(exception);

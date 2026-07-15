@@ -74,11 +74,9 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
             const int kk       = k0 + kl;
             __nv_bfloat16* dst = &Bs[stage][tl * BK + gemm_swz64(tl, kl)];
             if constexpr (FullTiles) {
-                gemm_cp_async<16, Cfg>(
-                    dst, &x[static_cast<std::int64_t>(col) * k + kk]);
+                gemm_cp_async<16, Cfg>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else if (col < t && kk + 8 <= k) {
-                gemm_cp_async<16, Cfg>(
-                    dst, &x[static_cast<std::int64_t>(col) * k + kk]);
+                gemm_cp_async<16, Cfg>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
                 store_vec(dst, make_int4(0, 0, 0, 0));
             }
@@ -147,7 +145,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
         for (int row = warp; row < BM; row += Cfg::WARPS) {
             const __nv_bfloat162 w = Q4Codec::load_pair_bf162_scale_ptr(
                 Cr[stage], nullptr, &Sr[stage][row * SB + scale_off], row, lane);
-            const int sc                                           = gemm_swz64(row, 2 * lane);
+            const int sc = gemm_swz64(row, 2 * lane);
             store_vec(&As[row * BK + sc], w);
         }
     };
@@ -174,22 +172,20 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
             for (int mi = 0; mi < MT; ++mi) {
                 const int arow = mi * 16 + a_rowoff;
                 ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                                 smem_addr(&As[arow * BK + gemm_swz64(arow, ks + a_coloff)]));
+                            smem_addr(&As[arow * BK + gemm_swz64(arow, ks + a_coloff)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int brow = wn * WN + ni * 8 + b_rin;
-                ldmatrix_x2(
-                    bf[ni][0], bf[ni][1],
-                    smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, ks + b_koff)]));
+                ldmatrix_x2(bf[ni][0], bf[ni][1],
+                            smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, ks + b_koff)]));
             }
 #pragma unroll
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
-                                           acc[mi][ni][3], af[mi][0], af[mi][1], af[mi][2],
-                                           af[mi][3], bf[ni][0], bf[ni][1]);
+                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                             af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
                 }
             }
         }

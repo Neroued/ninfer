@@ -6,7 +6,7 @@
 
 #include "ops/common/math.h"
 #include "ops/linear/reference/linear_generic.h" // launch declaration
-#include "core/device.h"                          // CUDA_CHECK
+#include "core/device.h"                         // CUDA_CHECK
 
 #include <cstdint>
 #include <stdexcept>
@@ -34,11 +34,10 @@ void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::ui
 template <int kTt, int kFullSlabs, int kStride>
 void launch_q5_direct_split2(const __nv_bfloat16* xp, const std::uint8_t* codes,
                              const std::uint8_t* high, const std::uint8_t* scales,
-                             __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
-                             std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
-                             cudaStream_t stream) {
+                             __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
+                             std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
     constexpr int kBlockThreads = 2 * 32;
-    const dim3    grid(static_cast<unsigned>(n), 1u, 1u);
+    const dim3 grid(static_cast<unsigned>(n), 1u, 1u);
     linear_rowsplit_gemm_smallt_kernel_direct_split2_q5<Q5Smallt, kTt, kFullSlabs, kStride>
         <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
                                              full_slabs);
@@ -47,11 +46,10 @@ void launch_q5_direct_split2(const __nv_bfloat16* xp, const std::uint8_t* codes,
 template <int kTt, int kFullSlabs, int kStride>
 void launch_q5_direct_split4(const __nv_bfloat16* xp, const std::uint8_t* codes,
                              const std::uint8_t* high, const std::uint8_t* scales,
-                             __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
-                             std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
-                             cudaStream_t stream) {
+                             __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
+                             std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
     constexpr int kBlockThreads = 4 * 32;
-    const dim3    grid(static_cast<unsigned>(n), 1u, 1u);
+    const dim3 grid(static_cast<unsigned>(n), 1u, 1u);
     linear_rowsplit_gemm_smallt_kernel_direct_split4_q5<Q5Smallt, kTt, kFullSlabs, kStride>
         <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
                                              full_slabs);
@@ -59,10 +57,9 @@ void launch_q5_direct_split4(const __nv_bfloat16* xp, const std::uint8_t* codes,
 
 template <int kTt>
 bool try_launch_q5_direct(const __nv_bfloat16* xp, const std::uint8_t* codes,
-                          const std::uint8_t* high, const std::uint8_t* scales,
-                          __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
-                          std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
-                          cudaStream_t stream) {
+                          const std::uint8_t* high, const std::uint8_t* scales, __nv_bfloat16* outp,
+                          std::int32_t n, std::int32_t k, std::int32_t t, std::int32_t padded_k,
+                          std::int32_t full_slabs, cudaStream_t stream) {
     if (full_slabs * 1024 != k || padded_k != k) { return false; }
     if (n == 7168 && k == 5120) {
         launch_q5_direct_split2<kTt, 5, 5120>(xp, codes, high, scales, outp, n, k, t, padded_k,
@@ -88,26 +85,25 @@ bool try_launch_q5_direct(const __nv_bfloat16* xp, const std::uint8_t* codes,
 }
 
 bool try_launch_q5_direct(const __nv_bfloat16* xp, const std::uint8_t* codes,
-                          const std::uint8_t* high, const std::uint8_t* scales,
-                          __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
-                          std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
-                          cudaStream_t stream) {
+                          const std::uint8_t* high, const std::uint8_t* scales, __nv_bfloat16* outp,
+                          std::int32_t n, std::int32_t k, std::int32_t t, std::int32_t padded_k,
+                          std::int32_t full_slabs, cudaStream_t stream) {
     switch (t) {
     case 2:
-        return try_launch_q5_direct<2>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                       full_slabs, stream);
+        return try_launch_q5_direct<2>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
+                                       stream);
     case 3:
-        return try_launch_q5_direct<3>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                       full_slabs, stream);
+        return try_launch_q5_direct<3>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
+                                       stream);
     case 4:
-        return try_launch_q5_direct<4>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                       full_slabs, stream);
+        return try_launch_q5_direct<4>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
+                                       stream);
     case 5:
-        return try_launch_q5_direct<5>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                       full_slabs, stream);
+        return try_launch_q5_direct<5>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
+                                       stream);
     case 6:
-        return try_launch_q5_direct<6>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                       full_slabs, stream);
+        return try_launch_q5_direct<6>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
+                                       stream);
     default:
         return false;
     }
@@ -147,17 +143,16 @@ void linear_rowsplit_gemm_smallt_launch(const Tensor& x, const Weight& w, Tensor
     const std::int32_t k        = x.ne[0];
     const std::int32_t t        = x.ne[1];
     const std::int32_t padded_k = w.padded_shape[1];
-    const auto*        codes    = static_cast<const std::uint8_t*>(w.qdata);
-    const auto*        high     = static_cast<const std::uint8_t*>(w.qhigh);
-    const auto*        scales   = static_cast<const std::uint8_t*>(w.scales);
-    const auto*        xp       = static_cast<const __nv_bfloat16*>(x.data);
-    auto*              outp     = static_cast<__nv_bfloat16*>(out.data);
+    const auto* codes           = static_cast<const std::uint8_t*>(w.qdata);
+    const auto* high            = static_cast<const std::uint8_t*>(w.qhigh);
+    const auto* scales          = static_cast<const std::uint8_t*>(w.scales);
+    const auto* xp              = static_cast<const __nv_bfloat16*>(x.data);
+    auto* outp                  = static_cast<__nv_bfloat16*>(out.data);
 
     // The fast slab path streams x as 16-byte uint4 per column, which needs
     // k % 8 == 0 and a 16-byte aligned x base; otherwise the scalar tail path
     // covers the whole K range (test-only shapes; every model K is 1024-aligned).
-    const bool aligned_x =
-        (k % 8) == 0 && (reinterpret_cast<std::uintptr_t>(xp) & 0xfu) == 0;
+    const bool aligned_x = (k % 8) == 0 && (reinterpret_cast<std::uintptr_t>(xp) & 0xfu) == 0;
     const std::int32_t full_slabs = aligned_x ? k / 1024 : 0;
 
     switch (fmt) {

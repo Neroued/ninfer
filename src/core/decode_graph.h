@@ -22,8 +22,8 @@ public:
     void reset() noexcept;
 
 private:
-    cudaGraph_t graph_     = nullptr;
-    cudaGraphExec_t exec_  = nullptr;
+    cudaGraph_t graph_    = nullptr;
+    cudaGraphExec_t exec_ = nullptr;
 };
 
 } // namespace ninfer

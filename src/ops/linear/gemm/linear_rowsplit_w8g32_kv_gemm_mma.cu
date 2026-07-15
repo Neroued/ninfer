@@ -17,8 +17,7 @@ void linear_rowsplit_w8g32_kv_gemm_mma_launch(const Tensor& x, const Weight& k_w
     const std::int32_t k        = k_weight.k;
     const std::int32_t n        = x.ne[1];
     const std::int32_t padded_k = k_weight.padded_shape[1];
-    const dim3 grid(static_cast<unsigned>(div_up(m, BM)),
-                    static_cast<unsigned>(div_up(n, BN)), 1u);
+    const dim3 grid(static_cast<unsigned>(div_up(m, BM)), static_cast<unsigned>(div_up(n, BN)), 1u);
     const bool full = (m % BM) == 0 && (n % BN) == 0 && k == padded_k && (k % 64) == 0;
     const auto* xp  = static_cast<const __nv_bfloat16*>(x.data);
     const auto* kc  = static_cast<const std::uint8_t*>(k_weight.qdata);

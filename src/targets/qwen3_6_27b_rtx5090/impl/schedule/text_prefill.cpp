@@ -67,8 +67,7 @@ void sample_from_hidden(State& state, const Tensor& hidden, std::int32_t absolut
     CUDA_CHECK(cudaMemcpyAsync(state.io.pos.data, &absolute_position, sizeof(absolute_position),
                                cudaMemcpyHostToDevice, state.device.stream));
     ops::sample(logits, state.io.token, TextConfig::token_domain, state.sampling,
-                    static_cast<const std::int32_t*>(state.io.pos.data), purpose,
-                    state.device.stream);
+                static_cast<const std::int32_t*>(state.io.pos.data), purpose, state.device.stream);
     state.work.reset();
 }
 

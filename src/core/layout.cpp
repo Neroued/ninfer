@@ -47,8 +47,7 @@ Tensor TensorRegion::bind(DeviceSpan backing) const {
     if (expected.bytes() != region.bytes) {
         throw std::logic_error("tensor layout has an inconsistent byte size");
     }
-    return Tensor(region.bind(backing).data, dtype,
-                  {shape[0], shape[1], shape[2], shape[3]});
+    return Tensor(region.bind(backing).data, dtype, {shape[0], shape[1], shape[2], shape[3]});
 }
 
 LayoutBuilder::Scope::Scope(LayoutBuilder& builder) noexcept
@@ -63,8 +62,7 @@ LayoutBuilder::Scope::Scope(Scope&& other) noexcept
     other.builder_ = nullptr;
 }
 
-LayoutRegion LayoutBuilder::add(std::size_t bytes, std::size_t alignment,
-                                std::string_view label) {
+LayoutRegion LayoutBuilder::add(std::size_t bytes, std::size_t alignment, std::string_view label) {
     if (bytes == 0) { throw std::invalid_argument(std::string(label) + " must not be empty"); }
     const std::size_t offset = align_up(cursor_, alignment, label);
     cursor_                  = checked_add(offset, bytes, label);
@@ -72,8 +70,7 @@ LayoutRegion LayoutBuilder::add(std::size_t bytes, std::size_t alignment,
     return LayoutRegion{offset, bytes, alignment};
 }
 
-TensorRegion LayoutBuilder::add_tensor(DType dtype,
-                                       std::initializer_list<std::int32_t> shape,
+TensorRegion LayoutBuilder::add_tensor(DType dtype, std::initializer_list<std::int32_t> shape,
                                        std::size_t alignment, std::string_view label) {
     Tensor tensor(nullptr, dtype, shape);
     TensorRegion out;
@@ -101,8 +98,7 @@ WorkspaceLayoutBuilder::Scope::Scope(Scope&& other) noexcept
     other.builder_ = nullptr;
 }
 
-Tensor WorkspaceLayoutBuilder::alloc(DType dtype,
-                                     std::initializer_list<std::int32_t> shape,
+Tensor WorkspaceLayoutBuilder::alloc(DType dtype, std::initializer_list<std::int32_t> shape,
                                      std::size_t alignment) {
     Tensor tensor(nullptr, dtype, shape);
     cursor_ = align_up(cursor_, alignment, "workspace layout");

@@ -9,12 +9,11 @@ namespace ninfer::ops::detail {
 
 void sample_column_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                           const SamplingConfig* config, const std::int32_t* pos_base,
-                          std::int32_t purpose,
-                          cudaStream_t stream) {
-    const std::int32_t physical_rows = logits.ne[0];
-    const std::int32_t cols  = logits.ne[1];
+                          std::int32_t purpose, cudaStream_t stream) {
+    const std::int32_t physical_rows  = logits.ne[0];
+    const std::int32_t cols           = logits.ne[1];
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
-    const std::int32_t groups = sampler_group_count(partial_blocks);
+    const std::int32_t groups         = sampler_group_count(partial_blocks);
     // The single-block fallback and the multi-block scratch path share
     // sampler_multiblock_ok so exactly one owns any given shape; it also bounds
     // group_count*cap to the merge tile (F1) and the scratch partial budget.

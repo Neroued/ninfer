@@ -85,18 +85,18 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 }
 
 PersistentLayout persistent_layout(const SequencePlan::Impl& plan) {
-    const std::size_t columns   = plan.mtp_k + 1ULL;
-    const std::size_t drafts    = std::max<std::size_t>(1, plan.mtp_k);
-    const std::size_t slots     = columns + 1ULL;
+    const std::size_t columns = plan.mtp_k + 1ULL;
+    const std::size_t drafts  = std::max<std::size_t>(1, plan.mtp_k);
+    const std::size_t slots   = columns + 1ULL;
     LayoutBuilder builder;
     PersistentLayout out;
     out.text_kv = plan_kv_cache(builder, TextConfig::full_attention_layers(), plan.capacity,
                                 TextConfig::kv_heads, TextConfig::head_dim, plan.kv_dtype,
                                 plan.kv_quant_group);
     if (plan.mtp_k != 0) {
-        out.mtp_kv = plan_kv_cache(builder, TextConfig::mtp_layers, plan.capacity,
-                                   TextConfig::kv_heads, TextConfig::head_dim, plan.kv_dtype,
-                                   plan.kv_quant_group);
+        out.mtp_kv =
+            plan_kv_cache(builder, TextConfig::mtp_layers, plan.capacity, TextConfig::kv_heads,
+                          TextConfig::head_dim, plan.kv_dtype, plan.kv_quant_group);
     }
     out.gdn = plan_gdn_state(builder, TextConfig::gdn_layers(), TextConfig::convolution_dim,
                              TextConfig::gdn_conv_state_width, TextConfig::gdn_value_heads,
@@ -106,20 +106,19 @@ PersistentLayout persistent_layout(const SequencePlan::Impl& plan) {
     const auto i32 = [&](std::size_t n, const char* label) {
         return add_tensor(builder, DType::I32, {static_cast<std::int32_t>(n)}, label);
     };
-    out.io.token            = i32(1, "step token");
-    out.io.pos              = i32(1, "step position");
-    out.io.rope_pos         = i32(1, "step rope position");
-    out.io.rope_delta       = i32(1, "step rope delta");
-    out.io.logits           = add_tensor(builder, DType::BF16,
-                               {TextConfig::output_rows, static_cast<std::int32_t>(columns)},
-                               "step logits");
-    out.io.verify_hidden    = add_tensor(builder, DType::BF16,
-                                      {TextConfig::hidden, static_cast<std::int32_t>(columns)},
-                                      "step verify hidden");
-    out.io.prefill_hidden   = add_tensor(builder, DType::BF16,
-                                       {TextConfig::hidden,
-                                        static_cast<std::int32_t>(plan.prefill_chunk)},
-                                       "step prefill hidden");
+    out.io.token      = i32(1, "step token");
+    out.io.pos        = i32(1, "step position");
+    out.io.rope_pos   = i32(1, "step rope position");
+    out.io.rope_delta = i32(1, "step rope delta");
+    out.io.logits =
+        add_tensor(builder, DType::BF16,
+                   {TextConfig::output_rows, static_cast<std::int32_t>(columns)}, "step logits");
+    out.io.verify_hidden =
+        add_tensor(builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(columns)},
+                   "step verify hidden");
+    out.io.prefill_hidden = add_tensor(
+        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.prefill_chunk)},
+        "step prefill hidden");
     out.io.target_tokens    = i32(columns, "step target tokens");
     out.io.drafts           = i32(drafts, "step drafts");
     out.io.sampled_out      = i32(columns, "step sampled output");
@@ -131,34 +130,31 @@ PersistentLayout persistent_layout(const SequencePlan::Impl& plan) {
     out.io.accepted         = i32(1, "step accepted drafts");
     out.io.gdn_initial_slot = i32(1, "step GDN initial slot");
     out.io.ar_pos           = i32(1, "step MTP autoregressive position");
-    out.io.mtp_ar_hidden    = add_tensor(builder, DType::BF16, {TextConfig::hidden, 1},
-                                      "step MTP autoregressive hidden");
+    out.io.mtp_ar_hidden =
+        add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "step MTP autoregressive hidden");
     out.io.stats            = add_tensor(builder, DType::I64, {kStepStatsCounters}, "step stats");
     out.token_counts        = i32(TextConfig::token_domain, "sampling token counts");
     const auto config_words = static_cast<std::int32_t>(
         (sizeof(ops::SamplingConfig) + sizeof(std::int32_t) - 1) / sizeof(std::int32_t));
     out.sampling_config = add_tensor(builder, DType::I32, {config_words}, "sampling config");
-    out.tail_hidden = add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "tail hidden");
+    out.tail_hidden     = add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "tail hidden");
     out.boundary_hidden =
         add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "boundary hidden");
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
-    out.kv_payload_bytes = out.text_kv.payload_bytes() +
-                           (out.mtp_kv ? out.mtp_kv->payload_bytes() : 0);
+    out.kv_payload_bytes =
+        out.text_kv.payload_bytes() + (out.mtp_kv ? out.mtp_kv->payload_bytes() : 0);
     return out;
 }
 
 std::size_t workspace_bytes(const SequencePlan::Impl& plan) {
-    if (plan.prefill_chunk >
-        static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+    if (plan.prefill_chunk > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("prefill_chunk exceeds int32 workspace dimensions");
     }
     const auto prefill_tokens = static_cast<std::int32_t>(plan.prefill_chunk);
     const auto verify_tokens  = static_cast<std::int32_t>(plan.mtp_k + 1);
 
-    const auto matrix = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
-                           std::int32_t tokens) {
-        (void)layout.alloc(dtype, {rows, tokens});
-    };
+    const auto matrix      = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
+                           std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
     const auto common_root = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
         matrix(layout, DType::I32, 1, tokens);
         matrix(layout, DType::I32, 1, tokens);
@@ -177,8 +173,8 @@ std::size_t workspace_bytes(const SequencePlan::Impl& plan) {
         matrix(layout, DType::BF16, TextConfig::kv_size, tokens);
         matrix(layout, DType::BF16, TextConfig::query_size, tokens);
         layout.alloc_bytes(ops::gqa_attention_workspace_bytes(tokens));
-        layout.alloc_bytes(ops::linear_add_workspace_bytes(
-            TextConfig::hidden, TextConfig::query_size, tokens));
+        layout.alloc_bytes(
+            ops::linear_add_workspace_bytes(TextConfig::hidden, TextConfig::query_size, tokens));
     };
     const auto gdn_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
         auto scope = layout.scope();
@@ -186,8 +182,8 @@ std::size_t workspace_bytes(const SequencePlan::Impl& plan) {
         matrix(layout, DType::BF16, TextConfig::convolution_dim, tokens);
         {
             auto operator_scope = layout.scope();
-            layout.alloc_bytes(ops::gdn_input_proj_workspace_bytes(
-                2 * TextConfig::key_dim, TextConfig::value_dim, tokens));
+            layout.alloc_bytes(ops::gdn_input_proj_workspace_bytes(2 * TextConfig::key_dim,
+                                                                   TextConfig::value_dim, tokens));
         }
         matrix(layout, DType::BF16, TextConfig::convolution_dim, tokens);
         matrix(layout, DType::FP32, TextConfig::gdn_value_heads, tokens);
@@ -210,8 +206,8 @@ std::size_t workspace_bytes(const SequencePlan::Impl& plan) {
         }
         matrix(layout, DType::BF16, TextConfig::value_dim, tokens);
         matrix(layout, DType::BF16, TextConfig::value_dim, tokens);
-        layout.alloc_bytes(ops::linear_add_workspace_bytes(
-            TextConfig::hidden, TextConfig::value_dim, tokens));
+        layout.alloc_bytes(
+            ops::linear_add_workspace_bytes(TextConfig::hidden, TextConfig::value_dim, tokens));
     };
     const auto mlp_stage = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens) {
         auto scope = layout.scope();
@@ -219,13 +215,13 @@ std::size_t workspace_bytes(const SequencePlan::Impl& plan) {
         matrix(layout, DType::BF16, TextConfig::intermediate, tokens);
         {
             auto operator_scope = layout.scope();
-            layout.alloc_bytes(ops::linear_swiglu_workspace_bytes(
-                2 * TextConfig::intermediate, tokens));
+            layout.alloc_bytes(
+                ops::linear_swiglu_workspace_bytes(2 * TextConfig::intermediate, tokens));
         }
         {
             auto operator_scope = layout.scope();
-            layout.alloc_bytes(ops::linear_add_workspace_bytes(
-                TextConfig::hidden, TextConfig::intermediate, tokens));
+            layout.alloc_bytes(ops::linear_add_workspace_bytes(TextConfig::hidden,
+                                                               TextConfig::intermediate, tokens));
         }
     };
 
@@ -318,17 +314,17 @@ std::unique_ptr<SequencePlan::Impl> plan_sequence_impl(DeviceContext& device,
                                                        const EngineOptions& options) {
     validate_target_options(device, options);
 
-    auto impl            = std::make_unique<SequencePlan::Impl>();
-    impl->capacity       = options.max_context;
-    impl->prefill_chunk  = options.prefill_chunk;
-    impl->mtp_k          = options.speculative.draft_tokens;
-    impl->proposal_head  = options.speculative.proposal_head;
-    impl->use_cuda_graph = options.use_cuda_graph;
-    impl->device         = options.device;
-    impl->kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8;
-    impl->kv_quant_group = impl->kv_dtype == DType::I8 ? kKvQuantGroup : 0;
-    impl->persistent          = persistent_layout(*impl);
-    impl->workspace_bytes     = workspace_bytes(*impl);
+    auto impl             = std::make_unique<SequencePlan::Impl>();
+    impl->capacity        = options.max_context;
+    impl->prefill_chunk   = options.prefill_chunk;
+    impl->mtp_k           = options.speculative.draft_tokens;
+    impl->proposal_head   = options.speculative.proposal_head;
+    impl->use_cuda_graph  = options.use_cuda_graph;
+    impl->device          = options.device;
+    impl->kv_dtype        = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8;
+    impl->kv_quant_group  = impl->kv_dtype == DType::I8 ? kKvQuantGroup : 0;
+    impl->persistent      = persistent_layout(*impl);
+    impl->workspace_bytes = workspace_bytes(*impl);
     impl->graph_allowance_bytes = impl->use_cuda_graph ? 64ULL * kMiB : 0;
 
     std::size_t free_bytes  = 0;

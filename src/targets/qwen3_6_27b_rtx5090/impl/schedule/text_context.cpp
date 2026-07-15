@@ -325,7 +325,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     Tensor act = work_.alloc(DType::BF16, {kCfg.intermediate, T});
     ops::silu_mul(gate_up.slice(0, 0, kCfg.intermediate),
-                      gate_up.slice(0, kCfg.intermediate, kCfg.intermediate), act, s);
+                  gate_up.slice(0, kCfg.intermediate, kCfg.intermediate), act, s);
 
     Tensor d = work_.alloc(DType::BF16, {kCfg.hidden, T});
     ops::linear(act, *mtp_.down, d, work_, s);
@@ -450,7 +450,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::linear(mh, *mtp_.gate_up, gate_up, work_, s);
         Tensor act = work_.alloc(DType::BF16, {kCfg.intermediate, 1});
         ops::silu_mul(gate_up.slice(0, 0, kCfg.intermediate),
-                          gate_up.slice(0, kCfg.intermediate, kCfg.intermediate), act, s);
+                      gate_up.slice(0, kCfg.intermediate, kCfg.intermediate), act, s);
         Tensor d = work_.alloc(DType::BF16, {kCfg.hidden, 1});
         ops::linear(act, *mtp_.down, d, work_, s);
         ops::residual_add(d, x_last, s);
@@ -464,8 +464,7 @@ void TextContext::mtp_draft_argmax(const Tensor& hidden_col, Tensor& logits, Ten
         Tensor draft_logits = work_.alloc(DType::BF16, {lm_head_draft_n_, 1});
         ops::linear(hidden_col, *lm_head_draft_, draft_logits, work_, ctx_.stream);
         ops::argmax(draft_logits, draft_token, lm_head_draft_n_, ctx_.stream);
-        ops::mtp_remap_draft_token(draft_token, lm_head_draft_ids_, lm_head_draft_n_,
-                                       ctx_.stream);
+        ops::mtp_remap_draft_token(draft_token, lm_head_draft_ids_, lm_head_draft_n_, ctx_.stream);
     } else {
         ops::linear(hidden_col, *lm_head_, logits, work_, ctx_.stream);
         ops::argmax(logits, draft_token, kCfg.token_domain, ctx_.stream);
@@ -638,7 +637,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
     ops::attn_input_proj(h, *w.q_proj, *w.gate_proj, *w.k_proj, *w.v_proj, q_flat, gate_flat,
-                             k_flat, v_flat, work_, s);
+                         k_flat, v_flat, work_, s);
 
     Tensor qn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
     Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
@@ -677,7 +676,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         if (mtp_enabled()) {
             Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
             ops::causal_conv1d_silu_snapshot(qkv, *w.conv1d, conv_states, io_.gdn_initial_slot,
-                                                 qkv_c, s);
+                                             qkv_c, s);
         } else {
             Tensor conv_state = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
             ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, qkv_c, s);
@@ -701,7 +700,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         if (mtp_enabled()) {
             Tensor& ssm_states = state_.ssm.at(static_cast<std::size_t>(gidx));
             ops::gated_delta_rule_snapshot(qn, kn, vv, g, beta, kGdnScale, work_, ssm_states,
-                                               io_.gdn_initial_slot, o, s);
+                                           io_.gdn_initial_slot, o, s);
         } else {
             Tensor ssm_state = state_.ssm_slot(static_cast<std::uint32_t>(gidx), 0);
             ops::gated_delta_rule(qn, kn, vv, g, beta, kGdnScale, work_, ssm_state, o, s);
@@ -720,8 +719,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor qkv_c = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
     if (ph == Phase::Verify) {
         Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
-        ops::causal_conv1d_silu_snapshot(qkv, *w.conv1d, conv_states, io_.gdn_initial_slot,
-                                             qkv_c, s);
+        ops::causal_conv1d_silu_snapshot(qkv, *w.conv1d, conv_states, io_.gdn_initial_slot, qkv_c,
+                                         s);
     } else {
         // Prefill reads the committed conv window from gdn_prefill_read_slot_ and writes the
         // running window to slot 0 (in-place when the read slot is 0).
@@ -751,7 +750,7 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     if (ph == Phase::Verify) {
         Tensor& ssm_states = state_.ssm.at(static_cast<std::size_t>(gidx));
         ops::gated_delta_rule_snapshot(qn, kn, vv, g, beta, kGdnScale, work_, ssm_states,
-                                           io_.gdn_initial_slot, o, s);
+                                       io_.gdn_initial_slot, o, s);
     } else {
         // Prefill reads the committed recurrent state from gdn_prefill_read_slot_ and writes the
         // running state to slot 0 (in-place when the read slot is 0).
@@ -994,8 +993,8 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                 ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
                 if (sampling_config_ != nullptr) {
                     ops::sample(logits, io_.token, kCfg.token_domain, sampling_config_,
-                                    static_cast<const std::int32_t*>(io_.pos.data),
-                                    ops::kSamplePurposePrefill, s);
+                                static_cast<const std::int32_t*>(io_.pos.data),
+                                ops::kSamplePurposePrefill, s);
                 } else {
                     ops::argmax(logits, io_.token, kCfg.token_domain, s);
                 }

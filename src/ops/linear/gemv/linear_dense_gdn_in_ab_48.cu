@@ -18,15 +18,15 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kN       = 48;
-constexpr int kK       = 5120;
-constexpr int kThreads = 256;
-constexpr int kLogicalRows = 2 * kN;
-constexpr int kSmallTMax            = 8;
-constexpr int kSmallTKSlice         = 512;
-constexpr int kSmallTSplits         = kK / kSmallTKSlice;
-constexpr int kSmallTRowsPerBlock   = 4;
-constexpr int kSmallTThreads        = kSmallTRowsPerBlock * 32;
+constexpr int kN                  = 48;
+constexpr int kK                  = 5120;
+constexpr int kThreads            = 256;
+constexpr int kLogicalRows        = 2 * kN;
+constexpr int kSmallTMax          = 8;
+constexpr int kSmallTKSlice       = 512;
+constexpr int kSmallTSplits       = kK / kSmallTKSlice;
+constexpr int kSmallTRowsPerBlock = 4;
+constexpr int kSmallTThreads      = kSmallTRowsPerBlock * 32;
 static_assert(kK % kSmallTKSlice == 0, "small-T K split must divide K");
 
 template <int TokenTile, int KSlice, int RowsPerBlock>
@@ -40,8 +40,8 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
 
     __shared__ __align__(16) __nv_bfloat16 x_sh[TokenTile][KSlice];
 
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane   = static_cast<int>(threadIdx.x) & 31;
+    const int warp   = static_cast<int>(threadIdx.x) >> 5;
     const int token0 = static_cast<int>(blockIdx.z) * TokenTile;
     if (token0 >= t) { return; }
     const int ncols = min(TokenTile, t - token0);
@@ -53,8 +53,8 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
          i += static_cast<int>(blockDim.x)) {
         const int col = i / kVecsPerCol;
         const int vec = i - col * kVecsPerCol;
-        x_sh_v[col * kVecsPerCol + vec] = load_vec<uint4>(
-            x + static_cast<std::int64_t>(token0 + col) * kK + k0 + vec * 8);
+        x_sh_v[col * kVecsPerCol + vec] =
+            load_vec<uint4>(x + static_cast<std::int64_t>(token0 + col) * kK + k0 + vec * 8);
     }
     __syncthreads();
 
@@ -70,7 +70,7 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
     for (int tt = 0; tt < TokenTile; ++tt) { acc[tt] = 0.0f; }
 
     for (int vec = lane; vec < kVecsPerCol; vec += 32) {
-        const uint4 wv = load_vec<uint4>(wrow + vec * 8);
+        const uint4 wv   = load_vec<uint4>(wrow + vec * 8);
         const float2 wf0 = bf16x2_bits_to_float2(wv.x);
         const float2 wf1 = bf16x2_bits_to_float2(wv.y);
         const float2 wf2 = bf16x2_bits_to_float2(wv.z);
@@ -79,7 +79,7 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
 #pragma unroll
         for (int tt = 0; tt < TokenTile; ++tt) {
             if (tt < ncols) {
-                const uint4 xv = x_sh_v[tt * kVecsPerCol + vec];
+                const uint4 xv   = x_sh_v[tt * kVecsPerCol + vec];
                 const float2 xf0 = bf16x2_bits_to_float2(xv.x);
                 const float2 xf1 = bf16x2_bits_to_float2(xv.y);
                 const float2 xf2 = bf16x2_bits_to_float2(xv.z);
@@ -101,7 +101,7 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
         if (tt < ncols) {
             float sum = warp_reduce_sum(acc[tt]);
             if (lane == 0) {
-                const int token = token0 + tt;
+                const int token      = token0 + tt;
                 partial[(static_cast<std::int64_t>(split) * t + token) * kLogicalRows +
                         logical_row] = sum;
             }
@@ -113,34 +113,35 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_reduce_48_kernel(
     const float* __restrict__ partial, const float* __restrict__ A_log,
     const float* __restrict__ dt_bias, float* __restrict__ g, float* __restrict__ beta,
     std::int32_t t) {
-    const int i = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) +
-                  static_cast<int>(threadIdx.x);
+    const int i =
+        static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
     const int elems = kN * t;
     if (i >= elems) { return; }
 
     const int row   = i % kN;
     const int token = i / kN;
-    float acc_a = 0.0f;
-    float acc_b = 0.0f;
+    float acc_a     = 0.0f;
+    float acc_b     = 0.0f;
 #pragma unroll
     for (int split = 0; split < kSmallTSplits; ++split) {
-        const std::int64_t base =
-            (static_cast<std::int64_t>(split) * t + token) * kLogicalRows;
+        const std::int64_t base = (static_cast<std::int64_t>(split) * t + token) * kLogicalRows;
         acc_a += partial[base + row];
         acc_b += partial[base + kN + row];
     }
 
-    const float a_rounded = __bfloat162float(__float2bfloat16(acc_a));
-    const float b_rounded = __bfloat162float(__float2bfloat16(acc_b));
+    const float a_rounded        = __bfloat162float(__float2bfloat16(acc_a));
+    const float b_rounded        = __bfloat162float(__float2bfloat16(acc_b));
     const std::int64_t out_index = static_cast<std::int64_t>(token) * kN + row;
-    const float sp = softplus(a_rounded + dt_bias[row]);
-    g[out_index] = -expf(A_log[row]) * sp;
-    beta[out_index] = sigmoid(b_rounded);
+    const float sp               = softplus(a_rounded + dt_bias[row]);
+    g[out_index]                 = -expf(A_log[row]) * sp;
+    beta[out_index]              = sigmoid(b_rounded);
 }
 
-__global__ void linear_dense_gdn_in_ab_gated_48_kernel(
-    const __nv_bfloat16* x, const __nv_bfloat16* a_weight, const __nv_bfloat16* b_weight,
-    const float* A_log, const float* dt_bias, float* g, float* beta) {
+__global__ void linear_dense_gdn_in_ab_gated_48_kernel(const __nv_bfloat16* x,
+                                                       const __nv_bfloat16* a_weight,
+                                                       const __nv_bfloat16* b_weight,
+                                                       const float* A_log, const float* dt_bias,
+                                                       float* g, float* beta) {
     const int global_row = static_cast<int>(blockIdx.x);
     const bool is_b      = global_row >= kN;
     const int row        = is_b ? global_row - kN : global_row;
@@ -167,7 +168,7 @@ __global__ void linear_dense_gdn_in_ab_gated_48_kernel(
             beta[row] = sigmoid(rounded);
         } else {
             const float sp = softplus(rounded + dt_bias[row]);
-            g[row] = -expf(A_log[row]) * sp;
+            g[row]         = -expf(A_log[row]) * sp;
         }
     }
 }
@@ -200,9 +201,9 @@ void launch_dense_prefill_mma(const Tensor& x, const Weight& a_weight, const Wei
                     static_cast<unsigned>(SplitK));
     auto launch = [&](auto full_tokens) {
         constexpr bool FullTokens = decltype(full_tokens)::value;
-        static const cudaError_t attr = cudaFuncSetAttribute(
-            linear_dense_gdn_in_ab_gemm_mma_kernel<SplitK, FullTokens, Warps>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kDenseGdnSmemBytes);
+        static const cudaError_t attr =
+            cudaFuncSetAttribute(linear_dense_gdn_in_ab_gemm_mma_kernel<SplitK, FullTokens, Warps>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kDenseGdnSmemBytes);
         CUDA_CHECK(attr);
         if constexpr (SplitK > 1) {
             cudaLaunchConfig_t config{};
@@ -213,8 +214,8 @@ void launch_dense_prefill_mma(const Tensor& x, const Weight& a_weight, const Wei
             cudaLaunchAttribute cooperative{};
             cooperative.id              = cudaLaunchAttributeCooperative;
             cooperative.val.cooperative = 1;
-            config.attrs                 = &cooperative;
-            config.numAttrs              = 1;
+            config.attrs                = &cooperative;
+            config.numAttrs             = 1;
             CUDA_CHECK(cudaLaunchKernelEx(
                 &config, linear_dense_gdn_in_ab_gemm_mma_kernel<SplitK, FullTokens, Warps>,
                 static_cast<const __nv_bfloat16*>(x.data),
@@ -240,7 +241,6 @@ void launch_dense_prefill_mma(const Tensor& x, const Weight& a_weight, const Wei
         launch(std::false_type{});
     }
     CUDA_CHECK(cudaGetLastError());
-
 }
 
 } // namespace
@@ -272,9 +272,9 @@ void linear_dense_gdn_in_ab_gated_48_launch(const Tensor& x, const Weight& a_wei
         linear_dense_gdn_in_ab_gated_48_kernel<<<2 * kN, kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(a_weight.qdata),
-            static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
-            static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
-            static_cast<float*>(beta.data));
+            static_cast<const __nv_bfloat16*>(b_weight.qdata),
+            static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
+            static_cast<float*>(g.data), static_cast<float*>(beta.data));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -297,8 +297,8 @@ void linear_dense_gdn_in_ab_gated_48_launch(const Tensor& x, const Weight& a_wei
         CUDA_CHECK(cudaGetLastError());
 
         constexpr int kReduceThreads = 128;
-        const int reduce_elems = kN * t;
-        const int reduce_blocks = div_up(reduce_elems, kReduceThreads);
+        const int reduce_elems       = kN * t;
+        const int reduce_blocks      = div_up(reduce_elems, kReduceThreads);
         linear_dense_gdn_in_ab_gated_smallt_reduce_48_kernel<<<reduce_blocks, kReduceThreads, 0,
                                                                stream>>>(
             static_cast<const float*>(workspace), static_cast<const float*>(A_log.data),

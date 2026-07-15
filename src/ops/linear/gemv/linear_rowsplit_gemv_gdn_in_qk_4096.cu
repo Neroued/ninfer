@@ -14,17 +14,17 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kN = 4096;
-constexpr int kK = 5120;
-constexpr int kGroupK = 64;
-constexpr int kGroups = kK / kGroupK;
-constexpr int kBytesPerGroup = 32;
-constexpr int kVecBytes = 16;
-constexpr int kWarpsPerRow = 8;
-constexpr int kGroupsPerWarp = kGroups / kWarpsPerRow;
+constexpr int kN                 = 4096;
+constexpr int kK                 = 5120;
+constexpr int kGroupK            = 64;
+constexpr int kGroups            = kK / kGroupK;
+constexpr int kBytesPerGroup     = 32;
+constexpr int kVecBytes          = 16;
+constexpr int kWarpsPerRow       = 8;
+constexpr int kGroupsPerWarp     = kGroups / kWarpsPerRow;
 constexpr int kGroupsPerWarpTile = 16;
-constexpr int kVecsPerWarpTile = kGroupsPerWarpTile * kBytesPerGroup / kVecBytes;
-constexpr int kBlockThreads = kWarpsPerRow * 32;
+constexpr int kVecsPerWarpTile   = kGroupsPerWarpTile * kBytesPerGroup / kVecBytes;
+constexpr int kBlockThreads      = kWarpsPerRow * 32;
 static_assert(kBytesPerGroup == 2 * kVecBytes);
 static_assert(kVecsPerWarpTile == 32);
 
@@ -36,22 +36,22 @@ __global__ void linear_rowsplit_gemv_gdn_in_qk_4096_q4_kernel(
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int row = static_cast<int>(blockIdx.x);
+    const int row  = static_cast<int>(blockIdx.x);
     if (row >= kN) { return; }
 
     const std::uint8_t* code_row =
         codes + static_cast<std::int64_t>(row) * kGroups * kBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
-    const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* x2                = reinterpret_cast<const __nv_bfloat162*>(x);
 
-    float acc = 0.0f;
+    float acc             = 0.0f;
     const int group_begin = warp * kGroupsPerWarp;
 
     for (int tile = 0; tile < kGroupsPerWarp; tile += kGroupsPerWarpTile) {
-        const int tile_count =
-            (kGroupsPerWarp - tile) < kGroupsPerWarpTile ? (kGroupsPerWarp - tile)
-                                                         : kGroupsPerWarpTile;
-        const int tile_vecs = tile_count * kBytesPerGroup / kVecBytes;
+        const int tile_count = (kGroupsPerWarp - tile) < kGroupsPerWarpTile
+                                   ? (kGroupsPerWarp - tile)
+                                   : kGroupsPerWarpTile;
+        const int tile_vecs  = tile_count * kBytesPerGroup / kVecBytes;
         const auto* global_vecs =
             reinterpret_cast<const uint4*>(code_row + (group_begin + tile) * kBytesPerGroup);
         if (lane < tile_vecs) { code_tile[warp][lane] = global_vecs[lane]; }
@@ -59,24 +59,23 @@ __global__ void linear_rowsplit_gemv_gdn_in_qk_4096_q4_kernel(
 
         std::uint16_t lane_scale_bits = 0;
         if (lane < tile_count) {
-            lane_scale_bits =
-                load_vec<std::uint16_t>(scale_row + (group_begin + tile + lane) * 2);
+            lane_scale_bits = load_vec<std::uint16_t>(scale_row + (group_begin + tile + lane) * 2);
         }
         const auto* tile_codes = reinterpret_cast<const std::uint8_t*>(code_tile[warp]);
 #pragma unroll
         for (int tile_group = 0; tile_group < kGroupsPerWarpTile; ++tile_group) {
             if (tile_group >= tile_count) { break; }
-            const auto scale_bits = static_cast<std::uint16_t>(
-                __shfl_sync(0xffffffffu, lane_scale_bits, tile_group));
+            const auto scale_bits =
+                static_cast<std::uint16_t>(__shfl_sync(0xffffffffu, lane_scale_bits, tile_group));
             const float scale = __half2float(__ushort_as_half(scale_bits));
 
             const int packed = static_cast<int>(tile_codes[tile_group * kBytesPerGroup + lane]);
-            const int q0 = sign_extend<4>(packed & 0x0f);
-            const int q1 = sign_extend<4>(packed >> 4);
-            const int k0 = (group_begin + tile + tile_group) * kGroupK + lane * 2;
-            const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
-            acc = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
-            acc = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
+            const int q0     = sign_extend<4>(packed & 0x0f);
+            const int q1     = sign_extend<4>(packed >> 4);
+            const int k0     = (group_begin + tile + tile_group) * kGroupK + lane * 2;
+            const float2 xv  = __bfloat1622float2(x2[k0 >> 1]);
+            acc              = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
+            acc              = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
         }
         __syncwarp();
     }
@@ -88,9 +87,7 @@ __global__ void linear_rowsplit_gemv_gdn_in_qk_4096_q4_kernel(
     if (threadIdx.x == 0) {
         float row_acc = 0.0f;
 #pragma unroll
-        for (int i = 0; i < kWarpsPerRow; ++i) {
-            row_acc += partials[i];
-        }
+        for (int i = 0; i < kWarpsPerRow; ++i) { row_acc += partials[i]; }
         out[row] = __float2bfloat16(row_acc);
     }
 }

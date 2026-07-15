@@ -134,8 +134,8 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
                 cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
                 const std::int64_t gi = static_cast<std::int64_t>(grow < m ? grow : 0) * kg + g0;
-                ninfer::ops::cp_async_zfill<16>(
-                    dst, &codes[gi * 32 + chunk * 16], grow < m ? 16 : 0);
+                ninfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
+                                                grow < m ? 16 : 0);
             }
         }
         if ((kt % SCALE_CACHE_TILES) == 0) {
@@ -150,8 +150,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
-                    ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2],
-                                                                       valid_scales * 2);
+                    ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], valid_scales * 2);
                 }
             }
         }
@@ -222,16 +221,15 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
             for (int mi = 0; mi < MT; ++mi) {
                 const int ar = wm * WM + mi * 16 + a_rowoff;
                 const int ac = ks * 16 + a_coloff;
-                ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
-                                  af[slot][mi][3],
-                                  smem_addr(&As[ar * BK + w8g32_swz64(ar, ac)]));
+                ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                            smem_addr(&As[ar * BK + w8g32_swz64(ar, ac)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int br = wn * WN + ni * 8 + b_rin;
                 const int bc = ks * 16 + b_koff;
                 ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
-                                  smem_addr(&Bs[stage][br * BK + w8g32_swz64(br, bc)]));
+                            smem_addr(&Bs[stage][br * BK + w8g32_swz64(br, bc)]));
             }
         };
 
@@ -244,10 +242,9 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm
             for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
-                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
-                                            acc[mi][ni][3], af[slot][mi][0], af[slot][mi][1],
-                                            af[slot][mi][2], af[slot][mi][3], bf[slot][ni][0],
-                                            bf[slot][ni][1]);
+                    mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                             af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                             bf[slot][ni][0], bf[slot][ni][1]);
                 }
             }
         }

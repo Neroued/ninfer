@@ -653,26 +653,26 @@ Weight make_weight(const RowSplitPayload& payload, QType qtype, std::int32_t n, 
     const std::int32_t padded_k = static_cast<std::int32_t>(align_up_u64(k, 128));
     const std::int32_t group    = group_size(qtype);
     Weight w{};
-    w.payload           = payload.data.p;
-    w.payload_bytes     = payload.payload_bytes();
-    w.high_plane_bytes  = payload.high_bytes;
-    w.qtype             = qtype;
-    w.layout            = QuantLayout::RowSplit;
-    w.scale_dtype       = DType::FP16;
-    w.group_size        = static_cast<std::uint32_t>(group);
-    w.shape[0]          = n;
-    w.shape[1]          = k;
-    w.padded_shape[0]   = n;
-    w.padded_shape[1]   = padded_k;
-    w.ndim              = 2;
-    w.qdata             = payload.data.p;
-    w.qhigh             = payload.high_bytes == 0
-                              ? nullptr
-                              : static_cast<const std::uint8_t*>(payload.data.p) + payload.high_offset;
-    w.scales            = static_cast<const std::uint8_t*>(payload.data.p) + payload.scale_offset;
-    w.n                 = n;
-    w.k                 = k;
-    w.group             = group;
+    w.payload          = payload.data.p;
+    w.payload_bytes    = payload.payload_bytes();
+    w.high_plane_bytes = payload.high_bytes;
+    w.qtype            = qtype;
+    w.layout           = QuantLayout::RowSplit;
+    w.scale_dtype      = DType::FP16;
+    w.group_size       = static_cast<std::uint32_t>(group);
+    w.shape[0]         = n;
+    w.shape[1]         = k;
+    w.padded_shape[0]  = n;
+    w.padded_shape[1]  = padded_k;
+    w.ndim             = 2;
+    w.qdata            = payload.data.p;
+    w.qhigh            = payload.high_bytes == 0
+                             ? nullptr
+                             : static_cast<const std::uint8_t*>(payload.data.p) + payload.high_offset;
+    w.scales           = static_cast<const std::uint8_t*>(payload.data.p) + payload.scale_offset;
+    w.n                = n;
+    w.k                = k;
+    w.group            = group;
     return w;
 }
 
@@ -759,7 +759,7 @@ RunResult run_paired_kv(const Options& opt, double stream_ceiling_gbs, double tc
     Weight wv = make_weight(vbuf, QType::W8G32_F16S, shape.n, shape.k);
     WorkspaceArena ws(64ULL << 20);
 
-    const auto launch = [&](cudaStream_t s) { ops::linear_pair(tx, wk, wv, tk, tv, ws, s); };
+    const auto launch      = [&](cudaStream_t s) { ops::linear_pair(tx, wk, wv, tk, tv, ws, s); };
     const TimingStats cold = measure_cold(launch, flush, stream, opt.warmup, opt.repeat);
     const TimingStats warm = measure_warm(launch, stream, opt.warmup, opt.repeat);
 

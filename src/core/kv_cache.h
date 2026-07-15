@@ -33,9 +33,8 @@ struct KVCacheLayout {
 };
 
 [[nodiscard]] KVCacheLayout plan_kv_cache(LayoutBuilder& builder, std::uint32_t full_layers,
-                                          std::uint32_t max_context,
-                                          std::int32_t num_kv_heads, std::int32_t head_dim,
-                                          DType dtype = DType::BF16,
+                                          std::uint32_t max_context, std::int32_t num_kv_heads,
+                                          std::int32_t head_dim, DType dtype = DType::BF16,
                                           std::int32_t quant_group = 0);
 
 struct KVCache {

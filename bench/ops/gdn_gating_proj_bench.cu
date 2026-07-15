@@ -46,9 +46,9 @@ DBuf make_f32(std::size_t n, std::uint32_t seed) {
 
 Weight dense_bf16_weight(void* data) {
     Weight w{};
-    w.qtype             = QType::BF16_CTRL;
-    w.layout            = QuantLayout::Contiguous;
-    w.payload           = data;
+    w.qtype   = QType::BF16_CTRL;
+    w.layout  = QuantLayout::Contiguous;
+    w.payload = data;
     w.payload_bytes =
         static_cast<std::uint64_t>(kHeads) * static_cast<std::uint64_t>(kHidden) * 2ULL;
     w.qdata           = data;

@@ -34,7 +34,7 @@ std::uint64_t parse_u64(const char* text, const char* label) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " +
                                     (text == nullptr ? "" : text));
     }
-    errno                           = 0;
+    errno                          = 0;
     char* end                      = nullptr;
     const unsigned long long value = std::strtoull(text, &end, 10);
     if (errno == ERANGE || end == text || *end != '\0') {

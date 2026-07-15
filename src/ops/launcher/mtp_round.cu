@@ -10,18 +10,14 @@
 namespace ninfer::ops::detail {
 
 void mtp_prepare_verify_inputs_launch(const Tensor& token, const Tensor& drafts,
-                                      const Tensor& length, Tensor& window_base,
-                                      Tensor& verify_ids, Tensor& positions,
-                                      cudaStream_t stream) {
+                                      const Tensor& length, Tensor& window_base, Tensor& verify_ids,
+                                      Tensor& positions, cudaStream_t stream) {
     constexpr int kBlock = 32;
     const int T          = drafts.ne[0] + 1;
     mtp_prepare_verify_inputs_kernel<<<1, kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(token.data),
-        static_cast<const std::int32_t*>(drafts.data),
-        static_cast<const std::int32_t*>(length.data),
-        static_cast<std::int32_t*>(window_base.data),
-        static_cast<std::int32_t*>(verify_ids.data),
-        static_cast<std::int32_t*>(positions.data), T);
+        static_cast<const std::int32_t*>(token.data), static_cast<const std::int32_t*>(drafts.data),
+        static_cast<const std::int32_t*>(length.data), static_cast<std::int32_t*>(window_base.data),
+        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), T);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -30,10 +26,10 @@ void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
                               Tensor& sampled_out, Tensor& num_sampled, Tensor& accepted,
                               Tensor& ar_pos, Tensor& stats, std::int32_t token_domain,
                               const SamplingConfig* config, cudaStream_t stream) {
-    const std::int32_t physical_rows = logits.ne[0];
-    const std::int32_t cols = drafts.ne[0] + 1;
+    const std::int32_t physical_rows  = logits.ne[0];
+    const std::int32_t cols           = drafts.ne[0] + 1;
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
-    const std::int32_t groups = sampler_group_count(partial_blocks);
+    const std::int32_t groups         = sampler_group_count(partial_blocks);
     // Same shared predicate the accept kernel self-guards on, so exactly one of
     // the single-block and multi-block paths runs for any shape.
     if (!sampler_multiblock_ok(token_domain, cols, partial_blocks, groups)) {
@@ -43,8 +39,8 @@ void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
             static_cast<const std::int32_t*>(drafts.data), static_cast<std::int32_t*>(length.data),
             static_cast<std::int32_t*>(token.data), static_cast<std::int32_t*>(sampled_out.data),
             static_cast<std::int32_t*>(num_sampled.data), static_cast<std::int32_t*>(accepted.data),
-            static_cast<std::int32_t*>(ar_pos.data), static_cast<std::int64_t*>(stats.data),
-            config, token_domain, physical_rows, drafts.ne[0]);
+            static_cast<std::int32_t*>(ar_pos.data), static_cast<std::int64_t*>(stats.data), config,
+            token_domain, physical_rows, drafts.ne[0]);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -90,8 +86,8 @@ void mtp_gather_hidden_row_launch(const Tensor& hidden, const Tensor& accepted, 
 
 void mtp_remap_draft_token_launch(Tensor& draft_token, const std::int32_t* id_map, std::int32_t n,
                                   cudaStream_t stream) {
-    mtp_remap_draft_token_kernel<<<1, 1, 0, stream>>>(
-        static_cast<std::int32_t*>(draft_token.data), id_map, n);
+    mtp_remap_draft_token_kernel<<<1, 1, 0, stream>>>(static_cast<std::int32_t*>(draft_token.data),
+                                                      id_map, n);
     CUDA_CHECK(cudaGetLastError());
 }
 

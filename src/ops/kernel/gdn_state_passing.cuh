@@ -210,9 +210,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                                   const __nv_bfloat16* __restrict__ k_in,
                                   const float* __restrict__ g_cumsum, const float* state_in,
                                   __nv_bfloat16* __restrict__ v_new,
-                                  __nv_bfloat16* __restrict__ h_chunk, float* state_out,
-                                  int64_t T, int64_t H_v,
-                                  ninfer::ops::head_map qk_map,
+                                  __nv_bfloat16* __restrict__ h_chunk, float* state_out, int64_t T,
+                                  int64_t H_v, ninfer::ops::head_map qk_map,
                                   // Token-axis stride for k (in floats).
                                   // Caller passes the materialised value
                                   // (launcher handles 0 -> H_qk * S).
@@ -311,10 +310,10 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
             const int row_g1 = row_g0 + 8;
             const int col_d0 = warp_d_global + 2 * lane_t;
             const int col_d1 = col_d0 + 1;
-            h_frag[m][0] = load_ldg<float>(state_in + st_base + (int64_t)col_d0 * S + row_g0);
-            h_frag[m][1] = load_ldg<float>(state_in + st_base + (int64_t)col_d1 * S + row_g0);
-            h_frag[m][2] = load_ldg<float>(state_in + st_base + (int64_t)col_d0 * S + row_g1);
-            h_frag[m][3] = load_ldg<float>(state_in + st_base + (int64_t)col_d1 * S + row_g1);
+            h_frag[m][0]     = load_ldg<float>(state_in + st_base + (int64_t)col_d0 * S + row_g0);
+            h_frag[m][1]     = load_ldg<float>(state_in + st_base + (int64_t)col_d1 * S + row_g0);
+            h_frag[m][2]     = load_ldg<float>(state_in + st_base + (int64_t)col_d0 * S + row_g1);
+            h_frag[m][3]     = load_ldg<float>(state_in + st_base + (int64_t)col_d1 * S + row_g1);
         }
     }
 
@@ -536,9 +535,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                         // GDN's TF32 fragment consumes ldmatrix registers in 0,2,1,3 order.
                         ldmatrix_x4(ua0, ua2, ua1, ua3, a_addr);
 
-                        mma_tf32_bits(vnew_frag[m_mm1][0], vnew_frag[m_mm1][1],
-                                             vnew_frag[m_mm1][2], vnew_frag[m_mm1][3], ua0, ua1,
-                                             ua2, ua3, ub0, ub1);
+                        mma_tf32_bits(vnew_frag[m_mm1][0], vnew_frag[m_mm1][1], vnew_frag[m_mm1][2],
+                                      vnew_frag[m_mm1][3], ua0, ua1, ua2, ua3, ub0, ub1);
                     }
                 }
             }
@@ -608,10 +606,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
             const int row_g0_loc = s_idx * BT_PER_WARP + m_mm1 * MMA_M + lane_g;
             const int row_g1_loc = row_g0_loc + 8;
             const int col_d0_loc = warp_d_local + 2 * lane_t;
-            store_vec(&vd_view.at(row_g0_loc, col_d0_loc),
-                      make_float2(v0 * dec_top, v1 * dec_top));
-            store_vec(&vd_view.at(row_g1_loc, col_d0_loc),
-                      make_float2(v2 * dec_bot, v3 * dec_bot));
+            store_vec(&vd_view.at(row_g0_loc, col_d0_loc), make_float2(v0 * dec_top, v1 * dec_top));
+            store_vec(&vd_view.at(row_g1_loc, col_d0_loc), make_float2(v2 * dec_bot, v3 * dec_bot));
         }
 
 #pragma unroll
@@ -658,8 +654,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                     const float a2 = k_view.at(row_a1, col_a_top);
                     const float a3 = k_view.at(row_a1, col_a_bot);
 
-                    mma_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1,
-                                     a2, a3, b0, b1);
+                    mma_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1, a2, a3,
+                             b0, b1);
                 }
             }
         } else {
@@ -685,8 +681,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                     const float a2 = k_view.at(row_a1, col_a_top);
                     const float a3 = k_view.at(row_a1, col_a_bot);
 
-                    mma_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1,
-                                     a2, a3, b0, b1);
+                    mma_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1, a2, a3,
+                             b0, b1);
                 }
             }
 
@@ -721,8 +717,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
                     const float a2 = k_view.at(row_a1, col_a_top);
                     const float a3 = k_view.at(row_a1, col_a_bot);
 
-                    mma_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1,
-                                     a2, a3, b0, b1);
+                    mma_tf32(h_frag[m][0], h_frag[m][1], h_frag[m][2], h_frag[m][3], a0, a1, a2, a3,
+                             b0, b1);
                 }
             }
         }
@@ -764,8 +760,8 @@ __launch_bounds__(kernel_dims<S>::THREADS, 1) __global__
 }
 
 template <int S>
-cudaError_t launch_typed(const gdn_chunked::state_passing_config& cfg,
-                         ninfer::ops::head_map qk_map, int NT) {
+cudaError_t launch_typed(const gdn_chunked::state_passing_config& cfg, ninfer::ops::head_map qk_map,
+                         int NT) {
     using D                  = kernel_dims<S>;
     constexpr int smem_bytes = smem_layout<S>::SMEM_FLOATS * (int)sizeof(float);
 

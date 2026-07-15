@@ -1,7 +1,7 @@
 // ninfer::ops - argmax wrapper: public api validation and launcher dispatch.
 #include "ninfer/ops/argmax.h"
 
-#include "ops/launcher/argmax.h"  // detail::argmax_launch
+#include "ops/launcher/argmax.h" // detail::argmax_launch
 
 #include <cstdint>
 #include <limits>
@@ -35,15 +35,11 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
 } // namespace
 
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
-    if (logits.dtype != DType::BF16) {
-        throw std::invalid_argument("argmax: logits must be BF16");
-    }
-    if (out.dtype != DType::I32) {
-        throw std::invalid_argument("argmax: out must be I32");
-    }
+    if (logits.dtype != DType::BF16) { throw std::invalid_argument("argmax: logits must be BF16"); }
+    if (out.dtype != DType::I32) { throw std::invalid_argument("argmax: out must be I32"); }
 
     const std::int64_t logits_n = numel_allow_zero(logits, "logits");
-    (void) numel_allow_zero(out, "out");
+    (void)numel_allow_zero(out, "out");
 
     if (logits.ne[2] != 1 || logits.ne[3] != 1) {
         throw std::invalid_argument("argmax: logits must be rank-2 [vocab,T]");

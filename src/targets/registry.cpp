@@ -72,8 +72,8 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     auto model  = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
     auto loaded = std::make_unique<LoadedQwen3_6_27BRtx5090>(std::move(model));
     auto sequence_plan = Target::plan_sequence(*loaded->model, device, options);
-    auto instance      = std::make_unique<Qwen3_6_27BRtx5090Instance>(
-        std::move(loaded), std::move(sequence_plan), device);
+    auto instance      = std::make_unique<Qwen3_6_27BRtx5090Instance>(std::move(loaded),
+                                                                      std::move(sequence_plan), device);
 
     LoadSummary summary;
     summary.target               = "qwen3_6_27b_rtx5090";

@@ -20,8 +20,7 @@ __device__ __forceinline__ __nv_bfloat162 residual_add_pair(__nv_bfloat162 y, __
 
 __global__ void residual_add_scalar_kernel(const __nv_bfloat16* y, __nv_bfloat16* x,
                                            std::int64_t n) {
-    const std::int64_t start =
-        blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < n; i += stride) {
         x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) + __bfloat162float(y[i]));

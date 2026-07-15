@@ -5,7 +5,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/silu_and_mul.cuh"
-#include "core/device.h"  // CUDA_CHECK
+#include "core/device.h" // CUDA_CHECK
 
 #include <algorithm>
 #include <cstdint>
@@ -38,10 +38,10 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     constexpr int kBlock = 128;
     if (!gate.is_contiguous() || !up.is_contiguous()) {
         if (can_use_dim0_split_fast_path(gate, up, out)) {
-            const std::int64_t row_pairs = gate.ne[0] / 2;
+            const std::int64_t row_pairs          = gate.ne[0] / 2;
             constexpr std::int64_t kPairsPerBlock = kBlock * kSiluAndMulPairsPerThread;
-            const int grid_x = static_cast<int>(
-                std::max<std::int64_t>(1, div_up(row_pairs, kPairsPerBlock)));
+            const int grid_x =
+                static_cast<int>(std::max<std::int64_t>(1, div_up(row_pairs, kPairsPerBlock)));
             const dim3 grid(grid_x, static_cast<unsigned int>(gate.ne[1]));
             silu_and_mul_dim0_split_kernel<<<grid, kBlock, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(gate.data),
@@ -51,13 +51,12 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
             CUDA_CHECK(cudaGetLastError());
             return;
         }
-        const int scalar_grid =
-            static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
+        const int scalar_grid = static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
         silu_and_mul_strided_input_kernel<<<scalar_grid, kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(gate.data), static_cast<const __nv_bfloat16*>(up.data),
-            static_cast<__nv_bfloat16*>(out.data), n, gate.ne[0], gate.ne[1], gate.ne[2],
-            gate.nb[0], gate.nb[1], gate.nb[2], gate.nb[3], up.nb[0], up.nb[1], up.nb[2],
-            up.nb[3]);
+            static_cast<const __nv_bfloat16*>(gate.data),
+            static_cast<const __nv_bfloat16*>(up.data), static_cast<__nv_bfloat16*>(out.data), n,
+            gate.ne[0], gate.ne[1], gate.ne[2], gate.nb[0], gate.nb[1], gate.nb[2], gate.nb[3],
+            up.nb[0], up.nb[1], up.nb[2], up.nb[3]);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -66,23 +65,21 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
     const auto up_addr   = reinterpret_cast<std::uintptr_t>(up.data);
     const auto out_addr  = reinterpret_cast<std::uintptr_t>(out.data);
     if (((gate_addr | up_addr | out_addr) & (alignof(__nv_bfloat162) - 1)) != 0) {
-        const int scalar_grid =
-            static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
+        const int scalar_grid = static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));
         silu_and_mul_scalar_kernel<<<scalar_grid, kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(gate.data), static_cast<const __nv_bfloat16*>(up.data),
-            static_cast<__nv_bfloat16*>(out.data), n);
+            static_cast<const __nv_bfloat16*>(gate.data),
+            static_cast<const __nv_bfloat16*>(up.data), static_cast<__nv_bfloat16*>(out.data), n);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
 
-    const std::int64_t n2 = n / 2;
+    const std::int64_t n2                 = n / 2;
     constexpr std::int64_t kPairsPerBlock = kBlock * kSiluAndMulPairsPerThread;
-    const int grid =
-        static_cast<int>(std::max<std::int64_t>(1, div_up(n2, kPairsPerBlock)));
+    const int grid = static_cast<int>(std::max<std::int64_t>(1, div_up(n2, kPairsPerBlock)));
 
-    silu_and_mul_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(gate.data), static_cast<const __nv_bfloat16*>(up.data),
-        static_cast<__nv_bfloat16*>(out.data), n);
+    silu_and_mul_kernel<<<grid, kBlock, 0, stream>>>(static_cast<const __nv_bfloat16*>(gate.data),
+                                                     static_cast<const __nv_bfloat16*>(up.data),
+                                                     static_cast<__nv_bfloat16*>(out.data), n);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -18,7 +18,7 @@ static void run(int n, const char* tag) {
     Tensor tg(g.p, DType::BF16, {n}), tu(u.p, DType::BF16, {n}), tout(out.p, DType::BF16, {n});
 
     const double bytes = 3.0 * static_cast<double>(n) * 2.0; // read gate + read up + write out
-    const Result r = bench_loop([&](cudaStream_t s) { ops::silu_mul(tg, tu, tout, s); }, bytes);
+    const Result r     = bench_loop([&](cudaStream_t s) { ops::silu_mul(tg, tu, tout, s); }, bytes);
     print_result(tag, r);
 }
 

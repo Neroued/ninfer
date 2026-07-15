@@ -33,14 +33,12 @@ namespace ninfer::ops::detail {
 // Issue the cp.async copies for one 16-group tile into a shared buffer slot, then
 // commit them as one pipeline group. Every lane commits (even lanes that issue
 // fewer copies) so a uniform pipe_wait works warp-wide.
-__device__ __forceinline__ void q5_issue_tile(uint4* __restrict__ s_nib, uint4* __restrict__ s_hi,
-                                              uint4* __restrict__ s_sc,
-                                              const std::uint8_t* __restrict__ code_row,
-                                              const std::uint8_t* __restrict__ high_row,
-                                              const std::uint8_t* __restrict__ scale_row, int tile,
-                                              int lane) {
+__device__ __forceinline__ void
+q5_issue_tile(uint4* __restrict__ s_nib, uint4* __restrict__ s_hi, uint4* __restrict__ s_sc,
+              const std::uint8_t* __restrict__ code_row, const std::uint8_t* __restrict__ high_row,
+              const std::uint8_t* __restrict__ scale_row, int tile, int lane) {
     constexpr int kGroupsPerTile = 16;
-    const int     g0             = tile * kGroupsPerTile;
+    const int g0                 = tile * kGroupsPerTile;
     pipe_copy<16>(&s_nib[lane], reinterpret_cast<const uint4*>(code_row + g0 * 32) + lane);
     if (lane < 8) {
         pipe_copy<16>(&s_hi[lane], reinterpret_cast<const uint4*>(high_row + g0 * 8) + lane);
@@ -61,19 +59,19 @@ __device__ __forceinline__ float q5_consume_tile(const __nv_bfloat162* __restric
     constexpr int kGroupsPerTile       = 16;
     constexpr int kNibbleBytesPerGroup = 32;
     constexpr int kHighBytesPerGroup   = 8;
-    const auto*   tn  = reinterpret_cast<const std::uint8_t*>(s_nib);
-    const auto*   th  = reinterpret_cast<const std::uint8_t*>(s_hi);
-    const auto*   tsc = reinterpret_cast<const std::uint16_t*>(s_sc);
-    const int     g0  = tile * kGroupsPerTile;
+    const auto* tn                     = reinterpret_cast<const std::uint8_t*>(s_nib);
+    const auto* th                     = reinterpret_cast<const std::uint8_t*>(s_hi);
+    const auto* tsc                    = reinterpret_cast<const std::uint16_t*>(s_sc);
+    const int g0                       = tile * kGroupsPerTile;
 #pragma unroll
     for (int tg = 0; tg < kGroupsPerTile; ++tg) {
-        const float        scale = __half2float(__ushort_as_half(tsc[tg]));
-        const std::uint8_t low   = tn[tg * kNibbleBytesPerGroup + lane];
-        const std::uint8_t high  = th[tg * kHighBytesPerGroup + (lane >> 2)] >> ((lane & 3) * 2);
+        const float scale       = __half2float(__ushort_as_half(tsc[tg]));
+        const std::uint8_t low  = tn[tg * kNibbleBytesPerGroup + lane];
+        const std::uint8_t high = th[tg * kHighBytesPerGroup + (lane >> 2)] >> ((lane & 3) * 2);
         const int q0 = sign_extend<5>(static_cast<int>((low & 0x0fu) | ((high & 0x01u) << 4)));
         const int q1 = sign_extend<5>(static_cast<int>((low >> 4) | ((high & 0x02u) << 3)));
 
-        const int    k0 = (g0 + tg) * kGroupK + lane * 2;
+        const int k0    = (g0 + tg) * kGroupK + lane * 2;
         const float2 xv = __bfloat1622float2(x2[k0 >> 1]);
         acc             = fmaf(static_cast<float>(q0) * scale, xv.x, acc);
         acc             = fmaf(static_cast<float>(q1) * scale, xv.y, acc);
@@ -113,10 +111,9 @@ __global__ void linear_rowsplit_gemv_q5_kernel(const __nv_bfloat16* __restrict__
     if constexpr (kStageX) {
         // x must be 16-byte aligned for the uint4 staging (guaranteed: activations
         // come from the 256-byte-aligned workspace arena).
-        auto*       x_sh_v = reinterpret_cast<uint4*>(x_sh);
-        const auto* x_g    = reinterpret_cast<const uint4*>(x);
-        for (int i = static_cast<int>(threadIdx.x); i < kXVecs;
-             i += static_cast<int>(blockDim.x)) {
+        auto* x_sh_v    = reinterpret_cast<uint4*>(x_sh);
+        const auto* x_g = reinterpret_cast<const uint4*>(x);
+        for (int i = static_cast<int>(threadIdx.x); i < kXVecs; i += static_cast<int>(blockDim.x)) {
             x_sh_v[i] = x_g[i];
         }
         __syncthreads();
@@ -131,9 +128,8 @@ __global__ void linear_rowsplit_gemv_q5_kernel(const __nv_bfloat16* __restrict__
     const std::uint8_t* high_row =
         high_bits + static_cast<std::int64_t>(row) * kGroups * kHighBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
-    const auto*         x2 =
-        kStageX ? reinterpret_cast<const __nv_bfloat162*>(x_sh)
-                : reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* x2                = kStageX ? reinterpret_cast<const __nv_bfloat162*>(x_sh)
+                                            : reinterpret_cast<const __nv_bfloat162*>(x);
 
     // Prime up to kPrefetch tiles; empty commits keep the group count uniform so the
     // constant pipe_wait<kPrefetch>() in the loop is always valid.
@@ -171,7 +167,7 @@ __global__ void linear_rowsplit_gemv_q5_kernel(const __nv_bfloat16* __restrict__
     if constexpr (kResidual) {
         if (lane == 0) {
             const __nv_bfloat16 y = __float2bfloat16_rn(acc);
-            acc = __bfloat162float(residual[row]) + __bfloat162float(y);
+            acc                   = __bfloat162float(residual[row]) + __bfloat162float(y);
         }
     }
     if (lane == 0) { out[row] = __float2bfloat16_rn(acc); }
@@ -202,10 +198,9 @@ __global__ void linear_rowsplit_gemv_q5_dual_kernel(
     __shared__ uint4 s_sc[kRowsPerBlock][kStages][2];
 
     if constexpr (kStageX) {
-        auto*       x_sh_v = reinterpret_cast<uint4*>(x_sh);
-        const auto* x_g    = reinterpret_cast<const uint4*>(x);
-        for (int i = static_cast<int>(threadIdx.x); i < kXVecs;
-             i += static_cast<int>(blockDim.x)) {
+        auto* x_sh_v    = reinterpret_cast<uint4*>(x_sh);
+        const auto* x_g = reinterpret_cast<const uint4*>(x);
+        for (int i = static_cast<int>(threadIdx.x); i < kXVecs; i += static_cast<int>(blockDim.x)) {
             x_sh_v[i] = x_g[i];
         }
         __syncthreads();
@@ -220,16 +215,15 @@ __global__ void linear_rowsplit_gemv_q5_dual_kernel(
     const std::uint8_t* codes     = second ? codes1 : codes0;
     const std::uint8_t* high_bits = second ? high_bits1 : high_bits0;
     const std::uint8_t* scales    = second ? scales1 : scales0;
-    __nv_bfloat16*      out       = second ? out1 : out0;
+    __nv_bfloat16* out            = second ? out1 : out0;
 
     const std::uint8_t* code_row =
         codes + static_cast<std::int64_t>(row) * kGroups * kNibbleBytesPerGroup;
     const std::uint8_t* high_row =
         high_bits + static_cast<std::int64_t>(row) * kGroups * kHighBytesPerGroup;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroups * 2;
-    const auto*         x2 =
-        kStageX ? reinterpret_cast<const __nv_bfloat162*>(x_sh)
-                : reinterpret_cast<const __nv_bfloat162*>(x);
+    const auto* x2                = kStageX ? reinterpret_cast<const __nv_bfloat162*>(x_sh)
+                                            : reinterpret_cast<const __nv_bfloat162*>(x);
 
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
@@ -271,20 +265,19 @@ inline void launch_q5_rowsplit_gemv(const __nv_bfloat16* x, const std::uint8_t* 
                                     const std::uint8_t* high_bits, const std::uint8_t* scales,
                                     __nv_bfloat16* out, cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
-    const int     grid          = kN / kRowsPerBlock;
+    const int grid              = kN / kRowsPerBlock;
     linear_rowsplit_gemv_q5_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, false>
         <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, nullptr, out);
 }
 
 template <int kN, int kK, int kRowsPerBlock, int kStages = 2, bool kStageX = true>
-inline void launch_q5_rowsplit_gemv_residual(const __nv_bfloat16* x,
-                                             const std::uint8_t* codes,
+inline void launch_q5_rowsplit_gemv_residual(const __nv_bfloat16* x, const std::uint8_t* codes,
                                              const std::uint8_t* high_bits,
                                              const std::uint8_t* scales,
-                                             const __nv_bfloat16* residual,
-                                             __nv_bfloat16* out, cudaStream_t stream) {
+                                             const __nv_bfloat16* residual, __nv_bfloat16* out,
+                                             cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
-    const int     grid          = kN / kRowsPerBlock;
+    const int grid              = kN / kRowsPerBlock;
     linear_rowsplit_gemv_q5_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, true>
         <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, residual, out);
 }
@@ -292,13 +285,12 @@ inline void launch_q5_rowsplit_gemv_residual(const __nv_bfloat16* x,
 template <int kN, int kK, int kRowsPerBlock, int kStages = 2, bool kStageX = true>
 inline void launch_q5_rowsplit_gemv_dual(const __nv_bfloat16* x, const std::uint8_t* codes0,
                                          const std::uint8_t* high_bits0,
-                                         const std::uint8_t* scales0,
-                                         const std::uint8_t* codes1,
+                                         const std::uint8_t* scales0, const std::uint8_t* codes1,
                                          const std::uint8_t* high_bits1,
                                          const std::uint8_t* scales1, __nv_bfloat16* out0,
                                          __nv_bfloat16* out1, cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
-    const int     grid          = (2 * kN) / kRowsPerBlock;
+    const int grid              = (2 * kN) / kRowsPerBlock;
     linear_rowsplit_gemv_q5_dual_kernel<kN, kK, kRowsPerBlock, kStages, kStageX>
         <<<grid, kBlockThreads, 0, stream>>>(x, codes0, high_bits0, scales0, codes1, high_bits1,
                                              scales1, out0, out1);

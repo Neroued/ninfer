@@ -27,13 +27,13 @@ GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
 // convention consumed by Chatbox, Open WebUI, etc.), leaving `content` = answer.
 std::string make_chat_completion_response(const std::string& id, const std::string& model,
                                           std::int64_t created, const std::string& content,
-                                          const std::string& reasoning,
-                                          const char* finish_reason, const CompletionUsage& usage);
+                                          const std::string& reasoning, const char* finish_reason,
+                                          const CompletionUsage& usage);
 std::string make_chat_completion_tool_response(const std::string& id, const std::string& model,
-                                                std::int64_t created, const std::string& content,
-                                                const std::string& reasoning,
-                                                const std::vector<ToolCall>& tool_calls,
-                                                const CompletionUsage& usage);
+                                               std::int64_t created, const std::string& content,
+                                               const std::string& reasoning,
+                                               const std::vector<ToolCall>& tool_calls,
+                                               const CompletionUsage& usage);
 
 // Streaming SSE event strings ("data: {...}\n\n"). The first chunk carries the
 // assistant role; reasoning chunks carry `reasoning_content` deltas (the <think>
@@ -48,15 +48,14 @@ std::string make_chat_chunk_reasoning(const std::string& id, const std::string& 
                                       std::int64_t created, const std::string& delta_text,
                                       bool include_usage);
 std::string make_chat_chunk_content(const std::string& id, const std::string& model,
-                                     std::int64_t created, const std::string& delta_text,
-                                     bool include_usage);
+                                    std::int64_t created, const std::string& delta_text,
+                                    bool include_usage);
 std::string make_chat_chunk_tool_calls(const std::string& id, const std::string& model,
                                        std::int64_t created,
-                                       const std::vector<ToolCall>& tool_calls,
-                                       bool include_usage);
+                                       const std::vector<ToolCall>& tool_calls, bool include_usage);
 std::string make_chat_chunk_final(const std::string& id, const std::string& model,
-                                   std::int64_t created, const char* finish_reason,
-                                   bool include_usage);
+                                  std::int64_t created, const char* finish_reason,
+                                  bool include_usage);
 // Dedicated usage chunk: `choices: []` with the request's token usage. Emitted
 // only when stream_options.include_usage is true.
 std::string make_chat_chunk_usage(const std::string& id, const std::string& model,

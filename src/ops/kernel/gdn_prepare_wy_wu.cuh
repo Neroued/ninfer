@@ -36,10 +36,10 @@ static_assert(gdn_chunked::kChunkSize == 64,
               "stage_prepare_wy_wu: kChunkSize must be 64 (kernel hard-codes "
               "BT=64 = 4 * BC=16)");
 
-constexpr int N_SUB     = BT / BC;                           // 4
-constexpr int N_WARPS   = N_SUB;                             // 4 warps
+constexpr int N_SUB     = BT / BC;                          // 4
+constexpr int N_WARPS   = N_SUB;                            // 4 warps
 constexpr int THREADS   = N_WARPS * ninfer::ops::kWarpSize; // 128
-constexpr int N_K_TILES = BT / MMA_K;                        // 8 (recompute_wu)
+constexpr int N_K_TILES = BT / MMA_K;                       // 8 (recompute_wu)
 
 static_assert(MMA_M == BC, "kernel assumes MMA m == BC");
 
@@ -127,8 +127,8 @@ __device__ __forceinline__ void mma16_raw_x_swiz(float D[8], int lane,
             const int n_off = nt * MMA_N;
             const float b0  = M_view.at(M_row_off + k_off + lane_t, M_col_off + n_off + lane_g);
             const float b1  = M_view.at(M_row_off + k_off + lane_t + 4, M_col_off + n_off + lane_g);
-            mma_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2,
-                             a3, b0, b1);
+            mma_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2, a3, b0,
+                     b1);
         }
     }
 }
@@ -151,8 +151,8 @@ __device__ __forceinline__ void mma16_swiz_x_raw(float D[8], int lane, SmemTile<
             const int n_off = nt * MMA_N;
             const float b0  = B_buf[(k_off + lane_t) * SCR_STRIDE + (n_off + lane_g)];
             const float b1  = B_buf[(k_off + lane_t + 4) * SCR_STRIDE + (n_off + lane_g)];
-            mma_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2,
-                             a3, b0, b1);
+            mma_tf32(D[nt * 4 + 0], D[nt * 4 + 1], D[nt * 4 + 2], D[nt * 4 + 3], a0, a1, a2, a3, b0,
+                     b1);
         }
     }
 }
@@ -348,8 +348,8 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
                     const float b1  = K_view.at(row_b, col_t1);
 
                     mma_tf32(A_reg[j_sub][n_tile * 4 + 0], A_reg[j_sub][n_tile * 4 + 1],
-                                     A_reg[j_sub][n_tile * 4 + 2], A_reg[j_sub][n_tile * 4 + 3], a0,
-                                     a1, a2, a3, b0, b1);
+                             A_reg[j_sub][n_tile * 4 + 2], A_reg[j_sub][n_tile * 4 + 3], a0, a1, a2,
+                             a3, b0, b1);
                 }
             }
         }
@@ -533,7 +533,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
             (int64_t)b * T * v_stride_t + (int64_t)cs * v_stride_t + (int64_t)h_v * S;
         const int64_t row_stride = v_stride_t;
         ninfer::ops::issue_load_bf16_to_float_vec4<BT, S, THREADS>(VK_view, v_in + row_base,
-                                                                    row_stride, cl, tid);
+                                                                   row_stride, cl, tid);
     }
 
     if (tid < BT) { bg_smem[tid] = beta_smem[tid] * expf(g_smem[tid]); }
@@ -698,7 +698,7 @@ prepare_wy_wu_gdn_kernel(const __nv_bfloat16* __restrict__ k_in,
         const int64_t row_base =
             ((int64_t)b * T + cs) * k_stride_t + (int64_t)qk_map.qk_head(h_v) * S;
         ninfer::ops::issue_load_bf16_to_float_vec4<BT, S, THREADS>(VK_view, k_in + row_base,
-                                                                    k_stride_t, cl, tid);
+                                                                   k_stride_t, cl, tid);
     }
     __syncthreads();
 

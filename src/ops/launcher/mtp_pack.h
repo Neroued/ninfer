@@ -13,4 +13,3 @@ void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tenso
                               cudaStream_t stream);
 
 } // namespace ninfer::ops::detail
-

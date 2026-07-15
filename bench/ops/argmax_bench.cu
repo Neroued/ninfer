@@ -15,9 +15,9 @@ using namespace ninfer::bench;
 
 namespace {
 
-constexpr std::int32_t kVocab = 248320;
+constexpr std::int32_t kVocab       = 248320;
 constexpr std::int32_t kTokenDomain = 248077;
-constexpr int kLogitSlots = 256;
+constexpr int kLogitSlots           = 256;
 
 void run_decode() {
     DBuf logits =
@@ -28,13 +28,13 @@ void run_decode() {
     Tensor tout(out.p, DType::I32, {1});
 
     const double bytes = static_cast<double>(kTokenDomain) * 2.0;
-    int launch = 0;
-    const Result r = bench_loop(
+    int launch         = 0;
+    const Result r     = bench_loop(
         [&](cudaStream_t s) {
             const int slot = launch++ & (kLogitSlots - 1);
-            Tensor tlogits(logits_base + static_cast<std::size_t>(slot) *
-                                             static_cast<std::size_t>(kVocab),
-                           DType::BF16, {kVocab, 1});
+            Tensor tlogits(logits_base +
+                                   static_cast<std::size_t>(slot) * static_cast<std::size_t>(kVocab),
+                               DType::BF16, {kVocab, 1});
             ops::argmax(tlogits, tout, kTokenDomain, s);
         },
         bytes);

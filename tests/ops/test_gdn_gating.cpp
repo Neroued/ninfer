@@ -36,18 +36,18 @@ static void cpu_gdn_gating(const std::vector<float>& a, const std::vector<float>
 
 static Weight dense_bf16_weight(void* data) {
     Weight w{};
-    w.qtype             = QType::BF16_CTRL;
-    w.layout            = QuantLayout::Contiguous;
-    w.payload           = data;
-    w.payload_bytes     = static_cast<std::uint64_t>(48) * 5120u * 2u;
-    w.qdata             = data;
-    w.ndim              = 2;
-    w.shape[0]          = 48;
-    w.shape[1]          = 5120;
-    w.padded_shape[0]   = 48;
-    w.padded_shape[1]   = 5120;
-    w.n                 = 48;
-    w.k                 = 5120;
+    w.qtype           = QType::BF16_CTRL;
+    w.layout          = QuantLayout::Contiguous;
+    w.payload         = data;
+    w.payload_bytes   = static_cast<std::uint64_t>(48) * 5120u * 2u;
+    w.qdata           = data;
+    w.ndim            = 2;
+    w.shape[0]        = 48;
+    w.shape[1]        = 5120;
+    w.padded_shape[0] = 48;
+    w.padded_shape[1] = 5120;
+    w.n               = 48;
+    w.k               = 5120;
     return w;
 }
 

@@ -47,23 +47,22 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
                                   std::span<const std::uint64_t> shape);
 
 struct RowSplitGeometry {
-    std::uint64_t rows = 0;
-    std::uint64_t columns = 0;
-    std::uint64_t padded_columns = 0;
-    std::uint64_t group_size = 0;
-    std::uint64_t groups_per_row = 0;
-    std::uint64_t low_bytes_per_group = 0;
+    std::uint64_t rows                 = 0;
+    std::uint64_t columns              = 0;
+    std::uint64_t padded_columns       = 0;
+    std::uint64_t group_size           = 0;
+    std::uint64_t groups_per_row       = 0;
+    std::uint64_t low_bytes_per_group  = 0;
     std::uint64_t high_bytes_per_group = 0;
-    std::uint64_t low_plane_bytes = 0;
-    std::uint64_t high_plane_offset = 0;
-    std::uint64_t high_plane_bytes = 0;
-    std::uint64_t scale_plane_offset = 0;
-    std::uint64_t scale_plane_bytes = 0;
-    std::uint64_t encoded_bytes = 0;
+    std::uint64_t low_plane_bytes      = 0;
+    std::uint64_t high_plane_offset    = 0;
+    std::uint64_t high_plane_bytes     = 0;
+    std::uint64_t scale_plane_offset   = 0;
+    std::uint64_t scale_plane_bytes    = 0;
+    std::uint64_t encoded_bytes        = 0;
 };
 
-RowSplitGeometry row_split_geometry(NumericFormat format,
-                                    std::span<const std::uint64_t> shape);
+RowSplitGeometry row_split_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 
 struct TensorDescriptor {
     std::string name;
@@ -99,7 +98,7 @@ public:
 
     Reader(Reader&&) noexcept;
     Reader& operator=(Reader&&) noexcept;
-    Reader(const Reader&) = delete;
+    Reader(const Reader&)            = delete;
     Reader& operator=(const Reader&) = delete;
 
     const std::string& model_id() const noexcept;

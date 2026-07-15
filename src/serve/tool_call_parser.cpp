@@ -49,27 +49,27 @@ std::string new_tool_call_id() {
 }
 
 bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args) {
-    constexpr std::string_view kParamOpen = "<parameter=";
+    constexpr std::string_view kParamOpen  = "<parameter=";
     constexpr std::string_view kParamClose = "</parameter>";
     if (!starts_with_at(inner, pos, kParamOpen)) { return false; }
     const std::size_t name_begin = pos + kParamOpen.size();
     const std::size_t name_end   = inner.find('>', name_begin);
     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
-    const std::string key = std::string(inner.substr(name_begin, name_end - name_begin));
-    pos                   = name_end + 1;
+    const std::string key       = std::string(inner.substr(name_begin, name_end - name_begin));
+    pos                         = name_end + 1;
     const std::size_t value_end = inner.find(kParamClose, pos);
     if (value_end == std::string_view::npos) { return false; }
     const std::string raw_value = trim_ascii(inner.substr(pos, value_end - pos));
-    Json parsed                = Json::parse(raw_value, nullptr, false);
-    args[key]                  = parsed.is_discarded() ? Json(raw_value) : parsed;
-    pos                        = value_end + kParamClose.size();
+    Json parsed                 = Json::parse(raw_value, nullptr, false);
+    args[key]                   = parsed.is_discarded() ? Json(raw_value) : parsed;
+    pos                         = value_end + kParamClose.size();
     return true;
 }
 
 bool parse_one_tool_call(std::string_view block, ToolCall& out) {
-    constexpr std::string_view kFunctionOpen = "<function=";
+    constexpr std::string_view kFunctionOpen  = "<function=";
     constexpr std::string_view kFunctionClose = "</function>";
-    std::size_t pos = 0;
+    std::size_t pos                           = 0;
     skip_ws(block, pos);
     if (!starts_with_at(block, pos, kFunctionOpen)) { return false; }
     const std::size_t name_begin = pos + kFunctionOpen.size();
@@ -124,7 +124,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text) {
         if (pos >= text.size()) { break; }
         if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
         const std::size_t inner_begin = pos + kToolOpen.size();
-        const std::size_t close = text.find(kToolClose, inner_begin);
+        const std::size_t close       = text.find(kToolClose, inner_begin);
         if (close == std::string::npos) { return fallback(text); }
         ToolCall call;
         if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),

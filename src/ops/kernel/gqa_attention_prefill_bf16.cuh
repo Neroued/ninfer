@@ -87,11 +87,13 @@ __device__ __forceinline__ void gqa_prefill_stage_kv(__nv_bfloat16* dst, const _
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
-__launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_bf16_kernel(
-    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ cache_k,
-    const __nv_bfloat16* __restrict__ cache_v, const std::int32_t* __restrict__ positions,
-    float scale, __nv_bfloat16* __restrict__ out, std::int32_t tokens,
-    std::int32_t padded_context) {
+__launch_bounds__(kGqaPrefillThreads, 1) __global__
+    void gqa_attention_prefill_bf16_kernel(const __nv_bfloat16* __restrict__ q,
+                                           const __nv_bfloat16* __restrict__ cache_k,
+                                           const __nv_bfloat16* __restrict__ cache_v,
+                                           const std::int32_t* __restrict__ positions, float scale,
+                                           __nv_bfloat16* __restrict__ out, std::int32_t tokens,
+                                           std::int32_t padded_context) {
     constexpr int D             = kGqaPrefillHeadDim; // 256
     constexpr int Br            = kGqaPrefillBr;      // 64 query rows
     constexpr int Bc            = kGqaPrefillBc;      // 64 key cols
@@ -227,13 +229,12 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
         unsigned bf[2][QKNt][2];
         {
             ldmatrix_x4(af[0][0], af[0][1], af[0][2], af[0][3],
-                                    gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
+                        gqa_prefill_swz_addr(q_lane_base, 0u, q_as, q_r));
 #pragma unroll
             for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
-                ldmatrix_x4(
-                    bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
-                    gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2 * 4096), 0u, k_as,
-                                         k_r));
+                ldmatrix_x4(bf[0][nt2][0], bf[0][nt2][1], bf[0][nt2 + 1][0], bf[0][nt2 + 1][1],
+                            gqa_prefill_swz_addr(k_lane_base + static_cast<unsigned>(nt2 * 4096),
+                                                 0u, k_as, k_r));
             }
         }
 #pragma unroll
@@ -243,7 +244,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
             if (k + 1 < QKKs) {
                 const unsigned ck = static_cast<unsigned>((k + 1) << 5);
                 ldmatrix_x4(af[nxt][0], af[nxt][1], af[nxt][2], af[nxt][3],
-                                        gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
+                            gqa_prefill_swz_addr(q_lane_base, ck, q_as, q_r));
 #pragma unroll
                 for (int nt2 = 0; nt2 < QKNt; nt2 += 2) {
                     ldmatrix_x4(
@@ -254,9 +255,8 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
             }
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2],
-                                              score[nt][3], af[cur][0], af[cur][1], af[cur][2],
-                                              af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
+                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[cur][0],
+                         af[cur][1], af[cur][2], af[cur][3], bf[cur][nt][0], bf[cur][nt][1]);
             }
         }
 
@@ -306,14 +306,10 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
         if (full_score_tile) {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const float p00 =
-                    exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled));
-                const float p01 =
-                    exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled));
-                const float p10 =
-                    exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled));
-                const float p11 =
-                    exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled));
+                const float p00 = exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled));
+                const float p01 = exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled));
+                const float p10 = exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled));
+                const float p11 = exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled));
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
@@ -328,22 +324,18 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
         } else {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const float p00 =
-                    (score[nt][0] > -CUDART_INF_F)
-                        ? exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
-                        : 0.0f;
-                const float p01 =
-                    (score[nt][1] > -CUDART_INF_F)
-                        ? exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
-                        : 0.0f;
-                const float p10 =
-                    (score[nt][2] > -CUDART_INF_F)
-                        ? exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
-                        : 0.0f;
-                const float p11 =
-                    (score[nt][3] > -CUDART_INF_F)
-                        ? exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
-                        : 0.0f;
+                const float p00 = (score[nt][0] > -CUDART_INF_F)
+                                      ? exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
+                                      : 0.0f;
+                const float p01 = (score[nt][1] > -CUDART_INF_F)
+                                      ? exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
+                                      : 0.0f;
+                const float p10 = (score[nt][2] > -CUDART_INF_F)
+                                      ? exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
+                                      : 0.0f;
+                const float p11 = (score[nt][3] > -CUDART_INF_F)
+                                      ? exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
+                                      : 0.0f;
                 bl0 += p00 + p01;
                 bl1 += p10 + p11;
                 const int pk = nt >> 1;
@@ -390,7 +382,7 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
         unsigned vf[2][4];
         {
             ldmatrix_x4_t(vf[0][0], vf[0][1], vf[0][2], vf[0][3],
-                                          gqa_prefill_swz_addr(v_lane_base, 0u, v_as, v_r));
+                          gqa_prefill_swz_addr(v_lane_base, 0u, v_as, v_r));
         }
 #pragma unroll
         for (int li = 0; li < PVLoads; ++li) {
@@ -402,17 +394,14 @@ __launch_bounds__(kGqaPrefillThreads, 1) __global__ void gqa_attention_prefill_b
                 const int k2       = (li + 1) / PVHalf;
                 const int n2b      = ((li + 1) % PVHalf) * 2;
                 const unsigned ckv = static_cast<unsigned>(n2b << 4);
-                ldmatrix_x4_t(
-                    vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
-                    gqa_prefill_swz_addr(v_lane_base + static_cast<unsigned>(k2 * 8192), ckv, v_as,
-                                         v_r));
+                ldmatrix_x4_t(vf[nxt][0], vf[nxt][1], vf[nxt][2], vf[nxt][3],
+                              gqa_prefill_swz_addr(v_lane_base + static_cast<unsigned>(k2 * 8192),
+                                                   ckv, v_as, v_r));
             }
-            mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3],
-                                          p_frag[k][0], p_frag[k][1], p_frag[k][2], p_frag[k][3],
-                                          vf[cur][0], vf[cur][1]);
-            mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2],
-                                          acc[n2 + 1][3], p_frag[k][0], p_frag[k][1], p_frag[k][2],
-                                          p_frag[k][3], vf[cur][2], vf[cur][3]);
+            mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[k][0], p_frag[k][1],
+                     p_frag[k][2], p_frag[k][3], vf[cur][0], vf[cur][1]);
+            mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3], p_frag[k][0],
+                     p_frag[k][1], p_frag[k][2], p_frag[k][3], vf[cur][2], vf[cur][3]);
         }
     }
 

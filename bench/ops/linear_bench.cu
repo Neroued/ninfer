@@ -20,8 +20,8 @@ namespace {
 // real decode the working set is >>L2, so every weight read is a cold DRAM read.
 // --cold flushes a >L2 buffer before each timed launch to model that. ncu remains
 // the acceptance gate; this is a fast iteration signal.
-bool g_cold              = false;
-void* g_flush_buf        = nullptr;
+bool g_cold                       = false;
+void* g_flush_buf                 = nullptr;
 constexpr std::size_t kFlushBytes = std::size_t(256) << 20; // 256 MiB > L2
 
 void flush_l2() {
@@ -40,7 +40,7 @@ Result bench_loop_cold(const launch_fn& launch, double bytes_moved, int warmup =
     std::vector<double> samples;
     samples.reserve(repeat);
     for (int i = 0; i < repeat; ++i) {
-        flush_l2();                 // serialized before launch on the default stream
+        flush_l2(); // serialized before launch on the default stream
         cudaEventRecord(a, nullptr);
         launch(nullptr);
         cudaEventRecord(b, nullptr);
@@ -54,12 +54,12 @@ Result bench_loop_cold(const launch_fn& launch, double bytes_moved, int warmup =
 
     std::sort(samples.begin(), samples.end());
     Result r;
-    r.n_runs      = int(samples.size());
-    r.inner_iters = 1;
-    r.median_us   = samples[samples.size() / 2];
-    r.min_us      = samples.front();
-    r.p95_us      = samples[std::min(samples.size() - 1, std::size_t(0.95 * samples.size()))];
-    r.mean_us     = r.median_us;
+    r.n_runs         = int(samples.size());
+    r.inner_iters    = 1;
+    r.median_us      = samples[samples.size() / 2];
+    r.min_us         = samples.front();
+    r.p95_us         = samples[std::min(samples.size() - 1, std::size_t(0.95 * samples.size()))];
+    r.mean_us        = r.median_us;
     const double sec = r.median_us * 1e-6;
     r.gbs            = (sec > 0.0) ? bytes_moved / sec / 1e9 : 0.0;
     return r;
@@ -92,21 +92,21 @@ DBuf make_weight(QType qtype, std::size_t n) {
 
 Weight dense_weight(void* data, QType qtype, std::int32_t n, std::int32_t k) {
     Weight w{};
-    w.payload       = data;
-    w.payload_bytes = static_cast<std::uint64_t>(n) * k * ((qtype == QType::FP32_CTRL) ? 4u : 2u);
-    w.qtype         = qtype;
-    w.layout        = QuantLayout::Contiguous;
-    w.group_size        = 0;
-    w.shape[0]          = n;
-    w.shape[1]          = k;
-    w.padded_shape[0]   = n;
-    w.padded_shape[1]   = k;
-    w.ndim              = 2;
-    w.qdata             = data;
-    w.scales            = nullptr;
-    w.n                 = n;
-    w.k                 = k;
-    w.group             = 0;
+    w.payload         = data;
+    w.payload_bytes   = static_cast<std::uint64_t>(n) * k * ((qtype == QType::FP32_CTRL) ? 4u : 2u);
+    w.qtype           = qtype;
+    w.layout          = QuantLayout::Contiguous;
+    w.group_size      = 0;
+    w.shape[0]        = n;
+    w.shape[1]        = k;
+    w.padded_shape[0] = n;
+    w.padded_shape[1] = k;
+    w.ndim            = 2;
+    w.qdata           = data;
+    w.scales          = nullptr;
+    w.n               = n;
+    w.k               = k;
+    w.group           = 0;
     return w;
 }
 
@@ -148,19 +148,27 @@ void run_dense_stress(QType qtype) {
 
 std::int32_t nibble_bytes_per_group(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S: return 32;
-    case QType::Q5G64_F16S: return 32;
-    case QType::Q6G64_F16S: return 32;
-    default:                return 0;
+    case QType::Q4G64_F16S:
+        return 32;
+    case QType::Q5G64_F16S:
+        return 32;
+    case QType::Q6G64_F16S:
+        return 32;
+    default:
+        return 0;
     }
 }
 
 std::int32_t high_bytes_per_group(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S: return 0;
-    case QType::Q5G64_F16S: return 8;
-    case QType::Q6G64_F16S: return 16;
-    default:                return 0;
+    case QType::Q4G64_F16S:
+        return 0;
+    case QType::Q5G64_F16S:
+        return 8;
+    case QType::Q6G64_F16S:
+        return 16;
+    default:
+        return 0;
     }
 }
 
@@ -170,10 +178,9 @@ std::uint64_t align_up_u64(std::uint64_t value, std::uint64_t align) {
 
 DBuf make_row_split_payload(QType qtype, std::int32_t n, std::int32_t k) {
     constexpr std::uint16_t kScaleOne = 0x3c00u;
-    const std::int32_t k_pad = static_cast<std::int32_t>(align_up_u64(k, 128));
-    const std::int32_t kg    = k_pad / 64;
-    const std::uint64_t groups =
-        static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg);
+    const std::int32_t k_pad          = static_cast<std::int32_t>(align_up_u64(k, 128));
+    const std::int32_t kg             = k_pad / 64;
+    const std::uint64_t groups = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg);
     const std::uint64_t nibble_bytes =
         groups * static_cast<std::uint64_t>(nibble_bytes_per_group(qtype));
     const std::uint64_t high_bytes =
@@ -195,10 +202,8 @@ DBuf make_row_split_payload(QType qtype, std::int32_t n, std::int32_t k) {
         for (std::int32_t g = 0; g < kg; ++g) {
             const std::uint64_t off =
                 scale_offset + (static_cast<std::uint64_t>(row) * kg + g) * 2ULL;
-            payload[static_cast<std::size_t>(off)] =
-                static_cast<std::uint8_t>(kScaleOne & 0xffu);
-            payload[static_cast<std::size_t>(off + 1)] =
-                static_cast<std::uint8_t>(kScaleOne >> 8);
+            payload[static_cast<std::size_t>(off)] = static_cast<std::uint8_t>(kScaleOne & 0xffu);
+            payload[static_cast<std::size_t>(off + 1)] = static_cast<std::uint8_t>(kScaleOne >> 8);
         }
     }
     DBuf d(payload.size());
@@ -207,10 +212,9 @@ DBuf make_row_split_payload(QType qtype, std::int32_t n, std::int32_t k) {
 }
 
 Weight lowbit_weight(void* payload, QType qtype, std::int32_t n, std::int32_t k) {
-    const std::int32_t k_pad = static_cast<std::int32_t>(align_up_u64(k, 128));
-    const std::int32_t kg    = k_pad / 64;
-    const std::uint64_t groups =
-        static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg);
+    const std::int32_t k_pad   = static_cast<std::int32_t>(align_up_u64(k, 128));
+    const std::int32_t kg      = k_pad / 64;
+    const std::uint64_t groups = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg);
     const std::uint64_t nibble_bytes =
         groups * static_cast<std::uint64_t>(nibble_bytes_per_group(qtype));
     const std::uint64_t high_bytes =
@@ -220,25 +224,24 @@ Weight lowbit_weight(void* payload, QType qtype, std::int32_t n, std::int32_t k)
     const std::uint64_t scale_bytes =
         static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(kg) * 2ULL;
     Weight w{};
-    w.payload           = payload;
-    w.payload_bytes     = scale_offset + scale_bytes;
-    w.high_plane_bytes  = high_bytes;
-    w.qtype             = qtype;
-    w.layout            = QuantLayout::RowSplit;
-    w.scale_dtype       = DType::FP16;
-    w.group_size        = 64;
-    w.shape[0]          = n;
-    w.shape[1]          = k;
-    w.padded_shape[0]   = n;
-    w.padded_shape[1]   = k_pad;
-    w.ndim              = 2;
-    w.qdata             = payload;
-    w.qhigh             = high_bytes == 0 ? nullptr
-                                          : static_cast<std::uint8_t*>(payload) + high_offset;
-    w.scales            = static_cast<std::uint8_t*>(payload) + scale_offset;
-    w.n                 = n;
-    w.k                 = k;
-    w.group             = 64;
+    w.payload          = payload;
+    w.payload_bytes    = scale_offset + scale_bytes;
+    w.high_plane_bytes = high_bytes;
+    w.qtype            = qtype;
+    w.layout           = QuantLayout::RowSplit;
+    w.scale_dtype      = DType::FP16;
+    w.group_size       = 64;
+    w.shape[0]         = n;
+    w.shape[1]         = k;
+    w.padded_shape[0]  = n;
+    w.padded_shape[1]  = k_pad;
+    w.ndim             = 2;
+    w.qdata            = payload;
+    w.qhigh  = high_bytes == 0 ? nullptr : static_cast<std::uint8_t*>(payload) + high_offset;
+    w.scales = static_cast<std::uint8_t*>(payload) + scale_offset;
+    w.n      = n;
+    w.k      = k;
+    w.group  = 64;
     return w;
 }
 
@@ -256,10 +259,14 @@ Weight q6_weight(void* payload, std::int32_t n, std::int32_t k) {
 
 const char* lowbit_name(QType qtype) {
     switch (qtype) {
-    case QType::Q4G64_F16S: return "q4";
-    case QType::Q5G64_F16S: return "q5";
-    case QType::Q6G64_F16S: return "q6";
-    default:                return "lowbit";
+    case QType::Q4G64_F16S:
+        return "q4";
+    case QType::Q5G64_F16S:
+        return "q5";
+    case QType::Q6G64_F16S:
+        return "q6";
+    default:
+        return "lowbit";
     }
 }
 
@@ -276,17 +283,24 @@ void run_lowbit_decode(const LowbitShape& shape, QType qtype) {
     Tensor tout(out.p, DType::BF16, {shape.n, t});
     Weight w{};
     switch (qtype) {
-    case QType::Q4G64_F16S: w = q4_weight(wbuf.p, shape.n, shape.k); break;
-    case QType::Q5G64_F16S: w = q5_weight(wbuf.p, shape.n, shape.k); break;
-    case QType::Q6G64_F16S: w = q6_weight(wbuf.p, shape.n, shape.k); break;
-    default:                return;
+    case QType::Q4G64_F16S:
+        w = q4_weight(wbuf.p, shape.n, shape.k);
+        break;
+    case QType::Q5G64_F16S:
+        w = q5_weight(wbuf.p, shape.n, shape.k);
+        break;
+    case QType::Q6G64_F16S:
+        w = q6_weight(wbuf.p, shape.n, shape.k);
+        break;
+    default:
+        return;
     }
 
     const double bytes = static_cast<double>(x_elems) * 2.0 + static_cast<double>(w.payload_bytes) +
                          static_cast<double>(out_elems) * 2.0;
     WorkspaceArena ws(64ULL << 20);
     const launch_fn launch = [&](cudaStream_t s) { ops::linear(tx, w, tout, ws, s); };
-    const Result r = g_cold ? bench_loop_cold(launch, bytes) : bench_loop(launch, bytes);
+    const Result r         = g_cold ? bench_loop_cold(launch, bytes) : bench_loop(launch, bytes);
 
     char tag[112];
     std::snprintf(tag, sizeof(tag), "linear %s decode %-10s [%d,%d] T=1%s", lowbit_name(qtype),
@@ -300,9 +314,7 @@ void run_q4_decode() {
         {"gdn q/k", 2048, 5120},
         {"attn q", 6144, 5120},
     };
-    for (const LowbitShape& shape : shapes) {
-        run_lowbit_decode(shape, QType::Q4G64_F16S);
-    }
+    for (const LowbitShape& shape : shapes) { run_lowbit_decode(shape, QType::Q4G64_F16S); }
 }
 
 void run_q5_decode() {
@@ -312,9 +324,7 @@ void run_q5_decode() {
         {"out", 5120, 6144},
         {"attn gate", 6144, 5120},
     };
-    for (const LowbitShape& shape : shapes) {
-        run_lowbit_decode(shape, QType::Q5G64_F16S);
-    }
+    for (const LowbitShape& shape : shapes) { run_lowbit_decode(shape, QType::Q5G64_F16S); }
 }
 
 void run_q6_decode() {
@@ -332,7 +342,7 @@ int main(int argc, char** argv) {
     }
 
     bool decode = false, prefill = false, bf16 = false, fp32 = false, q4 = false, q5 = false;
-    bool q6 = false;
+    bool q6     = false;
     bool stress = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--decode"))

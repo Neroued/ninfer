@@ -33,8 +33,8 @@ __global__ void silu_and_mul_scalar_kernel(const __nv_bfloat16* gate, const __nv
 __global__ void silu_and_mul_strided_input_kernel(
     const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out, std::int64_t n,
     std::int32_t ne0, std::int32_t ne1, std::int32_t ne2, std::int64_t gnb0, std::int64_t gnb1,
-    std::int64_t gnb2, std::int64_t gnb3, std::int64_t unb0, std::int64_t unb1,
-    std::int64_t unb2, std::int64_t unb3) {
+    std::int64_t gnb2, std::int64_t gnb3, std::int64_t unb0, std::int64_t unb1, std::int64_t unb2,
+    std::int64_t unb3) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const auto* gate_bytes    = reinterpret_cast<const unsigned char*>(gate);
@@ -48,33 +48,30 @@ __global__ void silu_and_mul_strided_input_kernel(
         const auto d2 = static_cast<std::int32_t>(rem % ne2);
         const auto d3 = static_cast<std::int32_t>(rem / ne2);
 
-        const std::int64_t goff = static_cast<std::int64_t>(d0) * gnb0 +
-                                  static_cast<std::int64_t>(d1) * gnb1 +
-                                  static_cast<std::int64_t>(d2) * gnb2 +
-                                  static_cast<std::int64_t>(d3) * gnb3;
-        const std::int64_t uoff = static_cast<std::int64_t>(d0) * unb0 +
-                                  static_cast<std::int64_t>(d1) * unb1 +
-                                  static_cast<std::int64_t>(d2) * unb2 +
-                                  static_cast<std::int64_t>(d3) * unb3;
+        const std::int64_t goff =
+            static_cast<std::int64_t>(d0) * gnb0 + static_cast<std::int64_t>(d1) * gnb1 +
+            static_cast<std::int64_t>(d2) * gnb2 + static_cast<std::int64_t>(d3) * gnb3;
+        const std::int64_t uoff =
+            static_cast<std::int64_t>(d0) * unb0 + static_cast<std::int64_t>(d1) * unb1 +
+            static_cast<std::int64_t>(d2) * unb2 + static_cast<std::int64_t>(d3) * unb3;
         const auto gv = *reinterpret_cast<const __nv_bfloat16*>(gate_bytes + goff);
         const auto uv = *reinterpret_cast<const __nv_bfloat16*>(up_bytes + uoff);
         out[i]        = __float2bfloat16(silu(__bfloat162float(gv)) * __bfloat162float(uv));
     }
 }
 
-__launch_bounds__(256) __global__ void silu_and_mul_dim0_split_kernel(
-    const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out, std::int32_t rows,
-    std::int64_t gate_col_stride, std::int64_t up_col_stride) {
-    const int col             = blockIdx.y;
-    const std::int64_t pair0 =
-        (blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x) *
-        kSiluAndMulPairsPerThread;
+__launch_bounds__(256) __global__
+    void silu_and_mul_dim0_split_kernel(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                                        __nv_bfloat16* out, std::int32_t rows,
+                                        std::int64_t gate_col_stride, std::int64_t up_col_stride) {
+    const int col            = blockIdx.y;
+    const std::int64_t pair0 = (blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x) *
+                               kSiluAndMulPairsPerThread;
     const std::int64_t row_pairs = rows / 2;
 
-    const auto* gate2 =
-        reinterpret_cast<const __nv_bfloat162*>(gate + col * gate_col_stride);
-    const auto* up2 = reinterpret_cast<const __nv_bfloat162*>(up + col * up_col_stride);
-    auto* out2      = reinterpret_cast<__nv_bfloat162*>(out + col * static_cast<std::int64_t>(rows));
+    const auto* gate2 = reinterpret_cast<const __nv_bfloat162*>(gate + col * gate_col_stride);
+    const auto* up2   = reinterpret_cast<const __nv_bfloat162*>(up + col * up_col_stride);
+    auto* out2 = reinterpret_cast<__nv_bfloat162*>(out + col * static_cast<std::int64_t>(rows));
 
     for (int p = 0; p < kSiluAndMulPairsPerThread; ++p) {
         const std::int64_t j = pair0 + p;
@@ -117,8 +114,7 @@ __launch_bounds__(256) __global__
     if (tid == 0) {
         if ((n & 1) != 0) {
             const std::int64_t i = n - 1;
-            out[i] =
-                __float2bfloat16(silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
+            out[i] = __float2bfloat16(silu(__bfloat162float(gate[i])) * __bfloat162float(up[i]));
         }
     }
 }

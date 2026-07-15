@@ -19,9 +19,9 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     if (rows > std::numeric_limits<int>::max()) {
         throw std::overflow_error("rmsnorm: row count exceeds CUDA grid limit");
     }
-    const auto x_addr = reinterpret_cast<std::uintptr_t>(x.data);
-    const auto w_addr = reinterpret_cast<std::uintptr_t>(weight.data);
-    const auto o_addr = reinterpret_cast<std::uintptr_t>(out.data);
+    const auto x_addr   = reinterpret_cast<std::uintptr_t>(x.data);
+    const auto w_addr   = reinterpret_cast<std::uintptr_t>(weight.data);
+    const auto o_addr   = reinterpret_cast<std::uintptr_t>(out.data);
     const bool aligned2 = ((x_addr | w_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
 
     if (d == 5120 && z == nullptr && aligned2) {

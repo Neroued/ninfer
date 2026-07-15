@@ -27,7 +27,7 @@ Binder::Binder(const Reader& reader)
 }
 
 ObjectHandle Binder::find_unconsumed(std::string_view name) {
-    const auto& objects = reader_.objects();
+    const auto& objects            = reader_.objects();
     const ObjectDescriptor* object = reader_.find(name);
     if (object == nullptr) {
         throw ArtifactError("required artifact object is missing: " + std::string(name));
@@ -41,10 +41,9 @@ ObjectHandle Binder::find_unconsumed(std::string_view name) {
 }
 
 ObjectHandle Binder::require_tensor(std::string_view name, NumericFormat format,
-                                    StorageLayout layout,
-                                    std::span<const std::uint64_t> shape) {
+                                    StorageLayout layout, std::span<const std::uint64_t> shape) {
     const ObjectHandle handle = find_unconsumed(name);
-    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    const auto* tensor        = std::get_if<TensorDescriptor>(&descriptor(handle));
     if (tensor == nullptr) {
         throw ArtifactError("required tensor is a resource: " + std::string(name));
     }
@@ -58,7 +57,7 @@ ObjectHandle Binder::require_tensor(std::string_view name, NumericFormat format,
 
 ObjectHandle Binder::require_resource(std::string_view name, ResourceEncoding encoding) {
     const ObjectHandle handle = find_unconsumed(name);
-    const auto* resource = std::get_if<ResourceDescriptor>(&descriptor(handle));
+    const auto* resource      = std::get_if<ResourceDescriptor>(&descriptor(handle));
     if (resource == nullptr) {
         throw ArtifactError("required resource is a tensor: " + std::string(name));
     }
@@ -90,15 +89,14 @@ void Binder::materialize_on_device(ObjectHandle handle) {
                             std::string(tensor->name));
     }
     const std::uint64_t alignment = tensor_alignment(tensor->layout);
-    const std::uint64_t offset =
-        align_up(materialization_.device_capacity_bytes, alignment);
+    const std::uint64_t offset    = align_up(materialization_.device_capacity_bytes, alignment);
     if (tensor->bytes > std::numeric_limits<std::uint64_t>::max() - offset) {
         throw ArtifactError("materialization plan size overflows u64");
     }
     materialization_.device_objects.push_back(
         DeviceMaterialization{handle, offset, tensor->bytes, alignment});
     materialization_.device_capacity_bytes = offset + tensor->bytes;
-    planned_[handle.index] = true;
+    planned_[handle.index]                 = true;
 }
 
 void Binder::retain_on_host(ObjectHandle handle) {

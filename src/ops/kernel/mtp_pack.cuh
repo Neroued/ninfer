@@ -19,22 +19,22 @@ __global__ void mtp_pack_fc_input_kernel(const __nv_bfloat16* embedding_norm,
     const std::int64_t n   = static_cast<std::int64_t>(kMtpHiddenRows) * tokens;
     if (idx >= n) { return; }
 
-    const int row   = static_cast<int>(idx % kMtpHiddenRows);
-    const int token = static_cast<int>(idx / kMtpHiddenRows);
-    const std::int64_t out_base = static_cast<std::int64_t>(token) * kMtpFcRows;
-    out[out_base + row]                 = embedding_norm[idx];
+    const int row                        = static_cast<int>(idx % kMtpHiddenRows);
+    const int token                      = static_cast<int>(idx / kMtpHiddenRows);
+    const std::int64_t out_base          = static_cast<std::int64_t>(token) * kMtpFcRows;
+    out[out_base + row]                  = embedding_norm[idx];
     out[out_base + kMtpHiddenRows + row] = hidden_norm[idx];
 }
 
 __global__ void mtp_split_attn_in_kernel(const __nv_bfloat16* attn_in, __nv_bfloat16* q,
-                                         __nv_bfloat16* k, __nv_bfloat16* gate,
-                                         __nv_bfloat16* v, std::int32_t tokens) {
+                                         __nv_bfloat16* k, __nv_bfloat16* gate, __nv_bfloat16* v,
+                                         std::int32_t tokens) {
     const std::int64_t idx = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t n   = static_cast<std::int64_t>(kMtpAttnRows) * tokens;
     if (idx >= n) { return; }
 
-    const int row   = static_cast<int>(idx % kMtpAttnRows);
-    const int token = static_cast<int>(idx / kMtpAttnRows);
+    const int row             = static_cast<int>(idx % kMtpAttnRows);
+    const int token           = static_cast<int>(idx / kMtpAttnRows);
     const __nv_bfloat16 value = attn_in[idx];
 
     if (row < kMtpQRows) {
@@ -42,12 +42,12 @@ __global__ void mtp_split_attn_in_kernel(const __nv_bfloat16* attn_in, __nv_bflo
         return;
     }
     if (row < kMtpQRows + kMtpKvRows) {
-        const int local = row - kMtpQRows;
+        const int local                                          = row - kMtpQRows;
         k[static_cast<std::int64_t>(token) * kMtpKvRows + local] = value;
         return;
     }
     if (row < kMtpQRows + kMtpKvRows + kMtpQRows) {
-        const int local = row - kMtpQRows - kMtpKvRows;
+        const int local                                            = row - kMtpQRows - kMtpKvRows;
         gate[static_cast<std::int64_t>(token) * kMtpQRows + local] = value;
         return;
     }
@@ -57,4 +57,3 @@ __global__ void mtp_split_attn_in_kernel(const __nv_bfloat16* attn_in, __nv_bflo
 }
 
 } // namespace ninfer::ops
-

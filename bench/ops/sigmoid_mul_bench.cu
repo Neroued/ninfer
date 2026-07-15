@@ -17,7 +17,7 @@ static void run(int n, const char* tag) {
     Tensor tgate(gate.p, DType::BF16, {n}), tx(x.p, DType::BF16, {n});
 
     const double bytes = 3.0 * static_cast<double>(n) * 2.0; // read gate + read x + write x
-    const Result r = bench_loop([&](cudaStream_t s) { ops::sigmoid_mul(tgate, tx, s); }, bytes);
+    const Result r     = bench_loop([&](cudaStream_t s) { ops::sigmoid_mul(tgate, tx, s); }, bytes);
     print_result(tag, r);
 }
 

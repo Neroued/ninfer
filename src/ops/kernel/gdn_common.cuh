@@ -100,8 +100,8 @@ issue_async_load_vec4(View view, const float* __restrict__ gmem_base_row0,
     }
 }
 
-static __device__ __forceinline__ float4 load_bf16_vec4_as_float4(
-    const __nv_bfloat16* __restrict__ src) {
+static __device__ __forceinline__ float4
+load_bf16_vec4_as_float4(const __nv_bfloat16* __restrict__ src) {
     const auto* src2 = reinterpret_cast<const __nv_bfloat162*>(src);
     const float2 lo  = __bfloat1622float2(src2[0]);
     const float2 hi  = __bfloat1622float2(src2[1]);

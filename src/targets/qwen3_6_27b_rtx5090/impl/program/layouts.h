@@ -53,16 +53,16 @@ struct PersistentLayout {
 };
 
 struct SequencePlan::Impl {
-    std::uint32_t capacity       = 0;
-    std::uint32_t prefill_chunk  = 0;
-    std::uint32_t mtp_k          = 0;
-    DType kv_dtype               = DType::BF16;
-    std::int32_t kv_quant_group  = 0;
-    ProposalHead proposal_head   = ProposalHead::Full;
-    bool use_cuda_graph          = true;
-    int device                   = 0;
+    std::uint32_t capacity      = 0;
+    std::uint32_t prefill_chunk = 0;
+    std::uint32_t mtp_k         = 0;
+    DType kv_dtype              = DType::BF16;
+    std::int32_t kv_quant_group = 0;
+    ProposalHead proposal_head  = ProposalHead::Full;
+    bool use_cuda_graph         = true;
+    int device                  = 0;
     PersistentLayout persistent;
-    std::size_t workspace_bytes  = 0;
+    std::size_t workspace_bytes       = 0;
     std::size_t graph_allowance_bytes = 0;
 };
 

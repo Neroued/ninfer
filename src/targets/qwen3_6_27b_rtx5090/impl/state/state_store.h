@@ -24,11 +24,10 @@ struct GdnStateLayout {
 
 [[nodiscard]] GdnStateLayout plan_gdn_state(LayoutBuilder& builder, std::uint32_t gdn_layers,
                                             std::int32_t conv_dim, std::int32_t conv_width,
-                                            std::int32_t value_heads,
-                                            std::int32_t value_head_dim,
+                                            std::int32_t value_heads, std::int32_t value_head_dim,
                                             std::int32_t key_head_dim,
                                             std::int32_t snapshot_slots = 1,
-                                            DType conv_dtype = DType::BF16);
+                                            DType conv_dtype            = DType::BF16);
 
 struct GdnState {
     std::vector<Tensor> conv;

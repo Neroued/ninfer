@@ -8,9 +8,8 @@
 namespace ninfer::ops::detail {
 
 void mtp_prepare_verify_inputs_launch(const Tensor& token, const Tensor& drafts,
-                                      const Tensor& length, Tensor& window_base,
-                                      Tensor& verify_ids, Tensor& positions,
-                                      cudaStream_t stream);
+                                      const Tensor& length, Tensor& window_base, Tensor& verify_ids,
+                                      Tensor& positions, cudaStream_t stream);
 
 void mtp_accept_tokens_launch(const Tensor& target_tokens, const Tensor& logits,
                               const Tensor& drafts, Tensor& length, Tensor& token,

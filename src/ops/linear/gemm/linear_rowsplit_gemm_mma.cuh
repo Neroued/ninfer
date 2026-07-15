@@ -188,12 +188,10 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
             const int kk       = k0 + kl;
             __nv_bfloat16* dst = &Bs[stage][tl * BK + gemm_swz64(tl, kl)];
             if constexpr (FullTiles) {
-                gemm_cp_async<16, Cfg>(
-                    dst, &x[static_cast<std::int64_t>(col) * k + kk]);
+                gemm_cp_async<16, Cfg>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
             } else {
                 if (col < t && kk + 8 <= k) {
-                    gemm_cp_async<16, Cfg>(
-                        dst, &x[static_cast<std::int64_t>(col) * k + kk]);
+                    gemm_cp_async<16, Cfg>(dst, &x[static_cast<std::int64_t>(col) * k + kk]);
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
@@ -325,7 +323,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 } else {
                     w = Codec::load_pair_bf162(Cr[stage], Hr[stage], Sr[stage], group_index, lane);
                 }
-                const int sc                                 = gemm_swz64(row, gg * 64 + 2 * lane);
+                const int sc = gemm_swz64(row, gg * 64 + 2 * lane);
                 store_vec(&dst[sc], w);
             }
         }
@@ -354,14 +352,14 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 const int arow = wm * WM + mi * 16 + a_rowoff;
                 const int acol = ks + a_coloff;
                 ldmatrix_x4(af[mi][0], af[mi][1], af[mi][2], af[mi][3],
-                                 smem_addr(&As[arow * BK + gemm_swz64(arow, acol)]));
+                            smem_addr(&As[arow * BK + gemm_swz64(arow, acol)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int brow = wn * WN + ni * 8 + b_rin;
                 const int bcol = ks + b_koff;
                 ldmatrix_x2(bf[ni][0], bf[ni][1],
-                                 smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, bcol)]));
+                            smem_addr(&Bs[stage][brow * BK + gemm_swz64(brow, bcol)]));
             }
         };
 
@@ -378,10 +376,9 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
-                                               acc[mi][ni][3], af[cur][mi][0], af[cur][mi][1],
-                                               af[cur][mi][2], af[cur][mi][3], bf[cur][ni][0],
-                                               bf[cur][ni][1]);
+                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                 af[cur][mi][0], af[cur][mi][1], af[cur][mi][2], af[cur][mi][3],
+                                 bf[cur][ni][0], bf[cur][ni][1]);
                     }
                 }
             }
@@ -395,9 +392,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit
                 for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
                     for (int ni = 0; ni < NT; ++ni) {
-                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2],
-                                               acc[mi][ni][3], af[mi][0], af[mi][1], af[mi][2],
-                                               af[mi][3], bf[ni][0], bf[ni][1]);
+                        mma_bf16(acc[mi][ni][0], acc[mi][ni][1], acc[mi][ni][2], acc[mi][ni][3],
+                                 af[mi][0], af[mi][1], af[mi][2], af[mi][3], bf[ni][0], bf[ni][1]);
                     }
                 }
             }

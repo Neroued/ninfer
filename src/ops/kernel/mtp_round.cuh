@@ -11,12 +11,9 @@ namespace ninfer::ops {
 inline constexpr int kMtpRoundAcceptedPerPosOffset = 4;
 inline constexpr int kMtpRoundAcceptedPerPosLimit  = 5;
 
-__global__ void mtp_prepare_verify_inputs_kernel(const std::int32_t* token,
-                                                 const std::int32_t* drafts,
-                                                 const std::int32_t* length,
-                                                 std::int32_t* window_base,
-                                                 std::int32_t* verify_ids,
-                                                 std::int32_t* positions, std::int32_t T) {
+__global__ void mtp_prepare_verify_inputs_kernel(
+    const std::int32_t* token, const std::int32_t* drafts, const std::int32_t* length,
+    std::int32_t* window_base, std::int32_t* verify_ids, std::int32_t* positions, std::int32_t T) {
     const int i = threadIdx.x;
     if (i == 0) { *window_base = *length; }
     if (i >= T) { return; }
@@ -37,12 +34,14 @@ __global__ void mtp_prepare_verify_inputs_kernel(const std::int32_t* token,
 // collapses to `u < p_i(drafts[i])`. Launch with a single block of kSamplerBlock
 // threads; only thread 0 performs the sequential accept/commit while the whole
 // block cooperates on the per-column truncated-distribution build.
-__launch_bounds__(kSamplerBlock) __global__ void mtp_accept_tokens_kernel(
-    const std::int32_t* target_tokens, const __nv_bfloat16* logits, const std::int32_t* drafts,
-    std::int32_t* length, std::int32_t* token, std::int32_t* sampled_out,
-    std::int32_t* num_sampled, std::int32_t* accepted, std::int32_t* ar_pos, std::int64_t* stats,
-    const SamplingConfig* cfg_ptr, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t k) {
+__launch_bounds__(kSamplerBlock) __global__
+    void mtp_accept_tokens_kernel(const std::int32_t* target_tokens, const __nv_bfloat16* logits,
+                                  const std::int32_t* drafts, std::int32_t* length,
+                                  std::int32_t* token, std::int32_t* sampled_out,
+                                  std::int32_t* num_sampled, std::int32_t* accepted,
+                                  std::int32_t* ar_pos, std::int64_t* stats,
+                                  const SamplingConfig* cfg_ptr, std::int32_t token_domain,
+                                  std::int32_t physical_rows, std::int32_t k) {
     const int tid            = threadIdx.x;
     const SamplingConfig cfg = *cfg_ptr;
 
@@ -92,10 +91,10 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_accept_tokens_kernel(
     if (sampler_multiblock_ok(token_domain, k + 1, partial_blocks, group_count)) { return; }
 
     if (tid == 0) {
-        a_sh    = 0;
-        done_sh = 0;
+        a_sh     = 0;
+        done_sh  = 0;
         tstar_sh = 0;
-        L_sh    = *length;
+        L_sh     = *length;
     }
     __syncthreads();
 
@@ -122,10 +121,9 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_accept_tokens_kernel(
                         break;
                     }
                 }
-                const float u =
-                    sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeMtpAccept, 0u);
+                const float u = sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeMtpAccept, 0u);
                 if (u < pd) {
-                    a_sh = i + 1;  // accept drafts[i], keep verifying
+                    a_sh = i + 1; // accept drafts[i], keep verifying
                 } else {
                     const float ur =
                         sampling_uniform(cfg.seed, L + i + 1, kSamplePurposeMtpResample, 0u);
@@ -134,10 +132,9 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_accept_tokens_kernel(
                 }
             } else {
                 // Every draft accepted: bonus token from the last verify column.
-                const float u =
-                    sampling_uniform(cfg.seed, L + k + 1, kSamplePurposeMtpBonus, 0u);
-                tstar_sh = sampling_pick_from_support(cand_idx, prob, n_support, -1, u);
-                done_sh  = 1;
+                const float u = sampling_uniform(cfg.seed, L + k + 1, kSamplePurposeMtpBonus, 0u);
+                tstar_sh      = sampling_pick_from_support(cand_idx, prob, n_support, -1, u);
+                done_sh       = 1;
             }
         }
         __syncthreads();
@@ -172,9 +169,10 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_accept_tokens_kernel(
     }
 }
 
-__launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_partial_topk_kernel(
-    const __nv_bfloat16* logits, const std::int32_t* drafts, const SamplingConfig* cfg_ptr,
-    std::int32_t token_domain, std::int32_t physical_rows) {
+__launch_bounds__(kSamplerBlock) __global__
+    void mtp_sampling_partial_topk_kernel(const __nv_bfloat16* logits, const std::int32_t* drafts,
+                                          const SamplingConfig* cfg_ptr, std::int32_t token_domain,
+                                          std::int32_t physical_rows) {
     const int col            = static_cast<int>(blockIdx.y);
     const int partial        = static_cast<int>(blockIdx.x);
     const SamplingConfig cfg = *cfg_ptr;
@@ -187,9 +185,9 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_partial_topk_kerne
     __shared__ typename SamplingPartialMergeSort::TempStorage sort_storage;
     unsigned long long keys[kSamplerItemsPerThread];
 
-    const int cap = sampling_candidate_cap(cfg, token_domain);
+    const int cap           = sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
-    const int tile_start = partial * kSamplerPartialTileItems;
+    const int tile_start    = partial * kSamplerPartialTileItems;
     // Column col's penalty overlay is the first `col` drafts (see accept loop);
     // applying it before top-k selection lets it change the candidate set, not
     // just the post-truncation probabilities.
@@ -210,7 +208,7 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_partial_topk_kerne
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int rank = threadIdx.x * kSamplerItemsPerThread + item;
         if (rank < cap) {
-            const int off = sampling_partial_offset(col, partial, rank);
+            const int off             = sampling_partial_offset(col, partial, rank);
             sampling_partial_key[off] = keys[item];
         }
     }
@@ -235,12 +233,12 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
     if (!(cfg.temperature > 0.0f)) {
         if (tid == 0 && col == 0 && group == 0) {
             const int k = cols - 1;
-            int a = 0;
+            int a       = 0;
             while (a < k && target_tokens[a] == drafts[a]) { ++a; }
             const int t_star = target_tokens[a];
             for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
             for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
-            sampled_out[a] = t_star;
+            sampled_out[a]     = t_star;
             const int produced = a + 1;
             *num_sampled       = produced;
             *accepted          = a;
@@ -279,7 +277,7 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
     }
 
     const int group_begin = group * kSamplerPartialsPerGroup;
-    int group_partials = partial_blocks - group_begin;
+    int group_partials    = partial_blocks - group_begin;
     if (group_partials < 0) { group_partials = 0; }
     if (group_partials > kSamplerPartialsPerGroup) { group_partials = kSamplerPartialsPerGroup; }
     const int group_n = group_partials * cap;
@@ -288,9 +286,9 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
         const int p = item * blockDim.x + tid;
         if (p < group_n) {
             const int partial = group_begin + p / cap;
-            const int j = p - (p / cap) * cap;
-            const int off = sampling_partial_offset(col, partial, j);
-            keys[item] = sampling_partial_key[off];
+            const int j       = p - (p / cap) * cap;
+            const int off     = sampling_partial_offset(col, partial, j);
+            keys[item]        = sampling_partial_key[off];
         } else {
             keys[item] = 0ull;
         }
@@ -310,7 +308,7 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
     if (tid == 0) {
         __threadfence();
         const int done = atomicAdd(&sampling_group_done[col], 1) + 1;
-        is_last_group = (done == group_count) ? 1 : 0;
+        is_last_group  = (done == group_count) ? 1 : 0;
     }
     __syncthreads();
     if (!is_last_group) { return; }
@@ -321,9 +319,9 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
         const int p = item * blockDim.x + tid;
         if (p < final_n) {
             const int partial = partial_blocks + p / cap;
-            const int j = p - (p / cap) * cap;
-            const int off = sampling_partial_offset(col, partial, j);
-            keys[item] = sampling_partial_key[off];
+            const int j       = p - (p / cap) * cap;
+            const int off     = sampling_partial_offset(col, partial, j);
+            keys[item]        = sampling_partial_key[off];
         } else {
             keys[item] = 0ull;
         }
@@ -346,8 +344,8 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
         while (atomicAdd(&sampling_mtp_finalize_init, 0) != 1) {}
         sampling_dist_support[col] = n_support;
         for (int j = 0; j < n_support; ++j) {
-            const int off = sampling_dist_offset(col, j);
-            sampling_dist_idx[off] = cand_idx[j];
+            const int off           = sampling_dist_offset(col, j);
+            sampling_dist_idx[off]  = cand_idx[j];
             sampling_dist_prob[off] = prob[j];
         }
         sampling_group_done[col] = 0;
@@ -359,8 +357,8 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
             int a       = 0;
             int tstar   = 0;
             for (int i = 0; i <= k; ++i) {
-                const int n = sampling_dist_support[i];
-                const int* dist_idx = sampling_dist_idx + sampling_dist_offset(i, 0);
+                const int n            = sampling_dist_support[i];
+                const int* dist_idx    = sampling_dist_idx + sampling_dist_offset(i, 0);
                 const float* dist_prob = sampling_dist_prob + sampling_dist_offset(i, 0);
                 if (i < k) {
                     const int d = drafts[i];
@@ -383,11 +381,11 @@ __launch_bounds__(kSamplerBlock) __global__ void mtp_sampling_group_finalize_ker
                     break;
                 }
                 const float u = sampling_uniform(cfg.seed, L + k + 1, kSamplePurposeMtpBonus, 0u);
-                tstar = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
+                tstar         = sampling_pick_from_support(dist_idx, dist_prob, n, -1, u);
             }
             for (int i = 0; i <= k; ++i) { sampled_out[i] = 0; }
             for (int i = 0; i < a; ++i) { sampled_out[i] = drafts[i]; }
-            sampled_out[a] = tstar;
+            sampled_out[a]     = tstar;
             const int produced = a + 1;
             *num_sampled       = produced;
             *accepted          = a;
@@ -430,8 +428,8 @@ __global__ void mtp_gather_hidden_row_kernel(const __nv_bfloat16* hidden,
     out[row] = hidden[static_cast<std::int64_t>(col) * rows + row];
 }
 
-__global__ void mtp_remap_draft_token_kernel(std::int32_t* draft_token,
-                                             const std::int32_t* id_map, std::int32_t n) {
+__global__ void mtp_remap_draft_token_kernel(std::int32_t* draft_token, const std::int32_t* id_map,
+                                             std::int32_t n) {
     const int idx = *draft_token;
     if (idx >= 0 && idx < n) { *draft_token = id_map[idx]; }
 }

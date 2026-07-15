@@ -16,14 +16,14 @@ using namespace ninfer::test;
 static void cpu_argmax(const std::vector<float>& logits, int vocab, int t_count,
                        std::vector<int>& out) {
     for (int t = 0; t < t_count; ++t) {
-        const int base = t * vocab;
-        int best_idx = 0;
+        const int base   = t * vocab;
+        int best_idx     = 0;
         float best_value = logits[base];
         for (int v = 1; v < vocab; ++v) {
             const float value = logits[base + v];
             if (value > best_value) {
                 best_value = value;
-                best_idx = v;
+                best_idx   = v;
             }
         }
         out[t] = best_idx;
@@ -43,21 +43,19 @@ static void install_ties(std::vector<float>& logits, int vocab, int t_count) {
         if (a == b) { b = (a + 1) % vocab; }
         if (b < a) {
             const int tmp = a;
-            a = b;
-            b = tmp;
+            a             = b;
+            b             = tmp;
         }
 
         const float tie_value = 24.0f + static_cast<float>(t);
-        logits[base + a] = tie_value;
-        logits[base + b] = tie_value;
+        logits[base + a]      = tie_value;
+        logits[base + b]      = tie_value;
     }
 }
 
-static int verify_i32(const char* label, const std::vector<int>& got,
-                      const std::vector<int>& ref) {
+static int verify_i32(const char* label, const std::vector<int>& got, const std::vector<int>& ref) {
     if (got.size() != ref.size()) {
-        std::cerr << label << ": size mismatch got=" << got.size() << " ref=" << ref.size()
-                  << '\n';
+        std::cerr << label << ": size mismatch got=" << got.size() << " ref=" << ref.size() << '\n';
         return 1;
     }
     for (std::size_t i = 0; i < got.size(); ++i) {
@@ -82,7 +80,7 @@ static int one_shape(const char* tag, int vocab, int t_count, std::uint32_t seed
     cpu_argmax(logits, vocab, t_count, ref);
 
     DBuf dlogits = to_device_bf16(logits);
-    DBuf dout = to_device_i32(std::vector<int>(static_cast<std::size_t>(t_count), -777));
+    DBuf dout    = to_device_i32(std::vector<int>(static_cast<std::size_t>(t_count), -777));
     Tensor tlogits(dlogits.p, DType::BF16, {vocab, t_count});
     Tensor tout(dout.p, DType::I32, {t_count});
 
@@ -119,9 +117,7 @@ template <typename Fn>
 static int expect_invalid(const char* label, const Fn& fn) {
     try {
         fn();
-    } catch (const std::invalid_argument&) {
-        return 0;
-    } catch (const std::exception& e) {
+    } catch (const std::invalid_argument&) { return 0; } catch (const std::exception& e) {
         std::cerr << label << ": expected invalid_argument, got " << e.what() << '\n';
         return 1;
     }
@@ -133,9 +129,7 @@ template <typename Fn>
 static int expect_overflow(const char* label, const Fn& fn) {
     try {
         fn();
-    } catch (const std::overflow_error&) {
-        return 0;
-    } catch (const std::exception& e) {
+    } catch (const std::overflow_error&) { return 0; } catch (const std::exception& e) {
         std::cerr << label << ": expected overflow_error, got " << e.what() << '\n';
         return 1;
     }
@@ -149,18 +143,18 @@ static int validation_checks() {
     std::vector<float> logits_h(4, -1.0f);
     round_to_bf16(logits_h);
     DBuf dlogits = to_device_bf16(logits_h);
-    DBuf dout = to_device_i32(std::vector<int>(2, -1));
+    DBuf dout    = to_device_i32(std::vector<int>(2, -1));
     Tensor logits(dlogits.p, DType::BF16, {2, 2});
     Tensor out(dout.p, DType::I32, {2});
 
     f += expect_invalid("argmax validation logits dtype", [&] {
         Tensor bad = logits;
-        bad.dtype = DType::FP32;
+        bad.dtype  = DType::FP32;
         ops::argmax(bad, out, 2, nullptr);
     });
     f += expect_invalid("argmax validation out dtype", [&] {
         Tensor bad = out;
-        bad.dtype = DType::BF16;
+        bad.dtype  = DType::BF16;
         ops::argmax(logits, bad, 2, nullptr);
     });
     f += expect_invalid("argmax validation out shape", [&] {
@@ -177,12 +171,12 @@ static int validation_checks() {
     });
     f += expect_invalid("argmax validation logits contiguous", [&] {
         Tensor bad = logits;
-        bad.nb[0] = 4;
+        bad.nb[0]  = 4;
         ops::argmax(bad, out, 2, nullptr);
     });
     f += expect_invalid("argmax validation out contiguous", [&] {
         Tensor bad = out;
-        bad.nb[0] = 8;
+        bad.nb[0]  = 8;
         ops::argmax(logits, bad, 2, nullptr);
     });
     f += expect_invalid("argmax validation null data", [&] {
@@ -192,7 +186,7 @@ static int validation_checks() {
     });
     f += expect_invalid("argmax validation negative dim", [&] {
         Tensor bad = logits;
-        bad.ne[0] = -1;
+        bad.ne[0]  = -1;
         ops::argmax(bad, out, 2, nullptr);
     });
     f += expect_invalid("argmax validation zero vocab", [&] {
@@ -200,21 +194,19 @@ static int validation_checks() {
         Tensor zero_out(nullptr, DType::I32, {1});
         zero_logits.ne[0] = 0;
         zero_logits.ne[1] = 0;
-        zero_out.ne[0] = 0;
+        zero_out.ne[0]    = 0;
         ops::argmax(zero_logits, zero_out, 1, nullptr);
     });
-    f += expect_invalid("argmax validation zero valid rows", [&] {
-        ops::argmax(logits, out, 0, nullptr);
-    });
-    f += expect_invalid("argmax validation valid rows exceeds physical rows", [&] {
-        ops::argmax(logits, out, 3, nullptr);
-    });
+    f += expect_invalid("argmax validation zero valid rows",
+                        [&] { ops::argmax(logits, out, 0, nullptr); });
+    f += expect_invalid("argmax validation valid rows exceeds physical rows",
+                        [&] { ops::argmax(logits, out, 3, nullptr); });
     f += expect_overflow("argmax validation overflow", [&] {
         Tensor huge_logits(nullptr, DType::BF16, {1});
         Tensor huge_out(nullptr, DType::I32, {1});
         for (int d = 0; d < 4; ++d) {
             huge_logits.ne[d] = std::numeric_limits<std::int32_t>::max();
-            huge_out.ne[d] = std::numeric_limits<std::int32_t>::max();
+            huge_out.ne[d]    = std::numeric_limits<std::int32_t>::max();
         }
         ops::argmax(huge_logits, huge_out, 1, nullptr);
     });
@@ -226,10 +218,10 @@ static int validation_checks() {
         zero_logits.ne[1] = 0;
         zero_logits.ne[2] = 1;
         zero_logits.ne[3] = 1;
-        zero_out.ne[0] = 0;
-        zero_out.ne[1] = 1;
-        zero_out.ne[2] = 1;
-        zero_out.ne[3] = 1;
+        zero_out.ne[0]    = 0;
+        zero_out.ne[1]    = 1;
+        zero_out.ne[2]    = 1;
+        zero_out.ne[3]    = 1;
         ops::argmax(zero_logits, zero_out, 7, nullptr);
     } catch (const std::exception& e) {
         std::cerr << "argmax validation zero T: expected no throw, got " << e.what() << '\n';

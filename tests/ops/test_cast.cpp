@@ -16,8 +16,8 @@ int main() {
         return 0;
     }
 
-    const std::vector<float> source{-10.5f, -1.00390625f, -0.0f, 0.0f, 0.333251953125f,
-                                    1.00390625f, 3.1415927f, 65504.0f};
+    const std::vector<float> source{-10.5f,          -1.00390625f, -0.0f,      0.0f,
+                                    0.333251953125f, 1.00390625f,  3.1415927f, 65504.0f};
     DBuf device_source = to_device_f32(source);
     DBuf device_destination(source.size() * sizeof(std::uint16_t));
     Tensor source_tensor(device_source.p, DType::FP32,

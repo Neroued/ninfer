@@ -49,8 +49,7 @@ GdnStateLayout plan_gdn_state(LayoutBuilder& builder, std::uint32_t gdn_layers,
     const Tensor conv_shape(nullptr, conv_dtype_in,
                             {conv_dim_in, conv_width_in, snapshot_slots_in});
     const Tensor ssm_shape(nullptr, DType::FP32,
-                           {key_head_dim_in, value_head_dim_in, value_heads_in,
-                            snapshot_slots_in});
+                           {key_head_dim_in, value_head_dim_in, value_heads_in, snapshot_slots_in});
 
     GdnStateLayout layout;
     layout.conv_dim       = conv_dim_in;
@@ -71,10 +70,9 @@ GdnStateLayout plan_gdn_state(LayoutBuilder& builder, std::uint32_t gdn_layers,
 }
 
 GdnState::GdnState(DeviceSpan backing, const GdnStateLayout& layout)
-    : conv_dim(layout.conv_dim), conv_width(layout.conv_width),
-      value_heads(layout.value_heads), value_head_dim(layout.value_head_dim),
-      key_head_dim(layout.key_head_dim), snapshot_slots(layout.snapshot_slots),
-      conv_dtype(layout.conv_dtype) {
+    : conv_dim(layout.conv_dim), conv_width(layout.conv_width), value_heads(layout.value_heads),
+      value_head_dim(layout.value_head_dim), key_head_dim(layout.key_head_dim),
+      snapshot_slots(layout.snapshot_slots), conv_dtype(layout.conv_dtype) {
     if (layout.conv.empty() || layout.ssm.size() != layout.conv.size()) {
         throw std::invalid_argument("GdnState layout layer counts are inconsistent");
     }
@@ -88,8 +86,9 @@ GdnState::GdnState(DeviceSpan backing, const GdnStateLayout& layout)
             layout.ssm[layer].bytes != ssm_shape.bytes()) {
             throw std::logic_error("GdnState layout tensor byte size is inconsistent");
         }
-        conv.emplace_back(layout.conv[layer].bind(backing).data, conv_dtype,
-                          std::initializer_list<std::int32_t>{conv_dim, conv_width, snapshot_slots});
+        conv.emplace_back(
+            layout.conv[layer].bind(backing).data, conv_dtype,
+            std::initializer_list<std::int32_t>{conv_dim, conv_width, snapshot_slots});
         ssm.emplace_back(layout.ssm[layer].bind(backing).data, DType::FP32,
                          std::initializer_list<std::int32_t>{key_head_dim, value_head_dim,
                                                              value_heads, snapshot_slots});

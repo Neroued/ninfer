@@ -59,7 +59,7 @@ struct SamplingConfig {
  * out, uses no caller workspace, and has no other persistent state side effect.
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
-            const SamplingConfig* config,
-            const std::int32_t* pos_base, std::int32_t purpose, cudaStream_t stream);
+            const SamplingConfig* config, const std::int32_t* pos_base, std::int32_t purpose,
+            cudaStream_t stream);
 
 } // namespace ninfer::ops

@@ -77,8 +77,8 @@ PreparedPrompt Engine::prepare(PromptInput input) const {
                 throw std::invalid_argument("prepared prompt exceeds Engine context capacity");
             }
             const double seconds = prepared.prepare_seconds();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, seconds, std::move(prepared)));
+            return PreparedPrompt(
+                std::make_unique<PreparedPrompt::Impl>(info, seconds, std::move(prepared)));
         },
         impl_->active);
 }
@@ -96,8 +96,8 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                 throw std::invalid_argument("prepared prompt exceeds Engine context capacity");
             }
             const double seconds = prepared.prepare_seconds();
-            return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, seconds, std::move(prepared)));
+            return PreparedPrompt(
+                std::make_unique<PreparedPrompt::Impl>(info, seconds, std::move(prepared)));
         },
         impl_->active);
 }
@@ -121,8 +121,8 @@ GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options,
     return std::visit(
         [&](auto& target_ptr) -> GenerationResult {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            using Instance = std::remove_reference_t<decltype(*target_ptr)>;
-            using Prepared = typename Instance::Package::PreparedPrompt;
+            using Instance      = std::remove_reference_t<decltype(*target_ptr)>;
+            using Prepared      = typename Instance::Package::PreparedPrompt;
             auto* target_prompt = std::get_if<Prepared>(&prompt.impl_->value);
             if (target_prompt == nullptr) {
                 throw std::invalid_argument("PreparedPrompt target does not match Engine target");
@@ -186,9 +186,7 @@ void Engine::reset_memory_peaks() noexcept {
     std::unique_lock lock(impl_->generation_mutex, std::defer_lock);
     try {
         lock.lock();
-    } catch (...) {
-        return;
-    }
+    } catch (...) { return; }
     std::visit(
         [](auto& target_ptr) {
             if (target_ptr != nullptr) { target_ptr->program->reset_memory_peaks(); }

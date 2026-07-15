@@ -72,8 +72,8 @@ void run_prefill() {
     Tensor tout(out.p, DType::BF16, {kChannels, kTokens});
 
     const double bytes = 4.0 * static_cast<double>(n) * 2.0;
-    const Result r     = bench_loop(
-        [&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tout, s); }, bytes);
+    const Result r =
+        bench_loop([&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tout, s); }, bytes);
     print_result("causal_conv1d prefill [10240,4096]", r);
     run_copy_baseline(bytes, "copy same-byte prefill baseline");
 }
@@ -92,8 +92,8 @@ void run_decode() {
     Tensor tout(out.p, DType::BF16, {kChannels, 1});
 
     const double bytes = 12.0 * static_cast<double>(kChannels) * 2.0;
-    const Result r     = bench_loop(
-        [&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tout, s); }, bytes);
+    const Result r =
+        bench_loop([&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tout, s); }, bytes);
     print_result("causal_conv1d decode  [10240,1]", r);
     run_copy_baseline(bytes, "copy same-byte decode baseline");
 }

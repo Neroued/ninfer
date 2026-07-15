@@ -36,21 +36,19 @@ CacheBinding bind_cache(DeviceArena& arena, std::uint32_t layers, std::uint32_t 
                         std::int32_t heads, std::int32_t head_dim, DType dtype,
                         std::int32_t quant_group) {
     LayoutBuilder builder;
-    auto layout = l0::plan_kv_cache(builder, layers, max_context, heads, head_dim, dtype,
-                                     quant_group);
+    auto layout =
+        l0::plan_kv_cache(builder, layers, max_context, heads, head_dim, dtype, quant_group);
     auto backing = arena.alloc_bytes(builder.finish(256));
     return CacheBinding{backing, std::move(layout)};
 }
 
 struct KVCache : l0::KVCache {
-    KVCache(DeviceArena& arena, std::uint32_t layers, std::uint32_t max_context,
-            std::int32_t heads, std::int32_t head_dim, DType dtype = DType::BF16,
-            std::int32_t quant_group = 0)
+    KVCache(DeviceArena& arena, std::uint32_t layers, std::uint32_t max_context, std::int32_t heads,
+            std::int32_t head_dim, DType dtype = DType::BF16, std::int32_t quant_group = 0)
         : KVCache(bind_cache(arena, layers, max_context, heads, head_dim, dtype, quant_group)) {}
 
 private:
-    explicit KVCache(CacheBinding binding)
-        : l0::KVCache(binding.backing, binding.layout) {}
+    explicit KVCache(CacheBinding binding) : l0::KVCache(binding.backing, binding.layout) {}
 };
 
 constexpr std::int32_t kHeadDim          = 256;
@@ -934,8 +932,7 @@ int split_api_parity_case(DType cache_dtype, std::int32_t tokens, std::int32_t b
 
     ops::gqa_attention(tq, tk, tv, tpos, kScale, full_cache, 0, ws, tout_full, nullptr);
     ops::gqa_kv_append(tk, tv, tpos, split_cache, 0, nullptr);
-    ops::gqa_attention_cached(tq_split, tpos_split, kScale, split_cache, 0, tout_split,
-                                  nullptr);
+    ops::gqa_attention_cached(tq_split, tpos_split, kScale, split_cache, 0, tout_split, nullptr);
     cudaDeviceSynchronize();
 
     const std::string dtype_label = cache_dtype == DType::BF16 ? "bf16" : "int8";
@@ -1057,11 +1054,11 @@ int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed)
     Tensor tout_decode(dout_decode.p, DType::BF16, {kHeadDim, kQHeads, 1});
 
     ops::gqa_attention(tq_prefill, tk_prefill, tv_prefill, tpos_prefill, kScale, kv, 0, ws,
-                           tout_prefill, nullptr);
+                       tout_prefill, nullptr);
     kv.pos                             = static_cast<std::uint32_t>(tokens);
     const std::uint32_t initial_kv_pos = kv.pos;
     ops::gqa_attention(tq_decode, tk_decode, tv_decode, tpos, kScale, kv, 0, ws, tout_decode,
-                           nullptr);
+                       nullptr);
     cudaDeviceSynchronize();
 
     int f             = 0;

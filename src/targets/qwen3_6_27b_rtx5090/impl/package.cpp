@@ -61,9 +61,7 @@ void Program::finish_active() { impl_->finish_active(); }
 
 void Program::abort_request() noexcept { impl_->abort_request(); }
 
-std::uint32_t Program::materialized_tokens() const noexcept {
-    return impl_->materialized_tokens();
-}
+std::uint32_t Program::materialized_tokens() const noexcept { return impl_->materialized_tokens(); }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 

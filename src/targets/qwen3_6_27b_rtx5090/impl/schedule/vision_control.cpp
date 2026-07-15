@@ -50,9 +50,9 @@ VisionControl build_vision_control(const ProcessedInput& input) {
         const int h = item.grid.h;
         const int w = item.grid.w;
         if (t <= 0 || h <= 0 || w <= 0 || h % kMerge != 0 || w % kMerge != 0) {
-            throw std::invalid_argument("vision control grid must be positive and merge-aligned: " +
-                                        std::to_string(t) + "x" + std::to_string(h) + "x" +
-                                        std::to_string(w));
+            throw std::invalid_argument(
+                "vision control grid must be positive and merge-aligned: " + std::to_string(t) +
+                "x" + std::to_string(h) + "x" + std::to_string(w));
         }
         const std::size_t item_patches = static_cast<std::size_t>(t) * h * w;
         if (item.patch_begin != patch_cursor || item.patch_count != item_patches) {

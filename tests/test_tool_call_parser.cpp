@@ -17,14 +17,14 @@ int fail(const std::string& message) {
 int check(bool condition, const std::string& message) { return condition ? 0 : fail(message); }
 
 int test_single_call() {
-    const ninfer::serve::ParsedToolCallOutput parsed = ninfer::serve::parse_qwen_tool_call_output(
-        "Calling weather.\n"
-        "<tool_call>\n"
-        "<function=get_weather>\n"
-        "<parameter=city>\nParis\n</parameter>\n"
-        "<parameter=days>\n2\n</parameter>\n"
-        "</function>\n"
-        "</tool_call>");
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output("Calling weather.\n"
+                                                   "<tool_call>\n"
+                                                   "<function=get_weather>\n"
+                                                   "<parameter=city>\nParis\n</parameter>\n"
+                                                   "<parameter=days>\n2\n</parameter>\n"
+                                                   "</function>\n"
+                                                   "</tool_call>");
 
     int failures = 0;
     failures += check(parsed.is_tool_call_response, "single call parsed as tool response");
@@ -66,7 +66,8 @@ int test_multiple_calls_and_json_values() {
 
 int test_malformed_falls_back_to_text() {
     const std::string text = "<tool_call>\n<function=get_weather>\n";
-    const ninfer::serve::ParsedToolCallOutput parsed = ninfer::serve::parse_qwen_tool_call_output(text);
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "malformed xml is not tool response");
     failures += check(parsed.content == text, "malformed xml preserved as text");
@@ -75,14 +76,14 @@ int test_malformed_falls_back_to_text() {
 }
 
 int test_suffix_after_tool_falls_back_to_text() {
-    const std::string text =
-        "<tool_call>\n"
-        "<function=get_weather>\n"
-        "<parameter=city>\nParis\n</parameter>\n"
-        "</function>\n"
-        "</tool_call>\n"
-        "extra answer";
-    const ninfer::serve::ParsedToolCallOutput parsed = ninfer::serve::parse_qwen_tool_call_output(text);
+    const std::string text = "<tool_call>\n"
+                             "<function=get_weather>\n"
+                             "<parameter=city>\nParis\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "extra answer";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(text);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
     failures += check(parsed.content == text, "suffix fallback preserves text");

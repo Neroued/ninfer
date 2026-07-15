@@ -10,10 +10,10 @@ namespace ninfer::ops {
 namespace {
 
 void require_i32_vector(const Tensor& tensor, const char* name) {
-    if (tensor.dtype != DType::I32 || tensor.ne[0] <= 0 || tensor.ne[1] != 1 ||
-        tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() ||
-        tensor.data == nullptr) {
-        throw std::invalid_argument(std::string(name) + " must be a non-empty contiguous I32 vector");
+    if (tensor.dtype != DType::I32 || tensor.ne[0] <= 0 || tensor.ne[1] != 1 || tensor.ne[2] != 1 ||
+        tensor.ne[3] != 1 || !tensor.is_contiguous() || tensor.data == nullptr) {
+        throw std::invalid_argument(std::string(name) +
+                                    " must be a non-empty contiguous I32 vector");
     }
 }
 

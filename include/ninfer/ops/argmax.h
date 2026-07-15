@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-#include <cuda_runtime.h>  // cudaStream_t
+#include <cuda_runtime.h> // cudaStream_t
 
 namespace ninfer::ops {
 

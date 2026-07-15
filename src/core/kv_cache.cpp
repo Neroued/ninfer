@@ -103,11 +103,10 @@ Tensor bind_tensor(DeviceSpan backing, const LayoutRegion& region, DType dtype,
 
 KVCacheLayout plan_kv_cache(LayoutBuilder& builder, std::uint32_t full_layers,
                             std::uint32_t max_context_in, std::int32_t num_kv_heads_in,
-                            std::int32_t head_dim_in, DType dtype_in,
-                            std::int32_t quant_group_in) {
+                            std::int32_t head_dim_in, DType dtype_in, std::int32_t quant_group_in) {
     if (full_layers == 0) { throw std::invalid_argument("KVCache layers must be nonzero"); }
-    if (max_context_in == 0 || max_context_in >
-                                   static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+    if (max_context_in == 0 ||
+        max_context_in > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("KVCache max_context out of range");
     }
     if (num_kv_heads_in <= 0) {
@@ -150,7 +149,7 @@ KVCacheLayout plan_kv_cache(LayoutBuilder& builder, std::uint32_t full_layers,
 
 std::size_t KVCacheLayout::payload_bytes() const noexcept {
     std::size_t total = 0;
-    const auto add = [&](const std::vector<LayoutRegion>& regions) {
+    const auto add    = [&](const std::vector<LayoutRegion>& regions) {
         for (const auto& region : regions) { total += region.bytes; }
     };
     add(k);
@@ -178,10 +177,8 @@ KVCache::KVCache(DeviceSpan backing, const KVCacheLayout& layout)
     k_scale.reserve(layout.k_scale.size());
     v_scale.reserve(layout.v_scale.size());
     for (std::size_t layer = 0; layer < layers; ++layer) {
-        k.push_back(bind_tensor(backing, layout.k[layer], dtype,
-                                {head_dim, padded, num_kv_heads}));
-        v.push_back(bind_tensor(backing, layout.v[layer], dtype,
-                                {head_dim, padded, num_kv_heads}));
+        k.push_back(bind_tensor(backing, layout.k[layer], dtype, {head_dim, padded, num_kv_heads}));
+        v.push_back(bind_tensor(backing, layout.v[layer], dtype, {head_dim, padded, num_kv_heads}));
         if (dtype == DType::I8) {
             k_scale.push_back(bind_tensor(backing, layout.k_scale[layer], DType::FP16,
                                           {groups, padded, num_kv_heads}));

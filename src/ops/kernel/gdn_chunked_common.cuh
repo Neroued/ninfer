@@ -8,10 +8,10 @@
 #include <cstdint>
 #include <cstdio>
 
-#define NINFER_GDN_PROPAGATE(expr)                                                                    \
+#define NINFER_GDN_PROPAGATE(expr)                                                                 \
     do {                                                                                           \
-        const cudaError_t ninfer_gdn_err = (expr);                                                    \
-        if (ninfer_gdn_err != cudaSuccess) { return ninfer_gdn_err; }                                    \
+        const cudaError_t ninfer_gdn_err = (expr);                                                 \
+        if (ninfer_gdn_err != cudaSuccess) { return ninfer_gdn_err; }                              \
     } while (0)
 
 namespace ninfer::ops::detail::gdn_chunked {
@@ -48,8 +48,8 @@ inline workspace_layout compute_workspace_layout(std::int64_t S, std::int64_t H_
     (void)H_qk;
     constexpr std::int64_t f    = static_cast<std::int64_t>(sizeof(float));
     constexpr std::int64_t bf16 = static_cast<std::int64_t>(sizeof(__nv_bfloat16));
-    const std::int64_t T     = L;
-    const std::int64_t NT    = div_up(T, kChunkSize);
+    const std::int64_t T        = L;
+    const std::int64_t NT       = div_up(T, kChunkSize);
 
     const std::int64_t per_token_g   = B * T * H_v;
     const std::int64_t per_token_S   = B * T * H_v * S;
@@ -86,11 +86,11 @@ struct prepare_wy_wu_config {
 
     const __nv_bfloat16* k = nullptr;
     const __nv_bfloat16* v = nullptr;
-    const float* g_in = nullptr;
-    const float* beta = nullptr;
+    const float* g_in      = nullptr;
+    const float* beta      = nullptr;
 
-    __nv_bfloat16* W   = nullptr;
-    __nv_bfloat16* U   = nullptr;
+    __nv_bfloat16* W    = nullptr;
+    __nv_bfloat16* U    = nullptr;
     float* g_cumsum_out = nullptr;
 
     std::int64_t k_stride_t_floats = 0;
@@ -109,12 +109,12 @@ struct state_passing_config {
     const __nv_bfloat16* W = nullptr;
     const __nv_bfloat16* U = nullptr;
     const __nv_bfloat16* k = nullptr;
-    const float* g_cumsum = nullptr;
-    const float* state_in = nullptr;
+    const float* g_cumsum  = nullptr;
+    const float* state_in  = nullptr;
 
-    __nv_bfloat16* v_new = nullptr;
+    __nv_bfloat16* v_new   = nullptr;
     __nv_bfloat16* h_chunk = nullptr;
-    float* state_out = nullptr;
+    float* state_out       = nullptr;
 
     std::int64_t k_stride_t_floats = 0;
 
@@ -128,10 +128,10 @@ struct chunk_output_config {
     std::int64_t L    = 0;
     std::int64_t B    = 0;
 
-    const __nv_bfloat16* q = nullptr;
-    const __nv_bfloat16* k = nullptr;
-    const __nv_bfloat16* v_new = nullptr;
-    const float* g_cumsum = nullptr;
+    const __nv_bfloat16* q       = nullptr;
+    const __nv_bfloat16* k       = nullptr;
+    const __nv_bfloat16* v_new   = nullptr;
+    const float* g_cumsum        = nullptr;
     const __nv_bfloat16* h_chunk = nullptr;
 
     __nv_bfloat16* attn_out = nullptr;

@@ -66,9 +66,8 @@ void mtp_prepare_verify_inputs(const Tensor& token, const Tensor& drafts, const 
 
 void mtp_accept_tokens(const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
                        Tensor& length, Tensor& token, Tensor& sampled_out, Tensor& num_sampled,
-                       Tensor& accepted, Tensor& ar_pos, Tensor& stats,
-                       std::int32_t token_domain, const SamplingConfig* config,
-                       cudaStream_t stream) {
+                       Tensor& accepted, Tensor& ar_pos, Tensor& stats, std::int32_t token_domain,
+                       const SamplingConfig* config, cudaStream_t stream) {
     constexpr const char* op = "mtp_accept_tokens";
     const std::int32_t k     = drafts.ne[0];
     require_vector(target_tokens, DType::I32, k + 1, op, "target_tokens");
@@ -77,8 +76,7 @@ void mtp_accept_tokens(const Tensor& target_tokens, const Tensor& logits, const 
         throw std::invalid_argument("mtp_accept_tokens: logits must be [physical_rows, >=k+1]");
     }
     if (token_domain <= 0 || token_domain > logits.ne[0]) {
-        throw std::invalid_argument(
-            "mtp_accept_tokens: token_domain must be in [1, logits.ne[0]]");
+        throw std::invalid_argument("mtp_accept_tokens: token_domain must be in [1, logits.ne[0]]");
     }
     require_vector(drafts, DType::I32, k, op, "drafts");
     require_scalar(length, DType::I32, op, "length");

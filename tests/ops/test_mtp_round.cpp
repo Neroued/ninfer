@@ -92,8 +92,7 @@ int prepare_verify_case() {
     Tensor window_base(d_window_base.p, DType::I32, {1});
     Tensor verify(d_verify.p, DType::I32, {k + 1});
     Tensor positions(d_positions.p, DType::I32, {k + 1});
-    ops::mtp_prepare_verify_inputs(token, drafts, length, window_base, verify, positions,
-                                       nullptr);
+    ops::mtp_prepare_verify_inputs(token, drafts, length, window_base, verify, positions, nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -130,8 +129,8 @@ int accept_partial_case() {
     Tensor accepted(d_accepted.p, DType::I32, {1});
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {kStepStatsCounters});
-    ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                               ar_pos, stats, 16, config_ptr(d_cfg), nullptr);
+    ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted, ar_pos,
+                           stats, 16, config_ptr(d_cfg), nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -142,9 +141,8 @@ int accept_partial_case() {
     failures += expect_eq("accept partial length", from_device_i32(d_length, 1), {23});
     failures += expect_eq("accept partial token", from_device_i32(d_token, 1), {9});
     failures += expect_eq("accept partial ar_pos", from_device_i32(d_ar_pos, 1), {23});
-    failures +=
-        expect_eq("accept partial stats", from_device_i64(d_stats, kStepStatsCounters),
-                  {10, 9, 4, 4, 101, 201, 300, 400, 500});
+    failures += expect_eq("accept partial stats", from_device_i64(d_stats, kStepStatsCounters),
+                          {10, 9, 4, 4, 101, 201, 300, 400, 500});
     return failures;
 }
 
@@ -172,8 +170,8 @@ int accept_all_reject_case() {
     Tensor accepted(d_accepted.p, DType::I32, {1});
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {kStepStatsCounters});
-    ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                               ar_pos, stats, 16, config_ptr(d_cfg), nullptr);
+    ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted, ar_pos,
+                           stats, 16, config_ptr(d_cfg), nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -184,9 +182,8 @@ int accept_all_reject_case() {
     failures += expect_eq("accept all reject length", from_device_i32(d_length, 1), {21});
     failures += expect_eq("accept all reject token", from_device_i32(d_token, 1), {7});
     failures += expect_eq("accept all reject ar_pos", from_device_i32(d_ar_pos, 1), {21});
-    failures +=
-        expect_eq("accept all reject stats", from_device_i64(d_stats, kStepStatsCounters),
-                  {5, 0, 1, 0, 0, 0, 0, 0, 0});
+    failures += expect_eq("accept all reject stats", from_device_i64(d_stats, kStepStatsCounters),
+                          {5, 0, 1, 0, 0, 0, 0, 0, 0});
     return failures;
 }
 
@@ -214,8 +211,8 @@ int accept_all_case() {
     Tensor accepted(d_accepted.p, DType::I32, {1});
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {kStepStatsCounters});
-    ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                               ar_pos, stats, 16, config_ptr(d_cfg), nullptr);
+    ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted, ar_pos,
+                           stats, 16, config_ptr(d_cfg), nullptr);
     cudaDeviceSynchronize();
 
     int failures = 0;
@@ -396,7 +393,7 @@ int reject_sampling_distribution_case() {
         cudaMemcpyAsync(d_scratch.p, static_cast<const std::int32_t*>(d_lengths.p) + r,
                         sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
         ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                                   ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
+                               ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
         cudaMemcpyAsync(static_cast<std::int32_t*>(d_collect.p) + r, d_sampled.p,
                         sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
     }
@@ -463,7 +460,7 @@ int reject_sampling_reproducible_case() {
         auto d_length = to_device_i32({10});
         Tensor length(d_length.p, DType::I32, {1});
         ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                                   ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
+                               ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
         cudaDeviceSynchronize();
         std::vector<int> out = from_device_i32(d_sampled, k + 1);
         out.push_back(from_device_i32(d_num, 1)[0]);
@@ -540,7 +537,7 @@ int reject_sampling_real_shape_distribution_case() {
         cudaMemcpyAsync(d_scratch.p, static_cast<const std::int32_t*>(d_lengths.p) + r,
                         sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
         ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                                   ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
+                               ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
         cudaMemcpyAsync(static_cast<std::int32_t*>(d_collect.p) + r, d_sampled.p,
                         sizeof(std::int32_t), cudaMemcpyDeviceToDevice, nullptr);
     }
@@ -614,7 +611,7 @@ std::vector<int> run_real_shape_mtp_sequence(const std::vector<float>& logits_h,
         const int len = 1000 + r;
         cudaMemcpy(d_length.p, &len, sizeof(len), cudaMemcpyHostToDevice);
         ops::mtp_accept_tokens(targets, logits, drafts, length, token, sampled, num, accepted,
-                                   ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
+                               ar_pos, stats, vocab, config_ptr(d_cfg), nullptr);
         std::int32_t* out = static_cast<std::int32_t*>(d_collect.p) + r * (k + 2);
         cudaMemcpyAsync(out, d_sampled.p, static_cast<std::size_t>(k + 1) * sizeof(std::int32_t),
                         cudaMemcpyDeviceToDevice, nullptr);
@@ -655,8 +652,8 @@ int reject_sampling_real_shape_reproducible_case() {
         return 1;
     }
     ops::SamplingConfig cfg2 = cfg;
-    cfg2.seed                    = 9002u;
-    std::vector<int> c           = run_real_shape_mtp_sequence(logits_h, drafts, cfg2, rounds);
+    cfg2.seed                = 9002u;
+    std::vector<int> c       = run_real_shape_mtp_sequence(logits_h, drafts, cfg2, rounds);
     if (a == c) {
         std::cerr << "real-shape reject reproducible: different seed produced identical stream\n";
         return 1;
@@ -710,8 +707,8 @@ std::vector<int> run_one_mtp_round(const std::vector<float>& logits_h, int vocab
     Tensor ar_pos(d_ar_pos.p, DType::I32, {1});
     Tensor stats(d_stats.p, DType::I64, {kStepStatsCounters});
 
-    ops::mtp_accept_tokens(targets, logits, drafts, length_t, token, sampled, num, accepted,
-                               ar_pos, stats, token_domain, config_ptr(d_cfg), nullptr);
+    ops::mtp_accept_tokens(targets, logits, drafts, length_t, token, sampled, num, accepted, ar_pos,
+                           stats, token_domain, config_ptr(d_cfg), nullptr);
     cudaDeviceSynchronize();
 
     std::vector<int> out = from_device_i32(d_sampled, k + 1);
@@ -728,10 +725,10 @@ int physical_stride_and_token_domain_case() {
     constexpr int bonus         = 200003;
     std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
     for (int col = 0; col <= k; ++col) {
-        const std::size_t base = static_cast<std::size_t>(col) * physical_rows;
+        const std::size_t base                    = static_cast<std::size_t>(col) * physical_rows;
         logits[base + (col == 0 ? first : bonus)] = 20.0f;
-        logits[base + token_domain]                = 100.0f;
-        logits[base + physical_rows - 1]           = 200.0f;
+        logits[base + token_domain]               = 100.0f;
+        logits[base + physical_rows - 1]          = 200.0f;
     }
     round_to_bf16(logits);
 
@@ -741,14 +738,14 @@ int physical_stride_and_token_domain_case() {
     cfg.seed        = 1234;
 
     int failures = 0;
-    failures += expect_eq(
-        "MTP physical stride + token domain bonus",
-        run_one_mtp_round(logits, physical_rows, k, {first}, cfg, 10, token_domain),
-        {first, bonus, 2, 1});
-    failures += expect_eq(
-        "MTP physical stride + token domain rejection",
-        run_one_mtp_round(logits, physical_rows, k, {7919}, cfg, 10, token_domain),
-        {first, 0, 1, 0});
+    failures +=
+        expect_eq("MTP physical stride + token domain bonus",
+                  run_one_mtp_round(logits, physical_rows, k, {first}, cfg, 10, token_domain),
+                  {first, bonus, 2, 1});
+    failures +=
+        expect_eq("MTP physical stride + token domain rejection",
+                  run_one_mtp_round(logits, physical_rows, k, {7919}, cfg, 10, token_domain),
+                  {first, 0, 1, 0});
     if (failures == 0) {
         std::cout << "    MTP physical stride + token domain rejection/bonus ok\n";
     }

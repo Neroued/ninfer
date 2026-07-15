@@ -39,9 +39,8 @@ std::int32_t vision_attention_scratch_tiles(std::int32_t patches, std::int32_t s
     return (patches + tile_rows - 1) / tile_rows + segments - 1;
 }
 
-void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                      const Tensor& cu_seqlens, Tensor* scratch_tiles, Tensor& out,
-                      cudaStream_t stream) {
+void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& cu_seqlens,
+                      Tensor* scratch_tiles, Tensor& out, cudaStream_t stream) {
     const std::int32_t patches = q.ne[2];
     if (patches <= 0) { throw std::invalid_argument("vision_attention: P must be positive"); }
     require_qkv(q, patches, "q");
@@ -56,8 +55,7 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         cu_seqlens.data == nullptr) {
         throw std::invalid_argument("vision_attention: cu_seqlens must be contiguous I32 [S+1]");
     }
-    const std::int32_t required =
-        vision_attention_scratch_tiles(patches, cu_seqlens.ne[0] - 1);
+    const std::int32_t required = vision_attention_scratch_tiles(patches, cu_seqlens.ne[0] - 1);
     if (required == 0) {
         if (scratch_tiles != nullptr && scratch_tiles->data != nullptr) {
             throw std::invalid_argument("vision_attention: one segment requires no scratch tiles");
@@ -73,14 +71,14 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& cu_seqlens,
                       WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     const std::int32_t patches  = q.ne[2];
-    const std::int32_t segments      = cu_seqlens.ne[0] - 1;
-    auto scratch_scope               = workspace.scope();
+    const std::int32_t segments = cu_seqlens.ne[0] - 1;
+    auto scratch_scope          = workspace.scope();
     Tensor tiles;
-    Tensor* tiles_ptr = nullptr;
+    Tensor* tiles_ptr            = nullptr;
     const std::int32_t max_tiles = vision_attention_scratch_tiles(patches, segments);
     if (max_tiles != 0) {
-        tiles                        = workspace.alloc(DType::I32, {4, max_tiles});
-        tiles_ptr                    = &tiles;
+        tiles     = workspace.alloc(DType::I32, {4, max_tiles});
+        tiles_ptr = &tiles;
     }
     vision_attention(q, k, v, cu_seqlens, tiles_ptr, out, stream);
 }

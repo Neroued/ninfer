@@ -106,9 +106,8 @@ void run(int t, const char* tag, bool copy_baseline) {
     const Result r =
         copy_baseline
             ? bench_loop([&](cudaStream_t s) { launch_copy_baseline(q, k, qn, kn, s); }, bytes)
-            : bench_loop(
-                  [&](cudaStream_t s) { ops::rope(tpos, kRotaryDim, kTheta, tq, tk, s); },
-                  bytes);
+            : bench_loop([&](cudaStream_t s) { ops::rope(tpos, kRotaryDim, kTheta, tq, tk, s); },
+                         bytes);
     print_result(tag, r);
 }
 
@@ -123,8 +122,7 @@ void run_mrope(int t) {
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKHeads, t});
     const double bytes  = 4.0 * static_cast<double>(qn + kn);
     const Result result = bench_loop(
-        [&](cudaStream_t stream) { ops::rope(tpos, kRotaryDim, kTheta, tq, tk, stream); },
-        bytes);
+        [&](cudaStream_t stream) { ops::rope(tpos, kRotaryDim, kTheta, tq, tk, stream); }, bytes);
     print_result("rope MRoPE [3,4096]", result);
 }
 
@@ -143,8 +141,7 @@ void run_vision(int patches) {
     Tensor tpos(positions.p, DType::I32, {patches, 2});
     const double bytes  = 8.0 * static_cast<double>(hidden) * patches;
     const Result result = bench_loop(
-        [&](cudaStream_t stream) { ops::rope(tpos, head_dim, 10000.0f, tq, tk, stream); },
-        bytes);
+        [&](cudaStream_t stream) { ops::rope(tpos, head_dim, 10000.0f, tq, tk, stream); }, bytes);
     print_result("rope Vision packed P=4096", result);
 }
 

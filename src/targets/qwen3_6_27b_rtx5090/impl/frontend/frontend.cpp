@@ -384,7 +384,7 @@ struct DecoderState {
 };
 
 struct StopMatch {
-    bool found                     = false;
+    bool found                      = false;
     std::uint32_t committed_tokens  = 0;
     std::uint64_t byte_cut          = 0;
     std::uint32_t declaration_order = 0;
@@ -453,8 +453,7 @@ void close_channel(DecoderState& state, OutputChannel channel, PublishedOutput& 
 }
 
 void feed_content(DecoderState& state, std::string text, const StopPolicy& policy,
-                  PublishedOutput& emitted, std::uint32_t committed_tokens,
-                  StopMatch* best_match) {
+                  PublishedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best_match) {
     if (state.strip_content_leading) {
         std::size_t begin = 0;
         while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {

@@ -637,9 +637,7 @@ void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
     kv.pos                  = static_cast<std::uint32_t>(context);
     const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv.dtype);
     const Result r          = bench_loop(
-        [&](cudaStream_t s) {
-            ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s);
-        },
+        [&](cudaStream_t s) { ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s); },
         static_cast<double>(bytes.total));
 
     char tag[96];
@@ -795,8 +793,7 @@ AppendPromptMetrics run_append_prompt_attention_only(KVCache& kv, std::int32_t t
     const double bytes = append_prompt_global_floor_bytes(tokens, context, kv.dtype);
     const Result r     = bench_loop(
         [&](cudaStream_t s) {
-            ops::detail::gqa_attention_prompt_attention_launch(tq, tpos, kScale, kv, 0, tout,
-                                                                       s);
+            ops::detail::gqa_attention_prompt_attention_launch(tq, tpos, kScale, kv, 0, tout, s);
         },
         bytes, timing.warmup, timing.repeat, timing.min_time_ms);
 
@@ -900,9 +897,7 @@ PrefillMetrics run_prefill(KVCache& kv, std::int32_t tokens, const PrefillTiming
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
     const Result r = bench_loop(
-        [&](cudaStream_t s) {
-            ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s);
-        },
+        [&](cudaStream_t s) { ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s); },
         prefill_model_floor_bytes(tokens, kv.dtype), timing.warmup, timing.repeat,
         timing.min_time_ms);
 
@@ -1137,23 +1132,24 @@ struct Options {
 };
 
 void fail_usage(const char* message) {
-    std::fprintf(stderr,
-                 "error: %s\n"
-                 "usage: ninfer_gqa_attention_bench [--prefill] [--tokens T[,T...]] "
-                 "[--kv-dtype bf16|int8] "
-                 "[--expect-tflops-pct-min PCT] [--csv-out path] [--json-out path]\n"
-                 "       ninfer_gqa_attention_bench --prefill --tokens 4096 --profile-once\n"
-                 "       ninfer_gqa_attention_bench --append-small-t --tokens T --context N "
-                 "[--kv-dtype bf16|int8] [--profile-once] [--cold-cache]\n"
-                 "       ninfer_gqa_attention_bench --append-prompt-baseline --tokens T[,T...] "
-                 "--context N[,N...] [--kv-dtype bf16|int8] [--csv-out path] [--json-out path]\n"
-                 "       ninfer_gqa_attention_bench --append-prompt-attention-only --tokens T[,T...] "
-                 "--context N[,N...] [--kv-dtype bf16|int8]\n"
-                 "       ninfer_gqa_attention_bench --copy-ceiling --tokens T --context N "
-                 "[--kv-dtype bf16|int8]\n"
-                 "       ninfer_gqa_attention_bench --decode [--decode-pos N] [--profile-once] "
-                 "[--cold-cache] [--round-robin-layers 16] [--kv-dtype bf16|int8]\n",
-                 message);
+    std::fprintf(
+        stderr,
+        "error: %s\n"
+        "usage: ninfer_gqa_attention_bench [--prefill] [--tokens T[,T...]] "
+        "[--kv-dtype bf16|int8] "
+        "[--expect-tflops-pct-min PCT] [--csv-out path] [--json-out path]\n"
+        "       ninfer_gqa_attention_bench --prefill --tokens 4096 --profile-once\n"
+        "       ninfer_gqa_attention_bench --append-small-t --tokens T --context N "
+        "[--kv-dtype bf16|int8] [--profile-once] [--cold-cache]\n"
+        "       ninfer_gqa_attention_bench --append-prompt-baseline --tokens T[,T...] "
+        "--context N[,N...] [--kv-dtype bf16|int8] [--csv-out path] [--json-out path]\n"
+        "       ninfer_gqa_attention_bench --append-prompt-attention-only --tokens T[,T...] "
+        "--context N[,N...] [--kv-dtype bf16|int8]\n"
+        "       ninfer_gqa_attention_bench --copy-ceiling --tokens T --context N "
+        "[--kv-dtype bf16|int8]\n"
+        "       ninfer_gqa_attention_bench --decode [--decode-pos N] [--profile-once] "
+        "[--cold-cache] [--round-robin-layers 16] [--kv-dtype bf16|int8]\n",
+        message);
     std::exit(2);
 }
 

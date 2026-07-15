@@ -22,21 +22,34 @@
 
 namespace ninfer::bench {
 
-constexpr double kRooflineGBs = 1792.0;  // RTX 5090 GDDR7 bandwidth roofline.
+constexpr double kRooflineGBs = 1792.0; // RTX 5090 GDDR7 bandwidth roofline.
 
 struct DBuf {
     void* p           = nullptr;
     std::size_t bytes = 0;
+
     explicit DBuf(std::size_t b) : bytes(b) { cudaMalloc(&p, b); }
-    ~DBuf() { if (p) cudaFree(p); }
-    DBuf(DBuf&& o) noexcept : p(o.p), bytes(o.bytes) { o.p = nullptr; o.bytes = 0; }
+
+    ~DBuf() {
+        if (p) cudaFree(p);
+    }
+
+    DBuf(DBuf&& o) noexcept : p(o.p), bytes(o.bytes) {
+        o.p     = nullptr;
+        o.bytes = 0;
+    }
+
     DBuf& operator=(DBuf&& o) noexcept {
         if (this != &o) {
             if (p) cudaFree(p);
-            p = o.p; bytes = o.bytes; o.p = nullptr; o.bytes = 0;
+            p       = o.p;
+            bytes   = o.bytes;
+            o.p     = nullptr;
+            o.bytes = 0;
         }
         return *this;
     }
+
     DBuf(const DBuf&)            = delete;
     DBuf& operator=(const DBuf&) = delete;
 };
@@ -58,6 +71,7 @@ inline DBuf make_bf16(std::size_t n) {
     cudaMemcpy(d.p, h.data(), n * 2, cudaMemcpyHostToDevice);
     return d;
 }
+
 inline DBuf make_zeros(std::size_t bytes) {
     DBuf d(bytes);
     cudaMemset(d.p, 0, bytes);
@@ -70,13 +84,13 @@ inline DBuf make_zeros(std::size_t bytes) {
 inline double device_peak_bw_gbs(int /*dev*/ = 0) { return kRooflineGBs; }
 
 struct Result {
-    int n_runs      = 0;
-    int inner_iters = 1;
+    int n_runs       = 0;
+    int inner_iters  = 1;
     double median_us = 0.0;
     double min_us    = 0.0;
     double p95_us    = 0.0;
     double mean_us   = 0.0;
-    double gbs       = 0.0;  // from median
+    double gbs       = 0.0; // from median
 };
 
 using launch_fn = std::function<void(cudaStream_t)>;
@@ -107,7 +121,7 @@ inline Result bench_loop(const launch_fn& launch, double bytes_moved, int warmup
 
     std::vector<double> samples;
     long long total_us = 0;
-    while (int(samples.size()) < repeat || total_us < (long long) min_time_ms * 1000) {
+    while (int(samples.size()) < repeat || total_us < (long long)min_time_ms * 1000) {
         cudaEventRecord(a, stream);
         for (int i = 0; i < inner; ++i) launch(stream);
         cudaEventRecord(b, stream);
@@ -116,7 +130,7 @@ inline Result bench_loop(const launch_fn& launch, double bytes_moved, int warmup
         cudaEventElapsedTime(&ms, a, b);
         const double batch_us = double(ms) * 1000.0;
         samples.push_back(batch_us / inner);
-        total_us += (long long) batch_us;
+        total_us += (long long)batch_us;
         if (samples.size() > 100000) break;
     }
     cudaEventDestroy(a);
@@ -132,22 +146,22 @@ inline Result bench_loop(const launch_fn& launch, double bytes_moved, int warmup
     for (double v : samples) sum += v;
 
     Result r;
-    r.n_runs      = int(samples.size());
-    r.inner_iters = inner;
-    r.median_us   = pct(0.50);
-    r.min_us      = sorted.front();
-    r.p95_us      = pct(0.95);
-    r.mean_us     = sum / samples.size();
+    r.n_runs         = int(samples.size());
+    r.inner_iters    = inner;
+    r.median_us      = pct(0.50);
+    r.min_us         = sorted.front();
+    r.p95_us         = pct(0.95);
+    r.mean_us        = sum / samples.size();
     const double sec = r.median_us * 1e-6;
     r.gbs            = (sec > 0.0) ? bytes_moved / sec / 1e9 : 0.0;
     return r;
 }
 
 inline void print_result(const char* tag, const Result& r) {
-    std::printf("%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (%.1f%% of %.0f GB/s "
-                "roofline)\n",
-                tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / kRooflineGBs * 100.0,
-                kRooflineGBs);
+    std::printf(
+        "%-32s median=%8.2f us  min=%8.2f us  p95=%8.2f us  %8.1f GB/s  (%.1f%% of %.0f GB/s "
+        "roofline)\n",
+        tag, r.median_us, r.min_us, r.p95_us, r.gbs, r.gbs / kRooflineGBs * 100.0, kRooflineGBs);
 }
 
 } // namespace ninfer::bench

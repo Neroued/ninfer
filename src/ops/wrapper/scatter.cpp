@@ -43,14 +43,15 @@ void extract_bf16_columns(const Tensor& source, std::int32_t source_column, Tens
     }
     if (!source.is_contiguous() || !destination.is_contiguous() || source.data == nullptr ||
         destination.data == nullptr) {
-        throw std::invalid_argument("extract_bf16_columns: tensors must be contiguous and non-null");
+        throw std::invalid_argument(
+            "extract_bf16_columns: tensors must be contiguous and non-null");
     }
     if (source.data == destination.data) {
         throw std::invalid_argument("extract_bf16_columns: source and destination must not alias");
     }
     const std::size_t element_bytes = dtype_size(DType::BF16);
-    const std::size_t width = static_cast<std::size_t>(destination.ne[0]) * element_bytes;
-    const std::size_t source_pitch = static_cast<std::size_t>(source.ne[0]) * element_bytes;
+    const std::size_t width         = static_cast<std::size_t>(destination.ne[0]) * element_bytes;
+    const std::size_t source_pitch  = static_cast<std::size_t>(source.ne[0]) * element_bytes;
     const std::size_t destination_pitch =
         static_cast<std::size_t>(destination.ne[0]) * element_bytes;
     const auto* source_ptr = static_cast<const unsigned char*>(source.data) +

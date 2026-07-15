@@ -149,9 +149,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     for (int k = 0; k < QKKs; ++k) {
         const int arow = warp_row0 + a_rowoff;
         const int acol = k * 16 + a_coloff;
-        ldmatrix_x4(
-            af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
-            smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
+        ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
+                    smem_addr(&qkv_s[arow * D + gqa_small_t_tc_swz(arow, acol)]));
     }
     __syncthreads();
 
@@ -205,12 +204,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 unsigned bf[2];
                 const int brow = nt * 8 + b_rin;
                 const int bcol = k * 16 + b_koff;
-                ldmatrix_x2(
-                    bf[0], bf[1],
-                    smem_addr(&k_s[brow * D + gqa_small_t_tc_swz(brow, bcol)]));
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2],
-                                                 score[nt][3], af_q[k][0], af_q[k][1], af_q[k][2],
-                                                 af_q[k][3], bf[0], bf[1]);
+                ldmatrix_x2(bf[0], bf[1],
+                            smem_addr(&k_s[brow * D + gqa_small_t_tc_swz(brow, bcol)]));
+                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
+                         af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
             }
         }
 
@@ -225,10 +222,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0 = nt * 8 + 2 * lid;
-            const int col1 = col0 + 1;
-            const int key0 = k0 + col0;
-            const int key1 = col1 + k0;
+            const int col0       = nt * 8 + 2 * lid;
+            const int col1       = col0 + 1;
+            const int key0       = k0 + col0;
+            const int key1       = col1 + k0;
             const int new_token0 = key0 - first_pos;
             const int new_token1 = key1 - first_pos;
             const bool from_new0 = new_token0 >= 0 && new_token0 < tokens && key0 >= first_pos;
@@ -249,8 +246,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                             !(from_new1 && new_token1 > token1))
                                        ? score[nt][3] * scale
                                        : -CUDART_INF_F;
-            bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-            bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+            bm0                  = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+            bm1                  = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
         }
         bm0 = warp_max<4>(bm0, FullMask);
         bm1 = warp_max<4>(bm1, FullMask);
@@ -306,18 +303,15 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             for (int k = 0; k < PVKs; ++k) {
                 unsigned pf[4];
                 const int pcol = k * 16 + a_coloff;
-                ldmatrix_x4(
-                    pf[0], pf[1], pf[2], pf[3],
-                    smem_addr(
-                        &p_sw[a_rowoff * Bc + gqa_small_t_tc_swz32(a_rowoff, pcol)]));
+                ldmatrix_x4(pf[0], pf[1], pf[2], pf[3],
+                            smem_addr(&p_sw[a_rowoff * Bc + gqa_small_t_tc_swz32(a_rowoff, pcol)]));
                 unsigned vf[2];
                 const int vrow = k * 16 + b_koff + b_rin;
                 const int vcol = n * 8;
-                ldmatrix_x2_t(
-                    vf[0], vf[1],
-                    smem_addr(&v_s[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0],
-                                                 pf[1], pf[2], pf[3], vf[0], vf[1]);
+                ldmatrix_x2_t(vf[0], vf[1],
+                              smem_addr(&v_s[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
+                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
+                         vf[0], vf[1]);
             }
         }
         __syncthreads();

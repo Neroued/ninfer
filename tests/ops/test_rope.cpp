@@ -496,12 +496,12 @@ int validation_checks() {
         bad.ne[2]  = -1;
         ops::rope(pos, kRotaryDim, kTheta, bad, k, nullptr);
     });
-    f += expect_invalid("validation rotary <= 0",
-                        [&] { ops::rope(pos, 0, kTheta, q, k, nullptr); });
+    f +=
+        expect_invalid("validation rotary <= 0", [&] { ops::rope(pos, 0, kTheta, q, k, nullptr); });
     f += expect_invalid("validation rotary > head dim",
                         [&] { ops::rope(pos, 258, kTheta, q, k, nullptr); });
-    f += expect_invalid("validation rotary odd",
-                        [&] { ops::rope(pos, 63, kTheta, q, k, nullptr); });
+    f +=
+        expect_invalid("validation rotary odd", [&] { ops::rope(pos, 63, kTheta, q, k, nullptr); });
     f += expect_invalid("validation theta finite positive",
                         [&] { ops::rope(pos, kRotaryDim, -1.0f, q, k, nullptr); });
     f += expect_overflow("validation overflow dims", [&] {

@@ -14,11 +14,11 @@
 using namespace ninfer;
 using namespace ninfer::test;
 
-static void cpu_l2norm(const std::vector<float>& x, float eps, std::int32_t d,
-                       std::int64_t rows, std::vector<double>& o) {
+static void cpu_l2norm(const std::vector<float>& x, float eps, std::int32_t d, std::int64_t rows,
+                       std::vector<double>& o) {
     for (std::int64_t r = 0; r < rows; ++r) {
         const std::int64_t base = r * d;
-        double sumsq = 0.0;
+        double sumsq            = 0.0;
         for (std::int32_t i = 0; i < d; ++i) {
             const double xv = static_cast<double>(x[base + i]);
             sumsq += xv * xv;
@@ -36,10 +36,10 @@ static Tensor tensor_for_shape(void* data, std::int32_t d0, std::int32_t d1, std
     return Tensor(data, DType::BF16, {d0, d1});
 }
 
-static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::int32_t d2,
-                     bool rank3, std::uint32_t seed, float lo, float hi) {
+static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::int32_t d2, bool rank3,
+                     std::uint32_t seed, float lo, float hi) {
     const auto rows = static_cast<std::int64_t>(d1) * static_cast<std::int64_t>(d2);
-    const auto n = static_cast<std::size_t>(d0) * static_cast<std::size_t>(rows);
+    const auto n    = static_cast<std::size_t>(d0) * static_cast<std::size_t>(rows);
     std::vector<float> x(n);
     fill_uniform(x, seed, lo, hi);
     round_to_bf16(x);
@@ -47,8 +47,8 @@ static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::int
     std::vector<double> ref(n);
     cpu_l2norm(x, 1e-6f, d0, rows, ref);
 
-    DBuf dx = to_device_bf16(x), dout(n * 2);
-    Tensor tx = tensor_for_shape(dx.p, d0, d1, d2, rank3);
+    DBuf dx     = to_device_bf16(x), dout(n * 2);
+    Tensor tx   = tensor_for_shape(dx.p, d0, d1, d2, rank3);
     Tensor tout = tensor_for_shape(dout.p, d0, d1, d2, rank3);
     ops::l2norm(tx, 1e-6f, tout, nullptr);
     cudaDeviceSynchronize();
@@ -57,17 +57,15 @@ static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::int
 }
 
 static int near_zero_row_case() {
-    constexpr std::int32_t d0 = 128;
-    constexpr std::int32_t d1 = 16;
-    constexpr std::int32_t d2 = 1;
+    constexpr std::int32_t d0   = 128;
+    constexpr std::int32_t d1   = 16;
+    constexpr std::int32_t d2   = 1;
     constexpr std::int64_t rows = static_cast<std::int64_t>(d1) * d2;
-    constexpr std::size_t n = static_cast<std::size_t>(d0) * rows;
+    constexpr std::size_t n     = static_cast<std::size_t>(d0) * rows;
 
     std::vector<float> x(n);
     fill_uniform(x, 20260626u, -8.f, 8.f);
-    for (std::int32_t i = 0; i < d0; ++i) {
-        x[i] = (i & 1) ? -1.0e-7f : 1.0e-7f;
-    }
+    for (std::int32_t i = 0; i < d0; ++i) { x[i] = (i & 1) ? -1.0e-7f : 1.0e-7f; }
     round_to_bf16(x);
 
     std::vector<double> ref(n);
@@ -93,10 +91,10 @@ static DBuf to_device_bf16_unaligned(const std::vector<float>& h) {
 }
 
 static int unaligned_data_case() {
-    constexpr std::int32_t d0 = 127;
-    constexpr std::int32_t d1 = 5;
+    constexpr std::int32_t d0   = 127;
+    constexpr std::int32_t d1   = 5;
     constexpr std::int64_t rows = d1;
-    constexpr std::size_t n = static_cast<std::size_t>(d0) * d1;
+    constexpr std::size_t n     = static_cast<std::size_t>(d0) * d1;
     std::vector<float> x(n);
     fill_uniform(x, 3026u, -8.f, 8.f);
     round_to_bf16(x);
@@ -104,7 +102,7 @@ static int unaligned_data_case() {
     std::vector<double> ref(n);
     cpu_l2norm(x, 1e-6f, d0, rows, ref);
 
-    DBuf dx = to_device_bf16_unaligned(x), dout((n + 1) * 2);
+    DBuf dx    = to_device_bf16_unaligned(x), dout((n + 1) * 2);
     auto* xptr = static_cast<unsigned char*>(dx.p) + 2;
     auto* optr = static_cast<unsigned char*>(dout.p) + 2;
     Tensor tx(xptr, DType::BF16, {d0, d1});
@@ -139,7 +137,7 @@ static int validation_checks() {
     try {
         Tensor empty_x(nullptr, DType::BF16, {1});
         Tensor empty_out(nullptr, DType::BF16, {1});
-        empty_x.ne[0] = 0;
+        empty_x.ne[0]   = 0;
         empty_out.ne[0] = 0;
         ops::l2norm(empty_x, 1e-6f, empty_out, nullptr);
     } catch (const std::exception& e) {
@@ -150,8 +148,8 @@ static int validation_checks() {
     try {
         Tensor bad_empty_x(nullptr, DType::BF16, {1});
         Tensor bad_empty_out(nullptr, DType::BF16, {1});
-        bad_empty_x.ne[0] = 0;
-        bad_empty_x.ne[1] = -1;
+        bad_empty_x.ne[0]   = 0;
+        bad_empty_x.ne[1]   = -1;
         bad_empty_out.ne[0] = 0;
         bad_empty_out.ne[1] = -1;
         ops::l2norm(bad_empty_x, 1e-6f, bad_empty_out, nullptr);
@@ -160,7 +158,7 @@ static int validation_checks() {
     } catch (const std::invalid_argument&) {}
 
     try {
-        Tensor huge_x = make_huge_rows();
+        Tensor huge_x   = make_huge_rows();
         Tensor huge_out = make_huge_rows();
         ops::l2norm(huge_x, 1e-6f, huge_out, nullptr);
         std::cerr << "validation huge rows: expected overflow_error\n";
@@ -188,7 +186,7 @@ static int validation_checks() {
 
     try {
         Tensor bad_stride = out;
-        bad_stride.nb[0] = 4;
+        bad_stride.nb[0]  = 4;
         ops::l2norm(x, 1e-6f, bad_stride, nullptr);
         std::cerr << "validation contiguous: expected invalid_argument\n";
         ++f;

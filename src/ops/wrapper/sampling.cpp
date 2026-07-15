@@ -8,8 +8,8 @@
 namespace ninfer::ops {
 
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
-            const SamplingConfig* config,
-            const std::int32_t* pos_base, std::int32_t purpose, cudaStream_t stream) {
+            const SamplingConfig* config, const std::int32_t* pos_base, std::int32_t purpose,
+            cudaStream_t stream) {
     if (logits.dtype != DType::BF16) { throw std::invalid_argument("sample: logits must be BF16"); }
     if (out.dtype != DType::I32) { throw std::invalid_argument("sample: out must be I32"); }
     if (logits.ne[2] != 1 || logits.ne[3] != 1) {

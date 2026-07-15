@@ -86,8 +86,8 @@ __launch_bounds__(THREADS, 3) __global__
                                  const __nv_bfloat16* __restrict__ v_new_in,
                                  const float* __restrict__ g_cumsum_in,
                                  const __nv_bfloat16* __restrict__ h_chunk_in,
-                                 __nv_bfloat16* __restrict__ attn_out,
-                                 int64_t T, int64_t H_v, ninfer::ops::head_map qk_map,
+                                 __nv_bfloat16* __restrict__ attn_out, int64_t T, int64_t H_v,
+                                 ninfer::ops::head_map qk_map,
                                  // Token-axis strides (in floats) for
                                  // q / k. Caller passes materialised
                                  // values (launcher handles 0 ->
@@ -143,9 +143,9 @@ __launch_bounds__(THREADS, 3) __global__
 
     // === Phase A: bf16 q (full S) + k_pass[0] -> float smem; sync-load g_cumsum ===
     ninfer::ops::issue_load_bf16_to_float_vec4<BT, S, THREADS>(q_view, q_in + q_base, q_stride_t,
-                                                                cl, tid);
-    ninfer::ops::issue_load_bf16_to_float_vec4<BT, K_PER_PASS, THREADS>(
-        k_pass_view, k_in + k_base, k_stride_t, cl, tid);
+                                                               cl, tid);
+    ninfer::ops::issue_load_bf16_to_float_vec4<BT, K_PER_PASS, THREADS>(k_pass_view, k_in + k_base,
+                                                                        k_stride_t, cl, tid);
 
     if (tid < BT) {
         float val = 0.0f;
@@ -189,8 +189,8 @@ __launch_bounds__(THREADS, 3) __global__
                     n_off + lane_g; // B operand: row=t, but B is K^T so rows are k cols
                 const float b0 = k_pass_view.at(row_t, col_t0_l);
                 const float b1 = k_pass_view.at(row_t, col_t1_l);
-                mma_tf32(A_strip[nt][0], A_strip[nt][1], A_strip[nt][2], A_strip[nt][3], a0,
-                                 a1, a2, a3, b0, b1);
+                mma_tf32(A_strip[nt][0], A_strip[nt][1], A_strip[nt][2], A_strip[nt][3], a0, a1, a2,
+                         a3, b0, b1);
             }
         }
 
@@ -305,8 +305,8 @@ __launch_bounds__(THREADS, 3) __global__
                 const int row_t = n_off + lane_g;
                 const float b0  = h_part_view.at(row_t, col_t0);
                 const float b1  = h_part_view.at(row_t, col_t1);
-                mma_tf32(D_frag[nt][0], D_frag[nt][1], D_frag[nt][2], D_frag[nt][3], a0, a1,
-                                 a2, a3, b0, b1);
+                mma_tf32(D_frag[nt][0], D_frag[nt][1], D_frag[nt][2], D_frag[nt][3], a0, a1, a2, a3,
+                         b0, b1);
             }
         }
 
@@ -346,8 +346,8 @@ __launch_bounds__(THREADS, 3) __global__
                 const int col_g  = n_off + lane_g;
                 const float b0   = v_part_view.at(row_t0, col_g);
                 const float b1   = v_part_view.at(row_t1, col_g);
-                mma_tf32(D_frag[nt][0], D_frag[nt][1], D_frag[nt][2], D_frag[nt][3], a0, a1,
-                                 a2, a3, b0, b1);
+                mma_tf32(D_frag[nt][0], D_frag[nt][1], D_frag[nt][2], D_frag[nt][3], a0, a1, a2, a3,
+                         b0, b1);
             }
         }
 

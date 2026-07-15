@@ -107,8 +107,7 @@ void validate_cache(KVCache& kv, int layer, const char* op) {
 
 std::size_t gqa_attention_workspace_bytes(std::int32_t tokens) {
     if (tokens <= 0 || !detail::gqa_attention_uses_small_t(tokens)) { return 0; }
-    const Tensor acc(nullptr, DType::BF16,
-                     {kHeadDim, kQHeads, tokens, detail::kGqaDecodeSplits});
+    const Tensor acc(nullptr, DType::BF16, {kHeadDim, kQHeads, tokens, detail::kGqaDecodeSplits});
     const Tensor stat(nullptr, DType::FP32, {kQHeads, tokens, detail::kGqaDecodeSplits});
     LayoutBuilder layout;
     (void)layout.add(acc.bytes(), 256, "GQA partial accumulator");

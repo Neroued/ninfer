@@ -18,19 +18,19 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kSamplerBlock         = 256;
-inline constexpr int kSamplerTileItems     = 256;
-inline constexpr int kSamplerItemsPerThread = 3;
-inline constexpr int kSamplerPartialTileItems = kSamplerBlock * kSamplerItemsPerThread;
+inline constexpr int kSamplerBlock               = 256;
+inline constexpr int kSamplerTileItems           = 256;
+inline constexpr int kSamplerItemsPerThread      = 3;
+inline constexpr int kSamplerPartialTileItems    = kSamplerBlock * kSamplerItemsPerThread;
 inline constexpr int kSamplerGroupItemsPerThread = 2;
-inline constexpr int kSamplerGroupTileItems = kSamplerBlock * kSamplerGroupItemsPerThread;
-inline constexpr int kSamplerPartialsPerGroup = 20;
-inline constexpr int kSamplerFastCandidates = 20;
+inline constexpr int kSamplerGroupTileItems      = kSamplerBlock * kSamplerGroupItemsPerThread;
+inline constexpr int kSamplerPartialsPerGroup    = 20;
+inline constexpr int kSamplerFastCandidates      = 20;
 // Effective per-column candidate cap. The multi-block partial/group merge tiles
 // are sized for this cap, so the sampler clamps top_k to it: top_k <= 0 or a
 // larger top_k both collapse to this cap.
-inline constexpr int kSamplerCandidateCap = kSamplerFastCandidates;
-inline constexpr int kSamplerScratchColumns = 8;
+inline constexpr int kSamplerCandidateCap         = kSamplerFastCandidates;
+inline constexpr int kSamplerScratchColumns       = 8;
 inline constexpr int kSamplerScratchPartialBlocks = 1024;
 
 // One group merge sorts a single kSamplerGroupTileItems-wide tile. It must hold
@@ -86,13 +86,15 @@ __device__ __forceinline__ unsigned long long sampling_splitmix64(unsigned long 
 // Uniform float in [0,1) from (seed, position, purpose, sub). Pure function of
 // its inputs so it is safe under CUDA-graph replay (no mutable RNG state).
 __device__ __forceinline__ float sampling_uniform(unsigned long long seed, int position,
-                                                   int purpose, unsigned int sub) {
+                                                  int purpose, unsigned int sub) {
     unsigned long long key = seed;
-    key = sampling_splitmix64(key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) *
-                                     0xD1B54A32D192ED03ull));
-    key = sampling_splitmix64(key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(purpose)) << 21) ^
-                              (static_cast<unsigned long long>(sub) * 0x2545F4914F6CDD1Dull));
-    const unsigned int bits = static_cast<unsigned int>(key >> 40);  // 24 bits
+    key                    = sampling_splitmix64(
+        key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) *
+               0xD1B54A32D192ED03ull));
+    key = sampling_splitmix64(
+        key ^ (static_cast<unsigned long long>(static_cast<unsigned int>(purpose)) << 21) ^
+        (static_cast<unsigned long long>(sub) * 0x2545F4914F6CDD1Dull));
+    const unsigned int bits = static_cast<unsigned int>(key >> 40); // 24 bits
     return static_cast<float>(bits) * (1.0f / 16777216.0f);
 }
 
@@ -119,7 +121,7 @@ __device__ __forceinline__ unsigned long long sampling_sort_key(float v, int idx
 
 __device__ __forceinline__ float sampling_key_float(unsigned long long key) {
     const unsigned int ordered = static_cast<unsigned int>(key >> 32);
-    const unsigned int bits = (ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered;
+    const unsigned int bits    = (ordered & 0x80000000u) ? (ordered ^ 0x80000000u) : ~ordered;
     return __uint_as_float(bits);
 }
 
@@ -154,10 +156,9 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 // the penalty at each column sees the same prefix a per-token sampler would.
 // Non-MTP callers pass no overlay. The scan is bounded by k (a few tokens) and
 // only runs when penalties are active, so it is free on the no-penalty path.
-__device__ __forceinline__ float sampling_adjusted_logit(float raw, int v,
-                                                         const SamplingConfig& c,
+__device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
-                                                         int overlay_len = 0) {
+                                                         int overlay_len             = 0) {
     float x = raw;
     if (c.token_counts != nullptr) {
         int cnt = c.token_counts[v];
@@ -165,15 +166,13 @@ __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v,
             if (overlay[j] == v) { ++cnt; }
         }
         if (cnt > 0) { x -= c.presence_penalty; }
-        if (c.frequency_penalty != 0.0f) {
-            x -= c.frequency_penalty * static_cast<float>(cnt);
-        }
+        if (c.frequency_penalty != 0.0f) { x -= c.frequency_penalty * static_cast<float>(cnt); }
     }
     return x;
 }
 
-__device__ __forceinline__ void sampling_insert_candidate(float* vals, int* idxs, int cap,
-                                                          float v, int idx) {
+__device__ __forceinline__ void sampling_insert_candidate(float* vals, int* idxs, int cap, float v,
+                                                          int idx) {
     if (cap <= 0 || !sampling_better(v, idx, vals[cap - 1], idxs[cap - 1])) { return; }
     int pos = cap - 1;
     while (pos > 0 && sampling_better(v, idx, vals[pos - 1], idxs[pos - 1])) {
@@ -192,19 +191,18 @@ __device__ inline void sampling_sort_tile_desc(float* vals, int* idxs) {
             const int other = tid ^ stride;
             __syncthreads();
             if (other > tid) {
-                const float ov = vals[other];
-                const int oi = idxs[other];
+                const float ov        = vals[other];
+                const int oi          = idxs[other];
                 const bool descending = ((tid & size) == 0);
-                const bool swap =
-                    descending ? sampling_better(ov, oi, vals[tid], idxs[tid])
-                               : sampling_better(vals[tid], idxs[tid], ov, oi);
+                const bool swap       = descending ? sampling_better(ov, oi, vals[tid], idxs[tid])
+                                                   : sampling_better(vals[tid], idxs[tid], ov, oi);
                 if (swap) {
                     const float tv = vals[tid];
-                    const int ti = idxs[tid];
-                    vals[tid] = ov;
-                    idxs[tid] = oi;
-                    vals[other] = tv;
-                    idxs[other] = ti;
+                    const int ti   = idxs[tid];
+                    vals[tid]      = ov;
+                    idxs[tid]      = oi;
+                    vals[other]    = tv;
+                    idxs[other]    = ti;
                 }
             }
             __syncthreads();
@@ -218,8 +216,8 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
     const int tid = threadIdx.x;
     if (tid == 0) {
         const float inv_temp = 1.0f / cfg.temperature;
-        const float m = cand_val[0] * inv_temp;
-        float sum     = 0.0f;
+        const float m        = cand_val[0] * inv_temp;
+        float sum            = 0.0f;
         for (int j = 0; j < n; ++j) {
             const float e = __expf(cand_val[j] * inv_temp - m);
             prob[j]       = e;
@@ -247,18 +245,14 @@ __device__ inline void sampling_normalize_support(const SamplingConfig& cfg, flo
     __syncthreads();
 }
 
-
 // All threads of the block must call. Small-column exact truncated support
 // builder used by unit tests and any <=256-token column. It sorts one shared
 // tile and then applies the same top-p/min-p renormalization as the large path.
-__device__ inline void sampling_build_truncated_small(const __nv_bfloat16* logits,
-                                                      std::int64_t base, std::int32_t vocab,
-                                                      const SamplingConfig& cfg, float* tile_val,
-                                                      int* tile_idx, float* cand_val,
-                                                      int* cand_idx, float* prob,
-                                                      int* n_support,
-                                                      const std::int32_t* overlay = nullptr,
-                                                      int overlay_len = 0) {
+__device__ inline void
+sampling_build_truncated_small(const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab,
+                               const SamplingConfig& cfg, float* tile_val, int* tile_idx,
+                               float* cand_val, int* cand_idx, float* prob, int* n_support,
+                               const std::int32_t* overlay = nullptr, int overlay_len = 0) {
     const int tid = threadIdx.x;
     const int cap = sampling_candidate_cap(cfg, vocab);
     if (tid < kSamplerTileItems) {
@@ -285,17 +279,12 @@ __device__ inline void sampling_build_truncated_small(const __nv_bfloat16* logit
 // Single-block fallback for large columns when the fixed sampler scratch cannot
 // represent the launch. It still reads each vocab entry once and keeps a bounded
 // per-thread top-20, so the old top_k*vocab global reread pattern is gone.
-__device__ inline void sampling_build_truncated_block_fast(const __nv_bfloat16* logits,
-                                                           std::int64_t base,
-                                                           std::int32_t vocab,
-                                                           const SamplingConfig& cfg,
-                                                           float* merge_val, int* merge_idx,
-                                                           float* cand_val, int* cand_idx,
-                                                           float* prob, int* n_support,
-                                                           const std::int32_t* overlay = nullptr,
-                                                           int overlay_len = 0) {
+__device__ inline void sampling_build_truncated_block_fast(
+    const __nv_bfloat16* logits, std::int64_t base, std::int32_t vocab, const SamplingConfig& cfg,
+    float* merge_val, int* merge_idx, float* cand_val, int* cand_idx, float* prob, int* n_support,
+    const std::int32_t* overlay = nullptr, int overlay_len = 0) {
     const int tid = threadIdx.x;
-    const int cap = sampling_candidate_cap(cfg, vocab);  // always <= kSamplerFastCandidates
+    const int cap = sampling_candidate_cap(cfg, vocab); // always <= kSamplerFastCandidates
 
     float local_val[kSamplerFastCandidates];
     int local_idx[kSamplerFastCandidates];
@@ -307,13 +296,13 @@ __device__ inline void sampling_build_truncated_block_fast(const __nv_bfloat16* 
 
     const int fast_cap = cap;
     for (int v = tid; v < vocab; v += blockDim.x) {
-        const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg,
-                                                overlay, overlay_len);
+        const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg, overlay,
+                                                overlay_len);
         sampling_insert_candidate(local_val, local_idx, fast_cap, x, v);
     }
 
     for (int j = 0; j < kSamplerFastCandidates; ++j) {
-        const int off = tid * kSamplerFastCandidates + j;
+        const int off  = tid * kSamplerFastCandidates + j;
         merge_val[off] = local_val[j];
         merge_idx[off] = local_idx[j];
     }

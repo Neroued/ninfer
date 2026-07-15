@@ -38,15 +38,15 @@ int prefill_output_grid_for(std::int32_t C, std::int32_t T, int block) {
 void causal_conv1d_prefill_launch(const Tensor& x, const Tensor& weight,
                                   const Tensor& conv_state_in, Tensor& conv_state_out, Tensor& out,
                                   cudaStream_t stream) {
-    constexpr int kBlock     = 256;
-    constexpr int kPairBlock = 256;
-    const std::int32_t C     = x.ne[0];
-    const std::int32_t T     = x.ne[1];
-    const auto x_addr        = reinterpret_cast<std::uintptr_t>(x.data);
-    const auto w_addr        = reinterpret_cast<std::uintptr_t>(weight.data);
-    const auto in_addr       = reinterpret_cast<std::uintptr_t>(conv_state_in.data);
+    constexpr int kBlock      = 256;
+    constexpr int kPairBlock  = 256;
+    const std::int32_t C      = x.ne[0];
+    const std::int32_t T      = x.ne[1];
+    const auto x_addr         = reinterpret_cast<std::uintptr_t>(x.data);
+    const auto w_addr         = reinterpret_cast<std::uintptr_t>(weight.data);
+    const auto in_addr        = reinterpret_cast<std::uintptr_t>(conv_state_in.data);
     const auto out_state_addr = reinterpret_cast<std::uintptr_t>(conv_state_out.data);
-    const auto out_addr      = reinterpret_cast<std::uintptr_t>(out.data);
+    const auto out_addr       = reinterpret_cast<std::uintptr_t>(out.data);
 
     if (((x_addr | w_addr | in_addr | out_state_addr | out_addr) & (alignof(__nv_bfloat162) - 1)) ==
             0 &&
@@ -88,9 +88,9 @@ void causal_conv1d_decode_launch(const Tensor& x, const Tensor& weight, Tensor& 
 void causal_conv1d_sequence_snapshot_launch(const Tensor& x, const Tensor& weight,
                                             Tensor& conv_states, const Tensor& initial_slot,
                                             Tensor& out, cudaStream_t stream) {
-    constexpr int kBlock = 256;
-    const std::int32_t C = x.ne[0];
-    const std::int32_t T = x.ne[1];
+    constexpr int kBlock     = 256;
+    const std::int32_t C     = x.ne[0];
+    const std::int32_t T     = x.ne[1];
     const std::int32_t slots = conv_states.ne[2];
     const std::int64_t slot_stride =
         static_cast<std::int64_t>(conv_states.ne[0]) * static_cast<std::int64_t>(conv_states.ne[1]);

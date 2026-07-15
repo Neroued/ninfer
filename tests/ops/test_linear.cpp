@@ -49,10 +49,10 @@ const char* qtype_name(QType qtype) {
 
 Weight dense_weight(void* data, QType qtype, std::int32_t n, std::int32_t k) {
     Weight w{};
-    w.qtype             = qtype;
-    w.layout            = QuantLayout::Contiguous;
-    w.payload           = data;
-    w.payload_bytes     = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k) *
+    w.qtype         = qtype;
+    w.layout        = QuantLayout::Contiguous;
+    w.payload       = data;
+    w.payload_bytes = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k) *
                       ((qtype == QType::FP32_CTRL) ? 4u : 2u);
     w.qdata           = data;
     w.scales          = nullptr;
@@ -288,8 +288,8 @@ int paired_w8g32_shape(std::int32_t n, std::int32_t k, const std::vector<std::in
         Tensor tx(dx.p, DType::BF16, {k, t});
         Tensor tk(dkout.p, DType::BF16, {n, t});
         Tensor tv(dvout.p, DType::BF16, {n, t});
-        ops::linear_pair(tx, kpacked.device_weight(dkw.p), vpacked.device_weight(dvw.p), tk, tv,
-                             ws, nullptr);
+        ops::linear_pair(tx, kpacked.device_weight(dkw.p), vpacked.device_weight(dvw.p), tk, tv, ws,
+                         nullptr);
         cudaDeviceSynchronize();
         const std::size_t count = static_cast<std::size_t>(n) * t;
         const std::vector<double> kr(kref.begin(), kref.begin() + count);
@@ -305,7 +305,7 @@ int paired_w8g32_shape(std::int32_t n, std::int32_t k, const std::vector<std::in
 }
 
 row_split::PackedWeight patterned_weight(QType qtype, std::int32_t n, std::int32_t k,
-                                     std::uint32_t seed) {
+                                         std::uint32_t seed) {
     const auto spec                  = row_split::detail::quant_spec(qtype);
     const std::int32_t padded_k      = row_split::detail::align_up(k, 128);
     const std::int32_t kg            = padded_k / spec.group_size;
@@ -332,23 +332,23 @@ row_split::PackedWeight patterned_weight(QType qtype, std::int32_t n, std::int32
     }
     for (std::uint64_t i = 0; i < groups; ++i) {
         row_split::detail::store_u16_le(packed.payload,
-                                    static_cast<std::size_t>(packed.scale_plane_offset + i * 2),
-                                    0x3c00u); // fp16 1.0
+                                        static_cast<std::size_t>(packed.scale_plane_offset + i * 2),
+                                        0x3c00u); // fp16 1.0
     }
-    packed.weight.qtype             = qtype;
-    packed.weight.layout            = QuantLayout::RowSplit;
-    packed.weight.scale_dtype       = DType::FP16;
-    packed.weight.payload_bytes     = packed.payload.size();
-    packed.weight.high_plane_bytes  = high_bytes;
-    packed.weight.group_size        = spec.group_size;
-    packed.weight.group             = spec.group_size;
-    packed.weight.ndim              = 2;
-    packed.weight.shape[0]          = n;
-    packed.weight.shape[1]          = k;
-    packed.weight.padded_shape[0]   = n;
-    packed.weight.padded_shape[1]   = padded_k;
-    packed.weight.n                 = n;
-    packed.weight.k                 = k;
+    packed.weight.qtype            = qtype;
+    packed.weight.layout           = QuantLayout::RowSplit;
+    packed.weight.scale_dtype      = DType::FP16;
+    packed.weight.payload_bytes    = packed.payload.size();
+    packed.weight.high_plane_bytes = high_bytes;
+    packed.weight.group_size       = spec.group_size;
+    packed.weight.group            = spec.group_size;
+    packed.weight.ndim             = 2;
+    packed.weight.shape[0]         = n;
+    packed.weight.shape[1]         = k;
+    packed.weight.padded_shape[0]  = n;
+    packed.weight.padded_shape[1]  = padded_k;
+    packed.weight.n                = n;
+    packed.weight.k                = k;
     return packed;
 }
 
@@ -394,8 +394,8 @@ int grouped_attention_correctness(std::int32_t t) {
     ops::linear(tx, gweight, tg_ref, ws, nullptr);
     ops::linear(tx, kweight, tk_ref, ws, nullptr);
     ops::linear(tx, vweight, tv_ref, ws, nullptr);
-    ops::attn_input_proj(tx, qweight, gweight, kweight, vweight, tq_got, tg_got, tk_got, tv_got,
-                             ws, nullptr);
+    ops::attn_input_proj(tx, qweight, gweight, kweight, vweight, tq_got, tg_got, tk_got, tv_got, ws,
+                         nullptr);
     cudaDeviceSynchronize();
 
     int f = 0;
@@ -472,8 +472,7 @@ int gate_up_silu_correctness(std::int32_t t) {
     WorkspaceArena ws(256ULL << 20);
     const Weight weight = packed.device_weight(dw.p);
     ops::linear(tx, weight, tgate_up, ws, nullptr);
-    ops::silu_mul(tgate_up.slice(0, 0, kInter), tgate_up.slice(0, kInter, kInter), tref,
-                      nullptr);
+    ops::silu_mul(tgate_up.slice(0, 0, kInter), tgate_up.slice(0, kInter, kInter), tref, nullptr);
     ops::linear_swiglu(tx, weight, tgot, ws, nullptr);
     cudaDeviceSynchronize();
     return verify("linear Q4 gate/up SiLU paired",

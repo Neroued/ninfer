@@ -96,8 +96,8 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
                 cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
                 const std::int64_t gi = static_cast<std::int64_t>(grow < m ? grow : 0) * kg + g0;
-                ninfer::ops::cp_async_zfill<16>(
-                    dst, &codes[gi * 32 + chunk * 16], grow < m ? 16 : 0);
+                ninfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
+                                                grow < m ? 16 : 0);
             }
         }
     };
@@ -114,16 +114,14 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
                     if (g0 + 8 <= kg) {
                         cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
                     } else {
-                        ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2],
-                                                                           max(0, kg - g0) * 2);
+                        ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], max(0, kg - g0) * 2);
                     }
                 } else {
                     const bool valid_row   = grow < m;
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
-                    ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2],
-                                                                       valid_scales * 2);
+                    ninfer::ops::cp_async_zfill<16>(dst, &scales[gi * 2], valid_scales * 2);
                 }
             }
         }
@@ -164,16 +162,15 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
             for (int mi = 0; mi < MT; ++mi) {
                 const int ar = mi * 16 + a_rowoff;
                 const int ac = ks * 16 + a_coloff;
-                ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2],
-                                  af[slot][mi][3],
-                                  smem_addr(&As[ar * BK + w8g32_swz64(ar, ac)]));
+                ldmatrix_x4(af[slot][mi][0], af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
+                            smem_addr(&As[ar * BK + w8g32_swz64(ar, ac)]));
             }
 #pragma unroll
             for (int ni = 0; ni < NT; ++ni) {
                 const int br = wn * WN + ni * 8 + b_rin;
                 const int bc = ks * 16 + b_koff;
                 ldmatrix_x2(bf[slot][ni][0], bf[slot][ni][1],
-                                  smem_addr(&Bs[stage][br * BK + w8g32_swz64(br, bc)]));
+                            smem_addr(&Bs[stage][br * BK + w8g32_swz64(br, bc)]));
             }
         };
         load_fragments(0, 0);
@@ -186,15 +183,15 @@ __global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kern
 #pragma unroll
                 for (int ni = 0; ni < NT; ++ni) {
                     if (p == 0) {
-                        mma_bf16(acc_k[mi][ni][0], acc_k[mi][ni][1],
-                                                acc_k[mi][ni][2], acc_k[mi][ni][3], af[slot][mi][0],
-                                                af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
-                                                bf[slot][ni][0], bf[slot][ni][1]);
+                        mma_bf16(acc_k[mi][ni][0], acc_k[mi][ni][1], acc_k[mi][ni][2],
+                                 acc_k[mi][ni][3], af[slot][mi][0], af[slot][mi][1],
+                                 af[slot][mi][2], af[slot][mi][3], bf[slot][ni][0],
+                                 bf[slot][ni][1]);
                     } else {
-                        mma_bf16(acc_v[mi][ni][0], acc_v[mi][ni][1],
-                                                acc_v[mi][ni][2], acc_v[mi][ni][3], af[slot][mi][0],
-                                                af[slot][mi][1], af[slot][mi][2], af[slot][mi][3],
-                                                bf[slot][ni][0], bf[slot][ni][1]);
+                        mma_bf16(acc_v[mi][ni][0], acc_v[mi][ni][1], acc_v[mi][ni][2],
+                                 acc_v[mi][ni][3], af[slot][mi][0], af[slot][mi][1],
+                                 af[slot][mi][2], af[slot][mi][3], bf[slot][ni][0],
+                                 bf[slot][ni][1]);
                     }
                 }
             }

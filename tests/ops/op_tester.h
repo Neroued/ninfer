@@ -14,7 +14,7 @@
 //   failures += verify("op n=...", from_device_bf16(dout, n), ref,
 //                      Tolerance::bf16_elementwise());
 
-#include "core/tensor.h"   // ninfer::DType, ninfer::Tensor (for op call sites)
+#include "core/tensor.h" // ninfer::DType, ninfer::Tensor (for op call sites)
 #include "ops/op_check.h"
 
 #include <cuda_runtime.h>
@@ -42,14 +42,16 @@ inline float bf16_to_f32(std::uint16_t h) {
     std::memcpy(&f, &u, 4);
     return f;
 }
+
 inline std::uint16_t f32_to_bf16(float f) {
     std::uint32_t u;
     std::memcpy(&u, &f, 4);
-    if ((u & 0x7fffffffu) > 0x7f800000u) return std::uint16_t((u >> 16) | 0x0040u);  // keep NaN
+    if ((u & 0x7fffffffu) > 0x7f800000u) return std::uint16_t((u >> 16) | 0x0040u); // keep NaN
     const std::uint32_t lsb = (u >> 16) & 1u;
     u += 0x7fffu + lsb;
     return std::uint16_t(u >> 16);
 }
+
 // Round an fp32 buffer to the bf16 grid in place, so a CPU reference computes
 // from EXACTLY the values the kernel will read.
 inline void round_to_bf16(std::vector<float>& v) {
@@ -60,16 +62,29 @@ inline void round_to_bf16(std::vector<float>& v) {
 struct DBuf {
     void* p           = nullptr;
     std::size_t bytes = 0;
+
     explicit DBuf(std::size_t b) : bytes(b) { cudaMalloc(&p, b); }
-    ~DBuf() { if (p) cudaFree(p); }
-    DBuf(DBuf&& o) noexcept : p(o.p), bytes(o.bytes) { o.p = nullptr; o.bytes = 0; }
+
+    ~DBuf() {
+        if (p) cudaFree(p);
+    }
+
+    DBuf(DBuf&& o) noexcept : p(o.p), bytes(o.bytes) {
+        o.p     = nullptr;
+        o.bytes = 0;
+    }
+
     DBuf& operator=(DBuf&& o) noexcept {
         if (this != &o) {
             if (p) cudaFree(p);
-            p = o.p; bytes = o.bytes; o.p = nullptr; o.bytes = 0;
+            p       = o.p;
+            bytes   = o.bytes;
+            o.p     = nullptr;
+            o.bytes = 0;
         }
         return *this;
     }
+
     DBuf(const DBuf&)            = delete;
     DBuf& operator=(const DBuf&) = delete;
 };
@@ -80,9 +95,11 @@ inline void fill_uniform(std::vector<float>& v, std::uint32_t seed, float lo, fl
     std::uniform_real_distribution<float> d(lo, hi);
     for (auto& x : v) x = d(g);
 }
+
 inline void fill_iota_i32(std::vector<int>& v, int start = 0) {
     for (std::size_t i = 0; i < v.size(); ++i) v[i] = start + static_cast<int>(i);
 }
+
 // L2-normalize each contiguous `d`-element row (matches RMSNorm/F.normalize
 // upstream of GDN q/k; keeps recurrence test inputs from overflowing).
 inline void l2_normalize_rows(std::vector<float>& v, int d, long long rows) {
@@ -104,11 +121,13 @@ inline DBuf to_device_bf16(const std::vector<float>& h) {
     cudaMemcpy(d.p, b.data(), h.size() * 2, cudaMemcpyHostToDevice);
     return d;
 }
+
 inline DBuf to_device_f32(const std::vector<float>& h) {
     DBuf d(h.size() * 4);
     cudaMemcpy(d.p, h.data(), h.size() * 4, cudaMemcpyHostToDevice);
     return d;
 }
+
 inline DBuf to_device_i32(const std::vector<int>& h) {
     DBuf d(h.size() * 4);
     cudaMemcpy(d.p, h.data(), h.size() * 4, cudaMemcpyHostToDevice);
@@ -123,6 +142,7 @@ inline std::vector<double> from_device_bf16(const DBuf& d, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) o[i] = double(bf16_to_f32(b[i]));
     return o;
 }
+
 inline std::vector<double> from_device_f32(const DBuf& d, std::size_t n) {
     std::vector<float> f(n);
     cudaMemcpy(f.data(), d.p, n * 4, cudaMemcpyDeviceToHost);
@@ -130,6 +150,7 @@ inline std::vector<double> from_device_f32(const DBuf& d, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) o[i] = double(f[i]);
     return o;
 }
+
 inline std::vector<int> from_device_i32(const DBuf& d, std::size_t n) {
     std::vector<int> o(n);
     cudaMemcpy(o.data(), d.p, n * 4, cudaMemcpyDeviceToHost);
@@ -138,13 +159,13 @@ inline std::vector<int> from_device_i32(const DBuf& d, std::size_t n) {
 
 // --- verdict ----------------------------------------------------------------
 // Returns 0 (pass) / 1 (fail). Prints the diff line with the chosen preset.
-inline int verify(const char* label, const std::vector<double>& got,
-                  const std::vector<double>& ref, const Tolerance& tol) {
+inline int verify(const char* label, const std::vector<double>& got, const std::vector<double>& ref,
+                  const Tolerance& tol) {
     if (got.size() != ref.size()) {
         std::cerr << label << ": size mismatch got=" << got.size() << " ref=" << ref.size() << '\n';
         return 1;
     }
-    const DiffStats s = compute_diff(got.data(), ref.data(), (long long) got.size(), tol);
+    const DiffStats s = compute_diff(got.data(), ref.data(), (long long)got.size(), tol);
     print_diff(label, s, tol);
     const bool ok = diff_passes(s, tol);
     if (!ok) std::cerr << label << ": FAIL (see diff above)\n";

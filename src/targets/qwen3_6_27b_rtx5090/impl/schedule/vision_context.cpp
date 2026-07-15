@@ -60,8 +60,8 @@ VisionWorkspaceLayout build_workspace_layout(const ProcessedInput& input,
     const auto patches64 = static_cast<std::size_t>(input.stats.raw_patches);
     const auto tokens64  = static_cast<std::size_t>(input.stats.vision_tokens);
     if (patches64 == 0 || tokens64 == 0 ||
-        patches64 != checked_mul(tokens64, VisionScheduleConfig::merge_unit,
-                                 "patch/token relation")) {
+        patches64 !=
+            checked_mul(tokens64, VisionScheduleConfig::merge_unit, "patch/token relation")) {
         throw std::invalid_argument("Vision workspace requires P=4V>0");
     }
     if (patches64 > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
@@ -79,30 +79,28 @@ VisionWorkspaceLayout build_workspace_layout(const ProcessedInput& input,
                          const char* label) {
         return builder.add_tensor(dtype, shape, kWorkspaceAlignment, label);
     };
-    out.output       = add(DType::BF16, {VisionScheduleConfig::out_hidden, tokens}, "vision output");
+    out.output = add(DType::BF16, {VisionScheduleConfig::out_hidden, tokens}, "vision output");
     out.position_ids = add(DType::I32, {patches, 2}, "vision position ids");
-    out.cu_seqlens   = add(DType::I32,
-                         {static_cast<std::int32_t>(control.cu_seqlens.size())},
-                         "vision segment bounds");
+    out.cu_seqlens   = add(DType::I32, {static_cast<std::int32_t>(control.cu_seqlens.size())},
+                           "vision segment bounds");
     out.pos_indices  = add(DType::I32, {4, patches}, "vision position indices");
     out.pos_weights  = add(DType::FP32, {4, patches}, "vision position weights");
     out.x            = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision residual");
     {
-        auto scope    = builder.scope();
-        out.patch_bf16 = add(DType::BF16, {VisionScheduleConfig::patch_dim, patches},
-                             "vision BF16 patches");
-        out.patch_f32 = add(DType::FP32, {VisionScheduleConfig::patch_dim, patches},
-                            "vision FP32 patches");
+        auto scope = builder.scope();
+        out.patch_bf16 =
+            add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
+        out.patch_f32 =
+            add(DType::FP32, {VisionScheduleConfig::patch_dim, patches}, "vision FP32 patches");
     }
     {
         auto attention_scope = builder.scope();
-        out.attended = add(DType::BF16, {VisionScheduleConfig::hidden, patches},
-                           "vision attended");
+        out.attended = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision attended");
         {
             auto qkv_scope = builder.scope();
             out.qkv = add(DType::BF16, {3 * VisionScheduleConfig::hidden, patches}, "vision QKV");
             {
-                auto norm_scope = builder.scope();
+                auto norm_scope    = builder.scope();
                 out.attention_norm = add(DType::BF16, {VisionScheduleConfig::hidden, patches},
                                          "vision attention norm");
             }
@@ -112,23 +110,24 @@ VisionWorkspaceLayout build_workspace_layout(const ProcessedInput& input,
                 out.attention_tiles = add(DType::I32, {4, tile_count}, "vision attention tiles");
             }
         }
-        out.projected = add(DType::BF16, {VisionScheduleConfig::hidden, patches},
-                            "vision projected");
+        out.projected =
+            add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision projected");
     }
     {
         auto mlp_scope = builder.scope();
         out.mlp_down = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision MLP down");
-        out.mlp_up = add(DType::BF16, {VisionScheduleConfig::intermediate, patches}, "vision MLP up");
+        out.mlp_up =
+            add(DType::BF16, {VisionScheduleConfig::intermediate, patches}, "vision MLP up");
         {
             auto norm_scope = builder.scope();
-            out.mlp_norm = add(DType::BF16, {VisionScheduleConfig::hidden, patches},
-                               "vision MLP norm");
+            out.mlp_norm =
+                add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision MLP norm");
         }
     }
-    out.normalized = add(DType::BF16, {VisionScheduleConfig::hidden, patches},
-                         "vision merger norm");
-    out.merger_hidden = add(DType::BF16, {VisionScheduleConfig::merger_hidden, tokens},
-                            "vision merger hidden");
+    out.normalized =
+        add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision merger norm");
+    out.merger_hidden =
+        add(DType::BF16, {VisionScheduleConfig::merger_hidden, tokens}, "vision merger hidden");
     out.bytes = builder.finish(kWorkspaceAlignment, "vision workspace");
     return out;
 }
@@ -231,7 +230,7 @@ Tensor VisionContext::encode(const ProcessedInput& input, WorkspaceArena& worksp
                 {
                     Tensor h = layout.attention_norm.bind(backing);
                     ops::layer_norm(x, *block.norm1_weight, *block.norm1_bias,
-                                        VisionScheduleConfig::norm_eps, h, stream);
+                                    VisionScheduleConfig::norm_eps, h, stream);
                     ops::linear(h, *block.qkv, qkv, workspace, stream);
                 }
                 ops::add_bias(*block.qkv_bias, qkv, stream);
@@ -247,7 +246,7 @@ Tensor VisionContext::encode(const ProcessedInput& input, WorkspaceArena& worksp
                 k.nb[2] = qkv.nb[1];
                 v.nb[2] = qkv.nb[1];
                 ops::rope(position_ids, VisionScheduleConfig::rotary_dim,
-                              VisionScheduleConfig::rope_theta, q, k, stream);
+                          VisionScheduleConfig::rope_theta, q, k, stream);
                 Tensor attended_heads = attended.view(
                     {VisionScheduleConfig::head_dim, VisionScheduleConfig::heads, patches});
                 Tensor attention_tiles;
@@ -256,8 +255,8 @@ Tensor VisionContext::encode(const ProcessedInput& input, WorkspaceArena& worksp
                     attention_tiles     = layout.attention_tiles->bind(backing);
                     attention_tiles_ptr = &attention_tiles;
                 }
-                ops::vision_attention(q, k, v, cu_seqlens, attention_tiles_ptr,
-                                          attended_heads, stream);
+                ops::vision_attention(q, k, v, cu_seqlens, attention_tiles_ptr, attended_heads,
+                                      stream);
             }
             Tensor projected = layout.projected.bind(backing);
             ops::linear(attended, *block.projection, projected, workspace, stream);
@@ -270,7 +269,7 @@ Tensor VisionContext::encode(const ProcessedInput& input, WorkspaceArena& worksp
             {
                 Tensor h = layout.mlp_norm.bind(backing);
                 ops::layer_norm(x, *block.norm2_weight, *block.norm2_bias,
-                                    VisionScheduleConfig::norm_eps, h, stream);
+                                VisionScheduleConfig::norm_eps, h, stream);
                 ops::linear(h, *block.fc1, up, workspace, stream);
             }
             ops::add_bias(*block.fc1_bias, up, stream);
@@ -286,7 +285,7 @@ Tensor VisionContext::encode(const ProcessedInput& input, WorkspaceArena& worksp
 
     Tensor normalized = layout.normalized.bind(backing);
     ops::layer_norm(x, *merger_.norm_weight, *merger_.norm_bias, VisionScheduleConfig::norm_eps,
-                        normalized, stream);
+                    normalized, stream);
     Tensor merged = normalized.view({VisionScheduleConfig::merger_hidden, tokens});
     Tensor hidden = layout.merger_hidden.bind(backing);
     ops::linear(merged, *merger_.fc1, hidden, workspace, stream);

@@ -23,10 +23,10 @@ using namespace ninfer::bench;
 
 namespace {
 
-constexpr std::int32_t kVocab = 248320;
+constexpr std::int32_t kVocab       = 248320;
 constexpr std::int32_t kTokenDomain = 248077;
-constexpr std::int32_t kMtpK  = 3;
-constexpr std::int32_t kStats = 9;
+constexpr std::int32_t kMtpK        = 3;
+constexpr std::int32_t kStats       = 9;
 
 struct Options {
     int cols    = 1;
@@ -136,9 +136,9 @@ void run_argmax(DBuf& logits, int cols) {
     DBuf out(static_cast<std::size_t>(cols) * sizeof(std::int32_t));
     Tensor tlogits(logits.p, DType::BF16, {kVocab, cols});
     Tensor tout(out.p, DType::I32, {cols});
-    const Result r = bench_loop(
-        [&](cudaStream_t s) { ops::argmax(tlogits, tout, kTokenDomain, s); },
-                                payload_bytes(cols, false));
+    const Result r =
+        bench_loop([&](cudaStream_t s) { ops::argmax(tlogits, tout, kTokenDomain, s); },
+                   payload_bytes(cols, false));
     print_result(cols == 1 ? "argmax_tiled_atomic [vocab,1]" : "argmax_tiled_atomic [vocab,4]", r);
 }
 
@@ -152,8 +152,8 @@ void run_sample(DBuf& logits, DBuf& cfg, int cols) {
     auto* pos_ptr  = static_cast<const std::int32_t*>(pos.p);
     const Result r = bench_loop(
         [&](cudaStream_t s) {
-            ops::sample(tlogits, tout, kTokenDomain, cfg_ptr, pos_ptr,
-                            ops::kSamplePurposeDecode, s);
+            ops::sample(tlogits, tout, kTokenDomain, cfg_ptr, pos_ptr, ops::kSamplePurposeDecode,
+                        s);
         },
         payload_bytes(cols, true));
     print_result(cols == 1 ? "sample [vocab,1]" : "sample [vocab,4]", r);
@@ -185,7 +185,7 @@ void run_mtp(DBuf& logits, DBuf& cfg) {
     const Result r = bench_loop(
         [&](cudaStream_t s) {
             ops::mtp_accept_tokens(ttargets, tlogits, tdrafts, tlength, ttoken, tsampled, tnum,
-                                       taccepted, tar_pos, tstats, kTokenDomain, cfg_ptr, s);
+                                   taccepted, tar_pos, tstats, kTokenDomain, cfg_ptr, s);
         },
         payload_bytes(kMtpK + 1, true));
     print_result("mtp_accept k=3 [vocab,4]", r);

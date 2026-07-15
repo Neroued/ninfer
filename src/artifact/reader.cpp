@@ -38,8 +38,7 @@ std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, std::string_view lab
     return a + b;
 }
 
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment,
-                       std::string_view label) {
+std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, std::string_view label) {
     const auto biased = checked_add(value, alignment - 1, label);
     return biased / alignment * alignment;
 }
@@ -70,9 +69,7 @@ const std::string& require_string(const Json& value, std::string_view label) {
         throw ArtifactError(std::string(label) + " must be a nonempty string");
     }
     const auto& result = value.get_ref<const std::string&>();
-    if (result.empty()) {
-        throw ArtifactError(std::string(label) + " must be a nonempty string");
-    }
+    if (result.empty()) { throw ArtifactError(std::string(label) + " must be a nonempty string"); }
     return result;
 }
 
@@ -81,51 +78,29 @@ std::uint64_t require_unsigned(const Json& value, std::string_view label, bool p
         throw ArtifactError(std::string(label) + " must be an integer");
     }
     const auto result = value.get<std::uint64_t>();
-    if (positive && result == 0) {
-        throw ArtifactError(std::string(label) + " must be positive");
-    }
+    if (positive && result == 0) { throw ArtifactError(std::string(label) + " must be positive"); }
     return result;
 }
 
 NumericFormat parse_format(std::string_view name) {
-    if (name == "BF16") {
-        return NumericFormat::BF16;
-    }
-    if (name == "FP32") {
-        return NumericFormat::FP32;
-    }
-    if (name == "I32") {
-        return NumericFormat::I32;
-    }
-    if (name == "Q4G64_F16S") {
-        return NumericFormat::Q4G64_F16S;
-    }
-    if (name == "Q5G64_F16S") {
-        return NumericFormat::Q5G64_F16S;
-    }
-    if (name == "Q6G64_F16S") {
-        return NumericFormat::Q6G64_F16S;
-    }
-    if (name == "W8G32_F16S") {
-        return NumericFormat::W8G32_F16S;
-    }
+    if (name == "BF16") { return NumericFormat::BF16; }
+    if (name == "FP32") { return NumericFormat::FP32; }
+    if (name == "I32") { return NumericFormat::I32; }
+    if (name == "Q4G64_F16S") { return NumericFormat::Q4G64_F16S; }
+    if (name == "Q5G64_F16S") { return NumericFormat::Q5G64_F16S; }
+    if (name == "Q6G64_F16S") { return NumericFormat::Q6G64_F16S; }
+    if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
 StorageLayout parse_layout(std::string_view name) {
-    if (name == "contiguous-le-v1") {
-        return StorageLayout::ContiguousLeV1;
-    }
-    if (name == "row-split-k128-v1") {
-        return StorageLayout::RowSplitK128V1;
-    }
+    if (name == "contiguous-le-v1") { return StorageLayout::ContiguousLeV1; }
+    if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 
 ResourceEncoding parse_encoding(std::string_view name) {
-    if (name == "raw-bytes-v1") {
-        return ResourceEncoding::RawBytesV1;
-    }
+    if (name == "raw-bytes-v1") { return ResourceEncoding::RawBytesV1; }
     throw ArtifactError("unknown resource encoding: " + std::string(name));
 }
 
@@ -142,9 +117,7 @@ TensorDescriptor parse_tensor(const Json& value) {
     const auto stored_size = require_unsigned(value.at("bytes"), "tensor bytes", true);
 
     const auto& raw_shape = value.at("shape");
-    if (!raw_shape.is_array()) {
-        throw ArtifactError("tensor shape must be an array");
-    }
+    if (!raw_shape.is_array()) { throw ArtifactError("tensor shape must be an array"); }
     std::vector<std::uint64_t> shape;
     shape.reserve(raw_shape.size());
     for (const auto& dim : raw_shape) {
@@ -173,20 +146,14 @@ ResourceDescriptor parse_resource(const Json& value) {
 }
 
 ObjectDescriptor parse_object(const Json& value) {
-    if (!value.is_object()) {
-        throw ArtifactError("each object entry must be a JSON object");
-    }
+    if (!value.is_object()) { throw ArtifactError("each object entry must be a JSON object"); }
     const auto it = value.find("kind");
     if (it == value.end() || !it->is_string()) {
         throw ArtifactError("object kind must be 'tensor' or 'resource'");
     }
     const auto& kind = it->get_ref<const std::string&>();
-    if (kind == "tensor") {
-        return parse_tensor(value);
-    }
-    if (kind == "resource") {
-        return parse_resource(value);
-    }
+    if (kind == "tensor") { return parse_tensor(value); }
+    if (kind == "resource") { return parse_resource(value); }
     throw ArtifactError("object kind must be 'tensor' or 'resource'");
 }
 
@@ -196,6 +163,7 @@ struct TransparentStringHash {
     std::size_t operator()(std::string_view value) const noexcept {
         return std::hash<std::string_view>{}(value);
     }
+
     std::size_t operator()(const std::string& value) const noexcept {
         return (*this)(std::string_view(value));
     }
@@ -206,20 +174,18 @@ public:
     explicit MappedFile(const std::filesystem::path& path) {
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
-            throw std::system_error(errno, std::generic_category(),
-                                    "open " + path.string());
+            throw std::system_error(errno, std::generic_category(), "open " + path.string());
         }
 
         struct stat status {};
+
         if (::fstat(fd, &status) != 0) {
             const int error = errno;
             ::close(fd);
-            throw std::system_error(error, std::generic_category(),
-                                    "fstat " + path.string());
+            throw std::system_error(error, std::generic_category(), "fstat " + path.string());
         }
         if (status.st_size < 0 ||
-            static_cast<std::uintmax_t>(status.st_size) >
-                std::numeric_limits<std::size_t>::max()) {
+            static_cast<std::uintmax_t>(status.st_size) > std::numeric_limits<std::size_t>::max()) {
             ::close(fd);
             throw ArtifactError("artifact size does not fit the process address space");
         }
@@ -231,8 +197,7 @@ public:
             if (mapping == MAP_FAILED) {
                 const int error = errno;
                 ::close(fd);
-                throw std::system_error(error, std::generic_category(),
-                                        "mmap " + path.string());
+                throw std::system_error(error, std::generic_category(), "mmap " + path.string());
             }
         }
         fd_   = fd;
@@ -241,18 +206,15 @@ public:
     }
 
     ~MappedFile() {
-        if (data_ != nullptr) {
-            ::munmap(const_cast<std::byte*>(data_), size_);
-        }
-        if (fd_ >= 0) {
-            ::close(fd_);
-        }
+        if (data_ != nullptr) { ::munmap(const_cast<std::byte*>(data_), size_); }
+        if (fd_ >= 0) { ::close(fd_); }
     }
 
-    MappedFile(const MappedFile&) = delete;
+    MappedFile(const MappedFile&)            = delete;
     MappedFile& operator=(const MappedFile&) = delete;
 
     const std::byte* data() const noexcept { return data_; }
+
     std::size_t size() const noexcept { return size_; }
 
 private:
@@ -286,11 +248,9 @@ struct Reader::Impl {
         }
 
         const auto json_bytes = read_u64_le(file.data() + 8);
-        if (json_bytes == 0) {
-            throw ArtifactError("json_bytes must be positive");
-        }
+        if (json_bytes == 0) { throw ArtifactError("json_bytes must be positive"); }
         const auto metadata_end = checked_add(kPrefixBytes, json_bytes, "JSON range");
-        payload_start = align_up(metadata_end, kPayloadAlignment, "payload offset");
+        payload_start           = align_up(metadata_end, kPayloadAlignment, "payload offset");
         if (metadata_end > file.size() || payload_start > file.size()) {
             throw ArtifactError("declared JSON or payload start extends beyond the file");
         }
@@ -298,7 +258,7 @@ struct Reader::Impl {
         Json directory;
         try {
             const auto* begin = reinterpret_cast<const char*>(file.data() + kPrefixBytes);
-            directory = Json::parse(begin, begin + json_bytes);
+            directory         = Json::parse(begin, begin + json_bytes);
         } catch (const Json::exception& error) {
             throw ArtifactError(std::string("invalid JSON directory: ") + error.what());
         }
@@ -315,12 +275,12 @@ struct Reader::Impl {
         index.reserve(raw_objects.size());
 
         const auto payload_bytes = static_cast<std::uint64_t>(file.size()) - payload_start;
-        std::uint64_t cursor      = 0;
+        std::uint64_t cursor     = 0;
         for (const auto& raw_object : raw_objects) {
-            auto object         = parse_object(raw_object);
-            const auto name     = object_name(object);
-            const auto offset   = object_offset(object);
-            const auto bytes    = object_bytes(object);
+            auto object          = parse_object(raw_object);
+            const auto name      = object_name(object);
+            const auto offset    = object_offset(object);
+            const auto bytes     = object_bytes(object);
             const auto alignment = std::visit(
                 [](const auto& descriptor) {
                     using Descriptor = std::decay_t<decltype(descriptor)>;
@@ -333,8 +293,7 @@ struct Reader::Impl {
                 object);
 
             if (offset < cursor) {
-                throw ArtifactError("object " + std::string(name) +
-                                    " overlaps or is out of order");
+                throw ArtifactError("object " + std::string(name) + " overlaps or is out of order");
             }
             if (offset % alignment != 0) {
                 throw ArtifactError("object " + std::string(name) + " is not " +
@@ -342,14 +301,11 @@ struct Reader::Impl {
             }
             const auto end = checked_add(offset, bytes, "object payload range");
             if (end > payload_bytes) {
-                throw ArtifactError("object " + std::string(name) +
-                                    " extends beyond the file");
+                throw ArtifactError("object " + std::string(name) + " extends beyond the file");
             }
             const auto object_index = entries.size();
-            auto [_, inserted] = index.emplace(std::string(name), object_index);
-            if (!inserted) {
-                throw ArtifactError("duplicate object name: " + std::string(name));
-            }
+            auto [_, inserted]      = index.emplace(std::string(name), object_index);
+            if (!inserted) { throw ArtifactError("duplicate object name: " + std::string(name)); }
             entries.push_back(std::move(object));
             cursor = end;
         }
@@ -363,38 +319,29 @@ struct Reader::Impl {
 };
 
 Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {}
-Reader::~Reader() = default;
-Reader::Reader(Reader&&) noexcept = default;
+
+Reader::~Reader()                            = default;
+Reader::Reader(Reader&&) noexcept            = default;
 Reader& Reader::operator=(Reader&&) noexcept = default;
 
-const std::string& Reader::model_id() const noexcept {
-    return impl_->model;
-}
+const std::string& Reader::model_id() const noexcept { return impl_->model; }
 
-const std::vector<ObjectDescriptor>& Reader::objects() const noexcept {
-    return impl_->entries;
-}
+const std::vector<ObjectDescriptor>& Reader::objects() const noexcept { return impl_->entries; }
 
 const ObjectDescriptor* Reader::find(std::string_view name) const noexcept {
     const auto it = impl_->index.find(name);
     return it == impl_->index.end() ? nullptr : &impl_->entries[it->second];
 }
 
-std::uint64_t Reader::file_bytes() const noexcept {
-    return impl_->file.size();
-}
+std::uint64_t Reader::file_bytes() const noexcept { return impl_->file.size(); }
 
-std::uint64_t Reader::payload_offset() const noexcept {
-    return impl_->payload_start;
-}
+std::uint64_t Reader::payload_offset() const noexcept { return impl_->payload_start; }
 
 PayloadSpan Reader::payload(const ObjectDescriptor& object) const {
-    const auto absolute = checked_add(impl_->payload_start, object_offset(object),
-                                      "absolute payload offset");
+    const auto absolute =
+        checked_add(impl_->payload_start, object_offset(object), "absolute payload offset");
     const auto end = checked_add(absolute, object_bytes(object), "absolute payload range");
-    if (end > impl_->file.size()) {
-        throw ArtifactError("object payload extends beyond the file");
-    }
+    if (end > impl_->file.size()) { throw ArtifactError("object payload extends beyond the file"); }
     return {
         absolute,
         std::span<const std::byte>(impl_->file.data() + absolute,
@@ -404,9 +351,7 @@ PayloadSpan Reader::payload(const ObjectDescriptor& object) const {
 
 PayloadSpan Reader::payload(std::string_view name) const {
     const auto* object = find(name);
-    if (object == nullptr) {
-        throw ArtifactError("unknown artifact object: " + std::string(name));
-    }
+    if (object == nullptr) { throw ArtifactError("unknown artifact object: " + std::string(name)); }
     return payload(*object);
 }
 

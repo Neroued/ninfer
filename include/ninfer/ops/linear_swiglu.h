@@ -16,8 +16,8 @@ namespace ninfer::ops {
  * Returns zero for T=1 or T>16; otherwise returns one contiguous BF16
  * [gate_up_rows,tokens] fallback matrix. gate_up_rows must be positive and even.
  */
-[[nodiscard]] std::size_t linear_swiglu_workspace_bytes(
-    std::int32_t gate_up_rows, std::int32_t tokens);
+[[nodiscard]] std::size_t linear_swiglu_workspace_bytes(std::int32_t gate_up_rows,
+                                                        std::int32_t tokens);
 
 /**
  * Op: linear_swiglu

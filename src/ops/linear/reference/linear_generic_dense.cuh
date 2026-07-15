@@ -29,8 +29,8 @@ __device__ __forceinline__ float load_dense_weight(const void* weight, std::int6
 }
 
 __global__ void linear_generic_dense_gemv_kernel(const __nv_bfloat16* x, const void* weight,
-                                                 __nv_bfloat16* out, std::int32_t n,
-                                                 std::int32_t k, bool weight_fp32) {
+                                                 __nv_bfloat16* out, std::int32_t n, std::int32_t k,
+                                                 bool weight_fp32) {
     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x);
     if (row >= n) { return; }
     __shared__ float warp_sums[kDenseGemvThreads / kWarpSize];
@@ -121,9 +121,8 @@ __global__ void linear_generic_dense_small_gemv_kernel(const __nv_bfloat16* x, c
 }
 
 __global__ void linear_generic_dense_gemm_kernel(const __nv_bfloat16* x, const void* weight,
-                                                 __nv_bfloat16* out, std::int32_t n,
-                                                 std::int32_t k, std::int32_t t,
-                                                 bool weight_fp32) {
+                                                 __nv_bfloat16* out, std::int32_t n, std::int32_t k,
+                                                 std::int32_t t, bool weight_fp32) {
     const std::int32_t row =
         static_cast<std::int32_t>(blockIdx.x) * blockDim.x + static_cast<std::int32_t>(threadIdx.x);
     const std::int32_t col =

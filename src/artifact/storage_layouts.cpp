@@ -22,8 +22,7 @@ std::uint64_t checked_mul(std::uint64_t a, std::uint64_t b, std::string_view lab
     return a * b;
 }
 
-std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment,
-                       std::string_view label) {
+std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, std::string_view label) {
     const auto biased = checked_add(value, alignment - 1, label);
     return biased / alignment * alignment;
 }
@@ -101,13 +100,9 @@ std::string_view encoding_name(ResourceEncoding encoding) noexcept {
     return {};
 }
 
-std::uint64_t tensor_alignment(StorageLayout) noexcept {
-    return kTensorAlignment;
-}
+std::uint64_t tensor_alignment(StorageLayout) noexcept { return kTensorAlignment; }
 
-std::uint64_t resource_alignment(ResourceEncoding) noexcept {
-    return 1;
-}
+std::uint64_t resource_alignment(ResourceEncoding) noexcept { return 1; }
 
 std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
                                   std::span<const std::uint64_t> shape) {
@@ -117,17 +112,13 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
         }
         std::uint64_t elements = 1;
         for (const auto dim : shape) {
-            if (dim == 0) {
-                throw ArtifactError("tensor shape dimensions must be positive");
-            }
+            if (dim == 0) { throw ArtifactError("tensor shape dimensions must be positive"); }
             elements = checked_mul(elements, dim, "tensor element count");
         }
         return checked_mul(elements, direct_word_bytes(format), "tensor encoded size");
     }
 
-    if (layout != StorageLayout::RowSplitK128V1) {
-        throw ArtifactError("unknown tensor layout");
-    }
+    if (layout != StorageLayout::RowSplitK128V1) { throw ArtifactError("unknown tensor layout"); }
     if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
         throw ArtifactError("row-split-k128-v1 requires a positive rank-two shape");
     }
@@ -135,32 +126,27 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     return row_split_geometry(format, shape).encoded_bytes;
 }
 
-RowSplitGeometry row_split_geometry(NumericFormat format,
-                                    std::span<const std::uint64_t> shape) {
+RowSplitGeometry row_split_geometry(NumericFormat format, std::span<const std::uint64_t> shape) {
     if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
         throw ArtifactError("row-split-k128-v1 requires a positive rank-two shape");
     }
     const auto format_geometry = quant_geometry(format);
     RowSplitGeometry out;
-    out.rows = shape[0];
-    out.columns = shape[1];
-    out.padded_columns = align_up(shape[1], kKAlignment, "padded K");
-    out.group_size = format_geometry.group_size;
-    out.groups_per_row = out.padded_columns / out.group_size;
-    out.low_bytes_per_group = format_geometry.base_bytes_per_group;
+    out.rows                 = shape[0];
+    out.columns              = shape[1];
+    out.padded_columns       = align_up(shape[1], kKAlignment, "padded K");
+    out.group_size           = format_geometry.group_size;
+    out.groups_per_row       = out.padded_columns / out.group_size;
+    out.low_bytes_per_group  = format_geometry.base_bytes_per_group;
     out.high_bytes_per_group = format_geometry.high_bytes_per_group;
-    const auto groups = checked_mul(out.rows, out.groups_per_row, "physical group count");
-    out.low_plane_bytes =
-        checked_mul(groups, out.low_bytes_per_group, "base plane bytes");
-    out.high_plane_bytes =
-        checked_mul(groups, out.high_bytes_per_group, "high plane bytes");
-    out.scale_plane_bytes = checked_mul(groups, 2, "scale plane bytes");
-    out.high_plane_offset =
-        align_up(out.low_plane_bytes, kTensorAlignment, "high plane offset");
+    const auto groups        = checked_mul(out.rows, out.groups_per_row, "physical group count");
+    out.low_plane_bytes      = checked_mul(groups, out.low_bytes_per_group, "base plane bytes");
+    out.high_plane_bytes     = checked_mul(groups, out.high_bytes_per_group, "high plane bytes");
+    out.scale_plane_bytes    = checked_mul(groups, 2, "scale plane bytes");
+    out.high_plane_offset    = align_up(out.low_plane_bytes, kTensorAlignment, "high plane offset");
     const auto aligned_high =
         align_up(out.high_plane_bytes, kTensorAlignment, "scale plane alignment");
-    out.scale_plane_offset =
-        checked_add(out.high_plane_offset, aligned_high, "scale plane offset");
+    out.scale_plane_offset = checked_add(out.high_plane_offset, aligned_high, "scale plane offset");
     out.encoded_bytes =
         checked_add(out.scale_plane_offset, out.scale_plane_bytes, "tensor encoded size");
     return out;

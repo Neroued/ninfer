@@ -62,7 +62,7 @@ void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_we
     require_dense_bf16(a_weight, "a_weight");
     require_dense_bf16(b_weight, "b_weight");
 
-    auto scratch_scope = ws.scope();
+    auto scratch_scope                = ws.scope();
     const std::size_t workspace_bytes = gdn_gating_proj_workspace_bytes(tokens);
     Tensor workspace;
     if (workspace_bytes > 0) {

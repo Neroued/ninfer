@@ -49,11 +49,10 @@ public:
 
     [[nodiscard]] LayoutRegion add(std::size_t bytes, std::size_t alignment,
                                    std::string_view label);
-    [[nodiscard]] TensorRegion add_tensor(DType dtype,
-                                          std::initializer_list<std::int32_t> shape,
+    [[nodiscard]] TensorRegion add_tensor(DType dtype, std::initializer_list<std::int32_t> shape,
                                           std::size_t alignment, std::string_view label);
     [[nodiscard]] Scope scope() noexcept;
-    [[nodiscard]] std::size_t finish(std::size_t alignment = 1,
+    [[nodiscard]] std::size_t finish(std::size_t alignment  = 1,
                                      std::string_view label = "layout") const;
 
 private:
@@ -62,7 +61,8 @@ private:
 };
 
 // Dry-run counterpart of WorkspaceArena. Target allocation helpers can run against this builder
-// and the real arena, including identical nested scope lifetimes, without maintaining byte formulas.
+// and the real arena, including identical nested scope lifetimes, without maintaining byte
+// formulas.
 class WorkspaceLayoutBuilder {
 public:
     class Scope {

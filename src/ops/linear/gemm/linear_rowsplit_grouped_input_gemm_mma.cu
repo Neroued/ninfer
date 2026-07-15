@@ -26,8 +26,8 @@ RowsplitGroupedJob make_job(const Weight& weight, Tensor& out, std::int32_t out_
 template <class Cfg, GroupedInputCodec Codec = GroupedInputCodec::Mixed, int Jobs = 4>
 void launch_grouped_cfg(const Tensor& x, RowsplitGroupedJob job0, RowsplitGroupedJob job1,
                         RowsplitGroupedJob job2, RowsplitGroupedJob job3, cudaStream_t stream) {
-    const int tiles = div_up(job0.n, Cfg::BM) + div_up(job1.n, Cfg::BM) +
-                      div_up(job2.n, Cfg::BM) + div_up(job3.n, Cfg::BM);
+    const int tiles = div_up(job0.n, Cfg::BM) + div_up(job1.n, Cfg::BM) + div_up(job2.n, Cfg::BM) +
+                      div_up(job3.n, Cfg::BM);
     const int t = x.ne[1];
     const dim3 grid(static_cast<unsigned>(tiles), static_cast<unsigned>(div_up(t, Cfg::BN)));
     const bool full_tiles = (t % Cfg::BN) == 0;
@@ -58,9 +58,9 @@ void linear_rowsplit_attn_input_grouped_mma_launch(const Tensor& x, const Weight
                                                    cudaStream_t stream) {
     using Cfg = GemmCfg<64, 128, 64, 64, 32, 2, 1, false, true, true>;
     RowsplitGroupedJob empty{};
-    launch_grouped_cfg<Cfg, GroupedInputCodec::Q4, 2>(
-        x, make_job(q_weight, q, q.ne[0], 0, false),
-        make_job(k_weight, k, k.ne[0], 0, false), empty, empty, stream);
+    launch_grouped_cfg<Cfg, GroupedInputCodec::Q4, 2>(x, make_job(q_weight, q, q.ne[0], 0, false),
+                                                      make_job(k_weight, k, k.ne[0], 0, false),
+                                                      empty, empty, stream);
     launch_grouped_cfg<Cfg, GroupedInputCodec::Q5, 2>(
         x, make_job(gate_weight, gate, gate.ne[0], 0, true),
         make_job(v_weight, v, v.ne[0], 0, true), empty, empty, stream);

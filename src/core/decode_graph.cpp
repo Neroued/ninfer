@@ -38,8 +38,7 @@ void discard_capture(cudaStream_t stream) noexcept {
 
 DecodeGraph::~DecodeGraph() { reset(); }
 
-DecodeGraph::DecodeGraph(DecodeGraph&& other) noexcept
-    : graph_(other.graph_), exec_(other.exec_) {
+DecodeGraph::DecodeGraph(DecodeGraph&& other) noexcept : graph_(other.graph_), exec_(other.exec_) {
     other.graph_ = nullptr;
     other.exec_  = nullptr;
 }

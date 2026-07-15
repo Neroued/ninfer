@@ -513,8 +513,10 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
         ledger.push_back(host_tokens[0]);
-        text_kv_valid     = prompt_tokens;
-        current_gdn_slot  = 0;
+        text_kv_valid = prompt_tokens;
+        // Target prefill leaves its recurrent state in slot 0. Exact-frontier reuse performs no
+        // target work, so it must retain the MTP snapshot that was committed at the old frontier.
+        if (had_suffix) { current_gdn_slot = 0; }
         mtp_kv_valid      = mtp_prepared ? prompt_tokens : 0;
         proposal_ready    = mtp_prepared;
         tail_hidden_valid = true;

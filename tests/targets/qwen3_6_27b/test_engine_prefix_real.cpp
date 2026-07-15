@@ -102,6 +102,65 @@ int exercise_partial_mtp_terminal(ninfer::Engine& engine,
     return 0;
 }
 
+int exercise_zero_suffix_gdn(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& prompt) {
+    ninfer::RequestOptions baseline_options;
+    baseline_options.execution.requested_output_tokens = 8;
+    baseline_options.execution.sampling.temperature    = 0.0F;
+    baseline_options.execution.allow_prefix_reuse      = false;
+    baseline_options.stop.include_model_defaults       = false;
+    const ninfer::GenerationResult baseline =
+        engine.generate(engine.prepare_tokens(prompt), baseline_options);
+    // With K=3 and no fallback, eight outputs can only finish on a four-token MTP return. The
+    // committed target state therefore lives in snapshot slot 3 rather than slot 0.
+    if (baseline.generated_token_ids.size() != 8 || baseline.speculative.rounds == 0 ||
+        baseline.speculative.draft_window != 3 || baseline.speculative.fallback_steps != 0 ||
+        1 + baseline.speculative.rounds + baseline.speculative.accepted_tokens !=
+            baseline.generated_token_ids.size() ||
+        baseline.speculative.accepted_per_position.size() != baseline.speculative.draft_window ||
+        baseline.speculative.accepted_per_position.back() == 0) {
+        std::cerr << "zero-suffix fixture did not end on a fully accepted MTP round: outputs="
+                  << baseline.generated_token_ids.size()
+                  << " rounds=" << baseline.speculative.rounds
+                  << " draft_window=" << baseline.speculative.draft_window
+                  << " accepted=" << baseline.speculative.accepted_tokens
+                  << " fallbacks=" << baseline.speculative.fallback_steps << '\n';
+        return 1;
+    }
+
+    std::vector<ninfer::TokenId> exact_frontier = prompt;
+    exact_frontier.insert(exact_frontier.end(), baseline.generated_token_ids.begin(),
+                          baseline.generated_token_ids.end() - 1);
+
+    ninfer::RequestOptions reuse_options;
+    reuse_options.execution.requested_output_tokens = 2;
+    reuse_options.execution.sampling.temperature    = 0.0F;
+    reuse_options.execution.allow_prefix_reuse      = true;
+    reuse_options.stop.include_model_defaults       = false;
+    const ninfer::GenerationResult reused =
+        engine.generate(engine.prepare_tokens(exact_frontier), reuse_options);
+    if (reused.reused_prompt_tokens != exact_frontier.size()) {
+        std::cerr << "zero-suffix reuse count is " << reused.reused_prompt_tokens << ", expected "
+                  << exact_frontier.size() << '\n';
+        return 1;
+    }
+    if (reused.generated_token_ids.size() != 2 ||
+        reused.generated_token_ids.front() != baseline.generated_token_ids.back() ||
+        reused.speculative.fallback_steps != 1) {
+        std::cerr << "zero-suffix reuse did not resume and take one ordinary target step\n";
+        return 1;
+    }
+
+    ninfer::RequestOptions reset_options       = reuse_options;
+    reset_options.execution.allow_prefix_reuse = false;
+    const ninfer::GenerationResult reset =
+        engine.generate(engine.prepare_tokens(exact_frontier), reset_options);
+    if (reused.generated_token_ids != reset.generated_token_ids) {
+        std::cerr << "zero-suffix reuse lost the committed MTP GDN snapshot\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_prefix(ninfer::Engine& engine) {
     ninfer::RequestOptions first_options;
     first_options.execution.requested_output_tokens = 5;
@@ -152,6 +211,8 @@ int exercise_prefix(ninfer::Engine& engine) {
         std::cerr << "reused MTP frontier differs from a full reset frontier\n";
         return 1;
     }
+
+    if (const int result = exercise_zero_suffix_gdn(engine, prompt); result != 0) { return result; }
 
     if (const int result = exercise_partial_mtp_terminal(engine, prompt, first); result != 0) {
         return result;

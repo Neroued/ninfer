@@ -265,13 +265,11 @@ static int snapshot_chain_equivalence(std::uint32_t seed, std::int32_t T, float 
     return f;
 }
 
-static int selected_slot_snapshot_equivalence(std::uint32_t seed, std::int32_t T,
-                                              std::int32_t initial_slot) {
-    constexpr std::int32_t C     = 10240;
-    constexpr std::int32_t Slots = 6;
-    const std::size_t n          = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
-    const std::size_t state_n    = static_cast<std::size_t>(C) * 3u;
-    const std::size_t weight_n   = static_cast<std::size_t>(C) * 4u;
+static int selected_slot_snapshot_equivalence(std::uint32_t seed, std::int32_t C, std::int32_t T,
+                                              std::int32_t slots, std::int32_t initial_slot) {
+    const std::size_t n        = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
+    const std::size_t state_n  = static_cast<std::size_t>(C) * 3u;
+    const std::size_t weight_n = static_cast<std::size_t>(C) * 4u;
 
     std::vector<float> x(n), weight(weight_n), state(state_n);
     fill_uniform(x, seed, -8.f, 8.f);
@@ -281,7 +279,7 @@ static int selected_slot_snapshot_equivalence(std::uint32_t seed, std::int32_t T
     round_to_bf16(weight);
     round_to_bf16(state);
 
-    std::vector<float> snapshot_state(state_n * Slots, 17.0f);
+    std::vector<float> snapshot_state(state_n * static_cast<std::size_t>(slots), 17.0f);
     for (std::size_t i = 0; i < snapshot_state.size(); ++i) {
         snapshot_state[i] = bf16_to_f32(f32_to_bf16(snapshot_state[i]));
     }
@@ -293,7 +291,7 @@ static int selected_slot_snapshot_equivalence(std::uint32_t seed, std::int32_t T
          dinitial_slot    = to_device_i32({initial_slot});
     Tensor tx_snapshot(dx_snapshot.p, DType::BF16, {C, T});
     Tensor tw_snapshot(dw_snapshot.p, DType::BF16, {C, 4});
-    Tensor ts_snapshot(dstates_snapshot.p, DType::BF16, {C, 3, Slots});
+    Tensor ts_snapshot(dstates_snapshot.p, DType::BF16, {C, 3, slots});
     Tensor tinitial_slot(dinitial_slot.p, DType::I32, {1});
     Tensor tout_snapshot(dout_snapshot.p, DType::BF16, {C, T});
     ops::causal_conv1d_silu_snapshot(tx_snapshot, tw_snapshot, ts_snapshot, tinitial_slot,
@@ -617,9 +615,9 @@ int main() {
         for (std::int32_t T : {1, 2, 3, 4, 5, 6}) {
             f += snapshot_chain_equivalence(seed + 6000u + static_cast<std::uint32_t>(T), T);
         }
-        f += selected_slot_snapshot_equivalence(seed + 7000u, 4, 0);
-        f += selected_slot_snapshot_equivalence(seed + 7100u, 4, 2);
-        f += selected_slot_snapshot_equivalence(seed + 7200u, 5, 5);
+        f += selected_slot_snapshot_equivalence(seed + 7000u, 10240, 4, 6, 0);
+        f += selected_slot_snapshot_equivalence(seed + 7100u, 10241, 4, 6, 2);
+        f += selected_slot_snapshot_equivalence(seed + 7200u, 10240, 5, 6, 5);
     }
     f += prefill_state_carry_equivalence(6061u, 10240, 257, 129);
     f += prefill_state_carry_equivalence(6067u, 10241, 257, 2);
@@ -628,6 +626,11 @@ int main() {
     f += prefill_from_slot_equivalence(6075u, 10240, 64, 8, 5);
     f += prefill_from_slot_equivalence(6077u, 10240, 2, 8, 4);
     f += prefill_from_slot_equivalence(6079u, 10241, 7, 8, 3);
+    f += one_prefill_shape("causal_conv1d 35B prefill [8192,1024]", 8192, 1024, 6083u);
+    f += one_decode_shape("causal_conv1d 35B decode [8192,1]", 8192, 6089u);
+    f += prefill_from_slot_equivalence(6090u, 8192, 1, 7, 6);
+    f += prefill_from_slot_equivalence(6091u, 8192, 6, 7, 6);
+    f += selected_slot_snapshot_equivalence(6097u, 8192, 6, 7, 6);
     f += one_prefill_shape("causal_conv1d stress prefill [10241,64] [-32,32]", 10241, 64, 4242u,
                            -32.f, 32.f);
     f += one_decode_shape("causal_conv1d stress decode [10240,1] [-32,32]", 10240, 4343u, -32.f,

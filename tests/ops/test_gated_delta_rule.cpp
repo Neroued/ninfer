@@ -64,19 +64,20 @@ void fill_uniform_shared(std::vector<float>& buf, std::mt19937& gen, float lo, f
     for (float& x : buf) { x = d(gen); }
 }
 
-gdn_ref::Inputs make_inputs(int T, std::uint32_t seed, bool stress_g) {
+gdn_ref::Inputs make_inputs_for_geometry(int head_dim, int qk_heads, int value_heads, int T,
+                                         std::uint32_t seed, bool stress_g) {
     gdn_ref::Inputs in{};
-    in.S    = S;
-    in.H_qk = H_qk;
-    in.H_v  = H_v;
+    in.S    = head_dim;
+    in.H_qk = qk_heads;
+    in.H_v  = value_heads;
     in.T    = T;
     in.B    = B;
-    in.q.resize(static_cast<std::size_t>(B * T * H_qk * S));
-    in.k.resize(static_cast<std::size_t>(B * T * H_qk * S));
-    in.v.resize(static_cast<std::size_t>(B * T * H_v * S));
-    in.g.resize(static_cast<std::size_t>(B * T * H_v));
-    in.beta.resize(static_cast<std::size_t>(B * T * H_v));
-    in.state.resize(static_cast<std::size_t>(B * H_v * S * S));
+    in.q.resize(static_cast<std::size_t>(B * T * qk_heads * head_dim));
+    in.k.resize(static_cast<std::size_t>(B * T * qk_heads * head_dim));
+    in.v.resize(static_cast<std::size_t>(B * T * value_heads * head_dim));
+    in.g.resize(static_cast<std::size_t>(B * T * value_heads));
+    in.beta.resize(static_cast<std::size_t>(B * T * value_heads));
+    in.state.resize(static_cast<std::size_t>(B * value_heads * head_dim * head_dim));
 
     std::mt19937 gen(seed);
     fill_uniform_shared(in.q, gen, -1.0f, 1.0f);
@@ -86,12 +87,16 @@ gdn_ref::Inputs make_inputs(int T, std::uint32_t seed, bool stress_g) {
     fill_uniform_shared(in.beta, gen, 0.05f, 0.95f);
     fill_uniform_shared(in.state, gen, -0.1f, 0.1f);
 
-    l2_normalize_rows(in.q, S, static_cast<long long>(B * T * H_qk));
-    l2_normalize_rows(in.k, S, static_cast<long long>(B * T * H_qk));
+    l2_normalize_rows(in.q, head_dim, static_cast<long long>(B * T * qk_heads));
+    l2_normalize_rows(in.k, head_dim, static_cast<long long>(B * T * qk_heads));
     round_to_bf16(in.q);
     round_to_bf16(in.k);
     round_to_bf16(in.v);
     return in;
+}
+
+gdn_ref::Inputs make_inputs(int T, std::uint32_t seed, bool stress_g) {
+    return make_inputs_for_geometry(S, H_qk, H_v, T, seed, stress_g);
 }
 
 std::size_t align_up_size(std::size_t n, std::size_t align) {
@@ -259,9 +264,10 @@ int snapshot_chain_equivalence_case(int T, std::uint32_t seed, bool stress_g) {
     return failures;
 }
 
-int selected_slot_snapshot_equivalence_case(int T, int initial_slot, std::uint32_t seed) {
-    constexpr int Slots       = 6;
-    const auto in             = make_inputs(T, seed, false);
+int selected_slot_snapshot_equivalence_case(int head_dim, int qk_heads, int value_heads, int T,
+                                            int initial_slot, std::uint32_t seed) {
+    constexpr int Slots = 7;
+    const auto in       = make_inputs_for_geometry(head_dim, qk_heads, value_heads, T, seed, false);
     const std::size_t state_n = in.state.size();
 
     std::vector<float> snapshot_state(state_n * Slots, 17.0f);
@@ -278,18 +284,19 @@ int selected_slot_snapshot_equivalence_case(int T, int initial_slot, std::uint32
     DBuf dinitial_slot = to_device_i32({initial_slot});
     WorkspaceArena ws_snapshot(chunked_arena_bytes(T));
 
-    Tensor tq_snapshot(dq_snapshot.p, DType::BF16, {S, H_qk, T});
-    Tensor tk_snapshot(dk_snapshot.p, DType::BF16, {S, H_qk, T});
-    Tensor tv_snapshot(dv_snapshot.p, DType::BF16, {S, H_v, T});
-    Tensor tg_snapshot(dg_snapshot.p, DType::FP32, {H_v, T});
-    Tensor tbeta_snapshot(dbeta_snapshot.p, DType::FP32, {H_v, T});
-    Tensor tstate_snapshot(dstate_snapshot.p, DType::FP32, {S, S, H_v, Slots});
+    Tensor tq_snapshot(dq_snapshot.p, DType::BF16, {head_dim, qk_heads, T});
+    Tensor tk_snapshot(dk_snapshot.p, DType::BF16, {head_dim, qk_heads, T});
+    Tensor tv_snapshot(dv_snapshot.p, DType::BF16, {head_dim, value_heads, T});
+    Tensor tg_snapshot(dg_snapshot.p, DType::FP32, {value_heads, T});
+    Tensor tbeta_snapshot(dbeta_snapshot.p, DType::FP32, {value_heads, T});
+    Tensor tstate_snapshot(dstate_snapshot.p, DType::FP32,
+                           {head_dim, head_dim, value_heads, Slots});
     Tensor tinitial_slot(dinitial_slot.p, DType::I32, {1});
-    Tensor tout_snapshot(dout_snapshot.p, DType::BF16, {S, H_v, T});
+    Tensor tout_snapshot(dout_snapshot.p, DType::BF16, {head_dim, value_heads, T});
 
     ops::gated_delta_rule_snapshot(tq_snapshot, tk_snapshot, tv_snapshot, tg_snapshot,
-                                       tbeta_snapshot, 1.0f / std::sqrt(float(S)), ws_snapshot,
-                                       tstate_snapshot, tinitial_slot, tout_snapshot, nullptr);
+                                   tbeta_snapshot, 1.0f / std::sqrt(float(head_dim)), ws_snapshot,
+                                   tstate_snapshot, tinitial_slot, tout_snapshot, nullptr);
     cudaDeviceSynchronize();
 
     DBuf dq_step     = to_device_bf16(in.q);
@@ -301,13 +308,13 @@ int selected_slot_snapshot_equivalence_case(int T, int initial_slot, std::uint32
     DBuf dout_step(in.v.size() * 2);
     WorkspaceArena ws_step(chunked_arena_bytes(T));
 
-    Tensor tq_step(dq_step.p, DType::BF16, {S, H_qk, T});
-    Tensor tk_step(dk_step.p, DType::BF16, {S, H_qk, T});
-    Tensor tv_step(dv_step.p, DType::BF16, {S, H_v, T});
-    Tensor tg_step(dg_step.p, DType::FP32, {H_v, T});
-    Tensor tbeta_step(dbeta_step.p, DType::FP32, {H_v, T});
-    Tensor tstate_step(dstate_step.p, DType::FP32, {S, S, H_v});
-    Tensor tout_step(dout_step.p, DType::BF16, {S, H_v, T});
+    Tensor tq_step(dq_step.p, DType::BF16, {head_dim, qk_heads, T});
+    Tensor tk_step(dk_step.p, DType::BF16, {head_dim, qk_heads, T});
+    Tensor tv_step(dv_step.p, DType::BF16, {head_dim, value_heads, T});
+    Tensor tg_step(dg_step.p, DType::FP32, {value_heads, T});
+    Tensor tbeta_step(dbeta_step.p, DType::FP32, {value_heads, T});
+    Tensor tstate_step(dstate_step.p, DType::FP32, {head_dim, head_dim, value_heads});
+    Tensor tout_step(dout_step.p, DType::BF16, {head_dim, value_heads, T});
 
     std::vector<std::uint32_t> expected_slots(snapshot_state.size());
     for (std::size_t i = 0; i < snapshot_state.size(); ++i) {
@@ -320,8 +327,8 @@ int selected_slot_snapshot_equivalence_case(int T, int initial_slot, std::uint32
         Tensor g_t    = tg_step.slice(1, t, 1);
         Tensor beta_t = tbeta_step.slice(1, t, 1);
         Tensor out_t  = tout_step.slice(2, t, 1);
-        ops::gated_delta_rule(q_t, k_t, v_t, g_t, beta_t, 1.0f / std::sqrt(float(S)), ws_step,
-                                  tstate_step, out_t, nullptr);
+        ops::gated_delta_rule(q_t, k_t, v_t, g_t, beta_t, 1.0f / std::sqrt(float(head_dim)),
+                              ws_step, tstate_step, out_t, nullptr);
         cudaDeviceSynchronize();
         const auto state_bits = from_device_u32(dstate_step.p, state_n);
         std::memcpy(expected_slots.data() + static_cast<std::size_t>(t) * state_n,
@@ -329,8 +336,10 @@ int selected_slot_snapshot_equivalence_case(int T, int initial_slot, std::uint32
     }
     cudaDeviceSynchronize();
 
-    const std::string tag =
-        "gdn selected snapshot slot=" + std::to_string(initial_slot) + " T=" + std::to_string(T);
+    const std::string tag = "gdn selected snapshot S=" + std::to_string(head_dim) +
+                            " Hqk=" + std::to_string(qk_heads) +
+                            " Hv=" + std::to_string(value_heads) +
+                            " slot=" + std::to_string(initial_slot) + " T=" + std::to_string(T);
     int failures = 0;
     failures += verify_bits_equal((tag + " out bits").c_str(),
                                   from_device_u16(dout_snapshot.p, in.v.size()),
@@ -404,6 +413,51 @@ GpuResult run_chunked_gpu_split(const gdn_ref::Inputs& in, int split) {
 
     cudaDeviceSynchronize();
     return {from_device_bf16(dout, in.v.size()), from_device_f32(dstate, in.state.size())};
+}
+
+int general_geometry_case(int head_dim, int qk_heads, int value_heads, int T, std::uint32_t seed) {
+    const auto in      = make_inputs_for_geometry(head_dim, qk_heads, value_heads, T, seed, false);
+    const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+    std::vector<double> ref_out(in.v.size());
+    std::vector<double> ref_state(in.state.size());
+    gdn_ref::forward_chunked(in.q.data(), in.k.data(), in.v.data(), in.g.data(), in.beta.data(),
+                             in.state.data(), ref_out.data(), ref_state.data(), head_dim, qk_heads,
+                             value_heads, T, B, scale, BT);
+
+    DBuf dq        = to_device_bf16(in.q);
+    DBuf dk        = to_device_bf16(in.k);
+    DBuf dv        = to_device_bf16(in.v);
+    DBuf dg        = to_device_f32(in.g);
+    DBuf dbeta     = to_device_f32(in.beta);
+    DBuf dstate_in = to_device_f32(in.state);
+    DBuf dstate_out(in.state.size() * sizeof(float));
+    DBuf dout(in.v.size() * sizeof(std::uint16_t));
+
+    Tensor tq(dq.p, DType::BF16, {head_dim, qk_heads, T});
+    Tensor tk(dk.p, DType::BF16, {head_dim, qk_heads, T});
+    Tensor tv(dv.p, DType::BF16, {head_dim, value_heads, T});
+    Tensor tg(dg.p, DType::FP32, {value_heads, T});
+    Tensor tbeta(dbeta.p, DType::FP32, {value_heads, T});
+    Tensor tstate_in(dstate_in.p, DType::FP32, {head_dim, head_dim, value_heads});
+    Tensor tstate_out(dstate_out.p, DType::FP32, {head_dim, head_dim, value_heads});
+    Tensor tout(dout.p, DType::BF16, {head_dim, value_heads, T});
+    const std::size_t workspace_bytes =
+        ops::gated_delta_rule_workspace_bytes(head_dim, qk_heads, value_heads, T);
+    WorkspaceArena ws(std::max<std::size_t>(workspace_bytes, 256));
+
+    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, static_cast<float>(scale), ws, tstate_in,
+                          tstate_out, tout, nullptr);
+    cudaDeviceSynchronize();
+
+    const std::string tag = "gdn geometry S=" + std::to_string(head_dim) +
+                            " Hqk=" + std::to_string(qk_heads) +
+                            " Hv=" + std::to_string(value_heads) + " T=" + std::to_string(T);
+    int failures = 0;
+    failures += verify((tag + " out").c_str(), from_device_bf16(dout, ref_out.size()), ref_out,
+                       Tolerance::gdn_output_bf16());
+    failures += verify((tag + " state").c_str(), from_device_f32(dstate_out, ref_state.size()),
+                       ref_state, Tolerance::gdn_state_fp32());
+    return failures;
 }
 
 int recurrent_case(int T, std::uint32_t seed, bool stress_g) {
@@ -716,10 +770,15 @@ int main() {
         }
     }
     failures += snapshot_chain_equivalence_case(6, 9028u, true);
-    failures += selected_slot_snapshot_equivalence_case(4, 0, 10028u);
-    failures += selected_slot_snapshot_equivalence_case(4, 2, 10038u);
-    failures += selected_slot_snapshot_equivalence_case(5, 5, 10048u);
+    failures += selected_slot_snapshot_equivalence_case(S, H_qk, H_v, 4, 0, 10028u);
+    failures += selected_slot_snapshot_equivalence_case(S, H_qk, H_v, 4, 2, 10038u);
+    failures += selected_slot_snapshot_equivalence_case(S, H_qk, H_v, 5, 5, 10048u);
+    failures += selected_slot_snapshot_equivalence_case(128, 16, 32, 6, 6, 10058u);
     failures += validation_case();
+    failures += general_geometry_case(16, 4, 4, 1, 12016u);
+    failures += general_geometry_case(32, 4, 8, 3, 12032u);
+    failures += general_geometry_case(64, 4, 16, 70, 12064u);
+    failures += general_geometry_case(128, 16, 32, 128, 12128u);
     failures += chunked_case(32, 4528u, true, true);
     failures += chunked_case(64, 4090u, true, true);
     failures += chunked_case(128, 4154u, true, true);

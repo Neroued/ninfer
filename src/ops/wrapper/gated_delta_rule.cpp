@@ -1,6 +1,7 @@
 #include "ninfer/ops/gated_delta_rule.h"
 
 #include "ops/common/math.h"
+#include "ops/kernel/gdn_common.cuh"
 #include "ops/launcher/gated_delta_rule.h"
 #include "core/device.h"
 
@@ -14,10 +15,14 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kS         = 128;
-constexpr std::int32_t kHqk       = 16;
-constexpr std::int32_t kHv        = 48;
 constexpr std::int32_t kChunkSize = 64;
+
+struct Geometry {
+    std::int32_t head_dim;
+    std::int32_t qk_heads;
+    std::int32_t value_heads;
+    std::int32_t tokens;
+};
 
 void require_dtype(const Tensor& t, DType dtype, const char* name) {
     if (t.dtype != dtype) { throw std::invalid_argument(std::string("gated_delta_rule: ") + name); }
@@ -41,9 +46,31 @@ void require_contiguous_nonnull(const Tensor& t, const char* name) {
     }
 }
 
-void validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                        const Tensor& beta, float scale, const Tensor& ssm_state,
-                        const Tensor& out) {
+Geometry require_geometry(const Tensor& q, const Tensor& v) {
+    const Geometry geometry{q.ne[0], q.ne[1], v.ne[1], q.ne[2]};
+    if (!is_supported_gdn_head_dim(geometry.head_dim)) {
+        throw std::invalid_argument("gated_delta_rule: head dimension must be 16, 32, 64, or 128");
+    }
+    if (!are_gdn_head_counts_valid(geometry.qk_heads, geometry.value_heads)) {
+        throw std::invalid_argument(
+            "gated_delta_rule: value heads must be at least q/k heads and divisible by them");
+    }
+    if (geometry.tokens <= 0) {
+        throw std::invalid_argument("gated_delta_rule: T must be positive");
+    }
+    return geometry;
+}
+
+void require_scale(float scale, std::int32_t head_dim) {
+    const float expected_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    if (!std::isfinite(scale) || scale <= 0.0f || std::abs(scale - expected_scale) > 1.0e-6f) {
+        throw std::invalid_argument("gated_delta_rule: scale must be 1/sqrt(head_dim)");
+    }
+}
+
+Geometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                            const Tensor& beta, float scale, const Tensor& ssm_state,
+                            const Tensor& out) {
     require_dtype(q, DType::BF16, "q must be BF16");
     require_dtype(k, DType::BF16, "k must be BF16");
     require_dtype(v, DType::BF16, "v must be BF16");
@@ -52,15 +79,15 @@ void validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const
     require_dtype(beta, DType::FP32, "beta must be FP32");
     require_dtype(ssm_state, DType::FP32, "ssm_state must be FP32");
 
-    const std::int32_t T = q.ne[2];
-    if (T <= 0) { throw std::invalid_argument("gated_delta_rule: T must be positive"); }
-    require_shape(q, kS, kHqk, T, 1, "q");
-    require_shape(k, kS, kHqk, T, 1, "k");
-    require_shape(v, kS, kHv, T, 1, "v");
-    require_shape(out, kS, kHv, T, 1, "out");
-    require_shape(g, kHv, T, 1, 1, "g");
-    require_shape(beta, kHv, T, 1, 1, "beta");
-    require_shape(ssm_state, kS, kS, kHv, 1, "ssm_state");
+    const Geometry geometry = require_geometry(q, v);
+    require_shape(q, geometry.head_dim, geometry.qk_heads, geometry.tokens, 1, "q");
+    require_shape(k, geometry.head_dim, geometry.qk_heads, geometry.tokens, 1, "k");
+    require_shape(v, geometry.head_dim, geometry.value_heads, geometry.tokens, 1, "v");
+    require_shape(out, geometry.head_dim, geometry.value_heads, geometry.tokens, 1, "out");
+    require_shape(g, geometry.value_heads, geometry.tokens, 1, 1, "g");
+    require_shape(beta, geometry.value_heads, geometry.tokens, 1, 1, "beta");
+    require_shape(ssm_state, geometry.head_dim, geometry.head_dim, geometry.value_heads, 1,
+                  "ssm_state");
 
     require_contiguous_nonnull(q, "q");
     require_contiguous_nonnull(k, "k");
@@ -70,15 +97,14 @@ void validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const
     require_contiguous_nonnull(ssm_state, "ssm_state");
     require_contiguous_nonnull(out, "out");
 
-    constexpr float expected_scale = 0.08838834764831845f;
-    if (!std::isfinite(scale) || scale <= 0.0f || std::abs(scale - expected_scale) > 1.0e-6f) {
-        throw std::invalid_argument("gated_delta_rule: scale must be 1/sqrt(128)");
-    }
+    require_scale(scale, geometry.head_dim);
+    return geometry;
 }
 
-void validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                                 const Tensor& beta, float scale, const Tensor& ssm_states,
-                                 const Tensor& initial_slot, const Tensor& out) {
+Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
+                                     const Tensor& g, const Tensor& beta, float scale,
+                                     const Tensor& ssm_states, const Tensor& initial_slot,
+                                     const Tensor& out) {
     require_dtype(q, DType::BF16, "q must be BF16");
     require_dtype(k, DType::BF16, "k must be BF16");
     require_dtype(v, DType::BF16, "v must be BF16");
@@ -88,16 +114,15 @@ void validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor&
     require_dtype(ssm_states, DType::FP32, "ssm_states must be FP32");
     require_dtype(initial_slot, DType::I32, "initial_slot must be I32");
 
-    const std::int32_t T = q.ne[2];
-    if (T <= 0) { throw std::invalid_argument("gated_delta_rule: T must be positive"); }
-    require_shape(q, kS, kHqk, T, 1, "q");
-    require_shape(k, kS, kHqk, T, 1, "k");
-    require_shape(v, kS, kHv, T, 1, "v");
-    require_shape(out, kS, kHv, T, 1, "out");
-    require_shape(g, kHv, T, 1, 1, "g");
-    require_shape(beta, kHv, T, 1, 1, "beta");
-    if (ssm_states.ne[0] != kS || ssm_states.ne[1] != kS || ssm_states.ne[2] != kHv ||
-        ssm_states.ne[3] < T) {
+    const Geometry geometry = require_geometry(q, v);
+    require_shape(q, geometry.head_dim, geometry.qk_heads, geometry.tokens, 1, "q");
+    require_shape(k, geometry.head_dim, geometry.qk_heads, geometry.tokens, 1, "k");
+    require_shape(v, geometry.head_dim, geometry.value_heads, geometry.tokens, 1, "v");
+    require_shape(out, geometry.head_dim, geometry.value_heads, geometry.tokens, 1, "out");
+    require_shape(g, geometry.value_heads, geometry.tokens, 1, 1, "g");
+    require_shape(beta, geometry.value_heads, geometry.tokens, 1, 1, "beta");
+    if (ssm_states.ne[0] != geometry.head_dim || ssm_states.ne[1] != geometry.head_dim ||
+        ssm_states.ne[2] != geometry.value_heads || ssm_states.ne[3] < geometry.tokens) {
         throw std::invalid_argument("gated_delta_rule: invalid shape for ssm_states snapshot");
     }
     require_shape(initial_slot, 1, 1, 1, 1, "initial_slot");
@@ -111,10 +136,8 @@ void validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor&
     require_contiguous_nonnull(initial_slot, "initial_slot");
     require_contiguous_nonnull(out, "out");
 
-    constexpr float expected_scale = 0.08838834764831845f;
-    if (!std::isfinite(scale) || scale <= 0.0f || std::abs(scale - expected_scale) > 1.0e-6f) {
-        throw std::invalid_argument("gated_delta_rule: scale must be 1/sqrt(128)");
-    }
+    require_scale(scale, geometry.head_dim);
+    return geometry;
 }
 
 void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -122,9 +145,10 @@ void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const T
                       const Tensor& ssm_state_out, const Tensor& out) {
     // ssm_state_out carries the running-state contract validated by validate_recurrent;
     // ssm_state_in is an equally-shaped read view (may alias ssm_state_out for in-place).
-    validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, out);
+    const Geometry geometry = validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, out);
     require_dtype(ssm_state_in, DType::FP32, "ssm_state_in must be FP32");
-    require_shape(ssm_state_in, kS, kS, kHv, 1, "ssm_state_in");
+    require_shape(ssm_state_in, geometry.head_dim, geometry.head_dim, geometry.value_heads, 1,
+                  "ssm_state_in");
     require_contiguous_nonnull(ssm_state_in, "ssm_state_in");
 }
 
@@ -138,10 +162,15 @@ std::int32_t checked_arena_floats(std::size_t bytes) {
 
 } // namespace
 
-std::size_t gated_delta_rule_workspace_bytes(std::int32_t tokens) {
-    if (tokens <= 0) { return 0; }
+std::size_t gated_delta_rule_workspace_bytes(std::int32_t head_dim, std::int32_t qk_heads,
+                                             std::int32_t value_heads, std::int32_t tokens) {
+    if (!is_supported_gdn_head_dim(head_dim) || !are_gdn_head_counts_valid(qk_heads, value_heads) ||
+        tokens <= 0) {
+        throw std::invalid_argument("gated_delta_rule_workspace_bytes: invalid geometry");
+    }
     const std::int32_t full = (tokens / kChunkSize) * kChunkSize;
-    return full == 0 ? 0 : detail::gdn_chunked_workspace_bytes(full);
+    return full == 0 ? 0
+                     : detail::gdn_chunked_workspace_bytes(head_dim, qk_heads, value_heads, full);
 }
 
 void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -178,8 +207,9 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
     const std::int32_t T      = q.ne[2];
     const std::int32_t T_full = (T / kChunkSize) * kChunkSize;
     if (T_full > 0) {
-        const std::size_t stage_bytes = gated_delta_rule_workspace_bytes(T);
-        Tensor stage_workspace        = ws.alloc(DType::FP32, {checked_arena_floats(stage_bytes)});
+        const std::size_t stage_bytes =
+            gated_delta_rule_workspace_bytes(q.ne[0], q.ne[1], v.ne[1], T);
+        Tensor stage_workspace = ws.alloc(DType::FP32, {checked_arena_floats(stage_bytes)});
 
         Tensor q_full    = q.slice(2, 0, T_full);
         Tensor k_full    = k.slice(2, 0, T_full);

@@ -11,16 +11,15 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr std::int64_t kS   = 128;
-constexpr std::int64_t kHqk = 16;
-constexpr std::int64_t kHv  = 48;
-constexpr std::int64_t kB   = 1;
+constexpr std::int64_t kB = 1;
 
 } // namespace
 
-std::size_t gdn_chunked_workspace_bytes(std::int64_t T) {
-    if (T <= 0) { return 0; }
-    return static_cast<std::size_t>(gdn_chunked::workspace_bytes(kS, kHqk, kHv, T, kB));
+std::size_t gdn_chunked_workspace_bytes(std::int64_t head_dim, std::int64_t qk_heads,
+                                        std::int64_t value_heads, std::int64_t tokens) {
+    if (tokens <= 0) { return 0; }
+    return static_cast<std::size_t>(
+        gdn_chunked::workspace_bytes(head_dim, qk_heads, value_heads, tokens, kB));
 }
 
 void gated_delta_rule_chunked_launch(const Tensor& q, const Tensor& k, const Tensor& v,

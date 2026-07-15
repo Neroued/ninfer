@@ -6,8 +6,9 @@
 > `/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16`: Text, sparse
 > MoE, MTP, Vision, multimodal positions, numerics, and persistent state. Runtime support remains
 > defined by [`design.md`](design.md) and the project README. This document does not define a
-> `.ninfer` artifact contract, claim that the current runtime can load this checkpoint, or qualify the advertised
-> extended million-token mode.
+> `.ninfer` artifact contract, claim that the current runtime can load this checkpoint, or qualify
+> the advertised extended million-token mode. The accepted future-target artifact and quantization
+> specification is [`qwen3.6-35b-a3b-ninfer-artifact.md`](qwen3.6-35b-a3b-ninfer-artifact.md).
 
 ## 1. Model identity
 

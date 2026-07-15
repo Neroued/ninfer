@@ -27,10 +27,13 @@ defined by `include/ninfer/engine.h` and `include/ninfer/types.h`.
 | [`ninfer-storage-layouts.md`](ninfer-storage-layouts.md) | registered persistent byte layouts and resource encoding |
 | [`ninfer-container-format.md`](ninfer-container-format.md) | `.ninfer` framing, embedded JSON directory, object geometry, and container/model boundary |
 | [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md) | complete Qwen3.6-27B object inventory, source transforms, resources, views, and binder obligations |
+| [`qwen3.6-35b-a3b-ninfer-artifact.md`](qwen3.6-35b-a3b-ninfer-artifact.md) | accepted future-target specification for MoE quantization, expert layout, exact inventory, conversion, and the 256K RTX 5090 memory envelope |
 
-These contracts are implemented by the generic artifact reader/writer/inspector, the registered
-27B converter and verifier, the C++ artifact reader/binder/materializer, the compiled target package,
-and the Python correctness reference.
+The common contracts and 27B artifact contract are implemented by the generic artifact
+reader/writer/inspector, the registered 27B converter and verifier, the C++ artifact
+reader/binder/materializer, the compiled target package, and the Python correctness reference. The
+35B-A3B contract is an accepted design authority for future implementation; it does not register a
+current product target.
 
 ## Model computation references
 

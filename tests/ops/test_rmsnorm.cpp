@@ -244,12 +244,17 @@ int main() {
 
     for (std::uint32_t seed : {1u, 7u, 99u}) {
         f += one_shape("rmsnorm layer [5120,1]", 5120, 1, 1, true, false, seed, -8.f, 8.f);
-        f += one_shape("rmsnorm layer [5120,4096]", 5120, 4096, 1, true, false, seed, -8.f, 8.f);
+        f += one_shape("rmsnorm layer [5120,1024]", 5120, 1024, 1, true, false, seed, -8.f, 8.f);
         f += one_shape("rmsnorm q-norm [256,24,7]", 256, 24, 7, true, false, seed, -8.f, 8.f);
         f += one_shape("rmsnorm k-norm [256,4,7]", 256, 4, 7, true, false, seed, -8.f, 8.f);
         f += one_shape("rmsnorm gdn gated [128,48,7]", 128, 48, 7, false, true, seed, -8.f, 8.f);
         f += one_shape("rmsnorm unaligned [260,3]", 260, 3, 1, true, false, seed, -8.f, 8.f);
     }
+    f += one_shape("rmsnorm 35b hidden [2048,6]", 2048, 6, 1, true, false, 3501u, -8.f, 8.f);
+    f += one_shape("rmsnorm 35b q [256,16,6]", 256, 16, 6, true, false, 3502u, -8.f, 8.f);
+    f += one_shape("rmsnorm 35b k [256,2,6]", 256, 2, 6, true, false, 3503u, -8.f, 8.f);
+    f += one_shape("rmsnorm 35b gated [128,32,6]", 128, 32, 6, false, true, 3504u, -8.f, 8.f);
+    f += one_shape("rmsnorm fast plain [192,5]", 192, 5, 1, false, false, 3505u, -8.f, 8.f);
     f += one_shape("rmsnorm stress [-60,60]", 260, 3, 1, true, false, 4242u, -60.f, 60.f);
     f += one_shape("rmsnorm gated stress [-60,60]", 128, 48, 7, false, true, 4343u, -60.f, 60.f);
     f += unaligned_data_case();

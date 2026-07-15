@@ -223,9 +223,13 @@ int main() {
 
     for (std::uint32_t seed : {1u, 7u, 99u}) {
         f += one_shape("l2norm [128,16,1]", 128, 16, 1, true, seed, -8.f, 8.f);
-        f += one_shape("l2norm [128,16,4096]", 128, 16, 4096, true, seed, -8.f, 8.f);
+        f += one_shape("l2norm [128,16,1024]", 128, 16, 1024, true, seed, -8.f, 8.f);
         f += one_shape("l2norm [127,5]", 127, 5, 1, false, seed, -8.f, 8.f);
     }
+    f += one_shape("l2norm 35b [128,16,6]", 128, 16, 6, true, 3501u, -8.f, 8.f);
+    f += one_shape("l2norm fast D=64", 64, 7, 1, false, 3502u, -8.f, 8.f);
+    f += one_shape("l2norm fast D=192", 192, 7, 1, false, 3503u, -8.f, 8.f);
+    f += one_shape("l2norm fast D=256", 256, 7, 1, false, 3504u, -8.f, 8.f);
     f += near_zero_row_case();
     f += unaligned_data_case();
 

@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - l2norm kernel. One warp handles one row, reducing over ne[0].
+// ninfer::ops - L2Norm kernels over contiguous BF16 rows.
 
 #include "ops/common/warp.cuh"
 
@@ -10,60 +10,71 @@
 
 namespace ninfer::ops {
 
-__launch_bounds__(512) __global__ void l2norm_kernel(const __nv_bfloat16* x, __nv_bfloat16* out,
-                                                     std::int32_t d, std::int64_t rows, float eps) {
-    constexpr unsigned kFullWarpMask = 0xffffffffu;
-    constexpr int kWarpSize          = 32;
-    const int lane                   = threadIdx.x & (kWarpSize - 1);
-    const int warp                   = threadIdx.x >> 5;
-    const std::int64_t row = (static_cast<std::int64_t>(blockIdx.x) * (blockDim.x / kWarpSize)) +
-                             static_cast<std::int64_t>(warp);
+// Fast domain: D in {64, 128, 192, 256}. One warp owns one row and keeps the input in registers.
+template <int Block>
+__launch_bounds__(Block) __global__
+    void l2norm_warp_bf16x2_kernel(const __nv_bfloat162* x, __nv_bfloat162* out, std::int32_t d,
+                                   std::int64_t rows, float eps) {
+    static_assert(Block % kWarpSize == 0);
+    constexpr int kWarpsPerBlock   = Block / kWarpSize;
+    constexpr int kMaxPairsPerLane = 4;
+    const int lane                 = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp                 = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t row         = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+    if (row >= rows) { return; }
+
+    const int pairs             = d / 2;
+    const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
+    __nv_bfloat162 values[kMaxPairsPerLane];
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k = 0; k < kMaxPairsPerLane; ++k) {
+        const int pair = lane + k * kWarpSize;
+        if (pair < pairs) {
+            values[k]       = x[row_base + pair];
+            const float2 xf = __bfloat1622float2(values[k]);
+            sum += xf.x * xf.x + xf.y * xf.y;
+        }
+    }
+
+    sum       = warp_reduce_sum(sum);
+    float inv = lane == 0 ? rsqrtf(sum + eps) : 0.0f;
+    inv       = __shfl_sync(kFullWarpMask, inv, 0);
+
+#pragma unroll
+    for (int k = 0; k < kMaxPairsPerLane; ++k) {
+        const int pair = lane + k * kWarpSize;
+        if (pair < pairs) {
+            const float2 xf      = __bfloat1622float2(values[k]);
+            out[row_base + pair] = __floats2bfloat162_rn(xf.x * inv, xf.y * inv);
+        }
+    }
+}
+
+// Functional fallback for unaligned data and widths outside the aligned fast domain.
+__launch_bounds__(512) __global__
+    void l2norm_generic_kernel(const __nv_bfloat16* x, __nv_bfloat16* out, std::int32_t d,
+                               std::int64_t rows, float eps) {
+    constexpr int kRowsPerBlock = 512 / kWarpSize;
+    const int lane              = static_cast<int>(threadIdx.x) & (kWarpSize - 1);
+    const int warp              = static_cast<int>(threadIdx.x) / kWarpSize;
+    const std::int64_t row      = static_cast<std::int64_t>(blockIdx.x) * kRowsPerBlock + warp;
     if (row >= rows) { return; }
 
     const std::int64_t base = row * static_cast<std::int64_t>(d);
-    const std::int64_t d64  = static_cast<std::int64_t>(d);
-
-    float sum = 0.0f;
-    if (d <= 128) {
-        const std::int64_t i0 = static_cast<std::int64_t>(lane);
-        const std::int64_t i1 = i0 + kWarpSize;
-        const std::int64_t i2 = i1 + kWarpSize;
-        const std::int64_t i3 = i2 + kWarpSize;
-
-        float v0 = 0.0f;
-        float v1 = 0.0f;
-        float v2 = 0.0f;
-        float v3 = 0.0f;
-        if (i0 < d64) { v0 = __bfloat162float(x[base + i0]); }
-        if (i1 < d64) { v1 = __bfloat162float(x[base + i1]); }
-        if (i2 < d64) { v2 = __bfloat162float(x[base + i2]); }
-        if (i3 < d64) { v3 = __bfloat162float(x[base + i3]); }
-        sum = v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
-
-        sum = warp_reduce_sum(sum, kFullWarpMask);
-
-        float inv = (lane == 0) ? rsqrtf(sum + eps) : 0.0f;
-        inv       = __shfl_sync(kFullWarpMask, inv, 0);
-        if (i0 < d64) { out[base + i0] = __float2bfloat16_rn(v0 * inv); }
-        if (i1 < d64) { out[base + i1] = __float2bfloat16_rn(v1 * inv); }
-        if (i2 < d64) { out[base + i2] = __float2bfloat16_rn(v2 * inv); }
-        if (i3 < d64) { out[base + i3] = __float2bfloat16_rn(v3 * inv); }
-        return;
+    float sum               = 0.0f;
+    for (std::int64_t i = lane; i < static_cast<std::int64_t>(d); i += kWarpSize) {
+        const float value = __bfloat162float(x[base + i]);
+        sum += value * value;
     }
 
-    for (std::int64_t i = lane; i < d64; i += kWarpSize) {
-        const float xv = __bfloat162float(x[base + i]);
-        sum += xv * xv;
-    }
-
-    sum = warp_reduce_sum(sum, kFullWarpMask);
-
-    float inv = (lane == 0) ? rsqrtf(sum + eps) : 0.0f;
+    sum       = warp_reduce_sum(sum);
+    float inv = lane == 0 ? rsqrtf(sum + eps) : 0.0f;
     inv       = __shfl_sync(kFullWarpMask, inv, 0);
-    for (std::int64_t i = lane; i < d64; i += kWarpSize) {
-        const std::int64_t idx = base + i;
-        const float v          = __bfloat162float(x[idx]) * inv;
-        out[idx]               = __float2bfloat16_rn(v);
+    for (std::int64_t i = lane; i < static_cast<std::int64_t>(d); i += kWarpSize) {
+        const std::int64_t index = base + i;
+        out[index]               = __float2bfloat16_rn(__bfloat162float(x[index]) * inv);
     }
 }
 

@@ -5,6 +5,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/gqa_attention.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/config.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/load/bindings.h"
 #include "core/kv_cache.h"
@@ -216,7 +217,7 @@ class TextContext {
 public:
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                 KVCache& kv, GdnState& state, StepState& io, std::uint32_t prefill_chunk,
-                KVCache* mtp_kv = nullptr);
+                std::uint32_t text_kv_base, KVCache* mtp_kv = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -251,15 +252,17 @@ public:
     void diagnostic_prefill(std::span<const int> ids, void* context, TextTapCallback callback);
     void diagnostic_prefill(const ProcessedInput& input, const Tensor& visual_embeddings,
                             void* context, TextTapCallback callback);
-    void target_verify(const Tensor& ids, const Tensor& positions);
-    void diagnostic_target_verify(const Tensor& ids, const Tensor& positions, void* context,
+    void target_verify(const Tensor& ids, const Tensor& positions,
+                       ops::GqaExecutionEnvelope envelope);
+    void diagnostic_target_verify(const Tensor& ids, const Tensor& positions,
+                                  ops::GqaExecutionEnvelope envelope, void* context,
                                   TextTapCallback callback);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                           Tensor& mtp_hidden, int logits_column, Tensor* logits,
-                           Tensor* draft_token);
+                           ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
+                           int logits_column, Tensor* logits, Tensor* draft_token);
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
-                             const Tensor& position, Tensor& mtp_hidden, Tensor& logits,
-                             Tensor& draft_token);
+                             const Tensor& position, ops::GqaExecutionEnvelope envelope,
+                             Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
     void mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Tensor& row, Tensor& out_hidden,
                                     Tensor& logits, Tensor& draft_token);
 
@@ -279,11 +282,14 @@ private:
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
     void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
-                          const Tensor& rope_positions, Tensor& mtp_hidden);
+                          const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
+                          Tensor& mtp_hidden);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                          const Tensor& rope_positions, Tensor& mtp_hidden);
+                          const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
+                          Tensor& mtp_hidden);
     void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
-                           const Tensor& positions, const Tensor& rope_positions, bool final_chunk,
+                           const Tensor& positions, const Tensor& rope_positions,
+                           ops::GqaExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void mtp_draft_argmax(const Tensor& hidden, Tensor& logits, Tensor& draft_token);
 
@@ -297,7 +303,8 @@ private:
     template <class Tap>
     void prefill_impl(std::span<const int> ids, const MultimodalPrefill* multimodal, Tap& tap);
     template <class Tap>
-    void target_verify_impl(const Tensor& ids, const Tensor& positions, Tap& tap);
+    void target_verify_impl(const Tensor& ids, const Tensor& positions,
+                            ops::GqaExecutionEnvelope envelope, Tap& tap);
 
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
@@ -307,13 +314,15 @@ private:
     GdnState& state_;
     StepState& io_;
     std::uint32_t prefill_chunk_;
-    const Tensor* active_cache_positions_   = nullptr;
-    const Tensor* active_rope_positions_    = nullptr;
-    std::int32_t rope_delta_                = 0;
-    std::int32_t gdn_prefill_read_slot_     = 0;
-    std::int64_t prefill_snapshot_boundary_ = -1;
-    Tensor* boundary_hidden_output_         = nullptr;
-    bool mtp_prompt_prepared_               = false;
+    std::uint32_t text_kv_base_;
+    const Tensor* active_cache_positions_                 = nullptr;
+    const Tensor* active_rope_positions_                  = nullptr;
+    const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
+    std::int32_t rope_delta_                              = 0;
+    std::int32_t gdn_prefill_read_slot_                   = 0;
+    std::int64_t prefill_snapshot_boundary_               = -1;
+    Tensor* boundary_hidden_output_                       = nullptr;
+    bool mtp_prompt_prepared_                             = false;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

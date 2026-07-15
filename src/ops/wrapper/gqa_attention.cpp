@@ -1,8 +1,7 @@
-// ninfer::ops - gqa_attention wrapper: public api validation and phase dispatch.
+// ninfer::ops - GQA A1/A2/A3 validation and finite route dispatch.
 #include "ninfer/ops/gqa_attention.h"
 
 #include "core/layout.h"
-
 #include "ops/launcher/gqa_attention.h"
 
 #include <cmath>
@@ -36,80 +35,116 @@ std::int32_t checked_i32(std::uint32_t value, const char* op, const char* name) 
     return static_cast<std::int32_t>(value);
 }
 
-void require_shape(const Tensor& t, std::int32_t n0, std::int32_t n1, std::int32_t n2,
+void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* op, const char* name) {
-    if (t.ne[0] != n0 || t.ne[1] != n1 || t.ne[2] != n2 || t.ne[3] != n3) {
+    if (tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 || tensor.ne[3] != n3) {
         throw std::invalid_argument(std::string(op) + ": invalid shape for " + name);
     }
 }
 
-void require_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
-    if (!t.is_contiguous()) {
+void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char* name) {
+    if (!tensor.is_contiguous()) {
         throw std::invalid_argument(std::string(op) + ": " + name + " must be contiguous");
     }
-    if (t.data == nullptr) {
+    if (tensor.data == nullptr) {
         throw std::invalid_argument(std::string(op) + ": " + name + " data must be non-null");
     }
 }
 
-void validate_cache(KVCache& kv, int layer, std::int32_t kv_heads, const char* op) {
-    if (layer < 0 || static_cast<std::uint32_t>(layer) >= kv.layer_count()) {
-        throw std::invalid_argument(std::string(op) + ": layer out of range");
+void validate_cache(const KVCacheLayerView& cache, std::int32_t kv_heads, const char* op) {
+    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
+        cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
-    if ((kv.dtype != DType::BF16 && kv.dtype != DType::I8) || kv.num_kv_heads != kv_heads ||
-        kv.head_dim != kHeadDim) {
-        throw std::invalid_argument(std::string(op) + ": invalid KVCache geometry or dtype");
+    if (cache.max_context == 0 || cache.padded_context < cache.max_context) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
-    if (kv.dtype == DType::BF16 && kv.quant_group != 0) {
-        throw std::invalid_argument(std::string(op) + ": BF16 KVCache must not have quant_group");
+    if (cache.dtype == DType::BF16 && cache.quant_group != 0) {
+        throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
     }
-    if (kv.dtype == DType::I8 && kv.quant_group != kKvQuantGroup) {
-        throw std::invalid_argument(std::string(op) + ": I8 KVCache must use quant_group 64");
-    }
-    if (kv.padded_context < kv.max_context) {
-        throw std::invalid_argument(std::string(op) + ": KVCache padded_context is too small");
-    }
-    if (kv.k.size() != kv.v.size() || kv.k.size() != kv.layer_count()) {
-        throw std::invalid_argument(std::string(op) + ": invalid KVCache layer vectors");
+    if (cache.dtype == DType::I8 && cache.quant_group != kKvQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
     }
 
-    const Tensor& cache_k            = kv.k[static_cast<std::uint32_t>(layer)];
-    const Tensor& cache_v            = kv.v[static_cast<std::uint32_t>(layer)];
-    const DType expected_cache_dtype = kv.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache_k.dtype != expected_cache_dtype || cache_v.dtype != expected_cache_dtype) {
-        throw std::invalid_argument(std::string(op) + ": invalid KVCache code tensor dtype");
+    const std::int32_t padded = checked_i32(cache.padded_context, op, "padded_context");
+    const DType code_dtype    = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
+    if (cache.k.dtype != code_dtype || cache.v.dtype != code_dtype) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
     }
-    const std::int32_t padded_context = checked_i32(kv.padded_context, op, "padded_context");
-    if (cache_k.ne[0] != kHeadDim || cache_k.ne[1] != padded_context || cache_k.ne[2] != kv_heads ||
-        cache_k.ne[3] != 1 || cache_v.ne[0] != kHeadDim || cache_v.ne[1] != padded_context ||
-        cache_v.ne[2] != kv_heads || cache_v.ne[3] != 1) {
-        throw std::invalid_argument(std::string(op) + ": invalid KVCache tensor shape");
-    }
-    require_contiguous_nonnull(cache_k, op, "cache k");
-    require_contiguous_nonnull(cache_v, op, "cache v");
+    require_shape(cache.k, kHeadDim, padded, kv_heads, 1, op, "cache k");
+    require_shape(cache.v, kHeadDim, padded, kv_heads, 1, op, "cache v");
+    require_contiguous_nonnull(cache.k, op, "cache k");
+    require_contiguous_nonnull(cache.v, op, "cache v");
 
-    if (kv.dtype == DType::BF16) {
-        if (!kv.k_scale.empty() || !kv.v_scale.empty()) {
-            throw std::invalid_argument(std::string(op) + ": BF16 KVCache must not have scales");
+    if (cache.dtype == DType::BF16) {
+        if (cache.k_scale.data != nullptr || cache.v_scale.data != nullptr) {
+            throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
         }
         return;
     }
 
-    if (kv.k_scale.size() != kv.layer_count() || kv.v_scale.size() != kv.layer_count()) {
-        throw std::invalid_argument(std::string(op) + ": invalid KVCache scale vectors");
+    constexpr std::int32_t groups = kHeadDim / kKvQuantGroup;
+    if (cache.k_scale.dtype != DType::FP16 || cache.v_scale.dtype != DType::FP16) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
-    const Tensor& cache_k_scale         = kv.k_scale[static_cast<std::uint32_t>(layer)];
-    const Tensor& cache_v_scale         = kv.v_scale[static_cast<std::uint32_t>(layer)];
-    constexpr std::int32_t kScaleGroups = kHeadDim / kKvQuantGroup;
-    if (cache_k_scale.dtype != DType::FP16 || cache_v_scale.dtype != DType::FP16 ||
-        cache_k_scale.ne[0] != kScaleGroups || cache_k_scale.ne[1] != padded_context ||
-        cache_k_scale.ne[2] != kv_heads || cache_k_scale.ne[3] != 1 ||
-        cache_v_scale.ne[0] != kScaleGroups || cache_v_scale.ne[1] != padded_context ||
-        cache_v_scale.ne[2] != kv_heads || cache_v_scale.ne[3] != 1) {
-        throw std::invalid_argument(std::string(op) + ": invalid KVCache scale tensor shape");
+    require_shape(cache.k_scale, groups, padded, kv_heads, 1, op, "cache k scale");
+    require_shape(cache.v_scale, groups, padded, kv_heads, 1, op, "cache v scale");
+    require_contiguous_nonnull(cache.k_scale, op, "cache k scale");
+    require_contiguous_nonnull(cache.v_scale, op, "cache v scale");
+}
+
+void validate_envelope(GqaExecutionEnvelope envelope, const KVCacheLayerView& cache,
+                       std::int32_t tokens, const char* op) {
+    if (envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
+        envelope.max_visible_keys > cache.max_context) {
+        throw std::invalid_argument(std::string(op) + ": invalid execution envelope");
     }
-    require_contiguous_nonnull(cache_k_scale, op, "cache k scale");
-    require_contiguous_nonnull(cache_v_scale, op, "cache v scale");
+    if (envelope.max_visible_keys < static_cast<std::uint32_t>(tokens)) {
+        throw std::invalid_argument(std::string(op) + ": execution envelope is shorter than T");
+    }
+}
+
+void validate_attention_tensors(const Tensor& q, const Tensor& positions, const Tensor& out,
+                                const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,
+                                float scale, const char* op) {
+    if (q.dtype != DType::BF16 || out.dtype != DType::BF16) {
+        throw std::invalid_argument(std::string(op) + ": q/out must be BF16");
+    }
+    if (positions.dtype != DType::I32) {
+        throw std::invalid_argument(std::string(op) + ": positions must be I32");
+    }
+    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-6f) {
+        throw std::invalid_argument(std::string(op) + ": scale must be 1/sqrt(256)");
+    }
+    const std::int32_t q_heads  = q.ne[1];
+    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
+    const std::int32_t tokens   = q.ne[2];
+    if (tokens <= 0) { throw std::invalid_argument(std::string(op) + ": T must be positive"); }
+    require_shape(q, kHeadDim, q_heads, tokens, 1, op, "q");
+    require_shape(positions, tokens, 1, 1, 1, op, "positions");
+    require_shape(out, kHeadDim, q_heads, tokens, 1, op, "out");
+    require_contiguous_nonnull(q, op, "q");
+    require_contiguous_nonnull(positions, op, "positions");
+    require_contiguous_nonnull(out, op, "out");
+    validate_cache(cache, kv_heads, op);
+    validate_envelope(envelope, cache, tokens, op);
+}
+
+struct SmallTWorkspace {
+    Tensor acc;
+    Tensor m;
+    Tensor l;
+};
+
+SmallTWorkspace allocate_small_t_workspace(WorkspaceArena& workspace, std::int32_t q_heads,
+                                           std::int32_t tokens) {
+    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, "gqa_attention workspace");
+    const std::int32_t splits   = detail::gqa_attention_decode_splits(q_heads, kv_heads);
+    return {
+        workspace.alloc(DType::BF16, {kHeadDim, q_heads, tokens, splits}),
+        workspace.alloc(DType::FP32, {q_heads, tokens, splits}),
+        workspace.alloc(DType::FP32, {q_heads, tokens, splits}),
+    };
 }
 
 } // namespace
@@ -128,68 +163,33 @@ std::size_t gqa_attention_workspace_bytes(std::int32_t q_heads, std::int32_t tok
 }
 
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   float scale, KVCache& kv, int layer, WorkspaceArena& ws, Tensor& out,
-                   cudaStream_t stream) {
+                   float scale, KVCacheLayerView cache, GqaExecutionEnvelope envelope,
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "gqa_attention";
-    if (q.dtype != DType::BF16 || k.dtype != DType::BF16 || v.dtype != DType::BF16 ||
-        out.dtype != DType::BF16) {
-        throw std::invalid_argument("gqa_attention: q/k/v/out must be BF16");
+    validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
+    if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
+        throw std::invalid_argument("gqa_attention: k/v must be BF16");
     }
-    if (positions.dtype != DType::I32) {
-        throw std::invalid_argument("gqa_attention: positions must be I32");
-    }
-    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-6f) {
-        throw std::invalid_argument("gqa_attention: scale must be 1/sqrt(256)");
-    }
-
-    const std::int32_t q_heads  = q.ne[1];
-    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
     const std::int32_t tokens   = q.ne[2];
-    if (tokens <= 0) { throw std::invalid_argument("gqa_attention: T must be positive"); }
-    require_shape(q, kHeadDim, q_heads, tokens, 1, op, "q");
+    const std::int32_t kv_heads = kv_heads_for_q_heads(q.ne[1], op);
     require_shape(k, kHeadDim, kv_heads, tokens, 1, op, "k");
     require_shape(v, kHeadDim, kv_heads, tokens, 1, op, "v");
-    require_shape(positions, tokens, 1, 1, 1, op, "positions");
-    require_shape(out, kHeadDim, q_heads, tokens, 1, op, "out");
-
-    require_contiguous_nonnull(q, op, "q");
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
-    require_contiguous_nonnull(positions, op, "positions");
-    require_contiguous_nonnull(out, op, "out");
-    validate_cache(kv, layer, kv_heads, op);
 
-    const std::uint32_t token_count = static_cast<std::uint32_t>(tokens);
-    if (token_count > kv.max_context) {
-        throw std::invalid_argument("gqa_attention: T exceeds KVCache max_context");
-    }
-    if (token_count > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error("gqa_attention: T exceeds int32");
-    }
-
-    auto scratch_scope = ws.scope();
-    Tensor partial_acc;
-    Tensor partial_m;
-    Tensor partial_l;
-    Tensor* partial_acc_ptr = nullptr;
-    Tensor* partial_m_ptr   = nullptr;
-    Tensor* partial_l_ptr   = nullptr;
+    auto scope = workspace.scope();
     if (detail::gqa_attention_uses_small_t(tokens)) {
-        const std::int32_t splits = detail::gqa_attention_decode_splits(q_heads, kv_heads);
-        partial_acc               = ws.alloc(DType::BF16, {kHeadDim, q_heads, tokens, splits});
-        partial_m                 = ws.alloc(DType::FP32, {q_heads, tokens, splits});
-        partial_l                 = ws.alloc(DType::FP32, {q_heads, tokens, splits});
-        partial_acc_ptr           = &partial_acc;
-        partial_m_ptr             = &partial_m;
-        partial_l_ptr             = &partial_l;
+        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], tokens);
+        detail::gqa_attention_launch(q, k, v, positions, scale, cache, envelope, &partial.acc,
+                                     &partial.m, &partial.l, out, stream);
+        return;
     }
-
-    detail::gqa_attention_launch(q, k, v, positions, scale, kv, layer, partial_acc_ptr,
-                                 partial_m_ptr, partial_l_ptr, out, stream);
+    detail::gqa_attention_launch(q, k, v, positions, scale, cache, envelope, nullptr, nullptr,
+                                 nullptr, out, stream);
 }
 
-void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions, KVCache& kv,
-                   int layer, cudaStream_t stream) {
+void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
+                   KVCacheLayerView cache, cudaStream_t stream) {
     constexpr const char* op = "gqa_kv_append";
     if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
         throw std::invalid_argument("gqa_kv_append: k/v must be BF16");
@@ -207,40 +207,27 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions, KV
     require_contiguous_nonnull(k, op, "k");
     require_contiguous_nonnull(v, op, "v");
     require_contiguous_nonnull(positions, op, "positions");
-    validate_cache(kv, layer, kv_heads, op);
-    if (static_cast<std::uint32_t>(tokens) > kv.max_context) {
-        throw std::invalid_argument("gqa_kv_append: T exceeds KVCache max_context");
+    validate_cache(cache, kv_heads, op);
+    if (static_cast<std::uint32_t>(tokens) > cache.max_context) {
+        throw std::invalid_argument("gqa_kv_append: T exceeds KV cache capacity");
     }
-    detail::gqa_kv_append_launch(k, v, positions, kv, layer, stream);
+    detail::gqa_kv_append_launch(k, v, positions, cache, stream);
 }
 
-void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale, KVCache& kv,
-                          int layer, Tensor& out, cudaStream_t stream) {
+void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
+                          const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,
+                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "gqa_attention_cached";
-    if (q.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("gqa_attention_cached: q/out must be BF16");
+    validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
+
+    auto scope = workspace.scope();
+    if (detail::gqa_attention_uses_small_t(q.ne[2])) {
+        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2]);
+        detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
+                                                    partial.acc, partial.m, partial.l, out, stream);
+        return;
     }
-    if (positions.dtype != DType::I32) {
-        throw std::invalid_argument("gqa_attention_cached: positions must be I32");
-    }
-    if (!std::isfinite(scale) || std::abs(scale - kExpectedScale) > 1.0e-6f) {
-        throw std::invalid_argument("gqa_attention_cached: scale must be 1/sqrt(256)");
-    }
-    const std::int32_t q_heads  = q.ne[1];
-    const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, op);
-    const std::int32_t tokens   = q.ne[2];
-    if (tokens <= 0) { throw std::invalid_argument("gqa_attention_cached: T must be positive"); }
-    require_shape(q, kHeadDim, q_heads, tokens, 1, op, "q");
-    require_shape(positions, tokens, 1, 1, 1, op, "positions");
-    require_shape(out, kHeadDim, q_heads, tokens, 1, op, "out");
-    require_contiguous_nonnull(q, op, "q");
-    require_contiguous_nonnull(positions, op, "positions");
-    require_contiguous_nonnull(out, op, "out");
-    validate_cache(kv, layer, kv_heads, op);
-    if (static_cast<std::uint32_t>(tokens) > kv.max_context) {
-        throw std::invalid_argument("gqa_attention_cached: T exceeds KVCache max_context");
-    }
-    detail::gqa_attention_prompt_attention_launch(q, positions, scale, kv, layer, out, stream);
+    detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
 }
 
 } // namespace ninfer::ops

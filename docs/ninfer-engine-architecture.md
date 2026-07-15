@@ -210,7 +210,7 @@ Each target package owns:
 - tokenizer/template/media preparation and checkpoint-native positions;
 - all persistent and transient memory formulas for that target;
 - Text, Vision, MoE, recurrent, MTP, sampling, and final-head schedule;
-- physical KV/recurrent state types, cursors, snapshots, and commit rules;
+- physical KV/recurrent state instances, published cache prefixes, snapshots, and commit rules;
 - prefix-reuse matching, checkpoints, restoration, and invalidation;
 - CUDA Graph choice, graph-stable bindings, warmup, and recapture policy;
 - decode-round maximum yield and context-tail fallback;
@@ -1090,8 +1090,10 @@ For a begin round accepting its one token, the corresponding Resident forms are 
 (P, P + 1)` or `(P + 1, P + 1)`. A target may leave physical candidate bytes after either form, but
 no cursor, checkpoint, proposal, or identity may reach any suffix beyond `S_f`.
 
-No cache cursor, recurrent slot, MTP cache, host token mirror, position state, or prefix checkpoint
-beyond the committed logical sequence may be reachable after finish.
+No published cache prefix, recurrent slot, MTP proposal state, host token mirror, position state, or
+prefix checkpoint beyond the committed logical sequence may be reachable after finish. Physical KV
+rows beyond a published prefix may retain stale bytes, but no lifecycle decision may treat them as
+valid merely because storage was written.
 
 ### 11.3 Serialized request planning
 
@@ -1388,12 +1390,24 @@ means copying into stable control buffers, not replacing pointers captured by a 
 Graph ownership, warmup, capture eligibility, recapture, and tail fallback are target-private.
 Common code only invokes `begin` and `decode_round`.
 
-### 15.2 Graph completeness
+### 15.2 Graph completeness and execution intervals
 
 A target may use separate graphs for ordinary decode, MTP round, verification shapes, or other exact
 paths. It must ensure that graph outputs and all mutable state are normalized by the round-resolution
 contract. A graph launch is an implementation detail, not proof that a logical transaction is
 committed.
+
+When device values affect an Op's launch capacity, the target uses finite, sorted, gap-free graph
+variants over its legal execution-frontier domain. Each variant supplies explicit execution
+envelopes whose intervals cover every replay in that variant. Device positions continue to define
+mathematics; the envelope only selects a launch valid for the whole interval. Ordinary and MTP
+tables remain independent because their legal tail domains and fixed round shapes differ.
+
+Graph preparation initializes physical cache planes once to a valid representation, then restores a
+representative device position, recurrent state, workspace cursor, and graph-stable controls before
+eager warmup, capture, and first replay of every variant. These writes do not publish a cache prefix.
+The target measures total driver memory for the retained variant set, includes an explicit allowance
+in sequence planning, and rejects construction if post-capture consumption exceeds it.
 
 ### 15.3 Host/device synchronization
 
@@ -1446,7 +1460,8 @@ The 27B `Program` owns:
 - logical token identity, exact prefix-reuse ledger, and assistant-boundary checkpoint;
 - position/rope controls and multimodal continuation state;
 - sampling controls, occurrence counters, licensed output buffer, and MTP counters;
-- ordinary-decode and MTP-round graphs and every graph-stable tensor;
+- explicit Text/MTP valid-prefix lengths and MTP proposal readiness;
+- target-private ordinary/aligned and MTP frontier-tier graphs plus every graph-stable tensor;
 - prefill, verification, proposal, head, and Vision workspaces with their lifetimes separated.
 
 They are one ownership unit because only the 27B target can state their cross-component invariant.
@@ -1502,11 +1517,11 @@ The required resolved states are:
 | terminal `m < n` | not exposed | not exposed | `Invalid`; exact output prefix is returned but no sequence identity is reusable |
 | terminal `m = n`, Resident | `E + n` | `E + n + 1` | final correction/bonus remains the frontier |
 
-Advertising the Resident form requires agreement among the host KV cursor, device Text
-position, decode RoPE position (`rope_pos = text_pos + rope_delta` for this target), GDN initial slot,
-logical token mirror, MTP KV/carry/proposal
-reachability, graph control scalars, and any still-active sampler state. Repairing only the host KV
-cursor and GDN slot is insufficient.
+Advertising the Resident form requires agreement among the Program's `text_kv_valid` and
+`mtp_kv_valid` prefixes, device Text position, decode RoPE position
+(`rope_pos = text_pos + rope_delta` for this target), GDN initial slot, logical token mirror, MTP
+carry/proposal reachability, graph control scalars, and any still-active sampler state. Repairing
+only one prefix counter and the GDN slot is insufficient.
 
 Occurrence-count and RNG buffers are Program-resident storage but request-active values. They are
 initialized at every successful begin and retired at Finish. A partial terminal result need not make
@@ -1627,10 +1642,10 @@ Core and artifact mechanisms include:
 - generic direct/packed storage descriptors from registered formats/layouts;
 - CUDA Graph lifetime wrappers;
 - raw host/device transfers and pinned stable host buffers;
-- target-neutral physical KV-cache containers and cursor mechanisms;
+- target-neutral physical KV-cache containers and checked per-layer views;
 - diagnostic counters and timing/NVTX mechanisms.
 
-Program owns each cache/state instance and all advance, rewind, reset, prefix, commit, and rollback
+Program owns each cache/state instance and all published-prefix, rewind/reset, commit, and rollback
 policy. An Op may consume a core container or explicit view without acquiring its lifetime. A
 materially different future state representation may use another core type or remain target-owned;
 this does not require a universal cache hierarchy.
@@ -1647,7 +1662,7 @@ not make an Op target-private. An exact-shape CUDA kernel is an implementation s
 wrapper; another target may later use the same contract and implementation without moving code.
 
 An Op does not own model layer order, operand/view selection, prompt chunking, MTP round
-orchestration, cache cursor policy, prefix checkpoints, or graph lifetime. Those remain in the
+orchestration, cache-frontier policy, prefix checkpoints, or graph lifetime. Those remain in the
 target Program and schedule. The complete definition, contract-comment format, source layering,
 and admission procedure are authoritative in [`op-development.md`](op-development.md).
 

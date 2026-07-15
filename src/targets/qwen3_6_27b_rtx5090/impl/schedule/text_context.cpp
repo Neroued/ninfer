@@ -123,6 +123,23 @@ private:
     const Tensor*& slot_;
 };
 
+class ScopedEnvelope {
+public:
+    ScopedEnvelope(const ops::GqaExecutionEnvelope*& slot,
+                   const ops::GqaExecutionEnvelope& envelope)
+        : slot_(slot) {
+        slot_ = &envelope;
+    }
+
+    ScopedEnvelope(const ScopedEnvelope&)            = delete;
+    ScopedEnvelope& operator=(const ScopedEnvelope&) = delete;
+
+    ~ScopedEnvelope() { slot_ = nullptr; }
+
+private:
+    const ops::GqaExecutionEnvelope*& slot_;
+};
+
 struct CallbackTap {
     static constexpr bool enabled = true;
 
@@ -140,9 +157,9 @@ struct CallbackTap {
 TextContext::TextContext(DeviceContext& ctx,
                          const targets::qwen3_6_27b_rtx5090::detail::LoadedModelData& weights,
                          WorkspaceArena& work, KVCache& kv, GdnState& state, StepState& io,
-                         std::uint32_t prefill_chunk, KVCache* mtp_kv)
+                         std::uint32_t prefill_chunk, std::uint32_t text_kv_base, KVCache* mtp_kv)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
-      prefill_chunk_(prefill_chunk) {
+      prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
     if (prefill_chunk_ == 0 || prefill_chunk_ % kPrefillChunkAlignment != 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext prefill_chunk must be a nonzero multiple of 128");
@@ -290,7 +307,8 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
 }
 
 void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
-                                   const Tensor& rope_positions, Tensor& mtp_hidden) {
+                                   const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
+                                   Tensor& mtp_hidden) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
@@ -310,7 +328,8 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
-    ops::gqa_attention(qn, kn, v, positions, kAttnScale, *mtp_kv_, 0, work_, a, s);
+    ops::gqa_attention(qn, kn, v, positions, kAttnScale, mtp_kv_->layer_view(0), envelope, work_, a,
+                       s);
     ops::sigmoid_mul(gate, a, s);
 
     Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, T});
@@ -335,18 +354,20 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 }
 
 void TextContext::mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                                   const Tensor& rope_positions, Tensor& mtp_hidden) {
+                                   const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
+                                   Tensor& mtp_hidden) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     auto scratch_scope = work_.scope();
     Tensor x;
     Tensor ah;
     mtp_forward_stem(ids, hidden, nullptr, x, ah);
-    mtp_forward_tail(x, ah, positions, rope_positions, mtp_hidden);
+    mtp_forward_tail(x, ah, positions, rope_positions, envelope, mtp_hidden);
 }
 
 void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                     const Tensor* input_embeddings, const Tensor& positions,
-                                    const Tensor& rope_positions, bool final_chunk,
+                                    const Tensor& rope_positions,
+                                    ops::GqaExecutionEnvelope envelope, bool final_chunk,
                                     Tensor* final_hidden, Tensor* logits, Tensor* draft_token) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP prefill is not enabled"); }
     const int T = ids.ne[0];
@@ -395,7 +416,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
         ops::rmsnorm(k, *mtp_.k_norm, kCfg.rms_eps, true, kn, s);
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, kn, s);
-        ops::gqa_kv_append(kn, v, positions, *mtp_kv_, 0, s);
+        ops::gqa_kv_append(kn, v, positions, mtp_kv_->layer_view(0), s);
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -437,7 +458,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rope(last_rope_position, kCfg.rotary_dim, kCfg.rope_theta, qn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, kAttnScale, *mtp_kv_, 0, a, s);
+        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_->layer_view(0), envelope,
+                                  work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {kCfg.hidden, 1});
@@ -472,8 +494,9 @@ void TextContext::mtp_draft_argmax(const Tensor& hidden_col, Tensor& logits, Ten
 }
 
 void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
-                                    const Tensor& positions, Tensor& mtp_hidden, int logits_column,
-                                    Tensor* logits, Tensor* draft_token) {
+                                    const Tensor& positions, ops::GqaExecutionEnvelope envelope,
+                                    Tensor& mtp_hidden, int logits_column, Tensor* logits,
+                                    Tensor* draft_token) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
@@ -495,7 +518,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     auto position_scope   = work_.scope();
     Tensor rope_positions = work_.alloc(DType::I32, {T});
     ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, ctx_.stream);
-    mtp_forward_core(ids, hidden, positions, rope_positions, mtp_hidden);
+    mtp_forward_core(ids, hidden, positions, rope_positions, envelope, mtp_hidden);
 
     if (logits_column >= 0) {
         auto logits_scope = work_.scope();
@@ -505,8 +528,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
 }
 
 void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
-                                      const Tensor& position, Tensor& mtp_hidden, Tensor& logits,
-                                      Tensor& draft_token) {
+                                      const Tensor& position, ops::GqaExecutionEnvelope envelope,
+                                      Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(position, DType::I32, {1}, "MTP AR position");
@@ -518,7 +541,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     auto position_scope  = work_.scope();
     Tensor rope_position = work_.alloc(DType::I32, {1});
     ops::offset_i32_positions(position, io_.rope_delta, rope_position, ctx_.stream);
-    mtp_forward_core(token, previous_hidden, position, rope_position, mtp_hidden);
+    mtp_forward_core(token, previous_hidden, position, rope_position, envelope, mtp_hidden);
     auto logits_scope = work_.scope();
     mtp_draft_argmax(mtp_hidden, logits, draft_token);
 }
@@ -543,7 +566,8 @@ void TextContext::mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Ten
 }
 
 template <class Tap>
-void TextContext::target_verify_impl(const Tensor& ids, const Tensor& positions, Tap& tap) {
+void TextContext::target_verify_impl(const Tensor& ids, const Tensor& positions,
+                                     ops::GqaExecutionEnvelope envelope, Tap& tap) {
     const int T = ids.ne[0];
     if (T <= 0) { throw std::invalid_argument("target_verify T must be positive"); }
     require_tensor_shape(ids, DType::I32, {T}, "target_verify ids");
@@ -563,6 +587,7 @@ void TextContext::target_verify_impl(const Tensor& ids, const Tensor& positions,
         if constexpr (Tap::enabled) { tap(TapId::AfterEmbed, -1, Phase::Verify, x, s); }
         ScopedPositions scoped_cache(active_cache_positions_, positions);
         ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
+        ScopedEnvelope scoped_envelope(active_gqa_envelope_, envelope);
         run_layers(x, Phase::Verify, tap);
 
         Tensor hidden = matrix_window(io_.verify_hidden, T);
@@ -578,23 +603,28 @@ void TextContext::target_verify_impl(const Tensor& ids, const Tensor& positions,
     work_.reset();
 }
 
-void TextContext::target_verify(const Tensor& ids, const Tensor& positions) {
+void TextContext::target_verify(const Tensor& ids, const Tensor& positions,
+                                ops::GqaExecutionEnvelope envelope) {
     NullTap tap;
-    target_verify_impl(ids, positions, tap);
+    target_verify_impl(ids, positions, envelope, tap);
 }
 
 void TextContext::diagnostic_target_verify(const Tensor& ids, const Tensor& positions,
-                                           void* context, TextTapCallback callback) {
+                                           ops::GqaExecutionEnvelope envelope, void* context,
+                                           TextTapCallback callback) {
     if (callback == nullptr) {
         throw std::invalid_argument("diagnostic target verify callback is null");
     }
     CallbackTap tap{context, callback};
-    target_verify_impl(ids, positions, tap);
+    target_verify_impl(ids, positions, envelope, tap);
 }
 
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
+    if (active_gqa_envelope_ == nullptr) {
+        throw std::logic_error("Text GQA execution envelope is not set");
+    }
 
     Tensor h = work_.alloc(DType::BF16, {kCfg.hidden, T});
     ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
@@ -621,7 +651,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::gqa_attention(qn, kn, v, cache_positions, kAttnScale, kv_, fidx, work_, a, s);
+        ops::gqa_attention(qn, kn, v, cache_positions, kAttnScale, kv_.layer_view(fidx),
+                           *active_gqa_envelope_, work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
         ops::linear_add(a.view({kCfg.q_size, 1}), *w.o_proj, x, work_, s);
@@ -650,7 +681,8 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     ops::rope(rope_positions, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, T});
-    ops::gqa_attention(qn, kn, v, cache_positions, kAttnScale, kv_, fidx, work_, a, s);
+    ops::gqa_attention(qn, kn, v, cache_positions, kAttnScale, kv_.layer_view(fidx),
+                       *active_gqa_envelope_, work_, a, s);
     ops::sigmoid_mul(gate, a, s);
 
     ops::linear_add(a.view({kCfg.q_size, T}), *w.o_proj, x, work_, s);
@@ -833,7 +865,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     const int chunk      = static_cast<int>(prefill_chunk_);
 
     if (multimodal != nullptr) {
-        if (kv_.pos != 0) {
+        if (text_kv_base_ != 0) {
             throw std::invalid_argument("multimodal prefill must start from an empty cache");
         }
         if (multimodal->positions.size() != static_cast<std::size_t>(3) * ids.size()) {
@@ -858,14 +890,14 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                 "multimodal scatter indices must be unique, sorted, and inside prompt");
         }
         rope_delta_ = multimodal->rope_delta;
-    } else if (kv_.pos == 0) {
+    } else if (text_kv_base_ == 0) {
         rope_delta_ = 0;
     }
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
 
     // Prefix-append prefill continues an existing cache: positions are absolute (start at the
     // resident length) and KV/GDN state is not reset. For a reset prefill base == 0.
-    const std::uint32_t base = kv_.pos;
+    const std::uint32_t base = text_kv_base_;
     if (static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) >
         static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill absolute position exceeds int32");
@@ -948,6 +980,9 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             }
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
+            const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
+            const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
+            ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
             Tensor x = work_.alloc(DType::BF16, {kCfg.hidden, len});
             ops::embedding(ids_device, *embed_, x, s);
@@ -1033,15 +1068,18 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                     Tensor logits = matrix_window(io_.logits, 1);
                     Tensor draft0 = io_.drafts.slice(0, 0, 1);
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
-                                      rope_positions, true, &io_.mtp_ar_hidden, &logits, &draft0);
+                                      rope_positions, chunk_envelope, true, &io_.mtp_ar_hidden,
+                                      &logits, &draft0);
 
                     ops::set_i32_scalar(io_.ar_pos, base_i + T, s);
                     for (int i = 1; i < io_.drafts.ne[0]; ++i) {
-                        Tensor prev_token  = io_.drafts.slice(0, i - 1, 1);
-                        Tensor next_token  = io_.drafts.slice(0, i, 1);
-                        Tensor next_hidden = work_.alloc(DType::BF16, {kCfg.hidden, 1});
-                        mtp_forward_ar_step(prev_token, io_.mtp_ar_hidden, io_.ar_pos, next_hidden,
-                                            logits, next_token);
+                        Tensor prev_token     = io_.drafts.slice(0, i - 1, 1);
+                        Tensor next_token     = io_.drafts.slice(0, i, 1);
+                        Tensor next_hidden    = work_.alloc(DType::BF16, {kCfg.hidden, 1});
+                        const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
+                        const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
+                        mtp_forward_ar_step(prev_token, io_.mtp_ar_hidden, io_.ar_pos, ar_envelope,
+                                            next_hidden, logits, next_token);
                         CUDA_CHECK(cudaMemcpyAsync(io_.mtp_ar_hidden.data, next_hidden.data,
                                                    io_.mtp_ar_hidden.bytes(),
                                                    cudaMemcpyDeviceToDevice, s));
@@ -1049,7 +1087,8 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                     }
                 } else {
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
-                                      rope_positions, false, nullptr, nullptr, nullptr);
+                                      rope_positions, chunk_envelope, false, nullptr, nullptr,
+                                      nullptr);
                 }
             }
 
@@ -1061,8 +1100,6 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                                            boundary_hidden.bytes(), cudaMemcpyDeviceToDevice, s));
             }
         }
-
-        kv_.pos = base + static_cast<std::uint32_t>(t0 + len);
 
         // Snapshot the running GDN state at the requested boundary into the dedicated slot. This
         // chunk ended exactly at the boundary (see the len cap above), so slot 0 is the state

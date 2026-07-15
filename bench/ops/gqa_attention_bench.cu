@@ -8,6 +8,8 @@
 //       --context 0,128,512,2048,8192,32768,131072,261120
 //   ./ninfer_gqa_attention_bench --append-small-t --geometry 35b --tokens 1,2,3,4,5,6 \
 //       --context 0,128,512,2048,8192,32768,131072,261120
+//   ./ninfer_gqa_attention_bench --cached-small-t --geometry 35b --tokens 1,2,3,4,5,6 \
+//       --context 0,128,512,2048,8192,32768,131072,261120
 //   ./ninfer_gqa_attention_bench --kv-append --geometry 35b --tokens 1,2,3,4,5,6,1024 \
 //       --context 0,128,512,2048,8192,32768,131072,261120
 // Add --kv-dtype int8 to measure the INT8-G64 KV route.
@@ -63,6 +65,10 @@ constexpr double kDramPeakGBs                    = 1792.0;
 constexpr std::int32_t kPromptQBlock             = 64;
 constexpr std::int32_t kPromptKBlock             = 32;
 constexpr std::int32_t kBenchKvQuantGroup        = ninfer::kKvQuantGroup;
+
+ops::GqaExecutionEnvelope exact_envelope(std::uint32_t visible_keys) {
+    return {visible_keys, visible_keys};
+}
 
 constexpr std::int32_t align_up_128(std::int32_t value) { return ((value + 127) / 128) * 128; }
 
@@ -211,6 +217,15 @@ DecodeBytes append_small_t_bytes(std::int32_t tokens, std::int32_t context, DTyp
     bytes.useful_kv = k_cache_reads + v_cache_reads;
     bytes.scratch   = partial_acc_writes_reads + partial_ml_writes + partial_ml_reads;
     bytes.total     = bytes.useful_kv + new_kv_writes + q_reads + output_writes + bytes.scratch;
+    return bytes;
+}
+
+DecodeBytes cached_small_t_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
+    DecodeBytes bytes              = append_small_t_bytes(tokens, context, kv_dtype);
+    const auto token_count         = static_cast<std::size_t>(tokens);
+    const std::size_t cache_writes = static_cast<std::size_t>(
+        static_cast<double>(token_count * kKVHeads) * kv_cache_pair_bytes_per_head(kv_dtype));
+    bytes.total -= cache_writes;
     return bytes;
 }
 
@@ -702,10 +717,11 @@ void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& 
 
     const Result r = bench_loop(
         [&](cudaStream_t s) {
-            kv.pos          = static_cast<std::uint32_t>(pos_value);
             const int layer = static_cast<int>(next_layer);
             next_layer      = (next_layer + 1u) % round_robin_layers;
-            ops::gqa_attention(q, k, v, pos, kScale, kv, layer, ws, out, s);
+            ops::gqa_attention(q, k, v, pos, kScale, kv.layer_view(layer),
+                               exact_envelope(static_cast<std::uint32_t>(pos_value + 1)), ws, out,
+                               s);
         },
         static_cast<double>(bytes.total));
 
@@ -726,8 +742,9 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
     if (cold_cache != nullptr) {
         const Result r = bench_cold_cache_loop(
             [&](cudaStream_t s) {
-                kv.pos = static_cast<std::uint32_t>(pos_value);
-                ops::gqa_attention(q, k, v, pos, kScale, kv, 0, ws, out, s);
+                ops::gqa_attention(q, k, v, pos, kScale, kv.layer_view(0),
+                                   exact_envelope(static_cast<std::uint32_t>(pos_value + 1)), ws,
+                                   out, s);
             },
             *cold_cache, static_cast<double>(bytes.total));
 
@@ -743,8 +760,8 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
         return;
     }
 
-    kv.pos = static_cast<std::uint32_t>(pos_value);
-    ops::gqa_attention(q, k, v, pos, kScale, kv, 0, ws, out, stream);
+    ops::gqa_attention(q, k, v, pos, kScale, kv.layer_view(0),
+                       exact_envelope(static_cast<std::uint32_t>(pos_value + 1)), ws, out, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::printf("PROFILE_ONCE gqa_attention decode combined pos=%d kv_dtype=%s splits=%d kps=%d "
@@ -771,10 +788,13 @@ void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    kv.pos                  = static_cast<std::uint32_t>(context);
     const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv.dtype);
     const Result r          = bench_loop(
-        [&](cudaStream_t s) { ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s); },
+        [&](cudaStream_t s) {
+            ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                                        exact_envelope(static_cast<std::uint32_t>(context + tokens)), ws,
+                                        tout, s);
+        },
         static_cast<double>(bytes.total));
 
     char tag[96];
@@ -801,13 +821,14 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    kv.pos                  = static_cast<std::uint32_t>(context);
     const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv.dtype);
     cudaStream_t stream     = nullptr;
     if (cold_cache != nullptr) {
         const Result r = bench_cold_cache_loop(
             [&](cudaStream_t s) {
-                ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s);
+                ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                                   exact_envelope(static_cast<std::uint32_t>(context + tokens)), ws,
+                                   tout, s);
             },
             *cold_cache, static_cast<double>(bytes.total));
         char tag[96];
@@ -829,7 +850,9 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
         return;
     }
 
-    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, stream);
+    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                       exact_envelope(static_cast<std::uint32_t>(context + tokens)), ws, tout,
+                       stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::printf("PROFILE_ONCE gqa_attention append-small-T T=%d context=%d kv_dtype=%s splits=%d "
                 "useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu redundancy=%.6f "
@@ -841,6 +864,78 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
                     ? static_cast<double>(bytes.total) / static_cast<double>(bytes.useful_kv)
                     : 0.0,
                 small_t_ncu_kernel_regex(kv.dtype));
+}
+
+void run_cached_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) {
+    const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
+                           static_cast<std::size_t>(tokens);
+    DBuf q   = make_bf16(qn);
+    DBuf pos = make_i32_sequence(context, tokens);
+    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    WorkspaceArena ws(small_t_workspace_bytes(tokens));
+
+    Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tpos(pos.p, DType::I32, {tokens});
+    Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+
+    const DecodeBytes bytes = cached_small_t_bytes(tokens, context, kv.dtype);
+    const Result r          = bench_loop(
+        [&](cudaStream_t s) {
+            ops::gqa_attention_cached(tq, tpos, kScale, kv.layer_view(0),
+                                               exact_envelope(static_cast<std::uint32_t>(context + tokens)),
+                                               ws, tout, s);
+        },
+        static_cast<double>(bytes.total));
+
+    char tag[96];
+    std::snprintf(tag, sizeof(tag), "gqa_attention cached-small-T kv=%s", kv_dtype_name(kv.dtype));
+    print_append_small_t_result(tag, r, bytes, tokens, context, kv.dtype, "");
+}
+
+void run_cached_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t context,
+                                     DBuf* cold_cache) {
+    const std::size_t qn = static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(kQHeads) *
+                           static_cast<std::size_t>(tokens);
+    DBuf q   = make_bf16(qn);
+    DBuf pos = make_i32_sequence(context, tokens);
+    DBuf out = make_zeros(qn * sizeof(std::uint16_t));
+    WorkspaceArena ws(small_t_workspace_bytes(tokens));
+
+    Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tpos(pos.p, DType::I32, {tokens});
+    Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    const DecodeBytes bytes = cached_small_t_bytes(tokens, context, kv.dtype);
+
+    const auto launch = [&](cudaStream_t s) {
+        ops::gqa_attention_cached(tq, tpos, kScale, kv.layer_view(0),
+                                  exact_envelope(static_cast<std::uint32_t>(context + tokens)), ws,
+                                  tout, s);
+    };
+    if (cold_cache != nullptr) {
+        const Result r =
+            bench_cold_cache_loop(launch, *cold_cache, static_cast<double>(bytes.total));
+        char tag[96];
+        std::snprintf(tag, sizeof(tag), "PROFILE_COLD gqa_attention cached-small-T kv=%s",
+                      kv_dtype_name(kv.dtype));
+        print_append_small_t_result(tag, r, bytes, tokens, context, kv.dtype, " cold_cache");
+        std::printf("PROFILE_COLD_METADATA mode=cached-small-t T=%d context=%d kv_dtype=%s "
+                    "splits=%d cold_cache_bytes=%zu useful_kv_bytes=%zu scratch_bytes=%zu "
+                    "total_modeled_bytes=%zu repeats=%d ncu_kernel_regex='%s'\n",
+                    tokens, context, kv_dtype_name(kv.dtype),
+                    small_t_active_splits(tokens, context, kv.dtype), cold_cache->bytes,
+                    bytes.useful_kv, bytes.scratch, bytes.total, r.n_runs,
+                    small_t_ncu_kernel_regex(kv.dtype));
+        return;
+    }
+
+    launch(nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    std::printf("PROFILE_ONCE gqa_attention cached-small-T T=%d context=%d kv_dtype=%s "
+                "splits=%d useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu "
+                "ncu_kernel_regex='%s'\n",
+                tokens, context, kv_dtype_name(kv.dtype),
+                small_t_active_splits(tokens, context, kv.dtype), bytes.useful_kv, bytes.scratch,
+                bytes.total, small_t_ncu_kernel_regex(kv.dtype));
 }
 
 void launch_kv_append_control(DType kv_dtype, const DBuf& k, const DBuf& v, DBuf& control_k,
@@ -882,9 +977,9 @@ KvAppendMetrics run_kv_append(KVCache& kv, std::int32_t tokens, std::int32_t con
     Tensor tpos(pos.p, DType::I32, {tokens});
 
     const KvAppendBytes bytes = kv_append_bytes(tokens, kv.dtype);
-    const Result r = bench_loop([&](cudaStream_t s) { ops::gqa_kv_append(tk, tv, tpos, kv, 0, s); },
-                                static_cast<double>(bytes.total), timing.warmup, timing.repeat,
-                                timing.min_time_ms);
+    const Result r            = bench_loop(
+        [&](cudaStream_t s) { ops::gqa_kv_append(tk, tv, tpos, kv.layer_view(0), s); },
+        static_cast<double>(bytes.total), timing.warmup, timing.repeat, timing.min_time_ms);
     const Result control = bench_loop(
         [&](cudaStream_t s) {
             launch_kv_append_control(kv.dtype, k, v, control_k, control_v, tokens, s);
@@ -917,8 +1012,8 @@ void run_kv_append_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t c
     cudaStream_t stream = nullptr;
     if (cold_cache != nullptr) {
         const Result r = bench_cold_cache_loop(
-            [&](cudaStream_t s) { ops::gqa_kv_append(tk, tv, tpos, kv, 0, s); }, *cold_cache,
-            static_cast<double>(bytes.total));
+            [&](cudaStream_t s) { ops::gqa_kv_append(tk, tv, tpos, kv.layer_view(0), s); },
+            *cold_cache, static_cast<double>(bytes.total));
         const KvAppendMetrics metrics = kv_append_metrics_from_result(tokens, context, kv.dtype, r);
         print_kv_append_result(metrics, " cold_cache");
         std::printf("PROFILE_COLD_METADATA mode=kv-append T=%d context=%d kv_dtype=%s CTAs=%d "
@@ -930,7 +1025,7 @@ void run_kv_append_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t c
         return;
     }
 
-    ops::gqa_kv_append(tk, tv, tpos, kv, 0, stream);
+    ops::gqa_kv_append(tk, tv, tpos, kv.layer_view(0), stream);
     launch_kv_append_control(kv.dtype, k, v, control_k, control_v, tokens, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::printf("PROFILE_ONCE mode=kv-append T=%d context=%d kv_dtype=%s CTAs=%d "
@@ -993,7 +1088,8 @@ AppendPromptMetrics run_append_prompt_baseline(KVCache& kv, std::int32_t tokens,
     const double bytes = append_prompt_global_floor_bytes(tokens, context, kv.dtype);
     const Result r     = bench_loop(
         [&](cudaStream_t s) {
-            ops::detail::gqa_attention_prompt_launch(tq, tk, tv, tpos, kScale, kv, 0, tout, s);
+            ops::detail::gqa_attention_prompt_launch(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                                                         tout, s);
         },
         bytes, timing.warmup, timing.repeat, timing.min_time_ms);
 
@@ -1022,13 +1118,15 @@ AppendPromptMetrics run_append_prompt_attention_only(KVCache& kv, std::int32_t t
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
     cudaStream_t stream = nullptr;
-    ops::detail::gqa_attention_prompt_launch(tq, tk, tv, tpos, kScale, kv, 0, tout, stream);
+    ops::detail::gqa_attention_prompt_launch(tq, tk, tv, tpos, kScale, kv.layer_view(0), tout,
+                                             stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const double bytes = append_prompt_global_floor_bytes(tokens, context, kv.dtype);
     const Result r     = bench_loop(
         [&](cudaStream_t s) {
-            ops::detail::gqa_attention_prompt_attention_launch(tq, tpos, kScale, kv, 0, tout, s);
+            ops::detail::gqa_attention_prompt_attention_launch(tq, tpos, kScale, kv.layer_view(0),
+                                                                   tout, s);
         },
         bytes, timing.warmup, timing.repeat, timing.min_time_ms);
 
@@ -1132,7 +1230,10 @@ PrefillMetrics run_prefill(KVCache& kv, std::int32_t tokens, const PrefillTiming
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
     const Result r = bench_loop(
-        [&](cudaStream_t s) { ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, s); },
+        [&](cudaStream_t s) {
+            ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                               exact_envelope(static_cast<std::uint32_t>(tokens)), ws, tout, s);
+        },
         prefill_model_floor_bytes(tokens, kv.dtype), timing.warmup, timing.repeat,
         timing.min_time_ms);
 
@@ -1160,7 +1261,8 @@ void run_prefill_profile_once(KVCache& kv, std::int32_t tokens) {
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
     cudaStream_t stream = nullptr;
-    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, stream);
+    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                       exact_envelope(static_cast<std::uint32_t>(tokens)), ws, tout, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::printf("PROFILE_ONCE gqa_attention prefill T=%d kv_dtype=%s useful_flops=%.0f "
@@ -1406,6 +1508,7 @@ struct Options {
     bool decode                      = false;
     bool prefill                     = false;
     bool append_small_t              = false;
+    bool cached_small_t              = false;
     bool kv_append                   = false;
     bool append_prompt_baseline      = false;
     bool append_prompt_attention     = false;
@@ -1436,6 +1539,9 @@ void fail_usage(const char* message) {
         "[--expect-tflops-pct-min PCT] [--csv-out path] [--json-out path]\n"
         "       ninfer_gqa_attention_bench --prefill --tokens 4096 --profile-once\n"
         "       ninfer_gqa_attention_bench --append-small-t --tokens T[,T...] "
+        "--context N[,N...] [--geometry 27b|35b] [--kv-dtype bf16|int8] "
+        "[--profile-once] [--cold-cache]\n"
+        "       ninfer_gqa_attention_bench --cached-small-t --tokens T[,T...] "
         "--context N[,N...] [--geometry 27b|35b] [--kv-dtype bf16|int8] "
         "[--profile-once] [--cold-cache]\n"
         "       ninfer_gqa_attention_bench --kv-append --tokens T[,T...] "
@@ -1523,6 +1629,8 @@ Options parse_options(int argc, char** argv) {
             opt.prefill = true;
         } else if (!std::strcmp(argv[i], "--append-small-t")) {
             opt.append_small_t = true;
+        } else if (!std::strcmp(argv[i], "--cached-small-t")) {
+            opt.cached_small_t = true;
         } else if (!std::strcmp(argv[i], "--kv-append")) {
             opt.kv_append = true;
         } else if (!std::strcmp(argv[i], "--append-prompt-baseline")) {
@@ -1591,8 +1699,9 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
-    if (!opt.decode && !opt.prefill && !opt.append_small_t && !opt.kv_append &&
-        !opt.append_prompt_baseline && !opt.append_prompt_attention && !opt.copy_ceiling) {
+    if (!opt.decode && !opt.prefill && !opt.append_small_t && !opt.cached_small_t &&
+        !opt.kv_append && !opt.append_prompt_baseline && !opt.append_prompt_attention &&
+        !opt.copy_ceiling) {
         opt.prefill = true;
     }
     if (opt.prefill && opt.tokens.empty()) {
@@ -1603,6 +1712,7 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (opt.append_small_t && opt.tokens.empty()) { opt.tokens = {1}; }
+    if (opt.cached_small_t && opt.tokens.empty()) { opt.tokens = {1}; }
     if (opt.kv_append && opt.tokens.empty()) { opt.tokens = {1, 2, 3, 4, 5, 6, 1024}; }
     if ((opt.append_prompt_baseline || opt.append_prompt_attention) && opt.tokens.empty()) {
         opt.tokens = {1024};
@@ -1611,10 +1721,10 @@ Options parse_options(int argc, char** argv) {
     if (opt.copy_ceiling && opt.tokens.size() != 1u) {
         fail_usage("--copy-ceiling requires exactly one --tokens value");
     }
-    if (opt.append_small_t) {
+    if (opt.append_small_t || opt.cached_small_t) {
         for (const std::int32_t tokens : opt.tokens) {
             if (tokens <= 0 || tokens > 6) {
-                fail_usage("--append-small-t supports T values in [1,6]");
+                fail_usage("small-T attention supports T values in [1,6]");
             }
         }
     }
@@ -1628,7 +1738,7 @@ Options parse_options(int argc, char** argv) {
     if (opt.copy_ceiling && (opt.tokens[0] <= 0 || opt.tokens[0] > 6)) {
         fail_usage("--copy-ceiling currently supports T in [1,6]");
     }
-    if ((opt.append_small_t || opt.kv_append || opt.append_prompt_baseline ||
+    if ((opt.append_small_t || opt.cached_small_t || opt.kv_append || opt.append_prompt_baseline ||
          opt.append_prompt_attention || opt.copy_ceiling) &&
         !opt.context_set) {
         fail_usage("append/copy modes require --context");
@@ -1639,8 +1749,8 @@ Options parse_options(int argc, char** argv) {
     if ((opt.append_prompt_baseline || opt.append_prompt_attention) && opt.contexts.empty()) {
         fail_usage("--append-prompt modes require --context");
     }
-    if (opt.append_small_t || opt.kv_append || opt.copy_ceiling || opt.append_prompt_baseline ||
-        opt.append_prompt_attention) {
+    if (opt.append_small_t || opt.cached_small_t || opt.kv_append || opt.copy_ceiling ||
+        opt.append_prompt_baseline || opt.append_prompt_attention) {
         for (const std::int32_t tokens : opt.tokens) {
             for (const std::int32_t context : opt.contexts) {
                 if (context > std::numeric_limits<std::int32_t>::max() - tokens) {
@@ -1650,8 +1760,8 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (static_cast<int>(opt.decode) + static_cast<int>(opt.prefill) +
-            static_cast<int>(opt.append_small_t) + static_cast<int>(opt.kv_append) +
-            static_cast<int>(opt.append_prompt_baseline) +
+            static_cast<int>(opt.append_small_t) + static_cast<int>(opt.cached_small_t) +
+            static_cast<int>(opt.kv_append) + static_cast<int>(opt.append_prompt_baseline) +
             static_cast<int>(opt.append_prompt_attention) + static_cast<int>(opt.copy_ceiling) >
         1) {
         fail_usage("select exactly one benchmark mode");
@@ -1662,12 +1772,12 @@ Options parse_options(int argc, char** argv) {
     if (opt.decode_pos_set && opt.decode_pos == std::numeric_limits<std::int32_t>::max()) {
         fail_usage("--decode-pos exceeds the maximum supported decode window");
     }
-    if (opt.profile_once && static_cast<int>(opt.decode) + static_cast<int>(opt.prefill) +
-                                    static_cast<int>(opt.append_small_t) +
-                                    static_cast<int>(opt.kv_append) +
-                                    static_cast<int>(opt.append_prompt_baseline) +
-                                    static_cast<int>(opt.append_prompt_attention) >
-                                1) {
+    if (opt.profile_once &&
+        static_cast<int>(opt.decode) + static_cast<int>(opt.prefill) +
+                static_cast<int>(opt.append_small_t) + static_cast<int>(opt.cached_small_t) +
+                static_cast<int>(opt.kv_append) + static_cast<int>(opt.append_prompt_baseline) +
+                static_cast<int>(opt.append_prompt_attention) >
+            1) {
         fail_usage("--profile-once must target one mode");
     }
     if (opt.profile_once && opt.prefill && opt.tokens.size() != 1u) {
@@ -1677,6 +1787,10 @@ Options parse_options(int argc, char** argv) {
         (opt.tokens.size() != 1u || opt.contexts.size() != 1u)) {
         fail_usage("--append-small-t --profile-once requires one T and one context");
     }
+    if (opt.profile_once && opt.cached_small_t &&
+        (opt.tokens.size() != 1u || opt.contexts.size() != 1u)) {
+        fail_usage("--cached-small-t --profile-once requires one T and one context");
+    }
     if (opt.profile_once && opt.kv_append &&
         (opt.tokens.size() != 1u || opt.contexts.size() != 1u)) {
         fail_usage("--kv-append --profile-once requires one T and one context");
@@ -1684,10 +1798,9 @@ Options parse_options(int argc, char** argv) {
     if (opt.profile_once && opt.decode && opt.round_robin_layers != 1u) {
         fail_usage("--profile-once cannot be combined with --round-robin-layers");
     }
-    if (opt.cold_cache &&
-        (!opt.profile_once || (!opt.decode && !opt.append_small_t && !opt.kv_append))) {
-        fail_usage(
-            "--cold-cache is only valid with decode, append-small-t, or kv-append --profile-once");
+    if (opt.cold_cache && (!opt.profile_once || (!opt.decode && !opt.append_small_t &&
+                                                 !opt.cached_small_t && !opt.kv_append))) {
+        fail_usage("--cold-cache is only valid with decode or small-T/append --profile-once");
     }
     if (opt.profile_once && opt.copy_ceiling) {
         fail_usage("--copy-ceiling does not support --profile-once");
@@ -1747,7 +1860,7 @@ int main(int argc, char** argv) {
         max_context = std::max(max_context, pos + 1);
     }
     for (const std::int32_t tokens : opt.tokens) { max_context = std::max(max_context, tokens); }
-    if (opt.append_small_t || opt.kv_append || opt.append_prompt_baseline ||
+    if (opt.append_small_t || opt.cached_small_t || opt.kv_append || opt.append_prompt_baseline ||
         opt.append_prompt_attention || opt.copy_ceiling) {
         for (const std::int32_t tokens : opt.tokens) {
             for (const std::int32_t context : opt.contexts) {
@@ -1808,6 +1921,19 @@ int main(int argc, char** argv) {
             for (const std::int32_t tokens : opt.tokens) {
                 for (const std::int32_t context : opt.contexts) {
                     run_append_small_t(kv, tokens, context);
+                }
+            }
+        }
+    }
+    if (opt.cached_small_t) {
+        if (opt.profile_once) {
+            DBuf cold_cache = make_zeros(opt.cold_cache ? kColdCacheBytes : 1u);
+            run_cached_small_t_profile_once(kv, opt.tokens[0], opt.context,
+                                            opt.cold_cache ? &cold_cache : nullptr);
+        } else {
+            for (const std::int32_t tokens : opt.tokens) {
+                for (const std::int32_t context : opt.contexts) {
+                    run_cached_small_t(kv, tokens, context);
                 }
             }
         }

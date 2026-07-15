@@ -10,52 +10,54 @@
 
 namespace ninfer::ops {
 
+struct GqaExecutionEnvelope {
+    std::uint32_t min_visible_keys = 0;
+    std::uint32_t max_visible_keys = 0;
+};
+
 /**
- * Returns transient arena capacity for the fused attention route. It is nonzero for the
- * registered small-T (T=1..6) split-KV path and zero for prompt attention.
+ * Returns transient arena capacity for the fused attention routes. It is nonzero for the
+ * registered small-T (T=1..6) split-KV paths and zero for prompt attention.
  */
 [[nodiscard]] std::size_t gqa_attention_workspace_bytes(std::int32_t q_heads, std::int32_t tokens);
 
 /**
- * Appends K/V at the supplied absolute positions and computes causal grouped-query attention.
- * For query head h, kvh=floor(h/group), p=positions[t], and a populated cache history [0,p]:
+ * A1: append K/V at the supplied absolute positions and compute causal grouped-query attention.
+ * For query head h, kvh=floor(h/group), p=positions[t], and populated cache history [0,p]:
  *
- *   score[j]      = scale * dot(q[:,h,t], K_cache[:,j,kvh]), 0 <= j <= p
- *   probability   = softmax_j(score)
- *   out[:,h,t]    = BF16(sum_{j=0..p} probability[j] * V_cache[:,j,kvh]).
+ *   score[j]    = scale * dot(q[:,h,t], K_cache[:,j,kvh]), 0 <= j <= p
+ *   probability = softmax_j(score)
+ *   out[:,h,t]  = BF16(sum_j probability[j] * V_cache[:,j,kvh]).
  *
- * The registered q/k/v head geometries are `[256,24|4,T]` with group 6 and `[256,16|2,T]` with
- * group 8; out matches q. All q/k/v/out tensors are contiguous BF16, positions is contiguous I32
- * [T], and `scale` is 1/sqrt(256). Positions are valid cache slots in causal order and all earlier
- * slots read by attention are populated. For Hkv=4 or 2, the selected cache layer is either BF16
- * `[256,padded_context,Hkv]` or group-64 I8 codes with FP16 scales `[4,padded_context,Hkv]`. The
- * logical formula uses the values represented by that cache format.
+ * The registered geometries are `[256,24|4,T]` group 6 and `[256,16|2,T]` group 8. q/k/v/out
+ * are contiguous BF16, positions is contiguous sequential I32 [T], and scale is 1/sqrt(256).
+ * Cache storage is BF16 or INT8-G64. The caller guarantees that every row in the causal domain is
+ * populated and that `positions[T-1]+1` lies in the declared execution envelope. The envelope is
+ * a host launch-resource promise; it does not alter the causal mask.
  *
- * q/k/v/positions/out and cache storage must not overlap. The Op writes K/V (and I8 scales) at
- * positions but does not advance the host-side `kv.pos`; the caller owns that state transition.
- * `ws` provides transient capacity reported by gqa_attention_workspace_bytes(q.ne[1], T) and is
- * scoped to the call.
+ * q/k/v/positions/out, every cache plane, and live workspace suballocations are pairwise
+ * non-overlapping. The Op overwrites every addressed cache row but owns no persistent frontier.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   float scale, KVCache& kv, int layer, WorkspaceArena& ws, Tensor& out,
-                   cudaStream_t stream);
+                   float scale, KVCacheLayerView cache, GqaExecutionEnvelope envelope,
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
- * Performs only the cache-write part of gqa_attention. k/v use either registered contiguous BF16
- * shape `[256,4,T]` or `[256,2,T]`, and positions is contiguous I32 [T]; cache format, position,
- * alias, and `kv.pos` semantics are the same as above. Every addressed K/V code (and I8 scale) is
- * overwritten. No workspace is used.
+ * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
+ * contiguous sequential I32 [T], and every addressed code and INT8 scale is overwritten. It reads
+ * no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
  */
-void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions, KVCache& kv,
-                   int layer, cudaStream_t stream);
+void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
+                   KVCacheLayerView cache, cudaStream_t stream);
 
 /**
- * Performs only causal attention over an already populated cache, using the formula above.
- * q/out use either registered contiguous BF16 shape `[256,24,T]` or `[256,16,T]`, positions is
- * contiguous I32 [T], and scale is 1/sqrt(256). It writes all of out, does not mutate the cache or
- * `kv.pos`, and uses no caller workspace. Inputs, output, and cache storage must not overlap.
+ * A3: compute causal attention from an already populated cache without accepting new K/V or
+ * mutating any cache plane. q/out are contiguous BF16 `[256,24|16,T]`, positions is contiguous
+ * sequential I32 [T], and the mathematical formula and execution-envelope contract are identical
+ * to A1. Small-T uses caller workspace reported by gqa_attention_workspace_bytes().
  */
-void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale, KVCache& kv,
-                          int layer, Tensor& out, cudaStream_t stream);
+void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
+                          const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,
+                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

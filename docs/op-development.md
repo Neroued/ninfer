@@ -67,7 +67,26 @@ logical position, purpose/domain separation, and draw index required by the algo
 defines the probability process and state transition. It promises a particular backend bitstream
 or sampled sequence only when that is deliberately part of the semantics.
 
-### 1.2 Logical assignment versus raw transfer
+### 1.2 Execution envelopes
+
+An Op may accept an explicit host execution envelope when device-resident semantic inputs cannot
+be read on the host without synchronization but do affect launch capacity or concrete kernel
+selection. The envelope is an execution-resource promise, not a second mathematical input:
+
+- device tensors still define the exact result and state transition;
+- the caller proves the actual device value lies inside the declared finite interval;
+- a larger valid interval may change grid capacity or implementation choice, but not the logical
+  output or effects;
+- CUDA Graph capture records one launch valid for the complete interval and replays without reading
+  a target lifecycle cursor;
+- target-private graph tiers may choose intervals, while the Op owns interval-aware finite dispatch.
+
+GQA is the current concrete use: device `positions` define the causal mask, while
+`GqaExecutionEnvelope[min_visible_keys,max_visible_keys]` bounds the visible-key window for
+split capacity and INT8 implementation selection. The physical cache view contains no frontier or
+graph identity.
+
+### 1.3 Logical assignment versus raw transfer
 
 Classification follows the logical interface, not the CUDA primitive used underneath:
 
@@ -110,9 +129,10 @@ Core owns storage and execution mechanisms rather than mathematical contracts:
 - CUDA Graph lifetime;
 - raw host/device and device/device transfers.
 
-Container cursor operations such as advance, rewind, and reset are lifecycle mechanisms, not
-scalar Ops. Core implements the mechanism; Program owns the policy and every invocation. An Op may
-consume a core type or explicit view without owning that object's lifetime.
+Physical cache containers bind planes and produce checked per-layer views; they contain no logical
+sequence cursor. Published prefix lengths, rewind/reset decisions, transaction publication, and
+cache/state alignment are target Program values and policy. An Op may consume a core type or
+explicit view without owning that object's lifetime.
 
 ### 2.3 Implementation details
 

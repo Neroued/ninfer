@@ -67,6 +67,19 @@ struct PrefixCheckpoint {
     bool mtp_prefix_valid  = false;
 };
 
+struct OrdinaryGraphVariant {
+    std::uint32_t min_execution_frontier = 0;
+    std::uint32_t max_execution_frontier = 0;
+    DecodeGraph ordinary;
+    DecodeGraph ordinary_aligned;
+};
+
+struct MtpGraphVariant {
+    std::uint32_t min_execution_frontier = 0;
+    std::uint32_t max_execution_frontier = 0;
+    DecodeGraph mtp;
+};
+
 class Program::Impl {
 public:
     Impl(const LoadedModelData& model, const SequencePlan::Impl& plan, DeviceContext& device);
@@ -115,9 +128,8 @@ public:
     Tensor boundary_hidden;
     ops::SamplingConfig sampling_host;
 
-    DecodeGraph ordinary_graph;
-    DecodeGraph ordinary_aligned_graph;
-    DecodeGraph mtp_graph;
+    std::vector<OrdinaryGraphVariant> ordinary_graphs;
+    std::vector<MtpGraphVariant> mtp_graphs;
 
     PinnedHostBuffer round_host;
     std::int32_t* host_count = nullptr;
@@ -127,12 +139,13 @@ public:
     std::uint32_t E     = 0;
     std::uint32_t S     = 0;
     std::vector<TokenId> ledger;
-    std::int32_t rope_delta        = 0;
-    std::int32_t current_gdn_slot  = 0;
-    std::uint32_t mtp_materialized = 0;
-    bool proposal_ready            = false;
-    bool tail_hidden_valid         = false;
-    bool resident_multimodal       = false;
+    std::int32_t rope_delta       = 0;
+    std::int32_t current_gdn_slot = 0;
+    std::uint32_t text_kv_valid   = 0;
+    std::uint32_t mtp_kv_valid    = 0;
+    bool proposal_ready           = false;
+    bool tail_hidden_valid        = false;
+    bool resident_multimodal      = false;
     PrefixCheckpoint boundary;
     PendingCandidate pending;
     GenerationTimings timings;

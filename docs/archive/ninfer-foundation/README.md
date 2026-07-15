@@ -22,6 +22,9 @@ commands, paths, schemas, or project identity compatible with NInfer.
 - [`2026-07-15-ninfer-op-architecture-and-migration.md`](2026-07-15-ninfer-op-architecture-and-migration.md)
   — definition of the central Op boundary and atomic migration of mathematical CUDA implementations
   out of model-owned and temporary kernel directories.
+- [`2026-07-15-gqa-contract-and-execution-refactor.md`](2026-07-15-gqa-contract-and-execution-refactor.md)
+  — completed separation of physical KV storage, Program frontiers, device positions, GQA execution
+  envelopes, cached-only A3, and frontier-tier CUDA Graphs.
 
 The preserved `.qus` references describe the retired q5090 v4.2 route. The current C++ Engine and
 Python reference both consume the registered `.ninfer` artifact; archived `.qus` material is

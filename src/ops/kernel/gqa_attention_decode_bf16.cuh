@@ -15,12 +15,12 @@
 
 namespace ninfer::ops {
 
-template <typename Geometry, int TokenTile, int WarpsPerCta>
+template <typename Geometry, int TokenTile, int WarpsPerCta, typename CacheInput>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
-    const __nv_bfloat16* q, const __nv_bfloat16* k_new, const __nv_bfloat16* v_new,
-    const std::int32_t* pos, __nv_bfloat16* cache_k, __nv_bfloat16* cache_v, std::int32_t tokens,
-    std::int32_t padded_context, std::int32_t max_context, float scale, __nv_bfloat16* partial_acc,
-    float* partial_m, float* partial_l) {
+    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
+    __nv_bfloat16* cache_v, std::int32_t tokens, std::int32_t padded_context,
+    std::int32_t max_context, float scale, __nv_bfloat16* partial_acc, float* partial_m,
+    float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -90,7 +90,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
     const int window = last_pos + 1;
     const int active_split_count =
-        gqa_small_t_active_splits<Geometry>(window, split_count, TokenTile);
+        gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
 
     const int kps         = div_up(window, active_split_count);
@@ -102,22 +102,22 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         return;
     }
 
-    // Fused append: the split that owns each new token's absolute position writes its
-    // bf16 K/V head vector straight into the cache for FUTURE decode steps. The
-    // current step still reads the new tokens from k_new/v_new via the from_new path
-    // below, so no split reads back what it just wrote in the same launch.
-    for (int chunk = tid; chunk < tokens * (D / 8); chunk += Threads) {
-        const int token = chunk / (D / 8);
-        const int d     = (chunk - token * (D / 8)) * 8;
-        const int p_tok = pos[token];
-        if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 && p_tok < max_context) {
-            const std::int64_t new_off   = gqa_kv_new_index<Geometry>(kv_head, d, token);
-            const std::int64_t cache_off = gqa_cache_index(kv_head, d, p_tok, padded_context);
-            store_vec(&cache_k[cache_off], load_vec<int4>(&k_new[new_off]));
-            store_vec(&cache_v[cache_off], load_vec<int4>(&v_new[new_off]));
+    if constexpr (CacheInput::writes_cache) {
+        // The owning split writes each new row. Current attention reads those rows directly from
+        // input below, so no split depends on another split's cache write.
+        for (int chunk = tid; chunk < tokens * (D / 8); chunk += Threads) {
+            const int token = chunk / (D / 8);
+            const int d     = (chunk - token * (D / 8)) * 8;
+            const int p_tok = pos[token];
+            if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 && p_tok < max_context) {
+                const std::int64_t new_off   = gqa_kv_new_index<Geometry>(kv_head, d, token);
+                const std::int64_t cache_off = gqa_cache_index(kv_head, d, p_tok, padded_context);
+                store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
+                store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+            }
         }
+        __syncthreads();
     }
-    __syncthreads();
 
     for (int idx = tid; idx < Br * D; idx += Threads) {
         const int row = idx / D;
@@ -177,12 +177,18 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
             __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
             if (key < split_end) {
-                const int new_token = key - first_pos;
-                const bool from_new = new_token >= 0 && new_token < tokens && key >= first_pos;
-                if (from_new) {
-                    const std::int64_t off = gqa_kv_new_index<Geometry>(kv_head, d, new_token);
-                    ninfer::ops::cp_async<16>(k_dst, &k_new[off]);
-                    ninfer::ops::cp_async<16>(v_dst, &v_new[off]);
+                if constexpr (CacheInput::writes_cache) {
+                    const int new_token = key - first_pos;
+                    const bool from_new = new_token >= 0 && new_token < tokens && key >= first_pos;
+                    if (from_new) {
+                        const std::int64_t off = gqa_kv_new_index<Geometry>(kv_head, d, new_token);
+                        ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
+                        ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                    } else {
+                        const std::int64_t off = gqa_cache_index(kv_head, d, key, padded_context);
+                        ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
+                        ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                    }
                 } else {
                     const std::int64_t off = gqa_cache_index(kv_head, d, key, padded_context);
                     ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
@@ -224,32 +230,24 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0       = nt * 8 + 2 * lid;
-            const int col1       = col0 + 1;
-            const int key0       = k0 + col0;
-            const int key1       = col1 + k0;
-            const int new_token0 = key0 - first_pos;
-            const int new_token1 = key1 - first_pos;
-            const bool from_new0 = new_token0 >= 0 && new_token0 < tokens && key0 >= first_pos;
-            const bool from_new1 = new_token1 >= 0 && new_token1 < tokens && key1 >= first_pos;
-            score[nt][0]         = (row0 < row_count && key0 < split_end && key0 <= qabs0 &&
-                            !(from_new0 && new_token0 > token0))
-                                       ? score[nt][0] * scale
-                                       : -CUDART_INF_F;
-            score[nt][1]         = (row0 < row_count && key1 < split_end && key1 <= qabs0 &&
-                            !(from_new1 && new_token1 > token0))
-                                       ? score[nt][1] * scale
-                                       : -CUDART_INF_F;
-            score[nt][2]         = (row1 < row_count && key0 < split_end && key0 <= qabs1 &&
-                            !(from_new0 && new_token0 > token1))
-                                       ? score[nt][2] * scale
-                                       : -CUDART_INF_F;
-            score[nt][3]         = (row1 < row_count && key1 < split_end && key1 <= qabs1 &&
-                            !(from_new1 && new_token1 > token1))
-                                       ? score[nt][3] * scale
-                                       : -CUDART_INF_F;
-            bm0                  = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-            bm1                  = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+            const int col0 = nt * 8 + 2 * lid;
+            const int col1 = col0 + 1;
+            const int key0 = k0 + col0;
+            const int key1 = col1 + k0;
+            score[nt][0]   = (row0 < row_count && key0 < split_end && key0 <= qabs0)
+                                 ? score[nt][0] * scale
+                                 : -CUDART_INF_F;
+            score[nt][1]   = (row0 < row_count && key1 < split_end && key1 <= qabs0)
+                                 ? score[nt][1] * scale
+                                 : -CUDART_INF_F;
+            score[nt][2]   = (row1 < row_count && key0 < split_end && key0 <= qabs1)
+                                 ? score[nt][2] * scale
+                                 : -CUDART_INF_F;
+            score[nt][3]   = (row1 < row_count && key1 < split_end && key1 <= qabs1)
+                                 ? score[nt][3] * scale
+                                 : -CUDART_INF_F;
+            bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+            bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
         }
         bm0 = warp_max<4>(bm0, FullMask);
         bm1 = warp_max<4>(bm1, FullMask);

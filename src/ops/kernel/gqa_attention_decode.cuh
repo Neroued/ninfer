@@ -20,6 +20,16 @@ namespace ninfer::ops {
 
 inline constexpr int kGqaHeadDim = 256;
 
+struct GqaAppendInput {
+    static constexpr bool writes_cache = true;
+    const __nv_bfloat16* k;
+    const __nv_bfloat16* v;
+};
+
+struct GqaCachedInput {
+    static constexpr bool writes_cache = false;
+};
+
 __device__ __forceinline__ std::int64_t gqa_cache_index(int kv_head, int d, int position,
                                                         int padded_context) {
     return static_cast<std::int64_t>(d) + static_cast<std::int64_t>(kGqaHeadDim) *
@@ -67,15 +77,7 @@ __device__ __forceinline__ bool gqa_valid_q_head(int kv_head, int q_head) {
 }
 
 template <typename Geometry>
-__device__ __forceinline__ int gqa_small_t_active_splits(int window, int max_splits, int tokens) {
-    if (window <= 0) { return max_splits; }
-    // These int8 launch ranges deliberately use one 32-key tile per split.
-    // BF16 passes its ordinary split count here, so returning max_splits leaves
-    // the BF16 schedule unchanged while keeping the shared reducer in sync.
-    if ((tokens == 5 && window > 128 && window <= 512) ||
-        (tokens == 6 && window > 128 && window <= 160)) {
-        return max_splits;
-    }
+__device__ __forceinline__ int gqa_small_t_default_splits(int window) {
     int target_keys_per_split = 480 / Geometry::DecodeSplitScale;
     if (window <= 4096) {
         target_keys_per_split = 64 / Geometry::DecodeSplitScale;
@@ -86,8 +88,33 @@ __device__ __forceinline__ int gqa_small_t_active_splits(int window, int max_spl
     }
     constexpr int kMinSplits = 4 * Geometry::DecodeSplitScale;
     int splits               = div_up(window, target_keys_per_split);
-    splits                   = max(kMinSplits, splits);
-    return min(max_splits, splits);
+    splits                   = splits > kMinSplits ? splits : kMinSplits;
+    return splits < Geometry::DecodeSplits ? splits : Geometry::DecodeSplits;
+}
+
+template <typename Geometry, bool Int8>
+__device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_capacity,
+                                                         int tokens) {
+    if (window <= 0) { return launch_capacity; }
+    int splits = 0;
+    if constexpr (Int8) {
+        if (tokens == 5 && window > 128 && window <= 512) {
+            splits = div_up(window, 32 / Geometry::DecodeSplitScale);
+        } else if (tokens == 6 && window > 128 && window <= 160) {
+            splits = div_up(window, 24 / Geometry::DecodeSplitScale);
+        } else if (tokens == 6 && window > 5000 && window <= 8198) {
+            splits             = div_up(window, 192 / Geometry::DecodeSplitScale);
+            constexpr int kMin = 4 * Geometry::DecodeSplitScale;
+            constexpr int kMax = 42 * Geometry::DecodeSplitScale;
+            splits             = splits > kMin ? splits : kMin;
+            splits             = splits < kMax ? splits : kMax;
+        } else {
+            splits = gqa_small_t_default_splits<Geometry>(window);
+        }
+    } else {
+        splits = gqa_small_t_default_splits<Geometry>(window);
+    }
+    return splits < launch_capacity ? splits : launch_capacity;
 }
 
 __device__ __forceinline__ int gqa_small_t_tc_swz(int row, int col) {
@@ -114,7 +141,7 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
-template <typename Geometry, int DChunk>
+template <typename Geometry, int DChunk, bool Int8>
 __launch_bounds__(256) __global__
     void gqa_attention_small_t_reduce_output_kernel(const __nv_bfloat16* partial_acc,
                                                     const float* partial_m, const float* partial_l,
@@ -128,9 +155,10 @@ __launch_bounds__(256) __global__
     const int token   = static_cast<int>(blockIdx.z);
     const int tid     = threadIdx.x;
     if (q_head >= Geometry::QHeads || token >= tokens) { return; }
-    const int last_pos           = positions[tokens - 1];
-    const int window             = last_pos + 1;
-    const int active_split_count = gqa_small_t_active_splits<Geometry>(window, split_count, tokens);
+    const int last_pos = positions[tokens - 1];
+    const int window   = last_pos + 1;
+    const int active_split_count =
+        gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
 
     __shared__ float reduce[256];
 

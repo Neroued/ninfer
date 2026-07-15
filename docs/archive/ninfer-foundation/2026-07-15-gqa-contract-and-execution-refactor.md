@@ -1,15 +1,18 @@
 # GQA Contract and Execution Refactor
 
-Status: accepted implementation design; not yet the implemented API.
+Status: implemented and archived on 2026-07-15.
 
-This plan is the authority for the in-progress GQA refactor across `core`, `ops`, the registered
-27B target, CUDA Graph integration, and the future 35B-A3B target. It replaces an A3-local fix with
-one coherent design for all three causal grouped-query attention operations. While the refactor is
-in progress, the other active documents continue to describe the currently implemented product.
-When implementation is complete, the stable decisions here must be folded into
-[`op-development.md`](../op-development.md),
-[`ninfer-engine-architecture.md`](../ninfer-engine-architecture.md), and the affected GQA contract;
-this plan then moves to `docs/archive/`.
+This plan governed the completed GQA refactor across `core`, `ops`, the registered 27B target,
+CUDA Graph integration, and the future 35B-A3B target. It replaced an A3-local fix with one
+coherent design for all three causal grouped-query attention operations. Sections that describe
+the "current" cursor-based implementation record the pre-refactor state.
+
+The stable ownership, execution-envelope, cache-view, Program-frontier, and graph-tier decisions
+now live in [`op-development.md`](../../op-development.md),
+[`ninfer-engine-architecture.md`](../../ninfer-engine-architecture.md), and the repository-internal
+GQA contract. Retained qualification evidence is in the
+[`35B A3 roofline report`](../optimization-era/bench/qwen3.6-35b-gqa-a3-roofline.md) and the
+[`27B graph-frontier report`](../optimization-era/bench/qwen3.6-27b-gqa-graph-frontier-qualification.md).
 
 ## 1. Scope and outcome
 
@@ -184,7 +187,7 @@ One logical layer has K/V shape `[D, C, Hkv]`. Its physical view is either:
   `[D/64, C_pad, Hkv]`.
 
 INT8-G64 is a runtime-state codec, not a persistent format from
-[`ninfer-tensor-formats.md`](../ninfer-tensor-formats.md). Its observable cache encoding is part of
+[`ninfer-tensor-formats.md`](../../ninfer-tensor-formats.md). Its observable cache encoding is part of
 the GQA contract. For each 64-element BF16 source group `x` in one token and KV head:
 
 ```text

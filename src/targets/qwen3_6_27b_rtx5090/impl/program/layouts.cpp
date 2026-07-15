@@ -10,6 +10,7 @@
 #include "targets/qwen3_6_27b_rtx5090/impl/config.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/load/bindings.h"
+#include "targets/qwen3_6_27b_rtx5090/impl/program/graph_policy.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -325,7 +326,19 @@ std::unique_ptr<SequencePlan::Impl> plan_sequence_impl(DeviceContext& device,
     impl->kv_quant_group  = impl->kv_dtype == DType::I8 ? kKvQuantGroup : 0;
     impl->persistent      = persistent_layout(*impl);
     impl->workspace_bytes = workspace_bytes(*impl);
-    impl->graph_allowance_bytes = impl->use_cuda_graph ? 64ULL * kMiB : 0;
+    if (impl->use_cuda_graph) {
+        const std::size_t ordinary_variants = ordinary_graph_ranges(impl->capacity).size();
+        const std::size_t ordinary_graphs   = ordinary_variants * (impl->mtp_k == 0 ? 1ULL : 2ULL);
+        // Full-model capture measures 5-5.5 MiB per ordinary or short-window executable. Long MTP
+        // executables also trigger substantially larger driver allocations: repeated cold 256K
+        // K=5 construction peaks at 512.32 MiB against this 548 MiB target-private allowance.
+        impl->graph_allowance_bytes = ordinary_graphs * 6ULL * kMiB;
+        for (const GraphFrontierRange range : mtp_graph_ranges(impl->capacity, impl->mtp_k)) {
+            const std::uint64_t final_visible =
+                static_cast<std::uint64_t>(range.max) + 2ULL * impl->mtp_k;
+            impl->graph_allowance_bytes += (final_visible <= 4096 ? 6ULL : 82ULL) * kMiB;
+        }
+    }
 
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;

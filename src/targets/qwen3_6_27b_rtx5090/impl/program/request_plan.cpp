@@ -123,13 +123,12 @@ RequestPlan Program::Impl::plan_request(const PreparedPromptData& prompt,
             plan->prepare_mtp = true;
         } else if (plan->reuse == ReusePath::AppendAtFrontier && tail_hidden_valid &&
                    mtp_kv != nullptr &&
-                   (plan->reuse_base == 0 || (mtp_materialized >= plan->reuse_base - 1 &&
-                                              mtp_kv->pos >= plan->reuse_base - 1))) {
+                   (plan->reuse_base == 0 || mtp_kv_valid >= plan->reuse_base - 1)) {
             plan->prepare_mtp      = true;
             plan->needs_mtp_bridge = plan->reuse_base != 0;
         } else if (plan->reuse == ReusePath::RestoreBoundary && mtp_kv != nullptr &&
                    boundary.hidden_valid && boundary.mtp_prefix_valid &&
-                   mtp_kv->pos >= plan->reuse_base - 1) {
+                   mtp_kv_valid >= plan->reuse_base - 1) {
             plan->prepare_mtp      = true;
             plan->needs_mtp_bridge = true;
         }

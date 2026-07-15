@@ -46,16 +46,6 @@ target's storage and model semantics; they do not register a current product tar
 Model computation documents do not define product support, artifact framing, source ownership, or
 serving behavior. Runtime support requires an explicit compiled exact-checkpoint/GPU target.
 
-## Active implementation plans
-
-| Document | Scope |
-|---|---|
-| [`plans/2026-07-15-gqa-contract-and-execution-refactor.md`](plans/2026-07-15-gqa-contract-and-execution-refactor.md) | accepted cross-layer design for separating physical KV storage, Program frontiers, device positions, GQA execution envelopes, and CUDA Graph variants before 35B integration |
-
-Plans are temporary authorities for active cross-cutting work. Their stable decisions move into the
-maintained contracts above when implementation completes; completed or abandoned plans move to
-`archive/`.
-
 ## Implemented product boundary
 
 The only registered product target is `qwen3_6_27b_rtx5090`. Its artifact and request route are:

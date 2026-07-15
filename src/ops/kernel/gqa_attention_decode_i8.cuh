@@ -55,15 +55,15 @@ __device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int 
 // dequantize V while producers execute QK. After both consume the code tile, the
 // next K/V tile is prefetched into the same arena while the current PV runs.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena>
+          bool DynamicArena, typename CacheInput>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
-    void gqa_attention_decode_i8_tiled_kernel(const __nv_bfloat16* q, const __nv_bfloat16* k_new,
-                                              const __nv_bfloat16* v_new, const std::int32_t* pos,
-                                              std::int8_t* cache_k_i8, std::int8_t* cache_v_i8,
-                                              __half* cache_k_scale, __half* cache_v_scale,
-                                              std::int32_t padded_context, std::int32_t max_context,
-                                              float scale, __nv_bfloat16* partial_acc,
-                                              float* partial_m, float* partial_l) {
+    void gqa_attention_decode_i8_tiled_kernel(const __nv_bfloat16* q, CacheInput input,
+                                              const std::int32_t* pos, std::int8_t* cache_k_i8,
+                                              std::int8_t* cache_v_i8, __half* cache_k_scale,
+                                              __half* cache_v_scale, std::int32_t padded_context,
+                                              std::int32_t max_context, float scale,
+                                              __nv_bfloat16* partial_acc, float* partial_m,
+                                              float* partial_l) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -153,7 +153,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     const int window = last_pos + 1;
     const int active_split_count =
-        gqa_small_t_active_splits<Geometry>(window, split_count, TokenTile);
+        gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
 
     const int kps         = div_up(window, active_split_count);
@@ -165,47 +165,48 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         return;
     }
 
-    // The owning split quantizes each current token into the cache before its
-    // key/value tile is consumed.
-    for (int pair = warp; pair < TokenTile * Groups; pair += Wc) {
-        const int token    = pair / Groups;
-        const int grp      = pair - token * Groups;
-        const int position = pos[token];
-        if (position < split_start || position >= split_end) { continue; }
-        const int d0            = grp * kGqaKvQuantGroup + lane;
-        const int d1            = d0 + 32;
-        const std::int64_t src0 = gqa_kv_new_index<Geometry>(kv_head, d0, token);
-        const std::int64_t src1 = gqa_kv_new_index<Geometry>(kv_head, d1, token);
-        const float kv0         = __bfloat162float(k_new[src0]);
-        const float kv1         = __bfloat162float(k_new[src1]);
-        const float vv0         = __bfloat162float(v_new[src0]);
-        const float vv1         = __bfloat162float(v_new[src1]);
-        float kamax             = fmaxf(fabsf(kv0), fabsf(kv1));
-        float vamax             = fmaxf(fabsf(vv0), fabsf(vv1));
-        kamax                   = warp_max(kamax, FullMask);
-        vamax                   = warp_max(vamax, FullMask);
-        const __half ksh        = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
-        const __half vsh        = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
-        const float ks          = __half2float(ksh);
-        const float vs          = __half2float(vsh);
-        const float k_inv       = ks > 0.0f ? 1.0f / ks : 0.0f;
-        const float v_inv       = vs > 0.0f ? 1.0f / vs : 0.0f;
-        cache_k_i8[gqa_kv_quant_code_index(kv_head, d0, position, padded_context)] =
-            gqa_kv_quant_code(kv0, k_inv);
-        cache_k_i8[gqa_kv_quant_code_index(kv_head, d1, position, padded_context)] =
-            gqa_kv_quant_code(kv1, k_inv);
-        cache_v_i8[gqa_kv_quant_code_index(kv_head, d0, position, padded_context)] =
-            gqa_kv_quant_code(vv0, v_inv);
-        cache_v_i8[gqa_kv_quant_code_index(kv_head, d1, position, padded_context)] =
-            gqa_kv_quant_code(vv1, v_inv);
-        if (lane == 0) {
-            const std::int64_t so =
-                gqa_kv_quant_scale_index(kv_head, grp, position, padded_context);
-            cache_k_scale[so] = ksh;
-            cache_v_scale[so] = vsh;
+    if constexpr (CacheInput::writes_cache) {
+        // The owning split quantizes each current row before its cache tile is consumed.
+        for (int pair = warp; pair < TokenTile * Groups; pair += Wc) {
+            const int token    = pair / Groups;
+            const int grp      = pair - token * Groups;
+            const int position = pos[token];
+            if (position < split_start || position >= split_end) { continue; }
+            const int d0            = grp * kGqaKvQuantGroup + lane;
+            const int d1            = d0 + 32;
+            const std::int64_t src0 = gqa_kv_new_index<Geometry>(kv_head, d0, token);
+            const std::int64_t src1 = gqa_kv_new_index<Geometry>(kv_head, d1, token);
+            const float kv0         = __bfloat162float(input.k[src0]);
+            const float kv1         = __bfloat162float(input.k[src1]);
+            const float vv0         = __bfloat162float(input.v[src0]);
+            const float vv1         = __bfloat162float(input.v[src1]);
+            float kamax             = fmaxf(fabsf(kv0), fabsf(kv1));
+            float vamax             = fmaxf(fabsf(vv0), fabsf(vv1));
+            kamax                   = warp_max(kamax, FullMask);
+            vamax                   = warp_max(vamax, FullMask);
+            const __half ksh        = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
+            const __half vsh        = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
+            const float ks          = __half2float(ksh);
+            const float vs          = __half2float(vsh);
+            const float k_inv       = ks > 0.0f ? 1.0f / ks : 0.0f;
+            const float v_inv       = vs > 0.0f ? 1.0f / vs : 0.0f;
+            cache_k_i8[gqa_kv_quant_code_index(kv_head, d0, position, padded_context)] =
+                gqa_kv_quant_code(kv0, k_inv);
+            cache_k_i8[gqa_kv_quant_code_index(kv_head, d1, position, padded_context)] =
+                gqa_kv_quant_code(kv1, k_inv);
+            cache_v_i8[gqa_kv_quant_code_index(kv_head, d0, position, padded_context)] =
+                gqa_kv_quant_code(vv0, v_inv);
+            cache_v_i8[gqa_kv_quant_code_index(kv_head, d1, position, padded_context)] =
+                gqa_kv_quant_code(vv1, v_inv);
+            if (lane == 0) {
+                const std::int64_t so =
+                    gqa_kv_quant_scale_index(kv_head, grp, position, padded_context);
+                cache_k_scale[so] = ksh;
+                cache_v_scale[so] = vsh;
+            }
         }
+        __syncthreads();
     }
-    __syncthreads();
 
     for (int i = tid; i < Br * D; i += Threads) { q_i8[i] = 0; }
     for (int i = tid; i < RowCount * Groups; i += Threads) { q_scale_tmp[i] = 0.0f; }
@@ -371,34 +372,24 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const int col0       = nt * 8 + 2 * lid;
-                const int col1       = col0 + 1;
-                const int key0       = k0 + col0;
-                const int key1       = k0 + col1;
-                const int new_token0 = key0 - first_pos;
-                const int new_token1 = key1 - first_pos;
-                const bool from_new0 =
-                    new_token0 >= 0 && new_token0 < TokenTile && key0 >= first_pos;
-                const bool from_new1 =
-                    new_token1 >= 0 && new_token1 < TokenTile && key1 >= first_pos;
-                score[nt][0] = (row0 < RowCount && key0 < split_end && key0 <= qabs0 &&
-                                !(from_new0 && new_token0 > token0))
-                                   ? score[nt][0] * scale
-                                   : -CUDART_INF_F;
-                score[nt][1] = (row0 < RowCount && key1 < split_end && key1 <= qabs0 &&
-                                !(from_new1 && new_token1 > token0))
-                                   ? score[nt][1] * scale
-                                   : -CUDART_INF_F;
-                score[nt][2] = (row1 < RowCount && key0 < split_end && key0 <= qabs1 &&
-                                !(from_new0 && new_token0 > token1))
-                                   ? score[nt][2] * scale
-                                   : -CUDART_INF_F;
-                score[nt][3] = (row1 < RowCount && key1 < split_end && key1 <= qabs1 &&
-                                !(from_new1 && new_token1 > token1))
-                                   ? score[nt][3] * scale
-                                   : -CUDART_INF_F;
-                bm0          = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-                bm1          = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+                const int col0 = nt * 8 + 2 * lid;
+                const int col1 = col0 + 1;
+                const int key0 = k0 + col0;
+                const int key1 = k0 + col1;
+                score[nt][0]   = (row0 < RowCount && key0 < split_end && key0 <= qabs0)
+                                     ? score[nt][0] * scale
+                                     : -CUDART_INF_F;
+                score[nt][1]   = (row0 < RowCount && key1 < split_end && key1 <= qabs0)
+                                     ? score[nt][1] * scale
+                                     : -CUDART_INF_F;
+                score[nt][2]   = (row1 < RowCount && key0 < split_end && key0 <= qabs1)
+                                     ? score[nt][2] * scale
+                                     : -CUDART_INF_F;
+                score[nt][3]   = (row1 < RowCount && key1 < split_end && key1 <= qabs1)
+                                     ? score[nt][3] * scale
+                                     : -CUDART_INF_F;
+                bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+                bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }
             bm0 = warp_max<4>(bm0, FullMask);
             bm1 = warp_max<4>(bm1, FullMask);

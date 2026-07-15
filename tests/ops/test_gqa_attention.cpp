@@ -60,6 +60,10 @@ constexpr std::int32_t kKvQuantGroups    = kHeadDim / kKvQuantGroup;
 constexpr float kScale                   = 0.0625f;
 constexpr std::size_t kGqaWorkspaceBytes = 96ULL * 1024ULL * 1024ULL;
 
+ops::GqaExecutionEnvelope exact_envelope(std::uint32_t visible_keys) {
+    return {visible_keys, visible_keys};
+}
+
 enum class DecodeInputMode { Random, Stress };
 
 std::size_t q_index(std::int32_t q_head, std::int32_t d) {
@@ -555,8 +559,9 @@ int one_int8_prefill_case(std::int32_t tokens, std::uint32_t seed, std::int32_t 
     Tensor tpos(dpos.p, DType::I32, {tokens});
     Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    kv.pos = static_cast<std::uint32_t>(base);
-    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
+    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                       exact_envelope(static_cast<std::uint32_t>(base + tokens)), ws, tout,
+                       nullptr);
     cudaDeviceSynchronize();
 
     int f = 0;
@@ -681,9 +686,9 @@ int one_int8_decode_case(std::int32_t base, std::int32_t tokens, std::uint32_t s
     Tensor tpos(dpos.p, DType::I32, {tokens});
     Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    kv.pos                             = static_cast<std::uint32_t>(base);
-    const std::uint32_t initial_kv_pos = kv.pos;
-    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
+    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                       exact_envelope(static_cast<std::uint32_t>(base + tokens)), ws, tout,
+                       nullptr);
     cudaDeviceSynchronize();
 
     int f = 0;
@@ -698,11 +703,6 @@ int one_int8_decode_case(std::int32_t base, std::int32_t tokens, std::uint32_t s
                           from_device_u16(kv.k_scale[0].data, scale_n), expected_k_scale);
     f += check_bits_equal((label + " v scale").c_str(),
                           from_device_u16(kv.v_scale[0].data, scale_n), expected_v_scale);
-    if (kv.pos != initial_kv_pos) {
-        std::cerr << label << ": decode op must not advance host KVCache.pos; got " << kv.pos
-                  << '\n';
-        ++f;
-    }
     return f;
 }
 
@@ -767,9 +767,8 @@ int one_decode_case(std::int32_t pos, std::uint32_t seed,
     Tensor tpos(dpos.p, DType::I32, {1});
     Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, 1});
 
-    kv.pos                             = static_cast<std::uint32_t>(pos);
-    const std::uint32_t initial_kv_pos = kv.pos;
-    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
+    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                       exact_envelope(static_cast<std::uint32_t>(pos + 1)), ws, tout, nullptr);
     cudaDeviceSynchronize();
 
     int f             = 0;
@@ -782,11 +781,6 @@ int one_decode_case(std::int32_t pos, std::uint32_t seed,
     f +=
         check_bits_equal((label + " v append").c_str(),
                          from_device_bf16_bits(kv.v[0].data, cache_n), bf16_bits(expected_cache_v));
-    if (kv.pos != initial_kv_pos) {
-        std::cerr << label << ": decode op must not advance host KVCache.pos; got " << kv.pos
-                  << '\n';
-        ++f;
-    }
     return f;
 }
 
@@ -843,9 +837,9 @@ int one_prefill_case(std::int32_t tokens, std::uint32_t seed, std::int32_t cache
     Tensor tpos(dpos.p, DType::I32, {tokens});
     Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    const std::uint32_t initial_kv_pos = 777u;
-    kv.pos                             = initial_kv_pos;
-    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
+    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                       exact_envelope(static_cast<std::uint32_t>(cache_offset + tokens)), ws, tout,
+                       nullptr);
     cudaDeviceSynchronize();
 
     int f = 0;
@@ -856,11 +850,6 @@ int one_prefill_case(std::int32_t tokens, std::uint32_t seed, std::int32_t cache
                           bf16_bits(expected_cache_k));
     f += check_bits_equal((label + " v fill").c_str(), from_device_bf16_bits(kv.v[0].data, cache_n),
                           bf16_bits(expected_cache_v));
-    if (kv.pos != initial_kv_pos) {
-        std::cerr << label << ": attention op must not advance host KVCache.pos; got " << kv.pos
-                  << '\n';
-        ++f;
-    }
     return f;
 }
 
@@ -911,7 +900,6 @@ int split_api_parity_case(DType cache_dtype, std::int32_t tokens, std::int32_t b
             cudaMemset(cache->k_scale[0].data, 0, scale_n * sizeof(std::uint16_t));
             cudaMemset(cache->v_scale[0].data, 0, scale_n * sizeof(std::uint16_t));
         }
-        cache->pos = static_cast<std::uint32_t>(base);
     }
 
     Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
@@ -931,9 +919,12 @@ int split_api_parity_case(DType cache_dtype, std::int32_t tokens, std::int32_t b
     Tensor tpos_split(pos_split_ptr, DType::I32, {split_tokens});
     Tensor tout_split(dout_split.p, DType::BF16, {kHeadDim, kQHeads, split_tokens});
 
-    ops::gqa_attention(tq, tk, tv, tpos, kScale, full_cache, 0, ws, tout_full, nullptr);
-    ops::gqa_kv_append(tk, tv, tpos, split_cache, 0, nullptr);
-    ops::gqa_attention_cached(tq_split, tpos_split, kScale, split_cache, 0, tout_split, nullptr);
+    const auto envelope = exact_envelope(static_cast<std::uint32_t>(total));
+    ops::gqa_attention(tq, tk, tv, tpos, kScale, full_cache.layer_view(0), envelope, ws, tout_full,
+                       nullptr);
+    ops::gqa_kv_append(tk, tv, tpos, split_cache.layer_view(0), nullptr);
+    ops::gqa_attention_cached(tq_split, tpos_split, kScale, split_cache.layer_view(0), envelope, ws,
+                              tout_split, nullptr);
     cudaDeviceSynchronize();
 
     const std::string dtype_label = cache_dtype == DType::BF16 ? "bf16" : "int8";
@@ -1054,11 +1045,11 @@ int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed)
     Tensor tpos(dpos.p, DType::I32, {1});
     Tensor tout_decode(dout_decode.p, DType::BF16, {kHeadDim, kQHeads, 1});
 
-    ops::gqa_attention(tq_prefill, tk_prefill, tv_prefill, tpos_prefill, kScale, kv, 0, ws,
-                       tout_prefill, nullptr);
-    kv.pos                             = static_cast<std::uint32_t>(tokens);
-    const std::uint32_t initial_kv_pos = kv.pos;
-    ops::gqa_attention(tq_decode, tk_decode, tv_decode, tpos, kScale, kv, 0, ws, tout_decode,
+    ops::gqa_attention(tq_prefill, tk_prefill, tv_prefill, tpos_prefill, kScale, kv.layer_view(0),
+                       exact_envelope(static_cast<std::uint32_t>(tokens)), ws, tout_prefill,
+                       nullptr);
+    ops::gqa_attention(tq_decode, tk_decode, tv_decode, tpos, kScale, kv.layer_view(0),
+                       exact_envelope(static_cast<std::uint32_t>(tokens + 1)), ws, tout_decode,
                        nullptr);
     cudaDeviceSynchronize();
 
@@ -1072,11 +1063,6 @@ int one_prefill_decode_consistency_case(std::int32_t tokens, std::uint32_t seed)
     f +=
         check_bits_equal((label + " v cache").c_str(), from_device_bf16_bits(kv.v[0].data, cache_n),
                          bf16_bits(expected_cache_v));
-    if (kv.pos != initial_kv_pos) {
-        std::cerr << label << ": attention ops must not advance host KVCache.pos; got " << kv.pos
-                  << '\n';
-        ++f;
-    }
     return f;
 }
 
@@ -1155,7 +1141,9 @@ int one_future_token_isolation_case() {
         Tensor tv(dv.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
         Tensor tpos(dpos.p, DType::I32, {tokens});
         Tensor tout(dout.p, DType::BF16, {kHeadDim, kQHeads, tokens});
-        ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, nullptr);
+        ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
+                           exact_envelope(static_cast<std::uint32_t>(base + tokens)), ws, tout,
+                           nullptr);
         cudaDeviceSynchronize();
         return from_device_bf16_bits(dout.p, qn);
     };
@@ -1216,7 +1204,10 @@ int one_graph_relaunch_positions_case() {
     cudaGraph_t graph    = nullptr;
     cudaGraphExec_t exec = nullptr;
     cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
-    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv, 0, ws, tout, stream);
+    const ops::GqaExecutionEnvelope graph_envelope{static_cast<std::uint32_t>(base0 + tokens),
+                                                   static_cast<std::uint32_t>(base1 + tokens)};
+    ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0), graph_envelope, ws, tout,
+                       stream);
     cudaStreamEndCapture(stream, &graph);
     cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
 
@@ -1253,6 +1244,44 @@ int one_graph_relaunch_positions_case() {
 
     cudaGraphExecDestroy(exec);
     cudaGraphDestroy(graph);
+
+    // A3 records the same interval capacity without append operands or cache effects. Replay at
+    // the far end must use device positions for mathematics while leaving every cache bit intact.
+    cudaMemcpy(kv.k[0].data, cache_k_bits.data(), layer_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(kv.v[0].data, cache_v_bits.data(), layer_bytes, cudaMemcpyHostToDevice);
+    const int initial_positions[2] = {base0, base0 + 1};
+    cudaMemcpy(dpos.p, initial_positions, sizeof(initial_positions), cudaMemcpyHostToDevice);
+    graph = nullptr;
+    exec  = nullptr;
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    ops::gqa_attention_cached(tq, tpos, kScale, kv.layer_view(0), graph_envelope, ws, tout, stream);
+    cudaStreamEndCapture(stream, &graph);
+    cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    cudaGraphLaunch(exec, stream);
+    cudaStreamSynchronize(stream);
+    cudaMemcpy(dpos.p, next_positions, sizeof(next_positions), cudaMemcpyHostToDevice);
+    cudaGraphLaunch(exec, stream);
+    cudaStreamSynchronize(stream);
+
+    std::vector<double> cached_expected(qn);
+    const std::size_t q_column = static_cast<std::size_t>(kHeadDim) * kQHeads;
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        const auto begin = q.begin() + static_cast<std::ptrdiff_t>(t * q_column);
+        std::vector<float> q_token(begin, begin + static_cast<std::ptrdiff_t>(q_column));
+        std::vector<double> token_expected;
+        cpu_gqa_decode(q_token, cache_k, cache_v, base1 + t, padded_context, token_expected);
+        std::copy(token_expected.begin(), token_expected.end(),
+                  cached_expected.begin() + static_cast<std::ptrdiff_t>(t * q_column));
+    }
+    f += verify("gqa cached graph relaunch", from_device_bf16(dout, qn), cached_expected,
+                Tolerance::attention_bf16());
+    f += check_bits_equal("gqa cached graph relaunch k cache",
+                          from_device_bf16_bits(kv.k[0].data, cache_n), cache_k_bits);
+    f += check_bits_equal("gqa cached graph relaunch v cache",
+                          from_device_bf16_bits(kv.v[0].data, cache_n), cache_v_bits);
+
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
     cudaStreamDestroy(stream);
     return f;
 }
@@ -1280,40 +1309,42 @@ int validation_checks() {
     const std::size_t layer_bytes     = cache_elements(padded_context) * sizeof(std::uint16_t);
     DeviceArena cache_arena(2 * (layer_bytes + 256) + 4096);
     KVCache kv(cache_arena, 1, pos + 1, kKVHeads, kHeadDim, DType::BF16);
-    kv.pos = static_cast<std::uint32_t>(pos);
-
     Tensor q(dq.p, DType::BF16, {kHeadDim, kQHeads, 1});
     Tensor k(dk.p, DType::BF16, {kHeadDim, kKVHeads, 1});
     Tensor v(dv.p, DType::BF16, {kHeadDim, kKVHeads, 1});
     Tensor scalar_pos(dpos.p, DType::I32, {1});
     Tensor out(dout.p, DType::BF16, {kHeadDim, kQHeads, 1});
+    const auto envelope = exact_envelope(static_cast<std::uint32_t>(pos + 1));
 
     int f = 0;
     f += expect_invalid("gqa q shape", [&] {
         Tensor bad(dq.p, DType::BF16, {kHeadDim, kQHeads, 2});
-        ops::gqa_attention(bad, k, v, scalar_pos, kScale, kv, 0, ws, out, nullptr);
+        ops::gqa_attention(bad, k, v, scalar_pos, kScale, kv.layer_view(0), envelope, ws, out,
+                           nullptr);
     });
     f += expect_invalid("gqa k shape", [&] {
         Tensor bad(dk.p, DType::BF16, {kHeadDim, kKVHeads, 2});
-        ops::gqa_attention(q, bad, v, scalar_pos, kScale, kv, 0, ws, out, nullptr);
+        ops::gqa_attention(q, bad, v, scalar_pos, kScale, kv.layer_view(0), envelope, ws, out,
+                           nullptr);
     });
     f += expect_invalid("gqa zero T", [&] {
         Tensor bad = q;
         bad.ne[2]  = 0;
-        ops::gqa_attention(bad, k, v, scalar_pos, kScale, kv, 0, ws, out, nullptr);
+        ops::gqa_attention(bad, k, v, scalar_pos, kScale, kv.layer_view(0), envelope, ws, out,
+                           nullptr);
     });
     f += expect_invalid("gqa positions shape", [&] {
         Tensor bad(dpos.p, DType::I32, {2});
-        ops::gqa_attention(q, k, v, bad, kScale, kv, 0, ws, out, nullptr);
+        ops::gqa_attention(q, k, v, bad, kScale, kv.layer_view(0), envelope, ws, out, nullptr);
     });
     f += expect_invalid("gqa positions dtype", [&] {
         Tensor bad = scalar_pos;
         bad.dtype  = DType::BF16;
-        ops::gqa_attention(q, k, v, bad, kScale, kv, 0, ws, out, nullptr);
+        ops::gqa_attention(q, k, v, bad, kScale, kv.layer_view(0), envelope, ws, out, nullptr);
     });
     f += expect_invalid("gqa null positions", [&] {
         Tensor bad(nullptr, DType::I32, {1});
-        ops::gqa_attention(q, k, v, bad, kScale, kv, 0, ws, out, nullptr);
+        ops::gqa_attention(q, k, v, bad, kScale, kv.layer_view(0), envelope, ws, out, nullptr);
     });
     f += expect_invalid("gqa T exceeds max_context", [&] {
         Tensor q2(dq.p, DType::BF16, {kHeadDim, kQHeads, 2});
@@ -1324,7 +1355,8 @@ int validation_checks() {
         DeviceArena tiny_cache_arena(
             2 * (cache_elements(align_up_128(1)) * sizeof(std::uint16_t) + 256) + 4096);
         KVCache tiny_kv(tiny_cache_arena, 1, 1, kKVHeads, kHeadDim, DType::BF16);
-        ops::gqa_attention(q2, k2, v2, pos2, kScale, tiny_kv, 0, ws, out2, nullptr);
+        ops::gqa_attention(q2, k2, v2, pos2, kScale, tiny_kv.layer_view(0), {2, 2}, ws, out2,
+                           nullptr);
     });
     return f;
 }

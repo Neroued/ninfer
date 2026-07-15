@@ -3,6 +3,7 @@
 #include "ninfer/ops/mtp_round.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/config.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/load/bindings.h"
+#include "targets/qwen3_6_27b_rtx5090/impl/program/graph_policy.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/schedule/schedule.h"
 
 #include <cuda_runtime.h>
@@ -49,6 +50,42 @@ bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>
     return std::equal(prompt.token_ids.begin(),
                       prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
                       ledger.begin());
+}
+
+schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
+                                            std::uint32_t k) {
+    schedule::MtpGqaEnvelopes out;
+    out.target_verify = {min_frontier + k + 1, max_frontier + k + 1};
+    out.batch         = out.target_verify;
+    for (std::uint32_t i = 1; i < k; ++i) {
+        out.ar[i - 1] = {min_frontier + i + 1, max_frontier + k + i + 1};
+    }
+    return out;
+}
+
+template <typename Variant>
+Variant& select_graph_variant(std::vector<Variant>& variants, std::uint32_t frontier,
+                              const char* label) {
+    const auto it = std::lower_bound(variants.begin(), variants.end(), frontier,
+                                     [](const Variant& variant, std::uint32_t value) {
+                                         return variant.max_execution_frontier < value;
+                                     });
+    if (it == variants.end() || frontier < it->min_execution_frontier) {
+        throw std::logic_error(std::string(label) + " CUDA Graph coverage is incomplete");
+    }
+    return *it;
+}
+
+void validate_graph_ranges(const std::vector<GraphFrontierRange>& ranges,
+                           std::uint32_t max_frontier, const char* label) {
+    if (ranges.empty() || ranges.front().min != 0 || ranges.back().max != max_frontier) {
+        throw std::logic_error(std::string(label) + " CUDA Graph coverage has invalid endpoints");
+    }
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        if (ranges[i].min > ranges[i].max || (i != 0 && ranges[i].min != ranges[i - 1].max + 1)) {
+            throw std::logic_error(std::string(label) + " CUDA Graph coverage has a gap");
+        }
+    }
 }
 
 } // namespace
@@ -126,7 +163,8 @@ void Program::Impl::make_invalid() noexcept {
     S         = 0;
     ledger.clear();
     current_gdn_slot    = 0;
-    mtp_materialized    = 0;
+    text_kv_valid       = 0;
+    mtp_kv_valid        = 0;
     proposal_ready      = false;
     tail_hidden_valid   = false;
     resident_multimodal = false;
@@ -140,8 +178,6 @@ void Program::Impl::set_device_i32(Tensor& tensor, std::int32_t value) {
 }
 
 void Program::Impl::ordered_reset() {
-    text_kv->reset();
-    if (mtp_kv) { mtp_kv->reset(); }
     gdn->reset(device.stream);
     work.reset();
     set_device_i32(io.pos, 0);
@@ -152,7 +188,8 @@ void Program::Impl::ordered_reset() {
     set_device_i32(io.gdn_initial_slot, 0);
     set_device_i32(io.ar_pos, 0);
     current_gdn_slot = 0;
-    mtp_materialized = 0;
+    text_kv_valid    = 0;
+    mtp_kv_valid     = 0;
     proposal_ready   = false;
 }
 
@@ -173,12 +210,33 @@ void Program::Impl::prepare_graphs() {
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
     };
-    const auto reset_between_variants = [&] {
-        ordered_reset();
-        clear_stable_controls();
-        device.synchronize();
+    const auto initialize_cache = [&](KVCache& cache) {
+        for (Tensor& tensor : cache.k) {
+            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
+        }
+        for (Tensor& tensor : cache.v) {
+            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
+        }
+        for (Tensor& tensor : cache.k_scale) {
+            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
+        }
+        for (Tensor& tensor : cache.v_scale) {
+            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
+        }
     };
-    const auto state = [&] {
+    initialize_cache(*text_kv);
+    if (mtp_kv != nullptr) { initialize_cache(*mtp_kv); }
+    device.synchronize();
+
+    const auto prepare_representative = [&](std::uint32_t frontier) {
+        work.reset();
+        clear_stable_controls();
+        gdn->reset(device.stream);
+        set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
+        set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
+        set_device_i32(io.ar_pos, checked_i32(frontier, "graph representative MTP position"));
+    };
+    const auto state = [&](std::uint32_t frontier) {
         return schedule::State{device,
                                model,
                                work,
@@ -187,6 +245,7 @@ void Program::Impl::prepare_graphs() {
                                *gdn,
                                io,
                                prefill_chunk,
+                               frontier,
                                static_cast<const ops::SamplingConfig*>(sampling_config.data),
                                proposal_head,
                                &boundary_hidden,
@@ -195,20 +254,49 @@ void Program::Impl::prepare_graphs() {
                                nullptr};
     };
 
-    reset_between_variants();
-    auto ordinary_state = state();
-    schedule::warm_capture_ordinary_round(ordinary_state, false, ordinary_graph);
-    if (mtp_kv != nullptr) {
-        reset_between_variants();
-        auto aligned_state = state();
-        schedule::warm_capture_ordinary_round(aligned_state, true, ordinary_aligned_graph);
+    const auto ordinary_ranges = ordinary_graph_ranges(capacity);
+    validate_graph_ranges(ordinary_ranges, capacity - 1, "ordinary");
+    ordinary_graphs.reserve(ordinary_ranges.size());
+    for (const GraphFrontierRange range : ordinary_ranges) {
+        ordinary_graphs.emplace_back();
+        OrdinaryGraphVariant& variant      = ordinary_graphs.back();
+        variant.min_execution_frontier     = range.min;
+        variant.max_execution_frontier     = range.max;
+        const std::uint32_t representative = range.min;
+        const ops::GqaExecutionEnvelope envelope{range.min + 1, range.max + 1};
+        const auto prepare = [&, representative] { prepare_representative(representative); };
 
-        reset_between_variants();
-        auto mtp_state = state();
-        schedule::warm_capture_mtp_round(mtp_state, mtp_k, mtp_graph);
+        auto ordinary_state = state(representative);
+        schedule::warm_capture_ordinary_round(ordinary_state, false, envelope, prepare,
+                                              variant.ordinary);
+        if (mtp_kv != nullptr) {
+            auto aligned_state = state(representative);
+            schedule::warm_capture_ordinary_round(aligned_state, true, envelope, prepare,
+                                                  variant.ordinary_aligned);
+        }
     }
 
-    reset_between_variants();
+    const auto mtp_ranges = mtp_graph_ranges(capacity, mtp_k);
+    if (mtp_k != 0) {
+        validate_graph_ranges(mtp_ranges, capacity - 2 * mtp_k, "MTP");
+        mtp_graphs.reserve(mtp_ranges.size());
+        for (const GraphFrontierRange range : mtp_ranges) {
+            mtp_graphs.emplace_back();
+            MtpGraphVariant& variant           = mtp_graphs.back();
+            variant.min_execution_frontier     = range.min;
+            variant.max_execution_frontier     = range.max;
+            const std::uint32_t representative = range.min;
+            const auto prepare = [&, representative] { prepare_representative(representative); };
+
+            auto mtp_state = state(representative);
+            schedule::warm_capture_mtp_round(mtp_state, mtp_k,
+                                             mtp_gqa_envelopes(range.min, range.max, mtp_k),
+                                             prepare, variant.mtp);
+        }
+    }
+
+    ordered_reset();
+    clear_stable_controls();
     for (Tensor& tensor : gdn->conv) {
         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
@@ -303,17 +391,17 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
             ordered_reset();
             ledger.clear();
         } else if (plan.reuse == ReusePath::AppendAtFrontier) {
-            if (text_kv->pos < base) {
+            if (text_kv_valid < base) {
                 throw std::logic_error("resident Text KV is shorter than E");
             }
-            text_kv->rewind(base);
+            text_kv_valid = base;
             ledger.resize(base);
             set_device_i32(io.gdn_initial_slot, current_gdn_slot);
         } else {
-            if (text_kv->pos < base) {
+            if (text_kv_valid < base) {
                 throw std::logic_error("resident Text KV is shorter than boundary");
             }
-            text_kv->rewind(base);
+            text_kv_valid = base;
             gdn->copy_slot(gdn->snapshot_slots - 1, 0, device.stream);
             current_gdn_slot = 0;
             set_device_i32(io.gdn_initial_slot, 0);
@@ -322,11 +410,10 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
 
         if (plan.prepare_mtp && base != 0) {
             const std::uint32_t mtp_base = base - 1;
-            if (mtp_kv == nullptr || mtp_kv->pos < mtp_base) {
+            if (mtp_kv == nullptr || mtp_kv_valid < mtp_base) {
                 throw std::logic_error("reusable MTP prefix is shorter than its bridge position");
             }
-            mtp_kv->rewind(mtp_base);
-            mtp_materialized = mtp_base;
+            mtp_kv_valid = mtp_base;
         }
 
         install_sampling(plan.sampling);
@@ -351,6 +438,7 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
             *gdn,
             io,
             prefill_chunk,
+            base,
             static_cast<const ops::SamplingConfig*>(sampling_config.data),
             proposal_head,
             &boundary_hidden,
@@ -390,7 +478,7 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
                     schedule::mtp_bridge_and_propose(schedule_state, bridge_token, bridge_hidden,
                                                      checked_i32(base - 1, "bridge position"),
                                                      false);
-                    mtp_materialized = base;
+                    mtp_kv_valid = base;
                 }
                 mtp_prepared = schedule::prefill_text(
                     schedule_state, std::span<const TokenId>(prompt.token_ids).subspan(base),
@@ -425,10 +513,9 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
         ledger.push_back(host_tokens[0]);
-        text_kv->pos     = prompt_tokens;
-        current_gdn_slot = 0;
-        mtp_materialized = mtp_prepared ? prompt_tokens : 0;
-        if (mtp_kv) { mtp_kv->pos = mtp_materialized; }
+        text_kv_valid     = prompt_tokens;
+        current_gdn_slot  = 0;
+        mtp_kv_valid      = mtp_prepared ? prompt_tokens : 0;
         proposal_ready    = mtp_prepared;
         tail_hidden_valid = true;
         if (snapshot_boundary) {
@@ -474,10 +561,10 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
         throw std::logic_error("Active frontier is inconsistent");
     }
 
-    if (proposal_ready && (mtp_kv == nullptr || mtp_materialized != E || mtp_kv->pos != E)) {
+    if (proposal_ready && (mtp_kv == nullptr || mtp_kv_valid != E)) {
         throw std::logic_error("MTP proposal does not match the Active execution frontier");
     }
-    const bool use_mtp = mtp_k != 0 && proposal_ready && mtp_materialized == E &&
+    const bool use_mtp = mtp_k != 0 && proposal_ready && mtp_kv_valid == E &&
                          budget.generated_tokens_remaining >= mtp_k + 1 &&
                          static_cast<std::uint64_t>(E) + 2ULL * mtp_k <= capacity;
     const std::uint32_t base_E = E;
@@ -493,6 +580,7 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
             *gdn,
             io,
             prefill_chunk,
+            base_E,
             static_cast<const ops::SamplingConfig*>(sampling_config.data),
             proposal_head,
             &boundary_hidden,
@@ -504,9 +592,15 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
         std::uint32_t accepted = 0;
         PendingKind kind       = PendingKind::Ordinary;
         if (use_mtp) {
-            DecodeGraph* graph =
-                use_cuda_graph && diagnostic_text_tap == nullptr ? &mtp_graph : nullptr;
-            schedule::mtp_round(schedule_state, mtp_k, graph);
+            DecodeGraph* graph = nullptr;
+            auto envelopes     = mtp_gqa_envelopes(base_E, base_E, mtp_k);
+            if (use_cuda_graph && diagnostic_text_tap == nullptr) {
+                MtpGraphVariant& variant = select_graph_variant(mtp_graphs, base_E, "MTP");
+                graph                    = &variant.mtp;
+                envelopes                = mtp_gqa_envelopes(variant.min_execution_frontier,
+                                                             variant.max_execution_frontier, mtp_k);
+            }
+            schedule::mtp_round(schedule_state, mtp_k, envelopes, graph);
             ops::mtp_gather_hidden_row(io.verify_hidden, io.accepted, tail_hidden, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(host_count, io.num_sampled.data, sizeof(std::int32_t),
                                        cudaMemcpyDeviceToHost, device.stream));
@@ -524,28 +618,28 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
             }
             accepted          = produced - 1;
             kind              = PendingKind::Mtp;
-            text_kv->pos      = base_E + produced;
+            text_kv_valid     = base_E + produced;
             current_gdn_slot  = static_cast<std::int32_t>(accepted);
-            mtp_materialized  = base_E + produced;
-            mtp_kv->pos       = mtp_materialized;
+            mtp_kv_valid      = base_E + produced;
             proposal_ready    = true;
             tail_hidden_valid = true;
         } else {
-            const bool align_mtp = mtp_kv != nullptr && mtp_materialized == base_E;
+            const bool align_mtp = mtp_kv != nullptr && mtp_kv_valid == base_E;
             DecodeGraph* graph   = nullptr;
+            ops::GqaExecutionEnvelope envelope{base_E + 1, base_E + 1};
             if (use_cuda_graph && diagnostic_text_tap == nullptr) {
-                graph = align_mtp ? &ordinary_aligned_graph : &ordinary_graph;
+                OrdinaryGraphVariant& variant =
+                    select_graph_variant(ordinary_graphs, base_E, "ordinary");
+                graph    = align_mtp ? &variant.ordinary_aligned : &variant.ordinary;
+                envelope = {variant.min_execution_frontier + 1, variant.max_execution_frontier + 1};
             }
-            schedule::ordinary_round(schedule_state, align_mtp, graph);
+            schedule::ordinary_round(schedule_state, align_mtp, envelope, graph);
             copy_tail(io.verify_hidden.slice(1, 0, 1));
             copy_round_token();
             device.synchronize();
-            text_kv->pos     = base_E + 1;
+            text_kv_valid    = base_E + 1;
             current_gdn_slot = 0;
-            if (align_mtp) {
-                mtp_materialized = base_E + 1;
-                mtp_kv->pos      = mtp_materialized;
-            }
+            if (align_mtp) { mtp_kv_valid = base_E + 1; }
             proposal_ready    = false;
             tail_hidden_valid = true;
         }

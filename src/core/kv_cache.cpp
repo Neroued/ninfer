@@ -13,12 +13,6 @@ void validate_layer(const KVCache& cache, std::uint32_t layer) {
     if (layer >= cache.layer_count()) { throw std::out_of_range("KVCache layer out of range"); }
 }
 
-void validate_kv_head(const KVCache& cache, std::int32_t kv_head) {
-    if (kv_head < 0 || kv_head >= cache.num_kv_heads) {
-        throw std::out_of_range("KVCache kv_head out of range");
-    }
-}
-
 std::uint32_t align_up_u32(std::uint32_t value, std::uint32_t alignment) {
     const std::uint64_t mask    = static_cast<std::uint64_t>(alignment) - 1U;
     const std::uint64_t aligned = (static_cast<std::uint64_t>(value) + mask) & ~mask;
@@ -45,49 +39,6 @@ std::int32_t normalize_quant_group(DType dtype, std::int32_t quant_group, std::i
         throw std::invalid_argument("KVCache head_dim must be divisible by quant_group");
     }
     return group;
-}
-
-std::int32_t scale_groups(const KVCache& cache) {
-    if (cache.quant_group <= 0) { return 0; }
-    return cache.head_dim / cache.quant_group;
-}
-
-KVHeadSlot slot_at(const KVCache& cache, std::uint32_t layer, std::uint32_t position,
-                   std::int32_t kv_head) {
-    validate_layer(cache, layer);
-    validate_kv_head(cache, kv_head);
-    if (position >= cache.max_context ||
-        position > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::out_of_range("KVCache position out of range");
-    }
-    const std::int64_t element_offset = static_cast<std::int64_t>(cache.head_dim) *
-                                        (static_cast<std::int64_t>(position) +
-                                         static_cast<std::int64_t>(cache.padded_context) * kv_head);
-    const std::int64_t byte_offset =
-        element_offset * static_cast<std::int64_t>(dtype_size(cache.dtype));
-
-    auto* k_ptr = static_cast<unsigned char*>(cache.k[layer].data) + byte_offset;
-    auto* v_ptr = static_cast<unsigned char*>(cache.v[layer].data) + byte_offset;
-    KVHeadSlot slot{Tensor(k_ptr, cache.dtype, {cache.head_dim}),
-                    Tensor(v_ptr, cache.dtype, {cache.head_dim}),
-                    {},
-                    {}};
-    if (cache.dtype == DType::I8) {
-        const std::int32_t groups = scale_groups(cache);
-        const std::int64_t scale_element_offset =
-            static_cast<std::int64_t>(groups) *
-            (static_cast<std::int64_t>(position) +
-             static_cast<std::int64_t>(cache.padded_context) * kv_head);
-        const std::int64_t scale_byte_offset =
-            scale_element_offset * static_cast<std::int64_t>(dtype_size(DType::FP16));
-        auto* k_scale_ptr =
-            static_cast<unsigned char*>(cache.k_scale[layer].data) + scale_byte_offset;
-        auto* v_scale_ptr =
-            static_cast<unsigned char*>(cache.v_scale[layer].data) + scale_byte_offset;
-        slot.k_scale = Tensor(k_scale_ptr, DType::FP16, {groups});
-        slot.v_scale = Tensor(v_scale_ptr, DType::FP16, {groups});
-    }
-    return slot;
 }
 
 Tensor bind_tensor(DeviceSpan backing, const LayoutRegion& region, DType dtype,
@@ -160,7 +111,7 @@ std::size_t KVCacheLayout::payload_bytes() const noexcept {
 }
 
 KVCache::KVCache(DeviceSpan backing, const KVCacheLayout& layout)
-    : pos(0), max_context(layout.max_context), padded_context(layout.padded_context),
+    : max_context(layout.max_context), padded_context(layout.padded_context),
       num_kv_heads(layout.num_kv_heads), head_dim(layout.head_dim), dtype(layout.dtype),
       quant_group(layout.quant_group) {
     const auto layers = layout.k.size();
@@ -190,26 +141,23 @@ KVCache::KVCache(DeviceSpan backing, const KVCacheLayout& layout)
 
 std::uint32_t KVCache::layer_count() const noexcept { return static_cast<std::uint32_t>(k.size()); }
 
-KVHeadSlot KVCache::slot(std::uint32_t layer, std::uint32_t position, std::int32_t kv_head) const {
-    if (position >= pos) { throw std::out_of_range("KVCache read position has not been written"); }
-    return slot_at(*this, layer, position, kv_head);
+KVCacheLayerView KVCache::layer_view(std::uint32_t layer) const {
+    validate_layer(*this, layer);
+    KVCacheLayerView view{
+        .k              = k[layer],
+        .v              = v[layer],
+        .max_context    = max_context,
+        .padded_context = padded_context,
+        .num_kv_heads   = num_kv_heads,
+        .head_dim       = head_dim,
+        .dtype          = dtype,
+        .quant_group    = quant_group,
+    };
+    if (dtype == DType::I8) {
+        view.k_scale = k_scale[layer];
+        view.v_scale = v_scale[layer];
+    }
+    return view;
 }
-
-KVHeadSlot KVCache::append_slot(std::uint32_t layer, std::int32_t kv_head) const {
-    if (pos >= max_context) { throw std::out_of_range("KVCache append position is full"); }
-    return slot_at(*this, layer, pos, kv_head);
-}
-
-void KVCache::advance() {
-    if (pos >= max_context) { throw std::out_of_range("KVCache position is full"); }
-    ++pos;
-}
-
-void KVCache::rewind(std::uint32_t position) {
-    if (position > pos) { throw std::out_of_range("KVCache rewind cannot move forward"); }
-    pos = position;
-}
-
-void KVCache::reset() noexcept { pos = 0; }
 
 } // namespace ninfer

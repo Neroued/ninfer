@@ -6,83 +6,40 @@ materialization live in the sibling conversion recipe.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from tools.convert.qwen3_6.common.inventory import (
+    BF16,
+    CONTIGUOUS_LAYOUT,
+    DIRECT_FORMATS,
+    FORMAT_NAMES,
+    FP32,
+    I32,
+    LAYOUT_NAMES,
+    LogicalAliasSpec,
+    LogicalRowViewSpec,
+    Q4,
+    Q5,
+    Q6,
+    RESOURCE_ENCODING,
+    RESOURCE_SPECS,
+    ROW_SPLIT_LAYOUT,
+    ResourceSpec,
+    StoredObjectSpec,
+    TensorSpec,
+    VISION_LAYERS,
+    W8,
+    build_vision_specs,
+    tensor_spec,
+)
 
 
 MODEL_ID = "qwen3.6-27b"
 TARGET_KEY = "qwen3_6_27b_rtx5090"
 
-CONTIGUOUS_LAYOUT = "contiguous-le-v1"
-ROW_SPLIT_LAYOUT = "row-split-k128-v1"
-RESOURCE_ENCODING = "raw-bytes-v1"
-
-BF16 = "BF16"
-FP32 = "FP32"
-I32 = "I32"
-Q4 = "Q4G64_F16S"
-Q5 = "Q5G64_F16S"
-Q6 = "Q6G64_F16S"
-W8 = "W8G32_F16S"
-
-DIRECT_FORMATS = frozenset((BF16, FP32, I32))
-FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8)
-LAYOUT_NAMES = (CONTIGUOUS_LAYOUT, ROW_SPLIT_LAYOUT)
-
 FULL_ATTENTION_LAYERS = tuple(range(3, 64, 4))
 GDN_LAYERS = tuple(layer for layer in range(64) if layer not in FULL_ATTENTION_LAYERS)
-VISION_LAYERS = tuple(range(27))
 
 
-@dataclass(frozen=True, slots=True)
-class TensorSpec:
-    name: str
-    shape: tuple[int, ...]
-    format: str
-    layout: str
-
-    @property
-    def kind(self) -> str:
-        return "tensor"
-
-
-@dataclass(frozen=True, slots=True)
-class ResourceSpec:
-    name: str
-    encoding: str = RESOURCE_ENCODING
-
-    @property
-    def kind(self) -> str:
-        return "resource"
-
-
-@dataclass(frozen=True, slots=True)
-class LogicalRowViewSpec:
-    name_pattern: str
-    parent_pattern: str
-    row_begin: int
-    row_end: int
-    shape: tuple[int, int]
-    layers: tuple[int, ...] | None
-
-    @property
-    def row_count(self) -> int:
-        return self.row_end - self.row_begin
-
-
-@dataclass(frozen=True, slots=True)
-class LogicalAliasSpec:
-    role_pattern: str
-    object_patterns: tuple[str, ...]
-    layers: tuple[int, ...] | None = None
-    axis_order: tuple[int, ...] | None = None
-
-
-StoredObjectSpec = TensorSpec | ResourceSpec
-
-
-def _tensor(name: str, shape: tuple[int, ...], numeric_format: str) -> TensorSpec:
-    layout = CONTIGUOUS_LAYOUT if numeric_format in DIRECT_FORMATS else ROW_SPLIT_LAYOUT
-    return TensorSpec(name=name, shape=shape, format=numeric_format, layout=layout)
+_tensor = tensor_spec
 
 
 def _build_text_core_specs() -> tuple[TensorSpec, ...]:
@@ -162,55 +119,8 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
 
 
 def _build_vision_specs() -> tuple[TensorSpec, ...]:
-    specs: list[TensorSpec] = [
-        _tensor("vision/patch_embedding", (1152, 1536), Q6),
-        _tensor("vision/patch_embedding_bias", (1152,), BF16),
-        _tensor("vision/position_embedding", (2304, 1152), BF16),
-    ]
+    return build_vision_specs(5120)
 
-    for layer in VISION_LAYERS:
-        prefix = f"vision/layers/{layer}/"
-        specs.extend(
-            (
-                _tensor(prefix + "attention/qkv", (3456, 1152), Q4),
-                _tensor(prefix + "attention/qkv_bias", (3456,), BF16),
-                _tensor(prefix + "attention/output", (1152, 1152), Q5),
-                _tensor(prefix + "attention/output_bias", (1152,), BF16),
-                _tensor(prefix + "mlp/fc1", (4304, 1152), Q4),
-                _tensor(prefix + "mlp/fc1_bias", (4304,), BF16),
-                _tensor(prefix + "mlp/fc2", (1152, 4304), Q5),
-                _tensor(prefix + "mlp/fc2_bias", (1152,), BF16),
-                _tensor(prefix + "norm1/weight", (1152,), BF16),
-                _tensor(prefix + "norm1/bias", (1152,), BF16),
-                _tensor(prefix + "norm2/weight", (1152,), BF16),
-                _tensor(prefix + "norm2/bias", (1152,), BF16),
-            )
-        )
-
-    specs.extend(
-        (
-            _tensor("vision/merger/fc1", (4608, 4608), W8),
-            _tensor("vision/merger/fc1_bias", (4608,), BF16),
-            _tensor("vision/merger/fc2", (5120, 4608), W8),
-            _tensor("vision/merger/fc2_bias", (5120,), BF16),
-            _tensor("vision/merger/norm/weight", (1152,), BF16),
-            _tensor("vision/merger/norm/bias", (1152,), BF16),
-        )
-    )
-    return tuple(specs)
-
-
-RESOURCE_SPECS = tuple(
-    ResourceSpec(name)
-    for name in (
-        "frontend/tokenizer.json",
-        "frontend/tokenizer_config.json",
-        "frontend/chat_template.jinja",
-        "frontend/generation_config.json",
-        "frontend/preprocessor_config.json",
-        "frontend/video_preprocessor_config.json",
-    )
-)
 
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
 DRAFT_HEAD_TENSOR_SPECS = _build_draft_head_specs()

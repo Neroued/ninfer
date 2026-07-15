@@ -75,6 +75,10 @@ target-private types.
 - [`../tools/artifact/`](../tools/artifact/) — generic `.ninfer` read/write/layout/inspection code;
 - [`../tools/convert/qwen3_6_27b_rtx5090/`](../tools/convert/qwen3_6_27b_rtx5090/) — registered
   converter, inventory, recipe, draft head, and source verifier;
+- [`../tools/convert/qwen3_6/common/`](../tools/convert/qwen3_6/common/) — narrow Qwen3.6-family
+  conversion leaves shared without sibling-target imports;
+- [`../tools/convert/qwen3_6_35b_a3b_rtx5090/`](../tools/convert/qwen3_6_35b_a3b_rtx5090/) — accepted
+  future-target 35B-A3B converter, inventory, recipe, and preflight; not a registered Engine route;
 - [`../tools/reference/qwen3_6_27b_rtx5090/`](../tools/reference/qwen3_6_27b_rtx5090/) — complete
   artifact-native Python Text/Vision/MTP reference;
 - [`../tools/parity/qwen3_6_27b_rtx5090/`](../tools/parity/qwen3_6_27b_rtx5090/) — target-specific

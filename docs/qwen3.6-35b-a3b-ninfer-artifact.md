@@ -1,8 +1,10 @@
 # Qwen3.6-35B-A3B NInfer Artifact Contract and Conversion Recipe
 
 > Status: accepted implementation specification for the future
-> `qwen3_6_35b_a3b_rtx5090` target; no converter, artifact, binder, target package, or Engine route
-> currently implements this contract.
+> `qwen3_6_35b_a3b_rtx5090` target. The target-private converter, inventory, source recipe, and
+> conversion preflight implement this contract and have completed a real end-to-end conversion
+> with the fixed 27B-measured shortlist. No binder, runtime target package, verifier, artifact-native
+> reference model, or Engine route currently exists.
 >
 > Authority: this document defines the complete `.ninfer` persistent-object contract for
 > the exact Qwen3.6-35B-A3B checkpoint and the recipe that converts the selected Hugging Face BF16
@@ -108,8 +110,7 @@ This is token-id compatibility, not frontend-resource or weight identity. The tw
 `248044..248069`, while its `tokenizer_config.json` supplies the remaining seven ids
 `248070..248076`. The checkpoints also have different chat templates and pad-token choices. Their
 untied output heads have shapes `[248320,5120]` and `[248320,2048]`. Section 4.2 therefore retains
-the 35B frontend files, and Section 12.5 gathers draft rows from the 35B head even when a shortlist
-id map is shared or used as a bootstrap.
+the 35B frontend files, and Section 12.5 gathers the shared shortlist rows from the 35B head.
 
 Full-attention layers are exactly:
 
@@ -629,6 +630,29 @@ The selected conversion source is:
 /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
 ```
 
+The implementation is organized without sibling-target dependencies:
+
+```text
+tools/convert/common/
+    artifact-independent safetensors reading and numeric quantization
+
+tools/convert/qwen3_6/common/
+    Qwen3.6 recipe expressions, shortlist mechanics, shared Vision geometry/mapping,
+    frontend resource names, and artifact-writing mechanics
+
+tools/convert/qwen3_6_27b_rtx5090/
+    complete 27B target inventory, source mapping, config, ranking policy, and CLI
+
+tools/convert/qwen3_6_35b_a3b_rtx5090/
+    complete 35B-A3B target inventory, MoE/dense source mapping, config,
+    fixed ranking policy, and CLI
+```
+
+Both exact targets depend inward on the family common leaves; neither target imports the other.
+Family common code has no target identity, complete inventory, layer schedule, MoE precision set,
+or ranking path. Future reference-model work follows the same dependency direction but does not
+introduce a family base model or shared target schedule.
+
 That path is descriptive local provenance, not artifact metadata or a runtime validity condition.
 The converter resolves tensors through `model.safetensors.index.json` and requires these facts
 before emitting any payload:
@@ -684,11 +708,9 @@ Vision = 333
 total = 693 + 19 + 333 = 1045
 ```
 
-Frontend files must exist under their exact names. Before payload emission, the converter parses
-both tokenizer JSON resources, requires 248044 base token ids, 247587 normalized merges, and the 33
-complete `added_tokens_decoder` entries at `248044..248076`, and resolves the 35B pad token to
-`<|endoftext|>` id 248044. The 27B comparison in Section 2 is design evidence, not a converter or
-runtime prerequisite.
+Frontend files must exist under their exact names and are retained byte-for-byte. The exact
+tokenizer and processor semantics in Sections 2 and 4 are accepted checkpoint facts; conversion
+does not add a second defensive parser for resources that the target frontend will consume.
 
 ## 11. Common conversion rules
 
@@ -784,19 +806,19 @@ The source QKV row order is query `[0,2048)`, key `[2048,4096)`, and value `[409
 
 ### 12.5 Draft-head construction
 
-The final 35B draft-head id map is selected from the target-specific ranking fixture:
+The final 35B draft-head id map uses the existing 27B-measured ranking directly:
 
 ```text
-tools/freq_corpus/fixtures/qwen3_6_35b_a3b/ranking.train.counts.i64
+tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64
 ```
 
-That fixture must be produced in `teacher_forced_argmax` mode by the 35B artifact-native full-head
-target route over the registered ranking corpus and carry `ranking.train.manifest.json` in the same
-directory. The measurement uses `text/output_head`, not the draft head, so conversion may first
-build a complete bring-up artifact with the 27B shortlist candidate, measure the 35B target, and
-then regenerate the accepted artifact with the resulting map. This two-pass workflow does not
-create a second product profile. Padded matrix rows `248077..248319` must have zero counts and are
-not selection candidates. Apply the 27B selection algorithm unchanged over ids `0..248076`:
+This is a deliberate target-profile decision. Section 2 establishes that the 27B and 35B
+token-to-id domains are identical, so the measured ranking has exactly the same interpretation for
+both checkpoints. Its existing manifest remains descriptive measurement provenance; the converter
+does not require a separately regenerated 35B ranking.
+
+Padded matrix rows `248077..248319` are not selection candidates. Apply the 27B selection algorithm
+unchanged over ids `0..248076`:
 
 1. form the ascending forced-id set from entries whose complete merged
    `added_tokens_decoder[id].special` is true;
@@ -807,14 +829,10 @@ not selection candidates. Apply the 27B selection algorithm unchanged over ids `
 6. write those ids as I32 in the resulting order; and
 7. gather the same ordered rows from the 35B BF16 `lm_head.weight` before Q4 quantization.
 
-The 27B and 35B semantic vocabularies are identical, and applying the existing 27B fixture to
-either tokenizer produces the same 131072 ids. That map is therefore a valid deterministic
-bootstrap candidate, but its counts were generated from 27B teacher-forced argmax outputs and do
-not establish optimal 35B proposal coverage or MTP acceptance. It may be used for target bring-up,
-but the accepted converter must still generate the target-specific fixture above. The existing map
-is the final 35B map only if that regenerated 35B selection is byte-identical.
+The counts were measured from 27B teacher-forced argmax outputs, and that provenance is retained in
+the ranking manifest and conversion report. It does not change the fixed 35B storage contract.
 
-For every accepted id map, write the I32 ids, gather
+For this fixed id map, write the I32 ids, gather
 `lm_head.weight[selected_ids,:]` from the 35B source as BF16 `[131072,2048]`, and quantize those
 rows Q4. Reusing the 27B `[131072,5120]` draft payload, its full head, its embedding, or any packed
 row bytes is nonconforming. Ranking inputs and reports are conversion provenance; only the accepted
@@ -1181,15 +1199,15 @@ marked implemented only after all of the following exist.
   Section 9;
 - coverage of each of the 1045 unique source tensors with no unused source role; the only
   documented derived reread is `lm_head.weight` for the optimized draft-head gather;
-- exact frontend verification of all 248077 ids after merging the 35B tokenizer resources,
-  including ids `248070..248076`, the 35B pad id, and the retained 35B chat template;
+- retention of the six exact 35B frontend resources and correct native handling of the complete
+  248077-id tokenizer domain, including ids `248070..248076`;
 - exact codec verification for every format and representative expert ids, including half-split
   gate/up and A/B rows, first/last expert boundaries, Q5/Q6 layer assignment, and every plane
   offset, row stride, and expert stride in Section 3.4;
 - representative source probes after every concatenate, transpose, half-split flatten, and
   expert-major flatten;
-- the target-specific 35B ranking fixture and manifest in Section 12.5; if the 27B shortlist is
-  retained, exact byte equality between its I32 map and the independently regenerated 35B map;
+- the fixed Section 12.5 ranking and exact agreement between its selected ids and the stored I32
+  draft-head map;
 - an external conversion report recording checkpoint path, GGUF evidence path, format counts,
   component bytes, and encoder profile without making those values runtime gates.
 

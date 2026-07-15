@@ -1,10 +1,14 @@
-"""Convert the registered Qwen3.6-27B checkpoint into one complete artifact.
+"""Convert Qwen3.6-35B-A3B BF16 weights into its exact NInfer artifact.
 
 Canonical invocation::
 
-    python -m tools.convert.qwen3_6_27b_rtx5090.convert \
-      --model /path/to/Qwen3.6-27B/base-hf-bf16 \
-      --out out/qwen3_6_27b_rtx5090.ninfer
+    python -m tools.convert.qwen3_6_35b_a3b_rtx5090.convert \
+      --model /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16 \
+      --out out/qwen3_6_35b_a3b_rtx5090.ninfer
+
+The target deliberately reuses the measured 27B ranking because both checkpoints
+have the same semantic token-id vocabulary.  Draft rows are always gathered from
+the 35B output head.
 """
 
 from __future__ import annotations
@@ -18,10 +22,7 @@ from typing import Mapping, Sequence
 
 import torch
 
-from tools.artifact.container import (
-    ArtifactObject,
-    ArtifactWriter,
-)
+from tools.artifact.container import ArtifactObject, ArtifactWriter
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
@@ -29,13 +30,16 @@ from tools.convert.qwen3_6.common import conversion as family_conversion
 from . import draft_head, inventory, recipe
 
 
-RECIPE_ID = "qwen3_6_27b_rtx5090-v1"
+RECIPE_ID = "qwen3_6_35b_a3b_rtx5090-v1"
+ENCODER_PROFILE = "MAXABS_F16_RECIP_RNE_V1"
+GGUF_EVIDENCE_PATH = Path(
+    "/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/"
+    "gguf-ud-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+)
 
 _ROOT_CONFIG = {
-    "architectures": ["Qwen3_5ForConditionalGeneration"],
-    "model_type": "qwen3_5",
-    "language_model_only": False,
-    "mtp_num_hidden_layers": 1,
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "model_type": "qwen3_5_moe",
     "tie_word_embeddings": False,
     "vision_start_token_id": 248053,
     "vision_end_token_id": 248054,
@@ -43,43 +47,62 @@ _ROOT_CONFIG = {
     "video_token_id": 248057,
 }
 _TEXT_CONFIG = {
-    "num_hidden_layers": 64,
+    "num_hidden_layers": 40,
     "full_attention_interval": 4,
-    "hidden_size": 5120,
-    "intermediate_size": 17408,
+    "hidden_size": 2048,
     "vocab_size": 248320,
-    "num_attention_heads": 24,
-    "num_key_value_heads": 4,
+    "num_attention_heads": 16,
+    "num_key_value_heads": 2,
     "head_dim": 256,
+    "attn_output_gate": True,
+    "hidden_act": "silu",
     "linear_num_key_heads": 16,
-    "linear_num_value_heads": 48,
+    "linear_num_value_heads": 32,
     "linear_key_head_dim": 128,
     "linear_value_head_dim": 128,
     "linear_conv_kernel_dim": 4,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "moe_intermediate_size": 512,
+    "shared_expert_intermediate_size": 512,
+    "tie_word_embeddings": False,
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "rms_norm_eps": 1e-6,
     "mamba_ssm_dtype": "float32",
     "mtp_num_hidden_layers": 1,
     "mtp_use_dedicated_embeddings": False,
-    "tie_word_embeddings": False,
     "max_position_embeddings": 262144,
-    "rms_norm_eps": 1e-6,
 }
 _ROPE_CONFIG = {
     "rope_theta": 10000000,
     "mrope_section": [11, 11, 10],
+    "mrope_interleaved": True,
+    "partial_rotary_factor": 0.25,
 }
 _VISION_CONFIG = {
     "depth": 27,
     "hidden_size": 1152,
     "intermediate_size": 4304,
-    "out_hidden_size": 5120,
+    "out_hidden_size": 2048,
     "num_heads": 16,
     "in_channels": 3,
     "patch_size": 16,
     "temporal_patch_size": 2,
     "spatial_merge_size": 2,
     "num_position_embeddings": 2304,
+    "hidden_act": "gelu_pytorch_tanh",
+    "deepstack_visual_indexes": [],
 }
 
+EXPECTED_TENSOR_BYTES = 22_360_191_904
+EXPECTED_DEVICE_ARENA_BYTES = 22_360_207_360
+EXPECTED_COMPONENT_BYTES = {
+    "main_text": 21_038_461_952,
+    "draft_head": 143_130_624,
+    "mtp": 897_934_336,
+    "vision": 280_664_992,
+}
 
 ResourcePayload = family_conversion.ResourcePayload
 ObjectPlan = family_conversion.ObjectPlan
@@ -99,43 +122,33 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _load_config(model_dir: Path) -> dict[str, object]:
-    return family_conversion.load_json(model_dir / "config.json")
-
-
-def _check_members(
-    scope: str,
-    actual: Mapping[str, object],
-    expected: Mapping[str, object],
-) -> None:
-    family_conversion.check_members(scope, actual, expected)
-
-
 def validate_config(config: Mapping[str, object]) -> dict[str, object]:
-    """Validate the exact registered checkpoint dimensions and summarize them."""
+    """Validate every checkpoint fact that fixes storage or execution shape."""
 
-    _check_members("config", config, _ROOT_CONFIG)
+    family_conversion.check_members("config", config, _ROOT_CONFIG)
     text = config.get("text_config")
     vision = config.get("vision_config")
     if not isinstance(text, Mapping) or not isinstance(vision, Mapping):
         raise ValueError("config.json must contain text_config and vision_config")
-    _check_members("text_config", text, _TEXT_CONFIG)
+    family_conversion.check_members("text_config", text, _TEXT_CONFIG)
+
     expected_layer_types = tuple(
         "full_attention"
         if layer in inventory.FULL_ATTENTION_LAYERS
         else "linear_attention"
-        for layer in range(64)
+        for layer in range(40)
     )
     layer_types = text.get("layer_types")
     if not isinstance(layer_types, list) or tuple(layer_types) != expected_layer_types:
         raise ValueError(
-            "text_config.layer_types does not match the registered 64-layer schedule"
+            "text_config.layer_types does not match the target 40-layer schedule"
         )
+
     rope = text.get("rope_parameters")
     if not isinstance(rope, Mapping):
         raise ValueError("text_config.rope_parameters is missing")
-    _check_members("text_config.rope_parameters", rope, _ROPE_CONFIG)
-    _check_members("vision_config", vision, _VISION_CONFIG)
+    family_conversion.check_members("text_config.rope_parameters", rope, _ROPE_CONFIG)
+    family_conversion.check_members("vision_config", vision, _VISION_CONFIG)
     return {
         "architecture": config["architectures"][0],
         "model_type": config["model_type"],
@@ -143,12 +156,11 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
         "layer_types": {
             "layers": len(layer_types),
             "full_attention": len(inventory.FULL_ATTENTION_LAYERS),
-            "linear_attention": 64 - len(inventory.FULL_ATTENTION_LAYERS),
+            "linear_attention": len(inventory.GDN_LAYERS),
             "full_attention_layers": list(inventory.FULL_ATTENTION_LAYERS),
         },
         "rope": {name: rope[name] for name in _ROPE_CONFIG},
         "vision": {name: vision[name] for name in _VISION_CONFIG},
-        "mtp_num_hidden_layers": config["mtp_num_hidden_layers"],
         "vision_token_ids": {
             name: config[name]
             for name in (
@@ -162,9 +174,9 @@ def validate_config(config: Mapping[str, object]) -> dict[str, object]:
 
 
 def preflight_inventory() -> None:
-    """Establish the one complete target inventory and recipe pairing."""
+    """Prove the target-private inventory before any payload is written."""
 
-    if (
+    counts = (
         len(inventory.RESOURCE_SPECS),
         len(inventory.TEXT_CORE_TENSOR_SPECS),
         len(inventory.DRAFT_HEAD_TENSOR_SPECS),
@@ -172,8 +184,45 @@ def preflight_inventory() -> None:
         len(inventory.VISION_TENSOR_SPECS),
         len(inventory.TENSOR_SPECS),
         len(inventory.OBJECT_SPECS),
-    ) != (6, 819, 2, 12, 333, 1166, 1172):
-        raise ValueError("registered inventory is incomplete")
+    )
+    if counts != (6, 533, 2, 15, 333, 883, 889):
+        raise ValueError(f"target inventory is incomplete: {counts}")
+    if inventory.FORMAT_COUNTS != {
+        inventory.BF16: 461,
+        inventory.FP32: 60,
+        inventory.I32: 1,
+        inventory.Q4: 95,
+        inventory.Q5: 91,
+        inventory.Q6: 5,
+        inventory.W8: 170,
+    }:
+        raise ValueError(f"target format counts drifted: {inventory.FORMAT_COUNTS}")
+    if inventory.LAYOUT_COUNTS != {
+        inventory.CONTIGUOUS_LAYOUT: 522,
+        inventory.ROW_SPLIT_LAYOUT: 361,
+    }:
+        raise ValueError(f"target layout counts drifted: {inventory.LAYOUT_COUNTS}")
+    if family_conversion.tensor_payload_bytes(inventory.TENSOR_SPECS) != EXPECTED_TENSOR_BYTES:
+        raise ValueError("target tensor payload byte total drifted")
+    if (
+        family_conversion.device_arena_bytes(inventory.TENSOR_SPECS)
+        != EXPECTED_DEVICE_ARENA_BYTES
+    ):
+        raise ValueError("target device-arena byte total drifted")
+    component_bytes = {
+        "main_text": family_conversion.tensor_payload_bytes(
+            inventory.TEXT_CORE_TENSOR_SPECS
+        ),
+        "draft_head": family_conversion.tensor_payload_bytes(
+            inventory.DRAFT_HEAD_TENSOR_SPECS
+        ),
+        "mtp": family_conversion.tensor_payload_bytes(inventory.MTP_TENSOR_SPECS),
+        "vision": family_conversion.tensor_payload_bytes(
+            inventory.VISION_TENSOR_SPECS
+        ),
+    }
+    if component_bytes != EXPECTED_COMPONENT_BYTES:
+        raise ValueError(f"target component byte totals drifted: {component_bytes}")
     recipe.validate_recipe_coverage()
 
 
@@ -182,22 +231,31 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
 
 
 def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
-    """Compute every payload-relative object offset for the full inventory."""
-
     preflight_inventory()
     return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
 
 
 def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
-    """Finish all checkpoint, inventory, shortlist, and offset work before writing."""
+    """Complete config, source, shortlist, and offset work before writing."""
 
     model = Path(model_dir)
-    config_summary = validate_config(_load_config(model))
+    config_summary = validate_config(
+        family_conversion.load_json(model / "config.json")
+    )
     preflight_inventory()
     source = recipe.preflight_sources(model)
+    if (
+        source.recipe_count,
+        source.source_tensor_count,
+        source.source_shard_count,
+        source.source_dtype_counts,
+    ) != (883, 1045, 26, {"BF16": 1045}):
+        raise ValueError(f"checkpoint source inventory drifted: {source}")
+
     resources = load_resources(model)
     resource_map = {resource.name: resource.data for resource in resources}
     object_plan = build_object_plan(resource_map)
+
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
     return ConversionPreflight(
@@ -242,8 +300,6 @@ def encode_tensor_payload(
     spec: inventory.TensorSpec,
     device: str | torch.device,
 ) -> bytes:
-    """Encode one materialized tensor according to its registered signature."""
-
     return family_conversion.encode_tensor_payload(tensor, spec, device)
 
 
@@ -262,9 +318,7 @@ def build_conversion_report(
     revision: str | None = None,
     environment: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Build the external descriptive conversion report."""
-
-    return family_conversion.build_conversion_report(
+    report = family_conversion.build_conversion_report(
         model_id=inventory.MODEL_ID,
         target_key=inventory.TARGET_KEY,
         recipe_id=RECIPE_ID,
@@ -282,6 +336,22 @@ def build_conversion_report(
         revision=revision,
         environment_summary=environment,
     )
+    report["draft_head"] = {
+        "rows": draft_head.DRAFT_HEAD_N,
+        "tokenizer_vocab_size": draft_head.TOKENIZER_VOCAB_SIZE,
+        "ranking_source_target": draft_head.RANKING_SOURCE_TARGET,
+        "shared_semantic_vocabulary": True,
+    }
+    report["source"]["gguf_evidence_path"] = str(GGUF_EVIDENCE_PATH)
+    report["quantization"] = {
+        "encoder_profile": ENCODER_PROFILE,
+        "component_tensor_bytes": {
+            **EXPECTED_COMPONENT_BYTES,
+            "total": EXPECTED_TENSOR_BYTES,
+            "device_arena": EXPECTED_DEVICE_ARENA_BYTES,
+        },
+    }
+    return report
 
 
 def convert(
@@ -290,7 +360,7 @@ def convert(
     *,
     device: str | torch.device = "cuda",
 ) -> Path:
-    """Run the complete registered conversion and return the report path."""
+    """Run the complete target conversion and return its report path."""
 
     started = time.perf_counter()
     model = Path(model_dir)
@@ -301,7 +371,8 @@ def convert(
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
-        f"{preflight.source.source_tensor_count} source tensors, device={resolved_device}",
+        f"{preflight.source.source_tensor_count} source tensors, "
+        f"device={resolved_device}",
         flush=True,
     )
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -1683,10 +1683,11 @@ Its source key uses `<checkpoint_key>_<device_key>`, for example
 at runtime. The package still declares and validates the registered `.ninfer` `model_id`, actual
 device, and complete object signatures through compiled code.
 
-There is no family base directory, `qwen/common`, `BaseTarget`, or shared checkpoint implementation
-created in advance. A later target starts as another complete sibling for binding, frontend,
-Program, schedule, and state policy. Every device transformation it invokes is still classified by
-the Op boundary in Section 18; central Op ownership does not create a shared model schedule.
+There is no runtime or target-package family base directory, `qwen/common`, `BaseTarget`, or shared
+checkpoint implementation created in advance. A later target starts as another complete sibling
+for binding, frontend, Program, schedule, and state policy. Narrow family-common conversion tooling
+does not create a shared runtime schedule. Every device transformation remains classified by the Op
+boundary in Section 18.
 
 ### 19.2 Canonical repository tree
 
@@ -1742,7 +1743,9 @@ apps/
 tools/
 ├── artifact/                            generic .ninfer read/write/layout/inspection machinery
 ├── convert/common/                      generic checkpoint-reading/quantization helpers
+├── convert/qwen3_6/common/               narrow Qwen3.6-family conversion leaves
 ├── convert/qwen3_6_27b_rtx5090/         source mapping and conversion recipe
+├── convert/qwen3_6_35b_a3b_rtx5090/     accepted future-target conversion recipe
 ├── reference/qwen3_6_27b_rtx5090/       artifact-native Text/Vision/MTP Python reference
 ├── parity/qwen3_6_27b_rtx5090/          independent target/reference diagnostics
 ├── qwen3_6_27b_dump/                    C++ target activation dump
@@ -1755,11 +1758,15 @@ bench/                                   public Engine benchmark plus operator m
 tests/                                   component, operator, frontend, target, and product tests
 ```
 
-This structure is implemented for the 27B target. A later target is added as a complete sibling and
-an explicit registry/build entry; it is not pre-created as an empty directory. The top-level roots,
-one-directory-per-exact-target rule, physical `export/` versus `impl/` split, target responsibility
-partitions, package facade choke point, and dependency directions are normative. Files may split or
-merge inside one owner when their invariant and dependencies remain the same.
+The runtime structure is implemented only for the 27B target. Conversion tooling may precede a
+runtime registration when it implements an accepted complete artifact contract, as the 35B-A3B
+converter does; this does not create an Engine target or product route. A later runtime target is
+added as a complete sibling and an explicit registry/build entry, never as an empty placeholder.
+The top-level roots, one-directory-per-exact-target rule, physical `export/` versus `impl/` split,
+target responsibility partitions, package facade choke point, and dependency directions are
+normative. Family common tooling contains only identity-free leaves: exact targets may depend on it,
+but may not import sibling targets. Files may split or merge inside one owner when their invariant
+and dependencies remain the same.
 
 ### 19.3 Inside one target package
 

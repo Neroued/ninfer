@@ -1,850 +1,713 @@
-# Linear Kernel Architecture Refactor
+# Linear Kernel Architecture
 
-> Status: accepted design; implementation pending.
+> Status: recommended architecture and accepted atomic implementation plan. The current dirty
+> worktree is an evidence-producing prototype, not the product implementation baseline. It will be
+> preserved for provenance, while the product cut-over is reimplemented from the last clean code
+> baseline and integrated only as one complete architecture state. Per-policy roofline optimization
+> follows that ownership cut-over.
 >
-> Date: 2026-07-16.
+> Scope: the registered `qwen3_6_27b_rtx5090` target. Future Qwen3.6-35B shapes are used only to
+> test the design pressure; this document does not register 35B support.
 >
-> Scope: repository-internal implementation architecture for the pure `Linear` operation
-> `Y = W X`. This plan is independent of any one future target adaptation. It replaces the current
-> incremental organization of Linear kernels with a coherent, extensible, zero-overhead kernel
-> system while retaining finite registration and exact-target performance qualification.
->
-> Authority boundary: [`../op-development.md`](../op-development.md) and
-> [`../../include/ninfer/ops/linear.h`](../../include/ninfer/ops/linear.h) remain authoritative for
-> Op ownership and mathematical semantics. This document is the implementation authority for the
-> active Linear refactor. It does not change persistent numeric formats, storage layouts, target
-> registration, or the public Engine API.
+> Evidence: the complete commands, rejected prototypes, measurements, profiler reports, and
+> qualification limits are kept in the companion
+> [experiment report](2026-07-16-linear-kernel-architecture-experiment-log.md). They are evidence
+> for this design, not part of the design itself.
 
-## 1. Decision
+## 1. Architecture decision
 
-NInfer will refactor `src/ops/linear/` into a small compile-time kernel system built from:
-
-1. physical weight-format and layout definitions;
-2. path-specific weight decode atoms;
-3. a small number of execution mainloops;
-4. schedule, tile, pipeline, and epilogue policies;
-5. explicitly instantiated and finitely dispatched production policies.
-
-The desired result is not one universal Linear kernel. It is:
+NInfer Linear is a finite, target-optimized execution system, not a general GEMM framework. Its
+execution chain is:
 
 ```text
-few stable mainloops
-  x few registered storage/decode families
-  x few measured schedule policies
-  x explicit production instances
+target package statically binds TargetLinearProfile + compatible KernelCatalog
+  -> target schedule
+  -> semantic Op contract
+  -> exact physical-problem admission
+  -> Op-local planner
+  -> one named execution policy
+  -> one fixed launcher
+  -> one complete-lifecycle kernel or explicit materialized composition
 ```
 
-The system must accumulate useful implementation knowledge. Adding a numerical shape should
-normally add or select a policy instance rather than copy a complete kernel. Adding a weight format
-that belongs to an existing packing family should normally add format/decode behavior rather than
-duplicate GEMV and GEMM mainloops. Adding a future activation representation or compute mode should
-not require redefining the weight format.
+The corresponding implementation boundary is:
 
-The refactor accepts substantial source movement and kernel rewrites. It does not accept a
-performance regression merely to make source code appear uniform. An exact specialization remains
-valid when its measured dataflow genuinely differs; it must be expressed as a policy or explicit
-custom implementation behind the same plan and ownership seams.
+```text
+Semantic Op
+  owns mathematics, rounding, aliasing, and workspace semantics
 
-## 2. Why the refactor is now justified
+Target profile
+  owns exact checkpoint/GPU problems and their measured semantic-Op routes
 
-The original Linear implementation was built while there was insufficient kernel evidence to know
-which abstractions were real. The repository now contains enough independent implementations and
-measurements to identify stable similarities and necessary differences:
+Op planner and kernel catalog
+  own resolution mechanics, policy capabilities, workspace semantics, and fixed launch closure
 
-- Q4G64, Q5G64, and Q6G64 share a low-nibble plane, optional split high-bit plane, FP16 group
-  scales, signed reconstruction, and the same logical G64 row-split traversal;
-- W8G32 uses a simpler signed-byte code plane but a different group size, scale cadence, vector
-  mapping, and resource balance;
-- dense BF16 and FP32 weights need no packed-weight decode but still participate in the same
-  scheduling and output semantics;
-- single-token GEMV, bundled Small-T work, and tiled Large-T GEMM have materially different
-  accumulator, launch-coverage, and data-reuse requirements;
-- the current Q4/Q5/Q6 Large-T implementation already proves a shared codec-parameterized MMA
-  mainloop;
-- the current Small-T implementation already proves a shared format-parameterized streaming
-  mainloop;
-- the current W8 Large-T work proves that a common mathematical pipeline does not imply a common
-  optimal warp-role schedule;
-- the current T1 kernels expose the maintenance cost of encoding caller roles and exact shapes in
-  whole source files rather than composing a smaller set of schedule policies.
+Execution policy
+  names the complete schedule and its fixed launcher
 
-This is the point at which further copy-based specialization would create avoidable fragmentation,
-while an earlier attempt at the same design would have been speculative.
+Kernel lifecycle family
+  owns staging, synchronization, warp roles, accumulation, and reduction
 
-## 3. Goals
+Closed device primitives
+  provide encoding, path-specific decode, MMA, indexing, and finalization atoms
+```
 
-### 3.1 Primary goals
+Five invariants define the architecture:
 
-- Give every pure Linear implementation the same internal vocabulary and dispatch boundary.
-- Separate physical weight representation from activation representation and compute mode.
-- Express Q4/Q5/Q6 as one split-low4 storage family with compile-time bit width.
-- Reuse stable T1, Small-T, and Large-T mainloops across compatible formats and shapes.
-- Preserve a direct path for format- or shape-specific scheduling where measurements require it.
-- Make current A16 execution explicit without hard-wiring A16 into the weight codec.
-- Leave a clean architectural extension point for a future A8 compute mode without adding unused
-  A8 implementation now.
-- Allow semantically different fused Ops to reuse Linear implementation components later without
-  changing the base `linear()` contract.
-- Replace caller-role naming with operation-structural names and predicates.
-- Keep registration finite, allocation-free, graph-capture friendly, and specialized to compiled
-  targets.
+1. A quantized call is legal only when its effective physical weight view is explicitly
+   registered by the active target profile. There is no arbitrary-shape fallback or cross-target
+   shape union.
+2. The semantic Op planner is the only routing authority. After planning, no launcher performs a
+   second format, tile, or schedule selection.
+3. A policy is a named whole execution bundle, not a runtime or compile-time Cartesian product of
+   independently selectable format, tile, pipeline, and epilogue axes.
+4. A reusable mainloop ends where producer lifetime, synchronization, warp ownership, or final
+   reduction ownership changes. Reuse below that boundary is deliberately narrow.
+5. Fusion is an Op semantic and policy decision. A typed finalizer is extensible, but there is no
+   arbitrary runtime epilogue mechanism.
 
-### 3.2 What successful extension looks like
+This model keeps exact specializations first-class. Generality is useful only when it preserves
+the generated kernel and the measured winner.
 
-After the refactor:
+## 2. Contracts and ownership
 
-| Change | Expected implementation surface |
-|---|---|
-| New `(N,K)` using an existing format and regime | add/select a named policy instance and plan predicate |
-| New bit width compatible with split-low4 packing | add/instantiate format traits and decode atoms; reuse compatible mainloops |
-| New row-split byte format | add a format family and its path-specific decode; reuse schedules where measured appropriate |
-| New Large-T tile | add a tile/pipeline policy, not a copied mathematical kernel |
-| New T1 ownership strategy | add a schedule policy, not a new format implementation |
-| New A8 path | add an activation format and compute mode, plus required mainloop/policies; do not redefine W4 storage |
-| New fused semantic Op | add its own Op contract/wrapper and an exact epilogue/output policy over reusable Linear internals |
+### 2.1 Semantic Ops are the public implementation units
 
-## 4. Non-goals
+Base Linear, LinearAdd, LinearSwiGLU, `linear_pair`, grouped projection, and GDN projection are
+different semantic Ops. They can share kernels or primitives, but they do not share route
+economics or workspace contracts merely because they contain a contraction.
 
-This refactor will not create:
-
-- a general-purpose BLAS, CUTLASS replacement, or externally consumable GEMM library;
-- a runtime-pluggable kernel registry;
-- virtual kernel, codec, schedule, or epilogue interfaces;
-- a graph IR, generic model graph, target discovery mechanism, or string-driven dispatch;
-- an unconstrained template Cartesian product of every format, activation, tile, schedule, and
-  epilogue;
-- a promise that one kernel performs well for arbitrary dimensions;
-- hidden runtime weight repacking or a second persistent weight copy;
-- a requirement that all formats use identical warp roles or shared-memory allocation;
-- placeholder A8 code, speculative scale semantics, or an unqualified W4A8 product path;
-- fused-Op semantic changes disguised as an internal Linear refactor;
-- source or API compatibility with obsolete repository-internal Linear implementation names.
-
-Generic correctness is not production support. A domain is supported only when an exact selected
-policy has the required numerical and RTX 5090 performance evidence.
-
-## 5. Locked semantic and storage invariants
-
-The base Op remains:
+The base contract remains conceptually:
 
 ```text
 x   : contiguous BF16 [K,T]
-w   : registered logical weight [N,K]
+w   : bound weight with logical shape [N,K]
 out : contiguous BF16 [N,T]
 
 out[n,t] = BF16(sum_k dequantize(w)[n,k] * float(x[k,t]))
 ```
 
-The following invariants remain locked throughout the refactor:
+Each fused Op additionally owns its exact BF16/FP32 rounding sequence. This matters because
+`Linear -> BF16 -> Add`, the two independently rounded SwiGLU projections, and a dual-output pair
+are not interchangeable with an arbitrary function applied to an FP32 accumulator.
 
-1. `linear()` owns only the pure matrix projection and final BF16 output boundary.
-2. Weight logical semantics come from `ninfer-tensor-formats.md`; byte addressing comes from
-   `ninfer-storage-layouts.md` and the bound `Weight` metadata.
-3. The kernel consumes device-resident weight planes directly. It does not allocate or repack
-   persistent data.
-4. Accumulation grouping may differ by selected backend as already allowed by the Op contract.
-5. Runtime targets and caller tensor names do not participate in Op dispatch.
-6. Shape and layout assumptions are selected explicitly by the wrapper/plan and encoded in the
-   policy instance.
-7. The caller-owned workspace remains an implementation resource, not semantic state.
+The target package owns its immutable checkpoint/GPU profile: exact views, reachable token domain,
+and measured route selection for each semantic Op. The target schedule owns which calls are made,
+CUDA Graph lifetime, and arena reservation. The Op implementation owns the executable policy
+catalog and semantic workspace rules. Target code must not communicate policy through layer names,
+caller roles, or tensor names.
 
-## 6. Architectural axes
+### 2.2 Admission, reachability, and qualification are separate
 
-The internal design treats the following as separate axes:
+The design distinguishes three facts:
 
-```text
-LinearProblem
-├── WeightFormat       logical numeric reconstruction and plane geometry
-├── WeightLayout       physical addressing and tile traversal
-├── ActivationOperand  BF16 execution operand today; an explicitly scaled A8 operand may exist later
-├── ComputeMode        operand conversion, MMA/FMA atom, accumulator, scale composition
-├── Mainloop           T1 GEMV / Small-T / Large-T GEMM
-├── Schedule           warp/CTA ownership, split-K, tile raster, reduction
-├── Pipeline           movement, staging, synchronization, producer/consumer roles
-└── Epilogue           exact output mapping and rounding boundary
-```
+- **admission:** an exact physical problem is legal for an Op;
+- **reachability:** a target schedule can call that problem at a particular `T`;
+- **qualification:** a specific policy at that problem and `T` has correctness and performance
+  evidence.
 
-Not every axis becomes a runtime enum. Most are compile-time members of a named production policy.
-The host plan key contains only facts needed to choose among the explicitly instantiated policies.
+Conflating them either admits unused shapes or makes kernel planning depend on target call-site
+knowledge. Current 27B admission is an exact finite inventory in one statically selected target
+profile. Reachability remains target-owned, and qualification remains an evidence record attached
+to policy points.
 
-`ActivationOperand` describes the representation consumed by the selected execution mainloop; it
-does not silently widen the public Op input contract. The current source tensor remains BF16. A
-future A8 policy under the same Linear semantics would have to define where BF16 is quantized and
-where its scales live. Accepting an already-quantized input tensor would require an explicit
-semantic/internal Op contract rather than reinterpretation by this dispatcher.
+## 3. Problem and planning model
 
-### 6.1 Why the separation matters
+### 3.1 Closed physical identity
 
-Q5G64 does not imply a particular GEMV schedule. It describes how Q5 values and scales are stored
-and reconstructed. A T1 row-warp kernel, T1 split-K kernel, Small-T bundled kernel, and Large-T MMA
-kernel may all consume Q5G64 through different optimized decode atoms.
-
-Likewise, W4A16 and a possible W4A8 path may share weight storage but differ in activation storage,
-MMA atom, accumulator dtype, scale application, and tile alignment. Those differences belong to
-activation and compute mode, not to the W4 weight-format definition.
-
-## 7. Host-side problem and plan model
-
-### 7.1 `LinearProblem`
-
-The wrapper constructs a small non-owning internal problem view after semantic validation. Its
-conceptual fields are:
+The planning identity is conceptually:
 
 ```cpp
-struct LinearProblem {
-    Tensor x;
-    const Weight* weight;
-    Tensor out;
-    std::int32_t n;
-    std::int32_t k;
-    std::int32_t t;
-    std::int32_t padded_k;
+enum class EncodingId {
+    Q4G64RowSplitF16Scale,
+    Q5G64RowSplitF16Scale,
+    Q6G64RowSplitF16Scale,
+    W8G32RowSplitF16Scale,
+    DenseBF16,
+    DenseFP32,
+};
+
+struct PhysicalProblem {
+    EncodingId encoding;
+    int32_t n;
+    int32_t k;
+    int32_t padded_k;
 };
 ```
 
-The exact C++ representation may avoid copying `Tensor`, but it must contain only already-validated
-execution facts. It does not contain a target key, tensor role, layer index, or source tensor name.
+`EncodingId` is closed. Numeric traits and physical plane-layout traits may be separate compile-time
+implementation details, but they are not independent runtime axes and arbitrary pairings do not
+create new legal formats.
 
-### 7.2 Plan key
+Admission uses the effective bound view, not its parent tensor identity. Alignment and required
+planes are validated before planning. Current quantized product calls must bind their registered
+views directly; kernels do not repack weights or allocate memory.
 
-The new plan key is structural:
+### 3.2 Kernel catalog and target profile are separate authorities
+
+The Op-side catalog is a closed executable vocabulary. Conceptually, each typed policy descriptor
+contains:
 
 ```cpp
-struct LinearPlanKey {
-    LinearFormat format;   // registered qtype + physical layout class
-    std::int32_t n;
-    std::int32_t k;
-    std::int32_t t;
+struct PolicyDescriptor {
+    PolicyId id;
+    HardwareId hardware;
+    LifecycleId lifecycle;
+    CapabilitySignature capabilities;
+    // Fixed launch closure and semantic workspace traits are statically associated with id.
 };
 ```
 
-Plan resolution derives `T1 / SmallT / LargeT` from `t` and the measured candidates for the exact
-format and shape. Keeping exact `t` in the key also permits a selected `T=2..6` direct policy or a
-different Small-T token tile without hiding a second dispatch inside the launcher. The key does not
-use caller-role `ShapeFamily` values such as `MtpFc`, `AttnIn`, or `GdnQK`. Benchmark labels may
-retain descriptive call-site context, but it has no behavioral role.
+This is not a runtime registry or function-pointer table. It may compile to traits and exhaustive
+switches. Its purpose is to prove that a `PolicyId` is compatible with the selected hardware,
+encoding, lifecycle topology, finalization form, and fixed launcher.
 
-An exact shape may receive a named structural policy such as `W8A16N5120K10240LargeT`; the policy
-name states format, compute mode, numerical shape, and regime rather than model use.
-
-### 7.3 Plan resolution
-
-Plan resolution remains direct and finite:
-
-```text
-validated problem
-  -> classify registered format/layout
-  -> classify T regime using measured format/shape crossover
-  -> exact structural policy predicates
-  -> finite LinearPolicyId
-  -> switch to one explicit launcher
-```
-
-There is no dynamic registration or device function-pointer table. The plan implementation may use
-compact `constexpr` metadata for matching, followed by a `switch` over `LinearPolicyId`.
-
-Regime crossover is a measured property of `(format,N,K,schedule candidates)`, not a universal
-statement that GEMM is compute-bound. An MMA policy may win before the mathematical contraction
-crosses the compute roofline. Conversely, a small or tail-heavy GEMM may remain memory-, launch-,
-or dequantization-bound well into the Large-T range.
-
-## 8. Weight formats and layouts
-
-### 8.1 Responsibilities
-
-A weight-format definition owns only:
-
-- logical group width;
-- code/high/scale plane geometry;
-- code interpretation and sign reconstruction;
-- scale dtype and logical application;
-- compile-time constants needed by tile loaders and decode atoms.
-
-A weight-layout definition owns only:
-
-- plane address calculation;
-- row/group/tile strides;
-- alignment and padding interpretation;
-- the mapping from a logical tile to physical byte ranges.
-
-Neither owns warp assignment, token tiling, reduction, MMA fragments, or the output epilogue.
-
-### 8.2 Split-low4 family: Q4G64, Q5G64, Q6G64
-
-Q4G64, Q5G64, and Q6G64 become instantiations of one compile-time format family:
+The target-side profile is immutable constexpr data selected by the target package:
 
 ```cpp
-template <int Bits, int GroupK>
-struct SplitLow4WeightFormat;
+struct Route {
+    TokenRange tokens;       // closed, contiguous interval
+    PolicyId policy;         // final policy, not a hint
+};
 
-using Q4G64 = SplitLow4WeightFormat<4, 64>;
-using Q5G64 = SplitLow4WeightFormat<5, 64>;
-using Q6G64 = SplitLow4WeightFormat<6, 64>;
-```
+struct TargetOpProfile {
+    PhysicalProblem problem;
+    span<const Route> routes;
+};
 
-For one group of 64 values:
-
-| Format | low plane | high plane | FP16 scale |
-|---|---:|---:|---:|
-| Q4G64 | 32 B | 0 B | 2 B |
-| Q5G64 | 32 B | 8 B | 2 B |
-| Q6G64 | 32 B | 16 B | 2 B |
-
-For bit width `B`, logical reconstruction is:
-
-```text
-u = low4 | (high << 4)
-q = (u xor 2^(B-1)) - 2^(B-1)
-w = float(q) * float(fp16_scale)
-```
-
-The format family derives high bits per value, high bytes per group, sign bit, bias constants, and
-plane-presence decisions at compile time. Hot decode atoms may use format-specific instruction
-sequences, including the existing FP16 mantissa construction, but those specializations live under
-the common format family rather than in complete caller-specific kernels.
-
-### 8.3 Signed-byte family: W8G32
-
-W8G32 is a separate storage family:
-
-```cpp
-template <int GroupK>
-struct SignedByteWeightFormat;
-
-using W8G32 = SignedByteWeightFormat<32>;
-```
-
-Each group stores 32 signed bytes and one FP16 scale. It shares the format/decode vocabulary but
-does not pretend to have a split-low4 high plane. Its different group cadence and half-warp decode
-mapping remain visible to policy selection.
-
-### 8.4 Dense formats
-
-Dense BF16 and FP32 weight formats use contiguous row-major values and no group scale:
-
-```cpp
-struct DenseBf16WeightFormat;
-struct DenseFp32WeightFormat;
-```
-
-They participate in the same `LinearProblem`, plan, schedule, compute-mode, and epilogue model.
-They do not execute no-op quantization branches inside a low-bit codec.
-
-### 8.5 Path-specific decode atoms
-
-There is deliberately no requirement that every format expose one universal `decode()` method.
-Each mainloop consumes an interface suited to its dataflow:
-
-```text
-SIMT T1       -> decode the lane-owned pair/vector to FP32 accumulable values
-SIMT Small-T  -> decode a staged vector once and reuse it across token accumulators
-BF16 MMA      -> decode a raw tile to a swizzled BF16 shared-memory operand
-future A8     -> unpack/convert into that compute mode's integer operand representation
-```
-
-The implementation should express these as narrow compile-time adapters such as
-`SimtWeightDecode<Format>` and `Bf16MmaWeightDecode<Format>`. A format can specialize an adapter
-when its optimal instruction sequence differs. Mainloops do not duplicate bit reconstruction or
-plane geometry.
-
-## 9. Activation formats and compute modes
-
-### 9.1 Current A16 modes
-
-Current production Linear policies use BF16 activations and one of two compute modes:
-
-```text
-SimtA16F32:
-  packed/dense weight -> FP32 value
-  BF16 activation     -> FP32 value
-  FP32 FMA/reduction  -> BF16 epilogue
-
-MmaA16F32:
-  packed/dense weight -> BF16 MMA operand
-  BF16 activation     -> BF16 MMA operand
-  BF16 mma.sync       -> FP32 accumulator -> BF16 epilogue
-```
-
-The weight format does not mention A16. A named policy combines a weight format with one of these
-compute modes.
-
-### 9.2 Future A8 boundary
-
-A future W4A8 implementation is a new activation and compute-mode design, not another W4 codec
-method. It may require:
-
-- an explicit INT8 activation representation and scale contract;
-- a defined BF16-to-INT8 preparation boundary if the public source tensor remains BF16;
-- integer MMA and INT32 accumulation;
-- weight-scale and activation-scale composition at a defined granularity;
-- a different K tile and operand layout;
-- a separately registered persistent weight layout if native MMA cannot efficiently consume the
-  current row-split layout.
-
-No such choices are made by this plan. The only locked requirement is that current interfaces do
-not bind W4 storage to one execution operand representation. The existing `linear()` input remains
-BF16 unless its semantic contract is deliberately revised. A future implementation must add exact
-preparation, scale, workspace, and output semantics rather than activate dormant placeholders.
-
-## 10. Mainloop families
-
-The refactor defines three primary execution mainloops for quantized A16 Linear and one dense
-route. They share format, layout, policy, and epilogue vocabulary but retain materially different
-dataflows.
-
-### 10.1 T1 GEMV mainloop
-
-The T1 mainloop is bandwidth- and launch-coverage oriented:
-
-```text
-stream packed/dense weight
-  -> decode lane-owned values to FP32
-  -> multiply the reused BF16 activation vector
-  -> accumulate/reduce in FP32
-  -> epilogue one output column
-```
-
-Schedule policies include, when instantiated and measured:
-
-- `WarpPerRow`: one warp owns one complete output row;
-- `RowsPerWarp`: one warp owns several small-K rows when instruction balance permits;
-- `SplitKPerRow<Warps>`: several warps own K partitions of one row and reduce partials;
-- `RowStripe<Rows,KSplits>`: a CTA cooperatively loads a physical row stripe and computes several
-  rows;
-- `DualWeight`: two equal-shape weights reuse the same activation traversal while retaining
-  independent accumulators and outputs.
-
-These are schedule policies, not format names. Q4, Q5, Q6, and W8 may select different schedules
-for the same `(N,K)` because packed bytes, decode instruction count, launch waves, and scale traffic
-differ.
-
-A fully custom T1 policy remains possible for an exceptional domain, but it must reuse common
-format/layout semantics where applicable and be selected as an explicit structural policy.
-
-### 10.2 Small-T mainloop
-
-The Small-T mainloop streams one weight tile and updates a compile-time token tile:
-
-```text
-load/stage packed weight once
-  -> decode once
-  -> update Ttile independent FP32 accumulators
-  -> reduce and store valid columns
-```
-
-It remains separate from T1 because token-vector registers, activation access, column predicates,
-and the useful weight-reuse/occupancy tradeoff are different. T1 and Small-T may share decode and
-warp-reduction primitives without sharing one branch-heavy kernel.
-
-Named policies choose a small set of token tiles, initially preserving the measured `Ttile=4/8`
-design and any exact `T=2..6` direct instances that remain beneficial. Larger token tiles are not
-generated unless their register and occupancy behavior is measured to win.
-
-### 10.3 Quantized-to-BF16 Large-T MMA mainloop
-
-The Large-T A16 mainloop has a common logical CTA lifecycle:
-
-```text
-raw weight planes --WeightProducer--> swizzled BF16 As
-BF16 x            --ActivationProducer--> swizzled BF16 Bs
-As, Bs            --Bf16MmaConsumer--> FP32 accumulator tile
-accumulator       --Epilogue--> output
-```
-
-The common machinery owns:
-
-- CTA/warp tile coordinates;
-- stage lifecycle and synchronization contract;
-- shared-memory operand descriptors and swizzle vocabulary;
-- `ldmatrix` and `mma.sync.m16n8k16` fragment mapping;
-- accumulator traversal;
-- full-tile versus edge-tile output mapping;
-- epilogue invocation.
-
-The weight producer owns:
-
-- raw plane copies for its format/layout;
-- scale staging/cache policy;
-- dequantization work distribution;
-- conversion into the BF16 shared operand;
-- format-dependent shared-memory resources.
-
-This structure allows Q4/Q5/Q6 to share one split-low4 producer family, W8 to use its signed-byte
-producer, and dense BF16 to use a direct producer. It does not require them to allocate unused
-planes or use identical warp ownership.
-
-### 10.4 Dense mainloops
-
-Dense T1 uses a dedicated dense GEMV mainloop because it has no packed decode. Dense Large-T uses
-the common BF16 MMA consumer with a direct BF16 producer where beneficial. Dense FP32 may use a
-separate SIMT or conversion policy according to its exact supported domains.
-
-The current generic dense CUDA implementation remains a numerical reference until exact dense
-production policies replace it. It is not considered high-performance support.
-
-## 11. Schedule, tile, and pipeline policies
-
-### 11.1 Policy bundling
-
-Kernel entry points take one named policy rather than exposing a long arbitrary template argument
-list at every call site:
-
-```cpp
-template <class Policy>
-__global__ void linear_kernel(...);
-
-struct Q5A16N5120K17408T1Policy {
-    using WeightFormat = SplitLow4WeightFormat<5, 64>;
-    using WeightLayout = RowSplitK128Layout;
-    using ComputeMode  = SimtA16F32;
-    using Mainloop     = T1GemvMainloop;
-    using Schedule     = /* measured structural schedule */;
-    using Epilogue     = StoreBf16;
+struct TargetLinearProfile {
+    HardwareId hardware;
+    span<const TargetOpProfile> linear;
+    span<const TargetAddProfile> add;
+    span<const TargetSwiGluProfile> swiglu;
+    span<const TargetPairProfile> pair;
 };
 ```
 
-The exact class names may be shortened in implementation, but production policy identity must make
-format, compute mode, numerical domain, and regime discoverable without encoding a model role.
+Base, Add, SwiGLU, and pair use typed profile records rather than one universal runtime schema.
+The schematic structure above only shows the ownership relationship.
 
-Policy definitions provide compile-time resource and validity assertions:
+This separation is necessary even while only one product target exists. A future checkpoint can
+reuse a kernel catalog without adding its shapes to the current target, and two GPUs can choose
+different policies for the same physical problem. The target package statically passes its profile
+to the Op planner, either directly or through a small target-owned execution context. There is no
+string lookup, dynamic registration, or global “all known shapes” table.
 
-- tile divisibility and edge behavior;
-- format group and BK compatibility;
-- vector alignment;
-- shared-memory footprint;
-- thread/warp count;
-- accumulator and fragment mapping;
-- pipeline stage count;
-- supported output topology.
+### 3.3 One admitted problem, one complete route description
 
-### 11.2 No combinatorial registry
-
-Reusable templates may technically accept many combinations, but only named, explicitly
-instantiated policies enter the production binary. Build files enumerate those instance TUs.
-Unsupported combinations do not acquire a runtime entry merely because their templates compile.
-
-### 11.3 Warp specialization
-
-Warp specialization is a pipeline policy, not the Linear architecture itself.
-
-The current SM120 production default remains the measured cooperative pipeline in which the same
-warps participate in movement/dequantization and MMA phases. A future policy may assign dedicated
-TMA/copy/dequant producers and MMA consumers when a specific Large-T domain shows remaining
-producer/consumer overlap headroom.
-
-The W8 Large-T evidence is binding: the attempted `4 producer + 8 consumer` organization lost to
-the final eight-warp cooperative implementation. The new architecture must be capable of
-representing both, but it must not replace the winning cooperative policy with warp specialization
-for stylistic uniformity.
-
-Likewise, T1 and Small-T kernels do not adopt producer/consumer warp specialization by default.
-Their primary constraints are weight bandwidth, packed decode, register count, and launch
-coverage. A schedule is selected from measured dataflow, not architecture fashion.
-
-### 11.4 Persistent scheduling and TMA
-
-Persistent tile scheduling, TMA tensor maps, ping-pong consumers, and cooperative consumers are
-valid future pipeline policies. They are introduced only for an exact domain whose benchmark and
-NCU evidence identifies the problem solved by that machinery. They are not prerequisites for this
-refactor and do not enter the initial policy set as unused abstractions.
-
-## 12. Epilogue boundary
-
-The base Linear refactor initially implements exactly one epilogue:
+Each admitted target problem owns one explicit semantic-Op route profile:
 
 ```cpp
-struct StoreBf16;
+TargetOpProfile{physical_problem, complete_route_span}
 ```
 
-It maps accumulator fragment elements to contiguous `[N,T]` output and applies the selected
-backend's BF16 output boundary.
+The concrete code may store compact crossover facts and derive the route span, but every new
+problem must provide a complete profile. There are no format-wide default thresholds from which a
+new shape can silently inherit a route.
 
-The epilogue interface exists because the accumulator traversal and output mapping should not be
-copied into every mainloop, and because semantically closed Ops may later reuse the same internal
-mainloop. That future reuse does not merge Op contracts:
+Joint target-profile/catalog validation proves:
 
-- `LinearAdd` remains a separate Op with its exact residual rounding/order contract;
-- `LinearSwiGLU` remains a separate Op with split and activation semantics;
-- multi-output projection Ops retain their declared output views;
-- expert-grouped Linear remains private to its closed sparse Op schedule.
+- exactly one admission row exists;
+- token intervals are ordered, contiguous, and non-overlapping over the legal envelope;
+- every route names a policy owned by that semantic Op and compatible with the target hardware;
+- every named policy's lifecycle supports its encoding, topology, and finalization form;
+- every named policy has a fixed launch closure.
 
-Those Ops may instantiate a shared mainloop with an exact compile-time epilogue only when the full
-semantic operation and numerical boundary are preserved. They do not add an epilogue runtime axis
-to `linear()`.
+The planner returns a final execution plan:
 
-## 13. Source organization
+```cpp
+struct ExecutionPlan {
+    PolicyId policy;
+    WorkspacePlan workspace;
+};
+```
 
-The intended source tree is:
+The generic Op planner resolves a typed target profile and then obtains semantic workspace facts
+from the selected catalog policy. `WorkspacePlan` is part of the same route decision. Exact
+scratch is used for one launch; range-capacity scratch is the maximum of every route reachable
+within the reserved token range. This preserves stable CUDA Graph addresses even when the fastest
+policy is non-monotonic in `T`.
+
+### 3.4 Why finite tables are the right abstraction
+
+The supported target set is intentionally small, while the best schedule depends on geometry,
+tile waves, tails, encoding, and semantic topology. A global heuristic compresses the code but
+does not compress the real decision surface; it merely hides it.
+
+A finite target profile gives:
+
+- exact product scope and fail-closed behavior;
+- reviewable, reproducible routing;
+- local extension for a new measured shape;
+- no runtime autotuning or caller-role heuristics;
+- freedom to retain an exact kernel when it wins;
+- no accidental admission or route sharing between checkpoint/GPU targets.
+
+The number of route rows is data complexity, not device-code complexity. Only named, reachable
+policies are instantiated.
+
+## 4. Execution policies and kernel lifecycle families
+
+### 4.1 Policy is the optimization unit
+
+A production policy names the complete measured bundle:
 
 ```text
-src/ops/linear/
-├── linear.cpp                         # validation + finite policy dispatch
-├── problem.h                          # small validated internal problem values
-├── format/
-│   ├── split_low4.cuh                 # Q4/Q5/Q6 storage traits and reconstruction
-│   ├── signed_byte.cuh                # W8 storage traits and reconstruction
-│   ├── dense.cuh                      # dense BF16/FP32 traits
-│   └── rowsplit_layout.cuh            # registered row-split addressing
-├── core/
-│   ├── epilogue.cuh                   # StoreBf16 and later exact internal epilogues
-│   ├── fragments.cuh                  # Linear-local fragment traversal
-│   ├── pipeline.cuh                   # Linear-local stage/pipeline policies
-│   └── tile.cuh                       # tile/resource configuration values
-├── gemv/
-│   ├── t1_mainloop.cuh
-│   ├── smallt_mainloop.cuh
-│   ├── schedules.cuh
-│   └── instances/                     # explicit T1/Small-T production instances
-├── gemm/
-│   ├── bf16_mma_mainloop.cuh
-│   ├── producers.cuh                  # split-low4, W8, and dense BF16 producers
-│   ├── schedules.cuh
-│   └── instances/                     # explicit Large-T production instances
-├── plan/
-│   ├── linear_plan.h
-│   └── linear_plan.cpp
-└── reference/
-    ├── linear_reference.h
-    └── linear_reference_dense.cu
+encoding and geometry constraints
++ token/CTA ownership
++ CTA and warp topology
++ tile shape
++ producer and pipeline lifecycle
++ accumulator topology
++ finalization scope
++ fixed launcher
 ```
 
-Names may be adjusted during implementation to avoid empty or one-use files, but responsibilities
-and dependency direction are fixed:
+These fields are useful for reasoning and templates, but they are not freely composable API axes.
+A policy exists only when one concrete bundle is implemented and measured. The executor switches
+on the final `PolicyId` and launches it; it must not contain an `auto` path.
 
-```text
-format/layout + core primitives
-              ↓
-        mainloop/schedule
-              ↓
-       explicit instances
-              ↓
-       plan + linear.cpp
-```
+This design avoids two opposite failures:
 
-`src/ops/common/` continues to own only narrow cross-Op CUDA primitives such as basic memory,
-warp, and MMA instructions. Linear-specific format, swizzle, tile, stage, and fragment policy stays
-inside `src/ops/linear/`; it is not promoted to repository common merely because multiple Linear
-formats use it.
+- one giant configurable kernel whose unused options still affect registers, shared memory, or
+  scheduling;
+- unrelated copy-pasted kernels that cannot share proven zero-cost device mechanics.
 
-## 14. Current implementation mapping
+### 4.2 Complete-lifecycle mainloop boundary
 
-The current code maps into the new design as follows:
+A mainloop owns the complete K-loop lifecycle:
 
-| Current implementation | Destination concept |
+- encoded-data and scale staging;
+- shared-memory layout and lifetime;
+- asynchronous copy and wait distance;
+- prefetch and fragment buffering;
+- CTA and warp roles;
+- synchronization points;
+- accumulator ownership and final K reduction.
+
+If these properties differ, the implementations are different lifecycle families even when both
+eventually execute MMA instructions. The recommended families are:
+
+| Family | Purpose and boundary |
 |---|---|
-| `codec/linear_codec.cuh` Q4/Q5/Q6 | split-low4 format plus path-specific decode adapters |
-| `linear_rowsplit_gemm_smallt.*` | Small-T mainloop, format adapters, and explicit instances |
-| `linear_rowsplit_gemv_q5_core.cuh` | T1 mainloop plus Q5 policies/schedules |
-| caller-role Q4 T1 files | Q4 format adapter plus structural T1 schedule instances |
-| lm-head Q4/Q6 file | large-N T1 schedule instance(s), not an `lm_head` arithmetic family |
-| `linear_rowsplit_gemm_mma.*` | shared A16 BF16-MMA mainloop plus split-low4 producer |
-| `linear_rowsplit_w8g32_gemm_mma.*` | shared MMA consumer/lifecycle where zero-cost, W8 producer and policy |
-| dense reference kernels | retained reference, then replaced by explicit dense production policies |
-| `ShapeFamily` caller-role enum | structural `(N,K)` matching and named numerical policies |
+| exact T1/direct paths | geometry-specific row or split-K ownership for important decode/verify work |
+| row-streaming Small-T | shared compile-time token bundles with path-specific quantized decode |
+| split-low4 MMA | Q4/Q5/Q6 two-plane production and its own scale/stage lifetime |
+| W8 MMA | one code plane, persistent scale staging, and distinct small-M/general warp topologies |
+| dense | a future optimized dense lifecycle, separate from the correctness reference path |
+| grouped expert | expert/job mapping and grouped ownership, separate from plain Linear |
 
-Migration must delete obsolete caller-role launchers and duplicate codec logic once their selected
-production routes move. The repository does not keep compatibility wrappers for deleted internal
-names.
+In particular, split-low4 and W8 must not be forced behind a producer-hook mainloop. Their stage
+count, scale lifetime, waits, prefetch, shared footprint, and residency tradeoffs are materially
+different. A hook system capable of describing both would become a scheduling DSL and would put
+the cost of optional state into hot kernels.
 
-## 15. Relationship to grouped expert work
+### 4.3 Narrow reusable substrate
 
-Expert-grouped contractions share arithmetic building blocks but not the ordinary Linear schedule.
-Their dynamic expert selection, per-expert `M_e`, pointer/stride description, tile scheduling, and
-reduction belong to the closed sparse Op implementation.
+Reuse is accepted at stable, compile-time seams:
 
-Grouped expert kernels may reuse:
+- closed encoding and address facts;
+- lifecycle-specific decode atoms;
+- swizzles and fixed MMA atoms;
+- accumulator indexing;
+- typed lane-local or collective finalization helpers.
 
-- registered weight formats and layouts;
-- decode adapters;
-- MMA atoms and fragment helpers;
-- tile/resource policy vocabulary;
-- exact epilogue components.
+There are no runtime codec branches, device callbacks, virtual dispatch, or generic producer
+objects in an inner loop. A new shared abstraction is justified only after at least two real
+policy consumers demonstrate the same lifecycle and matched code generation, resources, and
+performance. Otherwise duplication at the lifecycle boundary is cheaper and clearer.
 
-They do not call the ordinary `linear()` wrapper per expert and do not force dynamic grouped
-metadata into `LinearPlan`.
+## 5. Fused operations and epilogue extensibility
 
-## 16. Migration plan
+### 5.1 The abstraction seam
 
-The refactor proceeds by working implementation slices. Each slice replaces and deletes its old
-path before the next family is migrated.
+Fused behavior is described by four compile-time concepts:
 
-### Phase 1: foundation and format consolidation
+```text
+CtaProblemMap
+  which physical input/output jobs a CTA owns before entering the K loop
 
-1. Add the new format/layout/core directories and the minimal policy vocabulary.
-2. Implement the split-low4 format family for Bits 4/5/6.
-3. Implement W8 and dense format traits.
-4. Add path-specific decode adapters required by the first migrated path.
-5. Keep existing public Op and plan behavior while the first new instances are introduced.
+AccumulatorTopology
+  one accumulator set, paired halves, or multiple output sets
 
-Exit condition: Q4/Q5/Q6 logical reconstruction has one source of truth per decode target; no new
-mainloop duplicates plane geometry or sign reconstruction.
+FinalizationScope
+  lane-local or CTA-collective ownership after complete reduction
 
-### Phase 2: Small-T as the first complete vertical slice
+Finalizer
+  the exact semantic rounding, terminal operation, and store
+```
 
-1. Re-express the existing Small-T kernel as the new Small-T mainloop.
-2. Instantiate Q4/Q5/Q6/W8 policies for the currently selected token tiles.
-3. Preserve direct exact-T policies only where they remain measured winners.
-4. Replace plan dispatch and delete the old Small-T kernel/codec duplication.
+These are narrow implementation concepts, not a public epilogue framework. Each lifecycle has a
+compile-time capability declaration describing the encodings, accumulator topologies,
+finalization scopes, synchronization/store ownership, and CTA maps it can carry. A named policy
+fixes one combination and is valid only when the lifecycle declares that combination supported.
+Users cannot assemble arbitrary combinations at runtime, and the build does not instantiate their
+Cartesian product.
 
-Small-T is first because it already demonstrates cross-format reuse and exercises format, layout,
-decode, schedule, policy, launch, and epilogue seams without first changing the most fragmented T1
-paths.
+If a fused behavior cannot run after the lifecycle's complete K reduction, needs unsupported
+shared-memory or synchronization lifetime, changes producer/warp ownership, or crosses CTA
+ownership, it is not an epilogue extension. It becomes a new lifecycle policy or an explicit
+materialized composition. This capability check is the hard boundary that prevents typed
+finalization from growing into a generic callback framework.
 
-### Phase 3: T1 GEMV family
+### 5.2 Three first-class execution forms
 
-1. Build common T1 mainloop and schedule policies.
-2. Migrate the existing Q5 core and its shape configurations.
-3. Migrate Q4 direct, row-stripe, and split-K implementations into structural policies.
-4. Migrate large-N Q4/Q6 output projection policies.
-5. Migrate W8 T1 through the same vocabulary and add special schedules only where measured.
-6. Delete caller-role files and policy IDs as each domain moves.
+Every fused Op can choose among three forms per route:
 
-Exit condition: a T1 production route is described by format + numerical shape + schedule policy;
-no arithmetic family exists solely because the caller calls its rows Q, K, V, gate, MLP, or head.
+1. **terminal finalizer:** reuse a lifecycle and apply a typed operation after the complete
+   contraction reduction;
+2. **topology-aware fused kernel:** change accumulator, CTA, or output ownership when fusion
+   genuinely crosses the finalizer seam;
+3. **materialized composition:** execute the base contraction, preserve its public rounding
+   boundary, then run a separate semantic kernel.
 
-### Phase 4: Large-T BF16 MMA family
+Materialization is not a fallback failure. It is a first-class policy because fusion can reduce
+launches yet lose on stores, tile tails, waves, registers, or occupancy. The Op-local planner
+selects the measured winner rather than assuming fused is faster.
 
-1. Rebuild the Q4/Q5/Q6 GEMM around the shared BF16-MMA mainloop and split-low4 producer.
-2. Express existing tile/config choices as named policies.
-3. Integrate W8 through the shared lifecycle/consumer/epilogue only where the generated hot path is
-   equal to the current dedicated kernel; retain a W8-specific producer and resource policy.
-4. Add a direct dense BF16 producer and explicit dense GEMM policies.
-5. Delete superseded Large-T source duplication.
+The current semantic examples establish the boundary:
 
-Exit condition: Q4/Q5/Q6, W8, and dense BF16 use one architectural vocabulary; any remaining
-separate kernel has a measured, documented reason rather than historical source isolation.
+- LinearAdd can use a lane-local or CTA-collective finalizer, but must preserve the projection's
+  BF16 round before residual addition.
+- LinearSwiGLU needs paired accumulator halves and two independent projection rounds; at some token
+  ranges materialization wins over the folded topology.
+- `linear_pair` changes output-job topology and owns routes independent of two base Linear calls.
+- grouped projection changes the CTA problem map and therefore remains a typed topology, not
+  baggage carried by every plain kernel.
 
-### Phase 5: plan and source cleanup
+### 5.3 Cost of adding a fused Op
 
-1. Replace caller-role `ShapeFamily` dispatch with structural keys and policies.
-2. Consolidate explicit instance declarations and build registration.
-3. Remove obsolete launch headers, policy names, comments, and archived-path references from active
-   documentation.
-4. Update `op-development.md` with the implemented final tree and permanent internal boundaries.
-5. Archive this plan after all selected existing production paths use the new architecture.
+A new fused Op pays only for what it uses:
 
-### Phase 6: fused consumers, separately scoped
+1. define its mathematical and rounding contract;
+2. define its typed accumulator/finalization topology;
+3. instantiate a small set of named policies plus materialized competitors;
+4. add its own route and workspace plan;
+5. qualify the semantic seams and measured winners.
 
-After the pure Linear architecture is complete, evaluate `LinearAdd`, `LinearSwiGLU`, paired
-projections, and multi-output projections one Op at a time. Reuse a mainloop/epilogue seam only when
-it reduces duplication without changing the semantic contract or the measured winning schedule.
-This phase is not required to declare the pure Linear refactor complete.
+There is no global register or shared-memory tax on unrelated Linear kernels. The tradeoff is
+intentional compile-time policy instances and an Op-local route table. This is a better cost model
+for NInfer than a universal epilogue API whose flexibility would be paid by every kernel.
 
-## 17. Correctness and performance gates
+## 6. Complexity control and extension budget
 
-### 17.1 Numerical verification
+The architecture controls complexity through closed vocabularies and local change surfaces:
 
-Each migrated mainloop/format combination uses the existing independent Linear oracle at relevant
-real shapes and regime boundaries. Verification follows the current Op contract:
+| Change | Expected architectural impact |
+|---|---|
+| new shape using an existing lifecycle | one target-local measurement entry, then one exact target profile and measured routes |
+| new encoding | one closed encoding registration, path decode support, and only the policies that consume it |
+| new fused Op | one semantic contract, Op-local planner/workspace, and a finite set of named fused/materialized policies |
+| new schedule winner | one policy and fixed launcher; existing profiles change only where evidence selects it |
+| new lifecycle | a deliberate kernel-family implementation and qualification, without rewriting unrelated families |
+| new target | one statically selected target profile; no shape union or role heuristics added to the Op planner |
 
-- exact format reconstruction where exact comparison is meaningful;
-- the established numerical criterion for SIMT FP32 accumulation;
-- the established normwise criterion for BF16-MMA weight rounding;
-- explicit full-tile and real padded-K edge domains used by registered artifacts.
+The following are rejected regardless of apparent convenience:
 
-The refactor does not add broad tests for template shape, class construction, enum values, or source
-organization. Tests protect numerical Linear behavior and selected real domains.
+- arbitrary quantized shape fallback;
+- format-by-tile-by-pipeline-by-finalizer registration matrices;
+- caller names or model roles in kernel routing;
+- runtime epilogue descriptors or device function pointers;
+- hidden allocation, weight repacking, or synchronization in kernels;
+- generic source abstractions justified only by fewer lines of code;
+- retaining unused policies or shapes for hypothetical compatibility.
 
-### 17.2 Performance preservation
+The practical complexity test is local reasoning: adding one measured shape or fused Op must not
+require understanding or recompiling an open-ended framework. If an extension changes the
+lifecycle, that cost is made explicit as a new family instead of hidden inside optional branches.
 
-For a previously roofline-qualified production policy, its replacement must retain the same
-limiting-resource interpretation and match or improve representative benchmark performance within
-normal measurement noise. If a generalized policy loses materially to the existing implementation,
-the architecture must express the winning specialization; the regression is not accepted as an
-abstraction cost.
+## 7. Roofline strategy
 
-For a newly generalized domain:
+### 7.1 What the architecture can guarantee
 
-- a generic correct route is useful implementation infrastructure but is not support;
-- support requires an exact selected policy and retained RTX 5090 evidence;
-- GEMV is judged against the relevant cold/warm weight-traffic roofline and launch-coverage limits;
-- Large-T GEMM is judged against measured useful throughput plus NCU compute/memory evidence;
-- Small-T is judged against the best relevant weight-streaming and MMA candidates rather than an
-  assumed backend label.
+An architecture cannot guarantee roofline performance by construction. It can guarantee that the
+performance unit is explicit, fixed, measurable, and replaceable. The relevant unit is:
 
-Run the smallest evidence set that proves each migration slice. NCU is used when a replacement
-misses its gate or a new roofline claim needs hardware-counter attribution, not as ceremony for
-every source movement. Whole-inference NSYS is required only when a migrated high-impact family
-could alter end-to-end attribution or launch composition.
+```text
+(semantic Op, exact physical problem, token range, PolicyId)
+```
 
-### 17.3 Build and integration properties
+Roofline qualification is therefore per policy point or homogeneous route class, not one global
+claim for “Linear.” Exact shape policies remain valid outcomes when they are needed to reach the
+machine limit.
 
-Every production policy must remain:
+### 7.2 Required performance model
 
-- allocation-free during launch;
-- free of hidden host/device synchronization;
-- compatible with stable CUDA Graph addresses;
-- explicit about workspace use;
-- directly compiled for the registered architecture;
-- free of runtime target-name or tensor-role dispatch.
+Every important policy records:
 
-## 18. Design constraints for maintainability
+- useful contraction FLOP;
+- actually executed FLOP including tile padding and tails;
+- minimum logical bytes and measured DRAM/L2 traffic;
+- CTA waves, partial-wave behavior, occupancy, registers, and shared memory;
+- its product-time attribution.
 
-The implementation must follow these constraints:
+This separates compute-limited full waves, bandwidth-limited T1, insufficient-parallelism cases,
+weight rereads, and padded-tail loss. Useful TFLOP/s or a logical-byte estimate alone is not a
+roofline conclusion.
 
-1. Prefer policy composition over inheritance.
-2. Use static interfaces and `if constexpr`; do not use virtual dispatch.
-3. Bundle named policies so launch sites do not repeat long template argument lists.
-4. Keep hot-path format decisions compile-time.
-5. Do not instantiate unsupported combinations.
-6. Keep format math in one place per decode target.
-7. Keep mainloop code independent of model caller roles.
-8. Keep exceptional specializations visible in the plan registry.
-9. Do not promote Linear-specific helpers into `src/ops/common/` without a second non-Linear Op
-   consumer and a genuinely format-independent contract.
-10. Treat compile time, binary size, SASS inspectability, and profiler kernel-name readability as
-    real design constraints.
+### 7.3 Qualification ladder
 
-## 19. Locked decisions and tuning freedoms
+Policies advance through four gates:
 
-### 19.1 Locked by this plan
+1. **semantic correctness:** an independent oracle at every decode, accumulation, and rounding
+   seam;
+2. **winner evidence:** matched candidate timing at real shapes, route boundaries, tails, and
+   reversals;
+3. **physical explanation:** NCU resources, traffic, waves, stalls, and executed work for selected
+   fixed kernels;
+4. **product value:** NSYS and real Engine evidence for routes with material end-to-end weight.
 
-- one pure Linear semantic Op;
-- structural rather than caller-role dispatch;
-- separation of weight format, layout, activation, compute mode, mainloop, schedule, pipeline, and
-  epilogue;
-- one split-low4 family for Q4/Q5/Q6;
-- separate signed-byte and dense format families;
-- distinct T1, Small-T, and Large-T mainloops;
-- named policy bundles and explicit instantiation;
-- cooperative and warp-specialized pipelines represented as policies rather than architecture-wide
-  choices;
-- no hidden repack, dynamic plugin registry, or universal arbitrary-shape promise;
-- performance-preserving specialization when a common policy loses.
+Optimization proceeds in product-attribution order. For each dominant policy, either the measured
+resource roof is reached or the remaining limit is explained and competing schedules fail to
+improve it. Kernel-count reduction and source uniformity are not performance objectives.
 
-### 19.2 Left to measurement
+After the target-profile ownership cut-over, the architecture stage completes admission, fixed
+routing, fusion seams, and the measurement method. The next stage optimizes current 27B policy
+families in this order:
 
-- exact T-regime crossovers per format/shape;
-- warp/CTA ownership and split-K factors;
-- BM/BN/BK and warp tiles;
-- cp.async versus TMA for a particular Large-T producer;
-- stage count, cache policy, shared swizzle, and fragment double buffering;
-- persistent versus static tile scheduling;
-- which exact domains justify a custom policy;
-- whether a fused Op benefits from reusing the final mainloop seam.
+1. Text/MTP T1 and Small-T policies that dominate decode and verification;
+2. full-wave W8 policies with physical weight rereads;
+3. partial-wave and tail-heavy low4, pair, Add, and SwiGLU policies;
+4. reachable high-T Vision routes.
 
-These are tuning freedoms inside the architecture, not reasons to bypass it.
+## 8. Future 35B pressure test
 
-## 20. Completion criteria
+Future support is evaluated by extension locality, not by pretending that arbitrary shapes already
+work.
 
-The refactor is complete when:
+The experiments show that the existing closed quantized codecs and lifecycle vocabulary can
+numerically execute the sampled non-grouped 35B geometries. They also show that routing is
+shape-local and sometimes non-monotonic as CTA waves change. Consequently, 35B quantized support
+cannot be inferred from one N/K threshold; it needs exact profiles and measured routes.
 
-1. all currently selected pure Linear production paths dispatch through structural policy IDs;
-2. Q4/Q5/Q6 storage and reconstruction are represented by the split-low4 family;
-3. T1, Small-T, and Large-T implementations use the new mainloop/policy organization;
-4. W8 and dense formats participate in the same architectural vocabulary without forced hot-path
-   uniformity;
-5. obsolete caller-role kernel files, policies, and compatibility launchers are deleted;
-6. current exact 27B Linear domains retain numerical behavior and performance qualification;
-7. active `op-development.md` reflects the implemented stable source boundary;
-8. this plan is moved to `docs/archive/` and removed from the active-plan index.
+Dense BF16 and grouped experts are different conclusions:
 
-## 21. Evidence references
+- the current dense path is a correctness reference, not a competitive lifecycle;
+- grouped experts change job mapping and ownership, so they require a separate lifecycle and
+  planner work.
 
-The following archived documents are evidence, not current authority:
+The admission workflow for a future target is:
 
-- [`../archive/optimization-era/m3-linear-backend-framework.md`](../archive/optimization-era/m3-linear-backend-framework.md) — original format/shape/regime plan seam and GEMV/GEMM split;
-- [`../archive/optimization-era/2026-07-01-prefill-linear-foundation-design.md`](../archive/optimization-era/2026-07-01-prefill-linear-foundation-design.md) — measured T1/Small-T/Large-T model and first shared Small-T/Large-T paths;
-- [`../archive/optimization-era/2026-07-10-w8g32-tensor-core-gemm-design.md`](../archive/optimization-era/2026-07-10-w8g32-tensor-core-gemm-design.md) — proposed W8 producer/consumer design;
-- [`../archive/optimization-era/2026-07-10-w8g32-tensor-core-gemm-implementation-report.md`](../archive/optimization-era/2026-07-10-w8g32-tensor-core-gemm-implementation-report.md) — measured rejection of that warp-specialized design and final cooperative W8 policy;
-- [`../archive/optimization-era/bench/q5090-v3-prefill-kernel-sweep-after-gemm-tuning.md`](../archive/optimization-era/bench/q5090-v3-prefill-kernel-sweep-after-gemm-tuning.md) — retained Q4/Q5/Q6 Large-T roofline evidence.
+1. inventory real effective views, encodings, alignments, reachable token sets, and fused Ops;
+2. add them to a measurement-only vocabulary;
+3. verify independent numerical oracles and benchmark existing fixed policies;
+4. add a new policy or lifecycle when the current vocabulary does not win;
+5. only then add exact product profiles, route closure, workspace, and target reachability.
+
+Existing 27B profiles and kernels do not change merely because a future shape is introduced. A
+35B target receives its own profile and selects from the compatible catalog. This is the intended
+meaning of extensibility: bounded local additions with evidence, not universal shape support.
+Qwen3.6-35B remains outside the current product contract.
+
+## 9. Source ownership
+
+```text
+include/ninfer/ops/
+  semantic Op contracts and public-internal workspace/alignment behavior
+
+src/ops/linear/plan/
+  generic typed resolvers, policy catalogs/capabilities, workspace semantics, and validation
+
+src/ops/linear/codec/
+  closed encoding registrations and path-specific decode atoms
+
+src/ops/linear/gemv/ and gemm/
+  complete lifecycle families and narrow shared device primitives
+
+src/ops/linear/linear.cpp and src/ops/wrapper/
+  validation, plan consumption, fixed launch closure, and explicit compositions
+
+src/targets/qwen3_6_27b_rtx5090/
+  exact Linear-family problem/route profiles, reachability, graph/state policy, and reservation
+
+bench/ops/ and tests/ops/
+  measurement-only candidates, independent numerics, and policy qualification
+```
+
+Source filenames are not architectural boundaries. They should be renamed only when real
+ownership work touches them; cosmetic uniformity does not justify churn.
+
+## 10. Evidence that determined the design
+
+The experiment report records the full proof. The architecture depends on these conclusions:
+
+| Hypothesis | Result used by this design |
+|---|---|
+| one generic quantized fallback | rejected: it admitted irrelevant shapes and concealed tuning gaps |
+| one global token threshold | rejected: winners change with encoding, shape, waves, tails, and semantic topology |
+| one configurable MMA mainloop | rejected: split-low4 and W8 have materially different lifecycles and residency constraints |
+| closed codec/decode substrate | accepted: useful source reuse was obtained without hot-path code-generation cost |
+| one universal T1 policy | rejected: lower-resource variants were not universal winners |
+| arbitrary fused epilogue | rejected: Add, SwiGLU, pair, and grouped projection cross different ownership and rounding seams |
+| finite typed finalization/topology | accepted: it supports direct, collective, paired, and materialized winners without taxing unrelated kernels |
+| generic future-shape heuristic | rejected: sampled future quantized routes were shape-local; dense/grouped work needs new lifecycles |
+| per-policy roofline model | accepted: NCU exposed compute roofs, bandwidth limits, under-wave work, tails, and physical rereads hidden by aggregate metrics |
+
+These conclusions are architectural; exact current route thresholds and benchmark values remain in
+the experiment report because they are tunable evidence, not stable design principles.
+
+## 11. Prototype status and product acceptance
+
+The current dirty worktree proves the important architectural hypotheses, but it is deliberately
+classified as an experimental prototype rather than the final product implementation. It contains:
+
+- exact current-27B quantized admission and measured route data;
+- Op-local fixed-policy planning experiments for base, Add, SwiGLU, and pair;
+- closed codec/decode reuse and distinct low4/W8 lifecycle evidence;
+- typed direct/collective finalization, paired topology, and materialized composition;
+- measurement-only future shapes with no accidental product admission;
+- the benchmark, correctness, NSYS, and NCU evidence recorded in the companion report.
+
+The prototype still places target problem and route facts in Op-global planners and was developed
+incrementally across the old ownership boundary. Continuing to repair that tree would make it hard
+to distinguish the intended architecture from transitional structure. The product implementation
+therefore starts from the last clean code baseline. The prototype is retained as reproducible
+evidence and a behavioral/performance oracle, not used as the cut-over base and not bulk
+cherry-picked into the new implementation.
+
+The product architecture is accepted when:
+
+- every registered product call resolves exactly one target-owned support profile and one fixed
+  Op-owned policy;
+- no unregistered quantized call, global target union, or caller-role heuristic reaches a
+  production kernel;
+- every fused policy preserves its Op's mathematical rounding and range-capacity workspace
+  contract;
+- every target route is jointly validated against the selected hardware catalog and a fixed
+  launcher;
+- the new implementation preserves the prototype's qualified route manifest, numerical behavior,
+  kernel resources, and matched product performance;
+- future support enters only through the measurement-first admission workflow.
+
+## 12. Atomic implementation plan
+
+### 12.1 Repository states and provenance
+
+Implementation uses three explicit repository states:
+
+```text
+clean code baseline
+  last committed product code before the experimental Linear work
+
+archived experiment
+  the complete prototype worktree, experiment report, and raw profiler provenance
+
+clean implementation
+  a fresh implementation of this architecture based on the clean code baseline
+```
+
+The final architecture document, experiment report, and raw `profiles/bench`, `profiles/nsys`, and
+`profiles/ncu` evidence are retained. Prototype product code, tests, and benchmark tools are
+captured on an archive branch for comparison, but they are not the source base of the clean
+implementation. Project instructions and unrelated user changes are preserved independently and
+are never absorbed into the Linear archive or reset as part of the cut-over.
+
+### 12.2 Meaning of an atomic cut-over
+
+The integrated product tree may contain either the complete old architecture or the complete new
+architecture. It must never retain a mixed product state. Development may proceed in an isolated
+branch or worktree, but integration occurs only after all callers and authorities have switched.
+
+The final cut-over has none of the following:
+
+- profile-less and profile-aware quantized Linear APIs living together;
+- some semantic Ops using target profiles while others use Op-global routes;
+- a new planner falling back to the old planner or an automatic launcher;
+- two support tables, compatibility aliases, feature flags, or transitional dispatch;
+- partially migrated Text, Vision, MTP, workspace-reservation, benchmark, or test callers.
+
+Intermediate implementation commits may be used on the isolated branch when they are complete,
+reviewable internal boundaries. Before integration they are squashed or arranged so that the
+product-facing cut-over itself is one complete commit. No half-migrated commit is merged.
+
+### 12.3 Minimal profile and catalog contract
+
+The Op layer defines non-owning typed profile views; the target owns their immutable backing data.
+The schematic aggregate is:
+
+```cpp
+enum class LinearHardwareId { Sm120a };
+
+struct LinearExecutionProfile {
+    LinearHardwareId hardware;
+    std::span<const LinearProblemProfile> linear;
+    std::span<const LinearAddProblemProfile> add;
+    std::span<const LinearSwiGluProblemProfile> swiglu;
+    std::span<const LinearPairProblemProfile> pair;
+};
+```
+
+Each problem-profile type has its own typed policy and route record. This aggregate is an execution
+context, not a universal route schema. The registered target instantiates one constexpr profile;
+a future target instantiates another without modifying the current target's support domain.
+
+The catalog remains static and closed. It is implemented with typed policy enums, constexpr
+capability traits, compile-time validation, semantic workspace functions, and exhaustive fixed
+launch switches. It is not a runtime registry, virtual interface, function-pointer table, or
+template Cartesian product.
+
+All quantized Linear-family calls explicitly receive the selected execution profile, including
+workspace-capacity queries and materialized compositions. There is no default profile, target
+lookup by string, profile stored in `Weight`, or mutable global selection.
+
+### 12.4 Compile-time joint validation
+
+The target profile and catalog are accepted together with compile-time checks proving:
+
+1. every effective physical problem appears exactly once in its semantic-Op profile;
+2. every problem owns a nonempty route span starting at one and ending at the target token ceiling;
+3. route token intervals are ordered, contiguous, and non-overlapping;
+4. every route names a policy from the correct semantic Op;
+5. the selected hardware catalog accepts that problem/policy pair;
+6. every named policy has one fixed launch closure and valid workspace semantics;
+7. materialized Add and SwiGLU routes reference a base problem admitted by the same target profile;
+8. measurement-only future problems are absent from the registered 27B profile.
+
+### 12.5 Isolated implementation sequence
+
+The clean implementation is built in these internal work packages, then exposed as one cut-over:
+
+1. define physical-problem, typed profile, execution-plan, workspace-plan, and catalog-capability
+   contracts without wiring product callers;
+2. re-establish the qualified fixed kernel vocabulary and narrow codec/finalizer/topology seams,
+   using the prototype only as evidence and a comparison oracle;
+3. instantiate the complete target-owned 27B base, Add, SwiGLU, and pair profiles from the measured
+   route manifest;
+4. switch every Text, Vision, MTP, wrapper, workspace-layout, benchmark, and test caller to explicit
+   profile injection in the same product-facing change;
+5. delete the old caller-role regimes, Op-global product routes, arbitrary quantized fallback,
+   hidden second dispatch, unreachable Decode shapes, and all transition code;
+6. validate structure, route identity, independent numerics, real-artifact behavior, matched
+   microbenchmarks, and representative profiler resources before integration.
+
+The qualified manifest expected at cut-over is 24 base problems and 83 base routes, two Add
+problems and eight routes, one SwiGLU problem and seven routes, and one pair problem with three
+routes. These counts protect the current target contract; they do not become a generic framework
+limit.
+
+### 12.6 Verification and commit gates
+
+The atomic implementation is not accepted until all of the following hold:
+
+- source ownership scans find no 27B exact route data in `src/ops`, no CUDA launcher in the target,
+  no profile-less quantized API, and no old regime/fallback authority;
+- compile-time profile/catalog validation and route-manifest tests pass;
+- registered and rejection tests, independent FP64/BF16 operator oracles, Add/SwiGLU rounding,
+  pair, Vision, MTP, token-ceiling, alignment, and range-capacity workspace checks pass;
+- the real 27B artifact completes the affected Text, Vision, and MTP product routes;
+- same-session comparison against the archived prototype preserves fixed policy selection, kernel
+  resources/SASS where the abstraction must be zero-cost, planner cost, representative
+  microbenchmarks, and end-to-end latency within measurement noise.
+
+Reasonable commits are made only at durable boundaries: the architecture/provenance baseline, the
+complete archived prototype, and the complete verified product cut-over. Private implementation
+checkpoints may exist during development, but no partially migrated state is presented as the
+product architecture.
+
+This cut-over deliberately excludes 35B product registration, optimized dense and grouped-expert
+lifecycles, runtime autotuning, source-tree cosmetic rewrites, and completion of every Stage-B
+roofline optimization. Per-policy roofline optimization remains the next performance stage, not an
+unresolved architecture decision.
+
+The detailed experiment report remains the evidence ledger; this document is the stable
+recommended design and supersedes the original draft.

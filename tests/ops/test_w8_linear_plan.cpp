@@ -51,6 +51,14 @@ S expected_schedule(const W8Problem& problem) {
         if (problem.cols == 5) { return S::SimtR8C8; }
         return S::MmaR64C128;
     }
+    if (problem.rows == 2048 && problem.k == 4608) {
+        if (problem.cols <= 14 || problem.cols == 16 || problem.cols == 20 || problem.cols == 24 ||
+            problem.cols == 28 || problem.cols == 32) {
+            return S::SimtR8C4;
+        }
+        if (problem.cols <= 871) { return S::MmaR32C128; }
+        return S::MmaR64C128;
+    }
     if (problem.rows == 1024) {
         if (problem.cols <= 4) { return S::SimtR8C4; }
         if (problem.cols <= 16) { return S::SimtR8C8; }
@@ -91,7 +99,7 @@ void expect_plan(const std::string& label, const W8Problem& problem) {
 }
 
 void route_boundaries() {
-    constexpr std::array<W8Problem, 40> cases{{
+    constexpr std::array<W8Problem, 60> cases{{
         {5120, 10240, 10240, 1},       {5120, 10240, 10240, 4},  {5120, 10240, 10240, 5},
         {5120, 10240, 10240, 16},      {5120, 10240, 10240, 17}, {5120, 10240, 10240, 128},
         {5120, 10240, 10240, 8388480}, {14336, 5120, 5120, 4},   {14336, 5120, 5120, 5},
@@ -105,16 +113,23 @@ void route_boundaries() {
         {4608, 4608, 4608, 13},        {4608, 4608, 4608, 256},  {4608, 4608, 4608, 257},
         {4608, 4608, 4608, 32768},     {5120, 4608, 4608, 4},    {5120, 4608, 4608, 5},
         {5120, 4608, 4608, 6},         {5120, 4608, 4608, 127},  {5120, 4608, 4608, 128},
-        {5120, 4608, 4608, 32768},
+        {5120, 4608, 4608, 32768},     {2048, 4608, 4608, 1},    {2048, 4608, 4608, 14},
+        {2048, 4608, 4608, 15},        {2048, 4608, 4608, 16},   {2048, 4608, 4608, 17},
+        {2048, 4608, 4608, 19},        {2048, 4608, 4608, 20},   {2048, 4608, 4608, 21},
+        {2048, 4608, 4608, 23},        {2048, 4608, 4608, 24},   {2048, 4608, 4608, 25},
+        {2048, 4608, 4608, 27},        {2048, 4608, 4608, 28},   {2048, 4608, 4608, 29},
+        {2048, 4608, 4608, 31},        {2048, 4608, 4608, 32},   {2048, 4608, 4608, 33},
+        {2048, 4608, 4608, 871},       {2048, 4608, 4608, 872},  {2048, 4608, 4608, 32768},
     }};
     for (const W8Problem& problem : cases) { expect_plan("route boundary", problem); }
 }
 
 void rejection_contract() {
-    constexpr std::array<W8Problem, 8> rejected{{
+    constexpr std::array<W8Problem, 9> rejected{{
         {5120, 10240, 10240, 0},
         {5120, 10240, 10240, 8388481},
         {4608, 4608, 4608, 32769},
+        {2048, 4608, 4608, 32769},
         {1024, 5120, 5248, 17},
         {7168, 5120, 5120, 1},
         {2048, 4096, 4096, 1},

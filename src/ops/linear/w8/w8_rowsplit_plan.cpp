@@ -35,7 +35,7 @@ struct W8RouteSpec {
     W8ScheduleId schedule;
 };
 
-constexpr std::array<W8SupportSpec, 9> kSupportSpecs{{
+constexpr std::array<W8SupportSpec, 10> kSupportSpecs{{
     {5120, 10240, 10240, {1, kMaxTextCols, 1}, 0, 3},
     {14336, 5120, 5120, {1, kMaxTextCols, 1}, 3, 3},
     {1024, 5120, 5120, {1, kMaxTextCols, 1}, 6, 3},
@@ -45,9 +45,10 @@ constexpr std::array<W8SupportSpec, 9> kSupportSpecs{{
     {5120, 17408, 17408, {1, kMaxTextCols, 1}, 18, 3},
     {4608, 4608, 4608, {1, kMaxVisionCols, 1}, 21, 5},
     {5120, 4608, 4608, {1, kMaxVisionCols, 1}, 26, 3},
+    {2048, 4608, 4608, {1, kMaxVisionCols, 1}, 29, 13},
 }};
 
-constexpr std::array<W8RouteSpec, 29> kRouteSpecs{{
+constexpr std::array<W8RouteSpec, 42> kRouteSpecs{{
     // [5120,10240]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 16, 1}, W8ScheduleId::SimtR8C8},
@@ -94,6 +95,21 @@ constexpr std::array<W8RouteSpec, 29> kRouteSpecs{{
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 5, 1}, W8ScheduleId::SimtR8C8},
     {{6, kMaxVisionCols, 1}, W8ScheduleId::MmaR64C128},
+
+    // Vision merger [2048,4608]
+    {{1, 14, 1}, W8ScheduleId::SimtR8C4},
+    {{15, 15, 1}, W8ScheduleId::MmaR32C128},
+    {{16, 16, 1}, W8ScheduleId::SimtR8C4},
+    {{17, 19, 1}, W8ScheduleId::MmaR32C128},
+    {{20, 20, 1}, W8ScheduleId::SimtR8C4},
+    {{21, 23, 1}, W8ScheduleId::MmaR32C128},
+    {{24, 24, 1}, W8ScheduleId::SimtR8C4},
+    {{25, 27, 1}, W8ScheduleId::MmaR32C128},
+    {{28, 28, 1}, W8ScheduleId::SimtR8C4},
+    {{29, 31, 1}, W8ScheduleId::MmaR32C128},
+    {{32, 32, 1}, W8ScheduleId::SimtR8C4},
+    {{33, 871, 1}, W8ScheduleId::MmaR32C128},
+    {{872, kMaxVisionCols, 1}, W8ScheduleId::MmaR64C128},
 }};
 
 constexpr bool known_schedule(W8ScheduleId schedule) noexcept {

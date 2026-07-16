@@ -234,6 +234,19 @@ constexpr std::array<RoutePoint, 4> kVision5120Routes{{
     {128, S::MmaR64C128, V::Full},
 }};
 
+constexpr std::array<RoutePoint, 20> kVision2048Routes{{
+    {1, S::SimtR8C4, V::Predicated},     {14, S::SimtR8C4, V::Predicated},
+    {15, S::MmaR32C128, V::Predicated},  {16, S::SimtR8C4, V::Full},
+    {17, S::MmaR32C128, V::Predicated},  {19, S::MmaR32C128, V::Predicated},
+    {20, S::SimtR8C4, V::Full},          {21, S::MmaR32C128, V::Predicated},
+    {23, S::MmaR32C128, V::Predicated},  {24, S::SimtR8C4, V::Full},
+    {25, S::MmaR32C128, V::Predicated},  {27, S::MmaR32C128, V::Predicated},
+    {28, S::SimtR8C4, V::Full},          {29, S::MmaR32C128, V::Predicated},
+    {31, S::MmaR32C128, V::Predicated},  {32, S::SimtR8C4, V::Full},
+    {33, S::MmaR32C128, V::Predicated},  {871, S::MmaR32C128, V::Predicated},
+    {872, S::MmaR64C128, V::Predicated}, {32768, S::MmaR64C128, V::Full},
+}};
+
 struct SupportCase {
     const char* label;
     std::int32_t rows;
@@ -393,7 +406,7 @@ int main() {
         return 0;
     }
 
-    constexpr std::array<SupportCase, 9> supports{{
+    constexpr std::array<SupportCase, 10> supports{{
         {"W8 [5120,10240]", 5120, 10240, kDefault17Routes.data(), kDefault17Routes.size(), 11u},
         {"W8 [14336,5120]", 14336, 5120, kEarly9Routes.data(), kEarly9Routes.size(), 13u},
         {"W8 [1024,5120]", 1024, 5120, kR32Routes.data(), kR32Routes.size(), 17u},
@@ -403,6 +416,7 @@ int main() {
         {"W8 [5120,17408]", 5120, 17408, kDefault17Routes.data(), kDefault17Routes.size(), 31u},
         {"W8 [4608,4608]", 4608, 4608, kVision4608Routes.data(), kVision4608Routes.size(), 37u},
         {"W8 [5120,4608]", 5120, 4608, kVision5120Routes.data(), kVision5120Routes.size(), 41u},
+        {"W8 [2048,4608]", 2048, 4608, kVision2048Routes.data(), kVision2048Routes.size(), 43u},
     }};
 
     try {

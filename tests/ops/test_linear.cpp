@@ -201,6 +201,79 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
     return failures;
 }
 
+int one_w8_shape_sampled(std::int32_t n, std::int32_t k, std::int32_t t, std::uint32_t seed) {
+    std::vector<float> source_weight(static_cast<std::size_t>(n) * k);
+    fill_uniform(source_weight, seed + 2000u, -0.125f, 0.125f);
+    round_to_bf16(source_weight);
+    row_split::PackedWeight packed =
+        row_split::pack_row_split_lowbit(source_weight, n, k, QType::W8G32_F16S);
+    std::vector<float>().swap(source_weight);
+
+    std::vector<float> x(static_cast<std::size_t>(k) * t);
+    fill_uniform(x, seed, -8.0f, 8.0f);
+    round_to_bf16(x);
+
+    DBuf dx = to_device_bf16(x);
+    DBuf dweight(packed.payload.size());
+    DBuf dout(static_cast<std::size_t>(n) * t * sizeof(std::uint16_t));
+    cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
+    WorkspaceArena ws(64ULL << 20);
+    Tensor tx(dx.p, DType::BF16, {k, t});
+    Tensor tout(dout.p, DType::BF16, {n, t});
+    try {
+        ops::linear(tx, packed.device_weight(dweight.p), tout, ws, nullptr);
+        cudaDeviceSynchronize();
+    } catch (const std::exception& e) {
+        std::cerr << "linear w8g32 sampled [" << n << "," << k << "] T=" << t << " seed=" << seed
+                  << ": unexpected exception: " << e.what() << '\n';
+        return 1;
+    }
+
+    const std::vector<double> full_output = from_device_bf16(dout, static_cast<std::size_t>(n) * t);
+    std::vector<std::int32_t> sampled_rows;
+    std::vector<std::int32_t> sampled_cols;
+    const auto add_unique = [](std::vector<std::int32_t>& values, std::int32_t value,
+                               std::int32_t limit) {
+        if (value >= 0 && value < limit &&
+            std::find(values.begin(), values.end(), value) == values.end()) {
+            values.push_back(value);
+        }
+    };
+    for (const std::int32_t row : {0, 1, n / 8, n / 3, n / 2, n - 2, n - 1}) {
+        add_unique(sampled_rows, row, n);
+    }
+    for (const std::int32_t col : {0, 1, t / 8, t / 3, t / 2, t - 2, t - 1}) {
+        add_unique(sampled_cols, col, t);
+    }
+
+    std::vector<double> actual;
+    std::vector<double> reference;
+    actual.reserve(sampled_rows.size() * sampled_cols.size());
+    reference.reserve(actual.capacity());
+    for (const std::int32_t col : sampled_cols) {
+        const float* xcol = x.data() + static_cast<std::size_t>(col) * k;
+        for (const std::int32_t row : sampled_rows) {
+            const float* wrow = packed.dequant.data() + static_cast<std::size_t>(row) * k;
+            double acc        = 0.0;
+            for (std::int32_t kk = 0; kk < k; ++kk) {
+                acc += static_cast<double>(wrow[kk]) * static_cast<double>(xcol[kk]);
+            }
+            actual.push_back(full_output[static_cast<std::size_t>(col) * n + row]);
+            reference.push_back(acc);
+        }
+    }
+
+    const ops::detail::W8Plan plan =
+        ops::detail::w8_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
+    const Tolerance tolerance = ops::detail::w8_schedule_uses_mma(plan.schedule)
+                                    ? Tolerance::linear_tc()
+                                    : Tolerance::linear_bf16();
+    const std::string label   = "linear w8g32 sampled [" + std::to_string(n) + "," +
+                              std::to_string(k) + "] T=" + std::to_string(t) +
+                              " seed=" + std::to_string(seed);
+    return verify(label.c_str(), actual, reference, tolerance);
+}
+
 int paired_w8g32_shape(std::int32_t n, std::int32_t k, const std::vector<std::int32_t>& ts,
                        std::uint32_t seed) {
     const std::int32_t max_t = *std::max_element(ts.begin(), ts.end());
@@ -637,6 +710,10 @@ int main() {
         int f = 0;
         f += one_quant_shape(QType::W8G32_F16S, 1024, 5120, {1, 4, 5, 16, 17}, 119u);
         f += one_quant_shape(QType::W8G32_F16S, 4608, 4608, {5, 6}, 121u);
+        f +=
+            one_quant_shape(QType::W8G32_F16S, 2048, 4608,
+                            {14, 15, 16, 17, 19, 20, 21, 23, 24, 25, 27, 28, 29, 31, 32, 33}, 123u);
+        f += one_w8_shape_sampled(2048, 4608, 16384, 125u);
         f += paired_w8g32_shape(1024, 5120, {4, 5, 57}, 127u);
         std::cout << (f ? "FAIL" : "OK") << " linear W8G32 focused correctness\n";
         return f ? 1 : 0;
@@ -661,6 +738,9 @@ int main() {
     f += one_quant_shape(QType::W8G32_F16S, 1024, 5120, {1, 4, 5, 16, 17}, 113u);
     f += one_quant_shape(QType::W8G32_F16S, 14336, 5120, {8, 9}, 117u);
     f += one_quant_shape(QType::W8G32_F16S, 4608, 4608, {5, 6}, 121u);
+    f += one_quant_shape(QType::W8G32_F16S, 2048, 4608,
+                         {14, 15, 16, 17, 19, 20, 21, 23, 24, 25, 27, 28, 29, 31, 32, 33}, 123u);
+    f += one_w8_shape_sampled(2048, 4608, 16384, 125u);
     f += paired_w8g32_shape(1024, 5120, {4, 5, 57}, 127u);
     // Q4 public correctness is exact-admission only. The dedicated Q4 plan/dispatch tests cover
     // every route seam and compare public auto against the fixed entry word-for-word; these

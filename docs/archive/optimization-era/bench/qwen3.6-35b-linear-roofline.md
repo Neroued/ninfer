@@ -6,7 +6,7 @@ Target: Qwen3.6-35B-A3B exact Linear domains on NVIDIA GeForce RTX 5090 (`sm_120
 CUDA 13.1, driver 591.86, NCU 2025.4.1).
 
 This is retained standalone Op evidence. It does not register the 35B Engine target. This revision
-establishes L7-L13.
+establishes L7-L14.
 
 ## L7: Q4 draft head `[131072,2048]`
 
@@ -688,3 +688,113 @@ profiles/ncu/qwen3_6_35b_a3b/linear/l13/final/
 L13 is supported for its complete Qwen3.6-35B-A3B target domain. The corrected route selects the
 measured small-domain winner, both maximum item sizes attain the matched W8 online-decode/MMA
 roofline, and all final topologies are spill-free.
+
+## L14: W8 Vision merger fc2 `[2048,4608]`
+
+The exact operation is W8G32_F16S RowSplit `[2048,4608]` times BF16 `[4608,V]`, producing visual
+BF16 `[2048,V]`. The complete target domain is every merger column count through maximum
+video/image `V=12288/16384`.
+
+### Route qualification
+
+Release candidate sweeps covered every existing W8 topology and then every `V=1..1024` point.
+Three-process confirmations resolved the non-monotonic SIMT full-tile wins and the MMA32/MMA64
+crossover. The final closed route is:
+
+```text
+V=1..14      SIMT R8C4
+V=15         MMA R32C128
+V=16         SIMT R8C4
+V=17..19     MMA R32C128
+V=20         SIMT R8C4
+V=21..23     MMA R32C128
+V=24         SIMT R8C4
+V=25..27     MMA R32C128
+V=28         SIMT R8C4
+V=29..31     MMA R32C128
+V=32         SIMT R8C4
+V=33..871    MMA R32C128
+V>=872       MMA R64C128
+```
+
+Representative three-process seam medians were:
+
+| V | SIMT R8C4 | MMA R32C128 | MMA R64C128 | Decision |
+|---:|---:|---:|---:|---|
+| 14 | 64.800 us | 68.896 us | - | SIMT |
+| 15 | 70.656 us | 68.864 us | - | MMA32 |
+| 16 | 46.304 us | 68.864 us | - | SIMT |
+| 20 | 46.336 us | 68.896 us | - | SIMT |
+| 24 | 56.288 us | 68.896 us | - | SIMT |
+| 28 | 62.400 us | 68.896 us | - | SIMT |
+| 32 | 64.800 us | 68.864 us | - | SIMT |
+| 33 | 111.904 us | 68.896 us | - | MMA32 |
+| 800 | - | 140.544 us | 143.360 us | MMA32 |
+| 864 | - | 144.256 us | 144.640 us | practical tie; retain MMA32 |
+| 872 | - | 144.640 us | 144.640 us | tie; switch to the forward MMA64 winner |
+
+### Correctness and dispatch
+
+```bash
+cmake --build build -j --target \
+  ninfer_linear_op_bench ninfer_linear_test \
+  ninfer_w8_linear_plan_test ninfer_w8_linear_dispatch_test
+ctest --test-dir build \
+  -R '^ninfer_(linear_test|w8_linear_plan_test|w8_linear_dispatch_test)$' \
+  --output-on-failure
+```
+
+All three tests passed. Exact FP64-oracle cases cover every small-route seam, and a sampled
+independent oracle checks the maximum `V=16384` MMA64 result across distributed rows and columns.
+The dispatch suite verifies every production route boundary against its fixed kernel identity.
+
+### Release timing and roofline
+
+Representative final production points were:
+
+| V | Route | Cold median | Useful/executed TFLOP/s |
+|---:|---|---:|---:|
+| 1 | SIMT R8C4 predicated | 27.872 us | 0.68 useful |
+| 14 | SIMT R8C4 predicated | 64.768 us | 4.08 useful |
+| 15 | MMA R32C128 predicated | 68.832 us | 4.11 / 35.10 |
+| 16 | SIMT R8C4 full | 45.952 us | 6.57 useful |
+| 32 | SIMT R8C4 full | 64.800 us | 9.32 useful |
+| 33 | MMA R32C128 predicated | 68.864 us | 9.04 / 35.08 |
+| 512 | MMA R32C128 full | 79.104 us | 122.16 |
+| 872 | MMA R64C128 predicated | 144.640 us | 113.79 / 116.92 |
+| 4096 | MMA R64C128 full | 474.880 us | 162.80 |
+
+Maximum-item rows are isolated three-process medians with eight warmups and forty cold samples:
+
+| V | Cold median | Executed TFLOP/s | Same-session BF16 MMA probe |
+|---:|---:|---:|---:|
+| 12288 | 1256.736 us | 184.55 | 88.31% |
+| 16384 | 1647.904 us | 187.66 | 91.42% |
+
+Both complete maxima reach the compute roofline despite the fused W8 online decode work.
+
+### NCU attribution
+
+| Topology | Representative | NCU duration | SM SOL | Memory SOL | Occupancy | Registers | Static shared | Waves/SM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SIMT R8C4 | V=16 | 46.05 us | 41.82% | 36.11% | 53.76% | 64 | 17.41 KiB | 1.51 |
+| MMA R32C128 | V=512 | 111.78 us | 52.19% | 56.25% | 25.10% | 83 | 39.42 KiB | 0.75 |
+| MMA R64C128 | V=16384 | 2.33 ms | 78.62% | 48.80% | 32.72% | 119 | 46.08 KiB | 12.05 |
+
+The small topologies are explicitly launch-wave limited. At maximum image size, Tensor is the
+highest-utilized pipeline and achieved occupancy is within 0.7 percentage points of the
+register/shared-memory-limited 33.33% theoretical occupancy. Every detailed topology reports zero
+local-memory and shared-memory spilling requests.
+
+Reports are retained locally under:
+
+```text
+profiles/bench/qwen3_6_35b_linear_qualification/l14/
+profiles/ncu/qwen3_6_35b_a3b/linear/l14/final/
+```
+
+## L14 retained result
+
+L14 is supported for its complete Qwen3.6-35B-A3B target domain. The exact finite route preserves
+the measured small-domain full-tile winners, both maximum item sizes reach the compute roofline,
+and every final topology is spill-free.

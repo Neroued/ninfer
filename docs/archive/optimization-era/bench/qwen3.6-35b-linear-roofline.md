@@ -6,7 +6,7 @@ Target: Qwen3.6-35B-A3B Linear rows L8-L13 on NVIDIA GeForce RTX 5090 (`sm_120a`
 CUDA 13.1, driver 591.86, NCU 2025.4.1).
 
 This is retained standalone Op evidence. It does not register the 35B Engine target. Qualification
-is being completed in Vision execution order; this revision establishes L8-L10.
+is being completed in Vision execution order; this revision establishes L8-L11.
 
 ## L8: Q6 Vision patch projection `[1152,1536]`
 
@@ -309,3 +309,102 @@ profiles/ncu/qwen3_6_35b_a3b/linear/l10/final/
 L10 is supported for its complete Qwen3.6-35B-A3B target domain. The corrected exact route removes
 large small-P regressions, selects the measured 64/128-column wave winner, and reaches at least
 86.59% Compute SOL at both maximum item sizes without spilling.
+
+## L11: Q4 Vision MLP fc1 `[4304,1152]`
+
+The exact operation is Q4G64_F16S RowSplit `[4304,1152]` times BF16 `[1152,P]`, producing BF16
+`[4304,P]`. Every MMA launch uses the predicated row variant because 4304 is not divisible by the
+64-row tile. The complete target domain is every admitted four-column patch count through maximum
+video/image `P=49152/65536`.
+
+### Route qualification
+
+Matched screens compared SIMT R8C4/R8C8 and MMA R64C64/R64C128 across every existing seam. The
+retained non-monotonic route was already the stable candidate decision:
+
+```text
+P=4          SIMT R8C4
+P=8          SIMT R8C8
+P=12         SIMT R8C4
+P=16..24     SIMT R8C8
+P=28..320    MMA R64C64
+P>=324       MMA R64C128
+```
+
+Three-process confirmation established:
+
+| P | MMA64 | MMA128 | Decision |
+|---:|---:|---:|---|
+| 40 | 29.984 us | 30.016 us | practical tie; retain MMA64 |
+| 68 | 29.696 us | 32.000 us | MMA64 |
+| 192 | 32.768 us | 32.224 us | 1.7% isolated difference; retain the stable interval |
+| 256 | 34.016 us | 33.952 us | practical tie |
+| 320 | 34.048 us | 36.096 us | MMA64 |
+| 324 | 36.096 us | 36.096 us | tie; begin the long-term MMA128 winner |
+
+No route change was required.
+
+### Correctness and dispatch
+
+```bash
+ctest --test-dir build \
+  -R '^ninfer_(linear_test|q4_linear_candidate_test|q4_linear_plan_test|q4_linear_dispatch_test)$' \
+  --output-on-failure
+```
+
+All four tests passed. The retained suites cover the independent Q4 oracle, the K=1152 checked
+group stage, the Rows=4304 edge, exact plan closure, and public-to-fixed dispatch identity.
+
+### Release timing and matched row-edge control
+
+The maximum rows use a measurement-only `[4352,1152]` Full variant as a same-work control. Both
+production and control execute the same padded 4352 rows, K, columns, and MMA tile count; the
+remaining timing difference therefore isolates production's 4304-row predication.
+
+| P | Production predicated | Full-row control | Executed TFLOP/s | Edge overhead |
+|---:|---:|---:|---:|---:|
+| 49152 | 2786.240 us | 2700.930 us | 176.89 | 3.16% |
+| 65536 | 3690.460 us | 3561.470 us | 178.06 | 3.62% |
+
+Each value is the median of three independent processes with eight warmups and forty cold samples.
+The production route is therefore within 3.7% of the same-grid, same-executed-work Full ceiling.
+
+Representative smaller production points were:
+
+| P | Route | Cold median | Executed TFLOP/s |
+|---:|---|---:|---:|
+| 4 | SIMT R8C4 | 11.520 us | 3.44 useful |
+| 8 | SIMT R8C8 | 13.568 us | 5.85 useful |
+| 12 | SIMT R8C4 | 17.888 us | 6.65 useful |
+| 24 | SIMT R8C8 | 27.904 us | 8.53 useful |
+| 320 | MMA R64C64 predicated | 34.048 us | 94.24 |
+| 324 | MMA R64C128 predicated | 35.968 us | 107.05 |
+| 4096 | MMA R64C128 predicated | 228.512 us | 179.73 |
+
+### NCU attribution
+
+| Topology | Representative | NCU duration | SM SOL | Memory SOL | Occupancy | Registers | Static shared | Waves/SM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SIMT R8C4 | P=12 | 19.74 us | 46.25% | 29.41% | 47.29% | 78 | 8.70 KiB | 3.16 |
+| SIMT R8C8 | P=24 | 31.84 us | 45.86% | 28.83% | 32.24% | 96 | 8.70 KiB | 4.75 |
+| MMA R64C64 | P=320 | 42.50 us | 45.30% | 33.65% | 16.49% | 101 | 28.93 KiB | 0.67 |
+| MMA R64C128 | P=49152 | 6.18 ms | 81.67% | 48.68% | 16.60% | 152 | 45.57 KiB | 76.80 |
+| MMA R64C128 | P=65536 | 6.64 ms | 82.89% | 49.04% | 16.60% | 152 | 45.57 KiB | 102.40 |
+
+The detailed maximum-image capture reports 84.22% Compute SOL with the tensor pipeline limiting
+execution. Its global/shared sector warnings are bounded by the direct Full-row control above:
+their complete observable cost is at most 3.62%, not the profiler's heuristic estimate. Every
+detailed topology reports zero local-memory and shared-memory spilling requests.
+
+Reports are retained locally under:
+
+```text
+profiles/bench/qwen3_6_35b_linear_qualification/l11/
+profiles/ncu/qwen3_6_35b_a3b/linear/l11/final/
+```
+
+## L11 retained result
+
+L11 is supported for its complete Qwen3.6-35B-A3B target domain. Its existing route selects the
+matched candidate winner, the maximum cases lie within 3.7% of the same-executed-work Full ceiling,
+and the saturated predicated kernel is tensor-pipe limited without spilling.

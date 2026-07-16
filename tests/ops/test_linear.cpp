@@ -15,6 +15,7 @@
 #include "ops/linear/q5/q5_rowsplit_launch.h"
 #include "ops/linear/q5/q5_rowsplit_plan.h"
 #include "ops/linear/q6/q6_rowsplit_plan.h"
+#include "ops/linear/w8/w8_rowsplit_plan.h"
 #include "ops/row_split_pack.h"
 
 #include <algorithm>
@@ -307,6 +308,11 @@ int one_quant_shape(QType qtype, std::int32_t n, std::int32_t k,
             const ops::detail::Q6Plan plan =
                 ops::detail::q6_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
             tol = ops::detail::q6_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
+                                                                   : Tolerance::linear_bf16();
+        } else if (qtype == QType::W8G32_F16S) {
+            const ops::detail::W8Plan plan =
+                ops::detail::w8_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
+            tol = ops::detail::w8_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
                                                                    : Tolerance::linear_bf16();
         }
         failures += verify(label.c_str(), from_device_bf16(dout, static_cast<std::size_t>(n) * t),
@@ -789,9 +795,9 @@ int main() {
 
     if (std::getenv("NINFER_LINEAR_TEST_W8G32_ONLY") != nullptr) {
         int f = 0;
-        f += one_quant_shape(QType::W8G32_F16S, 64, 256, {128}, 119u);
-        f += one_quant_shape(QType::W8G32_F16S, 70, 130, {17}, 121u);
-        f += paired_w8g32_shape(64, 256, {17, 128}, 127u);
+        f += one_quant_shape(QType::W8G32_F16S, 1024, 5120, {1, 4, 5, 16, 17}, 119u);
+        f += one_quant_shape(QType::W8G32_F16S, 4608, 4608, {5, 6}, 121u);
+        f += paired_w8g32_shape(1024, 5120, {4, 5, 57}, 127u);
         std::cout << (f ? "FAIL" : "OK") << " linear W8G32 focused correctness\n";
         return f ? 1 : 0;
     }
@@ -828,19 +834,13 @@ int main() {
     f += one_dense_shape(96, 128, 512, QType::BF16_CTRL, 53u);
     f += fp32_ctrl_first_column_consistency(48, 64, 7);
     f += fp32_ctrl_first_column_consistency(64, 64, 32);
-    for (std::uint32_t seed : {1u, 7u, 99u}) {
-        f += one_quant_shape(QType::W8G32_F16S, 70, 130, {1, 2, 5, 17}, seed);
-        f += one_quant_shape(QType::W8G32_F16S, 70, 131, {1, 2, 5, 17}, seed);
-        for (auto [n, k] : {std::pair<std::int32_t, std::int32_t>{5120, 10240},
-                            std::pair<std::int32_t, std::int32_t>{14336, 5120},
-                            std::pair<std::int32_t, std::int32_t>{5120, 6144},
-                            std::pair<std::int32_t, std::int32_t>{34816, 5120},
-                            std::pair<std::int32_t, std::int32_t>{5120, 17408}}) {
-            f += one_quant_shape(QType::W8G32_F16S, n, k, {1, 2, 5, 17}, seed);
-        }
-    }
-    f += one_quant_shape(QType::W8G32_F16S, 96, 130, {1, 2, 5, 17}, 113u, 8.0f, 1.25f, "stress");
-    f += paired_w8g32_shape(64, 256, {17, 128}, 127u);
+    // W8 public correctness is exact-admission only. The dedicated W8 dispatch test covers every
+    // registered view and route family word-for-word; these independent fp64-oracle points cover
+    // both SIMT schedules, both MMA row tiles, the Vision crossover, and the pair topology seam.
+    f += one_quant_shape(QType::W8G32_F16S, 1024, 5120, {1, 4, 5, 16, 17}, 113u);
+    f += one_quant_shape(QType::W8G32_F16S, 14336, 5120, {8, 9}, 117u);
+    f += one_quant_shape(QType::W8G32_F16S, 4608, 4608, {5, 6}, 121u);
+    f += paired_w8g32_shape(1024, 5120, {4, 5, 57}, 127u);
     // Q4 public correctness is exact-admission only. The dedicated Q4 plan/dispatch tests cover
     // every route seam and compare public auto against the fixed entry word-for-word; these
     // oracle points cover the split-K/SIMT numerical boundary at real product geometries.

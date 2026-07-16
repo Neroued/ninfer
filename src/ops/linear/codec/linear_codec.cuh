@@ -72,41 +72,4 @@ struct Q4Codec {
     }
 };
 
-struct W8G32Codec {
-    static constexpr int kBits                = 8;
-    static constexpr int kGroupK              = 32;
-    static constexpr int kBytesPerRowPerGroup = 32;
-
-    __device__ static void load_group(const std::uint8_t* codes, const std::uint8_t* high,
-                                      const std::uint8_t* scales, std::int32_t row,
-                                      std::int32_t group, std::int32_t kg, float out[kGroupK]) {
-        (void)high;
-        const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + group;
-        const float scale              = codec_load_scale_f16(scales, group_index);
-        const std::uint8_t* packed     = codes + group_index * kBytesPerRowPerGroup;
-#pragma unroll
-        for (int lane = 0; lane < kGroupK; ++lane) {
-            const auto q = static_cast<std::int8_t>(packed[lane]);
-            out[lane]    = static_cast<float>(q) * scale;
-        }
-    }
-
-    __device__ static void load_pair(const std::uint8_t* codes, const std::uint8_t* /*high*/,
-                                     const std::uint8_t* scales, std::int64_t group_index, int lane,
-                                     float& w0, float& w1) {
-        if (lane >= (kGroupK / 2)) {
-            w0 = 0.0f;
-            w1 = 0.0f;
-            return;
-        }
-        const float scale = codec_load_scale_f16(scales, group_index);
-        const std::uint8_t* packed =
-            codes + group_index * kBytesPerRowPerGroup + static_cast<std::int64_t>(lane) * 2;
-        const auto q0 = static_cast<std::int8_t>(packed[0]);
-        const auto q1 = static_cast<std::int8_t>(packed[1]);
-        w0            = static_cast<float>(q0) * scale;
-        w1            = static_cast<float>(q1) * scale;
-    }
-};
-
 } // namespace ninfer::ops::detail

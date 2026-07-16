@@ -7,9 +7,6 @@ namespace ninfer::ops::detail {
 LinearFormat classify_format(const Weight& w) {
     using L = QuantLayout;
     switch (w.qtype) {
-    case QType::W8G32_F16S:
-        return w.layout == L::RowSplit ? LinearFormat::W8G32_RowSplit
-                                       : LinearFormat::GenericUnsupported;
     case QType::BF16_CTRL:
         return w.layout == L::Contiguous ? LinearFormat::DenseBF16
                                          : LinearFormat::GenericUnsupported;
@@ -55,8 +52,7 @@ LinearRegime classify_regime(LinearFormat fmt, ShapeFamily shape, std::int32_t t
 }
 
 LinearPlan resolve_plan(LinearPlanKey key) {
-    // Dense keeps its reference GEMV/GEMM. W8 remains the only quantized format
-    // on this compatibility planner until its format backend is migrated.
+    // BF16/FP32 keep their reference GEMV/GEMM until the BF16 boundary is established.
     if (key.format == LinearFormat::DenseBF16 || key.format == LinearFormat::DenseFP32) {
         const bool gemv = (key.regime == LinearRegime::T1);
         const LinearPolicyId policy =
@@ -64,23 +60,11 @@ LinearPlan resolve_plan(LinearPlanKey key) {
         return LinearPlan{LinearBackendKind::Reference, policy, policy_name(policy),
                           /*uses_tensor_cores=*/false};
     }
-    if (key.format == LinearFormat::W8G32_RowSplit && key.regime == LinearRegime::LargeT) {
-        return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitW8G32GemmMma,
-                          policy_name(LinearPolicyId::RowsplitW8G32GemmMma),
-                          /*uses_tensor_cores=*/true};
-    }
-    if (key.format == LinearFormat::W8G32_RowSplit) {
-        return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmSmallt,
-                          policy_name(LinearPolicyId::RowsplitLowbitGemmSmallt),
-                          /*uses_tensor_cores=*/false};
-    }
     throw std::invalid_argument("legacy linear planner received an unsupported format");
 }
 
 const char* format_name(LinearFormat f) {
     switch (f) {
-    case LinearFormat::W8G32_RowSplit:
-        return "w8g32_rowsplit";
     case LinearFormat::DenseBF16:
         return "dense_bf16";
     case LinearFormat::DenseFP32:
@@ -133,10 +117,6 @@ const char* regime_name(LinearRegime r) {
 
 const char* policy_name(LinearPolicyId p) {
     switch (p) {
-    case LinearPolicyId::RowsplitLowbitGemmSmallt:
-        return "linear.rowsplit.gemm.smallt.v1";
-    case LinearPolicyId::RowsplitW8G32GemmMma:
-        return "linear.rowsplit.w8g32.gemm.mma.bf16.v1";
     case LinearPolicyId::GenericDenseGemv:
         return "linear.ref.dense.gemv.generic.v1";
     case LinearPolicyId::GenericDenseGemm:

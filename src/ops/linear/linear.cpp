@@ -6,6 +6,8 @@
 #include "ops/linear/q4/q4_rowsplit_plan.h"
 #include "ops/linear/q5/q5_rowsplit_plan.h"
 #include "ops/linear/q6/q6_rowsplit_plan.h"
+#include "ops/linear/w8/w8_rowsplit_plan.h"
+#include "ops/linear_pair/w8/w8_pair_plan.h"
 #include "ops/linear/reference/linear_generic.h"
 #include "core/weight.h" // as_dense
 
@@ -336,33 +338,20 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
         detail::q6_rowsplit_dispatch(x, w, out, stream);
         return;
     }
+    if (w.qtype == QType::W8G32_F16S) {
+        detail::w8_rowsplit_dispatch(x, w, out, stream);
+        return;
+    }
 
-    // W8/Dense continue through the existing planner until their format backends migrate.
+    // BF16/FP32 contiguous weights remain on the compatibility planner until the BF16 format
+    // boundary is established.
     (void)ws;
     const detail::LinearFormat fmt  = detail::classify_format(w);
     const detail::ShapeFamily shape = detail::classify_shape(w.n, w.k);
     detail::LinearRegime regime     = detail::classify_regime(fmt, shape, x.ne[1]);
-    // The LargeT bf16 tensor-core mma GEMM streams x with 16B cp.async (8 bf16 per
-    // token row), which requires k % 8 == 0 (else the per-token base k*col is not
-    // 16-byte aligned and the last k%8 elements would be dropped). Every Qwen3.6
-    // shape has k a multiple of 128; for any other k, fall back to the small-T
-    // GEMM, which is correct for all k.
-    const bool mma_routed_format = fmt == detail::LinearFormat::W8G32_RowSplit;
-    if (mma_routed_format && regime == detail::LinearRegime::LargeT && (w.k % 8) != 0) {
-        regime = detail::LinearRegime::SmallT;
-    }
-    if (fmt == detail::LinearFormat::W8G32_RowSplit && (w.padded_shape[1] % 256) != 0) {
-        regime = detail::LinearRegime::SmallT;
-    }
     const detail::LinearPlan plan = detail::resolve_plan(detail::LinearPlanKey{fmt, shape, regime});
 
     switch (plan.policy) {
-    case detail::LinearPolicyId::RowsplitLowbitGemmSmallt:
-        detail::linear_rowsplit_gemm_smallt_launch(x, w, out, fmt, stream);
-        break;
-    case detail::LinearPolicyId::RowsplitW8G32GemmMma:
-        detail::linear_rowsplit_w8g32_gemm_mma_launch(x, w, out, stream);
-        break;
     case detail::LinearPolicyId::GenericDenseGemv: {
         const Tensor dense = as_dense(w);
         detail::linear_generic_dense_gemv_launch(x, dense, out, stream);
@@ -405,14 +394,8 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     require_tensor_data(x, first_out);
     require_tensor_data(x, second_out);
 
-    if (first_weight.qtype == QType::W8G32_F16S && x.ne[1] > 16 && (first_weight.k % 8) == 0 &&
-        (first_weight.padded_shape[1] % 256) == 0) {
-        detail::linear_rowsplit_w8g32_kv_gemm_mma_launch(x, first_weight, second_weight, first_out,
-                                                         second_out, stream);
-        return;
-    }
-    linear(x, first_weight, first_out, ws, stream);
-    linear(x, second_weight, second_out, ws, stream);
+    (void)ws;
+    detail::w8_pair_dispatch(x, first_weight, second_weight, first_out, second_out, stream);
 }
 
 } // namespace ninfer::ops

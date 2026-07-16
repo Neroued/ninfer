@@ -15,9 +15,10 @@ namespace ninfer::ops {
  *
  * `x` is contiguous BF16 [K,T], both outputs are distinct contiguous BF16 [N,T], and both
  * weights have the same logical [N,K] shape and RowSplit W8G32_F16S encoding with FP16 scales.
- * Numeric semantics are those of linear(). Inputs, outputs, and weight planes must be mutually
- * non-overlapping. `ws` is caller-owned transient scratch; the Op has no persistent state side
- * effect.
+ * The current registry admits exactly the paired [1024,5120] projection and chooses either two
+ * format-local SIMT launches or one dual-output MMA launch from T. Numeric semantics are those of
+ * linear(). Inputs, outputs, and weight planes must be mutually non-overlapping. `ws` is
+ * caller-owned transient scratch; the Op has no persistent state side effect.
  */
 void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                  Tensor& first_out, Tensor& second_out, WorkspaceArena& ws, cudaStream_t stream);

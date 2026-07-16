@@ -71,10 +71,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/vision_pos_embed.cu
   ops/linear/gemm/linear_rowsplit_grouped_input_gemm_mma.cu
   ops/linear/gemm/linear_rowsplit_q4_gate_up_silu_gemm_mma.cu
-  ops/linear/gemm/linear_rowsplit_w8g32_gemm_mma.cu
-  ops/linear/gemm/linear_rowsplit_w8g32_kv_gemm_mma.cu
   ops/linear/gemv/linear_dense_gdn_in_ab_48.cu
-  ops/linear/gemv/linear_rowsplit_gemm_smallt.cu
   ops/linear/gemv/linear_rowsplit_gemv_mlp_gate_up_34816.cu
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_simt.cu
@@ -91,6 +88,12 @@ add_library(ninfer_ops STATIC
   ops/linear/q6/q6_rowsplit_gemm_mma.cu
   ops/linear/q6/q6_rowsplit_gemm_simt.cu
   ops/linear/q6/q6_rowsplit_plan.cpp
+  ops/linear/w8/w8_rowsplit_gemm_mma.cu
+  ops/linear/w8/w8_rowsplit_gemm_simt.cu
+  ops/linear/w8/w8_rowsplit_launch.cpp
+  ops/linear/w8/w8_rowsplit_plan.cpp
+  ops/linear_pair/w8/w8_pair_gemm_mma.cu
+  ops/linear_pair/w8/w8_pair_plan.cpp
   ops/linear/linear.cpp
   ops/linear/plan/linear_plan.cpp
   ops/linear/reference/linear_generic_dense.cu

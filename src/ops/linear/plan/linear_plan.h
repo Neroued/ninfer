@@ -8,7 +8,6 @@
 namespace ninfer::ops::detail {
 
 enum class LinearFormat {
-    W8G32_RowSplit,
     DenseBF16,
     DenseFP32,
     GenericUnsupported,
@@ -33,8 +32,6 @@ enum class LinearRegime { T1, SmallT, LargeT };
 enum class LinearBackendKind { Gemv, Gemm, Reference };
 
 enum class LinearPolicyId {
-    RowsplitLowbitGemmSmallt,
-    RowsplitW8G32GemmMma,
     GenericDenseGemv,
     GenericDenseGemm,
 };
@@ -52,12 +49,12 @@ struct LinearPlan {
     bool uses_tensor_cores; // derived metadata, reports only
 };
 
-// Host classification for the remaining W8/Dense compatibility planner.
+// Host classification for the remaining BF16/FP32 compatibility planner.
 LinearFormat classify_format(const Weight& w);
 ShapeFamily classify_shape(std::int32_t n, std::int32_t k);
 LinearRegime classify_regime(LinearFormat fmt, ShapeFamily shape, std::int32_t t);
 
-// Q4/Q5/Q6 pure Linear are owned by format-local plans and cannot be represented here.
+// Quantized pure Linear formats are owned by format-local plans and cannot be represented here.
 LinearPlan resolve_plan(LinearPlanKey key);
 
 // Names / identity for logs and (future) benchmarks. No behavioral role.

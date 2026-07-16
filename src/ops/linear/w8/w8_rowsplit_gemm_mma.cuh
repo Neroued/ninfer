@@ -9,6 +9,7 @@
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
 #include "ops/common/mma.cuh"
+#include "ops/linear/w8/w8_rowsplit_launch.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -18,7 +19,7 @@
 namespace ninfer::ops::detail {
 
 template <int BM_, int BN_, int WM_, int WN_, int MIN_BLOCKS_, int STAGES_ = 2>
-struct W8G32GemmCfg {
+struct W8RowSplitMmaGemmSchedule {
     static constexpr int BM                = BM_;
     static constexpr int BN                = BN_;
     static constexpr int BK                = 64;
@@ -48,20 +49,21 @@ __device__ __forceinline__ int w8g32_swz64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
 
-template <class Cfg, bool FullTiles>
-__global__
-__launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_w8g32_gemm_mma_kernel(
+template <class Cfg, W8KernelVariant Variant>
+__global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out, std::int32_t m,
     std::int32_t k, std::int32_t n, std::int32_t padded_k) {
-    constexpr int BM   = Cfg::BM;
-    constexpr int BN   = Cfg::BN;
-    constexpr int BK   = Cfg::BK;
-    constexpr int WM   = Cfg::WM;
-    constexpr int WN   = Cfg::WN;
-    constexpr int MT   = Cfg::MT;
-    constexpr int NT   = Cfg::NT;
-    constexpr int KSUB = Cfg::KSUB;
+    static_assert(Variant == W8KernelVariant::Full || Variant == W8KernelVariant::Predicated);
+    constexpr bool FullTiles = Variant == W8KernelVariant::Full;
+    constexpr int BM         = Cfg::BM;
+    constexpr int BN         = Cfg::BN;
+    constexpr int BK         = Cfg::BK;
+    constexpr int WM         = Cfg::WM;
+    constexpr int WN         = Cfg::WN;
+    constexpr int MT         = Cfg::MT;
+    constexpr int NT         = Cfg::NT;
+    constexpr int KSUB       = Cfg::KSUB;
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[Cfg::STAGES][BN * BK];

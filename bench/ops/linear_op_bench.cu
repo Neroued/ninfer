@@ -16,6 +16,9 @@
 #include "ops/linear/q5/q5_rowsplit_plan.h"
 #include "ops/linear/q6/q6_rowsplit_launch.h"
 #include "ops/linear/q6/q6_rowsplit_plan.h"
+#include "ops/linear/w8/w8_rowsplit_launch.h"
+#include "ops/linear/w8/w8_rowsplit_plan.h"
+#include "ops/linear_pair/w8/w8_pair_plan.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -84,20 +87,35 @@ enum class CandidateKind {
     Q4Fixed,
     Q5Fixed,
     Q6Fixed,
+    W8Fixed,
 };
 
 constexpr ShapeSpec kShapes[] = {
-    {"MtpFc5120x10240", 5120, 10240},        {"MtpKV1024x5120", 1024, 5120},
-    {"MtpAttnIn14336x5120", 14336, 5120},    {"MtpOProj5120x6144", 5120, 6144},
-    {"MtpMlpGateUp34816x5120", 34816, 5120}, {"MtpMlpDown5120x17408", 5120, 17408},
-    {"MlpGateUp34816x5120", 34816, 5120},    {"AttnInQKV7168x5120", 7168, 5120},
-    {"GdnInQK4096x5120", 4096, 5120},        {"MlpDown5120x17408", 5120, 17408},
-    {"LmHead248320x5120", 248320, 5120},     {"LmHeadDraft65536x5120", 65536, 5120},
-    {"LmHeadDraft98304x5120", 98304, 5120},  {"LmHeadDraft131072x5120", 131072, 5120},
-    {"Proj6144x5120", 6144, 5120},           {"Out5120x6144", 5120, 6144},
-    {"VisionPatch1152x1536", 1152, 1536},    {"VisionQKV3456x1152", 3456, 1152},
-    {"VisionFC14304x1152", 4304, 1152},      {"AttnV1024x5120", 1024, 5120},
-    {"VisionOut1152x1152", 1152, 1152},      {"VisionFC2_1152x4304", 1152, 4304},
+    {"MtpFc5120x10240", 5120, 10240},
+    {"MtpKV1024x5120", 1024, 5120},
+    {"MtpAttnIn14336x5120", 14336, 5120},
+    {"MtpOProj5120x6144", 5120, 6144},
+    {"MtpMlpGateUp34816x5120", 34816, 5120},
+    {"MtpMlpDown5120x17408", 5120, 17408},
+    {"MlpGateUp34816x5120", 34816, 5120},
+    {"AttnInQKV7168x5120", 7168, 5120},
+    {"GdnInQK4096x5120", 4096, 5120},
+    {"MlpDown5120x17408", 5120, 17408},
+    {"LmHead248320x5120", 248320, 5120},
+    {"LmHeadDraft65536x5120", 65536, 5120},
+    {"LmHeadDraft98304x5120", 98304, 5120},
+    {"LmHeadDraft131072x5120", 131072, 5120},
+    {"Proj6144x5120", 6144, 5120},
+    {"Out5120x6144", 5120, 6144},
+    {"VisionPatch1152x1536", 1152, 1536},
+    {"VisionQKV3456x1152", 3456, 1152},
+    {"VisionFC14304x1152", 4304, 1152},
+    {"AttnV1024x5120", 1024, 5120},
+    {"VisionOut1152x1152", 1152, 1152},
+    {"VisionFC2_1152x4304", 1152, 4304},
+    {"MtpQGate6144x5120", 6144, 5120},
+    {"VisionMergerFC1_4608x4608", 4608, 4608},
+    {"VisionMergerFC2_5120x4608", 5120, 4608},
 };
 
 constexpr TargetSpec kTask2Targets[] = {
@@ -122,6 +140,9 @@ constexpr TargetSpec kTask2Targets[] = {
     {{"MtpOProj5120x6144", 5120, 6144}, QType::W8G32_F16S},
     {{"MtpMlpGateUp34816x5120", 34816, 5120}, QType::W8G32_F16S},
     {{"MtpMlpDown5120x17408", 5120, 17408}, QType::W8G32_F16S},
+    {{"MtpQGate6144x5120", 6144, 5120}, QType::W8G32_F16S},
+    {{"VisionMergerFC1_4608x4608", 4608, 4608}, QType::W8G32_F16S},
+    {{"VisionMergerFC2_5120x4608", 5120, 4608}, QType::W8G32_F16S},
 };
 
 struct Options {
@@ -145,6 +166,9 @@ struct Options {
     ops::detail::Q6ScheduleId q6_schedule   = ops::detail::Q6ScheduleId::SimtR8C4;
     ops::detail::Q6KernelVariant q6_variant = ops::detail::Q6KernelVariant::Predicated;
     bool q6_variant_auto                    = true;
+    ops::detail::W8ScheduleId w8_schedule   = ops::detail::W8ScheduleId::SimtR8C4;
+    ops::detail::W8KernelVariant w8_variant = ops::detail::W8KernelVariant::Predicated;
+    bool w8_variant_auto                    = true;
     int warmup                              = kDefaultWarmup;
     int repeat                              = kDefaultRepeat;
     int copy_repeat                         = kDefaultCopyRepeat;
@@ -384,6 +408,11 @@ ops::detail::Q6Plan resolve_auto_q6_plan(const ShapeSpec& shape, std::int32_t t)
     return ops::detail::q6_rowsplit_resolve_plan({shape.n, shape.k, padded_k, t});
 }
 
+ops::detail::W8Plan resolve_auto_w8_plan(const ShapeSpec& shape, std::int32_t t) {
+    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
+    return ops::detail::w8_rowsplit_resolve_plan({shape.n, shape.k, padded_k, t});
+}
+
 std::string candidate_name(const Options& opt, QType qtype, const ShapeSpec& shape,
                            std::int32_t t) {
     switch (opt.candidate) {
@@ -397,13 +426,18 @@ std::string candidate_name(const Options& opt, QType qtype, const ShapeSpec& sha
         if (qtype == QType::Q6G64_F16S) {
             return ops::detail::q6_schedule_name(resolve_auto_q6_plan(shape, t).schedule);
         }
-        return "auto";
+        if (qtype == QType::W8G32_F16S) {
+            return ops::detail::w8_schedule_name(resolve_auto_w8_plan(shape, t).schedule);
+        }
+        return "unsupported";
     case CandidateKind::Q4Fixed:
         return ops::detail::q4_schedule_name(opt.q4_schedule);
     case CandidateKind::Q5Fixed:
         return ops::detail::q5_schedule_name(opt.q5_schedule);
     case CandidateKind::Q6Fixed:
         return ops::detail::q6_schedule_name(opt.q6_schedule);
+    case CandidateKind::W8Fixed:
+        return ops::detail::w8_schedule_name(opt.w8_schedule);
     }
     return "unknown";
 }
@@ -457,6 +491,18 @@ void parse_candidate(Options& opt, std::string_view raw) {
     } else if (candidate == "q6-mma-r64c128") {
         opt.candidate   = CandidateKind::Q6Fixed;
         opt.q6_schedule = ops::detail::Q6ScheduleId::MmaR64C128;
+    } else if (candidate == "w8-simt-r8c4") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SimtR8C4;
+    } else if (candidate == "w8-simt-r8c8") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SimtR8C8;
+    } else if (candidate == "w8-mma-r32c128") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C128;
+    } else if (candidate == "w8-mma-r64c128") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C128;
     } else {
         throw std::invalid_argument("unknown candidate: " + std::string(raw));
     }
@@ -501,6 +547,19 @@ ops::detail::Q6KernelVariant parse_q6_variant(std::string_view raw, bool& is_aut
     throw std::invalid_argument("unknown Q6 kernel variant: " + std::string(raw));
 }
 
+ops::detail::W8KernelVariant parse_w8_variant(std::string_view raw, bool& is_auto) {
+    const std::string variant = lower(raw);
+    if (variant == "auto") {
+        is_auto = true;
+        return ops::detail::W8KernelVariant::Predicated;
+    }
+    is_auto = false;
+    if (variant == "none") { return ops::detail::W8KernelVariant::None; }
+    if (variant == "full") { return ops::detail::W8KernelVariant::Full; }
+    if (variant == "predicated") { return ops::detail::W8KernelVariant::Predicated; }
+    throw std::invalid_argument("unknown W8 kernel variant: " + std::string(raw));
+}
+
 ops::detail::Q4KernelVariant resolve_q4_variant(ops::detail::Q4ScheduleId schedule,
                                                 std::int32_t rows, std::int32_t k,
                                                 std::int32_t padded_k, std::int32_t cols) {
@@ -535,6 +594,18 @@ ops::detail::Q6KernelVariant resolve_q6_variant(ops::detail::Q6ScheduleId schedu
     }
     throw std::invalid_argument(std::string("no legal variant for ") +
                                 ops::detail::q6_schedule_name(schedule));
+}
+
+ops::detail::W8KernelVariant resolve_w8_variant(ops::detail::W8ScheduleId schedule,
+                                                std::int32_t rows, std::int32_t k,
+                                                std::int32_t padded_k, std::int32_t cols) {
+    const ops::detail::W8Problem problem{rows, k, padded_k, cols};
+    using V = ops::detail::W8KernelVariant;
+    for (const V variant : {V::Full, V::Predicated}) {
+        if (ops::detail::w8_candidate_is_legal(schedule, variant, problem)) { return variant; }
+    }
+    throw std::invalid_argument(std::string("no legal variant for ") +
+                                ops::detail::w8_schedule_name(schedule));
 }
 
 ShapeSpec parse_shape(std::string_view raw) {
@@ -601,12 +672,12 @@ void usage(const char* argv0) {
         "Usage:\n"
         "  %s --all-targets [--warmup N] [--repeat N] [--copy-repeat N]\n"
         "  %s --shape ShapeFamily --qtype Q4|Q5|Q6|W8G32 [--repeat N]\n"
-        "  %s --rows N --k K --qtype Q4|Q5|Q6 --candidate NAME "
+        "  %s --rows N --k K --qtype Q4|Q5|Q6|W8G32 --candidate NAME "
         "[--variant auto|none|full|predicated]\n\n"
         "Options:\n"
         "  --all-targets              Run the registered target shape/qtype rows (default).\n"
         "  --shape NAME               One ShapeFamily string, e.g. MlpGateUp34816x5120.\n"
-        "  --rows N --k K             Numeric matrix geometry for Q4/Q5/Q6 candidate work.\n"
+        "  --rows N --k K             Numeric matrix geometry for fixed-candidate work.\n"
         "  --qtype Q4|Q5|Q6|W8G32     Low-bit ROW_SPLIT qtype for --shape.\n"
         "  --candidate NAME           auto, q4-gemv-r4w1-direct,\n"
         "                             q4-gemv-r1w8-direct, q4-simt-r8c4, q4-simt-r8c8,\n"
@@ -615,8 +686,10 @@ void usage(const char* argv0) {
         "                             q5-simt-split2-exact, q5-simt-split4-exact,\n"
         "                             q5-mma-r64c64, q5-mma-r64c128,\n"
         "                             q6-simt-r8c4,\n"
-        "                             q6-mma-r64c64, or q6-mma-r64c128.\n"
-        "  --variant NAME             Q4/Q5/Q6 fixed variant; auto is the default.\n"
+        "                             q6-mma-r64c64, q6-mma-r64c128,\n"
+        "                             w8-simt-r8c4, w8-simt-r8c8,\n"
+        "                             w8-mma-r32c128, or w8-mma-r64c128.\n"
+        "  --variant NAME             Fixed kernel variant; auto is the default.\n"
         "  --paired-kv                Benchmark paired MTP K/V (requires MtpKV + W8G32).\n"
         "  --warmup N                 Cold-cache warmup GEMV launches (default %d).\n"
         "  --repeat N                 Cold-cache measured GEMV launches (default %d).\n"
@@ -665,6 +738,7 @@ Options parse_args(int argc, char** argv) {
             opt.q4_variant             = parse_q4_variant(raw, opt.q4_variant_auto);
             opt.q5_variant             = parse_q5_variant(raw, opt.q5_variant_auto);
             opt.q6_variant             = parse_q6_variant(raw, opt.q6_variant_auto);
+            opt.w8_variant             = parse_w8_variant(raw, opt.w8_variant_auto);
             opt.all_targets            = false;
         } else if (arg == "--paired-kv") {
             opt.paired_kv   = true;
@@ -727,6 +801,12 @@ Options parse_args(int argc, char** argv) {
     if (opt.candidate == CandidateKind::Q6Fixed && opt.qtype != QType::Q6G64_F16S) {
         throw std::invalid_argument("Q6 fixed candidate requires Q6");
     }
+    if (opt.candidate == CandidateKind::W8Fixed && !numeric_shape && !opt.have_shape) {
+        throw std::invalid_argument("W8 fixed candidate requires one shape");
+    }
+    if (opt.candidate == CandidateKind::W8Fixed && opt.qtype != QType::W8G32_F16S) {
+        throw std::invalid_argument("W8 fixed candidate requires W8G32");
+    }
     if (opt.paired_kv &&
         (std::string_view(opt.shape.name) != "MtpKV1024x5120" || opt.qtype != QType::W8G32_F16S)) {
         throw std::invalid_argument("--paired-kv requires --shape MtpKV1024x5120 --qtype W8G32");
@@ -745,6 +825,7 @@ Options parse_args(int argc, char** argv) {
 }
 
 std::vector<int> default_t_sweep(const TargetSpec& target, const Options& opt) {
+    if (opt.paired_kv) { return {1, 4, 5, 16, 17, 56, 57, 128}; }
     if (opt.candidate == CandidateKind::Q4Fixed) {
         const bool gemv = opt.q4_schedule == ops::detail::Q4ScheduleId::GemvR4W1Direct ||
                           opt.q4_schedule == ops::detail::Q4ScheduleId::GemvR1W8Direct;
@@ -761,6 +842,9 @@ std::vector<int> default_t_sweep(const TargetSpec& target, const Options& opt) {
     }
     if (opt.candidate == CandidateKind::Q6Fixed) {
         return {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
+    }
+    if (opt.candidate == CandidateKind::W8Fixed) {
+        return {1, 2, 4, 5, 8, 9, 16, 17, 32, 56, 57, 64, 128, 256, 512, 1024, 2048};
     }
     if (target.qtype == QType::Q4G64_F16S) {
         if (target.shape.n == 131072 && target.shape.k == 5120) { return {1}; }
@@ -791,6 +875,11 @@ std::vector<int> default_t_sweep(const TargetSpec& target, const Options& opt) {
         if (target.shape.n == 1152 && target.shape.k == 4304) {
             return {4, 8, 84, 88, 92, 128, 512, 2048};
         }
+    }
+    if (target.qtype == QType::W8G32_F16S) {
+        if (target.shape.n == 14336 || target.shape.n == 34816) { return {1, 4, 5, 8, 9, 16, 128}; }
+        if (target.shape.k == 4608) { return {1, 4, 5, 6, 16, 128}; }
+        return {1, 4, 5, 8, 16, 17, 128};
     }
     return {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
 }
@@ -1048,6 +1137,14 @@ ops::detail::Q6KernelVariant selected_q6_variant(const Options& opt, const Shape
                                : opt.q6_variant;
 }
 
+ops::detail::W8KernelVariant selected_w8_variant(const Options& opt, const ShapeSpec& shape,
+                                                 std::int32_t t) {
+    if (opt.candidate != CandidateKind::W8Fixed) { return ops::detail::W8KernelVariant::None; }
+    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
+    return opt.w8_variant_auto ? resolve_w8_variant(opt.w8_schedule, shape.n, shape.k, padded_k, t)
+                               : opt.w8_variant;
+}
+
 void launch_candidate(const Options& opt, const ShapeSpec& shape, const Tensor& x, const Weight& w,
                       Tensor& out, WorkspaceArena& ws, cudaStream_t stream) {
     switch (opt.candidate) {
@@ -1067,6 +1164,11 @@ void launch_candidate(const Options& opt, const ShapeSpec& shape, const Tensor& 
     case CandidateKind::Q6Fixed: {
         const auto variant = selected_q6_variant(opt, shape, x.ne[1]);
         ops::detail::q6_rowsplit_launch_candidate(opt.q6_schedule, variant, x, w, out, stream);
+        return;
+    }
+    case CandidateKind::W8Fixed: {
+        const auto variant = selected_w8_variant(opt, shape, x.ne[1]);
+        ops::detail::w8_rowsplit_launch_candidate(opt.w8_schedule, variant, x, w, out, stream);
         return;
     }
     }
@@ -1124,6 +1226,20 @@ int schedule_col_tile(ops::detail::Q5ScheduleId schedule, std::int32_t exact_col
     throw std::invalid_argument("unknown Q5 schedule tile");
 }
 
+int schedule_col_tile(ops::detail::W8ScheduleId schedule) {
+    using S = ops::detail::W8ScheduleId;
+    switch (schedule) {
+    case S::SimtR8C4:
+        return 4;
+    case S::SimtR8C8:
+        return 8;
+    case S::MmaR32C128:
+    case S::MmaR64C128:
+        return 128;
+    }
+    throw std::invalid_argument("unknown W8 schedule tile");
+}
+
 int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, std::int32_t t) {
     switch (opt.candidate) {
     case CandidateKind::Auto:
@@ -1136,13 +1252,18 @@ int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, 
         if (qtype == QType::Q6G64_F16S) {
             return schedule_col_tile(resolve_auto_q6_plan(shape, t).schedule);
         }
-        return t;
+        if (qtype == QType::W8G32_F16S) {
+            return schedule_col_tile(resolve_auto_w8_plan(shape, t).schedule);
+        }
+        throw std::invalid_argument("unsupported qtype for auto candidate tile");
     case CandidateKind::Q4Fixed:
         return schedule_col_tile(opt.q4_schedule);
     case CandidateKind::Q5Fixed:
         return schedule_col_tile(opt.q5_schedule, t);
     case CandidateKind::Q6Fixed:
         return schedule_col_tile(opt.q6_schedule);
+    case CandidateKind::W8Fixed:
+        return schedule_col_tile(opt.w8_schedule);
     }
     throw std::invalid_argument("unknown Linear benchmark candidate tile");
 }
@@ -1157,6 +1278,9 @@ bool candidate_uses_mma(const Options& opt, QType qtype, const ShapeSpec& shape,
     if (opt.candidate == CandidateKind::Q6Fixed) {
         return ops::detail::q6_schedule_uses_mma(opt.q6_schedule);
     }
+    if (opt.candidate == CandidateKind::W8Fixed) {
+        return ops::detail::w8_schedule_uses_mma(opt.w8_schedule);
+    }
     if (opt.candidate != CandidateKind::Auto) { return false; }
     if (qtype == QType::Q4G64_F16S) {
         return ops::detail::q4_schedule_uses_mma(resolve_auto_q4_plan(shape, t).schedule);
@@ -1164,8 +1288,33 @@ bool candidate_uses_mma(const Options& opt, QType qtype, const ShapeSpec& shape,
     if (qtype == QType::Q5G64_F16S) {
         return ops::detail::q5_schedule_uses_mma(resolve_auto_q5_plan(shape, t).schedule);
     }
-    return qtype == QType::Q6G64_F16S &&
-           ops::detail::q6_schedule_uses_mma(resolve_auto_q6_plan(shape, t).schedule);
+    if (qtype == QType::Q6G64_F16S) {
+        return ops::detail::q6_schedule_uses_mma(resolve_auto_q6_plan(shape, t).schedule);
+    }
+    return qtype == QType::W8G32_F16S &&
+           ops::detail::w8_schedule_uses_mma(resolve_auto_w8_plan(shape, t).schedule);
+}
+
+int candidate_mma_row_tile(const Options& opt, QType qtype, const ShapeSpec& shape,
+                           std::int32_t t) {
+    ops::detail::W8ScheduleId schedule{};
+    if (opt.candidate == CandidateKind::W8Fixed) {
+        schedule = opt.w8_schedule;
+    } else if (opt.candidate == CandidateKind::Auto && qtype == QType::W8G32_F16S) {
+        schedule = resolve_auto_w8_plan(shape, t).schedule;
+    } else {
+        return 64;
+    }
+    switch (schedule) {
+    case ops::detail::W8ScheduleId::MmaR32C128:
+        return 32;
+    case ops::detail::W8ScheduleId::MmaR64C128:
+        return 64;
+    case ops::detail::W8ScheduleId::SimtR8C4:
+    case ops::detail::W8ScheduleId::SimtR8C8:
+        throw std::logic_error("SIMT W8 schedule has no MMA row tile");
+    }
+    throw std::logic_error("unknown W8 schedule row tile");
 }
 
 RunResult run_target(const TargetSpec& target, const Options& opt, double stream_ceiling_gbs,
@@ -1206,7 +1355,8 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     double executed_tflops = std::numeric_limits<double>::quiet_NaN();
     double executed_tc_pct = std::numeric_limits<double>::quiet_NaN();
     if (candidate_uses_mma(opt, target.qtype, shape, t)) {
-        const std::int64_t executed_rows = align_up_u64(shape.n, 64);
+        const std::int64_t executed_rows =
+            align_up_u64(shape.n, candidate_mma_row_tile(opt, target.qtype, shape, t));
         const std::int64_t executed_cols = align_up_u64(t, col_tile);
         const double executed_flops      = 2.0 * static_cast<double>(executed_rows) *
                                       static_cast<double>(shape.k) *
@@ -1231,6 +1381,8 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
         r.kernel_variant = ops::detail::q5_kernel_variant_name(selected_q5_variant(opt, shape, t));
     } else if (opt.candidate == CandidateKind::Q6Fixed) {
         r.kernel_variant = ops::detail::q6_kernel_variant_name(selected_q6_variant(opt, shape, t));
+    } else if (opt.candidate == CandidateKind::W8Fixed) {
+        r.kernel_variant = ops::detail::w8_kernel_variant_name(selected_w8_variant(opt, shape, t));
     } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q4G64_F16S) {
         r.kernel_variant =
             ops::detail::q4_kernel_variant_name(resolve_auto_q4_plan(shape, t).variant);
@@ -1240,6 +1392,9 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q6G64_F16S) {
         r.kernel_variant =
             ops::detail::q6_kernel_variant_name(resolve_auto_q6_plan(shape, t).variant);
+    } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::W8G32_F16S) {
+        r.kernel_variant =
+            ops::detail::w8_kernel_variant_name(resolve_auto_w8_plan(shape, t).variant);
     } else {
         r.kernel_variant = "n/a";
     }
@@ -1302,12 +1457,20 @@ RunResult run_paired_kv(const Options& opt, double stream_ceiling_gbs, double tc
     const double sec                 = cold.median_us * 1e-6;
     const double flops =
         4.0 * static_cast<double>(shape.n) * static_cast<double>(shape.k) * static_cast<double>(t);
+    const ops::detail::W8PairPlan plan =
+        ops::detail::w8_pair_resolve_plan({shape.n, shape.k, shape.k, t});
+    const int col_tile = plan.schedule == ops::detail::W8PairScheduleId::TwoSimtR8C4   ? 4
+                         : plan.schedule == ops::detail::W8PairScheduleId::TwoSimtR8C8 ? 8
+                                                                                       : 128;
+    const std::uint64_t weight_passes = static_cast<std::uint64_t>((t + col_tile - 1) / col_tile);
+    const std::uint64_t weight_replay_lower_bound_bytes =
+        weight_bytes * weight_passes + x_bytes + out_bytes;
 
     RunResult r;
     r.shape_name                      = shape.name;
     r.qtype_name                      = "W8G32x2";
-    r.candidate_name                  = "auto";
-    r.kernel_variant                  = "n/a";
+    r.candidate_name                  = ops::detail::w8_pair_schedule_name(plan.schedule);
+    r.kernel_variant                  = ops::detail::w8_kernel_variant_name(plan.variant);
     r.n                               = shape.n * 2;
     r.k                               = shape.k;
     r.t                               = t;
@@ -1315,16 +1478,27 @@ RunResult run_paired_kv(const Options& opt, double stream_ceiling_gbs, double tc
     r.x_bytes                         = x_bytes;
     r.out_bytes                       = out_bytes;
     r.useful_bytes                    = useful_bytes;
-    r.weight_replay_lower_bound_bytes = useful_bytes;
+    r.weight_replay_lower_bound_bytes = weight_replay_lower_bound_bytes;
     r.cold_median_us                  = cold.median_us;
     r.cold_min_us                     = cold.min_us;
     r.cold_p95_us                     = cold.p95_us;
     r.warm_median_us                  = warm.median_us;
     r.useful_gbs = sec > 0.0 ? static_cast<double>(useful_bytes) / sec / 1e9 : 0.0;
-    r.weight_replay_lower_bound_gbs = r.useful_gbs;
+    r.weight_replay_lower_bound_gbs =
+        sec > 0.0 ? static_cast<double>(weight_replay_lower_bound_bytes) / sec / 1e9 : 0.0;
     r.useful_copy_ceiling_pct =
         stream_ceiling_gbs > 0.0 ? r.useful_gbs / stream_ceiling_gbs * 100.0 : 0.0;
-    r.useful_tflops        = sec > 0.0 ? flops / sec / 1e12 : 0.0;
+    r.useful_tflops = sec > 0.0 ? flops / sec / 1e12 : 0.0;
+    if (plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C128) {
+        const auto executed_rows    = align_up_u64(shape.n, 32);
+        const auto executed_cols    = align_up_u64(t, 128);
+        const double executed_flops = 4.0 * static_cast<double>(executed_rows) *
+                                      static_cast<double>(shape.k) *
+                                      static_cast<double>(executed_cols);
+        r.executed_tflops = sec > 0.0 ? executed_flops / sec / 1e12 : 0.0;
+        r.executed_tc_pct =
+            tc_ceiling_tflops > 0.0 ? r.executed_tflops / tc_ceiling_tflops * 100.0 : 0.0;
+    }
     r.tc_ceiling_tflops    = tc_ceiling_tflops;
     r.stream_ceiling_gbs   = stream_ceiling_gbs;
     r.useful_copy_floor_us = stream_ceiling_gbs > 0.0 ? static_cast<double>(useful_bytes) /

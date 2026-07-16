@@ -3,17 +3,20 @@
 // Paired MTP K/V W8G32 GEMM. One CTA keeps a single BF16 activation tile in
 // shared memory and contracts it against independent K and V weight tiles.
 
-#include "ops/linear/gemm/linear_rowsplit_w8g32_gemm_mma.cuh"
+#include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
+#include "ops/linear/w8/w8_rowsplit_launch.h"
 
 namespace ninfer::ops::detail {
 
-template <bool FullTiles>
-__global__ __launch_bounds__(256, 2) void linear_rowsplit_w8g32_kv_gemm_mma_kernel(
+template <W8KernelVariant Variant>
+__global__ __launch_bounds__(256, 2) void w8_pair_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ k_codes,
     const std::uint8_t* __restrict__ k_scales, const std::uint8_t* __restrict__ v_codes,
     const std::uint8_t* __restrict__ v_scales, __nv_bfloat16* __restrict__ k_out,
     __nv_bfloat16* __restrict__ v_out, std::int32_t m, std::int32_t k, std::int32_t n,
     std::int32_t padded_k) {
+    static_assert(Variant == W8KernelVariant::Full || Variant == W8KernelVariant::Predicated);
+    constexpr bool FullTiles        = Variant == W8KernelVariant::Full;
     constexpr int BM                = 32;
     constexpr int BN                = 128;
     constexpr int BK                = 64;

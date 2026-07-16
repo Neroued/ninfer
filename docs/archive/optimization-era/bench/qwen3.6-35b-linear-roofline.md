@@ -6,7 +6,96 @@ Target: Qwen3.6-35B-A3B exact Linear domains on NVIDIA GeForce RTX 5090 (`sm_120
 CUDA 13.1, driver 591.86, NCU 2025.4.1).
 
 This is retained standalone Op evidence. It does not register the 35B Engine target. This revision
-establishes L7-L14.
+establishes L5 and L7-L14.
+
+## L5: W8 MTP stem `[2048,4096]`
+
+The exact operation is W8G32_F16S RowSplit `[2048,4096]` times BF16 `[4096,T]`, producing the
+plain BF16 MTP-stem output `[2048,T]` for every Text chunk size `1<=T<=1024`.
+
+### Route qualification
+
+Matched Release-build sweeps screened all four existing W8 schedules. SIMT R8C8 never won.
+Three independent processes around both crossovers established the following finite route:
+
+```text
+T=1..56      SIMT R8C4
+T=57..895    MMA R32C128
+T=896..1024  MMA R64C128
+```
+
+The first seam measured 62.496 us versus 62.720 us for SIMT/MMA32 at `T=56`, then
+64.800 us versus 62.688 us at `T=57`. Around the second seam, MMA32 and MMA64 were practical
+ties at `T=888/895`; at `T=896`, MMA64 measured 124.128 us, and at `T=897` it avoided the
+MMA32 tail-wave jump from about 128 us to 145 us.
+
+### Correctness and dispatch
+
+```bash
+cmake --build build -j --target \
+  ninfer_linear_op_bench ninfer_linear_test \
+  ninfer_w8_linear_plan_test ninfer_w8_linear_dispatch_test
+ctest --test-dir build \
+  -R '^ninfer_(linear_test|w8_linear_plan_test|w8_linear_dispatch_test)$' \
+  --output-on-failure
+```
+
+All three tests passed. The independent FP64 oracle checks both sides of the SIMT/MMA seam at
+`T=56/57`, while a distributed row/column sample checks the complete maximum `T=1024` problem.
+The measured relative L2 errors were `1.654e-3`, `2.156e-3`, and `2.689e-3`, respectively.
+Plan and dispatch tests close the complete admitted interval and verify every route boundary
+against its fixed kernel identity.
+
+### Release timing and launch-aware roofline
+
+Production `auto` used eight warmups, forty L2-flushed samples, and isolated processes at the
+reported points:
+
+| T | Route | Cold median | Executed TFLOP/s |
+|---:|---|---:|---:|
+| 1 | SIMT R8C4 | 17.696 us | fixed launch/ownership floor |
+| 56 | SIMT R8C4 | 62.464 us | 15.04 useful |
+| 57 | MMA R32C128 | 62.720 us | crossover winner |
+| 512 | MMA R32C128 | 71.392 us | 120.32 |
+| 895 | MMA R32C128 | 128.768 us | 116.74 |
+| 896 | MMA R64C128 | 124.128 us | 121.10 |
+| 1024 | MMA R64C128 | 124.064 us | 138.48 |
+
+At `T=1024`, the fixed 2048-row MMA64 grid contains only 256 CTAs, or 0.75 full device waves, so
+a full-device dense-MMA percentage is not the relevant ceiling. The already qualified L14
+`[2048,4608]` problem at the same `T=1024` uses the same W8 format, output rows, grid, schedule,
+and resource envelope while executing 12.5% more K work. Three alternating independent processes
+measured 124.064 us and 138.48 TFLOP/s for L5 versus 138.496 us and 139.55 TFLOP/s for that
+control. L5 is therefore only 0.77% below the matched launch-aware throughput ceiling.
+
+### NCU attribution
+
+Basic-first captures matched the intended SIMT and MMA kernel substrings. Detailed follow-ups
+reported:
+
+| Topology | Representative | NCU duration | SM SOL | Memory SOL | Occupancy | Registers | Static shared | Waves/SM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SIMT R8C4 | T=56 | 72.58 us | 63.51% | 54.88% | 62.82% | 64 | 17.41 KiB | 5.27 |
+| MMA R32C128 | T=512 | 97.50 us | 52.40% | 57.47% | 25.10% | 83 | 39.42 KiB | 0.75 |
+| MMA R64C128 | T=1024 | 182.37 us | 55.63% | 34.86% | 25.45% | 119 | 46.08 KiB | 0.75 |
+
+The L14 control's basic capture has the same 256-CTA grid, 0.75 waves/SM, 119 registers/thread,
+46.08 KiB static shared memory, and 25.44% achieved occupancy as the L5 MMA64 maximum. All three
+detailed L5 captures report zero local-memory and shared-memory spilling requests. NCU durations
+are diagnostic counter-replay measurements and are not substituted for the CUDA-event medians.
+
+Reports are retained locally under:
+
+```text
+profiles/bench/qwen3_6_35b_linear_qualification/l5/
+profiles/ncu/qwen3_6_35b_a3b/linear/l5/final/
+```
+
+## L5 retained result
+
+L5 is supported for its complete Qwen3.6-35B-A3B target domain. Its finite route selects the
+measured crossover winners, the maximum remains within 0.77% of a same-topology launch-aware
+ceiling, and all production topologies are profiler-confirmed without spilling.
 
 ## L7: Q4 draft head `[131072,2048]`
 

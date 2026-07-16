@@ -215,7 +215,19 @@ constexpr std::array<RoutePoint, 4> kR32Routes{{
     {128, S::MmaR32C128, V::Full},
 }};
 
-constexpr std::array<RoutePoint, 4> kVisionRoutes{{
+constexpr std::array<RoutePoint, 9> kVision4608Routes{{
+    {1, S::SimtR8C4, V::Predicated},
+    {8, S::SimtR8C4, V::Full},
+    {9, S::MmaR32C128, V::Predicated},
+    {11, S::MmaR32C128, V::Predicated},
+    {12, S::SimtR8C4, V::Full},
+    {13, S::MmaR32C128, V::Predicated},
+    {256, S::MmaR32C128, V::Full},
+    {257, S::MmaR64C128, V::Predicated},
+    {32768, S::MmaR64C128, V::Full},
+}};
+
+constexpr std::array<RoutePoint, 4> kVision5120Routes{{
     {4, S::SimtR8C4, V::Full},
     {5, S::SimtR8C8, V::Predicated},
     {6, S::MmaR64C128, V::Predicated},
@@ -389,8 +401,8 @@ int main() {
         {"W8 [5120,6144]", 5120, 6144, kDefault17Routes.data(), kDefault17Routes.size(), 23u},
         {"W8 [34816,5120]", 34816, 5120, kEarly9Routes.data(), kEarly9Routes.size(), 29u},
         {"W8 [5120,17408]", 5120, 17408, kDefault17Routes.data(), kDefault17Routes.size(), 31u},
-        {"W8 [4608,4608]", 4608, 4608, kVisionRoutes.data(), kVisionRoutes.size(), 37u},
-        {"W8 [5120,4608]", 5120, 4608, kVisionRoutes.data(), kVisionRoutes.size(), 41u},
+        {"W8 [4608,4608]", 4608, 4608, kVision4608Routes.data(), kVision4608Routes.size(), 37u},
+        {"W8 [5120,4608]", 5120, 4608, kVision5120Routes.data(), kVision5120Routes.size(), 41u},
     }};
 
     try {

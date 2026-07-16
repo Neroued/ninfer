@@ -6,7 +6,7 @@ Target: Qwen3.6-35B-A3B Linear rows L8-L13 on NVIDIA GeForce RTX 5090 (`sm_120a`
 CUDA 13.1, driver 591.86, NCU 2025.4.1).
 
 This is retained standalone Op evidence. It does not register the 35B Engine target. Qualification
-is being completed in Vision execution order; this revision establishes L8-L12.
+was completed in Vision execution order; this revision establishes L8-L13.
 
 ## L8: Q6 Vision patch projection `[1152,1536]`
 
@@ -507,3 +507,115 @@ profiles/ncu/qwen3_6_35b_a3b/linear/l12/final/
 L12 is supported for its complete Qwen3.6-35B-A3B target domain. The corrected route removes large
 small-P regressions, the maximum K-tail cases remain within 8.1% of the same-topology Full-K
 ceiling, and all final topologies are spill-free.
+
+## L13: W8 Vision merger fc1 `[4608,4608]`
+
+The exact operation is W8G32_F16S RowSplit `[4608,4608]` times BF16 `[4608,V]`, producing BF16
+`[4608,V]`. The complete target domain is every merger column count through maximum video/image
+`V=12288/16384`.
+
+### Route correction
+
+The retained route selected SIMT R8C8 only at `V=5` and MMA R64C128 from `V=6`. Matched
+fixed-candidate sweeps found that R8C8 never won, R64C128 paid too much fixed cost below 257
+columns, and the small-domain winner changed at two non-monotonic seams. The final closed route is:
+
+```text
+V=1..8       SIMT R8C4
+V=9..11      MMA R32C128
+V=12         SIMT R8C4
+V=13..256    MMA R32C128
+V>=257       MMA R64C128
+```
+
+The seams were confirmed with three independent processes, eight warmups, and forty cold samples
+per process:
+
+| V | SIMT R8C4 | MMA R32C128 | MMA R64C128 | Decision |
+|---:|---:|---:|---:|---|
+| 8 | 50.464 us | 72.512 us | - | SIMT |
+| 9 | 83.232 us | 72.800 us | - | MMA32 |
+| 11 | 87.040 us | 72.896 us | - | MMA32 |
+| 12 | 60.704 us | 72.928 us | - | SIMT |
+| 13 | 101.664 us | 72.736 us | - | MMA32 |
+| 256 | - | 87.328 us | 93.376 us | MMA32 |
+| 257 | - | 156.960 us | 142.624 us | MMA64 |
+
+The adjacent `[5120,4608]` registered route was kept unchanged.
+
+### Correctness and dispatch
+
+```bash
+cmake --build build -j --target \
+  ninfer_linear_op_bench ninfer_linear_test \
+  ninfer_w8_linear_plan_test ninfer_w8_linear_dispatch_test
+ctest --test-dir build \
+  -R '^ninfer_(linear_test|w8_linear_plan_test|w8_linear_dispatch_test)$' \
+  --output-on-failure
+```
+
+All three tests passed. The W8 dispatch suite retains an independent FP64 oracle at representative
+points for every final topology and verifies public-to-fixed BF16 identity. The plan suite checks
+all revised seams, the complete admitted upper bound, and that the `[5120,4608]` route did not
+change.
+
+### Release timing and matched W8 ceiling
+
+Representative final production points were:
+
+| V | Route | Cold median | Useful TFLOP/s |
+|---:|---|---:|---:|
+| 1 | SIMT R8C4 predicated | 34.048 us | 1.25 useful |
+| 8 | SIMT R8C4 full | 50.272 us | 6.76 useful |
+| 9 | MMA R32C128 predicated | 70.912 us | 5.39 |
+| 12 | SIMT R8C4 full | 60.704 us | 8.39 useful |
+| 13 | MMA R32C128 predicated | 70.912 us | 7.79 |
+| 256 | MMA R32C128 full | 85.280 us | 127.48 |
+| 257 | MMA R64C128 predicated | 142.624 us | 76.52 |
+| 1024 | MMA R64C128 full | 275.712 us | 157.72 |
+| 4096 | MMA R64C128 full | 933.888 us | 186.26 |
+
+W8 performs online group-scale decode before each MMA tile, so a dense BF16-only probe is not the
+semantic roofline for this fused kernel. Maximum-item qualification therefore uses the existing
+`[5120,4608]` W8 route as a matched format ceiling: it has the same K, storage format, decode
+cadence, MMA schedule, and two-CTA-per-SM resource envelope.
+
+| V | L13 cold median | L13 TFLOP/s | Matched-control TFLOP/s | Difference |
+|---:|---:|---:|---:|---:|
+| 12288 | 3110.880 us | 167.75 | 168.07 | -0.19% |
+| 16384 | 4141.860 us | 167.99 | 164.35 | +2.21% |
+
+These are independent three-process medians with eight warmups and forty cold samples. L13 tracks
+or exceeds the same-format ceiling at both complete maximum item sizes.
+
+### NCU attribution
+
+Basic-first captures matched the intended W8 SIMT/MMA kernel substrings. Detailed captures then
+checked pipeline balance and spilling for every distinct topology.
+
+| Topology | Representative | NCU duration | SM SOL | Memory SOL | Occupancy | Registers | Static shared | Waves/SM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SIMT R8C4 | V=8 | 57.86 us | 37.35% | 32.25% | 61.86% | 64 | 17.41 KiB | 1.69 |
+| MMA R32C128 | V=256 | 116.70 us | 56.12% | 60.76% | 27.99% | 83 | 39.42 KiB | 0.85 |
+| MMA R64C128 | V=12288 | 5.09 ms | 78.17% | 50.52% | 32.94% | 119 | 46.08 KiB | 20.33 |
+| MMA R64C128 | V=16384 | 7.19 ms | 76.89% | 49.74% | 33.02% | 119 | 46.08 KiB | 27.11 |
+| `[5120,4608]` matched control | V=16384 | 9.34 ms | 75.69% | 49.05% | 33.03% | 119 | 46.08 KiB | 30.12 |
+
+The detailed large-MMA capture identifies Tensor as the highest-utilized pipeline. Achieved
+occupancy is within 0.4 percentage points of the 33.33% register/shared-memory-limited theoretical
+occupancy, and its dominant warp stall is waiting for the oversubscribed math pipeline. The exact
+L13 maximum reaches higher Compute SOL than the matched control. Every detailed topology reports
+zero local-memory and shared-memory spilling requests.
+
+Reports are retained locally under:
+
+```text
+profiles/bench/qwen3_6_35b_linear_qualification/l13/
+profiles/ncu/qwen3_6_35b_a3b/linear/l13/final/
+```
+
+## L13 retained result
+
+L13 is supported for its complete Qwen3.6-35B-A3B target domain. The corrected route selects the
+measured small-domain winner, both maximum item sizes attain the matched W8 online-decode/MMA
+roofline, and all final topologies are spill-free.

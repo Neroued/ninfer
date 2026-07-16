@@ -1,6 +1,7 @@
 # Linear Kernel 架构
 
-> 状态：已实现。本文描述当前源码中的 Linear-family 架构，而不是迁移步骤。
+> 状态：已实现并归档。本文记录完成时的 Linear-family 架构与验收结论；
+> 当前 exact route 以源码和测试为准。
 >
 > 适用目标：当前注册产品 `qwen3_6_27b_rtx5090`。未来 35B shape 只作为扩展压力，
 > 不属于本文声明的运行时支持面。
@@ -489,7 +490,7 @@ production 接受。
   T1 9.528→9.393 us，T1024 16.471→16.401 us，T4097 50.068→49.939 us。
 
 完整实验过程和原始命令保存在
-[`../archive/optimization-era/plans/2026-07-16-linear-kernel-architecture-experiment-log.md`](../archive/optimization-era/plans/2026-07-16-linear-kernel-architecture-experiment-log.md)。
+[`2026-07-16-linear-kernel-architecture-experiment-log.md`](2026-07-16-linear-kernel-architecture-experiment-log.md)。
 
 ## 12. 与被否决设计的差异
 

@@ -4,7 +4,7 @@
 
 本文统计当前产品基线中已经存在的 Linear 算子、精确执行问题、执行策略和 CUDA kernel。
 它与
-[`2026-07-16-linear-kernel-architecture-refactor.md`](../../../plans/2026-07-16-linear-kernel-architecture-refactor.md)
+[`2026-07-16-linear-kernel-architecture-refactor.md`](2026-07-16-linear-kernel-architecture-refactor.md)
 分工不同：架构文档描述未来应当采用的所有权和调度边界；本文只回答当前有什么、哪些路径
 真实可达、现有证据是否充分，以及后续应逐项决定保留、重写、扩面、泛化还是删除。
 

@@ -9,7 +9,7 @@
 > grouped projection、SwiGLU、MoE grouped 或任意运行时 epilogue。
 >
 > 上位边界：
-> [Linear Kernel Architecture](../../../plans/2026-07-16-linear-kernel-architecture-refactor.md)。
+> [Linear Kernel Architecture](2026-07-16-linear-kernel-architecture-refactor.md)。
 > 当前算子和物理问题：
 > [Linear 算子盘点](2026-07-16-linear-operator-inventory.md)。
 > 测量、失败方案和资格限制：

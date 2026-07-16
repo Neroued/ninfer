@@ -12,7 +12,6 @@ implementations, dated investigations, and performance evidence belong under [`a
 | [`ninfer-project-positioning.md`](ninfer-project-positioning.md) | project mission, exact-target policy, workload, performance priorities, and non-goals |
 | [`design.md`](design.md) | implemented component ownership, load/request flows, lifetime boundaries, and build direction |
 | [`ninfer-engine-architecture.md`](ninfer-engine-architecture.md) | detailed target-package, Engine, Frontend, Program, generated-token transaction, and source-organization decisions |
-| [`plans/2026-07-16-linear-kernel-architecture-refactor.md`](plans/2026-07-16-linear-kernel-architecture-refactor.md) | 当前已实现的 Linear-family 接口边界、格式与语义 Op 所有权、exact route、workspace、融合扩展和 roofline 验收架构 |
 | [`serving.md`](serving.md) | CLI, server, sampling, multimodal input, streaming, usage, and tool-call behavior |
 | [`op-development.md`](op-development.md) | Op definition and contracts, central implementation ownership, numerical validation, benchmarking, and profiling |
 | [`ninfer-naming.md`](ninfer-naming.md) | canonical NInfer project name and `.ninfer` artifact extension |

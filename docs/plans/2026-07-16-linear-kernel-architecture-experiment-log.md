@@ -1,6 +1,8 @@
 # Linear Kernel Architecture Experiment Log
 
-> Status: final experiment report for the recommended architecture.
+> Status: retained experiment evidence. E051 supersedes the target-owned profile/injection
+> conclusion; kernel, route, numerical, performance, and profiler evidence remains applicable to
+> the revised Op-owned architecture.
 >
 > Started: 2026-07-16.
 >
@@ -116,6 +118,7 @@ limits. Useful traffic/FLOP accounting is kept separate from physical NCU traffi
 | E048 | 2026-07-16 | Re-attribute final full-inference latency under Release. | P128, TG32, and MTP P32+G32 optimized-head routes. | Isolated `cudaProfilerApi` capture around one measured request; NSYS report plus SQLite summary. | Linear/GEMM is 93.0% of P128 kernel time and 77.7% of the MTP kernel time. Decode remains dominated by T1/Small-T Linear families. Release kernel sums are lower than the invalid Debug captures. | Keep Linear as the dominant optimization target. Use NSYS for product attribution and NCU only for selected fixed kernels. |
 | E049 | 2026-07-16 | Establish physical roofline/resource evidence for representative final policies. | T1, TT4, Q5 direct, BN64/BN128, W8 small/general, pair, Add, SwiGLU, 32K Vision. | NCU application replay, exact base-name filters, one launch; microbench timing remains authoritative. | The sampled policies occupy distinct resource/traffic regimes: 8.3--89.9% achieved occupancy, 24.2--90.7% SM SOL, 3.8--76.8% DRAM SOL, 37--154 registers, and 4.1--47.6 KiB static shared. No sampled kernel spills. | Reject one global roofline threshold and qualify per fixed policy plus wave/tail class. Retain separate split-low4 and W8 lifecycles and treat profiler duration only as diagnostic. |
 | E050 | 2026-07-16 | Close source/binary congruence and verify the exact final worktree. | Single exact support/route-profile authority, support-derived benchmark inventory, fail-closed launch, dead tuned kernels, all Linear tests and default build. | Release build, CPU structural tests, four GPU correctness modes, 24-view/pair smoke, formatting/diff checks, linked entry/SASS/resource audit. | All checks pass after fixing one missing CUDA include path on the host-only planner benchmark. The final benchmark has 85 true Linear entries, zero 7168/dual-Q5 entries, zero stack/local, and is 123,152 B smaller than the pre-cleanup checkpoint. | Accept the implemented foundation. Keep per-policy roofline closure as Stage B rather than claiming all 83 routes are qualified. |
+| E051 | 2026-07-16 | Re-evaluate the semantic boundary before implementing the clean cut-over. | Proposed target-owned `LinearExecutionProfile`, all Linear-family APIs and callers. | Interface/ownership review against the original Op contract and the requirement that callers remain unaware of dispatch. The uncommitted clean implementation was discarded and its branch deleted. | Explicit or hidden target-profile injection makes target code part of Linear routing, leaks implementation semantics through every caller, and cannot be repaired by moving the same dependency into Engine, Program, `Weight`, global state, or workspace. The original `linear(x,w,out,ws,stream)` boundary is correct. | Supersede the ownership conclusion of E050. Retain its physical problem inventory, route winners, fixed policies, codegen, correctness, and performance evidence; rebuild exact admission and routing as an immutable hardware-specific catalog wholly owned by each semantic Op. Reject unqualified grid-ceiling tails as “best” production routing. |
 
 ## 5. Environment and baseline inventory
 
@@ -1918,31 +1921,56 @@ For descriptive provenance, the final benchmark and test binaries have SHA-256
 stream is `90968069136c6d18eed028131a1397165bce567cf31702dbf85c6e04c2a3fc67`. These hashes describe
 this checkpoint and are not product validity requirements.
 
-## 10. Final conclusions and residual work
+## 10. Revised conclusions and residual work
 
-No unresolved design choice blocks adoption of the recommended architecture. The evidence closes
-the original questions as follows:
+E051 changes ownership, not the measured execution facts.
 
-- support is an exact finite physical-view registry; future shapes add measured rows rather than
-  weakening current admission;
-- each semantic Op owns a finite route/workspace plan and one fixed launcher identity;
+The retained conclusions are:
+
+- support is a finite set of exact physical problems; future shapes add measured rows rather than
+  weakening admission;
+- route boundaries are geometry-local and may be non-monotonic;
+- each semantic Op needs one finite route/workspace plan and one fixed execution closure;
 - complete mainloops are shared only when staging lifetime, synchronization, warp ownership, and
-  output ownership match; codecs and narrow finalizers may be shared below that boundary;
-- fusion is supported as finite accumulator-topology/finalizer policies. LinearAdd can finalize
-  collectively, folded SwiGLU is retained only in winning bands, and pair owns its joint topology;
-  a universal runtime epilogue is neither necessary nor free;
-- pure registered Linear remains workspace-free; fused Ops may own explicit materialization when
-  it is the measured winner, and capacity is the maximum route scratch over the reachable range;
-- roofline qualification is per fixed policy and wave/tail class. The 32K Vision Q4 policy has a
-  demonstrated 96.38% same-process compute-roof result; this is not generalized to all routes.
+  output ownership match;
+- codecs, decode atoms, MMA fragments, topology helpers, and narrow finalizers may be shared below
+  that boundary when codegen evidence permits;
+- fusion is supported through independent semantic Ops and finite complete policies, not a
+  universal runtime epilogue;
+- materialized composition is a legitimate winning policy, and capacity is the maximum scratch
+  across every reachable route;
+- roofline qualification is per fixed policy and wave/tail class. The demonstrated 32K Vision
+  result does not qualify every route.
 
-Remaining work is deliberately staged rather than an architecture ambiguity:
+The superseded conclusions are:
 
-- optimize and physically qualify the product-dominant T1/Small-T, W8 reread, partial-wave, and
-  tail-heavy policies identified by E048/E049;
-- add a high-T independent Vision numerical oracle if those routes are changed, since the public
-  image integration test is not such an oracle;
-- design optimized dense BF16 and grouped-expert lifecycles only in future-target scope;
-- admit 35B only through its own exact support, numerical, winner, physical, and product gates;
-- perform optional naming/`EncodingId` cleanup only when it removes maintenance cost without
-  expanding the template or runtime-policy surface.
+- target owns Linear route selection;
+- callers should pass `LinearExecutionProfile`;
+- target/profile and kernel catalog form the semantic execution contract;
+- a grid-legal terminal route can be admitted beyond its winner evidence;
+- a fused executor may call public auto-dispatch Linear and silently inherit later Base route
+  changes.
+
+The revised ownership is:
+
+```text
+target owns which physical calls are reachable
+semantic Op owns exact support, route resolution, workspace, and fixed execution
+```
+
+The 24 current base problems, 83 prototype routes, fused route surfaces, kernel resources, SASS,
+correctness results, NSYS attribution, and NCU reports remain the starting evidence for a clean
+Op-owned implementation. They must be rechecked against the qualified token envelope rather than
+copied as a target profile.
+
+Remaining work is:
+
+- implement the corrected Op-owned architecture from the clean product baseline;
+- revalidate the admitted token envelope against real Text, Vision, and MTP reachability;
+- preserve or improve the measured route winners with unchanged semantic APIs;
+- optimize and physically qualify product-dominant T1/Small-T, W8 reread, partial-wave, and
+  tail-heavy policies;
+- add a high-T independent Vision numerical oracle before changing those routes;
+- design optimized dense BF16 and grouped-expert lifecycles only when required;
+- admit future 35B physical problems only through exact numerical, winner, physical, and product
+  gates.

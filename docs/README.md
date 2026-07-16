@@ -50,8 +50,8 @@ serving behavior. Runtime support requires an explicit compiled exact-checkpoint
 
 | Document | Scope |
 |---|---|
-| [`plans/2026-07-16-linear-kernel-architecture-refactor.md`](plans/2026-07-16-linear-kernel-architecture-refactor.md) | evidence-backed recommended Linear architecture, target-profile ownership cut-over, and staged per-policy roofline program |
-| [`plans/2026-07-16-linear-kernel-architecture-experiment-log.md`](plans/2026-07-16-linear-kernel-architecture-experiment-log.md) | final experiment report, including measurements, rejected alternatives, invalidated runs, and qualification limits |
+| [`plans/2026-07-16-linear-kernel-architecture-refactor.md`](plans/2026-07-16-linear-kernel-architecture-refactor.md) | revised evidence-backed Linear architecture with unchanged semantic APIs, Op-owned exact routing, independent fused planners, and staged per-policy roofline work |
+| [`plans/2026-07-16-linear-kernel-architecture-experiment-log.md`](plans/2026-07-16-linear-kernel-architecture-experiment-log.md) | retained experiment report, including measurements, superseded ownership conclusions, invalidated runs, and qualification limits |
 
 Active plans guide implementation but do not replace the semantic and ownership authorities above.
 When a plan is complete or abandoned, move it under `archive/`, remove it from this table, and

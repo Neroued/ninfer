@@ -69,7 +69,10 @@ add_library(ninfer_ops STATIC
   ops/launcher/silu_and_mul.cu
   ops/launcher/vision_attention.cu
   ops/launcher/vision_pos_embed.cu
-  ops/linear/gemm/linear_rowsplit_grouped_input_gemm_mma.cu
+  ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
+  ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
+  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
+  ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
   ops/linear/gemv/linear_dense_gdn_in_ab_48.cu
   ops/linear/bf16/bf16_contiguous_plan.cpp
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
@@ -107,9 +110,10 @@ add_library(ninfer_ops STATIC
   ops/wrapper/gated_delta_rule.cpp
   ops/wrapper/gdn_gating.cpp
   ops/wrapper/gdn_gating_proj.cpp
+  ops/wrapper/gdn_input_proj.cpp
   ops/wrapper/gelu.cpp
   ops/wrapper/gqa_attention.cpp
-  ops/wrapper/input_proj.cpp
+  ops/wrapper/attn_input_proj.cpp
   ops/wrapper/l2norm.cpp
   ops/wrapper/layer_norm.cpp
   ops/wrapper/linear_add.cpp

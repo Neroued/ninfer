@@ -13,11 +13,13 @@
 namespace ninfer::ops {
 
 /**
- * Returns two contiguous BF16 temporary matrices, [qk_rows,tokens] and
- * [value_rows,tokens], for 1<=tokens<=16; returns zero for tokens>16.
+ * Returns the maximum transient capacity required by any admitted GdnInputProj route in
+ * [1,max_tokens]. The registered Q4+Q5 problem materializes two BF16 projections through T=16,
+ * so the capacity saturates at (qk_rows+value_rows)*16 BF16 elements.
  */
-[[nodiscard]] std::size_t
-gdn_input_proj_workspace_bytes(std::int32_t qk_rows, std::int32_t value_rows, std::int32_t tokens);
+[[nodiscard]] std::size_t gdn_input_proj_workspace_bytes(std::int32_t qk_rows,
+                                                         std::int32_t value_rows,
+                                                         std::int32_t max_tokens);
 
 /**
  * Op: gdn_input_proj

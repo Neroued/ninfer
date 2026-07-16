@@ -1,14 +1,11 @@
 #pragma once
 
-// Grouped Q4/Q5 input projection for the text attention and GDN mixers. Every
-// CTA owns one homogeneous BMxBN output tile. Attention uses one compile-time
-// codec-specialized launch for Q+K and one for Gate+V; GDN keeps one mixed-codec
-// launch because its asymmetric 4096/6144 grid benefits from the larger shared
-// scheduling pool.
+// Closed Q4/Q5 RowSplit grouped-MMA mechanism. Semantic Ops own the exact job
+// set, route plan, workspace, and fixed instantiations.
 
 #include "ops/common/math.h"
-#include "ops/linear/codec/linear_codec.cuh"
 #include "ops/linear/common/rowsplit_mma_common.cuh"
+#include "ops/linear/q4/q4_rowsplit_storage.cuh"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "core/tensor.h"
 
@@ -18,7 +15,7 @@
 
 namespace ninfer::ops::detail {
 
-struct RowsplitGroupedJob {
+struct RowSplitGroupedMmaJob {
     const std::uint8_t* codes   = nullptr;
     const std::uint8_t* high    = nullptr;
     const std::uint8_t* scales  = nullptr;
@@ -29,18 +26,17 @@ struct RowsplitGroupedJob {
     bool q5                     = false;
 };
 
-enum class GroupedInputCodec : std::uint8_t {
+enum class RowSplitGroupedMmaCodec : std::uint8_t {
     Mixed,
     Q4,
     Q5,
 };
 
-template <class Cfg, bool FullTiles, GroupedInputCodec Codec = GroupedInputCodec::Mixed,
+template <class Cfg, bool FullTiles, RowSplitGroupedMmaCodec Codec = RowSplitGroupedMmaCodec::Mixed,
           int Jobs = 4>
-__global__
-__launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_input_gemm_mma_kernel(
-    const __nv_bfloat16* __restrict__ x, RowsplitGroupedJob job0, RowsplitGroupedJob job1,
-    RowsplitGroupedJob job2, RowsplitGroupedJob job3, std::int32_t k, std::int32_t t,
+__global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_grouped_mma_kernel(
+    const __nv_bfloat16* __restrict__ x, RowSplitGroupedMmaJob job0, RowSplitGroupedMmaJob job1,
+    RowSplitGroupedMmaJob job2, RowSplitGroupedMmaJob job3, std::int32_t k, std::int32_t t,
     std::int32_t padded_k) {
     constexpr int BM   = Cfg::BM;
     constexpr int BN   = Cfg::BN;
@@ -53,7 +49,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
     constexpr int KSUB = BK / 16;
     constexpr int S    = Cfg::STAGES;
     constexpr int SB   = Cfg::SCALE_BYTES;
-    constexpr int HB   = Codec == GroupedInputCodec::Q4 ? 1 : 8;
+    constexpr int HB   = Codec == RowSplitGroupedMmaCodec::Q4 ? 1 : 8;
     static_assert(GPB == 1, "grouped input GEMM requires BK=group_size=64");
     static_assert(Jobs == 2 || Jobs == 4, "grouped input GEMM supports two or four jobs");
 
@@ -65,7 +61,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
 
     const int tiles0 = div_up(job0.n, BM);
     int tile         = static_cast<int>(blockIdx.x);
-    RowsplitGroupedJob job;
+    RowSplitGroupedMmaJob job;
     if constexpr (Jobs == 2) {
         if (tile < tiles0) {
             job = job0;
@@ -157,7 +153,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                 store_vec(dst, make_int4(0, 0, 0, 0));
             }
         }
-        if constexpr (Codec == GroupedInputCodec::Q5) {
+        if constexpr (Codec == RowSplitGroupedMmaCodec::Q5) {
 #pragma unroll 1
             for (int row = tid; row < BM; row += Cfg::THREADS) {
                 const int grow = m0 + row;
@@ -172,7 +168,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                     *reinterpret_cast<std::uint64_t*>(dst) = 0;
                 }
             }
-        } else if constexpr (Codec == GroupedInputCodec::Mixed) {
+        } else if constexpr (Codec == RowSplitGroupedMmaCodec::Mixed) {
             if (job.q5) {
 #pragma unroll 1
                 for (int row = tid; row < BM; row += Cfg::THREADS) {
@@ -244,7 +240,7 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
         const int scale_off = ((kt * BK >> 6) & 1) * 2;
         for (int row = warp; row < BM; row += Cfg::WARPS) {
             __nv_bfloat162 w;
-            if constexpr (Codec == GroupedInputCodec::Q5) {
+            if constexpr (Codec == RowSplitGroupedMmaCodec::Q5) {
                 if constexpr (Cfg::SCALE_PAIR_LOAD) {
                     w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage],
                                                      &Sr[stage][row * SB + scale_off], row, lane);
@@ -252,12 +248,12 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                     w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage], &Sr[stage][row * SB],
                                                      row, lane);
                 }
-            } else if constexpr (Codec == GroupedInputCodec::Q4) {
+            } else if constexpr (Codec == RowSplitGroupedMmaCodec::Q4) {
                 if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                    w = Q4Codec::load_pair_bf162_scale_ptr(
-                        Cr[stage], nullptr, &Sr[stage][row * SB + scale_off], row, lane);
+                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB + scale_off],
+                                                     row, lane);
                 } else {
-                    w = Q4Codec::load_pair_bf162(Cr[stage], nullptr, Sr[stage], row, lane);
+                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB], row, lane);
                 }
             } else {
                 if (job.q5) {
@@ -269,10 +265,10 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
                                                          row, lane);
                     }
                 } else if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                    w = Q4Codec::load_pair_bf162_scale_ptr(
-                        Cr[stage], nullptr, &Sr[stage][row * SB + scale_off], row, lane);
+                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB + scale_off],
+                                                     row, lane);
                 } else {
-                    w = Q4Codec::load_pair_bf162(Cr[stage], nullptr, Sr[stage], row, lane);
+                    w = Q4MmaDecodeAtom::decode_pair(Cr[stage], &Sr[stage][row * SB], row, lane);
                 }
             }
             const int sc = gemm_swz64(row, 2 * lane);
@@ -355,15 +351,5 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
         }
     }
 }
-
-void linear_rowsplit_attn_input_grouped_mma_launch(const Tensor& x, const Weight& q_weight,
-                                                   const Weight& gate_weight,
-                                                   const Weight& k_weight, const Weight& v_weight,
-                                                   Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                                                   cudaStream_t stream);
-
-void linear_rowsplit_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
-                                                  const Weight& v_weight, Tensor& qkv,
-                                                  cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

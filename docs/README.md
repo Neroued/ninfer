@@ -51,6 +51,7 @@ serving behavior. Runtime support requires an explicit compiled exact-checkpoint
 | Document | Scope |
 |---|---|
 | [`plans/2026-07-16-linear-kernel-architecture-refactor.md`](plans/2026-07-16-linear-kernel-architecture-refactor.md) | revised evidence-backed Linear architecture with unchanged semantic APIs, Op-owned exact routing, independent fused planners, and staged per-policy roofline work |
+| [`plans/2026-07-16-linear-operator-inventory.md`](plans/2026-07-16-linear-operator-inventory.md) | current-source Linear-family semantic Ops, reachable physical problems, kernel families, dead paths, evidence gaps, and per-operator review order |
 | [`plans/2026-07-16-linear-kernel-architecture-experiment-log.md`](plans/2026-07-16-linear-kernel-architecture-experiment-log.md) | retained experiment report, including measurements, superseded ownership conclusions, invalidated runs, and qualification limits |
 
 Active plans guide implementation but do not replace the semantic and ownership authorities above.

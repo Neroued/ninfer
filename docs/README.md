@@ -52,6 +52,7 @@ serving behavior. Runtime support requires an explicit compiled exact-checkpoint
 |---|---|
 | [`plans/2026-07-16-linear-kernel-architecture-refactor.md`](plans/2026-07-16-linear-kernel-architecture-refactor.md) | revised evidence-backed Linear architecture with unchanged semantic APIs, Op-owned exact routing, independent fused planners, and staged per-policy roofline work |
 | [`plans/2026-07-16-linear-operator-inventory.md`](plans/2026-07-16-linear-operator-inventory.md) | 当前 Linear-family 语义算子、精确执行问题、内核族、不可达路径、证据缺口与逐算子审查顺序 |
+| [`plans/2026-07-16-q4-linear-kernel-template-design.md`](plans/2026-07-16-q4-linear-kernel-template-design.md) | Q4 RowSplit 纯 Linear 的 GEMV、SIMT GEMM、MMA GEMM 三模板族、闭合 schedule、exact route、roofline 验收和原子切换设计 |
 | [`plans/2026-07-16-linear-kernel-architecture-experiment-log.md`](plans/2026-07-16-linear-kernel-architecture-experiment-log.md) | retained experiment report, including measurements, superseded ownership conclusions, invalidated runs, and qualification limits |
 
 Active plans guide implementation but do not replace the semantic and ownership authorities above.

@@ -399,33 +399,40 @@ int grouped_gdn_correctness(std::int32_t t) {
                   Tolerance::linear_tc());
 }
 
-int gate_up_silu_correctness(std::int32_t t) {
+int gate_up_silu_route_correctness() {
     constexpr int kHidden = 5120;
     constexpr int kInter  = 17408;
     auto packed           = patterned_weight(QType::Q4G64_F16S, 2 * kInter, kHidden, 31u);
     DBuf dw(packed.payload.size());
     cudaMemcpy(dw.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
-    std::vector<float> x(static_cast<std::size_t>(kHidden) * t);
-    fill_uniform(x, 313u, -0.01f, 0.01f);
-    round_to_bf16(x);
-    DBuf dx = to_device_bf16(x);
-    DBuf gate_up(static_cast<std::size_t>(2 * kInter) * t * 2);
-    DBuf ref(static_cast<std::size_t>(kInter) * t * 2);
-    DBuf got(static_cast<std::size_t>(kInter) * t * 2);
-    Tensor tx(dx.p, DType::BF16, {kHidden, t});
-    Tensor tgate_up(gate_up.p, DType::BF16, {2 * kInter, t});
-    Tensor tref(ref.p, DType::BF16, {kInter, t});
-    Tensor tgot(got.p, DType::BF16, {kInter, t});
     WorkspaceArena ws(256ULL << 20);
     const Weight weight = packed.device_weight(dw.p);
-    launch_q4_test_reference(tx, weight, tgate_up, nullptr);
-    ops::silu_mul(tgate_up.slice(0, 0, kInter), tgate_up.slice(0, kInter, kInter), tref, nullptr);
-    ops::linear_swiglu(tx, weight, tgot, ws, nullptr);
-    cudaDeviceSynchronize();
-    return verify("linear Q4 gate/up SiLU paired",
-                  from_device_bf16(got, static_cast<std::size_t>(kInter) * t),
-                  from_device_bf16(ref, static_cast<std::size_t>(kInter) * t),
-                  Tolerance::linear_tc());
+
+    int failures = 0;
+    for (const std::int32_t t :
+         {1, 2, 128, 129, 256, 257, 384, 385, 512, 513, 640, 641, 1024, 1025, 2048}) {
+        std::vector<float> x(static_cast<std::size_t>(kHidden) * t);
+        fill_uniform(x, 313u + static_cast<std::uint32_t>(t), -0.01f, 0.01f);
+        round_to_bf16(x);
+        DBuf dx = to_device_bf16(x);
+        DBuf gate_up(static_cast<std::size_t>(2 * kInter) * t * 2);
+        DBuf ref(static_cast<std::size_t>(kInter) * t * 2);
+        DBuf got(static_cast<std::size_t>(kInter) * t * 2);
+        Tensor tx(dx.p, DType::BF16, {kHidden, t});
+        Tensor tgate_up(gate_up.p, DType::BF16, {2 * kInter, t});
+        Tensor tref(ref.p, DType::BF16, {kInter, t});
+        Tensor tgot(got.p, DType::BF16, {kInter, t});
+        launch_q4_test_reference(tx, weight, tgate_up, nullptr);
+        ops::silu_mul(tgate_up.slice(0, 0, kInter), tgate_up.slice(0, kInter, kInter), tref,
+                      nullptr);
+        ops::linear_swiglu(tx, weight, tgot, ws, nullptr);
+        cudaDeviceSynchronize();
+        const std::string label = "linear Q4 gate/up SiLU paired T=" + std::to_string(t);
+        failures += verify(
+            label.c_str(), from_device_bf16(got, static_cast<std::size_t>(kInter) * t),
+            from_device_bf16(ref, static_cast<std::size_t>(kInter) * t), Tolerance::linear_tc());
+    }
+    return failures;
 }
 
 int residual_epilogue_correctness(std::int32_t t) {
@@ -464,9 +471,9 @@ int prefill_fusion_correctness() {
     for (const std::int32_t t : {4, 17, 128, 129}) {
         f += grouped_attention_correctness(t);
         f += grouped_gdn_correctness(t);
-        f += gate_up_silu_correctness(t);
         f += residual_epilogue_correctness(t);
     }
+    f += gate_up_silu_route_correctness();
     return f;
 }
 

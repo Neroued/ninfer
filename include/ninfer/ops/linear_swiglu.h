@@ -13,11 +13,12 @@
 namespace ninfer::ops {
 
 /**
- * Returns zero for T=1 or T>16; otherwise returns one contiguous BF16
- * [gate_up_rows,tokens] fallback matrix. gate_up_rows must be positive and even.
+ * Returns the maximum transient capacity required by any admitted LinearSwiGLU route in
+ * [1,max_tokens]. For the registered Q4 problem this is the largest materialized BF16
+ * [gate_up_rows,T] projection selected in that range and saturates at T=640.
  */
 [[nodiscard]] std::size_t linear_swiglu_workspace_bytes(std::int32_t gate_up_rows,
-                                                        std::int32_t tokens);
+                                                        std::int32_t max_tokens);
 
 /**
  * Op: linear_swiglu

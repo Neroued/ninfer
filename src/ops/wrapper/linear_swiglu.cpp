@@ -1,21 +1,22 @@
 #include "ninfer/ops/linear_swiglu.h"
-#include "ops/launcher/linear_swiglu.h"
 
-#include "ops/linear/gemv/linear_rowsplit_gemv_mlp_gate_up_34816.cuh"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/silu_mul.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 
+#include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::ops {
+namespace {
 
-std::size_t linear_swiglu_workspace_bytes(std::int32_t gate_up_rows, std::int32_t tokens) {
-    if (gate_up_rows <= 0 || (gate_up_rows % 2) != 0 || tokens <= 0) {
-        throw std::invalid_argument(
-            "linear_swiglu_workspace_bytes: rows must be positive/even and tokens positive");
-    }
-    if (tokens == 1 || tokens > 16) { return 0; }
-    return Tensor(nullptr, DType::BF16, {gate_up_rows, tokens}).bytes();
+bool aligned_to(const void* pointer, std::uintptr_t alignment) {
+    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
+}
+
+} // namespace
+
+std::size_t linear_swiglu_workspace_bytes(std::int32_t gate_up_rows, std::int32_t max_tokens) {
+    return detail::q4_linear_swiglu_capacity_workspace_bytes(gate_up_rows, gate_up_rows / 2, 5120,
+                                                             5120, max_tokens);
 }
 
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
@@ -46,20 +47,12 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
         gate_up_weight.padded_shape[0] != 34816 || gate_up_weight.padded_shape[1] != 5120) {
         throw std::invalid_argument("linear_swiglu: weight must be 34816x5120");
     }
-    if (t == 1) {
-        detail::linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_launch(x, gate_up_weight, out,
-                                                                      stream);
-        return;
-    }
-    if (t > 16) {
-        detail::linear_rowsplit_q4_gate_up_silu_gemm_mma_launch(x, gate_up_weight, out, stream);
-        return;
+    if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16) ||
+        !aligned_to(gate_up_weight.qdata, 16) || !aligned_to(gate_up_weight.scales, 4)) {
+        throw std::invalid_argument("linear_swiglu: Q4 requires aligned x/out/code/scale storage");
     }
 
-    auto scratch_scope = ws.scope();
-    Tensor gate_up     = ws.alloc(DType::BF16, {34816, t});
-    linear(x, gate_up_weight, gate_up, ws, stream);
-    silu_mul(gate_up.slice(0, 0, 17408), gate_up.slice(0, 17408, 17408), out, stream);
+    detail::q4_linear_swiglu_dispatch(x, gate_up_weight, out, ws, stream);
 }
 
 } // namespace ninfer::ops

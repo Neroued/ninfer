@@ -1,4 +1,4 @@
-#include "ops/linear/gemv/linear_rowsplit_gemv_mlp_gate_up_34816.cuh"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -54,9 +54,10 @@ __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[
     pipe_commit();
 }
 
-__global__ void linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
+__global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
+                                                  const std::uint8_t* __restrict__ codes,
+                                                  const std::uint8_t* __restrict__ scales,
+                                                  __nv_bfloat16* __restrict__ out) {
     constexpr int kStages   = 3;
     constexpr int kPrefetch = kStages - 1;
     __shared__ __align__(16) __nv_bfloat16 x_sh[kK];
@@ -148,13 +149,13 @@ __global__ void linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_kernel(
 
 } // namespace
 
-void linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_launch(const Tensor& x, const Weight& w,
-                                                           Tensor& out, cudaStream_t stream) {
+void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                       cudaStream_t stream) {
     if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
-        throw std::invalid_argument("mlp_gate_up_silu_decode: Q4 fused weight requires 34816x5120");
+        throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
     }
     const int grid = kIntermediate / kPairsPerBlock;
-    linear_rowsplit_gemv_mlp_gate_up_silu_17408_q4_kernel<<<grid, kBlockThreads, 0, stream>>>(
+    q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
     CUDA_CHECK(cudaGetLastError());

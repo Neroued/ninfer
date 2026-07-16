@@ -83,22 +83,6 @@ struct Q4RowSplitMmaGemmSchedule {
                   "Q4 MMA staged shared memory exceeds the static 48 KiB budget");
 };
 
-struct Q4MmaDecodeAtom {
-    static __device__ __forceinline__ __nv_bfloat162 decode_pair(const std::uint8_t* staged_codes,
-                                                                 const std::uint8_t* scale_ptr,
-                                                                 std::int64_t staged_group_index,
-                                                                 int lane) {
-        const float scale =
-            __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
-        const std::uint8_t packed =
-            staged_codes[staged_group_index * Q4RowSplitStorage::kCodeBytesPerGroup + lane];
-        const int q0 = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
-        const int q1 = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
-        return __floats2bfloat162_rn(static_cast<float>(q0) * scale,
-                                     static_cast<float>(q1) * scale);
-    }
-};
-
 // XOR swizzle for a [rows][64] BF16 tile. The eight 16-byte column groups are
 // permuted by the low row bits so ldmatrix reads do not repeatedly hit the same
 // shared-memory bank group.

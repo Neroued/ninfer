@@ -5,13 +5,19 @@
 // contraction therefore produces both projections in one accumulator array;
 // the warp's first and second row halves pair directly in the SiLU epilogue.
 
-#include "ops/linear/gemm/linear_rowsplit_q4_gate_up_silu_gemm_mma.cuh"
+#include "ops/common/math.cuh"
+#include "ops/linear/common/rowsplit_mma_common.cuh"
+#include "ops/linear/q4/q4_rowsplit_storage.cuh"
+
+#include <cuda_bf16.h>
+
+#include <cstdint>
 
 namespace ninfer::ops::detail {
 
 template <class Cfg, bool FullTiles>
 __global__
-__launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up_silu_gemm_mma_folded_kernel(
+__launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split_half_pair_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
     std::int32_t intermediate, std::int32_t k, std::int32_t t, std::int32_t padded_k) {
@@ -143,8 +149,8 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_q4_gate_up
     auto dequant_to_As = [&](int stage, int kt) {
         const int scale_off = ((kt * BK >> 6) & 1) * 2;
         for (int row = warp; row < BM; row += Cfg::WARPS) {
-            const __nv_bfloat162 w = Q4Codec::load_pair_bf162_scale_ptr(
-                Cr[stage], nullptr, &Sr[stage][row * SB + scale_off], row, lane);
+            const __nv_bfloat162 w = Q4MmaDecodeAtom::decode_pair(
+                Cr[stage], &Sr[stage][row * SB + scale_off], row, lane);
             const int sc = gemm_swz64(row, 2 * lane);
             store_vec(&As[row * BK + sc], w);
         }

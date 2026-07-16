@@ -85,12 +85,10 @@ __device__ __forceinline__ float q5_gemv_consume_tile(const __nv_bfloat162* __re
 // kStages : cp.async pipeline depth (shared buffers; >=2 to overlap).
 // kStageX : stage the activation vector into shared (false when x is too large).
 template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kResidual>
-__global__ void q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x,
-                                        const std::uint8_t* __restrict__ codes,
-                                        const std::uint8_t* __restrict__ high_bits,
-                                        const std::uint8_t* __restrict__ scales,
-                                        const __nv_bfloat16* __restrict__ residual,
-                                        __nv_bfloat16* __restrict__ out) {
+__global__ void
+q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+                        const std::uint8_t* __restrict__ high_bits,
+                        const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out) {
     constexpr int kGroupK              = 64;
     constexpr int kGroups              = kK / kGroupK;
     constexpr int kGroupsPerTile       = 16;
@@ -168,7 +166,7 @@ __global__ void q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x,
     if constexpr (kResidual) {
         if (lane == 0) {
             const __nv_bfloat16 y = __float2bfloat16_rn(acc);
-            acc                   = __bfloat162float(residual[row]) + __bfloat162float(y);
+            acc                   = __bfloat162float(out[row]) + __bfloat162float(y);
         }
     }
     if (lane == 0) { out[row] = __float2bfloat16_rn(acc); }
@@ -183,19 +181,18 @@ inline void q5_rowsplit_gemv_launch_kernel(const __nv_bfloat16* x, const std::ui
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     const int grid              = kN / kRowsPerBlock;
     q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, false>
-        <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, nullptr, out);
+        <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, out);
 }
 
 template <int kN, int kK, int kRowsPerBlock, int kStages = 2, bool kStageX = true>
 inline void
 q5_rowsplit_gemv_residual_launch_kernel(const __nv_bfloat16* x, const std::uint8_t* codes,
                                         const std::uint8_t* high_bits, const std::uint8_t* scales,
-                                        const __nv_bfloat16* residual, __nv_bfloat16* out,
-                                        cudaStream_t stream) {
+                                        __nv_bfloat16* residual_out, cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     const int grid              = kN / kRowsPerBlock;
     q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, true>
-        <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, residual, out);
+        <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, residual_out);
 }
 
 

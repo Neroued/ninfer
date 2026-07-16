@@ -13,11 +13,13 @@
 namespace ninfer::ops {
 
 /**
- * Returns zero for T=1 or T>24; otherwise returns one contiguous BF16
- * [output_rows,tokens] fallback matrix. Dimensions must be positive.
+ * Returns the maximum transient capacity required by any admitted LinearAdd route in
+ * [1,max_tokens]. For the registered Q5 problems this saturates at one contiguous BF16
+ * [output_rows,24] materialization matrix. Dimensions must be positive.
  */
 [[nodiscard]] std::size_t linear_add_workspace_bytes(std::int32_t output_rows,
-                                                     std::int32_t input_rows, std::int32_t tokens);
+                                                     std::int32_t input_rows,
+                                                     std::int32_t max_tokens);
 
 /**
  * Op: linear_add

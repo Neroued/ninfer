@@ -68,18 +68,4 @@ void q5_rowsplit_mma_r64_c128_launch(Q5KernelVariant variant, const Tensor& x, c
     launch_variant<MmaR64C128Schedule, Q5MmaEpilogue::Store>(variant, x, w, out, stream);
 }
 
-void q5_rowsplit_mma_residual_r64_c64_launch(Q5KernelVariant variant, const Tensor& x,
-                                             const Weight& w, Tensor& residual_out,
-                                             cudaStream_t stream) {
-    launch_variant<MmaR64C64Schedule, Q5MmaEpilogue::AddResidual>(variant, x, w, residual_out,
-                                                                  stream);
-}
-
-void q5_rowsplit_mma_residual_r64_c128_launch(Q5KernelVariant variant, const Tensor& x,
-                                              const Weight& w, Tensor& residual_out,
-                                              cudaStream_t stream) {
-    launch_variant<MmaR64C128Schedule, Q5MmaEpilogue::AddResidual>(variant, x, w, residual_out,
-                                                                   stream);
-}
-
 } // namespace ninfer::ops::detail

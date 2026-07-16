@@ -82,9 +82,11 @@ add_library(ninfer_ops STATIC
   ops/linear/q5/q5_rowsplit_gemm_mma.cu
   ops/linear/q5/q5_rowsplit_gemm_simt.cu
   ops/linear/q5/q5_rowsplit_gemv.cu
-  ops/linear/q5/q5_rowsplit_add.cpp
   ops/linear/q5/q5_rowsplit_launch.cpp
   ops/linear/q5/q5_rowsplit_plan.cpp
+  ops/linear_add/q5/q5_linear_add_gemm_mma.cu
+  ops/linear_add/q5/q5_linear_add_gemv.cu
+  ops/linear_add/q5/q5_linear_add_plan.cpp
   ops/linear/q6/q6_rowsplit_launch.cpp
   ops/linear/q6/q6_rowsplit_gemm_mma.cu
   ops/linear/q6/q6_rowsplit_gemm_simt.cu

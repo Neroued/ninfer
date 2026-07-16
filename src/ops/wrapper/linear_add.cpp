@@ -1,8 +1,6 @@
 #include "ninfer/ops/linear_add.h"
 
-#include "ninfer/ops/residual_add.h"
-#include "ops/linear/q5/q5_rowsplit_add.h"
-#include "ops/linear/q5/q5_rowsplit_plan.h"
+#include "ops/linear_add/q5/q5_linear_add_plan.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -35,8 +33,9 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
 } // namespace
 
 std::size_t linear_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
-                                       std::int32_t tokens) {
-    return detail::q5_rowsplit_add_workspace_bytes(output_rows, input_rows, tokens);
+                                       std::int32_t max_tokens) {
+    return detail::q5_linear_add_capacity_workspace_bytes(output_rows, input_rows, input_rows,
+                                                          max_tokens);
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,
@@ -54,15 +53,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
             "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
     }
 
-    if (detail::q5_rowsplit_add_route(t) != detail::Q5AddRoute::Materialized) {
-        detail::q5_rowsplit_add_dispatch(x, w, residual_out, stream);
-        return;
-    }
-
-    auto scratch_scope = ws.scope();
-    Tensor linear_out  = ws.alloc(DType::BF16, {w.n, t});
-    detail::q5_rowsplit_dispatch(x, w, linear_out, stream);
-    residual_add(linear_out, residual_out, stream);
+    detail::q5_linear_add_dispatch(x, w, residual_out, ws, stream);
 }
 
 } // namespace ninfer::ops

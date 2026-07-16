@@ -1,4 +1,3 @@
-#include "ops/linear/q5/q5_rowsplit_add.h"
 #include "ops/linear/q5/q5_rowsplit_plan.h"
 
 #include <array>
@@ -168,37 +167,12 @@ void rejection_contract() {
     }
 }
 
-void add_route_contract() {
-    using R                 = ninfer::ops::detail::Q5AddRoute;
-    const auto expect_route = [](std::int32_t columns, R expected) {
-        const R actual = ninfer::ops::detail::q5_rowsplit_add_route(columns);
-        if (actual != expected) {
-            fail("linear_add route", "unexpected route at columns=" + std::to_string(columns));
-        }
-    };
-    expect_route(1, R::GemvResidual);
-    expect_route(2, R::Materialized);
-    expect_route(24, R::Materialized);
-    expect_route(25, R::MmaR64C64Residual);
-    expect_route(128, R::MmaR64C64Residual);
-    expect_route(129, R::MmaR64C128Residual);
-
-    const std::size_t expected = static_cast<std::size_t>(5120) * 24 * 2;
-    if (ninfer::ops::detail::q5_rowsplit_add_workspace_bytes(5120, 6144, 24) != expected ||
-        ninfer::ops::detail::q5_rowsplit_add_workspace_bytes(5120, 6144, 1) != 0 ||
-        ninfer::ops::detail::q5_rowsplit_add_workspace_bytes(5120, 6144, 25) != 0) {
-        fail("linear_add workspace", "workspace does not follow the resolved route");
-    }
-}
-
 } // namespace
 
 int main() {
     admission_scans();
     route_boundaries();
     rejection_contract();
-    add_route_contract();
-
     std::cout << (failures == 0 ? "OK" : "FAIL") << " Q5 Linear production plan\n";
     return failures == 0 ? 0 : 1;
 }

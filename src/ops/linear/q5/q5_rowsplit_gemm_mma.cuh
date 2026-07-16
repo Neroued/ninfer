@@ -15,6 +15,7 @@
 // statically compiled boundary variant outside the kernel.
 
 #include "ops/common/mma.cuh"
+#include "ops/common/bf16_vector.cuh"
 #include "ops/linear/q5/q5_rowsplit_launch.h"
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 
@@ -38,7 +39,15 @@ enum class Q5ScaleLoad {
 enum class Q5MmaEpilogue {
     Store,
     AddResidual,
+    CtaCollectiveResidual,
 };
+
+union alignas(16) Q5Bf16x8Bits {
+    int4 raw;
+    Bf16x8Pack pack;
+};
+
+static_assert(sizeof(Q5Bf16x8Bits) == 16);
 
 template <int BlockRows_, int BlockCols_, int BlockK_, int WarpRows_, int WarpCols_,
           int PipelineStages_, int LaunchBoundsMinBlocks_, Q5FragmentPipeline FragmentPipeline_,
@@ -116,7 +125,8 @@ void q5_rowsplit_gemm_mma_kernel(
     using Schedule = Schedule_;
     static_assert(Variant == Q5KernelVariant::Full || Variant == Q5KernelVariant::Predicated,
                   "Q5 MMA requires a tiled kernel variant");
-    static_assert(Epilogue == Q5MmaEpilogue::Store || Epilogue == Q5MmaEpilogue::AddResidual,
+    static_assert(Epilogue == Q5MmaEpilogue::Store || Epilogue == Q5MmaEpilogue::AddResidual ||
+                      Epilogue == Q5MmaEpilogue::CtaCollectiveResidual,
                   "Q5 MMA requires a supported epilogue");
 
     constexpr bool kFull = Variant == Q5KernelVariant::Full;
@@ -407,47 +417,128 @@ void q5_rowsplit_gemm_mma_kernel(
         cp_commit();
     }
 
+    if constexpr (Epilogue == Q5MmaEpilogue::CtaCollectiveResidual) {
+        static_assert(BM == BK, "Q5 collective residual reuses Bs and requires BM == BK");
+        __nv_bfloat16* projected_shared = Bs[0];
 #pragma unroll
-    for (int mi = 0; mi < MT; ++mi) {
-        const int output_row0 = row0 + warp_row * WM + mi * 16 + mma_row;
-        const int output_row1 = output_row0 + 8;
+        for (int mi = 0; mi < MT; ++mi) {
+            const int local_row0 = warp_row * WM + mi * 16 + mma_row;
+            const int local_row1 = local_row0 + 8;
 #pragma unroll
-        for (int ni = 0; ni < NT; ++ni) {
-            const int output_col0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
-            const int output_col1 = output_col0 + 1;
-            const float* values   = accum[mi][ni];
-            auto store_value      = [&](std::int64_t index, float value) {
-                __nv_bfloat16 result = __float2bfloat16_rn(value);
-                if constexpr (Epilogue == Q5MmaEpilogue::AddResidual) {
-                    result = __float2bfloat16_rn(__bfloat162float(residual[index]) +
-                                                      __bfloat162float(result));
-                }
-                out[index] = result;
-            };
+            for (int ni = 0; ni < NT; ++ni) {
+                const int local_col0 = warp_col * WN + ni * 8 + 2 * mma_col;
+                const int local_col1 = local_col0 + 1;
+                const float* values  = accum[mi][ni];
+                projected_shared[local_col0 * BM + local_row0] = __float2bfloat16_rn(values[0]);
+                projected_shared[local_col1 * BM + local_row0] = __float2bfloat16_rn(values[1]);
+                projected_shared[local_col0 * BM + local_row1] = __float2bfloat16_rn(values[2]);
+                projected_shared[local_col1 * BM + local_row1] = __float2bfloat16_rn(values[3]);
+            }
+        }
+        __syncthreads();
+
+        constexpr int kRowsPerPack = 8;
+        constexpr int kPacksPerCol = BM / kRowsPerPack;
+        static_assert(BM % kRowsPerPack == 0);
+        for (int pack = tid; pack < BN * kPacksPerCol; pack += Schedule::kThreads) {
+            const int local_col = pack / kPacksPerCol;
+            const int row_pack  = pack - local_col * kPacksPerCol;
+            const int local_row = row_pack * kRowsPerPack;
+            const int col       = col0 + local_col;
+            const int row       = row0 + local_row;
             if constexpr (kFull) {
-                store_value(static_cast<std::int64_t>(output_col0) * rows + output_row0, values[0]);
-                store_value(static_cast<std::int64_t>(output_col1) * rows + output_row0, values[1]);
-                store_value(static_cast<std::int64_t>(output_col0) * rows + output_row1, values[2]);
-                store_value(static_cast<std::int64_t>(output_col1) * rows + output_row1, values[3]);
-            } else {
-                if (output_row0 < rows) {
-                    if (output_col0 < cols) {
-                        store_value(static_cast<std::int64_t>(output_col0) * rows + output_row0,
-                                    values[0]);
+                Q5Bf16x8Bits projected;
+                projected.raw = load_vec<int4>(&projected_shared[local_col * BM + local_row]);
+                Q5Bf16x8Bits residual_values;
+                residual_values.raw =
+                    load_vec<int4>(&out[static_cast<std::int64_t>(col) * rows + row]);
+#pragma unroll
+                for (int pair = 0; pair < 4; ++pair) {
+                    residual_values.pack.pair[pair] =
+                        __floats2bfloat162_rn(__low2float(residual_values.pack.pair[pair]) +
+                                                  __low2float(projected.pack.pair[pair]),
+                                              __high2float(residual_values.pack.pair[pair]) +
+                                                  __high2float(projected.pack.pair[pair]));
+                }
+                store_vec(&out[static_cast<std::int64_t>(col) * rows + row], residual_values.raw);
+            } else if (col < cols && row < rows) {
+                if (row + kRowsPerPack <= rows) {
+                    Q5Bf16x8Bits projected;
+                    projected.raw = load_vec<int4>(&projected_shared[local_col * BM + local_row]);
+                    Q5Bf16x8Bits residual_values;
+                    residual_values.raw =
+                        load_vec<int4>(&out[static_cast<std::int64_t>(col) * rows + row]);
+#pragma unroll
+                    for (int pair = 0; pair < 4; ++pair) {
+                        residual_values.pack.pair[pair] =
+                            __floats2bfloat162_rn(__low2float(residual_values.pack.pair[pair]) +
+                                                      __low2float(projected.pack.pair[pair]),
+                                                  __high2float(residual_values.pack.pair[pair]) +
+                                                      __high2float(projected.pack.pair[pair]));
                     }
-                    if (output_col1 < cols) {
-                        store_value(static_cast<std::int64_t>(output_col1) * rows + output_row0,
-                                    values[1]);
+                    store_vec(&out[static_cast<std::int64_t>(col) * rows + row],
+                              residual_values.raw);
+                } else {
+#pragma unroll
+                    for (int i = 0; i < kRowsPerPack; ++i) {
+                        if (row + i < rows) {
+                            const std::int64_t index =
+                                static_cast<std::int64_t>(col) * rows + row + i;
+                            out[index] = __float2bfloat16_rn(
+                                __bfloat162float(out[index]) +
+                                __bfloat162float(projected_shared[local_col * BM + local_row + i]));
+                        }
                     }
                 }
-                if (output_row1 < rows) {
-                    if (output_col0 < cols) {
-                        store_value(static_cast<std::int64_t>(output_col0) * rows + output_row1,
-                                    values[2]);
+            }
+        }
+    } else {
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            const int output_row0 = row0 + warp_row * WM + mi * 16 + mma_row;
+            const int output_row1 = output_row0 + 8;
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+                const int output_col0 = col0 + warp_col * WN + ni * 8 + 2 * mma_col;
+                const int output_col1 = output_col0 + 1;
+                const float* values   = accum[mi][ni];
+                auto store_value      = [&](std::int64_t index, float value) {
+                    __nv_bfloat16 result = __float2bfloat16_rn(value);
+                    if constexpr (Epilogue == Q5MmaEpilogue::AddResidual) {
+                        result = __float2bfloat16_rn(__bfloat162float(residual[index]) +
+                                                          __bfloat162float(result));
                     }
-                    if (output_col1 < cols) {
-                        store_value(static_cast<std::int64_t>(output_col1) * rows + output_row1,
-                                    values[3]);
+                    out[index] = result;
+                };
+                if constexpr (kFull) {
+                    store_value(static_cast<std::int64_t>(output_col0) * rows + output_row0,
+                                values[0]);
+                    store_value(static_cast<std::int64_t>(output_col1) * rows + output_row0,
+                                values[1]);
+                    store_value(static_cast<std::int64_t>(output_col0) * rows + output_row1,
+                                values[2]);
+                    store_value(static_cast<std::int64_t>(output_col1) * rows + output_row1,
+                                values[3]);
+                } else {
+                    if (output_row0 < rows) {
+                        if (output_col0 < cols) {
+                            store_value(static_cast<std::int64_t>(output_col0) * rows + output_row0,
+                                        values[0]);
+                        }
+                        if (output_col1 < cols) {
+                            store_value(static_cast<std::int64_t>(output_col1) * rows + output_row0,
+                                        values[1]);
+                        }
+                    }
+                    if (output_row1 < rows) {
+                        if (output_col0 < cols) {
+                            store_value(static_cast<std::int64_t>(output_col0) * rows + output_row1,
+                                        values[2]);
+                        }
+                        if (output_col1 < cols) {
+                            store_value(static_cast<std::int64_t>(output_col1) * rows + output_row1,
+                                        values[3]);
+                        }
                     }
                 }
             }

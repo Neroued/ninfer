@@ -6,7 +6,7 @@ Target: Qwen3.6-35B-A3B exact Linear domains on NVIDIA GeForce RTX 5090 (`sm_120
 CUDA 13.1, driver 591.86, NCU 2025.4.1).
 
 This is retained standalone Op evidence. It does not register the 35B Engine target. This revision
-establishes L1-L2 and L4-L14.
+establishes L1-L14.
 
 ## L1: W8 attention input parent `[9216,2048]`
 
@@ -185,6 +185,131 @@ profiles/ncu/qwen3_6_35b_a3b/linear/l2/final/
 L2 is supported for its complete Qwen3.6-35B-A3B target domain. One plain parent Linear provides
 all four logical output views, its exact finite route selects the measured candidate winners, and
 the maximum reaches 85.36% of the measured BF16 MMA ceiling without spilling.
+
+## L3: BF16 GDN-control parent `[64,2048]`
+
+The exact operation consumes one contiguous BF16_CTRL parent `[64,2048]`, BF16
+`x[2048,T]`, and FP32 `A_log,dt_bias[32]` for every Text chunk size `1<=T<=1024`.
+Rows `[0,32)` and `[32,64)` are zero-copy A/B views. The fused single launch computes:
+
+```text
+a = BF16(Wa x)
+b = BF16(Wb x)
+g = -exp(A_log) * softplus(float(a) + dt_bias)
+beta = sigmoid(float(b))
+```
+
+The explicit BF16 rounds after both complete projections are part of the numeric contract. The
+35B overload never repacks the parent and retains the existing two-weight `[48,5120]` 27B
+domain unchanged.
+
+### Route qualification
+
+Release sweeps screened warp-row SIMT C4/C8 and cooperative MMA split-K
+`{32,16,8,4,2,1}` wherever the cooperative grid was resident. Tile-width screening then compared
+BN128, BN64, and BN32. BN64 reduced `T=512` from about 9.25 us to the 7.42-7.49 us plateau while
+retaining the 9.47 us maximum. BN32 regressed the maximum to 11.52 us and made its larger split
+grids exceed cooperative residency; BN128 remained slower through the middle of the domain.
+
+With BN64 fixed, three independent high-repeat processes established:
+
+- split16 is about 2.0 us faster at `T=64` and retains a small advantage at `T=96`;
+- `T=127/128` is a practical timer-resolution tie, so split8 takes the second interval with half
+  the partial workspace;
+- split8 stays on the same 7.4/9.47 us plateaus thereafter and avoids split16's 11.52 us maximum;
+- split32 only ties the tiny fixed floor while doubling workspace, and split4/2/1 plus both SIMT
+  routes remain slower.
+
+The retained exact route is:
+
+```text
+T=1..127     BN64 cooperative MMA split16
+T=128..1024  BN64 cooperative MMA split8
+```
+
+The 35B route peaks at 2,097,152 workspace bytes at `T=1024`. The shared public capacity API
+still returns 3,145,728 bytes for `max_tokens=1024` because it also preserves the larger existing
+27B split8 domain.
+
+### Correctness, admission, and graph capture
+
+```bash
+cmake --build build -j --target \
+  ninfer_gdn_gating_proj_test ninfer_gdn_gating_proj_plan_test \
+  ninfer_gdn_gating_test
+ctest --test-dir build \
+  -R '^ninfer_gdn_gating(_proj(_plan)?)?_test$' \
+  --output-on-failure
+```
+
+All three tests passed. The independent oracle performs FP32 FMA projection from BF16-rounded
+weights and activations, applies the explicit BF16 projection round, then evaluates the two FP32
+control formulas. It covers split16 full/predicated cases at `T=64/127`, both sides of the route
+seam at `T=127/128`, a split8 predicated case at `T=129`, and a distributed `T=1024` sample.
+Across `T=1/64/127/128/129/1024`, `g` relative-L2 stayed at or below `6.503e-8` and beta at or
+below `5.069e-8`. The maximum case also executes through CUDA Graph capture.
+`compute-sanitizer --tool memcheck` completed the same test with zero errors.
+
+Plan tests close the exact `T=1..1024` admission interval, both route boundaries, token
+predication, cooperative candidate residency, and capacity workspace. The pre-existing 27B
+projection and standalone GDN-control tests remain in the same regression.
+
+### Release timing and fixed-shape roofline
+
+Three independent production processes each used 12 warmups and 120 L2-flushed samples:
+
+| T | Route | Cold median | Executed TFLOP/s |
+|---:|---|---:|---:|
+| 1 | BN64 split16 | 5.376 us | fixed 32-CTA launch floor |
+| 64 | BN64 split16 | 5.408 us | 3.10 |
+| 96 | BN64 split16 | 7.360 us | 4.56 |
+| 127 | BN64 split16 | 7.392 us | 4.54 |
+| 128 | BN64 split8 | 7.392 us | 4.54 |
+| 129 | BN64 split8 | 7.424 us | 6.78 |
+| 512 | BN64 split8 | 7.488 us | 17.92 |
+| 896 | BN64 split8 | 9.472 us | 24.80 |
+| 1024 | BN64 split8 | 9.472 us | 28.34 |
+
+This fused Op includes the contraction, deterministic split reduction, grid-wide barrier, BF16
+rounds, and two transcendental epilogues. Its 64 logical rows cannot expose a full-device dense
+MMA percentage: production launches only 32 CTAs at `T=1/64`, 64 at `T=127`, 32 at `T=128`,
+48 at `T=129`, and 256 at `T=1024`. The meaningful roofline is therefore the lower envelope of
+legal exact-operation single-launch candidates at the same shape. Production sits on that
+measured envelope at the fixed floor, the route seam, and the maximum; omitting the required
+reduction or nonlinear epilogues would not be a semantic control for L3.
+
+### NCU attribution
+
+Basic-first reports matched the intended geometry, split count, and full/predicated template
+specializations. Detailed follow-ups reported:
+
+| Route / variant | Representative | NCU duration | SM SOL | Memory SOL | Occupancy | Registers | Dynamic shared | Waves/SM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| split16 full | T=64 | 5.63 us | 1.97% | 5.44% | 16.60% | 56 | 24 KiB | 0.05 |
+| split16 predicated | T=127 | 5.73 us | 3.87% | 9.12% | 16.69% | 56 | 24 KiB | 0.09 |
+| split8 predicated | T=129 | 6.50 us | 4.45% | 7.34% | 16.28% | 62 | 24 KiB | 0.07 |
+| split8 full | T=1024 | 9.57 us | 16.31% | 32.98% | 23.95% | 62 | 24 KiB | 0.38 |
+
+NCU explicitly identifies every grid as too small to fill the device. At `T=127`, the leading
+sampled stalls are CTA barrier and long-scoreboard waits at 4.71 and 3.42 of 16.02 cycles per
+issued instruction. At `T=1024`, they are 5.70 and 5.32 of 19.23 cycles, followed by 2.01 cycles
+of math-pipe throttle. All four detailed captures report zero local-memory and shared-memory
+spilling requests. NCU replay durations are diagnostic and are not substituted for the CUDA-event
+medians.
+
+Reports are retained locally under:
+
+```text
+profiles/bench/qwen3_6_35b_linear_qualification/l3/
+profiles/ncu/qwen3_6_35b_a3b/linear/l3/final/
+```
+
+## L3 retained result
+
+L3 is supported for its complete Qwen3.6-35B-A3B target domain. One contiguous parent supplies
+both projections without repacking, the finite split16/split8 route covers every `T=1..1024`,
+production reaches the measured exact-operation single-launch candidate floor, and every
+production compile variant is profiler-confirmed without spilling.
 
 ## L4: W8 Text mixer LinearAdd `[2048,4096]`
 

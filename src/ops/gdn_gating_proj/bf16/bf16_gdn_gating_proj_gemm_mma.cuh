@@ -1,11 +1,12 @@
 #pragma once
 
-// SM120 BF16 GDN gating projection for the fixed Qwen3.6-27B shape:
+// SM120 BF16 GDN gating projection for the two exact registered geometries:
 //
-//   a = Wa[48,5120] @ x[5120,T]
-//   b = Wb[48,5120] @ x[5120,T]
+//   Qwen3.6-27B:     a/b = W[48,5120] @ x[5120,T]
+//   Qwen3.6-35B-A3B: a/b = W[32,2048] @ x[2048,T]
 //
-// A CTA computes the same 16 output rows from both weights over 128 tokens.
+// A CTA computes the same 16 output rows from both weights over 128 (27B) or
+// 64 (35B) tokens.
 // Split-K routes use a tuned eight- or sixteen-warp specialization and an
 // in-kernel cooperative grid reduction; the unsplit long-context route uses
 // eight warps for more independent MMA accumulators. Both preserve a single
@@ -21,40 +22,59 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr int kBf16GdnHeads       = 48;
-inline constexpr int kBf16GdnHidden      = 5120;
-inline constexpr int kBf16GdnLogicalRows = 2 * kBf16GdnHeads;
-inline constexpr int kBf16GdnBlockM      = 16;
-inline constexpr int kBf16GdnBlockN      = 128;
-inline constexpr int kBf16GdnBlockK      = 64;
-inline constexpr int kBf16GdnWarps       = 16;
-inline constexpr int kBf16GdnStages      = 2;
-inline constexpr int kBf16GdnKTiles      = kBf16GdnHidden / kBf16GdnBlockK;
-inline constexpr int kBf16GdnMFragments  = kBf16GdnBlockM / 16;
-inline constexpr int kBf16GdnSmemElements =
-    kBf16GdnStages * (kBf16GdnBlockN * kBf16GdnBlockK + 2 * kBf16GdnBlockM * kBf16GdnBlockK);
-inline constexpr int kBf16GdnSmemBytes = kBf16GdnSmemElements * sizeof(__nv_bfloat16);
+inline constexpr int kBf16GdnBlockM     = 16;
+inline constexpr int kBf16GdnBlockK     = 64;
+inline constexpr int kBf16GdnWarps      = 16;
+inline constexpr int kBf16GdnStages     = 2;
+inline constexpr int kBf16GdnMFragments = kBf16GdnBlockM / 16;
 
-static_assert(kBf16GdnHidden % kBf16GdnBlockK == 0);
+template <int BlockN>
+inline constexpr int kBf16GdnSmemElements =
+    kBf16GdnStages * (BlockN * kBf16GdnBlockK + 2 * kBf16GdnBlockM * kBf16GdnBlockK);
+
+template <int BlockN>
+inline constexpr int kBf16GdnSmemBytes = kBf16GdnSmemElements<BlockN> * sizeof(__nv_bfloat16);
+
+struct Bf16Gdn27Geometry {
+    static constexpr int kHeads  = 48;
+    static constexpr int kHidden = 5120;
+    static constexpr int kBlockN = 128;
+};
+
+struct Bf16Gdn35Geometry {
+    static constexpr int kHeads  = 32;
+    static constexpr int kHidden = 2048;
+    static constexpr int kBlockN = 64;
+};
+
+static_assert(Bf16Gdn27Geometry::kHidden % kBf16GdnBlockK == 0);
+static_assert(Bf16Gdn35Geometry::kHidden % kBf16GdnBlockK == 0);
 
 __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);
 }
 
-template <int SplitK, bool FullTokens, int Warps>
+template <class Geometry, int SplitK, bool FullTokens, int Warps>
 __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
     const __nv_bfloat16* __restrict__ b_weight, const float* __restrict__ A_log,
     const float* __restrict__ dt_bias, float* __restrict__ partial, float* __restrict__ g,
     float* __restrict__ beta, std::int32_t t) {
+    constexpr int kBf16GdnHeads       = Geometry::kHeads;
+    constexpr int kBf16GdnHidden      = Geometry::kHidden;
+    constexpr int kBf16GdnBlockN      = Geometry::kBlockN;
+    constexpr int kBf16GdnLogicalRows = 2 * kBf16GdnHeads;
+    constexpr int kBf16GdnKTiles      = kBf16GdnHidden / kBf16GdnBlockK;
     static_assert(SplitK >= 1 && kBf16GdnKTiles % SplitK == 0,
-                  "BF16 GDN split-K must divide the 80 K tiles");
+                  "BF16 GDN split-K must divide the exact geometry's K tiles");
     static_assert(Warps == 8 || Warps == 16);
+    static_assert(kBf16GdnBlockN % Warps == 0);
     constexpr int kTilesPerSplit = kBf16GdnKTiles / SplitK;
     constexpr int kKSubtiles     = kBf16GdnBlockK / 16;
     constexpr int kThreads       = Warps * 32;
     constexpr int kWarpN         = kBf16GdnBlockN / Warps;
-    constexpr int kNFragments    = kWarpN / 8;
+    static_assert(kWarpN % 8 == 0);
+    constexpr int kNFragments = kWarpN / 8;
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto* xs  = reinterpret_cast<__nv_bfloat16*>(smem_raw);

@@ -94,6 +94,47 @@ void route_tests() {
                    [] { (void)ninfer::ops::detail::bf16_gdn_gating_resolve_plan({47, 5120, 1}); });
 }
 
+void route35_tests() {
+    using S = Bf16GdnGatingScheduleId;
+    constexpr std::array<std::int32_t, 6> boundaries{1, 127, 128, 1024, 0, 1025};
+    for (const std::int32_t cols : boundaries) {
+        const ninfer::ops::detail::Bf16GdnGatingProblem problem{32, 2048, cols};
+        const bool admitted = cols >= 1 && cols <= 1024;
+        if (ninfer::ops::detail::bf16_gdn_gating_admits(problem) != admitted) {
+            std::cerr << "wrong 35B GDN gating admission C=" << cols << '\n';
+            ++failures;
+            continue;
+        }
+        if (!admitted) { continue; }
+        const auto plan          = ninfer::ops::detail::bf16_gdn_gating_resolve_plan(problem);
+        const S expected         = cols <= 127 ? S::MmaCooperativeSplit16 : S::MmaCooperativeSplit8;
+        const std::int32_t split = cols <= 127 ? 16 : 8;
+        const std::size_t workspace = static_cast<std::size_t>(split) * cols * 64u * sizeof(float);
+        const auto variant          = (cols % 64) == 0 ? Bf16GdnGatingTokenVariant::Full
+                                                       : Bf16GdnGatingTokenVariant::Predicated;
+        if (plan.schedule != expected || plan.token_variant != variant ||
+            plan.workspace_bytes != workspace || !plan.performance_qualified) {
+            std::cerr << "wrong 35B GDN gating route C=" << cols << '\n';
+            ++failures;
+        }
+    }
+
+    const auto split32 = ninfer::ops::detail::bf16_gdn_gating_resolve_candidate(
+        S::MmaCooperativeSplit32, {32, 2048, 640});
+    if (split32.workspace_bytes != 32u * 640u * 64u * sizeof(float)) {
+        std::cerr << "wrong 35B split32 candidate workspace\n";
+        ++failures;
+    }
+    expect_invalid("35B split32 cooperative grid too large", [] {
+        (void)ninfer::ops::detail::bf16_gdn_gating_resolve_candidate(
+            Bf16GdnGatingScheduleId::MmaCooperativeSplit32, {32, 2048, 641});
+    });
+    expect_invalid("35B legacy small-T candidate", [] {
+        (void)ninfer::ops::detail::bf16_gdn_gating_resolve_candidate(
+            Bf16GdnGatingScheduleId::SmallTSplit10, {32, 2048, 2});
+    });
+}
+
 void workspace_tests() {
     struct Case {
         std::int32_t capacity;
@@ -101,12 +142,12 @@ void workspace_tests() {
     };
 
     constexpr std::array<Case, 12> cases{{
-        {1, 0},
-        {2, 7'680},
-        {8, 30'720},
-        {9, 30'720},
-        {10, 30'720},
-        {128, 393'216},
+        {1, 4'096},
+        {2, 8'192},
+        {8, 32'768},
+        {9, 36'864},
+        {10, 40'960},
+        {128, 520'192},
         {1024, 3'145'728},
         {1025, 3'145'728},
         {2048, 3'145'728},
@@ -129,6 +170,7 @@ void workspace_tests() {
 
 int main() {
     route_tests();
+    route35_tests();
     workspace_tests();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16 GDN gating projection plan\n";
     return failures == 0 ? 0 : 1;

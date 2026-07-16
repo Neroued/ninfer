@@ -10,7 +10,7 @@
 
 namespace ninfer::ops {
 
-// Maximum transient capacity required by any admitted route in [1,max_tokens].
+// Maximum transient capacity required by any admitted exact route with T <= max_tokens.
 [[nodiscard]] std::size_t gdn_gating_proj_workspace_bytes(std::int32_t max_tokens);
 
 /**
@@ -30,5 +30,15 @@ namespace ninfer::ops {
 void gdn_gating_proj(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                      const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g,
                      Tensor& beta, cudaStream_t stream);
+
+/**
+ * Qwen3.6-35B-A3B exact storage domain. `ab_weight` is one contiguous BF16_CTRL [64,2048]
+ * parent whose rows [0,32) and [32,64) are A and B. The implementation consumes those halves
+ * as zero-copy views and preserves the same explicit BF16 projection rounds before producing
+ * FP32 g/beta [32,T]. All other effects and non-overlap requirements match the two-weight form.
+ */
+void gdn_gating_proj(const Tensor& x, const Weight& ab_weight, const Tensor& A_log,
+                     const Tensor& dt_bias, WorkspaceArena& ws, Tensor& g, Tensor& beta,
+                     cudaStream_t stream);
 
 } // namespace ninfer::ops

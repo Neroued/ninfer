@@ -73,7 +73,8 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.cpp
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_gemm_mma.cu
   ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.cpp
-  ops/linear/gemv/linear_dense_gdn_in_ab_48.cu
+  ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu
+  ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.cpp
   ops/linear/bf16/bf16_contiguous_plan.cpp
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_simt.cu

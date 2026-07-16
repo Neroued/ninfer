@@ -1,9 +1,9 @@
-#include "ops/linear/gemv/linear_dense_gdn_in_ab_48.cuh"
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/linear/gemm/linear_dense_gdn_in_ab_gemm_mma.cuh"
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_gemm_mma.cuh"
 
 #include "core/device.h" // CUDA_CHECK
 
@@ -30,7 +30,7 @@ constexpr int kSmallTThreads      = kSmallTRowsPerBlock * 32;
 static_assert(kK % kSmallTKSlice == 0, "small-T K split must divide K");
 
 template <int TokenTile, int KSlice, int RowsPerBlock>
-__global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
+__global__ void bf16_gdn_gating_proj_small_t_partial_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
     const __nv_bfloat16* __restrict__ b_weight, float* __restrict__ partial, std::int32_t t) {
     static_assert(TokenTile == kSmallTMax, "small-T token tile is fixed to 8");
@@ -109,10 +109,12 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel(
     }
 }
 
-__global__ void linear_dense_gdn_in_ab_gated_smallt_reduce_48_kernel(
-    const float* __restrict__ partial, const float* __restrict__ A_log,
-    const float* __restrict__ dt_bias, float* __restrict__ g, float* __restrict__ beta,
-    std::int32_t t) {
+__global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restrict__ partial,
+                                                           const float* __restrict__ A_log,
+                                                           const float* __restrict__ dt_bias,
+                                                           float* __restrict__ g,
+                                                           float* __restrict__ beta,
+                                                           std::int32_t t) {
     const int i =
         static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
     const int elems = kN * t;
@@ -137,11 +139,10 @@ __global__ void linear_dense_gdn_in_ab_gated_smallt_reduce_48_kernel(
     beta[out_index]              = sigmoid(b_rounded);
 }
 
-__global__ void linear_dense_gdn_in_ab_gated_48_kernel(const __nv_bfloat16* x,
-                                                       const __nv_bfloat16* a_weight,
-                                                       const __nv_bfloat16* b_weight,
-                                                       const float* A_log, const float* dt_bias,
-                                                       float* g, float* beta) {
+__global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
+                                                 const __nv_bfloat16* a_weight,
+                                                 const __nv_bfloat16* b_weight, const float* A_log,
+                                                 const float* dt_bias, float* g, float* beta) {
     const int global_row = static_cast<int>(blockIdx.x);
     const bool is_b      = global_row >= kN;
     const int row        = is_b ? global_row - kN : global_row;
@@ -176,40 +177,31 @@ __global__ void linear_dense_gdn_in_ab_gated_48_kernel(const __nv_bfloat16* x,
 void require_shape(const Weight& w, const char* name) {
     if (w.n != kN || w.k != kK || w.shape[0] != kN || w.shape[1] != kK) {
         throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
-                                    " requires 48x5120 dense BF16");
+                                    " requires contiguous BF16 [48,5120]");
     }
 }
 
-int dense_prefill_split_k(std::int32_t tokens) {
-    // Keep one K-association for every normal prefill chunk through 1024.
-    // Changing SplitK changes FP32 grouping before the final BF16 round and can
-    // make chunked and unchunked model execution cross an argmax boundary.
-    if (tokens <= 1024) { return 8; }
-    if (tokens <= 2048) { return 4; }
-    if (tokens <= 4096) { return 2; }
-    return 1;
-}
-
-template <int SplitK, int Warps = kDenseGdnWarps>
-void launch_dense_prefill_mma(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
-                              const Tensor& A_log, const Tensor& dt_bias, void* workspace,
-                              Tensor& g, Tensor& beta, cudaStream_t stream) {
+template <int SplitK, int Warps = kBf16GdnWarps>
+void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                             const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                             const Tensor& dt_bias, void* workspace, Tensor& g, Tensor& beta,
+                             cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
     const dim3 block(Warps * 32);
-    const dim3 grid(static_cast<unsigned>(div_up(t, kDenseGdnBlockN)),
-                    static_cast<unsigned>(kDenseGdnHeads / kDenseGdnBlockM),
+    const dim3 grid(static_cast<unsigned>(div_up(t, kBf16GdnBlockN)),
+                    static_cast<unsigned>(kBf16GdnHeads / kBf16GdnBlockM),
                     static_cast<unsigned>(SplitK));
     auto launch = [&](auto full_tokens) {
         constexpr bool FullTokens = decltype(full_tokens)::value;
         static const cudaError_t attr =
-            cudaFuncSetAttribute(linear_dense_gdn_in_ab_gemm_mma_kernel<SplitK, FullTokens, Warps>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kDenseGdnSmemBytes);
+            cudaFuncSetAttribute(bf16_gdn_gating_proj_gemm_mma_kernel<SplitK, FullTokens, Warps>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kBf16GdnSmemBytes);
         CUDA_CHECK(attr);
         if constexpr (SplitK > 1) {
             cudaLaunchConfig_t config{};
             config.gridDim          = grid;
             config.blockDim         = block;
-            config.dynamicSmemBytes = kDenseGdnSmemBytes;
+            config.dynamicSmemBytes = kBf16GdnSmemBytes;
             config.stream           = stream;
             cudaLaunchAttribute cooperative{};
             cooperative.id              = cudaLaunchAttributeCooperative;
@@ -217,7 +209,7 @@ void launch_dense_prefill_mma(const Tensor& x, const Weight& a_weight, const Wei
             config.attrs                = &cooperative;
             config.numAttrs             = 1;
             CUDA_CHECK(cudaLaunchKernelEx(
-                &config, linear_dense_gdn_in_ab_gemm_mma_kernel<SplitK, FullTokens, Warps>,
+                &config, bf16_gdn_gating_proj_gemm_mma_kernel<SplitK, FullTokens, Warps>,
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const __nv_bfloat16*>(a_weight.qdata),
                 static_cast<const __nv_bfloat16*>(b_weight.qdata),
@@ -225,8 +217,8 @@ void launch_dense_prefill_mma(const Tensor& x, const Weight& a_weight, const Wei
                 static_cast<float*>(workspace), static_cast<float*>(g.data),
                 static_cast<float*>(beta.data), t));
         } else {
-            linear_dense_gdn_in_ab_gemm_mma_kernel<SplitK, FullTokens, Warps>
-                <<<grid, block, kDenseGdnSmemBytes, stream>>>(
+            bf16_gdn_gating_proj_gemm_mma_kernel<SplitK, FullTokens, Warps>
+                <<<grid, block, kBf16GdnSmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(x.data),
                     static_cast<const __nv_bfloat16*>(a_weight.qdata),
                     static_cast<const __nv_bfloat16*>(b_weight.qdata),
@@ -235,101 +227,102 @@ void launch_dense_prefill_mma(const Tensor& x, const Weight& a_weight, const Wei
                     static_cast<float*>(beta.data), t);
         }
     };
-    if ((t % kDenseGdnBlockN) == 0) {
+    if (variant == Bf16GdnGatingTokenVariant::Full) {
         launch(std::true_type{});
-    } else {
+    } else if (variant == Bf16GdnGatingTokenVariant::Predicated) {
         launch(std::false_type{});
+    } else {
+        throw std::invalid_argument(
+            "BF16 GDN gating MMA requires Full or Predicated token variant");
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
 
-std::size_t linear_dense_gdn_in_ab_gated_48_workspace_bytes(std::int32_t tokens) {
-    if (tokens >= 2 && tokens <= kSmallTMax) {
-        return static_cast<std::size_t>(kSmallTSplits) * static_cast<std::size_t>(tokens) *
-               static_cast<std::size_t>(kLogicalRows) * sizeof(float);
-    }
-    if (tokens > kSmallTMax) {
-        const int split_k = dense_prefill_split_k(tokens);
-        if (split_k > 1) {
-            return static_cast<std::size_t>(split_k) * static_cast<std::size_t>(tokens) *
-                   static_cast<std::size_t>(kLogicalRows) * sizeof(float);
-        }
-    }
-    return 0;
-}
-
-void linear_dense_gdn_in_ab_gated_48_launch(const Tensor& x, const Weight& a_weight,
-                                            const Weight& b_weight, const Tensor& A_log,
-                                            const Tensor& dt_bias, void* workspace,
-                                            std::size_t workspace_bytes, Tensor& g, Tensor& beta,
-                                            cudaStream_t stream) {
+void bf16_gdn_gating_proj_gemv_launch(const Tensor& x, const Weight& a_weight,
+                                      const Weight& b_weight, const Tensor& A_log,
+                                      const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                      cudaStream_t stream) {
     require_shape(a_weight, "a_weight");
     require_shape(b_weight, "b_weight");
-    const std::int32_t t = x.ne[1];
-    if (t == 1) {
-        linear_dense_gdn_in_ab_gated_48_kernel<<<2 * kN, kThreads, 0, stream>>>(
+    bf16_gdn_gating_proj_gemv_kernel<<<2 * kN, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(A_log.data),
+        static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
+        static_cast<float*>(beta.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& a_weight,
+                                                 const Weight& b_weight, const Tensor& A_log,
+                                                 const Tensor& dt_bias, void* workspace,
+                                                 std::size_t workspace_bytes, Tensor& g,
+                                                 Tensor& beta, cudaStream_t stream) {
+    require_shape(a_weight, "a_weight");
+    require_shape(b_weight, "b_weight");
+    const std::int32_t t       = x.ne[1];
+    const std::size_t required = static_cast<std::size_t>(kSmallTSplits) *
+                                 static_cast<std::size_t>(t) *
+                                 static_cast<std::size_t>(kLogicalRows) * sizeof(float);
+    if (workspace == nullptr || workspace_bytes < required) {
+        throw std::invalid_argument("gdn_gating_proj: small-T workspace is too small");
+    }
+
+    dim3 partial_block(kSmallTThreads);
+    dim3 partial_grid(div_up(kLogicalRows, kSmallTRowsPerBlock), kSmallTSplits,
+                      div_up(t, kSmallTMax));
+    bf16_gdn_gating_proj_small_t_partial_kernel<kSmallTMax, kSmallTKSlice, kSmallTRowsPerBlock>
+        <<<partial_grid, partial_block, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const __nv_bfloat16*>(a_weight.qdata),
-            static_cast<const __nv_bfloat16*>(b_weight.qdata),
-            static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
-            static_cast<float*>(g.data), static_cast<float*>(beta.data));
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
+            static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<float*>(workspace), t);
+    CUDA_CHECK(cudaGetLastError());
 
-    if (t <= kSmallTMax) {
-        const std::size_t required = linear_dense_gdn_in_ab_gated_48_workspace_bytes(t);
-        if (workspace == nullptr || workspace_bytes < required) {
-            throw std::invalid_argument("gdn_gating_proj: small-T workspace is too small");
-        }
-        dim3 partial_block(kSmallTThreads);
-        dim3 partial_grid(div_up(kLogicalRows, kSmallTRowsPerBlock), kSmallTSplits,
-                          div_up(t, kSmallTMax));
-        linear_dense_gdn_in_ab_gated_smallt_partial_48_kernel<kSmallTMax, kSmallTKSlice,
-                                                              kSmallTRowsPerBlock>
-            <<<partial_grid, partial_block, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const __nv_bfloat16*>(a_weight.qdata),
-                static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<float*>(workspace),
-                t);
-        CUDA_CHECK(cudaGetLastError());
+    constexpr int kReduceThreads = 128;
+    const int reduce_elems       = kN * t;
+    const int reduce_blocks      = div_up(reduce_elems, kReduceThreads);
+    bf16_gdn_gating_proj_small_t_reduce_kernel<<<reduce_blocks, kReduceThreads, 0, stream>>>(
+        static_cast<const float*>(workspace), static_cast<const float*>(A_log.data),
+        static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
+        static_cast<float*>(beta.data), t);
+    CUDA_CHECK(cudaGetLastError());
+}
 
-        constexpr int kReduceThreads = 128;
-        const int reduce_elems       = kN * t;
-        const int reduce_blocks      = div_up(reduce_elems, kReduceThreads);
-        linear_dense_gdn_in_ab_gated_smallt_reduce_48_kernel<<<reduce_blocks, kReduceThreads, 0,
-                                                               stream>>>(
-            static_cast<const float*>(workspace), static_cast<const float*>(A_log.data),
-            static_cast<const float*>(dt_bias.data), static_cast<float*>(g.data),
-            static_cast<float*>(beta.data), t);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
+void bf16_gdn_gating_proj_mma_split8_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                            const Weight& a_weight, const Weight& b_weight,
+                                            const Tensor& A_log, const Tensor& dt_bias,
+                                            void* workspace, Tensor& g, Tensor& beta,
+                                            cudaStream_t stream) {
+    launch_bf16_prefill_mma<8, 8>(variant, x, a_weight, b_weight, A_log, dt_bias, workspace, g,
+                                  beta, stream);
+}
 
-    const std::size_t required = linear_dense_gdn_in_ab_gated_48_workspace_bytes(t);
-    if (required > 0 && (workspace == nullptr || workspace_bytes < required)) {
-        throw std::invalid_argument("gdn_gating_proj: dense prefill workspace is too small");
-    }
-    switch (dense_prefill_split_k(t)) {
-    case 8:
-        launch_dense_prefill_mma<8, 8>(x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
-                                       stream);
-        break;
-    case 4:
-        launch_dense_prefill_mma<4>(x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
-                                    stream);
-        break;
-    case 2:
-        launch_dense_prefill_mma<2>(x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
-                                    stream);
-        break;
-    default:
-        launch_dense_prefill_mma<1, 8>(x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
-                                       stream);
-        break;
-    }
+void bf16_gdn_gating_proj_mma_split4_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                            const Weight& a_weight, const Weight& b_weight,
+                                            const Tensor& A_log, const Tensor& dt_bias,
+                                            void* workspace, Tensor& g, Tensor& beta,
+                                            cudaStream_t stream) {
+    launch_bf16_prefill_mma<4>(variant, x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
+                               stream);
+}
+
+void bf16_gdn_gating_proj_mma_split2_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                            const Weight& a_weight, const Weight& b_weight,
+                                            const Tensor& A_log, const Tensor& dt_bias,
+                                            void* workspace, Tensor& g, Tensor& beta,
+                                            cudaStream_t stream) {
+    launch_bf16_prefill_mma<2>(variant, x, a_weight, b_weight, A_log, dt_bias, workspace, g, beta,
+                               stream);
+}
+
+void bf16_gdn_gating_proj_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                             const Weight& a_weight, const Weight& b_weight,
+                                             const Tensor& A_log, const Tensor& dt_bias, Tensor& g,
+                                             Tensor& beta, cudaStream_t stream) {
+    launch_bf16_prefill_mma<1, 8>(variant, x, a_weight, b_weight, A_log, dt_bias, nullptr, g, beta,
+                                  stream);
 }
 
 } // namespace ninfer::ops::detail

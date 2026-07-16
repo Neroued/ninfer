@@ -103,6 +103,9 @@ foreach(op IN LISTS ninfer_op_tests)
     SOURCES ops/test_${op}.cpp
     LIBRARIES ninfer_ops)
 endforeach()
+ninfer_add_test(ninfer_gdn_gating_proj_plan_test
+  SOURCES ops/test_gdn_gating_proj_plan.cpp
+  LIBRARIES ninfer_ops)
 
 # Stateful, fused, and exact-shape Ops remain central even when the current implementation domain
 # is one checkpoint/device.

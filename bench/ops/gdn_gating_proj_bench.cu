@@ -1,6 +1,6 @@
 // Performance bench for the Qwen3.6-27B fused GDN in_a/in_b prefill path:
-// two dense BF16 [48,5120] projections fused with gdn_gating.
-//   ./ninfer_gdn_in_ab_prefill_bench -p 128,256,512,1024,2048,4096,8192,16384
+// two contiguous BF16 [48,5120] projections fused with gdn_gating.
+//   ./ninfer_gdn_gating_proj_bench -p 128,256,512,1024,2048,4096,8192,16384
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer_bench_common.h"
 
@@ -21,7 +21,7 @@ constexpr std::int32_t kHeads        = 48;
 constexpr std::int32_t kSmallTMax    = 8;
 constexpr std::int32_t kSmallTSplits = 10;
 
-int dense_prefill_split_k(std::int32_t tokens) {
+int bf16_prefill_split_k(std::int32_t tokens) {
     if (tokens <= 128) { return 40; }
     if (tokens <= 256) { return 20; }
     if (tokens <= 512) { return 10; }
@@ -44,7 +44,7 @@ DBuf make_f32(std::size_t n, std::uint32_t seed) {
     return d;
 }
 
-Weight dense_bf16_weight(void* data) {
+Weight bf16_weight(void* data) {
     Weight w{};
     w.qtype   = QType::BF16_CTRL;
     w.layout  = QuantLayout::Contiguous;
@@ -100,10 +100,10 @@ void run(std::int32_t T, int warmup, int repeat, int min_time_ms) {
     Tensor tdt_bias(dt_bias.p, DType::FP32, {kHeads});
     Tensor tg(g.p, DType::FP32, {kHeads, T});
     Tensor tbeta(beta.p, DType::FP32, {kHeads, T});
-    Weight wa = dense_bf16_weight(aw.p);
-    Weight wb = dense_bf16_weight(bw.p);
+    Weight wa = bf16_weight(aw.p);
+    Weight wb = bf16_weight(bw.p);
 
-    const int split_k = (T >= 2 && T <= kSmallTMax) ? kSmallTSplits : dense_prefill_split_k(T);
+    const int split_k = (T >= 2 && T <= kSmallTMax) ? kSmallTSplits : bf16_prefill_split_k(T);
     const char* route = (T == 1)            ? "decode-row"
                         : (T <= kSmallTMax) ? "smallt-splitk"
                         : (split_k > 1)     ? "mma-coop-splitk"

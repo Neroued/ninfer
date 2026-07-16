@@ -1,5 +1,5 @@
 // Correctness coverage for the fused GDN in_a/in_b prefill path at Qwen3.6-27B
-// shapes: two dense BF16 [48,5120] projections fused with gdn_gating.
+// shapes: two contiguous BF16 [48,5120] projections fused with gdn_gating.
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "core/arena.h"
 #include "ops/op_tester.h"
@@ -18,7 +18,7 @@ namespace {
 constexpr std::int32_t kHidden = 5120;
 constexpr std::int32_t kHeads  = 48;
 
-Weight dense_bf16_weight(void* data) {
+Weight bf16_weight(void* data) {
     Weight w{};
     w.qtype   = QType::BF16_CTRL;
     w.layout  = QuantLayout::Contiguous;
@@ -41,11 +41,10 @@ Weight dense_bf16_weight(void* data) {
 
 double softplus(double x) { return (x > 20.0) ? x : std::log1p(std::exp(x)); }
 
-void cpu_gdn_in_ab_prefill(const std::vector<float>& x, const std::vector<float>& aw,
-                           const std::vector<float>& bw, const std::vector<float>& A_log,
-                           const std::vector<float>& dt_bias,
-                           const std::vector<std::int32_t>& tokens, std::vector<double>& g,
-                           std::vector<double>& beta) {
+void cpu_gdn_gating_proj(const std::vector<float>& x, const std::vector<float>& aw,
+                         const std::vector<float>& bw, const std::vector<float>& A_log,
+                         const std::vector<float>& dt_bias, const std::vector<std::int32_t>& tokens,
+                         std::vector<double>& g, std::vector<double>& beta) {
     const std::size_t out_elems =
         static_cast<std::size_t>(kHeads) * static_cast<std::size_t>(tokens.size());
     g.assign(out_elems, 0.0);
@@ -94,7 +93,7 @@ int one_shape(std::int32_t T, std::uint32_t seed, std::vector<std::int32_t> samp
     round_to_bf16(bw);
 
     std::vector<double> ref_g, ref_beta;
-    cpu_gdn_in_ab_prefill(x, aw, bw, A_log, dt_bias, sample_tokens, ref_g, ref_beta);
+    cpu_gdn_gating_proj(x, aw, bw, A_log, dt_bias, sample_tokens, ref_g, ref_beta);
 
     DBuf dx = to_device_bf16(x), daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
     DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
@@ -106,8 +105,8 @@ int one_shape(std::int32_t T, std::uint32_t seed, std::vector<std::int32_t> samp
     Tensor tdt_bias(ddt_bias.p, DType::FP32, {kHeads});
     Tensor tg(dg.p, DType::FP32, {kHeads, T});
     Tensor tbeta(dbeta.p, DType::FP32, {kHeads, T});
-    Weight wa = dense_bf16_weight(daw.p);
-    Weight wb = dense_bf16_weight(dbw.p);
+    Weight wa = bf16_weight(daw.p);
+    Weight wb = bf16_weight(dbw.p);
     WorkspaceArena ws(64u * 1024u * 1024u);
 
     if (use_graph) {
@@ -141,7 +140,7 @@ int one_shape(std::int32_t T, std::uint32_t seed, std::vector<std::int32_t> samp
             sampled_beta[sample * kHeads + static_cast<std::size_t>(h)] = full_beta[source + h];
         }
     }
-    const std::string label = "gdn_in_ab_prefill fused [48,5120] T=" + std::to_string(T) +
+    const std::string label = "gdn_gating_proj [48,5120] T=" + std::to_string(T) +
                               " samples=" + std::to_string(sample_tokens.size());
     int failures = 0;
     failures += verify((label + " g").c_str(), sampled_g, ref_g, Tolerance::gdn_output_bf16());
@@ -171,6 +170,6 @@ int main() {
     failures += one_shape(4096, 0x505u, {0, 2047, 4095});
     failures += one_shape(4097, 0x555u, {0, 2048, 4096});
 
-    std::cout << (failures ? "FAIL" : "OK") << " gdn_in_ab_prefill correctness\n";
+    std::cout << (failures ? "FAIL" : "OK") << " gdn_gating_proj correctness\n";
     return failures ? 1 : 0;
 }

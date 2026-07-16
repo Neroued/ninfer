@@ -34,7 +34,7 @@ static void cpu_gdn_gating(const std::vector<float>& a, const std::vector<float>
     }
 }
 
-static Weight dense_bf16_weight(void* data) {
+static Weight bf16_weight(void* data) {
     Weight w{};
     w.qtype           = QType::BF16_CTRL;
     w.layout          = QuantLayout::Contiguous;
@@ -87,8 +87,8 @@ static int fused_decode_matches_two_step() {
     Tensor tdt_bias(ddt_bias.p, DType::FP32, {48});
     Tensor tg(dg.p, DType::FP32, {48, 1});
     Tensor tbeta(dbeta.p, DType::FP32, {48, 1});
-    Weight wa = dense_bf16_weight(daw.p);
-    Weight wb = dense_bf16_weight(dbw.p);
+    Weight wa = bf16_weight(daw.p);
+    Weight wb = bf16_weight(dbw.p);
     WorkspaceArena ws(4u * 1024u * 1024u);
 
     ops::gdn_gating_proj(tx, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, nullptr);

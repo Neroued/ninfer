@@ -10,11 +10,11 @@
 
 namespace ninfer::ops {
 
-// Transient arena capacity used by gdn_gating_proj for a positive token count.
-[[nodiscard]] std::size_t gdn_gating_proj_workspace_bytes(std::int32_t tokens);
+// Maximum transient capacity required by any admitted route in [1,max_tokens].
+[[nodiscard]] std::size_t gdn_gating_proj_workspace_bytes(std::int32_t max_tokens);
 
 /**
- * Fuses two dense projections with Gated DeltaNet gate preparation. For each h,t:
+ * Fuses two BF16 projections with Gated DeltaNet gate preparation. For each h,t:
  *
  *   a[h,t]    = BF16(sum_k float(a_weight[h,k]) * float(x[k,t]))
  *   b[h,t]    = BF16(sum_k float(b_weight[h,k]) * float(x[k,t]))

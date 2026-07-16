@@ -84,6 +84,10 @@ add_library(ninfer_ops STATIC
   ops/linear/gemv/linear_rowsplit_gemv_mlp_gate_up_34816.cu
   ops/linear/gemv/linear_rowsplit_gemv_out_6144.cu
   ops/linear/gemv/linear_rowsplit_gemv_proj_6144.cu
+  ops/linear/q4/q4_rowsplit_gemm_mma.cu
+  ops/linear/q4/q4_rowsplit_gemm_simt.cu
+  ops/linear/q4/q4_rowsplit_gemv.cu
+  ops/linear/q4/q4_rowsplit_launch.cpp
   ops/linear/linear.cpp
   ops/linear/plan/linear_plan.cpp
   ops/linear/reference/linear_generic_dense.cu

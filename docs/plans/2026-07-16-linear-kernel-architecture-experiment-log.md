@@ -119,6 +119,9 @@ limits. Useful traffic/FLOP accounting is kept separate from physical NCU traffi
 | E049 | 2026-07-16 | Establish physical roofline/resource evidence for representative final policies. | T1, TT4, Q5 direct, BN64/BN128, W8 small/general, pair, Add, SwiGLU, 32K Vision. | NCU application replay, exact base-name filters, one launch; microbench timing remains authoritative. | The sampled policies occupy distinct resource/traffic regimes: 8.3--89.9% achieved occupancy, 24.2--90.7% SM SOL, 3.8--76.8% DRAM SOL, 37--154 registers, and 4.1--47.6 KiB static shared. No sampled kernel spills. | Reject one global roofline threshold and qualify per fixed policy plus wave/tail class. Retain separate split-low4 and W8 lifecycles and treat profiler duration only as diagnostic. |
 | E050 | 2026-07-16 | Close source/binary congruence and verify the exact final worktree. | Single exact support/route-profile authority, support-derived benchmark inventory, fail-closed launch, dead tuned kernels, all Linear tests and default build. | Release build, CPU structural tests, four GPU correctness modes, 24-view/pair smoke, formatting/diff checks, linked entry/SASS/resource audit. | All checks pass after fixing one missing CUDA include path on the host-only planner benchmark. The final benchmark has 85 true Linear entries, zero 7168/dual-Q5 entries, zero stack/local, and is 123,152 B smaller than the pre-cleanup checkpoint. | Accept the implemented foundation. Keep per-policy roofline closure as Stage B rather than claiming all 83 routes are qualified. |
 | E051 | 2026-07-16 | Re-evaluate the semantic boundary before implementing the clean cut-over. | Proposed target-owned `LinearExecutionProfile`, all Linear-family APIs and callers. | Interface/ownership review against the original Op contract and the requirement that callers remain unaware of dispatch. The uncommitted clean implementation was discarded and its branch deleted. | Explicit or hidden target-profile injection makes target code part of Linear routing, leaks implementation semantics through every caller, and cannot be repaired by moving the same dependency into Engine, Program, `Weight`, global state, or workspace. The original `linear(x,w,out,ws,stream)` boundary is correct. | Supersede the ownership conclusion of E050. Retain its physical problem inventory, route winners, fixed policies, codegen, correctness, and performance evidence; rebuild exact admission and routing as an immutable hardware-specific catalog wholly owned by each semantic Op. Reject unqualified grid-ceiling tails as “best” production routing. |
+| E052 | 2026-07-16 | Define the implementation boundary for Q4 pure Linear before writing kernels. | Q4G64 RowSplit only; current seven physical contractions plus future `[131072,2048]` pressure. | Current-source audit, retained E003/E008/E011/E014/E016/E044/E049 evidence, three independent design/implementation/verification reviews, and the accepted Q4 template design document. | The bounded architecture is three template lifecycles—GEMV, SIMT GEMM, and MMA GEMM—with runtime Rows/K/Cols, a finite `ScheduleId + KernelVariant` set, exact Op-owned admission, and no application-role naming. Split-K partitions aligned scale pairs; SIMT owns vectorized partial K stages; MMA fixes BK64. | Implement dormant fixed candidates first while production dispatch remains unchanged. Rebuild the measurement harness from current source before making any new performance claim, then qualify and cut over Q4 atomically. |
+| E053 | 2026-07-16 | Integrate the first dormant Q4 templates and reject any abstraction-induced regression before route work. | Three GEMV schedules, SIMT C4/C8 Full+Predicated, MMA C64/C128 Full+Predicated; matched legacy points. | Fresh Release `sm_120a` build; independent BF16-boundary/Q4-dequant/FP64 oracle; `cuobjdump` resources; one-process 5-warmup/20-cold structural screen with canonical candidate CSV. | All 11 initial candidates passed; no local/stack spill. New versus legacy cold median: warp-row 68.896/70.880 us (-2.8%), split-K 15.616/11.552 us (+35.2%), SIMT C4 27.904/32.032 us (-12.9%), SIMT C8 134.112/204.064 us (-34.3%), MMA C64 105.728/105.760 us (tie), MMA C128 29.952/29.920 us (tie). The split-K candidate used 48 registers versus the old winner's 34 and changed the lane/decode/scale topology. | Keep the three-family architecture and the successful schedules, but reject the first R1/W8 schedule. Make GEMV lane/decode/transfer topology an explicit compile-time schedule axis and regenerate split-K as byte-per-lane, scalar-scale/shuffle, synchronous-vector code staging before any qualification or commit. |
+| E054 | 2026-07-16 | Recover the split-K winner without reintroducing an application- or exact-Rows kernel. | `q4_rowsplit_gemv_kernel` R1/W8 at K5120; runtime and static group-ownership variants. | Bounded sequence: runtime PackedWord8 15.616 us; runtime PackedByte2 pair-loop 19.488 us; active-groups-10 unrolled 17.408 us; then the same template with `StaticGroupsPerRow=80`. Each step used the same Release benchmark and independent numerical oracle; final resources came from linked `cuobjdump`. | The final static-group schedule is 11.520 us versus legacy 11.520 us; R4/W1 is 70.880 versus 70.912 us. R1/W8 uses 36 versus 34 registers, identical 5,152 B linked static shared, zero local/stack spill, and a matching hot mix of 20 FFMA, 10 X loads, 10 code shared loads, and 10 shuffles. The complete candidate suite, including K5120 numerical coverage and static-K rejection, passes. Runtime ownership prevented the compiler from recovering the legacy hot-loop ILP even after the lane/decode path matched; specializing group count, not Rows or role, restored it. | Accept `StaticGroupsPerRow` as an evidence-gated codegen axis with 0 meaning runtime. Bind R1/W8 to 80 groups/K5120 and reject other K; any K5120 Rows can reuse it. Do not instantiate further static K values unless a runtime schedule fails the same >1% gate. |
 
 ## 5. Environment and baseline inventory
 
@@ -1974,3 +1977,155 @@ Remaining work is:
 - design optimized dense BF16 and grouped-expert lifecycles only when required;
 - admit future 35B physical problems only through exact numerical, winner, physical, and product
   gates.
+
+## 11. Q4 三模板族重启实验（E052--E054）
+
+### 11.1 实现边界与环境
+
+本轮只实现纯 `Q4G64_F16S / RowSplit / Kpad==K` Linear candidate，production
+`linear()` dispatch 保持不变。新增三个 kernel 模板族：
+
+```text
+q4_rowsplit_gemv_kernel
+q4_rowsplit_gemm_simt_kernel
+q4_rowsplit_gemm_mma_kernel
+```
+
+构建和运行环境：
+
+| 项目 | 值 |
+|---|---|
+| GPU | NVIDIA GeForce RTX 5090 |
+| compute capability | 12.0，编译目标 `sm_120a` |
+| CUDA runtime / driver | 13.1 / 13.1，benchmark 数值 `13010/13010` |
+| build | CMake `Release`，`-O3 -DNDEBUG` |
+| candidate binary | 当前源码重新构建的 `build/bench/ninfer_linear_op_bench` |
+| raw CSV | `profiles/bench/q4-linear-template-20260716/` |
+
+构建、数值与资源命令：
+
+```bash
+cmake --build build -j 12 \
+  --target ninfer_q4_linear_candidate_test ninfer_linear_op_bench
+
+./build/tests/ninfer_q4_linear_candidate_test
+
+/usr/local/cuda/bin/cuobjdump --dump-resource-usage \
+  build/src/libninfer_ops.a
+```
+
+benchmark 的 fixed Q4 路径接受任意 measurement-only `Rows/K/Cols`，记录 canonical
+schedule identity、variant、build、GPU 和 CUDA。CSV 明确区分：
+
+- `useful_*`；
+- 只考虑 column tile 权重重放的 `weight_replay_lower_bound_*`；
+- 仅 forced MMA 有意义的 `executed_tflops/executed_tc_pct`；
+- physical bytes、occupancy 和 SOL 留给 NCU。
+
+因此结构 screen 中传入的 `--stream-ceiling-gbs 1000` 只是固定输出上下文，不构成
+roofline 结论；本节只使用 cold latency 比较候选。
+
+### 11.2 数值门
+
+oracle 固定为：
+
+```text
+BF16-rounded X
+test-side packed Q4 RowSplit dequant
+FP64 CPU W @ X
+```
+
+覆盖：
+
+- 三个 GEMV schedule，包括最终 R1/W8 K5120；
+- SIMT C4/C8 的 Full、Predicated、K1152 partial stage；
+- SIMT K3072 的三 stage ring-buffer 复用；
+- MMA C64/C128 的 Full、Predicated；
+- MMA K384 的多 stage 复用；
+- illegal Full、lifecycle variant mismatch、Kpad mismatch、静态 GEMV K mismatch 和未知
+  ScheduleId rejection。
+
+最终 `ninfer_q4_linear_candidate_test` 报告：
+
+```text
+OK Q4 Linear fixed candidates
+```
+
+GEMV/SIMT `rel_l2` 约为 `1.54e-3..1.81e-3`；MMA 为
+`2.08e-3..2.11e-3`，低于 `linear_tc` 的 `4e-3` normwise 上限。
+
+### 11.3 最终 linked resources
+
+以下是 linked archive 的 `cuobjdump` 数值；所有 entry 均为 0 stack、0 local、无 spill：
+
+| schedule / variant | registers | linked static shared |
+|---|---:|---:|
+| GEMV R4/W1 shared | 40 | 3,200 B，另加运行时 `2*K` dynamic shared |
+| GEMV R4/W1 direct | 40 | 3,200 B |
+| GEMV R1/W8 static-groups80 | 36 | 5,152 B |
+| SIMT R8/C4 Full / Predicated | 102 / 78 | 9,728 B |
+| SIMT R8/C8 Full / Predicated | 128 / 96 | 9,728 B |
+| MMA R64/C64 Full / Predicated | 98 / 101 | 29,952 B |
+| MMA R64/C128 Full / Predicated | 150 / 152 | 46,592 B |
+
+MMA 的 source-level array 总量比 linked shared 少 1,024 B；资格记录采用 linked
+resource，而不是只引用模板公式。
+
+### 11.4 Matched structural screen
+
+共同命令形态：
+
+```bash
+./build/bench/ninfer_linear_op_bench \
+  --rows N --k K --qtype Q4 \
+  --candidate CANDIDATE --t-sweep T \
+  --warmup 5 --repeat 20 \
+  --stream-ceiling-gbs 1000 \
+  --csv-out profiles/bench/q4-linear-template-20260716/NAME.csv
+```
+
+结果：
+
+| matched point | legacy cold median | new cold median | 结论 |
+|---|---:|---:|---|
+| split-K GEMV `[4096,5120] C1` | 11.520 us | 11.520 us | 等价 |
+| warp-row GEMV `[34816,5120] C1` | 70.912 us | 70.880 us | 等价 |
+| SIMT C4 `[6144,5120] C4` | 32.032 us | 27.904 us | 新实现快 12.9% |
+| SIMT C8 `[34816,5120] C8` | 204.064 us | 134.112 us | 新实现快 34.3% |
+| MMA C64 `[4096,5120] C64` | 105.760 us | 105.728 us | practical tie |
+| MMA C128 `[3456,1152] C128` | 29.920 us | 29.952 us | practical tie |
+
+这仍是 structural screen；最终 route seam 和小于 3% 的差异按三进程
+8-warmup/40-cold 规则确认。
+
+### 11.5 Split-K 失败序列与架构修正
+
+首版 R1/W8 把 warp-row 的 PackedWord8/SharedPair32 内层映射强加给 split-K，结果为：
+
+| 版本 | cold median | resources | 判断 |
+|---|---:|---|---|
+| runtime PackedWord8 | 15.616 us | 48 reg / 5,408 B | 比旧 winner 慢 35.2%，拒绝 |
+| runtime PackedByte2 pair loop | 19.488 us | 37 reg / 5,152 B | 资源恢复但 ILP 更差，拒绝 |
+| runtime ownership + active-groups-10 unroll | 17.408 us | 39 reg / 5,152 B | 仍慢 51.1%，拒绝 |
+| `StaticGroupsPerRow=80` | 11.520 us | 36 reg / 5,152 B | 与旧 winner 相同，接受 |
+
+最终 schedule 保持 runtime Rows，但将 K5120 的 80 个 group 编译期均分到 8 个 warp：
+
+```text
+10 groups / warp
+5 scale pairs / warp
+PackedByte2 + ScalarInteger
+SyncVector16 code
+Scalar16Shuffle scale
+```
+
+最终 SASS hot mix 与旧实现对应：20 FFMA、10 X global loads、10 code shared loads、10
+shuffle。结论不是“所有 K 都应静态化”，而是：
+
+```text
+默认 StaticGroupsPerRow=0
+只有 runtime K 稳定回退超过 1% 且静态值可跨 Rows 复用时，才增加一个静态 schedule
+```
+
+R1/W8 因此只接受 K5120；R4/W1、SIMT 和 MMA 继续使用 runtime K。这个修正保留三个
+kernel lifecycle，不增加应用场景 kernel，也不把 exact Rows 变成模板参数。

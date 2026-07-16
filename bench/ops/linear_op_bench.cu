@@ -10,6 +10,10 @@
 #include "ninfer/ops/linear_pair.h"
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "ops/linear/gemv/linear_rowsplit_gemv_gdn_in_qk_4096.cuh"
+#include "ops/linear/gemv/linear_rowsplit_gemv_mlp_gate_up_34816.cuh"
+#include "ops/linear/q4/q4_rowsplit_launch.h"
+#include "ops/linear/reference/linear_generic.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -73,6 +77,15 @@ struct TargetSpec {
     QType qtype;
 };
 
+enum class CandidateKind {
+    Auto,
+    LegacySimt,
+    LegacyMma,
+    LegacyGemvR4W1Shared,
+    LegacyGemvR1W8Direct,
+    Q4Fixed,
+};
+
 constexpr ShapeSpec kShapes[] = {
     {"MtpFc5120x10240", 5120, 10240},        {"MtpKV1024x5120", 1024, 5120},
     {"MtpAttnIn14336x5120", 14336, 5120},    {"MtpOProj5120x6144", 5120, 6144},
@@ -105,18 +118,26 @@ constexpr TargetSpec kTask2Targets[] = {
 };
 
 struct Options {
-    bool all_targets          = true;
-    bool have_shape           = false;
-    bool have_qtype           = false;
-    bool paired_kv            = false;
-    ShapeSpec shape           = kTask2Targets[0].shape;
-    QType qtype               = kTask2Targets[0].qtype;
-    int warmup                = kDefaultWarmup;
-    int repeat                = kDefaultRepeat;
-    int copy_repeat           = kDefaultCopyRepeat;
-    std::uint64_t flush_bytes = kDefaultFlushBytes;
-    std::uint64_t copy_bytes  = kDefaultCopyBytes;
-    double stream_ceiling_gbs = 0.0;
+    bool all_targets                        = true;
+    bool have_shape                         = false;
+    bool have_qtype                         = false;
+    bool paired_kv                          = false;
+    bool have_rows                          = false;
+    bool have_k                             = false;
+    ShapeSpec shape                         = kTask2Targets[0].shape;
+    QType qtype                             = kTask2Targets[0].qtype;
+    std::int32_t rows                       = 0;
+    std::int32_t k                          = 0;
+    CandidateKind candidate                 = CandidateKind::Auto;
+    ops::detail::Q4ScheduleId q4_schedule   = ops::detail::Q4ScheduleId::SimtR8C4;
+    ops::detail::Q4KernelVariant q4_variant = ops::detail::Q4KernelVariant::Predicated;
+    bool q4_variant_auto                    = true;
+    int warmup                              = kDefaultWarmup;
+    int repeat                              = kDefaultRepeat;
+    int copy_repeat                         = kDefaultCopyRepeat;
+    std::uint64_t flush_bytes               = kDefaultFlushBytes;
+    std::uint64_t copy_bytes                = kDefaultCopyBytes;
+    double stream_ceiling_gbs               = 0.0;
     std::vector<int> t_sweep; // activation columns to sweep; empty => default set
     std::string csv_out;
 };
@@ -141,29 +162,40 @@ struct RowSplitPayload {
 };
 
 struct RunResult {
-    const char* shape_name             = "";
-    const char* qtype_name             = "";
-    std::int32_t n                     = 0;
-    std::int32_t k                     = 0;
-    std::int32_t t                     = 1;
-    std::uint64_t weight_payload_bytes = 0;
-    std::uint64_t x_bytes              = 0;
-    std::uint64_t out_bytes            = 0;
-    std::uint64_t bytes_streamed       = 0;
-    double cold_median_us              = 0.0;
-    double cold_min_us                 = 0.0;
-    double cold_p95_us                 = 0.0;
-    double warm_median_us              = 0.0;
-    double achieved_gbs                = 0.0;
-    double achieved_dram_pct           = 0.0;
-    double achieved_tflops             = 0.0;
-    double tc_ceiling_tflops           = 0.0;
-    double tc_pct                      = 0.0;
-    double stream_ceiling_gbs          = 0.0;
-    double roofline_us                 = 0.0;
-    int repeat                         = 0;
-    int warmup                         = 0;
-    std::uint64_t flush_bytes          = 0;
+    const char* shape_name = "";
+    const char* qtype_name = "";
+    std::string candidate_name;
+    const char* kernel_variant = "";
+    const char* build_type     = "";
+    std::string gpu_name;
+    int cuda_runtime_version                      = 0;
+    int cuda_driver_version                       = 0;
+    int compute_major                             = 0;
+    int compute_minor                             = 0;
+    std::int32_t n                                = 0;
+    std::int32_t k                                = 0;
+    std::int32_t t                                = 1;
+    std::uint64_t weight_payload_bytes            = 0;
+    std::uint64_t x_bytes                         = 0;
+    std::uint64_t out_bytes                       = 0;
+    std::uint64_t useful_bytes                    = 0;
+    std::uint64_t weight_replay_lower_bound_bytes = 0;
+    double cold_median_us                         = 0.0;
+    double cold_min_us                            = 0.0;
+    double cold_p95_us                            = 0.0;
+    double warm_median_us                         = 0.0;
+    double useful_gbs                             = 0.0;
+    double weight_replay_lower_bound_gbs          = 0.0;
+    double useful_copy_ceiling_pct                = 0.0;
+    double useful_tflops                          = 0.0;
+    double executed_tflops                        = std::numeric_limits<double>::quiet_NaN();
+    double tc_ceiling_tflops                      = 0.0;
+    double executed_tc_pct                        = std::numeric_limits<double>::quiet_NaN();
+    double stream_ceiling_gbs                     = 0.0;
+    double useful_copy_floor_us                   = 0.0;
+    int repeat                                    = 0;
+    int warmup                                    = 0;
+    std::uint64_t flush_bytes                     = 0;
 };
 
 __global__ void fill_codes_kernel(std::uint8_t* codes, std::uint64_t nbytes) {
@@ -251,6 +283,27 @@ const char* qtype_name(QType qtype) {
     }
 }
 
+const char* build_type_name() {
+#ifdef NDEBUG
+    return "Release";
+#else
+    return "Debug";
+#endif
+}
+
+void fill_environment(RunResult& result) {
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    cudaDeviceProp props{};
+    CUDA_CHECK(cudaGetDeviceProperties(&props, device));
+    CUDA_CHECK(cudaRuntimeGetVersion(&result.cuda_runtime_version));
+    CUDA_CHECK(cudaDriverGetVersion(&result.cuda_driver_version));
+    result.build_type    = build_type_name();
+    result.gpu_name      = props.name;
+    result.compute_major = props.major;
+    result.compute_minor = props.minor;
+}
+
 std::int32_t group_size(QType qtype) {
     switch (qtype) {
     case QType::Q4G64_F16S:
@@ -301,6 +354,93 @@ QType parse_qtype(std::string_view raw) {
     if (q == "q6" || q == "q6g64_f16s") { return QType::Q6G64_F16S; }
     if (q == "w8g32" || q == "w8g32_f16s") { return QType::W8G32_F16S; }
     throw std::invalid_argument("unknown qtype: " + std::string(raw));
+}
+
+std::string candidate_name(const Options& opt, const ShapeSpec& shape, std::int32_t t) {
+    switch (opt.candidate) {
+    case CandidateKind::Auto:
+        return "auto";
+    case CandidateKind::LegacySimt:
+        return t <= 4 ? "legacy.q4.simt.r8.c4.slab1024.s2" : "legacy.q4.simt.r8.c8.slab1024.s2";
+    case CandidateKind::LegacyMma:
+        return shape.n == 4096 && shape.k == 5120 && t <= 128 ? "legacy.q4.mma.r64.c64.k64"
+                                                              : "legacy.q4.mma.r64.c128.k64";
+    case CandidateKind::LegacyGemvR4W1Shared:
+        return "legacy.q4.gemv.r4.w1.x_shared.k5120";
+    case CandidateKind::LegacyGemvR1W8Direct:
+        return "legacy.q4.gemv.r1.w8.x_direct.k5120";
+    case CandidateKind::Q4Fixed:
+        return ops::detail::q4_schedule_name(opt.q4_schedule);
+    }
+    return "unknown";
+}
+
+void parse_candidate(Options& opt, std::string_view raw) {
+    const std::string candidate = lower(raw);
+    if (candidate == "auto") {
+        opt.candidate = CandidateKind::Auto;
+        return;
+    }
+    if (candidate == "legacy-simt") {
+        opt.candidate = CandidateKind::LegacySimt;
+        return;
+    }
+    if (candidate == "legacy-mma") {
+        opt.candidate = CandidateKind::LegacyMma;
+        return;
+    }
+    if (candidate == "legacy-gemv-r4w1-shared") {
+        opt.candidate = CandidateKind::LegacyGemvR4W1Shared;
+        return;
+    }
+    if (candidate == "legacy-gemv-r1w8-direct") {
+        opt.candidate = CandidateKind::LegacyGemvR1W8Direct;
+        return;
+    }
+
+    opt.candidate = CandidateKind::Q4Fixed;
+    if (candidate == "q4-gemv-r4w1-shared") {
+        opt.q4_schedule = ops::detail::Q4ScheduleId::GemvR4W1Shared;
+    } else if (candidate == "q4-gemv-r4w1-direct") {
+        opt.q4_schedule = ops::detail::Q4ScheduleId::GemvR4W1Direct;
+    } else if (candidate == "q4-gemv-r1w8-direct") {
+        opt.q4_schedule = ops::detail::Q4ScheduleId::GemvR1W8Direct;
+    } else if (candidate == "q4-simt-r8c4") {
+        opt.q4_schedule = ops::detail::Q4ScheduleId::SimtR8C4;
+    } else if (candidate == "q4-simt-r8c8") {
+        opt.q4_schedule = ops::detail::Q4ScheduleId::SimtR8C8;
+    } else if (candidate == "q4-mma-r64c64") {
+        opt.q4_schedule = ops::detail::Q4ScheduleId::MmaR64C64;
+    } else if (candidate == "q4-mma-r64c128") {
+        opt.q4_schedule = ops::detail::Q4ScheduleId::MmaR64C128;
+    } else {
+        throw std::invalid_argument("unknown candidate: " + std::string(raw));
+    }
+}
+
+ops::detail::Q4KernelVariant parse_q4_variant(std::string_view raw, bool& is_auto) {
+    const std::string variant = lower(raw);
+    if (variant == "auto") {
+        is_auto = true;
+        return ops::detail::Q4KernelVariant::Predicated;
+    }
+    is_auto = false;
+    if (variant == "none") { return ops::detail::Q4KernelVariant::None; }
+    if (variant == "full") { return ops::detail::Q4KernelVariant::Full; }
+    if (variant == "predicated") { return ops::detail::Q4KernelVariant::Predicated; }
+    throw std::invalid_argument("unknown Q4 kernel variant: " + std::string(raw));
+}
+
+ops::detail::Q4KernelVariant resolve_q4_variant(ops::detail::Q4ScheduleId schedule,
+                                                std::int32_t rows, std::int32_t k,
+                                                std::int32_t padded_k, std::int32_t cols) {
+    const ops::detail::Q4Problem problem{rows, k, padded_k, cols};
+    using V = ops::detail::Q4KernelVariant;
+    for (const V variant : {V::None, V::Full, V::Predicated}) {
+        if (ops::detail::q4_candidate_is_legal(schedule, variant, problem)) { return variant; }
+    }
+    throw std::invalid_argument(std::string("no legal variant for ") +
+                                ops::detail::q4_schedule_name(schedule));
 }
 
 ShapeSpec parse_shape(std::string_view raw) {
@@ -366,11 +506,19 @@ void usage(const char* argv0) {
         stderr,
         "Usage:\n"
         "  %s --all-targets [--warmup N] [--repeat N] [--copy-repeat N]\n"
-        "  %s --shape ShapeFamily --qtype Q4|Q5|Q6|W8G32 [--repeat N]\n\n"
+        "  %s --shape ShapeFamily --qtype Q4|Q5|Q6|W8G32 [--repeat N]\n"
+        "  %s --rows N --k K --qtype Q4 --candidate NAME [--variant auto|none|full|predicated]\n\n"
         "Options:\n"
         "  --all-targets              Run the registered target shape/qtype rows (default).\n"
         "  --shape NAME               One ShapeFamily string, e.g. MlpGateUp34816x5120.\n"
+        "  --rows N --k K             Numeric matrix geometry for Q4 candidate work.\n"
         "  --qtype Q4|Q5|Q6|W8G32     Low-bit ROW_SPLIT qtype for --shape.\n"
+        "  --candidate NAME           auto, legacy-simt, legacy-mma,\n"
+        "                             legacy-gemv-r4w1-shared, legacy-gemv-r1w8-direct,\n"
+        "                             q4-gemv-r4w1-shared, q4-gemv-r4w1-direct,\n"
+        "                             q4-gemv-r1w8-direct, q4-simt-r8c4, q4-simt-r8c8,\n"
+        "                             q4-mma-r64c64, or q4-mma-r64c128.\n"
+        "  --variant NAME             Q4 fixed variant; auto is the default.\n"
         "  --paired-kv                Benchmark paired MTP K/V (requires MtpKV + W8G32).\n"
         "  --warmup N                 Cold-cache warmup GEMV launches (default %d).\n"
         "  --repeat N                 Cold-cache measured GEMV launches (default %d).\n"
@@ -378,10 +526,11 @@ void usage(const char* argv0) {
         "  --flush-mib N              L2 flush buffer size in MiB (default 256).\n"
         "  --copy-mib N               Copy-ceiling buffer size in MiB (default 512).\n"
         "  --stream-ceiling-gbs X     Use a premeasured copy ceiling instead of measuring it.\n"
-        "  --t-sweep L                Comma list of activation columns T, e.g. 1,8,64,512\n"
-        "                             (default 1,2,4,8,16,32,64,128,256,512,1024,2048).\n"
+        "  --t-sweep L                Comma list of activation columns T, e.g. 1,8,64,512.\n"
+        "                             Fixed GEMV defaults to 1; other paths default to\n"
+        "                             1,2,4,8,16,32,64,128,256,512,1024,2048.\n"
         "  --csv-out PATH             Write the result table as CSV.\n",
-        argv0, argv0, kDefaultWarmup, kDefaultRepeat, kDefaultCopyRepeat);
+        argv0, argv0, argv0, kDefaultWarmup, kDefaultRepeat, kDefaultCopyRepeat);
 }
 
 Options parse_args(int argc, char** argv) {
@@ -398,9 +547,23 @@ Options parse_args(int argc, char** argv) {
             opt.shape       = parse_shape(next("shape"));
             opt.have_shape  = true;
             opt.all_targets = false;
+        } else if (arg == "--rows") {
+            opt.rows        = parse_int(next("rows"), "rows");
+            opt.have_rows   = true;
+            opt.all_targets = false;
+        } else if (arg == "--k") {
+            opt.k           = parse_int(next("k"), "k");
+            opt.have_k      = true;
+            opt.all_targets = false;
         } else if (arg == "--qtype") {
             opt.qtype       = parse_qtype(next("qtype"));
             opt.have_qtype  = true;
+            opt.all_targets = false;
+        } else if (arg == "--candidate") {
+            parse_candidate(opt, next("candidate"));
+            opt.all_targets = false;
+        } else if (arg == "--variant") {
+            opt.q4_variant  = parse_q4_variant(next("variant"), opt.q4_variant_auto);
             opt.all_targets = false;
         } else if (arg == "--paired-kv") {
             opt.paired_kv   = true;
@@ -429,8 +592,25 @@ Options parse_args(int argc, char** argv) {
         }
     }
 
-    if (!opt.all_targets && (!opt.have_shape || !opt.have_qtype)) {
+    const bool numeric_shape = opt.have_rows || opt.have_k;
+    if (numeric_shape && (!opt.have_rows || !opt.have_k)) {
+        throw std::invalid_argument("--rows and --k must be provided together");
+    }
+    if (numeric_shape && opt.have_shape) {
+        throw std::invalid_argument("--rows/--k cannot be combined with --shape");
+    }
+    if (!opt.all_targets && !numeric_shape && (!opt.have_shape || !opt.have_qtype)) {
         throw std::invalid_argument("--shape and --qtype must be provided together");
+    }
+    if (!opt.all_targets && numeric_shape && !opt.have_qtype) {
+        throw std::invalid_argument("--rows/--k require --qtype");
+    }
+    if (opt.candidate != CandidateKind::Auto &&
+        (opt.qtype != QType::Q4G64_F16S || opt.paired_kv || opt.all_targets)) {
+        throw std::invalid_argument("fixed candidates require one non-paired Q4 shape");
+    }
+    if (opt.candidate == CandidateKind::Q4Fixed && !numeric_shape && !opt.have_shape) {
+        throw std::invalid_argument("Q4 fixed candidate requires one shape");
     }
     if (opt.paired_kv &&
         (std::string_view(opt.shape.name) != "MtpKV1024x5120" || opt.qtype != QType::W8G32_F16S)) {
@@ -439,11 +619,25 @@ Options parse_args(int argc, char** argv) {
     if (opt.repeat <= 0) { throw std::invalid_argument("--repeat must be positive"); }
     if (opt.warmup < 0) { throw std::invalid_argument("--warmup must be nonnegative"); }
     if (opt.copy_repeat <= 0) { throw std::invalid_argument("--copy-repeat must be positive"); }
+    if (numeric_shape && (opt.rows <= 0 || opt.k <= 0)) {
+        throw std::invalid_argument("--rows and --k must be positive");
+    }
     if (opt.flush_bytes == 0) { throw std::invalid_argument("--flush-mib must be positive"); }
     if (opt.copy_bytes == 0 || (opt.copy_bytes % sizeof(uint4)) != 0) {
         throw std::invalid_argument("--copy-mib must produce a positive uint4-aligned byte count");
     }
-    if (opt.t_sweep.empty()) { opt.t_sweep = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048}; }
+    if (opt.t_sweep.empty()) {
+        const bool gemv_candidate =
+            opt.candidate == CandidateKind::LegacyGemvR4W1Shared ||
+            opt.candidate == CandidateKind::LegacyGemvR1W8Direct ||
+            (opt.candidate == CandidateKind::Q4Fixed &&
+             (opt.q4_schedule == ops::detail::Q4ScheduleId::GemvR4W1Shared ||
+              opt.q4_schedule == ops::detail::Q4ScheduleId::GemvR4W1Direct ||
+              opt.q4_schedule == ops::detail::Q4ScheduleId::GemvR1W8Direct));
+        opt.t_sweep = gemv_candidate
+                          ? std::vector<int>{1}
+                          : std::vector<int>{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
+    }
     return opt;
 }
 
@@ -676,6 +870,88 @@ Weight make_weight(const RowSplitPayload& payload, QType qtype, std::int32_t n, 
     return w;
 }
 
+ops::detail::Q4KernelVariant selected_q4_variant(const Options& opt, const ShapeSpec& shape,
+                                                 std::int32_t t) {
+    if (opt.candidate != CandidateKind::Q4Fixed) { return ops::detail::Q4KernelVariant::None; }
+    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
+    return opt.q4_variant_auto ? resolve_q4_variant(opt.q4_schedule, shape.n, shape.k, padded_k, t)
+                               : opt.q4_variant;
+}
+
+void launch_candidate(const Options& opt, const ShapeSpec& shape, const Tensor& x, const Weight& w,
+                      Tensor& out, WorkspaceArena& ws, cudaStream_t stream) {
+    switch (opt.candidate) {
+    case CandidateKind::Auto:
+        ops::linear(x, w, out, ws, stream);
+        return;
+    case CandidateKind::LegacySimt:
+        ops::detail::linear_rowsplit_gemm_smallt_launch(
+            x, w, out, ops::detail::LinearFormat::Q4G64_RowSplit, stream);
+        return;
+    case CandidateKind::LegacyMma:
+        ops::detail::linear_rowsplit_gemm_mma_launch(
+            x, w, out, ops::detail::LinearFormat::Q4G64_RowSplit, stream);
+        return;
+    case CandidateKind::LegacyGemvR4W1Shared:
+        if (shape.n != 34816 || shape.k != 5120 || x.ne[1] != 1) {
+            throw std::invalid_argument(
+                "legacy R4/W1 shared GEMV is only valid for [34816,5120] Cols=1");
+        }
+        ops::detail::linear_rowsplit_gemv_mlp_gate_up_34816_q4_launch(x, w, out, ws, stream);
+        return;
+    case CandidateKind::LegacyGemvR1W8Direct:
+        if (shape.n != 4096 || shape.k != 5120 || x.ne[1] != 1) {
+            throw std::invalid_argument(
+                "legacy R1/W8 direct GEMV is only valid for [4096,5120] Cols=1");
+        }
+        ops::detail::linear_rowsplit_gemv_gdn_in_qk_4096_q4_launch(x, w, out, ws, stream);
+        return;
+    case CandidateKind::Q4Fixed: {
+        const auto variant = selected_q4_variant(opt, shape, x.ne[1]);
+        ops::detail::q4_rowsplit_launch_candidate(opt.q4_schedule, variant, x, w, out, stream);
+        return;
+    }
+    }
+    throw std::invalid_argument("unknown Linear benchmark candidate");
+}
+
+int candidate_col_tile(const Options& opt, const ShapeSpec& shape, std::int32_t t) {
+    using S = ops::detail::Q4ScheduleId;
+    switch (opt.candidate) {
+    case CandidateKind::Auto:
+        return t;
+    case CandidateKind::LegacySimt:
+        return t <= 4 ? 4 : 8;
+    case CandidateKind::LegacyMma:
+        return shape.n == 4096 && shape.k == 5120 && t <= 128 ? 64 : 128;
+    case CandidateKind::LegacyGemvR4W1Shared:
+    case CandidateKind::LegacyGemvR1W8Direct:
+        return 1;
+    case CandidateKind::Q4Fixed:
+        switch (opt.q4_schedule) {
+        case S::GemvR4W1Shared:
+        case S::GemvR4W1Direct:
+        case S::GemvR1W8Direct:
+            return 1;
+        case S::SimtR8C4:
+            return 4;
+        case S::SimtR8C8:
+            return 8;
+        case S::MmaR64C64:
+            return 64;
+        case S::MmaR64C128:
+            return 128;
+        }
+    }
+    throw std::invalid_argument("unknown Linear benchmark candidate tile");
+}
+
+bool candidate_uses_mma(const Options& opt) {
+    return opt.candidate == CandidateKind::LegacyMma ||
+           (opt.candidate == CandidateKind::Q4Fixed &&
+            ops::detail::q4_schedule_uses_mma(opt.q4_schedule));
+}
+
 RunResult run_target(const TargetSpec& target, const Options& opt, double stream_ceiling_gbs,
                      double tc_ceiling_tflops, std::int32_t t, DeviceBuffer& flush,
                      cudaStream_t stream) {
@@ -692,50 +968,81 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     Weight w = make_weight(wbuf, target.qtype, shape.n, shape.k);
     WorkspaceArena ws(64ULL << 20);
 
-    const auto launch      = [&](cudaStream_t s) { ops::linear(tx, w, tout, ws, s); };
+    const auto launch = [&](cudaStream_t s) { launch_candidate(opt, shape, tx, w, tout, ws, s); };
     const TimingStats cold = measure_cold(launch, flush, stream, opt.warmup, opt.repeat);
     const TimingStats warm = measure_warm(launch, stream, opt.warmup, opt.repeat);
 
-    const std::uint64_t x_bytes        = static_cast<std::uint64_t>(shape.k) * tt * 2ULL;
-    const std::uint64_t out_bytes      = static_cast<std::uint64_t>(shape.n) * tt * 2ULL;
-    const std::uint64_t bytes_streamed = w.payload_bytes + x_bytes + out_bytes;
-    const double sec                   = cold.median_us * 1e-6;
-    const double achieved_gbs = sec > 0.0 ? static_cast<double>(bytes_streamed) / sec / 1e9 : 0.0;
-    const double achieved_dram_pct =
-        stream_ceiling_gbs > 0.0 ? achieved_gbs / stream_ceiling_gbs * 100.0 : 0.0;
-    const double flops =
+    const std::uint64_t x_bytes       = static_cast<std::uint64_t>(shape.k) * tt * 2ULL;
+    const std::uint64_t out_bytes     = static_cast<std::uint64_t>(shape.n) * tt * 2ULL;
+    const std::uint64_t useful_bytes  = w.payload_bytes + x_bytes + out_bytes;
+    const int col_tile                = candidate_col_tile(opt, shape, t);
+    const std::uint64_t weight_passes = static_cast<std::uint64_t>((t + col_tile - 1) / col_tile);
+    const std::uint64_t weight_replay_lower_bound_bytes =
+        w.payload_bytes * weight_passes + x_bytes + out_bytes;
+    const double sec        = cold.median_us * 1e-6;
+    const double useful_gbs = sec > 0.0 ? static_cast<double>(useful_bytes) / sec / 1e9 : 0.0;
+    const double weight_replay_lower_bound_gbs =
+        sec > 0.0 ? static_cast<double>(weight_replay_lower_bound_bytes) / sec / 1e9 : 0.0;
+    const double useful_copy_ceiling_pct =
+        stream_ceiling_gbs > 0.0 ? useful_gbs / stream_ceiling_gbs * 100.0 : 0.0;
+    const double useful_flops =
         2.0 * static_cast<double>(shape.n) * static_cast<double>(shape.k) * static_cast<double>(t);
-    const double achieved_tflops = sec > 0.0 ? flops / sec / 1e12 : 0.0;
-    const double tc_pct =
-        tc_ceiling_tflops > 0.0 ? achieved_tflops / tc_ceiling_tflops * 100.0 : 0.0;
-    const double roofline_us = stream_ceiling_gbs > 0.0 ? static_cast<double>(bytes_streamed) /
-                                                              (stream_ceiling_gbs * 1e9) * 1e6
-                                                        : 0.0;
+    double executed_tflops = std::numeric_limits<double>::quiet_NaN();
+    double executed_tc_pct = std::numeric_limits<double>::quiet_NaN();
+    if (candidate_uses_mma(opt)) {
+        const std::int64_t executed_rows = align_up_u64(shape.n, 64);
+        const std::int64_t executed_cols = align_up_u64(t, col_tile);
+        const double executed_flops      = 2.0 * static_cast<double>(executed_rows) *
+                                      static_cast<double>(shape.k) *
+                                      static_cast<double>(executed_cols);
+        executed_tflops = sec > 0.0 ? executed_flops / sec / 1e12 : 0.0;
+        executed_tc_pct =
+            tc_ceiling_tflops > 0.0 ? executed_tflops / tc_ceiling_tflops * 100.0 : 0.0;
+    }
+    const double useful_tflops = sec > 0.0 ? useful_flops / sec / 1e12 : 0.0;
+    const double useful_copy_floor_us =
+        stream_ceiling_gbs > 0.0
+            ? static_cast<double>(useful_bytes) / (stream_ceiling_gbs * 1e9) * 1e6
+            : 0.0;
 
     RunResult r;
-    r.shape_name           = shape.name;
-    r.qtype_name           = qtype_name(target.qtype);
-    r.n                    = shape.n;
-    r.k                    = shape.k;
-    r.t                    = t;
-    r.weight_payload_bytes = w.payload_bytes;
-    r.x_bytes              = x_bytes;
-    r.out_bytes            = out_bytes;
-    r.bytes_streamed       = bytes_streamed;
-    r.cold_median_us       = cold.median_us;
-    r.cold_min_us          = cold.min_us;
-    r.cold_p95_us          = cold.p95_us;
-    r.warm_median_us       = warm.median_us;
-    r.achieved_gbs         = achieved_gbs;
-    r.achieved_dram_pct    = achieved_dram_pct;
-    r.achieved_tflops      = achieved_tflops;
-    r.tc_ceiling_tflops    = tc_ceiling_tflops;
-    r.tc_pct               = tc_pct;
-    r.stream_ceiling_gbs   = stream_ceiling_gbs;
-    r.roofline_us          = roofline_us;
-    r.repeat               = opt.repeat;
-    r.warmup               = opt.warmup;
-    r.flush_bytes          = opt.flush_bytes;
+    r.shape_name     = shape.name;
+    r.qtype_name     = qtype_name(target.qtype);
+    r.candidate_name = candidate_name(opt, shape, t);
+    if (opt.candidate == CandidateKind::Q4Fixed) {
+        r.kernel_variant = ops::detail::q4_kernel_variant_name(selected_q4_variant(opt, shape, t));
+    } else if (opt.candidate == CandidateKind::LegacyMma) {
+        r.kernel_variant = (shape.n % 64) == 0 && (t % col_tile) == 0 && (shape.k % 64) == 0
+                               ? "full"
+                               : "predicated";
+    } else {
+        r.kernel_variant = "n/a";
+    }
+    r.n                               = shape.n;
+    r.k                               = shape.k;
+    r.t                               = t;
+    r.weight_payload_bytes            = w.payload_bytes;
+    r.x_bytes                         = x_bytes;
+    r.out_bytes                       = out_bytes;
+    r.useful_bytes                    = useful_bytes;
+    r.weight_replay_lower_bound_bytes = weight_replay_lower_bound_bytes;
+    r.cold_median_us                  = cold.median_us;
+    r.cold_min_us                     = cold.min_us;
+    r.cold_p95_us                     = cold.p95_us;
+    r.warm_median_us                  = warm.median_us;
+    r.useful_gbs                      = useful_gbs;
+    r.weight_replay_lower_bound_gbs   = weight_replay_lower_bound_gbs;
+    r.useful_copy_ceiling_pct         = useful_copy_ceiling_pct;
+    r.useful_tflops                   = useful_tflops;
+    r.executed_tflops                 = executed_tflops;
+    r.tc_ceiling_tflops               = tc_ceiling_tflops;
+    r.executed_tc_pct                 = executed_tc_pct;
+    r.stream_ceiling_gbs              = stream_ceiling_gbs;
+    r.useful_copy_floor_us            = useful_copy_floor_us;
+    r.repeat                          = opt.repeat;
+    r.warmup                          = opt.warmup;
+    r.flush_bytes                     = opt.flush_bytes;
+    fill_environment(r);
     return r;
 }
 
@@ -763,41 +1070,45 @@ RunResult run_paired_kv(const Options& opt, double stream_ceiling_gbs, double tc
     const TimingStats cold = measure_cold(launch, flush, stream, opt.warmup, opt.repeat);
     const TimingStats warm = measure_warm(launch, stream, opt.warmup, opt.repeat);
 
-    const std::uint64_t weight_bytes   = wk.payload_bytes + wv.payload_bytes;
-    const std::uint64_t x_bytes        = static_cast<std::uint64_t>(shape.k) * tt * 2ULL;
-    const std::uint64_t out_bytes      = 2ULL * static_cast<std::uint64_t>(shape.n) * tt * 2ULL;
-    const std::uint64_t bytes_streamed = weight_bytes + x_bytes + out_bytes;
-    const double sec                   = cold.median_us * 1e-6;
+    const std::uint64_t weight_bytes = wk.payload_bytes + wv.payload_bytes;
+    const std::uint64_t x_bytes      = static_cast<std::uint64_t>(shape.k) * tt * 2ULL;
+    const std::uint64_t out_bytes    = 2ULL * static_cast<std::uint64_t>(shape.n) * tt * 2ULL;
+    const std::uint64_t useful_bytes = weight_bytes + x_bytes + out_bytes;
+    const double sec                 = cold.median_us * 1e-6;
     const double flops =
         4.0 * static_cast<double>(shape.n) * static_cast<double>(shape.k) * static_cast<double>(t);
 
     RunResult r;
-    r.shape_name           = shape.name;
-    r.qtype_name           = "W8G32x2";
-    r.n                    = shape.n * 2;
-    r.k                    = shape.k;
-    r.t                    = t;
-    r.weight_payload_bytes = weight_bytes;
-    r.x_bytes              = x_bytes;
-    r.out_bytes            = out_bytes;
-    r.bytes_streamed       = bytes_streamed;
-    r.cold_median_us       = cold.median_us;
-    r.cold_min_us          = cold.min_us;
-    r.cold_p95_us          = cold.p95_us;
-    r.warm_median_us       = warm.median_us;
-    r.achieved_gbs         = sec > 0.0 ? static_cast<double>(bytes_streamed) / sec / 1e9 : 0.0;
-    r.achieved_dram_pct =
-        stream_ceiling_gbs > 0.0 ? r.achieved_gbs / stream_ceiling_gbs * 100.0 : 0.0;
-    r.achieved_tflops   = sec > 0.0 ? flops / sec / 1e12 : 0.0;
-    r.tc_ceiling_tflops = tc_ceiling_tflops;
-    r.tc_pct = tc_ceiling_tflops > 0.0 ? r.achieved_tflops / tc_ceiling_tflops * 100.0 : 0.0;
-    r.stream_ceiling_gbs = stream_ceiling_gbs;
-    r.roofline_us        = stream_ceiling_gbs > 0.0
-                               ? static_cast<double>(bytes_streamed) / (stream_ceiling_gbs * 1e9) * 1e6
-                               : 0.0;
-    r.repeat             = opt.repeat;
-    r.warmup             = opt.warmup;
-    r.flush_bytes        = opt.flush_bytes;
+    r.shape_name                      = shape.name;
+    r.qtype_name                      = "W8G32x2";
+    r.candidate_name                  = "auto";
+    r.kernel_variant                  = "n/a";
+    r.n                               = shape.n * 2;
+    r.k                               = shape.k;
+    r.t                               = t;
+    r.weight_payload_bytes            = weight_bytes;
+    r.x_bytes                         = x_bytes;
+    r.out_bytes                       = out_bytes;
+    r.useful_bytes                    = useful_bytes;
+    r.weight_replay_lower_bound_bytes = useful_bytes;
+    r.cold_median_us                  = cold.median_us;
+    r.cold_min_us                     = cold.min_us;
+    r.cold_p95_us                     = cold.p95_us;
+    r.warm_median_us                  = warm.median_us;
+    r.useful_gbs = sec > 0.0 ? static_cast<double>(useful_bytes) / sec / 1e9 : 0.0;
+    r.weight_replay_lower_bound_gbs = r.useful_gbs;
+    r.useful_copy_ceiling_pct =
+        stream_ceiling_gbs > 0.0 ? r.useful_gbs / stream_ceiling_gbs * 100.0 : 0.0;
+    r.useful_tflops        = sec > 0.0 ? flops / sec / 1e12 : 0.0;
+    r.tc_ceiling_tflops    = tc_ceiling_tflops;
+    r.stream_ceiling_gbs   = stream_ceiling_gbs;
+    r.useful_copy_floor_us = stream_ceiling_gbs > 0.0 ? static_cast<double>(useful_bytes) /
+                                                            (stream_ceiling_gbs * 1e9) * 1e6
+                                                      : 0.0;
+    r.repeat               = opt.repeat;
+    r.warmup               = opt.warmup;
+    r.flush_bytes          = opt.flush_bytes;
+    fill_environment(r);
     return r;
 }
 
@@ -805,16 +1116,26 @@ void print_table(const std::vector<RunResult>& rows, double stream_ceiling_gbs,
                  double tc_ceiling_tflops, std::uint64_t copy_bytes) {
     std::printf("# stream_ceiling_gbs=%.3f tc_ceiling_tflops=%.3f\n", stream_ceiling_gbs,
                 tc_ceiling_tflops);
+    if (!rows.empty()) {
+        const RunResult& env = rows.front();
+        std::printf("# build_type=%s gpu=%s sm=%d%d cuda_runtime=%d cuda_driver=%d\n",
+                    env.build_type, env.gpu_name.c_str(), env.compute_major, env.compute_minor,
+                    env.cuda_runtime_version, env.cuda_driver_version);
+    }
     std::printf("# stream_ceiling_method=cold L2-flushed uint4 copy kernel, bytes_per_sample=%llu "
                 "(read+write counted as 2x copy bytes); "
                 "tc_ceiling_method=dense bf16 mma.sync m16n8k16 probe\n",
                 static_cast<unsigned long long>(copy_bytes));
-    std::printf("%-22s %-3s %8s %8s %6s %12s %11s %7s %11s %7s %12s\n", "shape", "qt", "N", "K",
-                "T", "cold_us", "ach_GB/s", "DRAM_%", "ach_TFLOP", "TC_%", "warm_us");
+    std::printf("%-22s %-3s %8s %8s %6s %12s %11s %11s %11s %11s %7s %12s %-12s %s\n", "shape",
+                "qt", "N", "K", "T", "cold_us", "use_GB/s", "wreplay_GB/s", "use_TFLOP",
+                "exec_TFLOP", "TC_%", "warm_us", "variant", "candidate");
     for (const RunResult& r : rows) {
-        std::printf("%-22s %-3s %8d %8d %6d %12.3f %11.3f %7.2f %11.2f %7.2f %12.3f\n",
-                    r.shape_name, r.qtype_name, r.n, r.k, r.t, r.cold_median_us, r.achieved_gbs,
-                    r.achieved_dram_pct, r.achieved_tflops, r.tc_pct, r.warm_median_us);
+        std::printf("%-22s %-3s %8d %8d %6d %12.3f %11.3f %11.3f %11.2f %11.2f %7.2f %12.3f "
+                    "%-12s %s\n",
+                    r.shape_name, r.qtype_name, r.n, r.k, r.t, r.cold_median_us, r.useful_gbs,
+                    r.weight_replay_lower_bound_gbs, r.useful_tflops, r.executed_tflops,
+                    r.executed_tc_pct, r.warm_median_us, r.kernel_variant,
+                    r.candidate_name.c_str());
     }
 }
 
@@ -822,21 +1143,27 @@ void write_csv(const std::filesystem::path& path, const std::vector<RunResult>& 
     if (path.has_parent_path()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV output: " + path.string()); }
-    // Existing columns are kept in place; the T-sweep + compute-roofline columns are
-    // appended so downstream parsers that read by name (or the leading columns) are
-    // unaffected. Each row is now one (shape, qtype, T) point.
-    out << "shape,qtype,N,K,weight_payload_bytes,x_bytes,out_bytes,bytes_streamed,"
-           "cold_median_us,cold_min_us,cold_p95_us,achieved_gbs,achieved_dram_pct,"
-           "stream_ceiling_gbs,roofline_us,warmup,repeat,flush_bytes,"
-           "T,achieved_tflops,tc_ceiling_tflops,tc_pct,warm_median_us\n";
+    // Each row is one (shape, qtype, T, physical candidate) point. Useful counters,
+    // column-tiled weight-replay lower bounds, and forced-MMA executed counters remain
+    // distinct; physical traffic and SOL percentages come only from NCU.
+    out << "shape,qtype,N,K,weight_payload_bytes,x_bytes,out_bytes,useful_bytes,"
+           "weight_replay_lower_bound_bytes,cold_median_us,cold_min_us,cold_p95_us,useful_gbs,"
+           "weight_replay_lower_bound_gbs,useful_copy_ceiling_pct,stream_ceiling_gbs,"
+           "useful_copy_floor_us,warmup,repeat,flush_bytes,T,useful_tflops,executed_tflops,"
+           "tc_ceiling_tflops,executed_tc_pct,warm_median_us,candidate,kernel_variant,build_type,"
+           "gpu_name,cuda_runtime_version,cuda_driver_version,compute_major,compute_minor\n";
     for (const RunResult& r : rows) {
         out << r.shape_name << ',' << r.qtype_name << ',' << r.n << ',' << r.k << ','
             << r.weight_payload_bytes << ',' << r.x_bytes << ',' << r.out_bytes << ','
-            << r.bytes_streamed << ',' << r.cold_median_us << ',' << r.cold_min_us << ','
-            << r.cold_p95_us << ',' << r.achieved_gbs << ',' << r.achieved_dram_pct << ','
-            << r.stream_ceiling_gbs << ',' << r.roofline_us << ',' << r.warmup << ',' << r.repeat
-            << ',' << r.flush_bytes << ',' << r.t << ',' << r.achieved_tflops << ','
-            << r.tc_ceiling_tflops << ',' << r.tc_pct << ',' << r.warm_median_us << '\n';
+            << r.useful_bytes << ',' << r.weight_replay_lower_bound_bytes << ',' << r.cold_median_us
+            << ',' << r.cold_min_us << ',' << r.cold_p95_us << ',' << r.useful_gbs << ','
+            << r.weight_replay_lower_bound_gbs << ',' << r.useful_copy_ceiling_pct << ','
+            << r.stream_ceiling_gbs << ',' << r.useful_copy_floor_us << ',' << r.warmup << ','
+            << r.repeat << ',' << r.flush_bytes << ',' << r.t << ',' << r.useful_tflops << ','
+            << r.executed_tflops << ',' << r.tc_ceiling_tflops << ',' << r.executed_tc_pct << ','
+            << r.warm_median_us << ',' << r.candidate_name << ',' << r.kernel_variant << ','
+            << r.build_type << ',' << r.gpu_name << ',' << r.cuda_runtime_version << ','
+            << r.cuda_driver_version << ',' << r.compute_major << ',' << r.compute_minor << '\n';
     }
 }
 
@@ -866,6 +1193,8 @@ int main(int argc, char** argv) {
         std::vector<TargetSpec> targets;
         if (opt.all_targets) {
             targets.assign(std::begin(kTask2Targets), std::end(kTask2Targets));
+        } else if (opt.have_rows) {
+            targets.push_back(TargetSpec{{"Numeric", opt.rows, opt.k}, opt.qtype});
         } else {
             targets.push_back(TargetSpec{opt.shape, opt.qtype});
         }

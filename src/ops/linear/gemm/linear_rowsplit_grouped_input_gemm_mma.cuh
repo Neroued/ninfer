@@ -7,7 +7,9 @@
 // scheduling pool.
 
 #include "ops/common/math.h"
-#include "ops/linear/gemm/linear_rowsplit_gemm_mma.cuh"
+#include "ops/linear/codec/linear_codec.cuh"
+#include "ops/linear/common/rowsplit_mma_common.cuh"
+#include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "core/tensor.h"
 
 #include <cuda_bf16.h>
@@ -244,10 +246,11 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
             __nv_bfloat162 w;
             if constexpr (Codec == GroupedInputCodec::Q5) {
                 if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                    w = Q5Codec::load_pair_bf162_scale_ptr(
-                        Cr[stage], Hr[stage], &Sr[stage][row * SB + scale_off], row, lane);
+                    w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage],
+                                                     &Sr[stage][row * SB + scale_off], row, lane);
                 } else {
-                    w = Q5Codec::load_pair_bf162(Cr[stage], Hr[stage], Sr[stage], row, lane);
+                    w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage], &Sr[stage][row * SB],
+                                                     row, lane);
                 }
             } else if constexpr (Codec == GroupedInputCodec::Q4) {
                 if constexpr (Cfg::SCALE_PAIR_LOAD) {
@@ -259,10 +262,11 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void linear_rowsplit_grouped_in
             } else {
                 if (job.q5) {
                     if constexpr (Cfg::SCALE_PAIR_LOAD) {
-                        w = Q5Codec::load_pair_bf162_scale_ptr(
+                        w = Q5MmaDecodeAtom::decode_pair(
                             Cr[stage], Hr[stage], &Sr[stage][row * SB + scale_off], row, lane);
                     } else {
-                        w = Q5Codec::load_pair_bf162(Cr[stage], Hr[stage], Sr[stage], row, lane);
+                        w = Q5MmaDecodeAtom::decode_pair(Cr[stage], Hr[stage], &Sr[stage][row * SB],
+                                                         row, lane);
                     }
                 } else if constexpr (Cfg::SCALE_PAIR_LOAD) {
                     w = Q4Codec::load_pair_bf162_scale_ptr(

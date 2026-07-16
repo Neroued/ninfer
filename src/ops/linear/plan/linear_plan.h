@@ -8,9 +8,6 @@
 namespace ninfer::ops::detail {
 
 enum class LinearFormat {
-    Q4G64_RowSplit,
-    Q5G64_RowSplit,
-    Q6G64_RowSplit,
     W8G32_RowSplit,
     DenseBF16,
     DenseFP32,
@@ -37,14 +34,9 @@ enum class LinearBackendKind { Gemv, Gemm, Reference };
 
 enum class LinearPolicyId {
     RowsplitLowbitGemmSmallt,
-    RowsplitLowbitGemmMma,
     RowsplitW8G32GemmMma,
     GenericDenseGemv,
     GenericDenseGemm,
-    AttnInQKV7168Q5RowsplitGemv,
-    MlpDownQ5RowsplitGemv,
-    Proj6144Q5RowsplitGemv,
-    Out6144Q5RowsplitGemv,
 };
 
 struct LinearPlanKey {
@@ -60,12 +52,12 @@ struct LinearPlan {
     bool uses_tensor_cores; // derived metadata, reports only
 };
 
-// Host classification. Format-local Q4/Q6 dispatch occurs before this legacy planner is used.
+// Host classification for the remaining W8/Dense compatibility planner.
 LinearFormat classify_format(const Weight& w);
 ShapeFamily classify_shape(std::int32_t n, std::int32_t k);
 LinearRegime classify_regime(LinearFormat fmt, ShapeFamily shape, std::int32_t t);
 
-// Legacy planner for Q5/W8/Dense. Q4/Q6 pure Linear are owned by their format-local plans.
+// Q4/Q5/Q6 pure Linear are owned by format-local plans and cannot be represented here.
 LinearPlan resolve_plan(LinearPlanKey key);
 
 // Names / identity for logs and (future) benchmarks. No behavioral role.

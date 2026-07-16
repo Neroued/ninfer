@@ -7,15 +7,6 @@ namespace ninfer::ops::detail {
 LinearFormat classify_format(const Weight& w) {
     using L = QuantLayout;
     switch (w.qtype) {
-    case QType::Q4G64_F16S:
-        return w.layout == L::RowSplit ? LinearFormat::Q4G64_RowSplit
-                                       : LinearFormat::GenericUnsupported;
-    case QType::Q5G64_F16S:
-        return w.layout == L::RowSplit ? LinearFormat::Q5G64_RowSplit
-                                       : LinearFormat::GenericUnsupported;
-    case QType::Q6G64_F16S:
-        return w.layout == L::RowSplit ? LinearFormat::Q6G64_RowSplit
-                                       : LinearFormat::GenericUnsupported;
     case QType::W8G32_F16S:
         return w.layout == L::RowSplit ? LinearFormat::W8G32_RowSplit
                                        : LinearFormat::GenericUnsupported;
@@ -54,12 +45,8 @@ ShapeFamily classify_shape(std::int32_t n, std::int32_t k) {
     return ShapeFamily::Generic;
 }
 
-// SmallT -> LargeT crossover per (format, shape). The original T-swept
-// calibration found that the cp.async tensor-core GEMM overtakes the multi-step
-// GEMV around T~16 on every shape (at
-// T<=8 its BN-wide token tile is mostly empty, so the GEMV is faster; from T=32
-// it is ~3-6x faster and keeps climbing to ~65-74% of the bf16 mma ceiling). So
-// route T<=16 to the multi-step GEMV and T>16 to the mma GEMM.
+// Compatibility-only W8/Dense regime classification. Migrated formats do not
+// use this coarse threshold; their exact format-local plans own route ranges.
 std::int32_t regime_threshold(LinearFormat /*fmt*/, ShapeFamily /*shape*/) { return 16; }
 
 LinearRegime classify_regime(LinearFormat fmt, ShapeFamily shape, std::int32_t t) {
@@ -68,39 +55,8 @@ LinearRegime classify_regime(LinearFormat fmt, ShapeFamily shape, std::int32_t t
 }
 
 LinearPlan resolve_plan(LinearPlanKey key) {
-    if (key.format == LinearFormat::Q4G64_RowSplit || key.format == LinearFormat::Q6G64_RowSplit) {
-        throw std::invalid_argument("legacy linear planner does not own Q4/Q6 pure Linear");
-    }
-    if (key.format == LinearFormat::Q5G64_RowSplit &&
-        key.shape == ShapeFamily::AttnInQKV7168x5120 && key.regime == LinearRegime::T1) {
-        return LinearPlan{LinearBackendKind::Gemv, LinearPolicyId::AttnInQKV7168Q5RowsplitGemv,
-                          policy_name(LinearPolicyId::AttnInQKV7168Q5RowsplitGemv),
-                          /*uses_tensor_cores=*/false};
-    }
-    if (key.format == LinearFormat::Q5G64_RowSplit && key.shape == ShapeFamily::MlpDown5120x17408 &&
-        key.regime == LinearRegime::T1) {
-        return LinearPlan{LinearBackendKind::Gemv, LinearPolicyId::MlpDownQ5RowsplitGemv,
-                          policy_name(LinearPolicyId::MlpDownQ5RowsplitGemv),
-                          /*uses_tensor_cores=*/false};
-    }
-    if (key.format == LinearFormat::Q5G64_RowSplit && key.shape == ShapeFamily::Proj6144x5120 &&
-        key.regime == LinearRegime::T1) {
-        return LinearPlan{LinearBackendKind::Gemv, LinearPolicyId::Proj6144Q5RowsplitGemv,
-                          policy_name(LinearPolicyId::Proj6144Q5RowsplitGemv),
-                          /*uses_tensor_cores=*/false};
-    }
-    if (key.format == LinearFormat::Q5G64_RowSplit && key.shape == ShapeFamily::Out5120x6144 &&
-        key.regime == LinearRegime::T1) {
-        return LinearPlan{LinearBackendKind::Gemv, LinearPolicyId::Out6144Q5RowsplitGemv,
-                          policy_name(LinearPolicyId::Out6144Q5RowsplitGemv),
-                          /*uses_tensor_cores=*/false};
-    }
-    // Dense keeps its reference GEMV/GEMM. Q5 low-bit routes by regime:
-    // registered-shape T1 -> tuned GEMV above; generic T1 and SmallT -> the
-    // small-T streaming GEMM (memory-bound, CUDA cores, weights streamed once
-    // per column tile); LargeT -> bf16 tensor-core mma GEMM (compute-bound).
-    // W8G32 owns a separate LargeT MMA backend so its group-32 dequantization and
-    // SM120 tile pipeline can be tuned without changing the Q5 kernel.
+    // Dense keeps its reference GEMV/GEMM. W8 remains the only quantized format
+    // on this compatibility planner until its format backend is migrated.
     if (key.format == LinearFormat::DenseBF16 || key.format == LinearFormat::DenseFP32) {
         const bool gemv = (key.regime == LinearRegime::T1);
         const LinearPolicyId policy =
@@ -113,24 +69,16 @@ LinearPlan resolve_plan(LinearPlanKey key) {
                           policy_name(LinearPolicyId::RowsplitW8G32GemmMma),
                           /*uses_tensor_cores=*/true};
     }
-    if (key.regime == LinearRegime::LargeT) {
-        return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmMma,
-                          policy_name(LinearPolicyId::RowsplitLowbitGemmMma),
-                          /*uses_tensor_cores=*/true};
+    if (key.format == LinearFormat::W8G32_RowSplit) {
+        return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmSmallt,
+                          policy_name(LinearPolicyId::RowsplitLowbitGemmSmallt),
+                          /*uses_tensor_cores=*/false};
     }
-    return LinearPlan{LinearBackendKind::Gemm, LinearPolicyId::RowsplitLowbitGemmSmallt,
-                      policy_name(LinearPolicyId::RowsplitLowbitGemmSmallt),
-                      /*uses_tensor_cores=*/false};
+    throw std::invalid_argument("legacy linear planner received an unsupported format");
 }
 
 const char* format_name(LinearFormat f) {
     switch (f) {
-    case LinearFormat::Q4G64_RowSplit:
-        return "q4_rowsplit";
-    case LinearFormat::Q5G64_RowSplit:
-        return "q5_rowsplit";
-    case LinearFormat::Q6G64_RowSplit:
-        return "q6_rowsplit";
     case LinearFormat::W8G32_RowSplit:
         return "w8g32_rowsplit";
     case LinearFormat::DenseBF16:
@@ -187,22 +135,12 @@ const char* policy_name(LinearPolicyId p) {
     switch (p) {
     case LinearPolicyId::RowsplitLowbitGemmSmallt:
         return "linear.rowsplit.gemm.smallt.v1";
-    case LinearPolicyId::RowsplitLowbitGemmMma:
-        return "linear.rowsplit.gemm.mma.bf16.v1";
     case LinearPolicyId::RowsplitW8G32GemmMma:
         return "linear.rowsplit.w8g32.gemm.mma.bf16.v1";
     case LinearPolicyId::GenericDenseGemv:
         return "linear.ref.dense.gemv.generic.v1";
     case LinearPolicyId::GenericDenseGemm:
         return "linear.ref.dense.gemm.generic.v1";
-    case LinearPolicyId::AttnInQKV7168Q5RowsplitGemv:
-        return "linear.rowsplit.gemv.attn_in_7168.q5.warp_row.v1";
-    case LinearPolicyId::MlpDownQ5RowsplitGemv:
-        return "linear.rowsplit.gemv.mlp_down.q5.warp_row.v1";
-    case LinearPolicyId::Proj6144Q5RowsplitGemv:
-        return "linear.rowsplit.gemv.proj_6144.q5.warp_row.v1";
-    case LinearPolicyId::Out6144Q5RowsplitGemv:
-        return "linear.rowsplit.gemv.out_6144.q5.warp_row.v1";
     }
     return "linear.ref.unknown";
 }

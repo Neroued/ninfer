@@ -1,11 +1,10 @@
 #include "ninfer/ops/linear_add.h"
 
-#include "ops/linear/reference/linear_generic.h"
-#include "ops/linear/gemv/linear_rowsplit_gemv_mlp_down.cuh"
-#include "ops/linear/gemv/linear_rowsplit_gemv_out_6144.cuh"
-#include "ninfer/ops/linear.h"
 #include "ninfer/ops/residual_add.h"
+#include "ops/linear/q5/q5_rowsplit_add.h"
+#include "ops/linear/q5/q5_rowsplit_plan.h"
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 
@@ -29,15 +28,15 @@ void require_q5(const Weight& w) {
     }
 }
 
+bool aligned_to(const void* pointer, std::uintptr_t alignment) {
+    return pointer != nullptr && (reinterpret_cast<std::uintptr_t>(pointer) & (alignment - 1)) == 0;
+}
+
 } // namespace
 
 std::size_t linear_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                        std::int32_t tokens) {
-    if (output_rows <= 0 || input_rows <= 0 || tokens <= 0) {
-        throw std::invalid_argument("linear_add_workspace_bytes: dimensions must be positive");
-    }
-    if (tokens == 1 || tokens > 16) { return 0; }
-    return Tensor(nullptr, DType::BF16, {output_rows, tokens}).bytes();
+    return detail::q5_rowsplit_add_workspace_bytes(output_rows, input_rows, tokens);
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,
@@ -49,24 +48,20 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
 
     const bool supported_shape = (w.n == 5120 && w.k == 17408) || (w.n == 5120 && w.k == 6144);
     if (!supported_shape) { throw std::invalid_argument("linear_add: unsupported Q5 shape"); }
-
-    if (t > 16 && (w.k % 8) == 0) {
-        detail::linear_rowsplit_gemm_mma_residual_q5_launch(x, w, residual_out, stream);
-        return;
+    if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) || !aligned_to(w.qdata, 16) ||
+        !aligned_to(w.qhigh, 16) || !aligned_to(w.scales, 16)) {
+        throw std::invalid_argument(
+            "linear_add: Q5 requires 16-byte x/residual/code/high/scale alignment");
     }
 
-    if (t == 1 && w.k == 17408) {
-        detail::linear_rowsplit_gemv_mlp_down_residual_q5_launch(x, w, residual_out, ws, stream);
-        return;
-    }
-    if (t == 1 && w.k == 6144) {
-        detail::linear_rowsplit_gemv_out_6144_residual_q5_launch(x, w, residual_out, ws, stream);
+    if (detail::q5_rowsplit_add_route(t) != detail::Q5AddRoute::Materialized) {
+        detail::q5_rowsplit_add_dispatch(x, w, residual_out, stream);
         return;
     }
 
     auto scratch_scope = ws.scope();
     Tensor linear_out  = ws.alloc(DType::BF16, {w.n, t});
-    linear(x, w, linear_out, ws, stream);
+    detail::q5_rowsplit_dispatch(x, w, linear_out, stream);
     residual_add(linear_out, residual_out, stream);
 }
 

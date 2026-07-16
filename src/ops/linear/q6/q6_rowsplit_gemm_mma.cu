@@ -1,8 +1,7 @@
 #include "ops/linear/q6/q6_rowsplit_kernels.h"
 
 #include "ops/common/math.h"
-#include "ops/linear/gemm/linear_rowsplit_gemm_mma.cuh"
-#include "ops/linear/reference/linear_generic.h"
+#include "ops/linear/q6/q6_rowsplit_gemm_mma.cuh"
 #include "core/device.h"
 
 #include <cstdint>
@@ -11,8 +10,12 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using MmaR64C64Cfg  = GemmCfg<64, 64, 64, 32, 32, 2, 3>;
-using MmaR64C128Cfg = GemmCfg<64, 128, 64, 64, 32, 2, 1, false, true, true>;
+using MmaR64C64Schedule =
+    Q6RowSplitMmaGemmSchedule<64, 64, 64, 32, 32, 2, 3, Q6FragmentPipeline::PingPong, Cache::ca,
+                              Cache::ca, Q6ScaleLoad::Scalar16>;
+using MmaR64C128Schedule =
+    Q6RowSplitMmaGemmSchedule<64, 128, 64, 64, 32, 2, 1, Q6FragmentPipeline::Serial, Cache::cg,
+                              Cache::cg, Q6ScaleLoad::Pair32>;
 
 template <class Cfg>
 void launch_variant(Q6KernelVariant variant, const Tensor& x, const Weight& w, Tensor& out,
@@ -26,19 +29,17 @@ void launch_variant(Q6KernelVariant variant, const Tensor& x, const Weight& w, T
     const std::int32_t k        = x.ne[0];
     const std::int32_t t        = x.ne[1];
     const std::int32_t padded_k = w.padded_shape[1];
-    const dim3 grid(static_cast<unsigned>(div_up(n, Cfg::BM)),
-                    static_cast<unsigned>(div_up(t, Cfg::BN)), 1u);
+    const dim3 grid(static_cast<unsigned>(div_up(n, Cfg::kBlockRows)),
+                    static_cast<unsigned>(div_up(t, Cfg::kBlockCols)), 1u);
 
     switch (variant) {
     case Q6KernelVariant::Full:
-        linear_rowsplit_gemm_mma_kernel<Q6Codec, Cfg, true, false>
-            <<<grid, Cfg::THREADS, 0, stream>>>(xp, codes, high, scales, nullptr, outp, n, k, t,
-                                                padded_k);
+        q6_rowsplit_gemm_mma_kernel<Cfg, Q6KernelVariant::Full>
+            <<<grid, Cfg::kThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k);
         break;
     case Q6KernelVariant::Predicated:
-        linear_rowsplit_gemm_mma_kernel<Q6Codec, Cfg, false, false>
-            <<<grid, Cfg::THREADS, 0, stream>>>(xp, codes, high, scales, nullptr, outp, n, k, t,
-                                                padded_k);
+        q6_rowsplit_gemm_mma_kernel<Cfg, Q6KernelVariant::Predicated>
+            <<<grid, Cfg::kThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k);
         break;
     case Q6KernelVariant::None:
         throw std::invalid_argument("q6 MMA launch requires Full or Predicated variant");
@@ -52,12 +53,12 @@ void launch_variant(Q6KernelVariant variant, const Tensor& x, const Weight& w, T
 
 void q6_rowsplit_mma_r64_c64_launch(Q6KernelVariant variant, const Tensor& x, const Weight& w,
                                     Tensor& out, cudaStream_t stream) {
-    launch_variant<MmaR64C64Cfg>(variant, x, w, out, stream);
+    launch_variant<MmaR64C64Schedule>(variant, x, w, out, stream);
 }
 
 void q6_rowsplit_mma_r64_c128_launch(Q6KernelVariant variant, const Tensor& x, const Weight& w,
                                      Tensor& out, cudaStream_t stream) {
-    launch_variant<MmaR64C128Cfg>(variant, x, w, out, stream);
+    launch_variant<MmaR64C128Schedule>(variant, x, w, out, stream);
 }
 
 } // namespace ninfer::ops::detail

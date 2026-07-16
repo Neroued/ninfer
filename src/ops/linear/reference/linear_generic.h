@@ -7,16 +7,10 @@
 
 namespace ninfer::ops::detail {
 
-// Low-bit (Q4/Q5/Q6/W8G32): launcher selects the codec by fmt. w carries
-// payload/qdata/qhigh + padded_shape. The small-T streaming GEMM is the universal
-// low-bit path outside the tuned T==1 GEMVs and the LargeT tensor-core GEMM.
+// W8 compatibility launcher until W8 owns a format-local backend.
 void linear_rowsplit_gemm_smallt_launch(const Tensor& x, const Weight& w, Tensor& out,
                                         LinearFormat fmt, cudaStream_t stream);
-// LargeT (T > tau) tensor-core path: bf16 mma.sync with on-chip low-bit dequant.
-void linear_rowsplit_gemm_mma_launch(const Tensor& x, const Weight& w, Tensor& out,
-                                     LinearFormat fmt, cudaStream_t stream);
-void linear_rowsplit_gemm_mma_residual_q5_launch(const Tensor& x, const Weight& w,
-                                                 Tensor& residual_out, cudaStream_t stream);
+// W8 tensor-core paths.
 void linear_rowsplit_w8g32_gemm_mma_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream);
 void linear_rowsplit_w8g32_kv_gemm_mma_launch(const Tensor& x, const Weight& k_weight,

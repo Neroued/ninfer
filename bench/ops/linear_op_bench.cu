@@ -12,6 +12,8 @@
 #include "ninfer_bench_common.h"
 #include "ops/linear/q4/q4_rowsplit_launch.h"
 #include "ops/linear/q4/q4_rowsplit_plan.h"
+#include "ops/linear/q5/q5_rowsplit_launch.h"
+#include "ops/linear/q5/q5_rowsplit_plan.h"
 #include "ops/linear/q6/q6_rowsplit_launch.h"
 #include "ops/linear/q6/q6_rowsplit_plan.h"
 
@@ -80,6 +82,7 @@ struct TargetSpec {
 enum class CandidateKind {
     Auto,
     Q4Fixed,
+    Q5Fixed,
     Q6Fixed,
 };
 
@@ -93,7 +96,8 @@ constexpr ShapeSpec kShapes[] = {
     {"LmHeadDraft98304x5120", 98304, 5120},  {"LmHeadDraft131072x5120", 131072, 5120},
     {"Proj6144x5120", 6144, 5120},           {"Out5120x6144", 5120, 6144},
     {"VisionPatch1152x1536", 1152, 1536},    {"VisionQKV3456x1152", 3456, 1152},
-    {"VisionFC14304x1152", 4304, 1152},
+    {"VisionFC14304x1152", 4304, 1152},      {"AttnV1024x5120", 1024, 5120},
+    {"VisionOut1152x1152", 1152, 1152},      {"VisionFC2_1152x4304", 1152, 4304},
 };
 
 constexpr TargetSpec kTask2Targets[] = {
@@ -104,12 +108,14 @@ constexpr TargetSpec kTask2Targets[] = {
     {{"LmHeadDraft131072x5120", 131072, 5120}, QType::Q4G64_F16S},
     {{"VisionQKV3456x1152", 3456, 1152}, QType::Q4G64_F16S},
     {{"VisionFC14304x1152", 4304, 1152}, QType::Q4G64_F16S},
-    {{"AttnInQKV7168x5120", 7168, 5120}, QType::Q5G64_F16S},
+    {{"AttnV1024x5120", 1024, 5120}, QType::Q5G64_F16S},
     {{"MlpDown5120x17408", 5120, 17408}, QType::Q5G64_F16S},
     {{"LmHead248320x5120", 248320, 5120}, QType::Q6G64_F16S},
     {{"VisionPatch1152x1536", 1152, 1536}, QType::Q6G64_F16S},
     {{"Proj6144x5120", 6144, 5120}, QType::Q5G64_F16S},
     {{"Out5120x6144", 5120, 6144}, QType::Q5G64_F16S},
+    {{"VisionOut1152x1152", 1152, 1152}, QType::Q5G64_F16S},
+    {{"VisionFC2_1152x4304", 1152, 4304}, QType::Q5G64_F16S},
     {{"MtpFc5120x10240", 5120, 10240}, QType::W8G32_F16S},
     {{"MtpKV1024x5120", 1024, 5120}, QType::W8G32_F16S},
     {{"MtpAttnIn14336x5120", 14336, 5120}, QType::W8G32_F16S},
@@ -133,6 +139,9 @@ struct Options {
     ops::detail::Q4ScheduleId q4_schedule   = ops::detail::Q4ScheduleId::SimtR8C4;
     ops::detail::Q4KernelVariant q4_variant = ops::detail::Q4KernelVariant::Predicated;
     bool q4_variant_auto                    = true;
+    ops::detail::Q5ScheduleId q5_schedule   = ops::detail::Q5ScheduleId::SimtR8C4;
+    ops::detail::Q5KernelVariant q5_variant = ops::detail::Q5KernelVariant::Predicated;
+    bool q5_variant_auto                    = true;
     ops::detail::Q6ScheduleId q6_schedule   = ops::detail::Q6ScheduleId::SimtR8C4;
     ops::detail::Q6KernelVariant q6_variant = ops::detail::Q6KernelVariant::Predicated;
     bool q6_variant_auto                    = true;
@@ -365,6 +374,11 @@ ops::detail::Q4Plan resolve_auto_q4_plan(const ShapeSpec& shape, std::int32_t t)
     return ops::detail::q4_rowsplit_resolve_plan({shape.n, shape.k, padded_k, t});
 }
 
+ops::detail::Q5Plan resolve_auto_q5_plan(const ShapeSpec& shape, std::int32_t t) {
+    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
+    return ops::detail::q5_rowsplit_resolve_plan({shape.n, shape.k, padded_k, t});
+}
+
 ops::detail::Q6Plan resolve_auto_q6_plan(const ShapeSpec& shape, std::int32_t t) {
     const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
     return ops::detail::q6_rowsplit_resolve_plan({shape.n, shape.k, padded_k, t});
@@ -377,12 +391,17 @@ std::string candidate_name(const Options& opt, QType qtype, const ShapeSpec& sha
         if (qtype == QType::Q4G64_F16S) {
             return ops::detail::q4_schedule_name(resolve_auto_q4_plan(shape, t).schedule);
         }
+        if (qtype == QType::Q5G64_F16S) {
+            return ops::detail::q5_schedule_name(resolve_auto_q5_plan(shape, t).schedule);
+        }
         if (qtype == QType::Q6G64_F16S) {
             return ops::detail::q6_schedule_name(resolve_auto_q6_plan(shape, t).schedule);
         }
         return "auto";
     case CandidateKind::Q4Fixed:
         return ops::detail::q4_schedule_name(opt.q4_schedule);
+    case CandidateKind::Q5Fixed:
+        return ops::detail::q5_schedule_name(opt.q5_schedule);
     case CandidateKind::Q6Fixed:
         return ops::detail::q6_schedule_name(opt.q6_schedule);
     }
@@ -408,6 +427,27 @@ void parse_candidate(Options& opt, std::string_view raw) {
         opt.q4_schedule = ops::detail::Q4ScheduleId::MmaR64C64;
     } else if (candidate == "q4-mma-r64c128") {
         opt.q4_schedule = ops::detail::Q4ScheduleId::MmaR64C128;
+    } else if (candidate == "q5-gemv-r16s2x") {
+        opt.candidate   = CandidateKind::Q5Fixed;
+        opt.q5_schedule = ops::detail::Q5ScheduleId::GemvR16S2X;
+    } else if (candidate == "q5-simt-r8c4") {
+        opt.candidate   = CandidateKind::Q5Fixed;
+        opt.q5_schedule = ops::detail::Q5ScheduleId::SimtR8C4;
+    } else if (candidate == "q5-simt-r8c8") {
+        opt.candidate   = CandidateKind::Q5Fixed;
+        opt.q5_schedule = ops::detail::Q5ScheduleId::SimtR8C8;
+    } else if (candidate == "q5-simt-split2-exact") {
+        opt.candidate   = CandidateKind::Q5Fixed;
+        opt.q5_schedule = ops::detail::Q5ScheduleId::SimtSplit2Exact;
+    } else if (candidate == "q5-simt-split4-exact") {
+        opt.candidate   = CandidateKind::Q5Fixed;
+        opt.q5_schedule = ops::detail::Q5ScheduleId::SimtSplit4Exact;
+    } else if (candidate == "q5-mma-r64c64") {
+        opt.candidate   = CandidateKind::Q5Fixed;
+        opt.q5_schedule = ops::detail::Q5ScheduleId::MmaR64C64;
+    } else if (candidate == "q5-mma-r64c128") {
+        opt.candidate   = CandidateKind::Q5Fixed;
+        opt.q5_schedule = ops::detail::Q5ScheduleId::MmaR64C128;
     } else if (candidate == "q6-simt-r8c4") {
         opt.candidate   = CandidateKind::Q6Fixed;
         opt.q6_schedule = ops::detail::Q6ScheduleId::SimtR8C4;
@@ -435,6 +475,19 @@ ops::detail::Q4KernelVariant parse_q4_variant(std::string_view raw, bool& is_aut
     throw std::invalid_argument("unknown Q4 kernel variant: " + std::string(raw));
 }
 
+ops::detail::Q5KernelVariant parse_q5_variant(std::string_view raw, bool& is_auto) {
+    const std::string variant = lower(raw);
+    if (variant == "auto") {
+        is_auto = true;
+        return ops::detail::Q5KernelVariant::Predicated;
+    }
+    is_auto = false;
+    if (variant == "none") { return ops::detail::Q5KernelVariant::None; }
+    if (variant == "full") { return ops::detail::Q5KernelVariant::Full; }
+    if (variant == "predicated") { return ops::detail::Q5KernelVariant::Predicated; }
+    throw std::invalid_argument("unknown Q5 kernel variant: " + std::string(raw));
+}
+
 ops::detail::Q6KernelVariant parse_q6_variant(std::string_view raw, bool& is_auto) {
     const std::string variant = lower(raw);
     if (variant == "auto") {
@@ -458,6 +511,18 @@ ops::detail::Q4KernelVariant resolve_q4_variant(ops::detail::Q4ScheduleId schedu
     }
     throw std::invalid_argument(std::string("no legal variant for ") +
                                 ops::detail::q4_schedule_name(schedule));
+}
+
+ops::detail::Q5KernelVariant resolve_q5_variant(ops::detail::Q5ScheduleId schedule,
+                                                std::int32_t rows, std::int32_t k,
+                                                std::int32_t padded_k, std::int32_t cols) {
+    const ops::detail::Q5Problem problem{rows, k, padded_k, cols};
+    using V = ops::detail::Q5KernelVariant;
+    for (const V variant : {V::None, V::Full, V::Predicated}) {
+        if (ops::detail::q5_candidate_is_legal(schedule, variant, problem)) { return variant; }
+    }
+    throw std::invalid_argument(std::string("no legal variant for ") +
+                                ops::detail::q5_schedule_name(schedule));
 }
 
 ops::detail::Q6KernelVariant resolve_q6_variant(ops::detail::Q6ScheduleId schedule,
@@ -536,19 +601,22 @@ void usage(const char* argv0) {
         "Usage:\n"
         "  %s --all-targets [--warmup N] [--repeat N] [--copy-repeat N]\n"
         "  %s --shape ShapeFamily --qtype Q4|Q5|Q6|W8G32 [--repeat N]\n"
-        "  %s --rows N --k K --qtype Q4|Q6 --candidate NAME "
+        "  %s --rows N --k K --qtype Q4|Q5|Q6 --candidate NAME "
         "[--variant auto|none|full|predicated]\n\n"
         "Options:\n"
         "  --all-targets              Run the registered target shape/qtype rows (default).\n"
         "  --shape NAME               One ShapeFamily string, e.g. MlpGateUp34816x5120.\n"
-        "  --rows N --k K             Numeric matrix geometry for Q4/Q6 candidate work.\n"
+        "  --rows N --k K             Numeric matrix geometry for Q4/Q5/Q6 candidate work.\n"
         "  --qtype Q4|Q5|Q6|W8G32     Low-bit ROW_SPLIT qtype for --shape.\n"
         "  --candidate NAME           auto, q4-gemv-r4w1-direct,\n"
         "                             q4-gemv-r1w8-direct, q4-simt-r8c4, q4-simt-r8c8,\n"
         "                             q4-mma-r64c64, q4-mma-r64c128,\n"
+        "                             q5-gemv-r16s2x, q5-simt-r8c4, q5-simt-r8c8,\n"
+        "                             q5-simt-split2-exact, q5-simt-split4-exact,\n"
+        "                             q5-mma-r64c64, q5-mma-r64c128,\n"
         "                             q6-simt-r8c4,\n"
         "                             q6-mma-r64c64, or q6-mma-r64c128.\n"
-        "  --variant NAME             Q4/Q6 fixed variant; auto is the default.\n"
+        "  --variant NAME             Q4/Q5/Q6 fixed variant; auto is the default.\n"
         "  --paired-kv                Benchmark paired MTP K/V (requires MtpKV + W8G32).\n"
         "  --warmup N                 Cold-cache warmup GEMV launches (default %d).\n"
         "  --repeat N                 Cold-cache measured GEMV launches (default %d).\n"
@@ -595,6 +663,7 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--variant") {
             const std::string_view raw = next("variant");
             opt.q4_variant             = parse_q4_variant(raw, opt.q4_variant_auto);
+            opt.q5_variant             = parse_q5_variant(raw, opt.q5_variant_auto);
             opt.q6_variant             = parse_q6_variant(raw, opt.q6_variant_auto);
             opt.all_targets            = false;
         } else if (arg == "--paired-kv") {
@@ -646,6 +715,12 @@ Options parse_args(int argc, char** argv) {
     if (opt.candidate == CandidateKind::Q4Fixed && opt.qtype != QType::Q4G64_F16S) {
         throw std::invalid_argument("Q4 fixed candidate requires Q4");
     }
+    if (opt.candidate == CandidateKind::Q5Fixed && !numeric_shape && !opt.have_shape) {
+        throw std::invalid_argument("Q5 fixed candidate requires one shape");
+    }
+    if (opt.candidate == CandidateKind::Q5Fixed && opt.qtype != QType::Q5G64_F16S) {
+        throw std::invalid_argument("Q5 fixed candidate requires Q5");
+    }
     if (opt.candidate == CandidateKind::Q6Fixed && !numeric_shape && !opt.have_shape) {
         throw std::invalid_argument("Q6 fixed candidate requires one shape");
     }
@@ -676,6 +751,14 @@ std::vector<int> default_t_sweep(const TargetSpec& target, const Options& opt) {
         return gemv ? std::vector<int>{1}
                     : std::vector<int>{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
     }
+    if (opt.candidate == CandidateKind::Q5Fixed) {
+        if (opt.q5_schedule == ops::detail::Q5ScheduleId::GemvR16S2X) { return {1}; }
+        if (opt.q5_schedule == ops::detail::Q5ScheduleId::SimtSplit2Exact ||
+            opt.q5_schedule == ops::detail::Q5ScheduleId::SimtSplit4Exact) {
+            return {2, 3, 4, 5, 6};
+        }
+        return {1, 2, 4, 8, 16, 24, 25, 32, 64, 128, 256, 512, 1024, 2048};
+    }
     if (opt.candidate == CandidateKind::Q6Fixed) {
         return {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
     }
@@ -692,6 +775,21 @@ std::vector<int> default_t_sweep(const TargetSpec& target, const Options& opt) {
         if (target.shape.n == 1152 && target.shape.k == 1536) {
             return {4,   36,  40,  64,  128,  704,  708,  768,  772,  832, 836,
                     896, 900, 960, 964, 1024, 1028, 1088, 1092, 1152, 2048};
+        }
+    }
+    if (target.qtype == QType::Q5G64_F16S) {
+        if (target.shape.n == 1024 && target.shape.k == 5120) { return {1, 2, 4, 5, 8, 16}; }
+        if (target.shape.n == 6144 && target.shape.k == 5120) {
+            return {1, 2, 4, 6, 7, 16, 24, 25, 64, 65, 128, 512, 1024, 2048};
+        }
+        if (target.shape.n == 5120 && (target.shape.k == 6144 || target.shape.k == 17408)) {
+            return {2, 4, 6, 7, 16, 24};
+        }
+        if (target.shape.n == 1152 && target.shape.k == 1152) {
+            return {4, 8, 56, 60, 64, 128, 512, 2048};
+        }
+        if (target.shape.n == 1152 && target.shape.k == 4304) {
+            return {4, 8, 84, 88, 92, 128, 512, 2048};
         }
     }
     return {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
@@ -934,6 +1032,14 @@ ops::detail::Q4KernelVariant selected_q4_variant(const Options& opt, const Shape
                                : opt.q4_variant;
 }
 
+ops::detail::Q5KernelVariant selected_q5_variant(const Options& opt, const ShapeSpec& shape,
+                                                 std::int32_t t) {
+    if (opt.candidate != CandidateKind::Q5Fixed) { return ops::detail::Q5KernelVariant::None; }
+    const auto padded_k = static_cast<std::int32_t>(align_up_u64(shape.k, 128));
+    return opt.q5_variant_auto ? resolve_q5_variant(opt.q5_schedule, shape.n, shape.k, padded_k, t)
+                               : opt.q5_variant;
+}
+
 ops::detail::Q6KernelVariant selected_q6_variant(const Options& opt, const ShapeSpec& shape,
                                                  std::int32_t t) {
     if (opt.candidate != CandidateKind::Q6Fixed) { return ops::detail::Q6KernelVariant::None; }
@@ -951,6 +1057,11 @@ void launch_candidate(const Options& opt, const ShapeSpec& shape, const Tensor& 
     case CandidateKind::Q4Fixed: {
         const auto variant = selected_q4_variant(opt, shape, x.ne[1]);
         ops::detail::q4_rowsplit_launch_candidate(opt.q4_schedule, variant, x, w, out, stream);
+        return;
+    }
+    case CandidateKind::Q5Fixed: {
+        const auto variant = selected_q5_variant(opt, shape, x.ne[1]);
+        ops::detail::q5_rowsplit_launch_candidate(opt.q5_schedule, variant, x, w, out, stream);
         return;
     }
     case CandidateKind::Q6Fixed: {
@@ -993,11 +1104,34 @@ int schedule_col_tile(ops::detail::Q6ScheduleId schedule) {
     throw std::invalid_argument("unknown Q6 schedule tile");
 }
 
+int schedule_col_tile(ops::detail::Q5ScheduleId schedule, std::int32_t exact_cols) {
+    using S = ops::detail::Q5ScheduleId;
+    switch (schedule) {
+    case S::GemvR16S2X:
+        return 1;
+    case S::SimtR8C4:
+        return 4;
+    case S::SimtR8C8:
+        return 8;
+    case S::SimtSplit2Exact:
+    case S::SimtSplit4Exact:
+        return exact_cols;
+    case S::MmaR64C64:
+        return 64;
+    case S::MmaR64C128:
+        return 128;
+    }
+    throw std::invalid_argument("unknown Q5 schedule tile");
+}
+
 int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, std::int32_t t) {
     switch (opt.candidate) {
     case CandidateKind::Auto:
         if (qtype == QType::Q4G64_F16S) {
             return schedule_col_tile(resolve_auto_q4_plan(shape, t).schedule);
+        }
+        if (qtype == QType::Q5G64_F16S) {
+            return schedule_col_tile(resolve_auto_q5_plan(shape, t).schedule, t);
         }
         if (qtype == QType::Q6G64_F16S) {
             return schedule_col_tile(resolve_auto_q6_plan(shape, t).schedule);
@@ -1005,6 +1139,8 @@ int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, 
         return t;
     case CandidateKind::Q4Fixed:
         return schedule_col_tile(opt.q4_schedule);
+    case CandidateKind::Q5Fixed:
+        return schedule_col_tile(opt.q5_schedule, t);
     case CandidateKind::Q6Fixed:
         return schedule_col_tile(opt.q6_schedule);
     }
@@ -1015,12 +1151,18 @@ bool candidate_uses_mma(const Options& opt, QType qtype, const ShapeSpec& shape,
     if (opt.candidate == CandidateKind::Q4Fixed) {
         return ops::detail::q4_schedule_uses_mma(opt.q4_schedule);
     }
+    if (opt.candidate == CandidateKind::Q5Fixed) {
+        return ops::detail::q5_schedule_uses_mma(opt.q5_schedule);
+    }
     if (opt.candidate == CandidateKind::Q6Fixed) {
         return ops::detail::q6_schedule_uses_mma(opt.q6_schedule);
     }
     if (opt.candidate != CandidateKind::Auto) { return false; }
     if (qtype == QType::Q4G64_F16S) {
         return ops::detail::q4_schedule_uses_mma(resolve_auto_q4_plan(shape, t).schedule);
+    }
+    if (qtype == QType::Q5G64_F16S) {
+        return ops::detail::q5_schedule_uses_mma(resolve_auto_q5_plan(shape, t).schedule);
     }
     return qtype == QType::Q6G64_F16S &&
            ops::detail::q6_schedule_uses_mma(resolve_auto_q6_plan(shape, t).schedule);
@@ -1085,11 +1227,16 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     r.candidate_name = candidate_name(opt, target.qtype, shape, t);
     if (opt.candidate == CandidateKind::Q4Fixed) {
         r.kernel_variant = ops::detail::q4_kernel_variant_name(selected_q4_variant(opt, shape, t));
+    } else if (opt.candidate == CandidateKind::Q5Fixed) {
+        r.kernel_variant = ops::detail::q5_kernel_variant_name(selected_q5_variant(opt, shape, t));
     } else if (opt.candidate == CandidateKind::Q6Fixed) {
         r.kernel_variant = ops::detail::q6_kernel_variant_name(selected_q6_variant(opt, shape, t));
     } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q4G64_F16S) {
         r.kernel_variant =
             ops::detail::q4_kernel_variant_name(resolve_auto_q4_plan(shape, t).variant);
+    } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q5G64_F16S) {
+        r.kernel_variant =
+            ops::detail::q5_kernel_variant_name(resolve_auto_q5_plan(shape, t).variant);
     } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q6G64_F16S) {
         r.kernel_variant =
             ops::detail::q6_kernel_variant_name(resolve_auto_q6_plan(shape, t).variant);
@@ -1222,7 +1369,7 @@ void write_csv(const std::filesystem::path& path, const std::vector<RunResult>& 
     std::ofstream out(path);
     if (!out) { throw std::runtime_error("failed to open CSV output: " + path.string()); }
     // Each row is one (shape, qtype, T, physical candidate) point. Useful counters,
-    // column-tiled weight-replay lower bounds, and MMA-resolved Q4/Q6 executed counters remain
+    // column-tiled weight-replay lower bounds, and MMA-resolved Q4/Q5/Q6 executed counters remain
     // distinct; physical traffic and SOL percentages come only from NCU.
     out << "shape,qtype,N,K,weight_payload_bytes,x_bytes,out_bytes,useful_bytes,"
            "weight_replay_lower_bound_bytes,cold_median_us,cold_min_us,cold_p95_us,useful_gbs,"

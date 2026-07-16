@@ -13,7 +13,7 @@
 namespace ninfer::ops {
 
 /**
- * Returns zero for T=1 or T>16; otherwise returns one contiguous BF16
+ * Returns zero for T=1 or T>24; otherwise returns one contiguous BF16
  * [output_rows,tokens] fallback matrix. Dimensions must be positive.
  */
 [[nodiscard]] std::size_t linear_add_workspace_bytes(std::int32_t output_rows,

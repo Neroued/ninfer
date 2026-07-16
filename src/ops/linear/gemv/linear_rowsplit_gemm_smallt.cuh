@@ -1,18 +1,14 @@
 #pragma once
 
-// Warp-per-row small-T row-split low-bit GEMM: out[N,T] = W[N,K] . x[K,T].
+// Legacy W8G32 warp-per-row small-column GEMM: out[N,T] = W[N,K] . x[K,T].
 //
-// This is the universal low-bit path for every T the tuned decode GEMVs and the
-// LargeT tensor-core GEMM do not own: SmallT (2..16) for Q5/Q6, all T for
-// W8G32, generic-shape T==1, and the k%8!=0 LargeT fallback. The design target
-// is the DRAM roofline: stream the weight payload once per kTt-column tile at
-// copy-ceiling bandwidth, so the cost of T<=kTt is nearly flat versus T==1 (the
-// property MTP verify needs).
+// Q4/Q5/Q6 own format-local kernels. This file remains only until W8G32 moves
+// behind the same format-backend boundary.
 //
 //   - One warp owns one output row. blockIdx.y selects a tile of kTt activation
 //     columns; for T <= kTt the weights are streamed exactly once.
 //   - K is processed in 1024-value slabs staged through shared memory with a
-//     cp.async double buffer (same structure as the tuned T==1 Q5 core): all
+//     cp.async double buffer: all
 //     weight-plane reads are coalesced 128-bit loads, so DRAM latency is hidden
 //     without relying on occupancy alone. Deeper pipelines and launch-bounds
 //     occupancy caps were both measured slower (spills / no gain, see report).
@@ -23,10 +19,7 @@
 //     stride lanes 64B apart and burn 4x the L1 throughput on the same bytes).
 //     The weight planes index out conflict-free or broadcast under the same
 //     ownership.
-//   - Dequant uses the fp16 mantissa trick: nibbles are OR-ed into the mantissa
-//     of 1024.0f16 (plus high bits for Q5/Q6 at mantissa bits 4..5), the sign
-//     fixup is a constant xor folded into the packed word, and one hsub2 yields
-//     two exact signed values; the group scale is applied per 8-value chunk.
+//   - W8 bytes are converted to FP32 and scaled per 32-value group.
 //     fp32 FMA into per-column accumulators; warp-shuffle reduction per column.
 //   - kTt is 4 or 8 only. Larger column tiles blow past the register budget
 //     (kTt=16 needs ~98 regs -> 2 blocks/SM -> latency-bound at ~20% of DRAM),
@@ -48,80 +41,16 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
-#include <type_traits>
 
 namespace ninfer::ops::detail {
 
-// Per-codec slab traits + dequant. A slab is 1024 K-values:
-//   nibble/code bytes : 32 B per group  -> kNibU4 uint4 per slab
-//   high-plane bytes  : 0/8/16 B per group -> kHighU4 uint4 per slab
-//   scales            : 2 B per group -> kScaleU32 4-byte words per slab
+// W8 slab traits + dequant. A slab is 1024 K-values.
 // (Scales are staged with 4-byte cp.async because a row's scale plane is only
 // guaranteed 4-byte aligned for generic kg.)
 //
 // dequant_chunk(s_nib, s_hi, s_sc, c, lane, w): dequantize the lane's 8 values
 // of phase c into w[0..7], scale applied. All shared reads are conflict-free or
 // broadcast under the phase-interleaved ownership.
-
-struct Q5Smallt {
-    using Codec                             = Q5Codec;
-    static constexpr int kNibU4             = 32;
-    static constexpr int kHighU4            = 8;
-    static constexpr int kScaleU32          = 8;
-    static constexpr int kHighBytesPerGroup = 8;
-
-    // u = lo | hi<<4, signed s = (u ^ 16) - 16 = lo + 16*(hi^1) - 16. Build
-    // 1024 + lo + 16*(hi^1) in fp16 (hi^1 at mantissa bit 4), subtract 1040.
-    __device__ static __forceinline__ void dequant_chunk(const uint4* s_nib, const uint4* s_hi,
-                                                         const std::uint32_t* s_sc, int c, int lane,
-                                                         float (&w)[8]) {
-        const std::uint32_t word = reinterpret_cast<const std::uint32_t*>(s_nib)[c * 32 + lane];
-        const std::uint32_t hc = reinterpret_cast<const std::uint8_t*>(s_hi)[c * 32 + lane] ^ 0xffu;
-        const float scale      = __half2float(
-            __ushort_as_half(reinterpret_cast<const std::uint16_t*>(s_sc)[c * 4 + (lane >> 3)]));
-        const __half2 bias = __half2half2(__ushort_as_half(0x6410)); // 1040.0
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
-            bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
-            const __half2 h = __hsub2(half2_from_bits(bits), bias);
-            const float2 f  = __half22float2(h);
-            w[p]            = f.x * scale;
-            w[p + 4]        = f.y * scale;
-        }
-    }
-};
-
-struct Q6Smallt {
-    using Codec                             = Q6Codec;
-    static constexpr int kNibU4             = 32;
-    static constexpr int kHighU4            = 16;
-    static constexpr int kScaleU32          = 8;
-    static constexpr int kHighBytesPerGroup = 16;
-
-    // u = lo | hi2<<4, signed s = (u ^ 32) - 32 = lo + 16*(hi2 ^ 2) - 32: flip
-    // bit 1 of every 2-bit field (xor 0xaaaa), place at mantissa bits 4..5,
-    // subtract 1056.
-    __device__ static __forceinline__ void dequant_chunk(const uint4* s_nib, const uint4* s_hi,
-                                                         const std::uint32_t* s_sc, int c, int lane,
-                                                         float (&w)[8]) {
-        const std::uint32_t word = reinterpret_cast<const std::uint32_t*>(s_nib)[c * 32 + lane];
-        const std::uint32_t hw =
-            reinterpret_cast<const std::uint16_t*>(s_hi)[c * 32 + lane] ^ 0xaaaau;
-        const float scale = __half2float(
-            __ushort_as_half(reinterpret_cast<const std::uint16_t*>(s_sc)[c * 4 + (lane >> 3)]));
-        const __half2 bias = __half2half2(__ushort_as_half(0x6420)); // 1056.0
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
-            bits |= (((hw >> (2 * p)) & 3u) << 4) | (((hw >> (2 * p + 8)) & 3u) << 20);
-            const __half2 h = __hsub2(half2_from_bits(bits), bias);
-            const float2 f  = __half22float2(h);
-            w[p]            = f.x * scale;
-            w[p + 4]        = f.y * scale;
-        }
-    }
-};
 
 struct W8Smallt {
     using Codec                             = W8G32Codec;
@@ -209,199 +138,6 @@ smallt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, st
                 acc[tt]         = fmaf(w[7], f3.y, acc[tt]);
             }
         }
-    }
-}
-
-template <class SC, int kTt, int kFullSlabs, int kStride>
-__launch_bounds__(64, 16) __global__ void linear_rowsplit_gemm_smallt_kernel_direct_split2_q5(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k, std::int32_t t,
-    std::int32_t padded_k, std::int32_t full_slabs) {
-    static_assert(std::is_same_v<SC, Q5Smallt>, "direct split2 small-T kernel is Q5-only");
-    static_assert(kTt > 0, "direct split2 requires a positive column tile");
-    static_assert(kFullSlabs > 0 && kStride > 0, "direct split2 requires exact positive shape");
-    (void)full_slabs;
-    (void)k;
-    (void)t;
-
-    __shared__ float s_part[2][kTt];
-
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int part = static_cast<int>(threadIdx.x) >> 5;
-    const int row  = static_cast<int>(blockIdx.x);
-    if (row >= n) { return; }
-
-    const int kg_padded          = padded_k / Q5Codec::kGroupK;
-    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
-    const std::uint8_t* high_row =
-        high + static_cast<std::int64_t>(row) * kg_padded * Q5Smallt::kHighBytesPerGroup;
-    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg_padded * 2;
-
-    float acc[kTt];
-#pragma unroll
-    for (int i = 0; i < kTt; ++i) { acc[i] = 0.0f; }
-
-#pragma unroll
-    for (int s = 0; s < kFullSlabs; ++s) {
-#pragma unroll
-        for (int local = 0; local < 2; ++local) {
-            const int chunk = part * 2 + local;
-            const std::uint8_t* code_phase =
-                code_row + static_cast<std::int64_t>(s) * 512 + chunk * 128 + lane * 4;
-            const std::uint8_t* high_phase =
-                high_row + static_cast<std::int64_t>(s) * 128 + chunk * 32 + lane;
-            const int group_in_slab  = chunk * 4 + (lane >> 3);
-            std::uint32_t scale_bits = 0;
-            if ((lane & 7) == 0) {
-                scale_bits = *reinterpret_cast<const std::uint16_t*>(
-                    scale_row + (static_cast<std::int64_t>(s) * 16 + group_in_slab) * 2);
-            }
-            scale_bits = __shfl_sync(0xffffffffu, scale_bits, lane & ~7);
-
-            const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(code_phase);
-            const std::uint32_t hc   = static_cast<std::uint32_t>(*high_phase) ^ 0xffu;
-            const float scale        = __half2float(__ushort_as_half(scale_bits));
-            const __half2 bias       = __half2half2(__ushort_as_half(0x6410)); // 1040.0
-            float w[8];
-#pragma unroll
-            for (int p = 0; p < 4; ++p) {
-                std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
-                bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
-                const __half2 h = __hsub2(half2_from_bits(bits), bias);
-                const float2 f  = __half22float2(h);
-                w[p]            = f.x * scale;
-                w[p + 4]        = f.y * scale;
-            }
-
-            const std::int64_t xoff = static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
-#pragma unroll
-            for (int tt = 0; tt < kTt; ++tt) {
-                const uint4 xv =
-                    load_vec<uint4>(x + static_cast<std::int64_t>(tt) * kStride + xoff);
-                const float2 f0 = bf16x2_bits_to_float2(xv.x);
-                const float2 f1 = bf16x2_bits_to_float2(xv.y);
-                const float2 f2 = bf16x2_bits_to_float2(xv.z);
-                const float2 f3 = bf16x2_bits_to_float2(xv.w);
-                acc[tt]         = fmaf(w[0], f0.x, acc[tt]);
-                acc[tt]         = fmaf(w[1], f0.y, acc[tt]);
-                acc[tt]         = fmaf(w[2], f1.x, acc[tt]);
-                acc[tt]         = fmaf(w[3], f1.y, acc[tt]);
-                acc[tt]         = fmaf(w[4], f2.x, acc[tt]);
-                acc[tt]         = fmaf(w[5], f2.y, acc[tt]);
-                acc[tt]         = fmaf(w[6], f3.x, acc[tt]);
-                acc[tt]         = fmaf(w[7], f3.y, acc[tt]);
-            }
-        }
-    }
-
-#pragma unroll
-    for (int tt = 0; tt < kTt; ++tt) {
-        float a = acc[tt];
-        a       = warp_reduce_sum(a);
-        if (lane == 0) { s_part[part][tt] = a; }
-    }
-
-    __syncthreads();
-
-    if (part == 0 && lane < kTt) {
-        const float sum                                = s_part[0][lane] + s_part[1][lane];
-        out[static_cast<std::int64_t>(lane) * n + row] = __float2bfloat16(sum);
-    }
-}
-
-template <class SC, int kTt, int kFullSlabs, int kStride>
-__launch_bounds__(128, 10) __global__ void linear_rowsplit_gemm_smallt_kernel_direct_split4_q5(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ out, std::int32_t n, std::int32_t k, std::int32_t t,
-    std::int32_t padded_k, std::int32_t full_slabs) {
-    static_assert(std::is_same_v<SC, Q5Smallt>, "direct split4 small-T kernel is Q5-only");
-    static_assert(kTt > 0, "direct split4 requires a positive column tile");
-    static_assert(kFullSlabs > 0 && kStride > 0, "direct split4 requires exact positive shape");
-    (void)full_slabs;
-    (void)k;
-    (void)t;
-
-    __shared__ float s_part[4][kTt];
-
-    const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const int chunk = static_cast<int>(threadIdx.x) >> 5;
-    const int row   = static_cast<int>(blockIdx.x);
-    if (row >= n) { return; }
-
-    const int kg_padded          = padded_k / Q5Codec::kGroupK;
-    const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
-    const std::uint8_t* high_row =
-        high + static_cast<std::int64_t>(row) * kg_padded * Q5Smallt::kHighBytesPerGroup;
-    const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kg_padded * 2;
-
-    float acc[kTt];
-#pragma unroll
-    for (int i = 0; i < kTt; ++i) { acc[i] = 0.0f; }
-
-#pragma unroll
-    for (int s = 0; s < kFullSlabs; ++s) {
-        const std::uint8_t* code_phase =
-            code_row + static_cast<std::int64_t>(s) * 512 + chunk * 128 + lane * 4;
-        const std::uint8_t* high_phase =
-            high_row + static_cast<std::int64_t>(s) * 128 + chunk * 32 + lane;
-        const int group_in_slab  = chunk * 4 + (lane >> 3);
-        std::uint32_t scale_bits = 0;
-        if ((lane & 7) == 0) {
-            scale_bits = *reinterpret_cast<const std::uint16_t*>(
-                scale_row + (static_cast<std::int64_t>(s) * 16 + group_in_slab) * 2);
-        }
-        scale_bits = __shfl_sync(0xffffffffu, scale_bits, lane & ~7);
-
-        const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(code_phase);
-        const std::uint32_t hc   = static_cast<std::uint32_t>(*high_phase) ^ 0xffu;
-        const float scale        = __half2float(__ushort_as_half(scale_bits));
-        const __half2 bias       = __half2half2(__ushort_as_half(0x6410)); // 1040.0
-        float w[8];
-#pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            std::uint32_t bits = ((word >> (4 * p)) & 0x000f000fu) | 0x64006400u;
-            bits |= (((hc >> p) & 1u) << 4) | (((hc >> (p + 4)) & 1u) << 20);
-            const __half2 h = __hsub2(half2_from_bits(bits), bias);
-            const float2 f  = __half22float2(h);
-            w[p]            = f.x * scale;
-            w[p + 4]        = f.y * scale;
-        }
-
-        const std::int64_t xoff = static_cast<std::int64_t>(s) * 1024 + chunk * 256 + lane * 8;
-#pragma unroll
-        for (int tt = 0; tt < kTt; ++tt) {
-            const uint4 xv  = load_vec<uint4>(x + static_cast<std::int64_t>(tt) * kStride + xoff);
-            const float2 f0 = bf16x2_bits_to_float2(xv.x);
-            const float2 f1 = bf16x2_bits_to_float2(xv.y);
-            const float2 f2 = bf16x2_bits_to_float2(xv.z);
-            const float2 f3 = bf16x2_bits_to_float2(xv.w);
-            acc[tt]         = fmaf(w[0], f0.x, acc[tt]);
-            acc[tt]         = fmaf(w[1], f0.y, acc[tt]);
-            acc[tt]         = fmaf(w[2], f1.x, acc[tt]);
-            acc[tt]         = fmaf(w[3], f1.y, acc[tt]);
-            acc[tt]         = fmaf(w[4], f2.x, acc[tt]);
-            acc[tt]         = fmaf(w[5], f2.y, acc[tt]);
-            acc[tt]         = fmaf(w[6], f3.x, acc[tt]);
-            acc[tt]         = fmaf(w[7], f3.y, acc[tt]);
-        }
-    }
-
-#pragma unroll
-    for (int tt = 0; tt < kTt; ++tt) {
-        float a = acc[tt];
-        a       = warp_reduce_sum(a);
-        if (lane == 0) { s_part[chunk][tt] = a; }
-    }
-
-    __syncthreads();
-
-    if (chunk == 0 && lane < kTt) {
-        float sum = 0.0f;
-#pragma unroll
-        for (int p = 0; p < 4; ++p) { sum += s_part[p][lane]; }
-        out[static_cast<std::int64_t>(lane) * n + row] = __float2bfloat16(sum);
     }
 }
 

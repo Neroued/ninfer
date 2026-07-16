@@ -127,6 +127,12 @@ ninfer_add_test(ninfer_q4_linear_plan_test
 ninfer_add_test(ninfer_q4_linear_dispatch_test
   SOURCES ops/test_q4_linear_dispatch.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_q5_linear_candidate_test
+  SOURCES ops/test_q5_linear_candidates.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_q5_linear_plan_test
+  SOURCES ops/test_q5_linear_plan.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_test(ninfer_q6_linear_candidate_test
   SOURCES ops/test_q6_linear_candidates.cpp
   LIBRARIES ninfer_ops)

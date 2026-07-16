@@ -1,6 +1,7 @@
 # Linear Kernel Architecture
 
-> Status: revised architecture proposal. Implementation has intentionally not started.
+> Status: implementation in progress. Q4, Q5, and Q6 pure Linear now use independent
+> format-local backends; W8 and dense remain on compatibility paths until their own migrations.
 >
 > Correction: the earlier target-owned `LinearExecutionProfile` design is rejected. Passing a
 > target/profile into Linear-family Ops leaks dispatch ownership across the semantic Op boundary.
@@ -40,10 +41,12 @@ The complete execution chain is:
 ```text
 target schedule
   -> linear(original semantic inputs)
-  -> validate tensors and physical weight facts
-  -> normalize one exact physical problem
-  -> Op-owned RTX 5090 route resolver
-  -> one final execution plan
+  -> validate common tensor semantics and physical weight facts
+  -> switch on the weight format
+  -> q4 / q5 / q6 / w8 / bf16 format backend
+  -> normalize one format-local physical problem
+  -> format-local RTX 5090 route resolver
+  -> one format-local final execution plan
   -> one fixed launcher or one explicit fixed composition
 ```
 
@@ -56,8 +59,8 @@ Seven invariants define the architecture:
    target-owned dispatch data.
 2. **The Op owns its complete support domain.** A quantized call is legal only if the Op's internal
    hardware backend contains an exact physical-problem route for it.
-3. **The Op planner is the sole routing authority.** After resolution, no launcher performs a
-   second format, shape, tile, or schedule choice.
+3. **The selected format backend is the sole routing authority.** After resolution, no launcher
+   performs a second format, shape, tile, or schedule choice.
 4. **Unknown production problems fail closed.** There is no arbitrary quantized fallback, shape
    similarity rule, global token threshold, or caller-role heuristic.
 5. **A policy is a complete execution bundle.** It names a lifecycle, topology, finalization form,
@@ -111,7 +114,7 @@ The correct ownership boundary is:
 |---|---|
 | `src/targets/<target>` | checkpoint inventory, storage binding, effective weight views, schedules, reachability, graph/state policy, arena reservation, product integration |
 | semantic Op | mathematics, rounding, aliasing, exact supported physical problems, route resolution, workspace semantics, fixed execution closure |
-| hardware backend inside the Op | RTX 5090-specific route winners, legality capabilities, kernel resources, and fixed launcher implementations |
+| format backend inside the semantic Op | format-specific storage/decode semantics, RTX 5090 route winners, legality capabilities, kernel resources, and fixed launcher implementations |
 | core/runtime | tensors, arenas, device/stream lifetime, graph capture, and public Engine behavior |
 | benchmark/test tools | candidate forcing, measurement-only future problems, independent numerical oracles, and qualification evidence |
 
@@ -157,38 +160,31 @@ support that model path, even if an internal Op is capable of executing the same
 
 ## 3. Exact physical problem and internal planning
 
-### 3.1 Closed physical identity
+### 3.1 Format-local physical identity
 
-Linear normalizes the existing operands into an internal structural signature:
+Linear does not normalize every encoding into one cross-format planner key. After common semantic
+validation it dispatches exactly once on `Weight::qtype`. Each format backend then defines the
+smallest physical problem needed by that encoding:
 
 ```cpp
-enum class LinearFormat {
-    Q4G64RowSplit,
-    Q5G64RowSplit,
-    Q6G64RowSplit,
-    W8G32RowSplit,
-    DenseBF16,
-    DenseFP32,
-};
-
-enum class PhysicalViewClass {
-    RowSplitPlanes,
-    DenseContiguous,
-};
-
-struct WeightViewSig {
-    LinearFormat format;
-    PhysicalViewClass view;
-    int32_t n;
+struct Q5Problem {
+    int32_t rows;
     int32_t k;
     int32_t padded_k;
+    int32_t cols;
 };
 
-struct LinearProblem {
-    WeightViewSig weight;
-    int32_t tokens;
+struct Q6Problem {
+    int32_t rows;
+    int32_t k;
+    int32_t padded_k;
+    int32_t cols;
 };
 ```
+
+These types are intentionally separate. Equal fields do not imply shared admission, schedules,
+decode atoms, kernel bodies, or route tables. W8 and dense will receive the same ownership shape
+when their compatibility paths migrate.
 
 The real implementation may include additional physical facts only when they alter legality or
 the generated execution, for example a required alignment class or storage encoding revision.
@@ -204,28 +200,33 @@ The key must not contain:
 Policy names may mention exact geometry when the kernel is geometry-specialized, but routing still
 uses physical facts rather than caller roles.
 
-### 3.2 Op-owned immutable route catalog
+### 3.2 Format-owned immutable route catalogs
 
-The RTX 5090 backend owns a closed compile-time catalog:
+Each RTX 5090 format backend owns its own closed compile-time catalog:
 
 ```cpp
-struct TokenRange {
+struct Q5ColsSet {
     int32_t first;
     int32_t last;
+    int32_t step;
 };
 
-struct LinearRoute {
-    TokenRange tokens;
-    LinearPolicyId policy;
+struct Q5RouteSpec {
+    Q5ColsSet cols;
+    Q5ScheduleId schedule;
 };
 
-struct LinearSupportSpec {
-    WeightViewSig weight;
-    std::span<const LinearRoute> routes;
+struct Q5SupportSpec {
+    int32_t rows;
+    int32_t k;
+    int32_t padded_k;
+    Q5ColsSet admitted_cols;
+    // span into the Q5 route table
 };
 ```
 
-The catalog maps an exact effective weight view and token interval to a final policy. It is:
+The catalog maps an exact effective weight view and token set to a final format-local schedule. It
+is:
 
 - immutable;
 - compiled into the Op;
@@ -234,12 +235,11 @@ The catalog maps an exact effective weight view and token interval to a final po
 - free of runtime registration and initialization order;
 - free of virtual calls, function-pointer registries, and string lookup.
 
-It is not a target profile. It does not select an active model-specific subset. It describes the
-physical execution capability of the Linear Op on the current hardware backend.
+It is not a target profile and not a cross-format registry. It describes the physical execution
+capability of one weight format on the current hardware backend.
 
-The preferred lookup is a compact constexpr table or nested switch organized by format and packed
-geometry. A hash table, mutable cache, or target-selected global registry is unnecessary for the
-current finite domain.
+The preferred lookup is a compact constexpr table or nested switch inside that format directory. A
+global `LinearPolicyId`, hash table, mutable cache, or target-selected registry is unnecessary.
 
 ### 3.3 One resolution, one final plan
 
@@ -249,24 +249,30 @@ The internal execution sequence is:
 void linear(const Tensor& x, const Weight& w, Tensor& out,
             WorkspaceArena& ws, cudaStream_t stream) {
     validate_semantics_and_storage(x, w, out);
-    const LinearProblem problem = normalize_problem(x, w);
-    const LinearPlan plan = resolve_rtx5090_plan(problem);
-    execute_fixed(plan, x, w, out, ws, stream);
+    switch (w.qtype) {
+    case QType::Q4G64_F16S:
+        return q4_rowsplit_dispatch(x, w, out, stream);
+    case QType::Q5G64_F16S:
+        return q5_rowsplit_dispatch(x, w, out, stream);
+    case QType::Q6G64_F16S:
+        return q6_rowsplit_dispatch(x, w, out, stream);
+    // W8 and dense use compatibility paths until their format migrations.
+    }
 }
 ```
 
-The plan contains complete execution facts:
+Each backend has its own plan type:
 
 ```cpp
-struct LinearPlan {
-    LinearPolicyId policy;
-    WorkspacePlan workspace;
+struct Q5Plan {
+    Q5ScheduleId schedule;
+    Q5KernelVariant variant;
 };
 ```
 
-`execute_fixed` uses an exhaustive switch. Each case launches one fixed implementation. It may
-validate assumptions, but it may not choose another tile size, token tile, mainloop, split factor,
-or fallback kernel.
+The format-local fixed launcher uses an exhaustive switch. Each case launches one fixed
+implementation. It may validate assumptions, but it may not choose another tile size, token tile,
+mainloop, split factor, or fallback kernel.
 
 The following old structures are rejected:
 
@@ -376,8 +382,9 @@ Examples of legitimate policy identities include:
 - row-streaming TT8;
 - Q5 direct split2;
 - Q5 direct split4;
-- split-low4 BF16 MMA BN64;
-- split-low4 BF16 MMA BN128;
+- Q4 BF16 MMA BN64 or BN128;
+- Q5 BF16 MMA BN64 or BN128;
+- Q6 BF16 MMA BN64 or BN128;
 - W8G32 small-M MMA;
 - W8G32 general MMA;
 - an exact T1 warp-per-row specialization;
@@ -400,27 +407,27 @@ A reusable mainloop ends when any of the following changes materially:
 
 The experiments support separate complete lifecycles for:
 
-- row-streaming Small-T;
-- Q5 direct Small-T;
-- split-low4 Q4/Q5/Q6 MMA;
+- Q4 row-streaming, SIMT, and MMA;
+- Q5 GEMV, direct Small-T, SIMT, and MMA;
+- Q6 SIMT and MMA;
 - W8G32 MMA;
 - ownership-specific T1;
 - paired or grouped output topologies.
 
-Trying to force all of these through one configurable loop would create a scheduling DSL, enlarge
-template combinations, and risk generated-code regressions.
+Q5 and Q6 deliberately do not share a configurable kernel body, schedule type, route table, or
+codec abstraction. Their optimization trajectories must remain independent. Trying to force these
+lifecycles through one configurable loop would create a scheduling DSL, enlarge template
+combinations, and risk generated-code regressions.
 
 ### 4.3 Narrow reusable substrate
 
-Reuse is encouraged below the lifecycle boundary:
+Reuse is restricted below the lifecycle boundary:
 
-- numeric-format semantics;
-- physical plane addressing;
-- path-specific decode atoms;
-- swizzles and index helpers;
-- BF16 MMA fragment consumption;
-- small fixed finalizers;
-- alignment and launch-contract checks.
+- core memory, warp, and MMA instruction primitives;
+- neutral swizzles and address helpers;
+- small mechanics-only configuration helpers used by fused kernels;
+- format-local storage/decode atoms reused only by consumers of the same format;
+- alignment and launch-contract checks that contain no format policy.
 
 These primitives must remain closed and compile-time. They are accepted only when representative
 resource usage, SASS, and matched timing show that the hot policy is preserved.
@@ -773,21 +780,22 @@ include/ninfer/ops/
   grouped projection semantic headers
 
 src/ops/linear/
-  problem/
-    physical_problem.*
-  plan/
-    linear_plan.*
-    linear_add_plan.*
-    linear_swiglu_plan.*
-    linear_pair_plan.*
-    grouped projection planners
-  backend/rtx5090_sm120a/
-    exact route catalogs
-    policy capability catalogs
-    fixed launch closure
-  codec/
-  gemv/
-  gemm/
+  q4/
+    storage/decode atoms
+    GEMV/SIMT/MMA kernel families
+    schedule capability, exact routes, fixed launch closure
+  q5/
+    storage/decode atoms
+    GEMV/SIMT/MMA and residual kernel families
+    schedule capability, exact routes, fixed launch closure
+  q6/
+    storage/decode atoms
+    SIMT/MMA kernel families
+    schedule capability, exact routes, fixed launch closure
+  w8/                       # migration target; currently compatibility code
+  bf16/                     # migration target; currently dense reference code
+  common/                   # mechanics only; no cross-format route or kernel body
+  gemv/ and gemm/           # transitional W8/dense/fused files, removed as migrations finish
   reference/                 # internal oracle/measurement code, not product fallback
   linear.cpp
 
@@ -824,11 +832,12 @@ The archived experiment remains valuable. Its measurements support:
 - a 24-problem current 27B base Linear inventory;
 - geometry-local route boundaries rather than one global regime threshold;
 - 83 candidate-selected base route intervals in the prototype manifest;
-- distinct TT4, TT8, Q5 direct, split-low4 MMA, W8 MMA, and exact T1 policies;
+- independent Q4, Q5, and Q6 format-local plans and kernel lifecycles;
+- distinct TT4, TT8, Q5 direct, W8 MMA, and exact T1 policies;
 - two LinearAdd problems with nontrivial fused/materialized/collective routes;
 - one non-monotonic LinearSwiGLU route surface;
 - one independently routed W8 LinearPair problem;
-- narrow codec/finalizer/topology reuse;
+- mechanics-only cross-format reuse plus same-format decode reuse by fused Ops;
 - removal of unreachable 7168 and dead dual-Q5 tuned execution paths;
 - Linear dominance in whole-inference attribution;
 - representative per-policy resource and NCU evidence.

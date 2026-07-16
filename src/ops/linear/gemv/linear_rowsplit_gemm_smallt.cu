@@ -1,6 +1,4 @@
-// Launcher for the legacy warp-per-row small-T row-split low-bit GEMM: Q5
-// SmallT/fallback and every T for W8G32. Format-local Q4/Q6 implementations own
-// their production instances separately.
+// Compatibility launcher for W8G32 until that format owns a local backend.
 #include "ops/linear/gemv/linear_rowsplit_gemm_smallt.cuh"
 
 #include "ops/common/math.h"
@@ -9,7 +7,6 @@
 
 #include <cstdint>
 #include <stdexcept>
-#include <type_traits>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -30,84 +27,6 @@ void launch_tt(const __nv_bfloat16* xp, const std::uint8_t* codes, const std::ui
                                              full_slabs);
 }
 
-template <int kTt, int kFullSlabs, int kStride>
-void launch_q5_direct_split2(const __nv_bfloat16* xp, const std::uint8_t* codes,
-                             const std::uint8_t* high, const std::uint8_t* scales,
-                             __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
-                             std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
-    constexpr int kBlockThreads = 2 * 32;
-    const dim3 grid(static_cast<unsigned>(n), 1u, 1u);
-    linear_rowsplit_gemm_smallt_kernel_direct_split2_q5<Q5Smallt, kTt, kFullSlabs, kStride>
-        <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                             full_slabs);
-}
-
-template <int kTt, int kFullSlabs, int kStride>
-void launch_q5_direct_split4(const __nv_bfloat16* xp, const std::uint8_t* codes,
-                             const std::uint8_t* high, const std::uint8_t* scales,
-                             __nv_bfloat16* outp, std::int32_t n, std::int32_t k, std::int32_t t,
-                             std::int32_t padded_k, std::int32_t full_slabs, cudaStream_t stream) {
-    constexpr int kBlockThreads = 4 * 32;
-    const dim3 grid(static_cast<unsigned>(n), 1u, 1u);
-    linear_rowsplit_gemm_smallt_kernel_direct_split4_q5<Q5Smallt, kTt, kFullSlabs, kStride>
-        <<<grid, kBlockThreads, 0, stream>>>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                             full_slabs);
-}
-
-template <int kTt>
-bool try_launch_q5_direct(const __nv_bfloat16* xp, const std::uint8_t* codes,
-                          const std::uint8_t* high, const std::uint8_t* scales, __nv_bfloat16* outp,
-                          std::int32_t n, std::int32_t k, std::int32_t t, std::int32_t padded_k,
-                          std::int32_t full_slabs, cudaStream_t stream) {
-    if (full_slabs * 1024 != k || padded_k != k) { return false; }
-    if (n == 7168 && k == 5120) {
-        launch_q5_direct_split2<kTt, 5, 5120>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                              full_slabs, stream);
-        return true;
-    }
-    if (n == 6144 && k == 5120) {
-        launch_q5_direct_split4<kTt, 5, 5120>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                              full_slabs, stream);
-        return true;
-    }
-    if (n == 5120 && k == 6144) {
-        launch_q5_direct_split2<kTt, 6, 6144>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                              full_slabs, stream);
-        return true;
-    }
-    if (n == 5120 && k == 17408) {
-        launch_q5_direct_split2<kTt, 17, 17408>(xp, codes, high, scales, outp, n, k, t, padded_k,
-                                                full_slabs, stream);
-        return true;
-    }
-    return false;
-}
-
-bool try_launch_q5_direct(const __nv_bfloat16* xp, const std::uint8_t* codes,
-                          const std::uint8_t* high, const std::uint8_t* scales, __nv_bfloat16* outp,
-                          std::int32_t n, std::int32_t k, std::int32_t t, std::int32_t padded_k,
-                          std::int32_t full_slabs, cudaStream_t stream) {
-    switch (t) {
-    case 2:
-        return try_launch_q5_direct<2>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
-                                       stream);
-    case 3:
-        return try_launch_q5_direct<3>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
-                                       stream);
-    case 4:
-        return try_launch_q5_direct<4>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
-                                       stream);
-    case 5:
-        return try_launch_q5_direct<5>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
-                                       stream);
-    case 6:
-        return try_launch_q5_direct<6>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
-                                       stream);
-    default:
-        return false;
-    }
-}
-
 // Fallback kTt is the column-tile width: T <= kTt streams the weights exactly
 // once. Only 4 and 8 exist for the generic fallback: wider tiles blow the
 // register budget and end up latency-bound (see the kernel header). T > 8
@@ -119,12 +38,6 @@ void launch_codec(const __nv_bfloat16* xp, const std::uint8_t* codes, const std:
                   const std::uint8_t* scales, __nv_bfloat16* outp, std::int32_t n, std::int32_t k,
                   std::int32_t t, std::int32_t padded_k, std::int32_t full_slabs,
                   cudaStream_t stream) {
-    if constexpr (std::is_same_v<SC, Q5Smallt>) {
-        if (try_launch_q5_direct(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
-                                 stream)) {
-            return;
-        }
-    }
     if (t <= 4) {
         launch_tt<SC, 4, kRowsPerBlockDefault>(xp, codes, high, scales, outp, n, k, t, padded_k,
                                                full_slabs, stream);
@@ -143,7 +56,6 @@ void linear_rowsplit_gemm_smallt_launch(const Tensor& x, const Weight& w, Tensor
     const std::int32_t t        = x.ne[1];
     const std::int32_t padded_k = w.padded_shape[1];
     const auto* codes           = static_cast<const std::uint8_t*>(w.qdata);
-    const auto* high            = static_cast<const std::uint8_t*>(w.qhigh);
     const auto* scales          = static_cast<const std::uint8_t*>(w.scales);
     const auto* xp              = static_cast<const __nv_bfloat16*>(x.data);
     auto* outp                  = static_cast<__nv_bfloat16*>(out.data);
@@ -154,18 +66,10 @@ void linear_rowsplit_gemm_smallt_launch(const Tensor& x, const Weight& w, Tensor
     const bool aligned_x = (k % 8) == 0 && (reinterpret_cast<std::uintptr_t>(xp) & 0xfu) == 0;
     const std::int32_t full_slabs = aligned_x ? k / 1024 : 0;
 
-    switch (fmt) {
-    case LinearFormat::Q5G64_RowSplit:
-        launch_codec<Q5Smallt>(xp, codes, high, scales, outp, n, k, t, padded_k, full_slabs,
-                               stream);
-        break;
-    case LinearFormat::W8G32_RowSplit:
-        launch_codec<W8Smallt>(xp, codes, nullptr, scales, outp, n, k, t, padded_k, full_slabs,
-                               stream);
-        break;
-    default:
-        throw std::invalid_argument("linear: small-T GEMM requires a Q5/W8G32 row-split format");
+    if (fmt != LinearFormat::W8G32_RowSplit) {
+        throw std::invalid_argument("linear: legacy small-T GEMM requires W8G32 RowSplit");
     }
+    launch_codec<W8Smallt>(xp, codes, nullptr, scales, outp, n, k, t, padded_k, full_slabs, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

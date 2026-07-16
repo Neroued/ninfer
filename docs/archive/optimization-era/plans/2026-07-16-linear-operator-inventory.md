@@ -1,11 +1,10 @@
-# 当前 Linear 算子清单
+# Linear 算子清单（迁移前历史快照）
 
-> 状态：当前源码现状清单与逐算子整理队列。Q4 纯 Linear 已完成三模板架构和生产原子
-> 切换；Q5/Q6/W8、dense 以及各融合/成组语义算子仍按本文队列逐项审查。
+> 状态：已归档。本文记录逐算子迁移开始时的源码快照，不描述当前实现。
 
 本文统计当前产品基线中已经存在的 Linear 算子、精确执行问题、执行策略和 CUDA kernel。
 它与
-[`2026-07-16-linear-kernel-architecture-refactor.md`](2026-07-16-linear-kernel-architecture-refactor.md)
+[`2026-07-16-linear-kernel-architecture-refactor.md`](../../../plans/2026-07-16-linear-kernel-architecture-refactor.md)
 分工不同：架构文档描述未来应当采用的所有权和调度边界；本文只回答当前有什么、哪些路径
 真实可达、现有证据是否充分，以及后续应逐项决定保留、重写、扩面、泛化还是删除。
 

@@ -7,7 +7,7 @@
 > Started: 2026-07-16.
 >
 > Scope: evidence used to review and replace
-> [`2026-07-16-linear-kernel-architecture-refactor.md`](2026-07-16-linear-kernel-architecture-refactor.md).
+> [`2026-07-16-linear-kernel-architecture-refactor.md`](../../../plans/2026-07-16-linear-kernel-architecture-refactor.md).
 > This file records unsuccessful experiments as well as retained decisions. The companion
 > architecture document is the recommendation authority; this report is its evidence trail.
 

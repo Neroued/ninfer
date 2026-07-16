@@ -1,1013 +1,542 @@
-# Linear Kernel Architecture
+# Linear Kernel 架构
 
-> Status: implementation in progress. Q4, Q5, and Q6 pure Linear now use independent
-> format-local backends; W8 and dense remain on compatibility paths until their own migrations.
+> 状态：已实现。本文描述当前源码中的 Linear-family 架构，而不是迁移步骤。
 >
-> Correction: the earlier target-owned `LinearExecutionProfile` design is rejected. Passing a
-> target/profile into Linear-family Ops leaks dispatch ownership across the semantic Op boundary.
-> The original Op interfaces remain unchanged; exact admission, planning, workspace semantics,
-> and fixed-launch selection are entirely internal to each Op.
->
-> Scope: the current `qwen3_6_27b_rtx5090` product and its RTX 5090 execution backend. Future
-> Qwen3.6-35B shapes are design-pressure inputs only; this document does not register or advertise
-> a 35B product target.
->
-> Evidence: commands, failed designs, route measurements, numerical checks, NSYS attribution, NCU
-> reports, and qualification limits remain in
-> [the experiment report](2026-07-16-linear-kernel-architecture-experiment-log.md). The archived
-> prototype is evidence and a comparison oracle, not an implementation base.
+> 适用目标：当前注册产品 `qwen3_6_27b_rtx5090`。未来 35B shape 只作为扩展压力，
+> 不属于本文声明的运行时支持面。
 
-## 1. Architecture decision
+## 1. 结论
 
-NInfer Linear is a finite, hardware-qualified semantic Op, not a target-configured dispatch
-service and not a general GEMM framework.
+当前架构采用两类彼此独立的执行所有权：
 
-The public repository-internal execution interface remains:
+1. 纯 `linear()` 只表达单个投影，并在内部按 weight format 分发到
+   Q4、Q5、Q6、W8 或预留的 BF16 backend；
+2. `linear_add`、`linear_swiglu`、`linear_pair`、`attn_input_proj`、
+   `gdn_input_proj`、`gdn_gating_proj` 各自是闭合语义 Op，各自拥有 exact problem、
+   route plan、workspace 合同和 fixed execution backend。
 
-```cpp
-void linear(const Tensor& x,
-            const Weight& w,
-            Tensor& out,
-            WorkspaceArena& ws,
-            cudaStream_t stream);
-```
-
-The caller expresses only the semantic operation and provides its operands, transient arena, and
-stream. It does not provide a target, profile, policy, candidate, shape family, hardware selector,
-or epilogue descriptor.
-
-The complete execution chain is:
+调用者只传原有语义输入，不传 target、profile、policy、kernel id 或性能提示。
+Linear-family Op 自己负责：
 
 ```text
-target schedule
-  -> linear(original semantic inputs)
-  -> validate common tensor semantics and physical weight facts
-  -> switch on the weight format
-  -> q4 / q5 / q6 / w8 / bf16 format backend
-  -> normalize one format-local physical problem
-  -> format-local RTX 5090 route resolver
-  -> one format-local final execution plan
-  -> one fixed launcher or one explicit fixed composition
+验证语义输入
+  -> 构造 exact problem
+  -> 检查是否注册
+  -> 解析唯一 route plan
+  -> 按 plan 申请固定 workspace
+  -> 启动 plan 指定的 fixed kernel/composition
 ```
 
-The same rule applies independently to `linear_add`, `linear_swiglu`, `linear_pair`, grouped
-attention input projection, and grouped GDN input projection.
+这条边界解决了旧设计的核心问题：运行 target 不再向 Linear 接口注入调度语义，
+也不存在调用者选择 kernel 的第二条控制面。
 
-Seven invariants define the architecture:
+## 2. 目标与非目标
 
-1. **The semantic API is target-independent.** No Linear-family execution or workspace API accepts
-   target-owned dispatch data.
-2. **The Op owns its complete support domain.** A quantized call is legal only if the Op's internal
-   hardware backend contains an exact physical-problem route for it.
-3. **The selected format backend is the sole routing authority.** After resolution, no launcher
-   performs a second format, shape, tile, or schedule choice.
-4. **Unknown production problems fail closed.** There is no arbitrary quantized fallback, shape
-   similarity rule, global token threshold, or caller-role heuristic.
-5. **A policy is a complete execution bundle.** It names a lifecycle, topology, finalization form,
-   workspace behavior, and fixed launcher rather than a Cartesian product of independent knobs.
-6. **Fusion belongs to the fused semantic Op.** Base Linear does not expose an arbitrary epilogue
-   interface.
-7. **Admission implies qualified routing over a declared envelope.** An unmeasured conservative
-   tail is not presented as the best production route.
+### 2.1 当前目标
 
-The planner guarantees the best qualified production policy among the evaluated viable candidates
-for an admitted physical problem and token range. It cannot prove that no undiscovered kernel
-could ever be faster; that remains an optimization process rather than an API concern.
+- 保持 Qwen3.6-27B Text、Vision、MTP 的全部已注册 Linear-family 语义；
+- 对已注册 exact problem fail closed，不为未注册 shape 提供任意 fallback；
+- 让同一 weight format 的 kernel 机制可复用，但让 Q4/Q5/Q6/W8 独立演化；
+- 允许融合、成组、成对和显式物化成为一等 route；
+- 将 workspace 纳入 route plan，保证 CUDA Graph 地址稳定；
+- 让每个固定 route 可以独立做数值、microbenchmark、NSYS、NCU 和 roofline 验收；
+- 后续加入相似 shape 时，优先复用已有模板实例和 fixed kernel。
 
-## 2. Semantic boundary and ownership
+### 2.2 非目标
 
-### 2.1 The caller does not participate in dispatch
+- 不支持任意 `N/K/T` 的通用 GEMM；
+- 不引入运行时 autotune、target profile 或字符串驱动的 policy registry；
+- 不承诺未注册 shape 的正确性或性能；
+- 不建立通用运行时 epilogue callback/framework；
+- 不在本阶段注册 35B runtime target；
+- 不把“物理可启动”误写成“已经达到 roofline”。
 
-The original Linear contract is the correct abstraction boundary:
+## 3. 公共语义边界
 
-```text
-x   : contiguous BF16 [K,T]
-w   : bound physical weight with logical shape [N,K]
-out : contiguous BF16 [N,T]
-
-out[n,t] = BF16(sum_k dequantize(w)[n,k] * float(x[k,t]))
-```
-
-`Weight` already contains physical storage facts such as qtype, layout, dimensions, padded
-dimensions, group size, scale dtype, and plane pointers. Linear may inspect and validate those
-facts because they are part of the operand. It must not require the caller to attach execution
-policy.
-
-In particular, `Weight` must not gain:
-
-- a target identity;
-- a `PolicyId`;
-- a route or crossover table;
-- a launcher pointer;
-- workspace requirements;
-- an opaque target profile.
-
-A `Weight` may be sliced into effective row views, reused by different semantic Ops, and executed
-at different token counts. A cached policy would be stale or semantically ambiguous under those
-operations.
-
-### 2.2 Ownership split
-
-The correct ownership boundary is:
-
-| Owner | Responsibilities |
-|---|---|
-| `src/targets/<target>` | checkpoint inventory, storage binding, effective weight views, schedules, reachability, graph/state policy, arena reservation, product integration |
-| semantic Op | mathematics, rounding, aliasing, exact supported physical problems, route resolution, workspace semantics, fixed execution closure |
-| format backend inside the semantic Op | format-specific storage/decode semantics, RTX 5090 route winners, legality capabilities, kernel resources, and fixed launcher implementations |
-| core/runtime | tensors, arenas, device/stream lifetime, graph capture, and public Engine behavior |
-| benchmark/test tools | candidate forcing, measurement-only future problems, independent numerical oracles, and qualification evidence |
-
-The target decides **which Linear calls exist**. Linear decides **whether each physical call is
-supported and exactly how it executes**.
-
-Target code must not contain:
-
-- Linear policy enums;
-- route intervals or crossover thresholds;
-- kernel launcher selection;
-- profile injection;
-- model-role strings used to influence Linear dispatch.
-
-Op code must not require a model target name to choose a kernel.
-
-### 2.3 Admission, reachability, qualification, and product support
-
-Four separate facts must not be conflated:
-
-- **Op admission:** the hardware-specific Op backend supports an exact physical problem over a
-  declared token envelope.
-- **target reachability:** a target schedule can produce that problem and call the Op at a token
-  count.
-- **qualification:** the selected route has numerical, performance, and when necessary physical
-  profiler evidence.
-- **product support:** an Engine target binds the required tensors and exposes the behavior through
-  the product.
-
-This distinction resolves the earlier cross-target concern.
-
-If a future 35B target needs a new exact Linear problem, that problem is added to Linear's supported
-physical domain after qualification. Once added, the Op can execute that physical problem
-regardless of which model produced it. This is correct: identical physical operands on the same
-hardware should not choose different kernels merely because they came from different targets.
-
-If two apparently identical calls measure different winners, the design must first find the
-missing physical variable—encoding, padded layout, alignment, token range, execution mode, or
-hardware class. Target identity is not an acceptable substitute for an incomplete problem key.
-
-Product isolation remains target-owned: a target that does not bind or schedule a problem does not
-support that model path, even if an internal Op is capable of executing the same physical shape.
-
-## 3. Exact physical problem and internal planning
-
-### 3.1 Format-local physical identity
-
-Linear does not normalize every encoding into one cross-format planner key. After common semantic
-validation it dispatches exactly once on `Weight::qtype`. Each format backend then defines the
-smallest physical problem needed by that encoding:
-
-```cpp
-struct Q5Problem {
-    int32_t rows;
-    int32_t k;
-    int32_t padded_k;
-    int32_t cols;
-};
-
-struct Q6Problem {
-    int32_t rows;
-    int32_t k;
-    int32_t padded_k;
-    int32_t cols;
-};
-```
-
-These types are intentionally separate. Equal fields do not imply shared admission, schedules,
-decode atoms, kernel bodies, or route tables. W8 and dense will receive the same ownership shape
-when their compatibility paths migrate.
-
-The real implementation may include additional physical facts only when they alter legality or
-the generated execution, for example a required alignment class or storage encoding revision.
-
-The key must not contain:
-
-- model or target names;
-- layer roles such as MLP, attention, or head;
-- Text/Vision/MTP phase;
-- tensor binding names;
-- caller-selected backend names.
-
-Policy names may mention exact geometry when the kernel is geometry-specialized, but routing still
-uses physical facts rather than caller roles.
-
-### 3.2 Format-owned immutable route catalogs
-
-Each RTX 5090 format backend owns its own closed compile-time catalog:
-
-```cpp
-struct Q5ColsSet {
-    int32_t first;
-    int32_t last;
-    int32_t step;
-};
-
-struct Q5RouteSpec {
-    Q5ColsSet cols;
-    Q5ScheduleId schedule;
-};
-
-struct Q5SupportSpec {
-    int32_t rows;
-    int32_t k;
-    int32_t padded_k;
-    Q5ColsSet admitted_cols;
-    // span into the Q5 route table
-};
-```
-
-The catalog maps an exact effective weight view and token set to a final format-local schedule. It
-is:
-
-- immutable;
-- compiled into the Op;
-- hardware-specific;
-- finite and reviewable;
-- free of runtime registration and initialization order;
-- free of virtual calls, function-pointer registries, and string lookup.
-
-It is not a target profile and not a cross-format registry. It describes the physical execution
-capability of one weight format on the current hardware backend.
-
-The preferred lookup is a compact constexpr table or nested switch inside that format directory. A
-global `LinearPolicyId`, hash table, mutable cache, or target-selected registry is unnecessary.
-
-### 3.3 One resolution, one final plan
-
-The internal execution sequence is:
+纯 Linear 的接口保持不变：
 
 ```cpp
 void linear(const Tensor& x, const Weight& w, Tensor& out,
-            WorkspaceArena& ws, cudaStream_t stream) {
-    validate_semantics_and_storage(x, w, out);
-    switch (w.qtype) {
-    case QType::Q4G64_F16S:
-        return q4_rowsplit_dispatch(x, w, out, stream);
-    case QType::Q5G64_F16S:
-        return q5_rowsplit_dispatch(x, w, out, stream);
-    case QType::Q6G64_F16S:
-        return q6_rowsplit_dispatch(x, w, out, stream);
-    // W8 and dense use compatibility paths until their format migrations.
-    }
-}
+            WorkspaceArena& ws, cudaStream_t stream);
 ```
 
-Each backend has its own plan type:
+其语义仍然是一个投影：
+
+```text
+out[N,T] = Linear(x[K,T], w[N,K])
+```
+
+`linear()` 不知道调用者把输出用于 Q、K、V、MLP、MTP 还是 Vision，也不接受外部
+调度提示。它只根据 `w.qtype`、weight metadata 和实际 `N/K/padded_K/T` 决定执行。
+
+融合 Op 的公共接口也只包含自身数学合同需要的输入。例如 `linear_add` 接受 residual，
+`linear_swiglu` 接受 gate/up 权重，`attn_input_proj` 接受四组权重；它们不暴露内部
+route 或 target 信息。
+
+## 4. 统一的内部生命周期
+
+每个 backend 使用相同的控制结构，但不共享一个巨型基类。
+
+### 4.1 Exact problem
+
+Problem 是决定执行所需的最小物理事实，例如：
 
 ```cpp
-struct Q5Plan {
-    Q5ScheduleId schedule;
-    Q5KernelVariant variant;
+struct Problem {
+    int32_t rows;
+    int32_t k;
+    int32_t padded_k;
+    int32_t cols;
 };
 ```
 
-The format-local fixed launcher uses an exhaustive switch. Each case launches one fixed
-implementation. It may validate assumptions, but it may not choose another tile size, token tile,
-mainloop, split factor, or fallback kernel.
+融合 Op 还会加入输出拓扑需要的维度，例如 `gate_up_rows`、`output_rows`、
+`query_rows`、`kv_rows` 或 `heads`。Problem 不包含模型层号、调用者角色、target key
+或 profile。
 
-The following old structures are rejected:
+### 4.2 Admission
 
-- `ShapeFamily`;
-- `LinearRegime`;
-- one global Small-T/Large-T threshold;
-- automatic launchers that reclassify after the planner;
-- generic quantized fallback;
-- caller-role specialization as route authority.
+`*_admits(problem)` 只接受显式注册的精确 shape 和 T 域。
 
-### 3.4 Policy legality and route selection are separate internal facts
+- 相似 shape 不自动获得支持；
+- 未注册 shape 不落入低速 reference fallback；
+- 对齐、payload、plane、stride 和指针要求在 Op 边界检查；
+- 无调用者的旧 shape 直接删除。
 
-Two Op-owned authorities remain distinct:
+### 4.3 Route plan
 
-1. the **route catalog** records which qualified policy wins for an exact problem and token range;
-2. the **policy capability catalog** records whether a fixed policy is physically legal for a
-   format, geometry, token range, alignment contract, and hardware backend.
+`*_resolve_plan(problem)` 返回唯一闭合计划，通常包含：
 
-Compile-time validation proves:
+- schedule id；
+- Full/Predicated 等 fixed variant；
+- 必要时的格式子计划；
+- exact workspace bytes；
+- 有明确标记的 performance-qualified 状态。
 
-- every support problem is unique;
-- every route interval is ordered, contiguous, and non-overlapping;
-- every admitted interval lies within the declared supported envelope;
-- every route names a policy owned by the correct semantic Op;
-- the policy capability accepts that exact problem and range;
-- every policy has one fixed execution closure;
-- workspace semantics exist for every policy;
-- no `Default`, `Auto`, `Fallback`, or `Unknown` policy can appear in production routes.
+Route 表在编译期检查连续性和闭合性。语义 Op 的 `execute_plan()` 会用实际输入重新解析
+计划并比较，因此不能执行一个“物理上能启动、但不是该 exact problem 注册路径”的
+伪造计划。
 
-Capability does not imply admission. A geometry-generic TT4 or MMA kernel may be physically capable
-of running many shapes, while the production resolver admits only shapes that have completed the
-measurement and correctness workflow.
+格式 backend 还提供更低一层的 fixed candidate executor：它检查 schedule/variant 的
+物理合法性，但不会要求该 candidate 是 public pure Linear 的当前赢家。这让
+LinearSwiGLU 等语义 Op 可以显式固定一个经过自身测量的格式子计划，同时不扩大
+public `linear()` 的 admission。
 
-### 3.5 Supported token envelope
+### 4.4 Fixed execution
 
-Each exact physical problem declares only the token envelope for which production routing is
-qualified.
-
-The previous proposal used the CUDA grid limit as a universal terminal route even where winner
-measurements stopped much earlier. That is rejected. Grid legality proves that a launch can run; it
-does not prove that Linear selected the best qualified kernel.
-
-For each admitted problem:
-
-- the supported envelope must cover the current product's declared reachable domain;
-- candidate comparison must include route boundaries, tile-wave changes, important tails, and
-  representative high-token points;
-- the final route may use a structurally stable policy over a broad interval only when evidence
-  justifies that conclusion;
-- outside the qualified envelope, the Op rejects the call.
-
-If the product needs a larger prefill or Vision token range, qualification expands before the
-public target limit expands. The product limit must not silently outrun the Op's qualified domain.
-
-### 3.6 Hardware selection remains internal
-
-The current product supports exactly RTX 5090 and builds CUDA for `sm_120a`; target preflight
-already rejects other devices. Therefore the current Linear implementation may compile and link
-one RTX 5090 backend without adding hardware to the API or querying device properties on every
-call.
-
-A future additional GPU backend must remain an Op/runtime-internal concern and requires separate
-design review. It must not reintroduce target profiles into semantic calls. Possible future
-mechanisms include separate product builds or an immutable device backend chosen once by core, but
-neither is current scope.
-
-### 3.7 Dense reference code is not a production fallback
-
-The requirement that Linear choose a qualified best kernel is incompatible with silently routing
-arbitrary dense shapes to a slow reference implementation.
-
-Generic dense BF16/FP32 implementations may remain as:
-
-- internal numerical oracles;
-- benchmark candidates;
-- diagnostic tools.
-
-They do not make arbitrary dense shapes production-supported. A dense production problem must
-receive the same exact admission and qualification treatment as a quantized problem. Current
-optimized dense and future grouped-expert lifecycles remain separate future work.
-
-## 4. Execution policy and kernel lifecycle
-
-### 4.1 Policy is the optimization unit
-
-A `PolicyId` names a complete execution bundle:
+执行层只消费已经确定的 plan：
 
 ```text
-physical encoding assumptions
-CTA problem mapping
-token and row ownership
-staging lifecycle
-decode path
-MMA or CUDA-core accumulation
-reduction topology
-final BF16 boundary
-workspace behavior
-fixed launcher
+resolve_plan() 负责选择
+execute_plan() 负责执行
+launch_fixed() 不再二次调度
 ```
 
-A policy is not assembled dynamically from independent format, tile, pipeline, split-K, and
-epilogue choices.
+物化组合中的基础投影直接调用格式 backend 的 fixed executor，不会绕回 public
+`linear()` 再做一次 dispatch；public pure Linear 仍只能由格式 backend 自己的
+exact planner 选择 route。
 
-Examples of legitimate policy identities include:
+### 4.5 Workspace
 
-- row-streaming TT4;
-- row-streaming TT8;
-- Q5 direct split2;
-- Q5 direct split4;
-- Q4 BF16 MMA BN64 or BN128;
-- Q5 BF16 MMA BN64 or BN128;
-- Q6 BF16 MMA BN64 or BN128;
-- W8G32 small-M MMA;
-- W8G32 general MMA;
-- an exact T1 warp-per-row specialization;
-- an exact T1 split-K specialization.
+workspace 是 plan 的组成部分，不是 wrapper 的经验公式。
 
-Multiple exact support problems may select the same policy. Exact dispatch does not imply one
-kernel per shape.
+容量查询必须扫描 `[1, max_T]` 内所有 route 端点，因为最佳路线可能不单调。
+例如 LinearSwiGLU 在 folded 和 materialized 路线之间多次切换；只查看 `max_T`
+对应的 route 会低估容量。
 
-### 4.2 Complete-lifecycle reuse boundary
+## 5. 源码所有权
 
-A reusable mainloop ends when any of the following changes materially:
-
-- producer lifetime;
-- asynchronous staging protocol;
-- synchronization schedule;
-- warp ownership;
-- accumulator topology;
-- final reduction ownership;
-- output mapping.
-
-The experiments support separate complete lifecycles for:
-
-- Q4 row-streaming, SIMT, and MMA;
-- Q5 GEMV, direct Small-T, SIMT, and MMA;
-- Q6 SIMT and MMA;
-- W8G32 MMA;
-- ownership-specific T1;
-- paired or grouped output topologies.
-
-Q5 and Q6 deliberately do not share a configurable kernel body, schedule type, route table, or
-codec abstraction. Their optimization trajectories must remain independent. Trying to force these
-lifecycles through one configurable loop would create a scheduling DSL, enlarge template
-combinations, and risk generated-code regressions.
-
-### 4.3 Narrow reusable substrate
-
-Reuse is restricted below the lifecycle boundary:
-
-- core memory, warp, and MMA instruction primitives;
-- neutral swizzles and address helpers;
-- small mechanics-only configuration helpers used by fused kernels;
-- format-local storage/decode atoms reused only by consumers of the same format;
-- alignment and launch-contract checks that contain no format policy.
-
-These primitives must remain closed and compile-time. They are accepted only when representative
-resource usage, SASS, and matched timing show that the hot policy is preserved.
-
-Source reuse is not a goal by itself. An exact implementation remains first-class whenever it is
-the measured winner or the clearer ownership boundary.
-
-## 5. Fused semantic Ops and epilogue extensibility
-
-### 5.1 Base Linear remains semantically closed
-
-Base `linear()` does not accept:
-
-- an epilogue enum;
-- an auxiliary pointer descriptor;
-- a callback or function pointer;
-- a target-selected finalizer;
-- a template argument exposed to callers.
-
-LinearAdd, LinearSwiGLU, LinearPair, grouped attention input, and grouped GDN input are independent
-semantic Ops because they have different rounding, topology, aliasing, and workspace contracts.
-
-Each owns its own internal:
-
-- exact physical-problem key;
-- immutable route catalog;
-- typed policy enum;
-- workspace resolver;
-- exhaustive fixed executor.
-
-### 5.2 Typed internal finalizers
-
-Narrow compile-time finalizers are still useful implementation seams. Examples include:
+当前目录结构为：
 
 ```text
-StoreBf16
-ResidualAddAfterProjectionRound
-CtaCollectiveResidualAfterProjectionRound
-SwiGluAfterTwoProjectionRounds
+src/ops/
+  linear/
+    linear.cpp
+    q4/
+    q5/
+    q6/
+    w8/
+    bf16/
+
+  linear_add/q5/
+  linear_swiglu/q4/
+  linear_pair/w8/
+  attn_input_proj/q4_q5/
+  gdn_input_proj/q4_q5/
+  gdn_gating_proj/bf16/
+
+  common/
+    rowsplit_mma.cuh
+    rowsplit_grouped_mma.cuh
 ```
 
-They are internal pieces of complete policies, not runtime extensions.
+所有权规则：
 
-The semantic rounding boundaries are mandatory:
+- `linear/<format>` 拥有纯 Linear 的格式解码、kernel family、候选合法性和 exact route；
+- 语义 Op 目录拥有自身的融合/成组 kernel、route 和 workspace；
+- `ops/common` 只放稳定的 CUDA 机制，例如 MMA tile 配置、异步搬运和 grouped job mapping；
+- common 机制不拥有 shape catalog、route、语义 finalization 或 weight-format dispatch；
+- wrapper 只做语义验证并进入对应 backend。
 
-- LinearAdd must preserve its declared BF16 projection boundary before the residual update;
-- SwiGLU must preserve the required independently rounded projection halves;
-- Pair owns two weight streams and two outputs, not merely one accumulator epilogue;
-- grouped projection changes the CTA problem map and output ownership.
+旧的 `src/ops/linear/gemv`、`linear/gemm`、`linear/codec` 和
+`linear/common` 兼容组织已经删除。
 
-The finalizer seam may be shared only where those semantics and ownership facts match.
+## 6. 纯 Linear：按 weight format 分发
 
-### 5.3 Three first-class execution forms
+`linear()` 只做一次 format dispatch：
 
-A fused semantic Op may select one of three complete forms:
+| Weight format | Backend | 当前状态 |
+|---|---|---|
+| `Q4G64_F16S` | `linear/q4` | 已注册 exact supports |
+| `Q5G64_F16S` | `linear/q5` | 已注册 exact supports |
+| `Q6G64_F16S` | `linear/q6` | 已注册 exact supports |
+| `W8G32_F16S` | `linear/w8` | 已注册 exact supports |
+| `BF16_CTRL` | `linear/bf16` | 格式边界已预留，纯 Linear registry 为空 |
 
-1. **terminal finalizer:** an otherwise compatible mainloop finishes through a typed finalizer;
-2. **topology-aware fused kernel:** the Op requires paired/grouped accumulators or a different CTA
-   problem map;
-3. **materialized composition:** fixed internal subplans execute into explicit scratch and a
-   second semantic step completes the Op.
+BF16 不能因为存在 `gdn_gating_proj` 的 BF16 kernel 就自动成为通用纯 Linear。
+`gdn_gating_proj` 是独立语义 Op；未来只有在真实纯 BF16 Linear problem 被注册并测量后，
+`linear/bf16` 才能加入 schedule。
 
-Materialized composition is not an inferior fallback. It is a first-class policy when measurement
-selects it.
+### 6.1 Q4
 
-### 5.4 Materialized composition must not redispatch
+Q4 使用六个生产 schedule，覆盖 GEMV、SIMT GEMM 和 MMA GEMM 三个模板族：
 
-The fused planner resolves a complete composed plan once. Its executor must not call public
-`linear()` and trigger a second automatic route decision.
+- `GemvR4W1Direct`
+- `GemvR1W8Direct`
+- `SimtR8C4`
+- `SimtR8C8`
+- `MmaR64C64`
+- `MmaR64C128`
 
-For example:
+当前 exact routes：
 
-```cpp
-struct LinearAddPlan {
-    LinearAddPolicyId policy;
-    std::optional<LinearPolicyId> materialized_base_policy;
-    WorkspacePlan workspace;
-};
-```
+| `[N,K]` | T 域 | Route |
+|---|---:|---|
+| `[1024,5120]` | 1 / 2–15 / 16 | R1W8 GEMV / SIMT C4 / SIMT C8 |
+| `[4096,5120]` | 1 / 2–4 / 5–16 | R1W8 GEMV / SIMT C4 / SIMT C8 |
+| `[6144,5120]` | 1 / 2–7 / 8–16 | R1W8 GEMV / SIMT C4 / SIMT C8 |
+| `[34816,5120]` | 2–4 / 5–16 | SIMT C4 / SIMT C8 |
+| `[131072,5120]` | 1 | R4W1 direct GEMV |
+| `[3456,1152]` | 4–36 / 40–320 / 324–131072，步长 4 | SIMT C4 / MMA C64 / MMA C128 |
+| `[4304,1152]` | 4 / 8 / 12 / 16–24 / 28–320 / 324–131072，步长 4 | C4 / C8 / C4 / C8 / MMA C64 / MMA C128 |
 
-The exact representation may differ, but the invariant is:
+`[34816,5120], T=1` 由 `linear_swiglu` 的 paired GEMV 拥有；更大 T 也由该语义 Op
+选择 folded 或 materialized 路线，不能重复注册为 public pure Linear 的隐式 fallback。
 
-- the fused route fixes or resolves its required base subplan during the fused planning step;
-- execution invokes the fixed base launcher directly;
-- changing a Base Linear route cannot silently change a qualified fused route;
-- compile-time validation proves the composed subpolicy is legal for the same physical problem.
+### 6.2 Q5
 
-This preserves one routing authority per semantic Op while allowing controlled reuse.
+Q5 独立拥有：
 
-### 5.5 Cost of adding a fused capability
+- `GemvR16S2X`
+- `SimtR8C4`
+- `SimtR8C8`
+- `SimtSplit2Exact`
+- `SimtSplit4Exact`
+- `MmaR64C64`
+- `MmaR64C128`
 
-Adding a fused Op or fused policy requires:
+当前 exact routes：
 
-- one explicit semantic and rounding contract;
-- one physical problem definition;
-- one finite route catalog;
-- one or more complete policies;
-- exact and range-capacity workspace rules;
-- independent numerical verification;
-- candidate timing and end-to-end evidence;
-- resource/SASS inspection when a supposedly zero-cost seam is introduced.
+| `[N,K,Kpad]` | T 域 | Route |
+|---|---:|---|
+| `[1024,5120,5120]` | 1–4 / 5–16 | SIMT C4 / SIMT C8 |
+| `[6144,5120,5120]` | 1 / 2–6 / 7–24 / 25–64 / 65–8388480 | GEMV / Split4 / C8 / MMA C64 / MMA C128 |
+| `[5120,6144,6144]` | 2–6 / 7–24 | Split2 / SIMT C8 |
+| `[5120,17408,17408]` | 2–6 / 7–24 | Split2 / SIMT C8 |
+| `[1152,1152,1152]` | 4 / 8–56 / 60–131072，步长 4 | C4 / C8 / MMA C128 |
+| `[1152,4304,4352]` | 4 / 8–84 / 88–131072，步长 4 | C4 / C8 / MMA C128 |
 
-The cost stays inside the Op. Target callers continue to use the original semantic interface.
+两个 `[5120,*]` residual 投影的 T1 和 T25+ 由 `linear_add` 拥有。
 
-## 6. Workspace and CUDA Graph behavior
+### 6.3 Q6
 
-### 6.1 Exact workspace belongs to the resolved plan
+Q6 保留与 Q4/Q5 不同的独立 schedule 生命周期：
 
-Every policy defines exact scratch for one call. Workspace availability must not influence route
-selection:
+| `[N,K]` | T 域 | Route |
+|---|---:|---|
+| `[248320,5120]` | 1–6 | SIMT C4 |
+| `[1152,1536]` | 4–36 | SIMT C4 |
+| `[1152,1536]` | 40–704 | MMA C64 |
+| `[1152,1536]` | 708–1088，步长 4 | 按已测 tile-wave 区间在 MMA C128/C64 间切换 |
+| `[1152,1536]` | 1092–131072，步长 4 | MMA C128 |
 
-```text
-resolve best qualified policy
-  -> compute exact workspace
-  -> require caller arena capacity
-  -> execute or fail
-```
+Q6 不与 Q5 共用 route 表或 kernel 文件；二者只复用经过验证的更底层 CUDA 机制。
 
-The implementation must not select a slower policy because the caller provided less scratch.
+### 6.4 W8
 
-Base Linear policies should remain externally workspace-free when that preserves the winner and
-simplifies graph stability. This is a preference, not permission to hide allocation. If a future
-winning Base policy requires scratch, a target-independent capacity API must be designed
-explicitly.
+W8 使用 `SimtR8C4`、`SimtR8C8`、`MmaR32C128` 和 `MmaR64C128`：
 
-### 6.2 Capacity queries use the same route authority
-
-Target layout planning may ask a semantic Op for capacity using semantic dimensions, physical
-weight facts where necessary, and `max_tokens`. This is an execution-resource query, not dispatch
-configuration.
-
-For a route-dependent fused Op:
-
-```text
-capacity(max_tokens)
-  = max(exact_workspace(route(T))) for every admitted T in [1,max_tokens]
-```
-
-The query must not inspect only the route at `T=max_tokens`, because winning policies can be
-non-monotonic.
-
-Materialized workspace includes:
-
-- intermediate BF16/FP32 tensors;
-- alignment padding;
-- any fixed subplan scratch;
-- the maximum simultaneous lifetime, not a sum of sequentially reusable allocations.
-
-Execution and capacity queries must share the same Op-owned route facts so they cannot drift.
-
-### 6.3 CUDA Graph stability
-
-Planning is deterministic host work derived from immutable inputs and a compiled catalog.
-
-During CUDA Graph capture:
-
-- the same physical problem and token count resolve the same policy;
-- workspace addresses come from the pre-reserved arena;
-- no lazy initialization, autotuning, allocation, or mutable registration occurs.
-
-Replay executes the captured kernel nodes and does not repeat host dispatch. This removes any
-motivation to pollute `Weight` with cached policies.
-
-## 7. Extending the supported domain
-
-### 7.1 Adding a similar shape
-
-Shape similarity proposes candidates; it never decides production routing.
-
-For a new physical problem:
-
-```text
-construct exact benchmark problem
-  -> enumerate physically compatible existing policies
-  -> verify numerical legality
-  -> compare candidates at relevant T and wave/tail points
-  -> select route intervals
-  -> add exact Op-owned support rows
-```
-
-If an existing lifecycle wins, the change adds only exact routes pointing to that policy. If no
-existing policy is adequate, the change adds a new complete policy or exact specialization.
-
-Until that process completes, the new shape is unsupported.
-
-### 7.2 Future 35B workflow
-
-Introducing 35B later follows this sequence:
-
-1. inventory effective physical Linear-family problems from the target's real bound views;
-2. expose those problems only in measurement tools;
-3. test existing codecs and policies as candidates;
-4. add missing dense or grouped-expert lifecycles where required;
-5. qualify exact token routes on RTX 5090;
-6. extend the Op-owned support catalogs;
-7. implement the 35B target using unchanged semantic Op interfaces;
-8. validate the real artifact and product schedules.
-
-Current 27B callers and public interfaces do not change.
-
-The existing experiments already show that future quantized problems can often reuse current
-closed policies, but route boundaries remain geometry-local and sometimes non-monotonic. Dense
-BF16 and grouped experts still require separate lifecycle work.
-
-### 7.3 Extension budget
-
-The intended cost is:
-
-| Change | Required architecture work |
+| `[N,K]` | T route |
 |---|---|
-| new exact shape using a qualified lifecycle | one exact support row plus measured token routes |
-| new route winner for existing shapes | one policy addition or route update, with affected evidence |
-| new fused semantic Op | semantic contract, planner, policies, workspace, numerical and performance evidence |
-| new physical encoding | codec/addressing contract plus compatible policy qualification |
-| new hardware | separate Op-owned hardware backend and a dedicated design review |
-| new product target | target binding/schedules plus coverage proof; no Linear API changes |
+| `[5120,10240]` | 1–4 C4；5–16 C8；17+ MMA R64 |
+| `[14336,5120]` | 1–4 C4；5–8 C8；9+ MMA R64 |
+| `[1024,5120]` | 1–4 C4；5–16 C8；17+ MMA R32 |
+| `[6144,5120]` | 1–4 C4；5–16 C8；17+ MMA R64 |
+| `[5120,6144]` | 1–4 C4；5–16 C8；17+ MMA R64 |
+| `[34816,5120]` | 1–4 C4；5–8 C8；9+ MMA R64 |
+| `[5120,17408]` | 1–4 C4；5–16 C8；17+ MMA R64 |
+| `[4608,4608]` | 1–4 C4；5 C8；6–32768 MMA R64 |
+| `[5120,4608]` | 1–4 C4；5 C8；6–32768 MMA R64 |
 
-This is intentionally not constant-cost arbitrary extensibility. New execution behavior pays for
-the facts it introduces, without forcing unrelated callers or kernels into a broader framework.
+同 shape 的双投影不是两个 pure W8 route 的简单别名，而由 `linear_pair/w8` 独立选择
+“两次 SIMT”或“一次 dual MMA”。
 
-## 8. Complexity control and rejected alternatives
+## 7. 融合、成组和成对语义 Op
 
-### 8.1 Accepted abstractions
+### 7.1 总表
 
-- exact physical signatures;
-- finite immutable support and route tables;
-- typed complete policies;
-- exhaustive fixed launch switches;
-- hardware-local capability traits;
-- Op-local planners and workspace plans;
-- narrow closed codec, decode, MMA, topology, and finalizer primitives;
-- internal measurement-only candidate launchers that cannot enter product resolution.
+| Op | Exact problem | Route 所有权 | 最大 capacity workspace |
+|---|---|---|---:|
+| `linear_add` | Q5 `[5120,6144]`、`[5120,17408]` | `linear_add/q5` | 245,760 B |
+| `linear_swiglu` | Q4 `[34816,5120] -> [17408,T]` | `linear_swiglu/q4` | 44,564,480 B |
+| `linear_pair` | W8 `[1024,5120] x2` | `linear_pair/w8` | 0 |
+| `attn_input_proj` | Q4/Q5 四投影 | `attn_input_proj/q4_q5` | 0 |
+| `gdn_input_proj` | Q4/Q5 双投影并按行拼接 | `gdn_input_proj/q4_q5` | 327,680 B |
+| `gdn_gating_proj` | BF16 `[48,5120] x2` 加 GDN gate 变换 | `gdn_gating_proj/bf16` | 3,145,728 B |
 
-### 8.2 Rejected abstractions
+这些 Op 的 plan 都在合法 T 域内闭合；当前 `performance_qualified` 标记到 T=1024。
+T1025+ 的终端 route 表示物理可执行和数值合同，不自动表示已经完成 roofline 验收。
 
-| Rejected design | Reason |
+### 7.2 LinearAdd / Q5
+
+| T | Schedule | Workspace |
+|---:|---|---:|
+| 1 | fused residual GEMV | 0 |
+| 2–24 | fixed Q5 projection + `residual_add` | `5120*T*2` |
+| 25–128 | MMA R64C64 + CTA-collective residual writeback | 0 |
+| 129–8388480 | MMA R64C128 + CTA-collective residual writeback | 0 |
+
+这里的 residual 不是任意 callback。它是编译期固定语义：
+
+```text
+投影的 BF16 舍入边界
+  -> 读取 BF16 residual
+  -> FP32 add
+  -> BF16 写回
+```
+
+### 7.3 LinearSwiGLU / Q4
+
+| T | Schedule | Workspace |
+|---:|---|---:|
+| 1 | paired-row GEMV | 0 |
+| 2–128 | materialized Q4 projection + `silu_mul` | `34816*T*2` |
+| 129–256 | folded split-half-pair MMA | 0 |
+| 257–384 | materialized | `34816*T*2` |
+| 385–512 | folded | 0 |
+| 513–640 | materialized | `34816*T*2` |
+| 641–8388480 | folded | 0 |
+
+materialized 子计划也固定：
+
+- T2–4：Q4 `SimtR8C4`
+- T5–16：Q4 `SimtR8C8`
+- T17+：Q4 `MmaR64C128`
+
+非单调 route 是测量结果，不应被压缩成 `SmallT/LargeT` 单阈值。
+
+### 7.4 LinearPair / W8
+
+| T | Schedule |
+|---:|---|
+| 1–4 | 两次 fixed `SimtR8C4` |
+| 5–56 | 两次 fixed `SimtR8C8` |
+| 57–8388480 | 一次 `DualMmaR32C128` |
+
+双投影 MMA 的 crossover 是 T56/57，而不是单投影 W8 的 T16/17。
+因此 topology 必须进入独立 plan，不能继承 base W8 阈值。
+
+### 7.5 AttnInputProj / Q4+Q5
+
+语义是同一个 `[5120,T]` 输入上的四个独立 BF16 输出：
+
+```text
+Q    [6144,T] Q4
+gate [6144,T] Q5
+K    [1024,T] Q4
+V    [1024,T] Q5
+```
+
+| T | Schedule |
+|---:|---|
+| 1–16 | 四个格式 backend 的 fixed subplan |
+| 17–8388480 | 一次 Q4 homogeneous pair MMA + 一次 Q5 homogeneous pair MMA |
+
+大 T 仍是两次 launch，因为 Q4 和 Q5 的解码生命周期不同。强行做一个运行时混合格式
+大 kernel 会扩大寄存器、分支和实例组合，不是当前测量赢家。
+
+### 7.6 GdnInputProj / Q4+Q5
+
+语义是：
+
+```text
+qk  = Q4 Linear [4096,5120] x X
+v   = Q5 Linear [6144,5120] x X
+qkv = concat_rows(qk, v)  // [10240,T]
+```
+
+| T | Schedule | Workspace |
+|---:|---|---:|
+| 1–16 | 两个 fixed subplan + 两次 D2D 2D copy | `10240*T*2` |
+| 17–8388480 | 一次 mixed Q4/Q5 grouped MMA，直接写最终行区间 | 0 |
+
+### 7.7 GdnGatingProj / BF16
+
+这个 Op 不是通用 BF16 Linear。它拥有两个 `[48,5120]` BF16 投影及后续 GDN gate
+变换的完整数学合同。
+
+| T | Schedule | Split-K |
+|---:|---|---:|
+| 1 | paired-row GEMV | 1 |
+| 2–8 | Small-T partial + reduce | 10 |
+| 9–1024 | cooperative MMA | 8 |
+| 1025–2048 | cooperative MMA | 4 |
+| 2049–4096 | cooperative MMA | 2 |
+| 4097–8388480 | unsplit MMA | 1 |
+
+workspace 是 `split_k * 96 * T * sizeof(float)`；最大值在多个区间都达到
+3,145,728 B。
+
+## 8. Epilogue 扩展策略
+
+Linear-family 可以支持 fused epilogue，但边界不是“给 `linear()` 传一个任意 epilogue”。
+当前采用三种有限形式：
+
+1. **固定 finalization**：如 LinearAdd，将 residual 语义编译进专用 kernel；
+2. **固定 accumulator topology**：如 SwiGLU 的 split-half pair、W8 的 dual projection；
+3. **固定 problem map**：如 attention/GDN 的 homogeneous 或 mixed grouped jobs。
+
+显式物化同样是一等 route。当融合 kernel 在某个 T 区间更慢时，plan 可以选择
+“fixed projection + 第二个 Op”，而不是为了形式上的融合牺牲性能。
+
+不采用通用运行时 epilogue framework，原因是其代价会落在所有 plain Linear 路径上：
+
+- 额外参数和分支；
+- 更大的寄存器/共享内存压力；
+- accumulator ownership 被迫统一；
+- 模板笛卡尔积和编译产物膨胀；
+- 不同语义舍入边界容易被错误合并；
+- route 调优矩阵失控。
+
+只有当多个已注册 Op 确实共享同一零成本代码形态时，才把机制下沉到 `ops/common`。
+
+## 9. 新 shape 如何复用 kernel
+
+注册一个相似 shape 时，不根据“看起来相似”直接选 kernel。流程是：
+
+1. 明确 weight format、`N/K/Kpad/T` 域和语义舍入边界；
+2. 构造新的 exact problem；
+3. 用该 format 的 `candidate_is_legal()` 枚举物理合法的现有 schedule/variant；
+4. 运行独立数值 oracle，排除不满足格式和 BF16 边界的候选；
+5. 对合法候选做 matched benchmark，覆盖 crossover、tail、wave 和 Full/Predicated；
+6. 若已有 kernel 达标，只在 support/route catalog 增加一项；
+7. 只有所有现有候选都不能满足性能目标时，才增加新的 compile-time schedule axis；
+8. 高影响 shape 再做真实模型端到端和 NSYS/NCU 验收。
+
+因此，未来相似 shape 的底层 kernel 通常来自现有 GEMV/SIMT/MMA 模板实例；新增工作主要是
+exact admission 和 route 数据。Q4 的未来 `[131072,2048]` 实验已经证明：
+R4 GEMV、C8、C64、C128 现有模板可以覆盖其不同 T 区间，但它仍不会在未注册前被
+production 接受。
+
+35B 引入时也遵循同一规则。新 shape 不需要 target 向 Linear 注入 profile；只需要在
+对应 format 或新语义 Op 中增加 exact problem、候选证据和闭合 route。
+
+## 10. 复杂度控制
+
+复杂度通过以下边界受控：
+
+- 公共语义接口数量有限且稳定；
+- 每个 format/Op 有自己的小型 plan，不建立全局万能 policy 类型；
+- route 表只包含真实注册 problem；
+- kernel 名称忠实描述执行结构，不使用模型角色命名；
+- compile-time 参数只保留能够改变代码生成或性能的轴；
+- Q4/Q5/Q6/W8 不因代码相似而强制共用完整 mainloop；
+- common 层只共享经过 SASS/resource/timing 验证的机械组件；
+- materialized route 不被视为失败或临时兼容；
+- 删除无调用者 shape、旧目录和 fallback，而不是继续维护迁移分支。
+
+## 11. Roofline 与性能验收
+
+不存在一个对所有 Linear route 都合理的统一 roofline 百分比：
+
+- T1 常受权重流量和 launch/ownership 限制；
+- Small-T 常受重复读权重、occupancy、issue 和 tile 数限制；
+- prefill MMA 受 tensor pipe、tile wave、tail 和输出写回限制；
+- grouped、paired、folded、residual route 又有不同的数据流。
+
+因此验收单位是固定 `(format, exact problem, schedule, variant, T/wave class)`：
+
+1. 独立数值 oracle；
+2. matched microbenchmark 和 crossover；
+3. 资源/SASS 检查，确认无意外 spill 或抽象成本；
+4. NSYS 证明它是端到端热点；
+5. NCU 分析实际 DRAM、SM、tensor pipe、occupancy 和 stall；
+6. 高影响切换回到真实 `ninfer_bench` 做 A/B。
+
+当前证据已经支持架构选择，但不声称所有 route 都完成 roofline 收敛：
+
+- Q4 新模板相对旧实现：两个 GEMV 和 C128 持平，C64 约快 1.2%，C4/C8 约快
+  12.9%/34.1%，代表性饱和 C128 达到 90.66% SM SOL；
+- LinearAdd 的 CTA-collective writeback 相对旧 fused 路径快 1.30%–5.74%，并消除
+  大量全局 load/store 指令；
+- LinearSwiGLU 的 non-monotonic route 来自完整区间测量，而不是经验阈值；
+- W8 Pair 的真实 crossover 为 T56/57，避免了 T17 时约 94.7% 的错误切换回归；
+- 同会话端到端消融显示新 Add/SwiGLU route 使 prefill 提升 0.63%–1.38%，TG32
+  在 0.16 ms 内不变；
+- Release NSYS 显示 Linear/GEMM 占 P128 kernel 时间 93.0%，占 MTP kernel 时间
+  77.7%，说明继续逐 route 优化是正确方向；
+- GdnGatingProj 所有权迁移前后代表点在测量噪声内：
+  T1 9.528→9.393 us，T1024 16.471→16.401 us，T4097 50.068→49.939 us。
+
+完整实验过程和原始命令保存在
+[`../archive/optimization-era/plans/2026-07-16-linear-kernel-architecture-experiment-log.md`](../archive/optimization-era/plans/2026-07-16-linear-kernel-architecture-experiment-log.md)。
+
+## 12. 与被否决设计的差异
+
+| 被否决设计 | 当前架构 |
 |---|---|
-| target/profile parameter on Linear-family Ops | leaks dispatch ownership and burdens every caller |
-| profile hidden in Engine, Program, WorkspaceArena, global state, or thread-local state | preserves the same dependency while making it implicit |
-| policy or target identity stored in `Weight` | stale across T, views, semantic Ops, and hardware; contaminates storage contracts |
-| target-owned route tables | makes target code choose Op implementation |
-| target-keyed duplicate routes | identical physical problems should share one hardware route |
-| ShapeFamily or caller-role dispatch | names models rather than kernel-relevant facts |
-| global Small-T/Large-T threshold | measured crossovers are geometry-local |
-| unknown quantized fallback | silently expands support without qualification |
-| arbitrary dense reference fallback | contradicts best-qualified production dispatch |
-| launcher-side auto selection | creates a second routing authority |
-| runtime registry or function-pointer table | unnecessary dynamism and initialization complexity |
-| runtime autotuning | nondeterministic startup/capture behavior and weak reproducibility |
-| universal configurable mainloop | hides materially different lifecycles in a scheduling DSL |
-| arbitrary runtime epilogue | cannot preserve all semantic rounding and topology contracts |
-| route chosen from available workspace | makes correctness/performance depend on arena pressure |
-| grid-legal but unqualified terminal tail | launch legality is not best-kernel evidence |
-
-### 8.3 Code-size discipline
-
-Finite exact policies may increase compiled code, but uncontrolled template cross-products are not
-accepted.
-
-Every new policy must justify:
-
-- which admitted problem/range selects it;
-- why an existing policy is insufficient;
-- generated entry count and binary impact;
-- registers, shared memory, stack/local memory, and representative SASS;
-- matched timing and numerical evidence.
-
-Unused tuned translation units and unreachable caller-role kernels are deleted when the real target
-inventory proves they have no execution path.
-
-## 9. Roofline and performance qualification
-
-### 9.1 What architecture can and cannot guarantee
-
-The architecture can guarantee:
-
-- one observable final policy per admitted problem and token count;
-- no hidden post-plan dispatch;
-- stable fixed kernels for measurement;
-- isolated policy changes;
-- explicit workspace and fusion semantics;
-- exact rejection outside the qualified domain.
-
-It cannot guarantee roofline merely by introducing abstractions or route tables. Roofline is a
-measured property of a fixed policy at a geometry, token range, wave count, and tail class.
-
-### 9.2 Performance models by regime
-
-Qualification uses the appropriate model:
-
-- **T1 and row-streaming Small-T:** useful and physical weight traffic, launch floor, occupancy,
-  issue efficiency, and redundant rereads;
-- **Q5 direct:** split ownership, extra-plane decode, reduction cost, and output traffic;
-- **split-low4 MMA:** dequantization throughput, tensor-pipe utilization, wave occupancy, and
-  BN64/BN128 tails;
-- **W8 MMA:** code/scale staging, fragment consumption, two-CTA residency, and partial waves;
-- **fused policies:** avoided launches and memory traffic versus registers, shared memory,
-  collective stores, and topology overhead;
-- **grouped policies:** CTA problem-map utilization and output tails;
-- **end-to-end:** route frequency, CUDA Graph composition, launch gaps, and interaction with other
-  Ops.
-
-A useful-byte ratio above 100% is evidence that the accounting model is incomplete, not proof that
-hardware limits were exceeded.
-
-### 9.3 Qualification ladder
-
-Each policy or route change follows:
-
-1. **semantic oracle:** exact formats/transformations or independent FP64/BF16 numerical criteria;
-2. **winner selection:** matched candidate measurements at real shapes and relevant token points;
-3. **generated code:** resource and SASS comparison for abstraction-sensitive changes;
-4. **physical diagnosis:** NCU only after the kernel and question are identified;
-5. **product attribution:** NSYS and real-artifact benchmarks for important route families;
-6. **admission update:** only after the evidence selects a production route.
-
-Same-session matched comparison is required for performance claims. Profiler replay duration is
-diagnostic and does not replace the normal benchmark timing.
-
-### 9.4 Stage A and Stage B
-
-The architecture cut-over is Stage A:
-
-- correct ownership;
-- exact internal admission;
-- one final plan;
-- fixed launch closure;
-- preserved qualified winners;
-- no caller API change.
-
-Stage B iteratively pushes high-impact policies toward their attainable roofline:
-
-- product-dominant T1 and Small-T;
-- W8 reread and partial-wave behavior;
-- tail-heavy Vision routes;
-- dense and grouped-expert lifecycles when those products are admitted.
-
-Stage B does not require another architecture rewrite.
-
-## 10. Source and build ownership
-
-The intended source shape is:
-
-```text
-include/ninfer/ops/
-  linear.h
-  linear_add.h
-  linear_swiglu.h
-  linear_pair.h
-  grouped projection semantic headers
-
-src/ops/linear/
-  q4/
-    storage/decode atoms
-    GEMV/SIMT/MMA kernel families
-    schedule capability, exact routes, fixed launch closure
-  q5/
-    storage/decode atoms
-    GEMV/SIMT/MMA and residual kernel families
-    schedule capability, exact routes, fixed launch closure
-  q6/
-    storage/decode atoms
-    SIMT/MMA kernel families
-    schedule capability, exact routes, fixed launch closure
-  w8/                       # migration target; currently compatibility code
-  bf16/                     # migration target; currently dense reference code
-  common/                   # mechanics only; no cross-format route or kernel body
-  gemv/ and gemm/           # transitional W8/dense/fused files, removed as migrations finish
-  reference/                 # internal oracle/measurement code, not product fallback
-  linear.cpp
-
-src/ops/wrapper/
-  semantic fused/grouped Op implementations
-
-src/targets/qwen3_6_27b_rtx5090/
-  bound storage views
-  schedules and reachability
-  workspace reservation through semantic capacity APIs
-  real-artifact integration
-```
-
-Exact route data and policy selection live in `src/ops`, because they are execution behavior of the
-Op. Target code contains no parallel manifest of policy choices.
-
-The target may retain or derive an inventory test proving that every live bound view and reachable
-token domain is accepted by the Op. That test is coverage evidence, not a second routing
-authority.
-
-Measurement tools may expose:
-
-- exact production resolver mode;
-- forced candidate mode;
-- future physical problems not admitted by product resolution;
-- policy identity and route boundaries.
-
-Forced candidates call internal fixed launchers and are unavailable through semantic product APIs.
-
-## 11. Current evidence and revised conclusions
-
-The archived experiment remains valuable. Its measurements support:
-
-- a 24-problem current 27B base Linear inventory;
-- geometry-local route boundaries rather than one global regime threshold;
-- 83 candidate-selected base route intervals in the prototype manifest;
-- independent Q4, Q5, and Q6 format-local plans and kernel lifecycles;
-- distinct TT4, TT8, Q5 direct, W8 MMA, and exact T1 policies;
-- two LinearAdd problems with nontrivial fused/materialized/collective routes;
-- one non-monotonic LinearSwiGLU route surface;
-- one independently routed W8 LinearPair problem;
-- mechanics-only cross-format reuse plus same-format decode reuse by fused Ops;
-- removal of unreachable 7168 and dead dual-Q5 tuned execution paths;
-- Linear dominance in whole-inference attribution;
-- representative per-policy resource and NCU evidence.
-
-Those are execution facts, not proof of the rejected target-profile boundary.
-
-The following earlier conclusions are superseded:
-
-- route data must be target-owned;
-- Linear-family APIs should receive an execution profile;
-- target/profile and kernel catalog require a public-facing joint contract;
-- all routes should extend to a CUDA grid ceiling regardless of qualification;
-- materialized fused execution may call public auto-dispatch Linear during execution.
-
-The revised interpretation is:
-
-- the measured 24/83 manifest is the starting RTX 5090 Op support catalog;
-- exact route ownership belongs to Linear, not the 27B target;
-- fused Ops receive their own Op-owned catalogs;
-- the qualified envelope must be reviewed against real product reachability before admission;
-- future 35B rows extend the same physical capability catalog after measurement.
-
-The archived prototype branch and raw profiler outputs are preserved only for comparison. Its
-profile-injection implementation must not be cherry-picked into the product.
-
-## 12. Atomic implementation plan
-
-### 12.1 Repository states and provenance
-
-The implementation uses three explicit states:
-
-```text
-clean product baseline
-  original Linear-family APIs and current product behavior
-
-archived experiment
-  measured prototype, raw reports, and failed target-profile architecture
-
-clean Op-owned implementation
-  fresh internal planner/catalog cut-over with unchanged callers
-```
-
-The failed uncommitted profile-injection implementation has been discarded. The archive remains
-available as behavioral, numerical, kernel, and performance evidence.
-
-### 12.2 Meaning of an atomic cut-over
-
-The product-facing API remains unchanged throughout. Atomicity concerns internal routing authority:
-the integrated tree contains either the complete old internal dispatch or the complete new
-Op-owned exact dispatch.
-
-The final tree must not contain:
-
-- `LinearExecutionProfile` or equivalent target dispatch objects;
-- profile-aware overloads;
-- target route tables;
-- old `ShapeFamily`/`LinearRegime` authority beside exact routes;
-- generic quantized fallback;
-- planner plus launcher-side auto selection;
-- fused executors that redispatch through public Linear;
-- old and new workspace semantics simultaneously.
-
-Because callers do not change, no Text/Vision/MTP profile migration is required.
-
-### 12.3 Implementation work packages
-
-The clean implementation proceeds in these bounded packages:
-
-1. define internal physical-problem, token-range, execution-plan, workspace-plan, and complete
-   policy contracts;
-2. define the RTX 5090 capability catalog and compile-time closure checks;
-3. selectively re-establish qualified fixed kernels and narrow codec/finalizer/topology seams from
-   the archive evidence;
-4. reconstruct the exact Base Linear support/routes inside the Op;
-5. implement independent Add, SwiGLU, Pair, and grouped semantic planners;
-6. make every executor consume one final plan and call only fixed launchers;
-7. remove ShapeFamily/regime/fallback/second-dispatch and unreachable tuned kernels;
-8. align capacity queries with the same non-monotonic route facts;
-9. update structural, numerical, benchmark, and real-artifact verification;
-10. complete matched performance and binary/profiler closure before the product cut-over commit.
-
-The prototype's 24 base problems, 83 base routes, two Add problems/eight routes, one SwiGLU
-problem/seven routes, and one Pair problem/three routes are evidence inputs. They are not copied
-blindly: supported token envelopes and every route claimed as best must be revalidated under the
-revised admission rule.
-
-### 12.4 Structural acceptance
-
-Compile-time and host tests must prove:
-
-- exact physical problems are unique;
-- route intervals are ordered, contiguous, non-overlapping, and within qualified envelopes;
-- every policy is legal for its exact problem/range;
-- every policy has one fixed launcher and workspace definition;
-- no production route names Auto/Default/Fallback;
-- fused materialized routes contain fixed valid subplans;
-- all live 27B effective views are covered;
-- dead/unreachable parent storage views are not accidentally admitted;
-- measurement-only 35B problems remain absent until separately qualified.
-
-Source scans must find:
-
-- no target/profile parameter in Linear-family APIs;
-- no target-owned policy or route facts;
-- no target/layer/phase-driven Linear routing;
-- no arbitrary quantized or dense production fallback;
-- no launcher-side second dispatch.
-
-### 12.5 Numerical and product acceptance
-
-Verification must include:
-
-- independent dequantization and FP64/BF16 operator oracles at real shapes;
-- every route boundary and representative tail/wave point;
-- exact fused rounding for Add, SwiGLU, Pair, and grouped projections;
-- alignment and physical-view validation;
-- non-monotonic range-capacity workspace checks;
-- rejection outside exact problem and token envelopes;
-- real 27B Text, Vision, MTP, prefix reuse, and CUDA Graph routes.
-
-Final-token plausibility is not operator verification.
-
-### 12.6 Performance acceptance
-
-The cut-over must preserve or improve:
-
-- final policy selection relative to revalidated experiment winners;
-- representative kernel resources and SASS where an abstraction claims zero cost;
-- planner cost at the real call mix;
-- matched per-Op latency;
-- real-artifact prefill, decode, Vision, and MTP behavior within same-session noise.
-
-NSYS is used for whole-inference attribution. NCU is used only for identified fixed kernels and
-specific resource/roofline questions.
-
-No claim is made that all supported routes already reach roofline. The cut-over must make each
-route independently measurable and preserve the known winners; Stage B performs further policy
-optimization.
-
-### 12.7 Commit boundaries
-
-Reasonable durable commits are:
-
-1. this corrected architecture and provenance record;
-2. the already preserved experiment archive;
-3. one complete verified product cut-over.
-
-Private implementation checkpoints may exist on an isolated branch, but no partially migrated
-internal architecture is presented as the product state.
-
-## 13. Final recommendation
-
-The recommended architecture is:
-
-```text
-unchanged semantic Op API
-  + Op-owned exact physical support
-  + Op-owned hardware-specific routes
-  + complete typed policies
-  + one final plan
-  + fixed launch closure
-  + independent fused semantic planners
-  + qualification-bounded admission
-```
-
-The defining ownership statement is:
-
-> The target owns which Linear calls exist. The Linear-family Op owns the entire decision about
-> whether a physical call is supported and which qualified kernel executes it.
-
-This keeps the caller simple, preserves exact specialization, supports measured reuse for future
-shapes, prevents target semantics from leaking into Ops, and provides a stable foundation for
-per-policy roofline work.
+| target 构造 `LinearExecutionProfile` 并传给 Op | Op 从实际输入和 weight format 自主解析 |
+| 调用者知道目标 kernel/policy | 调用者只知道语义接口 |
+| 一个全局 T1/Small/Large regime | 每个 exact problem 有自己的有限 route 区间 |
+| Q4/Q5/Q6/W8 受同一 gemv/gemm 目录牵制 | 每个 format 独立 backend |
+| fused op 作为 base Linear 的附属布尔开关 | 每个 fused/grouped/paired Op 自有 plan/backend |
+| 只允许 fused 或只允许 materialized | 两者都是可测量、可选择的一等 route |
+| workspace 由 wrapper 估算 | workspace 来自同一个 route plan |
+| 相似 shape 自动 fallback | 新 shape 先验证、测量，再显式注册 |
+| 物理可启动等于支持/达标 | legal、registered、performance-qualified 分开 |
+| 保留旧 compatibility 路径 | 原子切换后直接删除旧组织 |
+
+## 13. 如何满足最初需求
+
+- **更合理的 Linear 边界**：接口与 target 无关，Op 全权负责内部最佳调度；
+- **保持 27B**：所有当前 Text/Vision/MTP exact problem 均显式注册，并通过真实 artifact
+  路径验证；
+- **方便以后引入 35B shape**：复用格式模板和候选合法性，只增 exact support/route；
+- **控制抽象与实际的边界**：共享机械 CUDA 组件，不共享未经证明的完整生命周期；
+- **控制复杂度**：format 与语义 Op 分治，没有全局万能 planner；
+- **支持 fused epilogue**：通过固定 finalization/topology/problem-map 扩展，同时保留
+  materialized winner；
+- **面向 roofline**：每个 fixed route 可独立观测、分析和替换，不再被隐藏二次 dispatch
+  干扰；
+- **原子切换**：public 语义不变，旧 backend 和兼容目录已删除，没有双轨状态。
+
+## 14. 实现边界提交
+
+本轮迁移按语义边界拆分为：
+
+- `1bcbc24 refactor(linear-add): isolate q5 fused schedules`
+- `4c61b06 refactor(linear-swiglu): isolate q4 paired schedules`
+- `c1223ed refactor(input-proj): isolate q4-q5 grouped schedules`
+- `9fce052 refactor(linear-pair): complete w8 op ownership`
+- `0e6ee59 refactor(gdn-gating-proj): isolate bf16 schedules`
+- `9b846a0 refactor(linear): neutralize shared mma mechanics`
+
+最终验收要求：
+
+- 默认 Release 全构建和完整 CTest；
+- Q4/Q5/Q6/W8 plan、dispatch、candidate 和数值测试；
+- 所有 fused/grouped/paired plan 的 route/workspace 边界测试；
+- full Linear numerical regression；
+- 真实 27B Text/Vision/MTP/prefix 路径；
+- 当前端到端 benchmark，并在发生回归时先用 NSYS 定位、再对确定 kernel 使用 NCU；
+- `git diff --check`，且 tracked tree 中不存在旧 compatibility 目录。

@@ -6,7 +6,7 @@ Target: Qwen3.6-35B-A3B Linear rows L8-L13 on NVIDIA GeForce RTX 5090 (`sm_120a`
 CUDA 13.1, driver 591.86, NCU 2025.4.1).
 
 This is retained standalone Op evidence. It does not register the 35B Engine target. Qualification
-is being completed in Vision execution order; this revision establishes L8-L11.
+is being completed in Vision execution order; this revision establishes L8-L12.
 
 ## L8: Q6 Vision patch projection `[1152,1536]`
 
@@ -408,3 +408,102 @@ profiles/ncu/qwen3_6_35b_a3b/linear/l11/final/
 L11 is supported for its complete Qwen3.6-35B-A3B target domain. Its existing route selects the
 matched candidate winner, the maximum cases lie within 3.7% of the same-executed-work Full ceiling,
 and the saturated predicated kernel is tensor-pipe limited without spilling.
+
+## L12: Q5 Vision MLP fc2 `[1152,4304]`, Kpad=4352
+
+The exact operation is Q5G64_F16S RowSplit `[1152,4304]` times BF16 `[4304,P]`, producing BF16
+`[1152,P]`. Registered storage pads K to 4352, so every MMA route uses the predicated K-tail
+variant. The complete target domain is every admitted four-column patch count through maximum
+video/image `P=49152/65536`.
+
+### Route correction
+
+The previous exact route selected C8 for `P=8..84` and MMA128 from `P=88`. Existing legal
+candidates were substantially faster:
+
+- `P=8`: C8 measured 38.112 us versus 21.760 us for C4;
+- `P=88`: MMA128 measured 111.904 us versus 83.232 us for C4;
+- MMA64 remained faster than or tied with MMA128 through approximately `P=1152`.
+
+Q5 split2/split4 and GEMV are not legal for this problem. Candidate sweeps and repeated crossover
+confirmation produced a simple final route:
+
+```text
+P=4..120      SIMT R8C4
+P=124..1148   MMA R64C64
+P>=1152       MMA R64C128
+```
+
+At `P=116`, C4 measured 101.664 us versus 107.776 us for MMA64. At `P=120`, the routes were a
+practical tie at 107.680/107.776 us, so the simpler C4 route was retained. At `P=124`, MMA64 was
+already the clear winner. Across six independent `P=1152` processes, MMA128 measured a median
+114.288 us versus 115.600 us for MMA64; from `P=1156` its advantage widened.
+
+### Correctness and dispatch
+
+```bash
+cmake --build build -j --target \
+  ninfer_linear_op_bench ninfer_linear_test \
+  ninfer_q5_linear_candidate_test ninfer_q5_linear_plan_test
+ctest --test-dir build \
+  -R '^ninfer_(linear_test|q5_linear_candidate_test|q5_linear_plan_test)$' \
+  --output-on-failure
+```
+
+All three tests passed. The complete Q5 plan scan covers the revised boundaries, while the
+numerical suite retains K=4304/Kpad=4352 public coverage and independent fixed-candidate oracles.
+
+### Release timing and matched K-tail control
+
+Representative final production points were:
+
+| P | Route | Cold median | Executed TFLOP/s |
+|---:|---|---:|---:|
+| 4 | SIMT R8C4 | 19.712 us | 2.01 useful |
+| 116 | SIMT R8C4 | 103.680 us | 11.09 useful |
+| 120 | SIMT R8C4 | 107.808 us | 11.04 useful |
+| 124 | MMA R64C64 predicated | 109.824 us | 11.56 |
+| 1024 | MMA R64C64 predicated | 113.856 us | 89.19 |
+| 1148 | MMA R64C64 predicated | 115.488 us | 98.92 |
+| 1152 | MMA R64C128 predicated | 114.816 us | 99.50 |
+| 4096 | MMA R64C128 predicated | 251.168 us | 161.72 |
+
+Maximum-item qualification uses measurement-only `[1152,4352]` Full-K as a matched control.
+Production and control have the same padded K, row/column tile count, and executed MMA work; the
+timing difference isolates the logical K=4304 tail.
+
+| P | Production K-tail | Full-K control | Production TFLOP/s | Tail overhead |
+|---:|---:|---:|---:|---:|
+| 49152 | 2964.770 us | 2791.870 us | 164.40 | 6.19% |
+| 65536 | 3965.380 us | 3668.960 us | 163.89 | 8.08% |
+
+These are three-process medians with eight warmups and forty cold samples. The production route
+remains within 8.1% of the same-topology Full-K ceiling across both complete maximum item sizes.
+
+### NCU attribution
+
+| Topology | Representative | NCU duration | SM SOL | Memory SOL | Occupancy | Registers | Static shared | Waves/SM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SIMT R8C4 | P=120 | 126.08 us | 62.23% | 44.72% | 63.48% | 58 | 10.75 KiB | 6.35 |
+| MMA R64C64 | P=1148 | 150.62 us | 45.62% | 51.79% | 15.80% | 103 | 29.95 KiB | 0.64 |
+| MMA R64C128 production | P=49152 | 3.63 ms | 81.93% | 60.99% | 16.62% | 154 | 46.59 KiB | 20.33 |
+| MMA R64C128 production | P=65536 | 5.74 ms | 80.60% | 60.25% | 16.63% | 154 | 46.59 KiB | 27.11 |
+| MMA R64C128 Full-K control | P=65536 | 5.81 ms | 89.33% | 56.42% | 16.62% | 154 | 46.59 KiB | 27.11 |
+
+Detailed production and control captures both identify the tensor pipeline as the limiter. The
+K-tail increases shared-memory wavefront overhead, but its complete timing cost is bounded by the
+matched 8.08% result above. Every captured topology reports zero local-memory and shared-memory
+spilling requests.
+
+Reports are retained locally under:
+
+```text
+profiles/bench/qwen3_6_35b_linear_qualification/l12/
+profiles/ncu/qwen3_6_35b_a3b/linear/l12/final/
+```
+
+## L12 retained result
+
+L12 is supported for its complete Qwen3.6-35B-A3B target domain. The corrected route removes large
+small-P regressions, the maximum K-tail cases remain within 8.1% of the same-topology Full-K
+ceiling, and all final topologies are spill-free.

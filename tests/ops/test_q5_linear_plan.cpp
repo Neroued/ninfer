@@ -69,8 +69,8 @@ S expected_schedule(const Q5Problem& problem) {
         return S::MmaR64C128;
     }
     if (problem.rows == 1152 && problem.k == 4304 && problem.padded_k == 4352) {
-        if (problem.cols == 4) { return S::SimtR8C4; }
-        if (problem.cols <= 84) { return S::SimtR8C8; }
+        if (problem.cols <= 120) { return S::SimtR8C4; }
+        if (problem.cols <= 1148) { return S::MmaR64C64; }
         return S::MmaR64C128;
     }
     throw std::logic_error("Q5 test oracle received an unregistered problem");
@@ -134,7 +134,7 @@ void admission_scans() {
 }
 
 void route_boundaries() {
-    constexpr std::array<Q5Problem, 43> cases{{
+    constexpr std::array<Q5Problem, 45> cases{{
         {1024, 5120, 5120, 1},         {1024, 5120, 5120, 4},    {1024, 5120, 5120, 5},
         {1024, 5120, 5120, 16},        {6144, 5120, 5120, 1},    {6144, 5120, 5120, 2},
         {6144, 5120, 5120, 6},         {6144, 5120, 5120, 7},    {6144, 5120, 5120, 24},
@@ -148,8 +148,8 @@ void route_boundaries() {
         {1152, 1152, 1152, 896},       {1152, 1152, 1152, 900},  {1152, 1152, 1152, 960},
         {1152, 1152, 1152, 964},       {1152, 1152, 1152, 1024}, {1152, 1152, 1152, 1028},
         {1152, 1152, 1152, 1088},      {1152, 1152, 1152, 1092}, {1152, 1152, 1152, 131072},
-        {1152, 4304, 4352, 4},         {1152, 4304, 4352, 84},   {1152, 4304, 4352, 88},
-        {1152, 4304, 4352, 131072},
+        {1152, 4304, 4352, 4},         {1152, 4304, 4352, 120},  {1152, 4304, 4352, 124},
+        {1152, 4304, 4352, 1148},      {1152, 4304, 4352, 1152}, {1152, 4304, 4352, 131072},
     }};
     for (const Q5Problem& problem : cases) { expect_plan("route boundary", problem); }
 }

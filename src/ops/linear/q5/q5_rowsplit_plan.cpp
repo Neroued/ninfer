@@ -77,9 +77,9 @@ constexpr std::array<Q5RouteSpec, 25> kRouteSpecs{{
     {{1092, 131072, 4}, Q5ScheduleId::MmaR64C128},
 
     // Vision [1152, 4304], Kpad=4352
-    {{4, 4, 4}, Q5ScheduleId::SimtR8C4},
-    {{8, 84, 4}, Q5ScheduleId::SimtR8C8},
-    {{88, 131072, 4}, Q5ScheduleId::MmaR64C128},
+    {{4, 120, 4}, Q5ScheduleId::SimtR8C4},
+    {{124, 1148, 4}, Q5ScheduleId::MmaR64C64},
+    {{1152, 131072, 4}, Q5ScheduleId::MmaR64C128},
 }};
 
 constexpr bool known_schedule(Q5ScheduleId schedule) noexcept {

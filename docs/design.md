@@ -5,6 +5,9 @@ mathematics are defined by the model architecture documents. Persistent numeric 
 container framing, and the Qwen3.6-27B object inventory are defined by their dedicated artifact
 documents.
 
+The Qwen3.6 family boundary recorded here is the accepted organization for registering the planned
+35B-A3B target. It does not claim that the second C++ target has already landed.
+
 ## 1. Product scope
 
 NInfer is a high-performance local inference engine for a small set of compiled exact
@@ -36,7 +39,7 @@ source BF16 checkpoint
   -> generic reader / binder / materializer
   -> selected compiled target package
        immutable LoadedModel
-       immutable Frontend
+       shared immutable Qwen3.6 Frontend
        reusable request memory
        one mutable non-movable Program
   -> common generated-token controller
@@ -58,7 +61,8 @@ execution behavior.
 | Neutral text/media decode | `src/text`, `src/media/decode` | Unicode primitives and image/video decoding over owning bytes |
 | Product media acquisition | `src/product/media_acquire` | local-path, HTTP(S), and data-URI acquisition into owning media values |
 | Product prompt input | `src/product/prompt_input` | shared JSON/message parsing into owning public prompt values for product tools |
-| Exact target | `src/targets/qwen3_6_27b_rtx5090` | registered storage signature, load bindings, frontend, sequence/request plans, Program state, fixed Text/Vision/MTP schedules, graph/lifecycle policy, target diagnostics |
+| Qwen3.6 family leaves | `src/targets/qwen3_6` | one tokenizer/template/media/MRoPE frontend, owning prepared prompt and output session, and passive common Vision geometry/binding definitions; no executable model graph or target identity |
+| Exact target | `src/targets/qwen3_6_27b_rtx5090` and, when registered, `src/targets/qwen3_6_35b_a3b_rtx5090` | registered storage signature, exact load bindings, sequence/request plans, Program state, fixed Text/Vision/MTP schedules, Op/fusion choices, graph/lifecycle policy, target diagnostics |
 | Registry | `src/targets/registry.*` | closed target selection and complete target construction |
 | Product runtime | `src/runtime` | generated-token budget, round resolution, cancellation, publication, public Engine PIMPL, target lifetime |
 | Serving | `src/serve` | OpenAI/Anthropic schemas, translation, streaming, usage, request logs, and HTTP transport |
@@ -71,14 +75,33 @@ The central placement rule is simple:
 - every host-callable, semantically closed tensor or explicit local-state transformation is an Op,
   and its complete implementation belongs in the central Op layer even when only one target,
   numerical shape, or GPU currently uses it;
+- tokenizer/template/output semantics, multimodal prompt construction, owning prepared values, and
+  passive Vision definitions that are identical for the two Qwen3.6 checkpoints belong in the
+  Qwen3.6 family leaves;
 - exact checkpoint binding, fixed layer order, operand/view selection, Vision composition, MTP
-  orchestration, prefix repair, state lifetime, and graph policy belong to the exact target;
+  orchestration, Op selection and fusion, prefix repair, state lifetime, workspace, and graph
+  policy belong to the exact target;
 - stop/output-budget/cancellation/publication policy belongs to common runtime;
 - schemas, URLs/files, protocol translation, and transport belong to product/serve code.
 
 The complete Op boundary and implementation rules are defined by
-[`op-development.md`](op-development.md). Small duplication of schedule and state policy between
-exact targets is preferable to a false family abstraction.
+[`op-development.md`](op-development.md). The family layer shares stable semantics and passive
+types only. Duplication of target schedules and state policy is intentional.
+
+### 3.1 Qwen3.6 family boundary
+
+The 27B and 35B-A3B packages use the same `qwen3_6::Frontend`, `PreparedPrompt`, and
+`OutputSession`. Both artifacts embed the same six frontend resources. The family frontend owns
+tokenizer/chat-template interpretation, image/video preprocessing, placeholder expansion, MRoPE
+construction, output decoding, and default-stop interpretation. The common Vision portion owns
+shared preprocessing, backbone geometry, and immutable binding vocabulary; the exact target still
+binds its target-width merger and decides how Vision is scheduled and fused with the rest of the
+request.
+
+This is compile-time code reuse, not family-level target selection. `src/targets/qwen3_6` has no
+`Program`, layer loop, execution graph, CUDA Graph, mutable sequence state, target registry entry,
+or fallback path. Both exact packages call their own Text/Vision/MTP schedules and may call different
+Ops or differently fused Ops even where the high-level mathematics are related.
 
 ## 4. Public C++ API
 
@@ -105,10 +128,10 @@ LoadSummary load_summary() const;
 MemorySummary memory_summary() const;
 ```
 
-`PreparedPrompt` is opaque, move-only, and tagged by its closed target-variant alternative. A
-prepared value may be consumed by another Engine instance of the same exact target; a different
-target alternative is rejected before planning. Preparation may run outside the GPU execution
-critical section. `generate` serializes access to the single Program.
+`PreparedPrompt` is opaque and move-only. For the supported and planned Qwen3.6 routes it contains
+one owning `qwen3_6::PreparedPrompt`; it has no exact-target alternative, target tag, provenance
+field, or mismatch check. Preparation may run outside the GPU execution critical section.
+`generate` serializes access to the single Program.
 
 ## 5. Load and target construction
 
@@ -117,11 +140,12 @@ Engine construction performs the complete load before publishing a usable object
 1. create the selected `DeviceContext` and observe the actual GPU;
 2. parse the `.ninfer` prefix and embedded object directory;
 3. select the compiled package by `model_id` and let it preflight the actual GPU and options;
-4. let the selected target consume every required tensor and frontend resource through
-   `artifact::Binder`, validating its complete registered storage signature;
+4. let the selected target consume every required tensor and let the Qwen3.6 family binder consume
+   the shared frontend/common-Vision resources through `artifact::Binder`, validating the complete
+   registered storage signature;
 5. materialize tensors directly into their final backing and retain required host resources;
 6. construct heap-stable immutable `LoadedModel` bindings;
-7. construct the target Frontend from retained resources;
+7. construct the shared Qwen3.6 Frontend from retained resources;
 8. plan sequence capacity and request work from the configured context/KV/graph/MTP options;
 9. construct reusable request memory and the non-movable Program at stable addresses;
 10. finish target initialization and release reader directory/name/staging state.
@@ -138,7 +162,7 @@ The long-lived product objects have one ownership order:
 
 ```text
 DeviceContext
-  -> LoadedModel and Frontend
+  -> LoadedModel and Qwen3.6 Frontend
   -> RequestMemory
   -> Program
 ```
@@ -159,22 +183,22 @@ Memory is divided by lifetime:
 `MemorySummary` exposes weights, sequence, workspace, KV payload, configured capacity, and storage
 mode without exposing internal allocators.
 
-## 7. Target Frontend
+## 7. Qwen3.6 family Frontend
 
-The Qwen target Frontend owns checkpoint-specific input and output semantics:
+The Qwen3.6 family Frontend owns the input and output semantics shared by both exact checkpoints:
 
 - tokenizer and chat-template resources embedded in the artifact;
 - message/tool rendering and thinking controls;
 - image/video placeholder expansion, patch construction, token types, and three-axis positions;
-- opaque owning target `PreparedPrompt` values;
+- opaque owning family `PreparedPrompt` values;
 - output token decoding, UTF-8 buffering, reasoning/content channel state, and model default stops.
 
-Apps and serving acquire media into owning bytes. The target receives those bytes and performs
-checkpoint-specific preprocessing. It has no HTTP or filesystem policy.
+Apps and serving acquire media into owning bytes. The family Frontend receives those bytes and
+performs Qwen3.6 preprocessing. It has no HTTP or filesystem policy.
 
-`Engine::prepare` returns a public opaque envelope containing the target prepared value, summary,
-and preparation time. The closed prepared-value variant alone identifies its exact target type.
-`Engine::prepare_tokens` supplies the equivalent raw-token route
+`Engine::prepare` returns a public opaque envelope containing the family prepared value, summary,
+and preparation time. The value contains no exact-target identity. `Engine::prepare_tokens`
+supplies the equivalent raw-token route
 for parity and repeatable benchmarks. `count_tokens` uses the same Frontend rendering and
 preprocessing rules without executing the model.
 
@@ -292,18 +316,23 @@ ninfer_media_decode
 ninfer_media_acquire
 ninfer_product_prompt_input
   -> ninfer_media_acquire
+ninfer_qwen3_6_family
+  -> ninfer_artifact + ninfer_text + ninfer_media_decode
 ninfer_qwen3_6_27b_rtx5090
-  -> ninfer_artifact + ninfer_ops + ninfer_text + ninfer_media_decode
+  -> ninfer_qwen3_6_family + ninfer_artifact + ninfer_ops
+ninfer_qwen3_6_35b_a3b_rtx5090                  # when registered
+  -> ninfer_qwen3_6_family + ninfer_artifact + ninfer_ops
 ninfer_engine
-  -> target package + common runtime
+  -> explicit target packages + common runtime
 ninfer_serve
   -> ninfer_engine + ninfer_media_acquire + protocol/transport
 apps / benchmark / diagnostic
 ```
 
-The registry is the composition boundary that sees the target package. Lower components do not
-discover target directories or import target semantics. Adding a target requires an explicit CMake
-entry and explicit closed-registry entry.
+The registry is the composition boundary that sees exact target packages. The family library is an
+ordinary inward dependency and cannot register or select a target. Lower components do not discover
+target directories or import target semantics. Adding a target requires an explicit CMake entry and
+explicit closed-registry entry.
 
 ## 14. Verification boundary
 
@@ -311,7 +340,7 @@ Permanent checks are organized by observable risk:
 
 - `.ninfer` framing, numeric formats, layouts, resources, binding, and real target inventory;
 - Op numerical/state-transition behavior at real supported shapes;
-- target Frontend behavior, Program state/prefix transactions, Text/Vision/MTP parity, and a real
+- family Frontend behavior, target Program state/prefix transactions, Text/Vision/MTP parity, and a real
   artifact smoke path;
 - OpenAI/Anthropic schema and tool-call behavior;
 - benchmark CLI/report contracts and real performance evidence.
@@ -325,7 +354,7 @@ tests do not define throughput requirements or duplicate the generation loop.
 - one active request and no continuous batching;
 - one GPU;
 - no runtime model graph, dynamic target discovery, or plugin ABI;
-- no family-level checkpoint compatibility;
+- no family-level execution selection or checkpoint fallback;
 - no general offload or distributed execution.
 
 These limits are product boundaries, not placeholders in the public API.

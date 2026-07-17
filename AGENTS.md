@@ -102,6 +102,13 @@ single-owner project. Registered models, generated artifacts, and the local work
 Requirements derived from a different workload, trust model, or deployment model are out of scope
 until that product contract is explicitly changed.
 
+The accepted boundary for adding `qwen3_6_35b_a3b_rtx5090` is deliberate family reuse without a
+family execution model. The 27B and 35B-A3B exact targets share one identity-free Qwen3.6 frontend,
+owning prepared-prompt/output-session types, and common passive Vision definitions. They do not
+share Program state, Text/Vision/MTP schedules, Op selection or fusion, workspace policy, or CUDA
+Graphs. Both artifacts embed the same six frontend resources. A Qwen3.6 prepared prompt carries no
+exact-target tag or cross-target mismatch machinery.
+
 ## Engineering priorities
 
 Prioritize functional correctness, requested inference performance, clear ownership, direct code,
@@ -153,10 +160,16 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/ops` owns every semantically closed Op implementation, including fused, fixed-shape, and
   device-specialized paths. Op ownership follows the mathematical or state-transition contract,
   not its first model caller or demonstrated cross-target reuse.
-- `src/targets/<target_key>` owns the exact checkpoint/GPU storage profile, LoadedModel, Frontend,
-  Program, recurrent state, Text/Vision/MTP schedules, target graph/state policy, and diagnostics.
-  Target schedules compose repository-internal Ops but do not own mathematical CUDA
-  implementations. A target is one closed package, not a model family or generic graph.
+- `src/targets/qwen3_6` owns only the Qwen3.6-family invariants shared by the 27B and 35B-A3B
+  targets: tokenizer/template and output semantics, media preprocessing and MRoPE prompt
+  construction, the owning prepared-prompt/output-session types, and passive common Vision
+  geometry/binding definitions. It has no target identity, registry entry, Program, execution
+  schedule, Op call/fusion policy, workspace, CUDA Graph, or mutable model state.
+- `src/targets/<target_key>` owns the exact checkpoint/GPU storage profile, LoadedModel, Program,
+  recurrent state, target-width bindings, Text/Vision/MTP schedules, target graph/state policy, and
+  diagnostics. A Qwen3.6 target composes the family leaves above. Target schedules compose
+  repository-internal Ops but do not own mathematical CUDA implementations. Each exact target is
+  one closed execution package, not a family model or generic graph.
 - `src/runtime` owns common contracts, generated-token transaction/publication policy, and the
   public Engine PIMPL. It does not own model mathematics or target state.
 - `src/media/decode` consumes already-owned bytes. URL/path/data acquisition belongs to

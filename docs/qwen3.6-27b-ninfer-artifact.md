@@ -140,10 +140,13 @@ source file bytes without an internal archive or filename header.
 | 4 | `frontend/preprocessor_config.json` | `raw-bytes-v1` | `preprocessor_config.json` | image resize, normalization, and patch limits |
 | 5 | `frontend/video_preprocessor_config.json` | `raw-bytes-v1` | `video_preprocessor_config.json` | video sampling, resize, normalization, and frame limits |
 
+These six payloads are byte-identical to the corresponding 35B-A3B resources. Both artifacts
+therefore carry the same Qwen3.6 family resource set.
+
 `vocab.json`, `merges.txt`, `added_tokens.json`, and `special_tokens_map.json` are not objects in
 this route because `tokenizer.json` already contains the registered tokenizer data.
 
-The C++ binder retains these payloads as owned strings and constructs the target-private native
+The C++ binder retains these payloads as owned strings and constructs the shared Qwen3.6 native
 tokenizer, template renderer, and image/video processor directly from them; it does not create a
 temporary checkpoint directory. The independent Python reference may materialize the six source
 filenames in a temporary directory and consume them through Transformers. The native route validates
@@ -656,8 +659,8 @@ Qwen3.6-27B binder must perform exactly the model-specific work below.
 9. Build the complete 27-layer Vision and merger bindings; Vision cannot be omitted merely because
    the current request is text-only.
 10. Retain the six frontend resource payloads for the loaded-model lifetime and construct the
-    target-private native Frontend from them. Verify the tokenizer domain, required special IDs,
-    template identity, and processor configuration before generation.
+    shared Qwen3.6 native Frontend from them. Verify the family resource identity, tokenizer domain,
+    required special IDs, template identity, and processor configuration before generation.
 11. Reject a partially bound product. Text, MTP, Vision, draft head, and frontend resources become
     usable together only after the complete binding succeeds.
 

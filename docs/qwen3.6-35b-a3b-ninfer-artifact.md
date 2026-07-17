@@ -108,12 +108,12 @@ normalizing their JSON representation, and the same 33 added-token definitions a
 `248044..248076`. Both native tokenizers therefore expose the same 248077-entry `id -> token`
 domain, and the same shortlist id map can be interpreted by either model.
 
-This is token-id compatibility, not frontend-resource or weight identity. The two
-`tokenizer.json` files are byte-different; the 35B file explicitly carries only added-token ids
-`248044..248069`, while its `tokenizer_config.json` supplies the remaining seven ids
-`248070..248076`. The checkpoints also have different chat templates and pad-token choices. Their
-untied output heads have shapes `[248320,5120]` and `[248320,2048]`. Section 4.2 therefore retains
-the 35B frontend files, and Section 12.5 gathers the shared shortlist rows from the 35B head.
+The two checkpoints use byte-identical copies of all six frontend resources in Section 4.2. They
+therefore share one Qwen3.6 frontend contract. The base `tokenizer.json` carries added-token ids only
+through `248069`; the shared `tokenizer_config.json` supplies ids `248070..248076`. The family
+frontend must therefore merge both resources. The two models still have different weights: their
+untied output heads have shapes `[248320,5120]` and `[248320,2048]`. Section 12.5 gathers the shared
+shortlist rows from the 35B head.
 
 Full-attention layers are exactly:
 
@@ -322,14 +322,14 @@ The artifact contains exactly these `raw-bytes-v1` resources:
 | 4 | `frontend/preprocessor_config.json` | `preprocessor_config.json` | image preprocessing limits and constants |
 | 5 | `frontend/video_preprocessor_config.json` | `video_preprocessor_config.json` | video sampling and preprocessing |
 
-The target-private native Frontend consumes the retained bytes directly and must merge
+The shared Qwen3.6 native Frontend consumes the retained bytes directly and must merge
 `tokenizer_config.json::added_tokens_decoder` over the base tokenizer. Parsing only
 `tokenizer.json` would truncate the valid domain at id 248069 and is nonconforming. The 35B
-resources are retained from the selected 35B checkpoint; the 27B pad token (`<|vision_pad|>`, id
-248055), chat template, or complete frontend resource set must not be copied over the 35B pad token
-(`<|endoftext|>`, id 248044) and template. The Python reference may materialize the retained bytes
-under their source filenames. MRoPE positions, patch data, visual embeddings, and `rope_delta` are
-request state rather than artifact objects.
+artifact retains its own copy of the family resource set so that every artifact remains
+self-contained; this duplicate storage does not create a second renderer or processor
+implementation. The Python reference may materialize the retained bytes under their source
+filenames. MRoPE positions, patch data, visual embeddings, and `rope_delta` are request state rather
+than artifact objects.
 
 ## 5. Text and optimized-draft inventory
 
@@ -714,7 +714,7 @@ total = 693 + 19 + 333 = 1045
 
 Frontend files must exist under their exact names and are retained byte-for-byte. The exact
 tokenizer and processor semantics in Sections 2 and 4 are accepted checkpoint facts; conversion
-does not add a second defensive parser for resources that the target frontend will consume.
+does not add a second defensive parser for resources that the family frontend will consume.
 
 ## 11. Common conversion rules
 
@@ -1229,7 +1229,7 @@ binding, memory-admission, end-to-end execution, and serving evidence remain req
   Section 9;
 - coverage of each of the 1045 unique source tensors with no unused source role; the only
   documented derived reread is `lm_head.weight` for the optimized draft-head gather;
-- retention of the six exact 35B frontend resources and correct native handling of the complete
+- retention of the six family frontend resources and correct native handling of the complete
   248077-id tokenizer domain, including ids `248070..248076`;
 - exact codec verification for every format and representative expert ids, including half-split
   gate/up and A/B rows, first/last expert boundaries, Q5/Q6 layer assignment, and every plane

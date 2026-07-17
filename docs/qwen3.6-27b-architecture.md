@@ -400,7 +400,7 @@ changes its fixed allocation.
 | dimensions and layer mapping | `src/targets/qwen3_6_27b_rtx5090/impl/config.h` |
 | immutable Text/MTP/Vision bindings | `src/targets/qwen3_6_27b_rtx5090/impl/load/` |
 | Text/MTP/Vision execution and state | `src/targets/qwen3_6_27b_rtx5090/impl/program/`, `impl/schedule/` |
-| tokenizer, template, multimodal processing, output decoder | `src/targets/qwen3_6_27b_rtx5090/impl/frontend/` |
+| tokenizer, template, multimodal processing, output decoder | `src/targets/qwen3_6/impl/frontend/` |
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | GQA physical cache container and checked per-layer views | `src/core/kv_cache.*` |
 | Text/MTP published cache prefixes and graph frontier variants | `src/targets/qwen3_6_27b_rtx5090/impl/program/` |

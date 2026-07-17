@@ -238,12 +238,10 @@ __global__ void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
         a       = warp_reduce_sum(a);
         if (lane == 0) {
             const std::int64_t index = static_cast<std::int64_t>(col0 + tt) * rows + row;
-            __nv_bfloat16 result     = __float2bfloat16_rn(a);
             if constexpr (Epilogue == W8Epilogue::Residual) {
-                result =
-                    __float2bfloat16_rn(__bfloat162float(out[index]) + __bfloat162float(result));
+                a = __bfloat162float(out[index]) + a;
             }
-            out[index] = result;
+            out[index] = __float2bfloat16_rn(a);
         }
     }
 }

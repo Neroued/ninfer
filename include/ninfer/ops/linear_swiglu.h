@@ -24,15 +24,18 @@ namespace ninfer::ops {
  * Op: linear_swiglu
  *
  * Math / indexing:
- *   gate_up = linear(x, gate_up_weight); M=gate_up_rows/2;
- *   out[i,t] = bf16(silu(float(gate_up[i,t])) * float(gate_up[M+i,t])).
+ *   gate_up = Linear(x, gate_up_weight); M=gate_up_rows/2;
+ *   out[i,t] = BF16(SiLU(gate_up[i,t]) * gate_up[M+i,t]).
  *
  * Logical shapes:
  *   x [5120,T] and out [17408,T] are contiguous BF16. gate_up_weight is Q4G64_F16S RowSplit
  *   [34816,5120] with FP16 scales.
  *
  * Numeric:
- *   Fused paths preserve the registered projection/SwiGLU rounding boundary.
+ *   The oracle exact-decodes the registered weight and evaluates the complete expression naively
+ *   in FP64 before converting the observable result to BF16. Production routes may fuse or
+ *   materialize gate/up and may choose their natural accumulator, staging, and workspace precision;
+ *   those private choices are qualified directly against the same oracle.
  *
  * Effects:
  *   Writes the full output; x/weight and output must not alias.

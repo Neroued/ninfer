@@ -243,8 +243,8 @@ Only concatenated Q/K/V passes through a depthwise causal width-4 convolution fo
 Z, A, and B do not pass through the convolution. The convolved Q and K are L2-normalized per head
 with epsilon `1e-6`; GDN consumes no position ids and applies no RoPE.
 
-The decay path promotes `A_log`, A, and `dt_bias` to FP32. The semantic decay and update controls
-for every V head are:
+The decay and update controls `g` and `beta` are observable FP32 values. Their logical formula for
+every V head is:
 
 ```text
 g     = -exp(A_log) * softplus(a + dt_bias)
@@ -286,10 +286,9 @@ For post-mixer normalized token state `h[2048]`, the router and selected weights
 
 ```text
 router_logits = W_router h                         # [256], no bias
-router_probs  = softmax(router_logits, dtype=FP32)
+router_probs  = softmax(router_logits)
 (values, ids) = topk(router_probs, 8)
 routing_weight = values / sum(values)
-routing_weight = cast_to_activation_dtype(routing_weight)  # HF source oracle
 ```
 
 For each selected routed expert `e`, the source tensor stores gate rows before up rows:
@@ -313,10 +312,10 @@ sparse_moe(h) = y_routed + shared_scale * shared
 
 Softmax is taken over all 256 router logits before top-k, and the selected values are then
 renormalized to sum to one. This is algebraically equivalent to a softmax over only the selected
-logits. Casting selected weights to activation dtype is the Hugging Face source-oracle boundary;
-vLLM keeps them FP32 through its fused expert path, so parity against the chosen oracle requires an
-explicit tolerance. Router auxiliary loss coefficient `0.001` and `output_router_logits=false` are
-training/output configuration; neither adds an inference term.
+logits. Hugging Face casts selected weights to activation dtype, while vLLM keeps them FP32 through
+its fused expert path. Those are execution profiles, not alternative mathematical oracles, and are
+useful only as supplementary parity evidence. Router auxiliary loss coefficient `0.001` and
+`output_router_logits=false` are training/output configuration; neither adds an inference term.
 
 Expert grouping, token permutation, physical expert reordering, shared-expert fusion, and separate
 decode/prefill kernels are execution policies. Logical expert id `e` remains router row `e`, all
@@ -513,35 +512,24 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
 
 ## 13. Precision and reference boundaries
 
-- all 1045 source-checkpoint tensors are BF16; the source has no quantization configuration;
-- Text/MTP ordinary and Q/K offset RMSNorms use FP32 variance computation and return activation
-  dtype;
-- the Hugging Face attention oracle computes softmax in FP32, casts probabilities back to query
-  dtype, and then multiplies by V; fused attention may use a different qualified accumulation path;
-- GDN Q/K L2 normalization uses epsilon `1e-6`, and the recurrent matrices and decay path use FP32;
-- checkpoint `A_log` and `dt_bias` are BF16 weights but are promoted before `exp`, `softplus`, and
-  recurrent use;
-- the Hugging Face GDN oracle rounds `sigmoid(B)` to activation dtype before its FP32 recurrence,
-  while vLLM keeps beta FP32; both implement the same equation but not the same rounding boundary;
-- the Hugging Face GDN gated norm uses an FP32 variance, rounds normalized activations before the
-  learned-weight multiply, and combines with an FP32 `SiLU(z)` before returning activation dtype;
-  vLLM's native gated norm keeps more of this path in FP32;
-- the MoE router softmax and top-k weight normalization are FP32 in both references; Hugging Face
-  casts selected route weights to activation dtype, whereas vLLM applies FP32 route weights in its
-  fused expert path;
-- expert projections consume activation dtype;
-- Vision LayerNorm reductions require an implementation-defined accumulation policy that must be
-  numerically qualified against the BF16 reference;
-- the independent full `lm_head` is part of target correctness even when a draft or fused sampling
-  path avoids materializing all logits;
-- weight quantization, KV quantization, expert reordering, and packed layouts are derived runtime
-  representations, not source-model mathematics.
-
-The recurrent matrix dtype is explicit, but beta, gated-norm, route-weight, and attention-kernel
-rounding are reference-implementation choices rather than unique checkpoint metadata. Convolution
-history also differs—vLLM normally retains activation dtype while llama.cpp uses FP32. A new runtime
-must name its numerical oracle, state these rounding boundaries, and test the resulting tolerance
-instead of inferring them from `mamba_ssm_dtype`.
+- All 1045 source-checkpoint tensors are BF16; the source has no quantization configuration.
+- Public activation, cache, and recurrent-state dtypes are stated by their owning Op/state contract.
+  In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16/INT8 KV
+  formats remain real persistent representation boundaries.
+- Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over its logical
+  inputs. Packed weights are decoded from their stored codes and exact stored scales. Exact
+  transforms and codecs use exact oracles.
+- Hugging Face, vLLM, llama.cpp, and the artifact-native Python route are execution/parity profiles,
+  not Op oracles. Their choices to cast attention probabilities, GDN controls, gated-norm values,
+  MoE route weights, expert activations, or convolution history do not bind NInfer kernels.
+- NInfer kernels may select their natural accumulator precision, operand staging, intermediate
+  materialization, workspace dtype, and reduction association. Each route is accepted directly
+  against the one Op oracle with its own documented tolerance; the oracle precision does not become
+  a required kernel operation order.
+- The independent full `lm_head` remains part of target correctness even when a draft or fused
+  sampling path avoids materializing all logits. Weight quantization, KV quantization, expert
+  reordering, and packed layouts are derived runtime representations rather than source-model
+  mathematics.
 
 ## 14. Persistent state inventory
 

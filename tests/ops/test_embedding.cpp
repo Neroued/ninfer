@@ -1,6 +1,6 @@
 // Correctness + coverage for embedding, against the frozen op-test standard
-// (docs/op-development.md): fp64 golden from bf16-rounded dense inputs,
-// exact Q6 ROW_SPLIT dequant reference, composite tolerance bf16_elementwise.
+// (docs/op-development.md): fp64 golden from bf16-rounded dense inputs, and
+// exact Q6/W8 ROW_SPLIT decode from the final payload bytes before naive gather.
 #include "ninfer/ops/embedding.h"
 #include "ops/op_tester.h"
 
@@ -149,8 +149,8 @@ static int unpack_q6_code(const std::uint8_t* nibble, const std::uint8_t* high, 
     return (u & 0x20u) ? static_cast<int>(u) - 64 : static_cast<int>(u);
 }
 
-static std::vector<std::uint8_t> encode_q6_row_split(const std::vector<float>& src, std::int32_t d,
-                                                     std::vector<float>& deq) {
+static std::vector<std::uint8_t> encode_q6_row_split(const std::vector<float>& src,
+                                                     std::int32_t d) {
     const std::int32_t kg = groups_for_d(d);
     const std::size_t nibble_plane_bytes =
         static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kNibbleBpr;
@@ -161,7 +161,6 @@ static std::vector<std::uint8_t> encode_q6_row_split(const std::vector<float>& s
     const std::size_t scale_plane_bytes =
         static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * 2u;
     std::vector<std::uint8_t> payload(scale_plane_offset + scale_plane_bytes);
-    deq.assign(src.size(), 0.0f);
     for (std::int32_t row = 0; row < kVocab; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
             const std::size_t base = static_cast<std::size_t>(row) * d + g * kGroup;
@@ -181,8 +180,7 @@ static std::vector<std::uint8_t> encode_q6_row_split(const std::vector<float>& s
                     q = static_cast<int>(std::nearbyint(src[base + i] / scale));
                     q = std::clamp(q, -32, 31);
                 }
-                codes[i]      = static_cast<std::int8_t>(q);
-                deq[base + i] = static_cast<float>(q) * scale;
+                codes[i] = static_cast<std::int8_t>(q);
             }
 
             const std::size_t group_index = static_cast<std::size_t>(row) * kg + g;
@@ -197,8 +195,8 @@ static std::vector<std::uint8_t> encode_q6_row_split(const std::vector<float>& s
     return payload;
 }
 
-static std::vector<std::uint8_t> encode_w8_row_split(const std::vector<float>& src, std::int32_t d,
-                                                     std::vector<float>& deq) {
+static std::vector<std::uint8_t> encode_w8_row_split(const std::vector<float>& src,
+                                                     std::int32_t d) {
     const std::int32_t kg = w8_groups_for_d(d);
     const std::size_t code_plane_bytes =
         static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kW8Group;
@@ -206,7 +204,6 @@ static std::vector<std::uint8_t> encode_w8_row_split(const std::vector<float>& s
     const std::size_t scale_plane_bytes =
         static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * 2u;
     std::vector<std::uint8_t> payload(scale_plane_offset + scale_plane_bytes);
-    deq.assign(src.size(), 0.0f);
     for (std::int32_t row = 0; row < kVocab; ++row) {
         for (std::int32_t g = 0; g < kg; ++g) {
             const std::size_t base = static_cast<std::size_t>(row) * d + g * kW8Group;
@@ -227,7 +224,6 @@ static std::vector<std::uint8_t> encode_w8_row_split(const std::vector<float>& s
                 }
                 payload[group_index * kW8Group + i] =
                     static_cast<std::uint8_t>(static_cast<std::int8_t>(q));
-                deq[base + i] = static_cast<float>(q) * scale;
             }
             const std::size_t scale_off = scale_plane_offset + group_index * 2;
             payload[scale_off + 0]      = static_cast<std::uint8_t>(scale_h & 0xffu);
@@ -245,6 +241,90 @@ static void cpu_gather(const std::vector<float>& table, const std::vector<int>& 
         for (std::int32_t col = 0; col < d; ++col) {
             out[static_cast<std::size_t>(t) * d + col] =
                 static_cast<double>(table[static_cast<std::size_t>(row) * d + col]);
+        }
+    }
+}
+
+static std::uint16_t load_u16_le(const std::vector<std::uint8_t>& payload, std::size_t off) {
+    if (off + 2u > payload.size()) {
+        throw std::out_of_range("embedding oracle scale read exceeds payload");
+    }
+    return static_cast<std::uint16_t>(payload[off]) |
+           static_cast<std::uint16_t>(static_cast<std::uint16_t>(payload[off + 1]) << 8);
+}
+
+static void cpu_gather_q6_payload(const std::vector<std::uint8_t>& payload,
+                                  const std::vector<int>& ids, std::int32_t d,
+                                  std::vector<double>& out) {
+    const std::int32_t kg = groups_for_d(d);
+    const std::size_t nibble_plane_bytes =
+        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kNibbleBpr;
+    const std::size_t high_plane_offset = align_up_size(nibble_plane_bytes, 256);
+    const std::size_t high_plane_bytes =
+        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kHighBpr;
+    const std::size_t scale_plane_offset = high_plane_offset + align_up_size(high_plane_bytes, 256);
+    const std::size_t expected_payload_bytes =
+        scale_plane_offset + static_cast<std::size_t>(kVocab) * kg * sizeof(std::uint16_t);
+    if (payload.size() != expected_payload_bytes) {
+        throw std::invalid_argument("embedding Q6 oracle payload size mismatch");
+    }
+
+    out.assign(static_cast<std::size_t>(d) * ids.size(), 0.0);
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        const std::int32_t row = ids[t];
+        if (row < 0 || row >= kVocab) {
+            throw std::out_of_range("embedding Q6 oracle token id out of range");
+        }
+        for (std::int32_t col = 0; col < d; ++col) {
+            const std::int32_t group      = col / kGroup;
+            const std::int32_t lane       = col % kGroup;
+            const std::size_t group_index = static_cast<std::size_t>(row) * kg + group;
+            const std::uint8_t* nibble    = payload.data() + group_index * kNibbleBpr;
+            const std::uint8_t* high = payload.data() + high_plane_offset + group_index * kHighBpr;
+            const int signed_code    = unpack_q6_code(nibble, high, lane);
+            const std::uint16_t stored_scale =
+                load_u16_le(payload, scale_plane_offset + group_index * sizeof(std::uint16_t));
+            const double exact_stored_fp16_scale = static_cast<double>(f16_to_f32(stored_scale));
+            out[t * static_cast<std::size_t>(d) + col] =
+                static_cast<double>(signed_code) * exact_stored_fp16_scale;
+        }
+    }
+}
+
+static void cpu_gather_w8_payload(const std::vector<std::uint8_t>& payload,
+                                  const std::vector<int>& ids, std::int32_t d,
+                                  std::vector<double>& out) {
+    const std::int32_t kg = w8_groups_for_d(d);
+    const std::size_t code_plane_bytes =
+        static_cast<std::size_t>(kVocab) * static_cast<std::size_t>(kg) * kW8Group;
+    const std::size_t scale_plane_offset = align_up_size(code_plane_bytes, 256);
+    const std::size_t expected_payload_bytes =
+        scale_plane_offset + static_cast<std::size_t>(kVocab) * kg * sizeof(std::uint16_t);
+    if (payload.size() != expected_payload_bytes) {
+        throw std::invalid_argument("embedding W8 oracle payload size mismatch");
+    }
+
+    out.assign(static_cast<std::size_t>(d) * ids.size(), 0.0);
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        const std::int32_t row = ids[t];
+        if (row < 0 || row >= kVocab) {
+            throw std::out_of_range("embedding W8 oracle token id out of range");
+        }
+        for (std::int32_t col = 0; col < d; ++col) {
+            const std::int32_t group      = col / kW8Group;
+            const std::int32_t lane       = col % kW8Group;
+            const std::size_t group_index = static_cast<std::size_t>(row) * kg + group;
+            const std::uint8_t raw_code   = payload[group_index * kW8Group + lane];
+            const int signed_code =
+                raw_code < 0x80u ? static_cast<int>(raw_code) : static_cast<int>(raw_code) - 256;
+            if (signed_code == -128) {
+                throw std::invalid_argument("embedding W8 oracle encountered forbidden -128 code");
+            }
+            const std::uint16_t stored_scale =
+                load_u16_le(payload, scale_plane_offset + group_index * sizeof(std::uint16_t));
+            const double exact_stored_fp16_scale = static_cast<double>(f16_to_f32(stored_scale));
+            out[t * static_cast<std::size_t>(d) + col] =
+                static_cast<double>(signed_code) * exact_stored_fp16_scale;
         }
     }
 }
@@ -359,13 +439,12 @@ static int one_dense_shape(std::int32_t T, std::int32_t d) {
 }
 
 static int one_q6_shape(std::int32_t T, std::int32_t d) {
-    const std::vector<float> src = make_source_table(d);
-    std::vector<float> deq;
-    std::vector<std::uint8_t> payload = encode_q6_row_split(src, d, deq);
+    const std::vector<float> src      = make_source_table(d);
+    std::vector<std::uint8_t> payload = encode_q6_row_split(src, d);
     const std::vector<int> ids        = ids_for_T(T);
 
     std::vector<double> ref;
-    cpu_gather(deq, ids, d, ref);
+    cpu_gather_q6_payload(payload, ids, d, ref);
 
     DBuf dtable(payload.size());
     cudaMemcpy(dtable.p, payload.data(), payload.size(), cudaMemcpyHostToDevice);
@@ -384,13 +463,12 @@ static int one_q6_shape(std::int32_t T, std::int32_t d) {
 }
 
 static int one_w8_shape(std::int32_t T, std::int32_t d) {
-    const std::vector<float> src = make_source_table(d);
-    std::vector<float> deq;
-    std::vector<std::uint8_t> payload = encode_w8_row_split(src, d, deq);
+    const std::vector<float> src      = make_source_table(d);
+    std::vector<std::uint8_t> payload = encode_w8_row_split(src, d);
     const std::vector<int> ids        = ids_for_T(T);
 
     std::vector<double> ref;
-    cpu_gather(deq, ids, d, ref);
+    cpu_gather_w8_payload(payload, ids, d, ref);
 
     DBuf dtable(payload.size());
     cudaMemcpy(dtable.p, payload.data(), payload.size(), cudaMemcpyHostToDevice);

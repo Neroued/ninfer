@@ -33,8 +33,9 @@ namespace ninfer::ops {
  *   v_weight is Q5G64_F16S RowSplit [6144,5120], both with FP16 scales.
  *
  * Numeric:
- *   Each projection follows linear.h; the concatenated BF16 outputs preserve their projection
- *   rounding boundaries.
+ *   The oracle exact-decodes both weights and evaluates both projections naively in FP64 before
+ *   converting the observable concatenated output to BF16. Production routes may fuse or
+ *   materialize the projections and choose their private precision independently.
  *
  * Effects:
  *   Writes the full qkv output; inputs and output must not alias.

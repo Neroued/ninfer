@@ -226,6 +226,56 @@ struct PackedWeight {
     }
 };
 
+// Independent logical decode for numerical oracles. This reads the registered payload bytes
+// directly: the signed code is decoded from its low/high planes, the stored FP16 scale is
+// converted exactly to FP64, and only then are the two multiplied. In particular, this helper
+// neither calls a production decoder nor constructs a full dequantized matrix.
+inline double decode_row_split_lowbit_fp64(const PackedWeight& packed, std::int32_t row,
+                                           std::int32_t column) {
+    const Weight& weight = packed.weight;
+    if (row < 0 || row >= weight.shape[0] || column < 0 || column >= weight.shape[1]) {
+        throw std::out_of_range("row-split FP64 decode: logical index out of range");
+    }
+
+    const detail::QuantSpec spec = detail::quant_spec(weight.qtype);
+    const std::int32_t padded_k  = weight.padded_shape[1];
+    if (padded_k < weight.shape[1] || padded_k % spec.group_size != 0) {
+        throw std::invalid_argument("row-split FP64 decode: invalid padded K");
+    }
+    const std::int32_t groups_per_row = padded_k / spec.group_size;
+    const std::int32_t group          = column / spec.group_size;
+    const std::int32_t lane           = column - group * spec.group_size;
+    const std::size_t group_index     = static_cast<std::size_t>(row) * groups_per_row + group;
+    const int nibble_bytes            = detail::nibble_bytes_per_group(spec);
+    const int high_bytes              = detail::high_bytes_per_group(spec);
+
+    const std::uint8_t* nibble       = packed.payload.data() + group_index * nibble_bytes;
+    const std::uint8_t* high         = high_bytes == 0 ? nullptr
+                                                       : packed.payload.data() + packed.high_plane_offset +
+                                                     group_index * high_bytes;
+    const std::uint16_t stored_scale = detail::load_u16_le(
+        packed.payload, packed.scale_plane_offset + group_index * sizeof(std::uint16_t));
+    const int signed_code                = detail::unpack_lowbit_code(nibble, high, spec, lane);
+    const double exact_stored_fp16_scale = static_cast<double>(detail::f16_to_f32(stored_scale));
+    return static_cast<double>(signed_code) * exact_stored_fp16_scale;
+}
+
+inline double dot_row_split_lowbit_fp64(const PackedWeight& packed, std::int32_t row,
+                                        const float* logical_input, std::int32_t k) {
+    if (logical_input == nullptr) {
+        throw std::invalid_argument("row-split FP64 dot: input must be non-null");
+    }
+    if (k != packed.weight.shape[1]) {
+        throw std::invalid_argument("row-split FP64 dot: logical K mismatch");
+    }
+    double acc = 0.0;
+    for (std::int32_t column = 0; column < k; ++column) {
+        acc += decode_row_split_lowbit_fp64(packed, row, column) *
+               static_cast<double>(logical_input[column]);
+    }
+    return acc;
+}
+
 inline std::vector<float> decode_row_split_lowbit(const std::vector<std::uint8_t>& payload,
                                                   std::int32_t n, std::int32_t k,
                                                   std::int32_t padded_k, QType qtype) {

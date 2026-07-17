@@ -21,6 +21,11 @@ The tables include logical tensor types and registered weight formats because th
 implementation domain. They do not define rounding, accumulation precision, tolerance, tensor
 layout, fusion policy, memory budgets, implementation order, or a test plan.
 
+Every floating-point row is checked against one independent naive FP32/FP64 mathematical oracle
+with exact logical weight decode. Public input/output and persistent-state dtypes remain part of the
+domain. Private stage representations, accumulator precision, operand staging, workspace dtype, and
+intermediate rounding are selected by the implementation and are not fixed by this inventory.
+
 ## 1. Scope, status, and notation
 
 ### 1.1 Support definition
@@ -77,11 +82,12 @@ eps = 1e-6                 normalization epsilon
 The accepted frontend budgets bound one image item at `P<=65536` and one video item at
 `P<=49152`. All Vision rows cover one item at a time within those bounds.
 
-Unless a row says otherwise, activation inputs and outputs are BF16. Positions, token ids, expert
-ids, and index maps are I32. GDN recurrent state and routing probabilities are FP32. Registered
-quantized weights use `row-split-k128-v1` with the named `Q4G64_F16S`, `Q5G64_F16S`,
-`Q6G64_F16S`, or `W8G32_F16S` format; direct weights use contiguous BF16 or FP32.
-Tables abbreviate these four registered formats as Q4, Q5, Q6, and W8 respectively.
+Unless a target-callable row says otherwise, its public activation inputs and outputs are BF16.
+Positions, token ids, expert ids, and index maps are I32, and GDN recurrent state is FP32. Private
+stage values such as routing probabilities use logical types in this inventory; their physical
+precision is not fixed here. Registered quantized weights use `row-split-k128-v1` with the named
+`Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, or `W8G32_F16S` format; direct weights use contiguous
+BF16 or FP32. Tables abbreviate these four registered formats as Q4, Q5, Q6, and W8 respectively.
 
 Host construction of multimodal metadata, raw transfers, allocation, published cache frontiers, state
 lifetime, graph capture, commit/rollback policy, and zero-work tensor views are not Ops. They are
@@ -109,8 +115,8 @@ output view, but the model names Q, K, V, gate, or Z do not create new arithmeti
 |---|---|---|---|---|
 | L1 | Multi-output Linear; W8 weight `[9216,2048]`, `X[2048,T]` | 10 Text full-attention layers and one MTP layer; all three T regimes | `Y=W X`; rows `0:4096`, `4096:4608`, `4608:8704`, and `8704:9216` produce Q `[256,16,T]`, K `[256,2,T]`, gate `[256,16,T]`, and V `[256,2,T]`. | **Supported for the complete target domain.** One contiguous W8 parent Linear covers `T=1..1024`, with Q/K/gate/V exposed as zero-work row views. Its exact SIMT/MMA32/MMA64 route reaches 176.42 TFLOP/s, or 83.79% of the same-session BF16 MMA probe, and has no spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
 | L2 | Multi-output Linear; W8 weight `[12288,2048]`, `X[2048,T]` | 30 GDN layers; all three T regimes | `Y=W X`; row widths `2048,2048,4096,4096` produce Q `[128,16,T]`, K `[128,16,T]`, V `[128,32,T]`, and Z `[128,32,T]`. | **Supported for the complete target domain.** One contiguous W8 parent Linear covers `T=1..1024`, with Q/K/V/Z exposed as zero-work row views. Its measured SIMT/MMA64 route reaches 169.31 TFLOP/s, or 85.36% of the same-session BF16 MMA ceiling, and has no spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
-| L3 | Linear with GDN-control epilogue; BF16 weight `[64,2048]`, FP32 `A_log,dt_bias[32]`, `X[2048,T]` -> FP32 `g,beta[32,T]` | 30 GDN layers; all three T regimes | `AB=W X`, split A/B into 32 rows each; `g[j,t]=-exp(A_log[j])*softplus(A[j,t]+dt_bias[j])`, `beta[j,t]=sigmoid(B[j,t])`. | **Supported for the complete target domain.** One contiguous BF16 parent is consumed as zero-copy A/B row views for `T=1..1024`; the exact BN64 split16/split8 cooperative-MMA route preserves the explicit BF16 projection seam. At `T=1024`, production sustains 28.34 TFLOP/s at the measured fixed-shape single-launch candidate ceiling, and all four production compile variants are profiler-confirmed without spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
-| L4 | LinearAdd; W8 weight `[2048,4096]`, `X[4096,T]`, residual `[2048,T]` | All 40 Text mixer outputs and the MTP attention output | `residual'=residual+W X`. Attention, GDN, and MTP are caller roles of this one exact operation domain. | **Supported for the complete target domain.** The exact `T=1..1024` SIMT/MMA32/MMA64 route fuses the residual epilogue while preserving the BF16 projection seam. At `T=1024`, production sustains 136.44 TFLOP/s and remains within 1.44% of the same-shape plain-W8 control; all three production topologies are profiler-confirmed without spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
+| L3 | Linear with GDN-control epilogue; BF16 weight `[64,2048]`, FP32 `A_log,dt_bias[32]`, `X[2048,T]` -> FP32 `g,beta[32,T]` | 30 GDN layers; all three T regimes | `AB=W X`, split A/B into 32 rows each; `g[j,t]=-exp(A_log[j])*softplus(A[j,t]+dt_bias[j])`, `beta[j,t]=sigmoid(B[j,t])`. | **Supported for the complete target domain.** One contiguous BF16 parent is consumed as zero-copy A/B row views for `T=1..1024`; the exact BN64 split16/split8 cooperative-MMA route covers the formula. At `T=1024`, production sustains 28.34 TFLOP/s at the measured fixed-shape single-launch candidate ceiling, and all four production compile variants are profiler-confirmed without spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
+| L4 | LinearAdd; W8 weight `[2048,4096]`, `X[4096,T]`, residual `[2048,T]` | All 40 Text mixer outputs and the MTP attention output | `residual'=residual+W X`. Attention, GDN, and MTP are caller roles of this one exact operation domain. | **Supported for the complete target domain.** The exact `T=1..1024` SIMT/MMA32/MMA64 route fuses the residual epilogue. At `T=1024`, production sustains 136.44 TFLOP/s and remains within 1.44% of the same-shape plain-W8 control; all three production topologies are profiler-confirmed without spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
 | L5 | Linear; W8 weight `[2048,4096]`, packed input `[4096,T]` -> `[2048,T]` | MTP stem | `Y=W X`. The two RMSNorms and the concat that form X are separate Ops. | **Supported for the complete target domain.** The exact `T=1..1024` SIMT/MMA32/MMA64 route selects the measured crossover winners. At `T=1024`, production sustains 138.48 TFLOP/s, only 0.77% below a same-grid, same-schedule W8 control; NCU confirms the identical launch/resource envelope and no spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
 | L6 | Linear; Q6 weight `[248320,2048]`, hidden `[2048,C]` -> logits `[248320,C]`, `1<=C<=6` | Full target head for ordinary decisions and verification; also MTP proposal when the draft head is disabled | `logits=W_head X`; token policy later consumes only rows `0:248077`. | **Supported for the complete target domain.** The exact C4/C8 route reaches 84.79%-97.08% of the cold-copy ceiling at `C=1..4`; the higher-reuse `C=5/6` path remains within 5.36% of a same-kernel, same-grid Q6 control and has no spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
 | L7 | Linear; Q4 weight `[131072,2048]`, hidden `[2048,1]` -> shortlist logits `[131072,1]` | Optimized MTP proposal | `logits=W_draft X`; the downstream I32 id map assigns each row its full token id. | **Supported for the complete target domain.** The exact singleton route uses the runtime-K Q4 GEMV winner, sustains 1350.91 GB/s or 89.58% of the same-session cold-copy ceiling, and is profiler-confirmed DRAM-bound without spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
@@ -130,11 +136,11 @@ Linear, LinearSwiGLU, or expert-grouped Linear rather than a model-role-specific
 
 | ID | Operation and exact typed domain | Execution regimes | Mathematical result | Current support |
 |---|---|---|---|---|
-| L15 | Linear; BF16 weight `[257,2048]`, `X[2048,T]` -> BF16 scores `[257,T]` | All three T regimes | Rows `0:256` are router logits and row 256 is the independent shared-expert score. | **Adapt existing.** Dense projection machinery is reusable, but there is no qualified exact 257-row path. This stage alone does not support `SparseMoeAdd`. |
-| L16 | LinearSwiGLU; W8 weight `[1024,2048]`, `X[2048,T]` -> `[512,T]` | All three T regimes | Split `W X` into gate/up `[512,T]`; output `SiLU(gate).*up` for the always-on shared expert. | **Adapt existing.** The semantic operation and low-bit machinery exist, but not this W8 exact domain. |
-| L17 | Linear; W8 weight `[2048,512]`, `X[512,T]` -> `[2048,T]` | All three T regimes | `Y_shared=W_shared_down X`. | **Adapt existing.** W8 Linear machinery exists without an exact qualified K=512 path. |
-| L18 | Expert-grouped LinearSwiGLU; per expert `W_gu[e][1024,2048]`, `X_e[2048,M_e]` -> `[512,M_e]` | Decode `M_e in {0,1}`; Small-T `sum M_e<=48`; prefill `sum M_e<=8192` | For every active expert, split `W_gu[e]X_e` into 512-row gate/up halves and return `SiLU(gate_e).*up_e`. | **New implementation.** No selected-expert or device-described grouped path exists. Main Text uses Q4 banks; MTP uses W8 banks. |
-| L19 | Expert-grouped Linear; per expert `W_down[e][2048,512]`, `X_e[512,M_e]` -> `[2048,M_e]` | Same three regimes | `Y_e=W_down[e]X_e` for every active expert. | **New implementation.** No K=512 grouped expert kernel exists. Main Text uses Q5 except Q6 in layers 34/38/39; MTP uses W8. |
+| L15 | Private Linear; BF16 weight `[257,2048]`, BF16 `X[2048,T]` -> logical scores `[257,T]` | All three T regimes | Rows `0:256` are router logits and row 256 is the independent shared-expert score. | **Adapt existing.** Dense projection machinery is reusable, but there is no qualified exact 257-row path. This stage alone does not support `SparseMoeAdd`. |
+| L16 | Private LinearSwiGLU; W8 weight `[1024,2048]`, BF16 `X[2048,T]` -> logical activation `[512,T]` | All three T regimes | Split `W X` into gate/up `[512,T]`; return `SiLU(gate).*up` for the always-on shared expert. | **Adapt existing.** The semantic operation and low-bit machinery exist, but not this W8 exact domain. |
+| L17 | Private Linear; W8 weight `[2048,512]`, logical `X[512,T]` -> logical result `[2048,T]` | All three T regimes | `Y_shared=W_shared_down X`. | **Adapt existing.** W8 Linear machinery exists without an exact qualified K=512 path. |
+| L18 | Private expert-grouped LinearSwiGLU; per expert `W_gu[e][1024,2048]`, BF16 `X_e[2048,M_e]` -> logical activation `[512,M_e]` | Decode `M_e in {0,1}`; Small-T `sum M_e<=48`; prefill `sum M_e<=8192` | For every active expert, split `W_gu[e]X_e` into 512-row gate/up halves and return `SiLU(gate_e).*up_e`. | **New implementation.** No selected-expert or device-described grouped path exists. Main Text uses Q4 banks; MTP uses W8 banks. |
+| L19 | Private expert-grouped Linear; per expert `W_down[e][2048,512]`, logical `X_e[512,M_e]` -> logical result `[2048,M_e]` | Same three regimes | `Y_e=W_down[e]X_e` for every active expert. | **New implementation.** No K=512 grouped expert kernel exists. Main Text uses Q5 except Q6 in layers 34/38/39; MTP uses W8. |
 
 The physical parents are `[262144,2048]` for 256 gate/up experts and `[524288,512]` for 256
 down experts. Expert id selects an equal-stride view directly; gathering or repacking selected
@@ -189,9 +195,9 @@ L2(x)          = x / sqrt(sum(x^2) + eps)
 | E3 | Broadcast bias add for `(D,C)=(1152,P),(4304,P),(4608,V),(2048,V)` | `x[d,c]'=x[d,c]+bias[d]`; used by patch/output/fc2, fc1, merger fc1, and merger fc2 respectively. | **Supported for the complete target domain.** The same D-aware BF16x8/BF16x2 dispatch covers every registered D and complete P/V bounds, including maximum image/video items, with retained exact and payload-control evidence. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
 | E4 | Residual add; two BF16 `[1152,P]` tensors | `x'=x+y`; 27 Vision attention and 27 Vision MLP residuals. Text mixer residuals are L4; sparse-MoE residuals are part of the closed Op in Section 9. | **Supported for the complete target domain.** One aligned BF16x8 stream covers all valid P values; maximum video/image cases reach about 1.54 TB/s and remain within 0.3% of the same-topology control. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
 | E5 | Sigmoid multiply; gate/x `[256,16,T]` | `x'=sigmoid(gate).*x`; full-attention output gate in ten Text layers and MTP. | **Supported for the complete target domain.** The aligned BF16x8 route covers `T=1..6/1024`; Small-T lies at the fixed launch floor and T=1024 remains within 4.4% of its same-payload control. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
-| E6 | Tanh GELU; BF16 x `[4304,4096]` | `x'=0.5*x.*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))`; Vision block fc1 activation. | **Supported for exactly P=4096.** The cache-sized BF16x8 route reduces the retained median from 44.0 to 19.1 us without changing FP32 operation order or BF16 rounding. See the [complete Section 5 report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
+| E6 | Tanh GELU; BF16 x `[4304,4096]` | `x'=0.5*x.*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))`; Vision block fc1 activation. | **Supported for exactly P=4096.** The cache-sized BF16x8 route reduces the retained median from 44.0 to 19.1 us and qualifies against the Op oracle. See the [complete Section 5 report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
 | E7 | Same tanh GELU, `[4304,P]` with `P!=4096` | Same equation. | **Supported for the complete target domain.** Cache-sized media use BF16x8 packs and larger media use the higher-throughput BF16x2 stream; maximum video/image cases track the same-payload control and sustain about 1.55 TB/s. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
-| E8 | Exact GELU; BF16 x `[4608,V]` | `x'=0.5*x.*(1+erf(x/sqrt(2)))`; Vision merger. | **Supported for the complete target domain.** The same finite dispatch retains the exact-erf FP32 formula and covers `V=P/4` through maximum video/image `V=12288/16384`, tracking the corresponding payload control. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
+| E8 | Exact GELU; BF16 x `[4608,V]` | `x'=0.5*x.*(1+erf(x/sqrt(2)))`; Vision merger. | **Supported for the complete target domain.** The same finite dispatch covers `V=P/4` through maximum video/image `V=12288/16384`, qualifies against the Op oracle, and tracks the corresponding payload control. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
 
 SwiGLU is already part of LinearSwiGLU rows L16 and L18. The convolution's SiLU and the GDN Z
 gate are parts of the closed operations in Sections 8 and 4, so they are not duplicate standalone
@@ -269,7 +275,9 @@ selection, routed experts, always-on shared expert, final merge, and decoder res
 
 ```text
 scores = W_router_shared X                  # L15, [257,T]
-p[e,t] = exp(scores[e,t]) / sum_j exp(scores[j,t])
+router_scores = scores[0:256,:]
+shared_score  = scores[256,:]
+p[e,t] = exp(router_scores[e,t]) / sum_{j=0..255} exp(router_scores[j,t])
 I_t = indices of the eight largest p[:,t]
 alpha[e,t] = p[e,t] / sum_{j in I_t} p[j,t]
 
@@ -277,7 +285,7 @@ Expert_e(x) = W_down[e] * SwiGLU(W_gate_up[e] * x)
 Shared(x)   = W_shared_down * SwiGLU(W_shared_gate_up * x)
 
 Y[:,t]  = sum_{e in I_t} alpha[e,t] * Expert_e(X[:,t])
-          + sigmoid(scores[256,t]) * Shared(X[:,t])
+          + sigmoid(shared_score[t]) * Shared(X[:,t])
 R[:,t]' = R[:,t] + Y[:,t]
 ```
 
@@ -287,7 +295,7 @@ beneath the closed boundary is:
 
 | ID | Required operation/stage | Exact domain and semantics | Current support |
 |---|---|---|---|
-| M1 | Router softmax, top-8, selected-weight renormalization, and shared sigmoid | Promote L15's BF16 router scores `[256,T]` and shared score `[T]` to FP32; produce I32 ids `[8,T]`, BF16 route weights `[8,T]`, and FP32 shared scale `[T]`. Select the eight largest softmax probabilities per token using the stated tie rule and renormalize only those eight; shared scale is the sigmoid of the independent score. | **New implementation.** No device router/top-8 path exists. |
+| M1 | Router softmax, top-8, selected-weight renormalization, and shared sigmoid | Consume L15's logical router scores `[256,T]` and independent shared score `[T]`; produce I32 ids `[8,T]`, logical route weights `[8,T]`, and a logical shared scale `[T]`. Select the eight largest softmax probabilities per token using the stated tie rule and renormalize only those eight; shared scale is the sigmoid of the independent score. Private storage precision is selected by the implementation. | **New implementation.** No device router/top-8 path exists. |
 | M2 | Assignment grouping and inverse-map construction | Form assignments `(expert,token,route_slot,weight)` for `A=8T`; partition them into expert jobs of size `M_e` while preserving a bijection back to token/route order. | **New implementation.** No device grouping path or job representation exists. |
 | M3 | Inverse scatter, route-weighted reduction, shared merge, and residual update | Restore token order, compute `Y_routed[:,t]=sum_r alpha[r,t]*Y_r[:,t]`, then update `R[:,t]'=R[:,t]+Y_routed[:,t]+shared_scale[t]*Y_shared[:,t]`. | **New implementation.** No routed reduction/merge/residual path exists. |
 | M4 | Closed SparseMoeAdd Op | Compose private Linear stages L15-L19 and sparse stages M1-M3 for decode T=1, Small-T `T<=6`, and prefill `T<=1024`, with the residual update and all workspace effects owned by one Op call. | **New implementation.** NInfer has no `SparseMoeAdd` contract or high-performance route today. |

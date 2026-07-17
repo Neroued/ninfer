@@ -207,12 +207,10 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
             const int col1 = col0 + 1;
             auto store     = [&](int token, int row, float av, float bv) {
                 if constexpr (SplitK == 1) {
-                    const float a = __bfloat162float(__float2bfloat16_rn(av));
-                    const float b = __bfloat162float(__float2bfloat16_rn(bv));
                     const std::int64_t out_i =
                         static_cast<std::int64_t>(token) * kBf16GdnHeads + row;
-                    g[out_i]    = -expf(A_log[row]) * softplus(a + dt_bias[row]);
-                    beta[out_i] = sigmoid(b);
+                    g[out_i]    = -expf(A_log[row]) * softplus(av + dt_bias[row]);
+                    beta[out_i] = sigmoid(bv);
                 } else {
                     const std::int64_t base =
                         (static_cast<std::int64_t>(split) * t + token) * kBf16GdnLogicalRows;
@@ -259,10 +257,8 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
                 av += partial[base + row];
                 bv += partial[base + kBf16GdnHeads + row];
             }
-            const float a = __bfloat162float(__float2bfloat16_rn(av));
-            const float b = __bfloat162float(__float2bfloat16_rn(bv));
-            g[i]          = -expf(A_log[row]) * softplus(a + dt_bias[row]);
-            beta[i]       = sigmoid(b);
+            g[i]    = -expf(A_log[row]) * softplus(av + dt_bias[row]);
+            beta[i] = sigmoid(bv);
         }
     }
 }

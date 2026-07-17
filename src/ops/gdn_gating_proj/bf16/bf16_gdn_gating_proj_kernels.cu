@@ -135,12 +135,10 @@ __global__ void bf16_gdn_gating_proj_small_t_reduce_kernel(const float* __restri
         acc_b += partial[base + kN + row];
     }
 
-    const float a_rounded        = __bfloat162float(__float2bfloat16(acc_a));
-    const float b_rounded        = __bfloat162float(__float2bfloat16(acc_b));
     const std::int64_t out_index = static_cast<std::int64_t>(token) * kN + row;
-    const float sp               = softplus(a_rounded + dt_bias[row]);
+    const float sp               = softplus(acc_a + dt_bias[row]);
     g[out_index]                 = -expf(A_log[row]) * sp;
-    beta[out_index]              = sigmoid(b_rounded);
+    beta[out_index]              = sigmoid(acc_b);
 }
 
 __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
@@ -168,11 +166,10 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
 
     acc = block_reduce_sum<kThreads>(acc, warp_sums);
     if (threadIdx.x == 0) {
-        const float rounded = __bfloat162float(__float2bfloat16(acc));
         if (is_b) {
-            beta[row] = sigmoid(rounded);
+            beta[row] = sigmoid(acc);
         } else {
-            const float sp = softplus(rounded + dt_bias[row]);
+            const float sp = softplus(acc + dt_bias[row]);
             g[row]         = -expf(A_log[row]) * sp;
         }
     }
@@ -233,12 +230,11 @@ __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restr
         if (col < ncols) {
             const float sum = warp_reduce_sum(acc[col]);
             if (lane == 0) {
-                const float rounded          = __bfloat162float(__float2bfloat16_rn(sum));
                 const std::int64_t out_index = static_cast<std::int64_t>(col0 + col) * k35N + row;
                 if (is_b) {
-                    beta[out_index] = sigmoid(rounded);
+                    beta[out_index] = sigmoid(sum);
                 } else {
-                    g[out_index] = -expf(A_log[row]) * softplus(rounded + dt_bias[row]);
+                    g[out_index] = -expf(A_log[row]) * softplus(sum + dt_bias[row]);
                 }
             }
         }

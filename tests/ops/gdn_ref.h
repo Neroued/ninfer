@@ -342,7 +342,8 @@ inline void forward_chunked_stages(const float* q, const float* k, const float* 
 inline void forward_recurrent(const float* q, const float* k, const float* v, const float* g,
                               const float* beta, const float* state_in, double* out,
                               double* state_out, std::int64_t S, std::int64_t H_qk,
-                              std::int64_t H_v, std::int64_t T, std::int64_t B, double scale) {
+                              std::int64_t H_v, std::int64_t T, std::int64_t B, double scale,
+                              double* state_snapshots = nullptr) {
     std::vector<double> St(static_cast<std::size_t>(S * S));
     std::vector<double> delta(static_cast<std::size_t>(S));
 
@@ -389,6 +390,13 @@ inline void forward_recurrent(const float* q, const float* k, const float* v, co
                     }
                     out_t[r] = partial * scale;
                 }
+
+                if (state_snapshots != nullptr) {
+                    const std::int64_t snapshot_base = (t * B * H_v + b * H_v + h) * S * S;
+                    for (std::int64_t i = 0; i < S * S; ++i) {
+                        state_snapshots[snapshot_base + i] = St[static_cast<std::size_t>(i)];
+                    }
+                }
             }
 
             double* state_h_out = state_out + ((b * H_v + h) * S * S);
@@ -399,10 +407,15 @@ inline void forward_recurrent(const float* q, const float* k, const float* v, co
     }
 }
 
-inline void forward_chunked(const float* q, const float* k, const float* v, const float* g,
-                            const float* beta, const float* state_in, double* out,
-                            double* state_out, std::int64_t S, std::int64_t H_qk, std::int64_t H_v,
-                            std::int64_t T, std::int64_t B, double scale, std::int64_t chunk_size) {
+// Supplementary model of the production chunk decomposition. This is useful for
+// profile-parity diagnostics only: it intentionally mirrors the chunk workspaces
+// and tail handoff, so it must never be used as the mathematical oracle for a
+// production entry point. forward_recurrent above is the one naive FP64 oracle.
+inline void forward_chunked_profile(const float* q, const float* k, const float* v, const float* g,
+                                    const float* beta, const float* state_in, double* out,
+                                    double* state_out, std::int64_t S, std::int64_t H_qk,
+                                    std::int64_t H_v, std::int64_t T, std::int64_t B, double scale,
+                                    std::int64_t chunk_size) {
     const std::int64_t T_full = (T / chunk_size) * chunk_size;
     if (T_full == 0) {
         forward_recurrent(q, k, v, g, beta, state_in, out, state_out, S, H_qk, H_v, T, B, scale);

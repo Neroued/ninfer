@@ -140,11 +140,7 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 
     gate_acc = warp_reduce_sum(gate_acc);
     up_acc   = warp_reduce_sum(up_acc);
-    if (lane == 0) {
-        const float g = __bfloat162float(__float2bfloat16(gate_acc));
-        const float u = __bfloat162float(__float2bfloat16(up_acc));
-        out[out_row]  = __float2bfloat16(silu(g) * u);
-    }
+    if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
 } // namespace

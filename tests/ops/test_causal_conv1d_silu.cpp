@@ -204,8 +204,8 @@ static int decode_chain_equivalence(std::uint32_t seed) {
     return f;
 }
 
-static int snapshot_chain_equivalence(std::uint32_t seed, std::int32_t T, float lo = -8.f,
-                                      float hi = 8.f) {
+static int snapshot_oracle_case(std::uint32_t seed, std::int32_t T, float lo = -8.f,
+                                float hi = 8.f) {
     constexpr std::int32_t C   = 10240;
     const std::size_t n        = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
     const std::size_t state_n  = static_cast<std::size_t>(C) * 3u;
@@ -222,6 +222,22 @@ static int snapshot_chain_equivalence(std::uint32_t seed, std::int32_t T, float 
     std::vector<float> snapshot_state(state_n * static_cast<std::size_t>(T), 17.0f);
     std::copy(state.begin(), state.end(), snapshot_state.begin());
 
+    std::vector<double> ref_out(n), ref_final_state(state_n);
+    cpu_prefill_ref(x, weight, state, C, T, ref_out, ref_final_state);
+    std::vector<std::uint16_t> expected_slots(snapshot_state.size(), f32_to_bf16(17.0f));
+    std::vector<float> running_state = state;
+    for (std::int32_t t = 0; t < T; ++t) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            running_state[idx2(c, 0, C)] = running_state[idx2(c, 1, C)];
+            running_state[idx2(c, 1, C)] = running_state[idx2(c, 2, C)];
+            running_state[idx2(c, 2, C)] = x[idx2(c, t, C)];
+        }
+        for (std::size_t i = 0; i < state_n; ++i) {
+            expected_slots[static_cast<std::size_t>(t) * state_n + i] =
+                f32_to_bf16(running_state[i]);
+        }
+    }
+
     DBuf dx_snapshot = to_device_bf16(x), dw_snapshot = to_device_bf16(weight),
          dstates_snapshot = to_device_bf16(snapshot_state), dout_snapshot(n * 2),
          dinitial_slot    = to_device_i32({0});
@@ -234,39 +250,18 @@ static int snapshot_chain_equivalence(std::uint32_t seed, std::int32_t T, float 
                                      tout_snapshot, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf dx_decode = to_device_bf16(x), dw_decode = to_device_bf16(weight),
-         dstate_decode = to_device_bf16(state), dout_decode(n * 2);
-    Tensor tw_decode(dw_decode.p, DType::BF16, {C, 4});
-    Tensor ts_decode(dstate_decode.p, DType::BF16, {C, 3});
-
-    std::vector<std::uint16_t> expected_slots(state_n * static_cast<std::size_t>(T));
-    for (std::int32_t t = 0; t < T; ++t) {
-        auto* x_step = static_cast<unsigned char*>(dx_decode.p) +
-                       static_cast<std::size_t>(t) * static_cast<std::size_t>(C) * 2u;
-        Tensor tx_step(x_step, DType::BF16, {C, 1});
-        auto* out_step = static_cast<unsigned char*>(dout_decode.p) +
-                         static_cast<std::size_t>(t) * static_cast<std::size_t>(C) * 2u;
-        Tensor tout_step(out_step, DType::BF16, {C, 1});
-        ops::causal_conv1d_silu(tx_step, tw_decode, ts_decode, tout_step, nullptr);
-        cudaDeviceSynchronize();
-        const auto state_bits = from_device_u16(dstate_decode.p, state_n);
-        std::memcpy(expected_slots.data() + static_cast<std::size_t>(t) * state_n,
-                    state_bits.data(), state_n * sizeof(std::uint16_t));
-    }
-    cudaDeviceSynchronize();
-
     const std::string tag = "causal_conv1d snapshot T=" + std::to_string(T);
     int f                 = 0;
-    f += verify_u16_equal((tag + " out bits").c_str(), from_device_u16(dout_snapshot.p, n),
-                          from_device_u16(dout_decode.p, n));
+    f += verify((tag + " out").c_str(), from_device_bf16(dout_snapshot, n), ref_out,
+                Tolerance::bf16_reduction());
     f += verify_u16_equal(
         (tag + " state slot bits").c_str(),
         from_device_u16(dstates_snapshot.p, state_n * static_cast<std::size_t>(T)), expected_slots);
     return f;
 }
 
-static int selected_slot_snapshot_equivalence(std::uint32_t seed, std::int32_t C, std::int32_t T,
-                                              std::int32_t slots, std::int32_t initial_slot) {
+static int selected_slot_snapshot_oracle(std::uint32_t seed, std::int32_t C, std::int32_t T,
+                                         std::int32_t slots, std::int32_t initial_slot) {
     const std::size_t n        = static_cast<std::size_t>(C) * static_cast<std::size_t>(T);
     const std::size_t state_n  = static_cast<std::size_t>(C) * 3u;
     const std::size_t weight_n = static_cast<std::size_t>(C) * 4u;
@@ -286,6 +281,25 @@ static int selected_slot_snapshot_equivalence(std::uint32_t seed, std::int32_t C
     std::copy(state.begin(), state.end(),
               snapshot_state.begin() + static_cast<std::size_t>(initial_slot) * state_n);
 
+    std::vector<double> ref_out(n), ref_final_state(state_n);
+    cpu_prefill_ref(x, weight, state, C, T, ref_out, ref_final_state);
+    std::vector<std::uint16_t> expected_slots(snapshot_state.size());
+    for (std::size_t i = 0; i < snapshot_state.size(); ++i) {
+        expected_slots[i] = f32_to_bf16(snapshot_state[i]);
+    }
+    std::vector<float> running_state = state;
+    for (std::int32_t t = 0; t < T; ++t) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            running_state[idx2(c, 0, C)] = running_state[idx2(c, 1, C)];
+            running_state[idx2(c, 1, C)] = running_state[idx2(c, 2, C)];
+            running_state[idx2(c, 2, C)] = x[idx2(c, t, C)];
+        }
+        for (std::size_t i = 0; i < state_n; ++i) {
+            expected_slots[static_cast<std::size_t>(t) * state_n + i] =
+                f32_to_bf16(running_state[i]);
+        }
+    }
+
     DBuf dx_snapshot = to_device_bf16(x), dw_snapshot = to_device_bf16(weight),
          dstates_snapshot = to_device_bf16(snapshot_state), dout_snapshot(n * 2),
          dinitial_slot    = to_device_i32({initial_slot});
@@ -298,35 +312,11 @@ static int selected_slot_snapshot_equivalence(std::uint32_t seed, std::int32_t C
                                      tout_snapshot, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf dx_decode = to_device_bf16(x), dw_decode = to_device_bf16(weight),
-         dstate_decode = to_device_bf16(state), dout_decode(n * 2);
-    Tensor tw_decode(dw_decode.p, DType::BF16, {C, 4});
-    Tensor ts_decode(dstate_decode.p, DType::BF16, {C, 3});
-
-    std::vector<std::uint16_t> expected_slots(snapshot_state.size());
-    for (std::size_t i = 0; i < snapshot_state.size(); ++i) {
-        expected_slots[i] = f32_to_bf16(snapshot_state[i]);
-    }
-    for (std::int32_t t = 0; t < T; ++t) {
-        auto* x_step = static_cast<unsigned char*>(dx_decode.p) +
-                       static_cast<std::size_t>(t) * static_cast<std::size_t>(C) * 2u;
-        Tensor tx_step(x_step, DType::BF16, {C, 1});
-        auto* out_step = static_cast<unsigned char*>(dout_decode.p) +
-                         static_cast<std::size_t>(t) * static_cast<std::size_t>(C) * 2u;
-        Tensor tout_step(out_step, DType::BF16, {C, 1});
-        ops::causal_conv1d_silu(tx_step, tw_decode, ts_decode, tout_step, nullptr);
-        cudaDeviceSynchronize();
-        const auto state_bits = from_device_u16(dstate_decode.p, state_n);
-        std::memcpy(expected_slots.data() + static_cast<std::size_t>(t) * state_n,
-                    state_bits.data(), state_n * sizeof(std::uint16_t));
-    }
-    cudaDeviceSynchronize();
-
     const std::string tag = "causal_conv1d selected snapshot slot=" + std::to_string(initial_slot) +
                             " T=" + std::to_string(T);
     int f = 0;
-    f += verify_u16_equal((tag + " out bits").c_str(), from_device_u16(dout_snapshot.p, n),
-                          from_device_u16(dout_decode.p, n));
+    f += verify((tag + " out").c_str(), from_device_bf16(dout_snapshot, n), ref_out,
+                Tolerance::bf16_reduction());
     f += verify_u16_equal((tag + " slots").c_str(),
                           from_device_u16(dstates_snapshot.p, expected_slots.size()),
                           expected_slots);
@@ -382,12 +372,10 @@ static int prefill_state_carry_equivalence(std::uint32_t seed, std::int32_t C, s
     return f;
 }
 
-// Prefix-append parity: reading the initial width-3 window from a selected slot and
-// writing the running window to slot 0 must match the in-place run seeded with the
-// same initial window. Same math -> bit-exact. read_slot == 0 exercises the in-place
-// equivalence; T < 3 exercises reading the initial window from the selected slot.
-static int prefill_from_slot_equivalence(std::uint32_t seed, std::int32_t C, std::int32_t T,
-                                         std::int32_t slots, std::int32_t read_slot) {
+// Distinct-state overload: read the initial width-3 window from a selected slot and
+// compare its output and slot-0 state directly with the FP64 formula.
+static int prefill_from_slot_oracle(std::uint32_t seed, std::int32_t C, std::int32_t T,
+                                    std::int32_t slots, std::int32_t read_slot) {
     const std::size_t n        = static_cast<std::size_t>(C) * T;
     const std::size_t state_n  = static_cast<std::size_t>(C) * 3u;
     const std::size_t weight_n = static_cast<std::size_t>(C) * 4u;
@@ -400,14 +388,12 @@ static int prefill_from_slot_equivalence(std::uint32_t seed, std::int32_t C, std
     round_to_bf16(weight);
     round_to_bf16(state);
 
-    DBuf rx = to_device_bf16(x), rw = to_device_bf16(weight), rstate = to_device_bf16(state),
-         rout(n * 2);
-    Tensor tx(rx.p, DType::BF16, {C, T});
-    Tensor tw(rw.p, DType::BF16, {C, 4});
-    Tensor ts(rstate.p, DType::BF16, {C, 3});
-    Tensor tout(rout.p, DType::BF16, {C, T});
-    ops::causal_conv1d_silu(tx, tw, ts, tout, nullptr);
-    cudaDeviceSynchronize();
+    std::vector<double> ref_out(n), ref_state(state_n);
+    cpu_prefill_ref(x, weight, state, C, T, ref_out, ref_state);
+    std::vector<std::uint16_t> ref_state_bits(state_n);
+    for (std::size_t i = 0; i < state_n; ++i) {
+        ref_state_bits[i] = f32_to_bf16(static_cast<float>(ref_state[i]));
+    }
 
     DBuf fx = to_device_bf16(x), fw = to_device_bf16(weight), fout(n * 2);
     DBuf fstates(state_n * static_cast<std::size_t>(slots) * 2u);
@@ -432,10 +418,10 @@ static int prefill_from_slot_equivalence(std::uint32_t seed, std::int32_t C, std
                             " T=" + std::to_string(T) + " slots=" + std::to_string(slots) +
                             " read_slot=" + std::to_string(read_slot);
     int f = 0;
-    f += verify_u16_equal((tag + " out bits").c_str(), from_device_u16(fout.p, n),
-                          from_device_u16(rout.p, n));
+    f += verify((tag + " out").c_str(), from_device_bf16(fout, n), ref_out,
+                Tolerance::bf16_reduction());
     f += verify_u16_equal((tag + " slot0 state bits").c_str(), from_device_u16(fstates.p, state_n),
-                          from_device_u16(rstate.p, state_n));
+                          ref_state_bits);
     return f;
 }
 
@@ -613,29 +599,29 @@ int main() {
         f += one_prefill_shape("causal_conv1d prefill [10241,64]", 10241, 64, seed + 4000u);
         f += decode_chain_equivalence(seed + 5000u);
         for (std::int32_t T : {1, 2, 3, 4, 5, 6}) {
-            f += snapshot_chain_equivalence(seed + 6000u + static_cast<std::uint32_t>(T), T);
+            f += snapshot_oracle_case(seed + 6000u + static_cast<std::uint32_t>(T), T);
         }
-        f += selected_slot_snapshot_equivalence(seed + 7000u, 10240, 4, 6, 0);
-        f += selected_slot_snapshot_equivalence(seed + 7100u, 10241, 4, 6, 2);
-        f += selected_slot_snapshot_equivalence(seed + 7200u, 10240, 5, 6, 5);
+        f += selected_slot_snapshot_oracle(seed + 7000u, 10240, 4, 6, 0);
+        f += selected_slot_snapshot_oracle(seed + 7100u, 10241, 4, 6, 2);
+        f += selected_slot_snapshot_oracle(seed + 7200u, 10240, 5, 6, 5);
     }
     f += prefill_state_carry_equivalence(6061u, 10240, 257, 129);
     f += prefill_state_carry_equivalence(6067u, 10241, 257, 2);
-    f += prefill_from_slot_equivalence(6071u, 10240, 7, 8, 0);
-    f += prefill_from_slot_equivalence(6073u, 10240, 7, 8, 3);
-    f += prefill_from_slot_equivalence(6075u, 10240, 64, 8, 5);
-    f += prefill_from_slot_equivalence(6077u, 10240, 2, 8, 4);
-    f += prefill_from_slot_equivalence(6079u, 10241, 7, 8, 3);
+    f += prefill_from_slot_oracle(6071u, 10240, 7, 8, 0);
+    f += prefill_from_slot_oracle(6073u, 10240, 7, 8, 3);
+    f += prefill_from_slot_oracle(6075u, 10240, 64, 8, 5);
+    f += prefill_from_slot_oracle(6077u, 10240, 2, 8, 4);
+    f += prefill_from_slot_oracle(6079u, 10241, 7, 8, 3);
     f += one_prefill_shape("causal_conv1d 35B prefill [8192,1024]", 8192, 1024, 6083u);
     f += one_decode_shape("causal_conv1d 35B decode [8192,1]", 8192, 6089u);
-    f += prefill_from_slot_equivalence(6090u, 8192, 1, 7, 6);
-    f += prefill_from_slot_equivalence(6091u, 8192, 6, 7, 6);
-    f += selected_slot_snapshot_equivalence(6097u, 8192, 6, 7, 6);
+    f += prefill_from_slot_oracle(6090u, 8192, 1, 7, 6);
+    f += prefill_from_slot_oracle(6091u, 8192, 6, 7, 6);
+    f += selected_slot_snapshot_oracle(6097u, 8192, 6, 7, 6);
     f += one_prefill_shape("causal_conv1d stress prefill [10241,64] [-32,32]", 10241, 64, 4242u,
                            -32.f, 32.f);
     f += one_decode_shape("causal_conv1d stress decode [10240,1] [-32,32]", 10240, 4343u, -32.f,
                           32.f);
-    f += snapshot_chain_equivalence(4444u, 6, -32.f, 32.f);
+    f += snapshot_oracle_case(4444u, 6, -32.f, 32.f);
 
     std::cout << (f ? "FAIL" : "OK") << " causal_conv1d correctness\n";
     return f ? 1 : 0;

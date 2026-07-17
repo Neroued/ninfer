@@ -6,6 +6,12 @@ implementation entrypoint.
 
 Use the active documentation index at [`../README.md`](../README.md) for current behavior.
 
+## Completed correctness audits
+
+- [`2026-07-17-op-numerical-correctness-audit.md`](2026-07-17-op-numerical-correctness-audit.md)
+  — independent FP32/FP64 Op-oracle coverage, kernel numerical-path freedom, 27B/35B
+  active-document corrections, and the docs-only logical contract for future 35B MoE work.
+
 ## Eras
 
 - [`pre-optimization/`](pre-optimization/) — L0/L1/L2 foundation, M2 hardening, and the M2.8

@@ -62,6 +62,23 @@ contract. The contract states the full composition and any observable intermedia
 rounding seam. A tile decoder, partial reduction, epilogue fragment, or warp primitive remains an
 implementation detail when it is only one step beneath a complete host-callable transformation.
 
+#### Oracle precision and implementation freedom
+
+Every floating-point Op has one independent naive FP32/FP64 mathematical oracle. The oracle starts
+from the values represented by the public inputs, evaluates the complete logical formula without
+production tiling or staging, and applies the declared observable output/state formats. For packed
+weights it decodes each signed code with the exact stored scale before evaluating the formula.
+Exact transforms and codecs use one independent exact oracle instead.
+
+The oracle defines correctness; it does not freeze the arithmetic path of a kernel. Private
+accumulators, instruction operand types, staging casts, reduction association, workspace dtypes,
+and kernel boundaries are implementation choices unless the value is independently observable in
+the Op contract. A fused implementation does not inherit a former unfused tensor's BF16 rounding
+merely because that tensor once existed, but it is also not required to keep every private value in
+FP32. Each route may use its natural numerical path and is qualified directly against the same
+oracle with an appropriate tolerance. An implementation profile or another GPU path is never a
+second oracle.
+
 For a stochastic Op, all semantic random inputs are explicit. This includes the RNG state or seed,
 logical position, purpose/domain separation, and draw index required by the algorithm. The contract
 defines the probability process and state transition. It promises a particular backend bitstream
@@ -219,7 +236,7 @@ the applicable fields below:
  *   <dtype, numeric format, storage layout, shape, and semantic variants>
  *
  * Numeric:
- *   <decode rule, accumulation, epsilon, casts, rounding, masking, and ties>
+ *   <logical decode, epsilon, observable casts/state formats, masking, ties, and output criterion>
  *
  * Effects:
  *   <outputs, old/new state, in-place writes, valid regions, and alias rules>
@@ -235,6 +252,8 @@ The comment describes behavior shared by every valid implementation. It must not
 - warp/CTA/tile decomposition;
 - launch count or kernel symbol;
 - a backend approximation instruction;
+- private accumulator, operand-staging, or workspace dtype;
+- an implementation-only intermediate cast or rounding point; or
 - bitwise equality unless the semantic format requires it.
 
 A contract may cite the authoritative tensor-format or layout document instead of duplicating a
@@ -423,14 +442,15 @@ criteria for floating-point and stochastic work. A stochastic test validates the
 contract or controlled semantic inputs; it does not require sampled text to remain identical unless
 the contract promises that result.
 
-When several optimized implementations approximate one ideal operation, keep one independent
-higher-precision oracle and give each implementation profile an explicit named tolerance when its
-rounding or quantization error differs. Do not copy query quantization, staging casts, reduction
-trees, or another implementation's output into the reference merely to make parity pass. State the
-qualification domain honestly: a tolerance established for registered shapes, supported regimes,
-the conformance matrix, and target-representative activations is not a universal error theorem for
-arbitrary unbounded or adversarial tensors. Each semantically complete entry point is checked
-directly against the oracle; pairwise implementation parity is supplementary evidence.
+Every floating-point Op uses the one naive FP32/FP64 oracle defined in Section 1.1. Give each
+implementation profile an explicit named tolerance when its rounding or quantization error differs.
+Do not copy query quantization, staging casts, reduction trees, or another implementation's output
+into the oracle merely to make parity pass. Conversely, do not turn the oracle's evaluation
+precision into a required kernel evaluation order. State the qualification domain honestly: a
+tolerance established for registered shapes, supported regimes, the conformance matrix, and
+target-representative activations is not a universal error theorem for arbitrary unbounded or
+adversarial tensors. Each semantically complete entry point is checked directly against the oracle;
+pairwise implementation parity is supplementary evidence.
 
 GQA applies this rule concretely. BF16 and INT8-G64 A1/A3 share an FP64 ideal attention oracle over
 BF16 Q and logical cache values (BF16 or FP32-decoded INT8-G64). The target's INT8 Q8-G64 compute
@@ -496,6 +516,8 @@ only private dispatch/implementation code and the evidence relevant to that path
 - Can its formula and effects be understood without a model name, layer role, or Program phase?
 - Are all inputs, state, random inputs, valid regions, and mutations explicit?
 - Does the contract state observable numeric and fusion boundaries without freezing CUDA strategy?
+- Does it leave private precision, staging, reduction, workspace representation, and intermediate
+  rounding to the implementation while keeping every route accountable to one oracle?
 - Does wrapper dispatch use only format, layout, numerical shape, regime, state dtype, and device
   facts?
 - Are launcher, kernel, common, codec, and plan headers invisible to targets?

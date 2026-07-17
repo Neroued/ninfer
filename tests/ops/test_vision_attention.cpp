@@ -59,7 +59,8 @@ void reference_attention(const std::vector<float>& q, const std::vector<float>& 
     }
 }
 
-int one_case(const std::vector<int>& cu, std::uint32_t seed, bool packed, int uniform_tile = 0) {
+int one_case(const std::vector<int>& cu, std::uint32_t seed, bool packed, int uniform_tile = 0,
+             bool raw_scratch = false) {
     const int patches       = cu.back();
     const std::size_t plane = static_cast<std::size_t>(patches) * kHeads * kDim;
     std::vector<float> q(plane), k(plane), v(plane);
@@ -117,11 +118,17 @@ int one_case(const std::vector<int>& cu, std::uint32_t seed, bool packed, int un
     Tensor tcu(dcu.p, DType::I32, {static_cast<int>(cu.size())});
     Tensor tout(dout.p, DType::BF16, {kDim, kHeads, patches});
     WorkspaceArena workspace(256);
+    const int scratch_count =
+        raw_scratch ? ops::vision_attention_scratch_tiles(patches, int(cu.size()) - 1) : 0;
+    DBuf dscratch(std::max<std::size_t>(1, static_cast<std::size_t>(scratch_count) * 4 * 4));
     if (uniform_tile > 0) {
         ops::detail::vision_attention_uniform_launch_with_tile(tq, tk, tv, cu[1] - cu[0],
                                                                uniform_tile, tout, nullptr);
     } else if (uniform_tile < 0) {
         ops::vision_attention(tq, tk, tv, cu[1] - cu[0], tout, nullptr);
+    } else if (raw_scratch) {
+        Tensor tscratch(dscratch.p, DType::I32, {4, scratch_count});
+        ops::vision_attention(tq, tk, tv, tcu, &tscratch, tout, nullptr);
     } else {
         ops::vision_attention(tq, tk, tv, tcu, workspace, tout, nullptr);
     }
@@ -129,6 +136,7 @@ int one_case(const std::vector<int>& cu, std::uint32_t seed, bool packed, int un
     const std::string label = uniform_tile > 0
                                   ? "vision attention uniform tile " + std::to_string(uniform_tile)
                               : uniform_tile < 0 ? "vision attention uniform auto"
+                              : raw_scratch      ? "vision attention raw tensor scratch"
                               : packed           ? "vision attention packed qkv"
                                                  : "vision attention contiguous";
     return verify(label.c_str(), from_device_bf16(dout, plane), reference,
@@ -145,6 +153,7 @@ int main() {
     int failures = 0;
     failures += one_case({0, 4, 11}, 1u, false);
     failures += one_case({0, 4, 11}, 7u, true);
+    failures += one_case({0, 4, 11}, 17u, true, 0, true);
     failures += one_case({0, 65, 194}, 31u, true);
     failures += one_case({0, 16}, 99u, true);
     failures += one_case({0, 256}, 2026u, true);

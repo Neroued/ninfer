@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "ops/op_tester.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -40,7 +41,7 @@ Weight bf16_weight(void* data, std::int32_t rows, std::int32_t hidden) {
     return w;
 }
 
-double softplus(double x) { return (x > 20.0) ? x : std::log1p(std::exp(x)); }
+double softplus_fp64(double x) { return std::max(x, 0.0) + std::log1p(std::exp(-std::abs(x))); }
 
 void cpu_gdn_gating_proj(const std::vector<float>& x, const std::vector<float>& aw,
                          const std::vector<float>& bw, const std::vector<float>& A_log,
@@ -58,19 +59,17 @@ void cpu_gdn_gating_proj(const std::vector<float>& x, const std::vector<float>& 
         for (std::int32_t h = 0; h < heads; ++h) {
             const float* aw_row = aw.data() + static_cast<std::size_t>(h) * hidden;
             const float* bw_row = bw.data() + static_cast<std::size_t>(h) * hidden;
-            float acc_a         = 0.0f;
-            float acc_b         = 0.0f;
+            double acc_a        = 0.0;
+            double acc_b        = 0.0;
             for (std::int32_t k = 0; k < hidden; ++k) {
-                acc_a = std::fma(aw_row[k], x_col[k], acc_a);
-                acc_b = std::fma(bw_row[k], x_col[k], acc_b);
+                acc_a += static_cast<double>(aw_row[k]) * static_cast<double>(x_col[k]);
+                acc_b += static_cast<double>(bw_row[k]) * static_cast<double>(x_col[k]);
             }
 
-            const float a       = bf16_to_f32(f32_to_bf16(acc_a));
-            const float b       = bf16_to_f32(f32_to_bf16(acc_b));
             const std::size_t i = sample * heads + static_cast<std::size_t>(h);
             g[i]                = -std::exp(static_cast<double>(A_log[h])) *
-                   softplus(static_cast<double>(a) + static_cast<double>(dt_bias[h]));
-            beta[i] = 1.0 / (1.0 + std::exp(-static_cast<double>(b)));
+                   softplus_fp64(acc_a + static_cast<double>(dt_bias[h]));
+            beta[i] = 1.0 / (1.0 + std::exp(-acc_b));
         }
     }
 }
@@ -144,10 +143,10 @@ int one_shape(std::int32_t T, std::uint32_t seed, std::vector<std::int32_t> samp
     }
     const std::string label = "gdn_gating_proj [48,5120] T=" + std::to_string(T) +
                               " samples=" + std::to_string(sample_tokens.size());
-    int failures = 0;
-    failures += verify((label + " g").c_str(), sampled_g, ref_g, Tolerance::gdn_output_bf16());
-    failures +=
-        verify((label + " beta").c_str(), sampled_beta, ref_beta, Tolerance::gdn_output_bf16());
+    const Tolerance tolerance = Tolerance::gdn_control_fp32();
+    int failures              = 0;
+    failures += verify((label + " g").c_str(), sampled_g, ref_g, tolerance);
+    failures += verify((label + " beta").c_str(), sampled_beta, ref_beta, tolerance);
     return failures;
 }
 
@@ -224,10 +223,10 @@ int one_shape35(std::int32_t T, std::uint32_t seed, std::vector<std::int32_t> sa
     }
     const std::string label = "gdn_gating_proj parent [64,2048] T=" + std::to_string(T) +
                               " samples=" + std::to_string(sample_tokens.size());
-    int failures = 0;
-    failures += verify((label + " g").c_str(), sampled_g, ref_g, Tolerance::gdn_output_bf16());
-    failures +=
-        verify((label + " beta").c_str(), sampled_beta, ref_beta, Tolerance::gdn_output_bf16());
+    const Tolerance tolerance = Tolerance::gdn_control_fp32();
+    int failures              = 0;
+    failures += verify((label + " g").c_str(), sampled_g, ref_g, tolerance);
+    failures += verify((label + " beta").c_str(), sampled_beta, ref_beta, tolerance);
     return failures;
 }
 

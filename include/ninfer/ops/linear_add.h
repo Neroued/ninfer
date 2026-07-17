@@ -26,15 +26,18 @@ namespace ninfer::ops {
  * Op: linear_add
  *
  * Math / indexing:
- *   residual[:,t]' = bf16(float(residual[:,t]) + float(linear(x,w)[:,t])).
+ *   residual[:,t]' = BF16(residual[:,t] + Linear(x,w)[:,t]).
  *
  * Logical shapes:
  *   Contiguous BF16 x [K,T] and residual [N,T]. Weight is either Q5G64_F16S RowSplit with
  *   logical shape [5120,17408] or [5120,6144], or W8G32_F16S RowSplit [2048,4096].
  *
  * Numeric:
- *   The linear projection follows linear.h. Fused implementations preserve the registered
- *   projection-plus-residual BF16 rounding seam.
+ *   The oracle exact-decodes the registered weight and evaluates the complete expression naively
+ *   in FP64 before converting the observable result to BF16. Production routes may fuse or
+ *   materialize the projection and may choose their natural accumulator, staging, and workspace
+ *   precision; those private choices are not semantic rounding boundaries and are qualified against
+ *   the same oracle with the route-appropriate tolerance.
  *
  * Effects:
  *   Updates the full residual tensor in place; x/weight must not alias residual.

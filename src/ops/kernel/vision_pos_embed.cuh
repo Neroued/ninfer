@@ -39,10 +39,9 @@ __global__ void vision_pos_embed_add_d1152_warp_kernel(const __nv_bfloat162* tab
             lo += value.x * corner_weights[corner];
             hi += value.y * corner_weights[corner];
         }
-        const __nv_bfloat162 rounded  = __floats2bfloat162_rn(lo, hi);
         const __nv_bfloat162 residual = x[x_base + pair];
-        x[x_base + pair] = __floats2bfloat162_rn(__low2float(residual) + __low2float(rounded),
-                                                 __high2float(residual) + __high2float(rounded));
+        x[x_base + pair] =
+            __floats2bfloat162_rn(__low2float(residual) + lo, __high2float(residual) + hi);
     }
 }
 
@@ -75,10 +74,9 @@ __launch_bounds__(Block) __global__
             lo += value.x * corner_weights[corner];
             hi += value.y * corner_weights[corner];
         }
-        const __nv_bfloat162 rounded  = __floats2bfloat162_rn(lo, hi);
         const __nv_bfloat162 residual = x[x_base + pair];
-        x[x_base + pair] = __floats2bfloat162_rn(__low2float(residual) + __low2float(rounded),
-                                                 __high2float(residual) + __high2float(rounded));
+        x[x_base + pair] =
+            __floats2bfloat162_rn(__low2float(residual) + lo, __high2float(residual) + hi);
     }
 }
 
@@ -101,9 +99,7 @@ __global__ void vision_pos_embed_add_kernel(const __nv_bfloat16* table, const st
                             weights[control];
             }
         }
-        // HF rounds the interpolated position to BF16 before the residual add.
-        const __nv_bfloat16 rounded = __float2bfloat16_rn(position);
-        x[linear] = __float2bfloat16_rn(__bfloat162float(x[linear]) + __bfloat162float(rounded));
+        x[linear] = __float2bfloat16_rn(__bfloat162float(x[linear]) + position);
     }
 }
 

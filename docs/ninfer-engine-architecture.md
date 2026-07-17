@@ -1490,7 +1490,8 @@ alone never authorizes multimodal reuse.
 
 The implemented path carries Vision-merger composed columns into shifted MTP inputs instead of
 reconstructing image/video placeholder columns through raw token embedding lookup. The native Python
-reference implements the same composed-embedding lookahead and remains the independent oracle.
+reference implements the same composed-embedding lookahead and provides supplementary behavioral
+parity. It does not replace the independent mathematical oracle of any participating Op.
 
 ### 16.4 Decode round
 

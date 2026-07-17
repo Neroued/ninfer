@@ -503,12 +503,10 @@ void q5_rowsplit_gemm_mma_kernel(
                 const int output_col1 = output_col0 + 1;
                 const float* values   = accum[mi][ni];
                 auto store_value      = [&](std::int64_t index, float value) {
-                    __nv_bfloat16 result = __float2bfloat16_rn(value);
                     if constexpr (Epilogue == Q5MmaEpilogue::AddResidual) {
-                        result = __float2bfloat16_rn(__bfloat162float(residual[index]) +
-                                                          __bfloat162float(result));
+                        value = __bfloat162float(residual[index]) + value;
                     }
-                    out[index] = result;
+                    out[index] = __float2bfloat16_rn(value);
                 };
                 if constexpr (kFull) {
                     store_value(static_cast<std::int64_t>(output_col0) * rows + output_row0,

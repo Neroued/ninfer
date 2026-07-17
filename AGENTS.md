@@ -186,9 +186,26 @@ parallel `final`, `v2`, or `new-design` authorities. Update active links and
 ## Numerical correctness
 
 When a task changes numerical behavior or makes a numerical claim, identify the mathematical
-oracle, input rounding boundary, accumulation precision, output criterion, and real model shapes
-relevant to that claim. Apply exact, tolerance-based, or behavioral comparison according to the
+oracle, represented public inputs, explicit semantic cast/quantization/state boundaries, output
+criterion, and real model shapes relevant to that claim. If a route's private precision or
+reduction profile matters to the evidence, describe it as an implementation profile rather than a
+semantic requirement. Apply exact, tolerance-based, or behavioral comparison according to the
 actual semantic contract.
+
+Every floating-point Op has one independent naive FP32/FP64 mathematical oracle; exact transforms
+and codecs have one independent exact oracle. The oracle evaluates the complete logical formula
+from the represented public inputs and, for packed weights, decodes the signed code with the exact
+stored scale. It does not copy a production kernel's staging casts, reduction tree, workspace dtype,
+or another implementation's output.
+
+The oracle does not prescribe a production arithmetic path. Unless an intermediate value is an
+observable Op output, explicit Cast/quantize/dequantize result, registered codec value, or specified
+persistent state, kernels may choose the natural intermediate precision, instruction operands,
+reduction association, workspace representation, and kernel decomposition for their route. A fused
+kernel is neither required to reproduce an unfused BF16 materialization nor forbidden from using a
+lower-precision intermediate when that is the natural qualified implementation. Every production
+route is checked directly against the same oracle with a criterion appropriate to its output and
+implementation profile; pairwise implementation parity is supplementary evidence only.
 
 Where relevant to the changed behavior, account for numeric-format decode, BF16 fusion order, FP32
 GDN state, BF16/INT8 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address stability.

@@ -159,7 +159,8 @@ b = in_b(h)       # [48,T]
 ```
 
 Q/K/V are concatenated into `[10240,T]` and passed through the depthwise causal width-4 convolution
-and SiLU. Q and K are then L2-normalized per head. The decay and update gates are computed in FP32:
+and SiLU. Q and K are then L2-normalized per head. The decay and update controls `g` and `beta` are
+observable FP32 values with the logical formula:
 
 ```text
 g    = -exp(A_log) * softplus(a + dt_bias)
@@ -320,10 +321,11 @@ The Text RoPE kernel consumes these positions during multimodal prefill and uses
 `rope_delta` during decode. This is why Vision can disappear after prefill while Text positions
 remain consistent.
 
-## 12. Precision invariants
+## 12. Precision and oracle boundaries
 
 - activations are BF16 at public model/operator boundaries;
-- ordinary and Q/K norms use FP32 accumulation and BF16 output;
+- ordinary and Q/K norm oracles evaluate their reductions in FP32/FP64 and compare the declared
+  BF16 outputs; production reduction and staging are route-private choices;
 - GDN `g`, `beta`, and recurrent state are FP32;
 - the ideal GQA oracle evaluates dot products, stable softmax, and value reduction in FP64 from
   BF16 Q and logical cache values; the BF16 Op output is promoted to FP64 for comparison;
@@ -335,6 +337,11 @@ remain consistent.
   accepted through the separate named INT8 tolerance rather than the BF16 tolerance;
 - the full target `lm_head` is used for prefill, verification, and ordinary decode regardless of
   draft-head mode.
+
+These points define public representations and mathematical oracles, not a mandatory kernel
+operation order. Private accumulator precision, Tensor Core operand staging, intermediate
+materialization, workspace dtype, and reduction association are selected by each implementation
+route and accepted against the corresponding oracle tolerance.
 
 GQA numerical qualification covers both registered geometries, supported prompt and small-T
 regimes, the maintained conformance matrix, and target-representative activation ranges. Its
@@ -375,6 +382,8 @@ changes its fixed allocation.
 | native `.ninfer` converter and verifier | `tools/convert/qwen3_6_27b_rtx5090` |
 | artifact-native Python Text/Vision/MTP reference | `tools/reference/qwen3_6_27b_rtx5090` |
 
-The Python reference is an independent executable oracle for model and artifact-path numerics; it
-is not a second implementation of every CLI, serving, or sampler option. The C++ target implements
-the complete Text/Vision/MTP product over `.ninfer` through the closed Engine architecture.
+The Python reference is an independent executable implementation for model/artifact-path and state
+parity; it is not the per-Op mathematical oracle and does not prescribe private C++ kernel
+precision. Each Op is checked against its own naive FP32/FP64 or exact oracle. The C++ target
+implements the complete Text/Vision/MTP product over `.ninfer` through the closed Engine
+architecture.

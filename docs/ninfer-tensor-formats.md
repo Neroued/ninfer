@@ -141,12 +141,12 @@ seven numeric formats.
 
 ### 2.7 Compute profile and kernel support
 
-A **compute profile** owns observable input and output types, accumulation precision, required
-rounding or fusion boundaries, determinism requirements, and operator-level numerical tolerances.
-Kernel tiling, Tensor Core use, internal reduction trees, split strategy, fusion schedule,
-dequantization staging, launch geometry, and hardware dispatch remain implementation choices when
-they satisfy those observable boundaries. Only an explicitly bitwise compute profile freezes an
-exact internal order.
+A **compute profile** owns observable input and output types, explicitly semantic casts or
+quantization boundaries, determinism requirements, and operator-level numerical tolerances. Kernel
+operand and accumulator precision, tiling, Tensor Core use, internal reduction trees, private
+staging or materialization, split strategy, fusion schedule, launch geometry, and hardware dispatch
+remain implementation choices. Exact or bitwise operations may require an exact observable result;
+that requirement does not turn a floating-point oracle into a prescribed internal evaluation order.
 
 Consequently, `W8G32_F16S` means neither W8A8 nor FP16 output, and `F16S` says nothing about the
 activation type. A kernel is usable only for an explicitly supported combination of numeric format,
@@ -390,14 +390,15 @@ w_hat[p,k] = binary32(s32 * binary32(q[p, k]))
 This binary32 expression is the mathematical conformance oracle. Every legal signed code is exactly
 representable in binary32, every binary16 value expands exactly to binary32, and their product is
 the scheme's represented value. A kernel need not materialize that product or use binary32 at every
-stage, but its operator-level result must satisfy the tolerance and rounding boundary of its compute
-profile relative to this oracle.
+stage; its operator-level result is qualified against this oracle with the tolerance appropriate to
+the route.
 
 The formula `code / scale` is wrong: the stored scale is a multiplier. An independent scheme decoder
 or exact oracle that introduces a zero point, recenters the code interval, or converts the scale
 through BF16 implements a different numerical contract. A production kernel may use lower-precision
-internal staging only when its compute profile explicitly permits it and its observable operator
-result passes that profile's tolerance.
+internal staging, different accumulator precision, or another reduction association; these are
+implementation choices, and the observable operator result must pass that route's tolerance against
+the same oracle.
 
 ### 6.3 Logical storage cost
 
@@ -579,9 +580,10 @@ codec and operator tests independently protect the representation and numerical 
 ### 8.4 Kernel and operator
 
 A consuming kernel or model component must interpret direct logical words according to Section 3 or
-quantized codes and scales according to Sections 5 and 6. It may fuse, reorder, or approximate
-intermediate work only as allowed by its operator compute profile. Kernel implementation details do
-not alter the persistent format and must not be needed to decode an artifact independently.
+quantized codes and scales according to Sections 5 and 6. It may choose its private fusion,
+reduction, staging, and intermediate precision; the observable Op result is qualified against the
+independent oracle with the route's tolerance. Kernel implementation details do not alter the
+persistent format and must not be needed to decode an artifact independently.
 
 There is no mandatory generic unpack-to-dense fallback. If NInfer has not implemented the exact
 combination required by a selected target, conversion or loading fails explicitly rather than
@@ -705,7 +707,8 @@ grouped formats, it is the binary32 reconstruction in Section 6.2. The canonical
 oracle is a bit-level host/software implementation of the ordered algorithm in Section 7; production
 converters require parity against it rather than defining the oracle through their own arithmetic.
 Numerical operator tests separately protect the combinations used by the registered target, including
-their activation rounding boundary, accumulation precision, output tolerance, and real target shapes.
+their public input/output formats, output tolerance, and real target shapes. Private staging and
+accumulation remain implementation choices.
 
 ## 13. Consequences for container and model design
 

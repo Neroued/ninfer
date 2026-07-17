@@ -211,10 +211,8 @@ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q4_linear_swiglu_mma_split
             const int cc0 = t0 + wn * WN + ni * 8 + 2 * lid;
             const int cc1 = cc0 + 1;
             auto store    = [&](int col, int row, float gv, float uv) {
-                const float g = __bfloat162float(__float2bfloat16_rn(gv));
-                const float u = __bfloat162float(__float2bfloat16_rn(uv));
                 out[static_cast<std::int64_t>(col) * intermediate + row] =
-                    __float2bfloat16_rn(silu(g) * u);
+                    __float2bfloat16_rn(silu(gv) * uv);
             };
             if constexpr (FullTiles) {
                 store(cc0, r0, acc[mi][ni][0], acc[mi + MT / 2][ni][0]);

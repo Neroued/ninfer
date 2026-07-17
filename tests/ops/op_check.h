@@ -66,6 +66,13 @@ struct Tolerance {
     // worst-ratio, and rel-L2 gates remain the BF16 values.
     static constexpr Tolerance attention_int8() { return {4e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
 
+    // GDN control projections expose FP32 g/beta. This qualifies current route profiles against
+    // the high-precision oracle without prescribing their private projection staging.
+    static constexpr Tolerance gdn_control_fp32() {
+        return {/*atol*/ 1e-6, /*rtol*/ 1e-5, /*tail_frac*/ 1e-4,
+                /*worst_ratio_max*/ 2.0, /*rel_l2_tol*/ 1e-5};
+    }
+
     static constexpr Tolerance gdn_output_bf16() { return {1e-3, 1.0e-2, 2e-3, 5.0, 8e-3}; }
 
     static constexpr Tolerance gdn_state_fp32() { return {5e-4, 5.0e-3, 2e-2, 5.0, 5e-3}; }

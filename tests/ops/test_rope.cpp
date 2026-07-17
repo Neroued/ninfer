@@ -248,6 +248,10 @@ int split_api_parity_case(std::int32_t T, std::uint32_t seed) {
     round_to_bf16(q);
     round_to_bf16(k);
 
+    std::vector<double> q_ref, k_ref;
+    cpu_rope_one(q, positions, kQHeads, T, kRotaryDim, kTheta, q_ref);
+    cpu_rope_one(k, positions, kKHeads, T, kRotaryDim, kTheta, k_ref);
+
     DBuf dpos     = to_device_i32(positions);
     DBuf dq_fused = to_device_bf16(q), dk_fused = to_device_bf16(k);
     DBuf dq_split = to_device_bf16(q), dk_split = to_device_bf16(k);
@@ -264,6 +268,10 @@ int split_api_parity_case(std::int32_t T, std::uint32_t seed) {
 
     const std::string label = "rope split API T=" + std::to_string(T);
     int f                   = 0;
+    f += verify((label + " q vs FP64").c_str(), from_device_bf16(dq_split, qn), q_ref,
+                Tolerance::bf16_elementwise());
+    f += verify((label + " k vs FP64").c_str(), from_device_bf16(dk_split, kn), k_ref,
+                Tolerance::bf16_elementwise());
     f += check_all_bits_same((label + " q").c_str(), from_device_bf16_bits(dq_split, qn),
                              from_device_bf16_bits(dq_fused, qn));
     f += check_all_bits_same((label + " k").c_str(), from_device_bf16_bits(dk_split, kn),
@@ -321,17 +329,25 @@ int text_mrope_case() {
     cpu_rope_nd(q, positions, 3, kHeadDim, kQHeads, tokens, kRotaryDim, kTheta, q_ref);
     cpu_rope_nd(k, positions, 3, kHeadDim, kKHeads, tokens, kRotaryDim, kTheta, k_ref);
     DBuf dpos = to_device_i32(positions);
-    DBuf dq   = to_device_bf16(q);
-    DBuf dk   = to_device_bf16(k);
+    DBuf dq = to_device_bf16(q), dk = to_device_bf16(k);
+    DBuf dq_single = to_device_bf16(q), dk_single = to_device_bf16(k);
     Tensor tpos(dpos.p, DType::I32, {tokens, 3});
     Tensor tq(dq.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tk(dk.p, DType::BF16, {kHeadDim, kKHeads, tokens});
+    Tensor tq_single(dq_single.p, DType::BF16, {kHeadDim, kQHeads, tokens});
+    Tensor tk_single(dk_single.p, DType::BF16, {kHeadDim, kKHeads, tokens});
     ops::rope(tpos, kRotaryDim, kTheta, tq, tk, nullptr);
+    ops::rope(tpos, kRotaryDim, kTheta, tq_single, nullptr);
+    ops::rope(tpos, kRotaryDim, kTheta, tk_single, nullptr);
     cudaDeviceSynchronize();
     int failures = 0;
     failures += verify("text MRoPE q", from_device_bf16(dq, q.size()), q_ref,
                        Tolerance::bf16_elementwise());
     failures += verify("text MRoPE k", from_device_bf16(dk, k.size()), k_ref,
+                       Tolerance::bf16_elementwise());
+    failures += verify("text MRoPE q single", from_device_bf16(dq_single, q.size()), q_ref,
+                       Tolerance::bf16_elementwise());
+    failures += verify("text MRoPE k single", from_device_bf16(dk_single, k.size()), k_ref,
                        Tolerance::bf16_elementwise());
     return failures;
 }
@@ -385,9 +401,13 @@ int text_35b_case(int tokens, int axes) {
                                        bf16_bits(q), q_heads, tokens, kRotaryDim);
     failures += check_passthrough_bits((label + " k passthrough").c_str(), k_pair_bits,
                                        bf16_bits(k), k_heads, tokens, kRotaryDim);
-    failures += check_all_bits_same((label + " q single").c_str(),
+    failures += verify((label + " q single vs FP64").c_str(), from_device_bf16(dq_one, q.size()),
+                       q_ref, Tolerance::bf16_elementwise());
+    failures += verify((label + " k single vs FP64").c_str(), from_device_bf16(dk_one, k.size()),
+                       k_ref, Tolerance::bf16_elementwise());
+    failures += check_all_bits_same((label + " q single parity").c_str(),
                                     from_device_bf16_bits(dq_one, q.size()), q_pair_bits);
-    failures += check_all_bits_same((label + " k single").c_str(),
+    failures += check_all_bits_same((label + " k single parity").c_str(),
                                     from_device_bf16_bits(dk_one, k.size()), k_pair_bits);
     return failures;
 }
@@ -418,29 +438,46 @@ int vision_rope_packed_case() {
     std::vector<double> k_ref;
     cpu_rope_nd(q, positions, 2, head_dim, heads, tokens, head_dim, 10000.0f, q_ref);
     cpu_rope_nd(k, positions, 2, head_dim, heads, tokens, head_dim, 10000.0f, k_ref);
-    DBuf dpacked = to_device_bf16(packed);
-    DBuf dpos    = to_device_i32(positions);
-    Tensor tq(dpacked.p, DType::BF16, {head_dim, heads, tokens});
+    DBuf dpacked_pair   = to_device_bf16(packed);
+    DBuf dpacked_single = to_device_bf16(packed);
+    DBuf dpos           = to_device_i32(positions);
+    Tensor tq(dpacked_pair.p, DType::BF16, {head_dim, heads, tokens});
     tq.nb[2]  = qkv * 2;
     Tensor tk = tq;
-    tk.data   = static_cast<unsigned char*>(dpacked.p) + hidden * 2;
+    tk.data   = static_cast<unsigned char*>(dpacked_pair.p) + hidden * 2;
+    Tensor tq_one(dpacked_single.p, DType::BF16, {head_dim, heads, tokens});
+    tq_one.nb[2]  = qkv * 2;
+    Tensor tk_one = tq_one;
+    tk_one.data   = static_cast<unsigned char*>(dpacked_single.p) + hidden * 2;
     Tensor tpos(dpos.p, DType::I32, {tokens, 2});
     ops::rope(tpos, head_dim, 10000.0f, tq, tk, nullptr);
+    ops::rope(tpos, head_dim, 10000.0f, tq_one, nullptr);
+    ops::rope(tpos, head_dim, 10000.0f, tk_one, nullptr);
     cudaDeviceSynchronize();
-    const std::vector<std::uint16_t> bits = from_device_bf16_bits(dpacked, packed.size());
-    std::vector<double> q_got(q.size());
-    std::vector<double> k_got(k.size());
+    const std::vector<std::uint16_t> pair_bits = from_device_bf16_bits(dpacked_pair, packed.size());
+    const std::vector<std::uint16_t> single_bits =
+        from_device_bf16_bits(dpacked_single, packed.size());
+    std::vector<double> q_got(q.size()), k_got(k.size());
+    std::vector<double> q_single_got(q.size()), k_single_got(k.size());
     for (int token = 0; token < tokens; ++token) {
         for (int i = 0; i < hidden; ++i) {
             q_got[static_cast<std::size_t>(token) * hidden + i] =
-                bf16_to_f32(bits[static_cast<std::size_t>(token) * qkv + i]);
+                bf16_to_f32(pair_bits[static_cast<std::size_t>(token) * qkv + i]);
             k_got[static_cast<std::size_t>(token) * hidden + i] =
-                bf16_to_f32(bits[static_cast<std::size_t>(token) * qkv + hidden + i]);
+                bf16_to_f32(pair_bits[static_cast<std::size_t>(token) * qkv + hidden + i]);
+            q_single_got[static_cast<std::size_t>(token) * hidden + i] =
+                bf16_to_f32(single_bits[static_cast<std::size_t>(token) * qkv + i]);
+            k_single_got[static_cast<std::size_t>(token) * hidden + i] =
+                bf16_to_f32(single_bits[static_cast<std::size_t>(token) * qkv + hidden + i]);
         }
     }
     int failures = 0;
     failures += verify("vision RoPE packed q", q_got, q_ref, Tolerance::bf16_elementwise());
     failures += verify("vision RoPE packed k", k_got, k_ref, Tolerance::bf16_elementwise());
+    failures +=
+        verify("vision RoPE packed q single", q_single_got, q_ref, Tolerance::bf16_elementwise());
+    failures +=
+        verify("vision RoPE packed k single", k_single_got, k_ref, Tolerance::bf16_elementwise());
     return failures;
 }
 

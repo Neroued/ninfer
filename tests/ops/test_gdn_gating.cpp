@@ -1,12 +1,13 @@
 // Correctness + coverage for gdn_gating, against the frozen op-test standard
 // (docs/op-development.md): fp64 golden from bf16-rounded inputs, honest
-// GDN gate ranges including the softplus guard, composite tolerance
+// GDN gate ranges including the production softplus guard domain, composite tolerance
 // fp32_transcendental.
 #include "ninfer/ops/gdn_gating.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "core/arena.h"
 #include "ops/op_tester.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -24,8 +25,8 @@ static void cpu_gdn_gating(const std::vector<float>& a, const std::vector<float>
     for (std::int32_t t = 0; t < T; ++t) {
         for (std::int32_t h = 0; h < 48; ++h) {
             const std::size_t i = static_cast<std::size_t>(t) * 48u + static_cast<std::size_t>(h);
-            double sp           = static_cast<double>(a[i]) + static_cast<double>(dt_bias[h]);
-            sp                  = (sp > 20.0) ? sp : std::log1p(std::exp(sp));
+            const double u      = static_cast<double>(a[i]) + static_cast<double>(dt_bias[h]);
+            const double sp     = std::max(u, 0.0) + std::log1p(std::exp(-std::abs(u)));
             g[i]                = -std::exp(static_cast<double>(A_log[h])) * sp;
 
             const double bv = static_cast<double>(b[i]);
@@ -51,7 +52,7 @@ static Weight bf16_weight(void* data) {
     return w;
 }
 
-static int fused_decode_matches_two_step() {
+static int fused_projection_matches_oracle() {
     std::vector<float> x(5120), aw(48 * 5120), bw(48 * 5120), A_log(48), dt_bias(48);
     fill_uniform(x, 501u, -2.f, 2.f);
     fill_uniform(aw, 502u, -0.05f, 0.05f);
@@ -62,21 +63,21 @@ static int fused_decode_matches_two_step() {
     round_to_bf16(aw);
     round_to_bf16(bw);
 
-    std::vector<float> a(48), b(48);
+    std::vector<double> ref_g(48), ref_beta(48);
     for (std::int32_t h = 0; h < 48; ++h) {
         const float* aw_row = aw.data() + static_cast<std::size_t>(h) * 5120u;
         const float* bw_row = bw.data() + static_cast<std::size_t>(h) * 5120u;
-        float acc_a         = 0.0f;
-        float acc_b         = 0.0f;
+        double acc_a        = 0.0;
+        double acc_b        = 0.0;
         for (std::int32_t k = 0; k < 5120; ++k) {
-            acc_a = std::fma(aw_row[k], x[k], acc_a);
-            acc_b = std::fma(bw_row[k], x[k], acc_b);
+            acc_a += static_cast<double>(aw_row[k]) * static_cast<double>(x[k]);
+            acc_b += static_cast<double>(bw_row[k]) * static_cast<double>(x[k]);
         }
-        a[h] = bf16_to_f32(f32_to_bf16(acc_a));
-        b[h] = bf16_to_f32(f32_to_bf16(acc_b));
+        const double u  = acc_a + static_cast<double>(dt_bias[h]);
+        const double sp = std::max(u, 0.0) + std::log1p(std::exp(-std::abs(u)));
+        ref_g[h]        = -std::exp(static_cast<double>(A_log[h])) * sp;
+        ref_beta[h]     = 1.0 / (1.0 + std::exp(-acc_b));
     }
-    std::vector<double> ref_g(48), ref_beta(48);
-    cpu_gdn_gating(a, b, A_log, dt_bias, 1, ref_g, ref_beta);
 
     DBuf dx = to_device_bf16(x), daw = to_device_bf16(aw), dbw = to_device_bf16(bw);
     DBuf dA_log = to_device_f32(A_log), ddt_bias = to_device_f32(dt_bias);
@@ -94,10 +95,11 @@ static int fused_decode_matches_two_step() {
     ops::gdn_gating_proj(tx, wa, wb, tA_log, tdt_bias, ws, tg, tbeta, nullptr);
     cudaDeviceSynchronize();
 
-    int f = 0;
-    f += verify("gdn_gating_proj T=1 g", from_device_f32(dg, 48), ref_g,
+    const std::string label = "gdn_gating_proj T=1 fp64-oracle";
+    int f                   = 0;
+    f += verify((label + " g").c_str(), from_device_f32(dg, 48), ref_g,
                 Tolerance::fp32_transcendental());
-    f += verify("gdn_gating_proj T=1 beta", from_device_f32(dbeta, 48), ref_beta,
+    f += verify((label + " beta").c_str(), from_device_f32(dbeta, 48), ref_beta,
                 Tolerance::fp32_transcendental());
     return f;
 }
@@ -257,7 +259,7 @@ int main() {
     }
     int f = 0;
     f += validation_checks();
-    f += fused_decode_matches_two_step();
+    f += fused_projection_matches_oracle();
 
     for (std::uint32_t seed : {1u, 7u, 99u}) {
         f += one_shape("gdn_gating [48,1]", 1, seed, -8.f, 8.f);

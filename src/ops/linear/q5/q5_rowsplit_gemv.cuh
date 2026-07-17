@@ -164,10 +164,7 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
 
     acc = warp_reduce_sum(acc);
     if constexpr (kResidual) {
-        if (lane == 0) {
-            const __nv_bfloat16 y = __float2bfloat16_rn(acc);
-            acc                   = __bfloat162float(out[row]) + __bfloat162float(y);
-        }
+        if (lane == 0) { acc = __bfloat162float(out[row]) + acc; }
     }
     if (lane == 0) { out[row] = __float2bfloat16_rn(acc); }
 }

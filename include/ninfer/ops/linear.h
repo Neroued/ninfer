@@ -10,7 +10,7 @@ namespace ninfer::ops {
 /**
  * Matrix projection, independently for every token column:
  *
- *   out[n,t] = BF16(sum_{k=0..K-1} dequantize(w)[n,k] * float(x[k,t])).
+ *   out[n,t] = BF16(sum_{k=0..K-1} dequantize(w)[n,k] * x[k,t]).
  *
  * `x` is contiguous BF16 [K,T], `w` has logical shape [N,K], and `out` is contiguous BF16
  * [N,T], with the first index stored fastest. Registered execution uses RowSplit Q4G64_F16S,
@@ -18,8 +18,10 @@ namespace ninfer::ops {
  * registry of exact physical problems and selects its kernel internally; the encoding and
  * alignment contract alone do not imply arbitrary-shape support. BF16_CTRL has a reserved
  * format-local boundary but currently admits no pure Linear problem. FP32_CTRL is unsupported by
- * this Op. `out` must not overlap x or any weight plane. `ws` is caller-owned transient storage
- * and carries no semantic state beyond the call.
+ * this Op. The oracle exact-decodes the weight and evaluates each dot product naively in FP64
+ * before converting the observable output to BF16. Production accumulator, staging, and reduction
+ * choices are route-private. `out` must not overlap x or any weight plane. `ws` is caller-owned
+ * transient storage and carries no semantic state beyond the call.
  */
 void linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws, cudaStream_t stream);
 

@@ -187,8 +187,16 @@ GpuResult run_recurrent_gpu_stepped(const gdn_ref::Inputs& in) {
     return {from_device_bf16(dout, in.v.size()), from_device_f32(dstate, in.state.size())};
 }
 
-int snapshot_chain_equivalence_case(int T, std::uint32_t seed, bool stress_g) {
+int snapshot_oracle_case(int T, std::uint32_t seed, bool stress_g) {
     const auto in = make_inputs(T, seed, stress_g);
+
+    const double scale = 1.0 / std::sqrt(static_cast<double>(S));
+    std::vector<double> ref_out(in.v.size());
+    std::vector<double> ref_state(in.state.size());
+    std::vector<double> ref_snapshots(in.state.size() * static_cast<std::size_t>(T));
+    gdn_ref::forward_recurrent(in.q.data(), in.k.data(), in.v.data(), in.g.data(), in.beta.data(),
+                               in.state.data(), ref_out.data(), ref_state.data(), S, H_qk, H_v, T,
+                               B, scale, ref_snapshots.data());
 
     std::vector<float> snapshot_state(in.state.size() * static_cast<std::size_t>(T), 17.0f);
     std::copy(in.state.begin(), in.state.end(), snapshot_state.begin());
@@ -217,55 +225,19 @@ int snapshot_chain_equivalence_case(int T, std::uint32_t seed, bool stress_g) {
                                    tstate_snapshot, tinitial_slot, tout_snapshot, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf dq_step     = to_device_bf16(in.q);
-    DBuf dk_step     = to_device_bf16(in.k);
-    DBuf dv_step     = to_device_bf16(in.v);
-    DBuf dg_step     = to_device_f32(in.g);
-    DBuf dbeta_step  = to_device_f32(in.beta);
-    DBuf dstate_step = to_device_f32(in.state);
-    DBuf dout_step(in.v.size() * 2);
-    WorkspaceArena ws_step(chunked_arena_bytes(T));
-
-    Tensor tq_step(dq_step.p, DType::BF16, {S, H_qk, T});
-    Tensor tk_step(dk_step.p, DType::BF16, {S, H_qk, T});
-    Tensor tv_step(dv_step.p, DType::BF16, {S, H_v, T});
-    Tensor tg_step(dg_step.p, DType::FP32, {H_v, T});
-    Tensor tbeta_step(dbeta_step.p, DType::FP32, {H_v, T});
-    Tensor tstate_step(dstate_step.p, DType::FP32, {S, S, H_v});
-    Tensor tout_step(dout_step.p, DType::BF16, {S, H_v, T});
-
-    std::vector<std::uint32_t> expected_slots(in.state.size() * static_cast<std::size_t>(T));
-    for (int t = 0; t < T; ++t) {
-        Tensor q_t    = tq_step.slice(2, t, 1);
-        Tensor k_t    = tk_step.slice(2, t, 1);
-        Tensor v_t    = tv_step.slice(2, t, 1);
-        Tensor g_t    = tg_step.slice(1, t, 1);
-        Tensor beta_t = tbeta_step.slice(1, t, 1);
-        Tensor out_t  = tout_step.slice(2, t, 1);
-        ops::gated_delta_rule(q_t, k_t, v_t, g_t, beta_t, 1.0f / std::sqrt(float(S)), ws_step,
-                              tstate_step, out_t, nullptr);
-        cudaDeviceSynchronize();
-        const auto state_bits = from_device_u32(dstate_step.p, in.state.size());
-        std::memcpy(expected_slots.data() + static_cast<std::size_t>(t) * in.state.size(),
-                    state_bits.data(), in.state.size() * sizeof(std::uint32_t));
-    }
-    cudaDeviceSynchronize();
-
     const std::string tag =
         "gdn recurrent snapshot T=" + std::to_string(T) + (stress_g ? " stress" : " default");
     int failures = 0;
-    failures += verify_bits_equal((tag + " out bits").c_str(),
-                                  from_device_u16(dout_snapshot.p, in.v.size()),
-                                  from_device_u16(dout_step.p, in.v.size()));
-    failures += verify_bits_equal(
-        (tag + " state slot bits").c_str(),
-        from_device_u32(dstate_snapshot.p, in.state.size() * static_cast<std::size_t>(T)),
-        expected_slots);
+    failures += verify((tag + " out").c_str(), from_device_bf16(dout_snapshot, in.v.size()),
+                       ref_out, Tolerance::gdn_output_bf16());
+    failures += verify((tag + " state slots").c_str(),
+                       from_device_f32(dstate_snapshot, ref_snapshots.size()), ref_snapshots,
+                       Tolerance::gdn_state_fp32());
     return failures;
 }
 
-int selected_slot_snapshot_equivalence_case(int head_dim, int qk_heads, int value_heads, int T,
-                                            int initial_slot, std::uint32_t seed) {
+int selected_slot_snapshot_oracle_case(int head_dim, int qk_heads, int value_heads, int T,
+                                       int initial_slot, std::uint32_t seed) {
     constexpr int Slots = 7;
     const auto in       = make_inputs_for_geometry(head_dim, qk_heads, value_heads, T, seed, false);
     const std::size_t state_n = in.state.size();
@@ -273,6 +245,16 @@ int selected_slot_snapshot_equivalence_case(int head_dim, int qk_heads, int valu
     std::vector<float> snapshot_state(state_n * Slots, 17.0f);
     std::copy(in.state.begin(), in.state.end(),
               snapshot_state.begin() + static_cast<std::size_t>(initial_slot) * state_n);
+
+    const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
+    std::vector<double> ref_out(in.v.size());
+    std::vector<double> ref_state(state_n);
+    std::vector<double> recurrent_snapshots(state_n * static_cast<std::size_t>(T));
+    gdn_ref::forward_recurrent(in.q.data(), in.k.data(), in.v.data(), in.g.data(), in.beta.data(),
+                               in.state.data(), ref_out.data(), ref_state.data(), head_dim,
+                               qk_heads, value_heads, T, B, scale, recurrent_snapshots.data());
+    std::vector<double> expected_slots(snapshot_state.begin(), snapshot_state.end());
+    std::copy(recurrent_snapshots.begin(), recurrent_snapshots.end(), expected_slots.begin());
 
     DBuf dq_snapshot     = to_device_bf16(in.q);
     DBuf dk_snapshot     = to_device_bf16(in.k);
@@ -299,54 +281,16 @@ int selected_slot_snapshot_equivalence_case(int head_dim, int qk_heads, int valu
                                    tstate_snapshot, tinitial_slot, tout_snapshot, nullptr);
     cudaDeviceSynchronize();
 
-    DBuf dq_step     = to_device_bf16(in.q);
-    DBuf dk_step     = to_device_bf16(in.k);
-    DBuf dv_step     = to_device_bf16(in.v);
-    DBuf dg_step     = to_device_f32(in.g);
-    DBuf dbeta_step  = to_device_f32(in.beta);
-    DBuf dstate_step = to_device_f32(in.state);
-    DBuf dout_step(in.v.size() * 2);
-    WorkspaceArena ws_step(chunked_arena_bytes(T));
-
-    Tensor tq_step(dq_step.p, DType::BF16, {head_dim, qk_heads, T});
-    Tensor tk_step(dk_step.p, DType::BF16, {head_dim, qk_heads, T});
-    Tensor tv_step(dv_step.p, DType::BF16, {head_dim, value_heads, T});
-    Tensor tg_step(dg_step.p, DType::FP32, {value_heads, T});
-    Tensor tbeta_step(dbeta_step.p, DType::FP32, {value_heads, T});
-    Tensor tstate_step(dstate_step.p, DType::FP32, {head_dim, head_dim, value_heads});
-    Tensor tout_step(dout_step.p, DType::BF16, {head_dim, value_heads, T});
-
-    std::vector<std::uint32_t> expected_slots(snapshot_state.size());
-    for (std::size_t i = 0; i < snapshot_state.size(); ++i) {
-        expected_slots[i] = f32_bits(snapshot_state[i]);
-    }
-    for (int t = 0; t < T; ++t) {
-        Tensor q_t    = tq_step.slice(2, t, 1);
-        Tensor k_t    = tk_step.slice(2, t, 1);
-        Tensor v_t    = tv_step.slice(2, t, 1);
-        Tensor g_t    = tg_step.slice(1, t, 1);
-        Tensor beta_t = tbeta_step.slice(1, t, 1);
-        Tensor out_t  = tout_step.slice(2, t, 1);
-        ops::gated_delta_rule(q_t, k_t, v_t, g_t, beta_t, 1.0f / std::sqrt(float(head_dim)),
-                              ws_step, tstate_step, out_t, nullptr);
-        cudaDeviceSynchronize();
-        const auto state_bits = from_device_u32(dstate_step.p, state_n);
-        std::memcpy(expected_slots.data() + static_cast<std::size_t>(t) * state_n,
-                    state_bits.data(), state_n * sizeof(std::uint32_t));
-    }
-    cudaDeviceSynchronize();
-
     const std::string tag = "gdn selected snapshot S=" + std::to_string(head_dim) +
                             " Hqk=" + std::to_string(qk_heads) +
                             " Hv=" + std::to_string(value_heads) +
                             " slot=" + std::to_string(initial_slot) + " T=" + std::to_string(T);
     int failures = 0;
-    failures += verify_bits_equal((tag + " out bits").c_str(),
-                                  from_device_u16(dout_snapshot.p, in.v.size()),
-                                  from_device_u16(dout_step.p, in.v.size()));
-    failures += verify_bits_equal((tag + " slots").c_str(),
-                                  from_device_u32(dstate_snapshot.p, expected_slots.size()),
-                                  expected_slots);
+    failures += verify((tag + " out").c_str(), from_device_bf16(dout_snapshot, in.v.size()),
+                       ref_out, Tolerance::gdn_output_bf16());
+    failures +=
+        verify((tag + " slots").c_str(), from_device_f32(dstate_snapshot, expected_slots.size()),
+               expected_slots, Tolerance::gdn_state_fp32());
     return failures;
 }
 
@@ -420,9 +364,9 @@ int general_geometry_case(int head_dim, int qk_heads, int value_heads, int T, st
     const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     std::vector<double> ref_out(in.v.size());
     std::vector<double> ref_state(in.state.size());
-    gdn_ref::forward_chunked(in.q.data(), in.k.data(), in.v.data(), in.g.data(), in.beta.data(),
-                             in.state.data(), ref_out.data(), ref_state.data(), head_dim, qk_heads,
-                             value_heads, T, B, scale, BT);
+    gdn_ref::forward_recurrent(in.q.data(), in.k.data(), in.v.data(), in.g.data(), in.beta.data(),
+                               in.state.data(), ref_out.data(), ref_state.data(), head_dim,
+                               qk_heads, value_heads, T, B, scale);
 
     DBuf dq        = to_device_bf16(in.q);
     DBuf dk        = to_device_bf16(in.k);
@@ -501,19 +445,19 @@ int recurrent_case(int T, std::uint32_t seed, bool stress_g) {
     return failures;
 }
 
-int chunked_case(int T, std::uint32_t seed, bool compare_recurrent, bool compare_ar_golden,
+int chunked_case(int T, std::uint32_t seed, bool compare_recurrent, bool compare_full_naive,
                  bool stress_g = false) {
     const auto in      = make_inputs(T, seed, stress_g);
     const double scale = 1.0 / std::sqrt(static_cast<double>(S));
-    std::vector<double> chunked_ref_out(static_cast<std::size_t>(B * T * H_v * S));
-    std::vector<double> chunked_ref_state(static_cast<std::size_t>(B * H_v * S * S));
-    gdn_ref::forward_chunked(in.q.data(), in.k.data(), in.v.data(), in.g.data(), in.beta.data(),
-                             in.state.data(), chunked_ref_out.data(), chunked_ref_state.data(), S,
-                             H_qk, H_v, T, B, scale, BT);
+    std::vector<double> profile_ref_out(static_cast<std::size_t>(B * T * H_v * S));
+    std::vector<double> profile_ref_state(static_cast<std::size_t>(B * H_v * S * S));
+    gdn_ref::forward_chunked_profile(in.q.data(), in.k.data(), in.v.data(), in.g.data(),
+                                     in.beta.data(), in.state.data(), profile_ref_out.data(),
+                                     profile_ref_state.data(), S, H_qk, H_v, T, B, scale, BT);
 
     std::vector<double> ar_ref_out;
     std::vector<double> ar_ref_state;
-    if (compare_ar_golden) {
+    if (compare_full_naive) {
         ar_ref_out.resize(static_cast<std::size_t>(B * T * H_v * S));
         ar_ref_state.resize(static_cast<std::size_t>(B * H_v * S * S));
         gdn_ref::forward_recurrent(in.q.data(), in.k.data(), in.v.data(), in.g.data(),
@@ -526,17 +470,16 @@ int chunked_case(int T, std::uint32_t seed, bool compare_recurrent, bool compare
         const GpuResult got = run_chunked_gpu(in);
         const std::string tag =
             std::string("gdn chunked T=") + std::to_string(T) + (stress_g ? " slow-decay" : "");
-        failures += verify((tag + " vs chunked-ref out").c_str(), got.out, chunked_ref_out,
-                           Tolerance::gdn_output_bf16());
-        failures += verify((tag + " vs chunked-ref state").c_str(), got.state, chunked_ref_state,
-                           Tolerance::gdn_state_fp32());
-        if (compare_ar_golden) {
-            failures += verify((tag + " vs AR-golden out").c_str(), got.out, ar_ref_out,
+        failures += verify((tag + " supplementary profile parity out").c_str(), got.out,
+                           profile_ref_out, Tolerance::gdn_output_bf16());
+        failures += verify((tag + " supplementary profile parity state").c_str(), got.state,
+                           profile_ref_state, Tolerance::gdn_state_fp32());
+        if (compare_full_naive) {
+            failures += verify((tag + " vs naive FP64 out").c_str(), got.out, ar_ref_out,
                                Tolerance::gdn_output_bf16());
-            failures += verify((tag + " vs AR-golden state").c_str(), got.state, ar_ref_state,
+            failures += verify((tag + " vs naive FP64 state").c_str(), got.state, ar_ref_state,
                                Tolerance::gdn_state_fp32());
         }
-
         if (compare_recurrent) {
             const GpuResult recurrent = run_recurrent_gpu(in);
             failures += verify((tag + " vs recurrent out").c_str(), got.out, recurrent.out,
@@ -764,15 +707,14 @@ int main() {
     failures += recurrent_case(2, 4028u, false);
     for (std::uint32_t seed : {7028u, 8128u}) {
         for (int T : {1, 2, 3, 4, 5, 6}) {
-            failures +=
-                snapshot_chain_equivalence_case(T, seed + static_cast<std::uint32_t>(T), false);
+            failures += snapshot_oracle_case(T, seed + static_cast<std::uint32_t>(T), false);
         }
     }
-    failures += snapshot_chain_equivalence_case(6, 9028u, true);
-    failures += selected_slot_snapshot_equivalence_case(S, H_qk, H_v, 4, 0, 10028u);
-    failures += selected_slot_snapshot_equivalence_case(S, H_qk, H_v, 4, 2, 10038u);
-    failures += selected_slot_snapshot_equivalence_case(S, H_qk, H_v, 5, 5, 10048u);
-    failures += selected_slot_snapshot_equivalence_case(128, 16, 32, 6, 6, 10058u);
+    failures += snapshot_oracle_case(6, 9028u, true);
+    failures += selected_slot_snapshot_oracle_case(S, H_qk, H_v, 4, 0, 10028u);
+    failures += selected_slot_snapshot_oracle_case(S, H_qk, H_v, 4, 2, 10038u);
+    failures += selected_slot_snapshot_oracle_case(S, H_qk, H_v, 5, 5, 10048u);
+    failures += selected_slot_snapshot_oracle_case(128, 16, 32, 6, 6, 10058u);
     failures += validation_case();
     failures += general_geometry_case(16, 4, 4, 1, 12016u);
     failures += general_geometry_case(32, 4, 8, 3, 12032u);

@@ -10,8 +10,8 @@ namespace ninfer::ops {
  * Applies split-half NeoX RoPE in place. For pair i in [0,rotary_dim/2), angle phi(i,t), and
  * each head:
  *
- *   x'[i]                  = BF16(float(x[i]) * cos(phi) - float(x[i+R/2]) * sin(phi))
- *   x'[i+rotary_dim/2]     = BF16(float(x[i+R/2]) * cos(phi) + float(x[i]) * sin(phi)).
+ *   x'[i]                  = BF16(x[i] * cos(phi) - x[i+R/2] * sin(phi))
+ *   x'[i+rotary_dim/2]     = BF16(x[i+R/2] * cos(phi) + x[i] * sin(phi)).
  *
  * Dimensions [rotary_dim,head_dim) are unchanged. Supported modes are:
  *
@@ -26,8 +26,9 @@ namespace ninfer::ops {
  * [head_dim,heads,T] with positive head counts, contiguous head features and heads, and an optional
  * padded token stride. The registered optimized domains are Text Q/K head geometries 24/4 and
  * 16/2, plus Vision geometry 16/16. q and k must not overlap one another or positions. The Op
- * mutates only dimensions [0,rotary_dim) of the supplied Q/K tensor storage and uses no workspace
- * or persistent state.
+ * mutates only dimensions [0,rotary_dim) of the supplied Q/K tensor storage. The oracle evaluates
+ * phases and rotations naively in FP64 before converting the observable result to BF16; private
+ * kernel arithmetic is implementation-defined. The Op uses no workspace or persistent state.
  */
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
           cudaStream_t stream);

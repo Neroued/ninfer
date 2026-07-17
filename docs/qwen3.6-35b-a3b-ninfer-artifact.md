@@ -4,14 +4,16 @@
 > `qwen3_6_35b_a3b_rtx5090` target. The target-private converter, inventory, source recipe, and
 > conversion preflight implement this contract and have completed a real end-to-end conversion
 > with the fixed 27B-measured shortlist. The complete artifact-native Python Text/MoE/Vision/MTP
-> reference implements the target's typed binding and execution semantics. No C++ binder, runtime
-> target package, source verifier, or Engine route currently exists.
+> path implements typed binding and a bring-up execution/parity profile; it is not a per-Op
+> mathematical oracle. No C++ binder, runtime target package, source verifier, or Engine route
+> currently exists.
 >
 > Authority: this document defines the complete `.ninfer` persistent-object contract for
 > the exact Qwen3.6-35B-A3B checkpoint and the recipe that converts the selected Hugging Face BF16
 > checkpoint into those objects. It is authoritative for object names, shapes, formats, layouts,
 > MoE expert ordering, fused row order, frontend resources, source transforms, memory envelope, and
-> implementation acceptance. It does not advertise current product support.
+> artifact acceptance. It does not prescribe private kernel accumulator, staging, workspace, or
+> rounding choices and does not advertise current product support.
 >
 > Common framing and JSON fields remain defined by
 > [`ninfer-container-format.md`](ninfer-container-format.md). Numeric meanings and the canonical
@@ -179,9 +181,9 @@ numerical and behavioral evidence in Section 17.
 | routed gate/up, all 40 Text layers | `Q4G64_F16S` | dominant residency, demonstrated low-bit role tier |
 | routed down, Text layers except 34/38/39 | `Q5G64_F16S` | down projection receives one extra bit |
 | routed down, Text layers 34/38/39 | `Q6G64_F16S` | preserve the local importance-ranked upgrades |
-| router and shared-expert scalar gate | `BF16` | preserve exact source values; compute/softmax remains FP32 |
+| router and shared-expert scalar gate | `BF16` | preserve exact source values; routing arithmetic is qualified separately |
 | Text norms, convolution, A/B projections | `BF16` | preserve exact source values |
-| GDN `A_log` and `dt_bias` | `FP32` | exact BF16 expansion for the FP32 decay path |
+| GDN `A_log` and `dt_bias` | `FP32` | preserve the exact expanded source values used by decay math |
 | optimized draft head | `Q4G64_F16S` | proposal-only shortlist |
 | MTP large matrices, including routed experts | `W8G32_F16S` | conservative within-budget tier; GGUF has no MTP evidence |
 | Vision block input/expansion matrices | `Q4G64_F16S` | reuse the 27B storage/kernel geometry subject to 35B qualification |
@@ -214,10 +216,10 @@ p = 1: up   row G[e,512+r,:]
 ```
 
 Expert `e` therefore owns consecutive stored rows `[e*1024,(e+1)*1024)`. A fused SwiGLU kernel
-reads row `e*1024+r` and matching row `e*1024+512+r` into two FP32 accumulators. The existing T=1
-kernel uses this two-accumulator pattern, while the folded prefill MMA tile reads 32 consecutive
-gate rows and the matching 32 consecutive up rows. Interleaving rows as `2r+p` would not reduce
-weight bytes or HBM transactions and would prevent direct reuse of those paths.
+reads row `e*1024+r` and matching row `e*1024+512+r` as one gate/up pair. The existing T=1 kernel
+uses this paired-row pattern, while the folded prefill MMA tile reads 32 consecutive gate rows and
+the matching 32 consecutive up rows. Interleaving rows as `2r+p` would not reduce weight bytes or
+HBM transactions and would prevent direct reuse of those paths.
 
 For source routed down bank `D[E,H,I]`, the stored shape is
 `[E*H,I] = [524288,512]`:
@@ -283,8 +285,8 @@ The converter also fixes these decode-oriented row transforms:
 - MoE router rows `0..255` and the shared-expert sigmoid-gate row 256 form one BF16 object;
 - gate/up rows are half-split as defined above.
 
-These are physical stored objects and row orders, not serialized fusion metadata. They preserve the
-mathematical rounding and state boundaries in the architecture reference.
+These are physical stored objects and row orders, not serialized fusion metadata. They preserve
+logical row identity and do not create a private kernel precision or rounding boundary.
 
 ## 4. Object namespace, order, and frontend resources
 
@@ -934,14 +936,17 @@ know expert roles or the closed target inventory.
 ### 15.1 Sparse-MoE execution
 
 The semantically closed sparse-MoE Op owns router selection, routed experts, gated shared expert,
-and their reduction. The accepted decode baseline is one graph-stable four-kernel sequence per
-layer, not eight expert launches or calls through the generic linear planner:
+and their reduction. The accepted decode topology to qualify is one graph-stable four-kernel
+sequence per layer, not eight expert launches or calls through the generic linear planner:
 
-1. one BF16 projection of the 257-row `router_shared_gate` object;
-2. one device-side FP32 softmax/top-8/normalization plus the independent shared-gate sigmoid;
-3. one selected-routed-plus-shared gate/up projection with fused SwiGLU; and
+1. one projection of the 257-row `router_shared_gate` object;
+2. one device-side softmax/top-8/normalization plus the independent shared-gate sigmoid;
+3. one selected-routed-plus-shared gate/up projection with SwiGLU; and
 4. one selected-routed-plus-shared down projection with route reduction, shared scaling, final
    addition, and decoder residual add.
+
+This is a launch/dataflow baseline, not a numerical evaluation order. Each kernel may choose its
+natural accumulator, operand staging, intermediate materialization, and workspace representation.
 
 The top-8 stage carries each route weight with its expert id. It may stable-sort those pairs by
 expert id before projection to make the eight plane streams monotonic; it must not change logical
@@ -955,13 +960,13 @@ grid.x       = 512
 block        = 9 warps
 warp 0..7    = selected routed slots
 warp 8       = shared expert
-output       = BF16 act[9,512], slot-major; no gate/up matrix materialized
+private act  = [9,512], slot-major; no public gate/up tensor
 ```
 
 The CTA cooperatively stages the 2048-element input once. Each routed warp reads matching rows
 `e*1024+r` and `e*1024+512+r`; the shared warp reads rows `r` and `512+r` from its W8 object. Each
-warp holds two FP32 dot-product accumulators, applies the two separate BF16 projection rounds, then
-SwiGLU and its BF16 output boundary.
+warp computes the gate/up dot products and SwiGLU. Their accumulator and staging types are private
+implementation choices.
 
 The corresponding first specialized down geometry is one CTA per hidden output coordinate:
 
@@ -970,40 +975,40 @@ grid.x       = 2048
 block        = 9 warps
 warp 0..7    = selected routed slots
 warp 8       = shared expert
-input        = BF16 act[9,512]
-output       = one routed/shared/residual result; no expert-output matrix materialized
+private act  = [9,512]
+output       = one BF16 routed/shared/residual result; no public expert-output tensor
 ```
 
-Every routed warp computes one selected expert row and reaches the BF16 `expert_down` boundary
-before multiplication by its BF16 route weight. The CTA reduces in FP32, applies the shared sigmoid
-to the shared W8 result, reaches the specified BF16 MoE-output boundary, and only then performs the
-fused decoder residual add. A K=512 row is a dedicated kernel case: Q5, Q6, and W8 consume exactly
-336, 400, and 544 encoded bytes per row. Reusing the current generic Small-T K=1024 loop would put
-the complete K=512 row in its scalar tail and is not an accepted decode path.
+Every routed warp computes one selected expert row and applies its matching route weight. The CTA
+combines routed and shared contributions with the decoder residual. Intermediate precision and
+reduction association remain private to the implementation. A K=512 row is a dedicated kernel
+case: Q5, Q6, and W8 consume exactly 336, 400, and 544 encoded bytes per row. Reusing the current
+generic Small-T K=1024 loop would put the complete K=512 row in its scalar tail and is not an
+accepted decode path.
 
 This nine-warp decomposition is the implementation baseline to qualify, not a persistent artifact
 field. A different CTA decomposition or a safe merger of the first two stages is acceptable only
-if it preserves the same row traffic and numerical boundaries and improves both the isolated Op
-and end-to-end decode measurements in Section 17. Per-expert launches, all-expert scans, and
+if it preserves the logical assignment/result and improves both the isolated Op and end-to-end
+decode measurements in Section 17. Per-expert launches, all-expert scans, and
 materialized `[8,gate/up,512]` or `[8,2048]` intermediates remain nonconforming.
 
-The observable decode and Small-T numerical profile is:
+The logical sparse-MoE formula is:
 
 ```text
-projection  = BF16(sum_k FP32(dequant(weight)) * FP32(BF16 activation))
-gate_up      = BF16(SiLU(FP32(BF16 gate)) * FP32(BF16 up))
-expert_down  = BF16(sum_k FP32(dequant(weight)) * FP32(BF16 gate_up))
-route prob   = FP32 softmax/top-k normalization, then BF16 route weights
-routed sum   = BF16(sum_e FP32(BF16 route_weight) * FP32(BF16 expert_down))
-shared_down  = BF16(sum_k FP32(dequant(W8 weight)) * FP32(BF16 shared_gate_up))
-MoE output   = BF16(FP32(BF16 routed_sum) + FP32(shared_sigmoid) * FP32(BF16 shared_down))
+scores       = Linear(router_shared_gate, X)
+p            = softmax(scores[0:256])
+ids          = top8(p)
+alpha        = p[ids] / sum(p[ids])
+routed       = sum_e alpha[e] * Expert_e(X)
+shared       = sigmoid(scores[256]) * Shared(X)
+residual'    = residual + routed + shared
 ```
 
-Kernel reduction grouping may vary, so conformance is numerical rather than bitwise except at the
-explicit BF16 boundaries. The independent oracle dequantizes the exact artifact codes/scales and
-implements the profile above; it does not compare against source BF16 weights after quantization.
-Capacity factors, token dropping, persistent expert permutation, or an all-expert fallback are not
-allowed.
+The independent oracle exact-dequantizes artifact codes/scales and evaluates this complete formula
+naively in FP32/FP64 from the public inputs, then compares the declared BF16 residual output.
+Production routes may use different private rounding and reduction profiles and qualify against the
+same oracle with route-appropriate tolerances. Capacity factors, token dropping, persistent expert
+permutation, or an all-expert fallback are not allowed.
 
 ### 15.2 Other fused projections
 
@@ -1015,10 +1020,8 @@ objects as unrelated generic linear calls:
 - `gdn_input_decode_w8_12288x2048` reads the one `[q,k,v,z]` parent once, writes Q/K/V in the
   contiguous convolution-input order, and writes Z to its independent consumer;
 - `gdn_ab_decode_bf16_64x2048` consumes the two half-split 32-row views in one launch and directly
-  produces FP32 `g` and `beta`, including the BF16 projection rounds and FP32 `A_log`/`dt_bias`
-  functions;
-- the attention and GDN W8 output projections fuse the decoder residual add without carrying
-  extra precision across the mixer-output boundary; and
+  produces FP32 `g` and `beta`, including the `A_log`/`dt_bias`, softplus, and sigmoid functions;
+- the attention and GDN W8 output projections fuse the decoder residual add; and
 - the Q6 full head and Q4 draft head use K=2048 fixed warp-row specializations rather than a
   shape-generic fallback.
 
@@ -1038,23 +1041,23 @@ coalesced 16-byte plane reads; for each K=1024 slab the encoded streams are:
 | Q6 | 512 B | 256 B | 32 B |
 | W8 | 1024 B | 0 | 64 B |
 
-Large-T kernels dequantize BK=64 tiles to BF16 shared memory and feed Tensor Core MMA. These
+Large-T candidates may dequantize BK=64 tiles to BF16 shared memory and feed Tensor Core MMA. These
 accesses, the half-split gate/up MMA mapping, and the K=512 special case are why this contract keeps
-`row-split-k128-v1` instead of defining a MoE-only codec or runtime repack.
-
-That MMA path has one additional explicit rounding boundary relative to Small-T:
+`row-split-k128-v1` instead of defining a MoE-only codec or runtime repack. That candidate profile
+includes implementation-private operand staging such as:
 
 ```text
-mma_weight     = BF16(FP32(code) * FP32(binary16_scale))
-mma_projection = BF16(sum_k FP32(mma_weight) * FP32(BF16 activation))
+mma_weight_stage = BF16(FP32(code) * FP32(binary16_scale))
 ```
 
-Prefill oracles and tolerances use this profile; they do not claim bit equality with the
-FP32-dequant Small-T association.
+The oracle does not reproduce this staging. Small-T and MMA routes are compared independently with
+the same exact-dequantized naive oracle, using tolerances appropriate to their implementation
+profiles.
 
-Full attention still preserves the Q/K norm+MRoPE and post-attention sigmoid boundaries. GDN still
-preserves convolution, L2 normalization, FP32 recurrent update, gated norm, and residual
-boundaries. Vision retains the implemented 27B block and merger numerical boundaries.
+Full attention still preserves the public Q/K norm+MRoPE and post-attention sigmoid Op boundaries.
+GDN still preserves convolution, L2 normalization, FP32 recurrent state, gated norm, and residual
+Op/state boundaries. Vision retains the implemented 27B block and merger Op boundaries. None of
+these boundaries prescribes a private accumulator or intermediate rounding path.
 
 The target schedule composes repository-internal Ops. CUDA implementations remain under
 `src/ops`; the target package owns fixed layer order, views, state, graph, and workspace policy.
@@ -1214,18 +1217,19 @@ marked implemented only after all of the following exist.
 
 ### 17.2 Numerical and behavioral correctness
 
-- independent dequantized-weight oracles for fused full-attention input, GDN input, routed/shared
-  MoE, MTP, and Vision at real shapes;
+- independent naive FP32/FP64 or exact oracles for fused full-attention input, GDN input,
+  routed/shared MoE, MTP, and Vision at real shapes, with exact logical weight decode;
 - expert tests that vary all eight selected ids, include experts 0 and 255, and compare fused
-  gate/up/down/reduction against the Section 15 numerical profile;
-- source-BF16 versus artifact-reference activation comparisons at every layer type, with stated
-  BF16 input rounding, FP32 accumulation, output tolerances, and router top-8 agreement statistics;
+  gate/up/down/reduction against the complete Section 15 oracle rather than private stage goldens;
+- source-BF16 versus artifact-implementation activation comparisons at every layer type as
+  supplementary parity evidence, with output tolerances and router top-8 agreement statistics;
 - 35B full-head target and MTP held-out traces reporting shortlist coverage, MTP accepted-token
   replay, and Q4 draft-head top-1 drift; these are required even if the final ids equal the 27B map;
 - complete text prefill/decode, image, video, mixed-media, MTP prefill/proposal/verification, and
   accepted/rejected state continuation through the artifact-native reference and C++ Engine;
-- behavioral comparison against the BF16 source oracle and the project-accepted local GGUF
-  precedent before accepting the different NInfer codecs and fused route in the product target.
+- behavioral comparison against the BF16 source implementation and the project-accepted local GGUF
+  precedent before accepting the different NInfer codecs and fused route in the product target;
+  neither implementation replaces a per-Op mathematical oracle.
 
 The GGUF comparison is a target-route regression check, not a new numeric-format admission or a
 byte-equivalence test. Exact probabilistic token streams and fixed artifact hashes are not required.

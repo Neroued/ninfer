@@ -106,6 +106,8 @@ add_library(ninfer_ops STATIC
   ops/linear/w8/w8_rowsplit_plan.cpp
   ops/linear_pair/w8/w8_pair_gemm_mma.cu
   ops/linear_pair/w8/w8_pair_plan.cpp
+  ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
+  ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
   ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
@@ -135,6 +137,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/scatter.cpp
   ops/wrapper/sigmoid_mul.cpp
   ops/wrapper/silu_mul.cpp
+  ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
 ninfer_internal_includes(ninfer_ops)

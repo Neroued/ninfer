@@ -12,6 +12,14 @@ Use the active documentation index at [`../README.md`](../README.md) for current
   — independent FP32/FP64 Op-oracle coverage, kernel numerical-path freedom, 27B/35B
   active-document corrections, and the docs-only logical contract for future 35B MoE work.
 
+## Completed operator plans
+
+- [`2026-07-17-sparse-moe-decode-implementation.md`](2026-07-17-sparse-moe-decode-implementation.md)
+  — the closed `SparseMoe` decode `T=1` API/workspace, four-stage implementation, independent
+  oracle, CUDA Graph test, and RTX 5090 stage qualification.
+- [`optimization-era/bench/qwen3.6-35b-sparse-moe-decode-roofline.md`](optimization-era/bench/qwen3.6-35b-sparse-moe-decode-roofline.md)
+  — retained candidate, payload-control, full-route, and Nsight Compute evidence for that domain.
+
 ## Completed cutovers
 
 - [`optimization-era/plans/2026-07-17-qwen3-6-27b-decode-projection-cutover.md`](optimization-era/plans/2026-07-17-qwen3-6-27b-decode-projection-cutover.md)

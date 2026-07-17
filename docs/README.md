@@ -24,7 +24,6 @@ defined by `include/ninfer/engine.h` and `include/ninfer/types.h`.
 | Document | Active scope |
 |---|---|
 | [`plans/2026-07-17-sparse-moe-design-log.md`](plans/2026-07-17-sparse-moe-design-log.md) | decisions for the closed future-target `SparseMoe` Op |
-| [`plans/2026-07-17-sparse-moe-decode-implementation.md`](plans/2026-07-17-sparse-moe-decode-implementation.md) | decode-only framework, D1-D4 implementation, correctness, and qualification sequence |
 
 Completed plans are indexed under [`archive/`](archive/README.md).
 

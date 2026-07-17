@@ -9,7 +9,7 @@ import torch
 
 from .bindings import ExpertBank, MoeBinding
 from .config import CFG
-from .ops import bf16, linear, silu_mul
+from .ops import bf16
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,16 +21,27 @@ class MoeResult:
 
 
 def route(router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """FP32 softmax/top-8/renormalization with a BF16 route boundary."""
+    """Select lower-id-stable top-8 logits and normalize only the selected set."""
 
-    probabilities = torch.softmax(router_logits.float(), dim=-1)
-    values, expert_ids = torch.topk(
-        probabilities,
-        CFG.experts_per_token,
+    logits = router_logits.float()
+    expert_ids = torch.argsort(
+        logits,
         dim=-1,
-    )
-    values = values / values.sum(dim=-1, keepdim=True)
-    return values.to(torch.bfloat16), expert_ids
+        descending=True,
+        stable=True,
+    )[:, : CFG.experts_per_token]
+    selected = torch.gather(logits, -1, expert_ids)
+    return torch.softmax(selected, dim=-1), expert_ids
+
+
+def _linear_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Mathematical projection from represented inputs without a private BF16 output cast."""
+
+    return x.float() @ weight.float().t()
+
+
+def _silu_mul_fp32(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.silu(gate.float()) * up.float()
 
 
 def _expert_rows(
@@ -60,29 +71,26 @@ def forward(
 ) -> MoeResult:
     """Evaluate routed and gated-shared experts without decoding unused banks."""
 
-    router_shared = linear(
+    router_shared = _linear_fp32(
         x,
         model.block_weight(weights.router_shared_gate, small_t=small_t),
-        small_t=small_t,
     )
     router_logits = router_shared[:, : CFG.experts]
     shared_scale = torch.sigmoid(router_shared[:, CFG.experts :].float())
     route_weights, expert_ids = route(router_logits)
 
-    shared_gate_up = linear(
+    shared_gate_up = _linear_fp32(
         x,
         model.block_weight(weights.shared_gate_up, small_t=small_t),
-        small_t=small_t,
     )
     shared_gate, shared_up = shared_gate_up.split(
         CFG.shared_intermediate,
         dim=-1,
     )
-    shared_hidden = silu_mul(shared_gate, shared_up)
-    shared_down = linear(
+    shared_hidden = _silu_mul_fp32(shared_gate, shared_up)
+    shared_down = _linear_fp32(
         shared_hidden,
         model.block_weight(weights.shared_down, small_t=small_t),
-        small_t=small_t,
     )
 
     routed_accum = torch.zeros(
@@ -104,9 +112,9 @@ def forward(
             small_t=small_t,
         )
         split = cast(int, weights.routed_gate_up.split_rows)
-        gate_up = linear(expert_input, gate_up_weight, small_t=small_t)
+        gate_up = _linear_fp32(expert_input, gate_up_weight)
         gate, up = gate_up.split(split, dim=-1)
-        expert_hidden = silu_mul(gate, up)
+        expert_hidden = _silu_mul_fp32(gate, up)
 
         down_weight = _expert_rows(
             model,
@@ -115,7 +123,7 @@ def forward(
             x.device,
             small_t=small_t,
         )
-        expert_down = linear(expert_hidden, down_weight, small_t=small_t)
+        expert_down = _linear_fp32(expert_hidden, down_weight)
         selected_weights = route_weights[token_rows, route_slots]
         routed_accum.index_add_(
             0,
@@ -123,8 +131,7 @@ def forward(
             expert_down.float() * selected_weights.float().unsqueeze(-1),
         )
 
-    routed = bf16(routed_accum)
-    output = bf16(routed.float() + shared_scale * shared_down.float())
+    output = bf16(routed_accum + shared_scale * shared_down.float())
     return MoeResult(output, router_logits, route_weights, expert_ids)
 
 

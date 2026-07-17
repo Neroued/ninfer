@@ -1,8 +1,9 @@
 # SparseMoe Decode Implementation Plan
 
-> Status: active implementation plan for the future `qwen3_6_35b_a3b_rtx5090` target.
+> Status: completed on 2026-07-17 and archived after decode qualification. The complete 35B target
+> remains future work.
 
-This plan turns the accepted [`SparseMoe` design decisions](2026-07-17-sparse-moe-design-log.md)
+This plan turned the accepted [`SparseMoe` design decisions](../plans/2026-07-17-sparse-moe-design-log.md)
 into an executable first implementation phase. It covers only ordinary decode with `T=1`. Small-T
 and prefill keep the same closed Op identity but remain outside this plan until their private
 execution designs are discussed separately.
@@ -16,12 +17,11 @@ not replace any of those authorities.
 
 ## 1. Outcome and boundaries
 
-The phase is complete when the repository contains one repository-internal `SparseMoe` Op whose
+The phase is complete: the repository contains one repository-internal `SparseMoe` Op whose
 decode route:
 
 - accepts the exact 35B `T=1` input, residual, and five registered weight roles;
-- executes the accepted D1-D4 mathematical responsibilities with either four launches or a
-  qualified D1+D2 launch fusion;
+- executes the accepted D1-D4 mathematical responsibilities with exactly four launches;
 - supports main Text Q4 routed gate/up with Q5 or Q6 routed down, plus the MTP W8/W8 routed route;
 - uses the artifact's direct expert-bank addressing without selected-weight gathering or repacking;
 - finishes the required `AddResidual` epilogue in D4;
@@ -159,10 +159,14 @@ Private code may use finite enums for D1, D2, D3, and D4 candidates and one clos
 records:
 
 - the four selected schedules;
-- whether D1+D2 is fused;
-- routed gate/up and routed-down codec specializations;
 - the private activation profile;
 - required workspace bytes.
+
+Codec specializations resolve directly from the already validated registered weight views rather
+than being duplicated in the plan.
+
+The experimental plan temporarily recorded whether D1+D2 was fused. The accepted plan removed
+that field together with the rejected fusion route.
 
 Production dispatch resolves only the accepted exact route. Tests and benchmarks may resolve a
 fixed candidate so one kernel can be varied while the other three use the correctness baseline or
@@ -183,10 +187,6 @@ route metadata:
     shared_scale           FP32
     live from D2 through D4
 
-fusion synchronization:
-    completion_count       I32
-    live only inside optional fused D1+D2 and reset before that launch exits
-
 phase scratch union:
     D1 scores or split partials
     D3/D4 act[9][512]
@@ -196,6 +196,10 @@ The separate D1 route writes FP32 scores; after D2 consumes them, D3 may reuse t
 the activation handoff. The initial D3/D4 activation view is FP32 `[9,512]`, slot-major and aligned
 for vector access. A workspace scope is acquired and restored inside one Op call. Allocation and
 addresses remain deterministic under CUDA Graph capture.
+
+The evaluated draining-fusion candidate additionally allocated one I32 completion counter. That
+candidate was rejected because caller-owned transient workspace has no defined initial state; the
+accepted workspace therefore contains no counter or persistent cross-call state.
 
 ## 5. Correctness foundation
 
@@ -340,7 +344,7 @@ There is no predeclared percentage that substitutes for this evidence.
 | D4 W8+W8 | 9.5625 MiB | 9,437,184 FMA | encoded payload |
 
 At the approximately 1.50 TB/s same-machine cold-copy ceiling observed in the
-[`35B Linear roofline report`](../archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md),
+[`35B Linear roofline report`](optimization-era/bench/qwen3.6-35b-linear-roofline.md),
 ideal payload times are about 7.4 us for main D3, 13.4 us for MTP D3, 4.4/5.1 us for Q5/Q6 D4, and
 6.7 us for MTP D4. These are planning lower bounds, not acceptance thresholds; online decode,
 finite grid size, synchronization, and launch latency remain part of the exact operation.
@@ -426,6 +430,12 @@ memory ordering, counter reset, repeated Graph replay, and the last-CTA tail are
 qualification. A one-CTA 257-dot fusion and an always-resident cooperative grid are not baseline
 candidates.
 
+Outcome: the experiment reduced the Q4 front from about 11.3 us to 9.2 us, but required its
+completion counter to be zero before the first call. Initializing caller-owned transient workspace
+would add the launch/API work the fusion was meant to remove, and W8+W8 had no complete-route gain.
+Fusion was rejected and its counter, kernel, and benchmark route were removed. Production uses
+separate D1 and D2 launches.
+
 ## 11. D3: selected routed and shared gate/up SwiGLU
 
 ### 11.1 Common mapping
@@ -466,6 +476,10 @@ K=2048 contains two K=1024 slabs. The first candidate uses aligned direct/vector
 two-stage pipeline. It does not inherit a deeper pipeline from an unrelated K merely because that
 code exists. Q4 and W8 staging storage is sized by its own codec rather than allocating every warp
 for the larger W8 case.
+
+Outcome: the nine-warp mapping won for both routed codecs. The balanced candidate measured
+20.480 us versus 18.432 us for Q4 and 26.624 us versus 22.528 us for W8. W8 D3 was improved by
+giving all 32 lanes one value each; the same mapping did not benefit D4.
 
 ### 11.4 Candidate progression and gate
 
@@ -524,6 +538,10 @@ residual, performs the final FP32 additions, and writes BF16 once.
 
 The initial profile applies route/shared scales after each dot. Pre-scaling the FP32 D3 activation
 is a later D3+D4 sequence candidate, not a separate semantic route.
+
+Outcome: the nine-warp one-row mapping won for Q5, Q6, and W8. R2 did not improve the direct
+control, and balanced R4 reduced grid parallelism and regressed every codec. R2 was removed; R4 is
+retained only as a benchmark control.
 
 ### 12.4 Candidate progression and gate
 
@@ -619,15 +637,18 @@ report as stages complete:
 
 | Stage | Accepted candidate | Correctness | Performance evidence | Status |
 |---|---|---|---|---|
-| D1 | pending | pending | pending | not qualified |
-| D2 | pending | pending | pending | not qualified |
-| D1+D2 fusion | pending decision | pending | pending | undecided |
-| D3 Q4/W8 | pending | pending | pending | not qualified |
-| D3 W8/W8 | pending | pending | pending | not qualified |
-| D4 Q5/W8 | pending | pending | pending | not qualified |
-| D4 Q6/W8 | pending | pending | pending | not qualified |
-| D4 W8/W8 | pending | pending | pending | not qualified |
-| complete decode | pending | pending | pending | not qualified |
+| D1 | 257 row CTAs, 8 warps | complete Op oracle and Graph replay | 5.216 us versus 5.344 us payload control | qualified |
+| D2 | one-warp register top-8 | exact lower-id tie through final output | 6.176 us versus 14.368 us serial control | qualified |
+| D1+D2 fusion | rejected; separate launches | candidate correct; initial counter contract invalid | about 9.2 us fused versus 11.3 us separate for Q4; no W8 full-route gain | closed |
+| D3 Q4/W8 | nine path warps | Q4+Q5 and Q4+Q6 complete oracle | 18.432 us; payload 12.288 us; balanced 20.480 us; NCU-attributed | qualified |
+| D3 W8/W8 | nine path warps, 32-lane W8 dot | W8+W8 complete oracle | 22.528 us; payload 16.384 us; balanced 26.624 us; no local spill | qualified |
+| D4 Q5/W8 | nine path warps, R1 | Q4+Q5 complete oracle | 12.288 us, equal to payload control | qualified |
+| D4 Q6/W8 | nine path warps, R1 | Q4+Q6 complete oracle | 14.336 us, equal to payload control | qualified |
+| D4 W8/W8 | nine path warps, R1 | W8+W8 complete oracle | 16.416 us versus 16.384 us payload control | qualified |
+| complete decode | four launches, FP32 private activation | all three profiles, residual, workspace, Graph | 40.960/43.008/49.120 us for Q4+Q5/Q4+Q6/W8+W8 | qualified |
+
+The retained RTX 5090 methodology, candidate comparisons, and profiler attribution are in the
+[`SparseMoe decode qualification report`](optimization-era/bench/qwen3.6-35b-sparse-moe-decode-roofline.md).
 
 Qualifying L15-L19 private work does not by itself make M4 or the 35B target supported. Inventory
 status changes must distinguish a qualified private domain from the completed closed Op and the
@@ -643,6 +664,7 @@ During implementation:
 - retain concise benchmark/profiler reports only for claims that remain active; and
 - do not turn raw experiment logs or discarded candidates into permanent authorities.
 
-When decode implementation is complete, fold stable API, numerical, launch, and workspace
-requirements into the applicable active authorities. Archive this plan according to
-[`docs/archive/README.md`](../archive/README.md) rather than creating a second final plan.
+Stable API, numerical, launch, workspace, and support-status results were folded into the active
+authorities. This completed plan is archived according to
+[`docs/archive/README.md`](README.md); the active design log remains open for the later
+Small-T and prefill discussions.

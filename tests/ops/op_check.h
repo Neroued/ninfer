@@ -76,6 +76,15 @@ struct Tolerance {
     static constexpr Tolerance gdn_output_bf16() { return {1e-3, 1.0e-2, 2e-3, 5.0, 8e-3}; }
 
     static constexpr Tolerance gdn_state_fp32() { return {5e-4, 5.0e-3, 2e-2, 5.0, 5e-3}; }
+
+    // Registered SparseMoe profiles expose only the final BF16 destination. Each profile is
+    // checked against the same complete FP64 formula; separate names keep codec qualification
+    // explicit without encoding any private D1-D4 staging choice in the tolerance.
+    static constexpr Tolerance sparse_moe_q4_q5() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
+
+    static constexpr Tolerance sparse_moe_q4_q6() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
+
+    static constexpr Tolerance sparse_moe_w8_w8() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
 };
 
 struct DiffStats {

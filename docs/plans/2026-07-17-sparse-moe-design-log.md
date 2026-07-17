@@ -6,7 +6,7 @@ This file records decisions reached while designing the closed `SparseMoe` Op. S
 will be folded into the applicable active authorities when the design is complete.
 
 The accepted decode-only execution work is tracked in the
-[`SparseMoe Decode Implementation Plan`](2026-07-17-sparse-moe-decode-implementation.md).
+completed [`SparseMoe Decode Implementation Plan`](../archive/2026-07-17-sparse-moe-decode-implementation.md).
 
 ## 2026-07-17: top-level API
 
@@ -318,3 +318,37 @@ The exact CTA tiling, warp allocation, job encoding, workspace offsets, material
 format, and D1+D2/S1+S2 fusion choice remain implementation decisions. They are to be selected by
 complete-Op correctness against the common oracle and by isolated plus end-to-end measurements for
 the registered decode and Small-T workloads.
+
+## 2026-07-17: decode implementation outcome
+
+Decision:
+
+- The repository-internal interface is
+  `sparse_moe(x, weights, SparseMoeEpilogue::AddResidual, destination, workspace, stream)`, with
+  one `sparse_moe_workspace_bytes(max_tokens)` capacity query. The implemented route admits exactly
+  `max_tokens=1`; Small-T and prefill remain rejected rather than falling back to repeated decode.
+- Decode uses four launches: an 8-warp row-CTA router projection, one-warp register top-8 and
+  selected normalization, one nine-path-warp gate/up SwiGLU launch, and one nine-path-warp
+  one-output-row down/merge/`AddResidual` launch.
+- D1 hands FP32 scores to D2. D2 hands I32 ids, FP32 route weights, and one FP32 shared scale to the
+  expert launches. D3 hands slot-major FP32 `[9,512]` SwiGLU results directly to D4. Only D4 rounds
+  the observable destination to BF16. These are selected implementation profiles, not new
+  semantic rounding requirements.
+- Main Text directly specializes Q4 routed gate/up and Q5/Q6 routed down; MTP directly specializes
+  W8/W8. Shared gate/up and down are W8. Every selected expert id addresses its persistent bank
+  span directly, with no selected-weight gather, repack, or per-expert launch.
+- The D1+D2 draining-fusion experiment was rejected. Although it saved about 2 us for the Q4
+  route, its completion counter required initialized workspace state before the first call. Adding
+  a memset would reintroduce the launch/API work being removed, and W8+W8 had no complete-route
+  gain. Production workspace therefore carries no counter or cross-call state.
+- The complete Op is checked against one independent naive double-precision formula with exact
+  test-only packed-weight decode. Permanent cases cover Q4+Q5, Q4+Q6, W8+W8, expert-bank endpoints,
+  the lower-id boundary tie, nonzero residual, exact workspace capacity, and CUDA Graph replay;
+  there are no private-stage goldens or artificial sensitivity tests.
+- The accepted stage and complete-route measurements, rejected candidates, and profiler
+  attribution are retained in the
+  [`SparseMoe decode qualification report`](../archive/optimization-era/bench/qwen3.6-35b-sparse-moe-decode-roofline.md).
+
+This closes ordinary decode implementation only. The previously agreed Small-T semantics remain
+design input for a later implementation phase, and prefill routing/grouping/topology remains
+undecided.

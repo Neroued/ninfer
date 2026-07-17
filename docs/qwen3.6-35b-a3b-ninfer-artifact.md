@@ -937,8 +937,9 @@ know expert roles or the closed target inventory.
 ### 15.1 Sparse-MoE execution
 
 The semantically closed sparse-MoE Op owns router selection, routed experts, gated shared expert,
-and their reduction. The accepted decode topology to qualify is one graph-stable four-kernel
-sequence per layer, not eight expert launches or calls through the generic linear planner:
+and their reduction. The qualified repository-internal decode topology is one graph-stable
+four-kernel sequence per layer, not eight expert launches or calls through the generic linear
+planner:
 
 1. one projection of the 257-row `router_shared_gate` object;
 2. one device-side softmax/top-8/normalization plus the independent shared-gate sigmoid;
@@ -954,7 +955,7 @@ expert id before projection to make the eight plane streams monotonic; it must n
 selection or detach weights from ids. The Op derives the eight views from the Section 3.4 bank
 descriptor on device. No selected expert is gathered into another weight buffer.
 
-The required first specialized gate/up geometry is one CTA per intermediate coordinate:
+The qualified specialized gate/up geometry is one CTA per intermediate coordinate:
 
 ```text
 grid.x       = 512
@@ -969,7 +970,7 @@ The CTA cooperatively stages the 2048-element input once. Each routed warp reads
 warp computes the gate/up dot products and SwiGLU. Their accumulator and staging types are private
 implementation choices.
 
-The corresponding first specialized down geometry is one CTA per hidden output coordinate:
+The corresponding qualified down geometry is one CTA per hidden output coordinate:
 
 ```text
 grid.x       = 2048
@@ -987,10 +988,12 @@ case: Q5, Q6, and W8 consume exactly 336, 400, and 544 encoded bytes per row. Re
 generic Small-T K=1024 loop would put the complete K=512 row in its scalar tail and is not an
 accepted decode path.
 
-This nine-warp decomposition is the implementation baseline to qualify, not a persistent artifact
-field. A different CTA decomposition or a safe merger of the first two stages is acceptable only
-if it preserves the logical assignment/result and improves both the isolated Op and end-to-end
-decode measurements in Section 17. Per-expert launches, all-expert scans, and
+This nine-warp decomposition is the qualified decode implementation profile, not a persistent
+artifact field. D1 uses 257 8-warp row CTAs, D2 uses one warp, D3 uses the mapping above, and D4
+uses the corresponding one-row mapping. W8 D3 assigns one value to each of 32 lanes; D4 retains
+paired values per active lane because that is its measured producer-aware winner. The attempted
+D1+D2 draining fusion was rejected because caller-owned transient workspace has no initialized
+counter state and W8+W8 had no complete-route gain. Per-expert launches, all-expert scans, and
 materialized `[8,gate/up,512]` or `[8,2048]` intermediates remain nonconforming.
 
 The logical sparse-MoE formula is:
@@ -1198,6 +1201,12 @@ down banks; all-Q5 is not excluded by capacity alone.
 This document is a design authority, not evidence that the target already works. The target may be
 marked implemented only after all of the following exist.
 
+The decode-only `SparseMoe` Op now has independent-oracle, CUDA Graph, candidate-envelope, payload,
+and NCU evidence in the
+[`retained qualification report`](archive/optimization-era/bench/qwen3.6-35b-sparse-moe-decode-roofline.md).
+That closes only the operator domain `T=1`; it does not satisfy Small-T, prefill, target binding,
+memory-admission, end-to-end execution, or serving evidence below.
+
 ### 17.1 Artifact and conversion
 
 - converter-generated exact inventory: 883 tensors, six resources, all counts and byte totals in
@@ -1259,8 +1268,8 @@ byte-equivalence test. Exact probabilistic token streams and fixed artifact hash
 - NCU comparison of global-plane and expert-local layouts only if the accepted global-plane kernel
   exhibits a TLB or long-scoreboard hotspot; no persistent layout change is justified by pointer
   proximity alone; and
-- end-to-end decode evidence that the sparse-MoE Op uses the graph-stable fused schedule and does
-  not scan, launch, gather, or materialize the other 248 routed experts.
+- end-to-end decode evidence that the sparse-MoE Op uses the graph-stable closed four-launch
+  schedule and does not scan, launch, gather, or materialize the other 248 routed experts.
 
 Until this evidence and the complete target land, `qwen3_6_27b_rtx5090` remains the only registered
 NInfer product target.

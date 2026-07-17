@@ -1,6 +1,7 @@
 #include "ops/linear/q6/q6_rowsplit_launch.h"
 
 #include "ops/linear/q6/q6_rowsplit_kernels.h"
+#include "ops/common/token_slices.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -121,21 +122,26 @@ void q6_rowsplit_launch_fixed(Q6Plan plan, const Tensor& x, const Weight& w, Ten
                                     q6_kernel_variant_name(plan.variant));
     }
 
-    switch (plan.schedule) {
-    case Q6ScheduleId::SimtR8C4:
-        q6_rowsplit_simt_r8_c4_launch(x, w, out, stream);
-        return;
-    case Q6ScheduleId::SimtR8C8:
-        q6_rowsplit_simt_r8_c8_launch(x, w, out, stream);
-        return;
-    case Q6ScheduleId::MmaR64C64:
-        q6_rowsplit_mma_r64_c64_launch(plan.variant, x, w, out, stream);
-        return;
-    case Q6ScheduleId::MmaR64C128:
-        q6_rowsplit_mma_r64_c128_launch(plan.variant, x, w, out, stream);
-        return;
-    }
-    throw std::logic_error("q6 fixed launch: unknown schedule");
+    for_each_token_slice(
+        x.ne[1], schedule_cols(plan.schedule), [&](std::int32_t offset, std::int32_t count) {
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor out_slice     = out.slice(1, offset, count);
+            switch (plan.schedule) {
+            case Q6ScheduleId::SimtR8C4:
+                q6_rowsplit_simt_r8_c4_launch(x_slice, w, out_slice, stream);
+                return;
+            case Q6ScheduleId::SimtR8C8:
+                q6_rowsplit_simt_r8_c8_launch(x_slice, w, out_slice, stream);
+                return;
+            case Q6ScheduleId::MmaR64C64:
+                q6_rowsplit_mma_r64_c64_launch(plan.variant, x_slice, w, out_slice, stream);
+                return;
+            case Q6ScheduleId::MmaR64C128:
+                q6_rowsplit_mma_r64_c128_launch(plan.variant, x_slice, w, out_slice, stream);
+                return;
+            }
+            throw std::logic_error("q6 fixed launch: unknown schedule");
+        });
 }
 
 void q6_rowsplit_launch_candidate(Q6ScheduleId schedule, Q6KernelVariant variant, const Tensor& x,

@@ -1,3 +1,4 @@
+#include "ops/common/token_slices.h"
 #include "ops/linear/w8/w8_rowsplit_plan.h"
 #include "ops/linear_pair/w8/w8_pair_plan.h"
 
@@ -5,8 +6,11 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 using ninfer::ops::detail::W8KernelVariant;
 using ninfer::ops::detail::W8PairPlan;
@@ -112,48 +116,45 @@ void expect_plan(const std::string& label, const W8Problem& problem) {
 }
 
 void route_boundaries() {
-    constexpr std::array<W8Problem, 76> cases{{
-        {5120, 10240, 10240, 1},       {5120, 10240, 10240, 4},  {5120, 10240, 10240, 5},
-        {5120, 10240, 10240, 16},      {5120, 10240, 10240, 17}, {5120, 10240, 10240, 128},
-        {5120, 10240, 10240, 8388480}, {14336, 5120, 5120, 4},   {14336, 5120, 5120, 5},
-        {14336, 5120, 5120, 8},        {14336, 5120, 5120, 9},   {1024, 5120, 5120, 4},
-        {1024, 5120, 5120, 5},         {1024, 5120, 5120, 16},   {1024, 5120, 5120, 17},
-        {1024, 5120, 5120, 128},       {6144, 5120, 5120, 16},   {6144, 5120, 5120, 17},
-        {5120, 6144, 6144, 16},        {5120, 6144, 6144, 17},   {34816, 5120, 5120, 4},
-        {34816, 5120, 5120, 8},        {34816, 5120, 5120, 9},   {5120, 17408, 17408, 16},
-        {5120, 17408, 17408, 17},      {4608, 4608, 4608, 1},    {4608, 4608, 4608, 8},
-        {4608, 4608, 4608, 9},         {4608, 4608, 4608, 11},   {4608, 4608, 4608, 12},
-        {4608, 4608, 4608, 13},        {4608, 4608, 4608, 256},  {4608, 4608, 4608, 257},
-        {4608, 4608, 4608, 32768},     {5120, 4608, 4608, 4},    {5120, 4608, 4608, 5},
-        {5120, 4608, 4608, 6},         {5120, 4608, 4608, 127},  {5120, 4608, 4608, 128},
-        {5120, 4608, 4608, 32768},     {2048, 4608, 4608, 1},    {2048, 4608, 4608, 14},
-        {2048, 4608, 4608, 15},        {2048, 4608, 4608, 16},   {2048, 4608, 4608, 17},
-        {2048, 4608, 4608, 19},        {2048, 4608, 4608, 20},   {2048, 4608, 4608, 21},
-        {2048, 4608, 4608, 23},        {2048, 4608, 4608, 24},   {2048, 4608, 4608, 25},
-        {2048, 4608, 4608, 27},        {2048, 4608, 4608, 28},   {2048, 4608, 4608, 29},
-        {2048, 4608, 4608, 31},        {2048, 4608, 4608, 32},   {2048, 4608, 4608, 33},
-        {2048, 4608, 4608, 871},       {2048, 4608, 4608, 872},  {2048, 4608, 4608, 32768},
-        {2048, 4096, 4096, 1},         {2048, 4096, 4096, 56},   {2048, 4096, 4096, 57},
-        {2048, 4096, 4096, 895},       {2048, 4096, 4096, 896},  {2048, 4096, 4096, 1024},
-        {12288, 2048, 2048, 1},        {12288, 2048, 2048, 16},  {12288, 2048, 2048, 17},
-        {12288, 2048, 2048, 1024},     {9216, 2048, 2048, 1},    {9216, 2048, 2048, 13},
-        {9216, 2048, 2048, 14},        {9216, 2048, 2048, 128},  {9216, 2048, 2048, 129},
-        {9216, 2048, 2048, 1024},
+    constexpr std::array<W8Problem, 78> cases{{
+        {5120, 10240, 10240, 1},  {5120, 10240, 10240, 4},   {5120, 10240, 10240, 5},
+        {5120, 10240, 10240, 16}, {5120, 10240, 10240, 17},  {5120, 10240, 10240, 128},
+        {14336, 5120, 5120, 4},   {14336, 5120, 5120, 5},    {14336, 5120, 5120, 8},
+        {14336, 5120, 5120, 9},   {1024, 5120, 5120, 4},     {1024, 5120, 5120, 5},
+        {1024, 5120, 5120, 16},   {1024, 5120, 5120, 17},    {1024, 5120, 5120, 128},
+        {6144, 5120, 5120, 16},   {6144, 5120, 5120, 17},    {5120, 6144, 6144, 16},
+        {5120, 6144, 6144, 17},   {34816, 5120, 5120, 4},    {34816, 5120, 5120, 8},
+        {34816, 5120, 5120, 9},   {5120, 17408, 17408, 16},  {5120, 17408, 17408, 17},
+        {4608, 4608, 4608, 1},    {4608, 4608, 4608, 8},     {4608, 4608, 4608, 9},
+        {4608, 4608, 4608, 11},   {4608, 4608, 4608, 12},    {4608, 4608, 4608, 13},
+        {4608, 4608, 4608, 256},  {4608, 4608, 4608, 257},   {4608, 4608, 4608, 32768},
+        {5120, 4608, 4608, 4},    {5120, 4608, 4608, 5},     {5120, 4608, 4608, 6},
+        {5120, 4608, 4608, 127},  {5120, 4608, 4608, 128},   {5120, 4608, 4608, 32768},
+        {2048, 4608, 4608, 1},    {2048, 4608, 4608, 14},    {2048, 4608, 4608, 15},
+        {2048, 4608, 4608, 16},   {2048, 4608, 4608, 17},    {2048, 4608, 4608, 19},
+        {2048, 4608, 4608, 20},   {2048, 4608, 4608, 21},    {2048, 4608, 4608, 23},
+        {2048, 4608, 4608, 24},   {2048, 4608, 4608, 25},    {2048, 4608, 4608, 27},
+        {2048, 4608, 4608, 28},   {2048, 4608, 4608, 29},    {2048, 4608, 4608, 31},
+        {2048, 4608, 4608, 32},   {2048, 4608, 4608, 33},    {2048, 4608, 4608, 871},
+        {2048, 4608, 4608, 872},  {2048, 4608, 4608, 32768}, {2048, 4096, 4096, 1},
+        {2048, 4096, 4096, 56},   {2048, 4096, 4096, 57},    {2048, 4096, 4096, 895},
+        {2048, 4096, 4096, 896},  {2048, 4096, 4096, 1024},  {12288, 2048, 2048, 1},
+        {12288, 2048, 2048, 16},  {12288, 2048, 2048, 17},   {12288, 2048, 2048, 1024},
+        {9216, 2048, 2048, 1},    {9216, 2048, 2048, 13},    {9216, 2048, 2048, 14},
+        {9216, 2048, 2048, 128},  {9216, 2048, 2048, 129},   {9216, 2048, 2048, 1024},
+        {2048, 4096, 4096, 1025}, {12288, 2048, 2048, 1025}, {9216, 2048, 2048, 1025},
     }};
     for (const W8Problem& problem : cases) { expect_plan("route boundary", problem); }
 }
 
 void rejection_contract() {
-    constexpr std::array<W8Problem, 11> rejected{{
+    constexpr std::array<W8Problem, 8> rejected{{
         {5120, 10240, 10240, 0},
-        {5120, 10240, 10240, 8388481},
         {4608, 4608, 4608, 32769},
+        {5120, 4608, 4608, 32769},
         {2048, 4608, 4608, 32769},
         {1024, 5120, 5248, 17},
         {7168, 5120, 5120, 1},
-        {2048, 4096, 4096, 1025},
-        {12288, 2048, 2048, 1025},
-        {9216, 2048, 2048, 1025},
         {5120, 10240, 10368, 17},
         {5120, 2048, 2048, 1},
     }};
@@ -182,7 +183,7 @@ void pair_contract() {
         127,
         128,
         2048,
-        8388480,
+        4096,
     }};
     for (const std::int32_t value : cols) {
         const W8PairProblem problem{1024, 5120, 5120, value};
@@ -204,16 +205,13 @@ void pair_contract() {
         if (plan.variant != expected_variant(base_schedule, base)) {
             fail("pair variant", "unexpected variant at C=" + std::to_string(value));
         }
-        if (plan.workspace_bytes != 0 ||
-            plan.performance_qualified != (value <= ninfer::ops::detail::kW8PairQualifiedCols)) {
-            fail("pair metadata",
-                 "unexpected workspace/qualification at C=" + std::to_string(value));
+        if (plan.workspace_bytes != 0) {
+            fail("pair metadata", "unexpected workspace at C=" + std::to_string(value));
         }
     }
 
     for (const W8PairProblem problem :
-         {W8PairProblem{1024, 5120, 5120, 0}, W8PairProblem{1024, 5120, 5120, 8388481},
-          W8PairProblem{6144, 5120, 5120, 57}}) {
+         {W8PairProblem{1024, 5120, 5120, 0}, W8PairProblem{6144, 5120, 5120, 57}}) {
         if (ninfer::ops::detail::w8_pair_admits(problem)) {
             fail("pair rejection", "accepted an unregistered pair problem");
         }
@@ -224,12 +222,52 @@ void pair_contract() {
     }
 }
 
+void token_slice_boundaries() {
+    constexpr std::int32_t kColumnsPerBlock = 128;
+    constexpr std::int32_t kSliceCapacity = kColumnsPerBlock * ninfer::ops::detail::kCudaGridYLimit;
+
+    const auto collect = [](std::int32_t tokens) {
+        std::vector<std::pair<std::int32_t, std::int32_t>> slices;
+        ninfer::ops::detail::for_each_token_slice(
+            tokens, kColumnsPerBlock, [&slices](std::int32_t offset, std::int32_t count) {
+                slices.emplace_back(offset, count);
+            });
+        return slices;
+    };
+
+    if (collect(1024) != std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 1024}}) {
+        fail("token slicing default target", "1024 should require one launch");
+    }
+    if (collect(kSliceCapacity) !=
+        std::vector<std::pair<std::int32_t, std::int32_t>>{{0, kSliceCapacity}}) {
+        fail("token slicing last single launch", "grid-y capacity should require one launch");
+    }
+    if (collect(kSliceCapacity + 1) != std::vector<std::pair<std::int32_t, std::int32_t>>{
+                                           {0, kSliceCapacity}, {kSliceCapacity, 1}}) {
+        fail("token slicing first split launch", "capacity+1 should produce two exact slices");
+    }
+
+    std::int64_t expected_offset = 0;
+    ninfer::ops::detail::for_each_token_slice(
+        std::numeric_limits<std::int32_t>::max(), kColumnsPerBlock,
+        [&expected_offset](std::int32_t offset, std::int32_t count) {
+            if (offset != expected_offset || count <= 0 || count > kSliceCapacity) {
+                fail("token slicing int32 domain", "slices are not contiguous or launchable");
+            }
+            expected_offset += count;
+        });
+    if (expected_offset != std::numeric_limits<std::int32_t>::max()) {
+        fail("token slicing int32 domain", "slices do not cover the complete logical T");
+    }
+}
+
 } // namespace
 
 int main() {
     route_boundaries();
     rejection_contract();
     pair_contract();
+    token_slice_boundaries();
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " W8 Linear production plan\n";
     return failures == 0 ? 0 : 1;

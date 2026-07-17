@@ -10,9 +10,6 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kW8PairMaxCols       = 128 * 65535;
-inline constexpr std::int32_t kW8PairQualifiedCols = 1024;
-
 enum class W8PairScheduleId {
     TwoSimtR8C4,
     TwoSimtR8C8,
@@ -30,7 +27,6 @@ struct W8PairPlan {
     W8PairScheduleId schedule;
     W8KernelVariant variant;
     std::size_t workspace_bytes;
-    bool performance_qualified;
 };
 
 const char* w8_pair_schedule_name(W8PairScheduleId schedule);

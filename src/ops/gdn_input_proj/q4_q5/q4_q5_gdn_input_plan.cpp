@@ -1,13 +1,17 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 
 #include "core/device.h"
+#include "ops/common/token_slices.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 
 #include <array>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 struct ColsSet {
     std::int32_t first;
@@ -25,12 +29,12 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 2> kRoutes{{
     {{1, 16}, Q4Q5GdnInputScheduleId::IndependentDirectFixed},
-    {{17, kQ4Q5GdnInputMaxCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
+    {{17, kAnyCols}, Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
     return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last + 1 == kRoutes[1].cols.first &&
-           kRoutes[1].cols.last == kQ4Q5GdnInputMaxCols;
+           kRoutes[1].cols.last == kAnyCols;
 }
 
 static_assert(catalog_is_closed(), "GDN input routes must be exact and closed");
@@ -68,7 +72,7 @@ const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexc
 }
 
 bool q4_q5_gdn_input_admits(const Q4Q5GdnInputProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1 && problem.cols <= kQ4Q5GdnInputMaxCols;
+    return supported_shape(problem) && problem.cols >= 1;
 }
 
 Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem) {
@@ -84,7 +88,6 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
             Q4KernelVariant::None,
             std::nullopt,
             0,
-            problem.cols <= kQ4Q5GdnInputQualifiedCols,
         };
         if (route.schedule == Q4Q5GdnInputScheduleId::IndependentDirectFixed) {
             plan.independent = Q4Q5GdnInputSubplans{
@@ -132,8 +135,12 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         return;
     }
     case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
-        q4_q5_gdn_input_grouped_mma_launch(plan.grouped_variant, x, qk_weight, v_weight, qkv,
-                                           stream);
+        for_each_token_slice(problem.cols, 128, [&](std::int32_t offset, std::int32_t count) {
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor qkv_slice     = qkv.slice(1, offset, count);
+            q4_q5_gdn_input_grouped_mma_launch(plan.grouped_variant, x_slice, qk_weight, v_weight,
+                                               qkv_slice, stream);
+        });
         return;
     }
     throw std::logic_error("Q4/Q5 GDN input: unknown schedule");

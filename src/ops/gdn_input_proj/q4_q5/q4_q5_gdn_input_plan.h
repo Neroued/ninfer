@@ -12,9 +12,6 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kQ4Q5GdnInputMaxCols       = 128 * 65535;
-inline constexpr std::int32_t kQ4Q5GdnInputQualifiedCols = 1024;
-
 enum class Q4Q5GdnInputScheduleId {
     IndependentDirectFixed,
     GroupedMixedMmaR64C128,
@@ -39,7 +36,6 @@ struct Q4Q5GdnInputPlan {
     Q4KernelVariant grouped_variant;
     std::optional<Q4Q5GdnInputSubplans> independent;
     std::size_t workspace_bytes;
-    bool performance_qualified;
 };
 
 const char* q4_q5_gdn_input_schedule_name(Q4Q5GdnInputScheduleId schedule) noexcept;

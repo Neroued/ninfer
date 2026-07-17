@@ -40,7 +40,7 @@ V expected_variant(S schedule, const Q5Problem& problem) {
 
 S expected_schedule(const Q5Problem& problem) {
     if (problem.rows == 1024 && problem.k == 5120 && problem.padded_k == 5120) {
-        return problem.cols <= 4 ? S::SimtR8C4 : S::SimtR8C8;
+        return problem.cols <= 4 ? S::SimtR8C4 : (problem.cols <= 16 ? S::SimtR8C8 : S::MmaR64C128);
     }
     if (problem.rows == 6144 && problem.k == 5120 && problem.padded_k == 5120) {
         if (problem.cols == 1) { return S::GemvR16S2X; }
@@ -52,13 +52,17 @@ S expected_schedule(const Q5Problem& problem) {
     if (problem.rows == 7168 && problem.k == 5120 && problem.padded_k == 5120) {
         if (problem.cols == 1) { return S::GemvR16S2X; }
         if (problem.cols <= 6) { return S::SimtSplit4Exact; }
-        return S::SimtR8C4;
+        return problem.cols <= 16 ? S::SimtR8C4 : S::MmaR64C128;
     }
     if (problem.rows == 5120 && problem.k == 6144 && problem.padded_k == 6144) {
-        return problem.cols <= 6 ? S::SimtSplit2Exact : S::SimtR8C8;
+        if (problem.cols == 1) { return S::SimtR8C4; }
+        return problem.cols <= 6 ? S::SimtSplit2Exact
+                                 : (problem.cols <= 24 ? S::SimtR8C8 : S::MmaR64C128);
     }
     if (problem.rows == 5120 && problem.k == 17408 && problem.padded_k == 17408) {
-        return problem.cols <= 6 ? S::SimtSplit2Exact : S::SimtR8C8;
+        if (problem.cols == 1) { return S::SimtR8C4; }
+        return problem.cols <= 6 ? S::SimtSplit2Exact
+                                 : (problem.cols <= 24 ? S::SimtR8C8 : S::MmaR64C128);
     }
     if (problem.rows == 1152 && problem.k == 1152 && problem.padded_k == 1152) {
         if (problem.cols <= 76) { return S::SimtR8C4; }
@@ -102,85 +106,72 @@ void expect_plan(const std::string& label, const Q5Problem& problem) {
 }
 
 void admission_scans() {
-    for (std::int32_t cols = 0; cols <= 17; ++cols) {
-        const Q5Problem problem{1024, 5120, 5120, cols};
-        const bool admitted = cols >= 1 && cols <= 16;
-        if (ninfer::ops::detail::q5_rowsplit_admits(problem) != admitted) {
-            fail("attention value admission",
-                 admitted ? "rejected admitted cols" : "accepted rejected cols");
+    constexpr std::array<Q5Problem, 5> text_shapes{{
+        {1024, 5120, 5120, 1},
+        {6144, 5120, 5120, 1},
+        {7168, 5120, 5120, 1},
+        {5120, 6144, 6144, 1},
+        {5120, 17408, 17408, 1},
+    }};
+    constexpr std::array<std::int32_t, 8> positive_t{1, 2, 5, 16, 17, 1024, 1025, 2048};
+    for (Q5Problem problem : text_shapes) {
+        problem.cols = 0;
+        if (ninfer::ops::detail::q5_rowsplit_admits(problem)) {
+            fail("T=0 rejection", "accepted zero columns");
         }
-        if (admitted) { expect_plan("attention value route", problem); }
-    }
-
-    for (std::int32_t cols = 0; cols <= 17; ++cols) {
-        const Q5Problem problem{7168, 5120, 5120, cols};
-        const bool admitted = cols >= 1 && cols <= 16;
-        if (ninfer::ops::detail::q5_rowsplit_admits(problem) != admitted) {
-            fail("attention gate/value parent admission",
-                 admitted ? "rejected admitted cols" : "accepted rejected cols");
-        }
-        if (admitted) { expect_plan("attention gate/value parent route", problem); }
-    }
-
-    for (const std::int32_t k : {6144, 17408}) {
-        for (std::int32_t cols = 0; cols <= 25; ++cols) {
-            const Q5Problem problem{5120, k, k, cols};
-            const bool admitted = cols >= 2 && cols <= 24;
-            if (ninfer::ops::detail::q5_rowsplit_admits(problem) != admitted) {
-                fail("residual materialization admission",
-                     admitted ? "rejected admitted cols" : "accepted rejected cols");
-            }
-            if (admitted) { expect_plan("residual materialization route", problem); }
+        for (const std::int32_t cols : positive_t) {
+            problem.cols = cols;
+            expect_plan("arbitrary positive T", problem);
         }
     }
 
-    for (const Q5Problem base : {Q5Problem{1152, 1152, 1152, 0}, Q5Problem{1152, 4304, 4352, 0}}) {
-        for (std::int32_t cols = 0; cols <= 131076; ++cols) {
-            Q5Problem problem   = base;
-            problem.cols        = cols;
-            const bool admitted = cols >= 4 && cols <= 131072 && cols % 4 == 0;
-            if (ninfer::ops::detail::q5_rowsplit_admits(problem) != admitted) {
-                fail("vision admission",
-                     admitted ? "rejected admitted cols" : "accepted rejected cols");
-            }
-            if (admitted) { expect_plan("vision route", problem); }
-        }
-    }
+    constexpr std::array<Q5Problem, 8> valid_vision{{
+        {1152, 1152, 1152, 4},
+        {1152, 1152, 1152, 1024},
+        {1152, 1152, 1152, 1028},
+        {1152, 1152, 1152, 131072},
+        {1152, 4304, 4352, 4},
+        {1152, 4304, 4352, 1024},
+        {1152, 4304, 4352, 1028},
+        {1152, 4304, 4352, 131072},
+    }};
+    for (const Q5Problem& problem : valid_vision) { expect_plan("valid Vision P", problem); }
 }
 
 void route_boundaries() {
-    constexpr std::array<Q5Problem, 50> cases{{
-        {1024, 5120, 5120, 1},         {1024, 5120, 5120, 4},      {1024, 5120, 5120, 5},
-        {1024, 5120, 5120, 16},        {6144, 5120, 5120, 1},      {6144, 5120, 5120, 2},
-        {6144, 5120, 5120, 6},         {6144, 5120, 5120, 7},      {6144, 5120, 5120, 24},
-        {6144, 5120, 5120, 25},        {6144, 5120, 5120, 64},     {6144, 5120, 5120, 65},
-        {6144, 5120, 5120, 8'388'480}, {5120, 6144, 6144, 2},      {5120, 6144, 6144, 6},
-        {7168, 5120, 5120, 1},         {7168, 5120, 5120, 2},      {7168, 5120, 5120, 6},
-        {7168, 5120, 5120, 7},         {7168, 5120, 5120, 16},     {5120, 6144, 6144, 7},
-        {5120, 6144, 6144, 24},        {5120, 17408, 17408, 2},    {5120, 17408, 17408, 24},
-        {1152, 1152, 1152, 4},         {1152, 1152, 1152, 76},     {1152, 1152, 1152, 80},
-        {1152, 1152, 1152, 636},       {1152, 1152, 1152, 640},    {1152, 1152, 1152, 700},
-        {1152, 1152, 1152, 704},       {1152, 1152, 1152, 708},    {1152, 1152, 1152, 828},
-        {1152, 1152, 1152, 832},       {1152, 1152, 1152, 836},    {1152, 1152, 1152, 896},
-        {1152, 1152, 1152, 900},       {1152, 1152, 1152, 960},    {1152, 1152, 1152, 964},
-        {1152, 1152, 1152, 1024},      {1152, 1152, 1152, 1028},   {1152, 1152, 1152, 1088},
-        {1152, 1152, 1152, 1092},      {1152, 1152, 1152, 131072}, {1152, 4304, 4352, 4},
-        {1152, 4304, 4352, 120},       {1152, 4304, 4352, 124},    {1152, 4304, 4352, 1148},
-        {1152, 4304, 4352, 1152},      {1152, 4304, 4352, 131072},
+    constexpr std::array<Q5Problem, 55> cases{{
+        {1024, 5120, 5120, 1},      {1024, 5120, 5120, 4},    {1024, 5120, 5120, 5},
+        {1024, 5120, 5120, 16},     {1024, 5120, 5120, 17},   {1024, 5120, 5120, 1025},
+        {6144, 5120, 5120, 1},      {6144, 5120, 5120, 2},    {6144, 5120, 5120, 6},
+        {6144, 5120, 5120, 7},      {6144, 5120, 5120, 24},   {6144, 5120, 5120, 25},
+        {6144, 5120, 5120, 64},     {6144, 5120, 5120, 65},   {6144, 5120, 5120, 2048},
+        {5120, 6144, 6144, 2},      {5120, 6144, 6144, 6},    {7168, 5120, 5120, 1},
+        {7168, 5120, 5120, 2},      {7168, 5120, 5120, 6},    {7168, 5120, 5120, 7},
+        {7168, 5120, 5120, 16},     {7168, 5120, 5120, 17},   {5120, 6144, 6144, 1},
+        {5120, 6144, 6144, 7},      {5120, 6144, 6144, 24},   {5120, 6144, 6144, 25},
+        {5120, 17408, 17408, 2},    {5120, 17408, 17408, 24}, {1152, 1152, 1152, 4},
+        {1152, 1152, 1152, 76},     {1152, 1152, 1152, 80},   {1152, 1152, 1152, 636},
+        {1152, 1152, 1152, 640},    {1152, 1152, 1152, 700},  {1152, 1152, 1152, 704},
+        {1152, 1152, 1152, 708},    {1152, 1152, 1152, 828},  {1152, 1152, 1152, 832},
+        {1152, 1152, 1152, 836},    {1152, 1152, 1152, 896},  {1152, 1152, 1152, 900},
+        {1152, 1152, 1152, 960},    {1152, 1152, 1152, 964},  {1152, 1152, 1152, 1024},
+        {1152, 1152, 1152, 1028},   {1152, 1152, 1152, 1088}, {1152, 1152, 1152, 1092},
+        {1152, 1152, 1152, 131072}, {1152, 4304, 4352, 4},    {1152, 4304, 4352, 120},
+        {1152, 4304, 4352, 124},    {1152, 4304, 4352, 1148}, {1152, 4304, 4352, 1152},
+        {1152, 4304, 4352, 131072},
     }};
     for (const Q5Problem& problem : cases) { expect_plan("route boundary", problem); }
 }
 
 void rejection_contract() {
-    constexpr std::array<Q5Problem, 8> rejected{{
-        {1024, 5120, 5120, 17},
-        {5120, 6144, 6144, 1},
-        {5120, 17408, 17408, 25},
+    constexpr std::array<Q5Problem, 7> rejected{{
+        {1152, 1152, 1152, 1},
         {1152, 1152, 1152, 5},
         {1152, 4304, 4352, 86},
+        {1152, 4304, 4352, 131076},
         {1152, 4304, 4304, 88},
-        {6144, 5120, 5120, 8'388'481},
         {6144, 2048, 2048, 1},
+        {6144, 5120, 5120, 0},
     }};
     for (const Q5Problem& problem : rejected) {
         if (ninfer::ops::detail::q5_rowsplit_admits(problem)) {

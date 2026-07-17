@@ -49,7 +49,7 @@ target's storage and model semantics; they do not register a current product tar
 |---|---|
 | [`qwen3.6-27b-architecture.md`](qwen3.6-27b-architecture.md) | current target's fixed dimensions, Text/MTP/Vision math, and state semantics |
 | [`qwen3.6-35b-a3b-architecture.md`](qwen3.6-35b-a3b-architecture.md) | exact 35B-A3B source-checkpoint Text/MoE/MTP/Vision reference; not runtime-support status |
-| [`qwen3.6-35b-a3b-operator-inventory.md`](qwen3.6-35b-a3b-operator-inventory.md) | complete 35B-A3B device-operator shapes and mathematics, with strict current roofline-qualified support status |
+| [`qwen3.6-35b-a3b-operator-inventory.md`](qwen3.6-35b-a3b-operator-inventory.md) | complete 35B-A3B device-operator shapes and mathematics, with separate current functional-admission and roofline-qualified performance status |
 
 Model computation documents do not define product support, artifact framing, source ownership, or
 serving behavior. Runtime support requires an explicit compiled exact-checkpoint/GPU target.

@@ -38,15 +38,14 @@ struct GqaExecutionEnvelope {
  * compute profile. Its profile-defined query quantization and any narrower staging do not replace
  * BF16 Q in the ideal oracle. BF16 and INT8 implementations therefore use the separate named
  * `attention_bf16` and `attention_int8` numerical qualification tolerances. Those envelopes apply
- * to the registered geometries, token regimes, conformance matrix, and target-representative
+ * to the registered geometries, tested token extents, conformance matrix, and target-representative
  * activation range; they are not a universal error bound for arbitrary adversarial BF16 tensors.
  * A1 and A3 are each qualified directly against the ideal oracle. A1-versus-A3 parity is only an
  * additional consistency check.
  */
 
 /**
- * Returns transient arena capacity for the fused attention routes. It is nonzero for the
- * registered small-T (T=1..6) split-KV paths and zero for prompt attention.
+ * Returns transient arena capacity required for the exact positive T supplied.
  */
 [[nodiscard]] std::size_t gqa_attention_workspace_bytes(std::int32_t q_heads, std::int32_t tokens);
 
@@ -60,6 +59,7 @@ struct GqaExecutionEnvelope {
  *
  * The registered geometries are `[256,24|4,T]` group 6 and `[256,16|2,T]` group 8. q/k/v/out
  * are contiguous BF16, positions is contiguous sequential I32 [T], and scale is 1/sqrt(256).
+ * T may be any positive value that fits the declared cache and execution envelope.
  * Cache storage is BF16 or INT8-G64 under the shared numerical contract above. The caller
  * guarantees that every row in the causal domain is populated and that `positions[T-1]+1` lies in
  * the declared execution envelope. The envelope is a host launch-resource promise; it does not
@@ -84,7 +84,7 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  * A3: compute causal attention from an already populated cache without accepting new K/V or
  * mutating any cache plane. q/out are contiguous BF16 `[256,24|16,T]`, positions is contiguous
  * sequential I32 [T], and the mathematical formula and execution-envelope contract are identical
- * to A1. Small-T uses caller workspace reported by gqa_attention_workspace_bytes().
+ * to A1. Caller workspace is reported by gqa_attention_workspace_bytes() for the exact T.
  */
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,

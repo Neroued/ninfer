@@ -1,15 +1,19 @@
 #include "ops/linear_pair/w8/w8_pair_plan.h"
 
 #include "ops/linear_pair/w8/w8_pair_kernels.h"
+#include "ops/common/token_slices.h"
 
 #include <array>
 #include <cstdint>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
 namespace ninfer::ops::detail {
 namespace {
+
+constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 struct W8PairRouteSpec {
     std::int32_t first;
@@ -20,16 +24,16 @@ struct W8PairRouteSpec {
 constexpr std::array<W8PairRouteSpec, 3> kRoutes{{
     {1, 4, W8PairScheduleId::TwoSimtR8C4},
     {5, 56, W8PairScheduleId::TwoSimtR8C8},
-    {57, kW8PairMaxCols, W8PairScheduleId::DualMmaR32C128},
+    {57, kAnyCols, W8PairScheduleId::DualMmaR32C128},
 }};
 
 constexpr bool routes_are_closed() noexcept {
-    std::int32_t expected = 1;
+    std::int64_t expected = 1;
     for (const W8PairRouteSpec& route : kRoutes) {
         if (route.first != expected || route.last < route.first) { return false; }
-        expected = route.last + 1;
+        expected = static_cast<std::int64_t>(route.last) + 1;
     }
-    return kRoutes.back().last == kW8PairMaxCols;
+    return kRoutes.back().last == kAnyCols && expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
 static_assert(routes_are_closed(), "W8 pair routes must be exact, contiguous, and closed");
@@ -116,7 +120,7 @@ W8PairProblem w8_pair_problem(const Tensor& x, const Weight& first_weight,
 
 bool w8_pair_admits(const W8PairProblem& problem) noexcept {
     return problem.rows == 1024 && problem.k == 5120 && problem.padded_k == 5120 &&
-           problem.cols >= 1 && problem.cols <= kW8PairMaxCols;
+           problem.cols >= 1;
 }
 
 W8PairPlan w8_pair_resolve_plan(const W8PairProblem& problem) {
@@ -125,8 +129,7 @@ W8PairPlan w8_pair_resolve_plan(const W8PairProblem& problem) {
     }
     for (const W8PairRouteSpec& route : kRoutes) {
         if (problem.cols >= route.first && problem.cols <= route.last) {
-            return {route.schedule, resolve_variant(route.schedule, problem), 0,
-                    problem.cols <= kW8PairQualifiedCols};
+            return {route.schedule, resolve_variant(route.schedule, problem), 0};
         }
     }
     throw std::logic_error("w8 pair: admitted problem has no covering route");
@@ -164,8 +167,13 @@ void w8_pair_execute_plan(W8PairPlan plan, const Tensor& x, const Weight& first_
         w8_rowsplit_launch_fixed(base_plan, x, second_weight, second_out, stream);
         return;
     case W8PairScheduleId::DualMmaR32C128:
-        w8_pair_gemm_mma_launch(plan.variant, x, first_weight, second_weight, first_out, second_out,
-                                stream);
+        for_each_token_slice(problem.cols, 128, [&](std::int32_t offset, std::int32_t count) {
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor first_slice   = first_out.slice(1, offset, count);
+            Tensor second_slice  = second_out.slice(1, offset, count);
+            w8_pair_gemm_mma_launch(plan.variant, x_slice, first_weight, second_weight, first_slice,
+                                    second_slice, stream);
+        });
         return;
     }
     throw std::logic_error("w8 pair fixed launch: unknown schedule");

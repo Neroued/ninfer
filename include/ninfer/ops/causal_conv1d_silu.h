@@ -17,7 +17,7 @@ namespace ninfer::ops {
  * naively in FP64 before converting the observable output to BF16. Kernel accumulator and staging
  * precision are implementation choices. Input, weight, output, and state storage do not overlap
  * except for the explicitly allowed exact alias between state input and state output. No caller
- * workspace is used.
+ * workspace is used. T may be any positive value.
  */
 
 // Reads conv_state as the initial window and replaces it with the final three values after x.

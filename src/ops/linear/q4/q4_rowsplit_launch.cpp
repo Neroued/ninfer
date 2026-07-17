@@ -1,6 +1,7 @@
 #include "ops/linear/q4/q4_rowsplit_launch.h"
 
 #include "ops/linear/q4/q4_rowsplit_kernels.h"
+#include "ops/common/token_slices.h"
 
 #include <cstdint>
 #include <limits>
@@ -190,7 +191,12 @@ void q4_rowsplit_launch_fixed(Q4Plan plan, const Tensor& x, const Weight& w, Ten
                                     q4_kernel_variant_name(plan.variant));
     }
 
-    launch_fixed_unchecked(plan, x, w, out, stream);
+    for_each_token_slice(x.ne[1], schedule_cols(plan.schedule),
+                         [&](std::int32_t offset, std::int32_t count) {
+                             const Tensor x_slice = x.slice(1, offset, count);
+                             Tensor out_slice     = out.slice(1, offset, count);
+                             launch_fixed_unchecked(plan, x_slice, w, out_slice, stream);
+                         });
 }
 
 void q4_rowsplit_launch_fixed_pitched(Q4Plan plan, const Tensor& x, const Weight& w, Tensor& out,
@@ -202,7 +208,12 @@ void q4_rowsplit_launch_fixed_pitched(Q4Plan plan, const Tensor& x, const Weight
          plan.schedule != Q4ScheduleId::SimtR8C8)) {
         throw std::invalid_argument("q4 fixed pitched launch: schedule is not admitted");
     }
-    launch_fixed_unchecked(plan, x, w, out, stream);
+    for_each_token_slice(x.ne[1], schedule_cols(plan.schedule),
+                         [&](std::int32_t offset, std::int32_t count) {
+                             const Tensor x_slice = x.slice(1, offset, count);
+                             Tensor out_slice     = out.slice(1, offset, count);
+                             launch_fixed_unchecked(plan, x_slice, w, out_slice, stream);
+                         });
 }
 
 void q4_rowsplit_launch_candidate(Q4ScheduleId schedule, Q4KernelVariant variant, const Tensor& x,

@@ -1,6 +1,7 @@
 #include "ops/launcher/mtp_pack.h"
 
 #include "ops/common/math.h"
+#include "ops/common/token_slices.h"
 #include "ops/kernel/mtp_pack.cuh"
 #include "core/device.h"
 
@@ -12,13 +13,18 @@ namespace ninfer::ops::detail {
 void mtp_pack_fc_input_launch(const Tensor& embedding_norm, const Tensor& hidden_norm, Tensor& out,
                               cudaStream_t stream) {
     constexpr int kBlock = 256;
-    const dim3 grid(static_cast<unsigned int>(div_up(embedding_norm.ne[0], kBlock)),
-                    static_cast<unsigned int>(embedding_norm.ne[1]));
-    mtp_pack_fc_input_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(embedding_norm.data),
-        static_cast<const __nv_bfloat16*>(hidden_norm.data), static_cast<__nv_bfloat16*>(out.data),
-        embedding_norm.ne[0]);
-    CUDA_CHECK(cudaGetLastError());
+    for_each_token_slice(embedding_norm.ne[1], 1, [&](int token_offset, int token_count) {
+        const Tensor embedding_slice = embedding_norm.slice(1, token_offset, token_count);
+        const Tensor hidden_slice    = hidden_norm.slice(1, token_offset, token_count);
+        Tensor out_slice             = out.slice(1, token_offset, token_count);
+        const dim3 grid(static_cast<unsigned int>(div_up(embedding_norm.ne[0], kBlock)),
+                        static_cast<unsigned int>(token_count));
+        mtp_pack_fc_input_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(embedding_slice.data),
+            static_cast<const __nv_bfloat16*>(hidden_slice.data),
+            static_cast<__nv_bfloat16*>(out_slice.data), embedding_norm.ne[0]);
+        CUDA_CHECK(cudaGetLastError());
+    });
 }
 
 void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,

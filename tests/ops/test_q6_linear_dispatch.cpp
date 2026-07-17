@@ -160,16 +160,18 @@ struct RoutePoint {
     V variant;
 };
 
-constexpr std::array<RoutePoint, 2> kHeadRoutes{{
+constexpr std::array<RoutePoint, 3> kHeadRoutes{{
     {1, S::SimtR8C4, V::None},
     {6, S::SimtR8C4, V::None},
+    {7, S::MmaR64C128, V::Predicated},
 }};
 
-constexpr std::array<RoutePoint, 4> kHead2048Routes{{
+constexpr std::array<RoutePoint, 5> kHead2048Routes{{
     {1, S::SimtR8C4, V::None},
     {4, S::SimtR8C4, V::None},
     {5, S::SimtR8C8, V::None},
     {6, S::SimtR8C8, V::None},
+    {7, S::MmaR64C128, V::Predicated},
 }};
 
 constexpr std::array<RoutePoint, 18> kVisionRoutes{{
@@ -304,16 +306,11 @@ void run_support(const char* label, std::int32_t rows, std::int32_t k,
 void rejection_checks() {
     WorkspaceArena workspace(256);
 
-    DeviceQ6Weight head(248320, 5120, 0x2du);
-    DeviceBuffer head_input(5120u * 7u * sizeof(std::uint16_t));
-    DeviceBuffer head_output(248320u * 7u * sizeof(std::uint16_t));
-    Tensor head_x(head_input.data(), DType::BF16, {5120, 7});
-    Tensor head_out(head_output.data(), DType::BF16, {248320, 7});
-    expect_public_rejection("head C=7", head_x, head.get(), head_out, workspace);
-
     DeviceQ6Weight draft(65536, 5120, 0x2fu);
-    Tensor draft_x(head_input.data(), DType::BF16, {5120, 1});
-    Tensor draft_out(head_output.data(), DType::BF16, {65536, 1});
+    DeviceBuffer draft_input(5120u * sizeof(std::uint16_t));
+    DeviceBuffer draft_output(65536u * sizeof(std::uint16_t));
+    Tensor draft_x(draft_input.data(), DType::BF16, {5120, 1});
+    Tensor draft_out(draft_output.data(), DType::BF16, {65536, 1});
     expect_public_rejection("unregistered N=65536", draft_x, draft.get(), draft_out, workspace);
 
     DeviceQ6Weight vision(1152, 1536, 0x35u);
@@ -322,12 +319,6 @@ void rejection_checks() {
     Tensor vision_x(vision_input.data(), DType::BF16, {1536, 5});
     Tensor vision_out(vision_output.data(), DType::BF16, {1152, 5});
     expect_public_rejection("vision non-step C=5", vision_x, vision.get(), vision_out, workspace);
-
-    DeviceQ6Weight future(248320, 2048, 0x37u);
-    DeviceBuffer future_input(2048u * 7u * sizeof(std::uint16_t));
-    Tensor future_x(future_input.data(), DType::BF16, {2048, 7});
-    Tensor future_out(head_output.data(), DType::BF16, {248320, 7});
-    expect_public_rejection("K=2048 C=7", future_x, future.get(), future_out, workspace);
 }
 
 void verify_coverage() {

@@ -9,13 +9,9 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kW8LinearAddMaxCols       = 1024;
-inline constexpr std::int32_t kW8LinearAddQualifiedCols = 1024;
-
 struct W8LinearAddPlan {
     W8ScheduleId schedule;
     W8KernelVariant variant;
-    bool performance_qualified;
 };
 
 bool w8_linear_add_admits(const W8Problem& problem) noexcept;

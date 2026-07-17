@@ -331,6 +331,62 @@ int one_quant_shape_sampled(QType qtype, std::int32_t n, std::int32_t k, std::in
     return verify(label.c_str(), actual, reference, tolerance);
 }
 
+int one_patterned_quant_shape_sampled(QType qtype, std::int32_t n, std::int32_t k, std::int32_t t,
+                                      std::uint32_t seed) {
+    row_split::PackedWeight packed = row_split::make_patterned_weight(qtype, n, k, seed + 2000u);
+    std::vector<float> x(static_cast<std::size_t>(k) * t);
+    fill_uniform(x, seed, -0.01f, 0.01f);
+    round_to_bf16(x);
+
+    DBuf dx = to_device_bf16(x);
+    DBuf dweight(packed.payload.size());
+    DBuf dout(static_cast<std::size_t>(n) * t * sizeof(std::uint16_t));
+    cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
+    WorkspaceArena ws(64ULL << 20);
+    Tensor tx(dx.p, DType::BF16, {k, t});
+    Tensor tout(dout.p, DType::BF16, {n, t});
+    try {
+        ops::linear(tx, packed.device_weight(dweight.p), tout, ws, nullptr);
+        cudaDeviceSynchronize();
+    } catch (const std::exception& e) {
+        std::cerr << "linear " << qtype_name(qtype) << " patterned sampled [" << n << "," << k
+                  << "] T=" << t << " seed=" << seed << ": unexpected exception: " << e.what()
+                  << '\n';
+        return 1;
+    }
+
+    Tolerance tolerance = Tolerance::linear_bf16();
+    if (qtype == QType::Q4G64_F16S) {
+        const auto plan =
+            ops::detail::q4_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
+        tolerance = ops::detail::q4_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
+                                                                     : Tolerance::linear_bf16();
+    } else if (qtype == QType::Q5G64_F16S) {
+        const auto plan =
+            ops::detail::q5_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
+        tolerance = ops::detail::q5_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
+                                                                     : Tolerance::linear_bf16();
+    } else if (qtype == QType::Q6G64_F16S) {
+        const auto plan =
+            ops::detail::q6_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
+        tolerance = ops::detail::q6_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
+                                                                     : Tolerance::linear_bf16();
+    } else if (qtype == QType::W8G32_F16S) {
+        const auto plan =
+            ops::detail::w8_rowsplit_resolve_plan({n, k, packed.weight.padded_shape[1], t});
+        tolerance = ops::detail::w8_schedule_uses_mma(plan.schedule) ? Tolerance::linear_tc()
+                                                                     : Tolerance::linear_bf16();
+    } else {
+        throw std::invalid_argument("patterned sampled Linear oracle received an unsupported type");
+    }
+
+    const std::string label = "linear " + std::string(qtype_name(qtype)) +
+                              " expanded-T patterned FP64 oracle [" + std::to_string(n) + "," +
+                              std::to_string(k) + "] T=" + std::to_string(t);
+    return verify_sampled_projection(label, from_device_bf16(dout, static_cast<std::size_t>(n) * t),
+                                     n, 0, x, k, t, packed, tolerance);
+}
+
 int paired_w8g32_shape(std::int32_t n, std::int32_t k, const std::vector<std::int32_t>& ts,
                        std::uint32_t seed) {
     const std::int32_t max_t = *std::max_element(ts.begin(), ts.end());
@@ -923,6 +979,7 @@ int main() {
     f += one_quant_shape_sampled(QType::W8G32_F16S, 12288, 2048, 1024, 135u);
     f += one_quant_shape(QType::W8G32_F16S, 9216, 2048, {13, 14, 128, 129}, 137u);
     f += one_quant_shape_sampled(QType::W8G32_F16S, 9216, 2048, 1024, 139u);
+    f += one_patterned_quant_shape_sampled(QType::W8G32_F16S, 2048, 4096, 1025, 141u);
     // Q4 public correctness is exact-admission only. The dedicated Q4 plan/dispatch tests cover
     // every route seam and compare public auto against the fixed entry word-for-word; these
     // oracle points cover both registered head K values and the split-K/SIMT numerical boundary
@@ -931,6 +988,8 @@ int main() {
     f += one_quant_shape(QType::Q4G64_F16S, 4096, 5120, {1}, 25u);
     f += one_quant_shape(QType::Q4G64_F16S, 131072, 2048, {1}, 26u);
     f += one_quant_shape(QType::Q4G64_F16S, 3456, 1152, {4, 40}, 27u);
+    f += one_patterned_quant_shape_sampled(QType::Q4G64_F16S, 34816, 5120, 1, 28u);
+    f += one_patterned_quant_shape_sampled(QType::Q4G64_F16S, 34816, 5120, 17, 28u);
     // Q5 public correctness is exact-admission only. Fused input projections own their
     // large-column parent operations; linear_add owns the residual epilogue for every T.
     f += one_quant_shape(QType::Q5G64_F16S, 1024, 5120, {1, 4, 5, 16}, 29u);
@@ -939,12 +998,15 @@ int main() {
     f += one_quant_shape(QType::Q5G64_F16S, 5120, 17408, {2, 6, 7, 24}, 41u);
     f += one_quant_shape(QType::Q5G64_F16S, 1152, 1152, {4, 56, 60, 128}, 43u);
     f += one_quant_shape(QType::Q5G64_F16S, 1152, 4304, {4, 84, 88, 128}, 47u);
+    f += one_patterned_quant_shape_sampled(QType::Q5G64_F16S, 6144, 5120, 1025, 49u);
     // Q6 public correctness is exact-admission only. The dedicated Q6 plan/dispatch tests cover
     // every route seam and compare public auto against the fixed entry word-for-word. These
     // independent fp64-oracle points cover the real head and Vision geometries.
     f += one_quant_shape(QType::Q6G64_F16S, 248320, 5120, {1}, 211u);
+    f += one_patterned_quant_shape_sampled(QType::Q6G64_F16S, 248320, 5120, 7, 212u);
     f += one_quant_shape(QType::Q6G64_F16S, 248320, 2048, {1}, 223u);
     f += one_quant_shape_sampled(QType::Q6G64_F16S, 248320, 2048, 6, 225u);
+    f += one_patterned_quant_shape_sampled(QType::Q6G64_F16S, 248320, 2048, 7, 226u);
     f += one_quant_shape(QType::Q6G64_F16S, 1152, 1536, {4, 40, 128}, 227u);
 
     std::cout << (f ? "FAIL" : "OK") << " linear correctness\n";

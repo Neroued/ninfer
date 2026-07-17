@@ -11,9 +11,6 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kBf16GdnGatingMaxCols       = 128 * 65535;
-inline constexpr std::int32_t kBf16GdnGatingQualifiedCols = 1024;
-
 enum class Bf16GdnGatingScheduleId {
     GemvPairedRows,
     SmallTSplit10,
@@ -37,7 +34,6 @@ struct Bf16GdnGatingPlan {
     Bf16GdnGatingScheduleId schedule;
     Bf16GdnGatingTokenVariant token_variant;
     std::size_t workspace_bytes;
-    bool performance_qualified;
 };
 
 const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noexcept;

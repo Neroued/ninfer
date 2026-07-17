@@ -42,27 +42,8 @@ Q4ScheduleId expected_materialized_schedule(std::int32_t cols) {
 }
 
 void route_tests() {
-    constexpr std::array<std::int32_t, 20> boundaries{
-        1,
-        2,
-        4,
-        5,
-        16,
-        17,
-        128,
-        129,
-        256,
-        257,
-        384,
-        385,
-        512,
-        513,
-        640,
-        641,
-        1024,
-        1025,
-        ninfer::ops::detail::kQ4LinearSwiGluMaxCols - 1,
-        ninfer::ops::detail::kQ4LinearSwiGluMaxCols,
+    constexpr std::array<std::int32_t, 18> boundaries{
+        1, 2, 4, 5, 16, 17, 128, 129, 256, 257, 384, 385, 512, 513, 640, 641, 1024, 1025,
     };
     for (const std::int32_t cols : boundaries) {
         const Q4LinearSwiGluProblem problem{34816, 17408, 5120, 5120, cols};
@@ -74,11 +55,6 @@ void route_tests() {
         const Q4LinearSwiGluPlan plan = ninfer::ops::detail::q4_linear_swiglu_resolve_plan(problem);
         if (plan.schedule != expected_schedule(cols)) {
             std::cerr << "wrong Q4 LinearSwiGLU route C=" << cols << '\n';
-            ++failures;
-        }
-        if (plan.performance_qualified !=
-            (cols <= ninfer::ops::detail::kQ4LinearSwiGluQualifiedCols)) {
-            std::cerr << "wrong Q4 LinearSwiGLU qualification C=" << cols << '\n';
             ++failures;
         }
         const bool materialized = plan.schedule == S::Materialized;
@@ -97,10 +73,6 @@ void route_tests() {
     expect_invalid("C=0", [] {
         (void)ninfer::ops::detail::q4_linear_swiglu_resolve_plan({34816, 17408, 5120, 5120, 0});
     });
-    expect_invalid("C=max+1", [] {
-        (void)ninfer::ops::detail::q4_linear_swiglu_resolve_plan(
-            {34816, 17408, 5120, 5120, ninfer::ops::detail::kQ4LinearSwiGluMaxCols + 1});
-    });
     expect_invalid("unsupported output rows", [] {
         (void)ninfer::ops::detail::q4_linear_swiglu_resolve_plan({34816, 17407, 5120, 5120, 1});
     });
@@ -115,7 +87,7 @@ void workspace_tests() {
         std::size_t bytes;
     };
 
-    constexpr std::array<Case, 16> cases{{
+    constexpr std::array<Case, 15> cases{{
         {1, 0},
         {2, 139'264},
         {128, 8'912'896},
@@ -131,7 +103,6 @@ void workspace_tests() {
         {1024, 44'564'480},
         {1025, 44'564'480},
         {2048, 44'564'480},
-        {ninfer::ops::detail::kQ4LinearSwiGluMaxCols, 44'564'480},
     }};
     for (const Case test : cases) {
         const std::size_t actual = ninfer::ops::linear_swiglu_workspace_bytes(34816, test.capacity);

@@ -256,6 +256,9 @@ int main() {
     failures += one_shape35(128, 0x751u, {0, 63, 127});
     failures += one_shape35(129, 0x801u, {0, 64, 128});
     failures += one_shape35(1024, 0x851u, {0, 511, 1023}, true);
+    failures += one_shape35(1025, 0x901u, {0, 512, 1024});
+    failures += one_shape35(2049, 0x951u, {0, 1024, 2048});
+    failures += one_shape35(4097, 0xa01u, {0, 2048, 4096});
 
     std::cout << (failures ? "FAIL" : "OK") << " gdn_gating_proj correctness\n";
     return failures ? 1 : 0;

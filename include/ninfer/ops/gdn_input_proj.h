@@ -13,8 +13,9 @@
 namespace ninfer::ops {
 
 /**
- * Validates the registered problem and token capacity. Every admitted route writes directly to
- * the final output, so the required transient capacity is zero.
+ * Validates the registered problem and positive token capacity. Every admitted route writes
+ * directly to the final output, so the required transient capacity is zero. `max_tokens` is a
+ * capacity query, not an execution limit.
  */
 [[nodiscard]] std::size_t gdn_input_proj_workspace_bytes(std::int32_t qk_rows,
                                                          std::int32_t value_rows,
@@ -28,6 +29,7 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   x [5120,T], qk weight/output rows 4096, v weight/output rows 6144, qkv [10240,T].
+ *   T may be any positive value.
  *   x and qkv are contiguous BF16. qk_weight is Q4G64_F16S RowSplit [4096,5120] and
  *   v_weight is Q5G64_F16S RowSplit [6144,5120], both with FP16 scales.
  *

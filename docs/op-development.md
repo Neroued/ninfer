@@ -40,11 +40,31 @@ A component is an Op only when it has all of these properties:
 6. **Independent invocation.** It has a meaningful host-callable boundary and can be verified from
    its explicit inputs, outputs, and state without running a complete model schedule.
 
-One caller, one supported shape, one registered tensor format, one token regime, one device
+One caller, one supported shape, one registered tensor format, one optimized token extent, one device
 implementation, mutable state, or a fused formula do not disqualify an Op. Reuse count and support
 breadth describe the current implementation domain; they do not determine ownership.
 
-### 1.1 Stateful, fused, and stochastic Ops
+### 1.1 Token extent is semantic input, not a request phase
+
+When an Op contract defines an axis as the Text/MTP token extent `T`, that axis accepts any positive
+value representable by the tensor and available storage unless the Op has an explicit semantic
+capacity such as a cache envelope. The default prefill chunk size of 1024 is a primary performance
+target, not an admission bound. `T=1`, other small values, and chunks around or beyond 1024 are
+values of the same Op contract.
+
+Do not infer that rule merely because an implementation stores work in matrix columns. Vision raw
+patches `P`, merged Vision tokens `V=P/4`, MTP proposal count `K`, vocabulary rows, head widths, and
+other axes keep the finite geometry or capacity declared by their own contracts. In particular,
+the registered Vision Linear problems admit the valid frontend `P` or `V` domain; those columns are
+not Text token `T`.
+
+Names such as decode, Small-T, and prefill may describe private benchmarks or implementation
+routes. They must not appear as semantic variants, admission domains, separate target-callable
+entry points, or API limits. A kernel may internally select a schedule or split one call into
+several launches to satisfy CUDA grid/resource limits; that decomposition is invisible to the
+caller and does not narrow T.
+
+### 1.2 Stateful, fused, and stochastic Ops
 
 A stateful Op defines both its produced value and its state transition:
 
@@ -84,7 +104,7 @@ logical position, purpose/domain separation, and draw index required by the algo
 defines the probability process and state transition. It promises a particular backend bitstream
 or sampled sequence only when that is deliberately part of the semantics.
 
-### 1.2 Execution envelopes
+### 1.3 Execution envelopes
 
 An Op may accept an explicit host execution envelope when device-resident semantic inputs cannot
 be read on the host without synchronization but do affect launch capacity or concrete kernel
@@ -103,7 +123,7 @@ GQA is the current concrete use: device `positions` define the causal mask, whil
 split capacity and INT8 implementation selection. The physical cache view contains no frontier or
 graph identity.
 
-### 1.3 Logical assignment versus raw transfer
+### 1.4 Logical assignment versus raw transfer
 
 Classification follows the logical interface, not the CUDA primitive used underneath:
 
@@ -230,7 +250,7 @@ the applicable fields below:
  *   <complete formula, algorithm, probability process, or index mapping>
  *
  * Logical shapes:
- *   <symbols, axes, valid ranges, and layout interpretation>
+ *   <symbols, semantic axes, valid ranges, and layout interpretation; identify T versus P/V/etc.>
  *
  * Supported domain:
  *   <dtype, numeric format, storage layout, shape, and semantic variants>
@@ -302,8 +322,8 @@ need empty source layers.
 1. semantic dtype, rank, shape, layout, and alignment validation;
 2. scalar, configuration, and explicit state validation;
 3. transient workspace scope creation;
-4. finite implementation selection from semantic variant, format, layout, numerical shape, token
-   regime, state dtype, and device capability;
+4. private implementation selection from semantic variant, format, layout, numerical shape, extent,
+   state dtype, and device capability, without turning a tuning threshold into an admission bound;
 5. invocation of the selected launcher or a composed fallback.
 
 A wrapper must not dispatch on target key, artifact tensor name, source layer role, Program phase,
@@ -346,14 +366,16 @@ src/ops/linear/
 
 - `linear.cpp` integrates contract validation and dispatch;
 - `codec/` implements registered device decode rules;
-- `plan/` performs finite format/shape/token/device classification;
+- `plan/` performs finite format/shape/device classification and private token-extent tuning;
 - `reference/` provides supported generic or dense CUDA paths;
 - `gemv/` contains single-token and small-token implementations;
 - `gemm/` contains larger-token tensor-core and fused implementations.
 
 This subtree is not a generic backend framework. Do not introduce an Op base class, runtime
 registry, universal plan interface, plugin discovery, string dispatch, or graph IR. Select directly
-from the finite formats, shapes, regimes, and devices that NInfer actually supports.
+from the finite formats, shapes, and devices that NInfer actually supports. Keep Text/MTP token T
+independent of benchmark or schedule phases, and preserve separately declared domains such as
+Vision P/V.
 
 ### 5.6 Implementation comments
 
@@ -362,7 +384,7 @@ predicate and implementation assumptions in a compact form:
 
 ```text
 Implements: include/ninfer/ops/<family>.h
-Match: <device, dtype/format, layout, numerical shape, token regime>
+Match: <device, dtype/format, layout, numerical shape, private token-extent route>
 Algorithm assumptions: <tiling, padding, alignment, staging, or launch requirements>
 ```
 
@@ -442,12 +464,12 @@ criteria for floating-point and stochastic work. A stochastic test validates the
 contract or controlled semantic inputs; it does not require sampled text to remain identical unless
 the contract promises that result.
 
-Every floating-point Op uses the one naive FP32/FP64 oracle defined in Section 1.1. Give each
+Every floating-point Op uses the one naive FP32/FP64 oracle defined in Section 1.2. Give each
 implementation profile an explicit named tolerance when its rounding or quantization error differs.
 Do not copy query quantization, staging casts, reduction trees, or another implementation's output
 into the oracle merely to make parity pass. Conversely, do not turn the oracle's evaluation
 precision into a required kernel evaluation order. State the qualification domain honestly: a
-tolerance established for registered shapes, supported regimes, the conformance matrix, and
+tolerance established for registered shapes, tested token extents, the conformance matrix, and
 target-representative activations is not a universal error theorem for arbitrary unbounded or
 adversarial tensors. Each semantically complete entry point is checked directly against the oracle;
 pairwise implementation parity is supplementary evidence.
@@ -465,14 +487,14 @@ coverage, retired compatibility, or hypothetical behavior.
 ## 9. Performance workflow
 
 Op microbenchmarks live under `bench/ops/` and link the Op layer directly. A useful result records
-the semantic operation, exact shape, format/layout, token regime, device/toolchain, warmup and
+the semantic operation, exact shape, format/layout, workload token extent, device/toolchain, warmup and
 measurement method, cache conditions, and actual selected implementation. A microbenchmark is an
 implementation measurement, not a correctness oracle or proof of end-to-end improvement.
 
 For a performance change:
 
 1. establish correctness with the affected Op test;
-2. measure the relevant Op and real supported regime;
+2. measure the relevant Op and workload token extent;
 3. check the affected product route when the change can influence end-to-end inference;
 4. use Nsight Systems when whole-request attribution or launch gaps matter;
 5. use Nsight Compute only after a specific kernel question has been identified.
@@ -491,8 +513,10 @@ Use this sequence for a proposed device transformation:
    overload or variant. Create a new family only for a distinct closed transformation.
 3. **Write the contract first.** Define formula/indexing, logical shapes, supported domain,
    numerical behavior, effects, alias rules, and workspace before selecting a CUDA organization.
-4. **Define finite support.** List the registered dtypes, layouts, shapes, regimes, state forms, and
-   devices actually implemented. Do not add hypothetical abstraction points.
+4. **Define finite support.** List the registered dtypes, layouts, numerical shapes, semantic axis
+   ranges, state forms, and devices actually implemented. Keep every positive Text/MTP T admitted;
+   list its measured counts only as correctness/performance evidence or private route thresholds.
+   Preserve genuine finite domains such as Vision geometry, cache capacity, or proposal count.
 5. **Place implementation code.** Put validation/dispatch in `wrapper`, launch policy in `launcher`,
    device code in `kernel`, and only genuinely narrow reusable primitives in `common`. Use the
    dedicated linear subtree for linear format/plan/GEMV/GEMM work.
@@ -518,8 +542,8 @@ only private dispatch/implementation code and the evidence relevant to that path
 - Does the contract state observable numeric and fusion boundaries without freezing CUDA strategy?
 - Does it leave private precision, staging, reduction, workspace representation, and intermediate
   rounding to the implementation while keeping every route accountable to one oracle?
-- Does wrapper dispatch use only format, layout, numerical shape, regime, state dtype, and device
-  facts?
+- Does wrapper dispatch keep positive Text/MTP T admitted, use it only for private implementation
+  selection, and preserve the declared ranges of other semantic axes?
 - Are launcher, kernel, common, codec, and plan headers invisible to targets?
 - Are workspace and state lifetime owned by the caller?
 - Is a raw transfer or cursor mechanism being incorrectly promoted into an Op?

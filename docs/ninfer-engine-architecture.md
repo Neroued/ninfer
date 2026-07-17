@@ -1914,8 +1914,9 @@ The exact file count may vary, but these ownership rules are fixed:
 
 - every contract comment defines the complete formula/indexing, logical shapes, supported domain,
   numerical behavior, effects/aliases, and workspace requirement;
-- wrappers validate semantic inputs and select a finite implementation from format, layout,
-  numerical shape, token regime, state dtype, and device facts;
+- wrappers validate semantic inputs and select an implementation from format, layout, numerical
+  shape, semantic extent, state dtype, and device facts without turning a tuning threshold into an
+  admission limit;
 - launchers own grid/block/shared-memory policy and CUDA entry invocation;
 - kernels and common/linear helpers are private implementation material and are never included by a
   target schedule;

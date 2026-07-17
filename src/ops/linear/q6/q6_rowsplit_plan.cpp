@@ -3,10 +3,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 struct Q6ColsSet {
     std::int32_t first;
@@ -33,18 +36,20 @@ struct Q6RouteSpec {
 };
 
 constexpr std::array<Q6SupportSpec, 3> kSupportSpecs{{
-    {248320, 5120, 5120, {1, 6, 1}, 0, 1},
-    {248320, 2048, 2048, {1, 6, 1}, 1, 2},
-    {1152, 1536, 1536, {4, 131072, 4}, 3, 9},
+    {248320, 5120, 5120, {1, kAnyCols, 1}, 0, 2},
+    {248320, 2048, 2048, {1, kAnyCols, 1}, 2, 3},
+    {1152, 1536, 1536, {4, 131072, 4}, 5, 9},
 }};
 
-constexpr std::array<Q6RouteSpec, 12> kRouteSpecs{{
+constexpr std::array<Q6RouteSpec, 14> kRouteSpecs{{
     // [248320, 5120]
     {{1, 6, 1}, Q6ScheduleId::SimtR8C4},
+    {{7, kAnyCols, 1}, Q6ScheduleId::MmaR64C128},
 
     // [248320, 2048]
     {{1, 4, 1}, Q6ScheduleId::SimtR8C4},
     {{5, 6, 1}, Q6ScheduleId::SimtR8C8},
+    {{7, kAnyCols, 1}, Q6ScheduleId::MmaR64C128},
 
     // [1152, 1536]
     {{4, 96, 4}, Q6ScheduleId::SimtR8C4},
@@ -90,7 +95,7 @@ constexpr bool catalog_is_closed() noexcept {
             }
         }
 
-        std::int32_t expected_first = support.admitted_cols.first;
+        std::int64_t expected_first = support.admitted_cols.first;
         for (std::size_t local = 0; local < support.route_count; ++local) {
             const Q6RouteSpec& route = kRouteSpecs[support.route_begin + local];
             if (!known_schedule(route.schedule) || route.cols.first != expected_first ||
@@ -101,9 +106,10 @@ constexpr bool catalog_is_closed() noexcept {
                 !support.admitted_cols.contains(route.cols.last)) {
                 return false;
             }
-            expected_first = route.cols.last + route.cols.step;
+            expected_first = static_cast<std::int64_t>(route.cols.last) + route.cols.step;
         }
-        if (expected_first != support.admitted_cols.last + support.admitted_cols.step) {
+        if (expected_first !=
+            static_cast<std::int64_t>(support.admitted_cols.last) + support.admitted_cols.step) {
             return false;
         }
         next_route += support.route_count;

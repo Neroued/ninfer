@@ -98,6 +98,20 @@ with context length.
 | position table | 48 × 48 |
 | Vision RoPE theta | 10000 |
 
+### 2.5 Runtime extents
+
+`T` denotes the Text/MTP token extent supplied to an Op. It is any positive tensor extent that
+fits the applicable storage or explicit state capacity. Decode (`T=1`), verification-sized calls,
+and prefill chunks are workload points and private implementation routes, not different Op domains.
+The configured prefill chunk controls target workspace and request decomposition; its default 1024
+does not cap an Op's `T`.
+
+Vision uses different axes. `P` is the aggregate raw-patch count and must be a positive multiple of
+4 because of the 2x2 spatial merge; `V=P/4` is the aggregate merged-token count. The registered 27B
+processor/implementation envelope is `4<=P<=131072` and `1<=V<=32768`, with the frontend's media,
+attention-pair, and prompt budgets imposing any additional request-specific restriction. These
+Vision columns are not Text token `T` and are not expanded beyond that envelope.
+
 ## 3. Shared decoder layer skeleton
 
 Both Text layer types use a pre-norm residual structure:

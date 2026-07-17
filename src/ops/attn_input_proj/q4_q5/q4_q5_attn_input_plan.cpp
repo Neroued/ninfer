@@ -1,12 +1,16 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
+#include "ops/common/token_slices.h"
 
 #include <array>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 struct ColsSet {
     std::int32_t first;
@@ -24,12 +28,12 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 2> kRoutes{{
     {{1, 16}, Q4Q5AttnInputScheduleId::ParentSplitFixed},
-    {{17, kQ4Q5AttnInputMaxCols}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR64C128},
+    {{17, kAnyCols}, Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR64C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
     return kRoutes[0].cols.first == 1 && kRoutes[0].cols.last + 1 == kRoutes[1].cols.first &&
-           kRoutes[1].cols.last == kQ4Q5AttnInputMaxCols;
+           kRoutes[1].cols.last == kAnyCols;
 }
 
 static_assert(catalog_is_closed(), "attention input routes must be exact and closed");
@@ -68,7 +72,7 @@ const char* q4_q5_attn_input_schedule_name(Q4Q5AttnInputScheduleId schedule) noe
 }
 
 bool q4_q5_attn_input_admits(const Q4Q5AttnInputProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1 && problem.cols <= kQ4Q5AttnInputMaxCols;
+    return supported_shape(problem) && problem.cols >= 1;
 }
 
 Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& problem) {
@@ -84,7 +88,6 @@ Q4Q5AttnInputPlan q4_q5_attn_input_resolve_plan(const Q4Q5AttnInputProblem& prob
             Q4KernelVariant::None,
             std::nullopt,
             0,
-            problem.cols <= kQ4Q5AttnInputQualifiedCols,
         };
         if (route.schedule == Q4Q5AttnInputScheduleId::ParentSplitFixed) {
             const std::int32_t parent_rows = problem.query_rows + problem.kv_rows;
@@ -123,8 +126,16 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
                                         stream);
         return;
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR64C128:
-        q4_q5_attn_input_grouped_mma_launch(plan.grouped_variant, x, query_key_weight,
-                                            gate_value_weight, q, gate, k, v, stream);
+        for_each_token_slice(problem.cols, 128, [&](std::int32_t offset, std::int32_t count) {
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor q_slice       = q.slice(1, offset, count);
+            Tensor gate_slice    = gate.slice(1, offset, count);
+            Tensor k_slice       = k.slice(1, offset, count);
+            Tensor v_slice       = v.slice(1, offset, count);
+            q4_q5_attn_input_grouped_mma_launch(plan.grouped_variant, x_slice, query_key_weight,
+                                                gate_value_weight, q_slice, gate_slice, k_slice,
+                                                v_slice, stream);
+        });
         return;
     }
     throw std::logic_error("Q4/Q5 attention input: unknown schedule");

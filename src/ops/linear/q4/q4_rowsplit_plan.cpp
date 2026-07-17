@@ -3,10 +3,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
+
+constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 struct Q4ColsSet {
     std::int32_t first;
@@ -33,32 +36,35 @@ struct Q4RouteSpec {
 };
 
 constexpr std::array<Q4SupportSpec, 9> kSupportSpecs{{
-    {1024, 5120, 5120, {1, 16, 1}, 0, 3},
-    {4096, 5120, 5120, {1, 16, 1}, 3, 3},
-    {6144, 5120, 5120, {1, 16, 1}, 6, 3},
-    {7168, 5120, 5120, {1, 16, 1}, 9, 5},
-    {34816, 5120, 5120, {2, 16, 1}, 14, 2},
-    {131072, 5120, 5120, {1, 1, 1}, 16, 1},
-    {131072, 2048, 2048, {1, 1, 1}, 17, 1},
-    {3456, 1152, 1152, {4, 131072, 4}, 18, 3},
-    {4304, 1152, 1152, {4, 131072, 4}, 21, 6},
+    {1024, 5120, 5120, {1, kAnyCols, 1}, 0, 4},
+    {4096, 5120, 5120, {1, kAnyCols, 1}, 4, 4},
+    {6144, 5120, 5120, {1, kAnyCols, 1}, 8, 4},
+    {7168, 5120, 5120, {1, kAnyCols, 1}, 12, 6},
+    {34816, 5120, 5120, {1, kAnyCols, 1}, 18, 4},
+    {131072, 5120, 5120, {1, kAnyCols, 1}, 22, 2},
+    {131072, 2048, 2048, {1, kAnyCols, 1}, 24, 2},
+    {3456, 1152, 1152, {4, 131072, 4}, 26, 3},
+    {4304, 1152, 1152, {4, 131072, 4}, 29, 6},
 }};
 
-constexpr std::array<Q4RouteSpec, 27> kRouteSpecs{{
+constexpr std::array<Q4RouteSpec, 35> kRouteSpecs{{
     // [1024, 5120]
     {{1, 1, 1}, Q4ScheduleId::GemvR1W8Direct},
     {{2, 15, 1}, Q4ScheduleId::SimtR8C4},
     {{16, 16, 1}, Q4ScheduleId::SimtR8C8},
+    {{17, kAnyCols, 1}, Q4ScheduleId::MmaR64C128},
 
     // [4096, 5120]
     {{1, 1, 1}, Q4ScheduleId::GemvR1W8Direct},
     {{2, 4, 1}, Q4ScheduleId::SimtR8C4},
     {{5, 16, 1}, Q4ScheduleId::SimtR8C8},
+    {{17, kAnyCols, 1}, Q4ScheduleId::MmaR64C128},
 
     // [6144, 5120]
     {{1, 1, 1}, Q4ScheduleId::GemvR1W8Direct},
     {{2, 7, 1}, Q4ScheduleId::SimtR8C4},
     {{8, 16, 1}, Q4ScheduleId::SimtR8C8},
+    {{17, kAnyCols, 1}, Q4ScheduleId::MmaR64C128},
 
     // [7168, 5120]
     {{1, 1, 1}, Q4ScheduleId::GemvR1W8Direct},
@@ -66,16 +72,21 @@ constexpr std::array<Q4RouteSpec, 27> kRouteSpecs{{
     {{8, 8, 1}, Q4ScheduleId::SimtR8C8},
     {{9, 15, 1}, Q4ScheduleId::SimtR8C4},
     {{16, 16, 1}, Q4ScheduleId::SimtR8C8},
+    {{17, kAnyCols, 1}, Q4ScheduleId::MmaR64C128},
 
     // [34816, 5120]
+    {{1, 1, 1}, Q4ScheduleId::GemvR1W8Direct},
     {{2, 4, 1}, Q4ScheduleId::SimtR8C4},
     {{5, 16, 1}, Q4ScheduleId::SimtR8C8},
+    {{17, kAnyCols, 1}, Q4ScheduleId::MmaR64C128},
 
     // [131072, 5120]
     {{1, 1, 1}, Q4ScheduleId::GemvR4W1Direct},
+    {{2, kAnyCols, 1}, Q4ScheduleId::MmaR64C128},
 
     // [131072, 2048]
     {{1, 1, 1}, Q4ScheduleId::GemvR4W1Direct},
+    {{2, kAnyCols, 1}, Q4ScheduleId::MmaR64C128},
 
     // [3456, 1152]
     {{4, 36, 4}, Q4ScheduleId::SimtR8C4},
@@ -126,7 +137,7 @@ constexpr bool catalog_is_closed() noexcept {
             }
         }
 
-        std::int32_t expected_first = support.admitted_cols.first;
+        std::int64_t expected_first = support.admitted_cols.first;
         for (std::size_t local = 0; local < support.route_count; ++local) {
             const Q4RouteSpec& route = kRouteSpecs[support.route_begin + local];
             if (!known_schedule(route.schedule) || route.cols.first != expected_first ||
@@ -137,9 +148,10 @@ constexpr bool catalog_is_closed() noexcept {
                 !support.admitted_cols.contains(route.cols.last)) {
                 return false;
             }
-            expected_first = route.cols.last + route.cols.step;
+            expected_first = static_cast<std::int64_t>(route.cols.last) + route.cols.step;
         }
-        if (expected_first != support.admitted_cols.last + support.admitted_cols.step) {
+        if (expected_first !=
+            static_cast<std::int64_t>(support.admitted_cols.last) + support.admitted_cols.step) {
             return false;
         }
         next_route += support.route_count;

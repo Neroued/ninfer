@@ -10,7 +10,7 @@
 
 namespace ninfer::ops {
 
-// Maximum transient capacity required by any admitted exact route with T <= max_tokens.
+// Maximum transient capacity required for any positive T <= max_tokens. This query does not cap T.
 [[nodiscard]] std::size_t gdn_gating_proj_workspace_bytes(std::int32_t max_tokens);
 
 /**
@@ -23,7 +23,8 @@ namespace ninfer::ops {
  *
  * `x` is contiguous BF16 [5120,T]; both weights are contiguous BF16_CTRL [48,5120]; A_log and
  * dt_bias are contiguous FP32 [48]; g and beta are distinct contiguous FP32 [48,T]. The numerical
- * oracle evaluates the logical formula naively in FP64 from the represented inputs. Projection
+ * contract accepts every positive T. The oracle evaluates the logical formula naively in FP64
+ * from the represented inputs. Projection
  * staging, accumulator precision, and any private materialization are implementation choices and
  * are compared with that oracle under the route's FP32-output criterion. All inputs and outputs are
  * non-overlapping. `ws` provides the transient capacity reported above and is scoped to the call;

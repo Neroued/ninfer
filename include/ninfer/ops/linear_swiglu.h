@@ -13,9 +13,9 @@
 namespace ninfer::ops {
 
 /**
- * Returns the maximum transient capacity required by any admitted LinearSwiGLU route in
- * [1,max_tokens]. For the registered Q4 problem this is the largest materialized BF16
- * [gate_up_rows,T] projection selected in that range and saturates at T=640.
+ * Returns the maximum transient capacity required by LinearSwiGLU for any T in [1,max_tokens].
+ * `max_tokens` sizes caller-owned storage; it does not cap later Op calls when sufficient storage
+ * is provided.
  */
 [[nodiscard]] std::size_t linear_swiglu_workspace_bytes(std::int32_t gate_up_rows,
                                                         std::int32_t max_tokens);
@@ -29,7 +29,7 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   x [5120,T] and out [17408,T] are contiguous BF16. gate_up_weight is Q4G64_F16S RowSplit
- *   [34816,5120] with FP16 scales.
+ *   [34816,5120] with FP16 scales. T may be any positive value.
  *
  * Numeric:
  *   The oracle exact-decodes the registered weight and evaluates the complete expression naively

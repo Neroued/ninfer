@@ -62,26 +62,37 @@ Q4KernelVariant expected_tiled_variant(Q4ScheduleId schedule, const Q4Problem& p
 Q4Plan expected_production_plan(const Q4Problem& problem) {
     S schedule;
     if (problem.rows == 1024 && problem.k == 5120) {
-        schedule = problem.cols == 1 ? S::GemvR1W8Direct
-                                     : (problem.cols <= 15 ? S::SimtR8C4 : S::SimtR8C8);
+        schedule = problem.cols == 1
+                       ? S::GemvR1W8Direct
+                       : (problem.cols <= 15 ? S::SimtR8C4
+                                             : (problem.cols == 16 ? S::SimtR8C8 : S::MmaR64C128));
     } else if (problem.rows == 4096 && problem.k == 5120) {
-        schedule =
-            problem.cols == 1 ? S::GemvR1W8Direct : (problem.cols <= 4 ? S::SimtR8C4 : S::SimtR8C8);
+        schedule = problem.cols == 1
+                       ? S::GemvR1W8Direct
+                       : (problem.cols <= 4 ? S::SimtR8C4
+                                            : (problem.cols <= 16 ? S::SimtR8C8 : S::MmaR64C128));
     } else if (problem.rows == 6144 && problem.k == 5120) {
-        schedule =
-            problem.cols == 1 ? S::GemvR1W8Direct : (problem.cols <= 7 ? S::SimtR8C4 : S::SimtR8C8);
+        schedule = problem.cols == 1
+                       ? S::GemvR1W8Direct
+                       : (problem.cols <= 7 ? S::SimtR8C4
+                                            : (problem.cols <= 16 ? S::SimtR8C8 : S::MmaR64C128));
     } else if (problem.rows == 7168 && problem.k == 5120) {
         if (problem.cols == 1) {
             schedule = S::GemvR1W8Direct;
         } else if (problem.cols <= 7 || (problem.cols >= 9 && problem.cols <= 15)) {
             schedule = S::SimtR8C4;
-        } else {
+        } else if (problem.cols == 8 || problem.cols == 16) {
             schedule = S::SimtR8C8;
+        } else {
+            schedule = S::MmaR64C128;
         }
     } else if (problem.rows == 34816 && problem.k == 5120) {
-        schedule = problem.cols <= 4 ? S::SimtR8C4 : S::SimtR8C8;
+        schedule = problem.cols == 1
+                       ? S::GemvR1W8Direct
+                       : (problem.cols <= 4 ? S::SimtR8C4
+                                            : (problem.cols <= 16 ? S::SimtR8C8 : S::MmaR64C128));
     } else if (problem.rows == 131072 && (problem.k == 5120 || problem.k == 2048)) {
-        schedule = S::GemvR4W1Direct;
+        schedule = problem.cols == 1 ? S::GemvR4W1Direct : S::MmaR64C128;
     } else if (problem.rows == 3456 && problem.k == 1152) {
         schedule =
             problem.cols <= 36 ? S::SimtR8C4 : (problem.cols <= 320 ? S::MmaR64C64 : S::MmaR64C128);
@@ -158,42 +169,41 @@ void expect_rejected(const std::string& label, const Q4Problem& problem, bool ex
     }
 }
 
-struct SupportCase {
-    const char* label;
-    std::int32_t rows;
-    std::int32_t k;
-    std::int32_t first;
-    std::int32_t last;
-    std::int32_t step;
-};
-
-void exact_admission_and_full_route_scan() {
-    constexpr std::array<SupportCase, 9> supports{{
-        {"text_1024x5120", 1024, 5120, 1, 16, 1},
-        {"text_4096x5120", 4096, 5120, 1, 16, 1},
-        {"text_6144x5120", 6144, 5120, 1, 16, 1},
-        {"text_7168x5120", 7168, 5120, 1, 16, 1},
-        {"text_34816x5120", 34816, 5120, 2, 16, 1},
-        {"text_131072x5120", 131072, 5120, 1, 1, 1},
-        {"text_131072x2048", 131072, 2048, 1, 1, 1},
-        {"vision_3456x1152", 3456, 1152, 4, 131072, 4},
-        {"vision_4304x1152", 4304, 1152, 4, 131072, 4},
+void semantic_length_admission() {
+    constexpr std::array<Q4Problem, 7> text_shapes{{
+        {1024, 5120, 5120, 1},
+        {4096, 5120, 5120, 1},
+        {6144, 5120, 5120, 1},
+        {7168, 5120, 5120, 1},
+        {34816, 5120, 5120, 1},
+        {131072, 5120, 5120, 1},
+        {131072, 2048, 2048, 1},
     }};
+    constexpr std::array<std::int32_t, 8> positive_t{1, 2, 5, 16, 17, 1024, 1025, 2048};
 
-    for (const SupportCase& support : supports) {
-        for (std::int32_t cols = 0; cols <= support.last + support.step; ++cols) {
-            const Q4Problem problem{support.rows, support.k, support.k, cols};
-            const bool expected_admission = cols >= support.first && cols <= support.last &&
-                                            ((cols - support.first) % support.step) == 0;
-            const bool actual_admission = ninfer::ops::detail::q4_rowsplit_admits(problem);
-            if (actual_admission != expected_admission) {
-                fail(support.label, std::string(expected_admission ? "rejected " : "accepted ") +
-                                        problem_name(problem));
-            }
-            if (expected_admission) {
-                expect_plan(support.label, problem, expected_production_plan(problem));
-            }
+    for (Q4Problem problem : text_shapes) {
+        problem.cols = 0;
+        if (ninfer::ops::detail::q4_rowsplit_admits(problem)) {
+            fail("T=0 rejection", "accepted " + problem_name(problem));
         }
+        for (const std::int32_t cols : positive_t) {
+            problem.cols = cols;
+            expect_plan("arbitrary positive T", problem, expected_production_plan(problem));
+        }
+    }
+
+    constexpr std::array<Q4Problem, 8> valid_vision{{
+        {3456, 1152, 1152, 4},
+        {3456, 1152, 1152, 1024},
+        {3456, 1152, 1152, 131072},
+        {4304, 1152, 1152, 4},
+        {4304, 1152, 1152, 8},
+        {4304, 1152, 1152, 1024},
+        {4304, 1152, 1152, 1028},
+        {4304, 1152, 1152, 131072},
+    }};
+    for (const Q4Problem& problem : valid_vision) {
+        expect_plan("valid Vision P", problem, expected_production_plan(problem));
     }
 }
 
@@ -204,11 +214,13 @@ struct RouteBoundaryCase {
 };
 
 void route_boundaries_and_seams() {
-    constexpr std::array<RouteBoundaryCase, 42> cases{{
+    constexpr std::array<RouteBoundaryCase, 46> cases{{
         {"1024 gemv end", {1024, 5120, 5120, 1}, {S::GemvR1W8Direct, V::None}},
         {"1024 gemv/simt seam", {1024, 5120, 5120, 2}, {S::SimtR8C4, V::Predicated}},
         {"1024 c4 end", {1024, 5120, 5120, 15}, {S::SimtR8C4, V::Predicated}},
         {"1024 c4/c8 seam", {1024, 5120, 5120, 16}, {S::SimtR8C8, V::Full}},
+        {"1024 general route", {1024, 5120, 5120, 17}, {S::MmaR64C128, V::Predicated}},
+        {"1024 beyond default", {1024, 5120, 5120, 1025}, {S::MmaR64C128, V::Predicated}},
 
         {"4096 gemv end", {4096, 5120, 5120, 1}, {S::GemvR1W8Direct, V::None}},
         {"4096 gemv/c4 seam", {4096, 5120, 5120, 2}, {S::SimtR8C4, V::Predicated}},
@@ -234,8 +246,10 @@ void route_boundaries_and_seams() {
         {"34816 c4 end", {34816, 5120, 5120, 4}, {S::SimtR8C4, V::Full}},
         {"34816 c4/c8 seam", {34816, 5120, 5120, 5}, {S::SimtR8C8, V::Predicated}},
         {"34816 c8 end", {34816, 5120, 5120, 16}, {S::SimtR8C8, V::Full}},
+        {"34816 T1", {34816, 5120, 5120, 1}, {S::GemvR1W8Direct, V::None}},
 
         {"131072 gemv singleton", {131072, 5120, 5120, 1}, {S::GemvR4W1Direct, V::None}},
+        {"131072 general route", {131072, 5120, 5120, 2}, {S::MmaR64C128, V::Predicated}},
         {"131072 K2048 gemv singleton", {131072, 2048, 2048, 1}, {S::GemvR4W1Direct, V::None}},
 
         {"3456 c4 begin", {3456, 1152, 1152, 4}, {S::SimtR8C4, V::Predicated}},
@@ -262,13 +276,12 @@ void route_boundaries_and_seams() {
 }
 
 void rejection_contract() {
-    constexpr std::array<Q4Problem, 7> capability_valid_unadmitted{{
+    constexpr std::array<Q4Problem, 6> capability_valid_unadmitted{{
         {128, 128, 128, 4},
         {17408, 5120, 5120, 8},
-        {34816, 5120, 5120, 1},
-        {1024, 5120, 5120, 17},
-        {131072, 5120, 5120, 2},
+        {3456, 1152, 1152, 1},
         {3456, 1152, 1152, 5},
+        {4304, 1152, 1152, 131073},
         {4304, 1152, 1152, 131076},
     }};
     for (std::size_t i = 0; i < capability_valid_unadmitted.size(); ++i) {
@@ -300,7 +313,7 @@ void rejection_contract() {
 } // namespace
 
 int main() {
-    exact_admission_and_full_route_scan();
+    semantic_length_admission();
     route_boundaries_and_seams();
     rejection_contract();
 

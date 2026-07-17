@@ -5,6 +5,7 @@
 #include "ops/launcher/argmax.h"
 
 #include "ops/common/math.h"
+#include "ops/common/token_slices.h"
 #include "ops/kernel/argmax.cuh"
 #include "core/device.h" // CUDA_CHECK
 
@@ -28,13 +29,19 @@ void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
         return;
     }
 
-    CUDA_CHECK(cudaMemsetAsync(out.data, 0,
-                               static_cast<std::size_t>(t_count) * sizeof(std::int32_t), stream));
-    const dim3 grid(static_cast<unsigned int>(tiled_blocks), static_cast<unsigned int>(t_count));
-    argmax_tiled_atomic_kernel<<<grid, kArgmaxBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data), static_cast<std::int32_t*>(out.data),
-        valid_rows, physical_rows);
-    CUDA_CHECK(cudaGetLastError());
+    for_each_token_slice(t_count, 1, [&](int token_offset, int token_count) {
+        const Tensor logits_slice = logits.slice(1, token_offset, token_count);
+        Tensor out_slice          = out.slice(0, token_offset, token_count);
+        CUDA_CHECK(cudaMemsetAsync(out_slice.data, 0,
+                                   static_cast<std::size_t>(token_count) * sizeof(std::int32_t),
+                                   stream));
+        const dim3 grid(static_cast<unsigned int>(tiled_blocks),
+                        static_cast<unsigned int>(token_count));
+        argmax_tiled_atomic_kernel<<<grid, kArgmaxBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(logits_slice.data),
+            static_cast<std::int32_t*>(out_slice.data), valid_rows, physical_rows);
+        CUDA_CHECK(cudaGetLastError());
+    });
 }
 
 } // namespace ninfer::ops::detail

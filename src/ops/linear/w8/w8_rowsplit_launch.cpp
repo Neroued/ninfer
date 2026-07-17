@@ -1,6 +1,7 @@
 #include "ops/linear/w8/w8_rowsplit_launch.h"
 
 #include "ops/linear/w8/w8_rowsplit_kernels.h"
+#include "ops/common/token_slices.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -142,21 +143,26 @@ void w8_rowsplit_launch_fixed(W8Plan plan, const Tensor& x, const Weight& w, Ten
         throw std::invalid_argument("w8 MMA candidate: scale plane must be 16-byte aligned");
     }
 
-    switch (plan.schedule) {
-    case W8ScheduleId::SimtR8C4:
-        w8_rowsplit_gemm_simt_r8_c4_launch(plan.variant, x, w, out, stream);
-        return;
-    case W8ScheduleId::SimtR8C8:
-        w8_rowsplit_gemm_simt_r8_c8_launch(plan.variant, x, w, out, stream);
-        return;
-    case W8ScheduleId::MmaR32C128:
-        w8_rowsplit_gemm_mma_r32_c128_launch(plan.variant, x, w, out, stream);
-        return;
-    case W8ScheduleId::MmaR64C128:
-        w8_rowsplit_gemm_mma_r64_c128_launch(plan.variant, x, w, out, stream);
-        return;
-    }
-    throw std::logic_error("w8 fixed launch: unknown schedule");
+    for_each_token_slice(
+        x.ne[1], schedule_cols(plan.schedule), [&](std::int32_t offset, std::int32_t count) {
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor out_slice     = out.slice(1, offset, count);
+            switch (plan.schedule) {
+            case W8ScheduleId::SimtR8C4:
+                w8_rowsplit_gemm_simt_r8_c4_launch(plan.variant, x_slice, w, out_slice, stream);
+                return;
+            case W8ScheduleId::SimtR8C8:
+                w8_rowsplit_gemm_simt_r8_c8_launch(plan.variant, x_slice, w, out_slice, stream);
+                return;
+            case W8ScheduleId::MmaR32C128:
+                w8_rowsplit_gemm_mma_r32_c128_launch(plan.variant, x_slice, w, out_slice, stream);
+                return;
+            case W8ScheduleId::MmaR64C128:
+                w8_rowsplit_gemm_mma_r64_c128_launch(plan.variant, x_slice, w, out_slice, stream);
+                return;
+            }
+            throw std::logic_error("w8 fixed launch: unknown schedule");
+        });
 }
 
 void w8_rowsplit_launch_candidate(W8ScheduleId schedule, W8KernelVariant variant, const Tensor& x,

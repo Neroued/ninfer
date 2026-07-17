@@ -13,10 +13,9 @@
 namespace ninfer::ops {
 
 /**
- * Returns the maximum transient capacity required by any admitted LinearAdd route in
- * [1,max_tokens]. The registered Q5 problems saturate at one contiguous BF16
- * [output_rows,24] materialization matrix; the W8 [2048,4096] problem requires no workspace.
- * Dimensions must be positive.
+ * Returns the maximum transient capacity required by LinearAdd for any T in [1,max_tokens].
+ * Dimensions must be positive. `max_tokens` sizes caller-owned storage; it does not cap later Op
+ * calls when sufficient storage is provided.
  */
 [[nodiscard]] std::size_t linear_add_workspace_bytes(std::int32_t output_rows,
                                                      std::int32_t input_rows,
@@ -31,6 +30,7 @@ namespace ninfer::ops {
  * Logical shapes:
  *   Contiguous BF16 x [K,T] and residual [N,T]. Weight is either Q5G64_F16S RowSplit with
  *   logical shape [5120,17408] or [5120,6144], or W8G32_F16S RowSplit [2048,4096].
+ *   T may be any positive value.
  *
  * Numeric:
  *   The oracle exact-decodes the registered weight and evaluates the complete expression naively

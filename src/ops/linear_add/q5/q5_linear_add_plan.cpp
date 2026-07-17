@@ -1,6 +1,7 @@
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 
 #include "ninfer/ops/residual_add.h"
+#include "ops/common/token_slices.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include <algorithm>
@@ -10,6 +11,8 @@
 
 namespace ninfer::ops::detail {
 namespace {
+
+constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 struct ColsSet {
     std::int32_t first;
@@ -40,16 +43,17 @@ constexpr std::array<RouteSpec, 4> kRoutes{{
     {{1, 1}, Q5LinearAddScheduleId::GemvResidual},
     {{2, 24}, Q5LinearAddScheduleId::Materialized},
     {{25, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
-    {{129, kQ5LinearAddMaxCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
+    {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
-    std::int32_t expected = 1;
+    std::int64_t expected = 1;
     for (const RouteSpec& route : kRoutes) {
         if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
-        expected = route.cols.last + 1;
+        expected = static_cast<std::int64_t>(route.cols.last) + 1;
     }
-    return kRoutes.back().cols.last == kQ5LinearAddMaxCols;
+    return kRoutes.back().cols.last == kAnyCols &&
+           expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
 static_assert(catalog_is_closed(), "Q5 LinearAdd routes must be exact, contiguous, and closed");
@@ -111,7 +115,7 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
 }
 
 bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1 && problem.cols <= kQ5LinearAddMaxCols;
+    return supported_shape(problem) && problem.cols >= 1;
 }
 
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
@@ -126,7 +130,6 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
             Q5KernelVariant::None,
             std::nullopt,
             0,
-            problem.cols <= kQ5LinearAddQualifiedCols,
         };
         switch (route.schedule) {
         case Q5LinearAddScheduleId::GemvResidual:
@@ -185,10 +188,18 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         return;
     }
     case Q5LinearAddScheduleId::MmaResidualR64C64:
-        q5_linear_add_mma_r64_c64_launch(plan.variant, x, w, residual_out, stream);
+        for_each_token_slice(problem.cols, 64, [&](std::int32_t offset, std::int32_t count) {
+            const Tensor x_slice  = x.slice(1, offset, count);
+            Tensor residual_slice = residual_out.slice(1, offset, count);
+            q5_linear_add_mma_r64_c64_launch(plan.variant, x_slice, w, residual_slice, stream);
+        });
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C128:
-        q5_linear_add_mma_r64_c128_launch(plan.variant, x, w, residual_out, stream);
+        for_each_token_slice(problem.cols, 128, [&](std::int32_t offset, std::int32_t count) {
+            const Tensor x_slice  = x.slice(1, offset, count);
+            Tensor residual_slice = residual_out.slice(1, offset, count);
+            q5_linear_add_mma_r64_c128_launch(plan.variant, x_slice, w, residual_slice, stream);
+        });
         return;
     }
     throw std::logic_error("q5 linear_add: unknown schedule");

@@ -8,7 +8,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-inline constexpr std::int32_t k35MaxCols = 1024;
+inline constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 struct ColsSet {
     std::int32_t first;
@@ -27,30 +27,37 @@ struct RouteSpec {
 constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
+    // As token tiles double, halve SplitK. This keeps the cooperative grid near 192 CTAs instead
+    // of making T a launch limit. Once the unsplit grid has enough independent work, it also
+    // removes the cooperative-residency constraint.
     {{9, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
     {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{4097, kBf16GdnGatingMaxCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
-constexpr std::array<RouteSpec, 2> k35Routes{{
+constexpr std::array<RouteSpec, 5> k35Routes{{
+    // The same progression keeps the long-range cooperative routes near 256 CTAs.
     {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
-    {{128, k35MaxCols}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{128, 1024}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
+    {{1025, 2048}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
+    {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
+    {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
                                  std::int32_t last) noexcept {
-    std::int32_t expected = 1;
+    std::int64_t expected = 1;
     for (const RouteSpec& route : routes) {
         if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
-        expected = route.cols.last + 1;
+        expected = static_cast<std::int64_t>(route.cols.last) + 1;
     }
-    return routes.back().cols.last == last;
+    return routes.back().cols.last == last && expected == static_cast<std::int64_t>(last) + 1;
 }
 
-static_assert(catalog_is_closed(k27Routes, kBf16GdnGatingMaxCols));
-static_assert(catalog_is_closed(k35Routes, k35MaxCols));
+static_assert(catalog_is_closed(k27Routes, kAnyCols));
+static_assert(catalog_is_closed(k35Routes, kAnyCols));
 
 bool is_27(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 48 && problem.input_rows == 5120;
@@ -105,6 +112,32 @@ std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
     throw std::logic_error("BF16 GDN gating: unknown schedule");
 }
 
+bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols,
+                                  std::int32_t tile_cols, std::int32_t row_tiles,
+                                  std::int32_t resident_ctas) noexcept {
+    const std::int64_t column_tiles = (static_cast<std::int64_t>(cols) + tile_cols - 1) / tile_cols;
+    const std::int64_t grid_ctas =
+        column_tiles * row_tiles * static_cast<std::int64_t>(schedule_split_k(schedule));
+    return grid_ctas <= resident_ctas;
+}
+
+bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
+    // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
+    // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
+    // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
+    return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
+}
+
+bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
+    // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles. With the registered CUDA
+    // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
+    // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
+    // device-wide limits are 340 and 680 CTAs respectively.
+    const std::int32_t resident_ctas =
+        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 340 : 680;
+    return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
+}
+
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
                         const Bf16GdnGatingProblem& problem) noexcept {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
@@ -117,6 +150,7 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+            return cooperative_27_grid_is_resident(schedule, problem.cols);
         case Bf16GdnGatingScheduleId::MmaUnsplit:
             return true;
         case Bf16GdnGatingScheduleId::SimtWarpRowC4:
@@ -129,17 +163,17 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
 
     switch (schedule) {
     case Bf16GdnGatingScheduleId::SimtWarpRowC4:
+        return problem.cols <= 4 * 65'535;
     case Bf16GdnGatingScheduleId::SimtWarpRowC8:
+        return problem.cols <= 8 * 65'535;
+    case Bf16GdnGatingScheduleId::MmaUnsplit:
+        return true;
+    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
-    case Bf16GdnGatingScheduleId::MmaUnsplit:
-        return true;
-    case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
-        // BN64 gives 64 cooperative CTAs per column tile. The RTX 5090 resident
-        // limit is 680 for this 256-thread, 24 KiB specialization.
-        return problem.cols <= 640;
+        return cooperative_35_grid_is_resident(schedule, problem.cols);
     case Bf16GdnGatingScheduleId::GemvPairedRows:
     case Bf16GdnGatingScheduleId::SmallTSplit10:
         return false;
@@ -281,8 +315,7 @@ const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noex
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    if (is_27(problem)) { return problem.cols <= kBf16GdnGatingMaxCols; }
-    return is_35(problem) && problem.cols <= k35MaxCols;
+    return is_27(problem) || is_35(problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,
@@ -298,7 +331,7 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId sche
     const std::int32_t split_k              = schedule_split_k(schedule);
     const std::size_t workspace =
         split_k > 1 ? checked_partial_bytes(problem.heads, split_k, problem.cols) : 0;
-    return {schedule, variant, workspace, problem.cols <= kBf16GdnGatingQualifiedCols};
+    return {schedule, variant, workspace};
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
@@ -325,8 +358,7 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t max_cols) {
     (void)bf16_gdn_gating_resolve_plan({48, 5120, max_cols});
     std::size_t maximum = route_capacity(k27Routes, {48, 5120, 1}, max_cols);
-    maximum =
-        std::max(maximum, route_capacity(k35Routes, {32, 2048, 1}, std::min(max_cols, k35MaxCols)));
+    maximum             = std::max(maximum, route_capacity(k35Routes, {32, 2048, 1}, max_cols));
     return maximum;
 }
 

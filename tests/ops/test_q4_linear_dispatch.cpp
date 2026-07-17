@@ -234,11 +234,13 @@ constexpr std::array<RoutePoint, 7> k7168Routes{{
     {16, S::SimtR8C8, V::Full},
 }};
 
-constexpr std::array<RoutePoint, 4> k34816Routes{{
+constexpr std::array<RoutePoint, 6> k34816Routes{{
+    {1, S::GemvR1W8Direct, V::None},
     {2, S::SimtR8C4, V::Predicated},
     {4, S::SimtR8C4, V::Full},
     {5, S::SimtR8C8, V::Predicated},
     {16, S::SimtR8C8, V::Full},
+    {17, S::MmaR64C128, V::Predicated},
 }};
 
 constexpr std::array<RoutePoint, 1> k131072Routes{{
@@ -336,8 +338,6 @@ void run_support(const SupportCase& support) {
     for (std::size_t i = 0; i < support.route_count; ++i) {
         max_cols = std::max(max_cols, support.routes[i].cols);
     }
-    if (support.rows == 34816) { max_cols = std::max(max_cols, 17); }
-
     test::row_split::PackedWeight packed =
         make_deterministic_q4(support.rows, support.k, support.seed);
     DeviceBuffer device_weight(packed.payload.size());
@@ -401,15 +401,6 @@ void run_support(const SupportCase& support) {
                                             static_cast<std::size_t>(route.cols));
     }
 
-    if (support.rows == 34816) {
-        for (std::int32_t cols : {1, 17}) {
-            Tensor x(input.data(), DType::BF16, {support.k, cols});
-            Tensor out(public_output.data(), DType::BF16, {support.rows, cols});
-            expect_public_rejection(std::string(support.label) +
-                                        " rejected C=" + std::to_string(cols),
-                                    x, weight, out, workspace);
-        }
-    }
     if (support.rows == 3456) {
         Tensor x(input.data(), DType::BF16, {support.k, 5});
         Tensor out(public_output.data(), DType::BF16, {support.rows, 5});

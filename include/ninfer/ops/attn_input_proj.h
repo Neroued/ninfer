@@ -16,6 +16,7 @@ namespace ninfer::ops {
  *   v[:,t]    = linear(x[:,t], gate_value_weight[6144:7168,:]).
  *
  * All tensors are contiguous BF16. Shapes are x [5120,T], q/gate [6144,T], and k/v [1024,T].
+ * T may be any positive value.
  * The two parent weights are RowSplit [7168,5120] with FP16 scales and group size 64:
  * query_key is Q4G64_F16S and gate_value is Q5G64_F16S. The oracle exact-decodes each row and
  * evaluates every projection naively in FP64 before converting the observable outputs to BF16.

@@ -1,6 +1,7 @@
 #include "ops/linear/q5/q5_rowsplit_launch.h"
 
 #include "ops/linear/q5/q5_rowsplit_kernels.h"
+#include "ops/common/token_slices.h"
 
 #include <cstdint>
 #include <limits>
@@ -121,6 +122,20 @@ void launch_fixed_unchecked(Q5Plan plan, const Tensor& x, const Weight& w, Tenso
     throw std::logic_error("q5 fixed launch: unknown schedule");
 }
 
+void launch_fixed_sliced(Q5Plan plan, const Tensor& x, const Weight& w, Tensor& out,
+                         cudaStream_t stream) {
+    const int tile_cols = schedule_cols(plan.schedule);
+    if (tile_cols == 0) {
+        launch_fixed_unchecked(plan, x, w, out, stream);
+        return;
+    }
+    for_each_token_slice(x.ne[1], tile_cols, [&](std::int32_t offset, std::int32_t count) {
+        const Tensor x_slice = x.slice(1, offset, count);
+        Tensor out_slice     = out.slice(1, offset, count);
+        launch_fixed_unchecked(plan, x_slice, w, out_slice, stream);
+    });
+}
+
 } // namespace
 
 const char* q5_schedule_name(Q5ScheduleId schedule) {
@@ -199,7 +214,7 @@ void q5_rowsplit_launch_fixed(Q5Plan plan, const Tensor& x, const Weight& w, Ten
                                     q5_kernel_variant_name(plan.variant));
     }
 
-    launch_fixed_unchecked(plan, x, w, out, stream);
+    launch_fixed_sliced(plan, x, w, out, stream);
 }
 
 void q5_rowsplit_launch_fixed_pitched(Q5Plan plan, const Tensor& x, const Weight& w, Tensor& out,
@@ -212,7 +227,7 @@ void q5_rowsplit_launch_fixed_pitched(Q5Plan plan, const Tensor& x, const Weight
          plan.schedule != Q5ScheduleId::SimtR8C8)) {
         throw std::invalid_argument("q5 fixed pitched launch: schedule is not admitted");
     }
-    launch_fixed_unchecked(plan, x, w, out, stream);
+    launch_fixed_sliced(plan, x, w, out, stream);
 }
 
 void q5_rowsplit_launch_candidate(Q5ScheduleId schedule, Q5KernelVariant variant, const Tensor& x,

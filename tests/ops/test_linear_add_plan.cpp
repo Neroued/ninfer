@@ -35,19 +35,8 @@ S expected_schedule(std::int32_t cols) {
 }
 
 void route_tests() {
-    constexpr std::array<std::int32_t, 12> boundaries{
-        1,
-        2,
-        24,
-        25,
-        128,
-        129,
-        512,
-        1024,
-        1025,
-        2048,
-        ninfer::ops::detail::kQ5LinearAddMaxCols - 1,
-        ninfer::ops::detail::kQ5LinearAddMaxCols,
+    constexpr std::array<std::int32_t, 10> boundaries{
+        1, 2, 24, 25, 128, 129, 512, 1024, 1025, 2048,
     };
     for (const std::int32_t k : {6144, 17408}) {
         for (const std::int32_t cols : boundaries) {
@@ -63,11 +52,6 @@ void route_tests() {
                 std::cerr << "wrong Q5 LinearAdd route K=" << k << " C=" << cols << '\n';
                 ++failures;
             }
-            if (plan.performance_qualified !=
-                (cols <= ninfer::ops::detail::kQ5LinearAddQualifiedCols)) {
-                std::cerr << "wrong Q5 LinearAdd qualification K=" << k << " C=" << cols << '\n';
-                ++failures;
-            }
             const bool materialized = plan.schedule == S::Materialized;
             if (plan.materialized_projection.has_value() != materialized ||
                 (plan.workspace_bytes != 0) != materialized) {
@@ -80,10 +64,6 @@ void route_tests() {
 
     expect_invalid("C=0", [] {
         (void)ninfer::ops::detail::q5_linear_add_resolve_plan({5120, 6144, 6144, 0});
-    });
-    expect_invalid("C=max+1", [] {
-        (void)ninfer::ops::detail::q5_linear_add_resolve_plan(
-            {5120, 6144, 6144, ninfer::ops::detail::kQ5LinearAddMaxCols + 1});
     });
     expect_invalid("unsupported rows", [] {
         (void)ninfer::ops::detail::q5_linear_add_resolve_plan({4096, 6144, 6144, 1});
@@ -106,32 +86,27 @@ void workspace_tests() {
         expect("C24", ninfer::ops::linear_add_workspace_bytes(5120, k, 24), 245'760);
         expect("C25", ninfer::ops::linear_add_workspace_bytes(5120, k, 25), 245'760);
         expect("C1024", ninfer::ops::linear_add_workspace_bytes(5120, k, 1024), 245'760);
-        expect("Cmax",
-               ninfer::ops::linear_add_workspace_bytes(5120, k,
-                                                       ninfer::ops::detail::kQ5LinearAddMaxCols),
-               245'760);
+        expect("C2048", ninfer::ops::linear_add_workspace_bytes(5120, k, 2048), 245'760);
     }
     expect_invalid("workspace unsupported shape",
                    [] { (void)ninfer::ops::linear_add_workspace_bytes(5120, 5120, 1); });
     expect_invalid("workspace C0",
                    [] { (void)ninfer::ops::linear_add_workspace_bytes(5120, 6144, 0); });
 
-    for (const std::int32_t cols : {1, 52, 53, 640, 641, 1024}) {
+    for (const std::int32_t cols : {1, 52, 53, 640, 641, 1024, 1025, 2048}) {
         expect("W8 workspace", ninfer::ops::linear_add_workspace_bytes(2048, 4096, cols), 0);
     }
     expect_invalid("W8 workspace C0",
                    [] { (void)ninfer::ops::linear_add_workspace_bytes(2048, 4096, 0); });
-    expect_invalid("W8 workspace C1025",
-                   [] { (void)ninfer::ops::linear_add_workspace_bytes(2048, 4096, 1025); });
 }
 
 void w8_route_tests() {
     using ninfer::ops::detail::W8KernelVariant;
     using ninfer::ops::detail::W8ScheduleId;
-    constexpr std::array<std::int32_t, 8> boundaries{1, 52, 53, 640, 641, 1024, 0, 1025};
+    constexpr std::array<std::int32_t, 9> boundaries{1, 52, 53, 640, 641, 1024, 1025, 2048, 0};
     for (const std::int32_t cols : boundaries) {
         const ninfer::ops::detail::W8Problem problem{2048, 4096, 4096, cols};
-        const bool admitted = cols >= 1 && cols <= 1024;
+        const bool admitted = cols >= 1;
         if (ninfer::ops::detail::w8_linear_add_admits(problem) != admitted) {
             std::cerr << "wrong W8 LinearAdd admission C=" << cols << '\n';
             ++failures;
@@ -142,8 +117,7 @@ void w8_route_tests() {
         const W8ScheduleId expected = cols <= 52    ? W8ScheduleId::SimtR8C4
                                       : cols <= 640 ? W8ScheduleId::MmaR32C128
                                                     : W8ScheduleId::MmaR64C128;
-        if (plan.schedule != expected || plan.variant == W8KernelVariant::None ||
-            !plan.performance_qualified) {
+        if (plan.schedule != expected || plan.variant == W8KernelVariant::None) {
             std::cerr << "wrong W8 LinearAdd route C=" << cols << '\n';
             ++failures;
         }

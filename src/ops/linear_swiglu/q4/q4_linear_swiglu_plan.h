@@ -11,9 +11,6 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kQ4LinearSwiGluMaxCols       = 128 * 65535;
-inline constexpr std::int32_t kQ4LinearSwiGluQualifiedCols = 1024;
-
 enum class Q4LinearSwiGluScheduleId {
     GemvPair,
     Materialized,
@@ -33,7 +30,6 @@ struct Q4LinearSwiGluPlan {
     Q4KernelVariant variant;
     std::optional<Q4Plan> materialized_projection;
     std::size_t workspace_bytes;
-    bool performance_qualified;
 };
 
 const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) noexcept;

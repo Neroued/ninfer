@@ -3,12 +3,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr std::int32_t kMaxTextCols   = 128 * 65535;
+constexpr std::int32_t kAnyCols       = std::numeric_limits<std::int32_t>::max();
 constexpr std::int32_t kMaxVisionCols = 32768;
 
 struct W8ColsSet {
@@ -36,56 +37,56 @@ struct W8RouteSpec {
 };
 
 constexpr std::array<W8SupportSpec, 13> kSupportSpecs{{
-    {5120, 10240, 10240, {1, kMaxTextCols, 1}, 0, 3},
-    {14336, 5120, 5120, {1, kMaxTextCols, 1}, 3, 3},
-    {1024, 5120, 5120, {1, kMaxTextCols, 1}, 6, 3},
-    {6144, 5120, 5120, {1, kMaxTextCols, 1}, 9, 3},
-    {5120, 6144, 6144, {1, kMaxTextCols, 1}, 12, 3},
-    {34816, 5120, 5120, {1, kMaxTextCols, 1}, 15, 3},
-    {5120, 17408, 17408, {1, kMaxTextCols, 1}, 18, 3},
+    {5120, 10240, 10240, {1, kAnyCols, 1}, 0, 3},
+    {14336, 5120, 5120, {1, kAnyCols, 1}, 3, 3},
+    {1024, 5120, 5120, {1, kAnyCols, 1}, 6, 3},
+    {6144, 5120, 5120, {1, kAnyCols, 1}, 9, 3},
+    {5120, 6144, 6144, {1, kAnyCols, 1}, 12, 3},
+    {34816, 5120, 5120, {1, kAnyCols, 1}, 15, 3},
+    {5120, 17408, 17408, {1, kAnyCols, 1}, 18, 3},
     {4608, 4608, 4608, {1, kMaxVisionCols, 1}, 21, 5},
     {5120, 4608, 4608, {1, kMaxVisionCols, 1}, 26, 3},
     {2048, 4608, 4608, {1, kMaxVisionCols, 1}, 29, 13},
-    {2048, 4096, 4096, {1, 1024, 1}, 42, 3},
-    {12288, 2048, 2048, {1, 1024, 1}, 45, 2},
-    {9216, 2048, 2048, {1, 1024, 1}, 47, 3},
+    {2048, 4096, 4096, {1, kAnyCols, 1}, 42, 3},
+    {12288, 2048, 2048, {1, kAnyCols, 1}, 45, 2},
+    {9216, 2048, 2048, {1, kAnyCols, 1}, 47, 3},
 }};
 
 constexpr std::array<W8RouteSpec, 50> kRouteSpecs{{
     // [5120,10240]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 16, 1}, W8ScheduleId::SimtR8C8},
-    {{17, kMaxTextCols, 1}, W8ScheduleId::MmaR64C128},
+    {{17, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 
     // [14336,5120]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 8, 1}, W8ScheduleId::SimtR8C8},
-    {{9, kMaxTextCols, 1}, W8ScheduleId::MmaR64C128},
+    {{9, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 
     // [1024,5120]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 16, 1}, W8ScheduleId::SimtR8C8},
-    {{17, kMaxTextCols, 1}, W8ScheduleId::MmaR32C128},
+    {{17, kAnyCols, 1}, W8ScheduleId::MmaR32C128},
 
     // [6144,5120]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 16, 1}, W8ScheduleId::SimtR8C8},
-    {{17, kMaxTextCols, 1}, W8ScheduleId::MmaR64C128},
+    {{17, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 
     // [5120,6144]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 16, 1}, W8ScheduleId::SimtR8C8},
-    {{17, kMaxTextCols, 1}, W8ScheduleId::MmaR64C128},
+    {{17, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 
     // [34816,5120]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 8, 1}, W8ScheduleId::SimtR8C8},
-    {{9, kMaxTextCols, 1}, W8ScheduleId::MmaR64C128},
+    {{9, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 
     // [5120,17408]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 16, 1}, W8ScheduleId::SimtR8C8},
-    {{17, kMaxTextCols, 1}, W8ScheduleId::MmaR64C128},
+    {{17, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 
     // Vision merger [4608,4608]
     {{1, 8, 1}, W8ScheduleId::SimtR8C4},
@@ -117,16 +118,16 @@ constexpr std::array<W8RouteSpec, 50> kRouteSpecs{{
     // [2048,4096]
     {{1, 56, 1}, W8ScheduleId::SimtR8C4},
     {{57, 895, 1}, W8ScheduleId::MmaR32C128},
-    {{896, 1024, 1}, W8ScheduleId::MmaR64C128},
+    {{896, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 
     // [12288,2048]
     {{1, 16, 1}, W8ScheduleId::SimtR8C4},
-    {{17, 1024, 1}, W8ScheduleId::MmaR64C128},
+    {{17, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 
     // [9216,2048]
     {{1, 13, 1}, W8ScheduleId::SimtR8C4},
     {{14, 128, 1}, W8ScheduleId::MmaR32C128},
-    {{129, 1024, 1}, W8ScheduleId::MmaR64C128},
+    {{129, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 }};
 
 constexpr bool known_schedule(W8ScheduleId schedule) noexcept {
@@ -161,7 +162,7 @@ constexpr bool catalog_is_closed() noexcept {
             }
         }
 
-        std::int32_t expected_first = support.admitted_cols.first;
+        std::int64_t expected_first = support.admitted_cols.first;
         for (std::size_t local = 0; local < support.route_count; ++local) {
             const W8RouteSpec& route = kRouteSpecs[support.route_begin + local];
             if (!known_schedule(route.schedule) || route.cols.first != expected_first ||
@@ -172,9 +173,10 @@ constexpr bool catalog_is_closed() noexcept {
                 !support.admitted_cols.contains(route.cols.last)) {
                 return false;
             }
-            expected_first = route.cols.last + route.cols.step;
+            expected_first = static_cast<std::int64_t>(route.cols.last) + route.cols.step;
         }
-        if (expected_first != support.admitted_cols.last + support.admitted_cols.step) {
+        if (expected_first !=
+            static_cast<std::int64_t>(support.admitted_cols.last) + support.admitted_cols.step) {
             return false;
         }
         next_route += support.route_count;

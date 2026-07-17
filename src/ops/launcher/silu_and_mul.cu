@@ -4,6 +4,7 @@
 #include "ops/launcher/silu_and_mul.h"
 
 #include "ops/common/math.h"
+#include "ops/common/token_slices.h"
 #include "ops/kernel/silu_and_mul.cuh"
 #include "core/device.h" // CUDA_CHECK
 
@@ -42,13 +43,20 @@ void silu_and_mul_launch(const Tensor& gate, const Tensor& up, Tensor& out, cuda
             constexpr std::int64_t kPairsPerBlock = kBlock * kSiluAndMulPairsPerThread;
             const int grid_x =
                 static_cast<int>(std::max<std::int64_t>(1, div_up(row_pairs, kPairsPerBlock)));
-            const dim3 grid(grid_x, static_cast<unsigned int>(gate.ne[1]));
-            silu_and_mul_dim0_split_kernel<<<grid, kBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(gate.data),
-                static_cast<const __nv_bfloat16*>(up.data), static_cast<__nv_bfloat16*>(out.data),
-                gate.ne[0], gate.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
-                up.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
-            CUDA_CHECK(cudaGetLastError());
+            for_each_token_slice(gate.ne[1], 1, [&](int token_offset, int token_count) {
+                const Tensor gate_slice = gate.slice(1, token_offset, token_count);
+                const Tensor up_slice   = up.slice(1, token_offset, token_count);
+                Tensor out_slice        = out.slice(1, token_offset, token_count);
+                const dim3 grid(static_cast<unsigned int>(grid_x),
+                                static_cast<unsigned int>(token_count));
+                silu_and_mul_dim0_split_kernel<<<grid, kBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(gate_slice.data),
+                    static_cast<const __nv_bfloat16*>(up_slice.data),
+                    static_cast<__nv_bfloat16*>(out_slice.data), gate.ne[0],
+                    gate.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+                    up.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+                CUDA_CHECK(cudaGetLastError());
+            });
             return;
         }
         const int scalar_grid = static_cast<int>(div_up(n, static_cast<std::int64_t>(kBlock)));

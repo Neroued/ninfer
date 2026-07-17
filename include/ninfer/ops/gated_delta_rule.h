@@ -12,7 +12,7 @@ namespace ninfer::ops {
 
 /**
  * Returns the transient arena capacity required by gated_delta_rule for the given geometry. It is
- * zero when no complete internal 64-token chunk is present. `head_dim` must be one of
+ * zero when the private implementation requires no transient storage. `head_dim` must be one of
  * {16,32,64,128}; `value_heads` must be at least `qk_heads` and divisible by it.
  */
 [[nodiscard]] std::size_t gated_delta_rule_workspace_bytes(std::int32_t head_dim,
@@ -33,8 +33,8 @@ namespace ninfer::ops {
  * Shapes/dtypes are contiguous q/k BF16 [S,Hqk,T], v/out BF16 [S,Hv,T], g/beta FP32 [Hv,T], and
  * state FP32 [S,S,Hv], where S is one of {16,32,64,128}, Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale`
  * is 1/sqrt(S). Inputs and out do not overlap state or one another. `ws` supplies transient
- * chunked-prefill storage reported by
- * gated_delta_rule_workspace_bytes; scratch is scoped to the call.
+ * storage reported by gated_delta_rule_workspace_bytes; scratch is scoped to the call. T may be
+ * any positive value.
  *
  * This overload reads and writes the same `ssm_state`, publishing the state after all T tokens.
  */

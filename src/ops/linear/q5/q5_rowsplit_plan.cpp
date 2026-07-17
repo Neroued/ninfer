@@ -3,12 +3,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr std::int32_t kMaxTextCols = 128 * 65535;
+constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 struct Q5ColsSet {
     std::int32_t first;
@@ -35,39 +36,45 @@ struct Q5RouteSpec {
 };
 
 constexpr std::array<Q5SupportSpec, 7> kSupportSpecs{{
-    {1024, 5120, 5120, {1, 16, 1}, 0, 2},
-    {6144, 5120, 5120, {1, kMaxTextCols, 1}, 2, 5},
-    {7168, 5120, 5120, {1, 16, 1}, 7, 3},
-    {5120, 6144, 6144, {2, 24, 1}, 10, 2},
-    {5120, 17408, 17408, {2, 24, 1}, 12, 2},
-    {1152, 1152, 1152, {4, 131072, 4}, 14, 11},
-    {1152, 4304, 4352, {4, 131072, 4}, 25, 3},
+    {1024, 5120, 5120, {1, kAnyCols, 1}, 0, 3},
+    {6144, 5120, 5120, {1, kAnyCols, 1}, 3, 5},
+    {7168, 5120, 5120, {1, kAnyCols, 1}, 8, 4},
+    {5120, 6144, 6144, {1, kAnyCols, 1}, 12, 4},
+    {5120, 17408, 17408, {1, kAnyCols, 1}, 16, 4},
+    {1152, 1152, 1152, {4, 131072, 4}, 20, 11},
+    {1152, 4304, 4352, {4, 131072, 4}, 31, 3},
 }};
 
-constexpr std::array<Q5RouteSpec, 28> kRouteSpecs{{
+constexpr std::array<Q5RouteSpec, 34> kRouteSpecs{{
     // [1024, 5120]
     {{1, 4, 1}, Q5ScheduleId::SimtR8C4},
     {{5, 16, 1}, Q5ScheduleId::SimtR8C8},
+    {{17, kAnyCols, 1}, Q5ScheduleId::MmaR64C128},
 
     // [6144, 5120]
     {{1, 1, 1}, Q5ScheduleId::GemvR16S2X},
     {{2, 6, 1}, Q5ScheduleId::SimtSplit4Exact},
     {{7, 24, 1}, Q5ScheduleId::SimtR8C8},
     {{25, 64, 1}, Q5ScheduleId::MmaR64C64},
-    {{65, kMaxTextCols, 1}, Q5ScheduleId::MmaR64C128},
+    {{65, kAnyCols, 1}, Q5ScheduleId::MmaR64C128},
 
     // [7168, 5120]
     {{1, 1, 1}, Q5ScheduleId::GemvR16S2X},
     {{2, 6, 1}, Q5ScheduleId::SimtSplit4Exact},
     {{7, 16, 1}, Q5ScheduleId::SimtR8C4},
+    {{17, kAnyCols, 1}, Q5ScheduleId::MmaR64C128},
 
     // [5120, 6144]
+    {{1, 1, 1}, Q5ScheduleId::SimtR8C4},
     {{2, 6, 1}, Q5ScheduleId::SimtSplit2Exact},
     {{7, 24, 1}, Q5ScheduleId::SimtR8C8},
+    {{25, kAnyCols, 1}, Q5ScheduleId::MmaR64C128},
 
     // [5120, 17408]
+    {{1, 1, 1}, Q5ScheduleId::SimtR8C4},
     {{2, 6, 1}, Q5ScheduleId::SimtSplit2Exact},
     {{7, 24, 1}, Q5ScheduleId::SimtR8C8},
+    {{25, kAnyCols, 1}, Q5ScheduleId::MmaR64C128},
 
     // Vision [1152, 1152]
     {{4, 76, 4}, Q5ScheduleId::SimtR8C4},
@@ -123,7 +130,7 @@ constexpr bool catalog_is_closed() noexcept {
             }
         }
 
-        std::int32_t expected_first = support.admitted_cols.first;
+        std::int64_t expected_first = support.admitted_cols.first;
         for (std::size_t local = 0; local < support.route_count; ++local) {
             const Q5RouteSpec& route = kRouteSpecs[support.route_begin + local];
             if (!known_schedule(route.schedule) || route.cols.first != expected_first ||
@@ -134,9 +141,10 @@ constexpr bool catalog_is_closed() noexcept {
                 !support.admitted_cols.contains(route.cols.last)) {
                 return false;
             }
-            expected_first = route.cols.last + route.cols.step;
+            expected_first = static_cast<std::int64_t>(route.cols.last) + route.cols.step;
         }
-        if (expected_first != support.admitted_cols.last + support.admitted_cols.step) {
+        if (expected_first !=
+            static_cast<std::int64_t>(support.admitted_cols.last) + support.admitted_cols.step) {
             return false;
         }
         next_route += support.route_count;

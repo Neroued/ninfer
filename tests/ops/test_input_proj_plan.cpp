@@ -31,7 +31,7 @@ void expect_invalid(const char* label, Fn&& fn) {
 
 void attn_route_tests() {
     constexpr std::array<std::int32_t, 10> boundaries{
-        1, 2, 16, 17, 127, 128, 129, 1024, 1025, ninfer::ops::detail::kQ4Q5AttnInputMaxCols,
+        1, 2, 16, 17, 127, 128, 129, 1024, 1025, 2048,
     };
     for (const std::int32_t cols : boundaries) {
         const Q4Q5AttnInputProblem problem{5120, 6144, 1024, 5120, cols};
@@ -51,11 +51,6 @@ void attn_route_tests() {
                 : ((cols % 128) == 0 ? Q4KernelVariant::Full : Q4KernelVariant::Predicated);
         if (plan.grouped_variant != expected_variant) {
             std::cerr << "wrong attention input variant C=" << cols << '\n';
-            ++failures;
-        }
-        if (plan.performance_qualified !=
-            (cols <= ninfer::ops::detail::kQ4Q5AttnInputQualifiedCols)) {
-            std::cerr << "wrong attention input qualification C=" << cols << '\n';
             ++failures;
         }
     }
@@ -86,7 +81,7 @@ void attn_route_tests() {
 
 void gdn_route_tests() {
     constexpr std::array<std::int32_t, 10> boundaries{
-        1, 2, 16, 17, 127, 128, 129, 1024, 1025, ninfer::ops::detail::kQ4Q5GdnInputMaxCols,
+        1, 2, 16, 17, 127, 128, 129, 1024, 1025, 2048,
     };
     for (const std::int32_t cols : boundaries) {
         const Q4Q5GdnInputProblem problem{5120, 4096, 6144, 10240, 5120, cols};
@@ -104,11 +99,6 @@ void gdn_route_tests() {
                         : ((cols % 128) == 0 ? Q4KernelVariant::Full : Q4KernelVariant::Predicated);
         if (plan.grouped_variant != expected_variant) {
             std::cerr << "wrong GDN input variant C=" << cols << '\n';
-            ++failures;
-        }
-        if (plan.performance_qualified !=
-            (cols <= ninfer::ops::detail::kQ4Q5GdnInputQualifiedCols)) {
-            std::cerr << "wrong GDN input qualification C=" << cols << '\n';
             ++failures;
         }
     }
@@ -134,7 +124,7 @@ void workspace_tests() {
         {128, 0},
         {1024, 0},
         {1025, 0},
-        {ninfer::ops::detail::kQ4Q5GdnInputMaxCols, 0},
+        {2048, 0},
     }};
     for (const Case test : cases) {
         const std::size_t actual =

@@ -11,9 +11,6 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kQ5LinearAddMaxCols       = 128 * 65535;
-inline constexpr std::int32_t kQ5LinearAddQualifiedCols = 1024;
-
 enum class Q5LinearAddScheduleId {
     GemvResidual,
     Materialized,
@@ -33,7 +30,6 @@ struct Q5LinearAddPlan {
     Q5KernelVariant variant;
     std::optional<Q5Plan> materialized_projection;
     std::size_t workspace_bytes;
-    bool performance_qualified;
 };
 
 const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept;

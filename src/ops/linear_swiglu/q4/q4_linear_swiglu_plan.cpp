@@ -1,6 +1,7 @@
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 
 #include "ninfer/ops/silu_mul.h"
+#include "ops/common/token_slices.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
 #include <algorithm>
@@ -10,6 +11,8 @@
 
 namespace ninfer::ops::detail {
 namespace {
+
+constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 struct ColsSet {
     std::int32_t first;
@@ -34,16 +37,17 @@ constexpr std::array<RouteSpec, 7> kRoutes{{
     {{257, 384}, Q4LinearSwiGluScheduleId::Materialized},
     {{385, 512}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
     {{513, 640}, Q4LinearSwiGluScheduleId::Materialized},
-    {{641, kQ4LinearSwiGluMaxCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{641, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
-    std::int32_t expected = 1;
+    std::int64_t expected = 1;
     for (const RouteSpec& route : kRoutes) {
         if (route.cols.first != expected || route.cols.last < route.cols.first) { return false; }
-        expected = route.cols.last + 1;
+        expected = static_cast<std::int64_t>(route.cols.last) + 1;
     }
-    return kRoutes.back().cols.last == kQ4LinearSwiGluMaxCols;
+    return kRoutes.back().cols.last == kAnyCols &&
+           expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
 static_assert(catalog_is_closed(), "Q4 LinearSwiGLU routes must be exact, contiguous, and closed");
@@ -109,7 +113,7 @@ const char* q4_linear_swiglu_schedule_name(Q4LinearSwiGluScheduleId schedule) no
 }
 
 bool q4_linear_swiglu_admits(const Q4LinearSwiGluProblem& problem) noexcept {
-    return supported_shape(problem) && problem.cols >= 1 && problem.cols <= kQ4LinearSwiGluMaxCols;
+    return supported_shape(problem) && problem.cols >= 1;
 }
 
 Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& problem) {
@@ -125,7 +129,6 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
             Q4KernelVariant::None,
             std::nullopt,
             0,
-            problem.cols <= kQ4LinearSwiGluQualifiedCols,
         };
         switch (route.schedule) {
         case Q4LinearSwiGluScheduleId::GemvPair:
@@ -183,7 +186,12 @@ void q4_linear_swiglu_execute_plan(const Q4LinearSwiGluPlan& plan, const Tensor&
         return;
     }
     case Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128:
-        q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(plan.variant, x, w, out, stream);
+        for_each_token_slice(problem.cols, 128, [&](std::int32_t offset, std::int32_t count) {
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor out_slice     = out.slice(1, offset, count);
+            q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(plan.variant, x_slice, w,
+                                                                 out_slice, stream);
+        });
         return;
     }
     throw std::logic_error("q4 linear_swiglu: unknown schedule");

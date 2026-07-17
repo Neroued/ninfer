@@ -1,4 +1,4 @@
-// ninfer::ops - rope launcher: finite fixed-domain dispatch and generic fallback.
+// ninfer::ops - rope launcher: private token-count tuning and generic fallback.
 #include "ops/launcher/rope.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -9,10 +9,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kLargeBlock         = 256;
-constexpr int kFullChunkBlock     = 192;
-constexpr int kSmallBlock         = 128;
-constexpr int kTextChunkMaxTokens = 1024;
+constexpr int kLargeBlock               = 256;
+constexpr int kFullChunkBlock           = 192;
+constexpr int kSmallBlock               = 128;
+constexpr int kDefaultChunkTargetTokens = 1024;
 // RTX 5090 has 170 SMs and admits six of these 256-thread CTAs per SM.
 constexpr int kLargeBlockWaveCapacity = 1020;
 
@@ -34,7 +34,7 @@ void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, cudaStream_t st
             block = (QHeads + KHeads) * 32;
         } else if (tokens <= kLargeBlockWaveCapacity) {
             block = kLargeBlock;
-        } else if (tokens <= kTextChunkMaxTokens) {
+        } else if (tokens <= kDefaultChunkTargetTokens) {
             block = kFullChunkBlock;
         }
         const int head_warps = (QHeads + KHeads) * 32;

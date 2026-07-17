@@ -1,4 +1,5 @@
 #include "ninfer/ops/mtp_pack.h"
+#include "ops/common/token_slices.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -6,12 +7,32 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
 using namespace ninfer::test;
 
 namespace {
+
+int token_slice_boundary_case() {
+    std::vector<std::pair<int, int>> slices;
+    ops::detail::for_each_token_slice(
+        65535, 1, [&](int offset, int count) { slices.emplace_back(offset, count); });
+    if (slices != std::vector<std::pair<int, int>>{{0, 65535}}) {
+        std::cerr << "token slices: 65535 boundary mismatch\n";
+        return 1;
+    }
+
+    slices.clear();
+    ops::detail::for_each_token_slice(
+        65536, 1, [&](int offset, int count) { slices.emplace_back(offset, count); });
+    if (slices != std::vector<std::pair<int, int>>{{0, 65535}, {65535, 1}}) {
+        std::cerr << "token slices: 65536 boundary mismatch\n";
+        return 1;
+    }
+    return 0;
+}
 
 std::vector<std::uint16_t> pattern(std::size_t n, std::uint32_t seed) {
     std::vector<std::uint16_t> out(n);
@@ -142,11 +163,11 @@ int validation_case() {
 } // namespace
 
 int main() {
+    int failures = token_slice_boundary_case();
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
-        return 0;
+        return failures ? 1 : 0;
     }
-    int failures = 0;
     for (int T : {1, 2, 6, 17, 1024}) {
         failures += one_pack_case(5120, T);
         failures += one_split_case(T);

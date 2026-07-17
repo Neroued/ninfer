@@ -24,8 +24,7 @@ enum class SparseMoeEpilogue : std::uint8_t {
 
 /**
  * Returns the transient capacity required by SparseMoe for every positive token count up to
- * max_tokens. The current column-serial implementation reuses one column's private storage, so
- * this capacity is independent of max_tokens.
+ * max_tokens.
  */
 [[nodiscard]] std::size_t sparse_moe_workspace_bytes(std::int32_t max_tokens);
 
@@ -50,10 +49,7 @@ enum class SparseMoeEpilogue : std::uint8_t {
  * shared banks are W8. Expert e directly selects its stored row spans; no selected-weight gather
  * or repack occurs.
  *
- * The current functional implementation submits the same single-column route once per contiguous
- * token column on stream and reuses the same private workspace. Token count does not select a
- * different numerical route. A future grouped implementation may replace this execution strategy
- * without changing the Op contract.
+ * Every positive T is supported.
  *
  * x, destination, all weight planes, and live workspace must be pairwise non-overlapping.
  * Execution is enqueued on stream without host synchronization. Workspace is caller-owned,

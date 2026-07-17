@@ -13,7 +13,7 @@ namespace ninfer::ops {
 template <class T>
 NINFER_KERNEL_HD constexpr T div_up(T x, T d) {
     static_assert(std::is_integral_v<T>, "div_up requires an integral type");
-    return (x + d - 1) / d;
+    return x / d + static_cast<T>(x % d != 0);
 }
 
 template <class T>

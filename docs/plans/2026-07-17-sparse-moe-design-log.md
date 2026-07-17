@@ -49,8 +49,9 @@ Decision:
 - Keep the multi-stage implementation together in a dedicated `src/ops/sparse_moe/` subtree rather
   than scattering its private launch policy, descriptors, and kernels across the global launcher
   and kernel directories.
-- Organize substantial implementation work primarily by the registered execution regimes
-  (decode, Small-T, and prefill), because one complete route mixes router BF16, routed
+- Organize substantial implementation work primarily by private workload-tuned routes
+  (single-column, verification-sized, and throughput-oriented), because one complete route mixes
+  router BF16, routed
   Q4/Q5/Q6/W8, and shared W8 work. Do not split the Op primarily into format-owned directories.
 - Plan data, workspace views, assignments, inverse maps, expert jobs, and other intermediate types
   remain private to the SparseMoe subtree. Move a narrow primitive to `src/ops/common/` only after
@@ -61,7 +62,8 @@ Decision:
   not create another library or runtime registry.
 - Correctness evidence is centered on the complete Op against one independent oracle. Private
   stages do not receive separate mathematical contracts or stage goldens. Benchmarking covers the
-  real decode, Small-T, and prefill domains.
+  real single-column, verification-sized, and prefill workloads without turning those measurement
+  points into Op domains.
 
 The exact directory depth, source filenames, translation-unit boundaries, and compilation grouping
 are intentionally deferred until implementation makes those boundaries concrete.
@@ -320,6 +322,9 @@ complete-Op correctness against the common oracle and by isolated plus end-to-en
 the registered decode and Small-T workloads.
 
 ## 2026-07-17: decode implementation outcome
+
+> Historical implementation outcome. The later functionally complete column-serial decision below
+> supersedes its `T=1` admission restriction.
 
 Decision:
 

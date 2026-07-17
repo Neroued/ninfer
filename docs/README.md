@@ -23,6 +23,7 @@ defined by `include/ninfer/engine.h` and `include/ninfer/types.h`.
 
 | Document | Active scope |
 |---|---|
+| [`plans/2026-07-18-qwen3.6-official-checkpoint-cutover.md`](plans/2026-07-18-qwen3.6-official-checkpoint-cutover.md) | replace the 27B Unsloth-derived frontend/config files with pinned official Qwen files and rebuild the canonical artifact without touching weights |
 | [`plans/2026-07-17-sparse-moe-design-log.md`](plans/2026-07-17-sparse-moe-design-log.md) | decisions for the closed future-target `SparseMoe` Op |
 
 Completed plans are indexed under [`archive/`](archive/README.md).

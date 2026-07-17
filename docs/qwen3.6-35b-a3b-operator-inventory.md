@@ -13,7 +13,7 @@ The checkpoint graph and dimensions come from
 target storage come from
 [`qwen3.6-35b-a3b-ninfer-artifact.md`](qwen3.6-35b-a3b-ninfer-artifact.md). Op boundaries follow
 [`op-development.md`](op-development.md): a semantically closed target-callable transformation is
-an Op, while a grouped GEMM or partial reduction inside the closed `SparseMoeAdd` Op is an
+an Op, while a grouped GEMM or partial reduction inside the closed `SparseMoe` Op is an
 implementation-private stage. This inventory still lists those private MoE stages because they
 are independent, performance-critical kernel work and cannot be replaced by generic Linear calls.
 
@@ -45,7 +45,7 @@ The status is deliberately stricter than API availability or functional executio
 
 A generic/reference CUDA path, Python implementation, correctness test, benchmark binary without
 retained results, or evidence for another shape does not establish support. Stage-level reuse
-inside `SparseMoeAdd` also does not make the closed Op partially supported.
+inside `SparseMoe` also does not make the closed Op partially supported.
 
 The bounded control/copy rows I4, I5, and I7-I12 are the explicit exception to standalone
 roofline qualification. Their complete registered work is at most six MTP columns or 1024 I32
@@ -128,7 +128,7 @@ output view, but the model names Q, K, V, gate, or Z do not create new arithmeti
 | L13 | Linear; W8 weight `[4608,4608]`, `X[4608,V]` -> `[4608,V]` | Vision merger fc1, once per item | `Y=W_m1 X`. | **Supported for the complete target domain.** The exact SIMT/MMA32/MMA64 route covers every merger column count through maximum video/image `V=12288/16384`. The maxima sustain 167.75/167.99 executed TFLOP/s, respectively -0.19%/+2.21% versus the same-K, same-format W8 online-decode/MMA ceiling; NCU confirms the same resource envelope and no spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
 | L14 | Linear; W8 weight `[2048,4608]`, `X[4608,V]` -> visual `[2048,V]` | Vision merger fc2, once per item | `Y=W_m2 X`. | **Supported for the complete target domain.** The exact finite SIMT/MMA32/MMA64 route covers every merger column count through maximum video/image `V=12288/16384`. The maxima sustain 184.55/187.66 executed TFLOP/s, or 88.31%/91.42% of the same-session BF16 MMA probe; NCU identifies the maximum route as tensor-pipe limited and reports no spilling. See the [retained RTX 5090 report](archive/optimization-era/bench/qwen3.6-35b-linear-roofline.md). |
 
-### 2.2 SparseMoeAdd-private Linear and expert-grouped domains
+### 2.2 SparseMoe-private Linear and expert-grouped domains
 
 All rows in this subsection are private stages of the closed sparse Op in Section 9, not
 target-callable Linear Ops. They remain classified here because the arithmetic to implement is
@@ -136,7 +136,7 @@ Linear, LinearSwiGLU, or expert-grouped Linear rather than a model-role-specific
 
 | ID | Operation and exact typed domain | Execution regimes | Mathematical result | Current support |
 |---|---|---|---|---|
-| L15 | Private Linear; BF16 weight `[257,2048]`, BF16 `X[2048,T]` -> logical scores `[257,T]` | All three T regimes | Rows `0:256` are router logits and row 256 is the independent shared-expert score. | **Adapt existing.** Dense projection machinery is reusable, but there is no qualified exact 257-row path. This stage alone does not support `SparseMoeAdd`. |
+| L15 | Private Linear; BF16 weight `[257,2048]`, BF16 `X[2048,T]` -> logical scores `[257,T]` | All three T regimes | Rows `0:256` are router logits and row 256 is the independent shared-expert score. | **Adapt existing.** Dense projection machinery is reusable, but there is no qualified exact 257-row path. This stage alone does not support `SparseMoe`. |
 | L16 | Private LinearSwiGLU; W8 weight `[1024,2048]`, BF16 `X[2048,T]` -> logical activation `[512,T]` | All three T regimes | Split `W X` into gate/up `[512,T]`; return `SiLU(gate).*up` for the always-on shared expert. | **Adapt existing.** The semantic operation and low-bit machinery exist, but not this W8 exact domain. |
 | L17 | Private Linear; W8 weight `[2048,512]`, logical `X[512,T]` -> logical result `[2048,T]` | All three T regimes | `Y_shared=W_shared_down X`. | **Adapt existing.** W8 Linear machinery exists without an exact qualified K=512 path. |
 | L18 | Private expert-grouped LinearSwiGLU; per expert `W_gu[e][1024,2048]`, BF16 `X_e[2048,M_e]` -> logical activation `[512,M_e]` | Decode `M_e in {0,1}`; Small-T `sum M_e<=48`; prefill `sum M_e<=8192` | For every active expert, split `W_gu[e]X_e` into 512-row gate/up halves and return `SiLU(gate_e).*up_e`. | **New implementation.** No selected-expert or device-described grouped path exists. Main Text uses Q4 banks; MTP uses W8 banks. |
@@ -193,7 +193,7 @@ L2(x)          = x / sqrt(sum(x^2) + eps)
 | E1 | Broadcast bias add; BF16 x `[3456,4096]`, bias `[3456]` | `x[d,p]'=x[d,p]+bias[d]`; Vision QKV. | **Supported for exactly P=4096.** The aligned BF16x8 cache-sized route preserves the broadcast dimension and reduces the retained median from 36.5 to 15.6 us. See the [complete Section 5 report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
 | E2 | Same bias add, `[3456,P]` with `P!=4096` | Same equation; Vision QKV. | **Supported for the complete target domain.** Finite dispatch uses the BF16x8 route through the cache-sized regime and a BF16x2 stream for larger media; small cases reach their fixed-work control and maximum video/image sizes reach the same-payload memory ceiling. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
 | E3 | Broadcast bias add for `(D,C)=(1152,P),(4304,P),(4608,V),(2048,V)` | `x[d,c]'=x[d,c]+bias[d]`; used by patch/output/fc2, fc1, merger fc1, and merger fc2 respectively. | **Supported for the complete target domain.** The same D-aware BF16x8/BF16x2 dispatch covers every registered D and complete P/V bounds, including maximum image/video items, with retained exact and payload-control evidence. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
-| E4 | Residual add; two BF16 `[1152,P]` tensors | `x'=x+y`; 27 Vision attention and 27 Vision MLP residuals. Text mixer residuals are L4; sparse-MoE residuals are part of the closed Op in Section 9. | **Supported for the complete target domain.** One aligned BF16x8 stream covers all valid P values; maximum video/image cases reach about 1.54 TB/s and remain within 0.3% of the same-topology control. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
+| E4 | Residual add; two BF16 `[1152,P]` tensors | `x'=x+y`; 27 Vision attention and 27 Vision MLP residuals. Text mixer residuals are L4; sparse-MoE residuals are the `AddResidual` epilogue mode of the closed Op in Section 9. | **Supported for the complete target domain.** One aligned BF16x8 stream covers all valid P values; maximum video/image cases reach about 1.54 TB/s and remain within 0.3% of the same-topology control. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
 | E5 | Sigmoid multiply; gate/x `[256,16,T]` | `x'=sigmoid(gate).*x`; full-attention output gate in ten Text layers and MTP. | **Supported for the complete target domain.** The aligned BF16x8 route covers `T=1..6/1024`; Small-T lies at the fixed launch floor and T=1024 remains within 4.4% of its same-payload control. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
 | E6 | Tanh GELU; BF16 x `[4304,4096]` | `x'=0.5*x.*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))`; Vision block fc1 activation. | **Supported for exactly P=4096.** The cache-sized BF16x8 route reduces the retained median from 44.0 to 19.1 us and qualifies against the Op oracle. See the [complete Section 5 report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
 | E7 | Same tanh GELU, `[4304,P]` with `P!=4096` | Same equation. | **Supported for the complete target domain.** Cache-sized media use BF16x8 packs and larger media use the higher-throughput BF16x2 stream; maximum video/image cases track the same-payload control and sustain about 1.55 TB/s. See the [retained report](archive/optimization-era/bench/qwen3.6-35b-pointwise-roofline.md). |
@@ -269,9 +269,10 @@ not require a descriptor tensor or setup launch.
 
 ## 9. Sparse routing, grouped expert work, and reduction
 
-`SparseMoeAdd` is the target-callable, semantically closed residual-updating sparse Op. For
-normalized input `X[2048,T]` and decoder residual `R[2048,T]`, it owns the router, top-8
-selection, routed experts, always-on shared expert, final merge, and decoder residual update:
+`SparseMoe` is the target-callable, semantically closed sparse Op. For normalized input
+`X[2048,T]`, it owns the router, top-8 selection, routed experts, always-on shared expert, and
+final merge. The 35B target invokes its `AddResidual` epilogue mode with decoder residual
+`R[2048,T]`; this mode remains fused into the Op but controls only the final observable writeback:
 
 ```text
 scores = W_router_shared X                  # L15, [257,T]
@@ -286,8 +287,14 @@ Shared(x)   = W_shared_down * SwiGLU(W_shared_gate_up * x)
 
 Y[:,t]  = sum_{e in I_t} alpha[e,t] * Expert_e(X[:,t])
           + sigmoid(shared_score[t]) * Shared(X[:,t])
-R[:,t]' = R[:,t] + Y[:,t]
+
+AddResidual: R[:,t]' = R[:,t] + Y[:,t]
 ```
+
+`AddResidual` is a semantic mode because it consumes and mutates the observable residual tensor.
+It is not part of the Op identity: production kernels may represent it as a template-selected
+epilogue that changes only the final store, without materializing `Y` or launching a separate
+residual-add kernel.
 
 At an exact top-8 boundary tie, lower expert id wins. There is no capacity limit and no token drop:
 all `8T` assignments enter the grouped contractions and reduction. The operation-class inventory
@@ -297,8 +304,8 @@ beneath the closed boundary is:
 |---|---|---|---|
 | M1 | Router softmax, top-8, selected-weight renormalization, and shared sigmoid | Consume L15's logical router scores `[256,T]` and independent shared score `[T]`; produce I32 ids `[8,T]`, logical route weights `[8,T]`, and a logical shared scale `[T]`. Select the eight largest softmax probabilities per token using the stated tie rule and renormalize only those eight; shared scale is the sigmoid of the independent score. Private storage precision is selected by the implementation. | **New implementation.** No device router/top-8 path exists. |
 | M2 | Assignment grouping and inverse-map construction | Form assignments `(expert,token,route_slot,weight)` for `A=8T`; partition them into expert jobs of size `M_e` while preserving a bijection back to token/route order. | **New implementation.** No device grouping path or job representation exists. |
-| M3 | Inverse scatter, route-weighted reduction, shared merge, and residual update | Restore token order, compute `Y_routed[:,t]=sum_r alpha[r,t]*Y_r[:,t]`, then update `R[:,t]'=R[:,t]+Y_routed[:,t]+shared_scale[t]*Y_shared[:,t]`. | **New implementation.** No routed reduction/merge/residual path exists. |
-| M4 | Closed SparseMoeAdd Op | Compose private Linear stages L15-L19 and sparse stages M1-M3 for decode T=1, Small-T `T<=6`, and prefill `T<=1024`, with the residual update and all workspace effects owned by one Op call. | **New implementation.** NInfer has no `SparseMoeAdd` contract or high-performance route today. |
+| M3 | Inverse scatter, route-weighted reduction, shared merge, and output epilogue | Restore token order and compute `Y[:,t]=sum_r alpha[r,t]*Y_r[:,t]+shared_scale[t]*Y_shared[:,t]`; in the required `AddResidual` mode, finish with `R[:,t]'=R[:,t]+Y[:,t]`. The mode affects only this final writeback. | **New implementation.** No routed reduction/merge/epilogue path exists. |
+| M4 | Closed SparseMoe Op | Compose private Linear stages L15-L19 and sparse stages M1-M3 for decode T=1, Small-T `T<=6`, and prefill `T<=1024`, with the required `AddResidual` epilogue and all workspace effects owned by one Op call. | **New implementation.** NInfer has no `SparseMoe` contract or high-performance route today. |
 
 L18 and L19 define the two exact grouped-contraction kernel domains and are not repeated as sparse
 stage IDs here. Generic Linear calls, eight selected-expert launches, one launch per active prefill
@@ -343,7 +350,7 @@ Under the strict support definition, the complete result is:
 |---|---|
 | **Supported** | L1 complete W8 attention input parent `[9216,2048]`; L2 complete W8 GDN input parent `[12288,2048]`; L3 complete BF16 GDN-control parent `[64,2048]`; L4 complete W8 Text mixer LinearAdd `[2048,4096]`; L5 complete W8 MTP stem `[2048,4096]`; L6 complete Q6 full head `[248320,2048]`; L7 complete Q4 draft head `[131072,2048]`; L8 complete Q6 Vision patch projection `[1152,1536]`; L9 complete Q4 Vision QKV projection `[3456,1152]`; L10 complete Q5 Vision attention output `[1152,1152]`; L11 complete Q4 Vision MLP fc1 `[4304,1152]`; L12 complete Q5 Vision MLP fc2 `[1152,4304]`; L13 complete W8 Vision merger fc1 `[4608,4608]`; L14 complete W8 Vision merger fc2 `[2048,4608]`; I1-I12 complete indexing/control domains; N1-N4 complete Text/GDN/MTP normalization domains; N5/N6 complete Vision LayerNorm `[1152,P]`; E1-E8 complete pointwise/broadcast/activation domains; R1 Text RoPE/MRoPE `[256,16|2,T]`; R2 complete packed Vision RoPE `[72,16,P]`; A1 append-and-attend GQA `[256,16|2,T]`; A2 standalone KV append `[256,2,T]`; A3 cached-only GQA `[256,16,T]`; A4 complete segmented Vision attention `[72,16,P]`; S1/S2 GDN causal convolution and snapshot state; S3/S4 GDN recurrence and snapshot state transition `[128,16,32]`; and G1-G3 complete token-decision/MTP-accept domains. |
 | **Adapt existing** | Private Linear domains L15-L17. All remain unsupported. |
-| **New implementation** | L18-L19 expert-grouped contractions and M1-M4 sparse routing/grouping/reduction/closed `SparseMoeAdd` execution. |
+| **New implementation** | L18-L19 expert-grouped contractions and M1-M4 sparse routing/grouping/reduction/closed `SparseMoe` execution with its required `AddResidual` epilogue. |
 
 No complete Text/GDN block, sparse-MoE execution, generation path, or MTP execution currently meets
 the support definition for the 35B target.

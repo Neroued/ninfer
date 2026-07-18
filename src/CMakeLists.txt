@@ -168,17 +168,21 @@ add_library(ninfer_media_decode STATIC
 ninfer_internal_includes(ninfer_media_decode)
 target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
 
-# Product-only path/data/HTTP acquisition. No target package links this library.
-add_library(ninfer_media_acquire STATIC
-  product/media_acquire/acquire.cpp)
-ninfer_internal_includes(ninfer_media_acquire)
-target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+if(NINFER_BUILD_MEDIA_ACQUIRE)
+  # Product-only path/data/HTTP acquisition. No target package links this library.
+  add_library(ninfer_media_acquire STATIC
+    product/media_acquire/acquire.cpp)
+  ninfer_internal_includes(ninfer_media_acquire)
+  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+endif()
 
-# Owning command-line message input shared by product entry points and target diagnostics.
-add_library(ninfer_product_prompt_input STATIC
-  product/prompt_input/prompt_input.cpp)
-ninfer_internal_includes(ninfer_product_prompt_input)
-target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
+if(NINFER_BUILD_PROMPT_INPUT)
+  # Owning command-line message input shared by product entry points and target diagnostics.
+  add_library(ninfer_product_prompt_input STATIC
+    product/prompt_input/prompt_input.cpp)
+  ninfer_internal_includes(ninfer_product_prompt_input)
+  target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire)
+endif()
 
 # One cold closed registry plus the opaque public product Engine. Family and exact-target
 # directories contribute their sources directly to this single compile owner below.
@@ -201,19 +205,21 @@ target_link_libraries(ninfer_engine
     ninfer_media_decode)
 add_library(ninfer::engine ALIAS ninfer_engine)
 
-# HTTP protocol/product adapter. No serving header is part of the installed API.
-add_library(ninfer_serve STATIC
-  serve/openai_schema.cpp
-  serve/anthropic_schema.cpp
-  serve/tool_call_parser.cpp
-  serve/translate.cpp
-  serve/generation_service.cpp
-  serve/request_log.cpp
-  serve/http_server.cpp
-  serve/serve_options.cpp)
-ninfer_internal_includes(ninfer_serve)
-target_include_directories(ninfer_serve PRIVATE
-  ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
-target_link_libraries(ninfer_serve
-  PUBLIC ninfer_engine Threads::Threads
-  PRIVATE ninfer_media_acquire)
+if(NINFER_BUILD_SERVE)
+  # HTTP protocol/product adapter. No serving header is part of the public API.
+  add_library(ninfer_serve STATIC
+    serve/openai_schema.cpp
+    serve/anthropic_schema.cpp
+    serve/tool_call_parser.cpp
+    serve/translate.cpp
+    serve/generation_service.cpp
+    serve/request_log.cpp
+    serve/http_server.cpp
+    serve/serve_options.cpp)
+  ninfer_internal_includes(ninfer_serve)
+  target_include_directories(ninfer_serve PRIVATE
+    ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+  target_link_libraries(ninfer_serve
+    PUBLIC ninfer_engine Threads::Threads
+    PRIVATE ninfer_media_acquire)
+endif()

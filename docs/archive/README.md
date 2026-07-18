@@ -25,6 +25,9 @@ Use the active documentation index at [`../README.md`](../README.md) for current
 
 ## Completed cutovers
 
+- [`2026-07-18-qwen3.6-family-runtime-mechanism-migration.md`](2026-07-18-qwen3.6-family-runtime-mechanism-migration.md)
+  — moved hybrid topology, decoder/GDN and round-state layouts/views, MTP alignment, and Vision
+  control into the identity-free family leaf while retaining 27B Program/schedule/graph ownership.
 - [`2026-07-18-qwen3.6-family-source-composition.md`](2026-07-18-qwen3.6-family-source-composition.md)
   — moved the shared Qwen3.6 frontend, resources, prepared values, and passive Vision bindings into
   family ownership while compiling family and exact-target sources once in `ninfer_engine`.

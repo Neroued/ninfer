@@ -11,7 +11,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `ops/` — independent numerical and state-transition checks at real supported shapes, plus the
   shared row-split packing helper;
 - `targets/qwen3_6/` — shared tokenizer/template, multimodal preprocessing, MRoPE, prepared-prompt,
-  stop, and incremental output-decoding behavior;
+  stop/output decoding, hybrid topology, decoder/GDN and round-state layouts/views, shifted-MTP
+  alignment, and Vision-control behavior;
 - `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
   bindings, reference behavior, target Program/multimodal/MTP behavior, and the opt-in real-Engine
   prefix test;
@@ -26,7 +27,8 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v8 reports;
 - `test_bench_matrix.py` — schema-v8 report consumption by the Python matrix summarizer;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
-  container, while GDN tests cover target-owned state and Op behavior at their proper boundaries.
+  container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
+  cover mathematical state transitions at their own boundary.
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
 

@@ -1,5 +1,5 @@
 #include "core/device.h"
-#include "targets/qwen3_6_27b_rtx5090/impl/state/state_store.h"
+#include <ninfer/targets/qwen3_6/decoder_state.h>
 
 #include <cuda_runtime.h>
 
@@ -10,10 +10,10 @@
 
 namespace {
 
-namespace q27 = ninfer::targets::qwen3_6_27b_rtx5090::detail;
+namespace q36 = ninfer::targets::qwen3_6;
 
 struct PlannedState {
-    q27::GdnStateLayout layout;
+    q36::GdnStateLayout layout;
     std::size_t bytes = 0;
 };
 
@@ -22,8 +22,14 @@ PlannedState plan_state(std::uint32_t layers, std::int32_t conv_dim, std::int32_
                         std::int32_t key_head_dim, std::int32_t snapshot_slots = 1,
                         ninfer::DType conv_dtype = ninfer::DType::BF16) {
     ninfer::LayoutBuilder builder;
-    auto layout = q27::plan_gdn_state(builder, layers, conv_dim, conv_width, value_heads,
-                                      value_head_dim, key_head_dim, snapshot_slots, conv_dtype);
+    auto layout = q36::plan_gdn_state(builder, q36::GdnStateSpec{.layers         = layers,
+                                                                 .conv_dim       = conv_dim,
+                                                                 .conv_width     = conv_width,
+                                                                 .value_heads    = value_heads,
+                                                                 .value_head_dim = value_head_dim,
+                                                                 .key_head_dim   = key_head_dim,
+                                                                 .snapshot_slots = snapshot_slots,
+                                                                 .conv_dtype     = conv_dtype});
     return PlannedState{std::move(layout), builder.finish(256)};
 }
 
@@ -89,13 +95,13 @@ int main() {
     ninfer::DeviceContext ctx(0);
     auto state_plan = plan_state(3, 10, 3, 4, 5, 6);
     ninfer::DeviceArena cache_arena(state_plan.bytes);
-    q27::GdnState state({cache_arena.base(), cache_arena.capacity()}, state_plan.layout);
+    q36::GdnStateStore state({cache_arena.base(), cache_arena.capacity()}, state_plan.layout);
 
     failures += expect_size(state.layer_count(), 3, "state.layer_count");
     failures += expect_size(state.conv.size(), 3, "state.conv.size");
     failures += expect_size(state.ssm.size(), 3, "state.ssm.size");
-    failures += expect_size(state.conv_width, 3, "state.conv_width");
-    failures += expect_size(state.snapshot_slots, 1, "state.snapshot_slots");
+    failures += expect_size(state.spec.conv_width, 3, "state.conv_width");
+    failures += expect_size(state.spec.snapshot_slots, 1, "state.snapshot_slots");
     for (std::size_t layer = 0; layer < state.layer_count(); ++layer) {
         failures += check_shape(state.conv[layer], {10, 3, 1, 1}, "state.conv");
         failures += check_shape(state.ssm[layer], {6, 5, 4, 1}, "state.ssm");
@@ -126,15 +132,16 @@ int main() {
     failures += expect_device_byte(state.ssm[0], 0, "untouched ssm0");
     failures += expect_device_byte(state.ssm[1], 0x5c, "sentinel ssm1");
 
-    state.reset(ctx.stream);
+    state.reset_running(ctx.stream);
     ctx.synchronize();
     failures += expect_device_byte(state.conv[0], 0, "reset conv0");
     failures += expect_device_byte(state.ssm[1], 0, "reset ssm1");
 
     auto slotted_plan = plan_state(2, 10, 3, 4, 5, 6, 3);
     ninfer::DeviceArena slotted_arena(slotted_plan.bytes);
-    q27::GdnState slotted({slotted_arena.base(), slotted_arena.capacity()}, slotted_plan.layout);
-    failures += expect_size(slotted.snapshot_slots, 3, "slotted.snapshot_slots");
+    q36::GdnStateStore slotted({slotted_arena.base(), slotted_arena.capacity()},
+                               slotted_plan.layout);
+    failures += expect_size(slotted.spec.snapshot_slots, 3, "slotted.snapshot_slots");
     failures += check_shape(slotted.conv[0], {10, 3, 3, 1}, "slotted.conv");
     failures += check_shape(slotted.ssm[0], {6, 5, 4, 3}, "slotted.ssm");
     failures += check_shape(slotted.conv_slot(0, 2), {10, 3, 1, 1}, "slotted.conv_slot");
@@ -163,7 +170,7 @@ int main() {
     failures += expect_device_byte(slotted.conv_slot(1, 2), 0x3c, "copied conv snapshot layer1");
     failures += expect_device_byte(slotted.ssm_slot(1, 2), 0x2d, "copied ssm snapshot layer1");
 
-    slotted.reset(ctx.stream);
+    slotted.reset_running(ctx.stream);
     ctx.synchronize();
     failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "slotted reset conv slot0");
     failures += expect_device_byte(slotted.conv_slot(0, 1), 0x6b, "slotted reset keeps conv slot1");

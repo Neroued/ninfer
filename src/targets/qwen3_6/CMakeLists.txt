@@ -4,7 +4,10 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/processor.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/resources.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/tokenizer.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/bindings.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/decoder_state.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/round_state.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/bindings.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/control.cpp)
 
 target_include_directories(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/export)

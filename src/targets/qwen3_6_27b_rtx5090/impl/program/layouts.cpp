@@ -87,53 +87,44 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 
 PersistentLayout persistent_layout(const SequencePlan::Impl& plan) {
     const std::size_t columns = plan.mtp_k + 1ULL;
-    const std::size_t drafts  = std::max<std::size_t>(1, plan.mtp_k);
     const std::size_t slots   = columns + 1ULL;
     LayoutBuilder builder;
     PersistentLayout out;
-    out.text_kv = plan_kv_cache(builder, TextConfig::full_attention_layers(), plan.capacity,
-                                TextConfig::kv_heads, TextConfig::head_dim, plan.kv_dtype,
-                                plan.kv_quant_group);
-    if (plan.mtp_k != 0) {
-        out.mtp_kv =
-            plan_kv_cache(builder, TextConfig::mtp_layers, plan.capacity, TextConfig::kv_heads,
-                          TextConfig::head_dim, plan.kv_dtype, plan.kv_quant_group);
-    }
-    out.gdn = plan_gdn_state(builder, TextConfig::gdn_layers(), TextConfig::convolution_dim,
-                             TextConfig::gdn_conv_state_width, TextConfig::gdn_value_heads,
-                             TextConfig::gdn_value_head_dim, TextConfig::gdn_key_head_dim,
-                             static_cast<std::int32_t>(slots));
+    out.decoder = qwen3_6::plan_decoder_state(
+        builder, qwen3_6::DecoderStateSpec{
+                     .full_attention_layers = TextConfig::full_attention_layers(),
+                     .mtp_layers            = TextConfig::mtp_layers,
+                     .capacity              = plan.capacity,
+                     .kv_heads              = TextConfig::kv_heads,
+                     .attention_head_dim    = TextConfig::head_dim,
+                     .kv_dtype              = plan.kv_dtype,
+                     .kv_quant_group        = plan.kv_quant_group,
+                     .enable_mtp            = plan.mtp_k != 0,
+                     .gdn =
+                         {
+                             .layers         = TextConfig::gdn_layers(),
+                             .conv_dim       = TextConfig::convolution_dim,
+                             .conv_width     = TextConfig::gdn_conv_state_width,
+                             .value_heads    = TextConfig::gdn_value_heads,
+                             .value_head_dim = TextConfig::gdn_value_head_dim,
+                             .key_head_dim   = TextConfig::gdn_key_head_dim,
+                             .snapshot_slots = static_cast<std::int32_t>(slots),
+                             .conv_dtype     = DType::BF16,
+                         },
+                 });
 
+    out.round = qwen3_6::begin_round_state_layout(
+        builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
+                                         .output_rows    = TextConfig::output_rows,
+                                         .draft_window   = plan.mtp_k,
+                                         .stats_counters = kStepStatsCounters});
+    out.prefill_hidden = add_tensor(
+        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.prefill_chunk)},
+        "step prefill hidden");
+    qwen3_6::complete_round_state_layout(builder, out.round);
     const auto i32 = [&](std::size_t n, const char* label) {
         return add_tensor(builder, DType::I32, {static_cast<std::int32_t>(n)}, label);
     };
-    out.io.token      = i32(1, "step token");
-    out.io.pos        = i32(1, "step position");
-    out.io.rope_pos   = i32(1, "step rope position");
-    out.io.rope_delta = i32(1, "step rope delta");
-    out.io.logits =
-        add_tensor(builder, DType::BF16,
-                   {TextConfig::output_rows, static_cast<std::int32_t>(columns)}, "step logits");
-    out.io.verify_hidden =
-        add_tensor(builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(columns)},
-                   "step verify hidden");
-    out.io.prefill_hidden = add_tensor(
-        builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.prefill_chunk)},
-        "step prefill hidden");
-    out.io.target_tokens    = i32(columns, "step target tokens");
-    out.io.drafts           = i32(drafts, "step drafts");
-    out.io.sampled_out      = i32(columns, "step sampled output");
-    out.io.num_sampled      = i32(1, "step sampled count");
-    out.io.verify_ids       = i32(columns, "step verify ids");
-    out.io.shifted_ids      = i32(columns, "step shifted ids");
-    out.io.positions        = i32(columns, "step positions");
-    out.io.window_base      = i32(1, "step window base");
-    out.io.accepted         = i32(1, "step accepted drafts");
-    out.io.gdn_initial_slot = i32(1, "step GDN initial slot");
-    out.io.ar_pos           = i32(1, "step MTP autoregressive position");
-    out.io.mtp_ar_hidden =
-        add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "step MTP autoregressive hidden");
-    out.io.stats            = add_tensor(builder, DType::I64, {kStepStatsCounters}, "step stats");
     out.token_counts        = i32(TextConfig::token_domain, "sampling token counts");
     const auto config_words = static_cast<std::int32_t>(
         (sizeof(ops::SamplingConfig) + sizeof(std::int32_t) - 1) / sizeof(std::int32_t));
@@ -141,9 +132,8 @@ PersistentLayout persistent_layout(const SequencePlan::Impl& plan) {
     out.tail_hidden     = add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "tail hidden");
     out.boundary_hidden =
         add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "boundary hidden");
-    out.bytes = builder.finish(kArenaAlign, "persistent layout");
-    out.kv_payload_bytes =
-        out.text_kv.payload_bytes() + (out.mtp_kv ? out.mtp_kv->payload_bytes() : 0);
+    out.bytes            = builder.finish(kArenaAlign, "persistent layout");
+    out.kv_payload_bytes = out.decoder.kv_payload_bytes();
     return out;
 }
 

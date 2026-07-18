@@ -25,7 +25,8 @@ void configure_text_card(TextContext& card, const State& state) {
 bool prefill_text(State& state, std::span<const TokenId> ids,
                   std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp) {
     TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                     state.prefill_chunk, state.text_kv_base, prepare_mtp ? state.mtp_kv : nullptr);
+                     state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
+                     prepare_mtp ? state.mtp_kv : nullptr);
     configure_text_card(card, state);
     card.set_boundary_hidden_output(state.boundary_hidden);
     card.set_prefill_snapshot_boundary(
@@ -39,10 +40,11 @@ bool prefill_text(State& state, std::span<const TokenId> ids,
     return card.mtp_prompt_prepared();
 }
 
-bool prefill_multimodal(State& state, const ProcessedInput& prompt, const Tensor& visual_embeddings,
-                        bool prepare_mtp) {
+bool prefill_multimodal(State& state, const PreparedPromptData& prompt,
+                        const Tensor& visual_embeddings, bool prepare_mtp) {
     TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                     state.prefill_chunk, state.text_kv_base, prepare_mtp ? state.mtp_kv : nullptr);
+                     state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
+                     prepare_mtp ? state.mtp_kv : nullptr);
     configure_text_card(card, state);
     card.set_boundary_hidden_output(nullptr);
     card.set_prefill_snapshot_boundary(-1);

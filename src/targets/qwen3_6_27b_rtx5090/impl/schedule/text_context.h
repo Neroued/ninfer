@@ -9,7 +9,9 @@
 #include "targets/qwen3_6_27b_rtx5090/impl/config.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/load/bindings.h"
 #include "core/kv_cache.h"
-#include "targets/qwen3_6_27b_rtx5090/impl/state/state_store.h"
+#include <ninfer/targets/qwen3_6/decoder_state.h>
+#include <ninfer/targets/qwen3_6/prepared_prompt.h>
+#include <ninfer/targets/qwen3_6/round_state.h>
 
 #include <array>
 #include <cstddef>
@@ -122,73 +124,6 @@ struct MtpW {
     const Tensor* norm                  = nullptr;
 };
 
-struct StepState {
-    Tensor token;
-    Tensor pos;
-    Tensor rope_pos;
-    Tensor rope_delta;
-    Tensor logits;
-    Tensor verify_hidden;
-    Tensor prefill_hidden;
-    Tensor target_tokens;
-    Tensor drafts;
-    Tensor sampled_out;
-    Tensor num_sampled;
-    Tensor verify_ids;
-    Tensor shifted_ids;
-    Tensor positions;
-    Tensor window_base;
-    Tensor accepted;
-    Tensor gdn_initial_slot;
-    Tensor ar_pos;
-    Tensor mtp_ar_hidden;
-    Tensor stats;
-};
-
-enum class Modality : std::uint8_t {
-    Image = 1,
-    Video = 2,
-};
-
-struct VisionGrid {
-    int t = 0;
-    int h = 0;
-    int w = 0;
-};
-
-struct TokenSpan {
-    std::size_t begin = 0;
-    std::size_t count = 0;
-};
-
-struct VisionItem {
-    Modality modality = Modality::Image;
-    VisionGrid grid;
-    std::size_t patch_begin = 0;
-    std::size_t patch_count = 0;
-    std::vector<double> timestamps;
-    std::vector<TokenSpan> token_spans;
-};
-
-struct PreprocessStats {
-    std::size_t media_items       = 0;
-    std::uint64_t raw_patches     = 0;
-    std::uint64_t vision_tokens   = 0;
-    std::uint64_t attention_pairs = 0;
-    std::size_t prompt_tokens     = 0;
-    std::size_t patch_bytes       = 0;
-};
-
-struct ProcessedInput {
-    std::vector<int> input_ids;
-    std::vector<std::uint8_t> token_types;
-    std::vector<std::int32_t> positions;
-    std::int32_t rope_delta = 0;
-    std::vector<float> patches;
-    std::vector<VisionItem> vision_items;
-    PreprocessStats stats;
-};
-
 enum class Phase {
     Prefill,
     Verify,
@@ -211,8 +146,9 @@ struct NullTap {
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                KVCache& kv, GdnState& state, StepState& io, std::uint32_t prefill_chunk,
-                std::uint32_t text_kv_base, KVCache* mtp_kv = nullptr);
+                KVCache& kv, qwen3_6::GdnStateStore& state, qwen3_6::RoundState& io,
+                Tensor& prefill_hidden, std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
+                KVCache* mtp_kv = nullptr);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -243,10 +179,11 @@ public:
     [[nodiscard]] bool mtp_prompt_prepared() const noexcept { return mtp_prompt_prepared_; }
 
     void prefill(std::span<const int> ids);
-    void prefill(const ProcessedInput& input, const Tensor& visual_embeddings);
+    void prefill(const qwen3_6::PreparedPromptData& input, const Tensor& visual_embeddings);
     void diagnostic_prefill(std::span<const int> ids, void* context, TextTapCallback callback);
-    void diagnostic_prefill(const ProcessedInput& input, const Tensor& visual_embeddings,
-                            void* context, TextTapCallback callback);
+    void diagnostic_prefill(const qwen3_6::PreparedPromptData& input,
+                            const Tensor& visual_embeddings, void* context,
+                            TextTapCallback callback);
     void target_verify(const Tensor& ids, const Tensor& positions,
                        ops::GqaExecutionEnvelope envelope);
     void diagnostic_target_verify(const Tensor& ids, const Tensor& positions,
@@ -306,8 +243,9 @@ private:
     WorkspaceArena& work_;
     KVCache& kv_;
     KVCache* mtp_kv_;
-    GdnState& state_;
-    StepState& io_;
+    qwen3_6::GdnStateStore& state_;
+    qwen3_6::RoundState& io_;
+    Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                 = nullptr;
@@ -333,19 +271,5 @@ private:
     std::array<Weight, TextConfig::gdn_layers()> gdn_in_b_{};
     std::array<Tensor, TextConfig::gdn_layers()> gdn_conv1d_views_{};
 };
-
-namespace detail {
-
-struct VisionControl {
-    std::vector<std::int32_t> position_ids;
-    std::vector<std::int32_t> cu_seqlens;
-    std::vector<std::int32_t> scatter_indices;
-    std::vector<std::int32_t> pos_indices;
-    std::vector<float> pos_weights;
-};
-
-VisionControl build_vision_control(const ProcessedInput& input);
-
-} // namespace detail
 
 } // namespace ninfer::targets::qwen3_6_27b_rtx5090::detail::schedule

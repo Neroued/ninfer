@@ -336,7 +336,8 @@ not retained for autoregressive decode.
 
 ## 11. Multimodal positions
 
-`ProcessedInput.positions` is axis-major `[3,T]` in temporal, height, width order.
+The family prepared prompt's `positions` value is axis-major `[3,T]` in temporal, height, width
+order.
 
 - ordinary text tokens advance all three axes together;
 - image/video placeholder tokens receive positions derived from the merged Vision grid;
@@ -397,14 +398,16 @@ changes its fixed allocation.
 
 | Model concern | Source |
 |---|---|
-| dimensions and layer mapping | `src/targets/qwen3_6_27b_rtx5090/impl/config.h` |
+| exact dimensions/layer counts and family hybrid-layer mapping | `src/targets/qwen3_6_27b_rtx5090/impl/config.h`, `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/hybrid_topology.h` |
 | immutable Text/MTP/Vision bindings | `src/targets/qwen3_6_27b_rtx5090/impl/load/` |
 | Text/MTP/Vision execution and state | `src/targets/qwen3_6_27b_rtx5090/impl/program/`, `impl/schedule/` |
 | tokenizer, template, multimodal processing, output decoder | `src/targets/qwen3_6/impl/frontend/` |
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | GQA physical cache container and checked per-layer views | `src/core/kv_cache.*` |
 | Text/MTP published cache prefixes and graph frontier variants | `src/targets/qwen3_6_27b_rtx5090/impl/program/` |
-| GDN state implementation and target-owned state policy | `src/targets/qwen3_6_27b_rtx5090/impl/state/`, `impl/program/` |
+| GDN layout/views/reset/copy and Text/MTP/GDN composition | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/decoder_state.h`, `src/targets/qwen3_6/impl/state/decoder_state.cpp` |
+| live state backing, valid frontiers, slot meaning, prefix policy, and CUDA Graphs | `src/targets/qwen3_6_27b_rtx5090/impl/program/` |
+| generated-round buffer schema, MTP alignment, and Vision control | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/`, `src/targets/qwen3_6/impl/state/round_state.cpp`, `src/targets/qwen3_6/impl/vision/control.cpp` |
 | `.ninfer` tensor assignment and binding | [`qwen3.6-27b-ninfer-artifact.md`](qwen3.6-27b-ninfer-artifact.md), `tools/reference/qwen3_6_27b_rtx5090/bindings.py` |
 | native `.ninfer` converter and verifier | `tools/convert/qwen3_6_27b_rtx5090` |
 | artifact-native Python Text/Vision/MTP reference | `tools/reference/qwen3_6_27b_rtx5090` |

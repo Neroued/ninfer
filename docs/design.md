@@ -61,8 +61,8 @@ execution behavior.
 | Neutral text/media decode | `src/text`, `src/media/decode` | Unicode primitives and image/video decoding over owning bytes |
 | Product media acquisition | `src/product/media_acquire` | local-path, HTTP(S), and data-URI acquisition into owning media values |
 | Product prompt input | `src/product/prompt_input` | shared JSON/message parsing into owning public prompt values for product tools |
-| Qwen3.6 family leaves | `src/targets/qwen3_6` | one tokenizer/template/media/MRoPE frontend, owning prepared prompt and output session, and passive common Vision geometry/binding definitions; no executable model graph or target identity |
-| Exact target | `src/targets/qwen3_6_27b_rtx5090` and, when registered, `src/targets/qwen3_6_35b_a3b_rtx5090` | registered storage signature, exact load bindings, sequence/request plans, Program state, fixed Text/Vision/MTP schedules, Op/fusion choices, graph/lifecycle policy, target diagnostics |
+| Qwen3.6 family leaves | `src/targets/qwen3_6` | one tokenizer/template/media/MRoPE frontend, owning prepared prompt and output session, passive Vision bindings, hybrid topology, dimension-driven decoder/GDN and round-state layouts/views, pure MTP alignment, and Vision control metadata; no executable model graph or target identity |
+| Exact target | `src/targets/qwen3_6_27b_rtx5090` and, when registered, `src/targets/qwen3_6_35b_a3b_rtx5090` | registered storage signature, exact load bindings, sequence/request plans, Program-owned backing and live state instances, fixed Text/Vision/MTP schedules, Op/fusion choices, graph/lifecycle policy, target diagnostics |
 | Registry | `src/targets/registry.*` | closed target selection and complete target construction |
 | Product runtime | `src/runtime` | generated-token budget, round resolution, cancellation, publication, public Engine PIMPL, target lifetime |
 | Serving | `src/serve` | OpenAI/Anthropic schemas, translation, streaming, usage, request logs, and HTTP transport |
@@ -75,18 +75,19 @@ The central placement rule is simple:
 - every host-callable, semantically closed tensor or explicit local-state transformation is an Op,
   and its complete implementation belongs in the central Op layer even when only one target,
   numerical shape, or GPU currently uses it;
-- tokenizer/template/output semantics, multimodal prompt construction, owning prepared values, and
-  passive Vision definitions that are identical for the two Qwen3.6 checkpoints belong in the
-  Qwen3.6 family leaves;
+- tokenizer/template/output semantics, multimodal prompt construction, owning prepared values,
+  passive Vision definitions, and identity-free topology/state-layout/control mechanisms that are
+  identical for the two Qwen3.6 checkpoints belong in the Qwen3.6 family leaves;
 - exact checkpoint binding, fixed layer order, operand/view selection, Vision composition, MTP
-  orchestration, Op selection and fusion, prefix repair, state lifetime, workspace, and graph
-  policy belong to the exact target;
+  orchestration, Op selection and fusion, Program backing and live instances, state commit/frontier
+  policy, prefix repair, workspace, and graph policy belong to the exact target;
 - stop/output-budget/cancellation/publication policy belongs to common runtime;
 - schemas, URLs/files, protocol translation, and transport belong to product/serve code.
 
 The complete Op boundary and implementation rules are defined by
-[`op-development.md`](op-development.md). The family layer shares stable semantics and passive
-types only. Duplication of target schedules and state policy is intentional.
+[`op-development.md`](op-development.md). The family layer shares stable semantics and
+dimension-driven mechanisms, but no schedule or state policy. Duplication of target computation
+graphs is intentional.
 
 ### 3.1 Qwen3.6 family boundary
 
@@ -94,14 +95,22 @@ The 27B and 35B-A3B packages use the same `qwen3_6::Frontend`, `PreparedPrompt`,
 `OutputSession`. Both artifacts embed the same six frontend resources. The family frontend owns
 tokenizer/chat-template interpretation, image/video preprocessing, placeholder expansion, MRoPE
 construction, output decoding, and default-stop interpretation. The common Vision portion owns
-shared preprocessing, backbone geometry, and immutable binding vocabulary; the exact target still
-binds its target-width merger and decides how Vision is scheduled and fused with the rest of the
-request.
+shared preprocessing, backbone geometry, immutable binding vocabulary, and prepared-item control
+metadata. The family also owns the four-layer hybrid topology, physical GDN layout/views, the
+composition of core Text/MTP KV with GDN state, graph-stable round-buffer schema, and pure shifted
+MTP alignment. Every differing dimension is explicit in the corresponding specification.
+
+These state objects are non-owning views into exact-Program memory. They can clear the running GDN
+slot or copy an explicitly named source slot to an explicitly named destination, but they do not
+assign committed/candidate meaning, publish a cache prefix, allocate backing memory, or select an
+execution phase. The exact target binds its target-width Vision merger and decides how all Text,
+Vision, and MTP work is scheduled and fused.
 
 This is compile-time code reuse, not family-level target selection. `src/targets/qwen3_6` has no
-`Program`, layer loop, execution graph, CUDA Graph, mutable sequence state, target registry entry,
-or fallback path. Both exact packages call their own Text/Vision/MTP schedules and may call different
-Ops or differently fused Ops even where the high-level mathematics are related.
+`Program`, live sequence owner, frontier/commit policy, layer loop, execution graph, CUDA Graph,
+target registry entry, or fallback path. Both exact packages call their own Text/Vision/MTP
+schedules and may call different Ops or differently fused Ops even where the high-level mathematics
+are related.
 
 ## 4. Public C++ API
 
@@ -175,8 +184,8 @@ Memory is divided by lifetime:
 | Lifetime | Owner | Examples |
 |---|---|---|
 | loaded immutable | `LoadedModel` | materialized weights, lookup tables, frontend resources |
-| sequence persistent | `Program` | Text/MTP KV, GDN state, token ledger, prefix checkpoint |
-| graph stable | `Program` | graph inputs/outputs, scalar controls, host mirrors |
+| sequence persistent | `Program` | arena and family-bound Text/MTP KV/GDN views, token ledger, prefix checkpoint |
+| graph stable | `Program` | family-bound round buffers, exact prefill/sampling buffers, host mirrors |
 | request active | `Program` | sampling counters/RNG and active-request controls |
 | request transient | `RequestMemory` | Vision and other request-planned scratch |
 
@@ -206,8 +215,8 @@ preprocessing rules without executing the model.
 
 The target `Program` is the sole mutable owner of sequence execution. It contains:
 
-- Text and MTP KV caches;
-- GDN recurrent/convolution state and slots;
+- one caller-owned persistent arena and family-bound Text/MTP KV and GDN state views;
+- family-bound graph-stable round buffers plus exact prefill/sampling buffers;
 - logical token ledger and execution frontier;
 - sampling configuration, occurrence counters, and RNG state;
 - prefix checkpoint and restoration state;
@@ -336,8 +345,8 @@ Permanent checks are organized by observable risk:
 
 - `.ninfer` framing, numeric formats, layouts, resources, binding, and real target inventory;
 - Op numerical/state-transition behavior at real supported shapes;
-- family Frontend behavior, target Program state/prefix transactions, Text/Vision/MTP parity, and a real
-  artifact smoke path;
+- family Frontend and runtime-mechanism behavior, target Program state/prefix transactions,
+  Text/Vision/MTP parity, and a real artifact smoke path;
 - OpenAI/Anthropic schema and tool-call behavior;
 - benchmark CLI/report contracts and real performance evidence.
 

@@ -41,8 +41,8 @@ class VisionContext {
 public:
     VisionContext(DeviceContext& device, const LoadedModelData& model);
 
-    [[nodiscard]] static std::size_t workspace_bytes(const ProcessedInput& input);
-    [[nodiscard]] Tensor encode(const ProcessedInput& input, WorkspaceArena& workspace,
+    [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::PreparedPromptData& input);
+    [[nodiscard]] Tensor encode(const qwen3_6::PreparedPromptData& input, WorkspaceArena& workspace,
                                 void* tap = nullptr, VisionTapCallback callback = nullptr) const;
 
 private:

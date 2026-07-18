@@ -8,8 +8,6 @@
 
 #include "targets/qwen3_6_27b_rtx5090/impl/load/bindings.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/program/layouts.h"
-#include "core/kv_cache.h"
-#include "targets/qwen3_6_27b_rtx5090/impl/state/state_store.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/schedule/text_context.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/schedule/vision_context.h"
 
@@ -120,10 +118,9 @@ public:
 
     DeviceArena persistent;
     WorkspaceArena work;
-    std::unique_ptr<KVCache> text_kv;
-    std::unique_ptr<KVCache> mtp_kv;
-    std::unique_ptr<GdnState> gdn;
-    schedule::StepState io;
+    std::unique_ptr<qwen3_6::DecoderState> decoder;
+    qwen3_6::RoundState io;
+    Tensor prefill_hidden;
     Tensor sampling_config;
     Tensor token_counts;
     Tensor tail_hidden;

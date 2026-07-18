@@ -28,7 +28,7 @@ void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor
                             std::int32_t position, bool build_proposal) {
     if (state.mtp_kv == nullptr) { throw std::logic_error("MTP bridge requires MTP storage"); }
     TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                     state.prefill_chunk, state.text_kv_base, state.mtp_kv);
+                     state.prefill_hidden, state.prefill_chunk, state.text_kv_base, state.mtp_kv);
     configure_text_card(card, state);
 
     Tensor position_view = state.io.positions.slice(0, 0, 1);
@@ -47,7 +47,7 @@ void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor
     for (int i = 1; i < state.io.drafts.ne[0]; ++i) {
         Tensor previous_token = state.io.drafts.slice(0, i - 1, 1);
         Tensor next_draft     = state.io.drafts.slice(0, i, 1);
-        Tensor next_hidden    = state.io.prefill_hidden.slice(1, i, 1);
+        Tensor next_hidden    = state.prefill_hidden.slice(1, i, 1);
         const auto visible    = static_cast<std::uint32_t>(position + i + 1);
         const ops::GqaExecutionEnvelope envelope{visible, visible};
         card.mtp_forward_ar_step(previous_token, state.io.mtp_ar_hidden, state.io.ar_pos, envelope,
@@ -89,7 +89,7 @@ void warm_capture(State& state, DecodeGraph& graph, const GraphPrepare& prepare,
 auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope) {
     auto record = [&state, align_mtp, envelope] {
         TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                         state.prefill_chunk, state.text_kv_base,
+                         state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
                          align_mtp ? state.mtp_kv : nullptr);
         configure_text_card(card, state);
 
@@ -130,7 +130,8 @@ auto mtp_body(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes) {
 
     auto record = [&state, k, envelopes] {
         TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
-                         state.prefill_chunk, state.text_kv_base, state.mtp_kv);
+                         state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
+                         state.mtp_kv);
         configure_text_card(card, state);
 
         ops::mtp_prepare_verify_inputs(state.io.token, state.io.drafts, state.io.pos,
@@ -148,7 +149,7 @@ auto mtp_body(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes) {
         const int columns = static_cast<int>(k) + 1;
         ops::mtp_prepare_shifted_ids(state.io.verify_ids, state.io.token, state.io.accepted,
                                      state.io.shifted_ids, state.device.stream);
-        Tensor mtp_hidden = state.io.prefill_hidden.slice(1, 0, columns);
+        Tensor mtp_hidden = state.prefill_hidden.slice(1, 0, columns);
         card.mtp_forward_batch(state.io.shifted_ids, state.io.verify_hidden, state.io.positions,
                                envelopes.batch, mtp_hidden, -1, nullptr, nullptr);
 
@@ -159,7 +160,7 @@ auto mtp_body(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes) {
         for (std::uint32_t i = 1; i < k; ++i) {
             Tensor previous_token = state.io.drafts.slice(0, static_cast<int>(i) - 1, 1);
             Tensor next_token     = state.io.drafts.slice(0, static_cast<int>(i), 1);
-            Tensor next_hidden    = state.io.prefill_hidden.slice(1, static_cast<int>(i), 1);
+            Tensor next_hidden    = state.prefill_hidden.slice(1, static_cast<int>(i), 1);
             card.mtp_forward_ar_step(previous_token, state.io.mtp_ar_hidden, state.io.ar_pos,
                                      envelopes.ar[i - 1], next_hidden, logits, next_token);
             CUDA_CHECK(cudaMemcpyAsync(state.io.mtp_ar_hidden.data, next_hidden.data,

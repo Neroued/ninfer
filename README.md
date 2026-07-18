@@ -203,8 +203,11 @@ The source and build boundaries are explicit:
 - `src/text` and `src/media/decode` own checkpoint-neutral Unicode and media decoding;
 - `src/product/media_acquire` owns path, URL, and data-URI acquisition for product entry points;
 - `src/product/prompt_input` owns the shared CLI/diagnostic message-input adapter;
-- `src/targets/qwen3_6_27b_rtx5090` owns exact checkpoint/GPU load, frontend, Program state,
-  schedules, and graph/lifecycle policy; its schedules invoke central Op contracts;
+- `src/targets/qwen3_6` owns the shared Frontend plus identity-free hybrid topology,
+  state-layout/view, round-buffer, MTP-alignment, and Vision-control mechanisms;
+- `src/targets/qwen3_6_27b_rtx5090` owns exact checkpoint/GPU load, Program backing and live state,
+  schedules, frontiers/commit policy, and graph/lifecycle policy; its schedules invoke central Op
+  contracts;
 - `src/runtime` owns common request contracts, generation policy, and the public
   Engine implementation;
 - `src/serve` owns HTTP schemas, translation, streaming, and transport;

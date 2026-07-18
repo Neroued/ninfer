@@ -40,8 +40,11 @@ int main() {
         DBuf dinput = to_device_bf16(token_embeddings);
         Tensor input(dinput.p, DType::BF16, {d, t});
         work.reset();
+        const auto window = targets::qwen3_6::plan_mtp_alignment_window(
+            static_cast<std::uint32_t>(prompt_tokens), 0, t);
         targets::qwen3_6_27b_rtx5090::detail::schedule::detail::scatter_shifted_visual_embeddings(
-            input, visual, scatter_indices, 1, prompt_tokens, work, nullptr);
+            input, visual, scatter_indices, static_cast<std::uint32_t>(prompt_tokens), window, work,
+            nullptr);
         cudaDeviceSynchronize();
 
         std::vector<double> reference(token_embeddings.begin(), token_embeddings.end());

@@ -9,9 +9,7 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/schedule/text_context.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/schedule/text_prefill.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/schedule/vision.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/impl/schedule/vision_context.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/impl/schedule/vision_control.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/state_store.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/schedule/vision_context.cpp)
 
 target_include_directories(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl

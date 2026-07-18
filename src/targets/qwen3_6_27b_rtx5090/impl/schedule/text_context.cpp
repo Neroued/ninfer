@@ -1,6 +1,7 @@
 #include "targets/qwen3_6_27b_rtx5090/impl/schedule/text_context.h"
 
 #include "targets/qwen3_6_27b_rtx5090/impl/schedule/visual_scatter.h"
+#include <ninfer/targets/qwen3_6/vision_control.h>
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -156,10 +157,11 @@ struct CallbackTap {
 
 TextContext::TextContext(DeviceContext& ctx,
                          const targets::qwen3_6_27b_rtx5090::detail::LoadedModelData& weights,
-                         WorkspaceArena& work, KVCache& kv, GdnState& state, StepState& io,
+                         WorkspaceArena& work, KVCache& kv, qwen3_6::GdnStateStore& state,
+                         qwen3_6::RoundState& io, Tensor& prefill_hidden,
                          std::uint32_t prefill_chunk, std::uint32_t text_kv_base, KVCache* mtp_kv)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
-      prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
+      prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base) {
     if (prefill_chunk_ == 0 || prefill_chunk_ % kPrefillChunkAlignment != 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext prefill_chunk must be a nonzero multiple of 128");
@@ -247,28 +249,17 @@ const MtpW& TextContext::mtp_weights() const {
 void detail::scatter_shifted_visual_embeddings(Tensor& input_embeddings,
                                                const Tensor& visual_embeddings,
                                                std::span<const std::int32_t> scatter_indices,
-                                               std::int32_t shifted_begin,
-                                               std::int32_t prompt_tokens, WorkspaceArena& work,
-                                               cudaStream_t stream) {
-    if (shifted_begin >= prompt_tokens || scatter_indices.empty()) { return; }
-
-    const std::int32_t shifted_count =
-        std::min(input_embeddings.ne[1], prompt_tokens - shifted_begin);
-    const std::int32_t shifted_end = shifted_begin + shifted_count;
-    const auto begin =
-        std::lower_bound(scatter_indices.begin(), scatter_indices.end(), shifted_begin);
-    const auto end   = std::lower_bound(begin, scatter_indices.end(), shifted_end);
-    const auto count = static_cast<std::int32_t>(end - begin);
-    if (count == 0) { return; }
-
-    const auto visual_begin = static_cast<std::int32_t>(begin - scatter_indices.begin());
-    std::vector<std::int32_t> local_indices(static_cast<std::size_t>(count));
-    for (std::int32_t i = 0; i < count; ++i) {
-        local_indices[static_cast<std::size_t>(i)] = begin[i] - shifted_begin;
-    }
+                                               std::uint32_t prompt_tokens,
+                                               const qwen3_6::MtpAlignmentWindow& window,
+                                               WorkspaceArena& work, cudaStream_t stream) {
+    const qwen3_6::MtpVisualOverlap overlap =
+        qwen3_6::shifted_visual_overlap(scatter_indices, prompt_tokens, window);
+    if (overlap.empty()) { return; }
+    const auto count      = static_cast<std::int32_t>(overlap.size());
     Tensor indices_device = work.alloc(DType::I32, {count});
-    copy_i32(local_indices.data(), indices_device, stream);
-    Tensor embeddings = visual_embeddings.slice(1, visual_begin, count);
+    copy_i32(overlap.destination_columns.data(), indices_device, stream);
+    Tensor embeddings =
+        visual_embeddings.slice(1, static_cast<std::int32_t>(overlap.source_begin), count);
     ops::scatter(embeddings, indices_device, input_embeddings, stream);
 }
 
@@ -827,7 +818,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     CUDA_CHECK(cudaStreamSynchronize(s));
     CUDA_CHECK(cudaMemcpy(&gdn_read_slot0, io_.gdn_initial_slot.data, sizeof(gdn_read_slot0),
                           cudaMemcpyDeviceToHost));
-    if (gdn_read_slot0 < 0 || gdn_read_slot0 >= state_.snapshot_slots) { gdn_read_slot0 = 0; }
+    if (gdn_read_slot0 < 0 || gdn_read_slot0 >= state_.spec.snapshot_slots) { gdn_read_slot0 = 0; }
 
     // Turn-boundary GDN snapshot: when a boundary is requested, publish the running conv/SSM state
     // into the dedicated last snapshot slot exactly at absolute position
@@ -840,7 +831,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     const bool has_snapshot =
         snap_abs > base64 && snap_abs <= base64 + static_cast<std::int64_t>(T);
     const int snap_rel               = has_snapshot ? static_cast<int>(snap_abs - base64) : -1;
-    const std::int32_t boundary_slot = state_.snapshot_slots - 1;
+    const std::int32_t boundary_slot = state_.spec.snapshot_slots - 1;
 
     bool prepare_mtp_prompt = false;
     if (mtp_enabled() && io_.drafts.data != nullptr) {
@@ -924,8 +915,8 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             if constexpr (Tap::enabled) { tap(TapId::AfterEmbed, -1, Phase::Prefill, x, s); }
             run_layers(x, Phase::Prefill, tap);
 
-            Tensor xf = io_.prefill_hidden.data != nullptr
-                            ? matrix_window(io_.prefill_hidden, len)
+            Tensor xf = prefill_hidden_.data != nullptr
+                            ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {kCfg.hidden, len});
             ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, xf, s);
             if constexpr (Tap::enabled) { tap(TapId::AfterFinalNorm, -1, Phase::Prefill, xf, s); }
@@ -952,20 +943,23 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             }
 
             if (prepare_mtp_prompt) {
+                const qwen3_6::MtpAlignmentWindow mtp_window = qwen3_6::plan_mtp_alignment_window(
+                    static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(t0),
+                    static_cast<std::uint32_t>(len));
                 std::vector<int> mtp_ids_host(static_cast<std::size_t>(len));
-                if (is_last) {
-                    for (int j = 0; j + 1 < len; ++j) {
-                        mtp_ids_host[static_cast<std::size_t>(j)] = ids[t0 + j + 1];
-                    }
+                const int prompt_columns =
+                    len - static_cast<int>(mtp_window.final_column_uses_generated_token);
+                for (int j = 0; j < prompt_columns; ++j) {
+                    mtp_ids_host[static_cast<std::size_t>(j)] =
+                        ids[static_cast<std::size_t>(mtp_window.shifted_embedding_begin) +
+                            static_cast<std::size_t>(j)];
+                }
+                if (mtp_window.final_column_uses_generated_token) {
                     int next_token = 0;
                     CUDA_CHECK(cudaStreamSynchronize(s));
                     CUDA_CHECK(cudaMemcpy(&next_token, io_.token.data, sizeof(next_token),
                                           cudaMemcpyDeviceToHost));
                     mtp_ids_host[static_cast<std::size_t>(len - 1)] = next_token;
-                } else {
-                    for (int j = 0; j < len; ++j) {
-                        mtp_ids_host[static_cast<std::size_t>(j)] = ids[t0 + j + 1];
-                    }
                 }
 
                 Tensor mtp_ids = work_.alloc(DType::I32, {len});
@@ -977,7 +971,7 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                     ops::embedding(mtp_ids, *embed_, mtp_input_embeddings, s);
                     detail::scatter_shifted_visual_embeddings(
                         mtp_input_embeddings, *multimodal->embeddings, multimodal->scatter_indices,
-                        t0 + 1, T, work_, s);
+                        static_cast<std::uint32_t>(T), mtp_window, work_, s);
                     mtp_input_embeddings_ptr = &mtp_input_embeddings;
                 }
                 if (is_last) {
@@ -1048,22 +1042,24 @@ void TextContext::diagnostic_prefill(std::span<const int> ids, void* context,
     prefill_impl(ids, nullptr, tap);
 }
 
-void TextContext::prefill(const ProcessedInput& input, const Tensor& visual_embeddings) {
-    const detail::VisionControl control = detail::build_vision_control(input);
+void TextContext::prefill(const qwen3_6::PreparedPromptData& input,
+                          const Tensor& visual_embeddings) {
+    const qwen3_6::VisionControl control = qwen3_6::build_vision_control(input);
     const MultimodalPrefill multimodal{input.positions, control.scatter_indices, &visual_embeddings,
                                        input.rope_delta};
     NullTap tap;
-    prefill_impl(input.input_ids, &multimodal, tap);
+    prefill_impl(input.token_ids, &multimodal, tap);
 }
 
-void TextContext::diagnostic_prefill(const ProcessedInput& input, const Tensor& visual_embeddings,
-                                     void* context, TextTapCallback callback) {
+void TextContext::diagnostic_prefill(const qwen3_6::PreparedPromptData& input,
+                                     const Tensor& visual_embeddings, void* context,
+                                     TextTapCallback callback) {
     if (callback == nullptr) { throw std::invalid_argument("diagnostic prefill callback is null"); }
-    const detail::VisionControl control = detail::build_vision_control(input);
+    const qwen3_6::VisionControl control = qwen3_6::build_vision_control(input);
     const MultimodalPrefill multimodal{input.positions, control.scatter_indices, &visual_embeddings,
                                        input.rope_delta};
     CallbackTap tap{context, callback};
-    prefill_impl(input.input_ids, &multimodal, tap);
+    prefill_impl(input.token_ids, &multimodal, tap);
 }
 
 

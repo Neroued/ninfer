@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include <ninfer/targets/qwen3_6/vision_control.h>
 #include "targets/qwen3_6_27b_rtx5090/impl/load/bindings.h"
 #include "ninfer/ops/add_bias.h"
 #include "ninfer/ops/cast.h"
@@ -55,10 +56,10 @@ struct VisionWorkspaceLayout {
     std::size_t bytes = 0;
 };
 
-VisionWorkspaceLayout build_workspace_layout(const ProcessedInput& input,
-                                             const detail::VisionControl& control) {
-    const auto patches64 = static_cast<std::size_t>(input.stats.raw_patches);
-    const auto tokens64  = static_cast<std::size_t>(input.stats.vision_tokens);
+VisionWorkspaceLayout build_workspace_layout(const qwen3_6::PreparedPromptData& input,
+                                             const qwen3_6::VisionControl& control) {
+    const auto patches64 = static_cast<std::size_t>(input.prepare.raw_patches);
+    const auto tokens64  = static_cast<std::size_t>(input.prepare.vision_tokens);
     if (patches64 == 0 || tokens64 == 0 ||
         patches64 !=
             checked_mul(tokens64, VisionScheduleConfig::merge_unit, "patch/token relation")) {
@@ -169,19 +170,19 @@ VisionContext::VisionContext(DeviceContext& ctx,
     merger_.fc2_bias    = &weights.vision.merger_fc2_bias;
 }
 
-std::size_t VisionContext::workspace_bytes(const ProcessedInput& input) {
-    const detail::VisionControl control = detail::build_vision_control(input);
+std::size_t VisionContext::workspace_bytes(const qwen3_6::PreparedPromptData& input) {
+    const qwen3_6::VisionControl control = qwen3_6::build_vision_control(input);
     return build_workspace_layout(input, control).bytes;
 }
 
-Tensor VisionContext::encode(const ProcessedInput& input, WorkspaceArena& workspace, void* tap,
-                             VisionTapCallback callback) const {
+Tensor VisionContext::encode(const qwen3_6::PreparedPromptData& input, WorkspaceArena& workspace,
+                             void* tap, VisionTapCallback callback) const {
     if ((tap == nullptr) != (callback == nullptr)) {
         throw std::invalid_argument("Vision tap context and callback must be provided together");
     }
-    const detail::VisionControl control = detail::build_vision_control(input);
-    const auto patches64                = static_cast<std::size_t>(input.stats.raw_patches);
-    const auto tokens64                 = static_cast<std::size_t>(input.stats.vision_tokens);
+    const qwen3_6::VisionControl control = qwen3_6::build_vision_control(input);
+    const auto patches64                 = static_cast<std::size_t>(input.prepare.raw_patches);
+    const auto tokens64                  = static_cast<std::size_t>(input.prepare.vision_tokens);
     if (input.patches.size() !=
         checked_mul(patches64, VisionScheduleConfig::patch_dim, "patch elements")) {
         throw std::invalid_argument("Vision processor patch buffer has invalid shape");
@@ -203,8 +204,8 @@ Tensor VisionContext::encode(const ProcessedInput& input, WorkspaceArena& worksp
     Tensor pos_weights  = layout.pos_weights.bind(backing);
     copy_host(control.position_ids.data(), position_ids, stream);
     copy_host(control.cu_seqlens.data(), cu_seqlens, stream);
-    copy_host(control.pos_indices.data(), pos_indices, stream);
-    copy_host(control.pos_weights.data(), pos_weights, stream);
+    copy_host(control.position_table_indices.data(), pos_indices, stream);
+    copy_host(control.position_table_weights.data(), pos_weights, stream);
 
     Tensor x          = layout.x.bind(backing);
     Tensor patch_bf16 = layout.patch_bf16.bind(backing);

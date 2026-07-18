@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ninfer/targets/qwen3_6/frontend.h>
+#include <ninfer/targets/qwen3_6/hybrid_topology.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
 #include <cstdint>
@@ -29,7 +30,7 @@ struct TextConfig {
     static constexpr int head_dim    = 256;
     static constexpr int rotary_dim  = 64;
 
-    static constexpr int full_attention_interval = 4;
+    static constexpr int full_attention_interval = qwen3_6::kHybridAttentionInterval;
     static constexpr float rms_epsilon           = 1.0e-6F;
     static constexpr float rope_theta            = 1.0e7F;
 
@@ -46,23 +47,24 @@ struct TextConfig {
     static constexpr int mtp_mlp_gate_up_rows     = 2 * intermediate;
 
     [[nodiscard]] static constexpr bool is_full_attention(int layer) {
-        return (layer + 1) % full_attention_interval == 0;
+        return qwen3_6::is_full_attention_layer(layer);
     }
 
     [[nodiscard]] static constexpr int full_attention_layers() {
-        return layers / full_attention_interval;
+        return qwen3_6::full_attention_layers(layers);
     }
 
-    [[nodiscard]] static constexpr int gdn_layers() { return layers - full_attention_layers(); }
+    [[nodiscard]] static constexpr int gdn_layers() { return qwen3_6::gdn_layers(layers); }
 
     [[nodiscard]] static constexpr int full_attention_index(int layer) {
-        return (layer + 1) / full_attention_interval - 1;
+        return qwen3_6::full_attention_index(layer);
     }
 
-    [[nodiscard]] static constexpr int gdn_index(int layer) {
-        return layer - (layer + 1) / full_attention_interval;
-    }
+    [[nodiscard]] static constexpr int gdn_index(int layer) { return qwen3_6::gdn_index(layer); }
 };
+
+static_assert(TextConfig::full_attention_layers() == 16);
+static_assert(TextConfig::gdn_layers() == 48);
 
 struct VisionConfig : qwen3_6::VisionBackboneConfig {
     static constexpr int output_hidden = TextConfig::hidden;

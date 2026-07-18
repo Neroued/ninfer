@@ -1,49 +1,24 @@
 #pragma once
 
-#include "core/layout.h"
 #include "core/dtype.h"
+#include "core/layout.h"
 #include "core/tensor.h"
-#include "core/kv_cache.h"
-#include "targets/qwen3_6_27b_rtx5090/impl/state/state_store.h"
+#include <ninfer/targets/qwen3_6/decoder_state.h>
+#include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6_27b_rtx5090/package.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <optional>
 
 namespace ninfer::targets::qwen3_6_27b_rtx5090::detail {
 
 using TensorLayout = TensorRegion;
 
-struct StepStateLayout {
-    TensorLayout token;
-    TensorLayout pos;
-    TensorLayout rope_pos;
-    TensorLayout rope_delta;
-    TensorLayout logits;
-    TensorLayout verify_hidden;
-    TensorLayout prefill_hidden;
-    TensorLayout target_tokens;
-    TensorLayout drafts;
-    TensorLayout sampled_out;
-    TensorLayout num_sampled;
-    TensorLayout verify_ids;
-    TensorLayout shifted_ids;
-    TensorLayout positions;
-    TensorLayout window_base;
-    TensorLayout accepted;
-    TensorLayout gdn_initial_slot;
-    TensorLayout ar_pos;
-    TensorLayout mtp_ar_hidden;
-    TensorLayout stats;
-};
-
 struct PersistentLayout {
-    KVCacheLayout text_kv;
-    std::optional<KVCacheLayout> mtp_kv;
-    GdnStateLayout gdn;
-    StepStateLayout io;
+    qwen3_6::DecoderStateLayout decoder;
+    qwen3_6::RoundStateLayout round;
+    TensorLayout prefill_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
     TensorLayout tail_hidden;

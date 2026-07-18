@@ -44,6 +44,8 @@ ninfer_add_test(ninfer_kv_cache_test
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
   LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_state_store_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_generation_controller_test SOURCES test_generation_controller.cpp)
 ninfer_add_test(ninfer_row_split_pack_golden_test
   SOURCES test_row_split_pack_golden.cpp
@@ -57,6 +59,11 @@ ninfer_add_test(ninfer_qwen3_6_frontend_test
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
+  SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
@@ -174,7 +181,6 @@ ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test
 # These tests deliberately compile against the exact target's internal contracts; the target does
 # not export impl/ to ordinary consumers.
 set(ninfer_qwen3_6_27b_internal_tests
-  ninfer_state_store_test
   ninfer_qwen3_6_27b_visual_scatter_test)
 foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
   target_include_directories(${test_target} PRIVATE

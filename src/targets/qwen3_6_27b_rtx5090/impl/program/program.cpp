@@ -100,34 +100,10 @@ Program::Impl::Impl(const LoadedModelData& model_in, const SequencePlan::Impl& p
       work(plan.workspace_bytes),
       round_host((static_cast<std::size_t>(mtp_k) + 2ULL) * sizeof(std::int32_t)) {
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
-    text_kv                  = std::make_unique<KVCache>(backing, plan.persistent.text_kv);
-    if (plan.persistent.mtp_kv) {
-        mtp_kv = std::make_unique<KVCache>(backing, *plan.persistent.mtp_kv);
-    }
-    gdn = std::make_unique<GdnState>(backing, plan.persistent.gdn);
+    decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
 
-    io = schedule::StepState{
-        plan.persistent.io.token.bind(backing),
-        plan.persistent.io.pos.bind(backing),
-        plan.persistent.io.rope_pos.bind(backing),
-        plan.persistent.io.rope_delta.bind(backing),
-        plan.persistent.io.logits.bind(backing),
-        plan.persistent.io.verify_hidden.bind(backing),
-        plan.persistent.io.prefill_hidden.bind(backing),
-        plan.persistent.io.target_tokens.bind(backing),
-        plan.persistent.io.drafts.bind(backing),
-        plan.persistent.io.sampled_out.bind(backing),
-        plan.persistent.io.num_sampled.bind(backing),
-        plan.persistent.io.verify_ids.bind(backing),
-        plan.persistent.io.shifted_ids.bind(backing),
-        plan.persistent.io.positions.bind(backing),
-        plan.persistent.io.window_base.bind(backing),
-        plan.persistent.io.accepted.bind(backing),
-        plan.persistent.io.gdn_initial_slot.bind(backing),
-        plan.persistent.io.ar_pos.bind(backing),
-        plan.persistent.io.mtp_ar_hidden.bind(backing),
-        plan.persistent.io.stats.bind(backing),
-    };
+    io              = qwen3_6::RoundState(backing, plan.persistent.round);
+    prefill_hidden  = plan.persistent.prefill_hidden.bind(backing);
     token_counts    = plan.persistent.token_counts.bind(backing);
     sampling_config = plan.persistent.sampling_config.bind(backing);
     tail_hidden     = plan.persistent.tail_hidden.bind(backing);
@@ -178,7 +154,7 @@ void Program::Impl::set_device_i32(Tensor& tensor, std::int32_t value) {
 }
 
 void Program::Impl::ordered_reset() {
-    gdn->reset(device.stream);
+    decoder->gdn.reset_running(device.stream);
     work.reset();
     set_device_i32(io.pos, 0);
     set_device_i32(io.rope_pos, 0);
@@ -224,14 +200,14 @@ void Program::Impl::prepare_graphs() {
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
     };
-    initialize_cache(*text_kv);
-    if (mtp_kv != nullptr) { initialize_cache(*mtp_kv); }
+    initialize_cache(decoder->text_kv);
+    if (decoder->mtp_cache() != nullptr) { initialize_cache(*decoder->mtp_cache()); }
     device.synchronize();
 
     const auto prepare_representative = [&](std::uint32_t frontier) {
         work.reset();
         clear_stable_controls();
-        gdn->reset(device.stream);
+        decoder->gdn.reset_running(device.stream);
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
         set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
         set_device_i32(io.ar_pos, checked_i32(frontier, "graph representative MTP position"));
@@ -240,10 +216,11 @@ void Program::Impl::prepare_graphs() {
         return schedule::State{device,
                                model,
                                work,
-                               *text_kv,
-                               mtp_kv.get(),
-                               *gdn,
+                               decoder->text_kv,
+                               decoder->mtp_cache(),
+                               decoder->gdn,
                                io,
+                               prefill_hidden,
                                prefill_chunk,
                                frontier,
                                static_cast<const ops::SamplingConfig*>(sampling_config.data),
@@ -269,7 +246,7 @@ void Program::Impl::prepare_graphs() {
         auto ordinary_state = state(representative);
         schedule::warm_capture_ordinary_round(ordinary_state, false, envelope, prepare,
                                               variant.ordinary);
-        if (mtp_kv != nullptr) {
+        if (decoder->mtp_cache() != nullptr) {
             auto aligned_state = state(representative);
             schedule::warm_capture_ordinary_round(aligned_state, true, envelope, prepare,
                                                   variant.ordinary_aligned);
@@ -297,10 +274,10 @@ void Program::Impl::prepare_graphs() {
 
     ordered_reset();
     clear_stable_controls();
-    for (Tensor& tensor : gdn->conv) {
+    for (Tensor& tensor : decoder->gdn.conv) {
         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
-    for (Tensor& tensor : gdn->ssm) {
+    for (Tensor& tensor : decoder->gdn.ssm) {
         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
@@ -402,7 +379,7 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
                 throw std::logic_error("resident Text KV is shorter than boundary");
             }
             text_kv_valid = base;
-            gdn->copy_slot(gdn->snapshot_slots - 1, 0, device.stream);
+            decoder->gdn.copy_slot(decoder->gdn.spec.snapshot_slots - 1, 0, device.stream);
             current_gdn_slot = 0;
             set_device_i32(io.gdn_initial_slot, 0);
             ledger.resize(base);
@@ -410,7 +387,7 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
 
         if (plan.prepare_mtp && base != 0) {
             const std::uint32_t mtp_base = base - 1;
-            if (mtp_kv == nullptr || mtp_kv_valid < mtp_base) {
+            if (decoder->mtp_cache() == nullptr || mtp_kv_valid < mtp_base) {
                 throw std::logic_error("reusable MTP prefix is shorter than its bridge position");
             }
             mtp_kv_valid = mtp_base;
@@ -433,10 +410,11 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
             device,
             model,
             work,
-            *text_kv,
-            mtp_kv.get(),
-            *gdn,
+            decoder->text_kv,
+            decoder->mtp_cache(),
+            decoder->gdn,
             io,
+            prefill_hidden,
             prefill_chunk,
             base,
             static_cast<const ops::SamplingConfig*>(sampling_config.data),
@@ -448,19 +426,18 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
         bool mtp_prepared = false;
 
         if (has_media) {
-            const auto vision_start            = Clock::now();
-            schedule::ProcessedInput processed = schedule::take_processed_prompt(std::move(prompt));
-            Tensor visual = schedule::encode_vision(schedule_state, processed, transient);
+            const auto vision_start = Clock::now();
+            Tensor visual           = schedule::encode_vision(schedule_state, prompt, transient);
             device.synchronize();
             timings.vision_seconds =
                 std::chrono::duration<double>(Clock::now() - vision_start).count();
 
             const auto text_start = Clock::now();
             mtp_prepared =
-                schedule::prefill_multimodal(schedule_state, processed, visual, plan.prepare_mtp);
+                schedule::prefill_multimodal(schedule_state, prompt, visual, plan.prepare_mtp);
             const std::uint32_t final_length =
                 final_prefill_chunk_length(0, prompt_tokens, prefill_chunk, std::nullopt);
-            copy_tail(io.prefill_hidden.slice(1, static_cast<int>(final_length) - 1, 1));
+            copy_tail(prefill_hidden.slice(1, static_cast<int>(final_length) - 1, 1));
             copy_round_token();
             device.synchronize();
             timings.prefill_seconds =
@@ -485,7 +462,7 @@ runtime::BeginResult Program::Impl::begin(PreparedPromptData&& prompt, RequestPl
                     snapshot_boundary, plan.prepare_mtp);
                 const std::uint32_t final_length = final_prefill_chunk_length(
                     base, prompt_tokens, prefill_chunk, snapshot_boundary);
-                copy_tail(io.prefill_hidden.slice(1, static_cast<int>(final_length) - 1, 1));
+                copy_tail(prefill_hidden.slice(1, static_cast<int>(final_length) - 1, 1));
             } else {
                 if (!tail_hidden_valid) {
                     throw std::logic_error("zero-suffix reuse has no target tail hidden");
@@ -563,7 +540,7 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
         throw std::logic_error("Active frontier is inconsistent");
     }
 
-    if (proposal_ready && (mtp_kv == nullptr || mtp_kv_valid != E)) {
+    if (proposal_ready && (decoder->mtp_cache() == nullptr || mtp_kv_valid != E)) {
         throw std::logic_error("MTP proposal does not match the Active execution frontier");
     }
     const bool use_mtp = mtp_k != 0 && proposal_ready && mtp_kv_valid == E &&
@@ -577,10 +554,11 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
             device,
             model,
             work,
-            *text_kv,
-            mtp_kv.get(),
-            *gdn,
+            decoder->text_kv,
+            decoder->mtp_cache(),
+            decoder->gdn,
             io,
+            prefill_hidden,
             prefill_chunk,
             base_E,
             static_cast<const ops::SamplingConfig*>(sampling_config.data),
@@ -626,7 +604,7 @@ runtime::GeneratedRound Program::Impl::decode_round(runtime::RoundBudget budget)
             proposal_ready    = true;
             tail_hidden_valid = true;
         } else {
-            const bool align_mtp = mtp_kv != nullptr && mtp_kv_valid == base_E;
+            const bool align_mtp = decoder->mtp_cache() != nullptr && mtp_kv_valid == base_E;
             DecodeGraph* graph   = nullptr;
             ops::GqaExecutionEnvelope envelope{base_E + 1, base_E + 1};
             if (use_cuda_graph && diagnostic_text_tap == nullptr) {

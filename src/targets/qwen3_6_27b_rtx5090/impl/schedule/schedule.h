@@ -9,7 +9,7 @@
 #include "targets/qwen3_6_27b_rtx5090/impl/config.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/load/bindings.h"
 #include "core/kv_cache.h"
-#include "targets/qwen3_6_27b_rtx5090/impl/state/state_store.h"
+#include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6_27b_rtx5090/impl/schedule/text_context.h"
 #include "targets/qwen3_6_27b_rtx5090/impl/schedule/vision_context.h"
 
@@ -31,8 +31,9 @@ struct State {
     WorkspaceArena& work;
     KVCache& text_kv;
     KVCache* mtp_kv;
-    GdnState& gdn;
-    StepState& io;
+    qwen3_6::GdnStateStore& gdn;
+    qwen3_6::RoundState& io;
+    Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
@@ -54,13 +55,12 @@ using GraphPrepare = std::function<void()>;
 void configure_text_card(TextContext& card, const State& state);
 
 [[nodiscard]] std::size_t vision_workspace_bytes(const PreparedPromptData& prompt);
-[[nodiscard]] ProcessedInput take_processed_prompt(PreparedPromptData&& prompt);
-[[nodiscard]] Tensor encode_vision(State& state, const ProcessedInput& prompt,
+[[nodiscard]] Tensor encode_vision(State& state, const PreparedPromptData& prompt,
                                    runtime::TransientRegion transient);
 
 [[nodiscard]] bool prefill_text(State& state, std::span<const TokenId> ids,
                                 std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp);
-[[nodiscard]] bool prefill_multimodal(State& state, const ProcessedInput& prompt,
+[[nodiscard]] bool prefill_multimodal(State& state, const PreparedPromptData& prompt,
                                       const Tensor& visual_embeddings, bool prepare_mtp);
 
 void sample_from_hidden(State& state, const Tensor& hidden, std::int32_t absolute_position,

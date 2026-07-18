@@ -12,6 +12,85 @@ from ninfer_eval.config import JobConfig
 
 
 class EvalScopeBackendTest(unittest.TestCase):
+    def test_plans_needle_haystack_generated_matrix(self):
+        backend = EvalScopeBackend()
+        job = JobConfig(
+            "needle",
+            "evalscope",
+            "needle_haystack",
+            "api",
+            1,
+            None,
+            1,
+            {},
+            {
+                "subset_list": ["english", "chinese"],
+                "dataset_args": {
+                    "extra_params": {
+                        "context_lengths_num_intervals": 3,
+                        "document_depth_percent_intervals": 11,
+                    }
+                },
+            },
+        )
+        plan = backend.plan(job, None)
+        self.assertEqual(plan.total, 66)
+        self.assertEqual(plan.subsets, ("english", "chinese"))
+
+    def test_normalizes_all_needle_haystack_grid_cells(self):
+        backend = EvalScopeBackend()
+        job = JobConfig(
+            "needle", "evalscope", "needle_haystack", "api", 1, None, 1, {}, {}
+        )
+        metrics = [
+            {
+                "name": "Context#1000 Depth#0",
+                "num": 2,
+                "score": 0.5,
+                "categories": [
+                    {
+                        "subsets": [
+                            {"name": "english", "num": 1, "score": 0.0},
+                            {"name": "chinese", "num": 1, "score": 1.0},
+                        ]
+                    }
+                ],
+            },
+            {
+                "name": "Context#2000 Depth#0",
+                "num": 2,
+                "score": 1.0,
+                "categories": [
+                    {
+                        "subsets": [
+                            {"name": "english", "num": 1, "score": 1.0},
+                            {"name": "chinese", "num": 1, "score": 1.0},
+                        ]
+                    }
+                ],
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp) / "backends" / "needle"
+            job_dir.mkdir(parents=True)
+            context = RunContext(
+                "run", job, job_dir, None, 1, threading.Event(), False, WorkPlan(4)
+            )
+            raw = {
+                "needle_haystack": {
+                    "score": 0.0,
+                    "num": 2,
+                    "metrics": metrics,
+                }
+            }
+            result = backend.normalize(
+                context, BackendRun(time.monotonic(), time.monotonic(), raw)
+            )
+            self.assertEqual(result.metrics["accuracy"], 0.75)
+            self.assertEqual(result.metrics["english_accuracy"], 0.5)
+            self.assertEqual(result.metrics["chinese_accuracy"], 1.0)
+            self.assertEqual(result.counts.completed, 4)
+
     def test_normalizes_accuracy_without_importing_evalscope(self):
         backend = EvalScopeBackend()
         job = JobConfig("gpqa", "evalscope", "gpqa_diamond", "api", 1, None, 1, {}, {})

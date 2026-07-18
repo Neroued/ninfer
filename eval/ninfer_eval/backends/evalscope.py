@@ -148,6 +148,12 @@ class EvalScopeBackend:
     def plan(self, job: JobConfig, target: ResolvedTarget | None) -> WorkPlan:
         del target
         counts = _DATASET_COUNTS.get(job.dataset)
+        if job.dataset == "needle_haystack":
+            params = job.backend_args.get("dataset_args", {}).get("extra_params", {})
+            per_subset = int(params.get("context_lengths_num_intervals", 10)) * int(
+                params.get("document_depth_percent_intervals", 10)
+            )
+            counts = {subset: per_subset for subset in ("english", "chinese")}
         subsets = tuple(
             job.backend_args.get("subset_list") or (counts.keys() if counts else ())
         )
@@ -355,7 +361,10 @@ class EvalScopeBackend:
         num = int(report.get("num") or 0)
         metrics: dict[str, Any] = {}
         primary = "accuracy"
-        if context.job.dataset == "bfcl_v4":
+        if context.job.dataset == "needle_haystack":
+            score, num, needle_metrics = self._needle_haystack_metrics(report)
+            metrics.update(needle_metrics)
+        elif context.job.dataset == "bfcl_v4":
             metrics.update(self._bfcl_metrics(report))
             full_subsets = set(
                 context.job.backend_args.get("subset_list")
@@ -414,6 +423,45 @@ class EvalScopeBackend:
             duration_seconds=run.duration_seconds,
             artifacts=artifacts,
         )
+
+    @staticmethod
+    def _needle_haystack_metrics(
+        report: dict[str, Any],
+    ) -> tuple[float, int, dict[str, float]]:
+        """Aggregate EvalScope's per-length/depth NIAH metrics.
+
+        EvalScope 1.9 emits one metric for every generated grid point. Its
+        top-level score is not the aggregate, and its top-level sample count may
+        describe only one grid point. Weight the retained cells by their sample
+        counts so the normalized run reflects every generated request.
+        """
+        weighted_score = 0.0
+        total = 0
+        subset_scores: dict[str, float] = {}
+        subset_counts: dict[str, int] = {}
+        for metric in report.get("metrics", []):
+            metric_num = int(metric.get("num") or 0)
+            metric_score = metric.get("score")
+            if metric_num > 0 and isinstance(metric_score, (int, float)):
+                weighted_score += float(metric_score) * metric_num
+                total += metric_num
+            for category in metric.get("categories", []):
+                for subset in category.get("subsets", []):
+                    name = str(subset.get("name", "")).lower()
+                    count = int(subset.get("num") or 0)
+                    value = subset.get("score")
+                    if not name or count <= 0 or not isinstance(value, (int, float)):
+                        continue
+                    subset_scores[name] = subset_scores.get(name, 0.0) + float(value) * count
+                    subset_counts[name] = subset_counts.get(name, 0) + count
+        if total == 0:
+            return 0.0, 0, {}
+        breakdown = {
+            f"{name}_accuracy": subset_scores[name] / subset_counts[name]
+            for name in sorted(subset_scores)
+            if subset_counts[name] > 0
+        }
+        return weighted_score / total, total, breakdown
 
     @staticmethod
     def _prediction_failures(job_dir: Path) -> int:

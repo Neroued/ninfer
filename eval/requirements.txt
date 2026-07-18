@@ -1,4 +1,4 @@
 PyYAML==6.0.3
 rich==15.0.0
-evalscope[bfcl]==1.9.0
+evalscope[bfcl,needle-haystack]==1.9.0
 soundfile==0.14.0

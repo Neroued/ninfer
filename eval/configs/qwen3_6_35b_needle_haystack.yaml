@@ -1,0 +1,140 @@
+schema_version: 1
+
+targets:
+  qwen35_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.6-35b-a3b
+    max_concurrency: 1
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  smoke:
+    jobs:
+      - id: needle_haystack_smoke
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen35_api
+        max_concurrency: 1
+        limit: 1
+        generation: &retrieval_generation
+          temperature: 0
+          max_tokens: 512
+          seed: 42
+          extra_body:
+            enable_thinking: false
+        backend_args:
+          subset_list: [english]
+          judge_strategy: rule
+          dataset_args:
+            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            extra_params:
+              context_lengths_min: 8192
+              context_lengths_max: 8192
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 50
+              document_depth_percent_max: 50
+              document_depth_percent_intervals: 1
+              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              show_score: true
+
+  standard:
+    jobs:
+      - id: needle_haystack_standard
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen35_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            extra_params:
+              context_lengths_min: 1000
+              context_lengths_max: 32000
+              context_lengths_num_intervals: 10
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 10
+              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              show_score: true
+
+  native_long:
+    jobs:
+      - id: needle_haystack_64k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen35_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            extra_params:
+              context_lengths_min: 65536
+              context_lengths_max: 65536
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 11
+              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              show_score: true
+
+      - id: needle_haystack_128k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen35_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            extra_params:
+              context_lengths_min: 131072
+              context_lengths_max: 131072
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 11
+              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              show_score: true
+
+      - id: needle_haystack_260k
+        backend: evalscope
+        dataset: needle_haystack
+        target: qwen35_api
+        max_concurrency: 1
+        generation: *retrieval_generation
+        backend_args:
+          subset_list: [english, chinese]
+          judge_strategy: rule
+          dataset_args:
+            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            extra_params:
+              context_lengths_min: 260000
+              context_lengths_max: 260000
+              context_lengths_num_intervals: 1
+              document_depth_percent_min: 0
+              document_depth_percent_max: 100
+              document_depth_percent_intervals: 11
+              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              show_score: true
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 30
+  samples:
+    retention: all

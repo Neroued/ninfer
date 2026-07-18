@@ -4,10 +4,13 @@ These rules apply to the whole repository.
 
 ## Governing objective
 
-Complete the user's explicit deliverable within the applicable product contract. Use the smallest
-coherent scope that fully satisfies the requested outcome, preserves supported behavior, and makes
-the result credible. “Smallest” means no missing necessary work and no unrelated work; it does not
-mean the fewest changed lines or a partial solution.
+Complete the user's explicit deliverable within the applicable product contract. For the declared
+product target and requested outcome, choose the technically strongest coherent solution. Optimize
+for architectural integrity, clear ownership, functional and numerical correctness, and maximum
+relevant performance. Never optimize a solution for a small diff, few changed files, low
+implementation effort, short-term simplicity, backward compatibility, or preservation of a
+superseded internal path. Make every affected implementation, test, tool, and active authority
+consistent with the selected design.
 
 Correctness, performance, tests, profiling, documentation, provenance, cleanup, and tooling are
 means to the requested outcome, not independent objectives. Do not let supporting work replace,
@@ -27,8 +30,8 @@ When choosing between possible work, use this order:
 1. respect applicable product and external-contract constraints;
 2. satisfy the user's explicit deliverable and acceptance criteria;
 3. preserve functional and numerical correctness of supported behavior;
-4. satisfy properties explicitly required by the task, including performance where applicable;
-5. preserve clear ownership and low maintenance cost;
+4. choose the strongest architecture and clearest ownership for the declared product model;
+5. maximize performance at the scope relevant to the task;
 6. gather only the evidence and provenance needed to support the result.
 
 The product and architecture described here are the current contract for ordinary work. A task may
@@ -48,11 +51,12 @@ Work is in scope only when it:
 - resolves uncertainty that could materially change the result; or
 - checks a realistic regression introduced by the change.
 
-Do not expand a task into a broader redesign, audit, cleanup, hardening effort, compatibility
-project, benchmark campaign, or documentation project without explicit user direction. General
-engineering preferences, possible future scenarios, and concerns outside the declared product
-model do not create requirements by themselves. Discuss a newly discovered cross-cutting
-constraint before adding it.
+An architectural redesign, cross-cutting refactor, or replacement of an existing path is in scope
+when it is necessary to deliver the strongest solution for the requested outcome. Do not use scope
+control as a reason to ship an inferior patch. Do not expand into unrelated audits, cleanup,
+hardening, compatibility work, benchmark campaigns, or documentation projects. General engineering
+preferences, possible future scenarios, and concerns outside the declared product model do not
+create requirements by themselves.
 
 Handle incidental findings proportionally:
 
@@ -62,9 +66,10 @@ Handle incidental findings proportionally:
 
 For analysis, review, or design work, the requested explanation or design artifact is the
 deliverable; experiments and code inspection serve only to resolve material questions. For
-implementation work, produce the smallest coherent implementation and validate its supported
-observable behavior. For diagnosis, establish the cause and supporting evidence without turning
-the task into an unrequested fix or redesign.
+implementation work, implement the selected design completely across its affected boundaries,
+remove the superseded project-owned path, and validate its supported observable behavior. For
+diagnosis, establish the cause and supporting evidence without turning the task into an unrequested
+fix or redesign.
 
 ## Evidence, provenance, and completion
 
@@ -120,9 +125,12 @@ exact-target tag or cross-target mismatch machinery.
 
 ## Engineering priorities
 
-Prioritize functional correctness, requested inference performance, clear ownership, direct code,
-and low maintenance cost. Generality, defensive hardening, formal completeness, broad compatibility,
-and test coverage are not goals by themselves.
+Prioritize functional correctness, architectural quality, clear ownership, direct code, and maximum
+requested inference performance. Change size, implementation difficulty, short-term simplicity,
+and backward compatibility for project-owned contracts are not quality criteria. Low maintenance
+cost may distinguish otherwise equivalent designs, but it never justifies worse architecture or
+performance. Generality, defensive hardening, formal completeness, broad compatibility, and test
+coverage are not goals by themselves.
 
 Prefer explicit target-specific implementation over framework-like abstraction. Do not add generic
 model graphs, family base classes, plugin discovery, string-driven execution, hidden device
@@ -131,7 +139,7 @@ explicitly changed product contract requires them.
 
 ## Sources of truth
 
-Read only the smallest relevant current authority needed for the task. The following list is a
+Read only current authorities relevant to a live decision in the task. The following list is a
 routing map, not a mandatory reading list:
 
 - `README.md` and executable `--help`: delivered capabilities and exact commands;
@@ -256,7 +264,7 @@ small real integration route, GPU lifetime, or a reproduced bug. Do not add test
 private file/class shape, getters/constructors, deleted compatibility, source-string scans,
 hypothetical failures, or test ceremony.
 
-Run the smallest set of checks sufficient to support the changed behavior and its material claims.
+Run a focused set of checks sufficient to support the changed behavior and its material claims.
 The following are typical choices, not a cumulative checklist:
 
 | Change | Relevant evidence |

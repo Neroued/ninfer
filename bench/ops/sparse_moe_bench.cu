@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
+#include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include <cuda_bf16.h>
@@ -628,7 +629,7 @@ Options parse_options(int argc, char** argv) {
             options.csv_out = next("--csv-out value");
         } else if (argument == "--help" || argument == "-h") {
             std::printf("Usage: %s [--matrix] [--scope full|d1|d2|d3|d4] "
-                        "[--candidate NAME] [--codec q4-q5|q4-q6|w8-w8] [--tokens 1..32] "
+                        "[--candidate NAME] [--codec q4-q5|q4-q6|w8-w8] [--tokens 1..16384] "
                         "[--distribution trace-like|independent|same] [--seed N] [--warmup N] "
                         "[--repeat N] [--csv-out PATH]\n\n"
                         "Candidates: production, small-t-persistent, decode-loop, payload-control, "
@@ -644,10 +645,17 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("warmup must be nonnegative and repeat positive");
     }
-    if (options.tokens < 1 || options.tokens > ops::detail::kSparseMoeSmallTMax) {
-        throw std::invalid_argument("--tokens must be in [1,32]");
+    if (options.tokens < 1 || options.tokens > 16384) {
+        throw std::invalid_argument("--tokens must be in [1,16384]");
     }
     return options;
+}
+
+std::size_t private_workspace_bytes(int tokens) {
+    if (tokens >= ops::detail::kSparseMoeSmallTMin && tokens <= ops::detail::kSparseMoeSmallTMax) {
+        return ops::detail::sparse_moe_small_t_workspace_bytes(tokens);
+    }
+    return ops::detail::sparse_moe_decode_workspace_bytes();
 }
 
 class BenchmarkState {
@@ -664,29 +672,42 @@ public:
           routed_down_(down_codec(profile), kExperts * kHidden, kIntermediate),
           shared_gate_(QType::W8G32_F16S, 1024, kHidden),
           shared_down_(QType::W8G32_F16S, kHidden, kIntermediate), flush_(kFlushBytes),
-          private_arena_(tokens == 1 ? ops::detail::sparse_moe_decode_workspace_bytes()
-                                     : ops::detail::sparse_moe_small_t_workspace_bytes(tokens)),
+          private_arena_(private_workspace_bytes(tokens)),
           decode_arena_(ops::detail::sparse_moe_decode_workspace_bytes()),
           public_workspace_(ops::sparse_moe_workspace_bytes(tokens)) {
-        // Keep T<=8 byte-for-byte comparable with the retained benchmark and
-        // reserve one additional marker coordinate per extended-range token.
-        const int route_markers = tokens <= 8 ? 8 : tokens <= 16 ? 16 : 32;
         std::vector<std::uint16_t> input(static_cast<std::size_t>(tokens) * kHidden);
         std::vector<std::uint16_t> residual(static_cast<std::size_t>(tokens) * kHidden);
+        const bool basis_router = tokens > ops::detail::kSparseMoeSmallTMax;
+        const int route_markers = tokens <= 8 ? 8 : tokens <= 16 ? 16 : 32;
         for (int token = 0; token < tokens; ++token) {
             for (int index = 0; index < kHidden; ++index) {
-                input[static_cast<std::size_t>(token) * kHidden + index] = bench::f32_to_bf16(
-                    0.02f + static_cast<float>((index + 7 * token) % 31) * 0.001f);
+                const int centered = (index * 17 + token * 29 + (index ^ token)) % 81 - 40;
+                input[static_cast<std::size_t>(token) * kHidden + index] =
+                    bench::f32_to_bf16(static_cast<float>(centered) * 0.001f);
                 residual[static_cast<std::size_t>(token) * kHidden + index] = bench::f32_to_bf16(
                     0.125f + static_cast<float>((index + 11 * token) % 17) * 0.002f);
             }
-            for (int marker = 0; marker < route_markers; ++marker) {
-                input[static_cast<std::size_t>(token) * kHidden + kHidden - route_markers +
-                      marker] = bench::f32_to_bf16(0.0f);
+            if (basis_router) {
+                for (int expert = 0; expert < kExperts; ++expert) {
+                    input[static_cast<std::size_t>(token) * kHidden + expert] =
+                        bench::f32_to_bf16(-0.25f);
+                }
+                for (int rank = 0; rank < kTopK; ++rank) {
+                    const int expert = route_pattern_.selected[token][rank];
+                    input[static_cast<std::size_t>(token) * kHidden + expert] =
+                        bench::f32_to_bf16(0.25f - static_cast<float>(rank) / 64.0f);
+                }
+                input[static_cast<std::size_t>(token) * kHidden + kExperts] =
+                    bench::f32_to_bf16(0.0625f);
+            } else {
+                for (int marker = 0; marker < route_markers; ++marker) {
+                    input[static_cast<std::size_t>(token) * kHidden + kHidden - route_markers +
+                          marker] = bench::f32_to_bf16(0.0f);
+                }
+                input[static_cast<std::size_t>(token) * kHidden] = bench::f32_to_bf16(1.0f);
+                input[static_cast<std::size_t>(token) * kHidden + kHidden - route_markers + token] =
+                    bench::f32_to_bf16(1.0f);
             }
-            input[static_cast<std::size_t>(token) * kHidden] = bench::f32_to_bf16(1.0f);
-            input[static_cast<std::size_t>(token) * kHidden + kHidden - route_markers + token] =
-                bench::f32_to_bf16(1.0f);
         }
         CUDA_CHECK(cudaMemcpy(input_.data, input.data(), input_.bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(residual_seed_.data, residual.data(), residual_seed_.bytes,
@@ -694,18 +715,25 @@ public:
         CUDA_CHECK(cudaMemcpy(destination_.data, residual_seed_.data, destination_.bytes,
                               cudaMemcpyDeviceToDevice));
         std::vector<float> router_values(static_cast<std::size_t>(kRouterRows) * kHidden, 0.0f);
-        for (int expert = 0; expert < kExperts; ++expert) {
-            router_values[static_cast<std::size_t>(expert) * kHidden] = -8.0f;
-        }
-        for (int token = 0; token < tokens; ++token) {
-            for (int rank = 0; rank < kTopK; ++rank) {
-                const int expert = route_pattern_.selected[token][rank];
-                const int marker = kHidden - route_markers + token;
-                router_values[static_cast<std::size_t>(expert) * kHidden + marker] =
-                    12.0f - 0.25f * rank;
+        if (basis_router) {
+            for (int expert = 0; expert < kExperts; ++expert) {
+                router_values[static_cast<std::size_t>(expert) * kHidden + expert] = 16.0f;
             }
+            router_values[static_cast<std::size_t>(kExperts) * kHidden + kExperts] = 4.0f;
+        } else {
+            for (int expert = 0; expert < kExperts; ++expert) {
+                router_values[static_cast<std::size_t>(expert) * kHidden] = -8.0f;
+            }
+            for (int token = 0; token < tokens; ++token) {
+                for (int rank = 0; rank < kTopK; ++rank) {
+                    const int expert = route_pattern_.selected[token][rank];
+                    const int marker = kHidden - route_markers + token;
+                    router_values[static_cast<std::size_t>(expert) * kHidden + marker] =
+                        12.0f - 0.25f * rank;
+                }
+            }
+            router_values[static_cast<std::size_t>(kExperts) * kHidden] = 0.25f;
         }
-        router_values[static_cast<std::size_t>(kExperts) * kHidden] = 0.25f;
         std::vector<std::uint16_t> router_bits(router_values.size());
         for (std::size_t index = 0; index < router_values.size(); ++index) {
             router_bits[index] = bench::f32_to_bf16(router_values[index]);
@@ -723,7 +751,7 @@ public:
         };
         x_                  = Tensor(input_.data, DType::BF16, {kHidden, tokens});
         destination_tensor_ = Tensor(destination_.data, DType::BF16, {kHidden, tokens});
-        if (tokens == 1) {
+        if (tokens == 1 || tokens > ops::detail::kSparseMoeSmallTMax) {
             workspace_ = ops::detail::allocate_sparse_moe_decode_workspace(private_arena_);
         } else {
             small_t_workspace_ =
@@ -998,6 +1026,22 @@ Candidate make_candidate(CodecProfile profile, Scope scope, std::string_view nam
     result.scope = scope;
     result.plan  = base_plan(profile);
 
+    if (tokens > ops::detail::kSparseMoeSmallTMax) {
+        if (scope != Scope::Full) {
+            throw std::invalid_argument("prefill benchmark currently measures the whole op");
+        }
+        if (name == "decode-loop") {
+            result.name        = "decode-loop";
+            result.decode_loop = true;
+        } else if (name == "production") {
+            result.name              = "production";
+            result.public_production = true;
+        } else {
+            throw std::invalid_argument("unknown prefill candidate");
+        }
+        return result;
+    }
+
     if (tokens > 1) {
         if (name == "decode-loop" && scope == Scope::Full) {
             result.name                 = "decode-loop";
@@ -1245,6 +1289,7 @@ Payload payload_for(CodecProfile profile, Scope scope, bool payload_control, int
 
 std::vector<std::pair<Scope, const char*>> matrix_candidates(CodecProfile profile, int tokens) {
     std::vector<std::pair<Scope, const char*>> result;
+    if (tokens > ops::detail::kSparseMoeSmallTMax) { return {{Scope::Full, "production"}}; }
     if (tokens > 1) {
         return {{Scope::D1, "small-t-persistent"},   {Scope::D2, "small-t-persistent"},
                 {Scope::D3, "small-t-persistent"},   {Scope::D4, "small-t-persistent"},
@@ -1269,14 +1314,14 @@ std::vector<std::pair<Scope, const char*>> matrix_candidates(CodecProfile profil
 }
 
 void print_result(const Result& result) {
-    const std::uint64_t bytes = result.payload.code + result.payload.high + result.payload.scale;
-    const double gbs          = bytes / (result.cold.median_us * 1.0e3);
+    const double useful_tflops =
+        2.0 * static_cast<double>(result.payload.useful_fma) / (result.warm.median_us * 1.0e6);
     std::printf("%-6s T=%d %-11s U=%-2d ov=%4.1f %-5s %-16s grid=%-4d block=%-3d "
-                "cold=%8.3f us warm=%8.3f us %8.1f GB/s",
+                "cold=%8.3f us warm=%8.3f us useful=%6.1f TFLOP/s",
                 codec_name(result.codec), result.tokens, distribution_name(result.distribution),
                 result.unique_experts, result.adjacent_overlap, scope_name(result.candidate.scope),
                 result.candidate.name, result.candidate.grid, result.candidate.block,
-                result.cold.median_us, result.warm.median_us, gbs);
+                result.cold.median_us, result.warm.median_us, useful_tflops);
     if (!std::isnan(result.matched_cold_us)) {
         std::printf(" control=%8.3f us", result.matched_cold_us);
     }
@@ -1361,9 +1406,10 @@ int main(int argc, char** argv) {
             for (const auto& [scope, name] : candidates) {
                 Candidate candidate         = make_candidate(profile, scope, name, options.tokens);
                 const RoutePattern& pattern = state.route_pattern();
-                const std::size_t workspace_bytes = candidate.small_t
-                                                        ? candidate.small_t_plan.workspace_bytes
-                                                        : candidate.plan.workspace_bytes;
+                const std::size_t workspace_bytes =
+                    candidate.public_production ? ops::sparse_moe_workspace_bytes(options.tokens)
+                    : candidate.small_t         ? candidate.small_t_plan.workspace_bytes
+                                                : candidate.plan.workspace_bytes;
                 Result result{profile,
                               options.tokens,
                               options.distribution,

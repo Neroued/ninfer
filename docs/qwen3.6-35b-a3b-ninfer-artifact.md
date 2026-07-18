@@ -1005,22 +1005,27 @@ D1+D2 draining fusion was rejected because caller-owned transient workspace has 
 counter state and W8+W8 had no complete-route gain. Per-expert launches, all-expert scans, and
 materialized `[8,gate/up,512]` or `[8,2048]` intermediates remain nonconforming.
 
-The closed Op now has three private dispatch regimes. `T=1` retains the four-launch decode route.
-For `T=2..8`, exact-T CUDA Core/SIMT templates share router work across all columns: four K
-partitions per row produce FP32 partial scores, and one block with one warp per token performs
-independent stable top-8 selection and scaling. The route then submits the qualified nine-path D3
-and D4 kernels once per token, using disjoint FP32 `[9,512]` activation regions. It therefore uses
-`2+2T` launches rather than `4T`, without tensor cores, grouped GEMM, a physical expert-job list,
-or a new numerical boundary. Profiled expert-grouped and token-batched alternatives lost on
-trace-like Small-T routes and are not retained as runtime branches.
+The closed Op has three private dispatch regimes. `T=1` retains the four-launch decode route. The
+Small-T CUDA Core/SIMT implementation admits `T=2..32`: exact-T router templates share each weight
+row across all columns, one warp per token performs independent stable top-8 selection, and one
+persistent D3 plus one persistent D4 launch advances through the token columns while retaining
+disjoint FP32 `[9,512]` activation regions. This is a four-launch route without tensor cores or a
+physical expert-job list.
 
-For `T>8`, functional completeness still comes from slicing contiguous input/destination tensors
-and submitting the complete single-column route on one stream. The fallback reuses one column's
-workspace and does not introduce another weight layout, numerical path, or observable
-intermediate. The target's prefill chunk size is a schedule choice rather than an Op limit, but
-this larger-T fallback has no performance qualification. The capacity query returns enough space
-for the maximum T8 exact route for any larger positive requested maximum, so one caller-owned
-graph-stable allocation covers every dispatch regime.
+The prefill implementation first projects all router columns with BF16 Tensor Core MMA, selects and
+counts assignments on device, prefix-sums per-expert counts, gathers input columns into expert-major
+order, and builds flattened expert/column jobs. Routed Q4 gate/up and Q5/Q6 down use persistent BF16
+MMA contractions with FP32 accumulation; W8 routed and shared contractions use their exact fixed
+shapes. A route-weighted inverse reduction and the shared-down epilogue perform the sole BF16
+residual write. No host synchronization, selected-weight repack, capacity factor, or token drop is
+introduced.
+
+Production selects the first trace-like RTX 5090 crossover for each routed codec: prefill begins at
+`T=12` for Q4+Q5, `T=11` for Q4+Q6, and `T=7` for W8+W8; smaller multi-column shapes use Small-T.
+The prefill route changes from 32-column/four-warp jobs to 64-column/eight-warp jobs at `T=768` and
+slices extents larger than 4096 without changing semantics. The workspace query reserves the
+largest required decode, Small-T, or at-most-4096-column prefill lifetime, so one caller-owned
+graph-stable allocation covers every positive requested maximum.
 
 The logical sparse-MoE formula is:
 
@@ -1078,10 +1083,10 @@ coalesced 16-byte plane reads; for each K=1024 slab the encoded streams are:
 | Q6 | 512 B | 256 B | 32 B |
 | W8 | 1024 B | 0 | 64 B |
 
-Large-T candidates may dequantize BK=64 tiles to BF16 shared memory and feed Tensor Core MMA. These
+The prefill route dequantizes BK=64 tiles to BF16 shared memory and feeds Tensor Core MMA. These
 accesses, the half-split gate/up MMA mapping, and the K=512 special case are why this contract keeps
-`row-split-k128-v1` instead of defining a MoE-only codec or runtime repack. That candidate profile
-includes implementation-private operand staging such as:
+`row-split-k128-v1` instead of defining a MoE-only codec or runtime repack. Its
+implementation-private operand staging includes:
 
 ```text
 mma_weight_stage = BF16(FP32(code) * FP32(binary16_scale))
@@ -1104,17 +1109,14 @@ workspace composition.
 ### 15.3 Prefill and MTP
 
 MTP, ordinary generation, and prefill call the same `SparseMoe` API. Their different schedule
-shapes do not select different Op semantics. Ordinary generation selects decode, verification and
-MTP rebuild windows through T8 select the exact-T Small-T templates, and larger prefill shapes
-remain on the functionally complete serial fallback. Every route consumes the same persistent
-weights directly.
+shapes do not select different Op semantics. Ordinary generation selects decode. Main Q4+Q5/Q6
+verification and rebuild windows use Small-T below their codec crossover, while MTP W8 uses
+Small-T through T6 and prefill from T7. Text prefill uses the grouped Tensor Core route. Every path
+consumes the same persistent weights directly.
 
-Physical assignment grouping is a possible larger-T implementation, not a semantic or artifact
-requirement. Such a candidate may sort assignments on device, use device-side job descriptors,
-apply the half-split gate/up mapping, and inverse-scatter to token order. It is admissible only if
-complete-Op and end-to-end evidence beats the current route; one host launch per active expert,
-selected-weight repacking, capacity factors, and token dropping remain disallowed. The accepted
-Small-T route needs none of those mechanisms.
+Assignment grouping, job construction, gather, and inverse reduction are private device stages of
+the prefill implementation, not semantic or artifact requirements. One host launch per active
+expert, selected-weight repacking, capacity factors, and token dropping remain disallowed.
 
 ### 15.4 Vision workspace lifetime
 
@@ -1232,6 +1234,14 @@ The registered artifact route is supported by focused evidence tied to this cont
   and inline Vision; and
 - construction at native `max_context=262144` with INT8-G64 KV and MTP window five verifies the
   admitted sequence/workspace layout and rejects an over-capacity request before Program mutation.
+
+`SparseMoe` is checked directly against its complete independent oracle across the decode,
+codec-specific Small-T/prefill transitions, all three routed codec profiles, the 768-column wide
+plan, and 4097-column sliced Graph replay. On the RTX 5090 trace-like workload, the complete
+Q4+Q5 Op at the primary `T=1024` point takes about 813 microseconds and sustains 72.6 useful
+TFLOP/s; larger qualified Q4+Q5 points reach about 105 useful TFLOP/s at T=2048 and 91.9 at T=4096.
+These are complete-Op measurements, not a claim that the logical sparse work equals dense executed
+FLOPs.
 
 Artifact-native Python execution remains a diagnostic implementation. It does not define an exact
 generated-token golden for the C++ runtime, and comparisons between different quantization,

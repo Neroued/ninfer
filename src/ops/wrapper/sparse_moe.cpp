@@ -1,6 +1,7 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
+#include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include <algorithm>
@@ -166,6 +167,9 @@ std::size_t sparse_moe_workspace_bytes(std::int32_t max_tokens) {
         const std::int32_t small_t_tokens = std::min(max_tokens, detail::kSparseMoeSmallTMax);
         required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(small_t_tokens));
     }
+    if (max_tokens >= detail::kSparseMoePrefillWorkspaceMin) {
+        required = std::max(required, detail::sparse_moe_prefill_workspace_bytes(max_tokens));
+    }
     return required;
 }
 
@@ -186,13 +190,22 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     validate_weights(weights, ranges);
 
     const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
-    const std::size_t required =
-        use_small_t ? detail::resolve_sparse_moe_small_t_plan(tokens, weights.routed_gate_up.qtype,
-                                                              weights.routed_down.qtype)
-                          .workspace_bytes
-                    : detail::resolve_sparse_moe_decode_plan(weights.routed_gate_up.qtype,
-                                                             weights.routed_down.qtype)
-                          .workspace_bytes;
+    const bool use_prefill = detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
+                                                             weights.routed_down.qtype);
+    std::size_t required   = 0;
+    if (use_prefill) {
+        required = detail::resolve_sparse_moe_prefill_plan(tokens, weights.routed_gate_up.qtype,
+                                                           weights.routed_down.qtype)
+                       .workspace_bytes;
+    } else if (use_small_t) {
+        required = detail::resolve_sparse_moe_small_t_plan(tokens, weights.routed_gate_up.qtype,
+                                                           weights.routed_down.qtype)
+                       .workspace_bytes;
+    } else {
+        required = detail::resolve_sparse_moe_decode_plan(weights.routed_gate_up.qtype,
+                                                          weights.routed_down.qtype)
+                       .workspace_bytes;
+    }
     if (workspace.base() == nullptr || workspace.capacity() < required ||
         workspace.used() > workspace.capacity() - required) {
         throw std::invalid_argument("sparse_moe: insufficient workspace capacity");
@@ -201,6 +214,14 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     require_disjoint(ranges);
 
     auto scope = workspace.scope();
+    if (use_prefill) {
+        const detail::SparseMoePrefillPlan plan = detail::resolve_sparse_moe_prefill_plan(
+            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+        const detail::SparseMoePrefillWorkspace views =
+            detail::allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens);
+        detail::sparse_moe_prefill_launch(x, weights, destination, plan, views, stream);
+        return;
+    }
     if (use_small_t) {
         const detail::SparseMoeSmallTPlan plan = detail::resolve_sparse_moe_small_t_plan(
             tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);

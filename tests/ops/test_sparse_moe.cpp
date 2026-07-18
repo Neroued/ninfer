@@ -33,6 +33,7 @@ constexpr std::int32_t kRoutedGateRows = kExperts * kExpertGateRows;
 constexpr std::int32_t kRoutedDownRows = kExperts * kHidden;
 constexpr std::int32_t kSharedGateRows = 2 * kIntermediate;
 constexpr std::int32_t kSmallTMax      = 32;
+constexpr std::int32_t kQ4Q5PrefillMin = 12;
 
 struct QuantGeometry {
     int group;
@@ -510,11 +511,12 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
         failures += expect_invalid("sparse_moe zero max_tokens",
                                    [] { (void)ops::sparse_moe_workspace_bytes(0); });
         const std::size_t decode_bytes  = ops::sparse_moe_workspace_bytes(1);
-        const std::size_t small_t_bytes = ops::sparse_moe_workspace_bytes(kSmallTMax);
-        if (small_t_bytes <= decode_bytes ||
+        const std::size_t narrow_bytes  = ops::sparse_moe_workspace_bytes(kSmallTMax);
+        const std::size_t prefill_bytes = ops::sparse_moe_workspace_bytes(4096);
+        if (narrow_bytes <= decode_bytes || prefill_bytes <= narrow_bytes ||
             ops::sparse_moe_workspace_bytes(std::numeric_limits<std::int32_t>::max()) !=
-                small_t_bytes) {
-            std::cerr << "sparse_moe: workspace range maximum does not cover Small-T\n";
+                prefill_bytes) {
+            std::cerr << "sparse_moe: workspace range maximum does not cover prefill\n";
             ++failures;
         }
         WorkspaceArena too_small(workspace_bytes - 1);
@@ -579,7 +581,9 @@ int main() {
     // orthogonal test dimensions.
     failures += run_case(profiles[0], boundary_tie, "sparse_moe boundary tie", 1, 1, false, false);
     for (int tokens = 2; tokens <= kSmallTMax; ++tokens) {
-        const std::string name = "sparse_moe small-T" + std::to_string(tokens);
+        const std::string name =
+            std::string(tokens < kQ4Q5PrefillMin ? "sparse_moe small-T" : "sparse_moe prefill T") +
+            std::to_string(tokens);
         failures += run_case(profiles[0], ordinary_route, name.c_str(), tokens, tokens,
                              tokens == kSmallTMax, false);
     }
@@ -587,10 +591,29 @@ int main() {
         run_case(profiles[1], ordinary_route, "sparse_moe q4+q6 small-T", 6, 6, false, false);
     failures +=
         run_case(profiles[2], ordinary_route, "sparse_moe w8+w8 small-T", 6, 6, false, false);
+    failures += run_case(profiles[1], ordinary_route, "sparse_moe q4+q6 transition T10", 10, 10,
+                         false, false);
+    failures += run_case(profiles[1], ordinary_route, "sparse_moe q4+q6 transition T11", 11, 11,
+                         false, false);
+    failures +=
+        run_case(profiles[2], ordinary_route, "sparse_moe w8+w8 transition T7", 7, 7, false, false);
     failures += run_case(profiles[0], ordinary_route, "sparse_moe correlated routes", 6, 6, true,
                          false, correlated_routes);
-    failures += run_case(profiles[0], ordinary_route, "sparse_moe serial T33", 33, kSmallTMax,
-                         false, false);
+    failures += run_case(profiles[0], ordinary_route, "sparse_moe prefill q4+q5 T33", 33,
+                         kSmallTMax, false, false);
+    failures += run_case(profiles[1], ordinary_route, "sparse_moe prefill q4+q6 T33", 33,
+                         kSmallTMax, false, false);
+    failures += run_case(profiles[2], ordinary_route, "sparse_moe prefill w8+w8 T33", 33,
+                         kSmallTMax, false, false);
+    for (std::size_t index = 0; index < profiles.size(); ++index) {
+        const std::string name = std::string("sparse_moe prefill wide ") + profiles[index].name;
+        failures +=
+            run_case(profiles[index], correlated_routes.front(), name.c_str(), 768,
+                     static_cast<int>(correlated_routes.size()), false, false, correlated_routes);
+    }
+    failures +=
+        run_case(profiles[0], correlated_routes.front(), "sparse_moe prefill sliced q4+q5 T4097",
+                 4097, static_cast<int>(correlated_routes.size()), true, false, correlated_routes);
     std::cout << (failures ? "FAIL" : "OK") << " sparse_moe correctness\n";
     return failures ? 1 : 0;
 }

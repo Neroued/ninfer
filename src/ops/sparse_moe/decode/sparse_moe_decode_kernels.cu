@@ -8,6 +8,7 @@
 #include "ops/linear/q5/q5_rowsplit_storage.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
+#include "ops/sparse_moe/sparse_moe_route.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -24,6 +25,8 @@ constexpr int kExperts      = 256;
 constexpr int kRouterRows   = kExperts + 1;
 constexpr int kTopK         = 8;
 constexpr int kIntermediate = 512;
+
+using RankedValue = SparseMoeRankedValue;
 
 __device__ __forceinline__ float dot_bf16_eight(const __nv_bfloat16* a, const __nv_bfloat16* b) {
     const uint4 av  = load_vec<uint4>(a);
@@ -82,78 +85,11 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
-struct RankedValue {
-    float value;
-    int id;
-    int origin;
-};
-
-__device__ __forceinline__ bool ranked_better(const RankedValue& a, const RankedValue& b) {
-    return a.value > b.value || (a.value == b.value && a.id < b.id);
-}
-
-__device__ __forceinline__ RankedValue warp_best(RankedValue value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        RankedValue other;
-        other.value  = __shfl_down_sync(kFullWarpMask, value.value, offset);
-        other.id     = __shfl_down_sync(kFullWarpMask, value.id, offset);
-        other.origin = __shfl_down_sync(kFullWarpMask, value.origin, offset);
-        if (ranked_better(other, value)) { value = other; }
-    }
-    value.value  = __shfl_sync(kFullWarpMask, value.value, 0);
-    value.id     = __shfl_sync(kFullWarpMask, value.id, 0);
-    value.origin = __shfl_sync(kFullWarpMask, value.origin, 0);
-    return value;
-}
-
-__device__ __forceinline__ void select_top8_warp(const float* scores, int* ids, float* alpha,
-                                                 float* shared_scale, float* selected_logits) {
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    RankedValue local[8];
-#pragma unroll
-    for (int item = 0; item < 8; ++item) {
-        const int id = lane + item * 32;
-        local[item]  = {scores[id], id, lane};
-    }
-#pragma unroll
-    for (int i = 1; i < 8; ++i) {
-        const RankedValue value = local[i];
-        int position            = i;
-        while (position > 0 && ranked_better(value, local[position - 1])) {
-            local[position] = local[position - 1];
-            --position;
-        }
-        local[position] = value;
-    }
-
-    int cursor = 0;
-#pragma unroll
-    for (int rank = 0; rank < kTopK; ++rank) {
-        RankedValue candidate =
-            cursor < 8 ? local[cursor] : RankedValue{-CUDART_INF_F, 0x7fffffff, lane};
-        const RankedValue winner = warp_best(candidate);
-        if (lane == 0) {
-            ids[rank]             = winner.id;
-            selected_logits[rank] = winner.value;
-        }
-        if (lane == winner.origin) { ++cursor; }
-        __syncwarp();
-    }
-
-    float exponential = 0.0f;
-    if (lane < kTopK) { exponential = expf(selected_logits[lane] - selected_logits[0]); }
-    float denominator = warp_reduce_sum(exponential);
-    denominator       = __shfl_sync(kFullWarpMask, denominator, 0);
-    if (lane < kTopK) { alpha[lane] = exponential / denominator; }
-    if (lane == 0) { *shared_scale = sigmoid(scores[kExperts]); }
-}
-
 __global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int* __restrict__ ids,
                                           float* __restrict__ alpha,
                                           float* __restrict__ shared_scale) {
     __shared__ float selected_logits[kTopK];
-    select_top8_warp(scores, ids, alpha, shared_scale, selected_logits);
+    sparse_moe_select_top8_warp(scores, ids, alpha, shared_scale, selected_logits);
 }
 
 __global__ void sparse_moe_d2_serial_control_kernel(const float* __restrict__ scores,
@@ -171,10 +107,11 @@ __global__ void sparse_moe_d2_serial_control_kernel(const float* __restrict__ sc
     for (int id = 0; id < kExperts; ++id) {
         const RankedValue value{scores[id], id, 0};
         const RankedValue tail{selected[kTopK - 1], selected_ids[kTopK - 1], 0};
-        if (!ranked_better(value, tail)) { continue; }
+        if (!sparse_moe_ranked_better(value, tail)) { continue; }
         int position = kTopK - 1;
-        while (position > 0 && ranked_better(value, RankedValue{selected[position - 1],
-                                                                selected_ids[position - 1], 0})) {
+        while (position > 0 &&
+               sparse_moe_ranked_better(
+                   value, RankedValue{selected[position - 1], selected_ids[position - 1], 0})) {
             selected[position]     = selected[position - 1];
             selected_ids[position] = selected_ids[position - 1];
             --position;

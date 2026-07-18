@@ -21,6 +21,9 @@ Use the active documentation index at [`../README.md`](../README.md) for current
   oracle, CUDA Graph test, and RTX 5090 stage qualification.
 - [`optimization-era/bench/qwen3.6-35b-sparse-moe-decode-roofline.md`](optimization-era/bench/qwen3.6-35b-sparse-moe-decode-roofline.md)
   — retained candidate, payload-control, full-route, and Nsight Compute evidence for that domain.
+- [`optimization-era/bench/qwen3.6-35b-sparse-moe-small-t.md`](optimization-era/bench/qwen3.6-35b-sparse-moe-small-t.md)
+  — retained realistic-route timing, candidate rejection, and Nsight Compute evidence for the
+  exact-T `T=2..8` CUDA Core/SIMT route.
 - [`optimization-era/bench/qwen3.6-35b-w8-input-projection.md`](optimization-era/bench/qwen3.6-35b-w8-input-projection.md)
   — retained complete-Op and Nsight Compute evidence for the 35B W8 Attention and GDN
   multi-output projections.

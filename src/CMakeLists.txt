@@ -117,6 +117,8 @@ add_library(ninfer_ops STATIC
   ops/linear_pair/w8/w8_pair_plan.cpp
   ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
   ops/sparse_moe/decode/sparse_moe_decode_plan.cpp
+  ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
+  ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ops/linear/linear.cpp
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp

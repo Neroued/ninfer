@@ -158,6 +158,10 @@ std::vector<float> make_input(int variant) {
     for (int k = 1; k < kHidden; ++k) {
         input[k] = 0.025f + static_cast<float>((k * 7 + variant * 11) % 19) * 0.002f;
     }
+    // Reserve eight one-hot marker coordinates so a shared router matrix can produce different
+    // selected experts for adjacent Small-T columns without changing the represented BF16 domain.
+    for (int marker = 0; marker < 8; ++marker) { input[kHidden - 8 + marker] = 0.0f; }
+    input[kHidden - 8 + variant] = 1.0f;
     round_to_bf16(input);
     return input;
 }
@@ -202,19 +206,44 @@ std::vector<float> make_down(std::int32_t rows, std::int32_t columns, std::uint3
     return source;
 }
 
-std::vector<float> make_router(const std::array<int, kTopK>& selected, int tie_excluded) {
-    std::vector<float> router(static_cast<std::size_t>(kExperts + 1) * kHidden, 0.0f);
+std::vector<float> make_router_pattern(const std::vector<std::array<int, kTopK>>& selected_columns,
+                                       const std::vector<int>& tie_excluded_columns) {
+    if (selected_columns.empty() || selected_columns.size() > 8 ||
+        tie_excluded_columns.size() != selected_columns.size()) {
+        throw std::invalid_argument("invalid router test pattern");
+    }
+    std::vector<float> router(static_cast<std::size_t>(kExperts + 1) * kHidden);
+    // Give every router row the same dense background. It cancels from the
+    // routing order while exercising every S1 K partition against the oracle.
+    for (int row = 0; row < kExperts + 1; ++row) {
+        for (int column = 0; column < kHidden; ++column) {
+            const int pattern = (column * 13 + 5) % 17 - 8;
+            router[static_cast<std::size_t>(row) * kHidden + column] =
+                static_cast<float>(pattern) * 0.001f;
+        }
+    }
     for (int expert = 0; expert < kExperts; ++expert) {
-        router[static_cast<std::size_t>(expert) * kHidden] = -8.0f;
+        router[static_cast<std::size_t>(expert) * kHidden] -= 8.0f;
     }
-    for (int rank = 0; rank < kTopK; ++rank) {
-        router[static_cast<std::size_t>(selected[rank]) * kHidden] =
-            rank == kTopK - 1 && tie_excluded >= 0 ? 2.0f : 4.0f - 0.25f * rank;
+    for (std::size_t column = 0; column < selected_columns.size(); ++column) {
+        const int marker       = kHidden - 8 + static_cast<int>(column);
+        const auto& selected   = selected_columns[column];
+        const int tie_excluded = tie_excluded_columns[column];
+        for (int rank = 0; rank < kTopK; ++rank) {
+            const float score = rank == kTopK - 1 && tie_excluded >= 0 ? 2.0f : 4.0f - 0.25f * rank;
+            router[static_cast<std::size_t>(selected[rank]) * kHidden + marker] += score + 8.0f;
+        }
+        if (tie_excluded >= 0) {
+            router[static_cast<std::size_t>(tie_excluded) * kHidden + marker] += 10.0f;
+        }
     }
-    if (tie_excluded >= 0) { router[static_cast<std::size_t>(tie_excluded) * kHidden] = 2.0f; }
-    router[static_cast<std::size_t>(kExperts) * kHidden] = 0.375f;
+    router[static_cast<std::size_t>(kExperts) * kHidden] += 0.375f;
     round_to_bf16(router);
     return router;
+}
+
+std::vector<float> make_router(const std::array<int, kTopK>& selected, int tie_excluded) {
+    return make_router_pattern({selected}, {tie_excluded});
 }
 
 struct HostExpert {
@@ -328,7 +357,11 @@ int expect_invalid(const char* label, const auto& call) {
 }
 
 int run_case(const CodecProfile& profile, const RouteCase& route, const char* case_name, int tokens,
-             int unique_columns, bool graph_replay, bool validate_contract) {
+             int unique_columns, bool graph_replay, bool validate_contract,
+             const std::vector<RouteCase>& route_columns = {}) {
+    if (!route_columns.empty() && static_cast<int>(route_columns.size()) != unique_columns) {
+        throw std::invalid_argument("route column count must match unique input columns");
+    }
     std::vector<std::vector<float>> input_columns;
     std::vector<std::vector<float>> residual_columns;
     input_columns.reserve(unique_columns);
@@ -346,7 +379,16 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
         std::copy(residual_columns[pattern].begin(), residual_columns[pattern].end(),
                   residual.begin() + static_cast<std::size_t>(token) * kHidden);
     }
-    const std::vector<float> router = make_router(route.selected, route.tie_excluded);
+    std::vector<std::array<int, kTopK>> selected_columns;
+    std::vector<int> tie_excluded_columns;
+    selected_columns.reserve(unique_columns);
+    tie_excluded_columns.reserve(unique_columns);
+    for (int column = 0; column < unique_columns; ++column) {
+        const RouteCase& column_route = route_columns.empty() ? route : route_columns[column];
+        selected_columns.push_back(column_route.selected);
+        tie_excluded_columns.push_back(column_route.tie_excluded);
+    }
+    const std::vector<float> router = make_router_pattern(selected_columns, tie_excluded_columns);
 
     DBuf device_input         = to_device_bf16(input);
     DBuf device_residual_seed = to_device_bf16(residual);
@@ -361,9 +403,17 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
     DeviceRowSplit shared_down_device(QType::W8G32_F16S, kHidden, kIntermediate);
 
     std::vector<HostExpert> host_experts;
-    host_experts.reserve(kTopK);
-    for (int slot = 0; slot < kTopK; ++slot) {
-        const int expert   = route.selected[slot];
+    std::vector<int> populated_experts;
+    for (const auto& selected : selected_columns) {
+        for (int expert : selected) {
+            if (std::find(populated_experts.begin(), populated_experts.end(), expert) ==
+                populated_experts.end()) {
+                populated_experts.push_back(expert);
+            }
+        }
+    }
+    host_experts.reserve(populated_experts.size());
+    for (int expert : populated_experts) {
         const float factor = 0.8f + static_cast<float>((expert * 3) % 11) * 0.045f;
         auto gate_up       = row_split::pack_row_split_lowbit(
             make_gate_up(kExpertGateRows, kHidden, 100u + static_cast<std::uint32_t>(expert),
@@ -399,9 +449,10 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
     std::vector<std::vector<double>> reference_columns;
     reference_columns.reserve(unique_columns);
     for (int column = 0; column < unique_columns; ++column) {
+        const RouteCase& column_route = route_columns.empty() ? route : route_columns[column];
         reference_columns.push_back(
             sparse_moe_oracle(input_columns[column], residual_columns[column], router, host_experts,
-                              host_shared_gate, host_shared_down, route.selected));
+                              host_shared_gate, host_shared_down, column_route.selected));
     }
     std::vector<double> reference(static_cast<std::size_t>(kHidden) * tokens);
     for (int token = 0; token < tokens; ++token) {
@@ -451,9 +502,12 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
     if (validate_contract) {
         failures += expect_invalid("sparse_moe zero max_tokens",
                                    [] { (void)ops::sparse_moe_workspace_bytes(0); });
-        if (ops::sparse_moe_workspace_bytes(1) !=
-            ops::sparse_moe_workspace_bytes(std::numeric_limits<std::int32_t>::max())) {
-            std::cerr << "sparse_moe: serial fallback should reuse one column workspace\n";
+        const std::size_t decode_bytes  = ops::sparse_moe_workspace_bytes(1);
+        const std::size_t small_t_bytes = ops::sparse_moe_workspace_bytes(8);
+        if (small_t_bytes <= decode_bytes ||
+            ops::sparse_moe_workspace_bytes(std::numeric_limits<std::int32_t>::max()) !=
+                small_t_bytes) {
+            std::cerr << "sparse_moe: workspace range maximum does not cover Small-T\n";
             ++failures;
         }
         WorkspaceArena too_small(workspace_bytes - 1);
@@ -503,15 +557,32 @@ int main() {
     }};
     const RouteCase ordinary_route{{255, 0, 17, 31, 63, 127, 191, 223}, -1};
     const RouteCase boundary_tie{{0, 17, 31, 63, 127, 191, 223, 254}, 255};
+    const std::vector<RouteCase> correlated_routes = {
+        {{{0, 32, 64, 96, 128, 160, 224, 255}}, -1}, {{{0, 32, 64, 96, 129, 161, 225, 254}}, -1},
+        {{{0, 32, 65, 97, 129, 161, 225, 253}}, -1}, {{{1, 33, 65, 97, 129, 162, 226, 253}}, -1},
+        {{{1, 33, 65, 98, 130, 162, 226, 252}}, -1}, {{{1, 34, 66, 98, 130, 162, 227, 252}}, -1},
+    };
 
     int failures = 0;
     for (std::size_t index = 0; index < profiles.size(); ++index) {
         failures += run_case(profiles[index], ordinary_route, profiles[index].name, 1, 1, false,
                              index == 0);
     }
-    // Codec decoding, routing tie behavior, and column traversal are orthogonal test dimensions.
+    // Codec decoding, routing tie behavior, exact-T dispatch, and per-token routing are
+    // orthogonal test dimensions.
     failures += run_case(profiles[0], boundary_tie, "sparse_moe boundary tie", 1, 1, false, false);
-    failures += run_case(profiles[0], ordinary_route, "sparse_moe multi-column", 3, 3, true, false);
+    for (int tokens = 2; tokens <= 8; ++tokens) {
+        const std::string name = "sparse_moe small-T" + std::to_string(tokens);
+        failures +=
+            run_case(profiles[0], ordinary_route, name.c_str(), tokens, tokens, tokens == 8, false);
+    }
+    failures +=
+        run_case(profiles[1], ordinary_route, "sparse_moe q4+q6 small-T", 6, 6, false, false);
+    failures +=
+        run_case(profiles[2], ordinary_route, "sparse_moe w8+w8 small-T", 6, 6, false, false);
+    failures += run_case(profiles[0], ordinary_route, "sparse_moe correlated routes", 6, 6, true,
+                         false, correlated_routes);
+    failures += run_case(profiles[0], ordinary_route, "sparse_moe serial T9", 9, 8, false, false);
     std::cout << (failures ? "FAIL" : "OK") << " sparse_moe correctness\n";
     return failures ? 1 : 0;
 }

@@ -388,3 +388,49 @@ Decision:
   boundary-tie case, and adds one multi-column case with distinct columns and Graph replay. Every
   result is checked against the same independent naive FP64 formula, never against another
   production route.
+
+## 2026-07-18: Small-T implementation outcome
+
+> Current Small-T outcome. This supersedes the planned grouped `2<=T<=6` topology above and the
+> column-serial route for `T=2..8`. The column-serial decision remains the functional fallback for
+> `T>8`.
+
+Decision:
+
+- `SparseMoe` keeps the same single repository-internal API and exact mathematical oracle. `T=1`
+  retains the qualified decode path, `T=2..8` selects an exact-T CUDA Core/SIMT route, and `T>8`
+  continues to reuse the complete decode route one column at a time. Token count and codec profile
+  remain independent dispatch dimensions.
+- Small-T S1 computes all token router columns jointly. Four K partitions per router row produce
+  1028 128-thread CTAs and FP32 `[T,257,4]` partial scores. Exact-T templates keep token
+  accumulators compile-time sized and reuse every loaded router vector across the T columns.
+- S2 uses one warp per token in one block. It reduces the four partitions and performs the same
+  lower-id-stable top-8, selected-logit normalization, and shared sigmoid as decode. There is no
+  cross-token routing assumption: every token owns independent ids and scales.
+- S3 and S4 deliberately reuse the qualified nine-path decode kernels once per token, with a
+  disjoint FP32 `[9,512]` activation region for every token. The complete route therefore uses
+  `2+2T` launches rather than the fallback's `4T`. This private token loop is the measured winner
+  for the registered Small-T workload; it does not create public sub-Ops or a semantic rounding
+  boundary.
+- Expert-grouped S3/S4, token-batched CTAs, and S1+S2 completion-counter fusion were implemented
+  and profiled as candidates. Trace-like routes made grouped jobs too small and imbalanced; shared
+  memory and tail-wave thresholds caused sharp T6/T7 regressions. Token batching added a partial
+  CTA wave, and fusion needed workspace initialization. These candidates lost the complete-route
+  comparison and were removed rather than retained as runtime branches.
+- Workspace now scales through T8: I32 ids `[8T]`, FP32 route weights `[8T]`, FP32 shared scales
+  `[T]`, and one FP32 scratch allocation `[9T,512]`. S1 reuses the scratch prefix for partial
+  scores. `sparse_moe_workspace_bytes(max_tokens)` returns at least the T8 requirement for every
+  larger positive maximum, so the graph-stable caller allocation covers both exact-T and serial
+  fallback dispatch.
+- Permanent correctness covers every exact template T2-T8, all three codec profiles, distinct and
+  correlated per-token routes, boundary ties, nonzero residual, workspace capacity, CUDA Graph
+  replay, and the T9 fallback against the independent complete oracle. A same-session three-run
+  binary control confirms no T1 decode regression.
+- The accepted timings, distribution sensitivity, rejected candidates, and Nsight Compute
+  attribution are retained in the
+  [`SparseMoe Small-T qualification report`](../archive/optimization-era/bench/qwen3.6-35b-sparse-moe-small-t.md).
+
+This outcome qualifies MTP verification-sized `T=2..8` without tensor cores or grouped GEMM.
+Larger-T prefill remains functionally supported but has no performance claim; any later grouped
+implementation must beat this route at the complete-Op level rather than being admitted by
+topology alone.

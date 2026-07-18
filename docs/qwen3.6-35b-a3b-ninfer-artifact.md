@@ -1005,12 +1005,22 @@ D1+D2 draining fusion was rejected because caller-owned transient workspace has 
 counter state and W8+W8 had no complete-route gain. Per-expert launches, all-expert scans, and
 materialized `[8,gate/up,512]` or `[8,2048]` intermediates remain nonconforming.
 
-For functional completeness before grouped kernels land, the same closed Op accepts any positive
-T by slicing the contiguous input/destination and submitting this complete four-launch
-single-column route once per column on one stream. It reuses one column's workspace and does not
-introduce another weight layout, numerical path, or observable intermediate. The target's current
-prefill chunk size is a schedule choice rather than an Op limit. This column-serial route does not
-qualify multi-column performance or replace the grouped execution requirements below.
+The closed Op now has three private dispatch regimes. `T=1` retains the four-launch decode route.
+For `T=2..8`, exact-T CUDA Core/SIMT templates share router work across all columns: four K
+partitions per row produce FP32 partial scores, and one block with one warp per token performs
+independent stable top-8 selection and scaling. The route then submits the qualified nine-path D3
+and D4 kernels once per token, using disjoint FP32 `[9,512]` activation regions. It therefore uses
+`2+2T` launches rather than `4T`, without tensor cores, grouped GEMM, a physical expert-job list,
+or a new numerical boundary. Profiled expert-grouped and token-batched alternatives lost on
+trace-like Small-T routes and are not retained as runtime branches.
+
+For `T>8`, functional completeness still comes from slicing contiguous input/destination tensors
+and submitting the complete single-column route on one stream. The fallback reuses one column's
+workspace and does not introduce another weight layout, numerical path, or observable
+intermediate. The target's prefill chunk size is a schedule choice rather than an Op limit, but
+this larger-T fallback has no performance qualification. The capacity query returns enough space
+for the maximum T8 exact route for any larger positive requested maximum, so one caller-owned
+graph-stable allocation covers every dispatch regime.
 
 The logical sparse-MoE formula is:
 
@@ -1093,18 +1103,18 @@ workspace composition.
 
 ### 15.3 Prefill and MTP
 
-Prefill sorts token/expert assignments on device, batches them by logical expert id, and supplies
-device-side job descriptors containing the selected plane spans to grouped kernels. One host launch
-per active expert is not allowed. The half-split row ranges within each expert permit the existing
-folded-SwiGLU MMA mapping: each 64-row tile consumes 32 consecutive gate rows and the matching 32
-consecutive up rows. The inverse scatter and route-weight reduction recover original token order
-and logical expert ids.
-
 MTP, ordinary generation, and prefill call the same `SparseMoe` API. Their different schedule
-shapes do not select different Op semantics: the current implementation covers all of them by
-iterating columns. Target performance qualification still requires grouped multi-column kernels
-that reuse each routed-weight stream across assigned columns. Every route consumes the same
-persistent weights directly.
+shapes do not select different Op semantics. Ordinary generation selects decode, verification and
+MTP rebuild windows through T8 select the exact-T Small-T templates, and larger prefill shapes
+remain on the functionally complete serial fallback. Every route consumes the same persistent
+weights directly.
+
+Physical assignment grouping is a possible larger-T implementation, not a semantic or artifact
+requirement. Such a candidate may sort assignments on device, use device-side job descriptors,
+apply the half-split gate/up mapping, and inverse-scatter to token order. It is admissible only if
+complete-Op and end-to-end evidence beats the current route; one host launch per active expert,
+selected-weight repacking, capacity factors, and token dropping remain disallowed. The accepted
+Small-T route needs none of those mechanisms.
 
 ### 15.4 Vision workspace lifetime
 

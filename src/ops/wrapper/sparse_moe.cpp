@@ -1,7 +1,9 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
+#include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -159,8 +161,12 @@ std::size_t sparse_moe_workspace_bytes(std::int32_t max_tokens) {
     if (max_tokens < 1) {
         throw std::invalid_argument("sparse_moe_workspace_bytes: max_tokens must be positive");
     }
-    // The functionally complete route serially reuses one column's private FP32 handoff storage.
-    return detail::sparse_moe_decode_workspace_bytes();
+    std::size_t required = detail::sparse_moe_decode_workspace_bytes();
+    if (max_tokens >= detail::kSparseMoeSmallTMin) {
+        const std::int32_t small_t_tokens = std::min(max_tokens, detail::kSparseMoeSmallTMax);
+        required = std::max(required, detail::sparse_moe_small_t_workspace_bytes(small_t_tokens));
+    }
+    return required;
 }
 
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
@@ -179,16 +185,33 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
     validate_weights(weights, ranges);
 
-    const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
-        weights.routed_gate_up.qtype, weights.routed_down.qtype);
-    if (workspace.base() == nullptr || workspace.capacity() < plan.workspace_bytes ||
-        workspace.used() > workspace.capacity() - plan.workspace_bytes) {
+    const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
+    const std::size_t required =
+        use_small_t ? detail::resolve_sparse_moe_small_t_plan(tokens, weights.routed_gate_up.qtype,
+                                                              weights.routed_down.qtype)
+                          .workspace_bytes
+                    : detail::resolve_sparse_moe_decode_plan(weights.routed_gate_up.qtype,
+                                                             weights.routed_down.qtype)
+                          .workspace_bytes;
+    if (workspace.base() == nullptr || workspace.capacity() < required ||
+        workspace.used() > workspace.capacity() - required) {
         throw std::invalid_argument("sparse_moe: insufficient workspace capacity");
     }
     ranges.push_back(address_range(workspace.base(), workspace.capacity(), "workspace"));
     require_disjoint(ranges);
 
     auto scope = workspace.scope();
+    if (use_small_t) {
+        const detail::SparseMoeSmallTPlan plan = detail::resolve_sparse_moe_small_t_plan(
+            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+        const detail::SparseMoeSmallTWorkspace views =
+            detail::allocate_sparse_moe_small_t_workspace(workspace, tokens);
+        detail::sparse_moe_small_t_launch(x, weights, destination, plan, views, stream);
+        return;
+    }
+
+    const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
+        weights.routed_gate_up.qtype, weights.routed_down.qtype);
     const detail::SparseMoeDecodeWorkspace views =
         detail::allocate_sparse_moe_decode_workspace(workspace);
     for (std::int32_t token = 0; token < tokens; ++token) {

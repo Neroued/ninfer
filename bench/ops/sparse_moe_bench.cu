@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
+#include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -19,6 +20,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -342,6 +344,131 @@ enum class CodecProfile {
     W8W8,
 };
 
+enum class ExpertDistribution {
+    TraceLike,
+    Independent,
+    Same,
+};
+
+const char* distribution_name(ExpertDistribution distribution) {
+    switch (distribution) {
+    case ExpertDistribution::TraceLike:
+        return "trace-like";
+    case ExpertDistribution::Independent:
+        return "independent";
+    case ExpertDistribution::Same:
+        return "same";
+    }
+    return "unknown";
+}
+
+ExpertDistribution parse_distribution(std::string_view value) {
+    if (value == "trace-like") return ExpertDistribution::TraceLike;
+    if (value == "independent") return ExpertDistribution::Independent;
+    if (value == "same") return ExpertDistribution::Same;
+    throw std::invalid_argument("--distribution must be trace-like, independent, or same");
+}
+
+struct RoutePattern {
+    std::vector<std::array<int, kTopK>> selected;
+    int unique_experts      = 0;
+    double adjacent_overlap = 0.0;
+};
+
+RoutePattern make_route_pattern(int tokens, ExpertDistribution distribution, std::uint32_t seed) {
+    std::mt19937 random(seed);
+    RoutePattern result;
+    result.selected.resize(tokens);
+
+    // Preserve the original decode benchmark route so T=1 comparisons remain
+    // directly comparable with the pre-Small-T baseline.
+    if (tokens == 1) {
+        result.selected[0]      = {0, 32, 64, 96, 128, 160, 224, 255};
+        result.unique_experts   = kTopK;
+        result.adjacent_overlap = kTopK;
+        return result;
+    }
+
+    const auto sample_unique = [&](const std::vector<int>& excluded) {
+        std::array<int, kTopK> selected{};
+        std::array<bool, kExperts> unavailable{};
+        for (int expert : excluded) { unavailable[expert] = true; }
+        std::uniform_int_distribution<int> expert_distribution(0, kExperts - 1);
+        for (int rank = 0; rank < kTopK; ++rank) {
+            int expert = 0;
+            do { expert = expert_distribution(random); } while (unavailable[expert]);
+            selected[rank]      = expert;
+            unavailable[expert] = true;
+        }
+        return selected;
+    };
+
+    // Trace-like MTP traffic combines a modest hot-expert bias with partial
+    // adjacency correlation. Independent and same-expert controls bound the
+    // sensitivity to assignment grouping and weight reuse.
+    std::array<int, 24> hot_pool{};
+    {
+        std::array<int, kExperts> experts{};
+        for (int expert = 0; expert < kExperts; ++expert) { experts[expert] = expert; }
+        std::shuffle(experts.begin(), experts.end(), random);
+        std::copy_n(experts.begin(), hot_pool.size(), hot_pool.begin());
+    }
+    result.selected[0] = sample_unique({});
+    for (int token = 1; token < tokens; ++token) {
+        if (distribution == ExpertDistribution::Same) {
+            result.selected[token] = result.selected[0];
+            continue;
+        }
+        if (distribution == ExpertDistribution::Independent) {
+            result.selected[token] = sample_unique({});
+            continue;
+        }
+
+        std::array<int, kTopK> selected{};
+        std::array<bool, kExperts> used{};
+        std::array<int, kTopK> previous = result.selected[token - 1];
+        std::shuffle(previous.begin(), previous.end(), random);
+        int count = 0;
+        for (; count < 3; ++count) {
+            selected[count]       = previous[count];
+            used[selected[count]] = true;
+        }
+        std::uniform_int_distribution<int> hot_distribution(0, hot_pool.size() - 1);
+        while (count < 5) {
+            const int expert = hot_pool[hot_distribution(random)];
+            if (used[expert]) { continue; }
+            selected[count++] = expert;
+            used[expert]      = true;
+        }
+        std::uniform_int_distribution<int> expert_distribution(0, kExperts - 1);
+        while (count < kTopK) {
+            const int expert = expert_distribution(random);
+            if (used[expert]) { continue; }
+            selected[count++] = expert;
+            used[expert]      = true;
+        }
+        std::shuffle(selected.begin(), selected.end(), random);
+        result.selected[token] = selected;
+    }
+
+    std::array<bool, kExperts> present{};
+    double overlap_sum = 0.0;
+    for (int token = 0; token < tokens; ++token) {
+        for (int expert : result.selected[token]) { present[expert] = true; }
+        if (token == 0) { continue; }
+        int overlap = 0;
+        for (int expert : result.selected[token]) {
+            overlap +=
+                std::find(result.selected[token - 1].begin(), result.selected[token - 1].end(),
+                          expert) != result.selected[token - 1].end();
+        }
+        overlap_sum += overlap;
+    }
+    result.unique_experts   = static_cast<int>(std::count(present.begin(), present.end(), true));
+    result.adjacent_overlap = tokens > 1 ? overlap_sum / (tokens - 1) : kTopK;
+    return result;
+}
+
 const char* codec_name(CodecProfile profile) {
     switch (profile) {
     case CodecProfile::Q4Q5:
@@ -398,6 +525,9 @@ struct Candidate {
     Scope scope;
     const char* name;
     ops::detail::SparseMoeDecodePlan plan;
+    ops::detail::SparseMoeSmallTPlan small_t_plan;
+    bool small_t                = false;
+    bool decode_loop            = false;
     bool public_production      = false;
     bool payload_control        = false;
     int grid                    = 0;
@@ -421,6 +551,11 @@ struct Payload {
 
 struct Result {
     CodecProfile codec;
+    int tokens;
+    ExpertDistribution distribution;
+    std::uint32_t seed;
+    int unique_experts;
+    double adjacent_overlap;
     Candidate candidate;
     Stats cold;
     Stats warm;
@@ -434,10 +569,13 @@ struct Options {
     int warmup = 3;
     int repeat = 30;
     std::string csv_out;
-    bool matrix           = true;
-    Scope scope           = Scope::Full;
-    std::string candidate = "production";
-    CodecProfile codec    = CodecProfile::Q4Q5;
+    bool matrix                     = true;
+    Scope scope                     = Scope::Full;
+    std::string candidate           = "production";
+    CodecProfile codec              = CodecProfile::Q4Q5;
+    int tokens                      = 1;
+    ExpertDistribution distribution = ExpertDistribution::TraceLike;
+    std::uint32_t seed              = 20260718U;
 };
 
 Scope parse_scope(std::string_view value) {
@@ -475,6 +613,13 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--codec") {
             options.codec  = parse_codec(next("--codec value"));
             options.matrix = false;
+        } else if (argument == "--tokens") {
+            options.tokens = std::stoi(std::string(next("--tokens value")));
+        } else if (argument == "--distribution") {
+            options.distribution = parse_distribution(next("--distribution value"));
+        } else if (argument == "--seed") {
+            options.seed =
+                static_cast<std::uint32_t>(std::stoul(std::string(next("--seed value"))));
         } else if (argument == "--warmup") {
             options.warmup = std::stoi(std::string(next("--warmup value")));
         } else if (argument == "--repeat") {
@@ -482,14 +627,14 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out value");
         } else if (argument == "--help" || argument == "-h") {
-            std::printf(
-                "Usage: %s [--matrix] [--scope full|d1|d2|d3|d4] "
-                "[--candidate NAME] [--codec q4-q5|q4-q6|w8-w8] [--warmup N] "
-                "[--repeat N] [--csv-out PATH]\n\n"
-                "Candidates: production, payload-control, row-cta-4w, row-cta-8w, serial-control, "
-                "warp-register, nine-warp-control, "
-                "balanced-eight-warp, nine-warp-r1, balanced-eight-warp-r4.\n",
-                argv[0]);
+            std::printf("Usage: %s [--matrix] [--scope full|d1|d2|d3|d4] "
+                        "[--candidate NAME] [--codec q4-q5|q4-q6|w8-w8] [--tokens 1..8] "
+                        "[--distribution trace-like|independent|same] [--seed N] [--warmup N] "
+                        "[--repeat N] [--csv-out PATH]\n\n"
+                        "Candidates: production, small-t-token-loop, decode-loop, payload-control, "
+                        "row-cta-4w, row-cta-8w, serial-control, warp-register, nine-warp-control, "
+                        "balanced-eight-warp, nine-warp-r1, balanced-eight-warp-r4.\n",
+                        argv[0]);
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(argument));
@@ -498,40 +643,63 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("warmup must be nonnegative and repeat positive");
     }
+    if (options.tokens < 1 || options.tokens > ops::detail::kSparseMoeSmallTMax) {
+        throw std::invalid_argument("--tokens must be in [1,8]");
+    }
     return options;
 }
 
 class BenchmarkState {
 public:
-    explicit BenchmarkState(CodecProfile profile)
-        : profile_(profile), input_(kHidden * 2), residual_seed_(kHidden * 2),
-          destination_(kHidden * 2), router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
+    BenchmarkState(CodecProfile profile, int tokens, ExpertDistribution distribution,
+                   std::uint32_t seed)
+        : profile_(profile), tokens_(tokens),
+          route_pattern_(make_route_pattern(tokens, distribution, seed)),
+          input_(static_cast<std::size_t>(tokens) * kHidden * 2),
+          residual_seed_(static_cast<std::size_t>(tokens) * kHidden * 2),
+          destination_(static_cast<std::size_t>(tokens) * kHidden * 2),
+          router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
           routed_gate_(gate_codec(profile), kExperts * 1024, kHidden),
           routed_down_(down_codec(profile), kExperts * kHidden, kIntermediate),
           shared_gate_(QType::W8G32_F16S, 1024, kHidden),
           shared_down_(QType::W8G32_F16S, kHidden, kIntermediate), flush_(kFlushBytes),
-          private_arena_(ops::detail::sparse_moe_decode_workspace_bytes()),
-          public_workspace_(ops::sparse_moe_workspace_bytes(1)) {
-        std::vector<std::uint16_t> input(kHidden);
-        std::vector<std::uint16_t> residual(kHidden);
-        for (int index = 0; index < kHidden; ++index) {
-            input[index]    = bench::f32_to_bf16(0.02f + static_cast<float>(index % 31) * 0.001f);
-            residual[index] = bench::f32_to_bf16(0.125f + static_cast<float>(index % 17) * 0.002f);
+          private_arena_(tokens == 1 ? ops::detail::sparse_moe_decode_workspace_bytes()
+                                     : ops::detail::sparse_moe_small_t_workspace_bytes(tokens)),
+          decode_arena_(ops::detail::sparse_moe_decode_workspace_bytes()),
+          public_workspace_(ops::sparse_moe_workspace_bytes(tokens)) {
+        std::vector<std::uint16_t> input(static_cast<std::size_t>(tokens) * kHidden);
+        std::vector<std::uint16_t> residual(static_cast<std::size_t>(tokens) * kHidden);
+        for (int token = 0; token < tokens; ++token) {
+            for (int index = 0; index < kHidden; ++index) {
+                input[static_cast<std::size_t>(token) * kHidden + index] = bench::f32_to_bf16(
+                    0.02f + static_cast<float>((index + 7 * token) % 31) * 0.001f);
+                residual[static_cast<std::size_t>(token) * kHidden + index] = bench::f32_to_bf16(
+                    0.125f + static_cast<float>((index + 11 * token) % 17) * 0.002f);
+            }
+            for (int marker = 0; marker < ops::detail::kSparseMoeSmallTMax; ++marker) {
+                input[static_cast<std::size_t>(token) * kHidden + kHidden -
+                      ops::detail::kSparseMoeSmallTMax + marker] = bench::f32_to_bf16(0.0f);
+            }
+            input[static_cast<std::size_t>(token) * kHidden] = bench::f32_to_bf16(1.0f);
+            input[static_cast<std::size_t>(token) * kHidden + kHidden -
+                  ops::detail::kSparseMoeSmallTMax + token]  = bench::f32_to_bf16(1.0f);
         }
-        input[0] = bench::f32_to_bf16(1.0f);
         CUDA_CHECK(cudaMemcpy(input_.data, input.data(), input_.bytes, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(residual_seed_.data, residual.data(), residual_seed_.bytes,
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(destination_.data, residual_seed_.data, destination_.bytes,
                               cudaMemcpyDeviceToDevice));
-
-        const std::array<int, kTopK> selected = {0, 32, 64, 96, 128, 160, 224, 255};
         std::vector<float> router_values(static_cast<std::size_t>(kRouterRows) * kHidden, 0.0f);
         for (int expert = 0; expert < kExperts; ++expert) {
             router_values[static_cast<std::size_t>(expert) * kHidden] = -8.0f;
         }
-        for (int rank = 0; rank < kTopK; ++rank) {
-            router_values[static_cast<std::size_t>(selected[rank]) * kHidden] = 4.0f - 0.25f * rank;
+        for (int token = 0; token < tokens; ++token) {
+            for (int rank = 0; rank < kTopK; ++rank) {
+                const int expert = route_pattern_.selected[token][rank];
+                const int marker = kHidden - ops::detail::kSparseMoeSmallTMax + token;
+                router_values[static_cast<std::size_t>(expert) * kHidden + marker] =
+                    12.0f - 0.25f * rank;
+            }
         }
         router_values[static_cast<std::size_t>(kExperts) * kHidden] = 0.25f;
         std::vector<std::uint16_t> router_bits(router_values.size());
@@ -549,11 +717,19 @@ public:
             shared_gate_.weight(),
             shared_down_.weight(),
         };
-        x_                  = Tensor(input_.data, DType::BF16, {kHidden, 1});
-        destination_tensor_ = Tensor(destination_.data, DType::BF16, {kHidden, 1});
-        workspace_          = ops::detail::allocate_sparse_moe_decode_workspace(private_arena_);
+        x_                  = Tensor(input_.data, DType::BF16, {kHidden, tokens});
+        destination_tensor_ = Tensor(destination_.data, DType::BF16, {kHidden, tokens});
+        if (tokens == 1) {
+            workspace_ = ops::detail::allocate_sparse_moe_decode_workspace(private_arena_);
+        } else {
+            small_t_workspace_ =
+                ops::detail::allocate_sparse_moe_small_t_workspace(private_arena_, tokens);
+            workspace_ = ops::detail::allocate_sparse_moe_decode_workspace(decode_arena_);
+        }
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+
+    [[nodiscard]] const RoutePattern& route_pattern() const noexcept { return route_pattern_; }
 
     void reset_destination(cudaStream_t stream) {
         CUDA_CHECK(cudaMemcpyAsync(destination_.data, residual_seed_.data, destination_.bytes,
@@ -564,11 +740,32 @@ public:
         CUDA_CHECK(cudaMemsetAsync(flush_.data, 0xa5, flush_.bytes, stream));
     }
 
-    void prepare(Scope scope, const ops::detail::SparseMoeDecodePlan& plan, bool cold,
-                 cudaStream_t stream) {
+    void prepare(const Candidate& candidate, bool cold, cudaStream_t stream) {
         if (cold) { flush(stream); }
-        if (scope == Scope::Full || scope == Scope::D4) { reset_destination(stream); }
-        switch (scope) {
+        if (candidate.scope == Scope::Full || candidate.scope == Scope::D4) {
+            reset_destination(stream);
+        }
+        if (candidate.small_t) {
+            switch (candidate.scope) {
+            case Scope::Full:
+            case Scope::D1:
+                return;
+            case Scope::D2:
+                ops::detail::sparse_moe_small_t_launch_s1(x_, weights_.router_shared_gate,
+                                                          small_t_workspace_, stream);
+                return;
+            case Scope::D3:
+                launch_small_t_front(candidate.small_t_plan, stream);
+                return;
+            case Scope::D4:
+                launch_small_t_front(candidate.small_t_plan, stream);
+                ops::detail::sparse_moe_small_t_launch_s3(x_, weights_, candidate.small_t_plan,
+                                                          small_t_workspace_, stream);
+                return;
+            }
+        }
+        const auto& plan = candidate.plan;
+        switch (candidate.scope) {
         case Scope::Full:
         case Scope::D1:
             return;
@@ -587,6 +784,46 @@ public:
     }
 
     void launch(const Candidate& candidate, cudaStream_t stream) {
+        if (candidate.decode_loop) {
+            for (int token = 0; token < tokens_; ++token) {
+                const Tensor x_column     = x_.slice(1, token, 1);
+                Tensor destination_column = destination_tensor_.slice(1, token, 1);
+                ops::detail::sparse_moe_decode_launch(x_column, weights_, destination_column,
+                                                      workspace_, candidate.plan, stream);
+            }
+            return;
+        }
+        if (candidate.small_t) {
+            switch (candidate.scope) {
+            case Scope::Full:
+                if (candidate.public_production) {
+                    ops::sparse_moe(x_, weights_, ops::SparseMoeEpilogue::AddResidual,
+                                    destination_tensor_, public_workspace_, stream);
+                } else {
+                    ops::detail::sparse_moe_small_t_launch(x_, weights_, destination_tensor_,
+                                                           candidate.small_t_plan,
+                                                           small_t_workspace_, stream);
+                }
+                return;
+            case Scope::D1:
+                ops::detail::sparse_moe_small_t_launch_s1(x_, weights_.router_shared_gate,
+                                                          small_t_workspace_, stream);
+                return;
+            case Scope::D2:
+                ops::detail::sparse_moe_small_t_launch_s2(candidate.small_t_plan,
+                                                          small_t_workspace_, stream);
+                return;
+            case Scope::D3:
+                ops::detail::sparse_moe_small_t_launch_s3(x_, weights_, candidate.small_t_plan,
+                                                          small_t_workspace_, stream);
+                return;
+            case Scope::D4:
+                ops::detail::sparse_moe_small_t_launch_s4(weights_, destination_tensor_,
+                                                          candidate.small_t_plan,
+                                                          small_t_workspace_, stream);
+                return;
+            }
+        }
         const auto& plan = candidate.plan;
         if (candidate.payload_control) {
             launch_payload_control(candidate.scope, stream);
@@ -686,7 +923,15 @@ private:
         ops::detail::sparse_moe_decode_launch_d2(workspace_, plan.d2, stream);
     }
 
+    void launch_small_t_front(const ops::detail::SparseMoeSmallTPlan& plan, cudaStream_t stream) {
+        ops::detail::sparse_moe_small_t_launch_s1(x_, weights_.router_shared_gate,
+                                                  small_t_workspace_, stream);
+        ops::detail::sparse_moe_small_t_launch_s2(plan, small_t_workspace_, stream);
+    }
+
     CodecProfile profile_;
+    int tokens_;
+    RoutePattern route_pattern_;
     DeviceBuffer input_;
     DeviceBuffer residual_seed_;
     DeviceBuffer destination_;
@@ -697,11 +942,13 @@ private:
     DeviceRowSplit shared_down_;
     DeviceBuffer flush_;
     DeviceArena private_arena_;
+    DeviceArena decode_arena_;
     WorkspaceArena public_workspace_;
     ops::SparseMoeWeights weights_{};
     Tensor x_;
     Tensor destination_tensor_;
     ops::detail::SparseMoeDecodeWorkspace workspace_;
+    ops::detail::SparseMoeSmallTWorkspace small_t_workspace_;
 };
 
 Stats measure(BenchmarkState& state, const Candidate& candidate, bool cold, int warmup,
@@ -713,7 +960,7 @@ Stats measure(BenchmarkState& state, const Candidate& candidate, bool cold, int 
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
     for (int index = 0; index < warmup; ++index) {
-        state.prepare(candidate.scope, candidate.plan, cold, stream);
+        state.prepare(candidate, cold, stream);
         state.launch(candidate, stream);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -721,7 +968,7 @@ Stats measure(BenchmarkState& state, const Candidate& candidate, bool cold, int 
     std::vector<double> samples;
     samples.reserve(repeat);
     for (int index = 0; index < repeat; ++index) {
-        state.prepare(candidate.scope, candidate.plan, cold, stream);
+        state.prepare(candidate, cold, stream);
         CUDA_CHECK(cudaEventRecord(start, stream));
         state.launch(candidate, stream);
         CUDA_CHECK(cudaEventRecord(stop, stream));
@@ -742,10 +989,54 @@ ops::detail::SparseMoeDecodePlan base_plan(CodecProfile profile) {
     return ops::detail::resolve_sparse_moe_decode_plan(gate_codec(profile), down_codec(profile));
 }
 
-Candidate make_candidate(CodecProfile profile, Scope scope, std::string_view name) {
+Candidate make_candidate(CodecProfile profile, Scope scope, std::string_view name, int tokens) {
     Candidate result;
     result.scope = scope;
     result.plan  = base_plan(profile);
+
+    if (tokens > 1) {
+        if (name == "decode-loop" && scope == Scope::Full) {
+            result.name                 = "decode-loop";
+            result.decode_loop          = true;
+            result.plan.workspace_bytes = ops::detail::sparse_moe_decode_workspace_bytes();
+            return result;
+        }
+        if (name != "production" && name != "small-t-token-loop") {
+            throw std::invalid_argument("unknown T > 1 candidate");
+        }
+        if (name == "production") {
+            result.name = "production";
+        } else {
+            result.name = "small-t-token-loop";
+        }
+        result.small_t      = true;
+        result.small_t_plan = ops::detail::resolve_sparse_moe_small_t_plan(
+            tokens, gate_codec(profile), down_codec(profile));
+        result.public_production = name == "production" && scope == Scope::Full;
+        switch (scope) {
+        case Scope::D1:
+            result.grid  = kRouterRows * 4;
+            result.block = 128;
+            break;
+        case Scope::D2:
+            result.grid  = 1;
+            result.block = tokens * 32;
+            break;
+        case Scope::D3:
+            result.grid  = kIntermediate;
+            result.block = 9 * 32;
+            break;
+        case Scope::D4:
+            result.grid  = kHidden;
+            result.block = 9 * 32;
+            break;
+        case Scope::Full:
+            result.grid  = 0;
+            result.block = 0;
+            break;
+        }
+        return result;
+    }
 
     if (name == "production") {
         result.name              = "production";
@@ -833,7 +1124,71 @@ Candidate make_candidate(CodecProfile profile, Scope scope, std::string_view nam
     return result;
 }
 
-Payload payload_for(CodecProfile profile, Scope scope, bool payload_control) {
+Payload payload_for(CodecProfile profile, Scope scope, bool payload_control, int tokens,
+                    bool joint_route) {
+    const auto add = [](Payload a, const Payload& b) {
+        a.code += b.code;
+        a.high += b.high;
+        a.scale += b.scale;
+        a.useful_fma += b.useful_fma;
+        a.executed_fma += b.executed_fma;
+        return a;
+    };
+
+    if (tokens > 1 && !joint_route) {
+        Payload result = payload_for(profile, scope, payload_control, 1, false);
+        result.code *= tokens;
+        result.high *= tokens;
+        result.scale *= tokens;
+        result.useful_fma *= tokens;
+        result.executed_fma *= tokens;
+        return result;
+    }
+
+    if (tokens > 1) {
+        Payload s1{static_cast<std::uint64_t>(kRouterRows) * kHidden * 2ULL, 0, 0,
+                   static_cast<std::uint64_t>(kRouterRows) * kHidden * tokens,
+                   static_cast<std::uint64_t>(kRouterRows) * kHidden * tokens};
+        Payload s2{static_cast<std::uint64_t>(kRouterRows) * sizeof(float) * tokens, 0, 0, 0, 0};
+        Payload s3;
+        if (profile == CodecProfile::W8W8) {
+            s3.code  = 18ULL * 1024 * 1024 * tokens;
+            s3.scale = (9ULL * 1024 * 1024 / 8) * tokens;
+        } else {
+            s3.code  = 10ULL * 1024 * 1024 * tokens;
+            s3.scale = (5ULL * 1024 * 1024 / 8) * tokens;
+        }
+        s3.useful_fma = s3.executed_fma = 18874368ULL * tokens;
+
+        Payload s4;
+        if (profile == CodecProfile::Q4Q5) {
+            s4.code  = 5ULL * 1024 * 1024 * tokens;
+            s4.high  = 1ULL * 1024 * 1024 * tokens;
+            s4.scale = (5ULL * 1024 * 1024 / 16) * tokens;
+        } else if (profile == CodecProfile::Q4Q6) {
+            s4.code  = 5ULL * 1024 * 1024 * tokens;
+            s4.high  = 2ULL * 1024 * 1024 * tokens;
+            s4.scale = (5ULL * 1024 * 1024 / 16) * tokens;
+        } else {
+            s4.code  = 9ULL * 1024 * 1024 * tokens;
+            s4.scale = (9ULL * 1024 * 1024 / 16) * tokens;
+        }
+        s4.useful_fma = s4.executed_fma = 9437184ULL * tokens;
+
+        switch (scope) {
+        case Scope::D1:
+            return s1;
+        case Scope::D2:
+            return s2;
+        case Scope::D3:
+            return s3;
+        case Scope::D4:
+            return s4;
+        case Scope::Full:
+            return add(add(add(s1, s2), s3), s4);
+        }
+    }
+
     Payload d1{static_cast<std::uint64_t>(kRouterRows) * kHidden * 2ULL, 0, 0,
                static_cast<std::uint64_t>(kRouterRows) * kHidden,
                static_cast<std::uint64_t>(kRouterRows) * kHidden};
@@ -859,14 +1214,6 @@ Payload payload_for(CodecProfile profile, Scope scope, bool payload_control) {
     }
     d4.useful_fma = d4.executed_fma = 9437184ULL;
 
-    const auto add = [](Payload a, const Payload& b) {
-        a.code += b.code;
-        a.high += b.high;
-        a.scale += b.scale;
-        a.useful_fma += b.useful_fma;
-        a.executed_fma += b.executed_fma;
-        return a;
-    };
     Payload result;
     switch (scope) {
     case Scope::D1:
@@ -892,8 +1239,14 @@ Payload payload_for(CodecProfile profile, Scope scope, bool payload_control) {
     return result;
 }
 
-std::vector<std::pair<Scope, const char*>> matrix_candidates(CodecProfile profile) {
+std::vector<std::pair<Scope, const char*>> matrix_candidates(CodecProfile profile, int tokens) {
     std::vector<std::pair<Scope, const char*>> result;
+    if (tokens > 1) {
+        return {{Scope::D1, "small-t-token-loop"},   {Scope::D2, "small-t-token-loop"},
+                {Scope::D3, "small-t-token-loop"},   {Scope::D4, "small-t-token-loop"},
+                {Scope::Full, "small-t-token-loop"}, {Scope::Full, "decode-loop"},
+                {Scope::Full, "production"}};
+    }
     if (profile == CodecProfile::Q4Q5) {
         result.insert(result.end(), {{Scope::D1, "row-cta-4w"},
                                      {Scope::D1, "row-cta-8w"},
@@ -914,10 +1267,12 @@ std::vector<std::pair<Scope, const char*>> matrix_candidates(CodecProfile profil
 void print_result(const Result& result) {
     const std::uint64_t bytes = result.payload.code + result.payload.high + result.payload.scale;
     const double gbs          = bytes / (result.cold.median_us * 1.0e3);
-    std::printf("%-6s %-5s %-25s grid=%-4d block=%-3d cold=%8.3f us warm=%8.3f us %8.1f GB/s",
-                codec_name(result.codec), scope_name(result.candidate.scope), result.candidate.name,
-                result.candidate.grid, result.candidate.block, result.cold.median_us,
-                result.warm.median_us, gbs);
+    std::printf("%-6s T=%d %-11s U=%-2d ov=%4.1f %-5s %-16s grid=%-4d block=%-3d "
+                "cold=%8.3f us warm=%8.3f us %8.1f GB/s",
+                codec_name(result.codec), result.tokens, distribution_name(result.distribution),
+                result.unique_experts, result.adjacent_overlap, scope_name(result.candidate.scope),
+                result.candidate.name, result.candidate.grid, result.candidate.block,
+                result.cold.median_us, result.warm.median_us, gbs);
     if (!std::isnan(result.matched_cold_us)) {
         std::printf(" control=%8.3f us", result.matched_cold_us);
     }
@@ -928,7 +1283,9 @@ void attach_matched_controls(std::vector<Result>& results) {
     for (Result& result : results) {
         if (result.candidate.matched_control[0] == '\0') { continue; }
         const auto control = std::find_if(results.begin(), results.end(), [&](const Result& other) {
-            return other.codec == result.codec && other.candidate.scope == result.candidate.scope &&
+            return other.codec == result.codec && other.tokens == result.tokens &&
+                   other.distribution == result.distribution &&
+                   other.candidate.scope == result.candidate.scope &&
                    std::string_view(other.candidate.name) == result.candidate.matched_control;
         });
         if (control != results.end()) {
@@ -953,21 +1310,24 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
-    stream << "codec,scope,candidate,matched_control,matched_cold_us,matched_warm_us,grid,block,"
+    stream << "codec,tokens,distribution,seed,unique_experts,adjacent_overlap,scope,candidate,"
+              "matched_control,matched_cold_us,matched_warm_us,grid,block,"
               "cold_median_us,cold_min_us,cold_p95_us,warm_median_us,warm_min_us,warm_p95_us,"
               "code_bytes,high_bytes,scale_bytes,useful_fma,executed_fma,workspace_bytes,warmup,"
               "repeat,build_type,gpu,cuda_runtime\n";
     for (const Result& result : results) {
-        stream << codec_name(result.codec) << ',' << scope_name(result.candidate.scope) << ','
-               << result.candidate.name << ',' << result.candidate.matched_control << ','
-               << result.matched_cold_us << ',' << result.matched_warm_us << ','
-               << result.candidate.grid << ',' << result.candidate.block << ','
-               << result.cold.median_us << ',' << result.cold.min_us << ',' << result.cold.p95_us
-               << ',' << result.warm.median_us << ',' << result.warm.min_us << ','
-               << result.warm.p95_us << ',' << result.payload.code << ',' << result.payload.high
-               << ',' << result.payload.scale << ',' << result.payload.useful_fma << ','
-               << result.payload.executed_fma << ',' << result.workspace_bytes << ','
-               << options.warmup << ',' << options.repeat << ','
+        stream << codec_name(result.codec) << ',' << result.tokens << ','
+               << distribution_name(result.distribution) << ',' << result.seed << ','
+               << result.unique_experts << ',' << result.adjacent_overlap << ','
+               << scope_name(result.candidate.scope) << ',' << result.candidate.name << ','
+               << result.candidate.matched_control << ',' << result.matched_cold_us << ','
+               << result.matched_warm_us << ',' << result.candidate.grid << ','
+               << result.candidate.block << ',' << result.cold.median_us << ','
+               << result.cold.min_us << ',' << result.cold.p95_us << ',' << result.warm.median_us
+               << ',' << result.warm.min_us << ',' << result.warm.p95_us << ','
+               << result.payload.code << ',' << result.payload.high << ',' << result.payload.scale
+               << ',' << result.payload.useful_fma << ',' << result.payload.executed_fma << ','
+               << result.workspace_bytes << ',' << options.warmup << ',' << options.repeat << ','
 #ifdef NDEBUG
                << "Release"
 #else
@@ -987,21 +1347,31 @@ int main(int argc, char** argv) {
                                                       CodecProfile::W8W8};
         for (CodecProfile profile : profiles) {
             if (!options.matrix && profile != options.codec) { continue; }
-            BenchmarkState state(profile);
+            BenchmarkState state(profile, options.tokens, options.distribution, options.seed);
             std::vector<std::pair<Scope, const char*>> candidates;
             if (options.matrix) {
-                candidates = matrix_candidates(profile);
+                candidates = matrix_candidates(profile, options.tokens);
             } else {
                 candidates.push_back({options.scope, options.candidate.c_str()});
             }
             for (const auto& [scope, name] : candidates) {
-                Candidate candidate = make_candidate(profile, scope, name);
+                Candidate candidate         = make_candidate(profile, scope, name, options.tokens);
+                const RoutePattern& pattern = state.route_pattern();
+                const std::size_t workspace_bytes = candidate.small_t
+                                                        ? candidate.small_t_plan.workspace_bytes
+                                                        : candidate.plan.workspace_bytes;
                 Result result{profile,
+                              options.tokens,
+                              options.distribution,
+                              options.seed,
+                              pattern.unique_experts,
+                              pattern.adjacent_overlap,
                               candidate,
                               measure(state, candidate, true, options.warmup, options.repeat),
                               measure(state, candidate, false, options.warmup, options.repeat),
-                              payload_for(profile, scope, candidate.payload_control),
-                              candidate.plan.workspace_bytes};
+                              payload_for(profile, scope, candidate.payload_control, options.tokens,
+                                          candidate.small_t),
+                              workspace_bytes};
                 results.push_back(std::move(result));
             }
         }

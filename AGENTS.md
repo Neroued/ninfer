@@ -13,6 +13,15 @@ Correctness, performance, tests, profiling, documentation, provenance, cleanup, 
 means to the requested outcome, not independent objectives. Do not let supporting work replace,
 delay, or materially enlarge the requested deliverable.
 
+## Responding to user corrections
+
+When the user points out an error in the agent's execution or reasoning, never reply with the
+formulaic opening “你说得对，……” ("you're right, ..."). This phrase and cosmetic variants of it
+are strictly prohibited in correction responses because they sound reflexive and insincere. Do not
+replace it with another generic agreement such as “确实如此”, “完全正确”, or “好问题”. Instead,
+state the specific mistake directly, explain its concrete effect when relevant, and say what has
+been or will be changed. Keep the response proportionate; do not add performative apology or praise.
+
 When choosing between possible work, use this order:
 
 1. respect applicable product and external-contract constraints;

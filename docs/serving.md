@@ -148,6 +148,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
+| `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--mtp-draft-tokens N` | MTP draft window, `0..5` | `0` |
 | `--lm-head-draft` | optimized MTP proposal head | off |
@@ -163,6 +164,42 @@ Server sampling defaults are temperature `0.6`, top-p `0.95`, top-k `20`, presen
 server was started with `--greedy`.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
+
+## Structured request log
+
+`--request-log-jsonl FILE` enables the machine-readable measurement log. The server opens `FILE`
+in append mode and flushes every event, so successive model or MTP blocks may share one campaign
+file. The parent directory must already exist. Failure to open the file aborts startup; the log path
+is also rejected if it resolves to the model artifact.
+
+```bash
+./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+  --model-id qwen3.6-27b \
+  --request-log-jsonl profiles/bench/run/server.requests.jsonl
+```
+
+Every line is one `ninfer_serve_request_log` schema-v1 JSON object. All events carry
+`timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
+that server instance.
+
+| Event | Contents |
+|---|---|
+| `server_start` | target/artifact, resolved Engine and sampler configuration, memory summary, CUDA/GPU environment, and redacted argv |
+| `request_start` | protocol, resolved sampler and seed, thinking mode, output budget, stream/message/tool shape |
+| `request_done` | finish reason, prompt/completion/cache tokens, unrounded phase seconds, and complete MTP counters |
+| `request_error` | the resolved request configuration and generation error message |
+
+`request_done.timings_seconds` contains `prepare`, `vision`, `prefill`, `decode`, and `total` as
+full-precision JSON numbers. Its `mtp` object contains `enabled`, `draft_window`, `rounds`,
+`drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates and TTFT
+are intentionally derived downstream from raw token counts and seconds instead of being stored as
+rounded strings.
+
+The JSONL file contains no generated response text and never records an API-key value; `argv`
+replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
+but are rounded and are not the aggregation source. Structured request events cover successfully
+prepared OpenAI/Anthropic generation requests and errors during their generation; schema rejection
+and token-count-only calls are not measurement requests and do not receive request IDs.
 
 ## Execution behavior
 

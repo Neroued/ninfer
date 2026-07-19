@@ -56,7 +56,7 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
-           "[--max-request-mib N] "
+           "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--kv-dtype bf16|int8] [--mtp-draft-tokens N] [--default-max-tokens N] "
            "[--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--cors] "
@@ -67,6 +67,7 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
+           "       --request-log-jsonl appends full-precision server/request records\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
            "top-k 20, presence-penalty 1.0); a request may override any field.\n"
@@ -75,6 +76,17 @@ std::string serve_usage_text(const char* argv0) {
 
 ServeOptions parse_serve_options(int argc, char** argv) {
     ServeOptions options;
+    options.startup_argv.reserve(static_cast<std::size_t>(argc));
+    bool redact_next = false;
+    for (int i = 0; i < argc; ++i) {
+        if (redact_next) {
+            options.startup_argv.emplace_back("<redacted>");
+            redact_next = false;
+            continue;
+        }
+        options.startup_argv.emplace_back(argv[i] == nullptr ? "" : argv[i]);
+        redact_next = options.startup_argv.back() == "--api-key";
+    }
     bool default_max_tokens_explicit = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
@@ -109,6 +121,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--max-request-mib is out of range");
             }
             options.max_request_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--request-log-jsonl") {
+            options.request_log_jsonl = require_value("--request-log-jsonl");
+            if (options.request_log_jsonl.empty()) {
+                throw std::invalid_argument("--request-log-jsonl must not be empty");
+            }
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {

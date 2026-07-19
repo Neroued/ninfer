@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -19,8 +20,9 @@ struct ServeOptions {
     std::string artifact_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
-    std::string api_key;                           // empty => no auth
-    std::string model_id          = "qwen3.6-27b"; // reported by /v1/models
+    std::string api_key;                  // empty => no auth
+    std::string model_id = "qwen3.6-27b"; // reported by /v1/models
+    std::string request_log_jsonl;        // empty => structured request logging disabled
     std::uint32_t max_context     = 8192;
     std::uint32_t prefill_chunk   = 1024;
     std::size_t max_request_bytes = kDefaultMaxRequestBytes;
@@ -47,6 +49,10 @@ struct ServeOptions {
     // request draws a fresh random seed so regenerations differ.
     std::optional<std::uint64_t> sampling_seed;
     bool greedy = false; // --greedy: force temperature 0 (exact argmax)
+
+    // Exact process argv for the server-start record. Secret-bearing option values are redacted
+    // while parsing; this is provenance only and never affects execution.
+    std::vector<std::string> startup_argv;
 };
 
 ServeOptions parse_serve_options(int argc, char** argv);

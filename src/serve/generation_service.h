@@ -24,10 +24,13 @@ struct GenerationMetrics {
     double decode_seconds  = 0.0;
     double total_seconds   = 0.0;
 
-    bool mtp_enabled                      = false;
-    std::uint64_t mtp_rounds              = 0;
-    std::uint64_t mtp_draft_tokens        = 0;
-    std::uint64_t mtp_accepted_tokens     = 0;
+    bool mtp_enabled                  = false;
+    std::uint32_t mtp_draft_window    = 0;
+    std::uint64_t mtp_rounds          = 0;
+    std::uint64_t mtp_draft_tokens    = 0;
+    std::uint64_t mtp_accepted_tokens = 0;
+    std::uint64_t mtp_fallback_steps  = 0;
+    std::vector<std::uint64_t> mtp_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens = 0;
 };
 
@@ -56,6 +59,7 @@ struct PreparedRequest {
     int prompt_tokens      = 0;
     bool include_usage     = false;
     bool tool_capable      = false;
+    bool enable_thinking   = true;
 
     // Limit concurrent ownership of media preprocessing buffers. Text requests
     // do not use this permit.
@@ -67,6 +71,10 @@ public:
     explicit GenerationService(ServeOptions options);
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+
+    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
+
+    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req) const;

@@ -105,7 +105,9 @@ std::string sse_error_event(const ApiError& error) {
 
 } // namespace
 
-HttpServer::HttpServer(ServeOptions options) : options_(std::move(options)) {
+HttpServer::HttpServer(ServeOptions options)
+    : options_(std::move(options)),
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
 }
@@ -113,6 +115,22 @@ HttpServer::HttpServer(ServeOptions options) : options_(std::move(options)) {
 void HttpServer::log_line(const std::string& line) {
     std::lock_guard<std::mutex> lock(log_mutex_);
     std::cerr << "ninfer-serve: " << line << '\n';
+}
+
+void HttpServer::log_request_start(const RequestLogContext& context) {
+    log_line(format_request_start(context));
+    request_jsonl_.write_request_start(context);
+}
+
+void HttpServer::log_request_done(const RequestLogContext& context,
+                                  const GenerationOutcome& outcome) {
+    log_line(format_request_done(context, outcome));
+    request_jsonl_.write_request_done(context, outcome);
+}
+
+void HttpServer::log_request_error(const RequestLogContext& context, const std::string& message) {
+    log_line(format_request_error(context, message));
+    request_jsonl_.write_request_error(context, message);
 }
 
 void HttpServer::register_routes() {
@@ -259,15 +277,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const std::string model    = request.model;
 
     const std::uint64_t req_id = ++request_seq_;
-    log_line(format_request_start(req_id, request.stream, request.messages.size(),
-                                  request.max_tokens, request.max_tokens_set, request.tools.size(),
-                                  request.tool_choice, request.has_tool_history(),
-                                  prepared.options.execution.sampling));
+    const RequestLogContext log_context =
+        make_request_log_context(req_id, "openai_chat_completions", request, prepared);
+    log_request_start(log_context);
 
     if (!request.stream) {
         try {
             const GenerationOutcome outcome = service_->run(prepared, nullptr);
-            log_line(format_request_done(req_id, outcome));
+            log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
             if (!outcome.tool_calls.empty()) {
                 res.set_content(make_chat_completion_tool_response(id, model, created, outcome.text,
@@ -281,7 +298,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                 "application/json");
             }
         } catch (const std::exception& e) {
-            log_line(format_request_error(req_id, e.what()));
+            log_request_error(log_context, e.what());
             throw;
         }
         return;
@@ -295,7 +312,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     const bool tool_capable  = prepared_ptr->tool_capable;
 
     worker->thread = std::thread([this, queue, cancelled, prepared_ptr, id, created, model,
-                                  include_usage, tool_capable, req_id]() {
+                                  include_usage, tool_capable, log_context]() {
         try {
             queue->push(make_chat_chunk_role(id, model, created, include_usage));
             StreamSink sink;
@@ -308,7 +325,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             sink.is_cancelled = [&]() { return cancelled->load(); };
 
             const GenerationOutcome outcome = service_->run(*prepared_ptr, &sink);
-            log_line(format_request_done(req_id, outcome));
+            log_request_done(log_context, outcome);
             if (!outcome.tool_calls.empty()) {
                 if (!outcome.text.empty()) {
                     queue->push(
@@ -331,10 +348,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             }
             queue->push(sse_done());
         } catch (const ApiException& e) {
-            log_line(format_request_error(req_id, e.error().message));
+            log_request_error(log_context, e.error().message);
             queue->push(sse_error_event(e.error()));
         } catch (const std::exception& e) {
-            log_line(format_request_error(req_id, e.what()));
+            log_request_error(log_context, e.what());
             ApiError error;
             error.status  = 500;
             error.type    = "internal_error";
@@ -450,15 +467,14 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const int input_tokens  = prepared.prompt_tokens;
 
     const std::uint64_t req_id = ++request_seq_;
-    log_line(format_request_start(req_id, request.stream, request.messages.size(),
-                                  request.max_tokens, request.max_tokens_set, request.tools.size(),
-                                  request.tool_choice, request.has_tool_history(),
-                                  prepared.options.execution.sampling));
+    const RequestLogContext log_context =
+        make_request_log_context(req_id, "anthropic_messages", request, prepared);
+    log_request_start(log_context);
 
     if (!request.stream) {
         try {
             const GenerationOutcome outcome = service_->run(prepared, nullptr);
-            log_line(format_request_done(req_id, outcome));
+            log_request_done(log_context, outcome);
             const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
             const char* stop_reason =
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
@@ -466,10 +482,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                                                    outcome.tool_calls, stop_reason, usage),
                             "application/json");
         } catch (const ApiException& e) {
-            log_line(format_request_error(req_id, e.error().message));
+            log_request_error(log_context, e.error().message);
             write_messages_error(res, e.error());
         } catch (const std::exception& e) {
-            log_line(format_request_error(req_id, e.what()));
+            log_request_error(log_context, e.what());
             ApiError error;
             error.status  = 500;
             error.type    = "internal_error";
@@ -485,98 +501,98 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     auto prepared_ptr       = std::make_shared<PreparedRequest>(std::move(prepared));
     const bool tool_capable = prepared_ptr->tool_capable;
 
-    worker->thread = std::thread(
-        [this, queue, cancelled, prepared_ptr, id, model, input_tokens, tool_capable, req_id]() {
-            // Anthropic content-block state machine: an optional thinking block (fed by
-            // the reasoning channel) precedes an optional text block; tool_use blocks
-            // are appended after generation. Block indices increase in emission order.
-            int next_index     = 0;
-            bool thinking_open = false;
-            int thinking_index = -1;
-            bool text_open     = false;
-            int text_index     = -1;
-            try {
-                queue->push(make_message_start(id, model, input_tokens));
+    worker->thread = std::thread([this, queue, cancelled, prepared_ptr, id, model, input_tokens,
+                                  tool_capable, log_context]() {
+        // Anthropic content-block state machine: an optional thinking block (fed by
+        // the reasoning channel) precedes an optional text block; tool_use blocks
+        // are appended after generation. Block indices increase in emission order.
+        int next_index     = 0;
+        bool thinking_open = false;
+        int thinking_index = -1;
+        bool text_open     = false;
+        int text_index     = -1;
+        try {
+            queue->push(make_message_start(id, model, input_tokens));
 
-                StreamSink sink;
-                sink.on_reasoning = [&](const std::string& text) {
-                    if (!thinking_open) {
-                        thinking_index = next_index++;
-                        thinking_open  = true;
-                        queue->push(make_content_block_start_thinking(thinking_index));
-                    }
-                    queue->push(make_content_block_delta_thinking(thinking_index, text));
-                };
-                sink.on_content = [&](const std::string& text) {
-                    // Reasoning fully precedes the answer in Qwen output; close the
-                    // thinking block before the first text delta.
-                    if (thinking_open) {
-                        queue->push(make_content_block_stop(thinking_index));
-                        thinking_open = false;
-                    }
-                    if (!text_open) {
-                        text_index = next_index++;
-                        text_open  = true;
-                        queue->push(make_content_block_start_text(text_index));
-                    }
-                    queue->push(make_content_block_delta_text(text_index, text));
-                };
-                sink.is_cancelled = [&]() { return cancelled->load(); };
-
-                const GenerationOutcome outcome = service_->run(*prepared_ptr, &sink);
-                log_line(format_request_done(req_id, outcome));
-
-                // Close any block still open from live streaming.
+            StreamSink sink;
+            sink.on_reasoning = [&](const std::string& text) {
+                if (!thinking_open) {
+                    thinking_index = next_index++;
+                    thinking_open  = true;
+                    queue->push(make_content_block_start_thinking(thinking_index));
+                }
+                queue->push(make_content_block_delta_thinking(thinking_index, text));
+            };
+            sink.on_content = [&](const std::string& text) {
+                // Reasoning fully precedes the answer in Qwen output; close the
+                // thinking block before the first text delta.
                 if (thinking_open) {
                     queue->push(make_content_block_stop(thinking_index));
                     thinking_open = false;
                 }
-                if (text_open) {
-                    queue->push(make_content_block_stop(text_index));
-                    text_open = false;
+                if (!text_open) {
+                    text_index = next_index++;
+                    text_open  = true;
+                    queue->push(make_content_block_start_text(text_index));
                 }
+                queue->push(make_content_block_delta_text(text_index, text));
+            };
+            sink.is_cancelled = [&]() { return cancelled->load(); };
 
-                // In tool mode the service buffers the answer instead of streaming it;
-                // emit the text and tool_use blocks now from the final outcome.
-                if (tool_capable) {
-                    if (!outcome.text.empty()) {
-                        const int idx = next_index++;
-                        queue->push(make_content_block_start_text(idx));
-                        queue->push(make_content_block_delta_text(idx, outcome.text));
-                        queue->push(make_content_block_stop(idx));
-                    }
-                    for (const ToolCall& call : outcome.tool_calls) {
-                        const int idx = next_index++;
-                        queue->push(make_content_block_start_tool_use(idx, call));
-                        queue->push(make_content_block_delta_tool_json(idx, call.arguments_json));
-                        queue->push(make_content_block_stop(idx));
-                    }
-                }
+            const GenerationOutcome outcome = service_->run(*prepared_ptr, &sink);
+            log_request_done(log_context, outcome);
 
-                if (next_index == 0) {
-                    // Nothing was produced; Anthropic content must not be empty.
+            // Close any block still open from live streaming.
+            if (thinking_open) {
+                queue->push(make_content_block_stop(thinking_index));
+                thinking_open = false;
+            }
+            if (text_open) {
+                queue->push(make_content_block_stop(text_index));
+                text_open = false;
+            }
+
+            // In tool mode the service buffers the answer instead of streaming it;
+            // emit the text and tool_use blocks now from the final outcome.
+            if (tool_capable) {
+                if (!outcome.text.empty()) {
                     const int idx = next_index++;
                     queue->push(make_content_block_start_text(idx));
+                    queue->push(make_content_block_delta_text(idx, outcome.text));
                     queue->push(make_content_block_stop(idx));
                 }
-
-                const char* stop_reason =
-                    messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
-                queue->push(make_message_delta(stop_reason, outcome.completion_tokens));
-                queue->push(make_message_stop());
-            } catch (const ApiException& e) {
-                log_line(format_request_error(req_id, e.error().message));
-                queue->push(messages_sse_error_event(e.error()));
-            } catch (const std::exception& e) {
-                log_line(format_request_error(req_id, e.what()));
-                ApiError error;
-                error.status  = 500;
-                error.type    = "internal_error";
-                error.message = e.what();
-                queue->push(messages_sse_error_event(error));
+                for (const ToolCall& call : outcome.tool_calls) {
+                    const int idx = next_index++;
+                    queue->push(make_content_block_start_tool_use(idx, call));
+                    queue->push(make_content_block_delta_tool_json(idx, call.arguments_json));
+                    queue->push(make_content_block_stop(idx));
+                }
             }
-            queue->mark_producer_done();
-        });
+
+            if (next_index == 0) {
+                // Nothing was produced; Anthropic content must not be empty.
+                const int idx = next_index++;
+                queue->push(make_content_block_start_text(idx));
+                queue->push(make_content_block_stop(idx));
+            }
+
+            const char* stop_reason =
+                messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
+            queue->push(make_message_delta(stop_reason, outcome.completion_tokens));
+            queue->push(make_message_stop());
+        } catch (const ApiException& e) {
+            log_request_error(log_context, e.error().message);
+            queue->push(messages_sse_error_event(e.error()));
+        } catch (const std::exception& e) {
+            log_request_error(log_context, e.what());
+            ApiError error;
+            error.status  = 500;
+            error.type    = "internal_error";
+            error.message = e.what();
+            queue->push(messages_sse_error_event(error));
+        }
+        queue->mark_producer_done();
+    });
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
@@ -616,6 +632,7 @@ void HttpServer::attach(GenerationService& service) {
         throw std::logic_error("HTTP generation service is already attached");
     }
     service_ = &service;
+    request_jsonl_.write_server_start(options_, service.load_summary(), service.memory_summary());
 }
 
 bool HttpServer::listen() {

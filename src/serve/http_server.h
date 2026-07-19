@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/request_log.h"
 #include "serve/serve_options.h"
 
 #include <httplib.h>
@@ -34,9 +35,13 @@ private:
     // Writes one console line ("ninfer-serve: <line>") under log_mutex_ so lines from
     // the httplib thread pool and streaming worker threads never interleave.
     void log_line(const std::string& line);
+    void log_request_start(const RequestLogContext& context);
+    void log_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
+    void log_request_error(const RequestLogContext& context, const std::string& message);
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
+    JsonlRequestLog request_jsonl_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex log_mutex_;

@@ -19,8 +19,8 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 3> kRoutes{{
     {1, 1, W8GdnInputScheduleId::DecodeR8Direct},
-    {2, 16, W8GdnInputScheduleId::SimtR8C4},
-    {17, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
+    {2, 96, W8GdnInputScheduleId::SplitKMmaDirect},
+    {97, kAnyCols, W8GdnInputScheduleId::MmaR64C128},
 }};
 
 constexpr bool catalog_is_closed() {
@@ -43,8 +43,8 @@ W8KernelVariant variant_for(W8GdnInputScheduleId schedule, std::int32_t cols) {
     switch (schedule) {
     case W8GdnInputScheduleId::DecodeR8Direct:
         return W8KernelVariant::None;
-    case W8GdnInputScheduleId::SimtR8C4:
-        return (cols % 4) == 0 ? W8KernelVariant::Full : W8KernelVariant::Predicated;
+    case W8GdnInputScheduleId::SplitKMmaDirect:
+        return W8KernelVariant::None;
     case W8GdnInputScheduleId::MmaR64C128:
         return (cols % 128) == 0 ? W8KernelVariant::Full : W8KernelVariant::Predicated;
     }
@@ -57,8 +57,8 @@ const char* w8_gdn_input_schedule_name(W8GdnInputScheduleId schedule) noexcept {
     switch (schedule) {
     case W8GdnInputScheduleId::DecodeR8Direct:
         return "gdn_input_proj.w8.decode.r8.direct.k2048.split2";
-    case W8GdnInputScheduleId::SimtR8C4:
-        return "gdn_input_proj.w8.simt.r8.c4.split2";
+    case W8GdnInputScheduleId::SplitKMmaDirect:
+        return "gdn_input_proj.w8.mma.splitk.direct.k2048";
     case W8GdnInputScheduleId::MmaR64C128:
         return "gdn_input_proj.w8.mma.r64.c128.split2";
     }
@@ -87,34 +87,23 @@ std::size_t w8_gdn_input_capacity_workspace_bytes(std::int32_t qkv_rows, std::in
     return 0;
 }
 
-void w8_gdn_input_execute_plan(const W8GdnInputPlan& plan, const Tensor& x, const Weight& weight,
-                               Tensor& qkv, Tensor& z, cudaStream_t stream) {
+void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                           cudaStream_t stream) {
     const W8GdnInputProblem problem{x.ne[0], qkv.ne[0], z.ne[0], weight.n, weight.padded_shape[1],
                                     x.ne[1]};
-    const W8GdnInputPlan resolved = w8_gdn_input_resolve_plan(problem);
-    if (resolved.schedule != plan.schedule || resolved.variant != plan.variant ||
-        resolved.workspace_bytes != plan.workspace_bytes) {
-        throw std::invalid_argument("W8 GDN input: plan does not match exact problem");
-    }
+    const W8GdnInputPlan plan = w8_gdn_input_resolve_plan(problem);
     switch (plan.schedule) {
     case W8GdnInputScheduleId::DecodeR8Direct:
         w8_gdn_input_decode_launch(x, weight, qkv, z, stream);
         return;
-    case W8GdnInputScheduleId::SimtR8C4:
-        w8_gdn_input_simt_r8_c4_launch(plan.variant, x, weight, qkv, z, stream);
+    case W8GdnInputScheduleId::SplitKMmaDirect:
+        w8_gdn_input_splitk_mma_launch(plan.variant, x, weight, qkv, z, stream);
         return;
     case W8GdnInputScheduleId::MmaR64C128:
         w8_gdn_input_mma_r64_c128_launch(plan.variant, x, weight, qkv, z, stream);
         return;
     }
     throw std::logic_error("W8 GDN input: unknown schedule");
-}
-
-void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
-                           cudaStream_t stream) {
-    const W8GdnInputProblem problem{x.ne[0], qkv.ne[0], z.ne[0], weight.n, weight.padded_shape[1],
-                                    x.ne[1]};
-    w8_gdn_input_execute_plan(w8_gdn_input_resolve_plan(problem), x, weight, qkv, z, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -332,10 +332,12 @@ int main(int argc, char** argv) {
                         ops::detail::w8_gdn_input_decode_launch(x, packed.weight, tqkv, tz, s);
                     });
                 }
-                run("simt_r8_c4", [&](cudaStream_t s) {
-                    ops::detail::w8_gdn_input_simt_r8_c4_launch(simt_variant(t), x, packed.weight,
-                                                                tqkv, tz, s);
-                });
+                if (t >= 2 && t <= 96) {
+                    run("small_t_splitk_mma", [&](cudaStream_t s) {
+                        ops::detail::w8_gdn_input_splitk_mma_launch(
+                            ops::detail::W8KernelVariant::None, x, packed.weight, tqkv, tz, s);
+                    });
+                }
                 run("mma_r64_c128", [&](cudaStream_t s) {
                     ops::detail::w8_gdn_input_mma_r64_c128_launch(mma_variant(t), x, packed.weight,
                                                                   tqkv, tz, s);

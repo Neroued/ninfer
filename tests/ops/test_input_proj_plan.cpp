@@ -162,12 +162,20 @@ void w8_gdn_route_tests() {
         W8KernelVariant variant;
     };
 
-    constexpr std::array<Case, 9> cases{{
+    constexpr std::array<Case, 17> cases{{
         {1, W8GdnInputScheduleId::DecodeR8Direct, W8KernelVariant::None},
-        {2, W8GdnInputScheduleId::SimtR8C4, W8KernelVariant::Predicated},
-        {4, W8GdnInputScheduleId::SimtR8C4, W8KernelVariant::Full},
-        {16, W8GdnInputScheduleId::SimtR8C4, W8KernelVariant::Full},
-        {17, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
+        {2, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {4, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {16, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {17, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {32, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {33, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {48, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {49, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {64, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {65, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {96, W8GdnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {97, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
         {127, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
         {128, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
         {129, W8GdnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},

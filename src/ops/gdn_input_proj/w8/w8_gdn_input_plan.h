@@ -12,7 +12,7 @@ namespace ninfer::ops::detail {
 
 enum class W8GdnInputScheduleId {
     DecodeR8Direct,
-    SimtR8C4,
+    SplitKMmaDirect,
     MmaR64C128,
 };
 
@@ -37,8 +37,6 @@ W8GdnInputPlan w8_gdn_input_resolve_plan(const W8GdnInputProblem& problem);
 std::size_t w8_gdn_input_capacity_workspace_bytes(std::int32_t qkv_rows, std::int32_t z_rows,
                                                   std::int32_t max_cols);
 
-void w8_gdn_input_execute_plan(const W8GdnInputPlan& plan, const Tensor& x, const Weight& weight,
-                               Tensor& qkv, Tensor& z, cudaStream_t stream);
 void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                            cudaStream_t stream);
 

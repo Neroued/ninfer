@@ -661,7 +661,8 @@ int w8_gdn_input_correctness() {
     WorkspaceArena ws(1);
 
     int failures = 0;
-    for (const std::int32_t t : {1, 2, 4, 16, 17, 128, 129, 1024}) {
+    for (const std::int32_t t : {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13,  14,  15,
+                                 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 1024}) {
         const std::size_t qkv_count = static_cast<std::size_t>(kQkvRows) * t;
         const std::size_t z_count   = static_cast<std::size_t>(kZRows) * t;
         GuardedBf16Output qkv_got(qkv_count), z_got(z_count);
@@ -671,7 +672,7 @@ int w8_gdn_input_correctness() {
         const auto launch = [&](cudaStream_t stream) {
             ops::gdn_input_proj(tx, weight, tqkv, tz, ws, stream);
         };
-        if (t == 1) {
+        if (t == 1 || t == 2 || t == 4 || t == 16) {
             capture_and_replay(launch);
         } else {
             launch(nullptr);

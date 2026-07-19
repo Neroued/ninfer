@@ -1,9 +1,10 @@
 # Performance
 
-This page records the representative NInfer CLI measurements used in the project README. The source
-run was captured on 2026-07-18 in
-`profiles/bench/qwen36_mtp_cli_repeat5_20260718`. Raw profiler output remains local; the complete
-aggregated results and test conditions are preserved here.
+This page records the representative NInfer CLI measurements used in the project README. The
+current NInfer runs were captured on 2026-07-19 from mainline revision `fdaf991` in
+`profiles/bench/qwen36_mtp_cli_repeat5_20260719_current`. The unchanged llama.cpp rows come from the
+2026-07-18 run in `profiles/bench/qwen36_mtp_cli_repeat5_20260718`. Raw run output remains local;
+the complete aggregated results and test conditions are preserved here.
 
 ## Test conditions
 
@@ -36,21 +37,21 @@ were alternated between MTP off and on to reduce ordering bias.
 |---|---|---:|---:|---:|---:|---:|
 | Qwen3.6-27B | llama.cpp | 0 | 2,966.58 ± 4.51 tok/s | 60.60 ± 0.14 tok/s | — | — |
 | Qwen3.6-27B | llama.cpp | 3 | 2,646.64 ± 30.47 tok/s | 140.38 ± 0.70 tok/s | not reported | not reported |
-| Qwen3.6-27B | NInfer | 0 | 2,841.46 ± 22.44 tok/s | 66.46 ± 0.08 tok/s | — | — |
-| Qwen3.6-27B | NInfer | 3 | 2,829.62 ± 6.65 tok/s | 167.22 ± 1.07 tok/s | 86.62% | 3.60 tok/round |
+| Qwen3.6-27B | NInfer | 0 | 3,278.79 ± 32.63 tok/s | 76.97 ± 0.58 tok/s | — | — |
+| Qwen3.6-27B | NInfer | 3 | 3,260.67 ± 30.85 tok/s | 188.30 ± 1.47 tok/s | 87.47% | 3.62 tok/round |
 | Qwen3.6-35B-A3B | llama.cpp | 0 | 6,272.86 ± 268.07 tok/s | 197.80 ± 1.13 tok/s | — | — |
 | Qwen3.6-35B-A3B | llama.cpp | 3 | 5,476.82 ± 312.99 tok/s | 285.88 ± 5.28 tok/s | not reported | not reported |
-| Qwen3.6-35B-A3B | NInfer | 0 | 13,594.36 ± 71.12 tok/s | 244.52 ± 0.21 tok/s | — | — |
-| Qwen3.6-35B-A3B | NInfer | 3 | 13,411.71 ± 111.89 tok/s | 436.32 ± 1.58 tok/s | 81.53% | 3.45 tok/round |
+| Qwen3.6-35B-A3B | NInfer | 0 | 15,674.64 ± 39.74 tok/s | 275.38 ± 0.20 tok/s | — | — |
+| Qwen3.6-35B-A3B | NInfer | 3 | 15,496.77 ± 140.45 tok/s | 593.60 ± 1.52 tok/s | 79.56% | 3.39 tok/round |
 
 ## Comparisons
 
 | Model | Comparison | Prefill ratio | Decode ratio |
 |---|---|---:|---:|
-| Qwen3.6-27B | NInfer MTP=3 / NInfer MTP=0 | 1.00x | 2.52x |
-| Qwen3.6-35B-A3B | NInfer MTP=3 / NInfer MTP=0 | 0.99x | 1.78x |
-| Qwen3.6-27B | NInfer / llama.cpp at MTP=3 | 1.07x | 1.19x |
-| Qwen3.6-35B-A3B | NInfer / llama.cpp at MTP=3 | 2.45x | 1.53x |
+| Qwen3.6-27B | NInfer MTP=3 / NInfer MTP=0 | 0.99x | 2.45x |
+| Qwen3.6-35B-A3B | NInfer MTP=3 / NInfer MTP=0 | 0.99x | 2.16x |
+| Qwen3.6-27B | NInfer / llama.cpp at MTP=3 | 1.23x | 1.34x |
+| Qwen3.6-35B-A3B | NInfer / llama.cpp at MTP=3 | 2.83x | 2.08x |
 
 Ratios are ratios of the five-run means before display rounding.
 

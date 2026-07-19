@@ -22,14 +22,14 @@ a draft window of three. Each value is the mean of five measured runs after one 
 
 | Model | Engine | Prefill | Decode |
 |---|---|---:|---:|
-| Qwen3.6-27B | **NInfer** | **2,829.62 tok/s** | **167.22 tok/s** |
+| Qwen3.6-27B | **NInfer** | **3,260.67 tok/s** | **188.30 tok/s** |
 | Qwen3.6-27B | llama.cpp | 2,646.64 tok/s | 140.38 tok/s |
-| Qwen3.6-35B-A3B | **NInfer** | **13,411.71 tok/s** | **436.32 tok/s** |
+| Qwen3.6-35B-A3B | **NInfer** | **15,496.77 tok/s** | **593.60 tok/s** |
 | Qwen3.6-35B-A3B | llama.cpp | 5,476.82 tok/s | 285.88 tok/s |
 
-For these configurations, NInfer reaches 1.07x/1.19x the llama.cpp prefill/decode rates on 27B and
-2.45x/1.53x on 35B-A3B. Within NInfer, enabling the measured MTP path raises decode throughput by
-2.52x on 27B and 1.78x on 35B-A3B.
+For these configurations, NInfer reaches 1.23x/1.34x the llama.cpp prefill/decode rates on 27B and
+2.83x/2.08x on 35B-A3B. Within NInfer, enabling the measured MTP path raises decode throughput by
+2.45x on 27B and 2.16x on 35B-A3B.
 
 These are complete-engine comparisons using each engine's corresponding quantized artifact, not
 kernel measurements or identical weight formats. See [Performance](docs/performance.md) for the

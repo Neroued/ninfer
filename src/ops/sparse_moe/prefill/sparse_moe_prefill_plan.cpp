@@ -29,7 +29,7 @@ bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
 
 std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens) {
     if (max_tokens < kSparseMoePrefillWorkspaceMin) {
-        throw std::invalid_argument("sparse_moe prefill: max_tokens must be at least 7");
+        throw std::invalid_argument("sparse_moe prefill: max_tokens must be at least 18");
     }
     const std::int32_t capacity_tokens = std::min(max_tokens, kSparseMoePrefillSliceMax);
     WorkspaceLayoutBuilder layout;

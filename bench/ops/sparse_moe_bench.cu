@@ -83,10 +83,33 @@ QuantGeometry geometry(QType qtype) {
     }
 }
 
-__global__ void fill_scale_kernel(std::uint16_t* scales, std::size_t count, std::uint16_t value) {
+__device__ __forceinline__ std::uint32_t payload_hash(std::size_t index, std::uint32_t seed) {
+    std::uint32_t value = static_cast<std::uint32_t>(index) ^
+                          static_cast<std::uint32_t>(index >> 32) ^ seed;
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+__global__ void fill_payload_kernel(std::uint8_t* payload, std::size_t count,
+                                    std::uint32_t seed) {
     const std::size_t start  = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
     const std::size_t stride = gridDim.x * static_cast<std::size_t>(blockDim.x);
-    for (std::size_t index = start; index < count; index += stride) { scales[index] = value; }
+    for (std::size_t index = start; index < count; index += stride) {
+        payload[index] = static_cast<std::uint8_t>(payload_hash(index, seed));
+    }
+}
+
+__global__ void fill_scale_kernel(std::uint16_t* scales, std::size_t count, std::uint32_t seed) {
+    const std::size_t start  = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
+    const std::size_t stride = gridDim.x * static_cast<std::size_t>(blockDim.x);
+    for (std::size_t index = start; index < count; index += stride) {
+        // Positive finite FP16 scales in [2^-10, 2^-9), with ten varied mantissa bits.
+        scales[index] = static_cast<std::uint16_t>(0x1400u | (payload_hash(index, seed) & 0x3ffu));
+    }
 }
 
 __device__ __forceinline__ std::uint32_t warp_xor(std::uint32_t value) {
@@ -267,7 +290,7 @@ __global__ void sparse_moe_d4_payload_control_kernel(
 
 class DeviceRowSplit {
 public:
-    DeviceRowSplit(QType qtype, int rows, int columns)
+    DeviceRowSplit(QType qtype, int rows, int columns, std::uint32_t seed)
         : qtype_(qtype), rows_(rows), columns_(columns), geometry_(geometry(qtype)),
           groups_per_row_(columns / geometry_.group),
           code_bytes_(static_cast<std::size_t>(rows) * groups_per_row_ *
@@ -277,12 +300,16 @@ public:
           scale_bytes_(static_cast<std::size_t>(rows) * groups_per_row_ * 2), codes_(code_bytes_),
           high_(high_bytes_ == 0 ? nullptr : std::make_unique<DeviceBuffer>(high_bytes_)),
           scales_(scale_bytes_) {
-        CUDA_CHECK(cudaMemset(codes_.data, 0x11, codes_.bytes));
-        if (high_) { CUDA_CHECK(cudaMemset(high_->data, 0, high_->bytes)); }
-        constexpr std::uint16_t kHalfScale = 0x1400; // FP16 2^-10.
-        const std::size_t count            = scale_bytes_ / 2;
+        const auto launch_payload = [](DeviceBuffer& buffer, std::uint32_t payload_seed) {
+            fill_payload_kernel<<<std::min<std::size_t>(4096, (buffer.bytes + 255) / 256), 256>>>(
+                static_cast<std::uint8_t*>(buffer.data), buffer.bytes, payload_seed);
+        };
+        launch_payload(codes_, seed ^ 0x243f6a88u);
+        if (high_) { launch_payload(*high_, seed ^ 0x85a308d3u); }
+        const std::size_t count = scale_bytes_ / 2;
         fill_scale_kernel<<<std::min<std::size_t>(4096, (count + 255) / 256), 256>>>(
-            static_cast<std::uint16_t*>(scales_.data), count, kHalfScale);
+            static_cast<std::uint16_t*>(scales_.data), count, seed ^ 0x13198a2eu);
+        CUDA_CHECK(cudaGetLastError());
     }
 
     Weight weight() const {
@@ -632,7 +659,7 @@ Options parse_options(int argc, char** argv) {
                         "[--candidate NAME] [--codec q4-q5|q4-q6|w8-w8] [--tokens 1..16384] "
                         "[--distribution trace-like|independent|same] [--seed N] [--warmup N] "
                         "[--repeat N] [--csv-out PATH]\n\n"
-                        "Candidates: production, small-t-persistent, decode-loop, payload-control, "
+                        "Candidates: production, small-t-tiled, decode-loop, payload-control, "
                         "row-cta-4w, row-cta-8w, serial-control, "
                         "warp-register, nine-warp-control, balanced-eight-warp, nine-warp-r1, "
                         "balanced-eight-warp-r4.\n",
@@ -668,17 +695,22 @@ public:
           residual_seed_(static_cast<std::size_t>(tokens) * kHidden * 2),
           destination_(static_cast<std::size_t>(tokens) * kHidden * 2),
           router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
-          routed_gate_(gate_codec(profile), kExperts * 1024, kHidden),
-          routed_down_(down_codec(profile), kExperts * kHidden, kIntermediate),
-          shared_gate_(QType::W8G32_F16S, 1024, kHidden),
-          shared_down_(QType::W8G32_F16S, kHidden, kIntermediate), flush_(kFlushBytes),
+          routed_gate_(gate_codec(profile), kExperts * 1024, kHidden, seed ^ 0xa4093822u),
+          routed_down_(down_codec(profile), kExperts * kHidden, kIntermediate,
+                       seed ^ 0x299f31d0u),
+          shared_gate_(QType::W8G32_F16S, 1024, kHidden, seed ^ 0x082efa98u),
+          shared_down_(QType::W8G32_F16S, kHidden, kIntermediate, seed ^ 0xec4e6c89u),
+          flush_(kFlushBytes),
           private_arena_(private_workspace_bytes(tokens)),
           decode_arena_(ops::detail::sparse_moe_decode_workspace_bytes()),
           public_workspace_(ops::sparse_moe_workspace_bytes(tokens)) {
         std::vector<std::uint16_t> input(static_cast<std::size_t>(tokens) * kHidden);
         std::vector<std::uint16_t> residual(static_cast<std::size_t>(tokens) * kHidden);
         const bool basis_router = tokens > ops::detail::kSparseMoeSmallTMax;
-        const int route_markers = tokens <= 8 ? 8 : tokens <= 16 ? 16 : 32;
+        const int route_markers = tokens <= 8    ? 8
+                                  : tokens <= 16 ? 16
+                                  : tokens <= 32 ? 32
+                                                 : ops::detail::kSparseMoeSmallTMax;
         for (int token = 0; token < tokens; ++token) {
             for (int index = 0; index < kHidden; ++index) {
                 const int centered = (index * 17 + token * 29 + (index ^ token)) % 81 - 40;
@@ -1049,13 +1081,13 @@ Candidate make_candidate(CodecProfile profile, Scope scope, std::string_view nam
             result.plan.workspace_bytes = ops::detail::sparse_moe_decode_workspace_bytes();
             return result;
         }
-        if (name != "production" && name != "small-t-persistent") {
+        if (name != "production" && name != "small-t-tiled") {
             throw std::invalid_argument("unknown T > 1 candidate");
         }
         if (name == "production") {
             result.name = "production";
         } else {
-            result.name = "small-t-persistent";
+            result.name = "small-t-tiled";
         }
         result.small_t      = true;
         result.small_t_plan = ops::detail::resolve_sparse_moe_small_t_plan(
@@ -1068,7 +1100,7 @@ Candidate make_candidate(CodecProfile profile, Scope scope, std::string_view nam
             break;
         case Scope::D2:
             result.grid  = 1;
-            result.block = tokens * 32;
+            result.block = std::min(tokens, 32) * 32;
             break;
         case Scope::D3:
             result.grid  = kIntermediate;
@@ -1291,9 +1323,9 @@ std::vector<std::pair<Scope, const char*>> matrix_candidates(CodecProfile profil
     std::vector<std::pair<Scope, const char*>> result;
     if (tokens > ops::detail::kSparseMoeSmallTMax) { return {{Scope::Full, "production"}}; }
     if (tokens > 1) {
-        return {{Scope::D1, "small-t-persistent"},   {Scope::D2, "small-t-persistent"},
-                {Scope::D3, "small-t-persistent"},   {Scope::D4, "small-t-persistent"},
-                {Scope::Full, "small-t-persistent"}, {Scope::Full, "decode-loop"},
+        return {{Scope::D1, "small-t-tiled"},   {Scope::D2, "small-t-tiled"},
+                {Scope::D3, "small-t-tiled"},   {Scope::D4, "small-t-tiled"},
+                {Scope::Full, "small-t-tiled"}, {Scope::Full, "decode-loop"},
                 {Scope::Full, "production"}};
     }
     if (profile == CodecProfile::Q4Q5) {

@@ -132,53 +132,49 @@ __global__ void sparse_moe_d2_serial_control_kernel(const float* __restrict__ sc
 }
 
 struct Q4Codec {
-    static constexpr int kGroupK                = 64;
-    static constexpr bool kD3SingleValuePerLane = false;
-
-    __device__ static __forceinline__ void load_pair(const std::uint8_t* codes, const std::uint8_t*,
-                                                     const std::uint8_t* scales,
-                                                     std::int64_t group_index, int lane, float& w0,
-                                                     float& w1) {
-        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(scales + group_index * 2);
-        const std::uint8_t packed = codes[group_index * 32 + lane];
-        Q4SimtDecodeAtom::decode_pair(packed, scale_bits, w0, w1);
-    }
+    static constexpr int kGroupK         = 64;
+    static constexpr bool kD3PackedWord8 = true;
 };
 
 struct Q5Codec {
-    static constexpr int kGroupK = 64;
+    static constexpr int kGroupK       = 64;
+    static constexpr bool kPackedWord8 = true;
 
     __device__ static __forceinline__ void
-    load_pair(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
-              std::int64_t group_index, int lane, float& w0, float& w1) {
-        Q5ScalarDecodeAtom::load_pair(codes, high, scales, group_index, lane, w0, w1);
+    load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
+               std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            codes + group_index * Q5RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
+        const std::uint8_t high_bits =
+            high[group_index * Q5RowSplitStorage::kHighBytesPerGroup + lane_in_group];
+        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            scales + group_index * Q5RowSplitStorage::kScaleBytesPerGroup);
+        Q5SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
     }
 };
 
 struct Q6Codec {
-    static constexpr int kGroupK = 64;
+    static constexpr int kGroupK       = 64;
+    static constexpr bool kPackedWord8 = true;
 
     __device__ static __forceinline__ void
-    load_pair(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
-              std::int64_t group_index, int lane, float& w0, float& w1) {
-        const float scale = __half2float(
-            __ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scales + group_index * 2)));
-        const std::uint8_t packed    = codes[group_index * 32 + lane];
-        const std::uint8_t high_byte = high[group_index * 16 + (lane >> 1)];
-        const int shift              = (lane & 1) * 4;
-        const int q0 =
-            ((static_cast<int>(packed & 0x0fu) | (((high_byte >> shift) & 3) << 4)) ^ 0x20) - 0x20;
-        const int q1 =
-            ((static_cast<int>(packed >> 4) | (((high_byte >> (shift + 2)) & 3) << 4)) ^ 0x20) -
-            0x20;
-        w0 = static_cast<float>(q0) * scale;
-        w1 = static_cast<float>(q1) * scale;
+    load_eight(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
+               std::int64_t group_index, int lane_in_group, float (&weights)[8]) {
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            codes + group_index * Q6RowSplitStorage::kCodeBytesPerGroup + lane_in_group * 4);
+        const std::uint16_t high_bits = *reinterpret_cast<const std::uint16_t*>(
+            high + group_index * Q6RowSplitStorage::kHighBytesPerGroup + lane_in_group * 2);
+        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            scales + group_index * Q6RowSplitStorage::kScaleBytesPerGroup);
+        Q6SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, weights);
     }
 };
 
 struct W8Codec {
     static constexpr int kGroupK                = 32;
     static constexpr bool kD3SingleValuePerLane = true;
+    static constexpr bool kD3PackedWord8        = false;
+    static constexpr bool kPackedWord8          = false;
 
     __device__ static __forceinline__ float load_one(const std::uint8_t* codes,
                                                      const std::uint8_t* scales,
@@ -207,7 +203,39 @@ __device__ __forceinline__ void dot_two_rows(const std::uint8_t* codes, const st
     float acc1            = 0.0f;
     const int first_group = k_begin / Codec::kGroupK;
     const int last_group  = k_end / Codec::kGroupK;
-    if constexpr (Codec::kD3SingleValuePerLane) {
+    if constexpr (Codec::kD3PackedWord8) {
+        // Four adjacent Q4 groups form one 128-byte warp transaction. Each lane owns eight
+        // consecutive K values, so one mantissa decode feeds eight FP32 FMAs instead of issuing
+        // four scalar code-pair/decode iterations.
+        const int lane_group    = lane >> 3;
+        const int lane_in_group = lane & 7;
+        for (int group_base = first_group; group_base < last_group; group_base += 4) {
+            const int group           = group_base + lane_group;
+            const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
+            const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
+            const std::uint32_t packed0 =
+                *reinterpret_cast<const std::uint32_t*>(codes + index0 * 32 + lane_in_group * 4);
+            const std::uint32_t packed1 =
+                *reinterpret_cast<const std::uint32_t*>(codes + index1 * 32 + lane_in_group * 4);
+            const auto scale0 = *reinterpret_cast<const std::uint16_t*>(scales + index0 * 2);
+            const auto scale1 = *reinterpret_cast<const std::uint16_t*>(scales + index1 * 2);
+            float weights0[8];
+            float weights1[8];
+            Q4SimtDecodeAtom::decode_eight(packed0, scale0, weights0);
+            Q4SimtDecodeAtom::decode_eight(packed1, scale1, weights1);
+            const uint4 input     = load_vec<uint4>(x + group * Codec::kGroupK + lane_in_group * 8);
+            const float2 x0       = bf16x2_bits_to_float2(input.x);
+            const float2 x1       = bf16x2_bits_to_float2(input.y);
+            const float2 x2       = bf16x2_bits_to_float2(input.z);
+            const float2 x3       = bf16x2_bits_to_float2(input.w);
+            const float values[8] = {x0.x, x0.y, x1.x, x1.y, x2.x, x2.y, x3.x, x3.y};
+#pragma unroll
+            for (int item = 0; item < 8; ++item) {
+                acc0 = fmaf(weights0[item], values[item], acc0);
+                acc1 = fmaf(weights1[item], values[item], acc1);
+            }
+        }
+    } else if constexpr (Codec::kD3SingleValuePerLane) {
         for (int group = first_group; group < last_group; ++group) {
             const std::int64_t index0 = static_cast<std::int64_t>(row0) * kGroups + group;
             const std::int64_t index1 = static_cast<std::int64_t>(row1) * kGroups + group;
@@ -265,53 +293,45 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = silu(gate) * up; }
 }
 
-template <class RoutedCodec>
-__global__ void sparse_moe_d3_persistent_kernel(
+template <class RoutedCodec, int PathsPerBlock>
+__global__ void sparse_moe_d3_path_tiled_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ token_ids,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ token_activations,
-    int tokens) {
-    __shared__ __align__(16) __nv_bfloat16 x_shared[2][kHidden];
-    const int tid  = static_cast<int>(threadIdx.x);
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
-    const int j    = static_cast<int>(blockIdx.x);
-
-    if (tid < 256) {
-        store_vec(x_shared[0] + tid * 8, load_vec<uint4>(x + tid * 8));
+    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ token_activations) {
+    // Three path CTAs per token/output row expose enough blocks for the 170-SM target and keep the
+    // heavier shared W8 path from holding eight completed routed warps resident.
+    static_assert(PathsPerBlock > 0 && (kTopK + 1) % PathsPerBlock == 0);
+    constexpr int kPathBlocks = (kTopK + 1) / PathsPerBlock;
+    __shared__ __align__(16) __nv_bfloat16 x_shared[kHidden];
+    const int tid        = static_cast<int>(threadIdx.x);
+    const int warp       = tid >> 5;
+    const int lane       = tid & 31;
+    const int token      = static_cast<int>(blockIdx.y) / kPathBlocks;
+    const int path_block = static_cast<int>(blockIdx.y) - token * kPathBlocks;
+    const int path       = path_block * PathsPerBlock + warp;
+    const auto* input    = x + static_cast<std::int64_t>(token) * kHidden;
+    for (int vector = tid; vector < kHidden / 8; vector += static_cast<int>(blockDim.x)) {
+        store_vec(x_shared + vector * 8, load_vec<uint4>(input + vector * 8));
     }
     __syncthreads();
 
-    for (int token = 0; token < tokens; ++token) {
-        const int buffer = token & 1;
-
-        float gate = 0.0f;
-        float up   = 0.0f;
-        if (warp < kTopK) {
-            const int expert   = token_ids[token * kTopK + warp];
-            const int row_base = expert * (2 * kIntermediate);
-            dot_two_rows<RoutedCodec, kHidden>(
-                routed_codes, routed_high, routed_scales, row_base + j,
-                row_base + kIntermediate + j, x_shared[buffer], 0, kHidden, gate, up);
-        } else {
-            dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j,
-                                           kIntermediate + j, x_shared[buffer], 0, kHidden, gate,
+    const int j = static_cast<int>(blockIdx.x);
+    float gate  = 0.0f;
+    float up    = 0.0f;
+    if (path < kTopK) {
+        const int expert   = token_ids[token * kTopK + path];
+        const int row_base = expert * (2 * kIntermediate);
+        dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales, row_base + j,
+                                           row_base + kIntermediate + j, x_shared, 0, kHidden, gate,
                                            up);
-        }
-        if (lane == 0) {
-            const std::int64_t offset =
-                (static_cast<std::int64_t>(token) * (kTopK + 1) + warp) * kIntermediate + j;
-            token_activations[offset] = silu(gate) * up;
-        }
-        if (token + 1 < tokens) {
-            if (tid < 256) {
-                const __nv_bfloat16* next_x =
-                    x + static_cast<std::int64_t>(token + 1) * kHidden;
-                store_vec(x_shared[buffer ^ 1] + tid * 8, load_vec<uint4>(next_x + tid * 8));
-            }
-            __syncthreads();
-        }
+    } else {
+        dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
+                                       x_shared, 0, kHidden, gate, up);
+    }
+    if (lane == 0) {
+        token_activations[(static_cast<std::int64_t>(token) * (kTopK + 1) + path) * kIntermediate +
+                          j] = silu(gate) * up;
     }
 }
 
@@ -370,7 +390,29 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
     float acc[Rows];
 #pragma unroll
     for (int row = 0; row < Rows; ++row) { acc[row] = 0.0f; }
-    if (lane < Codec::kGroupK / 2) {
+    if constexpr (Codec::kPackedWord8) {
+        // Q5/Q6 use the same eight-value lane ownership as D3. The high plane and FP16 scale are
+        // decoded exactly from their registered row-split codec before FP32 accumulation.
+        const int lane_group    = lane >> 3;
+        const int lane_in_group = lane & 7;
+        for (int group_base = first_group; group_base < last_group; group_base += 4) {
+            const int group = group_base + lane_group;
+            const float4 x0 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8);
+            const float4 x1 = load_vec<float4>(x + group * Codec::kGroupK + lane_in_group * 8 + 4);
+            const float values[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+            for (int row = 0; row < Rows; ++row) {
+                const std::int64_t group_index =
+                    static_cast<std::int64_t>(row_base + row) * kGroups + group;
+                float weights[8];
+                Codec::load_eight(codes, high, scales, group_index, lane_in_group, weights);
+#pragma unroll
+                for (int item = 0; item < 8; ++item) {
+                    acc[row] = fmaf(weights[item], values[item], acc[row]);
+                }
+            }
+        }
+    } else if (lane < Codec::kGroupK / 2) {
         for (int group = first_group; group < last_group; ++group) {
             const int k     = group * Codec::kGroupK + lane * 2;
             const float2 xv = load_vec<float2>(x + k);
@@ -432,46 +474,43 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
 }
 
 template <class RoutedCodec>
-__global__ void sparse_moe_d4_persistent_kernel(
+__global__ void sparse_moe_d4_token_kernel(
     const int* __restrict__ token_ids, const float* __restrict__ token_alpha,
     const float* __restrict__ shared_scale, const float* __restrict__ token_activations,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination,
-    int tokens) {
-    __shared__ float paths[2][kTopK + 1];
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int row  = static_cast<int>(blockIdx.x);
-
-    for (int token = 0; token < tokens; ++token) {
-        const int buffer = token & 1;
-        const float* act = token_activations +
-                           static_cast<std::int64_t>(token) * (kTopK + 1) * kIntermediate;
-        if (warp < kTopK) {
-            const int expert = token_ids[token * kTopK + warp];
-            float dot[1];
-            dot_fp32_rows<RoutedCodec, 1>(
-                routed_codes, routed_high, routed_scales, expert * kHidden + row,
-                act + static_cast<std::int64_t>(warp) * kIntermediate, 0,
-                kIntermediate / RoutedCodec::kGroupK, dot);
-            if (lane == 0) { paths[buffer][warp] = token_alpha[token * kTopK + warp] * dot[0]; }
-        } else {
-            float dot[1];
-            dot_fp32_rows<W8Codec, 1>(shared_codes, nullptr, shared_scales, row,
-                                      act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
-                                      kIntermediate / W8Codec::kGroupK, dot);
-            if (lane == 0) { paths[buffer][kTopK] = shared_scale[token] * dot[0]; }
-        }
-        __syncthreads();
-        if (warp == 0 && lane == 0) {
-            __nv_bfloat16* output =
-                destination + static_cast<std::int64_t>(token) * kHidden + row;
-            float value = __bfloat162float(*output);
+    const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination) {
+    // Token is a grid dimension rather than an in-CTA serial loop. This removes the small-T wave
+    // tail while retaining the deterministic rank-order FP32 epilogue below.
+    __shared__ float paths[kTopK + 1];
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int row   = static_cast<int>(blockIdx.x);
+    const int token = static_cast<int>(blockIdx.y);
+    const float* act =
+        token_activations + static_cast<std::int64_t>(token) * (kTopK + 1) * kIntermediate;
+    if (warp < kTopK) {
+        const int expert = token_ids[token * kTopK + warp];
+        float dot[1];
+        dot_fp32_rows<RoutedCodec, 1>(routed_codes, routed_high, routed_scales,
+                                      expert * kHidden + row,
+                                      act + static_cast<std::int64_t>(warp) * kIntermediate, 0,
+                                      kIntermediate / RoutedCodec::kGroupK, dot);
+        if (lane == 0) { paths[warp] = token_alpha[token * kTopK + warp] * dot[0]; }
+    } else {
+        float dot[1];
+        dot_fp32_rows<W8Codec, 1>(shared_codes, nullptr, shared_scales, row,
+                                  act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
+                                  kIntermediate / W8Codec::kGroupK, dot);
+        if (lane == 0) { paths[kTopK] = shared_scale[token] * dot[0]; }
+    }
+    __syncthreads();
+    if (warp == 0 && lane == 0) {
+        __nv_bfloat16* output = destination + static_cast<std::int64_t>(token) * kHidden + row;
+        float value           = __bfloat162float(*output);
 #pragma unroll
-            for (int path = 0; path < kTopK + 1; ++path) { value += paths[buffer][path]; }
-            *output = __float2bfloat16_rn(value);
-        }
+        for (int path = 0; path < kTopK + 1; ++path) { value += paths[path]; }
+        *output = __float2bfloat16_rn(value);
     }
 }
 
@@ -583,33 +622,34 @@ void launch_d4_codec(const SparseMoeWeights& weights, Tensor& destination,
 }
 
 template <class Codec>
-void launch_d3_persistent_codec(const Tensor& x, const SparseMoeWeights& weights,
-                                const int* token_ids, float* token_activations,
-                                std::int32_t tokens, cudaStream_t stream) {
-    sparse_moe_d3_persistent_kernel<Codec><<<kIntermediate, 9 * 32, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), token_ids,
-        static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata),
-        static_cast<const std::uint8_t*>(weights.routed_gate_up.qhigh),
-        static_cast<const std::uint8_t*>(weights.routed_gate_up.scales),
-        static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata),
-        static_cast<const std::uint8_t*>(weights.shared_gate_up.scales), token_activations,
-        tokens);
+void launch_d3_small_t_codec(const Tensor& x, const SparseMoeWeights& weights, const int* token_ids,
+                             float* token_activations, std::int32_t tokens, cudaStream_t stream) {
+    constexpr int kPathsPerBlock = 3;
+    constexpr int kPathBlocks    = (kTopK + 1) / kPathsPerBlock;
+    sparse_moe_d3_path_tiled_kernel<Codec, kPathsPerBlock>
+        <<<dim3(kIntermediate, tokens * kPathBlocks), kPathsPerBlock * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), token_ids,
+            static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata),
+            static_cast<const std::uint8_t*>(weights.routed_gate_up.qhigh),
+            static_cast<const std::uint8_t*>(weights.routed_gate_up.scales),
+            static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata),
+            static_cast<const std::uint8_t*>(weights.shared_gate_up.scales), token_activations);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Codec>
-void launch_d4_persistent_codec(const SparseMoeWeights& weights, Tensor& destination,
-                                const int* token_ids, const float* token_alpha,
-                                const float* shared_scale, const float* token_activations,
-                                std::int32_t tokens, cudaStream_t stream) {
-    sparse_moe_d4_persistent_kernel<Codec><<<kHidden, 9 * 32, 0, stream>>>(
+void launch_d4_small_t_codec(const SparseMoeWeights& weights, Tensor& destination,
+                             const int* token_ids, const float* token_alpha,
+                             const float* shared_scale, const float* token_activations,
+                             std::int32_t tokens, cudaStream_t stream) {
+    sparse_moe_d4_token_kernel<Codec><<<dim3(kHidden, tokens), 9 * 32, 0, stream>>>(
         token_ids, token_alpha, shared_scale, token_activations,
         static_cast<const std::uint8_t*>(weights.routed_down.qdata),
         static_cast<const std::uint8_t*>(weights.routed_down.qhigh),
         static_cast<const std::uint8_t*>(weights.routed_down.scales),
         static_cast<const std::uint8_t*>(weights.shared_down.qdata),
         static_cast<const std::uint8_t*>(weights.shared_down.scales),
-        static_cast<__nv_bfloat16*>(destination.data), tokens);
+        static_cast<__nv_bfloat16*>(destination.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -687,42 +727,40 @@ void sparse_moe_decode_launch_d4(const SparseMoeWeights& weights, Tensor& destin
     }
 }
 
-void sparse_moe_decode_launch_d3_persistent(
-    const Tensor& x, const SparseMoeWeights& weights, const int* token_ids,
-    float* token_activations, std::int32_t tokens, cudaStream_t stream) {
+void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
+                                         const int* token_ids, float* token_activations,
+                                         std::int32_t tokens, cudaStream_t stream) {
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
-        launch_d3_persistent_codec<Q4Codec>(x, weights, token_ids, token_activations, tokens,
-                                             stream);
+        launch_d3_small_t_codec<Q4Codec>(x, weights, token_ids, token_activations, tokens, stream);
         return;
     case QType::W8G32_F16S:
-        launch_d3_persistent_codec<W8Codec>(x, weights, token_ids, token_activations, tokens,
-                                             stream);
+        launch_d3_small_t_codec<W8Codec>(x, weights, token_ids, token_activations, tokens, stream);
         return;
     default:
-        throw std::invalid_argument("sparse_moe: unsupported persistent D3 codec");
+        throw std::invalid_argument("sparse_moe: unsupported small-T D3 codec");
     }
 }
 
-void sparse_moe_decode_launch_d4_persistent(
-    const SparseMoeWeights& weights, Tensor& destination, const int* token_ids,
-    const float* token_alpha, const float* shared_scale, const float* token_activations,
-    std::int32_t tokens, cudaStream_t stream) {
+void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destination,
+                                         const int* token_ids, const float* token_alpha,
+                                         const float* shared_scale, const float* token_activations,
+                                         std::int32_t tokens, cudaStream_t stream) {
     switch (weights.routed_down.qtype) {
     case QType::Q5G64_F16S:
-        launch_d4_persistent_codec<Q5Codec>(weights, destination, token_ids, token_alpha,
-                                             shared_scale, token_activations, tokens, stream);
+        launch_d4_small_t_codec<Q5Codec>(weights, destination, token_ids, token_alpha, shared_scale,
+                                         token_activations, tokens, stream);
         return;
     case QType::Q6G64_F16S:
-        launch_d4_persistent_codec<Q6Codec>(weights, destination, token_ids, token_alpha,
-                                             shared_scale, token_activations, tokens, stream);
+        launch_d4_small_t_codec<Q6Codec>(weights, destination, token_ids, token_alpha, shared_scale,
+                                         token_activations, tokens, stream);
         return;
     case QType::W8G32_F16S:
-        launch_d4_persistent_codec<W8Codec>(weights, destination, token_ids, token_alpha,
-                                             shared_scale, token_activations, tokens, stream);
+        launch_d4_small_t_codec<W8Codec>(weights, destination, token_ids, token_alpha, shared_scale,
+                                         token_activations, tokens, stream);
         return;
     default:
-        throw std::invalid_argument("sparse_moe: unsupported persistent D4 codec");
+        throw std::invalid_argument("sparse_moe: unsupported small-T D4 codec");
     }
 }
 

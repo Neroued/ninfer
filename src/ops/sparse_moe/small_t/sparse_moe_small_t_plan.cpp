@@ -12,7 +12,7 @@ bool sparse_moe_uses_small_t(std::int32_t tokens) noexcept {
 
 std::size_t sparse_moe_small_t_workspace_bytes(std::int32_t tokens) {
     if (!sparse_moe_uses_small_t(tokens)) {
-        throw std::invalid_argument("sparse_moe small-T: tokens must be in [2,32]");
+        throw std::invalid_argument("sparse_moe small-T: tokens must be in [2,44]");
     }
     WorkspaceLayoutBuilder layout;
     (void)allocate_sparse_moe_small_t_workspace(layout, tokens);

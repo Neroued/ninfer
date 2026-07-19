@@ -25,7 +25,7 @@ template <int Tokens>
 __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x,
                                              const __nv_bfloat16* __restrict__ router,
                                              float* __restrict__ partial_scores) {
-    static_assert(Tokens >= kSparseMoeSmallTMin && Tokens <= kSparseMoeSmallTMax);
+    static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
     __shared__ float partial[kRouterWarps][Tokens];
     const int row       = static_cast<int>(blockIdx.x) / kRouterPartitions;
     const int partition = static_cast<int>(blockIdx.x) - row * kRouterPartitions;
@@ -57,14 +57,17 @@ __global__ void sparse_moe_small_t_s1_kernel(const __nv_bfloat16* __restrict__ x
     }
     __syncthreads();
 
-    if (warp == 0 && lane < Tokens) {
-        float sum = 0.0f;
+    if (warp == 0) {
+        for (int token = lane; token < Tokens; token += 32) {
+            float sum = 0.0f;
 #pragma unroll
-        for (int source_warp = 0; source_warp < kRouterWarps; ++source_warp) {
-            sum += partial[source_warp][lane];
+            for (int source_warp = 0; source_warp < kRouterWarps; ++source_warp) {
+                sum += partial[source_warp][token];
+            }
+            partial_scores[(static_cast<std::int64_t>(token) * kRouterRows + row) *
+                               kRouterPartitions +
+                           partition] = sum;
         }
-        partial_scores[(static_cast<std::int64_t>(lane) * kRouterRows + row) * kRouterPartitions +
-                       partition] = sum;
     }
 }
 
@@ -72,7 +75,7 @@ template <int Tokens>
 __global__ void
 sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __restrict__ token_ids,
                              float* __restrict__ token_alpha, float* __restrict__ shared_scale) {
-    static_assert(Tokens >= kSparseMoeSmallTMin && Tokens <= kSparseMoeSmallTMax);
+    static_assert(Tokens >= 1 && Tokens <= kSparseMoeSmallTMax);
     __shared__ float scores[Tokens][kRouterRows];
     __shared__ float selected_logits[Tokens][kTopK];
     const int tid = static_cast<int>(threadIdx.x);
@@ -86,8 +89,8 @@ sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __re
     }
     __syncthreads();
 
-    const int token = tid >> 5;
-    if (token < Tokens) {
+    const int resident_warps = static_cast<int>(blockDim.x) >> 5;
+    for (int token = tid >> 5; token < Tokens; token += resident_warps) {
         sparse_moe_select_top8_warp(scores[token], token_ids + token * kTopK,
                                     token_alpha + token * kTopK, shared_scale + token,
                                     selected_logits[token]);
@@ -95,38 +98,35 @@ sparse_moe_small_t_s2_kernel(const float* __restrict__ partial_scores, int* __re
 }
 
 template <int Tokens>
-void launch_s1(const Tensor& x, const Weight& router, const SparseMoeSmallTWorkspace& workspace,
+void launch_s1(const __nv_bfloat16* x, const __nv_bfloat16* router, float* partial_scores,
                cudaStream_t stream) {
     sparse_moe_small_t_s1_kernel<Tokens>
         <<<kRouterRows * kRouterPartitions, kRouterWarps * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const __nv_bfloat16*>(router.qdata),
-            static_cast<float*>(workspace.scratch.data));
+            x, router, partial_scores);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <int Tokens>
-void launch_s2(const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
+void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha, float* shared_scale,
+               cudaStream_t stream) {
     sparse_moe_small_t_s2_kernel<Tokens>
-        <<<1, Tokens * 32, 0, stream>>>(static_cast<const float*>(workspace.scratch.data),
-                                        static_cast<int*>(workspace.token_ids.data),
-                                        static_cast<float*>(workspace.token_alpha.data),
-                                        static_cast<float*>(workspace.shared_scale.data));
+        <<<1, (Tokens < 32 ? Tokens : 32) * 32, 0, stream>>>(partial_scores, token_ids, token_alpha,
+                                                             shared_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_s3_persistent(const Tensor& x, const SparseMoeWeights& weights,
-                          const SparseMoeSmallTPlan& plan,
-                          const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
-    sparse_moe_decode_launch_d3_persistent(
+void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
+                     const SparseMoeSmallTPlan& plan, const SparseMoeSmallTWorkspace& workspace,
+                     cudaStream_t stream) {
+    sparse_moe_decode_launch_d3_small_t(
         x, weights, static_cast<const int*>(workspace.token_ids.data),
         static_cast<float*>(workspace.scratch.data), plan.tokens, stream);
 }
 
-void launch_s4_persistent(const SparseMoeWeights& weights, Tensor& destination,
-                          const SparseMoeSmallTPlan& plan,
-                          const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
-    sparse_moe_decode_launch_d4_persistent(
+void launch_s4_tiled(const SparseMoeWeights& weights, Tensor& destination,
+                     const SparseMoeSmallTPlan& plan, const SparseMoeSmallTWorkspace& workspace,
+                     cudaStream_t stream) {
+    sparse_moe_decode_launch_d4_small_t(
         weights, destination, static_cast<const int*>(workspace.token_ids.data),
         static_cast<const float*>(workspace.token_alpha.data),
         static_cast<const float*>(workspace.shared_scale.data),
@@ -136,6 +136,9 @@ void launch_s4_persistent(const SparseMoeWeights& weights, Tensor& destination,
 template <class Launch>
 void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
     switch (tokens) {
+    case 1:
+        launch.template operator()<1>();
+        return;
     case 2:
         launch.template operator()<2>();
         return;
@@ -229,6 +232,42 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
     case 32:
         launch.template operator()<32>();
         return;
+    case 33:
+        launch.template operator()<33>();
+        return;
+    case 34:
+        launch.template operator()<34>();
+        return;
+    case 35:
+        launch.template operator()<35>();
+        return;
+    case 36:
+        launch.template operator()<36>();
+        return;
+    case 37:
+        launch.template operator()<37>();
+        return;
+    case 38:
+        launch.template operator()<38>();
+        return;
+    case 39:
+        launch.template operator()<39>();
+        return;
+    case 40:
+        launch.template operator()<40>();
+        return;
+    case 41:
+        launch.template operator()<41>();
+        return;
+    case 42:
+        launch.template operator()<42>();
+        return;
+    case 43:
+        launch.template operator()<43>();
+        return;
+    case 44:
+        launch.template operator()<44>();
+        return;
     default:
         throw std::invalid_argument("sparse_moe small-T: unsupported token count");
     }
@@ -239,25 +278,32 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 void sparse_moe_small_t_launch_s1(const Tensor& x, const Weight& router_shared_gate,
                                   const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
     dispatch_tokens(x.ne[1], [&]<int Tokens>() {
-        launch_s1<Tokens>(x, router_shared_gate, workspace, stream);
+        launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),
+                          static_cast<const __nv_bfloat16*>(router_shared_gate.qdata),
+                          static_cast<float*>(workspace.scratch.data), stream);
     });
 }
 
 void sparse_moe_small_t_launch_s2(const SparseMoeSmallTPlan& plan,
                                   const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
-    dispatch_tokens(plan.tokens, [&]<int Tokens>() { launch_s2<Tokens>(workspace, stream); });
+    dispatch_tokens(plan.tokens, [&]<int Tokens>() {
+        launch_s2<Tokens>(static_cast<const float*>(workspace.scratch.data),
+                          static_cast<int*>(workspace.token_ids.data),
+                          static_cast<float*>(workspace.token_alpha.data),
+                          static_cast<float*>(workspace.shared_scale.data), stream);
+    });
 }
 
 void sparse_moe_small_t_launch_s3(const Tensor& x, const SparseMoeWeights& weights,
                                   const SparseMoeSmallTPlan& plan,
                                   const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
-    launch_s3_persistent(x, weights, plan, workspace, stream);
+    launch_s3_tiled(x, weights, plan, workspace, stream);
 }
 
 void sparse_moe_small_t_launch_s4(const SparseMoeWeights& weights, Tensor& destination,
                                   const SparseMoeSmallTPlan& plan,
                                   const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
-    launch_s4_persistent(weights, destination, plan, workspace, stream);
+    launch_s4_tiled(weights, destination, plan, workspace, stream);
 }
 
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,

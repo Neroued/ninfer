@@ -32,13 +32,56 @@ constexpr std::int32_t kExpertGateRows = 1024;
 constexpr std::int32_t kRoutedGateRows = kExperts * kExpertGateRows;
 constexpr std::int32_t kRoutedDownRows = kExperts * kHidden;
 constexpr std::int32_t kSharedGateRows = 2 * kIntermediate;
-constexpr std::int32_t kSmallTMax      = 32;
-constexpr std::int32_t kQ4Q5PrefillMin = 12;
+constexpr std::int32_t kSmallTMax       = 44;
+constexpr std::int32_t kQ4Q5PrefillMin  = 45;
+constexpr std::int32_t kQ4Q6PrefillMin  = 45;
+constexpr std::int32_t kW8W8PrefillMin  = 18;
 
 struct QuantGeometry {
     int group;
     int code_bytes_per_group;
     int high_bytes_per_group;
+};
+
+constexpr std::size_t kOutputGuardBytes = 256;
+constexpr std::uint8_t kOutputGuardByte = 0xa5;
+
+struct GuardedBf16Output {
+    explicit GuardedBf16Output(std::size_t words)
+        : storage(words * sizeof(std::uint16_t) + 2 * kOutputGuardBytes), words(words) {
+        cudaMemset(storage.p, kOutputGuardByte, storage.bytes);
+    }
+
+    void* data() const { return static_cast<std::uint8_t*>(storage.p) + kOutputGuardBytes; }
+
+    std::vector<double> values() const {
+        std::vector<std::uint16_t> bits(words);
+        cudaMemcpy(bits.data(), data(), words * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
+        std::vector<double> result(words);
+        for (std::size_t index = 0; index < words; ++index) {
+            result[index] = bf16_to_f32(bits[index]);
+        }
+        return result;
+    }
+
+    int verify_guards(const std::string& label) const {
+        std::vector<std::uint8_t> prefix(kOutputGuardBytes);
+        std::vector<std::uint8_t> suffix(kOutputGuardBytes);
+        cudaMemcpy(prefix.data(), storage.p, prefix.size(), cudaMemcpyDeviceToHost);
+        cudaMemcpy(suffix.data(),
+                   static_cast<const std::uint8_t*>(data()) + words * sizeof(std::uint16_t),
+                   suffix.size(), cudaMemcpyDeviceToHost);
+        const auto intact = [](const std::vector<std::uint8_t>& bytes) {
+            return std::all_of(bytes.begin(), bytes.end(),
+                               [](std::uint8_t byte) { return byte == kOutputGuardByte; });
+        };
+        if (intact(prefix) && intact(suffix)) { return 0; }
+        std::cerr << label << ": output guard was overwritten\n";
+        return 1;
+    }
+
+    DBuf storage;
+    std::size_t words;
 };
 
 QuantGeometry geometry(QType qtype) {
@@ -400,10 +443,10 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
 
     DBuf device_input         = to_device_bf16(input);
     DBuf device_residual_seed = to_device_bf16(residual);
-    DBuf device_destination(residual.size() * sizeof(std::uint16_t));
+    GuardedBf16Output device_destination(residual.size());
     DBuf device_router = to_device_bf16(router);
-    cudaMemcpy(device_destination.p, device_residual_seed.p, device_destination.bytes,
-               cudaMemcpyDeviceToDevice);
+    cudaMemcpy(device_destination.data(), device_residual_seed.p,
+               residual.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToDevice);
 
     DeviceRowSplit routed_gate(profile.routed_gate_up, kRoutedGateRows, kHidden);
     DeviceRowSplit routed_down(profile.routed_down, kRoutedDownRows, kIntermediate);
@@ -450,7 +493,7 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
         shared_down_device.weight(),
     };
     Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
-    Tensor destination(device_destination.p, DType::BF16, {kHidden, tokens});
+    Tensor destination(device_destination.data(), DType::BF16, {kHidden, tokens});
     const std::size_t workspace_bytes = ops::sparse_moe_workspace_bytes(tokens);
     WorkspaceArena workspace(workspace_bytes);
 
@@ -493,9 +536,10 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
         cudaDeviceSynchronize();
     }
 
-    const std::vector<double> actual = from_device_bf16(device_destination, input.size());
+    const std::vector<double> actual = device_destination.values();
     int failures                     = verify(case_name, actual, reference, profile.tolerance);
-    bool changed_residual            = false;
+    failures += device_destination.verify_guards(case_name);
+    bool changed_residual = false;
     for (std::size_t index = 0; index < actual.size(); ++index) {
         if (actual[index] != static_cast<double>(residual[index])) {
             changed_residual = true;
@@ -524,7 +568,8 @@ int run_case(const CodecProfile& profile, const RouteCase& route, const char* ca
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, too_small,
                             nullptr);
         });
-        Tensor mismatched_destination(device_destination.p, DType::BF16, {kHidden, tokens + 1});
+        Tensor mismatched_destination(device_destination.data(), DType::BF16,
+                                      {kHidden, tokens + 1});
         failures += expect_invalid("sparse_moe token mismatch", [&] {
             ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, mismatched_destination,
                             workspace, nullptr);
@@ -571,6 +616,12 @@ int main() {
         {{{0, 32, 65, 97, 129, 161, 225, 253}}, -1}, {{{1, 33, 65, 97, 129, 162, 226, 253}}, -1},
         {{{1, 33, 65, 98, 130, 162, 226, 252}}, -1}, {{{1, 34, 66, 98, 130, 162, 227, 252}}, -1},
     };
+    const std::vector<RouteCase> disjoint_routes = {
+        {{{0, 1, 2, 3, 4, 5, 6, 7}}, -1},
+        {{{32, 33, 34, 35, 36, 37, 38, 39}}, -1},
+        {{{96, 97, 98, 99, 100, 101, 102, 103}}, -1},
+        {{{192, 193, 194, 195, 196, 197, 198, 199}}, -1},
+    };
 
     int failures = 0;
     for (std::size_t index = 0; index < profiles.size(); ++index) {
@@ -580,6 +631,8 @@ int main() {
     // Codec decoding, routing tie behavior, exact-T dispatch, and per-token routing are
     // orthogonal test dimensions.
     failures += run_case(profiles[0], boundary_tie, "sparse_moe boundary tie", 1, 1, false, false);
+    failures +=
+        run_case(profiles[0], boundary_tie, "sparse_moe small-T boundary tie", 4, 1, false, false);
     for (int tokens = 2; tokens <= kSmallTMax; ++tokens) {
         const std::string name =
             std::string(tokens < kQ4Q5PrefillMin ? "sparse_moe small-T" : "sparse_moe prefill T") +
@@ -587,22 +640,26 @@ int main() {
         failures += run_case(profiles[0], ordinary_route, name.c_str(), tokens, tokens,
                              tokens == kSmallTMax, false);
     }
-    failures +=
-        run_case(profiles[1], ordinary_route, "sparse_moe q4+q6 small-T", 6, 6, false, false);
-    failures +=
-        run_case(profiles[2], ordinary_route, "sparse_moe w8+w8 small-T", 6, 6, false, false);
-    failures += run_case(profiles[1], ordinary_route, "sparse_moe q4+q6 transition T10", 10, 10,
+    for (int tokens = 2; tokens < kQ4Q6PrefillMin; ++tokens) {
+        const std::string name = "sparse_moe q4+q6 small-T" + std::to_string(tokens);
+        failures += run_case(profiles[1], ordinary_route, name.c_str(), tokens, tokens,
+                             tokens == kQ4Q6PrefillMin - 1, false);
+    }
+    for (int tokens = 2; tokens < kW8W8PrefillMin; ++tokens) {
+        const std::string name = "sparse_moe w8+w8 small-T" + std::to_string(tokens);
+        failures += run_case(profiles[2], ordinary_route, name.c_str(), tokens, tokens,
+                             tokens == kW8W8PrefillMin - 1, false);
+    }
+    failures += run_case(profiles[0], ordinary_route, "sparse_moe q4+q5 transition T45", 45,
+                         kSmallTMax, false, false);
+    failures += run_case(profiles[1], ordinary_route, "sparse_moe q4+q6 transition T45", 45,
+                         kSmallTMax, false, false);
+    failures += run_case(profiles[2], ordinary_route, "sparse_moe w8+w8 transition T18", 18, 18,
                          false, false);
-    failures += run_case(profiles[1], ordinary_route, "sparse_moe q4+q6 transition T11", 11, 11,
-                         false, false);
-    failures +=
-        run_case(profiles[2], ordinary_route, "sparse_moe w8+w8 transition T7", 7, 7, false, false);
     failures += run_case(profiles[0], ordinary_route, "sparse_moe correlated routes", 6, 6, true,
                          false, correlated_routes);
-    failures += run_case(profiles[0], ordinary_route, "sparse_moe prefill q4+q5 T33", 33,
-                         kSmallTMax, false, false);
-    failures += run_case(profiles[1], ordinary_route, "sparse_moe prefill q4+q6 T33", 33,
-                         kSmallTMax, false, false);
+    failures += run_case(profiles[0], ordinary_route, "sparse_moe disjoint routes", 4, 4, false,
+                         false, disjoint_routes);
     failures += run_case(profiles[2], ordinary_route, "sparse_moe prefill w8+w8 T33", 33,
                          kSmallTMax, false, false);
     for (std::size_t index = 0; index < profiles.size(); ++index) {

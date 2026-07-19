@@ -13,10 +13,10 @@ namespace ninfer::ops::detail {
 
 // RTX 5090 crossovers measured with the trace-like expert distribution. The
 // public workspace query starts at the earliest codec-specific crossover.
-inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 7;
-inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 12;
-inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 11;
-inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 7;
+inline constexpr std::int32_t kSparseMoePrefillWorkspaceMin = 18;
+inline constexpr std::int32_t kSparseMoePrefillQ4Q5Min      = 45;
+inline constexpr std::int32_t kSparseMoePrefillQ4Q6Min      = 45;
+inline constexpr std::int32_t kSparseMoePrefillW8W8Min      = 18;
 inline constexpr std::int32_t kSparseMoePrefillWideMin      = 768;
 inline constexpr std::int32_t kSparseMoePrefillSliceMax     = 4096;
 inline constexpr std::int32_t kSparseMoeRouteTileTokens     = 8;

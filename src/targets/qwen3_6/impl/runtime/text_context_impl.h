@@ -445,7 +445,7 @@ void TextContext::mtp_draft_argmax(const Tensor& hidden_col, Tensor& logits, Ten
 void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& positions, ops::GqaExecutionEnvelope envelope,
                                     Tensor& mtp_hidden, int logits_column, Tensor* logits,
-                                    Tensor* draft_token) {
+                                    Tensor* draft_token, const Tensor* explicit_rope_positions) {
     if (mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
@@ -464,10 +464,20 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP draft token");
     }
 
-    auto position_scope   = work_.scope();
-    Tensor rope_positions = work_.alloc(DType::I32, {T});
-    ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, ctx_.stream);
-    mtp_forward_core(ids, hidden, positions, rope_positions, envelope, mtp_hidden);
+    auto position_scope = work_.scope();
+    Tensor generated_rope_positions;
+    const Tensor* rope_positions = explicit_rope_positions;
+    if (rope_positions == nullptr) {
+        generated_rope_positions = work_.alloc(DType::I32, {T});
+        ops::offset_i32_positions(positions, io_.rope_delta, generated_rope_positions, ctx_.stream);
+        rope_positions = &generated_rope_positions;
+    } else if (rope_positions->dtype != DType::I32 || rope_positions->ne[0] != T ||
+               (rope_positions->ne[1] != 1 && rope_positions->ne[1] != 3) ||
+               rope_positions->ne[2] != 1 || rope_positions->ne[3] != 1 ||
+               !rope_positions->is_contiguous() || rope_positions->data == nullptr) {
+        throw std::invalid_argument("MTP explicit rope positions must be [T] or [T,3]");
+    }
+    mtp_forward_core(ids, hidden, positions, *rope_positions, envelope, mtp_hidden);
 
     if (logits_column >= 0) {
         auto logits_scope = work_.scope();
@@ -743,16 +753,18 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
     }
-    cudaStream_t s       = ctx_.stream;
-    mtp_prompt_prepared_ = false;
-    const int T          = static_cast<int>(ids.size());
-    const int chunk      = static_cast<int>(prefill_chunk_);
+    cudaStream_t s           = ctx_.stream;
+    mtp_prompt_prepared_     = false;
+    const int T              = static_cast<int>(ids.size());
+    const int chunk          = static_cast<int>(prefill_chunk_);
+    const std::uint32_t base = text_kv_base_;
 
     if (multimodal != nullptr) {
-        if (text_kv_base_ != 0) {
-            throw std::invalid_argument("multimodal prefill must start from an empty cache");
+        if (base != multimodal->begin ||
+            multimodal->token_ids.size() != static_cast<std::size_t>(base) + ids.size()) {
+            throw std::invalid_argument("multimodal prefill suffix does not match its cache base");
         }
-        if (multimodal->positions.size() != static_cast<std::size_t>(3) * ids.size()) {
+        if (multimodal->positions.size() != 3 * multimodal->token_ids.size()) {
             throw std::invalid_argument("multimodal positions must have shape [3,T]");
         }
         if (multimodal->vision == nullptr) {
@@ -766,7 +778,6 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
 
     // Prefix-append prefill continues an existing cache: positions are absolute (start at the
     // resident length) and KV/GDN state is not reset. For a reset prefill base == 0.
-    const std::uint32_t base = text_kv_base_;
     if (static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) >
         static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill absolute position exceeds int32");
@@ -823,13 +834,14 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
         work_.reset();
 
         VisionChunk vision_chunk;
+        const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
         if (multimodal != nullptr) {
             if (multimodal->vision == nullptr) {
                 throw std::logic_error("multimodal prefill has no Vision session");
             }
-            vision_chunk = multimodal->vision->prepare_chunk(static_cast<std::uint32_t>(t0),
-                                                             static_cast<std::uint32_t>(len));
-            len          = vision_chunk.length;
+            vision_chunk =
+                multimodal->vision->prepare_chunk(prompt_t0, static_cast<std::uint32_t>(len));
+            len = vision_chunk.length;
         }
         const bool is_last = (t0 + len == T);
         if (is_last) { last_prefill_chunk_length_ = static_cast<std::uint32_t>(len); }
@@ -850,9 +862,10 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             if (multimodal != nullptr) {
                 rope_positions = work_.alloc(DType::I32, {len, 3});
                 rope_positions_host.resize(static_cast<std::size_t>(3) * len);
+                const std::size_t prompt_tokens = multimodal->token_ids.size();
                 for (int axis = 0; axis < 3; ++axis) {
-                    const auto* src =
-                        multimodal->positions.data() + static_cast<std::size_t>(axis) * T + t0;
+                    const auto* src = multimodal->positions.data() +
+                                      static_cast<std::size_t>(axis) * prompt_tokens + prompt_t0;
                     std::copy_n(src, len,
                                 rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
                 }
@@ -872,14 +885,15 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             if (vision_chunk.control != nullptr) {
                 const auto scatter =
                     std::span<const std::int32_t>(vision_chunk.control->scatter_indices);
-                const auto begin = std::lower_bound(scatter.begin(), scatter.end(), t0);
-                const auto end   = std::lower_bound(begin, scatter.end(), t0 + len);
+                const auto begin = std::lower_bound(scatter.begin(), scatter.end(), prompt_t0);
+                const auto end   = std::lower_bound(begin, scatter.end(), prompt_t0 + len);
                 const auto count = static_cast<std::int32_t>(end - begin);
                 if (count > 0) {
                     const auto visual_begin = static_cast<std::int32_t>(begin - scatter.begin());
                     std::vector<std::int32_t> local_indices(static_cast<std::size_t>(count));
                     for (std::int32_t i = 0; i < count; ++i) {
-                        local_indices[static_cast<std::size_t>(i)] = begin[i] - t0;
+                        local_indices[static_cast<std::size_t>(i)] =
+                            begin[i] - static_cast<std::int32_t>(prompt_t0);
                     }
                     Tensor indices_device = work_.alloc(DType::I32, {count});
                     copy_i32(local_indices.data(), indices_device, s);
@@ -918,16 +932,22 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             }
 
             if (prepare_mtp_prompt) {
+                const std::uint32_t alignment_tokens =
+                    multimodal != nullptr ? static_cast<std::uint32_t>(multimodal->token_ids.size())
+                                          : static_cast<std::uint32_t>(T);
+                const std::uint32_t alignment_begin =
+                    multimodal != nullptr ? prompt_t0 : static_cast<std::uint32_t>(t0);
                 const qwen3_6::MtpAlignmentWindow mtp_window = qwen3_6::plan_mtp_alignment_window(
-                    static_cast<std::uint32_t>(T), static_cast<std::uint32_t>(t0),
-                    static_cast<std::uint32_t>(len));
+                    alignment_tokens, alignment_begin, static_cast<std::uint32_t>(len));
+                const std::span<const int> alignment_ids =
+                    multimodal != nullptr ? multimodal->token_ids : ids;
                 std::vector<int> mtp_ids_host(static_cast<std::size_t>(len));
                 const int prompt_columns =
                     len - static_cast<int>(mtp_window.final_column_uses_generated_token);
                 for (int j = 0; j < prompt_columns; ++j) {
                     mtp_ids_host[static_cast<std::size_t>(j)] =
-                        ids[static_cast<std::size_t>(mtp_window.shifted_embedding_begin) +
-                            static_cast<std::size_t>(j)];
+                        alignment_ids[static_cast<std::size_t>(mtp_window.shifted_embedding_begin) +
+                                      static_cast<std::size_t>(j)];
                 }
                 if (mtp_window.final_column_uses_generated_token) {
                     int next_token = 0;
@@ -947,8 +967,8 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                     if (vision_chunk.control != nullptr) {
                         qwen3_6::detail::scatter_shifted_visual_embeddings(
                             mtp_input_embeddings, vision_chunk.embeddings,
-                            vision_chunk.control->scatter_indices, static_cast<std::uint32_t>(T),
-                            mtp_window, work_, s);
+                            vision_chunk.control->scatter_indices, alignment_tokens, mtp_window,
+                            work_, s);
                     }
                     mtp_input_embeddings_ptr = &mtp_input_embeddings;
                 }
@@ -1020,19 +1040,28 @@ void TextContext::diagnostic_prefill(std::span<const int> ids, void* context,
     prefill_impl(ids, nullptr, tap);
 }
 
-void TextContext::prefill(const qwen3_6::PreparedPromptData& input, VisionPrefillSession& vision) {
-    const MultimodalPrefill multimodal{input.positions, &vision, input.rope_delta};
+void TextContext::prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
+                          VisionPrefillSession& vision) {
+    if (begin >= input.token_ids.size()) {
+        throw std::invalid_argument("multimodal prefill suffix is empty");
+    }
+    const std::span<const int> tokens(input.token_ids);
+    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
     NullTap tap;
-    prefill_impl(input.token_ids, &multimodal, tap);
+    prefill_impl(tokens.subspan(begin), &multimodal, tap);
 }
 
-void TextContext::diagnostic_prefill(const qwen3_6::PreparedPromptData& input,
+void TextContext::diagnostic_prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                                      VisionPrefillSession& vision, void* context,
                                      TextTapCallback callback) {
     if (callback == nullptr) { throw std::invalid_argument("diagnostic prefill callback is null"); }
-    const MultimodalPrefill multimodal{input.positions, &vision, input.rope_delta};
+    if (begin >= input.token_ids.size()) {
+        throw std::invalid_argument("diagnostic multimodal prefill suffix is empty");
+    }
+    const std::span<const int> tokens(input.token_ids);
+    const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
     CallbackTap tap{context, callback};
-    prefill_impl(input.token_ids, &multimodal, tap);
+    prefill_impl(tokens.subspan(begin), &multimodal, tap);
 }
 
 

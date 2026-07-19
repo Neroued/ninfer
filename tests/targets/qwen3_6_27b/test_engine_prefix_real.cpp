@@ -193,30 +193,115 @@ int exercise_prefix(ninfer::Engine& engine) {
 }
 
 int exercise_vision(ninfer::Engine& engine) {
-    ninfer::MessagePart image;
-    image.kind              = ninfer::MessagePartKind::Media;
-    image.media.kind        = ninfer::MediaKind::Image;
-    image.media.bytes       = gradient_ppm();
-    image.media.media_type  = "image/x-portable-pixmap";
-    image.media.source_name = "inline.ppm";
-    ninfer::ChatMessage message;
-    message.role = "user";
-    message.parts.push_back(std::move(image));
-    message.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "What is visible?", .media = {}});
-    ninfer::PromptInput input;
-    input.messages.push_back(std::move(message));
-    input.options.enable_thinking = false;
+    const auto image_bytes = gradient_ppm();
+    auto image_part        = [](const std::vector<std::uint8_t>& bytes, std::string name) {
+        ninfer::MessagePart image;
+        image.kind              = ninfer::MessagePartKind::Media;
+        image.media.kind        = ninfer::MediaKind::Image;
+        image.media.bytes       = bytes;
+        image.media.media_type  = "image/x-portable-pixmap";
+        image.media.source_name = std::move(name);
+        return image;
+    };
+    auto assistant_message = [](const ninfer::GenerationResult& result) {
+        ninfer::ChatMessage message;
+        message.role              = "assistant";
+        message.reasoning_content = result.reasoning;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = result.content, .media = {}});
+        return message;
+    };
+    auto first_input = [&](const std::vector<std::uint8_t>& bytes) {
+        ninfer::ChatMessage message;
+        message.role = "user";
+        message.parts.push_back(image_part(bytes, "inline.ppm"));
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "What is visible?", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.enable_thinking = false;
+        return input;
+    };
+    auto followup_input = [&](const std::vector<std::uint8_t>& bytes,
+                              const ninfer::GenerationResult& first) {
+        ninfer::PromptInput input = first_input(bytes);
+        input.messages.push_back(assistant_message(first));
+        ninfer::ChatMessage followup;
+        followup.role = "user";
+        followup.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "Give one more detail.", .media = {}});
+        input.messages.push_back(std::move(followup));
+        return input;
+    };
+    auto appended_media_input =
+        [&](const std::vector<std::uint8_t>& old_bytes, const ninfer::GenerationResult& first,
+            const ninfer::GenerationResult& second, const std::vector<std::uint8_t>& new_bytes) {
+            ninfer::PromptInput input = followup_input(old_bytes, first);
+            input.messages.push_back(assistant_message(second));
+            ninfer::ChatMessage followup;
+            followup.role = "user";
+            followup.parts.push_back(image_part(new_bytes, "second.ppm"));
+            followup.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = "Compare the images.", .media = {}});
+            input.messages.push_back(std::move(followup));
+            return input;
+        };
 
-    ninfer::RequestOptions options;
-    options.execution.requested_output_tokens = 1;
-    options.execution.sampling.temperature    = 0.0F;
-    options.stop.include_model_defaults       = false;
-    const ninfer::GenerationResult result =
-        engine.generate(engine.prepare(std::move(input)), options);
-    if (!result.prompt.has_media || result.generated_token_ids.size() != 1 ||
-        result.finish_reason != ninfer::FinishReason::OutputLimit) {
+    auto options = [](bool reuse) {
+        ninfer::RequestOptions result;
+        result.execution.requested_output_tokens = 2;
+        result.execution.sampling.temperature    = 0.0F;
+        result.execution.allow_prefix_reuse      = reuse;
+        result.stop.include_model_defaults       = false;
+        return result;
+    };
+
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(first_input(image_bytes)), options(false));
+    if (!first.prompt.has_media || first.generated_token_ids.size() != 2 ||
+        first.finish_reason != ninfer::FinishReason::OutputLimit) {
         std::cerr << "real Vision request did not complete through the public Engine\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult reused =
+        engine.generate(engine.prepare(followup_input(image_bytes, first)), options(true));
+    if (reused.reused_prompt_tokens == 0 || reused.timings.vision_seconds != 0.0 ||
+        reused.generated_token_ids.size() != 2) {
+        std::cerr << "same-media continuation did not reuse the resident Vision prefix: reused="
+                  << reused.reused_prompt_tokens << " vision=" << reused.timings.vision_seconds
+                  << '\n';
+        return 1;
+    }
+
+    std::vector<std::uint8_t> second_image = image_bytes;
+    second_image.back() ^= 0x5aU;
+    const ninfer::GenerationResult appended = engine.generate(
+        engine.prepare(appended_media_input(image_bytes, first, reused, second_image)),
+        options(true));
+    if (appended.reused_prompt_tokens == 0 || !(appended.timings.vision_seconds > 0.0) ||
+        appended.generated_token_ids.size() != 2) {
+        std::cerr << "new-media suffix did not preserve the old multimodal prefix: reused="
+                  << appended.reused_prompt_tokens << " vision=" << appended.timings.vision_seconds
+                  << '\n';
+        return 1;
+    }
+
+    const ninfer::GenerationResult baseline = engine.generate(
+        engine.prepare(appended_media_input(image_bytes, first, reused, second_image)),
+        options(false));
+    if (baseline.generated_token_ids != appended.generated_token_ids) {
+        std::cerr << "multimodal prefix reuse changed greedy output\n";
+        return 1;
+    }
+
+    std::vector<std::uint8_t> changed_prefix = image_bytes;
+    changed_prefix[changed_prefix.size() - 2] ^= 0x33U;
+    const ninfer::GenerationResult miss = engine.generate(
+        engine.prepare(appended_media_input(changed_prefix, first, reused, second_image)),
+        options(true));
+    if (miss.reused_prompt_tokens != 0) {
+        std::cerr << "changed media content incorrectly reused placeholder-token KV\n";
         return 1;
     }
     return 0;
@@ -224,9 +309,8 @@ int exercise_vision(ninfer::Engine& engine) {
 
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
-    if (load.target != "qwen3_6_27b" || load.tensor_count != 1118 ||
-        load.resource_count != 6 || load.host_to_device_bytes == 0 ||
-        load.artifact_bytes_read < load.host_to_device_bytes) {
+    if (load.target != "qwen3_6_27b" || load.tensor_count != 1118 || load.resource_count != 6 ||
+        load.host_to_device_bytes == 0 || load.artifact_bytes_read < load.host_to_device_bytes) {
         std::cerr << "Engine construction has an incomplete load summary\n";
         return 1;
     }

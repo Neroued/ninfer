@@ -313,13 +313,13 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
     if ((tap_ == nullptr) != (callback_ == nullptr)) {
         throw std::invalid_argument("Vision tap context and callback must be provided together");
     }
-    if (plan_.control.items.empty() || plan_.uses.size() != plan_.control.items.size()) {
-        throw std::invalid_argument("Vision prefill plan has incomplete item spans");
+    if (plan_.control.items.empty() || plan_.uses.empty()) {
+        throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
     if (transient_.data == nullptr || transient_.alignment < kWorkspaceAlignment) {
         throw std::invalid_argument("Vision item output transient is missing or misaligned");
     }
-    timers_.reserve(plan_.control.items.size());
+    timers_.reserve(plan_.uses.size());
 }
 
 VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length) {

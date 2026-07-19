@@ -2,6 +2,7 @@
 
 #include <ninfer/targets/qwen3_6/frontend.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -31,6 +32,9 @@ struct VisionItem {
     VisionGrid grid;
     std::size_t patch_begin = 0;
     std::size_t patch_count = 0;
+    // SHA-256 of the owned encoded media bytes. Grid/modality/span identity is carried
+    // separately so this digest binds the content without retaining the request payload.
+    std::array<std::uint8_t, 32> content_digest{};
     std::vector<double> timestamps;
     std::vector<TokenSpan> token_spans;
 };

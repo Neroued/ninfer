@@ -66,12 +66,14 @@ struct MultimodalPrefillResult {
 
 [[nodiscard]] MultimodalPrefillResult
 prefill_multimodal(State& state, const PreparedPromptData& prompt, const VisionPrefillPlan& plan,
-                   runtime::TransientRegion transient, bool prepare_mtp);
+                   runtime::TransientRegion transient,
+                   std::optional<std::uint32_t> snapshot_boundary, bool prepare_mtp);
 
 void sample_from_hidden(State& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose);
 void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor& previous_hidden,
-                            std::int32_t position, bool build_proposal);
+                            std::int32_t position, std::span<const std::int32_t> rope_position,
+                            bool build_proposal);
 
 // Executes an exact one-token target step through the verify schedule. The resulting target hidden
 // is in io.verify_hidden[:,0], the sampled token is in io.token, and GDN snapshot slot 0 is the

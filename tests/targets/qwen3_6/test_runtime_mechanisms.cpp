@@ -5,6 +5,8 @@
 #include <ninfer/targets/qwen3_6/round_state.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 
+#include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
@@ -175,6 +177,71 @@ void test_vision_control() {
            "video item control offsets");
 }
 
+q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
+    q36::PreparedPromptData prompt;
+    prompt.token_ids   = {10, 248056, 248056, 11};
+    prompt.token_types = {0, static_cast<std::uint8_t>(q36::PromptModality::Image),
+                          static_cast<std::uint8_t>(q36::PromptModality::Image), 0};
+    prompt.positions   = {0, 1, 1, 2, 0, 1, 1, 2, 0, 1, 2, 3};
+    prompt.rope_delta  = -1;
+    q36::VisionItem item{.modality    = q36::PromptModality::Image,
+                         .grid        = {.temporal = 1, .height = 2, .width = 4},
+                         .patch_begin = 0,
+                         .patch_count = 8,
+                         .token_spans = {{.begin = 1, .count = 2}}};
+    item.content_digest.fill(digest_byte);
+    prompt.vision_items.push_back(std::move(item));
+    return prompt;
+}
+
+void append_text_token(q36::PreparedPromptData& prompt, ninfer::TokenId token,
+                       std::int32_t position) {
+    const std::size_t old_tokens = prompt.token_ids.size();
+    std::vector<std::int32_t> positions;
+    positions.reserve(3 * (old_tokens + 1));
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        const auto begin =
+            prompt.positions.begin() + static_cast<std::ptrdiff_t>(axis * old_tokens);
+        positions.insert(positions.end(), begin, begin + static_cast<std::ptrdiff_t>(old_tokens));
+        positions.push_back(position);
+    }
+    prompt.token_ids.push_back(token);
+    prompt.token_types.push_back(0);
+    prompt.positions = std::move(positions);
+}
+
+void test_prefix_identity() {
+    q36::PreparedPromptData original    = identity_prompt();
+    std::vector<ninfer::TokenId> ledger = original.token_ids;
+    q36::detail::ResidentPrefixIdentity resident;
+    resident.reserve(16);
+    resident.assign(original);
+
+    expect(q36::detail::prefix_matches(original, ledger, resident, original.token_ids.size()),
+           "identical multimodal prefix identity");
+
+    q36::PreparedPromptData changed_media = identity_prompt(2);
+    expect(!q36::detail::prefix_matches(changed_media, ledger, resident,
+                                        changed_media.token_ids.size()),
+           "different media content must not reuse placeholder tokens");
+    expect(q36::detail::prefix_matches(changed_media, ledger, resident, 1),
+           "media wholly after the frontier does not affect prefix identity");
+    expect(!q36::detail::prefix_matches(original, ledger, resident, 2),
+           "frontier must not divide one Vision item");
+
+    q36::PreparedPromptData changed_position = identity_prompt();
+    changed_position.positions[0] += 1;
+    expect(!q36::detail::prefix_matches(changed_position, ledger, resident,
+                                        changed_position.token_ids.size()),
+           "different MRoPE positions must not reuse resident state");
+
+    resident.append_generated(1, original.rope_delta);
+    ledger.push_back(12);
+    append_text_token(original, 12, 3);
+    expect(q36::detail::prefix_matches(original, ledger, resident, ledger.size()),
+           "generated multimodal continuation identity");
+}
+
 } // namespace
 
 int main() {
@@ -183,6 +250,7 @@ int main() {
     test_round_layout();
     test_mtp_alignment();
     test_vision_control();
+    test_prefix_identity();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;

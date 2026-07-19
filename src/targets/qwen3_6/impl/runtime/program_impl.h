@@ -43,12 +43,14 @@ std::uint32_t final_prefill_chunk_length(std::uint32_t base, std::uint32_t end, 
     return last;
 }
 
-bool prefix_matches(const PreparedPromptData& prompt, const std::vector<TokenId>& ledger,
-                    std::uint32_t count) {
-    if (prompt.token_ids.size() < count || ledger.size() < count) { return false; }
-    return std::equal(prompt.token_ids.begin(),
-                      prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
-                      ledger.begin());
+std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& prompt,
+                                                 std::uint32_t token) {
+    const std::size_t tokens = prompt.token_ids.size();
+    if (token >= tokens || prompt.positions.size() != 3 * tokens) {
+        throw std::invalid_argument("MTP bridge position is outside prepared prompt metadata");
+    }
+    return {prompt.positions[token], prompt.positions[tokens + token],
+            prompt.positions[2 * tokens + token]};
 }
 
 schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
@@ -114,6 +116,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     host_count  = static_cast<std::int32_t*>(round_host.data());
     host_tokens = reinterpret_cast<TokenId*>(host_count + 1);
     ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
+    prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
 
     CUDA_CHECK(cudaMemsetAsync(io.num_sampled.data, 0, io.num_sampled.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
@@ -140,14 +143,14 @@ void ProgramImplCore::make_invalid() noexcept {
     E         = 0;
     S         = 0;
     ledger.clear();
-    current_gdn_slot    = 0;
-    text_kv_valid       = 0;
-    mtp_kv_valid        = 0;
-    proposal_ready      = false;
-    tail_hidden_valid   = false;
-    resident_multimodal = false;
-    boundary            = {};
-    pending             = {};
+    prefix_identity.clear();
+    current_gdn_slot  = 0;
+    text_kv_valid     = 0;
+    mtp_kv_valid      = 0;
+    proposal_ready    = false;
+    tail_hidden_valid = false;
+    boundary          = {};
+    pending           = {};
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -338,8 +341,14 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
     }
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
     if (prompt_tokens != plan.summary.prompt_tokens ||
-        prompt.has_media() != plan.vision.has_value()) {
+        (plan.vision.has_value() && !prompt.has_media())) {
         throw std::invalid_argument("request plan does not describe the prepared prompt");
+    }
+    const bool suffix_has_visual =
+        std::any_of(prompt.token_types.begin() + static_cast<std::ptrdiff_t>(plan.reuse_base),
+                    prompt.token_types.end(), [](std::uint8_t type) { return type != 0; });
+    if (suffix_has_visual != plan.vision.has_value()) {
+        throw std::invalid_argument("request plan does not describe the prompt suffix modality");
     }
     if (plan.summary.transient_bytes != 0 &&
         (transient.data == nullptr || transient.size < plan.summary.transient_bytes ||
@@ -347,7 +356,8 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
     if (plan.reuse != ReusePath::FullReset) {
-        if (lifecycle != Lifecycle::Resident || !prefix_matches(prompt, ledger, plan.reuse_base)) {
+        if (lifecycle != Lifecycle::Resident ||
+            !qwen3_6::detail::prefix_matches(prompt, ledger, prefix_identity, plan.reuse_base)) {
             throw std::logic_error("planned resident prefix is no longer reusable");
         }
         if (plan.reuse == ReusePath::RestoreBoundary &&
@@ -358,7 +368,6 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
 
     const std::uint32_t base              = plan.reuse_base;
     const bool had_suffix                 = prompt_tokens > base;
-    const bool has_media                  = prompt.has_media();
     const std::int32_t request_rope_delta = prompt.rope_delta;
     const auto snapshot_boundary          = plan.snapshot_boundary;
     const auto begin_start                = Clock::now();
@@ -399,15 +408,14 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         install_sampling(plan.sampling);
         rope_delta = request_rope_delta;
         set_device_i32(io.rope_delta, rope_delta);
-        resident_multimodal = has_media;
         // Invalidate the old checkpoint identity now that execution has started. The separately
         // allocated boundary_hidden tensor is deliberately left untouched until a restore bridge
         // consumes h[B-1] below.
         boundary = {};
         timings  = {};
 
-        ledger.insert(ledger.end(), prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(base),
-                      prompt.token_ids.end());
+        ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
+        prefix_identity.assign(prompt);
 
         schedule::State schedule_state{
             device,
@@ -428,10 +436,25 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             diagnostic_vision_tap};
         bool mtp_prepared = false;
 
-        if (has_media) {
-            const auto multimodal_start                    = Clock::now();
-            const schedule::MultimodalPrefillResult result = schedule::prefill_multimodal(
-                schedule_state, prompt, *plan.vision, transient, plan.prepare_mtp);
+        if (had_suffix && plan.needs_mtp_bridge) {
+            Tensor bridge_token = io.verify_ids.slice(0, 0, 1);
+            const TokenId token = prompt.token_ids[base];
+            CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
+                                       cudaMemcpyHostToDevice, device.stream));
+            const Tensor& bridge_hidden =
+                plan.reuse == ReusePath::RestoreBoundary ? boundary_hidden : tail_hidden;
+            const auto bridge_rope = prompt_rope_position(prompt, base - 1);
+            schedule::mtp_bridge_and_propose(schedule_state, bridge_token, bridge_hidden,
+                                             checked_i32(base - 1, "bridge position"), bridge_rope,
+                                             false);
+            mtp_kv_valid = base;
+        }
+
+        if (plan.vision) {
+            const auto multimodal_start = Clock::now();
+            const schedule::MultimodalPrefillResult result =
+                schedule::prefill_multimodal(schedule_state, prompt, *plan.vision, transient,
+                                             snapshot_boundary, plan.prepare_mtp);
             mtp_prepared = result.mtp_prepared;
             copy_tail(prefill_hidden.slice(1, static_cast<int>(result.final_chunk_tokens) - 1, 1));
             copy_round_token();
@@ -443,18 +466,6 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         } else {
             const auto text_start = Clock::now();
             if (had_suffix) {
-                if (plan.needs_mtp_bridge) {
-                    Tensor bridge_token = io.verify_ids.slice(0, 0, 1);
-                    const TokenId token = prompt.token_ids[base];
-                    CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
-                                               cudaMemcpyHostToDevice, device.stream));
-                    const Tensor& bridge_hidden =
-                        plan.reuse == ReusePath::RestoreBoundary ? boundary_hidden : tail_hidden;
-                    schedule::mtp_bridge_and_propose(schedule_state, bridge_token, bridge_hidden,
-                                                     checked_i32(base - 1, "bridge position"),
-                                                     false);
-                    mtp_kv_valid = base;
-                }
                 mtp_prepared = schedule::prefill_text(
                     schedule_state, std::span<const TokenId>(prompt.token_ids).subspan(base),
                     snapshot_boundary, plan.prepare_mtp);
@@ -471,9 +482,10 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
                 set_device_i32(io.rope_pos,
                                checked_i32(prompt_tokens, "rope position") + rope_delta);
                 if (plan.prepare_mtp) {
+                    const auto bridge_rope = prompt_rope_position(prompt, prompt_tokens - 1);
                     schedule::mtp_bridge_and_propose(
                         schedule_state, io.token, tail_hidden,
-                        checked_i32(prompt_tokens - 1, "bridge position"), true);
+                        checked_i32(prompt_tokens - 1, "bridge position"), bridge_rope, true);
                     mtp_prepared = true;
                 }
             }
@@ -488,6 +500,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
         ledger.push_back(host_tokens[0]);
+        prefix_identity.append_generated(1, rope_delta);
         text_kv_valid = prompt_tokens;
         // Target prefill leaves its recurrent state in slot 0. Exact-frontier reuse performs no
         // target work, so it must retain the MTP snapshot that was committed at the old frontier.
@@ -534,7 +547,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
         throw std::invalid_argument("decode round budget must be nonzero");
     }
     if (E >= capacity) { throw std::out_of_range("Text execution context is full"); }
-    if (S != E + 1 || ledger.size() != S) {
+    if (S != E + 1 || ledger.size() != S || prefix_identity.size() != S) {
         throw std::logic_error("Active frontier is inconsistent");
     }
 
@@ -644,6 +657,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, produced));
         ledger.insert(ledger.end(), host_tokens, host_tokens + produced);
+        prefix_identity.append_generated(produced, rope_delta);
         pending   = PendingCandidate{.kind          = kind,
                                      .base_E        = base_E,
                                      .base_S        = base_S,
@@ -691,7 +705,7 @@ void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool termin
     case PendingKind::None:
         throw std::logic_error("pending generated round has no candidate");
     }
-    if (S != E + 1 || ledger.size() != S) {
+    if (S != E + 1 || ledger.size() != S || prefix_identity.size() != S) {
         throw std::logic_error("resolved round did not establish a valid frontier");
     }
     lifecycle = terminal ? Lifecycle::Resident : Lifecycle::Active;

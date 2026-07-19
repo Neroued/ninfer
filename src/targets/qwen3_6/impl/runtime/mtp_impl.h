@@ -25,8 +25,13 @@ void target_verify(TextContext& card, State& state, const Tensor& ids, const Ten
 } // namespace
 
 void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor& previous_hidden,
-                            std::int32_t position, bool build_proposal) {
+                            std::int32_t position, std::span<const std::int32_t> rope_position,
+                            bool build_proposal) {
     if (state.mtp_kv == nullptr) { throw std::logic_error("MTP bridge requires MTP storage"); }
+    if (rope_position.size() != 3) {
+        throw std::invalid_argument("MTP bridge requires one three-axis rope position");
+    }
+    state.work.reset();
     TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
                      state.prefill_hidden, state.prefill_chunk, state.text_kv_base, state.mtp_kv);
     configure_text_card(card, state);
@@ -36,11 +41,15 @@ void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor
     Tensor mtp_hidden         = state.io.mtp_ar_hidden;
     Tensor logits             = state.io.logits.slice(1, 0, 1);
     Tensor draft0             = state.io.drafts.slice(0, 0, 1);
+    Tensor rope_position_view = state.work.alloc(DType::I32, {1, 3});
+    CUDA_CHECK(cudaMemcpyAsync(rope_position_view.data, rope_position.data(),
+                               rope_position.size_bytes(), cudaMemcpyHostToDevice,
+                               state.device.stream));
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
     const ops::GqaExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
-                           build_proposal ? &draft0 : nullptr);
+                           build_proposal ? &draft0 : nullptr, &rope_position_view);
     if (!build_proposal) { return; }
 
     ops::set_i32_scalar(state.io.ar_pos, position + 1, state.device.stream);

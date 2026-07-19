@@ -168,6 +168,12 @@ Run `./build/apps/ninfer-serve --help` for the exact option contract.
 The server accepts concurrent HTTP connections, but model execution is serialized because one
 Engine owns one resident sequence. It does not perform continuous batching.
 
+Compatible resident prefixes are reused for both text and multimodal histories. A multimodal hit
+requires matching token types, three-axis MRoPE positions, encoded-media digest, grid, and consumer
+spans; changing an earlier image or video therefore resets the prefix instead of reusing
+placeholder-token KV. Media wholly inside a matched prefix skips Vision execution, while new suffix
+media is encoded normally. The completion log reports the reused token count as `cache=`.
+
 MTP is an engine option and does not change protocol output shapes, stop behavior, or usage
 accounting. Output-limit and context-capacity finishes map to `length`/ `max_tokens`; ordinary
 model or string stops map to `stop`/ `end_turn`.

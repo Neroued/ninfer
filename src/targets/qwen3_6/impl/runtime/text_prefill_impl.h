@@ -42,22 +42,25 @@ bool prefill_text(State& state, std::span<const TokenId> ids,
 
 MultimodalPrefillResult prefill_multimodal(State& state, const PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient, bool prepare_mtp) {
+                                           runtime::TransientRegion transient,
+                                           std::optional<std::uint32_t> snapshot_boundary,
+                                           bool prepare_mtp) {
     TextContext card(state.device, state.model, state.work, state.text_kv, state.gdn, state.io,
                      state.prefill_hidden, state.prefill_chunk, state.text_kv_base,
                      prepare_mtp ? state.mtp_kv : nullptr);
     configure_text_card(card, state);
-    card.set_boundary_hidden_output(nullptr);
-    card.set_prefill_snapshot_boundary(-1);
+    card.set_boundary_hidden_output(state.boundary_hidden);
+    card.set_prefill_snapshot_boundary(
+        snapshot_boundary ? static_cast<std::int64_t>(*snapshot_boundary) : -1);
     void* vision_tap_context =
         state.diagnostic_vision_tap != nullptr ? state.diagnostic_context : nullptr;
     VisionPrefillSession vision(state.device, state.model, state.work, prompt, plan, transient,
                                 vision_tap_context, state.diagnostic_vision_tap);
     if (state.diagnostic_text_tap != nullptr) {
-        card.diagnostic_prefill(prompt, vision, state.diagnostic_context,
+        card.diagnostic_prefill(prompt, state.text_kv_base, vision, state.diagnostic_context,
                                 state.diagnostic_text_tap);
     } else {
-        card.prefill(prompt, vision);
+        card.prefill(prompt, state.text_kv_base, vision);
     }
     if (card.last_prefill_chunk_length() == 0) {
         throw std::logic_error("multimodal prefill produced no final chunk");

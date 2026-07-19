@@ -313,9 +313,10 @@ VisionItem convert_vision_item(fi::VisionItem item) {
     result.modality =
         item.modality == fi::Modality::Image ? PromptModality::Image : PromptModality::Video;
     result.grid = VisionGrid{.temporal = item.grid.t, .height = item.grid.h, .width = item.grid.w};
-    result.patch_begin = item.patch_begin;
-    result.patch_count = item.patch_count;
-    result.timestamps  = std::move(item.timestamps);
+    result.patch_begin    = item.patch_begin;
+    result.patch_count    = item.patch_count;
+    result.content_digest = item.content_digest;
+    result.timestamps     = std::move(item.timestamps);
     result.token_spans.reserve(item.token_spans.size());
     for (const fi::TokenSpan span : item.token_spans) {
         result.token_spans.push_back(TokenSpan{.begin = span.begin, .count = span.count});
@@ -835,7 +836,7 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
-    result.identity.reusable = !has_media;
+    result.identity.reusable = true;
     result.identity.assistant_content_boundary =
         assistant_boundary(*impl_->tokenizer, options, result.token_ids.size());
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;

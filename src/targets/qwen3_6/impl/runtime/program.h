@@ -8,6 +8,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -151,13 +152,13 @@ public:
     std::uint32_t E     = 0;
     std::uint32_t S     = 0;
     std::vector<TokenId> ledger;
+    qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
     std::int32_t rope_delta       = 0;
     std::int32_t current_gdn_slot = 0;
     std::uint32_t text_kv_valid   = 0;
     std::uint32_t mtp_kv_valid    = 0;
     bool proposal_ready           = false;
     bool tail_hidden_valid        = false;
-    bool resident_multimodal      = false;
     PrefixCheckpoint boundary;
     PendingCandidate pending;
     GenerationTimings timings;

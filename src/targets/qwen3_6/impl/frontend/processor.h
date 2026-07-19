@@ -3,6 +3,7 @@
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -49,6 +50,7 @@ struct VisionItem {
     VisionGrid grid;
     std::size_t patch_begin = 0;
     std::size_t patch_count = 0;
+    std::array<std::uint8_t, 32> content_digest{};
     std::vector<double> timestamps;
     std::vector<TokenSpan> token_spans;
 };

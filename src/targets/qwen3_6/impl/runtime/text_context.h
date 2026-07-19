@@ -157,10 +157,11 @@ public:
     }
 
     void prefill(std::span<const int> ids);
-    void prefill(const qwen3_6::PreparedPromptData& input, VisionPrefillSession& vision);
+    void prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
+                 VisionPrefillSession& vision);
     void diagnostic_prefill(std::span<const int> ids, void* context, TextTapCallback callback);
-    void diagnostic_prefill(const qwen3_6::PreparedPromptData& input, VisionPrefillSession& vision,
-                            void* context, TextTapCallback callback);
+    void diagnostic_prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
+                            VisionPrefillSession& vision, void* context, TextTapCallback callback);
     void target_verify(const Tensor& ids, const Tensor& positions,
                        ops::GqaExecutionEnvelope envelope);
     void diagnostic_target_verify(const Tensor& ids, const Tensor& positions,
@@ -168,7 +169,8 @@ public:
                                   TextTapCallback callback);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
-                           int logits_column, Tensor* logits, Tensor* draft_token);
+                           int logits_column, Tensor* logits, Tensor* draft_token,
+                           const Tensor* explicit_rope_positions = nullptr);
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::GqaExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
@@ -203,8 +205,10 @@ private:
     void mtp_draft_argmax(const Tensor& hidden, Tensor& logits, Tensor& draft_token);
 
     struct MultimodalPrefill {
+        std::span<const int> token_ids;
         std::span<const std::int32_t> positions;
         VisionPrefillSession* vision = nullptr;
+        std::uint32_t begin          = 0;
         std::int32_t rope_delta      = 0;
     };
 

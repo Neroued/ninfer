@@ -114,6 +114,11 @@ std::vector<std::uint8_t> gradient_ppm() {
 
 bool near(float actual, float expected) { return std::abs(actual - expected) < 1.0e-6F; }
 
+constexpr std::array<std::uint8_t, 32> kGradientDigest{
+    0x1e, 0x8c, 0xd9, 0x22, 0x40, 0xfa, 0x10, 0x62, 0x7b, 0x60, 0x86, 0x8e, 0xe9, 0x66, 0x41, 0xa2,
+    0x4d, 0x21, 0xff, 0xc7, 0xe9, 0xa2, 0x2b, 0x34, 0xc0, 0xec, 0x99, 0x84, 0x6c, 0xa9, 0xa4, 0x8a,
+};
+
 std::string channel_text(const PublishedOutput& output, ninfer::OutputChannel channel) {
     std::string result;
     for (const ninfer::OutputDelta& delta : output) {
@@ -337,10 +342,11 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                       "image frontend did not retain one Vision item");
     if (!prepared_data.vision_items.empty()) {
         const auto& item = prepared_data.vision_items.front();
-        failures += check(item.grid.temporal == 1 && item.grid.height == 4 &&
-                              item.grid.width == 4 && item.patch_count == 16 &&
-                              item.token_spans.size() == 1 && item.token_spans.front().count == 4,
-                          "image frontend grid/patch/placeholder geometry is incorrect");
+        failures +=
+            check(item.grid.temporal == 1 && item.grid.height == 4 && item.grid.width == 4 &&
+                      item.patch_count == 16 && item.content_digest == kGradientDigest &&
+                      item.token_spans.size() == 1 && item.token_spans.front().count == 4,
+                  "image frontend grid/patch/placeholder geometry is incorrect");
         if (!item.token_spans.empty()) {
             const std::size_t span = item.token_spans.front().begin;
             failures += check(
@@ -355,7 +361,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     }
     failures += check(
         prepared_data.patches.size() == 16 * 1536 && prepared_data.prepare.raw_patches == 16 &&
-            prepared_data.prepare.vision_tokens == 4 && !prepared_data.identity.reusable,
+            prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable,
         "image frontend did not own the expected patch payload and identity");
     if (prepared_data.patches.size() == 16 * 1536) {
         failures += check(near(prepared_data.patches[0], -1.0F) &&
@@ -386,18 +392,19 @@ int test_video_prepare(const Frontend& frontend) {
                          "video frontend did not retain one Vision item");
     if (!prepared_data.vision_items.empty()) {
         const auto& item = prepared_data.vision_items.front();
-        failures += check(item.modality == ninfer::targets::qwen3_6::PromptModality::Video &&
-                              item.grid.temporal == 1 && item.grid.height == 4 &&
-                              item.grid.width == 4 && item.patch_count == 16 &&
-                              item.timestamps.size() == 1 && item.timestamps.front() == 0.0 &&
-                              item.token_spans.size() == 1 && item.token_spans.front().count == 4,
-                          "video frontend temporal/grid/placeholder metadata is incorrect");
+        failures +=
+            check(item.modality == ninfer::targets::qwen3_6::PromptModality::Video &&
+                      item.grid.temporal == 1 && item.grid.height == 4 && item.grid.width == 4 &&
+                      item.patch_count == 16 && item.content_digest == kGradientDigest &&
+                      item.timestamps.size() == 1 && item.timestamps.front() == 0.0 &&
+                      item.token_spans.size() == 1 && item.token_spans.front().count == 4,
+                  "video frontend temporal/grid/placeholder metadata is incorrect");
     }
     failures +=
         check(prepared_data.patches.size() == 16 * 1536 &&
                   near(prepared_data.patches[0], prepared_data.patches[256]) &&
                   prepared_data.prepare.raw_patches == 16 &&
-                  prepared_data.prepare.vision_tokens == 4 && !prepared_data.identity.reusable,
+                  prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable,
               "video frontend did not duplicate the odd temporal frame correctly");
     return failures;
 }

@@ -38,13 +38,6 @@ ops::SamplingConfig translate_sampling(const SamplingParameters& source) {
     return out;
 }
 
-bool matches_prefix(std::span<const TokenId> incoming, const std::vector<TokenId>& resident,
-                    std::size_t count) {
-    if (incoming.size() < count || resident.size() < count) { return false; }
-    return std::equal(incoming.begin(), incoming.begin() + static_cast<std::ptrdiff_t>(count),
-                      resident.begin());
-}
-
 std::size_t checked_size_mul(std::size_t a, std::size_t b, const char* label) {
     if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
         throw std::overflow_error(label);
@@ -102,15 +95,15 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     plan->summary.transient_bytes        = 0;
     plan->sampling                       = translate_sampling(options.sampling);
 
-    const std::span<const TokenId> incoming(prompt.token_ids);
-    if (options.allow_prefix_reuse && prompt.identity.reusable && !prompt.has_media() &&
-        lifecycle == Lifecycle::Resident && !resident_multimodal) {
-        if (E != 0 && matches_prefix(incoming, ledger, E)) {
+    if (options.allow_prefix_reuse && prompt.identity.reusable &&
+        lifecycle == Lifecycle::Resident) {
+        if (E != 0 && qwen3_6::detail::prefix_matches(prompt, ledger, prefix_identity, E)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = E;
         } else if (boundary.valid && boundary.boundary != 0 &&
-                   boundary.boundary < incoming.size() &&
-                   matches_prefix(incoming, ledger, boundary.boundary)) {
+                   boundary.boundary < prompt.token_ids.size() &&
+                   qwen3_6::detail::prefix_matches(prompt, ledger, prefix_identity,
+                                                   boundary.boundary)) {
             plan->reuse      = ReusePath::RestoreBoundary;
             plan->reuse_base = boundary.boundary;
         }
@@ -135,6 +128,14 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             plan->needs_mtp_bridge = true;
         }
     }
+    if (plan->needs_mtp_bridge && plan->reuse_base < plan->summary.prompt_tokens &&
+        prompt.token_types[plan->reuse_base] != 0) {
+        // A bridge consumes the first suffix token as the MTP shifted embedding. Reusing target
+        // state remains valid when that token is visual, but the one-column bridge currently has
+        // no Vision embedding input. Keep the target prefix and fall back to ordinary decode.
+        plan->prepare_mtp      = false;
+        plan->needs_mtp_bridge = false;
+    }
 
     if (prompt.has_media()) {
         VisionPrefillPlan vision;
@@ -151,6 +152,7 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             const auto last           = static_cast<std::uint32_t>(item.scatter_indices.back());
             const std::uint32_t begin = plan->prepare_mtp && first != 0 ? first - 1 : first;
             const std::uint32_t end   = last + 1;
+            if (end <= plan->reuse_base) { continue; }
             if (!vision.uses.empty() && begin < previous_end) {
                 throw std::invalid_argument("vision item consumer spans overlap");
             }
@@ -164,18 +166,20 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             previous_end = end;
             max_merged   = std::max(max_merged, item.merged_count);
         }
-        const std::size_t output_elements =
-            checked_size_mul(static_cast<std::size_t>(VisionConfig::output_hidden), max_merged,
-                             "vision item output elements overflow size_t");
-        plan->summary.transient_alignment = 256;
-        plan->summary.transient_bytes =
-            align_up_256(checked_size_mul(output_elements, dtype_size(DType::BF16),
-                                          "vision item output bytes overflow size_t"),
-                         "vision item output alignment overflows size_t");
-        plan->vision = std::move(vision);
+        if (!vision.uses.empty()) {
+            const std::size_t output_elements =
+                checked_size_mul(static_cast<std::size_t>(VisionConfig::output_hidden), max_merged,
+                                 "vision item output elements overflow size_t");
+            plan->summary.transient_alignment = 256;
+            plan->summary.transient_bytes =
+                align_up_256(checked_size_mul(output_elements, dtype_size(DType::BF16),
+                                              "vision item output bytes overflow size_t"),
+                             "vision item output alignment overflows size_t");
+            plan->vision = std::move(vision);
+        }
     }
 
-    if (!prompt.has_media() && prompt.identity.assistant_content_boundary) {
+    if (prompt.identity.assistant_content_boundary) {
         const std::uint32_t candidate = *prompt.identity.assistant_content_boundary;
         if (candidate > plan->reuse_base && candidate <= plan->summary.prompt_tokens) {
             plan->snapshot_boundary = candidate;

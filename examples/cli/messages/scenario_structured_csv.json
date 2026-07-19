@@ -1,0 +1,6 @@
+[
+  {
+    "role": "user",
+    "content": "Produce CSV only, with one header and exactly 220 data rows. Columns are sample_id,language,category,prompt_tokens,output_tokens,accepted_drafts,drafted_tokens,decode_tok_s,valid. Use sample IDs S0001-S0220, cycle languages en/zh/ja, cycle categories code/story/translation/structured, and generate internally consistent positive numeric values. Quote fields only when CSV requires it. Do not add commentary before or after the CSV."
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are a senior software engineer. Produce complete, runnable code rather than sketches or omitted sections."
+  },
+  {
+    "role": "user",
+    "content": "Implement a complete CUDA 13.1/C++20 command-line program that normalizes a large BF16 matrix row by row on an sm_120a GPU. Include argument parsing, RAII device buffers, a numerically stable FP32 reference, a vectorized CUDA kernel, warm-up, CUDA-event timing, deterministic input generation, error checking, tolerance-based verification, and a CMakeLists.txt. Explain the memory layout and launch geometry after the code. Do not omit implementations or replace sections with comments."
+  }
+]

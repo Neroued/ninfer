@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are a long-form fiction writer. Follow every structural constraint and output only the story."
+  },
+  {
+    "role": "user",
+    "content": "Write a locked-room mystery of at least 2,500 words in seven titled parts. The setting is a mountain observatory during a power failure. The detective is a calibration engineer, the apparent victim is alive, and the clues are a warm brass key, a star chart printed upside down, eleven seconds missing from a voice recorder, and a cup of unsweetened tea. Reveal a fair, physical solution without supernatural events and end with a quiet ethical dilemma."
+  }
+]

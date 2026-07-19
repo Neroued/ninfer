@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are a senior software engineer. Produce complete, runnable code rather than sketches or omitted sections."
+  },
+  {
+    "role": "user",
+    "content": "Write a complete Python 3.11 package for a deterministic asynchronous job runner. It must read a JSON manifest, enforce one active GPU job, persist atomic state, resume completed work, stream structured JSONL events, handle SIGINT, redact configured secrets, and include pytest tests for success, failure, cancellation, and resume. Present every source file in a separate fenced block with its path and include pyproject.toml."
+  }
+]

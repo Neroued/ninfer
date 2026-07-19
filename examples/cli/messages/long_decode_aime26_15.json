@@ -1,0 +1,6 @@
+[
+  {
+    "role": "user",
+    "content": "Solve the following math problem step by step. Put your answer inside \\boxed{}.\n\nLet $a, b,$ and $n$ be positive integers with both $a$ and $b$ greater than or equal to $2$ and less than or equal to $2n$. Define an $a \\times b$ cell loop in a $2n \\times 2n$ grid of cells to be the $2a + 2b - 4$ cells that surround an $(a - 2) \\times (b - 2)$ (possibly empty) rectangle of cells in the grid. For example, the following diagram shows a way to partition a $6 \\times 6$ grid of cells into $4$ cell loops.\n\n| P   P P   P | Y   Y |\n| P | R R | P | Y | Y |\n| P | R R | P | Y | Y |\n| P   P P   P | Y | Y |\n| G   G G   G | Y | Y |\n| G   G G   G | Y   Y |\n\nFind the number of ways to partition a $10 \\times 10$ grid of cells into $5$ cell loops so that every cell of the grid belongs to exactly one cell loop.\n\nRemember to put your answer inside \\boxed{}."
+  }
+]

@@ -1,0 +1,6 @@
+[
+  {
+    "role": "user",
+    "content": "Solve the following math problem step by step. Put your answer inside \\boxed{}.\n\nFind the number of ordered 7-tuples $(a_1, a_2, a_3, \\ldots, a_7)$ having the following properties:\n- $a_k \\in \\{1,2,3\\}$ for all $k.$\n- $a_1+a_2+a_3+a_4+a_5+a_6+a_7$ is a multiple of $3.$\n- $a_1a_2 a_4 + a_2a_3a_5 + a_3a_4 a_6 + a_4 a_5 a_7 + a_5 a_6 a_1 + a_6 a_7 a_2 + a_7 a_1 a_3$ is a multiple of $3.$\n\nRemember to put your answer inside \\boxed{}."
+  }
+]

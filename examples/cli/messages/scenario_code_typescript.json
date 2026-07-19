@@ -1,0 +1,10 @@
+[
+  {
+    "role": "system",
+    "content": "You are a senior software engineer. Produce complete, runnable code rather than sketches or omitted sections."
+  },
+  {
+    "role": "user",
+    "content": "Create a complete TypeScript 5 service that consumes newline-delimited request metrics, validates them without third-party schema libraries, groups records by model and fixture, computes mean/median/sample standard deviation, and exposes /health, /summary, and /runs/:id endpoints. Include strict types, incremental parsing, bounded memory, malformed-input errors, unit tests, package.json, tsconfig.json, and a short operational guide. No placeholders."
+  }
+]

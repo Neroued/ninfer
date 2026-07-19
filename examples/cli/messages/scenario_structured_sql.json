@@ -1,0 +1,6 @@
+[
+  {
+    "role": "user",
+    "content": "Return one PostgreSQL script with no Markdown fences. Define normalized tables for models, fixtures, runs, and request_metrics; include primary/foreign keys, checks, useful indexes, two views, one transaction-safe upsert function, and at least 80 realistic INSERT rows spanning two models and four fixture kinds. Finish with six analytical SELECT queries for throughput, variability, long-context retention, and MTP acceptance. The script must run in dependency order."
+  }
+]

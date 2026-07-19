@@ -9,32 +9,47 @@
     {
       "path": "media/visual_chart.png",
       "kind": "image",
-      "dimensions": [768, 512],
+      "dimensions": [
+        768,
+        512
+      ],
       "source": "project-authored deterministic drawing"
     },
     {
       "path": "media/natural_scene.png",
       "kind": "image",
-      "dimensions": [768, 512],
+      "dimensions": [
+        768,
+        512
+      ],
       "source": "project-authored deterministic drawing"
     },
     {
       "path": "media/compare_left.png",
       "kind": "image",
-      "dimensions": [640, 384],
+      "dimensions": [
+        640,
+        384
+      ],
       "source": "project-authored deterministic drawing"
     },
     {
       "path": "media/compare_right.png",
       "kind": "image",
-      "dimensions": [640, 384],
+      "dimensions": [
+        640,
+        384
+      ],
       "source": "project-authored deterministic drawing"
     },
     {
       "path": "media/temporal_events.mp4",
       "kind": "video",
       "codec": "h264",
-      "dimensions": [640, 360],
+      "dimensions": [
+        640,
+        360
+      ],
       "fps": 8,
       "frames": 40,
       "duration_seconds": 5.0,
@@ -51,7 +66,10 @@
       "max_context": 2048,
       "max_new": 8,
       "kv_dtype": "bf16",
-      "oracle": {"mode": "exact", "stdout": "42"}
+      "oracle": {
+        "mode": "exact",
+        "stdout": "42"
+      }
     },
     {
       "name": "text_chat_history",
@@ -62,7 +80,10 @@
       "max_context": 2048,
       "max_new": 32,
       "kv_dtype": "bf16",
-      "oracle": {"mode": "exact", "stdout": "Cedar|2041-09-17|37"}
+      "oracle": {
+        "mode": "exact",
+        "stdout": "Cedar|2041-09-17|37"
+      }
     },
     {
       "name": "text_code_review",
@@ -75,7 +96,10 @@
       "kv_dtype": "bf16",
       "oracle": {
         "mode": "facts",
-        "facts": ["empty input divides by zero", "explicit empty-input handling"]
+        "facts": [
+          "empty input divides by zero",
+          "explicit empty-input handling"
+        ]
       }
     },
     {
@@ -83,14 +107,20 @@
       "messages": "messages/image_chart.json",
       "kind": "single_image",
       "thinking": false,
-      "media": ["media/visual_chart.png"],
+      "media": [
+        "media/visual_chart.png"
+      ],
       "prompt_tokens": 428,
       "max_context": 8192,
       "max_new": 64,
       "kv_dtype": "bf16",
       "oracle": {
         "mode": "facts",
-        "facts": ["NIFER VISION 731", "three red circles", "blue square is left of green triangle"]
+        "facts": [
+          "NIFER VISION 731",
+          "three red circles",
+          "blue square is left of green triangle"
+        ]
       }
     },
     {
@@ -98,26 +128,41 @@
       "messages": "messages/image_natural.json",
       "kind": "single_image_scene",
       "thinking": false,
-      "media": ["media/natural_scene.png"],
+      "media": [
+        "media/natural_scene.png"
+      ],
       "prompt_tokens": 417,
       "max_context": 8192,
       "max_new": 96,
       "kv_dtype": "bf16",
-      "oracle": {"mode": "facts", "facts": ["mailbox 24", "sun on right"]}
+      "oracle": {
+        "mode": "facts",
+        "facts": [
+          "mailbox 24",
+          "sun on right"
+        ]
+      }
     },
     {
       "name": "video_temporal",
       "messages": "messages/video_temporal.json",
       "kind": "video",
       "thinking": false,
-      "media": ["media/temporal_events.mp4"],
+      "media": [
+        "media/temporal_events.mp4"
+      ],
       "prompt_tokens": 1191,
       "max_context": 8192,
       "max_new": 64,
       "kv_dtype": "bf16",
       "oracle": {
         "mode": "facts",
-        "facts": ["red circle moves", "green 3", "blue square remains visible when 3 first appears", "ending 9"]
+        "facts": [
+          "red circle moves",
+          "green 3",
+          "blue square remains visible when 3 first appears",
+          "ending 9"
+        ]
       }
     },
     {
@@ -125,36 +170,58 @@
       "messages": "messages/multi_image_compare.json",
       "kind": "multiple_images",
       "thinking": false,
-      "media": ["media/compare_left.png", "media/compare_right.png"],
+      "media": [
+        "media/compare_left.png",
+        "media/compare_right.png"
+      ],
       "prompt_tokens": 531,
       "max_context": 8192,
       "max_new": 64,
       "kv_dtype": "bf16",
-      "oracle": {"mode": "facts", "facts": ["left count 2", "right count 3", "new yellow star"]}
+      "oracle": {
+        "mode": "facts",
+        "facts": [
+          "left count 2",
+          "right count 3",
+          "new yellow star"
+        ]
+      }
     },
     {
       "name": "mixed_image_video",
       "messages": "messages/mixed_image_video.json",
       "kind": "interleaved_image_video",
       "thinking": false,
-      "media": ["media/visual_chart.png", "media/temporal_events.mp4"],
+      "media": [
+        "media/visual_chart.png",
+        "media/temporal_events.mp4"
+      ],
       "prompt_tokens": 1575,
       "max_context": 8192,
       "max_new": 32,
       "kv_dtype": "bf16",
-      "oracle": {"mode": "exact", "stdout": "NIFER-9"}
+      "oracle": {
+        "mode": "exact",
+        "stdout": "NIFER-9"
+      }
     },
     {
       "name": "mixed_multiturn",
       "messages": "messages/mixed_multiturn.json",
       "kind": "multiturn_image_video",
       "thinking": false,
-      "media": ["media/natural_scene.png", "media/temporal_events.mp4"],
+      "media": [
+        "media/natural_scene.png",
+        "media/temporal_events.mp4"
+      ],
       "prompt_tokens": 1608,
       "max_context": 8192,
       "max_new": 32,
       "kv_dtype": "bf16",
-      "oracle": {"mode": "exact", "stdout": "24-9"}
+      "oracle": {
+        "mode": "exact",
+        "stdout": "24-9"
+      }
     },
     {
       "name": "thinking_logic_grid",
@@ -182,91 +249,421 @@
       "messages": "messages/thinking_multimodal_checksum.json",
       "kind": "multimodal_reasoning",
       "thinking": true,
-      "media": ["media/visual_chart.png", "media/natural_scene.png", "media/temporal_events.mp4"],
+      "media": [
+        "media/visual_chart.png",
+        "media/natural_scene.png",
+        "media/temporal_events.mp4"
+      ],
       "prompt_tokens": 2070,
       "max_context": 8192,
       "max_new": 4096,
       "kv_dtype": "bf16",
       "oracle": {
         "mode": "facts",
-        "facts": ["V=731", "C=3", "M=24", "G=3", "E=9", "CHECKSUM=2238"]
-      }
-    },
-    {
-      "name": "long_decode_design_review",
-      "messages": "messages/long_decode_design_review.json",
-      "kind": "long_decode_reasoning",
-      "thinking": true,
-      "prompt_tokens": 764,
-      "max_context": 32768,
-      "max_new": 16384,
-      "kv_dtype": "bf16",
-      "oracle": {
-        "mode": "structure_and_facts",
-        "required_sections": [
-          "范围与非目标",
-          "组件与所有权表",
-          "三档上下文的逐步显存计算表",
-          "状态机与伪代码",
-          "kernel/Op 接口和 CUDA Graph tier key",
-          "fusion 与性能方案",
-          "正确性、数值和性能验证矩阵",
-          "分阶段落地、回滚点和完成判据",
-          "设计自检"
-        ],
         "facts": [
-          "65536 payload 335544320 metadata 20971520 total memory 20.732 GiB",
-          "131072 payload 671088640 metadata 41943040 total memory 21.064 GiB",
-          "262144 payload 1342177280 metadata 83886080 total memory 21.728 GiB",
-          "only Program advances frontiers",
-          "failure transitions are atomic",
-          "performance claims name measurement methods"
+          "V=731",
+          "C=3",
+          "M=24",
+          "G=3",
+          "E=9",
+          "CHECKSUM=2238"
         ]
       }
     },
     {
-      "name": "long_8k",
-      "messages": "messages/long_8k.json",
-      "kind": "long_context",
+      "name": "long_niah_8k",
+      "messages": "messages/long_niah_8k.json",
+      "messages_sha256": "3080d984516f2917aacf159aab6b4b42d3f7d1abe8ab39e0dadbaf1f05d8ae99",
+      "kind": "long_context_niah",
       "thinking": false,
       "prompt_tokens": 7680,
-      "max_context": 8192,
-      "max_new": 64,
-      "kv_dtype": "bf16",
-      "oracle": {"mode": "exact", "stdout": "ORCHID=37; COPPER=8142; HARBOR=KESTREL; COLOR=AMBER; SUM=8179"}
+      "needle_depth_percent": 50,
+      "max_context": 262144,
+      "max_new": 128,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "exact",
+        "stdout": "ORCHID=493817; COLOR=COBALT"
+      }
     },
     {
-      "name": "long_64k",
-      "messages": "messages/long_64k.json",
-      "kind": "long_context",
+      "name": "long_niah_64k",
+      "messages": "messages/long_niah_64k.json",
+      "messages_sha256": "7160fdf1aff52cd79b5e35efa829e7ef43004fe61aa86136a3bf0adef9cc03f4",
+      "kind": "long_context_niah",
       "thinking": false,
       "prompt_tokens": 64512,
-      "max_context": 65536,
-      "max_new": 64,
+      "needle_depth_percent": 50,
+      "max_context": 262144,
+      "max_new": 128,
       "kv_dtype": "int8",
-      "oracle": {"mode": "exact", "stdout": "ORCHID=37; COPPER=8142; HARBOR=KESTREL; COLOR=AMBER; SUM=8179"}
+      "oracle": {
+        "mode": "exact",
+        "stdout": "ORCHID=493817; COLOR=COBALT"
+      }
     },
     {
-      "name": "long_128k",
-      "messages": "messages/long_128k.json",
-      "kind": "long_context",
+      "name": "long_niah_128k",
+      "messages": "messages/long_niah_128k.json",
+      "messages_sha256": "8dcece5215805293490baa0d8204d59a899d8bc3f9d010b0c142ed6624260a9a",
+      "kind": "long_context_niah",
       "thinking": false,
       "prompt_tokens": 130048,
-      "max_context": 131072,
-      "max_new": 64,
+      "needle_depth_percent": 50,
+      "max_context": 262144,
+      "max_new": 128,
       "kv_dtype": "int8",
-      "oracle": {"mode": "exact", "stdout": "ORCHID=37; COPPER=8142; HARBOR=KESTREL; COLOR=AMBER; SUM=8179"}
+      "oracle": {
+        "mode": "exact",
+        "stdout": "ORCHID=493817; COLOR=COBALT"
+      }
     },
     {
-      "name": "long_256k",
-      "messages": "messages/long_256k.json",
-      "kind": "long_context",
+      "name": "long_niah_256k",
+      "messages": "messages/long_niah_256k.json",
+      "messages_sha256": "73278973a82c80f5be8bcc7d4c89afd8bdd3edfe82e8900952cb4a7660cd9644",
+      "kind": "long_context_niah",
       "thinking": false,
       "prompt_tokens": 260096,
+      "needle_depth_percent": 50,
       "max_context": 262144,
-      "max_new": 64,
+      "max_new": 128,
       "kv_dtype": "int8",
-      "oracle": {"mode": "exact", "stdout": "ORCHID=37; COPPER=8142; HARBOR=KESTREL; COLOR=AMBER; SUM=8179"}
+      "oracle": {
+        "mode": "exact",
+        "stdout": "ORCHID=493817; COLOR=COBALT"
+      }
+    },
+    {
+      "name": "long_decode_aime26_01",
+      "messages": "messages/long_decode_aime26_01.json",
+      "messages_sha256": "2f5f3e05f805aece8a7ef26a6d686cf21b1fd6e7a0b995ad9b7f1274882ecb23",
+      "kind": "long_decode_math",
+      "dataset": "aime26",
+      "dataset_row": 1,
+      "dataset_id": "1",
+      "thinking": true,
+      "prompt_tokens": 186,
+      "max_context": 262144,
+      "max_new": 65536,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "boxed_integer",
+        "answer": "277"
+      }
+    },
+    {
+      "name": "long_decode_aime26_15",
+      "messages": "messages/long_decode_aime26_15.json",
+      "messages_sha256": "07f96a0c9c27be3a50dd702fbf814bbc35513f9521831ad08f52e7d1419ba029",
+      "kind": "long_decode_math",
+      "dataset": "aime26",
+      "dataset_row": 15,
+      "dataset_id": "15",
+      "thinking": true,
+      "prompt_tokens": 293,
+      "max_context": 262144,
+      "max_new": 65536,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "boxed_integer",
+        "answer": "83"
+      }
+    },
+    {
+      "name": "long_decode_aime26_30",
+      "messages": "messages/long_decode_aime26_30.json",
+      "messages_sha256": "752d9780366871d7e015cf302ad765cc791cb649d16b9de9698b3c178b59bbc8",
+      "kind": "long_decode_math",
+      "dataset": "aime26",
+      "dataset_row": 30,
+      "dataset_id": "30",
+      "thinking": true,
+      "prompt_tokens": 206,
+      "max_context": 262144,
+      "max_new": 65536,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "boxed_integer",
+        "answer": "393"
+      }
+    },
+    {
+      "name": "scenario_code_cuda",
+      "messages": "messages/scenario_code_cuda.json",
+      "messages_sha256": "47b21086735b5c2d6a08cba6a16ea7e9aedef4168107d90e447293cfaf9eb5ae",
+      "kind": "scenario_code",
+      "thinking": false,
+      "prompt_tokens": 144,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "CUDA kernel",
+          "FP32 reference",
+          "CMakeLists.txt",
+          "verification"
+        ]
+      }
+    },
+    {
+      "name": "scenario_code_python",
+      "messages": "messages/scenario_code_python.json",
+      "messages_sha256": "467a6df1e5a5b7ccccf4bfadf7c2b7761f803e7a61d478440ab31bd41229fab5",
+      "kind": "scenario_code",
+      "thinking": false,
+      "prompt_tokens": 122,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "pyproject.toml",
+          "asyncio",
+          "JSONL",
+          "pytest"
+        ]
+      }
+    },
+    {
+      "name": "scenario_code_typescript",
+      "messages": "messages/scenario_code_typescript.json",
+      "messages_sha256": "d0eddcbd3ef5076a02162ff94312ee851c8e8168fa8451407f931cac18da59fc",
+      "kind": "scenario_code",
+      "thinking": false,
+      "prompt_tokens": 122,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "package.json",
+          "tsconfig.json",
+          "sample standard deviation",
+          "/summary"
+        ]
+      }
+    },
+    {
+      "name": "scenario_story_zh_scifi",
+      "messages": "messages/scenario_story_zh_scifi.json",
+      "messages_sha256": "acbd46f48862d36b116f79f98bf6b6e61d177cbee1b48831bca25438293f9cf7",
+      "kind": "scenario_story",
+      "thinking": false,
+      "prompt_tokens": 127,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "六章",
+          "ORCHID-37",
+          "原子钟",
+          "不确定性"
+        ]
+      }
+    },
+    {
+      "name": "scenario_story_en_mystery",
+      "messages": "messages/scenario_story_en_mystery.json",
+      "messages_sha256": "e742075dbf6f5086b94e879a591551c57003ad6d8e800b07b006eb42d1e5cd39",
+      "kind": "scenario_story",
+      "thinking": false,
+      "prompt_tokens": 131,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "seven titled parts",
+          "brass key",
+          "eleven seconds",
+          "physical solution"
+        ]
+      }
+    },
+    {
+      "name": "scenario_story_zh_dialogue",
+      "messages": "messages/scenario_story_zh_dialogue.json",
+      "messages_sha256": "d4e8c079651b9c7b06ce9c793ec3e478cb891c114c9c1860d9cc2b791917e5c3",
+      "kind": "scenario_story",
+      "thinking": false,
+      "prompt_tokens": 135,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "五幕",
+          "沈砚",
+          "比例尺",
+          "洪水"
+        ]
+      }
+    },
+    {
+      "name": "scenario_translation_zh_en",
+      "messages": "messages/scenario_translation_zh_en.json",
+      "messages_sha256": "663536a15ad40fd8c84e6cec84c9f7c6b1bfb89d722900eea35aef635e5cc317",
+      "kind": "scenario_translation",
+      "thinking": false,
+      "prompt_tokens": 401,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "six sections",
+          "English translation",
+          "glossary"
+        ]
+      }
+    },
+    {
+      "name": "scenario_translation_en_zh",
+      "messages": "messages/scenario_translation_en_zh.json",
+      "messages_sha256": "d714b1afdf539d01e432e67dd3c222f043e7b51c509ba6c5eb2e701eb817648e",
+      "kind": "scenario_translation",
+      "thinking": false,
+      "prompt_tokens": 395,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "六个章节",
+          "中文译文",
+          "术语表"
+        ]
+      }
+    },
+    {
+      "name": "scenario_translation_markdown",
+      "messages": "messages/scenario_translation_markdown.json",
+      "messages_sha256": "c7c4a89642bb8bee2003df5c2f098ca7f6c243d9ab3a82530aebb4645d6e75fa",
+      "kind": "scenario_translation",
+      "thinking": false,
+      "prompt_tokens": 360,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "Markdown",
+          "table",
+          "JSON block",
+          "bilingual glossary"
+        ]
+      }
+    },
+    {
+      "name": "scenario_structured_jsonl",
+      "messages": "messages/scenario_structured_jsonl.json",
+      "messages_sha256": "7ef63d6a14d5bd34633388861b210d9af30638a6b5f1c94bf541b6daf6740111",
+      "kind": "scenario_structured",
+      "thinking": false,
+      "prompt_tokens": 130,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "160 JSONL records",
+          "RUN-0001",
+          "strict JSON"
+        ]
+      }
+    },
+    {
+      "name": "scenario_structured_csv",
+      "messages": "messages/scenario_structured_csv.json",
+      "messages_sha256": "94ec27ef5360abe8cc7a7f35320f0efef7f8681c2d9a1b0f991e43fa4c299e23",
+      "kind": "scenario_structured",
+      "thinking": false,
+      "prompt_tokens": 113,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "CSV header",
+          "220 rows",
+          "S0001",
+          "S0220"
+        ]
+      }
+    },
+    {
+      "name": "scenario_structured_sql",
+      "messages": "messages/scenario_structured_sql.json",
+      "messages_sha256": "28a982ecb3181f8db3b308459f7c25816a3d8cf18c679b31940b211312961275",
+      "kind": "scenario_structured",
+      "thinking": false,
+      "prompt_tokens": 101,
+      "max_context": 262144,
+      "max_new": 4096,
+      "kv_dtype": "int8",
+      "oracle": {
+        "mode": "structure",
+        "requirements": [
+          "PostgreSQL",
+          "80 INSERT rows",
+          "two views",
+          "six SELECT queries"
+        ]
+      }
     }
-  ]
+  ],
+  "text_corpus_sources": {
+    "description": "Frozen local sources used to build the committed text examples.",
+    "tokenizer": "Qwen3.6 tokenizer supplied by --tokenizer",
+    "niah": {
+      "dataset": "AI-ModelScope/Needle-in-a-Haystack-Corpus",
+      "file": "PaulGraham_Essays.txt",
+      "sha256": "0982f314869ac03c18ea254a6f3e5448f36835a173ea285cfca1d8ae6395b22e",
+      "excerpt": "first 200000 Unicode characters, repeated"
+    },
+    "aime26": {
+      "dataset": "evalscope/aime26",
+      "file": "aime26-test.arrow",
+      "sha256": "b382d6b1d67dd6172ec7c9429af8c0296ef5ef25ff3ba69db46f6cec6a609d97",
+      "selected": [
+        {
+          "row": 1,
+          "id": "1",
+          "answer": "277"
+        },
+        {
+          "row": 15,
+          "id": "15",
+          "answer": "83"
+        },
+        {
+          "row": 30,
+          "id": "30",
+          "answer": "393"
+        }
+      ]
+    }
+  },
+  "text_corpus_runtime": {
+    "max_context": 262144,
+    "kv_dtype": "int8",
+    "mtp_draft_tokens": 3,
+    "lm_head_draft": true,
+    "sampling": "server defaults",
+    "prefix_reuse": false
+  }
 }

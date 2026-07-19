@@ -1,0 +1,6 @@
+[
+  {
+    "role": "user",
+    "content": "Solve the following math problem step by step. Put your answer inside \\boxed{}.\n\nPatrick started walking at a constant rate along a straight road from school to the park. One hour after Patrick left, Tanya started running along the same road from school to the park. One hour after Tanya left, Jose started bicycling along the same road from school to the park. Tanya ran at a constant rate of $2$ miles per hour faster than Patrick walked, Jose bicycled at a constant rate of $7$ miles per hour faster than Tanya ran, and all three arrived at the park at the same time. The distance from the school to the park is $\\frac{m}{n}$ miles, where $m$ and $n$ are relatively prime positive integers. Find $m + n$.\n\nRemember to put your answer inside \\boxed{}."
+  }
+]

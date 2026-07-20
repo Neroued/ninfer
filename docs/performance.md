@@ -1,130 +1,122 @@
-# Performance
+# Single-GPU serving performance
 
-This page records the representative NInfer CLI measurements used in the project README. The
-current NInfer runs were captured on 2026-07-19 from mainline revision `fdaf991` in
-`profiles/bench/qwen36_mtp_cli_repeat5_20260719_current`. The unchanged llama.cpp rows come from the
-2026-07-18 run in `profiles/bench/qwen36_mtp_cli_repeat5_20260718`. Raw run output remains local;
-the complete aggregated results and test conditions are preserved here.
+Tested Git revision: `0795169393cab0f2c16246d4bac20dee735dc2a4`.
 
-## Test conditions
+These measurements characterize the two registered NInfer targets independently on one NVIDIA
+GeForce RTX 5090. They cover long-context prefill and baseline decode with MTP disabled, plus
+long-reasoning and cross-scenario decode with MTP enabled.
+
+All requests were submitted serially to a persistent `ninfer-serve` process over the loopback
+OpenAI-compatible HTTP endpoint. Each reported fixture used five fixed seeds. Values are arithmetic
+mean ± sample standard deviation; warm-up requests are excluded.
+
+## Test method
 
 | Setting | Value |
 |---|---|
-| GPU | NVIDIA GeForce RTX 5090 |
-| Driver reported by the run | 591.86 |
-| Prompt source | `examples/cli/messages/long_8k.json` |
-| NInfer prepared prompt | 7,678 tokens |
-| Context capacity | 16,384 tokens |
-| Generated tokens | 512 |
-| KV cache | BF16 |
-| Sampling | greedy |
-| NInfer prefill chunk | 1,024 |
-| CUDA Graph | enabled |
-| MTP draft window | 0 or 3 |
-| NInfer MTP proposal head | optimized when MTP=3 |
-| Warm-up | one run per configuration, excluded |
-| Measurement | five runs per configuration |
-| Reported statistic | mean plus sample standard deviation |
-| llama.cpp build | `b201-b369ae383` |
+| GPU | NVIDIA GeForce RTX 5090, 32 GiB |
+| CUDA compile/runtime/driver API | 13.1 / 13.1 / 13.1 |
+| Request mode | One active request, `stream=false` |
+| Maximum context | 262,144 tokens |
+| Prefill chunk | 1,024 tokens |
+| KV cache | INT8 group-64 |
+| CUDA Graph | Enabled |
+| Prefix reuse | Disabled |
+| Sampling | Temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.0 |
+| MTP0 | `--mtp-draft-tokens 0` |
+| MTP3 | `--mtp-draft-tokens 3 --lm-head-draft` |
 
-The NInfer and llama.cpp runs used the same source prompt and 512-token generation budget, with each
-engine applying its own chat path and reporting its own prefill/decode phase rate. Configurations
-were alternated between MTP off and on to reduce ordering bias.
+The MTP0 profile uses four Long NIAH prompts with approximately 8K, 64K, 128K, and 256K tokens.
+Thinking is disabled and the output budget is 128 tokens. These runs measure prefill throughput,
+server-internal time to first token, and baseline decode throughput at each context length. Content
+scenarios are not repeated with MTP disabled because they do not change the baseline decode path.
 
-## Full results
+The MTP3 corpus contains three long-reasoning fixtures with thinking enabled and a 65,536-token
+output limit, followed by twelve fixtures covering code, story, translation, and structured output.
+The cross-scenario fixtures disable thinking and use a 4,096-token output limit. The tables report
+actual completion lengths rather than assuming that every request reaches its limit.
 
-| Model | Engine | MTP | Prefill mean ± SD | Decode mean ± SD | MTP acceptance | Accepted length |
-|---|---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B | llama.cpp | 0 | 2,966.58 ± 4.51 tok/s | 60.60 ± 0.14 tok/s | — | — |
-| Qwen3.6-27B | llama.cpp | 3 | 2,646.64 ± 30.47 tok/s | 140.38 ± 0.70 tok/s | not reported | not reported |
-| Qwen3.6-27B | NInfer | 0 | 3,278.79 ± 32.63 tok/s | 76.97 ± 0.58 tok/s | — | — |
-| Qwen3.6-27B | NInfer | 3 | 3,260.67 ± 30.85 tok/s | 188.30 ± 1.47 tok/s | 87.47% | 3.62 tok/round |
-| Qwen3.6-35B-A3B | llama.cpp | 0 | 6,272.86 ± 268.07 tok/s | 197.80 ± 1.13 tok/s | — | — |
-| Qwen3.6-35B-A3B | llama.cpp | 3 | 5,476.82 ± 312.99 tok/s | 285.88 ± 5.28 tok/s | not reported | not reported |
-| Qwen3.6-35B-A3B | NInfer | 0 | 15,674.64 ± 39.74 tok/s | 275.38 ± 0.20 tok/s | — | — |
-| Qwen3.6-35B-A3B | NInfer | 3 | 15,496.77 ± 140.45 tok/s | 593.60 ± 1.52 tok/s | 79.56% | 3.39 tok/round |
+Metrics are computed from the server's unrounded phase timings and MTP counters:
 
-## Comparisons
-
-| Model | Comparison | Prefill ratio | Decode ratio |
-|---|---|---:|---:|
-| Qwen3.6-27B | NInfer MTP=3 / NInfer MTP=0 | 0.99x | 2.45x |
-| Qwen3.6-35B-A3B | NInfer MTP=3 / NInfer MTP=0 | 0.99x | 2.16x |
-| Qwen3.6-27B | NInfer / llama.cpp at MTP=3 | 1.23x | 1.34x |
-| Qwen3.6-35B-A3B | NInfer / llama.cpp at MTP=3 | 2.83x | 2.08x |
-
-Ratios are ratios of the five-run means before display rounding.
-
-## Artifact boundary
-
-This is an end-to-end configuration comparison, not an identical-format kernel comparison.
-
-NInfer used the published native artifacts:
-
-- `qwen3_6_27b.ninfer`, 17,495,365,888 bytes;
-- `qwen3_6_35b_a3b.ninfer`, 22,373,184,256 bytes.
-
-llama.cpp used:
-
-- `Qwen3.6-27B-Q4_K_M-mtp.gguf`;
-- `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`.
-
-The artifacts use different quantization and storage recipes. The comparison therefore describes
-the measured complete-engine combinations and must not be interpreted as an isolated runtime or
-kernel result.
-
-## NInfer command
-
-The measured MTP configuration for either registered artifact was:
-
-```bash
-./build/apps/ninfer "$ARTIFACT" \
-  --messages examples/cli/messages/long_8k.json \
-  --device 0 \
-  --max-context 16384 \
-  --prefill-chunk 1024 \
-  --kv-dtype bf16 \
-  --max-new 512 \
-  --greedy \
-  --mtp-draft-tokens 3 \
-  --lm-head-draft
+```text
+prefill_tok_s = prompt_tokens / prefill_seconds
+server_ttft_ms = 1000 * (prepare_seconds + vision_seconds + prefill_seconds)
+decode_tok_s = (completion_tokens - 1) / decode_seconds
+mtp_acceptance = accepted_tokens / drafted_tokens
+mtp_tokens_per_round = 1 + accepted_tokens / mtp_rounds
 ```
 
-The MTP=0 control replaced the final two flags with `--mtp-draft-tokens 0`.
+## Reproduction
 
-## llama.cpp command
-
-The corresponding llama.cpp MTP configuration was:
+Build `ninfer-serve`, prepare both registered `.ninfer` artifacts, and run:
 
 ```bash
-PROMPT=$(jq -r '.[0].content' examples/cli/messages/long_8k.json)
-
-llama-cli \
-  -m "$GGUF" \
-  --prompt "$PROMPT" \
-  --conversation \
-  --single-turn \
-  --chat-template-kwargs '{"enable_thinking":true}' \
-  --ctx-size 16384 \
-  --n-predict 512 \
-  --batch-size 2048 \
-  --ubatch-size 512 \
-  --gpu-layers all \
-  --split-mode none \
-  --main-gpu 0 \
-  --flash-attn on \
-  --cache-type-k bf16 \
-  --cache-type-v bf16 \
-  --temperature 0 \
-  --seed 0 \
-  --no-display-prompt \
-  --color off \
-  --perf \
-  --spec-type draft-mtp \
-  --spec-draft-n-max 3 \
-  --spec-draft-p-min 0 \
-  --spec-draft-type-k bf16 \
-  --spec-draft-type-v bf16
+python3 tools/bench/run_serve_corpus.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
+  --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
+  --output profiles/bench/serve_corpus_20260720
 ```
 
-The MTP=0 control omitted the five `--spec-*` options.
+## `qwen3_6_35b_a3b`
+
+### MTP0 context-length profile
+
+| Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+|---:|---:|---:|---:|---:|
+| 7,680 | 5 | 15,544.3 ± 242.4 | 500.2 ± 7.8 | 271.1 ± 3.6 |
+| 64,512 | 5 | 10,809.0 ± 95.3 | 6,009.9 ± 52.6 | 242.9 ± 1.3 |
+| 130,048 | 5 | 7,828.4 ± 34.1 | 16,693.3 ± 71.2 | 219.4 ± 1.6 |
+| 260,096 | 5 | 5,157.1 ± 52.4 | 50,598.8 ± 519.7 | 188.2 ± 2.1 |
+
+### MTP3 long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 8,675.4 ± 1,565.6 | 634.3 ± 14.2 | 82.7% ± 2.6% | 3.48 ± 0.08 |
+| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 542.8 ± 12.5 | 73.0% ± 2.5% | 3.19 ± 0.07 |
+| `long_decode_aime26_30` | 5 | 55,171.0 ± 5,407.1 | 572.9 ± 9.1 | 77.7% ± 1.4% | 3.33 ± 0.04 |
+
+### MTP3 cross-scenario decode
+
+Each category contains three fixtures and five seeds per fixture, for 15 samples.
+
+| Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 576.5 ± 21.7 | 71.0% ± 4.0% | 3.13 ± 0.12 |
+| Story | 15 | 395.9 ± 30.9 | 37.7% ± 5.8% | 2.13 ± 0.17 |
+| Translation | 15 | 559.3 ± 28.1 | 66.6% ± 5.1% | 3.00 ± 0.15 |
+| Structured | 15 | 661.2 ± 29.5 | 87.2% ± 6.0% | 3.62 ± 0.18 |
+
+## `qwen3_6_27b`
+
+### MTP0 context-length profile
+
+| Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+|---:|---:|---:|---:|---:|
+| 7,680 | 5 | 3,218.1 ± 4.3 | 2,392.4 ± 3.0 | 77.6 ± 0.1 |
+| 64,512 | 5 | 2,655.9 ± 2.9 | 24,335.7 ± 25.2 | 70.7 ± 0.1 |
+| 130,048 | 5 | 2,185.3 ± 0.3 | 59,590.3 ± 8.9 | 64.5 ± 0.1 |
+| 260,096 | 5 | 1,614.8 ± 0.6 | 161,221.8 ± 62.5 | 54.8 ± 0.1 |
+
+### MTP3 long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 11,009.4 ± 419.1 | 174.2 ± 3.3 | 79.9% ± 2.0% | 3.40 ± 0.06 |
+| `long_decode_aime26_15` | 5 | 62,652.6 ± 3,000.4 | 158.7 ± 5.2 | 73.3% ± 3.4% | 3.20 ± 0.10 |
+| `long_decode_aime26_30` | 5 | 47,837.8 ± 5,882.7 | 169.0 ± 2.7 | 79.3% ± 2.0% | 3.38 ± 0.06 |
+
+### MTP3 cross-scenario decode
+
+Each category contains three fixtures and five seeds per fixture, for 15 samples.
+
+| Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 163.9 ± 6.2 | 72.5% ± 3.9% | 3.18 ± 0.12 |
+| Story | 15 | 110.4 ± 9.2 | 37.9% ± 6.0% | 2.14 ± 0.18 |
+| Translation | 15 | 153.6 ± 11.7 | 65.7% ± 7.5% | 2.97 ± 0.23 |
+| Structured | 15 | 189.1 ± 15.7 | 88.9% ± 10.2% | 3.67 ± 0.31 |
+
+The MTP0 and MTP3 suites intentionally measure different supported workloads. No per-scenario
+MTP0/MTP3 speedup is reported.

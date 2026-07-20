@@ -16,24 +16,27 @@ runtime:
 
 ## Performance
 
-The primary MTP path was measured on an RTX 5090 using the same long-context prompt source (7,678
-tokens after NInfer prompt preparation), 512 generated tokens, BF16 KV cache, greedy decoding, and
-a draft window of three. Each value is the mean of five measured runs after one warm-up.
+Serving performance was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, a 1,024-
+token prefill chunk, and a maximum context of 262,144 tokens. Each reported fixture uses five fixed
+seeds after one warm-up. The two registered targets are reported independently and are not
+cross-target comparisons.
 
-| Model | Engine | Prefill | Decode |
-|---|---|---:|---:|
-| Qwen3.6-27B | **NInfer** | **3,260.67 tok/s** | **188.30 tok/s** |
-| Qwen3.6-27B | llama.cpp | 2,646.64 tok/s | 140.38 tok/s |
-| Qwen3.6-35B-A3B | **NInfer** | **15,496.77 tok/s** | **593.60 tok/s** |
-| Qwen3.6-35B-A3B | llama.cpp | 5,476.82 tok/s | 285.88 tok/s |
+**Qwen3.6-35B-A3B**
 
-For these configurations, NInfer reaches 1.23x/1.34x the llama.cpp prefill/decode rates on 27B and
-2.83x/2.08x on 35B-A3B. Within NInfer, enabling the measured MTP path raises decode throughput by
-2.45x on 27B and 2.16x on 35B-A3B.
+- MTP0 at a 7,680-token prompt: **15,544.3 prefill tok/s** and **271.1 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **5,157.1 prefill tok/s** and **188.2 decode tok/s**.
+- MTP3 long reasoning: **542.8–634.3 decode tok/s** with **73.0–82.7% acceptance**.
+- MTP3 structured output: **661.2 decode tok/s**, **87.2% acceptance**, and **3.62 tokens/round**.
 
-These are complete-engine comparisons using each engine's corresponding quantized artifact, not
-kernel measurements or identical weight formats. See [Performance](docs/performance.md) for the
-full MTP-on/off results, variability, exact commands, and comparison boundaries.
+**Qwen3.6-27B**
+
+- MTP0 at a 7,680-token prompt: **3,218.1 prefill tok/s** and **77.6 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **1,614.8 prefill tok/s** and **54.8 decode tok/s**.
+- MTP3 long reasoning: **158.7–174.2 decode tok/s** with **73.3–79.9% acceptance**.
+- MTP3 structured output: **189.1 decode tok/s**, **88.9% acceptance**, and **3.67 tokens/round**.
+
+See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
+and per-fixture results.
 
 ## Requirements
 

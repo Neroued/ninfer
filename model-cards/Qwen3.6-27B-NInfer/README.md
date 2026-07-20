@@ -12,7 +12,6 @@ tags:
   - conversational
   - cuda
   - rtx-5090
-# Replace every TBD evaluation value before publishing this card.
 model-index:
   - name: Qwen3.6-27B-NInfer
     results:

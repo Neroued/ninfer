@@ -38,6 +38,20 @@ cross-target comparisons.
 See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
 and per-fixture results.
 
+## Evaluation
+
+Capability scores from the published model cards, measured through NInfer's OpenAI-compatible
+serving route with thinking enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample
+per problem):
+
+| Model | AIME 2025 | AIME 2026 | GPQA-Diamond |
+|---|---:|---:|---:|
+| [Qwen3.6-27B](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
+| [Qwen3.6-35B-A3B](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
+
+These are single-sample results under that NInfer evaluation profile, not pass@k. See each model
+card for correct/total counts and the full evaluation notes.
+
 ## Requirements
 
 NInfer currently requires:

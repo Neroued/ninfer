@@ -2,3 +2,4 @@
 runs/
 __pycache__/
 *.pyc
+server-logs/*.requests.jsonl

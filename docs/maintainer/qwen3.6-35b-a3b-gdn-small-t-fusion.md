@@ -30,8 +30,8 @@ Build and run the committed whole-layer benchmark with:
 
 ```bash
 cmake --build build --parallel --target ninfer_gdn_layer_bench
-./build/bench/ninfer_gdn_layer_bench --route composed
-./build/bench/ninfer_gdn_layer_bench --route fused
+./build/bench/ninfer_gdn_layer_bench --route composed --qk-norm composed
+./build/bench/ninfer_gdn_layer_bench --route fused --qk-norm composed
 ```
 
 The benchmark uses one CUDA Graph per T, five warmups, forty measured replays, graph-bracketing
@@ -52,7 +52,8 @@ A CUDA Graph node trace at T=1, 4, and 6 attributes the median GPU duration as f
 nsys profile --force-overwrite=true \
   --trace=cuda --cuda-graph-trace=node --sample=none --cpuctxsw=none \
   -o /tmp/ninfer_gdn_layer_t4_nodes \
-  ./build/bench/ninfer_gdn_layer_bench --route composed --t-sweep 4 --warmup 5 --repeat 40
+  ./build/bench/ninfer_gdn_layer_bench --route composed --qk-norm composed \
+    --t-sweep 4 --warmup 5 --repeat 40
 ```
 
 Substitute T=1 or T=6 for the endpoint traces. Nsight instrumentation raises the whole-graph
@@ -161,25 +162,66 @@ regression at any T.
 
 ### 2.3 Fuse q/k normalization into the recurrent snapshot kernel
 
-Do not independently normalize q/k in every recurrent CTA. Each q/k head is shared by two value
-heads and eight state-row partitions, so that design repeats the reduction sixteen times.
+The selected implementation adds an explicit `normalize_qk` semantic switch to the BF16 recurrent
+Op and dispatches it to a compile-time kernel specialization. On every q/k token load, each warp
+loads raw BF16 values into FP32 registers, computes `rsqrt(sum(x^2) + 1e-6)`, and applies the factor
+before the existing recurrent math. The factors and normalized values are not materialized and no
+grid synchronization or workspace is added. The former BF16 `qn` and `kn` materializations do not
+constrain this fused implementation.
 
-Instead, make the recurrent kernel cooperative:
+This deliberately accepts repeated warp-local reductions. The 35B geometry shares each q/k head
+across two value heads and eight state-row partitions; 27B shares it across three value heads. A
+cooperative-grid factor stage would remove that repetition but add a global handoff to a kernel
+whose useful state grid is already large. Direct specialization was retained because it has no
+handoff, removes both launches, and does not regress any measured T.
 
-1. A small leading set of warps computes one FP32 inverse norm for every `(qk_head, token)` pair
-   and stores the factors in a small workspace.
-2. Synchronize the grid.
-3. Run the existing 256 logical recurrent CTAs. On q/k load, apply the normalization factor and
-   pass the naturally represented normalized values directly into the recurrent math.
-4. Preserve the existing FP32 SSM state and slots `0..T-1` snapshot writes.
+`normalize_qk` describes the input rather than selecting a T range. The Qwen family caller always
+passes raw convolution outputs with `normalize_qk=true` and has no normalization workspace or
+small-T branch. The GDN Op applies the template specialization directly whenever it selects the
+recurrent implementation. When a full chunk exists, the Op privately materializes normalized BF16
+q/k for the unchanged chunked implementation and any recurrent tail. Its workspace query includes
+that staging. The standalone L2Norm and non-normalizing recurrent specialization remain available.
 
-This removes both `qn` and `kn` materializations. Their former BF16 storage does not constrain the
-fused implementation; only the fused Op's declared outputs and persistent state formats do.
+Status: complete. The recurrent-segment benchmark uses both exact head geometries, CUDA Graph
+replay, a 256 MiB L2 flush, five warmups, and eighty measurements:
 
-Expected result: graph nodes `7 -> 5` and at least 1.5 us additional median improvement. The
-recurrent kernel itself must not regress enough to consume the two removed launches.
+```bash
+./build/bench/ninfer_gated_delta_rule_bench \
+  --small-t --H_v 32 --qk-norm composed --warmup 5 --repeat 80
+./build/bench/ninfer_gated_delta_rule_bench \
+  --small-t --H_v 32 --qk-norm fused --warmup 5 --repeat 80
+./build/bench/ninfer_gated_delta_rule_bench \
+  --small-t --H_v 48 --qk-norm composed --warmup 5 --repeat 80
+./build/bench/ninfer_gated_delta_rule_bench \
+  --small-t --H_v 48 --qk-norm fused --warmup 5 --repeat 80
+```
 
-### 2.4 Append gated RMSNorm to the recurrent cooperative kernel
+| Target | T | Composed median (us) | Fused median (us) | Saved (us) |
+|---|---:|---:|---:|---:|
+| 35B, Hv=32 | 1 | 9.440 | 5.408 | 4.032 |
+| 35B, Hv=32 | 2 | 9.472 | 7.424 | 2.048 |
+| 35B, Hv=32 | 3 | 11.488 | 9.472 | 2.016 |
+| 35B, Hv=32 | 4 | 11.520 | 11.520 | 0.000 |
+| 35B, Hv=32 | 5 | 13.248 | 11.552 | 1.696 |
+| 35B, Hv=32 | 6 | 13.568 | 13.568 | 0.000 |
+| 27B, Hv=48 | 1 | 9.472 | 7.424 | 2.048 |
+| 27B, Hv=48 | 2 | 11.520 | 7.424 | 4.096 |
+| 27B, Hv=48 | 3 | 11.520 | 9.472 | 2.048 |
+| 27B, Hv=48 | 4 | 13.568 | 11.520 | 2.048 |
+| 27B, Hv=48 | 5 | 15.520 | 13.568 | 1.952 |
+| 27B, Hv=48 | 6 | 15.616 | 15.616 | 0.000 |
+
+At the complete 35B layer boundary, graph nodes fall from eight to six. A reverse-order confirmation
+with ten warmups and 160 measurements gives composed-to-fused medians of `46.336 -> 44.320`,
+`46.304 -> 44.288`, `46.336 -> 44.288`, `48.384 -> 48.224`, `50.464 -> 50.400`, and
+`52.480 -> 50.432` us for T=1..6. Every T is non-regressing; the isolated recurrent-segment ties at
+T=4/6 do not turn into whole-layer regressions.
+
+Direct independent FP64 tests start from represented raw BF16 q/k and evaluate normalization plus
+the complete recurrence. They cover both exact value-head counts, T=1..6, near-zero q/k, ordinary
+and snapshot state publication, and preservation of untouched snapshot slots.
+
+### 2.4 Append gated RMSNorm to the recurrent kernel
 
 After recurrent output and snapshot publication:
 

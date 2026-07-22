@@ -18,7 +18,7 @@ namespace ninfer::ops {
 [[nodiscard]] std::size_t gated_delta_rule_workspace_bytes(std::int32_t head_dim,
                                                            std::int32_t qk_heads,
                                                            std::int32_t value_heads,
-                                                           std::int32_t tokens);
+                                                           std::int32_t tokens, bool normalize_qk);
 
 /**
  * Applies the Gated DeltaNet recurrence independently for each value head h. Let
@@ -32,15 +32,19 @@ namespace ninfer::ops {
  *
  * Shapes/dtypes are contiguous q/k BF16 [S,Hqk,T], v/out BF16 [S,Hv,T], g/beta FP32 [Hv,T], and
  * state FP32 [S,S,Hv], where S is one of {16,32,64,128}, Hqk>=1, Hv>=Hqk, and Hv%Hqk==0. `scale`
- * is 1/sqrt(S). Inputs and out do not overlap state or one another. `ws` supplies transient
- * storage reported by gated_delta_rule_workspace_bytes; scratch is scoped to the call. T may be
- * any positive value.
+ * is 1/sqrt(S). When `normalize_qk` is true, the recurrent implementation consumes raw q/k and
+ * applies x / sqrt(sum(x^2) + 1e-6) independently to every [S] row before using it. When false,
+ * q/k are consumed as supplied. Recurrent implementations may apply the normalization directly;
+ * chunked implementations may use private normalized staging. The corresponding private storage
+ * is included by gated_delta_rule_workspace_bytes when `normalize_qk` is true.
+ * Inputs and out do not overlap state or one another. `ws` supplies transient storage reported by
+ * gated_delta_rule_workspace_bytes; scratch is scoped to the call. T may be any positive value.
  *
  * This overload reads and writes the same `ssm_state`, publishing the state after all T tokens.
  */
 void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, WorkspaceArena& ws, Tensor& ssm_state,
-                      Tensor& out, cudaStream_t stream);
+                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                      Tensor& ssm_state, Tensor& out, cudaStream_t stream);
 
 /**
  * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
@@ -48,7 +52,7 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
  * arguments may overlap either state.
  */
 void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, WorkspaceArena& ws,
+                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
                       const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                       cudaStream_t stream);
 
@@ -60,8 +64,8 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
  * mutated.
  */
 void gated_delta_rule_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                               const Tensor& beta, float scale, WorkspaceArena& ws,
-                               Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
-                               cudaStream_t stream);
+                               const Tensor& beta, float scale, bool normalize_qk,
+                               WorkspaceArena& ws, Tensor& ssm_states, const Tensor& initial_slot,
+                               Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

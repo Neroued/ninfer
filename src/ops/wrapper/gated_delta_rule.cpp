@@ -1,14 +1,16 @@
 #include "ninfer/ops/gated_delta_rule.h"
 
+#include "ninfer/ops/l2norm.h"
+
 #include "ops/common/math.h"
 #include "ops/kernel/gdn_common.cuh"
 #include "ops/launcher/gated_delta_rule.h"
 #include "core/device.h"
+#include "core/layout.h"
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -152,53 +154,55 @@ void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const T
     require_contiguous_nonnull(ssm_state_in, "ssm_state_in");
 }
 
-std::int32_t checked_arena_floats(std::size_t bytes) {
-    const std::size_t floats = div_up(bytes, sizeof(float));
-    if (floats > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error("gated_delta_rule: chunked workspace exceeds Tensor shape limit");
-    }
-    return static_cast<std::int32_t>(floats);
-}
-
 } // namespace
 
 std::size_t gated_delta_rule_workspace_bytes(std::int32_t head_dim, std::int32_t qk_heads,
-                                             std::int32_t value_heads, std::int32_t tokens) {
+                                             std::int32_t value_heads, std::int32_t tokens,
+                                             bool normalize_qk) {
     if (!is_supported_gdn_head_dim(head_dim) || !are_gdn_head_counts_valid(qk_heads, value_heads) ||
         tokens <= 0) {
         throw std::invalid_argument("gated_delta_rule_workspace_bytes: invalid geometry");
     }
     const std::int32_t full = (tokens / kChunkSize) * kChunkSize;
-    return full == 0 ? 0
-                     : detail::gdn_chunked_workspace_bytes(head_dim, qk_heads, value_heads, full);
+    if (full == 0) { return 0; }
+
+    WorkspaceLayoutBuilder layout;
+    if (normalize_qk) {
+        (void)layout.alloc(DType::BF16, {head_dim, qk_heads, tokens});
+        (void)layout.alloc(DType::BF16, {head_dim, qk_heads, tokens});
+    }
+    layout.alloc_bytes(detail::gdn_chunked_workspace_bytes(head_dim, qk_heads, value_heads, full));
+    return layout.peak_bytes();
 }
 
 void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, WorkspaceArena& ws, Tensor& ssm_state,
-                      Tensor& out, cudaStream_t stream) {
+                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                      Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
     if (q.ne[2] != 1) {
-        gated_delta_rule(q, k, v, g, beta, scale, ws, ssm_state, ssm_state, out, stream);
+        gated_delta_rule(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state, ssm_state, out,
+                         stream);
         return;
     }
     validate_recurrent(q, k, v, g, beta, scale, ssm_state, out);
 
     (void)ws;
-    detail::gated_delta_rule_recurrent_bf16_launch(q, k, v, g, beta, scale, ssm_state, out, stream);
+    detail::gated_delta_rule_recurrent_bf16_launch(q, k, v, g, beta, scale, normalize_qk, ssm_state,
+                                                   out, stream);
 }
 
 void gated_delta_rule_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                               const Tensor& beta, float scale, WorkspaceArena& ws,
-                               Tensor& ssm_states, const Tensor& initial_slot, Tensor& out,
-                               cudaStream_t stream) {
+                               const Tensor& beta, float scale, bool normalize_qk,
+                               WorkspaceArena& ws, Tensor& ssm_states, const Tensor& initial_slot,
+                               Tensor& out, cudaStream_t stream) {
     validate_recurrent_snapshot(q, k, v, g, beta, scale, ssm_states, initial_slot, out);
 
     (void)ws;
-    detail::gated_delta_rule_recurrent_snapshot_bf16_launch(q, k, v, g, beta, scale, ssm_states,
-                                                            initial_slot, out, stream);
+    detail::gated_delta_rule_recurrent_snapshot_bf16_launch(q, k, v, g, beta, scale, normalize_qk,
+                                                            ssm_states, initial_slot, out, stream);
 }
 
 void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, WorkspaceArena& ws,
+                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
                       const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                       cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
@@ -206,26 +210,36 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
     auto scratch_scope        = ws.scope();
     const std::int32_t T      = q.ne[2];
     const std::int32_t T_full = (T / kChunkSize) * kChunkSize;
+    Tensor q_compute          = q;
+    Tensor k_compute          = k;
+    bool recurrent_normalize  = normalize_qk;
+    if (normalize_qk && T_full > 0) {
+        q_compute = ws.alloc(DType::BF16, {q.ne[0], q.ne[1], T});
+        k_compute = ws.alloc(DType::BF16, {k.ne[0], k.ne[1], T});
+        l2norm(q, 1.0e-6f, q_compute, stream);
+        l2norm(k, 1.0e-6f, k_compute, stream);
+        recurrent_normalize = false;
+    }
     if (T_full > 0) {
         const std::size_t stage_bytes =
-            gated_delta_rule_workspace_bytes(q.ne[0], q.ne[1], v.ne[1], T);
-        Tensor stage_workspace = ws.alloc(DType::FP32, {checked_arena_floats(stage_bytes)});
+            detail::gdn_chunked_workspace_bytes(q.ne[0], q.ne[1], v.ne[1], T_full);
+        const DeviceSpan stage_workspace = ws.alloc_bytes(stage_bytes);
 
-        Tensor q_full    = q.slice(2, 0, T_full);
-        Tensor k_full    = k.slice(2, 0, T_full);
+        Tensor q_full    = q_compute.slice(2, 0, T_full);
+        Tensor k_full    = k_compute.slice(2, 0, T_full);
         Tensor v_full    = v.slice(2, 0, T_full);
         Tensor g_full    = g.slice(1, 0, T_full);
         Tensor beta_full = beta.slice(1, 0, T_full);
         Tensor out_full  = out.slice(2, 0, T_full);
         detail::gated_delta_rule_chunked_launch(
             q_full, k_full, v_full, g_full, beta_full, scale, ssm_state_in, ssm_state_out, out_full,
-            stage_workspace.data, stage_workspace.bytes(), stream);
+            stage_workspace.data, stage_workspace.bytes, stream);
     }
 
     const std::int32_t tail = T - T_full;
     if (tail > 0) {
-        Tensor q_tail    = q.slice(2, T_full, tail);
-        Tensor k_tail    = k.slice(2, T_full, tail);
+        Tensor q_tail    = q_compute.slice(2, T_full, tail);
+        Tensor k_tail    = k_compute.slice(2, T_full, tail);
         Tensor v_tail    = v.slice(2, T_full, tail);
         Tensor g_tail    = g.slice(1, T_full, tail);
         Tensor beta_tail = beta.slice(1, T_full, tail);
@@ -234,9 +248,9 @@ void gated_delta_rule(const Tensor& q, const Tensor& k, const Tensor& v, const T
         // chunks) reads the caller-provided ssm_state_in. Either way the tail publishes to
         // ssm_state_out.
         const Tensor& tail_in = (T_full > 0) ? ssm_state_out : ssm_state_in;
-        detail::gated_delta_rule_recurrent_inout_bf16_launch(q_tail, k_tail, v_tail, g_tail,
-                                                             beta_tail, scale, tail_in,
-                                                             ssm_state_out, out_tail, stream);
+        detail::gated_delta_rule_recurrent_inout_bf16_launch(
+            q_tail, k_tail, v_tail, g_tail, beta_tail, scale, recurrent_normalize, tail_in,
+            ssm_state_out, out_tail, stream);
     }
 }
 

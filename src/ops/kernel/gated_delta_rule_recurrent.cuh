@@ -134,7 +134,9 @@ __global__ void __launch_bounds__(kWarpSize* kGdnNumWarps, 2)
     }
 }
 
-template <int S, int DQK_PER_LANE, int ACTIVE_LANES>
+inline constexpr float kGdnQkL2NormEps = 1.0e-6f;
+
+template <int S, int DQK_PER_LANE, int ACTIVE_LANES, bool NormalizeQK>
 __device__ __forceinline__ void gdn_load_qk_lane_bf16(float (&reg)[DQK_PER_LANE],
                                                       const __nv_bfloat16* base, int lane,
                                                       std::uint32_t dqk_base) {
@@ -143,6 +145,17 @@ __device__ __forceinline__ void gdn_load_qk_lane_bf16(float (&reg)[DQK_PER_LANE]
     } else {
 #pragma unroll
         for (int i = 0; i < DQK_PER_LANE; ++i) { reg[i] = __bfloat162float(base[dqk_base + i]); }
+    }
+
+    if constexpr (NormalizeQK) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < DQK_PER_LANE; ++i) { sum += reg[i] * reg[i]; }
+        sum       = warp_reduce_sum(sum);
+        float inv = lane == 0 ? rsqrtf(sum + kGdnQkL2NormEps) : 0.0f;
+        inv       = __shfl_sync(kFullWarpMask, inv, 0);
+#pragma unroll
+        for (int i = 0; i < DQK_PER_LANE; ++i) { reg[i] *= inv; }
     }
 }
 
@@ -153,7 +166,7 @@ __device__ __forceinline__ void gdn_load_qk_lane_bf16(float (&reg)[DQK_PER_LANE]
 //                       into state_write (slot-0 view). Passing state_read == state_write is the
 //                       in-place form; distinct views let prefix-append prefill read a committed
 //                       snapshot slot and publish the running state to slot 0.
-template <int HeadDim, bool Spec>
+template <int HeadDim, bool Spec, bool NormalizeQK>
 __global__ void __launch_bounds__(kWarpSize* kGdnNumWarps, 2)
     gated_delta_rule_recurrent_bf16_kernel(
         const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
@@ -192,7 +205,7 @@ __global__ void __launch_bounds__(kWarpSize* kGdnNumWarps, 2)
     }
 
     __align__(16) float k_reg[d_qk_per_lane];
-    gdn_load_qk_lane_bf16<HeadDim, d_qk_per_lane, active_lanes>(
+    gdn_load_qk_lane_bf16<HeadDim, d_qk_per_lane, active_lanes, NormalizeQK>(
         k_reg, k + static_cast<std::int64_t>(h_qk) * HeadDim, lane, dqk_base);
 
     for (std::int64_t t = 0; t < T; ++t) {
@@ -221,12 +234,12 @@ __global__ void __launch_bounds__(kWarpSize* kGdnNumWarps, 2)
         }
 
         if (t + 1 < T) {
-            gdn_load_qk_lane_bf16<HeadDim, d_qk_per_lane, active_lanes>(
+            gdn_load_qk_lane_bf16<HeadDim, d_qk_per_lane, active_lanes, NormalizeQK>(
                 k_reg, k + ((t + 1) * heads.H_qk + h_qk) * HeadDim, lane, dqk_base);
         }
 
         __align__(16) float q_reg[d_qk_per_lane];
-        gdn_load_qk_lane_bf16<HeadDim, d_qk_per_lane, active_lanes>(
+        gdn_load_qk_lane_bf16<HeadDim, d_qk_per_lane, active_lanes, NormalizeQK>(
             q_reg, q + (t * heads.H_qk + h_qk) * HeadDim, lane, dqk_base);
 
         float attn_val = 0.0f;

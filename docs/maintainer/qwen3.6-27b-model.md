@@ -177,7 +177,10 @@ b = in_b(h)       # [48,T]
 ```
 
 Q/K/V are concatenated into `[10240,T]` and passed through the depthwise causal width-4 convolution
-and SiLU. Q and K are then L2-normalized per head. The decay and update controls `g` and `beta` are
+and SiLU. Q and K are then L2-normalized per head with epsilon `1e-6`. The production GDN Op always
+receives raw BF16 convolution outputs. Its recurrent implementation keeps normalized values in FP32
+registers; when it selects the chunked implementation, it privately materializes normalized BF16
+q/k for the chunked body and recurrent tail. The decay and update controls `g` and `beta` are
 observable FP32 values with the logical formula:
 
 ```text

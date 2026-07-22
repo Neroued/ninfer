@@ -15,18 +15,21 @@ void gated_delta_rule_recurrent_launch(const Tensor& q, const Tensor& k, const T
 
 void gated_delta_rule_recurrent_bf16_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                             const Tensor& g, const Tensor& beta, float scale,
-                                            Tensor& ssm_state, Tensor& out, cudaStream_t stream);
+                                            bool normalize_qk, Tensor& ssm_state, Tensor& out,
+                                            cudaStream_t stream);
 
 void gated_delta_rule_recurrent_inout_bf16_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                                   const Tensor& g, const Tensor& beta, float scale,
-                                                  const Tensor& ssm_state_in, Tensor& ssm_state_out,
-                                                  Tensor& out, cudaStream_t stream);
+                                                  bool normalize_qk, const Tensor& ssm_state_in,
+                                                  Tensor& ssm_state_out, Tensor& out,
+                                                  cudaStream_t stream);
 
 void gated_delta_rule_recurrent_snapshot_bf16_launch(const Tensor& q, const Tensor& k,
                                                      const Tensor& v, const Tensor& g,
                                                      const Tensor& beta, float scale,
-                                                     Tensor& ssm_states, const Tensor& initial_slot,
-                                                     Tensor& out, cudaStream_t stream);
+                                                     bool normalize_qk, Tensor& ssm_states,
+                                                     const Tensor& initial_slot, Tensor& out,
+                                                     cudaStream_t stream);
 
 std::size_t gdn_chunked_workspace_bytes(std::int64_t head_dim, std::int64_t qk_heads,
                                         std::int64_t value_heads, std::int64_t tokens);

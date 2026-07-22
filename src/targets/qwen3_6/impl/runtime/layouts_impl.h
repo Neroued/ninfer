@@ -139,14 +139,12 @@ std::size_t workspace_bytes(const SequencePlanImpl& plan) {
             auto operator_scope = layout.scope();
             layout.alloc_bytes(Variant::gdn_control_projection_workspace_bytes(tokens));
         }
-        matrix(layout, DType::BF16, TextConfig::key_dim, tokens);
-        matrix(layout, DType::BF16, TextConfig::key_dim, tokens);
         matrix(layout, DType::BF16, TextConfig::value_dim, tokens);
         {
             auto operator_scope = layout.scope();
             layout.alloc_bytes(ops::gated_delta_rule_workspace_bytes(
                 TextConfig::gdn_value_head_dim, TextConfig::gdn_key_heads,
-                TextConfig::gdn_value_heads, tokens));
+                TextConfig::gdn_value_heads, tokens, /*normalize_qk=*/true));
         }
         {
             auto operator_scope = layout.scope();

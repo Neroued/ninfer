@@ -65,7 +65,8 @@ void fill_uniform_shared(std::vector<float>& buf, std::mt19937& gen, float lo, f
 }
 
 gdn_ref::Inputs make_inputs_for_geometry(int head_dim, int qk_heads, int value_heads, int T,
-                                         std::uint32_t seed, bool stress_g) {
+                                         std::uint32_t seed, bool stress_g,
+                                         bool normalized_qk = true) {
     gdn_ref::Inputs in{};
     in.S    = head_dim;
     in.H_qk = qk_heads;
@@ -87,8 +88,10 @@ gdn_ref::Inputs make_inputs_for_geometry(int head_dim, int qk_heads, int value_h
     fill_uniform_shared(in.beta, gen, 0.05f, 0.95f);
     fill_uniform_shared(in.state, gen, -0.1f, 0.1f);
 
-    l2_normalize_rows(in.q, head_dim, static_cast<long long>(B * T * qk_heads));
-    l2_normalize_rows(in.k, head_dim, static_cast<long long>(B * T * qk_heads));
+    if (normalized_qk) {
+        l2_normalize_rows(in.q, head_dim, static_cast<long long>(B * T * qk_heads));
+        l2_normalize_rows(in.k, head_dim, static_cast<long long>(B * T * qk_heads));
+    }
     round_to_bf16(in.q);
     round_to_bf16(in.k);
     round_to_bf16(in.v);
@@ -149,8 +152,8 @@ GpuResult run_recurrent_gpu(const gdn_ref::Inputs& in) {
     Tensor tout(dout.p, DType::BF16, {S, H_v, static_cast<int>(in.T)});
     WorkspaceArena ws(chunked_arena_bytes(static_cast<int>(in.T)));
 
-    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), ws, tstate, tout,
-                          nullptr);
+    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), false, ws, tstate,
+                          tout, nullptr);
     cudaDeviceSynchronize();
     return {from_device_bf16(dout, in.v.size()), from_device_f32(dstate, in.state.size())};
 }
@@ -180,8 +183,8 @@ GpuResult run_recurrent_gpu_stepped(const gdn_ref::Inputs& in) {
         Tensor g_t    = tg.slice(1, t, 1);
         Tensor beta_t = tbeta.slice(1, t, 1);
         Tensor out_t  = tout.slice(2, t, 1);
-        ops::gated_delta_rule(q_t, k_t, v_t, g_t, beta_t, 1.0f / std::sqrt(float(S)), ws, tstate,
-                              out_t, nullptr);
+        ops::gated_delta_rule(q_t, k_t, v_t, g_t, beta_t, 1.0f / std::sqrt(float(S)), false, ws,
+                              tstate, out_t, nullptr);
     }
     cudaDeviceSynchronize();
     return {from_device_bf16(dout, in.v.size()), from_device_f32(dstate, in.state.size())};
@@ -221,7 +224,7 @@ int snapshot_oracle_case(int T, std::uint32_t seed, bool stress_g) {
     Tensor tout_snapshot(dout_snapshot.p, DType::BF16, {S, H_v, T});
 
     ops::gated_delta_rule_snapshot(tq_snapshot, tk_snapshot, tv_snapshot, tg_snapshot,
-                                   tbeta_snapshot, 1.0f / std::sqrt(float(S)), ws_snapshot,
+                                   tbeta_snapshot, 1.0f / std::sqrt(float(S)), false, ws_snapshot,
                                    tstate_snapshot, tinitial_slot, tout_snapshot, nullptr);
     cudaDeviceSynchronize();
 
@@ -233,6 +236,168 @@ int snapshot_oracle_case(int T, std::uint32_t seed, bool stress_g) {
     failures += verify((tag + " state slots").c_str(),
                        from_device_f32(dstate_snapshot, ref_snapshots.size()), ref_snapshots,
                        Tolerance::gdn_state_fp32());
+    return failures;
+}
+
+void normalize_qk_for_fused_oracle(gdn_ref::Inputs& in) {
+    constexpr double eps = 1.0e-6;
+    const auto normalize = [&](std::vector<float>& values) {
+        const std::int64_t rows = in.B * in.T * in.H_qk;
+        for (std::int64_t row = 0; row < rows; ++row) {
+            float* base  = values.data() + row * in.S;
+            double sumsq = 0.0;
+            for (std::int64_t d = 0; d < in.S; ++d) {
+                const double value = static_cast<double>(base[d]);
+                sumsq += value * value;
+            }
+            const double inv = 1.0 / std::sqrt(sumsq + eps);
+            for (std::int64_t d = 0; d < in.S; ++d) {
+                base[d] = static_cast<float>(static_cast<double>(base[d]) * inv);
+            }
+        }
+    };
+    normalize(in.q);
+    normalize(in.k);
+}
+
+int fused_norm_snapshot_oracle_case(int value_heads, int T, std::uint32_t seed, bool near_zero) {
+    constexpr int Slots       = 7;
+    constexpr int InitialSlot = 6;
+    auto raw = make_inputs_for_geometry(S, H_qk, value_heads, T, seed, false, false);
+    if (near_zero) {
+        for (float& value : raw.q) { value *= 1.0e-4f; }
+        for (float& value : raw.k) { value *= 1.0e-4f; }
+        round_to_bf16(raw.q);
+        round_to_bf16(raw.k);
+    }
+
+    auto oracle = raw;
+    normalize_qk_for_fused_oracle(oracle);
+    const double scale = 1.0 / std::sqrt(static_cast<double>(S));
+    std::vector<double> ref_out(raw.v.size());
+    std::vector<double> ref_state(raw.state.size());
+    std::vector<double> ref_snapshots(raw.state.size() * static_cast<std::size_t>(T));
+    gdn_ref::forward_recurrent(oracle.q.data(), oracle.k.data(), oracle.v.data(), oracle.g.data(),
+                               oracle.beta.data(), oracle.state.data(), ref_out.data(),
+                               ref_state.data(), S, H_qk, value_heads, T, B, scale,
+                               ref_snapshots.data());
+
+    std::vector<float> snapshot_state(raw.state.size() * Slots, 17.0f);
+    std::copy(raw.state.begin(), raw.state.end(),
+              snapshot_state.begin() + static_cast<std::size_t>(InitialSlot) * raw.state.size());
+    std::vector<double> expected_slots(snapshot_state.begin(), snapshot_state.end());
+    std::copy(ref_snapshots.begin(), ref_snapshots.end(), expected_slots.begin());
+
+    DBuf dq = to_device_bf16(raw.q), dk = to_device_bf16(raw.k), dv = to_device_bf16(raw.v);
+    DBuf dg = to_device_f32(raw.g), dbeta = to_device_f32(raw.beta);
+    DBuf dstate        = to_device_f32(snapshot_state), dout(raw.v.size() * sizeof(std::uint16_t));
+    DBuf dinitial_slot = to_device_i32({InitialSlot});
+    WorkspaceArena ws(chunked_arena_bytes(T));
+
+    Tensor tq(dq.p, DType::BF16, {S, H_qk, T});
+    Tensor tk(dk.p, DType::BF16, {S, H_qk, T});
+    Tensor tv(dv.p, DType::BF16, {S, value_heads, T});
+    Tensor tg(dg.p, DType::FP32, {value_heads, T});
+    Tensor tbeta(dbeta.p, DType::FP32, {value_heads, T});
+    Tensor tstate(dstate.p, DType::FP32, {S, S, value_heads, Slots});
+    Tensor tinitial_slot(dinitial_slot.p, DType::I32, {1});
+    Tensor tout(dout.p, DType::BF16, {S, value_heads, T});
+
+    ops::gated_delta_rule_snapshot(tq, tk, tv, tg, tbeta, static_cast<float>(scale), true, ws,
+                                   tstate, tinitial_slot, tout, nullptr);
+    cudaDeviceSynchronize();
+
+    const std::string tag = "gdn fused qk norm snapshot Hv=" + std::to_string(value_heads) +
+                            " T=" + std::to_string(T) + (near_zero ? " near-zero" : "");
+    int failures = 0;
+    failures += verify((tag + " out").c_str(), from_device_bf16(dout, raw.v.size()), ref_out,
+                       Tolerance::gdn_output_bf16());
+    failures +=
+        verify((tag + " state slots").c_str(), from_device_f32(dstate, expected_slots.size()),
+               expected_slots, Tolerance::gdn_state_fp32());
+    return failures;
+}
+
+int fused_norm_recurrent_oracle_case(int value_heads, std::uint32_t seed) {
+    constexpr int T = 1;
+    auto raw        = make_inputs_for_geometry(S, H_qk, value_heads, T, seed, false, false);
+    auto oracle     = raw;
+    normalize_qk_for_fused_oracle(oracle);
+    const double scale = 1.0 / std::sqrt(static_cast<double>(S));
+    std::vector<double> ref_out(raw.v.size());
+    std::vector<double> ref_state(raw.state.size());
+    gdn_ref::forward_recurrent(oracle.q.data(), oracle.k.data(), oracle.v.data(), oracle.g.data(),
+                               oracle.beta.data(), oracle.state.data(), ref_out.data(),
+                               ref_state.data(), S, H_qk, value_heads, T, B, scale);
+
+    DBuf dq = to_device_bf16(raw.q), dk = to_device_bf16(raw.k), dv = to_device_bf16(raw.v);
+    DBuf dg = to_device_f32(raw.g), dbeta = to_device_f32(raw.beta);
+    DBuf dstate = to_device_f32(raw.state), dout(raw.v.size() * sizeof(std::uint16_t));
+    WorkspaceArena ws(chunked_arena_bytes(T));
+    Tensor tq(dq.p, DType::BF16, {S, H_qk, T});
+    Tensor tk(dk.p, DType::BF16, {S, H_qk, T});
+    Tensor tv(dv.p, DType::BF16, {S, value_heads, T});
+    Tensor tg(dg.p, DType::FP32, {value_heads, T});
+    Tensor tbeta(dbeta.p, DType::FP32, {value_heads, T});
+    Tensor tstate(dstate.p, DType::FP32, {S, S, value_heads});
+    Tensor tout(dout.p, DType::BF16, {S, value_heads, T});
+
+    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, static_cast<float>(scale), true, ws, tstate, tout,
+                          nullptr);
+    cudaDeviceSynchronize();
+
+    const std::string tag = "gdn fused qk norm recurrent Hv=" + std::to_string(value_heads);
+    int failures          = 0;
+    failures += verify((tag + " out").c_str(), from_device_bf16(dout, raw.v.size()), ref_out,
+                       Tolerance::gdn_output_bf16());
+    failures += verify((tag + " state").c_str(), from_device_f32(dstate, raw.state.size()),
+                       ref_state, Tolerance::gdn_state_fp32());
+    return failures;
+}
+
+int fused_norm_chunked_oracle_case(int value_heads, int T, std::uint32_t seed) {
+    auto raw    = make_inputs_for_geometry(S, H_qk, value_heads, T, seed, false, false);
+    auto oracle = raw;
+    normalize_qk_for_fused_oracle(oracle);
+    const double scale = 1.0 / std::sqrt(static_cast<double>(S));
+    std::vector<double> ref_out(raw.v.size());
+    std::vector<double> ref_state(raw.state.size());
+    gdn_ref::forward_recurrent(oracle.q.data(), oracle.k.data(), oracle.v.data(), oracle.g.data(),
+                               oracle.beta.data(), oracle.state.data(), ref_out.data(),
+                               ref_state.data(), S, H_qk, value_heads, T, B, scale);
+
+    DBuf dq = to_device_bf16(raw.q), dk = to_device_bf16(raw.k), dv = to_device_bf16(raw.v);
+    DBuf dg = to_device_f32(raw.g), dbeta = to_device_f32(raw.beta);
+    DBuf dstate = to_device_f32(raw.state), dout(raw.v.size() * sizeof(std::uint16_t));
+    const std::size_t workspace_bytes =
+        ops::gated_delta_rule_workspace_bytes(S, H_qk, value_heads, T, true);
+    const std::size_t non_normalizing_workspace =
+        ops::gated_delta_rule_workspace_bytes(S, H_qk, value_heads, T, false);
+    WorkspaceArena ws(workspace_bytes);
+
+    Tensor tq(dq.p, DType::BF16, {S, H_qk, T});
+    Tensor tk(dk.p, DType::BF16, {S, H_qk, T});
+    Tensor tv(dv.p, DType::BF16, {S, value_heads, T});
+    Tensor tg(dg.p, DType::FP32, {value_heads, T});
+    Tensor tbeta(dbeta.p, DType::FP32, {value_heads, T});
+    Tensor tstate(dstate.p, DType::FP32, {S, S, value_heads});
+    Tensor tout(dout.p, DType::BF16, {S, value_heads, T});
+
+    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, static_cast<float>(scale), true, ws, tstate, tout,
+                          nullptr);
+    cudaDeviceSynchronize();
+
+    const std::string tag =
+        "gdn fused qk norm chunked Hv=" + std::to_string(value_heads) + " T=" + std::to_string(T);
+    int failures = 0;
+    if (workspace_bytes <= non_normalizing_workspace) {
+        std::cerr << tag << ": normalizing workspace does not include private q/k staging\n";
+        ++failures;
+    }
+    failures += verify((tag + " out").c_str(), from_device_bf16(dout, raw.v.size()), ref_out,
+                       Tolerance::gdn_output_bf16());
+    failures += verify((tag + " state").c_str(), from_device_f32(dstate, raw.state.size()),
+                       ref_state, Tolerance::gdn_state_fp32());
     return failures;
 }
 
@@ -277,8 +442,9 @@ int selected_slot_snapshot_oracle_case(int head_dim, int qk_heads, int value_hea
     Tensor tout_snapshot(dout_snapshot.p, DType::BF16, {head_dim, value_heads, T});
 
     ops::gated_delta_rule_snapshot(tq_snapshot, tk_snapshot, tv_snapshot, tg_snapshot,
-                                   tbeta_snapshot, 1.0f / std::sqrt(float(head_dim)), ws_snapshot,
-                                   tstate_snapshot, tinitial_slot, tout_snapshot, nullptr);
+                                   tbeta_snapshot, 1.0f / std::sqrt(float(head_dim)), false,
+                                   ws_snapshot, tstate_snapshot, tinitial_slot, tout_snapshot,
+                                   nullptr);
     cudaDeviceSynchronize();
 
     const std::string tag = "gdn selected snapshot S=" + std::to_string(head_dim) +
@@ -312,8 +478,8 @@ GpuResult run_chunked_gpu(const gdn_ref::Inputs& in) {
     Tensor tstate(dstate.p, DType::FP32, {S, S, H_v});
     Tensor tout(dout.p, DType::BF16, {S, H_v, static_cast<int>(in.T)});
 
-    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), ws, tstate, tout,
-                          nullptr);
+    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), false, ws, tstate,
+                          tout, nullptr);
     cudaDeviceSynchronize();
     return {from_device_bf16(dout, in.v.size()), from_device_f32(dstate, in.state.size())};
 }
@@ -342,8 +508,8 @@ GpuResult run_chunked_gpu_split(const gdn_ref::Inputs& in, int split) {
     Tensor g0    = tg.slice(1, 0, split);
     Tensor beta0 = tbeta.slice(1, 0, split);
     Tensor out0  = tout.slice(2, 0, split);
-    ops::gated_delta_rule(q0, k0, v0, g0, beta0, 1.0f / std::sqrt(float(S)), ws, tstate, out0,
-                          nullptr);
+    ops::gated_delta_rule(q0, k0, v0, g0, beta0, 1.0f / std::sqrt(float(S)), false, ws, tstate,
+                          out0, nullptr);
 
     const int tail = static_cast<int>(in.T) - split;
     Tensor q1      = tq.slice(2, split, tail);
@@ -352,8 +518,8 @@ GpuResult run_chunked_gpu_split(const gdn_ref::Inputs& in, int split) {
     Tensor g1      = tg.slice(1, split, tail);
     Tensor beta1   = tbeta.slice(1, split, tail);
     Tensor out1    = tout.slice(2, split, tail);
-    ops::gated_delta_rule(q1, k1, v1, g1, beta1, 1.0f / std::sqrt(float(S)), ws, tstate, out1,
-                          nullptr);
+    ops::gated_delta_rule(q1, k1, v1, g1, beta1, 1.0f / std::sqrt(float(S)), false, ws, tstate,
+                          out1, nullptr);
 
     cudaDeviceSynchronize();
     return {from_device_bf16(dout, in.v.size()), from_device_f32(dstate, in.state.size())};
@@ -386,10 +552,10 @@ int general_geometry_case(int head_dim, int qk_heads, int value_heads, int T, st
     Tensor tstate_out(dstate_out.p, DType::FP32, {head_dim, head_dim, value_heads});
     Tensor tout(dout.p, DType::BF16, {head_dim, value_heads, T});
     const std::size_t workspace_bytes =
-        ops::gated_delta_rule_workspace_bytes(head_dim, qk_heads, value_heads, T);
+        ops::gated_delta_rule_workspace_bytes(head_dim, qk_heads, value_heads, T, false);
     WorkspaceArena ws(std::max<std::size_t>(workspace_bytes, 256));
 
-    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, static_cast<float>(scale), ws, tstate_in,
+    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, static_cast<float>(scale), false, ws, tstate_in,
                           tstate_out, tout, nullptr);
     cudaDeviceSynchronize();
 
@@ -431,7 +597,7 @@ int recurrent_case(int T, std::uint32_t seed, bool stress_g) {
 
     Tensor tstate(dstate.p, DType::FP32, {S, S, H_v});
 
-    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, static_cast<float>(scale), ws, tstate, tout,
+    ops::gated_delta_rule(tq, tk, tv, tg, tbeta, static_cast<float>(scale), false, ws, tstate, tout,
                           nullptr);
     cudaDeviceSynchronize();
 
@@ -564,7 +730,7 @@ int chunked_from_slot_equivalence_case(int T, int slots, int read_slot, std::uin
             Tensor tbeta(rbeta.p, DType::FP32, {H_v, static_cast<int>(in.T)});
             Tensor tstate(rstate.p, DType::FP32, {S, S, H_v});
             Tensor tout(rout.p, DType::BF16, {S, H_v, static_cast<int>(in.T)});
-            ops::gated_delta_rule(tq, tk, tv, tg, tbeta, scale, ws, tstate, tout, nullptr);
+            ops::gated_delta_rule(tq, tk, tv, tg, tbeta, scale, false, ws, tstate, tout, nullptr);
         }
         cudaDeviceSynchronize();
 
@@ -587,7 +753,8 @@ int chunked_from_slot_equivalence_case(int T, int slots, int read_slot, std::uin
                        DType::FP32, {S, S, H_v});
             Tensor tout_state(fstates.p, DType::FP32, {S, S, H_v});
             Tensor tout(fout.p, DType::BF16, {S, H_v, static_cast<int>(in.T)});
-            ops::gated_delta_rule(tq, tk, tv, tg, tbeta, scale, ws, tin, tout_state, tout, nullptr);
+            ops::gated_delta_rule(tq, tk, tv, tg, tbeta, scale, false, ws, tin, tout_state, tout,
+                                  nullptr);
         }
         cudaDeviceSynchronize();
 
@@ -618,7 +785,7 @@ int validation_case() {
         Tensor state(nullptr, DType::FP32, {S, S, H_v});
         Tensor out(nullptr, DType::BF16, {S, H_v, 1});
         WorkspaceArena ws(1024 * 1024);
-        ops::gated_delta_rule(q, k, v, g, beta, 1.0f / std::sqrt(float(S)), ws, state, out,
+        ops::gated_delta_rule(q, k, v, g, beta, 1.0f / std::sqrt(float(S)), false, ws, state, out,
                               nullptr);
     } catch (const std::invalid_argument&) { return 0; }
     std::cerr << "gdn recurrent null validation: expected invalid_argument\n";
@@ -647,8 +814,8 @@ int chunked_validation_case() {
     int failures = 0;
     try {
         Tensor tq_bad(dq.p, DType::BF16, {S - 1, H_qk, BT});
-        ops::gated_delta_rule(tq_bad, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), ws, tstate,
-                              tout, nullptr);
+        ops::gated_delta_rule(tq_bad, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), false, ws,
+                              tstate, tout, nullptr);
         std::cerr << "gdn chunked bad shape validation: expected invalid_argument\n";
         ++failures;
     } catch (const std::invalid_argument&) {
@@ -661,7 +828,7 @@ int chunked_validation_case() {
         Tensor too_few_slots(dstate.p, DType::FP32, {S, S, H_v, BT - 1});
         DBuf d_initial_slot = to_device_i32({0});
         Tensor initial_slot(d_initial_slot.p, DType::I32, {1});
-        ops::gated_delta_rule_snapshot(tq, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), ws,
+        ops::gated_delta_rule_snapshot(tq, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), false, ws,
                                        too_few_slots, initial_slot, tout, nullptr);
         std::cerr << "gdn snapshot T exceeds slots validation: expected invalid_argument\n";
         ++failures;
@@ -676,7 +843,7 @@ int chunked_validation_case() {
         Tensor states(dstate.p, DType::FP32, {S, S, H_v, BT});
         DBuf d_initial_slot(sizeof(std::int32_t));
         Tensor initial_slot(d_initial_slot.p, DType::FP32, {1});
-        ops::gated_delta_rule_snapshot(tq, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), ws,
+        ops::gated_delta_rule_snapshot(tq, tk, tv, tg, tbeta, 1.0f / std::sqrt(float(S)), false, ws,
                                        states, initial_slot, tout, nullptr);
         std::cerr << "gdn snapshot bad initial_slot validation: expected invalid_argument\n";
         ++failures;
@@ -711,6 +878,17 @@ int main() {
         }
     }
     failures += snapshot_oracle_case(6, 9028u, true);
+    for (int value_heads : {32, 48}) {
+        for (int T : {1, 2, 3, 4, 5, 6}) {
+            failures += fused_norm_snapshot_oracle_case(
+                value_heads, T, 9200u + static_cast<std::uint32_t>(value_heads * 10 + T), false);
+        }
+        failures += fused_norm_snapshot_oracle_case(
+            value_heads, 4, 9400u + static_cast<std::uint32_t>(value_heads), true);
+        failures += fused_norm_recurrent_oracle_case(
+            value_heads, 9500u + static_cast<std::uint32_t>(value_heads));
+    }
+    failures += fused_norm_chunked_oracle_case(32, 70, 9620u);
     failures += selected_slot_snapshot_oracle_case(S, H_qk, H_v, 4, 0, 10028u);
     failures += selected_slot_snapshot_oracle_case(S, H_qk, H_v, 4, 2, 10038u);
     failures += selected_slot_snapshot_oracle_case(S, H_qk, H_v, 5, 5, 10048u);

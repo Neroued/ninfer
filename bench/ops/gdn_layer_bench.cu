@@ -2,8 +2,9 @@
 //
 // The measured layer is exactly the gdn_mix composition from hidden RMSNorm through the W8
 // residual output projection. --route fused selects the production fused input/snapshot Op;
-// --route composed retains the projection, convolution, and q/k/v extracts as a control. Each T
-// owns one captured CUDA Graph. Device timing events bracket
+// --route composed retains the projection, convolution, and q/k/v extracts as a control.
+// --qk-norm fused moves the two L2 normalizations into the recurrent kernel; composed retains the
+// standalone kernels. Each T owns one captured CUDA Graph. Device timing events bracket
 // each replay, so the reported interval excludes host graph-submission latency. A 256 MiB L2 flush
 // precedes every measured replay and is outside the timed interval.
 
@@ -66,6 +67,7 @@ struct Options {
     int repeat              = 40;
     std::size_t flush_bytes = kDefaultFlushBytes;
     std::string route       = "fused";
+    std::string qk_norm     = "fused";
     std::string csv_out;
 };
 
@@ -224,9 +226,15 @@ Options parse_options(int argc, char** argv) {
             if (options.route != "fused" && options.route != "composed") {
                 throw std::invalid_argument("--route must be fused or composed");
             }
+        } else if (arg == "--qk-norm") {
+            options.qk_norm = next("--qk-norm value");
+            if (options.qk_norm != "fused" && options.qk_norm != "composed") {
+                throw std::invalid_argument("--qk-norm must be fused or composed");
+            }
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--t-sweep 1,2,...,6] [--warmup N] [--repeat N] "
-                        "[--flush-mib N] [--route fused|composed] [--csv-out PATH]\n",
+                        "[--flush-mib N] [--route fused|composed] "
+                        "[--qk-norm fused|composed] [--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -437,11 +445,18 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
         }
         ops::gdn_gating_proj(hidden, resources.control_weight, a_log, dt_bias, resources.workspace,
                              g, beta, s);
-        ops::l2norm(q.view({kHeadDim, kQkHeads, tokens}), kEps, q_norm, s);
-        ops::l2norm(k.view({kHeadDim, kQkHeads, tokens}), kEps, k_norm, s);
-        ops::gated_delta_rule_snapshot(q_norm, k_norm, v.view({kHeadDim, kValueHeads, tokens}), g,
-                                       beta, kGdnScale, resources.workspace, ssm_states,
-                                       initial_slot, recurrent_out, s);
+        Tensor q_recurrent       = q.view({kHeadDim, kQkHeads, tokens});
+        Tensor k_recurrent       = k.view({kHeadDim, kQkHeads, tokens});
+        const bool fused_qk_norm = options.qk_norm == "fused";
+        if (!fused_qk_norm) {
+            ops::l2norm(q_recurrent, kEps, q_norm, s);
+            ops::l2norm(k_recurrent, kEps, k_norm, s);
+            q_recurrent = q_norm;
+            k_recurrent = k_norm;
+        }
+        ops::gated_delta_rule_snapshot(
+            q_recurrent, k_recurrent, v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
+            fused_qk_norm, resources.workspace, ssm_states, initial_slot, recurrent_out, s);
         ops::gated_rmsnorm(recurrent_out, gdn_norm, z.view({kHeadDim, kValueHeads, tokens}), kEps,
                            gated_out, s);
         ops::linear_add(gated_out.view({kValueRows, tokens}), resources.output_weight.weight,
@@ -465,7 +480,8 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
 
     return {tokens,
             graph.body_nodes(),
-            options.route + ":" + ops::detail::w8_gdn_input_schedule_name(input_plan.schedule),
+            options.route + ":" + ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) +
+                "+qk-" + options.qk_norm,
             ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),
             ops::detail::w8_schedule_name(output_plan.schedule),
             timing};
@@ -545,6 +561,7 @@ void print_results(const Options& options, const std::vector<Result>& results) {
 
     std::printf("Qwen3.6-35B-A3B GDN verify layer\n");
     std::printf("  route      %s\n", options.route.c_str());
+    std::printf("  qk norm    %s\n", options.qk_norm.c_str());
     std::printf("  execution  CUDA Graph replay\n");
     std::printf("  cache      cold L2 (%zu MiB flush before each sample)\n",
                 options.flush_bytes >> 20);

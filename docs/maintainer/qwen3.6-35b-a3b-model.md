@@ -239,7 +239,10 @@ b   = in_b(h)      # [32,T]
 
 Only concatenated Q/K/V passes through a depthwise causal width-4 convolution followed by SiLU.
 Z, A, and B do not pass through the convolution. The convolved Q and K are L2-normalized per head
-with epsilon `1e-6`; GDN consumes no position ids and applies no RoPE.
+with epsilon `1e-6`; GDN consumes no position ids and applies no RoPE. The production GDN Op always
+receives raw BF16 q/k. Its recurrent implementation retains normalized values in FP32 registers;
+when it selects the chunked implementation, it privately materializes normalized BF16 q/k for the
+chunked body and recurrent tail.
 
 The decay and update controls `g` and `beta` are observable FP32 values. Their logical formula for
 every V head is:

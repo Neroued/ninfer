@@ -471,6 +471,87 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     }
 }
 
+using RouteMember = std::string Result::*;
+
+std::vector<std::string> unique_routes(const std::vector<Result>& results, RouteMember member) {
+    std::vector<std::string> routes;
+    for (const Result& result : results) {
+        const std::string& route = result.*member;
+        if (std::find(routes.begin(), routes.end(), route) == routes.end()) {
+            routes.push_back(route);
+        }
+    }
+    return routes;
+}
+
+std::size_t route_id(const std::vector<std::string>& routes, const std::string& route) {
+    const auto found = std::find(routes.begin(), routes.end(), route);
+    if (found == routes.end()) { throw std::logic_error("route missing from display index"); }
+    return static_cast<std::size_t>(found - routes.begin()) + 1;
+}
+
+std::string route_tokens(const std::vector<Result>& results, RouteMember member,
+                         const std::string& route) {
+    std::vector<std::int32_t> tokens;
+    for (const Result& result : results) {
+        if (result.*member == route) { tokens.push_back(result.tokens); }
+    }
+    std::sort(tokens.begin(), tokens.end());
+    tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+
+    std::string text = "T=";
+    for (std::size_t i = 0; i < tokens.size();) {
+        const std::size_t begin = i;
+        while (i + 1 < tokens.size() && tokens[i + 1] == tokens[i] + 1) { ++i; }
+        if (begin != 0) { text += ','; }
+        text += std::to_string(tokens[begin]);
+        if (i != begin) {
+            text += '-';
+            text += std::to_string(tokens[i]);
+        }
+        ++i;
+    }
+    return text;
+}
+
+void print_route_legend(const std::vector<Result>& results, char id_prefix, const char* stage,
+                        RouteMember member, const std::vector<std::string>& routes) {
+    for (std::size_t i = 0; i < routes.size(); ++i) {
+        const std::string tokens = route_tokens(results, member, routes[i]);
+        std::printf("  %c%-2zu %-8s %-8s %s\n", id_prefix, i + 1, stage, tokens.c_str(),
+                    routes[i].c_str());
+    }
+}
+
+void print_results(const Options& options, const std::vector<Result>& results) {
+    const auto input_routes   = unique_routes(results, &Result::input_route);
+    const auto control_routes = unique_routes(results, &Result::control_route);
+    const auto output_routes  = unique_routes(results, &Result::output_route);
+
+    std::printf("Qwen3.6-35B-A3B GDN verify layer\n");
+    std::printf("  execution  CUDA Graph replay\n");
+    std::printf("  cache      cold L2 (%zu MiB flush before each sample)\n",
+                options.flush_bytes >> 20);
+    std::printf("  samples    %d warmup + %d measured per T\n\n", options.warmup, options.repeat);
+
+    std::printf("Latency (us)\n");
+    std::printf("  T   nodes    median       min       p95   routes\n");
+    std::printf("---  ------  --------  --------  --------  --------\n");
+    for (const Result& result : results) {
+        std::printf("%3d  %6zu  %8.3f  %8.3f  %8.3f  I%zu/C%zu/O%zu\n", result.tokens,
+                    result.graph_nodes, result.timing.median_us, result.timing.min_us,
+                    result.timing.p95_us, route_id(input_routes, result.input_route),
+                    route_id(control_routes, result.control_route),
+                    route_id(output_routes, result.output_route));
+    }
+
+    std::printf("\nRoutes\n");
+    std::printf("  ID  stage    tokens   implementation\n");
+    print_route_legend(results, 'I', "input", &Result::input_route, input_routes);
+    print_route_legend(results, 'C', "control", &Result::control_route, control_routes);
+    print_route_legend(results, 'O', "output", &Result::output_route, output_routes);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -490,20 +571,15 @@ int main(int argc, char** argv) {
         std::vector<Result> results;
         results.reserve(options.t_sweep.size());
 
-        std::printf("# qwen3.6-35b-a3b GDN verify layer; graph replay; cold L2; "
-                    "flush_bytes=%zu\n",
-                    options.flush_bytes);
-        std::printf("T,graph_nodes,cold_median_us,cold_min_us,cold_p95_us,input_route,"
-                    "control_route,output_route\n");
         for (const std::int32_t tokens : options.t_sweep) {
             Result result = run_case(resources, flush, stream, options, tokens);
-            std::printf("%d,%zu,%.3f,%.3f,%.3f,%s,%s,%s\n", result.tokens, result.graph_nodes,
-                        result.timing.median_us, result.timing.min_us, result.timing.p95_us,
-                        result.input_route.c_str(), result.control_route.c_str(),
-                        result.output_route.c_str());
             results.push_back(std::move(result));
         }
+        print_results(options, results);
         write_csv(options, results);
+        if (!options.csv_out.empty()) {
+            std::printf("\nCSV written to %s\n", options.csv_out.c_str());
+        }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

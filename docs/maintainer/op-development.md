@@ -479,6 +479,64 @@ profile remains an intentional optimized implementation and uses the named
 `Tolerance::attention_int8()` rather than `Tolerance::attention_bf16()`; it is not folded into a
 second reference. Exact INT8 cache code and scale validation remains a separate codec check.
 
+### 8.1 Op qualification standard
+
+One semantic Op, or one closely related overload group, owns one identifiable qualification suite.
+The suite calls every semantically complete public entry directly. Tests of a private candidate,
+plan, dispatch decision, CUDA Graph replay, or pairwise implementation parity may protect their own
+risks, but they do not replace public Op qualification against the independent oracle.
+
+#### Oracle
+
+- A floating-point Op uses one test-owned, naive FP64 oracle. It starts from the values represented
+  by the public inputs, exact-decodes packed weights from their stored signed codes and scales, and
+  applies only the observable output or state casts declared by the contract.
+- An exact transform, codec, copy, or index mapping uses an independent bit- or byte-exact oracle.
+- A fused Op oracle evaluates the complete fused formula rather than calling the production Ops that
+  could be composed to approximate it. A stateful Op oracle computes both the output and new state.
+- A production kernel, another GPU route, a target reference implementation, or generated model
+  output is supplementary evidence, never the oracle.
+
+#### Coverage
+
+The suite maintains a finite conformance matrix derived from the supported contract. It covers:
+
+- every public entry, registered dtype/format/layout, semantic mode, state form, allowed alias form,
+  and real geometry used by either registered target;
+- every production route compiled into `ninfer_ops` and reachable through the public wrapper on the
+  supported `sm_120a` device;
+- `T=1` and, for an unbounded positive Text/MTP extent, each valid route boundary `b` at `b-1`, `b`,
+  and `b+1`, plus a representative interior value for every route. Finite axes such as Vision
+  geometry, cache capacity, and MTP proposal count keep their own declared boundaries;
+- target-representative inputs and the operation-specific risks that can change the result, such as
+  zero or near-zero values, ties, cancellation, saturation, quantization endpoints, and tile or
+  group tails; and
+- every output and documented state mutation, along with untouched regions and input preservation
+  where the contract promises them.
+
+Do not build a redundant Cartesian product when one case proves several dimensions. More random
+seeds do not substitute for a missing semantic or route boundary. When a full FP64 comparison of a
+registered large output is impractical, combine deterministic structure-aware sampling with a
+full-output write, guard, or analytic invariant; sampling alone does not qualify the route.
+
+#### Acceptance criteria
+
+- Exact outputs and exact regions compare every observable bit or byte.
+- Each approximate output or state uses one named criterion for its arithmetic profile. Tests do not
+  define per-case tolerance literals or runtime overrides.
+- A floating-point criterion states its non-finite policy. Unexpected NaN or infinity always fails.
+  Elementwise work uses a pointwise bound; reductions, GEMM, and attention use a normwise bound plus
+  a finite gross pointwise-error cap so cancellation does not require strict allclose and isolated
+  corruption cannot hide in a global norm.
+- Different routes use different criteria only when their real arithmetic or quantization profiles
+  differ. Widening a criterion requires a numerical reason and requalification of the complete
+  affected matrix; a failing implementation alone is not such a reason.
+
+An Op is qualified only when every public entry, finite semantic variant, registered geometry, and
+reachable production route maps to a direct oracle case, and every observable output and effect is
+checked. Unsupported models, devices, formats, and hypothetical failure modes do not enlarge this
+matrix.
+
 Keep schedule composition, state-lifetime, and end-to-end behavior in target/product integration
 tests. Do not add tests for private filenames, namespace strings, source paths, trivial wrappers,
 coverage, retired compatibility, or hypothetical behavior.
@@ -542,9 +600,9 @@ Use this sequence for a proposed device transformation:
    dedicated linear subtree for linear format/plan/GEMV/GEMM work.
 6. **Make resource ownership explicit.** The caller supplies outputs, state views, workspace, and
    stream. Keep persistent state and schedule policy outside the Op.
-7. **Add necessary evidence.** Add or update the smallest independent Op test that protects the
-   new semantic risk. Add a benchmark only when the operation or implementation needs isolated
-   performance measurement.
+7. **Add necessary evidence.** Add or update the smallest independent Op qualification suite that
+   satisfies Section 8.1 for the changed contract or production route. Add a benchmark only when the
+   operation or implementation needs isolated performance measurement.
 8. **Integrate through the contract.** Target code includes only the semantic header and supplies
    explicit operands. It must not select or include a private backend path.
 
@@ -568,6 +626,7 @@ only private dispatch/implementation code and the evidence relevant to that path
 - Are workspace and state lifetime owned by the caller?
 - Is a raw transfer or cursor mechanism being incorrectly promoted into an Op?
 - Is a target-callable device transformation being incorrectly hidden as target-private code?
-- Does the independent test protect a real semantic risk with the correct oracle/tolerance?
+- Does the independent qualification suite cover every affected entry and reachable route with the
+  correct oracle, effects checks, and named acceptance criterion?
 - If performance changed, was the relevant Op measured and the affected product route checked?
 - Does each source and symbol have one clear build/link owner?

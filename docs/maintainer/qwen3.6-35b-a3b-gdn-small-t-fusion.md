@@ -146,19 +146,37 @@ rejected because it regressed both median and P95 relative to the selected accum
 
 ### 2.2 Fuse hidden RMSNorm into the control projection
 
-The 35B BF16 control projection already uses a 32-CTA cooperative split-16 kernel. Extend it with a
-leading phase:
+The selected semantic Op produces BF16 `h` and FP32 `g/beta` from residual `x`, input-norm weight,
+and control weights. The family schedule always invokes this Op; its resolver owns the physical
+route. The exact 35B T=1..6 route uses cooperative split-32, while 27B and other T values compose
+the retained standalone RMSNorm and control kernels inside the same Op boundary.
 
-1. The first T CTAs execute the existing block-256 RMSNorm reduction over hidden size 2048 and
-   write BF16 h.
-2. Synchronize the cooperative grid.
-3. Run the existing split-K BF16 MMA and FP32 g/beta epilogue unchanged.
+The split-32 implementation adds no leading grid synchronization:
 
-The fused Op produces h, g, and beta. The fused W8 input/conv Op then consumes h. This avoids
-duplicating the hidden norm and preserves the shared BF16 h consumed by both projections.
+1. One warp in row tile zero computes the 64-value norm partial owned by each split-K slice.
+2. MMA consumes a natural BF16 staging of `x * (1 + norm_weight)`.
+3. The existing split-K grid synchronization makes both projection and norm partials visible.
+4. The final phase reduces the norm, scales the control accumulators, writes FP32 `g/beta`, and
+   publishes BF16 `h` for the W8 input/conv Op.
 
-Expected result: graph nodes `8 -> 7` and at least 1 us additional median improvement without a
-regression at any T.
+The control branch is checked directly against the complete FP64 normalized projection formula;
+it is not required to reproduce the former standalone BF16 `h` materialization. No activation is
+quantized, and BF16 `h` remains the explicit output boundary for its other consumers.
+
+Status: complete. With the fused input/snapshot and fused q/k-normalization routes enabled, a
+same-build reverse-order comparison uses ten warmups, 160 cold-L2 CUDA Graph replays, and reports:
+
+| T | Composed nodes | Composed median (us) | Fused nodes | Fused median (us) | Saved (us) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 6 | 44.320 | 5 | 42.240 | 2.080 |
+| 2 | 6 | 44.288 | 5 | 42.112 | 2.176 |
+| 3 | 6 | 46.336 | 5 | 42.240 | 4.096 |
+| 4 | 6 | 46.368 | 5 | 44.288 | 2.080 |
+| 5 | 6 | 50.432 | 5 | 46.336 | 4.096 |
+| 6 | 6 | 52.480 | 5 | 48.384 | 4.096 |
+
+Every median and P95 improves. Direct independent FP64 tests cover both exact target geometries at
+T=1..6, checking BF16 `h` and FP32 `g/beta` under their implementation profiles.
 
 ### 2.3 Fuse q/k normalization into the recurrent snapshot kernel
 

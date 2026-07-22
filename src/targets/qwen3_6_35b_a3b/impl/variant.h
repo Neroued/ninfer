@@ -60,9 +60,10 @@ struct Variant {
                                               const Tensor& initial_slot, Tensor& query,
                                               Tensor& key, Tensor& value, Tensor& output_gate,
                                               WorkspaceArena& workspace, cudaStream_t stream);
-    static void gdn_control_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                       Tensor& g, Tensor& beta, WorkspaceArena& workspace,
-                                       cudaStream_t stream);
+    static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
+                                            float eps, const GdnProjectionWeights& weights,
+                                            Tensor& hidden, Tensor& g, Tensor& beta,
+                                            WorkspaceArena& workspace, cudaStream_t stream);
     static void gdn_output_gate_projection(const Tensor& hidden,
                                            const GdnProjectionWeights& weights, Tensor& output_gate,
                                            WorkspaceArena& workspace, cudaStream_t stream);
@@ -77,7 +78,8 @@ struct Variant {
     [[nodiscard]] static std::size_t gdn_input_projection_workspace_bytes(std::int32_t tokens);
     [[nodiscard]] static std::size_t
     gdn_input_projection_snapshot_workspace_bytes(std::int32_t tokens);
-    [[nodiscard]] static std::size_t gdn_control_projection_workspace_bytes(std::int32_t tokens);
+    [[nodiscard]] static std::size_t
+    gdn_norm_control_projection_workspace_bytes(std::int32_t tokens);
     [[nodiscard]] static std::size_t
     gdn_output_gate_projection_workspace_bytes(std::int32_t tokens);
     [[nodiscard]] static std::size_t post_mixer_workspace_bytes(std::int32_t tokens);

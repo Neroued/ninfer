@@ -1,5 +1,7 @@
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
+#include "ninfer/ops/rmsnorm.h"
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -313,6 +315,16 @@ const char* bf16_gdn_gating_schedule_name(Bf16GdnGatingScheduleId schedule) noex
     return "gdn_gating_proj.bf16.unknown";
 }
 
+const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId schedule) noexcept {
+    switch (schedule) {
+    case Bf16GdnNormGatingScheduleId::Composed:
+        return "gdn_norm_gating_proj.bf16.composed";
+    case Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32:
+        return "gdn_norm_gating_proj.bf16.mma.cooperative_split32";
+    }
+    return "gdn_norm_gating_proj.bf16.unknown";
+}
+
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
     return is_27(problem) || is_35(problem);
@@ -362,6 +374,29 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t max_cols) {
     return maximum;
 }
 
+Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem) {
+    Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
+    Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
+    std::int32_t norm_splits             = 0;
+    if (is_35(problem) && problem.cols <= 6) {
+        control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
+                                                     problem);
+        schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
+        norm_splits = 32;
+    }
+    const std::size_t norm_partial_bytes =
+        static_cast<std::size_t>(norm_splits) * problem.cols * sizeof(float);
+    return {schedule, control, control.workspace_bytes + norm_partial_bytes};
+}
+
+std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t max_cols) {
+    std::size_t maximum           = bf16_gdn_gating_capacity_workspace_bytes(max_cols);
+    const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 6);
+    maximum                       = std::max(maximum,
+                                             bf16_gdn_norm_gating_resolve_plan({32, 2048, fused_cols}).workspace_bytes);
+    return maximum;
+}
+
 void bf16_gdn_gating_execute_plan(const Bf16GdnGatingPlan& plan, const Tensor& x,
                                   const Weight& a_weight, const Weight& b_weight,
                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
@@ -390,6 +425,27 @@ void bf16_gdn_gating_dispatch(const Tensor& x, const Weight& a_weight, const Wei
                               Tensor& g, Tensor& beta, cudaStream_t stream) {
     const Bf16GdnGatingPlan plan = bf16_gdn_gating_resolve_plan({g.ne[0], x.ne[0], x.ne[1]});
     bf16_gdn_gating_execute_plan(plan, x, a_weight, b_weight, A_log, dt_bias, ws, g, beta, stream);
+}
+
+void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
+                                   const Weight& a_weight, const Weight& b_weight,
+                                   const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
+                                   Tensor& g, Tensor& beta, cudaStream_t stream) {
+    const Bf16GdnGatingProblem problem{g.ne[0], x.ne[0], x.ne[1]};
+    const Bf16GdnNormGatingPlan plan = bf16_gdn_norm_gating_resolve_plan(problem);
+    if (plan.schedule == Bf16GdnNormGatingScheduleId::Composed) {
+        rmsnorm(x, norm_weight, eps, true, h, stream);
+        execute_resolved(plan.control, problem, h, a_weight, b_weight, A_log, dt_bias, ws, g, beta,
+                         stream);
+        return;
+    }
+
+    auto scratch_scope = ws.scope();
+    DeviceSpan scratch{};
+    if (plan.workspace_bytes != 0) { scratch = ws.alloc_bytes(plan.workspace_bytes); }
+    bf16_gdn_norm_gating_proj_35_mma_split32_launch(plan.control.token_variant, x, norm_weight, eps,
+                                                    h, a_weight, b_weight, A_log, dt_bias,
+                                                    scratch.data, g, beta, stream);
 }
 
 } // namespace ninfer::ops::detail

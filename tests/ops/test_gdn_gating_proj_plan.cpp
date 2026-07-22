@@ -11,6 +11,7 @@ namespace {
 
 using ninfer::ops::detail::Bf16GdnGatingScheduleId;
 using ninfer::ops::detail::Bf16GdnGatingTokenVariant;
+using ninfer::ops::detail::Bf16GdnNormGatingScheduleId;
 
 int failures = 0;
 
@@ -128,6 +129,14 @@ void route35_tests() {
             std::cerr << "wrong 35B GDN gating route C=" << cols << '\n';
             ++failures;
         }
+        const auto norm_plan     = ninfer::ops::detail::bf16_gdn_norm_gating_resolve_plan(problem);
+        const auto expected_norm = cols <= 6 ? Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32
+                                             : Bf16GdnNormGatingScheduleId::Composed;
+        const auto expected_control = cols <= 6 ? S::MmaCooperativeSplit32 : plan.schedule;
+        if (norm_plan.schedule != expected_norm || norm_plan.control.schedule != expected_control) {
+            std::cerr << "wrong 35B norm/control route C=" << cols << '\n';
+            ++failures;
+        }
     }
 
     struct CooperativeBoundary {
@@ -180,21 +189,22 @@ void workspace_tests() {
     struct Case {
         std::int32_t capacity;
         std::size_t bytes;
+        std::size_t norm_bytes;
     };
 
     constexpr std::array<Case, 12> cases{{
-        {1, 4'096},
-        {2, 8'192},
-        {8, 32'768},
-        {9, 36'864},
-        {10, 40'960},
-        {128, 520'192},
-        {1024, 3'145'728},
-        {1025, 3'145'728},
-        {2048, 3'145'728},
-        {4096, 3'145'728},
-        {4097, 3'145'728},
-        {8192, 3'145'728},
+        {1, 4'096, 8'320},
+        {2, 8'192, 16'640},
+        {8, 32'768, 49'920},
+        {9, 36'864, 49'920},
+        {10, 40'960, 49'920},
+        {128, 520'192, 520'192},
+        {1024, 3'145'728, 3'145'728},
+        {1025, 3'145'728, 3'145'728},
+        {2048, 3'145'728, 3'145'728},
+        {4096, 3'145'728, 3'145'728},
+        {4097, 3'145'728, 3'145'728},
+        {8192, 3'145'728, 3'145'728},
     }};
     for (const Case test : cases) {
         const std::size_t actual = ninfer::ops::gdn_gating_proj_workspace_bytes(test.capacity);
@@ -203,8 +213,17 @@ void workspace_tests() {
                       << actual << '\n';
             ++failures;
         }
+        const std::size_t norm_actual =
+            ninfer::ops::gdn_norm_gating_proj_workspace_bytes(test.capacity);
+        if (norm_actual != test.norm_bytes) {
+            std::cerr << "norm/control workspace C=" << test.capacity << ": expected "
+                      << test.norm_bytes << ", got " << norm_actual << '\n';
+            ++failures;
+        }
     }
     expect_invalid("workspace C0", [] { (void)ninfer::ops::gdn_gating_proj_workspace_bytes(0); });
+    expect_invalid("norm workspace C0",
+                   [] { (void)ninfer::ops::gdn_norm_gating_proj_workspace_bytes(0); });
 }
 
 } // namespace

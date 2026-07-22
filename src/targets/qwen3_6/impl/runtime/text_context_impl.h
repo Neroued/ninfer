@@ -619,8 +619,11 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
-    Tensor h = work_.alloc(DType::BF16, {kCfg.hidden, T});
-    ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
+    Tensor h    = work_.alloc(DType::BF16, {kCfg.hidden, T});
+    Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
+    Tensor beta = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
+    Variant::gdn_norm_control_projection(x, *w.input_norm, kCfg.rms_eps, *w.projection, h, g, beta,
+                                         work_, s);
 
     Tensor z  = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
     Tensor qc = work_.alloc(DType::BF16, {kCfg.key_dim, T});
@@ -643,10 +646,6 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
         ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
     }
-
-    Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
-    Tensor beta = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
-    Variant::gdn_control_projection(h, *w.projection, g, beta, work_, s);
 
     Tensor q_recurrent = qc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
     Tensor k_recurrent = kc.view({kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});

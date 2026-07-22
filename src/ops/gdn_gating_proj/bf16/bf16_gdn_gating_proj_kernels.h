@@ -56,6 +56,12 @@ void bf16_gdn_gating_proj_35_mma_split32_launch(Bf16GdnGatingTokenVariant varian
                                                 const Tensor& A_log, const Tensor& dt_bias,
                                                 void* workspace, Tensor& g, Tensor& beta,
                                                 cudaStream_t stream);
+void bf16_gdn_norm_gating_proj_35_mma_split32_launch(Bf16GdnGatingTokenVariant variant,
+                                                     const Tensor& x, const Tensor& norm_weight,
+                                                     float eps, Tensor& h, const Weight& a_weight,
+                                                     const Weight& b_weight, const Tensor& A_log,
+                                                     const Tensor& dt_bias, void* workspace,
+                                                     Tensor& g, Tensor& beta, cudaStream_t stream);
 void bf16_gdn_gating_proj_35_mma_split16_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                                                 const Weight& a_weight, const Weight& b_weight,
                                                 const Tensor& A_log, const Tensor& dt_bias,

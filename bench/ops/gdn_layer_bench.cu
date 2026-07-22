@@ -4,9 +4,10 @@
 // residual output projection. --route fused selects the production fused input/snapshot Op;
 // --route composed retains the projection, convolution, and q/k/v extracts as a control.
 // --qk-norm fused moves the two L2 normalizations into the recurrent kernel; composed retains the
-// standalone kernels. Each T owns one captured CUDA Graph. Device timing events bracket
-// each replay, so the reported interval excludes host graph-submission latency. A 256 MiB L2 flush
-// precedes every measured replay and is outside the timed interval.
+// standalone kernels. --norm-control fused combines hidden RMSNorm with the control projection;
+// composed retains their original order. Each T owns one captured CUDA Graph. Device timing events
+// bracket each replay, so the reported interval excludes host graph-submission latency. A 256 MiB
+// L2 flush precedes every measured replay and is outside the timed interval.
 
 // Examples:
 //   ./build/bench/ninfer_gdn_layer_bench
@@ -63,11 +64,12 @@ constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
 
 struct Options {
     std::vector<std::int32_t> t_sweep{1, 2, 3, 4, 5, 6};
-    int warmup              = 5;
-    int repeat              = 40;
-    std::size_t flush_bytes = kDefaultFlushBytes;
-    std::string route       = "fused";
-    std::string qk_norm     = "fused";
+    int warmup               = 5;
+    int repeat               = 40;
+    std::size_t flush_bytes  = kDefaultFlushBytes;
+    std::string route        = "fused";
+    std::string qk_norm      = "fused";
+    std::string norm_control = "fused";
     std::string csv_out;
 };
 
@@ -231,10 +233,16 @@ Options parse_options(int argc, char** argv) {
             if (options.qk_norm != "fused" && options.qk_norm != "composed") {
                 throw std::invalid_argument("--qk-norm must be fused or composed");
             }
+        } else if (arg == "--norm-control") {
+            options.norm_control = next("--norm-control value");
+            if (options.norm_control != "fused" && options.norm_control != "composed") {
+                throw std::invalid_argument("--norm-control must be fused or composed");
+            }
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--t-sweep 1,2,...,6] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--route fused|composed] "
-                        "[--qk-norm fused|composed] [--csv-out PATH]\n",
+                        "[--qk-norm fused|composed] [--norm-control fused|composed] "
+                        "[--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -363,7 +371,8 @@ struct Resources {
                                         kSnapshotSlots * sizeof(std::uint16_t))),
           ssm_states(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kHeadDim * kValueHeads *
                                        kSnapshotSlots * sizeof(float))),
-          workspace(std::max<std::size_t>(1, ops::gdn_gating_proj_workspace_bytes(max_tokens))) {}
+          workspace(
+              std::max<std::size_t>(1, ops::gdn_norm_gating_proj_workspace_bytes(max_tokens))) {}
 
     static bench::DBuf make_constant_i32(std::int32_t value) {
         bench::DBuf device(sizeof(value));
@@ -429,7 +438,13 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
     Tensor gated_out(resources.gated_out.p, DType::BF16, {kHeadDim, kValueHeads, tokens});
 
     const auto layer = [&](cudaStream_t s) {
-        ops::rmsnorm(residual, input_norm, kEps, true, hidden, s);
+        const bool fused_norm_control = options.norm_control == "fused";
+        if (fused_norm_control) {
+            ops::gdn_norm_gating_proj(residual, input_norm, kEps, resources.control_weight, a_log,
+                                      dt_bias, resources.workspace, hidden, g, beta, s);
+        } else {
+            ops::rmsnorm(residual, input_norm, kEps, true, hidden, s);
+        }
         if (options.route == "fused") {
             ops::gdn_input_proj_conv_snapshot(hidden, resources.input_weight.weight, conv_weight,
                                               conv_states, initial_slot, q, k, v, z,
@@ -443,8 +458,10 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
             ops::extract_bf16_columns(qkv_conv, kKeyRows, k, s);
             ops::extract_bf16_columns(qkv_conv, 2 * kKeyRows, v, s);
         }
-        ops::gdn_gating_proj(hidden, resources.control_weight, a_log, dt_bias, resources.workspace,
-                             g, beta, s);
+        if (!fused_norm_control) {
+            ops::gdn_gating_proj(hidden, resources.control_weight, a_log, dt_bias,
+                                 resources.workspace, g, beta, s);
+        }
         Tensor q_recurrent       = q.view({kHeadDim, kQkHeads, tokens});
         Tensor k_recurrent       = k.view({kHeadDim, kQkHeads, tokens});
         const bool fused_qk_norm = options.qk_norm == "fused";
@@ -475,6 +492,8 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
         {kHidden, kConvRows, kValueRows, kInputRows, kHidden, tokens});
     const auto control_plan =
         ops::detail::bf16_gdn_gating_resolve_plan({kValueHeads, kHidden, tokens});
+    const auto norm_control_plan =
+        ops::detail::bf16_gdn_norm_gating_resolve_plan({kValueHeads, kHidden, tokens});
     const auto output_plan =
         ops::detail::w8_linear_add_resolve_plan({kHidden, kValueRows, kValueRows, tokens});
 
@@ -482,7 +501,9 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
             graph.body_nodes(),
             options.route + ":" + ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) +
                 "+qk-" + options.qk_norm,
-            ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),
+            options.norm_control == "fused"
+                ? ops::detail::bf16_gdn_norm_gating_schedule_name(norm_control_plan.schedule)
+                : ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),
             ops::detail::w8_schedule_name(output_plan.schedule),
             timing};
 }

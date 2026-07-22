@@ -33,3 +33,7 @@ The executable `--help` output is the exact source for command-line option spell
 The files under [`maintainer/`](maintainer/) record the current artifact formats, exact model and
 artifact contracts, and Op-development rules used for ongoing project maintenance. They are not
 additional user workflows or installed API documentation.
+
+Active implementation design:
+
+- [Qwen3.6 small-T GDN fusion](maintainer/qwen3.6-35b-a3b-gdn-small-t-fusion.md)

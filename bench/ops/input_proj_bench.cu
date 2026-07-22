@@ -3,8 +3,10 @@
 // local: production dispatch has no fallback to them.
 
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/scatter.h"
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
@@ -28,21 +30,23 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kHidden       = 5120;
-constexpr std::int32_t kQueryRows    = 6144;
-constexpr std::int32_t kKvRows       = 1024;
-constexpr std::int32_t kParentRows   = kQueryRows + kKvRows;
-constexpr std::int32_t kGdnQkRows    = 4096;
-constexpr std::int32_t kGdnValueRows = 6144;
-constexpr std::int32_t kGdnRows      = kGdnQkRows + kGdnValueRows;
+constexpr std::int32_t kHidden         = 5120;
+constexpr std::int32_t kQueryRows      = 6144;
+constexpr std::int32_t kKvRows         = 1024;
+constexpr std::int32_t kParentRows     = kQueryRows + kKvRows;
+constexpr std::int32_t kGdnQkRows      = 4096;
+constexpr std::int32_t kGdnValueRows   = 6144;
+constexpr std::int32_t kGdnRows        = kGdnQkRows + kGdnValueRows;
+constexpr std::int32_t kGdnKeyRows     = 2048;
+constexpr std::int32_t kGdnSlots       = 7;
 constexpr std::int32_t kMaxBenchTokens = 16384;
-constexpr std::size_t kFlushBytes    = 256ULL << 20;
+constexpr std::size_t kFlushBytes      = 256ULL << 20;
 
 enum class OpSelection { All, Attention, Gdn };
 
 struct Options {
     OpSelection op = OpSelection::All;
-    std::vector<std::int32_t> t_sweep{1,  2,  3,  4,  5,  6,  7,  8,   9,  10,
+    std::vector<std::int32_t> t_sweep{1,  2,  3,  4,  5,  6,  7,  8,   9,   10,
                                       11, 12, 13, 14, 15, 16, 17, 128, 129, 1024};
     int warmup = 5;
     int repeat = 50;
@@ -292,7 +296,12 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         bench::DBuf flush(kFlushBytes);
         bench::DBuf input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
-        WorkspaceArena workspace(1);
+        const std::size_t workspace_bytes =
+            options.op == OpSelection::Attention
+                ? 1
+                : std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
+                                               kGdnKeyRows, kGdnKeyRows, kGdnValueRows, max_t));
+        WorkspaceArena workspace(workspace_bytes);
         std::vector<Result> results;
 
         if (options.op != OpSelection::Gdn) {
@@ -338,14 +347,32 @@ int main(int argc, char** argv) {
             DevicePackedWeight qk_weight    = make_weight(QType::Q4G64_F16S, kGdnQkRows);
             DevicePackedWeight value_weight = make_weight(QType::Q5G64_F16S, kGdnValueRows);
             bench::DBuf qkv(static_cast<std::size_t>(kGdnRows) * max_t * 2);
+            bench::DBuf qkv_conv(static_cast<std::size_t>(kGdnRows) * max_t * 2);
             bench::DBuf qk_tmp(static_cast<std::size_t>(kGdnQkRows) * max_t * 2);
             bench::DBuf value_tmp(static_cast<std::size_t>(kGdnValueRows) * max_t * 2);
+            bench::DBuf query(static_cast<std::size_t>(kGdnKeyRows) * max_t * 2);
+            bench::DBuf key(static_cast<std::size_t>(kGdnKeyRows) * max_t * 2);
+            bench::DBuf value_out(static_cast<std::size_t>(kGdnValueRows) * max_t * 2);
+            bench::DBuf conv_weight = bench::make_bf16(static_cast<std::size_t>(kGdnRows) * 4);
+            bench::DBuf conv_states =
+                bench::make_zeros(static_cast<std::size_t>(kGdnRows) * 3 * kGdnSlots * 2);
+            bench::DBuf initial_slot(sizeof(std::int32_t));
+            constexpr std::int32_t kInitialSlot = 6;
+            CUDA_CHECK(cudaMemcpy(initial_slot.p, &kInitialSlot, sizeof(kInitialSlot),
+                                  cudaMemcpyHostToDevice));
 
             for (const std::int32_t t : options.t_sweep) {
                 Tensor x(input.p, DType::BF16, {kHidden, t});
                 Tensor out(qkv.p, DType::BF16, {kGdnRows, t});
+                Tensor convolved(qkv_conv.p, DType::BF16, {kGdnRows, t});
                 Tensor qk(qk_tmp.p, DType::BF16, {kGdnQkRows, t});
                 Tensor value(value_tmp.p, DType::BF16, {kGdnValueRows, t});
+                Tensor tq(query.p, DType::BF16, {kGdnKeyRows, t});
+                Tensor tk(key.p, DType::BF16, {kGdnKeyRows, t});
+                Tensor tv(value_out.p, DType::BF16, {kGdnValueRows, t});
+                Tensor conv_w(conv_weight.p, DType::BF16, {kGdnRows, 4});
+                Tensor states(conv_states.p, DType::BF16, {kGdnRows, 3, kGdnSlots});
+                Tensor initial(initial_slot.p, DType::I32, {1});
                 const auto production = [&](cudaStream_t launch_stream) {
                     ops::gdn_input_proj(x, qk_weight.weight, value_weight.weight, out, workspace,
                                         launch_stream);
@@ -353,6 +380,28 @@ int main(int argc, char** argv) {
                 append_result(
                     results, "gdn", "production_direct", t,
                     measure_cold(production, flush, stream, options.warmup, options.repeat));
+                if (t <= 6) {
+                    const auto fused_snapshot = [&](cudaStream_t launch_stream) {
+                        ops::gdn_input_proj_conv_snapshot(x, qk_weight.weight, value_weight.weight,
+                                                          conv_w, states, initial, tq, tk, tv,
+                                                          workspace, launch_stream);
+                    };
+                    append_result(results, "gdn", "fused_projection_conv_snapshot", t,
+                                  measure_cold(fused_snapshot, flush, stream, options.warmup,
+                                               options.repeat));
+                    const auto composed_snapshot = [&](cudaStream_t launch_stream) {
+                        ops::gdn_input_proj(x, qk_weight.weight, value_weight.weight, out,
+                                            workspace, launch_stream);
+                        ops::causal_conv1d_silu_snapshot(out, conv_w, states, initial, convolved,
+                                                         launch_stream);
+                        ops::extract_bf16_columns(convolved, 0, tq, launch_stream);
+                        ops::extract_bf16_columns(convolved, kGdnKeyRows, tk, launch_stream);
+                        ops::extract_bf16_columns(convolved, 2 * kGdnKeyRows, tv, launch_stream);
+                    };
+                    append_result(results, "gdn", "composed_projection_conv_snapshot", t,
+                                  measure_cold(composed_snapshot, flush, stream, options.warmup,
+                                               options.repeat));
+                }
                 if (t <= 16) {
                     const auto projections = [&](cudaStream_t launch_stream) {
                         ops::linear(x, qk_weight.weight, qk, workspace, launch_stream);

@@ -57,6 +57,12 @@ struct Variant {
     static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                      Tensor& qkv, Tensor& output_gate, WorkspaceArena& workspace,
                                      cudaStream_t stream);
+    static void gdn_input_projection_snapshot(const Tensor& hidden,
+                                              const GdnProjectionWeights& weights,
+                                              const Tensor& conv_weight, Tensor& conv_states,
+                                              const Tensor& initial_slot, Tensor& query,
+                                              Tensor& key, Tensor& value, Tensor& output_gate,
+                                              WorkspaceArena& workspace, cudaStream_t stream);
     static void gdn_control_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                        Tensor& g, Tensor& beta, WorkspaceArena& workspace,
                                        cudaStream_t stream);
@@ -71,6 +77,8 @@ struct Variant {
     [[nodiscard]] static std::size_t mtp_kv_workspace_bytes(std::int32_t tokens);
     [[nodiscard]] static std::size_t mtp_q_gate_workspace_bytes(std::int32_t tokens);
     [[nodiscard]] static std::size_t gdn_input_projection_workspace_bytes(std::int32_t tokens);
+    [[nodiscard]] static std::size_t
+    gdn_input_projection_snapshot_workspace_bytes(std::int32_t tokens);
     [[nodiscard]] static std::size_t gdn_control_projection_workspace_bytes(std::int32_t tokens);
     [[nodiscard]] static std::size_t
     gdn_output_gate_projection_workspace_bytes(std::int32_t tokens);

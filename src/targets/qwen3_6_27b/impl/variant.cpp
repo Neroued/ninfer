@@ -129,6 +129,18 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
     ops::gdn_input_proj(hidden, weights.query_key, weights.value, qkv, workspace, stream);
 }
 
+void Variant::gdn_input_projection_snapshot(const Tensor& hidden,
+                                            const GdnProjectionWeights& weights,
+                                            const Tensor& conv_weight, Tensor& conv_states,
+                                            const Tensor& initial_slot, Tensor& query, Tensor& key,
+                                            Tensor& value, Tensor& output_gate,
+                                            WorkspaceArena& workspace, cudaStream_t stream) {
+    (void)output_gate;
+    ops::gdn_input_proj_conv_snapshot(hidden, weights.query_key, weights.value, conv_weight,
+                                      conv_states, initial_slot, query, key, value, workspace,
+                                      stream);
+}
+
 void Variant::gdn_control_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                      Tensor& g, Tensor& beta, WorkspaceArena& workspace,
                                      cudaStream_t stream) {
@@ -178,6 +190,11 @@ std::size_t Variant::mtp_q_gate_workspace_bytes(std::int32_t) { return 0; }
 std::size_t Variant::gdn_input_projection_workspace_bytes(std::int32_t tokens) {
     return ops::gdn_input_proj_workspace_bytes(2 * TextConfig::key_dim, TextConfig::value_dim,
                                                tokens);
+}
+
+std::size_t Variant::gdn_input_projection_snapshot_workspace_bytes(std::int32_t tokens) {
+    return ops::gdn_input_proj_conv_snapshot_workspace_bytes(
+        TextConfig::key_dim, TextConfig::key_dim, TextConfig::value_dim, tokens);
 }
 
 std::size_t Variant::gdn_control_projection_workspace_bytes(std::int32_t tokens) {

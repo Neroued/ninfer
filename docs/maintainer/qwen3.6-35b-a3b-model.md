@@ -101,6 +101,11 @@ Every two adjacent V heads share one Q/K head. Each GDN layer retains three prec
 projection columns and 32 recurrent matrices of shape `[128,128]`; its persistent state is bounded
 with respect to context length.
 
+Verify `T=1..6` invokes the shared `gdn_input_proj_conv_snapshot` contract. The exact W8 leaf feeds
+the projection accumulators for the first 8192 rows directly into causal convolution and SiLU,
+writes q/k/v and BF16 snapshots to slots `0..T-1`, and writes the final 4096 Z rows directly. The
+former materialized qkv tensor is not a semantic cast boundary.
+
 ### 2.4 Sparse MoE
 
 | Field | Value |

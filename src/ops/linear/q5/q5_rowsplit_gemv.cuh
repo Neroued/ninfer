@@ -84,13 +84,29 @@ __device__ __forceinline__ float q5_gemv_consume_tile(const __nv_bfloat162* __re
 // kRowsPerBlock : rows (= warps) per block.
 // kStages : cp.async pipeline depth (shared buffers; >=2 to overlap).
 // kStageX : stage the activation vector into shared (false when x is too large).
+struct Q5GemvStoreEpilogue {
+    template <bool SplitOutput, int SplitRow>
+    __device__ __forceinline__ void operator()(__nv_bfloat16* out, __nv_bfloat16* out_tail, int row,
+                                               float value) const {
+        if constexpr (SplitOutput) {
+            if (row < SplitRow) {
+                out[row] = __float2bfloat16_rn(value);
+            } else {
+                out_tail[row - SplitRow] = __float2bfloat16_rn(value);
+            }
+        } else {
+            out[row] = __float2bfloat16_rn(value);
+        }
+    }
+};
+
 template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kResidual,
-          bool kSplitOutput = false, int kSplitRow = 0>
+          bool kSplitOutput = false, int kSplitRow = 0, class Epilogue = Q5GemvStoreEpilogue>
 __global__ void
 q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                         const std::uint8_t* __restrict__ high_bits,
                         const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
-                        __nv_bfloat16* __restrict__ out_tail) {
+                        __nv_bfloat16* __restrict__ out_tail, Epilogue epilogue = {}) {
     constexpr int kGroupK              = 64;
     constexpr int kGroups              = kK / kGroupK;
     constexpr int kGroupsPerTile       = 16;
@@ -172,15 +188,7 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
         if (lane == 0) { acc = __bfloat162float(out[row]) + acc; }
     }
     if (lane == 0) {
-        if constexpr (kSplitOutput) {
-            if (row < kSplitRow) {
-                out[row] = __float2bfloat16_rn(acc);
-            } else {
-                out_tail[row - kSplitRow] = __float2bfloat16_rn(acc);
-            }
-        } else {
-            out[row] = __float2bfloat16_rn(acc);
-        }
+        epilogue.template operator()<kSplitOutput, kSplitRow>(out, out_tail, row, acc);
     }
 }
 

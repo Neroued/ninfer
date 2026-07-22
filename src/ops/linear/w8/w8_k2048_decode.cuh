@@ -12,12 +12,21 @@
 
 namespace ninfer::ops::detail {
 
-template <std::int32_t Rows, std::int32_t RowsPerCta, class Output>
+struct W8DecodeStoreEpilogue {
+    template <class Output>
+    __device__ __forceinline__ void operator()(const Output& output, std::int32_t cta_row0,
+                                               std::int32_t row, float accumulator) const {
+        *output.tile(cta_row0).at(row, 0) = __float2bfloat16_rn(accumulator);
+    }
+};
+
+template <std::int32_t Rows, std::int32_t RowsPerCta, class Output,
+          class Epilogue = W8DecodeStoreEpilogue>
 __global__ __launch_bounds__(RowsPerCta * 32,
                              2) void w8_k2048_decode_kernel(const __nv_bfloat16* __restrict__ x,
                                                             const std::uint8_t* __restrict__ codes,
                                                             const std::uint8_t* __restrict__ scales,
-                                                            Output output) {
+                                                            Output output, Epilogue epilogue = {}) {
     static_assert(Rows > 0 && RowsPerCta > 0 && (Rows % RowsPerCta) == 0);
     static_assert(RowsPerCta * 32 <= 1024);
     constexpr int kK                 = 2048;
@@ -29,12 +38,10 @@ __global__ __launch_bounds__(RowsPerCta * 32,
     constexpr int kPhases            = kK / kValuesPerPhase;
     constexpr unsigned kFullWarpMask = 0xffffffffu;
 
-    const int lane                 = static_cast<int>(threadIdx.x) & 31;
-    const int warp                 = static_cast<int>(threadIdx.x) >> 5;
-    const int cta_row0             = static_cast<int>(blockIdx.x) * RowsPerCta;
-    const int row                  = cta_row0 + warp;
-    const W8OutputTile output_tile = output.tile(cta_row0);
-
+    const int lane                = static_cast<int>(threadIdx.x) & 31;
+    const int warp                = static_cast<int>(threadIdx.x) >> 5;
+    const int cta_row0            = static_cast<int>(blockIdx.x) * RowsPerCta;
+    const int row                 = cta_row0 + warp;
     const std::uint8_t* code_row  = codes + static_cast<std::int64_t>(row) * kK;
     const std::uint8_t* scale_row = scales + static_cast<std::int64_t>(row) * kGroupsPerRow * 2;
 
@@ -81,7 +88,7 @@ __global__ __launch_bounds__(RowsPerCta * 32,
     }
 
     accumulator = warp_reduce_sum(accumulator);
-    if (lane == 0) { *output_tile.at(row, 0) = __float2bfloat16_rn(accumulator); }
+    if (lane == 0) { epilogue(output, cta_row0, row, accumulator); }
 }
 
 } // namespace ninfer::ops::detail

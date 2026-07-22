@@ -623,33 +623,31 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Tensor h = work_.alloc(DType::BF16, {kCfg.hidden, T});
     ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
 
-    Tensor qkv = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
-    Tensor z   = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
-    Variant::gdn_input_projection(h, *w.projection, qkv, z, work_, s);
-
-    Tensor qkv_c = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
+    Tensor z  = work_.alloc(DType::BF16, {kCfg.gdn_v_dim, kCfg.gdn_v_heads, T});
+    Tensor qc = work_.alloc(DType::BF16, {kCfg.key_dim, T});
+    Tensor kc = work_.alloc(DType::BF16, {kCfg.key_dim, T});
+    Tensor vc = work_.alloc(DType::BF16, {kCfg.value_dim, T});
     if (ph == Phase::Verify) {
         Tensor& conv_states = state_.conv.at(static_cast<std::size_t>(gidx));
-        ops::causal_conv1d_silu_snapshot(qkv, *w.conv1d, conv_states, io_.gdn_initial_slot, qkv_c,
-                                         s);
+        Variant::gdn_input_projection_snapshot(h, *w.projection, *w.conv1d, conv_states,
+                                               io_.gdn_initial_slot, qc, kc, vc, z, work_, s);
     } else {
+        Tensor qkv = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
+        Variant::gdn_input_projection(h, *w.projection, qkv, z, work_, s);
+        Tensor qkv_c = work_.alloc(DType::BF16, {kCfg.conv_dim, T});
         // Prefill reads the committed conv window from gdn_prefill_read_slot_ and writes the
         // running window to slot 0 (in-place when the read slot is 0).
         Tensor conv_in = state_.conv_slot(static_cast<std::uint32_t>(gidx), gdn_prefill_read_slot_);
         Tensor conv_out = state_.conv_slot(static_cast<std::uint32_t>(gidx), 0);
         ops::causal_conv1d_silu(qkv, *w.conv1d, conv_in, conv_out, qkv_c, s);
+        ops::extract_bf16_columns(qkv_c, 0, qc, s);
+        ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
+        ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
     }
 
     Tensor g    = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
     Tensor beta = work_.alloc(DType::FP32, {kCfg.gdn_v_heads, T});
     Variant::gdn_control_projection(h, *w.projection, g, beta, work_, s);
-
-    Tensor qc = work_.alloc(DType::BF16, {kCfg.key_dim, T});
-    Tensor kc = work_.alloc(DType::BF16, {kCfg.key_dim, T});
-    Tensor vc = work_.alloc(DType::BF16, {kCfg.value_dim, T});
-    ops::extract_bf16_columns(qkv_c, 0, qc, s);
-    ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
-    ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);
 
     Tensor qn = work_.alloc(DType::BF16, {kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});
     Tensor kn = work_.alloc(DType::BF16, {kCfg.gdn_k_dim, kCfg.gdn_k_heads, T});

@@ -144,6 +144,9 @@ ninfer_add_test(ninfer_mtp_round_test
 ninfer_add_test(ninfer_linear_test
   SOURCES ops/test_linear.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_gdn_input_proj_conv_snapshot_test
+  SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_test(ninfer_q4_linear_candidate_test
   SOURCES ops/test_q4_linear_candidates.cpp
   LIBRARIES ninfer_ops)

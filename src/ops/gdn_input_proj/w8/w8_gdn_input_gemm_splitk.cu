@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/gdn_input_proj/gdn_conv_snapshot.cuh"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 
 #include <cuda_bf16.h>
@@ -10,6 +11,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -23,6 +25,27 @@ constexpr int kRowsPerCta = 16;
 constexpr int kGroupK     = kWarps * kTileK;
 constexpr int kGroups     = kHidden / kGroupK;
 using Output              = W8SplitOutput2<8192, 4096>;
+
+struct W8SplitKStoreEpilogue {};
+
+struct W8GdnSplitKConvEpilogue {
+    GdnConvSnapshotEpilogue conv;
+    __nv_bfloat16* z;
+
+    template <int ActiveCols>
+    __device__ __forceinline__ void store(std::int32_t row,
+                                          const float (&projected)[ActiveCols]) const {
+        if (row < 8192) {
+            conv.store(row, projected);
+        } else {
+#pragma unroll
+            for (int token = 0; token < ActiveCols; ++token) {
+                z[static_cast<std::int64_t>(token) * 4096 + row - 8192] =
+                    __float2bfloat16_rn(projected[token]);
+            }
+        }
+    }
+};
 
 __device__ __forceinline__ int swizzle_64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
@@ -48,11 +71,11 @@ __device__ __forceinline__ unsigned bf16_pair_from_s8(unsigned values) {
     return result.bits;
 }
 
-template <int TileCols, int ActiveCols>
+template <int TileCols, int ActiveCols, class Epilogue = W8SplitKStoreEpilogue>
 __global__
 __launch_bounds__(kWarps * 32, kExactMinBlocks<TileCols>) void w8_gdn_input_exact_t_splitk_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, Output output) {
+    const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {}) {
     static_assert(TileCols == 8 || TileCols == 16 || TileCols == 24 || TileCols == 32);
     static_assert(ActiveCols >= 2 && ActiveCols <= TileCols);
     constexpr int kNt        = TileCols / 8;
@@ -245,6 +268,7 @@ __launch_bounds__(kWarps * 32, kExactMinBlocks<TileCols>) void w8_gdn_input_exac
 
     if (k_split == 0) {
         const W8OutputTile output_tile = output.tile(cta_row0);
+        float* projected               = partial;
 #pragma unroll
         for (int ni = 0; ni < kNt; ++ni) {
             float4 sum = make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]);
@@ -258,13 +282,35 @@ __launch_bounds__(kWarps * 32, kExactMinBlocks<TileCols>) void w8_gdn_input_exac
                 sum.w += value.w;
             }
             const int col0 = ni * 8 + 2 * lid;
-            if (col0 < ActiveCols) {
-                *output_tile.at(cta_row0 + gid, col0)     = __float2bfloat16_rn(sum.x);
-                *output_tile.at(cta_row0 + gid + 8, col0) = __float2bfloat16_rn(sum.z);
+            if constexpr (std::is_same_v<Epilogue, W8SplitKStoreEpilogue>) {
+                if (col0 < ActiveCols) {
+                    *output_tile.at(cta_row0 + gid, col0)     = __float2bfloat16_rn(sum.x);
+                    *output_tile.at(cta_row0 + gid + 8, col0) = __float2bfloat16_rn(sum.z);
+                }
+                if (col0 + 1 < ActiveCols) {
+                    *output_tile.at(cta_row0 + gid, col0 + 1)     = __float2bfloat16_rn(sum.y);
+                    *output_tile.at(cta_row0 + gid + 8, col0 + 1) = __float2bfloat16_rn(sum.w);
+                }
+            } else {
+                if (col0 < ActiveCols) {
+                    projected[gid * TileCols + col0]       = sum.x;
+                    projected[(gid + 8) * TileCols + col0] = sum.z;
+                }
+                if (col0 + 1 < ActiveCols) {
+                    projected[gid * TileCols + col0 + 1]       = sum.y;
+                    projected[(gid + 8) * TileCols + col0 + 1] = sum.w;
+                }
             }
-            if (col0 + 1 < ActiveCols) {
-                *output_tile.at(cta_row0 + gid, col0 + 1)     = __float2bfloat16_rn(sum.y);
-                *output_tile.at(cta_row0 + gid + 8, col0 + 1) = __float2bfloat16_rn(sum.w);
+        }
+        if constexpr (!std::is_same_v<Epilogue, W8SplitKStoreEpilogue>) {
+            __syncwarp();
+            if (lane < kRowsPerCta) {
+                float row_values[ActiveCols];
+#pragma unroll
+                for (int token = 0; token < ActiveCols; ++token) {
+                    row_values[token] = projected[lane * TileCols + token];
+                }
+                epilogue.store(cta_row0 + lane, row_values);
             }
         }
     }
@@ -488,6 +534,37 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
             static_cast<const std::uint8_t*>(weight.scales), output);
 }
 
+template <int ActiveCols>
+void launch_active_cols_conv_snapshot(const Tensor& x, const Weight& weight,
+                                      const Tensor& conv_weight, Tensor& conv_states,
+                                      const Tensor& initial_slot, Tensor& query, Tensor& key,
+                                      Tensor& value, Tensor& z, cudaStream_t stream) {
+    constexpr int TileCols = 8;
+    const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
+                                static_cast<__nv_bfloat16*>(z.data)};
+    const W8GdnSplitKConvEpilogue epilogue{
+        {
+            static_cast<const __nv_bfloat16*>(conv_weight.data),
+            static_cast<__nv_bfloat16*>(conv_states.data),
+            static_cast<const std::int32_t*>(initial_slot.data),
+            static_cast<__nv_bfloat16*>(query.data),
+            static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(value.data),
+            8192,
+            2048,
+            2048,
+            4096,
+            0,
+        },
+        static_cast<__nv_bfloat16*>(z.data),
+    };
+    w8_gdn_input_exact_t_splitk_kernel<TileCols, ActiveCols, W8GdnSplitKConvEpilogue>
+        <<<kRows / kRowsPerCta, kWarps * 32, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue);
+}
+
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                         cudaStream_t stream) {
@@ -611,6 +688,38 @@ void w8_gdn_input_splitk_mma_launch(W8KernelVariant variant, const Tensor& x, co
         } else {
             throw std::invalid_argument("W8 GDN split-K MMA requires T=2..96");
         }
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void w8_gdn_input_splitk_conv_snapshot_launch(const Tensor& x, const Weight& weight,
+                                              const Tensor& conv_weight, Tensor& conv_states,
+                                              const Tensor& initial_slot, Tensor& query,
+                                              Tensor& key, Tensor& value, Tensor& z,
+                                              cudaStream_t stream) {
+    switch (x.ne[1]) {
+    case 2:
+        launch_active_cols_conv_snapshot<2>(x, weight, conv_weight, conv_states, initial_slot,
+                                            query, key, value, z, stream);
+        break;
+    case 3:
+        launch_active_cols_conv_snapshot<3>(x, weight, conv_weight, conv_states, initial_slot,
+                                            query, key, value, z, stream);
+        break;
+    case 4:
+        launch_active_cols_conv_snapshot<4>(x, weight, conv_weight, conv_states, initial_slot,
+                                            query, key, value, z, stream);
+        break;
+    case 5:
+        launch_active_cols_conv_snapshot<5>(x, weight, conv_weight, conv_states, initial_slot,
+                                            query, key, value, z, stream);
+        break;
+    case 6:
+        launch_active_cols_conv_snapshot<6>(x, weight, conv_weight, conv_states, initial_slot,
+                                            query, key, value, z, stream);
+        break;
+    default:
+        throw std::invalid_argument("W8 fused GDN input snapshot requires T=2..6");
     }
     CUDA_CHECK(cudaGetLastError());
 }

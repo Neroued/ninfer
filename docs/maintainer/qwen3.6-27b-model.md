@@ -191,6 +191,12 @@ dimension 10240. It therefore allocates no concat workspace and performs no inpu
 copy. The grouped `T>=17` route is unchanged. Public `linear` output remains contiguous-only; the
 pitched row slices are private to this Op implementation.
 
+Verify `T=1..6` invokes the shared `gdn_input_proj_conv_snapshot` contract: the target leaf combines
+the Q4/Q5 projections with causal convolution, SiLU, direct q/k/v placement, and publication of
+BF16 convolution snapshots to slots `0..T-1`. The eliminated qkv intermediate is not a semantic
+cast boundary; each exact route uses its directly oracle-qualified private precision and staging.
+The separate Z projection remains in the target output-gate leaf.
+
 For V head `j`, let `q` and `k` come from Q/K head `j // 3`. With recurrent state
 `S[128,128]`, one token performs:
 

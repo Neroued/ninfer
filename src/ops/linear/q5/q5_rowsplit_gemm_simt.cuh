@@ -252,17 +252,37 @@ __launch_bounds__(64, 16) __global__
     }
 }
 
+struct Q5Split4StoreEpilogue {
+    template <bool SplitOutput, int SplitRow, int Tokens>
+    __device__ __forceinline__ void
+    operator()(__nv_bfloat16* out, __nv_bfloat16* out_tail, std::int32_t n, std::int32_t out_ld,
+               std::int32_t row, const float (&values)[Tokens]) const {
+#pragma unroll
+        for (int token = 0; token < Tokens; ++token) {
+            if constexpr (SplitOutput) {
+                if (row < SplitRow) {
+                    out[static_cast<std::int64_t>(token) * out_ld + row] =
+                        __float2bfloat16(values[token]);
+                } else {
+                    out_tail[static_cast<std::int64_t>(token) * (n - SplitRow) + row - SplitRow] =
+                        __float2bfloat16(values[token]);
+                }
+            } else {
+                out[static_cast<std::int64_t>(token) * out_ld + row] =
+                    __float2bfloat16(values[token]);
+            }
+        }
+    }
+};
+
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
-          int SplitRow = 0>
-__launch_bounds__(128, 10) __global__
-    void q5_rowsplit_gemm_simt_split4_kernel(const __nv_bfloat16* __restrict__ x,
-                                             const std::uint8_t* __restrict__ codes,
-                                             const std::uint8_t* __restrict__ high,
-                                             const std::uint8_t* __restrict__ scales,
-                                             __nv_bfloat16* __restrict__ out,
-                                             __nv_bfloat16* __restrict__ out_tail, std::int32_t n,
-                                             std::int32_t out_ld, std::int32_t k, std::int32_t t,
-                                             std::int32_t padded_k, std::int32_t full_slabs) {
+          int SplitRow = 0, class Epilogue = Q5Split4StoreEpilogue>
+__launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ out_tail, std::int32_t n,
+    std::int32_t out_ld, std::int32_t k, std::int32_t t, std::int32_t padded_k,
+    std::int32_t full_slabs, Epilogue epilogue = {}) {
     static_assert(std::is_same_v<SC, Q5RowSplitSimtSchedule>,
                   "direct split4 small-T kernel is Q5-only");
     static_assert(kTt > 0, "direct split4 requires a positive column tile");
@@ -347,19 +367,33 @@ __launch_bounds__(128, 10) __global__
 
     __syncthreads();
 
-    if (chunk == 0 && lane < kTt) {
-        float sum = 0.0f;
+    if constexpr (std::is_same_v<Epilogue, Q5Split4StoreEpilogue>) {
+        if (chunk == 0 && lane < kTt) {
+            float sum = 0.0f;
 #pragma unroll
-        for (int p = 0; p < 4; ++p) { sum += s_part[p][lane]; }
-        if constexpr (SplitOutput) {
-            if (row < SplitRow) {
-                out[static_cast<std::int64_t>(lane) * out_ld + row] = __float2bfloat16(sum);
+            for (int p = 0; p < 4; ++p) { sum += s_part[p][lane]; }
+            if constexpr (SplitOutput) {
+                if (row < SplitRow) {
+                    out[static_cast<std::int64_t>(lane) * out_ld + row] = __float2bfloat16(sum);
+                } else {
+                    out_tail[static_cast<std::int64_t>(lane) * (n - SplitRow) + row - SplitRow] =
+                        __float2bfloat16(sum);
+                }
             } else {
-                out_tail[static_cast<std::int64_t>(lane) * (n - SplitRow) + row - SplitRow] =
-                    __float2bfloat16(sum);
+                out[static_cast<std::int64_t>(lane) * out_ld + row] = __float2bfloat16(sum);
             }
-        } else {
-            out[static_cast<std::int64_t>(lane) * out_ld + row] = __float2bfloat16(sum);
+        }
+    } else {
+        if (chunk == 0 && lane < kTt) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int p = 0; p < 4; ++p) { sum += s_part[p][lane]; }
+            s_part[0][lane] = sum;
+        }
+        __syncthreads();
+        if (chunk == 0 && lane == 0) {
+            epilogue.template operator()<SplitOutput, SplitRow>(out, out_tail, n, out_ld, row,
+                                                                s_part[0]);
         }
     }
 }

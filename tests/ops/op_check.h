@@ -1,17 +1,18 @@
 #pragma once
 //
-// op_check.h — the FROZEN numerical correctness standard for L1 op tests.
+// op_check.h — numerical comparison primitives for Op tests.
 //
 // Adapted from ~/chunked_gdn/tests/test_utils.h. Comparison is done in fp64:
 // the per-op test computes its reference in `double` from bf16-rounded inputs,
 // upcasts the kernel output to `double`, and calls compute_diff/diff_passes.
 //
-// THE RULE (docs/op-development.md §7): if a test fails, fix the kernel,
+// THE RULE (docs/maintainer/op-development.md §8): if a test fails, fix the kernel,
 // not the tolerance. Presets are `static constexpr` and there is no per-op or
 // CLI override. A test selects a preset BY NAME (e.g. Tolerance::bf16_elementwise()).
 //
-// Pass criterion (composite, anti-gaming): NaN is always fatal; otherwise PASS
-// iff strict allclose (no element violates atol + rtol*|ref|) OR the tail
+// Pass criterion (composite, anti-gaming): a non-finite value is always fatal;
+// otherwise PASS iff strict allclose (no element violates
+// atol + rtol*|ref|) OR the tail
 // channel holds, which requires ALL THREE of: a violating-fraction cap, a
 // worst-violation-magnitude cap, and a relative-L2-residual cap.
 
@@ -29,7 +30,7 @@ struct Tolerance {
     double worst_ratio_max; // max |a-b| / (atol + rtol*|b|) among violators
     double rel_l2_tol;      // max ||a-b||_2 / ||b||_2
 
-    // ---- frozen presets (see docs/op-development.md §7) -------------
+    // ---- frozen presets (see docs/maintainer/op-development.md §8) --
     static constexpr Tolerance bf16_elementwise() {
         return {/*atol*/ 1e-3, /*rtol*/ 8e-3, /*tail_frac*/ 1e-3,
                 /*worst_ratio_max*/ 4.0, /*rel_l2_tol*/ 4e-3};
@@ -54,7 +55,7 @@ struct Tolerance {
     // fp32 path). This preset gates on rel_l2 only (tightened, a strong bug net since
     // any layout/index bug spikes it) with NaN/inf still fatal; the per-element
     // worst/frequency caps are neutralized (they mis-fire on cancellation). See
-    // docs/op-development.md §7.
+    // docs/maintainer/op-development.md §8.
     static constexpr Tolerance linear_tc() { return {2e-3, 1.6e-2, 1.0, 1e30, 4e-3}; }
 
     static constexpr Tolerance attention_bf16() { return {2e-3, 1.6e-2, 2e-3, 5.0, 8e-3}; }
@@ -110,6 +111,8 @@ struct DiffStats {
     long long worst_violation_idx = -1;
     long long n_nan_a             = 0;
     long long n_nan_b             = 0;
+    long long n_inf_a             = 0;
+    long long n_inf_b             = 0;
 };
 
 // a = kernel output (upcast to double); b = fp64 reference.
@@ -123,9 +126,13 @@ inline DiffStats compute_diff(const double* a, const double* b, long long n, con
         const double bd  = b[i];
         const bool a_nan = std::isnan(ad);
         const bool b_nan = std::isnan(bd);
+        const bool a_inf = std::isinf(ad);
+        const bool b_inf = std::isinf(bd);
         if (a_nan) ++s.n_nan_a;
         if (b_nan) ++s.n_nan_b;
-        if (a_nan || b_nan) continue;
+        if (a_inf) ++s.n_inf_a;
+        if (b_inf) ++s.n_inf_b;
+        if (a_nan || b_nan || a_inf || b_inf) continue;
 
         const double diff = ad - bd;
         const double da   = std::abs(diff);
@@ -160,11 +167,12 @@ inline DiffStats compute_diff(const double* a, const double* b, long long n, con
     return s;
 }
 
-// PASS iff: no NaN AND (strict allclose OR all three tail caps hold).
+// PASS iff: the compared range is non-empty, every value is finite, and
+// (strict allclose OR all three tail caps hold).
 inline bool diff_passes(const DiffStats& s, const Tolerance& tol) {
-    if (s.n_nan_a != 0 || s.n_nan_b != 0) return false;
-    if (s.n_violating == 0) return true;
     if (s.n <= 0) return false;
+    if (s.n_nan_a != 0 || s.n_nan_b != 0 || s.n_inf_a != 0 || s.n_inf_b != 0) return false;
+    if (s.n_violating == 0) return true;
     const double frac = (double)s.n_violating / (double)s.n;
     return frac <= tol.tail_frac && s.worst_violation_ratio <= tol.worst_ratio_max &&
            s.rel_l2 <= tol.rel_l2_tol;
@@ -187,6 +195,9 @@ inline void print_diff(const char* label, const DiffStats& s, const Tolerance& t
     }
     if (s.n_nan_a > 0 || s.n_nan_b > 0) {
         std::printf(" | NaN a=%lld b=%lld", (long long)s.n_nan_a, (long long)s.n_nan_b);
+    }
+    if (s.n_inf_a > 0 || s.n_inf_b > 0) {
+        std::printf(" | Inf a=%lld b=%lld", (long long)s.n_inf_a, (long long)s.n_inf_b);
     }
     std::printf("\n");
 }

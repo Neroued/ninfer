@@ -225,6 +225,37 @@ target directory.
 - Capture and replay `B=2` and `B=16`.
 - Benchmark only as part of block preparation unless the launch becomes visible in the round.
 
+**Qualification result (2026-07-24)**
+
+The repository now owns one exact-transform Op, wrapper, compact launcher, one-block kernel,
+independent test, and candidate/production benchmark. The implementation reads the device anchor
+and length directly, writes both complete I32 outputs, and owns no workspace or state. It does not
+consume draft tokens and does not fuse the deferred embedding gather.
+
+`ninfer_prepare_masked_block_test` passed exact comparison at every `B=2..16`, both ordinary and
+maximum-valid I32 positions. Both outputs are poisoned before execution and surrounded by guards;
+the test also proves preserved inputs, rejects output/output and input/output aliasing, qualifies
+all 32/64/128/256-thread candidate launches at every B, and captures/replays the public route at
+`B=2` and `B=16` with changing device inputs.
+
+Production uses one 32-thread CTA for every `B=2..16`. On RTX 5090, CUDA 13.1, `sm_120a`, all four
+candidate block sizes were tied at the timer resolution: the clock-conditioned hot CUDA Graph
+median was `2.048 us` at representative `B=2,8,16`, while the 256 MiB cold-cache medians stayed
+within `3.328..4.128 us` across repeated processes. Same-process candidate sweeps did not expose
+a B-dependent winner. Larger blocks therefore provide no measured benefit and only add idle warps.
+
+The targeted Nsight Compute command used `--set basic`, kernel regex
+`prepare_masked_block_kernel`, and `--launch-count 1`; its report is
+`profiles/ncu/prepare_masked_block_b16_basic.ncu-rep`. At `B=16`, the selected one-CTA/one-warp
+kernel used 16 registers/thread and zero static or dynamic shared memory. It executed for only
+11.95 active SM cycles inside a `2.43 us` profiled launch, with 1.26% DRAM throughput and 0.00%
+reported compute throughput. The logical traffic is only `(2+2B)*4 = 24..136` bytes, so bandwidth
+roofline percentage is not a meaningful acceptance target: the qualified terminal condition is
+the minimum legal launch topology at the fixed launch floor.
+
+The remaining unchecked integration gate belongs to masked-block embedding and the complete
+proposal graph, which do not exist yet.
+
 ### OP-N02: `swa`
 
 **Status:** [x] mask contract [x] definition [x] correctness [x] benchmark [x] route [ ] integration
@@ -993,7 +1024,7 @@ commit together.
 | 8 | `OP-A01` | W8 target-feature projection | [ ] | [ ] | [ ] | [ ] |
 | 9 | `OP-A03` | W8 context K/V pair projection | [ ] | [ ] | [ ] | [ ] |
 | 10 | `OP-N04` | Device-count linear/ring prefix append | [x] | [x] | [x] | [ ] |
-| 11 | `OP-N01` | Masked-block preparation | [ ] | [ ] | [ ] | [ ] |
+| 11 | `OP-N01` | Masked-block preparation | [x] | [x] | [x] | [ ] |
 | 12 | `OP-R01..R06` | Focused reuse and composed-route checks | [ ] | [ ] | [ ] | [ ] |
 | 13 | `INT-01..06` | Complete Text-only proposal/context round | [ ] | [ ] | [ ] | [ ] |
 

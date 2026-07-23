@@ -211,6 +211,29 @@ cmake --build build --parallel --target ninfer_kv_cache_append_prefix_bench
 Useful traffic is the exact committed K/V input read plus cache write, 8192 bytes per committed
 token. `C=0` still exercises the captured device-count launch but has zero useful bytes.
 
+## Masked-block preparation benchmark
+
+`ninfer_prepare_masked_block_bench` measures the exact I32 anchor/mask block transform for every
+registered `B=2..16`. Every timed invocation is one CUDA Graph replay. An untimed 256 MiB write
+conditions GPU clocks; hot mode primes the Op once after that write, while `--cold-cache` measures
+immediately after it. `--route warp32|block64|block128|block256` exposes private candidate
+controls, and `--route production` uses measured dispatch.
+
+```bash
+cmake --build build --parallel --target ninfer_prepare_masked_block_bench
+./build/bench/ninfer_prepare_masked_block_bench \
+  --block-sizes 2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --route all
+./build/bench/ninfer_prepare_masked_block_bench \
+  --block-sizes 2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --route production --cold-cache --warmup 20 --repeat 101
+./build/bench/ninfer_prepare_masked_block_bench \
+  --block-sizes 16 --route production --profile-once
+```
+
+Useful traffic is `(2+2B)*4` bytes: two device scalar reads and two complete I32 output writes.
+This benchmark qualifies block preparation and route selection only; it neither includes nor
+claims the deferred embedding fusion or complete-round performance.
+
 ## 35B W8 input-projection Op benchmark
 
 `ninfer_w8_input_proj_bench` measures the registered 35B-A3B target's W8 Attention

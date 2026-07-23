@@ -151,6 +151,9 @@ ninfer_add_test(ninfer_swa_test
 ninfer_add_test(ninfer_kv_cache_append_prefix_test
   SOURCES ops/test_kv_cache_append_prefix.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_prepare_masked_block_test
+  SOURCES ops/test_prepare_masked_block.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_test(ninfer_sparse_moe_test
   SOURCES ops/test_sparse_moe.cpp
   LIBRARIES ninfer_ops)

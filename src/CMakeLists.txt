@@ -64,6 +64,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/mtp_round.cu
   ops/launcher/speculative_round.cu
   ops/launcher/position.cu
+  ops/launcher/prepare_masked_block.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
   ops/launcher/rope.cu
@@ -153,6 +154,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/mtp_round.cpp
   ops/wrapper/speculative_round.cpp
   ops/wrapper/position.cpp
+  ops/wrapper/prepare_masked_block.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp
   ops/wrapper/rope.cpp

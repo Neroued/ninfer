@@ -114,8 +114,8 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
     const bool mtp_capacity =
-        mtp_k != 0 &&
-        static_cast<std::uint64_t>(plan->summary.prompt_tokens) + 2ULL * mtp_k <= capacity;
+        draft_window != 0 &&
+        static_cast<std::uint64_t>(plan->summary.prompt_tokens) + 2ULL * draft_window <= capacity;
     if (mtp_capacity) {
         if (plan->reuse == ReusePath::FullReset) {
             plan->prepare_mtp = true;

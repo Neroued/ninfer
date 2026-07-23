@@ -32,7 +32,6 @@ struct Variant {
     static constexpr std::uint32_t prefill_chunk_alignment  = kPrefillChunkAlignment;
     static constexpr std::uint32_t maximum_mtp_draft_tokens = kMaximumMtpDraftTokens;
     static constexpr std::uint32_t maximum_context          = kNativeContext;
-    static constexpr std::int32_t step_stats_counters       = kStepStatsCounters;
     static constexpr std::int32_t draft_head_rows           = 131072;
 
     static void attach_diagnostics(qwen3_6::Program<Variant>& program, void* context,

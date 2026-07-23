@@ -39,6 +39,7 @@ struct State {
     std::uint32_t text_kv_base;
     const ops::SamplingConfig* sampling;
     ProposalHead proposal_head;
+    Tensor* tail_hidden;
     Tensor* boundary_hidden;
     void* diagnostic_context                = nullptr;
     TextTapCallback diagnostic_text_tap     = nullptr;
@@ -71,6 +72,10 @@ prefill_multimodal(State& state, const PreparedPromptData& prompt, const VisionP
 
 void sample_from_hidden(State& state, const Tensor& hidden, std::int32_t absolute_position,
                         std::int32_t purpose);
+void target_verify(TextContext& card, State& state, const Tensor& ids, const Tensor& positions,
+                   ops::GqaExecutionEnvelope envelope);
+void speculative_verify_and_accept(State& state, TextContext& card, std::uint32_t draft_window,
+                                   ops::GqaExecutionEnvelope target_envelope);
 void mtp_bridge_and_propose(State& state, const Tensor& next_token, const Tensor& previous_hidden,
                             std::int32_t position, std::span<const std::int32_t> rope_position,
                             bool build_proposal);
@@ -83,8 +88,9 @@ void warm_capture_ordinary_round(State& state, bool align_mtp, ops::GqaExecution
 void ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope envelope,
                     DecodeGraph* graph);
 
-// Executes one fixed-k verify/accept/propose round. The number of licensed tokens is written to
-// io.num_sampled and the tokens to io.sampled_out.
+// Executes one fixed-k MTP synchronization/proposal round around the common speculative
+// verification transaction. The number of licensed tokens and their values are written to
+// io.speculative.
 void warm_capture_mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes,
                             const GraphPrepare& prepare, DecodeGraph& graph);
 void mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes, DecodeGraph* graph);

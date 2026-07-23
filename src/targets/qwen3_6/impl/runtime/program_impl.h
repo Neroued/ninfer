@@ -2,7 +2,6 @@
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include "core/nvtx.h"
-#include "ninfer/ops/mtp_round.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include <cuda_runtime.h>
@@ -94,13 +93,13 @@ void validate_graph_ranges(const std::vector<GraphFrontierRange>& ranges,
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity),
-      prefill_chunk(plan.prefill_chunk), mtp_k(plan.mtp_k), kv_dtype(plan.kv_dtype),
+      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window), kv_dtype(plan.kv_dtype),
       kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), persistent(plan.persistent.bytes),
       work(plan.workspace_bytes),
-      round_host((static_cast<std::size_t>(mtp_k) + 2ULL) * sizeof(std::int32_t)) {
+      round_host((static_cast<std::size_t>(draft_window) + 2ULL) * sizeof(std::int32_t)) {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
@@ -113,7 +112,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
 
-    io              = qwen3_6::RoundState(backing, plan.persistent.round);
+    io = qwen3_6::RoundState(backing, plan.persistent.round);
+    if (io.mtp.has_value() != (draft_window != 0)) {
+        throw std::logic_error("round-state MTP extension does not match the sequence plan");
+    }
     prefill_hidden  = plan.persistent.prefill_hidden.bind(backing);
     token_counts    = plan.persistent.token_counts.bind(backing);
     sampling_config = plan.persistent.sampling_config.bind(backing);
@@ -125,14 +127,19 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     ledger.reserve(static_cast<std::size_t>(capacity) + 1ULL);
     prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
 
-    CUDA_CHECK(cudaMemsetAsync(io.num_sampled.data, 0, io.num_sampled.bytes(), device.stream));
+    CUDA_CHECK(cudaMemsetAsync(io.speculative.produced_count.data, 0,
+                               io.speculative.produced_count.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
-    CUDA_CHECK(cudaMemsetAsync(io.window_base.data, 0, io.window_base.bytes(), device.stream));
-    CUDA_CHECK(cudaMemsetAsync(io.accepted.data, 0, io.accepted.bytes(), device.stream));
+    CUDA_CHECK(cudaMemsetAsync(io.speculative.accepted_drafts.data, 0,
+                               io.speculative.accepted_drafts.bytes(), device.stream));
     CUDA_CHECK(
         cudaMemsetAsync(io.gdn_initial_slot.data, 0, io.gdn_initial_slot.bytes(), device.stream));
-    CUDA_CHECK(cudaMemsetAsync(io.ar_pos.data, 0, io.ar_pos.bytes(), device.stream));
-    CUDA_CHECK(cudaMemsetAsync(io.stats.data, 0, io.stats.bytes(), device.stream));
+    if (io.mtp) {
+        CUDA_CHECK(
+            cudaMemsetAsync(io.mtp->position.data, 0, io.mtp->position.bytes(), device.stream));
+    }
+    CUDA_CHECK(
+        cudaMemsetAsync(io.speculative.stats.data, 0, io.speculative.stats.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     sampling_host = {};
     CUDA_CHECK(cudaMemcpyAsync(sampling_config.data, &sampling_host, sizeof(sampling_host),
@@ -154,7 +161,7 @@ void ProgramImplCore::make_invalid() noexcept {
     current_gdn_slot  = 0;
     text_kv_valid     = 0;
     mtp_kv_valid      = 0;
-    proposal_ready    = false;
+    drafts_ready      = false;
     tail_hidden_valid = false;
     boundary          = {};
     pending           = {};
@@ -171,14 +178,13 @@ void ProgramImplCore::ordered_reset() {
     set_device_i32(io.pos, 0);
     set_device_i32(io.rope_pos, 0);
     set_device_i32(io.rope_delta, 0);
-    set_device_i32(io.window_base, 0);
-    set_device_i32(io.accepted, 0);
+    set_device_i32(io.speculative.accepted_drafts, 0);
     set_device_i32(io.gdn_initial_slot, 0);
-    set_device_i32(io.ar_pos, 0);
+    if (io.mtp) { set_device_i32(io.mtp->position, 0); }
     current_gdn_slot = 0;
     text_kv_valid    = 0;
     mtp_kv_valid     = 0;
-    proposal_ready   = false;
+    drafts_ready     = false;
 }
 
 void ProgramImplCore::prepare_graphs() {
@@ -189,11 +195,25 @@ void ProgramImplCore::prepare_graphs() {
     CUDA_CHECK(cudaMemGetInfo(&free_before, &total_bytes));
 
     const auto clear_stable_controls = [&] {
-        const Tensor controls[] = {
-            io.token,     io.pos,         io.rope_pos,    io.rope_delta,       io.target_tokens,
-            io.drafts,    io.sampled_out, io.num_sampled, io.verify_ids,       io.shifted_ids,
-            io.positions, io.window_base, io.accepted,    io.gdn_initial_slot, io.ar_pos,
-            io.stats};
+        std::vector<Tensor> controls{
+            io.token,
+            io.pos,
+            io.rope_pos,
+            io.rope_delta,
+            io.speculative.target_argmax,
+            io.speculative.draft_tokens,
+            io.speculative.round_tokens,
+            io.speculative.produced_count,
+            io.speculative.target_input_ids,
+            io.speculative.target_positions,
+            io.speculative.accepted_drafts,
+            io.gdn_initial_slot,
+            io.speculative.stats,
+        };
+        if (io.mtp) {
+            controls.push_back(io.mtp->alignment_ids);
+            controls.push_back(io.mtp->position);
+        }
         for (const Tensor& tensor : controls) {
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
@@ -222,7 +242,10 @@ void ProgramImplCore::prepare_graphs() {
         decoder->gdn.reset_running(device.stream);
         set_device_i32(io.pos, checked_i32(frontier, "graph representative position"));
         set_device_i32(io.rope_pos, checked_i32(frontier, "graph representative rope position"));
-        set_device_i32(io.ar_pos, checked_i32(frontier, "graph representative MTP position"));
+        if (io.mtp) {
+            set_device_i32(io.mtp->position,
+                           checked_i32(frontier, "graph representative MTP position"));
+        }
     };
     const auto state = [&](std::uint32_t frontier) {
         return schedule::State{device,
@@ -237,6 +260,7 @@ void ProgramImplCore::prepare_graphs() {
                                frontier,
                                static_cast<const ops::SamplingConfig*>(sampling_config.data),
                                proposal_head,
+                               &tail_hidden,
                                &boundary_hidden,
                                nullptr,
                                nullptr,
@@ -265,9 +289,9 @@ void ProgramImplCore::prepare_graphs() {
         }
     }
 
-    const auto mtp_ranges = mtp_graph_ranges(capacity, mtp_k);
-    if (mtp_k != 0) {
-        validate_graph_ranges(mtp_ranges, capacity - 2 * mtp_k, "MTP");
+    const auto mtp_ranges = mtp_graph_ranges(capacity, draft_window);
+    if (draft_window != 0) {
+        validate_graph_ranges(mtp_ranges, capacity - 2 * draft_window, "MTP");
         mtp_graphs.reserve(mtp_ranges.size());
         for (const GraphFrontierRange range : mtp_ranges) {
             mtp_graphs.emplace_back();
@@ -278,8 +302,8 @@ void ProgramImplCore::prepare_graphs() {
             const auto prepare = [&, representative] { prepare_representative(representative); };
 
             auto mtp_state = state(representative);
-            schedule::warm_capture_mtp_round(mtp_state, mtp_k,
-                                             mtp_gqa_envelopes(range.min, range.max, mtp_k),
+            schedule::warm_capture_mtp_round(mtp_state, draft_window,
+                                             mtp_gqa_envelopes(range.min, range.max, draft_window),
                                              prepare, variant.mtp);
         }
     }
@@ -307,7 +331,8 @@ void ProgramImplCore::prepare_graphs() {
 
 void ProgramImplCore::install_sampling(const ops::SamplingConfig& config) {
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
-    CUDA_CHECK(cudaMemsetAsync(io.stats.data, 0, io.stats.bytes(), device.stream));
+    CUDA_CHECK(
+        cudaMemsetAsync(io.speculative.stats.data, 0, io.speculative.stats.bytes(), device.stream));
     sampling_host = config;
     const bool penalties =
         sampling_host.presence_penalty != 0.0F || sampling_host.frequency_penalty != 0.0F;
@@ -437,6 +462,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             base,
             static_cast<const ops::SamplingConfig*>(sampling_config.data),
             proposal_head,
+            &tail_hidden,
             &boundary_hidden,
             diagnostic_context,
             diagnostic_text_tap,
@@ -444,7 +470,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         bool mtp_prepared = false;
 
         if (had_suffix && plan.needs_mtp_bridge) {
-            Tensor bridge_token = io.verify_ids.slice(0, 0, 1);
+            Tensor bridge_token = io.speculative.target_input_ids.slice(0, 0, 1);
             const TokenId token = prompt.token_ids[base];
             CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
                                        cudaMemcpyHostToDevice, device.stream));
@@ -513,7 +539,7 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         // target work, so it must retain the MTP snapshot that was committed at the old frontier.
         if (had_suffix) { current_gdn_slot = 0; }
         mtp_kv_valid      = mtp_prepared ? prompt_tokens : 0;
-        proposal_ready    = mtp_prepared;
+        drafts_ready      = mtp_prepared;
         tail_hidden_valid = true;
         if (snapshot_boundary) {
             boundary.valid            = true;
@@ -558,12 +584,12 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
         throw std::logic_error("Active frontier is inconsistent");
     }
 
-    if (proposal_ready && (decoder->mtp_cache() == nullptr || mtp_kv_valid != E)) {
+    if (drafts_ready && (decoder->mtp_cache() == nullptr || mtp_kv_valid != E)) {
         throw std::logic_error("MTP proposal does not match the Active execution frontier");
     }
-    const bool use_mtp = mtp_k != 0 && proposal_ready && mtp_kv_valid == E &&
-                         budget.generated_tokens_remaining >= mtp_k + 1 &&
-                         static_cast<std::uint64_t>(E) + 2ULL * mtp_k <= capacity;
+    const bool use_mtp = draft_window != 0 && drafts_ready && mtp_kv_valid == E &&
+                         budget.generated_tokens_remaining >= draft_window + 1 &&
+                         static_cast<std::uint64_t>(E) + 2ULL * draft_window <= capacity;
     const std::uint32_t base_E = E;
     const std::uint32_t base_S = S;
     nvtx::ScopedRange round_range(use_mtp ? nvtx::Name::DecodeMtpRound
@@ -584,6 +610,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             base_E,
             static_cast<const ops::SamplingConfig*>(sampling_config.data),
             proposal_head,
+            &tail_hidden,
             &boundary_hidden,
             diagnostic_context,
             diagnostic_text_tap,
@@ -594,31 +621,30 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
         PendingKind kind       = PendingKind::Ordinary;
         if (use_mtp) {
             DecodeGraph* graph = nullptr;
-            auto envelopes     = mtp_gqa_envelopes(base_E, base_E, mtp_k);
+            auto envelopes     = mtp_gqa_envelopes(base_E, base_E, draft_window);
             if (use_cuda_graph && diagnostic_text_tap == nullptr) {
                 MtpGraphVariant& variant = select_graph_variant(mtp_graphs, base_E, "MTP");
                 graph                    = &variant.mtp;
                 envelopes                = mtp_gqa_envelopes(variant.min_execution_frontier,
-                                                             variant.max_execution_frontier, mtp_k);
+                                                             variant.max_execution_frontier, draft_window);
             }
             {
                 nvtx::ScopedRange submit_range(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                                                base_E);
-                schedule::mtp_round(schedule_state, mtp_k, envelopes, graph);
-                ops::mtp_gather_hidden_row(io.verify_hidden, io.accepted, tail_hidden,
-                                           device.stream);
-                CUDA_CHECK(cudaMemcpyAsync(host_count, io.num_sampled.data, sizeof(std::int32_t),
-                                           cudaMemcpyDeviceToHost, device.stream));
-                CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.sampled_out.data,
-                                           (mtp_k + 1ULL) * sizeof(TokenId), cudaMemcpyDeviceToHost,
+                schedule::mtp_round(schedule_state, draft_window, envelopes, graph);
+                CUDA_CHECK(cudaMemcpyAsync(host_count, io.speculative.produced_count.data,
+                                           sizeof(std::int32_t), cudaMemcpyDeviceToHost,
                                            device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.speculative.round_tokens.data,
+                                           (draft_window + 1ULL) * sizeof(TokenId),
+                                           cudaMemcpyDeviceToHost, device.stream));
             }
             {
                 nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                              base_E);
                 device.synchronize();
             }
-            if (*host_count <= 0 || *host_count > static_cast<std::int32_t>(mtp_k + 1)) {
+            if (*host_count <= 0 || *host_count > static_cast<std::int32_t>(draft_window + 1)) {
                 throw std::runtime_error("MTP returned an invalid licensed-token count");
             }
             produced = static_cast<std::uint32_t>(*host_count);
@@ -627,11 +653,11 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
                 throw std::runtime_error("MTP round exceeded its budget or context capacity");
             }
             accepted          = produced - 1;
-            kind              = PendingKind::Mtp;
+            kind              = PendingKind::Speculative;
             text_kv_valid     = base_E + produced;
             current_gdn_slot  = static_cast<std::int32_t>(accepted);
             mtp_kv_valid      = base_E + produced;
-            proposal_ready    = true;
+            drafts_ready      = true;
             tail_hidden_valid = true;
         } else {
             const bool align_mtp = decoder->mtp_cache() != nullptr && mtp_kv_valid == base_E;
@@ -658,7 +684,7 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             text_kv_valid    = base_E + 1;
             current_gdn_slot = 0;
             if (align_mtp) { mtp_kv_valid = base_E + 1; }
-            proposal_ready    = false;
+            drafts_ready      = false;
             tail_hidden_valid = true;
         }
 
@@ -691,15 +717,17 @@ void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool termin
     if (!terminal && accepted_tokens != pending.produced) {
         throw std::logic_error("a continuing round must accept every licensed token");
     }
-    if (terminal && pending.kind == PendingKind::Mtp && accepted_tokens < pending.produced) {
-        // The output policy may stop inside a target-licensed MTP batch. Target verification has
-        // already materialized KV, hidden, and one GDN snapshot for every returned prefix, so
-        // commit the exact externally accepted frontier instead of discarding the resident
-        // sequence. The next request rebuilds MTP proposals from this target state.
+    if (terminal && pending.kind == PendingKind::Speculative &&
+        accepted_tokens < pending.produced) {
+        // The output policy may stop inside a target-licensed speculative batch. Target
+        // verification has already materialized KV, hidden, and one GDN snapshot for every returned
+        // prefix, so commit the exact externally accepted frontier instead of discarding the
+        // resident sequence. The next request lets the active drafter rebuild proposals from this
+        // target state.
         const std::uint32_t committed_E = pending.base_E + accepted_tokens;
         const std::uint32_t committed_S = pending.base_S + accepted_tokens;
         if (committed_S > ledger.size() || committed_S > prefix_identity.size()) {
-            throw std::logic_error("partial MTP terminal exceeds the provisional ledger");
+            throw std::logic_error("partial speculative terminal exceeds the provisional ledger");
         }
         copy_tail(io.verify_hidden.slice(1, static_cast<int>(accepted_tokens) - 1, 1));
         ledger.resize(committed_S);
@@ -709,13 +737,13 @@ void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool termin
         current_gdn_slot = static_cast<std::int32_t>(accepted_tokens - 1);
         text_kv_valid    = committed_E;
         mtp_kv_valid     = committed_E;
-        proposal_ready   = false;
+        drafts_ready     = false;
         lifecycle        = Lifecycle::Resident;
         pending          = {};
         return;
     }
     if (accepted_tokens != pending.produced) {
-        throw std::logic_error("a non-MTP terminal round must accept its only token");
+        throw std::logic_error("a non-speculative terminal round must accept its only token");
     }
 
     switch (pending.kind) {
@@ -724,7 +752,7 @@ void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool termin
         S = pending.prompt_tokens + 1;
         break;
     case PendingKind::Ordinary:
-    case PendingKind::Mtp:
+    case PendingKind::Speculative:
         E = pending.base_E + pending.produced;
         S = pending.base_S + pending.produced;
         break;
@@ -770,19 +798,20 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
 
 SpeculativeStats ProgramImplCore::speculative_stats() const {
     SpeculativeStats out;
-    out.enabled      = mtp_k != 0;
-    out.draft_window = mtp_k;
-    if (mtp_k == 0) { return out; }
-    std::array<std::int64_t, kStepStatsCounters> values{};
-    CUDA_CHECK(cudaMemcpyAsync(values.data(), io.stats.data, io.stats.bytes(),
-                               cudaMemcpyDeviceToHost, device.stream));
+    out.enabled      = draft_window != 0;
+    out.draft_window = draft_window;
+    if (draft_window == 0) { return out; }
+    std::vector<std::int64_t> values(static_cast<std::size_t>(io.speculative.stats.ne[0]));
+    CUDA_CHECK(cudaMemcpyAsync(values.data(), io.speculative.stats.data,
+                               io.speculative.stats.bytes(), cudaMemcpyDeviceToHost,
+                               device.stream));
     device.synchronize();
     out.drafted_tokens  = static_cast<std::uint64_t>(std::max<std::int64_t>(0, values[0]));
     out.accepted_tokens = static_cast<std::uint64_t>(std::max<std::int64_t>(0, values[1]));
     out.rounds          = static_cast<std::uint64_t>(std::max<std::int64_t>(0, values[2]));
     out.fallback_steps  = static_cast<std::uint64_t>(std::max<std::int64_t>(0, values[3]));
-    out.accepted_per_position.resize(mtp_k);
-    for (std::uint32_t i = 0; i < mtp_k; ++i) {
+    out.accepted_per_position.resize(draft_window);
+    for (std::uint32_t i = 0; i < draft_window; ++i) {
         out.accepted_per_position[i] =
             static_cast<std::uint64_t>(std::max<std::int64_t>(0, values[4 + i]));
     }

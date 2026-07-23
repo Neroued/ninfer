@@ -12,11 +12,11 @@ namespace ninfer::ops {
 
 // Counter-based RNG subkey. Distinct purposes keep draws at the same logical position separate.
 enum SamplePurpose : std::int32_t {
-    kSamplePurposePrefill     = 0,
-    kSamplePurposeDecode      = 1,
-    kSamplePurposeMtpAccept   = 2,
-    kSamplePurposeMtpResample = 3,
-    kSamplePurposeMtpBonus    = 4,
+    kSamplePurposePrefill               = 0,
+    kSamplePurposeDecode                = 1,
+    kSamplePurposeSpeculativeAccept     = 2,
+    kSamplePurposeSpeculativeCorrection = 3,
+    kSamplePurposeSpeculativeBonus      = 4,
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32

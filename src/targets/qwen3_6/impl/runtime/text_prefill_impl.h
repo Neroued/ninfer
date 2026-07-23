@@ -13,12 +13,12 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 void configure_text_card(TextContext& card, const State& state) {
     card.set_sampling(state.sampling);
     if (state.proposal_head == ProposalHead::Full) {
-        card.set_lm_head_draft(nullptr, nullptr, 0);
+        card.set_proposal_head(nullptr, nullptr, 0);
         return;
     }
-    if (card.lm_head_draft() == nullptr || card.lm_head_draft_ids() == nullptr ||
-        card.lm_head_draft_n() <= 0) {
-        throw std::runtime_error("optimized MTP proposal head is unavailable");
+    if (card.proposal_head() == nullptr || card.proposal_head_ids() == nullptr ||
+        card.proposal_head_n() <= 0) {
+        throw std::runtime_error("optimized proposal head is unavailable");
     }
 }
 

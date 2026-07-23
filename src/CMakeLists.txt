@@ -59,6 +59,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
   ops/launcher/mtp_round.cu
+  ops/launcher/speculative_round.cu
   ops/launcher/position.cu
   ops/launcher/residual_add.cu
   ops/launcher/rmsnorm.cu
@@ -144,6 +145,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/linear_swiglu.cpp
   ops/wrapper/mtp_pack.cpp
   ops/wrapper/mtp_round.cpp
+  ops/wrapper/speculative_round.cpp
   ops/wrapper/position.cpp
   ops/wrapper/residual_add.cpp
   ops/wrapper/rmsnorm.cpp

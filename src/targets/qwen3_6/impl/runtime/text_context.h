@@ -128,10 +128,10 @@ public:
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
 
-    void set_lm_head_draft(const Weight* weight, const std::int32_t* ids, int count) noexcept {
-        lm_head_draft_     = weight;
-        lm_head_draft_ids_ = ids;
-        lm_head_draft_n_   = count;
+    void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {
+        proposal_head_     = weight;
+        proposal_head_ids_ = ids;
+        proposal_head_n_   = count;
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
@@ -142,13 +142,13 @@ public:
 
     void set_boundary_hidden_output(Tensor* output) noexcept { boundary_hidden_output_ = output; }
 
-    [[nodiscard]] const Weight* lm_head_draft() const noexcept { return lm_head_draft_; }
+    [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
 
-    [[nodiscard]] const std::int32_t* lm_head_draft_ids() const noexcept {
-        return lm_head_draft_ids_;
+    [[nodiscard]] const std::int32_t* proposal_head_ids() const noexcept {
+        return proposal_head_ids_;
     }
 
-    [[nodiscard]] int lm_head_draft_n() const noexcept { return lm_head_draft_n_; }
+    [[nodiscard]] int proposal_head_n() const noexcept { return proposal_head_n_; }
 
     [[nodiscard]] bool mtp_prompt_prepared() const noexcept { return mtp_prompt_prepared_; }
 
@@ -202,7 +202,7 @@ private:
                            const Tensor& positions, const Tensor& rope_positions,
                            ops::GqaExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
-    void mtp_draft_argmax(const Tensor& hidden, Tensor& logits, Tensor& draft_token);
+    void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
 
     struct MultimodalPrefill {
         std::span<const int> token_ids;
@@ -241,9 +241,9 @@ private:
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
     const Weight* lm_head_                      = nullptr;
-    const Weight* lm_head_draft_                = nullptr;
-    const std::int32_t* lm_head_draft_ids_      = nullptr;
-    int lm_head_draft_n_                        = 0;
+    const Weight* proposal_head_                = nullptr;
+    const std::int32_t* proposal_head_ids_      = nullptr;
+    int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     MtpW mtp_;
     std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};

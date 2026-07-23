@@ -4,14 +4,32 @@
 #include "core/tensor.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace ninfer::targets::qwen3_6 {
 
 struct RoundStateSpec {
-    std::int32_t hidden         = 0;
-    std::int32_t output_rows    = 0;
-    std::uint32_t draft_window  = 0;
-    std::int32_t stats_counters = 0;
+    std::int32_t hidden        = 0;
+    std::int32_t output_rows   = 0;
+    std::uint32_t draft_window = 0;
+    bool enable_mtp            = false;
+};
+
+struct SpeculativeRoundStateLayout {
+    TensorRegion target_argmax;
+    TensorRegion draft_tokens;
+    TensorRegion round_tokens;
+    TensorRegion produced_count;
+    TensorRegion target_input_ids;
+    TensorRegion target_positions;
+    TensorRegion accepted_drafts;
+    TensorRegion stats;
+};
+
+struct MtpRoundStateLayout {
+    TensorRegion alignment_ids;
+    TensorRegion position;
+    TensorRegion ar_hidden;
 };
 
 struct RoundStateLayout {
@@ -22,19 +40,9 @@ struct RoundStateLayout {
     TensorRegion rope_delta;
     TensorRegion logits;
     TensorRegion verify_hidden;
-    TensorRegion target_tokens;
-    TensorRegion drafts;
-    TensorRegion sampled_out;
-    TensorRegion num_sampled;
-    TensorRegion verify_ids;
-    TensorRegion shifted_ids;
-    TensorRegion positions;
-    TensorRegion window_base;
-    TensorRegion accepted;
     TensorRegion gdn_initial_slot;
-    TensorRegion ar_pos;
-    TensorRegion mtp_ar_hidden;
-    TensorRegion stats;
+    SpeculativeRoundStateLayout speculative;
+    std::optional<MtpRoundStateLayout> mtp;
     bool complete = false;
 };
 
@@ -45,6 +53,29 @@ struct RoundStateLayout {
                                                         const RoundStateSpec& spec);
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout);
 
+struct SpeculativeRoundState {
+    Tensor target_argmax;
+    Tensor draft_tokens;
+    Tensor round_tokens;
+    Tensor produced_count;
+    Tensor target_input_ids;
+    Tensor target_positions;
+    Tensor accepted_drafts;
+    Tensor stats;
+
+    SpeculativeRoundState() = default;
+    SpeculativeRoundState(DeviceSpan backing, const SpeculativeRoundStateLayout& layout);
+};
+
+struct MtpRoundState {
+    Tensor alignment_ids;
+    Tensor position;
+    Tensor ar_hidden;
+
+    MtpRoundState() = default;
+    MtpRoundState(DeviceSpan backing, const MtpRoundStateLayout& layout);
+};
+
 struct RoundState {
     Tensor token;
     Tensor pos;
@@ -52,19 +83,9 @@ struct RoundState {
     Tensor rope_delta;
     Tensor logits;
     Tensor verify_hidden;
-    Tensor target_tokens;
-    Tensor drafts;
-    Tensor sampled_out;
-    Tensor num_sampled;
-    Tensor verify_ids;
-    Tensor shifted_ids;
-    Tensor positions;
-    Tensor window_base;
-    Tensor accepted;
     Tensor gdn_initial_slot;
-    Tensor ar_pos;
-    Tensor mtp_ar_hidden;
-    Tensor stats;
+    SpeculativeRoundState speculative;
+    std::optional<MtpRoundState> mtp;
 
     RoundState() = default;
     RoundState(DeviceSpan backing, const RoundStateLayout& layout);

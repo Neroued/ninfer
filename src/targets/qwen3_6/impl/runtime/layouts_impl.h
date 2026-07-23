@@ -34,7 +34,7 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 }
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
-    const std::size_t columns = plan.mtp_k + 1ULL;
+    const std::size_t columns = plan.draft_window + 1ULL;
     const std::size_t slots   = columns + 1ULL;
     LayoutBuilder builder;
     PersistentLayout out;
@@ -47,7 +47,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim    = TextConfig::head_dim,
                      .kv_dtype              = plan.kv_dtype,
                      .kv_quant_group        = plan.kv_quant_group,
-                     .enable_mtp            = plan.mtp_k != 0,
+                     .enable_mtp            = plan.draft_window != 0,
                      .gdn =
                          {
                              .layers         = TextConfig::gdn_layers(),
@@ -62,10 +62,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                  });
 
     out.round = qwen3_6::begin_round_state_layout(
-        builder, qwen3_6::RoundStateSpec{.hidden         = TextConfig::hidden,
-                                         .output_rows    = TextConfig::output_rows,
-                                         .draft_window   = plan.mtp_k,
-                                         .stats_counters = kStepStatsCounters});
+        builder, qwen3_6::RoundStateSpec{.hidden       = TextConfig::hidden,
+                                         .output_rows  = TextConfig::output_rows,
+                                         .draft_window = plan.draft_window,
+                                         .enable_mtp   = plan.draft_window != 0});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.prefill_chunk)},
         "step prefill hidden");
@@ -90,7 +90,7 @@ std::size_t workspace_bytes(const SequencePlanImpl& plan) {
         throw std::invalid_argument("prefill_chunk exceeds int32 workspace dimensions");
     }
     const auto prefill_tokens = static_cast<std::int32_t>(plan.prefill_chunk);
-    const auto verify_tokens  = static_cast<std::int32_t>(plan.mtp_k + 1);
+    const auto verify_tokens  = static_cast<std::int32_t>(plan.draft_window + 1);
 
     const auto matrix      = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -254,13 +254,13 @@ std::size_t workspace_bytes(const SequencePlanImpl& plan) {
 
     WorkspaceLayoutBuilder mtp_prefill;
     WorkspaceLayoutBuilder mtp_full;
-    if (plan.mtp_k != 0) {
+    if (plan.draft_window != 0) {
         common_root(mtp_prefill, prefill_tokens);
         matrix(mtp_prefill, DType::I32, 1, prefill_tokens);
         matrix(mtp_prefill, DType::BF16, TextConfig::hidden, prefill_tokens);
         matrix(mtp_prefill, DType::I32, 1, prefill_tokens);
         mtp_prefill_chunk(mtp_prefill, prefill_tokens);
-        for (std::uint32_t i = 1; i < plan.mtp_k; ++i) {
+        for (std::uint32_t i = 1; i < plan.draft_window; ++i) {
             matrix(mtp_prefill, DType::BF16, TextConfig::hidden, 1);
             mtp_full_call(mtp_prefill, 1, true);
         }
@@ -314,7 +314,7 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
     auto impl             = std::make_unique<SequencePlanImpl>();
     impl->capacity        = options.max_context;
     impl->prefill_chunk   = options.prefill_chunk;
-    impl->mtp_k           = options.speculative.draft_tokens;
+    impl->draft_window    = options.speculative.draft_tokens;
     impl->proposal_head   = options.speculative.proposal_head;
     impl->features        = qwen3_6::startup_features(options);
     impl->use_cuda_graph  = options.use_cuda_graph;
@@ -325,15 +325,17 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
     impl->workspace_bytes = workspace_bytes(*impl);
     if (impl->use_cuda_graph) {
         const std::size_t ordinary_variants = ordinary_graph_ranges(impl->capacity).size();
-        const std::size_t ordinary_graphs   = ordinary_variants * (impl->mtp_k == 0 ? 1ULL : 2ULL);
+        const std::size_t ordinary_graphs =
+            ordinary_variants * (impl->draft_window == 0 ? 1ULL : 2ULL);
         // Cold full-model capture also materializes lazy CUDA module state. The 35B
         // K=3/C=4096 public benchmark measured 123,277,312 bytes across its 12 ordinary/aligned
         // and short-window executables. Keep one conservative family allowance of 12 MiB per
         // executable. Long MTP executables also trigger substantially larger driver allocations.
         impl->graph_allowance_bytes = ordinary_graphs * 12ULL * kMiB;
-        for (const GraphFrontierRange range : mtp_graph_ranges(impl->capacity, impl->mtp_k)) {
+        for (const GraphFrontierRange range :
+             mtp_graph_ranges(impl->capacity, impl->draft_window)) {
             const std::uint64_t final_visible =
-                static_cast<std::uint64_t>(range.max) + 2ULL * impl->mtp_k;
+                static_cast<std::uint64_t>(range.max) + 2ULL * impl->draft_window;
             impl->graph_allowance_bytes += (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
         }
     }

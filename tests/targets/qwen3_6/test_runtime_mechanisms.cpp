@@ -95,7 +95,7 @@ void test_round_layout() {
     ninfer::LayoutBuilder builder;
     q36::RoundStateLayout round = q36::begin_round_state_layout(
         builder, q36::RoundStateSpec{
-                     .hidden = 32, .output_rows = 128, .draft_window = 5, .stats_counters = 9});
+                     .hidden = 32, .output_rows = 128, .draft_window = 5, .enable_mtp = true});
     const ninfer::TensorRegion exact_prefill =
         builder.add_tensor(ninfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
     q36::complete_round_state_layout(builder, round);
@@ -104,11 +104,14 @@ void test_round_layout() {
     expect(round.logits.shape[0] == 128 && round.logits.shape[1] == 6, "round logits shape");
     expect(round.verify_hidden.shape[0] == 32 && round.verify_hidden.shape[1] == 6,
            "round verification hidden shape");
-    expect(round.drafts.shape[0] == 5 && round.sampled_out.shape[0] == 6,
+    expect(round.speculative.draft_tokens.shape[0] == 5 &&
+               round.speculative.round_tokens.shape[0] == 6,
            "round speculative vector shapes");
     expect(round.verify_hidden.region.offset < exact_prefill.region.offset &&
-               exact_prefill.region.offset < round.target_tokens.region.offset,
+               exact_prefill.region.offset < round.speculative.target_argmax.region.offset,
            "exact prefill extension retains established round-region order");
+    expect(round.mtp.has_value() && round.mtp->alignment_ids.shape[0] == 6,
+           "MTP round extension is explicit");
 }
 
 void test_mtp_alignment() {

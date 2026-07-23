@@ -26,8 +26,8 @@ void validate_spec(const RoundStateSpec& spec) {
     if (spec.output_rows <= 0) {
         throw std::invalid_argument("RoundState output_rows must be positive");
     }
-    if (spec.stats_counters <= 0) {
-        throw std::invalid_argument("RoundState stats_counters must be positive");
+    if (spec.enable_mtp && spec.draft_window == 0) {
+        throw std::invalid_argument("RoundState cannot enable MTP with an empty draft window");
     }
     (void)checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
                       "RoundState draft window exceeds int32");
@@ -59,25 +59,44 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                     "RoundState columns exceed int32");
     const std::int32_t drafts = checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window),
                                             "RoundState drafts exceed int32");
-    const auto i32            = [&](std::int32_t count, const char* label) {
+    const std::int32_t stats_counters =
+        checked_i32(4ULL + layout.spec.draft_window, "RoundState stats exceed int32");
+    const auto i32 = [&](std::int32_t count, const char* label) {
         return add_tensor(builder, DType::I32, {count}, label);
     };
-    layout.target_tokens    = i32(columns, "step target tokens");
-    layout.drafts           = i32(drafts, "step drafts");
-    layout.sampled_out      = i32(columns, "step sampled output");
-    layout.num_sampled      = i32(1, "step sampled count");
-    layout.verify_ids       = i32(columns, "step verify ids");
-    layout.shifted_ids      = i32(columns, "step shifted ids");
-    layout.positions        = i32(columns, "step positions");
-    layout.window_base      = i32(1, "step window base");
-    layout.accepted         = i32(1, "step accepted drafts");
-    layout.gdn_initial_slot = i32(1, "step GDN initial slot");
-    layout.ar_pos           = i32(1, "step MTP autoregressive position");
-    layout.mtp_ar_hidden =
-        add_tensor(builder, DType::BF16, {layout.spec.hidden, 1}, "step MTP autoregressive hidden");
-    layout.stats    = add_tensor(builder, DType::I64, {layout.spec.stats_counters}, "step stats");
+    layout.gdn_initial_slot             = i32(1, "step GDN initial slot");
+    layout.speculative.target_argmax    = i32(columns, "step target argmax");
+    layout.speculative.draft_tokens     = i32(drafts, "step draft tokens");
+    layout.speculative.round_tokens     = i32(columns, "step speculative round tokens");
+    layout.speculative.produced_count   = i32(1, "step speculative produced count");
+    layout.speculative.target_input_ids = i32(columns, "step target input ids");
+    layout.speculative.target_positions = i32(columns, "step target positions");
+    layout.speculative.accepted_drafts  = i32(1, "step accepted drafts");
+    layout.speculative.stats =
+        add_tensor(builder, DType::I64, {stats_counters}, "step speculative stats");
+    if (layout.spec.enable_mtp) {
+        layout.mtp.emplace();
+        layout.mtp->alignment_ids = i32(columns, "step MTP alignment ids");
+        layout.mtp->position      = i32(1, "step MTP autoregressive position");
+        layout.mtp->ar_hidden     = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
+                                               "step MTP autoregressive hidden");
+    }
     layout.complete = true;
 }
+
+SpeculativeRoundState::SpeculativeRoundState(DeviceSpan backing,
+                                             const SpeculativeRoundStateLayout& layout)
+    : target_argmax(layout.target_argmax.bind(backing)),
+      draft_tokens(layout.draft_tokens.bind(backing)),
+      round_tokens(layout.round_tokens.bind(backing)),
+      produced_count(layout.produced_count.bind(backing)),
+      target_input_ids(layout.target_input_ids.bind(backing)),
+      target_positions(layout.target_positions.bind(backing)),
+      accepted_drafts(layout.accepted_drafts.bind(backing)), stats(layout.stats.bind(backing)) {}
+
+MtpRoundState::MtpRoundState(DeviceSpan backing, const MtpRoundStateLayout& layout)
+    : alignment_ids(layout.alignment_ids.bind(backing)), position(layout.position.bind(backing)),
+      ar_hidden(layout.ar_hidden.bind(backing)) {}
 
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
@@ -87,19 +106,9 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     rope_delta       = layout.rope_delta.bind(backing);
     logits           = layout.logits.bind(backing);
     verify_hidden    = layout.verify_hidden.bind(backing);
-    target_tokens    = layout.target_tokens.bind(backing);
-    drafts           = layout.drafts.bind(backing);
-    sampled_out      = layout.sampled_out.bind(backing);
-    num_sampled      = layout.num_sampled.bind(backing);
-    verify_ids       = layout.verify_ids.bind(backing);
-    shifted_ids      = layout.shifted_ids.bind(backing);
-    positions        = layout.positions.bind(backing);
-    window_base      = layout.window_base.bind(backing);
-    accepted         = layout.accepted.bind(backing);
     gdn_initial_slot = layout.gdn_initial_slot.bind(backing);
-    ar_pos           = layout.ar_pos.bind(backing);
-    mtp_ar_hidden    = layout.mtp_ar_hidden.bind(backing);
-    stats            = layout.stats.bind(backing);
+    speculative      = SpeculativeRoundState(backing, layout.speculative);
+    if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }
 }
 
 } // namespace ninfer::targets::qwen3_6

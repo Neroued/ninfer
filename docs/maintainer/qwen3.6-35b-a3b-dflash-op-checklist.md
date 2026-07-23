@@ -446,7 +446,7 @@ specification for dFlash proposal generation.
 |---|---|---|
 | [ ] | Input/stem | optional `embedding`; two `rmsnorm`; `mtp_pack_fc_input`; W8 `linear` `[2048,4096]`; input `rmsnorm` |
 | [ ] | Full attention | W8 `attn_input_proj`; Q/K `rmsnorm`; `rope`; `gqa_attention`; `sigmoid_mul`; W8 `linear` `[2048,4096]`; `residual_add` |
-| [ ] | MoE/output | `rmsnorm`; W8/W8 `sparse_moe`; final `rmsnorm`; Q4 shortlist or Q6 full-head `linear`; `argmax`; optional `mtp_remap_draft_token` |
+| [ ] | MoE/output | `rmsnorm`; W8/W8 `sparse_moe`; final `rmsnorm`; Q4 shortlist or Q6 full-head `linear`; `argmax`; optional `proposal_remap_token_ids` |
 | [ ] | Prefill split | `gqa_kv_append`, followed by final-column `gqa_attention_cached` |
 
 The MTP W8/W8 sparse-MoE remains on Small-T for `T<=17`; its prefill route starts at `T=18`.
@@ -456,11 +456,11 @@ Generic W8 `[2048,4096]` linear stays on its SIMT route through `T=56`.
 
 | Status | Active Op | Role |
 |---|---|---|
-| [ ] | `mtp_prepare_verify_inputs` | Assemble shifted target-verification ids |
-| [ ] | `mtp_accept_tokens` | Compare target/proposal tokens, sample the rejection position, and publish acceptance counts |
-| [ ] | `mtp_prepare_shifted_ids` | Build the next MTP batch ids |
-| [ ] | `mtp_gather_hidden_row` | Select the accepted target hidden row |
-| [ ] | `mtp_remap_draft_token` | Convert shortlist head id to the global token domain |
+| [ ] | `speculative_prepare_verify_inputs` | Assemble target-verification ids and positions from any ordered draft block |
+| [ ] | `speculative_accept_greedy_drafts` | Accept a one-hot draft prefix, sample the correction/bonus, and publish acceptance counts |
+| [ ] | `speculative_select_accepted_hidden` | Select the target hidden column at the accepted frontier |
+| [ ] | `proposal_remap_token_ids` | Convert one or more shortlist-head ids to the global token domain |
+| [ ] | `mtp_prepare_alignment_ids` | Build the next MTP alignment batch; not part of the shared speculative transaction |
 | [ ] | `assign_i32_scalar`, scalar set/increment helpers | Select state slot and advance round scalars |
 
 After the dFlash proposal formula and represented inputs are known:
@@ -538,11 +538,11 @@ several schedules is listed once.
 - [ ] `mtp_pack_fc_input`
 - [ ] `gqa_kv_append`
 - [ ] `gqa_attention_cached`
-- [ ] `mtp_prepare_verify_inputs`
-- [ ] `mtp_accept_tokens`
-- [ ] `mtp_prepare_shifted_ids`
-- [ ] `mtp_gather_hidden_row`
-- [ ] `mtp_remap_draft_token`
+- [ ] `speculative_prepare_verify_inputs`
+- [ ] `speculative_accept_greedy_drafts`
+- [ ] `speculative_select_accepted_hidden`
+- [ ] `proposal_remap_token_ids`
+- [ ] `mtp_prepare_alignment_ids`
 - [ ] `set_i32_scalar`
 - [ ] `assign_i32_scalar`
 - [ ] `increment_i32_scalar`

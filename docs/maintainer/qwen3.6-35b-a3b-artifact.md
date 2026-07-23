@@ -1151,7 +1151,8 @@ FP32 recurrent matrices  = 30 * 32 * 128 * 128 * 4 = 60.00000 MiB
 one slot                                               61.40625 MiB
 ```
 
-The family state policy fixes `snapshot_slots = mtp_k + 2`. At `mtp_k=5`, seven slots consume
+The family state policy fixes `snapshot_slots = draft_window + 2`. With MTP's
+`draft_window=5`, seven slots consume
 450,723,840 bytes = 429.84375 MiB. Applying the family Program's fixed state layout to the 35B
 widths and a six-column verification window gives an 8,207,872-byte ceiling for fixed
 token/logit/hidden/ledger/sampling buffers. The algorithm is shared; the resulting byte count is a

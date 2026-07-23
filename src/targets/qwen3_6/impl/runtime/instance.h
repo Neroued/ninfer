@@ -32,7 +32,6 @@ inline constexpr float kAttentionScale                = Variant::attention_scale
 inline constexpr float kGdnScale                      = Variant::gdn_scale;
 inline constexpr std::uint32_t kPrefillChunkAlignment = Variant::prefill_chunk_alignment;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens = Variant::maximum_mtp_draft_tokens;
-inline constexpr std::int32_t kStepStatsCounters      = Variant::step_stats_counters;
 
 inline std::vector<GraphFrontierRange> ordinary_graph_ranges(std::uint32_t capacity) {
     return Variant::ordinary_graph_ranges(capacity);

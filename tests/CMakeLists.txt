@@ -141,6 +141,9 @@ ninfer_add_test(ninfer_mtp_pack_test
 ninfer_add_test(ninfer_mtp_round_test
   SOURCES ops/test_mtp_round.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_speculative_round_test
+  SOURCES ops/test_speculative_round.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_test(ninfer_linear_test
   SOURCES ops/test_linear.cpp
   LIBRARIES ninfer_ops)

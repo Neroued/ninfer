@@ -1,7 +1,7 @@
 #pragma once
 
 // Shared implementation primitives for include/ninfer/ops/sampling.h and
-// include/ninfer/ops/mtp_round.h. The ordering key is exact for finite BF16
+// include/ninfer/ops/speculative_round.h. The ordering key is exact for finite BF16
 // logits (including numeric-zero ties); candidate storage is bounded by the
 // semantic top-20 cap and all global staging is supplied by the caller.
 
@@ -128,11 +128,11 @@ __device__ __forceinline__ int sampling_dist_offset(int col, int j) {
 
 // Applies presence/frequency penalties to a raw logit. `overlay`/`overlay_len`
 // carry a round-local count overlay: tokens already committed earlier in the
-// current MTP round but not yet flushed to the global `token_counts`. For MTP
+// current speculative round but not yet flushed to the global `token_counts`. For speculative
 // verify column `col` the overlay is exactly drafts[0..col-1] (statically known,
 // since column `col` is only consumed when every earlier draft was accepted), so
 // the penalty at each column sees the same prefix a per-token sampler would.
-// Non-MTP callers pass no overlay. The scan is bounded by k (a few tokens) and
+// Non-speculative callers pass no overlay. The scan is bounded by k and
 // only runs when penalties are active, so it is free on the no-penalty path.
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,

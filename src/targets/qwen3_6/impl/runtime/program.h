@@ -54,7 +54,7 @@ enum class PendingKind : std::uint8_t {
     None,
     Begin,
     Ordinary,
-    Mtp,
+    Speculative,
 };
 
 struct PendingCandidate {
@@ -122,7 +122,7 @@ public:
     DeviceContext& device;
     const std::uint32_t capacity;
     const std::uint32_t prefill_chunk;
-    const std::uint32_t mtp_k;
+    const std::uint32_t draft_window;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
@@ -158,7 +158,7 @@ public:
     std::int32_t current_gdn_slot = 0;
     std::uint32_t text_kv_valid   = 0;
     std::uint32_t mtp_kv_valid    = 0;
-    bool proposal_ready           = false;
+    bool drafts_ready             = false;
     bool tail_hidden_valid        = false;
     PrefixCheckpoint boundary;
     PendingCandidate pending;

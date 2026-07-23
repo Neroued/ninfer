@@ -20,7 +20,6 @@
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
-#include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
@@ -29,6 +28,7 @@
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
+#include "ninfer/ops/speculative_round.h"
 
 #include <cuda_runtime.h>
 
@@ -167,6 +167,9 @@ TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, Wor
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext prefill_chunk must be a nonzero multiple of 128");
     }
+    if (mtp_kv_ != nullptr && !io_.mtp) {
+        throw std::invalid_argument("MTP TextContext requires MTP round state");
+    }
     bind();
 }
 
@@ -182,7 +185,7 @@ void TextContext::bind() {
     lm_head_    = &weights_.output_head;
     if (weights_.optimized_proposal) {
         const auto& proposal = *weights_.optimized_proposal;
-        set_lm_head_draft(&proposal.head, static_cast<const std::int32_t*>(proposal.token_ids.data),
+        set_proposal_head(&proposal.head, static_cast<const std::int32_t*>(proposal.token_ids.data),
                           proposal.head.n);
     }
 
@@ -430,19 +433,25 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x_last, work_, s);
         }
         ops::rmsnorm(x_last, *mtp_.norm, kCfg.rms_eps, true, *final_hidden, s);
-        mtp_draft_argmax(*final_hidden, *logits, *draft_token);
+        proposal_argmax(*final_hidden, *logits, *draft_token);
     }
 }
 
-void TextContext::mtp_draft_argmax(const Tensor& hidden_col, Tensor& logits, Tensor& draft_token) {
-    if (lm_head_draft_ != nullptr) {
-        Tensor draft_logits = work_.alloc(DType::BF16, {lm_head_draft_n_, 1});
-        ops::linear(hidden_col, *lm_head_draft_, draft_logits, work_, ctx_.stream);
-        ops::argmax(draft_logits, draft_token, lm_head_draft_n_, ctx_.stream);
-        ops::mtp_remap_draft_token(draft_token, lm_head_draft_ids_, lm_head_draft_n_, ctx_.stream);
+void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens) {
+    const int T = hidden.ne[1];
+    require_tensor_shape(hidden, DType::BF16, {kCfg.hidden, T}, "proposal hidden");
+    require_tensor_shape(proposal_tokens, DType::I32, {T}, "proposal tokens");
+    require_tensor_window(logits, DType::BF16, kCfg.vocab, T, "proposal logits");
+    if (proposal_head_ != nullptr) {
+        Tensor proposal_logits = work_.alloc(DType::BF16, {proposal_head_n_, T});
+        ops::linear(hidden, *proposal_head_, proposal_logits, work_, ctx_.stream);
+        ops::argmax(proposal_logits, proposal_tokens, proposal_head_n_, ctx_.stream);
+        ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
+                                      ctx_.stream);
     } else {
-        ops::linear(hidden_col, *lm_head_, logits, work_, ctx_.stream);
-        ops::argmax(logits, draft_token, kCfg.token_domain, ctx_.stream);
+        Tensor output_logits = matrix_window(logits, T);
+        ops::linear(hidden, *lm_head_, output_logits, work_, ctx_.stream);
+        ops::argmax(output_logits, proposal_tokens, kCfg.token_domain, ctx_.stream);
     }
 }
 
@@ -486,7 +495,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     if (logits_column >= 0) {
         auto logits_scope = work_.scope();
         Tensor col        = mtp_hidden.slice(1, logits_column, 1);
-        mtp_draft_argmax(col, *logits, *draft_token);
+        proposal_argmax(col, *logits, *draft_token);
     }
 }
 
@@ -506,7 +515,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     ops::offset_i32_positions(position, io_.rope_delta, rope_position, ctx_.stream);
     mtp_forward_core(token, previous_hidden, position, rope_position, envelope, mtp_hidden);
     auto logits_scope = work_.scope();
-    mtp_draft_argmax(mtp_hidden, logits, draft_token);
+    proposal_argmax(mtp_hidden, logits, draft_token);
 }
 
 void TextContext::mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Tensor& row,
@@ -524,8 +533,8 @@ void TextContext::mtp_sample_from_hidden_row(const Tensor& mtp_hidden, const Ten
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP sample draft token");
 
     auto scratch_scope = work_.scope();
-    ops::mtp_gather_hidden_row(mtp_hidden, row, out_hidden, ctx_.stream);
-    mtp_draft_argmax(out_hidden, logits, draft_token);
+    ops::speculative_select_accepted_hidden(mtp_hidden, row, out_hidden, ctx_.stream);
+    proposal_argmax(out_hidden, logits, draft_token);
 }
 
 template <class Tap>
@@ -537,7 +546,8 @@ void TextContext::target_verify_impl(const Tensor& ids, const Tensor& positions,
     require_tensor_shape(positions, DType::I32, {T}, "target_verify positions");
     require_tensor_window(io_.verify_hidden, DType::BF16, kCfg.hidden, T, "target_verify hidden");
     require_tensor_window(io_.logits, DType::BF16, kCfg.vocab, T, "target_verify logits");
-    require_vector_window(io_.target_tokens, DType::I32, T, "target_verify target_tokens");
+    require_vector_window(io_.speculative.target_argmax, DType::I32, T,
+                          "target_verify target_tokens");
 
     cudaStream_t s = ctx_.stream;
     work_.reset();
@@ -555,7 +565,7 @@ void TextContext::target_verify_impl(const Tensor& ids, const Tensor& positions,
 
         Tensor hidden = matrix_window(io_.verify_hidden, T);
         Tensor logits = matrix_window(io_.logits, T);
-        Tensor target = vector_window(io_.target_tokens, T);
+        Tensor target = vector_window(io_.speculative.target_argmax, T);
         ops::rmsnorm(x, *final_norm_, kCfg.rms_eps, true, hidden, s);
         if constexpr (Tap::enabled) { tap(TapId::AfterFinalNorm, -1, Phase::Verify, hidden, s); }
         ops::linear(hidden, *lm_head_, logits, work_, s);
@@ -808,16 +818,16 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
     const std::int32_t boundary_slot = state_.spec.snapshot_slots - 1;
 
     bool prepare_mtp_prompt = false;
-    if (mtp_enabled() && io_.drafts.data != nullptr) {
+    if (mtp_enabled() && io_.speculative.draft_tokens.data != nullptr) {
         const std::uint64_t mtp_required_end =
             static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) +
-            static_cast<std::uint64_t>(std::max(0, io_.drafts.ne[0] - 1));
+            static_cast<std::uint64_t>(std::max(0, io_.speculative.draft_tokens.ne[0] - 1));
         // Program::decode_round consumes these drafts only when the following target verify and
         // proposal window fits. Avoid preparing a prompt/draft tail that the scheduler will
         // immediately discard in favor of its one-token capacity fallback.
         const std::uint64_t target_round_required_end =
             static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) +
-            2ULL * static_cast<std::uint64_t>(io_.drafts.ne[0]);
+            2ULL * static_cast<std::uint64_t>(io_.speculative.draft_tokens.ne[0]);
         prepare_mtp_prompt =
             mtp_required_end <= static_cast<std::uint64_t>(mtp_kv_->max_context) &&
             target_round_required_end <= static_cast<std::uint64_t>(kv_.max_context);
@@ -975,24 +985,24 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
                 }
                 if (is_last) {
                     Tensor logits = matrix_window(io_.logits, 1);
-                    Tensor draft0 = io_.drafts.slice(0, 0, 1);
+                    Tensor draft0 = io_.speculative.draft_tokens.slice(0, 0, 1);
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,
-                                      rope_positions, chunk_envelope, true, &io_.mtp_ar_hidden,
+                                      rope_positions, chunk_envelope, true, &io_.mtp->ar_hidden,
                                       &logits, &draft0);
 
-                    ops::set_i32_scalar(io_.ar_pos, base_i + T, s);
-                    for (int i = 1; i < io_.drafts.ne[0]; ++i) {
-                        Tensor prev_token     = io_.drafts.slice(0, i - 1, 1);
-                        Tensor next_token     = io_.drafts.slice(0, i, 1);
+                    ops::set_i32_scalar(io_.mtp->position, base_i + T, s);
+                    for (int i = 1; i < io_.speculative.draft_tokens.ne[0]; ++i) {
+                        Tensor prev_token     = io_.speculative.draft_tokens.slice(0, i - 1, 1);
+                        Tensor next_token     = io_.speculative.draft_tokens.slice(0, i, 1);
                         Tensor next_hidden    = work_.alloc(DType::BF16, {kCfg.hidden, 1});
                         const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
                         const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
-                        mtp_forward_ar_step(prev_token, io_.mtp_ar_hidden, io_.ar_pos, ar_envelope,
-                                            next_hidden, logits, next_token);
-                        CUDA_CHECK(cudaMemcpyAsync(io_.mtp_ar_hidden.data, next_hidden.data,
-                                                   io_.mtp_ar_hidden.bytes(),
+                        mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, io_.mtp->position,
+                                            ar_envelope, next_hidden, logits, next_token);
+                        CUDA_CHECK(cudaMemcpyAsync(io_.mtp->ar_hidden.data, next_hidden.data,
+                                                   io_.mtp->ar_hidden.bytes(),
                                                    cudaMemcpyDeviceToDevice, s));
-                        ops::increment_i32_scalar(io_.ar_pos, s);
+                        ops::increment_i32_scalar(io_.mtp->position, s);
                     }
                 } else {
                     mtp_prefill_chunk(mtp_ids, xf, mtp_input_embeddings_ptr, positions,

@@ -5,8 +5,8 @@
 //   ./ninfer_sampling_select_bench --matrix
 #include "core/device.h"
 #include "core/tensor.h"
-#include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_round.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_runtime.h>
@@ -205,7 +205,6 @@ void run_mtp(DBuf& logits, DBuf& counts, int k, Mode mode, bool counts_active, i
     DBuf sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
     DBuf num(sizeof(std::int32_t));
     DBuf accepted(sizeof(std::int32_t));
-    DBuf ar_pos(sizeof(std::int32_t));
     DBuf stats = make_i64_zero(kStats);
 
     Tensor ttargets(targets.p, DType::I32, {k + 1});
@@ -216,7 +215,6 @@ void run_mtp(DBuf& logits, DBuf& counts, int k, Mode mode, bool counts_active, i
     Tensor tsampled(sampled.p, DType::I32, {k + 1});
     Tensor tnum(num.p, DType::I32, {1});
     Tensor taccepted(accepted.p, DType::I32, {1});
-    Tensor tar_pos(ar_pos.p, DType::I32, {1});
     Tensor tstats(stats.p, DType::I64, {kStats});
     WorkspaceArena workspace(ops::sampling_workspace_bytes(kTokenDomain, k + 1));
     const auto* config_ptr = static_cast<const ops::SamplingConfig*>(config.p);
@@ -225,9 +223,9 @@ void run_mtp(DBuf& logits, DBuf& counts, int k, Mode mode, bool counts_active, i
                                                : stochastic_payload_bytes(k + 1, counts_active);
     const Result result = bench_loop(
         [&](cudaStream_t stream) {
-            ops::mtp_accept_tokens(ttargets, tlogits, tdrafts, tlength, ttoken, tsampled, tnum,
-                                   taccepted, tar_pos, tstats, kTokenDomain, config_ptr, workspace,
-                                   stream);
+            ops::speculative_accept_greedy_drafts(ttargets, tlogits, tdrafts, tlength, ttoken,
+                                                  tsampled, tnum, taccepted, tstats, kTokenDomain,
+                                                  config_ptr, workspace, stream);
         },
         bytes);
     const std::string label = std::string("G3 K=") + std::to_string(k) + " " +

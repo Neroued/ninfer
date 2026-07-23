@@ -90,4 +90,22 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
     detail::w8_attn_input_dispatch(x, query_key_gate_value_weight, q, gate, k, v, stream);
 }
 
+void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
+                     Tensor& v, WorkspaceArena& ws, cudaStream_t stream) {
+    constexpr std::int32_t kHidden = 2048;
+    constexpr std::int32_t kQRows  = 4096;
+    constexpr std::int32_t kKvRows = 1024;
+    constexpr std::int32_t kRows   = 6144;
+    const std::int32_t cols        = x.ne[1];
+    if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(q, kQRows, cols, "q");
+    require_matrix(k, kKvRows, cols, "k");
+    require_matrix(v, kKvRows, cols, "v");
+    require_w8_rowsplit(query_key_value_weight, kRows, "query/key/value weight");
+
+    (void)ws;
+    detail::w8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
+}
+
 } // namespace ninfer::ops

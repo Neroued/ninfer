@@ -41,6 +41,23 @@ struct W8SplitOutput2 {
     }
 };
 
+template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2>
+struct W8SplitOutput3 {
+    static_assert(Rows0 > 0 && Rows1 > 0 && Rows2 > 0);
+
+    __nv_bfloat16* out0;
+    __nv_bfloat16* out1;
+    __nv_bfloat16* out2;
+
+    __device__ __forceinline__ W8OutputTile tile(std::int32_t parent_row_begin) const {
+        constexpr std::int32_t split1 = Rows0;
+        constexpr std::int32_t split2 = Rows0 + Rows1;
+        if (parent_row_begin < split1) { return {out0, Rows0, 0}; }
+        if (parent_row_begin < split2) { return {out1, Rows1, split1}; }
+        return {out2, Rows2, split2};
+    }
+};
+
 template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2, std::int32_t Rows3>
 struct W8SplitOutput4 {
     static_assert(Rows0 > 0 && Rows1 > 0 && Rows2 > 0 && Rows3 > 0);

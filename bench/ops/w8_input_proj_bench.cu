@@ -9,8 +9,10 @@
 #include "core/device.h"
 #include "ninfer_bench_common.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
+#include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
+#include "ops/linear/w8/w8_rowsplit_launch.h"
 
 #include <cuda_runtime.h>
 
@@ -31,16 +33,19 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kHidden     = 2048;
-constexpr std::int32_t kAttnQRows  = 4096;
-constexpr std::int32_t kAttnKvRows = 512;
-constexpr std::int32_t kAttnRows   = 9216;
-constexpr std::int32_t kGdnQkvRows = 8192;
-constexpr std::int32_t kGdnZRows   = 4096;
-constexpr std::int32_t kGdnRows    = 12288;
-constexpr std::size_t kFlushBytes  = 256ULL << 20;
+constexpr std::int32_t kHidden              = 2048;
+constexpr std::int32_t kAttnQRows           = 4096;
+constexpr std::int32_t kAttnKvRows          = 512;
+constexpr std::int32_t kAttnRows            = 9216;
+constexpr std::int32_t kCompanionAttnQRows  = 4096;
+constexpr std::int32_t kCompanionAttnKvRows = 1024;
+constexpr std::int32_t kCompanionAttnRows   = 6144;
+constexpr std::int32_t kGdnQkvRows          = 8192;
+constexpr std::int32_t kGdnZRows            = 4096;
+constexpr std::int32_t kGdnRows             = 12288;
+constexpr std::size_t kFlushBytes           = 256ULL << 20;
 
-enum class OpSelection { All, Attention, Gdn, GdnSnapshot };
+enum class OpSelection { All, Attention, CompanionAttention, Gdn, GdnSnapshot };
 
 struct Options {
     OpSelection op = OpSelection::All;
@@ -48,6 +53,8 @@ struct Options {
     int warmup = 5;
     int repeat = 30;
     std::string csv_out;
+    bool profile         = false;
+    bool production_only = false;
 };
 
 struct Stats {
@@ -155,12 +162,15 @@ Options parse_options(int argc, char** argv) {
                 options.op = OpSelection::All;
             else if (value == "attention")
                 options.op = OpSelection::Attention;
+            else if (value == "companion-attention")
+                options.op = OpSelection::CompanionAttention;
             else if (value == "gdn")
                 options.op = OpSelection::Gdn;
             else if (value == "gdn-snapshot")
                 options.op = OpSelection::GdnSnapshot;
             else
-                throw std::invalid_argument("--op must be all, attention, gdn, or gdn-snapshot");
+                throw std::invalid_argument(
+                    "--op must be all, attention, companion-attention, gdn, or gdn-snapshot");
         } else if (arg == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep value"));
         } else if (arg == "--warmup") {
@@ -169,10 +179,15 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(std::string(next("--repeat value")));
         } else if (arg == "--csv-out") {
             options.csv_out = next("--csv-out path");
+        } else if (arg == "--profile") {
+            options.profile = true;
+        } else if (arg == "--production-only") {
+            options.production_only = true;
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--op all|attention|gdn|gdn-snapshot] "
+            std::printf("Usage: %s [--op all|attention|companion-attention|gdn|gdn-snapshot] "
                         "[--t-sweep 1,2,...] "
-                        "[--warmup N] [--repeat N] [--csv-out PATH]\n",
+                        "[--warmup N] [--repeat N] [--csv-out PATH] [--profile] "
+                        "[--production-only]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -181,6 +196,14 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
+    }
+    if (options.profile &&
+        (options.op != OpSelection::CompanionAttention || options.t_sweep.size() != 1)) {
+        throw std::invalid_argument(
+            "--profile requires --op companion-attention and exactly one T");
+    }
+    if (options.production_only && options.op != OpSelection::CompanionAttention) {
+        throw std::invalid_argument("--production-only requires --op companion-attention");
     }
     return options;
 }
@@ -247,6 +270,21 @@ ops::detail::W8KernelVariant mma_variant(std::int32_t t) {
                           : ops::detail::W8KernelVariant::Predicated;
 }
 
+ops::detail::W8KernelVariant mma_c64_variant(std::int32_t t) {
+    return (t % 64) == 0 ? ops::detail::W8KernelVariant::Full
+                         : ops::detail::W8KernelVariant::Predicated;
+}
+
+ops::detail::W8KernelVariant mma_c96_variant(std::int32_t t) {
+    return (t % 96) == 0 ? ops::detail::W8KernelVariant::Full
+                         : ops::detail::W8KernelVariant::Predicated;
+}
+
+ops::detail::W8KernelVariant mma_c80_variant(std::int32_t t) {
+    return (t % 80) == 0 ? ops::detail::W8KernelVariant::Full
+                         : ops::detail::W8KernelVariant::Predicated;
+}
+
 bench::DBuf make_i32(std::int32_t value) {
     bench::DBuf device(sizeof(value));
     CUDA_CHECK(cudaMemcpy(device.p, &value, sizeof(value), cudaMemcpyHostToDevice));
@@ -266,6 +304,114 @@ int main(int argc, char** argv) {
         bench::DBuf input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         WorkspaceArena workspace(1);
         std::vector<Result> results;
+
+        if (options.op == OpSelection::All || options.op == OpSelection::CompanionAttention) {
+            DevicePackedWeight packed = make_w8_weight(kCompanionAttnRows);
+            bench::DBuf parent(static_cast<std::size_t>(kCompanionAttnRows) * max_t * 2);
+            bench::DBuf q(static_cast<std::size_t>(kCompanionAttnQRows) * max_t * 2);
+            bench::DBuf k(static_cast<std::size_t>(kCompanionAttnKvRows) * max_t * 2);
+            bench::DBuf v(static_cast<std::size_t>(kCompanionAttnKvRows) * max_t * 2);
+            for (const std::int32_t t : options.t_sweep) {
+                Tensor x(input.p, DType::BF16, {kHidden, t});
+                Tensor out_parent(parent.p, DType::BF16, {kCompanionAttnRows, t});
+                Tensor tq(q.p, DType::BF16, {kCompanionAttnQRows, t});
+                Tensor tk(k.p, DType::BF16, {kCompanionAttnKvRows, t});
+                Tensor tv(v.p, DType::BF16, {kCompanionAttnKvRows, t});
+                if (options.profile) {
+                    ops::attn_input_proj(x, packed.weight, tq, tk, tv, workspace, stream);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    const auto plan = ops::detail::w8_attn_input_resolve_plan(
+                        {kHidden, kCompanionAttnQRows, kCompanionAttnKvRows, kCompanionAttnRows,
+                         kHidden, t});
+                    std::printf("profile companion-attention T=%d route=%s\n", t,
+                                ops::detail::w8_attn_input_schedule_name(plan.schedule));
+                    continue;
+                }
+                const auto parent_launch = [&](cudaStream_t s) {
+                    const ops::detail::W8ScheduleId schedule =
+                        t <= 16    ? ops::detail::W8ScheduleId::SimtR8C4
+                        : t <= 128 ? ops::detail::W8ScheduleId::MmaR32C128
+                                   : ops::detail::W8ScheduleId::MmaR64C128;
+                    const ops::detail::W8KernelVariant variant =
+                        schedule == ops::detail::W8ScheduleId::SimtR8C4 ? simt_variant(t)
+                                                                        : mma_variant(t);
+                    ops::detail::w8_rowsplit_launch_candidate(schedule, variant, x, packed.weight,
+                                                              out_parent, s);
+                };
+                const auto run = [&](const char* path, auto&& launch) {
+                    append(results, "comp_attn", path, t,
+                           measure_cold(launch, flush, stream, options.warmup, options.repeat),
+                           kCompanionAttnRows);
+                };
+                run("production", [&](cudaStream_t s) {
+                    ops::attn_input_proj(x, packed.weight, tq, tk, tv, workspace, s);
+                });
+                if (options.production_only) { continue; }
+                if (t == 1) {
+                    run("decode_direct", [&](cudaStream_t s) {
+                        ops::detail::w8_attn_input_decode_launch(x, packed.weight, tq, tk, tv, s);
+                    });
+                    run("decode_r4", [&](cudaStream_t s) {
+                        ops::detail::w8_companion_attn_input_decode_r4_launch(x, packed.weight, tq,
+                                                                              tk, tv, s);
+                    });
+                    run("decode_r16", [&](cudaStream_t s) {
+                        ops::detail::w8_companion_attn_input_decode_r16_launch(x, packed.weight, tq,
+                                                                               tk, tv, s);
+                    });
+                }
+                run("simt_r8_c4", [&](cudaStream_t s) {
+                    ops::detail::w8_attn_input_simt_r8_c4_launch(simt_variant(t), x, packed.weight,
+                                                                 tq, tk, tv, s);
+                });
+                if (t >= 2 && t <= 96) {
+                    run("splitk_mma_direct", [&](cudaStream_t s) {
+                        ops::detail::w8_attn_input_splitk_mma_launch(
+                            ops::detail::W8KernelVariant::None, x, packed.weight, tq, tk, tv, s);
+                    });
+                }
+                run("mma_r32_c128", [&](cudaStream_t s) {
+                    ops::detail::w8_attn_input_mma_r32_c128_launch(mma_variant(t), x, packed.weight,
+                                                                   tq, tk, tv, s);
+                });
+                run("mma_r64_c128", [&](cudaStream_t s) {
+                    ops::detail::w8_attn_input_mma_r64_c128_launch(mma_variant(t), x, packed.weight,
+                                                                   tq, tk, tv, s);
+                });
+                run("mma_r32_c64", [&](cudaStream_t s) {
+                    ops::detail::w8_companion_attn_input_mma_r32_c64_launch(
+                        mma_c64_variant(t), x, packed.weight, tq, tk, tv, s);
+                });
+                run("mma_r64_c64", [&](cudaStream_t s) {
+                    ops::detail::w8_companion_attn_input_mma_r64_c64_launch(
+                        mma_c64_variant(t), x, packed.weight, tq, tk, tv, s);
+                });
+                run("mma_r32_c96", [&](cudaStream_t s) {
+                    ops::detail::w8_companion_attn_input_mma_r32_c96_launch(
+                        mma_c96_variant(t), x, packed.weight, tq, tk, tv, s);
+                });
+                run("mma_r64_c96", [&](cudaStream_t s) {
+                    ops::detail::w8_companion_attn_input_mma_r64_c96_launch(
+                        mma_c96_variant(t), x, packed.weight, tq, tk, tv, s);
+                });
+                run("mma_r128_c64", [&](cudaStream_t s) {
+                    ops::detail::w8_companion_attn_input_mma_r128_c64_launch(
+                        mma_c64_variant(t), x, packed.weight, tq, tk, tv, s);
+                });
+                run("mma_r128_c80", [&](cudaStream_t s) {
+                    ops::detail::w8_companion_attn_input_mma_r128_c80_launch(
+                        mma_c80_variant(t), x, packed.weight, tq, tk, tv, s);
+                });
+                run("parent_candidate", parent_launch);
+                run("parent_plus_extract", [&](cudaStream_t s) {
+                    parent_launch(s);
+                    ops::extract_bf16_columns(out_parent, 0, tq, s);
+                    ops::extract_bf16_columns(out_parent, kCompanionAttnQRows, tk, s);
+                    ops::extract_bf16_columns(out_parent,
+                                              kCompanionAttnQRows + kCompanionAttnKvRows, tv, s);
+                });
+            }
+        }
 
         if (options.op == OpSelection::All || options.op == OpSelection::Attention) {
             DevicePackedWeight packed = make_w8_weight(kAttnRows);

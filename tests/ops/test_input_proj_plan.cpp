@@ -125,23 +125,23 @@ void w8_attn_route_tests() {
         W8KernelVariant variant;
     };
 
-    constexpr std::array<Case, 23> cases{{
+    constexpr std::array<Case, 23> target_cases{{
         {1, W8AttnInputScheduleId::DecodeR8Direct, W8KernelVariant::None},
-        {2, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {3, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {4, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {5, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {6, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {7, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {8, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {9, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {10, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {11, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {12, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {13, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {14, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {15, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
-        {16, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {2, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {3, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {4, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {5, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {6, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {7, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {8, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {9, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {10, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {11, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {12, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {13, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {14, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {15, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {16, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
         {17, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Predicated},
         {127, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Predicated},
         {128, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Full},
@@ -150,20 +150,53 @@ void w8_attn_route_tests() {
         {1024, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
         {2048, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
     }};
-    for (const Case test : cases) {
-        const W8AttnInputProblem problem{2048, 4096, 512, 9216, 2048, test.cols};
-        const auto plan = ninfer::ops::detail::w8_attn_input_resolve_plan(problem);
-        if (plan.schedule != test.schedule || plan.variant != test.variant ||
-            plan.workspace_bytes != 0) {
-            std::cerr << "wrong W8 attention input route C=" << test.cols << '\n';
-            ++failures;
+    constexpr std::array<Case, 23> companion_cases{{
+        {1, W8AttnInputScheduleId::DecodeR8Direct, W8KernelVariant::None},
+        {2, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {16, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {32, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {96, W8AttnInputScheduleId::SplitKMmaDirect, W8KernelVariant::None},
+        {97, W8AttnInputScheduleId::MmaR32C64, W8KernelVariant::Predicated},
+        {192, W8AttnInputScheduleId::MmaR32C64, W8KernelVariant::Full},
+        {193, W8AttnInputScheduleId::MmaR64C96, W8KernelVariant::Predicated},
+        {288, W8AttnInputScheduleId::MmaR64C96, W8KernelVariant::Full},
+        {289, W8AttnInputScheduleId::MmaR64C64, W8KernelVariant::Predicated},
+        {320, W8AttnInputScheduleId::MmaR64C64, W8KernelVariant::Full},
+        {321, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
+        {384, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
+        {385, W8AttnInputScheduleId::MmaR128C64, W8KernelVariant::Predicated},
+        {448, W8AttnInputScheduleId::MmaR128C64, W8KernelVariant::Full},
+        {449, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Predicated},
+        {480, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Full},
+        {481, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Predicated},
+        {512, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Predicated},
+        {560, W8AttnInputScheduleId::MmaR128C80, W8KernelVariant::Full},
+        {561, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},
+        {1024, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
+        {2048, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Full},
+    }};
+    const auto check_cases = [&](const auto& cases, W8AttnInputProblem problem) {
+        for (const Case test : cases) {
+            problem.cols    = test.cols;
+            const auto plan = ninfer::ops::detail::w8_attn_input_resolve_plan(problem);
+            if (plan.schedule != test.schedule || plan.variant != test.variant ||
+                plan.workspace_bytes != 0) {
+                std::cerr << "wrong W8 attention input route rows=" << problem.parent_rows
+                          << " C=" << test.cols << '\n';
+                ++failures;
+            }
         }
-    }
+    };
+    check_cases(target_cases, {2048, 4096, 512, 9216, 2048, 1});
+    check_cases(companion_cases, {2048, 4096, 1024, 6144, 2048, 1});
     expect_invalid("W8 attention C0", [] {
         (void)ninfer::ops::detail::w8_attn_input_resolve_plan({2048, 4096, 512, 9216, 2048, 0});
     });
     expect_invalid("W8 attention unsupported shape", [] {
         (void)ninfer::ops::detail::w8_attn_input_resolve_plan({2048, 4096, 512, 9217, 2048, 1});
+    });
+    expect_invalid("W8 companion attention mixed geometry", [] {
+        (void)ninfer::ops::detail::w8_attn_input_resolve_plan({2048, 4096, 1024, 9216, 2048, 1});
     });
 }
 

@@ -682,7 +682,7 @@ This is one-dimensional RoPE. Target three-axis MRoPE and its `rope_delta` are n
 
 ### OP-A05: W8 `attn_input_proj [6144,2048]`
 
-**Status:** [ ] contract [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] contract [x] correctness [x] benchmark [x] route [ ] integration
 
 Add a Q/K/V overload to the existing attention-input projection family:
 
@@ -704,6 +704,30 @@ complete FP64 exact-decode oracle for all three outputs.
 
 The Op continues to output raw Q/K. A later kernel may not silently normalize or rotate them under
 this contract; that composition requires a fused semantic Op.
+
+**Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
+
+- The public three-output overload admits exactly W8 `[6144,2048]`, BF16 `x [2048,T]`, Q
+  `[4096,T]`, and distinct K/V `[1024,T]` allocations. `ninfer_linear_test` checks every
+  `T=1..16`, all output row seams, W8 group seams, guards and full writes, preserved input and
+  packed weight, Graph replay at `T=2/16`, sampled FP64 exact-decode projections throughout, and
+  one complete FP64 exact-decode comparison of every Q/K/V element.
+- `ninfer_w8_input_proj_bench --op companion-attention` retains decode, exact/medium split-K,
+  SIMT, eight MMA tile candidates, parent Linear, and parent-plus-three-extract controls. The
+  production sweep covers every `T=1..16` and every dispatch seam through prefill `T=1024`.
+  Selected direct routes are decode at `T=1`, exact or medium split-K Tensor Core at `T=2..96`,
+  and measured Tensor Core MMA tile schedules above 96. The critical small-T transition is
+  15.14/17.70 us at `T=16/17`, replacing the former 14.3/42.2 us cliff.
+- Cold-cache production latency is 13.54 us at `T=1`, 36.16 us at `T=96`, 124.16 us at
+  `T=896` (181.6 useful TFLOP/s), and 156.93 us at `T=1024` (164.2 useful TFLOP/s). At
+  `T=896/1024`, direct output is 2.4/1.3% faster than the same compiled RowSplit parent GEMM and
+  13.9/12.2% faster than parent-plus-extract, establishing the direct route at the measured W8
+  backend roofline without padded output traffic.
+- Focused NCU confirms that prefill executes exactly 25,769,803,776 useful BF16-FP32 HMMA
+  operations at `T=1024`; tensor-pipe utilization is 69.0% in the serialized profiler capture.
+  Decode consumes 948 GB/s of DRAM bandwidth, with 23.25 of 28.59 cycles per issued instruction
+  attributed to long-scoreboard latency. CTA-row candidates 4/8/16 all measure 13.57 us, so
+  `T=1` is at the empirical memory-latency/launch ceiling rather than an untuned occupancy point.
 
 ### OP-A06: W8 `linear_swiglu [12288,2048]`
 
@@ -1052,7 +1076,7 @@ commit together.
 | 0 | mask contract | Freeze non-causal symmetry and the inclusive `abs(delta)<4096` predicate | [x] | — | — | — |
 | 1 | `OP-A02` | Plain D2048/D128 RMSNorm domains | [x] | [x] | [x] | [ ] |
 | 2 | `OP-A04` | D128 full-head 1-D RoPE | [x] | [x] | [x] | [ ] |
-| 3 | `OP-A05` | W8 Q/K/V direct projection | [ ] | [ ] | [ ] | [ ] |
+| 3 | `OP-A05` | W8 Q/K/V direct projection | [x] | [x] | [x] | [ ] |
 | 4 | `OP-N03` | Bidirectional full GQA | [x] | [x] | [x] | [ ] |
 | 5 | `OP-N02` | Symmetric non-causal SWA | [x] | [x] | [x] | [ ] |
 | 6 | `OP-A06` | W8 fused dense SwiGLU | [ ] | [ ] | [ ] | [ ] |

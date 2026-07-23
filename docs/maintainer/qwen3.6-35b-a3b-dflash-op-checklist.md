@@ -279,7 +279,7 @@ preferred over a generic runtime attention framework.
 
 ### OP-N03: `bidirectional_gqa_attention`
 
-**Status:** [ ] definition [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] definition [x] correctness [x] benchmark [x] route [ ] integration
 
 **Definition**
 
@@ -315,6 +315,48 @@ head geometry and segmented-image semantics are not the public contract.
 - Benchmark hot and flushed-cache conditions; select routes by `B` and visible keys without
   changing the mathematical domain.
 - Close integration in the complete sixth companion layer and complete proposal graph.
+
+**Qualification result (2026-07-24)**
+
+The repository now owns the public semantic contract, wrapper, workspace calculation, compact
+`T=1..16` launcher, tensor-core kernel, split reducer, independent test, and candidate/production
+benchmark. The implementation keeps context and query K/V as separate read-only sources. A direct
+single-kernel route handles `L=0`; non-empty contexts use online-softmax split-KV partials followed
+by one reducer.
+
+`ninfer_bidirectional_gqa_attention_test` passed every `T=1..16` against an independent FP64
+full-attention oracle, with `L=0,1`, short route shapes, `L=4096`, both 32- and 64-key tiles, input
+immutability, output guards, and all-to-all query visibility. Across the random cases the largest
+observed relative L2 error was `2.754e-3`. Separate analytic equal-logit cases cover the exact
+`L=262144,T=2/16` maximum and replay each CUDA Graph twice; the T=16 maximum absolute error was
+`3.725e-9`.
+
+Production dispatch is the measured winner for these host execution envelopes:
+
+| T | `max_context` | Key tile | Split capacity |
+|---:|---:|---:|---:|
+| `1..8` | `1..131072` | 32 | `min(ceil(max_context/32),32)` |
+| `1..8` | `131073..196608` | 32 | 48 |
+| `1..8` | `196609..262144` | 32 | 64 |
+| `9..16` | `1..65536` | 32 | `min(ceil(max_context/32),32)` |
+| `9..16` | `65537..131072` | 64 | 32 |
+| `9..16` | `131073..196608` | 64 | 38 |
+| `9..16` | `196609..262144` | 64 | 40 |
+
+Every capacity is also capped by the number of context tiles, so a short exact envelope does not
+launch inactive split CTAs. Candidate controls remain benchmark-only.
+
+On RTX 5090, CUDA 13.1, `sm_120a`, a stable cold-cache CUDA Graph sweep at `L=262144` measured
+`663.3..670.7 us` median across `T=1..16`. This is
+`1.595..1.619 TB/s` of useful traffic and `89.0..90.3%` of the
+`max(bytes/1792 GB/s, FLOPs/209.5 TFLOP/s)` roofline. The corresponding hot-cache sweep measured
+`649.0..655.2 us`, or `91.5..92.3%` of the same conservative DRAM roofline. Nsight Compute on
+`T=16` confirmed the selected 64-key/40-split launch: 320 CTAs, 0.94 waves/SM, 242
+registers/thread, 32.77 KiB dynamic shared memory, and 7.50 achieved active warps/SM. Nsight replay
+timing is not substituted for the graph benchmark.
+
+The remaining unchecked integration gate belongs to the complete sixth companion layer and
+proposal graph, which do not exist yet.
 
 ### OP-N04: `kv_cache_append_prefix`
 
@@ -852,7 +894,7 @@ commit together.
 | 1 | `OP-A02` | Plain D2048/D128 RMSNorm domains | [ ] | [ ] | [ ] | [ ] |
 | 2 | `OP-A04` | D128 full-head 1-D RoPE | [ ] | [ ] | [ ] | [ ] |
 | 3 | `OP-A05` | W8 Q/K/V direct projection | [ ] | [ ] | [ ] | [ ] |
-| 4 | `OP-N03` | Bidirectional full GQA | [ ] | [ ] | [ ] | [ ] |
+| 4 | `OP-N03` | Bidirectional full GQA | [x] | [x] | [x] | [ ] |
 | 5 | `OP-N02` | Symmetric non-causal SWA | [ ] | [ ] | [ ] | [ ] |
 | 6 | `OP-A06` | W8 fused dense SwiGLU | [ ] | [ ] | [ ] | [ ] |
 | 7 | `OP-A07` | W8 MLP down plus residual | [ ] | [ ] | [ ] | [ ] |

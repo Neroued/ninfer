@@ -377,7 +377,6 @@ after the P0 contractions and state transitions are optimized.
 | DV-13 | [ ] | `embedding` | 1 | W8 `[248320,2048]`, gathered ids for `T=1..16`; include repeated ids and physical row decode. | `test_embedding`; `embedding_bench` |
 | DV-14 | [ ] | `offset_i32_positions` | 1 | Exact position construction for all `T`, including near context limit. | `test_position`; dedicated benchmark missing |
 | DV-15 | [ ] | `argmax` | 1 | Q6-head output with `T=1..16`, physical stride, valid vocabulary rows, stable ties. | `test_argmax`; `argmax_bench` |
-| DV-16 | [ ] | `sample` | 1 per ordinary/accepted publication path | Sampling semantics and cost on the final committed column; penalties and seeded behavior remain unchanged. | `test_sampling`; `sampling_select_bench` |
 
 ### P0 measurement infrastructure
 

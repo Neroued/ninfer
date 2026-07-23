@@ -575,6 +575,33 @@ phase.
 - Benchmark production candidates at both round and prefill scopes and verify the chosen route in
   the target-feature conditioning stage.
 
+**Op-layer evidence**
+
+- The W8 closed catalog now admits `[2048,16384]`. Production dispatch uses the direct K=16384
+  decode kernel at `T=1`, exact split-K Tensor Core kernels at `T=2..32`, composite exact
+  prefix/tail kernels at `T=33..88`, medium split-K kernels at `T=89..144`, and measured tiled
+  Tensor Core schedules above that range. Awkward tiled tails use the conditioning-only exact-tail
+  policy rather than paying for an additional padded tile.
+- The independent test exact-decodes signed W8 codes and FP16 scales and evaluates the complete
+  formula in FP64 for every `T=1..16`. Sparse cases cross all eight 2048-element source-slice
+  boundaries and W8 group seams and include negative and cancelling contributions. Dense sampled
+  checks cover 82 route/tail points through `T=2176`; guards, complete initialized writes,
+  input/weight preservation, and CUDA Graph capture/replay are checked on decode, medium,
+  exact-tail, and large tiled routes.
+- A cold-cache production sweep covers every `T=1..2112`. Representative latency is 31.49 us at
+  `T=1`, 46.24 us at `T=16`, 179.36 us at `T=128`, 480.51 us at the default `T=1024`, and
+  486.50 us / 176.57 useful TFLOP/s at `T=1280`. The latter is 80.0% of the same-process
+  220.83-TFLOP/s BF16 Tensor Core probe. The exact-tail policy reduces the former principal
+  tiled-boundary cliffs to 4.3% at `640/641`, 3.2% at `896/897`, and 3.0% at `960/961`;
+  remaining small-T discontinuities coincide with the measured fastest launch-count or kernel
+  family transition.
+- Focused NCU captures execute exactly the useful BF16-FP32 HMMA work: 1,073,741,824 operations at
+  `T=16`, 8,589,934,592 at `T=128`, and 85,899,345,920 at `T=1280`. The main prefill kernel
+  reaches 77.4% tensor-pipe active cycles; its remaining roofline gap is the required W8
+  code/scale decode and operand staging. Decode reaches 1.16 TB/s and is dominated by long
+  scoreboard latency, confirming the memory-bound route.
+- Target, Program, and Engine wiring remains intentionally unchecked in this Op-only phase.
+
 ### OP-A02: plain `rmsnorm`
 
 **Status:** [x] shape coverage [x] correctness [x] benchmark [x] route [ ] integration

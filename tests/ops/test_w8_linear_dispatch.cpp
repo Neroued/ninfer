@@ -22,6 +22,7 @@ namespace {
 
 using S = ops::detail::W8ScheduleId;
 using V = ops::detail::W8KernelVariant;
+using P = ops::detail::W8TailPolicy;
 
 int failures = 0;
 
@@ -190,6 +191,7 @@ struct RoutePoint {
     std::int32_t cols;
     S schedule;
     V variant;
+    P tail_policy = P::Homogeneous;
 };
 
 constexpr std::array<RoutePoint, 6> kDefault17Routes{{
@@ -276,6 +278,84 @@ constexpr std::array<RoutePoint, 8> kText9216x2048Routes{{
     {1024, S::MmaR64C128, V::Full},
 }};
 
+constexpr std::array<RoutePoint, 75> kConditioning2048x16384Routes{{
+    {1, S::DecodeR4, V::None},
+    {2, S::SplitKMmaExactT, V::None},
+    {32, S::SplitKMmaExactT, V::None},
+    {33, S::SplitKMma32PlusTail, V::None},
+    {88, S::SplitKMma32PlusTail, V::None},
+    {89, S::SplitKMediumC96, V::None},
+    {96, S::SplitKMediumC96, V::None},
+    {97, S::SplitKMediumC128, V::None},
+    {128, S::SplitKMediumC128, V::None},
+    {129, S::SplitKMediumC144, V::None},
+    {144, S::SplitKMediumC144, V::None},
+    {145, S::MmaR32C128, V::Predicated},
+    {255, S::MmaR32C128, V::Predicated},
+    {256, S::MmaR32C64, V::Full},
+    {384, S::MmaR32C64, V::Full},
+    {385, S::MmaR32C96, V::Predicated},
+    {480, S::MmaR32C96, V::Full},
+    {481, S::MmaR32C96, V::Predicated, P::ConditioningExact},
+    {482, S::MmaR32C128, V::Predicated},
+    {640, S::MmaR32C128, V::Full},
+    {641, S::MmaR32C128, V::Predicated, P::ConditioningExact},
+    {668, S::MmaR32C128, V::Predicated, P::ConditioningExact},
+    {669, S::MmaR48C96, V::Predicated},
+    {672, S::MmaR48C96, V::Predicated},
+    {673, S::MmaR48C96, V::Predicated, P::ConditioningExact},
+    {674, S::MmaR48C64, V::Predicated},
+    {704, S::MmaR48C64, V::Predicated},
+    {705, S::MmaR48C112, V::Predicated},
+    {784, S::MmaR48C112, V::Predicated},
+    {785, S::MmaR48C128, V::Predicated},
+    {896, S::MmaR48C128, V::Predicated},
+    {897, S::MmaR48C128, V::Predicated, P::ConditioningExact},
+    {912, S::MmaR48C128, V::Predicated, P::ConditioningExact},
+    {913, S::MmaR64C96, V::Predicated},
+    {960, S::MmaR64C96, V::Full},
+    {961, S::MmaR64C96, V::Predicated, P::ConditioningExact},
+    {1007, S::MmaR64C96, V::Predicated, P::ConditioningExact},
+    {1008, S::MmaR64C112, V::Full},
+    {1009, S::MmaR64C128, V::Predicated},
+    {1023, S::MmaR64C128, V::Predicated},
+    {1024, S::MmaR64C128, V::Full},
+    {1025, S::MmaR64C128, V::Predicated},
+    {1119, S::MmaR64C128, V::Predicated},
+    {1120, S::MmaR64C112, V::Full},
+    {1121, S::MmaR64C128, V::Predicated},
+    {1152, S::MmaR64C128, V::Full},
+    {1280, S::MmaR64C128, V::Full},
+    {1281, S::MmaR64C128, V::Predicated, P::ConditioningExact},
+    {1313, S::MmaR64C128, V::Predicated, P::ConditioningExact},
+    {1314, S::MmaR128C64, V::Predicated},
+    {1344, S::MmaR128C64, V::Full},
+    {1345, S::MmaR96C96, V::Predicated},
+    {1440, S::MmaR96C96, V::Predicated},
+    {1441, S::MmaR96C96, V::Predicated, P::ConditioningExact},
+    {1500, S::MmaR96C96, V::Predicated, P::ConditioningExact},
+    {1501, S::MmaR128C80, V::Predicated},
+    {1680, S::MmaR128C80, V::Full},
+    {1681, S::MmaR128C80, V::Predicated, P::ConditioningExact},
+    {1745, S::MmaR128C80, V::Predicated, P::ConditioningExact},
+    {1746, S::MmaR48C128, V::Predicated},
+    {1791, S::MmaR48C128, V::Predicated},
+    {1792, S::MmaR64C128, V::Full},
+    {1793, S::MmaR48C128, V::Predicated},
+    {1919, S::MmaR48C128, V::Predicated},
+    {1920, S::MmaR64C128, V::Full},
+    {1921, S::MmaR64C128, V::Predicated, P::ConditioningExact},
+    {1953, S::MmaR64C128, V::Predicated, P::ConditioningExact},
+    {1954, S::MmaR64C96, V::Predicated},
+    {2016, S::MmaR64C96, V::Full},
+    {2017, S::MmaR64C96, V::Predicated, P::ConditioningExact},
+    {2048, S::MmaR64C96, V::Predicated, P::ConditioningExact},
+    {2049, S::MmaR96C96, V::Predicated},
+    {2112, S::MmaR96C96, V::Predicated},
+    {2113, S::MmaR64C128, V::Predicated},
+    {2176, S::MmaR64C128, V::Full},
+}};
+
 struct SupportCase {
     const char* label;
     std::int32_t rows;
@@ -318,7 +398,8 @@ void run_support(const SupportCase& support) {
 
         const ops::detail::W8Plan plan =
             ops::detail::w8_rowsplit_resolve_plan({support.rows, support.k, support.k, route.cols});
-        if (plan.schedule != route.schedule || plan.variant != route.variant) {
+        if (plan.schedule != route.schedule || plan.variant != route.variant ||
+            plan.tail_policy != route.tail_policy) {
             std::cerr << "FAIL " << label << ": unexpected resolved plan\n";
             ++failures;
         }
@@ -331,7 +412,7 @@ void run_support(const SupportCase& support) {
             ops::linear(x, weight, public_out, workspace, nullptr);
             require_cuda(cudaDeviceSynchronize(), "public linear synchronize");
             ops::detail::w8_rowsplit_launch_candidate(plan.schedule, plan.variant, x, weight,
-                                                      fixed_out, nullptr);
+                                                      fixed_out, nullptr, plan.tail_policy);
             require_cuda(cudaDeviceSynchronize(), "fixed linear synchronize");
         } catch (const std::exception& error) {
             std::cerr << "FAIL " << label << ": launch failed: " << error.what() << '\n';
@@ -435,7 +516,7 @@ int main() {
         return 0;
     }
 
-    constexpr std::array<SupportCase, 13> supports{{
+    constexpr std::array<SupportCase, 14> supports{{
         {"W8 [5120,10240]", 5120, 10240, kDefault17Routes.data(), kDefault17Routes.size(), 11u},
         {"W8 [14336,5120]", 14336, 5120, kEarly9Routes.data(), kEarly9Routes.size(), 13u},
         {"W8 [1024,5120]", 1024, 5120, kR32Routes.data(), kR32Routes.size(), 17u},
@@ -452,6 +533,8 @@ int main() {
          53u},
         {"W8 [9216,2048]", 9216, 2048, kText9216x2048Routes.data(), kText9216x2048Routes.size(),
          59u},
+        {"W8 conditioning [2048,16384]", 2048, 16384, kConditioning2048x16384Routes.data(),
+         kConditioning2048x16384Routes.size(), 61u},
     }};
 
     try {

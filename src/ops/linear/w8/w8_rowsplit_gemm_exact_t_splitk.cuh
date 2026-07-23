@@ -153,7 +153,8 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
     cp_wait<0>();
     __syncthreads();
 
-#pragma unroll
+    constexpr int kGroupUnroll = Hidden <= 6144 ? kGroups : 12;
+#pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;
 

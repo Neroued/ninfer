@@ -19,11 +19,13 @@ using ninfer::ops::detail::W8PairScheduleId;
 using ninfer::ops::detail::W8Plan;
 using ninfer::ops::detail::W8Problem;
 using ninfer::ops::detail::W8ScheduleId;
+using ninfer::ops::detail::W8TailPolicy;
 
 namespace {
 
 using S = W8ScheduleId;
 using V = W8KernelVariant;
+using P = W8TailPolicy;
 
 int failures = 0;
 
@@ -34,10 +36,45 @@ void fail(const std::string& label, const std::string& message) {
 
 std::string plan_name(W8Plan plan) {
     return std::string(ninfer::ops::detail::w8_schedule_name(plan.schedule)) + "." +
-           ninfer::ops::detail::w8_kernel_variant_name(plan.variant);
+           ninfer::ops::detail::w8_kernel_variant_name(plan.variant) +
+           (plan.tail_policy == P::ConditioningExact ? ".conditioning_exact_tail" : "");
 }
 
 S expected_schedule(const W8Problem& problem) {
+    if (problem.rows == 2048 && problem.k == 16384) {
+        if (problem.cols == 1) { return S::DecodeR4; }
+        if (problem.cols <= 32) { return S::SplitKMmaExactT; }
+        if (problem.cols <= 88) { return S::SplitKMma32PlusTail; }
+        if (problem.cols <= 96) { return S::SplitKMediumC96; }
+        if (problem.cols <= 128) { return S::SplitKMediumC128; }
+        if (problem.cols <= 144) { return S::SplitKMediumC144; }
+        if (problem.cols <= 255) { return S::MmaR32C128; }
+        if (problem.cols <= 384) { return S::MmaR32C64; }
+        if (problem.cols <= 480) { return S::MmaR32C96; }
+        if (problem.cols == 481) { return S::MmaR32C96; }
+        if (problem.cols <= 668) { return S::MmaR32C128; }
+        if (problem.cols <= 673) { return S::MmaR48C96; }
+        if (problem.cols <= 704) { return S::MmaR48C64; }
+        if (problem.cols <= 784) { return S::MmaR48C112; }
+        if (problem.cols <= 912) { return S::MmaR48C128; }
+        if (problem.cols <= 1007) { return S::MmaR64C96; }
+        if (problem.cols == 1008) { return S::MmaR64C112; }
+        if (problem.cols <= 1119) { return S::MmaR64C128; }
+        if (problem.cols == 1120) { return S::MmaR64C112; }
+        if (problem.cols <= 1280) { return S::MmaR64C128; }
+        if (problem.cols <= 1313) { return S::MmaR64C128; }
+        if (problem.cols <= 1344) { return S::MmaR128C64; }
+        if (problem.cols <= 1500) { return S::MmaR96C96; }
+        if (problem.cols <= 1745) { return S::MmaR128C80; }
+        if (problem.cols <= 1791) { return S::MmaR48C128; }
+        if (problem.cols == 1792) { return S::MmaR64C128; }
+        if (problem.cols <= 1919) { return S::MmaR48C128; }
+        if (problem.cols == 1920) { return S::MmaR64C128; }
+        if (problem.cols <= 1953) { return S::MmaR64C128; }
+        if (problem.cols <= 2048) { return S::MmaR64C96; }
+        if (problem.cols <= 2112) { return S::MmaR96C96; }
+        return S::MmaR64C128;
+    }
     if (problem.rows == 14336 || problem.rows == 34816) {
         if (problem.cols <= 4) { return S::SimtR8C4; }
         if (problem.cols <= 8) { return S::SimtR8C8; }
@@ -87,12 +124,29 @@ S expected_schedule(const W8Problem& problem) {
 }
 
 V expected_variant(S schedule, const W8Problem& problem) {
-    const int rows  = schedule == S::MmaR32C128 ? 32 : (schedule == S::MmaR64C128 ? 64 : 8);
-    const int cols  = schedule == S::SimtR8C4 ? 4 : (schedule == S::SimtR8C8 ? 8 : 128);
-    const bool full = problem.rows % rows == 0 && problem.cols % cols == 0 &&
-                      (!ninfer::ops::detail::w8_schedule_uses_mma(schedule) ||
-                       (problem.k == problem.padded_k && problem.k % 64 == 0));
-    return full ? V::Full : V::Predicated;
+    if (ninfer::ops::detail::w8_candidate_is_legal(schedule, V::None, problem)) { return V::None; }
+    if (ninfer::ops::detail::w8_candidate_is_legal(schedule, V::Full, problem)) { return V::Full; }
+    return V::Predicated;
+}
+
+P expected_tail_policy(const W8Problem& problem) {
+    if (problem.rows != 2048 || problem.k != 16384) { return P::Homogeneous; }
+    switch (problem.cols) {
+    case 481:
+    case 673:
+        return P::ConditioningExact;
+    default:
+        return (problem.cols >= 641 && problem.cols <= 668) ||
+                       (problem.cols >= 897 && problem.cols <= 912) ||
+                       (problem.cols >= 961 && problem.cols <= 1007) ||
+                       (problem.cols >= 1281 && problem.cols <= 1313) ||
+                       (problem.cols >= 1441 && problem.cols <= 1500) ||
+                       (problem.cols >= 1681 && problem.cols <= 1745) ||
+                       (problem.cols >= 1921 && problem.cols <= 1953) ||
+                       (problem.cols >= 2017 && problem.cols <= 2048)
+                   ? P::ConditioningExact
+                   : P::Homogeneous;
+    }
 }
 
 void expect_plan(const std::string& label, const W8Problem& problem) {
@@ -101,10 +155,12 @@ void expect_plan(const std::string& label, const W8Problem& problem) {
         return;
     }
     const S schedule = expected_schedule(problem);
-    const W8Plan expected{schedule, expected_variant(schedule, problem)};
+    const W8Plan expected{schedule, expected_variant(schedule, problem),
+                          expected_tail_policy(problem)};
     try {
         const W8Plan actual = ninfer::ops::detail::w8_rowsplit_resolve_plan(problem);
-        if (actual.schedule != expected.schedule || actual.variant != expected.variant) {
+        if (actual.schedule != expected.schedule || actual.variant != expected.variant ||
+            actual.tail_policy != expected.tail_policy) {
             fail(label, "expected " + plan_name(expected) + ", got " + plan_name(actual));
         }
         if (!ninfer::ops::detail::w8_candidate_is_legal(actual.schedule, actual.variant, problem)) {
@@ -145,6 +201,19 @@ void route_boundaries() {
         {2048, 4096, 4096, 1025}, {12288, 2048, 2048, 1025}, {9216, 2048, 2048, 1025},
     }};
     for (const W8Problem& problem : cases) { expect_plan("route boundary", problem); }
+
+    constexpr std::int32_t conditioning_cols[]{
+        1,   2,    31,   32,   33,   88,   89,   96,   97,   128,  129,  144,
+        145, 255,  256,  384,  385,  480,  481,  482,  640,  641,  668,  669,
+        672, 673,  674,  704,  705,  784,  785,  896,  897,  912,  913,  960,
+        961, 1007, 1008, 1009, 1119, 1120, 1121, 1280, 1281, 1313, 1314, 1344,
+        1345, 1440, 1441, 1500, 1501, 1680, 1681, 1745, 1746, 1791, 1792, 1793,
+        1919, 1920, 1921, 1953, 1954, 2016, 2017, 2048, 2049, 2112, 2113, 2176,
+        4096, 8192,
+    };
+    for (const std::int32_t cols : conditioning_cols) {
+        expect_plan("conditioning route boundary", {2048, 16384, 16384, cols});
+    }
 }
 
 void rejection_contract() {

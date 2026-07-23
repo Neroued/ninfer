@@ -34,9 +34,10 @@ struct W8SupportSpec {
 struct W8RouteSpec {
     W8ColsSet cols;
     W8ScheduleId schedule;
+    W8TailPolicy tail_policy = W8TailPolicy::Homogeneous;
 };
 
-constexpr std::array<W8SupportSpec, 13> kSupportSpecs{{
+constexpr std::array<W8SupportSpec, 14> kSupportSpecs{{
     {5120, 10240, 10240, {1, kAnyCols, 1}, 0, 3},
     {14336, 5120, 5120, {1, kAnyCols, 1}, 3, 3},
     {1024, 5120, 5120, {1, kAnyCols, 1}, 6, 3},
@@ -50,9 +51,10 @@ constexpr std::array<W8SupportSpec, 13> kSupportSpecs{{
     {2048, 4096, 4096, {1, kAnyCols, 1}, 42, 3},
     {12288, 2048, 2048, {1, kAnyCols, 1}, 45, 2},
     {9216, 2048, 2048, {1, kAnyCols, 1}, 47, 3},
+    {2048, 16384, 16384, {1, kAnyCols, 1}, 50, 39},
 }};
 
-constexpr std::array<W8RouteSpec, 50> kRouteSpecs{{
+constexpr std::array<W8RouteSpec, 89> kRouteSpecs{{
     // [5120,10240]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 16, 1}, W8ScheduleId::SimtR8C8},
@@ -128,14 +130,89 @@ constexpr std::array<W8RouteSpec, 50> kRouteSpecs{{
     {{1, 13, 1}, W8ScheduleId::SimtR8C4},
     {{14, 128, 1}, W8ScheduleId::MmaR32C128},
     {{129, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
+
+    // DFlash conditioning projection [2048,16384]
+    {{1, 1, 1}, W8ScheduleId::DecodeR4},
+    {{2, 32, 1}, W8ScheduleId::SplitKMmaExactT},
+    {{33, 88, 1}, W8ScheduleId::SplitKMma32PlusTail},
+    {{89, 96, 1}, W8ScheduleId::SplitKMediumC96},
+    {{97, 128, 1}, W8ScheduleId::SplitKMediumC128},
+    {{129, 144, 1}, W8ScheduleId::SplitKMediumC144},
+    {{145, 255, 1}, W8ScheduleId::MmaR32C128},
+    {{256, 384, 1}, W8ScheduleId::MmaR32C64},
+    {{385, 480, 1}, W8ScheduleId::MmaR32C96},
+    {{481, 481, 1}, W8ScheduleId::MmaR32C96, W8TailPolicy::ConditioningExact},
+    {{482, 640, 1}, W8ScheduleId::MmaR32C128},
+    {{641, 668, 1}, W8ScheduleId::MmaR32C128, W8TailPolicy::ConditioningExact},
+    {{669, 672, 1}, W8ScheduleId::MmaR48C96},
+    {{673, 673, 1}, W8ScheduleId::MmaR48C96, W8TailPolicy::ConditioningExact},
+    {{674, 704, 1}, W8ScheduleId::MmaR48C64},
+    {{705, 784, 1}, W8ScheduleId::MmaR48C112},
+    {{785, 896, 1}, W8ScheduleId::MmaR48C128},
+    {{897, 912, 1}, W8ScheduleId::MmaR48C128, W8TailPolicy::ConditioningExact},
+    {{913, 960, 1}, W8ScheduleId::MmaR64C96},
+    {{961, 1007, 1}, W8ScheduleId::MmaR64C96, W8TailPolicy::ConditioningExact},
+    {{1008, 1008, 1}, W8ScheduleId::MmaR64C112},
+    {{1009, 1119, 1}, W8ScheduleId::MmaR64C128},
+    {{1120, 1120, 1}, W8ScheduleId::MmaR64C112},
+    {{1121, 1280, 1}, W8ScheduleId::MmaR64C128},
+    {{1281, 1313, 1}, W8ScheduleId::MmaR64C128, W8TailPolicy::ConditioningExact},
+    {{1314, 1344, 1}, W8ScheduleId::MmaR128C64},
+    {{1345, 1440, 1}, W8ScheduleId::MmaR96C96},
+    {{1441, 1500, 1}, W8ScheduleId::MmaR96C96, W8TailPolicy::ConditioningExact},
+    {{1501, 1680, 1}, W8ScheduleId::MmaR128C80},
+    {{1681, 1745, 1}, W8ScheduleId::MmaR128C80, W8TailPolicy::ConditioningExact},
+    {{1746, 1791, 1}, W8ScheduleId::MmaR48C128},
+    {{1792, 1792, 1}, W8ScheduleId::MmaR64C128},
+    {{1793, 1919, 1}, W8ScheduleId::MmaR48C128},
+    {{1920, 1920, 1}, W8ScheduleId::MmaR64C128},
+    {{1921, 1953, 1}, W8ScheduleId::MmaR64C128, W8TailPolicy::ConditioningExact},
+    {{1954, 2016, 1}, W8ScheduleId::MmaR64C96},
+    {{2017, 2048, 1}, W8ScheduleId::MmaR64C96, W8TailPolicy::ConditioningExact},
+    {{2049, 2112, 1}, W8ScheduleId::MmaR96C96},
+    {{2113, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
 }};
 
 constexpr bool known_schedule(W8ScheduleId schedule) noexcept {
     switch (schedule) {
+    case W8ScheduleId::DecodeR4:
+    case W8ScheduleId::DecodeR8:
+    case W8ScheduleId::DecodeR16:
+    case W8ScheduleId::SplitKMmaExactT:
+    case W8ScheduleId::SplitKMma32PlusTail:
+    case W8ScheduleId::SplitKMediumC48:
+    case W8ScheduleId::SplitKMediumC64:
+    case W8ScheduleId::SplitKMediumC96:
+    case W8ScheduleId::SplitKMediumC128:
+    case W8ScheduleId::SplitKMediumC144:
+    case W8ScheduleId::SplitKMediumC160:
     case W8ScheduleId::SimtR8C4:
     case W8ScheduleId::SimtR8C8:
+    case W8ScheduleId::MmaR32C32:
+    case W8ScheduleId::MmaR32C48:
+    case W8ScheduleId::MmaR32C64:
+    case W8ScheduleId::MmaR32C80:
+    case W8ScheduleId::MmaR32C96:
+    case W8ScheduleId::MmaR32C112:
     case W8ScheduleId::MmaR32C128:
+    case W8ScheduleId::MmaR48C64:
+    case W8ScheduleId::MmaR48C80:
+    case W8ScheduleId::MmaR48C96:
+    case W8ScheduleId::MmaR48C112:
+    case W8ScheduleId::MmaR48C128:
+    case W8ScheduleId::MmaR64C32:
+    case W8ScheduleId::MmaR64C48:
+    case W8ScheduleId::MmaR64C64:
+    case W8ScheduleId::MmaR64C80:
+    case W8ScheduleId::MmaR64C96:
+    case W8ScheduleId::MmaR64C112:
     case W8ScheduleId::MmaR64C128:
+    case W8ScheduleId::MmaR96C64:
+    case W8ScheduleId::MmaR96C80:
+    case W8ScheduleId::MmaR96C96:
+    case W8ScheduleId::MmaR96C112:
+    case W8ScheduleId::MmaR128C64:
+    case W8ScheduleId::MmaR128C80:
         return true;
     }
     return false;
@@ -198,6 +275,9 @@ const W8SupportSpec* find_support(const W8Problem& problem) noexcept {
 }
 
 W8KernelVariant resolve_variant(W8ScheduleId schedule, const W8Problem& problem) {
+    if (w8_candidate_is_legal(schedule, W8KernelVariant::None, problem)) {
+        return W8KernelVariant::None;
+    }
     if (w8_candidate_is_legal(schedule, W8KernelVariant::Full, problem)) {
         return W8KernelVariant::Full;
     }
@@ -227,7 +307,8 @@ W8Plan w8_rowsplit_resolve_plan(const W8Problem& problem) {
     for (std::size_t local = 0; local < support->route_count; ++local) {
         const W8RouteSpec& route = kRouteSpecs[support->route_begin + local];
         if (route.cols.contains(problem.cols)) {
-            return {route.schedule, resolve_variant(route.schedule, problem)};
+            const W8KernelVariant variant = resolve_variant(route.schedule, problem);
+            return {route.schedule, variant, route.tail_policy};
         }
     }
     throw std::logic_error("w8 linear: admitted problem has no covering route");

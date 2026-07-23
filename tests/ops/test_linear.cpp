@@ -1311,6 +1311,40 @@ std::vector<double> complete_sparse_linear_add_projection(
     return projection;
 }
 
+template <std::size_t ActiveCount>
+std::vector<double> complete_sparse_linear_projection(
+    const row_split::PackedWeight& packed, const std::vector<float>& x, std::int32_t k,
+    std::int32_t cols, std::int32_t rows,
+    const std::array<std::int32_t, ActiveCount>& active_columns) {
+    std::vector<double> projection(static_cast<std::size_t>(rows) * cols);
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const std::int32_t n_threads =
+        std::min<std::int32_t>(rows, static_cast<std::int32_t>(std::min<unsigned>(hw, 16u)));
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(n_threads));
+    for (std::int32_t tid = 0; tid < n_threads; ++tid) {
+        const std::int32_t row_begin =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(rows) * tid) / n_threads);
+        const std::int32_t row_end =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(rows) * (tid + 1)) / n_threads);
+        threads.emplace_back([&, row_begin, row_end] {
+            for (std::int32_t token = 0; token < cols; ++token) {
+                const float* xcol = x.data() + static_cast<std::size_t>(token) * k;
+                for (std::int32_t row = row_begin; row < row_end; ++row) {
+                    double value = 0.0;
+                    for (const std::int32_t column : active_columns) {
+                        value += row_split::decode_row_split_lowbit_fp64(packed, row, column) *
+                                 static_cast<double>(xcol[column]);
+                    }
+                    projection[static_cast<std::size_t>(token) * rows + row] = value;
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    return projection;
+}
+
 int w8_dflash_linear_add_correctness() {
     constexpr std::int32_t kRows = 2048;
     constexpr std::int32_t kK    = 6144;
@@ -1500,6 +1534,149 @@ int w8_dflash_linear_add_correctness() {
     }
     if (weight_after != weight_before) {
         std::cerr << "W8 [2048,6144] LinearAdd modified packed weight\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int w8_conditioning_linear_correctness() {
+    constexpr std::int32_t kRows = 2048;
+    constexpr std::int32_t kK    = 16384;
+    constexpr std::int32_t kMaxT = 2176;
+    constexpr std::array<std::int32_t, 18> kActiveColumns{
+        0,     31,    32,    2047,  2048,  4095,  4096,  6143,  6144,
+        8191,  8192,  10239, 10240, 12287, 12288, 14335, 14336, 16383,
+    };
+
+    row_split::PackedWeight packed =
+        row_split::make_patterned_weight(QType::W8G32_F16S, kRows, kK, 3801u);
+    DBuf dweight(packed.payload.size());
+    cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
+    const Weight weight = packed.device_weight(dweight.p);
+    WorkspaceArena ws(1);
+    int failures = 0;
+
+    std::vector<float> sparse_x(static_cast<std::size_t>(kK) * 16, 0.0f);
+    for (std::int32_t token = 0; token < 16; ++token) {
+        for (std::size_t index = 0; index < kActiveColumns.size(); ++index) {
+            const float sign = ((token + static_cast<std::int32_t>(index)) & 1) == 0 ? 1.0f : -1.0f;
+            sparse_x[static_cast<std::size_t>(token) * kK + kActiveColumns[index]] =
+                sign * (0.03125f + static_cast<float>((token * 3 + index) % 11) * 0.015625f);
+        }
+    }
+    round_to_bf16(sparse_x);
+    const std::vector<double> sparse_reference =
+        complete_sparse_linear_projection(packed, sparse_x, kK, 16, kRows, kActiveColumns);
+    const bool has_positive = std::any_of(sparse_reference.begin(), sparse_reference.end(),
+                                          [](double value) { return value > 0.25; });
+    const bool has_negative = std::any_of(sparse_reference.begin(), sparse_reference.end(),
+                                          [](double value) { return value < -0.25; });
+    const bool has_cancellation =
+        std::any_of(sparse_reference.begin(), sparse_reference.end(),
+                    [](double value) { return std::abs(value) < 0.0625; });
+    if (!has_positive || !has_negative || !has_cancellation) {
+        std::cerr << "W8 [2048,16384] conditioning oracle missed signed/cancellation cases\n";
+        ++failures;
+    }
+
+    DBuf sparse_dx = to_device_bf16(sparse_x);
+    std::vector<std::uint8_t> sparse_input_before(sparse_dx.bytes);
+    std::vector<std::uint8_t> weight_before(dweight.bytes);
+    sparse_dx.copy_to_host(sparse_input_before.data(), sparse_input_before.size());
+    dweight.copy_to_host(weight_before.data(), weight_before.size());
+
+    for (std::int32_t t = 1; t <= 16; ++t) {
+        const std::size_t count = static_cast<std::size_t>(kRows) * t;
+        GuardedBf16Output got(count);
+        Tensor tx(sparse_dx.p, DType::BF16, {kK, t});
+        Tensor tout(got.data(), DType::BF16, {kRows, t});
+        const auto launch = [&](cudaStream_t stream) { ops::linear(tx, weight, tout, ws, stream); };
+        if (t == 2 || t == 16) {
+            capture_and_replay(launch);
+        } else {
+            launch(nullptr);
+            cudaDeviceSynchronize();
+        }
+
+        const std::vector<double> actual = from_device_bf16_ptr(got.data(), count);
+        const std::vector<double> reference(sparse_reference.begin(),
+                                            sparse_reference.begin() + count);
+        const auto plan = ops::detail::w8_rowsplit_resolve_plan({kRows, kK, kK, t});
+        const Tolerance tolerance = ops::detail::w8_schedule_uses_mma(plan.schedule)
+                                        ? Tolerance::linear_tc()
+                                        : Tolerance::linear_bf16();
+        const std::string label =
+            "linear W8 [2048,16384] complete FP64 exact-decode oracle T=" + std::to_string(t);
+        failures += verify(label.c_str(), actual, reference, tolerance);
+        failures += got.verify_guards(label);
+        failures += got.verify_initialized(label);
+        if (std::any_of(actual.begin(), actual.end(),
+                        [](double value) { return !std::isfinite(value); })) {
+            std::cerr << label << ": non-finite output\n";
+            ++failures;
+        }
+    }
+
+    std::vector<float> dense_x(static_cast<std::size_t>(kK) * kMaxT);
+    fill_uniform(dense_x, 3803u, -0.01f, 0.01f);
+    round_to_bf16(dense_x);
+    DBuf dense_dx = to_device_bf16(dense_x);
+    std::vector<std::uint8_t> dense_input_before(dense_dx.bytes);
+    dense_dx.copy_to_host(dense_input_before.data(), dense_input_before.size());
+
+    constexpr std::array<std::int32_t, 82> kDenseRoutePoints{
+        17,  31,   32,   33,   34,   64,   65,   66,   88,   89,   96,   97,
+        128, 129,  144,  145,  255,  256,  320,  321,  384,  385,  480,  481,
+        482, 640,  641,  668,  669,  672,  673,  674,  704,  705,  784,  785,
+        896, 897,  912,  913,  960,  961,  992,  1007, 1008, 1009, 1023, 1024,
+        1025, 1119, 1120, 1121, 1152, 1280, 1281, 1313, 1314, 1344, 1345, 1440,
+        1441, 1500, 1501, 1680, 1681, 1745, 1746, 1791, 1792, 1793, 1919, 1920,
+        1921, 1953, 1954, 2016, 2017, 2048, 2049, 2112, 2113, 2176,
+    };
+    for (const std::int32_t t : kDenseRoutePoints) {
+        const std::size_t count = static_cast<std::size_t>(kRows) * t;
+        GuardedBf16Output got(count);
+        Tensor tx(dense_dx.p, DType::BF16, {kK, t});
+        Tensor tout(got.data(), DType::BF16, {kRows, t});
+        const auto launch = [&](cudaStream_t stream) { ops::linear(tx, weight, tout, ws, stream); };
+        if (t == 481 || t == 641 || t == 961 || t == 1281 || t == 1441 || t == 1681 ||
+            t == 1921 || t == 2017 || t == 2176) {
+            capture_and_replay(launch);
+        } else {
+            launch(nullptr);
+            cudaDeviceSynchronize();
+        }
+
+        const std::vector<double> full = from_device_bf16_ptr(got.data(), count);
+        const auto plan                = ops::detail::w8_rowsplit_resolve_plan({kRows, kK, kK, t});
+        const Tolerance tolerance = ops::detail::w8_schedule_uses_mma(plan.schedule)
+                                        ? Tolerance::linear_tc()
+                                        : Tolerance::linear_bf16();
+        const std::string label =
+            "linear W8 [2048,16384] dense sampled FP64 oracle T=" + std::to_string(t);
+        failures += verify_sampled_projection(label, full, kRows, 0, dense_x, kK, t, packed,
+                                              tolerance);
+        failures += got.verify_guards(label);
+        failures += got.verify_initialized(label);
+        if (std::any_of(full.begin(), full.end(),
+                        [](double value) { return !std::isfinite(value); })) {
+            std::cerr << label << ": non-finite output\n";
+            ++failures;
+        }
+    }
+
+    std::vector<std::uint8_t> sparse_input_after(sparse_dx.bytes);
+    std::vector<std::uint8_t> dense_input_after(dense_dx.bytes);
+    std::vector<std::uint8_t> weight_after(dweight.bytes);
+    sparse_dx.copy_to_host(sparse_input_after.data(), sparse_input_after.size());
+    dense_dx.copy_to_host(dense_input_after.data(), dense_input_after.size());
+    dweight.copy_to_host(weight_after.data(), weight_after.size());
+    if (sparse_input_after != sparse_input_before || dense_input_after != dense_input_before) {
+        std::cerr << "W8 [2048,16384] conditioning Linear modified input\n";
+        ++failures;
+    }
+    if (weight_after != weight_before) {
+        std::cerr << "W8 [2048,16384] conditioning Linear modified packed weight\n";
         ++failures;
     }
     return failures;
@@ -1703,6 +1880,11 @@ int main() {
         std::cout << (f ? "FAIL" : "OK") << " W8 LinearSwiGLU dFlash correctness\n";
         return f ? 1 : 0;
     }
+    if (std::getenv("NINFER_LINEAR_TEST_W8_CONDITIONING_ONLY") != nullptr) {
+        const int f = w8_conditioning_linear_correctness();
+        std::cout << (f ? "FAIL" : "OK") << " W8 conditioning Linear dFlash correctness\n";
+        return f ? 1 : 0;
+    }
     if (std::getenv("NINFER_LINEAR_TEST_W8G32_ONLY") != nullptr) {
         int f = 0;
         f += one_quant_shape(QType::W8G32_F16S, 1024, 5120, {1, 4, 5, 16, 17}, 119u);
@@ -1721,6 +1903,7 @@ int main() {
         f += w8_attention_input_correctness();
         f += w8_companion_attention_input_correctness();
         f += w8_gdn_input_correctness();
+        f += w8_conditioning_linear_correctness();
         std::cout << (f ? "FAIL" : "OK") << " linear W8G32 focused correctness\n";
         return f ? 1 : 0;
     }
@@ -1760,6 +1943,7 @@ int main() {
     f += one_quant_shape(QType::W8G32_F16S, 9216, 2048, {13, 14, 128, 129}, 137u);
     f += one_quant_shape_sampled(QType::W8G32_F16S, 9216, 2048, 1024, 139u);
     f += one_patterned_quant_shape_sampled(QType::W8G32_F16S, 2048, 4096, 1025, 141u);
+    f += w8_conditioning_linear_correctness();
     // Q4 public correctness is exact-admission only. The dedicated Q4 plan/dispatch tests cover
     // every route seam and compare public auto against the fixed entry word-for-word; these
     // oracle points cover both registered head K values and the split-K/SIMT numerical boundary

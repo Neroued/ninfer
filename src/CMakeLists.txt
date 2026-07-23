@@ -123,6 +123,8 @@ add_library(ninfer_ops STATIC
   ops/linear/q6/q6_rowsplit_plan.cpp
   ops/linear/w8/w8_rowsplit_gemm_mma.cu
   ops/linear/w8/w8_rowsplit_gemm_simt.cu
+  ops/linear/w8/w8_rowsplit_gemm_decode.cu
+  ops/linear/w8/w8_rowsplit_gemm_splitk.cu
   ops/linear/w8/w8_rowsplit_launch.cpp
   ops/linear/w8/w8_rowsplit_plan.cpp
   ops/linear_pair/w8/w8_pair_gemm_mma.cu

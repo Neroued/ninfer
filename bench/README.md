@@ -273,6 +273,29 @@ cmake --build build --parallel --target ninfer_w8_linear_add_bench
   --profile --production-only --t-sweep 1024
 ```
 
+## W8 conditioning Linear Op benchmark
+
+`ninfer_linear_op_bench` with numeric W8 shape `[2048,16384]` measures the 35B-A3B
+target-feature conditioning projection without introducing a target or Engine route. Production
+dispatch uses a direct decode kernel, exact and medium split-K Tensor Core kernels, and tuned tiled
+Tensor Core schedules. The retained fixed candidates and
+`--w8-conditioning-exact-tail` expose the alternatives used to tune every production seam.
+Every cold-cache sample follows a 256 MiB L2 flush; the row also reports the same-process BF16
+Tensor Core ceiling and useful/executed throughput.
+
+```bash
+cmake --build build --parallel --target ninfer_linear_op_bench
+./build/bench/ninfer_linear_op_bench \
+  --rows 2048 --k 16384 --qtype W8G32 --candidate auto \
+  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,33,64,65,96,128,129,256,480,481,640,641,704,705,896,897,960,961,1024,1120,1280,1344,1345,1440,1680,1792,1920,2016,2048,2112 \
+  --warmup 10 --repeat 50 \
+  --csv-out profiles/bench/w8_conditioning_linear.csv
+./build/bench/ninfer_linear_op_bench \
+  --rows 2048 --k 16384 --qtype W8G32 --candidate auto \
+  --t-sweep "$(seq -s, 1 2112)" --warmup 3 --repeat 10 \
+  --csv-out profiles/bench/w8_conditioning_linear_all_t.csv
+```
+
 ## 35B W8 input-projection Op benchmark
 
 `ninfer_w8_input_proj_bench` measures the registered 35B-A3B target's W8 Attention

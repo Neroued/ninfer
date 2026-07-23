@@ -178,6 +178,7 @@ struct Options {
     ops::detail::W8ScheduleId w8_schedule   = ops::detail::W8ScheduleId::SimtR8C4;
     ops::detail::W8KernelVariant w8_variant = ops::detail::W8KernelVariant::Predicated;
     bool w8_variant_auto                    = true;
+    bool w8_conditioning_exact_tail         = false;
     int warmup                              = kDefaultWarmup;
     int repeat                              = kDefaultRepeat;
     int copy_repeat                         = kDefaultCopyRepeat;
@@ -466,7 +467,11 @@ std::string candidate_name(const Options& opt, QType qtype, const ShapeSpec& sha
                 return ops::detail::w8_linear_add_schedule_name(
                     resolve_auto_w8_linear_add_plan(shape, t).schedule);
             }
-            return ops::detail::w8_schedule_name(resolve_auto_w8_plan(shape, t).schedule);
+            const auto plan = resolve_auto_w8_plan(shape, t);
+            return std::string(ops::detail::w8_schedule_name(plan.schedule)) +
+                   (plan.tail_policy == ops::detail::W8TailPolicy::ConditioningExact
+                        ? ".conditioning_exact_tail"
+                        : "");
         }
         return "unsupported";
     case CandidateKind::Q4Fixed:
@@ -477,7 +482,8 @@ std::string candidate_name(const Options& opt, QType qtype, const ShapeSpec& sha
         return ops::detail::q6_schedule_name(opt.q6_schedule);
     case CandidateKind::W8Fixed:
         return std::string(opt.linear_add ? "linear_add." : "") +
-               ops::detail::w8_schedule_name(opt.w8_schedule);
+               ops::detail::w8_schedule_name(opt.w8_schedule) +
+               (opt.w8_conditioning_exact_tail ? ".conditioning_exact_tail" : "");
     }
     return "unknown";
 }
@@ -540,12 +546,114 @@ void parse_candidate(Options& opt, std::string_view raw) {
     } else if (candidate == "w8-simt-r8c8") {
         opt.candidate   = CandidateKind::W8Fixed;
         opt.w8_schedule = ops::detail::W8ScheduleId::SimtR8C8;
+    } else if (candidate == "w8-decode-r4") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::DecodeR4;
+    } else if (candidate == "w8-decode-r8") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::DecodeR8;
+    } else if (candidate == "w8-decode-r16") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::DecodeR16;
+    } else if (candidate == "w8-splitk-exact-t") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMmaExactT;
+    } else if (candidate == "w8-splitk32-tail") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMma32PlusTail;
+    } else if (candidate == "w8-splitk-medium-c48") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC48;
+    } else if (candidate == "w8-splitk-medium-c64") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC64;
+    } else if (candidate == "w8-splitk-medium-c96") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC96;
+    } else if (candidate == "w8-splitk-medium-c128") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC128;
+    } else if (candidate == "w8-splitk-medium-c144") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC144;
+    } else if (candidate == "w8-splitk-medium-c160") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::SplitKMediumC160;
+    } else if (candidate == "w8-mma-r32c32") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C32;
+    } else if (candidate == "w8-mma-r32c48") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C48;
+    } else if (candidate == "w8-mma-r32c64") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C64;
+    } else if (candidate == "w8-mma-r32c80") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C80;
+    } else if (candidate == "w8-mma-r32c96") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C96;
+    } else if (candidate == "w8-mma-r32c112") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C112;
     } else if (candidate == "w8-mma-r32c128") {
         opt.candidate   = CandidateKind::W8Fixed;
         opt.w8_schedule = ops::detail::W8ScheduleId::MmaR32C128;
+    } else if (candidate == "w8-mma-r48c64") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C64;
+    } else if (candidate == "w8-mma-r48c80") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C80;
+    } else if (candidate == "w8-mma-r48c96") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C96;
+    } else if (candidate == "w8-mma-r48c112") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C112;
+    } else if (candidate == "w8-mma-r48c128") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR48C128;
+    } else if (candidate == "w8-mma-r64c32") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C32;
+    } else if (candidate == "w8-mma-r64c48") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C48;
+    } else if (candidate == "w8-mma-r64c64") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C64;
+    } else if (candidate == "w8-mma-r64c80") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C80;
+    } else if (candidate == "w8-mma-r64c96") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C96;
+    } else if (candidate == "w8-mma-r64c112") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C112;
     } else if (candidate == "w8-mma-r64c128") {
         opt.candidate   = CandidateKind::W8Fixed;
         opt.w8_schedule = ops::detail::W8ScheduleId::MmaR64C128;
+    } else if (candidate == "w8-mma-r96c64") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR96C64;
+    } else if (candidate == "w8-mma-r96c80") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR96C80;
+    } else if (candidate == "w8-mma-r96c96") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR96C96;
+    } else if (candidate == "w8-mma-r96c112") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR96C112;
+    } else if (candidate == "w8-mma-r128c64") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR128C64;
+    } else if (candidate == "w8-mma-r128c80") {
+        opt.candidate   = CandidateKind::W8Fixed;
+        opt.w8_schedule = ops::detail::W8ScheduleId::MmaR128C80;
     } else {
         throw std::invalid_argument("unknown candidate: " + std::string(raw));
     }
@@ -644,7 +752,7 @@ ops::detail::W8KernelVariant resolve_w8_variant(ops::detail::W8ScheduleId schedu
                                                 std::int32_t padded_k, std::int32_t cols) {
     const ops::detail::W8Problem problem{rows, k, padded_k, cols};
     using V = ops::detail::W8KernelVariant;
-    for (const V variant : {V::Full, V::Predicated}) {
+    for (const V variant : {V::None, V::Full, V::Predicated}) {
         if (ops::detail::w8_candidate_is_legal(schedule, variant, problem)) { return variant; }
     }
     throw std::invalid_argument(std::string("no legal variant for ") +
@@ -733,6 +841,8 @@ void usage(const char* argv0) {
         "                             w8-simt-r8c4, w8-simt-r8c8,\n"
         "                             w8-mma-r32c128, or w8-mma-r64c128.\n"
         "  --variant NAME             Fixed kernel variant; auto is the default.\n"
+        "  --w8-conditioning-exact-tail\n"
+        "                             Use the conditioning MMA core plus exact residual-T path.\n"
         "  --paired-kv                Benchmark paired MTP K/V (requires MtpKV + W8G32).\n"
         "  --linear-add               Benchmark Q5 [5120,17408]/[5120,6144] or W8 "
         "[2048,4096]/[2048,6144] LinearAdd.\n"
@@ -786,6 +896,9 @@ Options parse_args(int argc, char** argv) {
             opt.q6_variant             = parse_q6_variant(raw, opt.q6_variant_auto);
             opt.w8_variant             = parse_w8_variant(raw, opt.w8_variant_auto);
             opt.all_targets            = false;
+        } else if (arg == "--w8-conditioning-exact-tail") {
+            opt.w8_conditioning_exact_tail = true;
+            opt.all_targets                = false;
         } else if (arg == "--paired-kv") {
             opt.paired_kv   = true;
             opt.all_targets = false;
@@ -1267,7 +1380,11 @@ void launch_candidate(const Options& opt, const ShapeSpec& shape, const Tensor& 
     }
     case CandidateKind::W8Fixed: {
         const auto variant = selected_w8_variant(opt, shape, x.ne[1]);
-        ops::detail::w8_rowsplit_launch_candidate(opt.w8_schedule, variant, x, w, out, stream);
+        const auto tail_policy =
+            opt.w8_conditioning_exact_tail ? ops::detail::W8TailPolicy::ConditioningExact
+                                           : ops::detail::W8TailPolicy::Homogeneous;
+        ops::detail::w8_rowsplit_launch_candidate(opt.w8_schedule, variant, x, w, out, stream,
+                                                  tail_policy);
         return;
     }
     }
@@ -1325,14 +1442,63 @@ int schedule_col_tile(ops::detail::Q5ScheduleId schedule, std::int32_t exact_col
     throw std::invalid_argument("unknown Q5 schedule tile");
 }
 
-int schedule_col_tile(ops::detail::W8ScheduleId schedule) {
+int schedule_col_tile(ops::detail::W8ScheduleId schedule, std::int32_t t) {
     using S = ops::detail::W8ScheduleId;
     switch (schedule) {
+    case S::DecodeR4:
+    case S::DecodeR8:
+    case S::DecodeR16:
+        return 1;
+    case S::SplitKMmaExactT:
+        return t;
+    case S::SplitKMma32PlusTail:
+        return t;
+    case S::SplitKMediumC48:
+        return 48;
+    case S::SplitKMediumC64:
+        return 64;
+    case S::SplitKMediumC96:
+        return 96;
+    case S::SplitKMediumC128:
+        return 128;
+    case S::SplitKMediumC144:
+        return 144;
+    case S::SplitKMediumC160:
+        return 160;
     case S::SimtR8C4:
         return 4;
     case S::SimtR8C8:
         return 8;
+    case S::MmaR32C32:
+    case S::MmaR64C32:
+        return 32;
+    case S::MmaR32C48:
+    case S::MmaR64C48:
+        return 48;
+    case S::MmaR32C64:
+    case S::MmaR48C64:
+    case S::MmaR64C64:
+    case S::MmaR96C64:
+    case S::MmaR128C64:
+        return 64;
+    case S::MmaR32C80:
+    case S::MmaR48C80:
+    case S::MmaR64C80:
+    case S::MmaR96C80:
+    case S::MmaR128C80:
+        return 80;
+    case S::MmaR32C96:
+    case S::MmaR48C96:
+    case S::MmaR64C96:
+    case S::MmaR96C96:
+        return 96;
+    case S::MmaR32C112:
+    case S::MmaR48C112:
+    case S::MmaR64C112:
+    case S::MmaR96C112:
+        return 112;
     case S::MmaR32C128:
+    case S::MmaR48C128:
     case S::MmaR64C128:
         return 128;
     }
@@ -1421,7 +1587,7 @@ int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, 
             if (opt.linear_add) {
                 return linear_add_col_tile(resolve_auto_w8_linear_add_plan(shape, t), t);
             }
-            return schedule_col_tile(resolve_auto_w8_plan(shape, t).schedule);
+            return schedule_col_tile(resolve_auto_w8_plan(shape, t).schedule, t);
         }
         throw std::invalid_argument("unsupported qtype for auto candidate tile");
     case CandidateKind::Q4Fixed:
@@ -1431,9 +1597,30 @@ int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, 
     case CandidateKind::Q6Fixed:
         return schedule_col_tile(opt.q6_schedule);
     case CandidateKind::W8Fixed:
-        return schedule_col_tile(opt.w8_schedule);
+        return schedule_col_tile(opt.w8_schedule, t);
     }
     throw std::invalid_argument("unknown Linear benchmark candidate tile");
+}
+
+bool candidate_uses_conditioning_exact_tail(const Options& opt, QType qtype,
+                                            const ShapeSpec& shape, std::int32_t t) {
+    if (qtype != QType::W8G32_F16S || opt.linear_add) { return false; }
+    if (opt.candidate == CandidateKind::W8Fixed) { return opt.w8_conditioning_exact_tail; }
+    return opt.candidate == CandidateKind::Auto &&
+           resolve_auto_w8_plan(shape, t).tail_policy ==
+               ops::detail::W8TailPolicy::ConditioningExact;
+}
+
+std::uint64_t candidate_weight_passes(const Options& opt, QType qtype, const ShapeSpec& shape,
+                                      std::int32_t t, int col_tile) {
+    if (!candidate_uses_conditioning_exact_tail(opt, qtype, shape, t)) {
+        return static_cast<std::uint64_t>((t + col_tile - 1) / col_tile);
+    }
+    const int full_passes = t / col_tile;
+    const int tail        = t % col_tile;
+    if (tail == 0) { return static_cast<std::uint64_t>(full_passes); }
+    const int tail_passes = tail <= 32 ? 1 : (tail <= 88 ? (tail + 31) / 32 : 1);
+    return static_cast<std::uint64_t>(full_passes + tail_passes);
 }
 
 bool candidate_uses_mma(const Options& opt, QType qtype, const ShapeSpec& shape, std::int32_t t) {
@@ -1524,10 +1711,48 @@ int candidate_mma_row_tile(const Options& opt, QType qtype, const ShapeSpec& sha
         return 64;
     }
     switch (schedule) {
+    case ops::detail::W8ScheduleId::SplitKMmaExactT:
+    case ops::detail::W8ScheduleId::SplitKMma32PlusTail:
+    case ops::detail::W8ScheduleId::SplitKMediumC48:
+    case ops::detail::W8ScheduleId::SplitKMediumC64:
+    case ops::detail::W8ScheduleId::SplitKMediumC96:
+    case ops::detail::W8ScheduleId::SplitKMediumC128:
+    case ops::detail::W8ScheduleId::SplitKMediumC144:
+    case ops::detail::W8ScheduleId::SplitKMediumC160:
+        return 16;
+    case ops::detail::W8ScheduleId::MmaR32C32:
+    case ops::detail::W8ScheduleId::MmaR32C48:
+    case ops::detail::W8ScheduleId::MmaR32C64:
+    case ops::detail::W8ScheduleId::MmaR32C80:
+    case ops::detail::W8ScheduleId::MmaR32C96:
+    case ops::detail::W8ScheduleId::MmaR32C112:
     case ops::detail::W8ScheduleId::MmaR32C128:
         return 32;
+    case ops::detail::W8ScheduleId::MmaR48C64:
+    case ops::detail::W8ScheduleId::MmaR48C80:
+    case ops::detail::W8ScheduleId::MmaR48C96:
+    case ops::detail::W8ScheduleId::MmaR48C112:
+    case ops::detail::W8ScheduleId::MmaR48C128:
+        return 48;
+    case ops::detail::W8ScheduleId::MmaR64C32:
+    case ops::detail::W8ScheduleId::MmaR64C48:
+    case ops::detail::W8ScheduleId::MmaR64C64:
+    case ops::detail::W8ScheduleId::MmaR64C80:
+    case ops::detail::W8ScheduleId::MmaR64C96:
+    case ops::detail::W8ScheduleId::MmaR64C112:
     case ops::detail::W8ScheduleId::MmaR64C128:
         return 64;
+    case ops::detail::W8ScheduleId::MmaR96C64:
+    case ops::detail::W8ScheduleId::MmaR96C80:
+    case ops::detail::W8ScheduleId::MmaR96C96:
+    case ops::detail::W8ScheduleId::MmaR96C112:
+        return 96;
+    case ops::detail::W8ScheduleId::MmaR128C64:
+    case ops::detail::W8ScheduleId::MmaR128C80:
+        return 128;
+    case ops::detail::W8ScheduleId::DecodeR4:
+    case ops::detail::W8ScheduleId::DecodeR8:
+    case ops::detail::W8ScheduleId::DecodeR16:
     case ops::detail::W8ScheduleId::SimtR8C4:
     case ops::detail::W8ScheduleId::SimtR8C8:
         throw std::logic_error("SIMT W8 schedule has no MMA row tile");
@@ -1563,7 +1788,8 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     const std::uint64_t useful_bytes =
         w.payload_bytes + x_bytes + out_bytes * (opt.linear_add ? 2ULL : 1ULL);
     const int col_tile                = candidate_col_tile(opt, target.qtype, shape, t);
-    const std::uint64_t weight_passes = static_cast<std::uint64_t>((t + col_tile - 1) / col_tile);
+    const std::uint64_t weight_passes =
+        candidate_weight_passes(opt, target.qtype, shape, t, col_tile);
     const std::uint64_t weight_replay_lower_bound_bytes =
         w.payload_bytes * weight_passes + x_bytes + out_bytes * (opt.linear_add ? 2ULL : 1ULL);
     const double sec        = cold.median_us * 1e-6;
@@ -1579,7 +1805,10 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     if (candidate_uses_mma(opt, target.qtype, shape, t)) {
         const std::int64_t executed_rows =
             align_up_u64(shape.n, candidate_mma_row_tile(opt, target.qtype, shape, t));
-        const std::int64_t executed_cols = align_up_u64(t, col_tile);
+        const std::int64_t executed_cols =
+            candidate_uses_conditioning_exact_tail(opt, target.qtype, shape, t)
+                ? t
+                : align_up_u64(t, col_tile);
         const double executed_flops      = 2.0 * static_cast<double>(executed_rows) *
                                       static_cast<double>(shape.k) *
                                       static_cast<double>(executed_cols);
@@ -1604,7 +1833,10 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     } else if (opt.candidate == CandidateKind::Q6Fixed) {
         r.kernel_variant = ops::detail::q6_kernel_variant_name(selected_q6_variant(opt, shape, t));
     } else if (opt.candidate == CandidateKind::W8Fixed) {
-        r.kernel_variant = ops::detail::w8_kernel_variant_name(selected_w8_variant(opt, shape, t));
+        r.kernel_variant =
+            candidate_uses_conditioning_exact_tail(opt, target.qtype, shape, t)
+                ? "exact_tail"
+                : ops::detail::w8_kernel_variant_name(selected_w8_variant(opt, shape, t));
     } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::Q4G64_F16S) {
         const auto variant = opt.linear_swiglu
                                  ? resolve_auto_q4_linear_swiglu_plan(shape, t).variant
@@ -1618,9 +1850,14 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
         r.kernel_variant =
             ops::detail::q6_kernel_variant_name(resolve_auto_q6_plan(shape, t).variant);
     } else if (opt.candidate == CandidateKind::Auto && target.qtype == QType::W8G32_F16S) {
-        const auto variant = opt.linear_add ? resolve_auto_w8_linear_add_plan(shape, t).variant
-                                            : resolve_auto_w8_plan(shape, t).variant;
-        r.kernel_variant   = ops::detail::w8_kernel_variant_name(variant);
+        if (!opt.linear_add &&
+            candidate_uses_conditioning_exact_tail(opt, target.qtype, shape, t)) {
+            r.kernel_variant = "exact_tail";
+        } else {
+            const auto variant = opt.linear_add ? resolve_auto_w8_linear_add_plan(shape, t).variant
+                                                : resolve_auto_w8_plan(shape, t).variant;
+            r.kernel_variant   = ops::detail::w8_kernel_variant_name(variant);
+        }
     } else {
         r.kernel_variant = "n/a";
     }

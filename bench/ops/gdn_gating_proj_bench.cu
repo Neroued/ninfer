@@ -5,6 +5,7 @@
 //   ./build/bench/ninfer_gdn_gating_proj_bench --35b \
 //     --candidate mma-split16 -p 128,512,1024
 #include "ninfer/ops/gdn_gating_proj.h"
+#include "ninfer/ops/rmsnorm.h"
 #include "ninfer_bench_common.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
@@ -28,8 +29,10 @@ namespace {
 constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
 
 struct Options {
-    bool geometry35 = false;
-    bool auto_route = true;
+    bool geometry35            = false;
+    bool norm_control          = false;
+    bool auto_route            = true;
+    bool composed_norm_control = false;
     ops::detail::Bf16GdnGatingScheduleId candidate =
         ops::detail::Bf16GdnGatingScheduleId::SimtWarpRowC4;
     std::vector<std::int32_t> tokens{1, 2, 4, 6, 8, 9, 16, 32, 64, 128, 256, 512, 1024};
@@ -125,10 +128,15 @@ Options parse_args(int argc, char** argv) {
         };
         if (!std::strcmp(argv[i], "--35b")) {
             opt.geometry35 = true;
+        } else if (!std::strcmp(argv[i], "--norm-control")) {
+            opt.norm_control = true;
         } else if (!std::strcmp(argv[i], "--candidate")) {
             const std::string_view raw = next("candidate");
             opt.auto_route             = raw == "auto";
-            if (!opt.auto_route) { opt.candidate = parse_candidate(raw); }
+            opt.composed_norm_control  = raw == "composed";
+            if (!opt.auto_route && !opt.composed_norm_control) {
+                opt.candidate = parse_candidate(raw);
+            }
         } else if (!std::strcmp(argv[i], "-p") || !std::strcmp(argv[i], "--tokens")) {
             opt.tokens = parse_tokens(next("tokens"));
         } else if (!std::strcmp(argv[i], "--warmup")) {
@@ -140,7 +148,8 @@ Options parse_args(int argc, char** argv) {
             if (mib <= 0) { throw std::invalid_argument("flush MiB must be positive"); }
             opt.flush_bytes = static_cast<std::size_t>(mib) << 20;
         } else if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) {
-            std::printf("usage: %s [--35b] [--candidate auto|simt-c4|simt-c8|mma-split32|"
+            std::printf("usage: %s [--35b] [--norm-control] "
+                        "[--candidate auto|composed|simt-c4|simt-c8|mma-split32|"
                         "mma-split16|mma-split8|mma-split4|mma-split2|mma-unsplit] "
                         "[-p 1,2,...] [--warmup N] [--repeat N] [--flush-mib N]\n",
                         argv[0]);
@@ -151,6 +160,15 @@ Options parse_args(int argc, char** argv) {
     }
     if (!opt.geometry35 && !opt.auto_route) {
         throw std::invalid_argument("fixed candidate screening is supported only for --35b");
+    }
+    if (opt.norm_control && !opt.geometry35) {
+        throw std::invalid_argument("--norm-control requires --35b");
+    }
+    if (opt.norm_control && !opt.auto_route && !opt.composed_norm_control) {
+        throw std::invalid_argument("--norm-control supports only --candidate auto or composed");
+    }
+    if (!opt.norm_control && opt.composed_norm_control) {
+        throw std::invalid_argument("--candidate composed requires --norm-control");
     }
     if (opt.warmup < 0 || opt.repeat <= 0) {
         throw std::invalid_argument("warmup must be nonnegative and repeat positive");
@@ -200,14 +218,18 @@ void run(const Options& opt, std::int32_t tokens, DBuf& flush) {
         static_cast<std::size_t>(2 * heads) * static_cast<std::size_t>(hidden);
     const std::size_t out_elems = static_cast<std::size_t>(heads) * tokens;
 
-    DBuf x       = make_bf16(x_elems);
-    DBuf weights = make_bf16(weight_elems);
-    DBuf A_log   = make_f32(heads, 0x1234abcdU);
-    DBuf dt_bias = make_f32(heads, 0x9876fedcU);
-    DBuf g       = make_zeros(out_elems * sizeof(float));
-    DBuf beta    = make_zeros(out_elems * sizeof(float));
+    DBuf x           = make_bf16(x_elems);
+    DBuf weights     = make_bf16(weight_elems);
+    DBuf norm_weight = make_bf16(hidden);
+    DBuf A_log       = make_f32(heads, 0x1234abcdU);
+    DBuf dt_bias     = make_f32(heads, 0x9876fedcU);
+    DBuf h           = make_zeros(x_elems * sizeof(std::uint16_t));
+    DBuf g           = make_zeros(out_elems * sizeof(float));
+    DBuf beta        = make_zeros(out_elems * sizeof(float));
 
     Tensor tx(x.p, DType::BF16, {hidden, tokens});
+    Tensor tnorm_weight(norm_weight.p, DType::BF16, {hidden});
+    Tensor th(h.p, DType::BF16, {hidden, tokens});
     Tensor tA_log(A_log.p, DType::FP32, {heads});
     Tensor tdt_bias(dt_bias.p, DType::FP32, {heads});
     Tensor tg(g.p, DType::FP32, {heads, tokens});
@@ -217,14 +239,23 @@ void run(const Options& opt, std::int32_t tokens, DBuf& flush) {
     const Weight wb     = bf16_row_view(parent, heads, heads);
 
     const ops::detail::Bf16GdnGatingProblem problem{heads, hidden, tokens};
-    const auto plan = opt.auto_route
-                          ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
-                          : ops::detail::bf16_gdn_gating_resolve_candidate(opt.candidate, problem);
+    const auto plan      = opt.auto_route || opt.composed_norm_control
+                               ? ops::detail::bf16_gdn_gating_resolve_plan(problem)
+                               : ops::detail::bf16_gdn_gating_resolve_candidate(opt.candidate, problem);
+    const auto norm_plan = ops::detail::bf16_gdn_norm_gating_resolve_plan(problem);
     const std::size_t workspace_bytes =
-        std::max(plan.workspace_bytes, ops::gdn_gating_proj_workspace_bytes(tokens));
+        opt.norm_control
+            ? ops::gdn_norm_gating_proj_workspace_bytes(tokens)
+            : std::max(plan.workspace_bytes, ops::gdn_gating_proj_workspace_bytes(tokens));
     WorkspaceArena ws(std::max<std::size_t>(1, workspace_bytes));
     const auto launch = [&](cudaStream_t stream) {
-        if (opt.auto_route) {
+        if (opt.norm_control && opt.composed_norm_control) {
+            ops::rmsnorm(tx, tnorm_weight, 1.0e-6F, true, th, stream);
+            ops::gdn_gating_proj(th, parent, tA_log, tdt_bias, ws, tg, tbeta, stream);
+        } else if (opt.norm_control) {
+            ops::gdn_norm_gating_proj(tx, tnorm_weight, 1.0e-6F, parent, tA_log, tdt_bias, ws, th,
+                                      tg, tbeta, stream);
+        } else if (opt.auto_route) {
             if (opt.geometry35) {
                 ops::gdn_gating_proj(tx, parent, tA_log, tdt_bias, ws, tg, tbeta, stream);
             } else {
@@ -251,10 +282,19 @@ void run(const Options& opt, std::int32_t tokens, DBuf& flush) {
                             2 * out_elems * sizeof(float) + 2 * heads * sizeof(float));
     const double useful_gbs = useful_bytes / sec / 1e9;
 
-    std::printf("%s,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%zu\n", opt.geometry35 ? "35b" : "27b",
-                tokens, ops::detail::bf16_gdn_gating_schedule_name(plan.schedule), timing.median_us,
+    const char* route =
+        opt.norm_control
+            ? (opt.composed_norm_control
+                   ? "gdn_norm_gating_proj.bf16.composed_control"
+                   : ops::detail::bf16_gdn_norm_gating_schedule_name(norm_plan.schedule))
+            : ops::detail::bf16_gdn_gating_schedule_name(plan.schedule);
+    const std::size_t reported_workspace = opt.norm_control && !opt.composed_norm_control
+                                               ? norm_plan.workspace_bytes
+                                               : plan.workspace_bytes;
+    std::printf("%s,%s,%d,%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%zu\n", opt.geometry35 ? "35b" : "27b",
+                opt.norm_control ? "norm_control" : "control", tokens, route, timing.median_us,
                 timing.min_us, timing.p95_us, useful_tflops, executed_tflops, useful_gbs,
-                plan.workspace_bytes);
+                reported_workspace);
 }
 
 } // namespace
@@ -268,8 +308,8 @@ int main(int argc, char** argv) {
     try {
         const Options opt = parse_args(argc, argv);
         DBuf flush(opt.flush_bytes);
-        std::printf("geometry,T,route,median_us,min_us,p95_us,useful_tflops,executed_tflops,"
-                    "useful_gbps,workspace_bytes\n");
+        std::printf("geometry,operation,T,route,median_us,min_us,p95_us,useful_tflops,"
+                    "executed_tflops,useful_gbps,workspace_bytes\n");
         for (const std::int32_t tokens : opt.tokens) { run(opt, tokens, flush); }
         return 0;
     } catch (const std::exception& error) {

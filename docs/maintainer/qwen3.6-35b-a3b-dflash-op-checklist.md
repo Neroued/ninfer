@@ -108,7 +108,7 @@ Work these rows in order unless whole-round profiling demonstrates a different d
 | ID | Status | Op and exact role | Current `T=1..16` route/risk | Existing test/benchmark entry points | C | B | O | E |
 |---|---|---|---|---|---|---|---|---|
 | DV-01 | [x] | W8 `gdn_input_proj_conv_snapshot`, 30 calls | `T=1` fused decode; every exact `T=2..16` uses one split-K MMA kernel with fused projection, convolution, SiLU, Q/K/V split, z store, and snapshot publication; `T>=17` retains the composed fallback. | `test_gdn_input_proj_conv_snapshot`; `w8_input_proj_bench --op gdn-snapshot`; `gdn_layer_bench` | [x] | [x] | [x] | [x] |
-| DV-02 | [ ] | `gdn_norm_gating_proj`, 30 calls | Fused RMS/control projection only at `T<=6`; `T=7..16` is composed `rmsnorm` plus control projection. | `test_gdn_gating_proj`, `test_gdn_gating_proj_plan`; `gdn_gating_proj_bench`, `gdn_layer_bench` | [ ] | [ ] | [ ] | [ ] |
+| DV-02 | [x] | `gdn_norm_gating_proj`, 30 calls | Every exact `T=1..16` uses one cooperative split-32 MMA kernel with fused RMS reduction, normalized BF16 hidden publication, direct normalized A/B projection, and gate/beta transforms; larger T retains the composed route. | `test_gdn_gating_proj`, `test_gdn_gating_proj_plan`; `gdn_gating_proj_bench --35b --norm-control`, `gdn_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-03 | [ ] | `gated_delta_rule_snapshot`, 30 calls | Recurrent kernel publishes a full FP32 SSM snapshot after every column. Arithmetic and snapshot traffic both scale with `T_v`; current small-T evidence stops at 6. | `test_gated_delta_rule`; `gated_delta_rule_bench`, `gdn_layer_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-04 | [ ] | `gqa_attention`, 10 calls | Decode-specialized append/attention covers `T<=6`; `T=7..16` enters the prompt/prefill implementation. Cost and winner depend on live context and KV codec. | `test_gqa_attention`; `gqa_attention_bench`, `attention_layer_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-05 | [ ] | `sparse_moe`, 40 calls | Main Q4+Q5/Q6 profiles stay on Small-T for all `T=2..16` (Small-T through 44). It has no route cliff here but is invoked after every layer and streams routed/shared weights. | `test_sparse_moe`; `sparse_moe_bench` | [ ] | [ ] | [ ] | [ ] |
@@ -142,6 +142,30 @@ an Op and containing-layer claim, not a complete dFlash-round claim. The public 
 route passed a `K=5`, `tg8` smoke run. A CUDA Graph smoke at the same current `K` exposed a
 pre-existing graph workspace-planning shortfall (39,325,696 bytes consumed versus 37,748,736
 planned); it was not used as DV-01 evidence.
+
+#### DV-02 qualification record
+
+This Op was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`, with a 256 MiB L2 flush,
+ten warmups, 200 measured repetitions, and every exact `T=1..16`.
+
+- **C:** the 35B contiguous-parent public Op passed its complete FP64 oracle for normalized hidden,
+  A/B projections, gate, and beta at every exact `T=1..16`. All three outputs are poisoned before
+  execution and compared in full. Plan tests cover the new `T=16/17` route and workspace boundary;
+  the 27B two-weight peer form retains its existing regression.
+- **B:** production medians were 5.38--7.42 us at `T=1..12` and 9.25--9.47 us at `T=13..16`.
+  The benchmark reports the complete Op route and an explicit composed control.
+- **O:** composed took 11.26--11.30 us at `T=7..16`; fused is 16%--34% faster and removes one
+  launch, at the cost of increasing `T=16` transient workspace from 64 KiB to 130 KiB. The
+  implementation uses compile-time norm capacities 6/8/12/16 so extending the long-acceptance
+  range does not regress the original small-T kernel. Focused ncu captures at `T=12/16` found the
+  same 128 registers/thread and 33.3% theoretical occupancy; the remaining duration increase
+  follows the additional norm work rather than a new occupancy cliff.
+- **E:** captured 35B GDN-layer replay uses five graph nodes instead of six. Median layer latency
+  improved from 52.48 to 50.43 us at `T=7` (3.9%), from 54.53 to 50.46 us at `T=8` (7.5%), and
+  from 72.96 to 69.02 us at `T=16` (5.4%).
+
+As with DV-01, complete `target_verify(T=7..16)` evidence remains blocked by the current fixed
+`K<=5` controller; DV-02 closes the Op and containing-layer criteria only.
 
 ### P1: frequent elementwise, normalization, and selection Ops
 

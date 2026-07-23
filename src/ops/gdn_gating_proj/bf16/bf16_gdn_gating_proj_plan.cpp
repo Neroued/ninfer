@@ -378,7 +378,7 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
-    if (is_35(problem) && problem.cols <= 6) {
+    if (is_35(problem) && problem.cols <= 16) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
@@ -391,7 +391,7 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
 
 std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t max_cols) {
     std::size_t maximum           = bf16_gdn_gating_capacity_workspace_bytes(max_cols);
-    const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 6);
+    const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 16);
     maximum                       = std::max(maximum,
                                              bf16_gdn_norm_gating_resolve_plan({32, 2048, fused_cols}).workspace_bytes);
     return maximum;

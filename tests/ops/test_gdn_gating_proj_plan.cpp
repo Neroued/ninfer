@@ -98,8 +98,8 @@ void route_tests() {
 
 void route35_tests() {
     using S = Bf16GdnGatingScheduleId;
-    constexpr std::array<std::int32_t, 10> boundaries{1,    127,  128,  1024, 1025,
-                                                      2048, 2049, 4096, 4097, 8192};
+    constexpr std::array<std::int32_t, 15> boundaries{1,    6,    7,    15,   16,   17,   127, 128,
+                                                      1024, 1025, 2048, 2049, 4096, 4097, 8192};
     for (const std::int32_t cols : boundaries) {
         const ninfer::ops::detail::Bf16GdnGatingProblem problem{32, 2048, cols};
         const bool admitted = cols >= 1;
@@ -130,9 +130,9 @@ void route35_tests() {
             ++failures;
         }
         const auto norm_plan     = ninfer::ops::detail::bf16_gdn_norm_gating_resolve_plan(problem);
-        const auto expected_norm = cols <= 6 ? Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32
-                                             : Bf16GdnNormGatingScheduleId::Composed;
-        const auto expected_control = cols <= 6 ? S::MmaCooperativeSplit32 : plan.schedule;
+        const auto expected_norm = cols <= 16 ? Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32
+                                              : Bf16GdnNormGatingScheduleId::Composed;
+        const auto expected_control = cols <= 16 ? S::MmaCooperativeSplit32 : plan.schedule;
         if (norm_plan.schedule != expected_norm || norm_plan.control.schedule != expected_control) {
             std::cerr << "wrong 35B norm/control route C=" << cols << '\n';
             ++failures;
@@ -192,12 +192,14 @@ void workspace_tests() {
         std::size_t norm_bytes;
     };
 
-    constexpr std::array<Case, 12> cases{{
+    constexpr std::array<Case, 14> cases{{
         {1, 4'096, 8'320},
         {2, 8'192, 16'640},
-        {8, 32'768, 49'920},
-        {9, 36'864, 49'920},
-        {10, 40'960, 49'920},
+        {8, 32'768, 66'560},
+        {9, 36'864, 74'880},
+        {10, 40'960, 83'200},
+        {16, 65'536, 133'120},
+        {17, 69'632, 133'120},
         {128, 520'192, 520'192},
         {1024, 3'145'728, 3'145'728},
         {1025, 3'145'728, 3'145'728},

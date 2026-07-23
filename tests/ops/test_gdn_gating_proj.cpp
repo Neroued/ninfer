@@ -319,6 +319,9 @@ int one_norm_shape(std::int32_t hidden, std::int32_t heads, std::int32_t T, std:
     DBuf dh(static_cast<std::size_t>(hidden) * T * sizeof(std::uint16_t));
     DBuf dg(static_cast<std::size_t>(heads) * T * sizeof(float));
     DBuf dbeta(static_cast<std::size_t>(heads) * T * sizeof(float));
+    cudaMemset(dh.p, 0xff, dh.bytes);
+    cudaMemset(dg.p, 0xff, dg.bytes);
+    cudaMemset(dbeta.p, 0xff, dbeta.bytes);
     Tensor tx(dx.p, DType::BF16, {hidden, T});
     Tensor tnorm(dnorm.p, DType::BF16, {hidden});
     Tensor th(dh.p, DType::BF16, {hidden, T});
@@ -389,6 +392,8 @@ int main() {
     for (std::int32_t T = 1; T <= 6; ++T) {
         failures +=
             one_norm_shape(kHidden, kHeads, T, 0xb00u + static_cast<std::uint32_t>(T), false);
+    }
+    for (std::int32_t T = 1; T <= 16; ++T) {
         failures +=
             one_norm_shape(k35Hidden, k35Heads, T, 0xc00u + static_cast<std::uint32_t>(T), true);
     }

@@ -86,6 +86,24 @@ through their production dispatch at the default `T=1024` prefill extent:
 The benchmark records the selected physical route, kernel variant, cold-cache timing, measured
 tensor-core ceiling, and useful/executed throughput.
 
+## GDN control-projection Op benchmark
+
+`ninfer_gdn_gating_proj_bench` measures the registered BF16 control projection. With `--35b
+--norm-control`, it measures the complete 35B RMSNorm, normalized hidden output, A/B projection,
+gate transform, and beta transform contract. `--candidate auto` uses production dispatch;
+`--candidate composed` is the explicit RMSNorm-plus-control comparison. Every row reports the
+selected route and transient workspace after a 256 MiB L2 flush.
+
+```bash
+cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
+./build/bench/ninfer_gdn_gating_proj_bench \
+  --35b --norm-control --candidate auto \
+  -p 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --warmup 10 --repeat 200
+./build/bench/ninfer_gdn_gating_proj_bench \
+  --35b --norm-control --candidate composed \
+  -p 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --warmup 10 --repeat 200
+```
+
 ## Input-projection Op benchmark
 
 `ninfer_input_proj_bench` measures the exact Qwen3.6-27B Attention and GDN input-projection shapes.

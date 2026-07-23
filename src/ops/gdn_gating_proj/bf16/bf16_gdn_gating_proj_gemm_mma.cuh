@@ -55,7 +55,8 @@ __device__ __forceinline__ int bf16_gdn_swizzle(int row, int col) {
     return (col & ~63) + gemm_swz64(row, col & 63);
 }
 
-template <class Geometry, int SplitK, bool FullTokens, int Warps, bool NormalizeInput = false>
+template <class Geometry, int SplitK, bool FullTokens, int Warps, bool NormalizeInput = false,
+          int NormTokenCapacity = 0>
 __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ norm_weight,
     __nv_bfloat16* __restrict__ normalized_x, float norm_eps,
@@ -95,17 +96,17 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
 
     if constexpr (NormalizeInput) {
         static_assert(SplitK == 32, "fused input normalization is tuned for split-32");
-        constexpr int kLocalPairs    = kBf16GdnBlockK / 2;
-        constexpr int kMaxNormTokens = 6;
-        const auto* x2               = reinterpret_cast<const __nv_bfloat162*>(x);
-        const int token_count        = min(kBf16GdnBlockN, t - token0);
-        float sums[kMaxNormTokens]   = {};
+        static_assert(NormTokenCapacity > 0 && NormTokenCapacity <= 16);
+        constexpr int kLocalPairs     = kBf16GdnBlockK / 2;
+        const auto* x2                = reinterpret_cast<const __nv_bfloat162*>(x);
+        const int token_count         = min(kBf16GdnBlockN, t - token0);
+        float sums[NormTokenCapacity] = {};
         // One warp from row tile zero contributes a 64-element norm slice. The existing post-MMA
         // cooperative handoff reduces the 32 slices, so normalization adds no grid-wide barrier.
         if (blockIdx.y == 0 && warp == 0) {
             for (int pair = lane; pair < kLocalPairs; pair += kWarpSize) {
 #pragma unroll
-                for (int token_local = 0; token_local < kMaxNormTokens; ++token_local) {
+                for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {
                     if (token_local >= token_count) { continue; }
                     const std::int64_t row_base =
                         static_cast<std::int64_t>(token0 + token_local) * (kBf16GdnHidden / 2);
@@ -115,7 +116,7 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
                 }
             }
 #pragma unroll
-            for (int token_local = 0; token_local < kMaxNormTokens; ++token_local) {
+            for (int token_local = 0; token_local < NormTokenCapacity; ++token_local) {
                 sums[token_local] = warp_reduce_sum(sums[token_local]);
                 if (lane == 0 && token_local < token_count) {
                     float* norm_partial =

@@ -255,7 +255,8 @@ void require_shape35(const Weight& w, const char* name) {
     }
 }
 
-template <class Geometry, int SplitK, int Warps = kBf16GdnWarps, bool NormalizeInput = false>
+template <class Geometry, int SplitK, int Warps = kBf16GdnWarps, bool NormalizeInput = false,
+          int NormTokenCapacity = 0>
 void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                              const Tensor* norm_weight, float norm_eps, Tensor* normalized_x,
                              const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
@@ -269,11 +270,11 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                     static_cast<unsigned>(Geometry::kHeads / kBf16GdnBlockM),
                     static_cast<unsigned>(SplitK));
     auto launch = [&](auto full_tokens) {
-        constexpr bool FullTokens = decltype(full_tokens)::value;
-        static const cudaError_t attr =
-            cudaFuncSetAttribute(bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens,
-                                                                      Warps, NormalizeInput>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+        constexpr bool FullTokens     = decltype(full_tokens)::value;
+        static const cudaError_t attr = cudaFuncSetAttribute(
+            bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
+                                                 NormalizeInput, NormTokenCapacity>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
         CUDA_CHECK(attr);
         if constexpr (SplitK > 1) {
             cudaLaunchConfig_t config{};
@@ -289,7 +290,7 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
             CUDA_CHECK(cudaLaunchKernelEx(
                 &config,
                 bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
-                                                     NormalizeInput>,
+                                                     NormalizeInput, NormTokenCapacity>,
                 static_cast<const __nv_bfloat16*>(x.data),
                 norm_weight != nullptr ? static_cast<const __nv_bfloat16*>(norm_weight->data)
                                        : static_cast<const __nv_bfloat16*>(nullptr),
@@ -302,7 +303,7 @@ void launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                 static_cast<float*>(beta.data), t));
         } else {
             bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
-                                                 NormalizeInput>
+                                                 NormalizeInput, NormTokenCapacity>
                 <<<grid, block, kSmemBytes, stream>>>(
                     static_cast<const __nv_bfloat16*>(x.data),
                     norm_weight != nullptr ? static_cast<const __nv_bfloat16*>(norm_weight->data)
@@ -469,9 +470,23 @@ void bf16_gdn_norm_gating_proj_35_mma_split32_launch(Bf16GdnGatingTokenVariant v
                                                      Tensor& g, Tensor& beta, cudaStream_t stream) {
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
-    launch_bf16_prefill_mma<Bf16Gdn35Geometry, 32, 8, true>(variant, x, &norm_weight, eps, &h,
-                                                            a_weight, b_weight, A_log, dt_bias,
-                                                            workspace, g, beta, stream);
+    const auto launch = [&](auto token_capacity) {
+        constexpr int TokenCapacity = decltype(token_capacity)::value;
+        launch_bf16_prefill_mma<Bf16Gdn35Geometry, 32, 8, true, TokenCapacity>(
+            variant, x, &norm_weight, eps, &h, a_weight, b_weight, A_log, dt_bias, workspace, g,
+            beta, stream);
+    };
+    if (x.ne[1] <= 6) {
+        launch(std::integral_constant<int, 6>{});
+    } else if (x.ne[1] <= 8) {
+        launch(std::integral_constant<int, 8>{});
+    } else if (x.ne[1] <= 12) {
+        launch(std::integral_constant<int, 12>{});
+    } else if (x.ne[1] <= 16) {
+        launch(std::integral_constant<int, 16>{});
+    } else {
+        throw std::invalid_argument("fused BF16 GDN norm/control requires T=1..16");
+    }
 }
 
 void bf16_gdn_gating_proj_35_mma_split16_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,

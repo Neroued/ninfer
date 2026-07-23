@@ -260,9 +260,8 @@ void normalize_qk_for_fused_oracle(gdn_ref::Inputs& in) {
     normalize(in.k);
 }
 
-int fused_norm_snapshot_oracle_case(int value_heads, int T, std::uint32_t seed, bool near_zero) {
-    constexpr int Slots       = 7;
-    constexpr int InitialSlot = 6;
+int fused_norm_snapshot_oracle_case(int value_heads, int T, std::uint32_t seed, bool near_zero,
+                                    int slots, int initial_slot) {
     auto raw = make_inputs_for_geometry(S, H_qk, value_heads, T, seed, false, false);
     if (near_zero) {
         for (float& value : raw.q) { value *= 1.0e-4f; }
@@ -282,16 +281,17 @@ int fused_norm_snapshot_oracle_case(int value_heads, int T, std::uint32_t seed, 
                                ref_state.data(), S, H_qk, value_heads, T, B, scale,
                                ref_snapshots.data());
 
-    std::vector<float> snapshot_state(raw.state.size() * Slots, 17.0f);
+    std::vector<float> snapshot_state(raw.state.size() * static_cast<std::size_t>(slots), 17.0f);
     std::copy(raw.state.begin(), raw.state.end(),
-              snapshot_state.begin() + static_cast<std::size_t>(InitialSlot) * raw.state.size());
+              snapshot_state.begin() + static_cast<std::size_t>(initial_slot) * raw.state.size());
     std::vector<double> expected_slots(snapshot_state.begin(), snapshot_state.end());
     std::copy(ref_snapshots.begin(), ref_snapshots.end(), expected_slots.begin());
 
     DBuf dq = to_device_bf16(raw.q), dk = to_device_bf16(raw.k), dv = to_device_bf16(raw.v);
     DBuf dg = to_device_f32(raw.g), dbeta = to_device_f32(raw.beta);
-    DBuf dstate        = to_device_f32(snapshot_state), dout(raw.v.size() * sizeof(std::uint16_t));
-    DBuf dinitial_slot = to_device_i32({InitialSlot});
+    DBuf dstate = to_device_f32(snapshot_state), dout(raw.v.size() * sizeof(std::uint16_t));
+    cudaMemset(dout.p, 0xff, dout.bytes);
+    DBuf dinitial_slot = to_device_i32({initial_slot});
     WorkspaceArena ws(chunked_arena_bytes(T));
 
     Tensor tq(dq.p, DType::BF16, {S, H_qk, T});
@@ -299,7 +299,7 @@ int fused_norm_snapshot_oracle_case(int value_heads, int T, std::uint32_t seed, 
     Tensor tv(dv.p, DType::BF16, {S, value_heads, T});
     Tensor tg(dg.p, DType::FP32, {value_heads, T});
     Tensor tbeta(dbeta.p, DType::FP32, {value_heads, T});
-    Tensor tstate(dstate.p, DType::FP32, {S, S, value_heads, Slots});
+    Tensor tstate(dstate.p, DType::FP32, {S, S, value_heads, slots});
     Tensor tinitial_slot(dinitial_slot.p, DType::I32, {1});
     Tensor tout(dout.p, DType::BF16, {S, value_heads, T});
 
@@ -308,7 +308,8 @@ int fused_norm_snapshot_oracle_case(int value_heads, int T, std::uint32_t seed, 
     cudaDeviceSynchronize();
 
     const std::string tag = "gdn fused qk norm snapshot Hv=" + std::to_string(value_heads) +
-                            " T=" + std::to_string(T) + (near_zero ? " near-zero" : "");
+                            " T=" + std::to_string(T) + " slot=" + std::to_string(initial_slot) +
+                            (near_zero ? " near-zero" : "");
     int failures = 0;
     failures += verify((tag + " out").c_str(), from_device_bf16(dout, raw.v.size()), ref_out,
                        Tolerance::gdn_output_bf16());
@@ -878,15 +879,23 @@ int main() {
         }
     }
     failures += snapshot_oracle_case(6, 9028u, true);
-    for (int value_heads : {32, 48}) {
-        for (int T : {1, 2, 3, 4, 5, 6}) {
-            failures += fused_norm_snapshot_oracle_case(
-                value_heads, T, 9200u + static_cast<std::uint32_t>(value_heads * 10 + T), false);
-        }
+    for (int T = 1; T <= 16; ++T) {
+        failures += fused_norm_snapshot_oracle_case(32, T, 9520u + static_cast<std::uint32_t>(T),
+                                                    false, 17, 16);
+    }
+    for (int initial_slot = 0; initial_slot < 16; ++initial_slot) {
         failures += fused_norm_snapshot_oracle_case(
-            value_heads, 4, 9400u + static_cast<std::uint32_t>(value_heads), true);
+            32, 16, 9600u + static_cast<std::uint32_t>(initial_slot), false, 17, initial_slot);
+    }
+    for (int T : {1, 2, 3, 4, 5, 6}) {
+        failures += fused_norm_snapshot_oracle_case(48, T, 9680u + static_cast<std::uint32_t>(T),
+                                                    false, 7, 6);
+    }
+    failures += fused_norm_snapshot_oracle_case(32, 4, 9740u, true, 17, 16);
+    failures += fused_norm_snapshot_oracle_case(48, 4, 9748u, true, 7, 6);
+    for (int value_heads : {32, 48}) {
         failures += fused_norm_recurrent_oracle_case(
-            value_heads, 9500u + static_cast<std::uint32_t>(value_heads));
+            value_heads, 9800u + static_cast<std::uint32_t>(value_heads));
     }
     failures += fused_norm_chunked_oracle_case(32, 70, 9620u);
     failures += selected_slot_snapshot_oracle_case(S, H_qk, H_v, 4, 0, 10028u);

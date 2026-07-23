@@ -109,7 +109,7 @@ Work these rows in order unless whole-round profiling demonstrates a different d
 |---|---|---|---|---|---|---|---|---|
 | DV-01 | [x] | W8 `gdn_input_proj_conv_snapshot`, 30 calls | `T=1` fused decode; every exact `T=2..16` uses one split-K MMA kernel with fused projection, convolution, SiLU, Q/K/V split, z store, and snapshot publication; `T>=17` retains the composed fallback. | `test_gdn_input_proj_conv_snapshot`; `w8_input_proj_bench --op gdn-snapshot`; `gdn_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-02 | [x] | `gdn_norm_gating_proj`, 30 calls | Every exact `T=1..16` uses one cooperative split-32 MMA kernel with fused RMS reduction, normalized BF16 hidden publication, direct normalized A/B projection, and gate/beta transforms; larger T retains the composed route. | `test_gdn_gating_proj`, `test_gdn_gating_proj_plan`; `gdn_gating_proj_bench --35b --norm-control`, `gdn_layer_bench` | [x] | [x] | [x] | [x] |
-| DV-03 | [ ] | `gated_delta_rule_snapshot`, 30 calls | Recurrent kernel publishes a full FP32 SSM snapshot after every column. Arithmetic and snapshot traffic both scale with `T_v`; current small-T evidence stops at 6. | `test_gated_delta_rule`; `gated_delta_rule_bench`, `gdn_layer_bench` | [ ] | [ ] | [ ] | [ ] |
+| DV-03 | [x] | `gated_delta_rule_snapshot`, 30 calls | Every exact `T=1..16` uses one four-warp recurrent kernel with fused Q/K normalization, register-resident running state, vectorized FP32 snapshot stores, no workspace, and no route boundary. Each 35B layer reads one 2 MiB state and publishes another 2 MiB per column. | `test_gated_delta_rule`; `gated_delta_rule_bench --small-t --H_v 32`, `gdn_layer_bench --qk-norm` | [x] | [x] | [x] | [x] |
 | DV-04 | [ ] | `gqa_attention`, 10 calls | Decode-specialized append/attention covers `T<=6`; `T=7..16` enters the prompt/prefill implementation. Cost and winner depend on live context and KV codec. | `test_gqa_attention`; `gqa_attention_bench`, `attention_layer_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-05 | [ ] | `sparse_moe`, 40 calls | Main Q4+Q5/Q6 profiles stay on Small-T for all `T=2..16` (Small-T through 44). It has no route cliff here but is invoked after every layer and streams routed/shared weights. | `test_sparse_moe`; `sparse_moe_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-06 | [ ] | Q6 `linear` output head `[248320,2048]`, 1 call | `T=1..4` SIMT C4, `T=5..6` SIMT C8, `T>=7` MMA R64C128. The `T=6/7` transition spans the full vocabulary head. | `test_linear`, `test_q6_linear_plan`; `linear_op_bench` | [ ] | [ ] | [ ] | [ ] |
@@ -167,6 +167,37 @@ ten warmups, 200 measured repetitions, and every exact `T=1..16`.
 As with DV-01, complete `target_verify(T=7..16)` evidence remains blocked by the current fixed
 `K<=5` controller; DV-02 closes the Op and containing-layer criteria only.
 
+#### DV-03 qualification record
+
+This Op was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`, with a 256 MiB L2 flush,
+20 warmups, 500 measured repetitions, 17 snapshot slots, and every exact `T=1..16`.
+
+- **C:** the 35B fused-normalization snapshot route passed the independent complete FP64 recurrence
+  oracle at every exact `T=1..16`. The oracle normalizes raw represented BF16 Q/K independently,
+  evaluates every sequential state transition, and compares BF16 output plus all FP32 snapshots.
+  Output is poisoned before launch; inactive slots retain their seeded sentinel or initial-state
+  contents; and the maximum extent is checked from every legal initial slot `0..16`. The 27B peer
+  and near-zero Q/K cases retain focused regression coverage.
+- **B:** the benchmark now accepts an explicit exact-T subset, uses the production 17-slot state,
+  prints the complete route, and counts the unavoidable initial-state read plus every snapshot
+  write. Production medians grow smoothly from 5.41 us at `T=1` to 17.66 us at `T=8` and
+  29.95 us at `T=16`; the logical useful-byte rate reaches 1.20 TB/s at `T=16`.
+- **O:** the retained route keeps the full FP32 state tile in registers, publishes 128-bit
+  coalesced snapshot stores, fuses Q/K normalization, and allocates no workspace. A six-warp
+  candidate improved isolated medians by 7%--10% at selected T values but had no stable
+  containing-layer benefit; streaming snapshot stores also regressed some T values. Neither was
+  retained. The explicit two-L2Norm composition is faster in isolation at large T (23.81 versus
+  29.95 us at `T=16`) but loses after its extra launches and staging are included in the layer.
+- **E:** across six alternating cold-cache process pairs, the production fused-normalization GDN
+  layer had a median-of-medians of 50.45 us versus 52.48 us for the explicit composition at `T=8`
+  (3.9% faster), and 69.90 versus 72.75 us at `T=16` (3.9% faster). Both routes used the same other
+  four layer kernels and the production route remained five CUDA Graph nodes versus seven.
+
+The write-every-column state contract remains the dominant fact: one `T=16` call publishes 32 MiB
+of FP32 snapshots per GDN layer. Whether dFlash needs every intermediate state is a round-level
+decision in Section 5, not a legal shortcut inside this Op qualification. Complete
+`target_verify(T=7..16)` evidence remains blocked by the current fixed `K<=5` controller.
+
 ### P1: frequent elementwise, normalization, and selection Ops
 
 These Ops are individually smaller, but their aggregate launch and memory cost can become material
@@ -189,8 +220,8 @@ after the P0 contractions and state transitions are optimized.
   with sufficient snapshot slots for each case.
 - [ ] Extend `attention_layer_bench --t-sweep` from the current hard limit `1..6` to exact
   `1..16`.
-- [ ] Add an explicit exact `T=1..16` small-state mode to `gated_delta_rule_bench`; its current
-  small-T mode is fixed to `1..6`.
+- [x] Add an explicit exact `T=1..16` small-state mode to `gated_delta_rule_bench`, with 17
+  snapshot slots, complete route labels, and state-publication byte accounting.
 - [ ] Make every P0 benchmark print the selected production route so a fast result cannot hide an
   unintended fallback.
 - [ ] Add one target-layer benchmark for each of the 35B attention and GDN layers at `T=1..16`.

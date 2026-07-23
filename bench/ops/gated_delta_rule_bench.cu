@@ -62,6 +62,7 @@ struct Options {
     int repeat          = 100;
     int min_time_ms     = 1000;
     std::string qk_norm = "fused";
+    std::vector<int> t_sweep{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
 };
 
 struct BenchRow {
@@ -82,6 +83,24 @@ int parse_positive_int(const char* flag, const char* value) {
         fail((std::string("invalid positive integer for ") + flag + ": " + value).c_str());
     }
     return static_cast<int>(parsed);
+}
+
+std::vector<int> parse_t_sweep(const char* value) {
+    if (value == nullptr || *value == '\0') { fail("--t-sweep requires a comma-separated list"); }
+    std::vector<int> sweep;
+    const std::string spec(value);
+    std::size_t begin = 0;
+    while (begin < spec.size()) {
+        const std::size_t end   = spec.find(',', begin);
+        const std::string token = spec.substr(begin, end == std::string::npos ? end : end - begin);
+        const int T             = parse_positive_int("--t-sweep", token.c_str());
+        if (T > 16) { fail("--t-sweep supports exact T in [1,16]"); }
+        sweep.push_back(T);
+        if (end == std::string::npos) { break; }
+        begin = end + 1;
+    }
+    if (sweep.empty()) { fail("--t-sweep requires at least one T"); }
+    return sweep;
 }
 
 Options parse_options(int argc, char** argv) {
@@ -128,6 +147,8 @@ Options parse_options(int argc, char** argv) {
             if (opt.qk_norm != "fused" && opt.qk_norm != "composed") {
                 fail("--qk-norm must be fused or composed");
             }
+        } else if (!std::strcmp(arg, "--t-sweep")) {
+            opt.t_sweep = parse_t_sweep(take());
         } else {
             fail((std::string("unknown argument: ") + arg + " (try --help)").c_str());
         }
@@ -161,8 +182,9 @@ void print_help(const char* prog) {
                 "  --decode           run recurrent decode at L=1 (default when no mode is given)\n"
                 "  --prefill          run chunked prefill at L=4096 by default\n"
                 "  --chunked          alias for --prefill\n"
-                "  --small-t         sweep snapshot T over {1,2,3,4,5,6}\n"
-                "  --qk-norm MODE    small-T route: fused or composed (default: fused)\n"
+                "  --small-t          sweep snapshot T over exact 1..16\n"
+                "  --t-sweep LIST     comma-separated small-T subset in [1,16]\n"
+                "  --qk-norm MODE     small-T route: fused or composed (default: fused)\n"
                 "  --kernel-only      use the native-bf16 detail launcher path instead of the "
                 "public wrapper\n"
                 "  --sweep            with prefill, sweep L over {64,128,256,512,1024,4096}\n"
@@ -201,6 +223,18 @@ double estimate_user_bytes(const Options& opt, int T, std::size_t qkv_elem_size)
     const double state_n = static_cast<double>(opt.S) * opt.S * opt.H_v;
     return (2.0 * qk_n + 2.0 * v_n) * static_cast<double>(qkv_elem_size) +
            (2.0 * gb_n + 2.0 * state_n) * static_cast<double>(sizeof(float));
+}
+
+double estimate_snapshot_user_bytes(const Options& opt, int T) {
+    const double t       = static_cast<double>(T);
+    const double qk_n    = static_cast<double>(opt.S) * opt.H_qk * t;
+    const double v_n     = static_cast<double>(opt.S) * opt.H_v * t;
+    const double gb_n    = static_cast<double>(opt.H_v) * t;
+    const double state_n = static_cast<double>(opt.S) * opt.S * opt.H_v;
+    return (2.0 * qk_n + 2.0 * v_n) * static_cast<double>(sizeof(std::uint16_t)) +
+           2.0 * gb_n * static_cast<double>(sizeof(float)) +
+           (1.0 + t) * state_n * static_cast<double>(sizeof(float)) +
+           static_cast<double>(sizeof(std::int32_t));
 }
 
 DBuf make_f32(const std::vector<float>& h) {
@@ -318,8 +352,8 @@ Result graph_cold_loop(const launch_fn& launch, double bytes_moved, int warmup, 
 }
 
 BenchRow run_small_t_snapshot(const Options& opt, int T) {
-    constexpr int Slots       = 7;
-    constexpr int InitialSlot = 6;
+    constexpr int Slots       = 17;
+    constexpr int InitialSlot = 16;
     const std::size_t qk_n    = static_cast<std::size_t>(opt.S) * opt.H_qk * T;
     const std::size_t v_n     = static_cast<std::size_t>(opt.S) * opt.H_v * T;
     const std::size_t gb_n    = static_cast<std::size_t>(opt.H_v) * T;
@@ -348,7 +382,12 @@ BenchRow run_small_t_snapshot(const Options& opt, int T) {
     WorkspaceArena ws(256);
     const bool fused = opt.qk_norm == "fused";
 
-    BenchRow row{"small-t", fused ? "qk-fused" : "qk-composed", T, 0, {}};
+    BenchRow row{"small-t",
+                 fused ? "gated_delta_rule_snapshot.bf16.recurrent.qk_fused.w4"
+                       : "l2norm_x2+gated_delta_rule_snapshot.bf16.recurrent.qk_pre_normalized.w4",
+                 T,
+                 0,
+                 {}};
     row.result = graph_cold_loop(
         [&](cudaStream_t s) {
             const Tensor* q_recurrent = &tq;
@@ -362,7 +401,7 @@ BenchRow run_small_t_snapshot(const Options& opt, int T) {
             ops::gated_delta_rule_snapshot(*q_recurrent, *k_recurrent, tv, tg, tbeta,
                                            scale_for(opt), fused, ws, tstates, tinitial, tout, s);
         },
-        estimate_user_bytes(opt, T, sizeof(std::uint16_t)), opt.warmup, opt.repeat);
+        estimate_snapshot_user_bytes(opt, T), opt.warmup, opt.repeat);
     return row;
 }
 
@@ -556,7 +595,7 @@ int main(int argc, char** argv) {
         }
 
         if (opt.small_t) {
-            for (int T : {1, 2, 3, 4, 5, 6}) { print_row(run_small_t_snapshot(opt, T), opt); }
+            for (int T : opt.t_sweep) { print_row(run_small_t_snapshot(opt, T), opt); }
         }
 
         if (opt.prefill) {

@@ -104,6 +104,30 @@ cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
   -p 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --warmup 10 --repeat 200
 ```
 
+## Gated-delta snapshot Op benchmark
+
+`ninfer_gated_delta_rule_bench --small-t` measures the stateful recurrent snapshot contract with
+17 state slots and exact `T=1..16`. Every row reports the complete selected route. Its useful-byte
+rate includes raw Q/K/V, g/beta, output, the selected initial FP32 state read, and all `T` FP32
+snapshot writes; it does not inflate the rate with cache-line or implementation traffic.
+`--qk-norm fused` is the production one-kernel route. `composed` explicitly runs two L2Norm kernels
+and the pre-normalized recurrent kernel as a containing-layer control.
+
+```bash
+cmake --build build --parallel --target ninfer_gated_delta_rule_bench ninfer_gdn_layer_bench
+./build/bench/ninfer_gated_delta_rule_bench \
+  --small-t --H_v 32 --qk-norm fused \
+  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --warmup 20 --repeat 500 --csv
+./build/bench/ninfer_gated_delta_rule_bench \
+  --small-t --H_v 32 --qk-norm composed \
+  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --warmup 20 --repeat 500 --csv
+./build/bench/ninfer_gdn_layer_bench \
+  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --route fused --norm-control fused --qk-norm fused --warmup 20 --repeat 500
+```
+
 ## Input-projection Op benchmark
 
 `ninfer_input_proj_bench` measures the exact Qwen3.6-27B Attention and GDN input-projection shapes.

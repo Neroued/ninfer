@@ -507,10 +507,12 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
             options.route == "fused"
                 ? std::string(
                       ops::detail::w8_gdn_input_snapshot_schedule_name(snapshot_plan.schedule)) +
-                      "+qk-" + options.qk_norm
+                      "+gated_delta_rule_snapshot.bf16.recurrent." +
+                      (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4")
                 : std::string("gdn_input_proj_conv_snapshot.w8.composed_control+") +
-                      ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) + "+qk-" +
-                      options.qk_norm,
+                      ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) +
+                      "+gated_delta_rule_snapshot.bf16.recurrent." +
+                      (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4"),
             options.norm_control == "fused"
                 ? ops::detail::bf16_gdn_norm_gating_schedule_name(norm_control_plan.schedule)
                 : ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),

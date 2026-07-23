@@ -1,9 +1,11 @@
 # Qwen3.6-35B-A3B Model Reference
 
 This reference records the exact BF16 checkpoint's Text, sparse-MoE, MTP, Vision,
-multimodal-position, numeric, and persistent-state semantics. It does not define artifact bytes or
-qualify the advertised extended million-token mode. The registered artifact and quantization
-specification is [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md).
+multimodal-position, numeric, and persistent-state semantics, together with the model-side
+semantics of the optional Qwen3.6-35B-A3B-DFlash companion. It does not define artifact bytes,
+weight loading, packing or quantization, execution-Op design, or qualify the advertised extended
+million-token mode. The registered artifact and quantization specification is
+[`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md).
 
 ## 1. Model identity
 
@@ -18,6 +20,11 @@ native multimodal sparse-MoE model with three checkpoint components:
 The checkpoint uses the Hugging Face architecture identifiers
 `Qwen3_5MoeForConditionalGeneration`, `qwen3_5_moe`, and `qwen3_5_moe_text`. Those identifiers name
 the implementation family; they do not make this checkpoint Qwen3.5 or indicate a local renaming.
+
+`z-lab/Qwen3.6-35B-A3B-DFlash` is a separately distributed, optional BF16 draft companion for this
+exact target. It is not a standalone language model, a fourth component of the base checkpoint, or
+a replacement for the built-in MTP module. Pairing it with the target adds a proposal mechanism;
+the target remains the authority for every published token.
 
 The fixed shape and tensor inventory below are checkpoint facts. A different hidden size, layer
 count, expert layout, head layout, or Vision tower is a different exact model profile rather than a
@@ -146,7 +153,49 @@ The Vision backbone geometry matches Qwen3.6-27B, but its merger is checkpoint-s
 width 2048 rather than 5120. `deepstack_visual_indexes` is empty and the checkpoint contains no
 deep-stack merger weights.
 
-### 2.6 Exact checkpoint parameter inventory
+### 2.6 DFlash companion
+
+The values in this section are from companion revision
+`f181eece646affea2c38b2765f1aaa01a9734ccd`, the Z-Lab/Modal long-context retrain mirrored by the
+local `dflash-bf16` directory. Earlier published DFlash revisions with different layer counts,
+feature-layer ids, or mask ids are different draft profiles.
+
+| Field | Value |
+|---|---:|
+| draft hidden layers | 6 |
+| hidden size | 2048 |
+| dense SwiGLU intermediate size | 6144 |
+| query heads | 32 |
+| KV heads | 8 |
+| head dimension | 128 |
+| Q width | 4096 |
+| K/V width | 1024 each |
+| Q heads per KV head | 4 |
+| attention scale | `1/sqrt(128)` |
+| layer attention | 5 non-causal sliding + 1 non-causal full |
+| sliding-window parameter | 4096 |
+| position capacity | 262144 |
+| RMSNorm epsilon | `1e-6` |
+| one-dimensional RoPE theta | `1e7` |
+| vocabulary rows through shared target head | 248320 |
+| native total block length | 16 |
+| parallel mask proposals per native block | 15 |
+| internal mask row | 248077 |
+| target feature layers, zero-based | `1, 6, 11, 16, 22, 27, 32, 37` |
+| private BF16 tensors | 69 |
+| private parameters | 385,906,176 |
+
+The companion is six dense Qwen3 decoder blocks, not a copy of the target's hybrid GDN/MoE
+topology. It contains no embedding table, output head, Vision tower, GDN state, MoE, attention
+output gate, or projection bias. It reuses the target input embedding and independent target
+`lm_head`. Its internal mask id 248077 is the first reserved model row after the
+tokenizer-addressable range, not an encodable text token.
+
+The private parameter count comprises a bias-free `[2048,16384]` target-feature projection,
+dedicated hidden/final norms, and the six draft blocks. It is separate from the base-checkpoint
+inventory below.
+
+### 2.7 Exact base-checkpoint parameter inventory
 
 Header-only inspection of all 26 safetensors shards gives 1045 BF16 tensors and the following exact
 weight-element counts:
@@ -176,8 +225,9 @@ offset_rmsnorm(x,w) = (1 + w) * x / sqrt(mean(x^2) + eps)
 plain_rmsnorm(x,w)  =       w  * x / sqrt(mean(x^2) + eps)
 ```
 
-All Text/MTP input, post-attention, and final norms, the MTP stem norms, and full-attention Q/K
-norms use `offset_rmsnorm`. The GDN internal output norm is the only Text/MTP plain RMSNorm. Vision
+All base-checkpoint Text/MTP input, post-attention, and final norms, the MTP stem norms, and
+full-attention Q/K norms use `offset_rmsnorm`. The GDN internal output norm is the only Text/MTP
+plain RMSNorm. The external DFlash companion instead uses `plain_rmsnorm` throughout. Vision
 uses ordinary LayerNorm with learned weight and bias.
 
 Both Text layer types use the same pre-norm residual schedule:
@@ -350,7 +400,7 @@ matrix state, KV cache, or MRoPE positions.
 The full target head remains the correctness boundary. A shortlist, vocabulary partition, or fused
 top-k head is valid only if it is proven equivalent to the required output policy.
 
-## 8. MTP draft model and speculative semantics
+## 8. MTP draft model
 
 The checkpoint contains one MTP decoder layer. It is conditioned on both the target Text hidden
 state and the token following that state; it is not an auxiliary `lm_head` directly attached to the
@@ -406,16 +456,155 @@ One MTP hidden layer does not mean one possible draft token. After the first pro
 engine may feed the proposed token and previous MTP hidden state back through the same MTP module at
 the next position, advancing its KV state to propose further tokens.
 
-MTP is a proposal mechanism. Target verification must evaluate the candidate window with the main
-40-layer model and commit only the accepted prefix. Greedy verification accepts matching target
-argmax tokens. Sampling verification must use proposal/target probabilities and correction that
-preserve the processed target distribution. Rejected candidate state must not remain logically
-committed or reachable: the accepted-prefix snapshots of all ten target KV caches, thirty GDN
-convolution windows, and thirty recurrent-state sets define continuation. Stale bytes for rejected
-branches may remain in unreferenced physical storage. Low proposal quality may reduce throughput,
-but must not change target-model output semantics.
+## 9. DFlash block-diffusion draft model
 
-## 9. Vision preprocessing
+DFlash replaces repeated autoregressive draft steps with one masked-block forward. It is called a
+block-diffusion drafter because the draft model denoises several masked positions jointly, but
+inference performs neither an iterative diffusion schedule nor a candidate tree. One forward
+produces the entire ordered proposal block, and the target then verifies that block causally.
+
+In the DFlash training objective, one clean anchor precedes a block whose remaining positions are
+replaced by the internal mask row. Frozen target residual features condition the drafter, and the
+original tokens at all masked positions supply cross-entropy targets in one pass; position-dependent
+loss weighting emphasizes the earlier proposals whose errors would truncate more of the accepted
+prefix. The target model and its shared embedding/output head remain fixed. This objective explains
+the block-parallel inference geometry but does not add a diffusion timestep or iterative sampler.
+
+### Target conditioning
+
+Let `r_t^l` be the complete residual-stream output after zero-based target Text block `l` at
+position `t`, before the next block's input norm or the final Text norm. The companion selects eight
+such outputs and computes:
+
+```text
+s_t = concat(r_t^1, r_t^6, r_t^11, r_t^16,
+             r_t^22, r_t^27, r_t^32, r_t^37)       # [16384]
+c_t = plain_rmsnorm(W_fc s_t, hidden_norm)           # [16384] -> [2048]
+```
+
+`W_fc` is bias-free. The selected ids refer to target decoder blocks, not hidden-state-array
+indices; an API that includes the embedding state at index zero may therefore expose these values
+at boundaries `2, 7, 12, 17, 23, 28, 33, 38`.
+
+The same `c_t` is direct context for all six draft layers. It is not added to the draft residual
+stream and does not pass through the draft Q projection, output projection, or MLP. Instead, each
+layer independently projects every committed context position into that layer's K/V space:
+
+```text
+K_ctx^l(t) = rope_1d(
+    plain_head_rmsnorm(W_k^l c_t, k_norm^l), position=t
+)
+V_ctx^l(t) = W_v^l c_t
+```
+
+Thus the persistent DFlash context represents target-produced features, not draft hidden states
+recursively advanced through six layers. Initial prefill applies the feature projection and six
+K/V projections to each target-prefix position; it does not run the prefix through the six draft
+residual/MLP stacks. Decode extends this context only from newly committed target residual outputs.
+
+### Parallel proposal block
+
+Suppose the target has processed through token `x_t` and selected the still-unprocessed anchor
+`a = x_(t+1)`. For native total block length `B=16`, the DFlash query is:
+
+```text
+absolute position  t+1       t+2       ... t+16
+input row          a         MASK      ... MASK
+role               anchor    proposal      proposal
+```
+
+The initial query residuals are the target embeddings of these 16 rows. The anchor row conditions
+the block but is not sampled. After one six-layer forward, final plain RMSNorm and the shared target
+`lm_head` are applied, and only the 15 mask-row logits are sampled. A mask row predicts the token at
+that same absolute position; there is no causal-language-model one-position shift. Consequently,
+the checkpoint's `block_size=16` means one anchor plus 15 proposals. In an API where
+`num_speculative_tokens` counts proposals, the matching value is 15 rather than 16.
+
+The published companion also permits a shorter total block, such as eight rows. A total block of
+`B` rows always contains one anchor and `B-1` masks. Because the final layer is non-causal, changing
+`B` can change every proposal logit rather than merely truncate a fixed 16-row result.
+
+All proposals are obtained in this one forward. Sampled candidates are not fed back through the
+draft model before target verification, and there is no iterative mask refinement.
+
+### Draft-layer computation
+
+For draft-layer input `u_l`, let `n_l = plain_rmsnorm(u_l, input_norm_l)`. Each layer computes its
+query-block K/V in addition to the context K/V above:
+
+```text
+Q_l       = rope_1d(plain_head_rmsnorm(W_q^l n_l, q_norm_l), query_positions)
+K_query_l = rope_1d(plain_head_rmsnorm(W_k^l n_l, k_norm_l), query_positions)
+V_query_l = W_v^l n_l
+
+A_l = attention(
+    Q_l,
+    concat_sequence(K_ctx_l, K_query_l),
+    concat_sequence(V_ctx_l, V_query_l),
+    scale=1/sqrt(128),
+    layer_mask_l
+)
+
+v_l = u_l + W_o^l A_l
+m_l = plain_rmsnorm(v_l, post_attention_norm_l)
+u_(l+1) = v_l + W_down^l(SiLU(W_gate^l m_l) * W_up^l m_l)
+```
+
+Q has 32 heads, K/V have eight heads, and four Q heads share each K/V head. Q/K head norm and RoPE
+cover all 128 head dimensions. This is ordinary one-dimensional split-half Qwen3 RoPE with
+`theta=1e7`, not the target's partial three-axis MRoPE. All companion norms are multiplicative
+`plain_rmsnorm`; none use the target's offset-norm convention. `plain_head_rmsnorm` is the same
+formula applied independently over each 128-value Q or K head.
+
+All six DFlash layers are non-causal. Layers 0 through 4 apply non-causal local attention with the
+configured sliding-window parameter 4096, and layer 5 applies non-causal full attention. The
+16 query rows therefore attend bidirectionally to one another wherever the corresponding
+local/full mask admits them, while also attending the admitted context K/V. This all-non-causal
+mask is the single model contract and numerical oracle; a causal draft mask computes a different
+head and is not a supported execution profile.
+
+The companion consumes target Text residual features and owns no Vision component. Its query and
+context positions are scalar one-dimensional positions. This model-side contract does not by
+itself claim a product execution route for image/video prompts.
+
+## 10. Speculative verification and state transaction
+
+MTP and DFlash are proposal mechanisms. The main 40-layer target remains the only output authority.
+MTP advances its one-layer drafter autoregressively for each candidate, whereas DFlash proposes all
+15 mask positions in parallel; this scheduling difference does not change target verification.
+
+For DFlash, the target consumes the anchor followed by the 15 candidates in one causal forward.
+Unlike the same-position DFlash mask logits, target logits retain ordinary next-token alignment:
+
+```text
+target input row       anchor at t+1    ... candidate at t+15    candidate at t+16
+target logit checks    candidate t+2    ... candidate t+16       emits bonus t+17
+```
+
+Greedy verification scans left to right and accepts the longest candidate prefix equal to the
+target argmax at each corresponding position. At the first mismatch it publishes the target token
+for that position; if all candidates match, it publishes the target bonus following the block. If
+`k` proposals are accepted, that verification therefore publishes `k+1` tokens beyond the anchor,
+with a maximum of 16 for the native block. Any reported mean acceptance length must state whether
+this mandatory correction/bonus token is included.
+
+Sampling verification must use proposal and target probabilities with an acceptance/correction
+rule that preserves the processed target distribution; equality-only checking is sufficient only
+for greedy decoding. Draft quality changes acceptance and throughput, never the target-model
+distribution.
+
+Only the target state through the anchor and accepted candidate prefix becomes committed. The
+correction or bonus is the next still-unprocessed anchor. Rejected target state and draft-query K/V
+must not remain logically reachable. Continuation is defined by the accepted-prefix snapshots of
+all ten target KV caches, thirty GDN convolution windows, and thirty recurrent-state sets.
+
+For DFlash specifically, temporary K/V produced from anchor/mask query hidden states is speculative
+branch state, not durable context. After verification, target residual outputs for the newly
+committed positions are transformed through `W_fc` and the six per-layer K/V projections to extend
+the DFlash context. Rejected-tail features are discarded. Stale bytes may remain only in
+unreferenced physical storage.
+
+## 11. Vision preprocessing
 
 The checkpoint processor accepts image and video media. For each media item it:
 
@@ -433,7 +622,7 @@ pixel-frame bounds 4,096 through 25,165,824. These are frontend work budgets rat
 model dimensions. Before other limits, the resulting Vision-token count is
 `grid_t × grid_h × grid_w / 4`.
 
-## 10. Vision tower
+## 12. Vision tower
 
 Patch rows are converted to the model activation dtype and projected with a biased Conv3D kernel
 `[1152,3,2,16,16]`. The runtime adds a learned 2304-entry position table interpreted as 48×48 and
@@ -472,7 +661,7 @@ The resulting columns replace the matching Text placeholder embeddings. This che
 deep-stack feature injection. Autoregressive Text decode no longer consumes Vision activations
 after this replacement, so a runtime may release them after prefill.
 
-## 11. Multimodal Text positions
+## 13. Multimodal Text positions
 
 Text attention consumes axis-major positions `[3,T]` in temporal, height, width order.
 
@@ -487,7 +676,7 @@ Full-attention Q/K consumes these positions through the interleaved `[11,11,10]`
 GDN does not consume positions. After multimodal prefill, Vision can be released while Text decode
 continues with the saved `rope_delta`, KV caches, and GDN state.
 
-## 12. Vocabulary and generation boundaries
+## 14. Vocabulary and generation boundaries
 
 The tokenizer's base BPE vocabulary has 248044 entries and the local tokenizer resolves 33 added
 tokens, giving 248077 addressable ids. Important checkpoint ids are:
@@ -511,9 +700,11 @@ meanings into one inferred id.
 The tokenizer also defines reserved audio-related tokens, but the checkpoint contains no audio
 encoder or audio projection tower. Token presence is not evidence of an audio input modality.
 
-## 13. Precision and reference boundaries
+## 15. Precision and reference boundaries
 
-- All 1045 source-checkpoint tensors are BF16; the source has no quantization configuration.
+- All 1045 base-checkpoint tensors are BF16; the base source has no quantization configuration.
+- All 69 private DFlash-companion tensors are BF16. Its target embedding and `lm_head` are the
+  target's existing matrices rather than companion parameters.
 - Public activation, cache, and recurrent-state dtypes are stated by their owning Op/state contract.
   In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16/INT8 KV
   formats remain real persistent representation boundaries.
@@ -531,8 +722,10 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
   sampling path avoids materializing all logits. Weight quantization, KV quantization, expert
   reordering, and packed layouts are derived runtime representations rather than source-model
   mathematics.
+- DFlash proposal parity uses the all-non-causal mask defined in Section 9. A causal draft mask
+  changes the logical formula and cannot serve as a numerical or behavioral oracle.
 
-## 14. Persistent state inventory
+## 16. Persistent state inventory
 
 The logical per-sequence state is:
 
@@ -540,6 +733,8 @@ The logical per-sequence state is:
 |---|---|---:|---|
 | Text GQA K and V | 10 layers × context × 2 heads × 256 × 2 planes | 5.0 GiB BF16 | active sequence |
 | MTP K and V | 1 layer × context × 2 heads × 256 × 2 planes | 0.5 GiB BF16 | active sequence when MTP enabled |
+| DFlash sliding context K and V | 5 layers × non-causal local context × 8 heads × 128 × 2 planes | about 80 MiB BF16 | active sequence when DFlash enabled |
+| DFlash full context K and V | 1 layer × context × 8 heads × 128 × 2 planes | 1.0 GiB BF16 | active sequence when DFlash enabled |
 | GDN convolution history | 30 layers × 8192 channels × 3 columns | 1.406 MiB BF16 or 2.813 MiB FP32 | active sequence |
 | GDN recurrent matrices | 30 layers × 32 heads × 128 × 128 | 60 MiB FP32 | active sequence |
 | multimodal continuation | `rope_delta` and logical positions | negligible | active sequence |
@@ -548,7 +743,10 @@ The logical per-sequence state is:
 
 Allocator alignment, paging metadata, and scratch are not included. Speculative verification,
 prefix reuse, or transactional rollback multiplies the bounded GDN state by the required snapshot
-slots. Only full-attention KV and MTP KV grow with configured context; GDN state does not.
+slots. Target full-attention KV, MTP KV, and the final DFlash layer's context KV grow with
+configured context; GDN state and the first five DFlash context windows are bounded.
+The first five layers retain exactly the local context admitted by the non-causal 4096-window mask;
+they do not grow with total context.
 
 The Program freezes its feature set at startup. A zero MTP draft window has no MTP weight view,
 MTP KV cache, or optimized proposal head. With Vision disabled, it has no Vision weight view and
@@ -556,12 +754,13 @@ the shared workspace excludes the maximum Vision envelope; media is rejected by 
 Frontend. The complete artifact inventory is still validated before these resident views are
 published.
 
-## 15. Checkpoint tensor layout
+## 17. Base-checkpoint tensor layout
 
-The following source shapes are part of the exact checkpoint identity. Linear weights use
-`[out,in]` unless a batched expert or convolution shape is shown.
+The following source shapes are part of the exact base-checkpoint identity. Linear weights use
+`[out,in]` unless a batched expert or convolution shape is shown. DFlash loading and physical
+tensor-layout contracts are intentionally outside this model reference.
 
-### 15.1 Text roots
+### 17.1 Text roots
 
 ```text
 model.language_model.embed_tokens.weight                 [248320,2048]
@@ -569,7 +768,7 @@ model.language_model.norm.weight                         [2048]
 lm_head.weight                                            [248320,2048]
 ```
 
-### 15.2 One GDN layer
+### 17.2 One GDN layer
 
 ```text
 input_layernorm.weight                                    [2048]
@@ -589,7 +788,7 @@ post_attention_layernorm.weight                           [2048]
 groups for a fused recurrence only if the same permutation is applied to Z, A/B, decay parameters,
 convolution channels, output-projection columns, and state.
 
-### 15.3 One full-attention layer
+### 17.3 One full-attention layer
 
 ```text
 input_layernorm.weight                                    [2048]
@@ -604,7 +803,7 @@ post_attention_layernorm.weight                           [2048]
 
 Within `q_proj`, each head contributes `[query_256 | gate_256]` before the next head.
 
-### 15.4 MoE attached to every Text/MTP layer
+### 17.4 MoE attached to every Text/MTP layer
 
 ```text
 mlp.gate.weight                                           [256,2048]
@@ -620,7 +819,7 @@ For each routed expert, rows `[0,512)` of `gate_up_proj` are the SiLU gate and r
 are the multiplicative up projection. Expert index is the leading tensor index and equals the
 router-row identity.
 
-### 15.5 MTP-only stem and final norm
+### 17.5 MTP-only stem and final norm
 
 ```text
 mtp.pre_fc_norm_embedding.weight                          [2048]
@@ -632,7 +831,7 @@ mtp.norm.weight                                            [2048]
 
 There is no `mtp.embed_tokens` or MTP-specific output head in this checkpoint.
 
-### 15.6 Vision highlights
+### 17.6 Vision highlights
 
 ```text
 model.visual.patch_embed.proj.weight                      [1152,3,2,16,16]
@@ -647,9 +846,9 @@ model.visual.merger.linear_fc2.weight                     [2048,4608]
 Vision projections carry biases, and every Vision block contains two standard LayerNorm weight/bias
 pairs. The tensor inventory contains no deep-stack merger and no audio tower.
 
-## 16. Evidence and implementation map
+## 18. Evidence and implementation map
 
-This reference was cross-checked on 2026-07-13 against the following independent sources:
+This reference was cross-checked on 2026-07-23 against the following independent sources:
 
 | Concern | Source |
 |---|---|
@@ -661,6 +860,8 @@ This reference was cross-checked on 2026-07-13 against the following independent
 | Text, GDN, MoE, MTP execution | vLLM commit `92221485aaaa4088491db3f182dd65a390fc9ac5`, especially `qwen3_5.py`, `qwen3_5_mtp.py`, `qwen3_next.py`, and `qwen_gdn_linear_attn.py` |
 | independent Text/MTP recurrence graph | llama.cpp commit `07d937828636e305bc0cfe738b288f9ab05ff748`, especially `src/models/qwen35moe.cpp` and `src/models/delta-net-base.cpp` |
 | Vision and processor semantics | vLLM `qwen3_vl.py` / `qwen2_5_vl.py`, llama.cpp `tools/mtmd/models/qwen3vl.cpp`, and local processor configs |
+| DFlash algorithm, all-non-causal attention, and block verification | [DFlash paper, revision 2](https://arxiv.org/html/2602.06036v2), [pinned Z-Lab PyTorch reference](https://github.com/z-lab/dflash/blob/94e4abc5e0c31b67bc1a9d30f1cc34ece28a8756/dflash/model.py) |
+| exact DFlash companion identity and dimensions | [companion model card](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash), [checkpoint `config.json`](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash/blob/f181eece646affea2c38b2765f1aaa01a9734ccd/config.json), [companion PyTorch reference snapshot](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash/blob/0ce151d016ba8f0f0454d160a81b52ad4588c924/dflash.py), local safetensors header |
 
 The registered implementation maps these concerns as follows:
 
@@ -674,6 +875,10 @@ The registered implementation maps these concerns as follows:
 | mathematical and explicit local-state Op contracts/implementations | `include/ninfer/ops/`, `src/ops/` |
 | exact artifact and converter | [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md), `tools/convert/qwen3_6_35b_a3b/` |
 | artifact-native diagnostic reference | `tools/reference/qwen3_6_35b_a3b/` |
+
+The map above describes the currently registered base/MTP/Vision implementation. The DFlash
+sections document the planned external companion's model contract and do not claim that a NInfer
+DFlash loading, scheduling, or execution path already exists.
 
 The Python reference is diagnostic evidence, not a generated-token golden. Each production Op path
 is checked against its independent mathematical oracle; equality between different numerical or

@@ -5,6 +5,11 @@ This is the complete target-private artifact-native Python reference for the acc
 gated shared experts, Vision tower and 2048-wide merger, one-layer sparse-MoE MTP model, sampling,
 and persistent KV/GDN state directly from the `.ninfer` object layouts.
 
+The accepted artifact also contains the target-private DFlash companion tensors. The reference
+binds their complete typed weight views and can include them in an explicit weight-memory plan, but
+the current `RefModel` does not make them resident and has no DFlash state, schedule, or execution
+path.
+
 The reference is an independent diagnostic implementation for the registered artifact. The C++
 Engine target is registered separately; this Python route is not its generated-token golden and
 does not define equality across different numerical paths. It does not need the original Hugging

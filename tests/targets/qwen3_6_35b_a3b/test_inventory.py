@@ -46,7 +46,24 @@ def test_key_dense_moe_mtp_and_vision_signatures() -> None:
     assert tensors["mtp/layer/moe/routed_gate_up"].format == inventory.W8
     assert tensors["mtp/layer/moe/routed_down"].shape == (524288, 512)
     assert tensors["vision/merger/fc2"].shape == (2048, 4608)
+    assert tensors["dflash/feature_projection"] == inventory.TensorSpec(
+        "dflash/feature_projection",
+        (2048, 16384),
+        inventory.W8,
+        inventory.ROW_SPLIT_LAYOUT,
+    )
+    assert tensors["dflash/layers/0/attention/query_key_value"].shape == (
+        6144,
+        2048,
+    )
+    assert tensors["dflash/layers/5/mlp/gate_up"].shape == (12288, 2048)
+    assert tensors["dflash/layers/5/mlp/down"].shape == (2048, 6144)
+    assert tensors["dflash/final_norm"].format == inventory.BF16
 
     assert inventory.FULL_ATTENTION_LAYERS == tuple(range(3, 40, 4))
     assert len(inventory.GDN_LAYERS) == 30
     assert inventory.Q6_ROUTED_DOWN_LAYERS == (34, 38, 39)
+    assert inventory.DFLASH_LAYERS == tuple(range(6))
+    assert len(inventory.DFLASH_TENSOR_SPECS) == 51
+    assert len(inventory.TENSOR_SPECS) == 934
+    assert len(inventory.OBJECT_SPECS) == 940

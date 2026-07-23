@@ -46,6 +46,12 @@ def test_real_artifact_binding_and_selected_expert_rows(
     assert binding.mtp.full_output_head is binding.text.output_head
     assert binding.mtp.optimized_proposal_head is binding.text.draft_head
     assert binding.vision.merger.fc2.shape == (2048, 4608)
+    assert len(binding.tensors) == 934
+    assert len(binding.dflash.layers) == 6
+    assert binding.dflash.token_embedding is binding.text.token_embedding
+    assert binding.dflash.proposal_output_head is binding.text.output_head
+    assert binding.dflash.mask_embedding.row_begin == 248077
+    assert len(binding.blocks_for("dflash")) == 51
 
     weights = WeightStore(
         binding,
@@ -83,6 +89,23 @@ def test_real_artifact_binding_and_selected_expert_rows(
         assert down.dtype == torch.bfloat16
     finally:
         weights.close()
+
+    dflash_weights = WeightStore(
+        binding,
+        "cpu",
+        capacity=1,
+        text=False,
+        dflash=True,
+        memory_bytes=0,
+    )
+    try:
+        assert dflash_weights.plan.streamed_blocks == 53
+        assert (
+            dflash_weights.representation(binding.dflash.feature_projection)
+            == "stream"
+        )
+    finally:
+        dflash_weights.close()
 
 
 def test_256k_int8_text_mtp_fixed_bytes() -> None:

@@ -24,7 +24,7 @@ from tools.convert.qwen3_6.common.recipe import (
     expression_sources,
     materialize_expression,
     materialize_recipe,
-    preflight_sources as _common_preflight_sources,
+    preflight_source_reader,
     source,
     source_requirements as _common_source_requirements,
     validate_recipe_coverage as _common_validate_recipe_coverage,
@@ -343,39 +343,154 @@ def _build_mtp_recipes() -> tuple[TensorRecipe, ...]:
     return tuple(recipes)
 
 
-RECIPE_SPECS = (
+def _build_dflash_recipes() -> tuple[TensorRecipe, ...]:
+    recipes: list[TensorRecipe] = [
+        TensorRecipe(
+            "dflash/feature_projection",
+            source("fc.weight", (2048, 16384)),
+        ),
+        TensorRecipe(
+            "dflash/context_norm",
+            source("hidden_norm.weight", (2048,)),
+        ),
+    ]
+    for layer in inventory.DFLASH_LAYERS:
+        source_prefix = f"layers.{layer}."
+        object_prefix = f"dflash/layers/{layer}/"
+        recipes.extend(
+            (
+                TensorRecipe(
+                    object_prefix + "input_norm",
+                    source(source_prefix + "input_layernorm.weight", (2048,)),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/query_key_value",
+                    Concat(
+                        (
+                            source(
+                                source_prefix + "self_attn.q_proj.weight",
+                                (4096, 2048),
+                            ),
+                            source(
+                                source_prefix + "self_attn.k_proj.weight",
+                                (1024, 2048),
+                            ),
+                            source(
+                                source_prefix + "self_attn.v_proj.weight",
+                                (1024, 2048),
+                            ),
+                        ),
+                        0,
+                    ),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/query_norm",
+                    source(source_prefix + "self_attn.q_norm.weight", (128,)),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/key_norm",
+                    source(source_prefix + "self_attn.k_norm.weight", (128,)),
+                ),
+                TensorRecipe(
+                    object_prefix + "attention/output",
+                    source(
+                        source_prefix + "self_attn.o_proj.weight",
+                        (2048, 4096),
+                    ),
+                ),
+                TensorRecipe(
+                    object_prefix + "post_attention_norm",
+                    source(
+                        source_prefix + "post_attention_layernorm.weight",
+                        (2048,),
+                    ),
+                ),
+                TensorRecipe(
+                    object_prefix + "mlp/gate_up",
+                    Concat(
+                        (
+                            source(
+                                source_prefix + "mlp.gate_proj.weight",
+                                (6144, 2048),
+                            ),
+                            source(
+                                source_prefix + "mlp.up_proj.weight",
+                                (6144, 2048),
+                            ),
+                        ),
+                        0,
+                    ),
+                ),
+                TensorRecipe(
+                    object_prefix + "mlp/down",
+                    source(
+                        source_prefix + "mlp.down_proj.weight",
+                        (2048, 6144),
+                    ),
+                ),
+            )
+        )
+    recipes.append(
+        TensorRecipe("dflash/final_norm", source("norm.weight", (2048,)))
+    )
+    return tuple(recipes)
+
+
+BASE_RECIPE_SPECS = (
     _build_text_recipes()
     + _build_draft_head_recipes()
     + _build_mtp_recipes()
     + build_vision_recipes(2048)
 )
+DFLASH_RECIPE_SPECS = _build_dflash_recipes()
+RECIPE_SPECS = BASE_RECIPE_SPECS + DFLASH_RECIPE_SPECS
+BASE_RECIPES_BY_NAME = {item.object_name: item for item in BASE_RECIPE_SPECS}
+DFLASH_RECIPES_BY_NAME = {
+    item.object_name: item for item in DFLASH_RECIPE_SPECS
+}
 RECIPES_BY_NAME = {item.object_name: item for item in RECIPE_SPECS}
 
 
 def validate_recipe_coverage() -> None:
-    """Validate exact object pairing and complete 1045-source coverage."""
+    """Validate exact output pairing and both source-checkpoint inventories."""
 
     _common_validate_recipe_coverage(RECIPE_SPECS, inventory.TENSOR_SPECS)
-    if len(RECIPE_SPECS) != 883 or len(RECIPES_BY_NAME) != 883:
-        raise ValueError("35B recipe does not contain exactly 883 tensor transforms")
-    requirements = source_requirements()
-    if len(requirements) != 1045:
+    if len(RECIPE_SPECS) != 934 or len(RECIPES_BY_NAME) != 934:
+        raise ValueError("35B recipe does not contain exactly 934 tensor transforms")
+    base_requirements = base_source_requirements()
+    if len(base_requirements) != 1045:
         raise ValueError(
-            f"35B recipe covers {len(requirements)} unique sources, expected 1045"
+            f"35B base recipe covers {len(base_requirements)} unique sources, "
+            "expected 1045"
         )
-    if {item.dtype for item in requirements.values()} != {SOURCE_DTYPE}:
-        raise ValueError("35B source recipe must contain only BF16 tensors")
+    dflash_requirements = dflash_source_requirements()
+    if len(dflash_requirements) != 69:
+        raise ValueError(
+            f"35B DFlash recipe covers {len(dflash_requirements)} unique sources, "
+            "expected 69"
+        )
+    if {
+        item.dtype
+        for item in (*base_requirements.values(), *dflash_requirements.values())
+    } != {SOURCE_DTYPE}:
+        raise ValueError("35B source recipes must contain only BF16 tensors")
 
 
-def source_requirements() -> dict[str, SourceTensor]:
-    return _common_source_requirements(RECIPE_SPECS)
+def base_source_requirements() -> dict[str, SourceTensor]:
+    return _common_source_requirements(BASE_RECIPE_SPECS)
 
 
-def preflight_sources(model_dir: str | Path) -> SourcePreflight:
-    """Require the selected checkpoint's exact 1045-tensor source inventory."""
+def dflash_source_requirements() -> dict[str, SourceTensor]:
+    return _common_source_requirements(DFLASH_RECIPE_SPECS)
 
-    requirements = source_requirements()
-    with ShardReader(model_dir) as reader:
+
+def _preflight_exact_source(
+    reader: ShardReader,
+    recipes: tuple[TensorRecipe, ...],
+    requirements: dict[str, SourceTensor],
+    label: str,
+) -> SourcePreflight:
+    with reader:
         actual_names = set(reader.names)
     required_names = set(requirements)
     if actual_names != required_names:
@@ -387,15 +502,40 @@ def preflight_sources(model_dir: str | Path) -> SourcePreflight:
         if extra:
             details.append(f"extra={extra[:8]!r}")
         raise ValueError(
-            "35B checkpoint source inventory differs from the exact 1045 tensors"
+            f"{label} source inventory differs from its exact tensor contract"
             + (": " + ", ".join(details) if details else "")
         )
-    return _common_preflight_sources(model_dir, RECIPE_SPECS)
+    with reader:
+        return preflight_source_reader(reader, recipes)
+
+
+def preflight_base_sources(model_dir: str | Path) -> SourcePreflight:
+    model = Path(model_dir)
+    return _preflight_exact_source(
+        ShardReader.from_index(model / "model.safetensors.index.json"),
+        BASE_RECIPE_SPECS,
+        base_source_requirements(),
+        "35B base checkpoint",
+    )
+
+
+def preflight_dflash_sources(model_dir: str | Path) -> SourcePreflight:
+    model = Path(model_dir)
+    return _preflight_exact_source(
+        ShardReader.from_file(model / "model.safetensors"),
+        DFLASH_RECIPE_SPECS,
+        dflash_source_requirements(),
+        "35B DFlash checkpoint",
+    )
 
 
 __all__ = [
+    "BASE_RECIPES_BY_NAME",
+    "BASE_RECIPE_SPECS",
     "Cast",
     "Concat",
+    "DFLASH_RECIPES_BY_NAME",
+    "DFLASH_RECIPE_SPECS",
     "DRAFT_RANKING_PATH",
     "DRAFT_ROWS",
     "DraftHeadTokenIds",
@@ -415,7 +555,9 @@ __all__ = [
     "expression_sources",
     "materialize_expression",
     "materialize_recipe",
-    "preflight_sources",
-    "source_requirements",
+    "base_source_requirements",
+    "dflash_source_requirements",
+    "preflight_base_sources",
+    "preflight_dflash_sources",
     "validate_recipe_coverage",
 ]

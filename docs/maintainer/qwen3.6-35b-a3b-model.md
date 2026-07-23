@@ -868,7 +868,7 @@ The registered implementation maps these concerns as follows:
 | Model concern | Source |
 |---|---|
 | exact 2048-wide dimensions, 40-layer topology, limits, scales, and option facts | `src/targets/qwen3_6_35b_a3b/impl/config.h` |
-| exact 883-tensor/six-resource binding and immutable Text/MTP/Vision/MoE views | `src/targets/qwen3_6_35b_a3b/impl/load/` |
+| exact 934-tensor/six-resource binding, conditional residency, and immutable Text/MTP/Vision/MoE/DFlash views | `src/targets/qwen3_6_35b_a3b/impl/load/` |
 | fused attention projection, fused staged GDN projection/control, sparse-MoE post-mixer leaves, leaf workspace, and graph frontier ranges | `src/targets/qwen3_6_35b_a3b/impl/variant.h`, `impl/variant.cpp` |
 | fixed Text/MTP/Vision execution, planning, Program lifecycle, workspace composition, prefix/state transactions, and graph mechanics | `src/targets/qwen3_6/impl/runtime/` |
 | tokenizer, template, multimodal processing, and output decoding | `src/targets/qwen3_6/impl/frontend/` |
@@ -876,9 +876,10 @@ The registered implementation maps these concerns as follows:
 | exact artifact and converter | [`qwen3.6-35b-a3b-artifact.md`](qwen3.6-35b-a3b-artifact.md), `tools/convert/qwen3_6_35b_a3b/` |
 | artifact-native diagnostic reference | `tools/reference/qwen3_6_35b_a3b/` |
 
-The map above describes the currently registered base/MTP/Vision implementation. The DFlash
-sections document the planned external companion's model contract and do not claim that a NInfer
-DFlash loading, scheduling, or execution path already exists.
+The registered 35B binder validates the complete DFlash inventory and owns a target-private
+conditional materialization/model-view path. Public Engine construction currently leaves that
+weight group nonresident. The DFlash sections do not claim that scheduling, state, workspace, or
+execution exists.
 
 The Python reference is diagnostic evidence, not a generated-token golden. Each production Op path
 is checked against its independent mathematical oracle; equality between different numerical or

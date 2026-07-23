@@ -12,7 +12,7 @@ runtime:
 | Model | NInfer artifact | Size | SHA-256 |
 |---|---|---:|---|
 | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `74fac75f3a6b7ab7b52e08c36969c7a33a8ba23465910eccd72d195adb497127` |
-| [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `qwen3_6_35b_a3b.ninfer` | 22,373,184,256 bytes (20.84 GiB) | `9e8378398d2b789a77224b5110c7590adbbc6fd4accd139b918157b2b9da7163` |
+| [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `5194407dd6d3092b8c2f81ce41e014b50ca0d6f1ba4e5d8c1492b8652bfa267f` |
 
 ## Performance
 

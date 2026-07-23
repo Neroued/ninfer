@@ -77,6 +77,7 @@ class VisionEncoder:
             capacity=1,
             text=False,
             vision=True,
+            dflash=False,
             compile_codec=compile_codec,
             memory_bytes=memory_bytes,
             headroom_bytes=headroom_bytes,

@@ -117,6 +117,7 @@ class WeightStore:
         mtp: bool = False,
         draft_head: bool = False,
         vision: bool = False,
+        dflash: bool = False,
         compile_codec: bool = False,
         prefill_chunk: int = CFG.prefill_chunk,
         memory_bytes: int | None = None,
@@ -130,7 +131,7 @@ class WeightStore:
             raise ValueError("memory_bytes must be nonnegative")
         if headroom_bytes < 0:
             raise ValueError("headroom_bytes must be nonnegative")
-        if not any((text, mtp, draft_head, vision)):
+        if not any((text, mtp, draft_head, vision, dflash)):
             raise ValueError("at least one weight component must be selected")
 
         self.binding = binding
@@ -158,6 +159,14 @@ class WeightStore:
             add(binding.blocks_for("draft"))
         if vision:
             add(binding.blocks_for("vision"))
+        if dflash:
+            add(binding.blocks_for("dflash"))
+            add(
+                (
+                    binding.dflash.token_embedding,
+                    binding.dflash.proposal_output_head,
+                )
+            )
         blocks = tuple(selected[index] for index in sorted(selected))
 
         fixed = estimate_fixed_bytes(

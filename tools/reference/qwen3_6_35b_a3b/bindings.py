@@ -33,7 +33,7 @@ GDN_LAYERS = tuple(
 Q6_ROUTED_DOWN_LAYERS = frozenset((34, 38, 39))
 VISION_LAYERS = tuple(range(27))
 
-Component = Literal["text", "draft", "mtp", "vision"]
+Component = Literal["text", "draft", "mtp", "vision", "dflash"]
 
 
 class BindingError(ValueError):
@@ -238,6 +238,45 @@ class VisionBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class DFlashAttentionBinding:
+    query_key_value: PhysicalBlock
+    query: LogicalRowView
+    key: LogicalRowView
+    value: LogicalRowView
+    query_norm: PhysicalBlock
+    key_norm: PhysicalBlock
+    output: PhysicalBlock
+
+
+@dataclass(frozen=True, slots=True)
+class DFlashMlpBinding:
+    gate_up: PhysicalBlock
+    gate: LogicalRowView
+    up: LogicalRowView
+    down: PhysicalBlock
+
+
+@dataclass(frozen=True, slots=True)
+class DFlashLayerBinding:
+    index: int
+    input_norm: PhysicalBlock
+    attention: DFlashAttentionBinding
+    post_attention_norm: PhysicalBlock
+    mlp: DFlashMlpBinding
+
+
+@dataclass(frozen=True, slots=True)
+class DFlashBinding:
+    token_embedding: PhysicalBlock
+    mask_embedding: LogicalRowView
+    proposal_output_head: PhysicalBlock
+    feature_projection: PhysicalBlock
+    context_norm: PhysicalBlock
+    layers: tuple[DFlashLayerBinding, ...]
+    final_norm: PhysicalBlock
+
+
+@dataclass(frozen=True, slots=True)
 class _ExpectedTensor:
     name: str
     shape: tuple[int, ...]
@@ -382,6 +421,33 @@ def _vision_contract() -> tuple[_ExpectedTensor, ...]:
     return tuple(tensors)
 
 
+def _dflash_contract() -> tuple[_ExpectedTensor, ...]:
+    tensors: list[_ExpectedTensor] = [
+        _tensor("dflash/feature_projection", (2048, 16384), W8),
+        _tensor("dflash/context_norm", (2048,), BF16),
+    ]
+    for layer in range(6):
+        prefix = f"dflash/layers/{layer}/"
+        tensors.extend(
+            (
+                _tensor(prefix + "input_norm", (2048,), BF16),
+                _tensor(
+                    prefix + "attention/query_key_value",
+                    (6144, 2048),
+                    W8,
+                ),
+                _tensor(prefix + "attention/query_norm", (128,), BF16),
+                _tensor(prefix + "attention/key_norm", (128,), BF16),
+                _tensor(prefix + "attention/output", (2048, 4096), W8),
+                _tensor(prefix + "post_attention_norm", (2048,), BF16),
+                _tensor(prefix + "mlp/gate_up", (12288, 2048), W8),
+                _tensor(prefix + "mlp/down", (2048, 6144), W8),
+            )
+        )
+    tensors.append(_tensor("dflash/final_norm", (2048,), BF16))
+    return tuple(tensors)
+
+
 _RESOURCE_CONTRACT = tuple(
     _ExpectedResource(name)
     for name in (
@@ -397,16 +463,20 @@ _TEXT_CONTRACT = _text_contract()
 _DRAFT_CONTRACT = _draft_contract()
 _MTP_CONTRACT = _mtp_contract()
 _VISION_CONTRACT = _vision_contract()
+_DFLASH_CONTRACT = _dflash_contract()
 _OBJECT_CONTRACT: tuple[_ExpectedObject, ...] = (
     _RESOURCE_CONTRACT
     + _TEXT_CONTRACT
     + _DRAFT_CONTRACT
     + _MTP_CONTRACT
     + _VISION_CONTRACT
+    + _DFLASH_CONTRACT
 )
 
 
 def _component(name: str) -> Component:
+    if name.startswith("dflash/"):
+        return "dflash"
     if name.startswith("vision/"):
         return "vision"
     if name.startswith("mtp/"):
@@ -686,6 +756,50 @@ class ArtifactBinding:
                 norm_bias=blocks["vision/merger/norm/bias"],
             ),
         )
+
+        dflash_layers: list[DFlashLayerBinding] = []
+        for layer in range(6):
+            prefix = f"dflash/layers/{layer}/"
+            qkv = blocks[prefix + "attention/query_key_value"]
+            gate_up = blocks[prefix + "mlp/gate_up"]
+            dflash_layers.append(
+                DFlashLayerBinding(
+                    index=layer,
+                    input_norm=blocks[prefix + "input_norm"],
+                    attention=DFlashAttentionBinding(
+                        query_key_value=qkv,
+                        query=_row_view(qkv, 0, 4096, row_views),
+                        key=_row_view(qkv, 4096, 5120, row_views),
+                        value=_row_view(qkv, 5120, 6144, row_views),
+                        query_norm=blocks[prefix + "attention/query_norm"],
+                        key_norm=blocks[prefix + "attention/key_norm"],
+                        output=blocks[prefix + "attention/output"],
+                    ),
+                    post_attention_norm=blocks[
+                        prefix + "post_attention_norm"
+                    ],
+                    mlp=DFlashMlpBinding(
+                        gate_up=gate_up,
+                        gate=_row_view(gate_up, 0, 6144, row_views),
+                        up=_row_view(gate_up, 6144, 12288, row_views),
+                        down=blocks[prefix + "mlp/down"],
+                    ),
+                )
+            )
+        self.dflash = DFlashBinding(
+            token_embedding=self.text.token_embedding,
+            mask_embedding=_row_view(
+                self.text.token_embedding,
+                TOKENIZER_VOCAB_SIZE,
+                TOKENIZER_VOCAB_SIZE + 1,
+                row_views,
+            ),
+            proposal_output_head=self.text.output_head,
+            feature_projection=blocks["dflash/feature_projection"],
+            context_norm=blocks["dflash/context_norm"],
+            layers=tuple(dflash_layers),
+            final_norm=blocks["dflash/final_norm"],
+        )
         self.row_views = tuple(row_views)
         self.axis_views = tuple(axis_views)
         self.expert_banks = tuple(expert_banks)
@@ -744,6 +858,10 @@ __all__ = [
     "AxisView",
     "BindingError",
     "BoundResource",
+    "DFlashAttentionBinding",
+    "DFlashBinding",
+    "DFlashLayerBinding",
+    "DFlashMlpBinding",
     "DraftHeadBinding",
     "ExpertBank",
     "FrontendResources",

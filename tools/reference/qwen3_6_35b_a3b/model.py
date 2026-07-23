@@ -105,6 +105,7 @@ class RefModel:
             mtp=self.mtp_enabled,
             draft_head=self.draft_head,
             vision=False,
+            dflash=False,
             compile_codec=compile_codec,
             prefill_chunk=self.prefill_chunk,
             memory_bytes=self.memory_bytes,

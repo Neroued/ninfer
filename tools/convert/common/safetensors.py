@@ -1,4 +1,4 @@
-"""Lazy reads from a sharded Hugging Face safetensors checkpoint."""
+"""Lazy reads from explicitly selected indexed or single-file safetensors sources."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ class TensorMetadata:
 
 
 class ShardReader:
-    """Resolve an index lazily while keeping at most one shard handle open."""
+    """Resolve a safetensors source while keeping at most one file handle open."""
 
     def __init__(
         self,
@@ -30,6 +30,24 @@ class ShardReader:
         self.model_dir = Path(model_dir)
         index = json.loads((self.model_dir / index_filename).read_text())
         self.weight_map: dict[str, str] = dict(index["weight_map"])
+        self._reset_handle()
+
+    @classmethod
+    def from_index(cls, index_path: str | Path) -> ShardReader:
+        path = Path(index_path)
+        return cls(path.parent, path.name)
+
+    @classmethod
+    def from_file(cls, tensor_path: str | Path) -> ShardReader:
+        path = Path(tensor_path)
+        reader = cls.__new__(cls)
+        reader.model_dir = path.parent
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            reader.weight_map = {name: path.name for name in handle.keys()}
+        reader._reset_handle()
+        return reader
+
+    def _reset_handle(self) -> None:
         self._current_shard: str | None = None
         self._context = None
         self._handle = None

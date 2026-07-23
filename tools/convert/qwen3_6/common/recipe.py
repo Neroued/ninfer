@@ -300,9 +300,16 @@ def preflight_sources(
     model_dir: str | Path,
     recipes: Sequence[TensorRecipe],
 ) -> SourcePreflight:
-    requirements = source_requirements(recipes)
     with ShardReader(model_dir) as reader:
-        metadata = reader.metadata(requirements)
+        return preflight_source_reader(reader, recipes)
+
+
+def preflight_source_reader(
+    reader: ShardReader,
+    recipes: Sequence[TensorRecipe],
+) -> SourcePreflight:
+    requirements = source_requirements(recipes)
+    metadata = reader.metadata(requirements)
 
     dtype_counts: dict[str, int] = {}
     shards: set[str] = set()
@@ -410,6 +417,7 @@ __all__ = [
     "expression_sources",
     "materialize_expression",
     "materialize_recipe",
+    "preflight_source_reader",
     "preflight_sources",
     "source",
     "source_requirements",

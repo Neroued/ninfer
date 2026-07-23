@@ -71,20 +71,20 @@ only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, 
 | Field | Value |
 |---|---|
 | Filename | `qwen3_6_35b_a3b.ninfer` |
-| Size | 22,373,184,256 bytes (20.84 GiB) |
-| SHA-256 | `9e8378398d2b789a77224b5110c7590adbbc6fd4accd139b918157b2b9da7163` |
+| Size | 22,783,246,080 bytes (21.22 GiB) |
+| SHA-256 | `5194407dd6d3092b8c2f81ce41e014b50ca0d6f1ba4e5d8c1492b8652bfa267f` |
 | Container version | 1 |
 | NInfer model ID | `qwen3.6-35b-a3b` |
 | NInfer target key | `qwen3_6_35b_a3b` |
 
-The file contains the registered Text, Vision, MTP, proposal-head, tokenizer, chat-template,
-generation, and media-processor objects required by NInfer.
+The file contains the registered Text, Vision, MTP, proposal-head, DFlash, tokenizer,
+chat-template, generation, and media-processor objects required by NInfer.
 
 Verify a downloaded file with:
 
 ```bash
 printf '%s  %s\n' \
-  '9e8378398d2b789a77224b5110c7590adbbc6fd4accd139b918157b2b9da7163' \
+  '5194407dd6d3092b8c2f81ce41e014b50ca0d6f1ba4e5d8c1492b8652bfa267f' \
   'qwen3_6_35b_a3b.ninfer' | sha256sum --check
 ```
 
@@ -190,6 +190,8 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 - The artifact is accepted only by the matching NInfer target.
 - NInfer currently executes on one RTX 5090, one CUDA device, and one active request per Engine.
+- The artifact contains the DFlash companion weights, but the current Engine does not execute
+  DFlash proposals and leaves that weight group nonresident.
 - It does not provide continuous batching, multi-GPU execution, CPU/GPU offload, or distributed
   serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.
@@ -199,11 +201,12 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 | Field | Value |
 |---|---|
-| Source repository | `Qwen/Qwen3.6-35B-A3B` |
-| Source revision | `995ad96eacd98c81ed38be0c5b274b04031597b0` |
-| Conversion recipe | `qwen3_6_35b_a3b-v1` |
+| Base source repository | `Qwen/Qwen3.6-35B-A3B` |
+| Base source revision | `995ad96eacd98c81ed38be0c5b274b04031597b0` |
+| DFlash source repository | `z-lab/Qwen3.6-35B-A3B-DFlash` |
+| DFlash source revision | `f181eece646affea2c38b2765f1aaa01a9734ccd` |
+| Conversion recipe | `qwen3_6_35b_a3b-v2` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
-| Converter revision | `19d17f0dfe655e4a2e495f0ed992c8c168f31862` |
 
 The complete object inventory and conversion metadata are published in
 [`artifact-manifest.json`](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/blob/main/artifact-manifest.json).

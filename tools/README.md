@@ -32,7 +32,8 @@ python3 -m tools.convert.qwen3_6_27b.convert \
   --out out/qwen3_6_27b.ninfer
 
 python3 -m tools.convert.qwen3_6_35b_a3b.convert \
-  --model /path/to/Qwen3.6-35B-A3B \
+  --model /path/to/Qwen3.6-35B-A3B-base \
+  --dflash-model /path/to/Qwen3.6-35B-A3B-DFlash \
   --out out/qwen3_6_35b_a3b.ninfer
 ```
 

@@ -34,6 +34,7 @@ TEXT_LAYERS = tuple(range(40))
 FULL_ATTENTION_LAYERS = tuple(range(3, 40, 4))
 GDN_LAYERS = tuple(layer for layer in TEXT_LAYERS if layer not in FULL_ATTENTION_LAYERS)
 Q6_ROUTED_DOWN_LAYERS = (34, 38, 39)
+DFLASH_LAYERS = tuple(range(6))
 
 
 def _routed_down_format(layer: int) -> str:
@@ -128,16 +129,45 @@ def _build_mtp_specs() -> tuple[TensorSpec, ...]:
     )
 
 
+def _build_dflash_specs() -> tuple[TensorSpec, ...]:
+    specs: list[TensorSpec] = [
+        tensor_spec("dflash/feature_projection", (2048, 16384), W8),
+        tensor_spec("dflash/context_norm", (2048,), BF16),
+    ]
+    for layer in DFLASH_LAYERS:
+        prefix = f"dflash/layers/{layer}/"
+        specs.extend(
+            (
+                tensor_spec(prefix + "input_norm", (2048,), BF16),
+                tensor_spec(
+                    prefix + "attention/query_key_value",
+                    (6144, 2048),
+                    W8,
+                ),
+                tensor_spec(prefix + "attention/query_norm", (128,), BF16),
+                tensor_spec(prefix + "attention/key_norm", (128,), BF16),
+                tensor_spec(prefix + "attention/output", (2048, 4096), W8),
+                tensor_spec(prefix + "post_attention_norm", (2048,), BF16),
+                tensor_spec(prefix + "mlp/gate_up", (12288, 2048), W8),
+                tensor_spec(prefix + "mlp/down", (2048, 6144), W8),
+            )
+        )
+    specs.append(tensor_spec("dflash/final_norm", (2048,), BF16))
+    return tuple(specs)
+
+
 TEXT_CORE_TENSOR_SPECS = _build_text_core_specs()
 DRAFT_HEAD_TENSOR_SPECS = _build_draft_head_specs()
 MTP_TENSOR_SPECS = _build_mtp_specs()
 VISION_TENSOR_SPECS = build_vision_specs(2048)
+DFLASH_TENSOR_SPECS = _build_dflash_specs()
 
 TENSOR_SPECS = (
     TEXT_CORE_TENSOR_SPECS
     + DRAFT_HEAD_TENSOR_SPECS
     + MTP_TENSOR_SPECS
     + VISION_TENSOR_SPECS
+    + DFLASH_TENSOR_SPECS
 )
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
@@ -154,6 +184,8 @@ LAYOUT_COUNTS = {
 __all__ = [
     "BF16",
     "CONTIGUOUS_LAYOUT",
+    "DFLASH_LAYERS",
+    "DFLASH_TENSOR_SPECS",
     "DRAFT_HEAD_TENSOR_SPECS",
     "FORMAT_COUNTS",
     "FORMAT_NAMES",

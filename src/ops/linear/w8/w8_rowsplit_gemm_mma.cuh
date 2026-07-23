@@ -9,6 +9,7 @@
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
 #include "ops/common/mma.cuh"
+#include "ops/common/math.cuh"
 #include "ops/linear/w8/w8_rowsplit_launch.h"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 
@@ -64,15 +65,20 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
     const std::uint8_t* __restrict__ scales, Output output, std::int32_t m, std::int32_t k,
     std::int32_t n, std::int32_t padded_k) {
     static_assert(Variant == W8KernelVariant::Full || Variant == W8KernelVariant::Predicated);
-    constexpr bool FullTiles = Variant == W8KernelVariant::Full;
-    constexpr int BM         = Cfg::BM;
-    constexpr int BN         = Cfg::BN;
-    constexpr int BK         = Cfg::BK;
-    constexpr int WM         = Cfg::WM;
-    constexpr int WN         = Cfg::WN;
-    constexpr int MT         = Cfg::MT;
-    constexpr int NT         = Cfg::NT;
-    constexpr int KSUB       = Cfg::KSUB;
+    constexpr bool FullTiles        = Variant == W8KernelVariant::Full;
+    constexpr int BM                = Cfg::BM;
+    constexpr int BN                = Cfg::BN;
+    constexpr int BK                = Cfg::BK;
+    constexpr int WM                = Cfg::WM;
+    constexpr int WN                = Cfg::WN;
+    constexpr int MT                = Cfg::MT;
+    constexpr int NT                = Cfg::NT;
+    constexpr int KSUB              = Cfg::KSUB;
+    constexpr bool kSwiGlu          = Epilogue == W8Epilogue::SwiGluSplitHalf;
+    constexpr int kOutputRowsPerCta = kSwiGlu ? BM / 2 : BM;
+    static_assert(!kSwiGlu || (BM % 32) == 0);
+    static_assert(!kSwiGlu || Cfg::WARPS_M == 1 || Cfg::WARPS_M == 2,
+                  "SwiGLU supports warp-local or shared-memory row pairing");
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[Cfg::STAGES][BN * BK];
@@ -87,7 +93,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 
-    const int m0                   = static_cast<int>(blockIdx.x) * BM;
+    const int m0                   = static_cast<int>(blockIdx.x) * kOutputRowsPerCta;
     const int n0                   = static_cast<int>(blockIdx.y) * BN;
     const int kg                   = padded_k / 32;
     const W8OutputTile output_tile = output.tile(m0);
@@ -139,8 +145,9 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
         for (int item = tid; item < BM * (BK / 16); item += Cfg::THREADS) {
             const int row   = item / (BK / 16);
             const int chunk = item - row * (BK / 16);
-            const int grow  = m0 + row;
-            auto* dst       = &Cr[row * BK + chunk * 16];
+            const int grow =
+                kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
+            auto* dst = &Cr[row * BK + chunk * 16];
             if constexpr (FullTiles) {
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                 cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
@@ -152,8 +159,9 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
         }
         if ((kt % SCALE_CACHE_TILES) == 0) {
             for (int row = tid; row < BM; row += Cfg::THREADS) {
-                const int grow = m0 + row;
-                auto* dst      = &Sr[row * Cfg::SCALE_CACHE_BYTES];
+                const int grow =
+                    kSwiGlu ? m0 + (row % (BM / 2)) + (row >= BM / 2 ? m / 2 : 0) : m0 + row;
+                auto* dst = &Sr[row * Cfg::SCALE_CACHE_BYTES];
                 if constexpr (FullTiles) {
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                     cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
@@ -262,7 +270,117 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
         }
     }
 
-    if constexpr (Epilogue == W8Epilogue::Residual) {
+    if constexpr (kSwiGlu) {
+        if constexpr (Cfg::WARPS_M == 1) {
+            static_assert((MT % 2) == 0);
+            constexpr int kGateMt = MT / 2;
+#pragma unroll
+            for (int mi = 0; mi < kGateMt; ++mi) {
+                const int r0 = m0 + mi * 16 + gid;
+                const int r1 = r0 + 8;
+#pragma unroll
+                for (int ni = 0; ni < NT; ++ni) {
+                    const int c0          = n0 + wn * WN + ni * 8 + 2 * lid;
+                    const int c1          = c0 + 1;
+                    const float* gate_acc = acc[mi][ni];
+                    const float* up_acc   = acc[mi + kGateMt][ni];
+                    if constexpr (FullTiles) {
+                        *output_tile.at(r0, c0) =
+                            __float2bfloat16_rn(silu(gate_acc[0]) * up_acc[0]);
+                        *output_tile.at(r0, c1) =
+                            __float2bfloat16_rn(silu(gate_acc[1]) * up_acc[1]);
+                        *output_tile.at(r1, c0) =
+                            __float2bfloat16_rn(silu(gate_acc[2]) * up_acc[2]);
+                        *output_tile.at(r1, c1) =
+                            __float2bfloat16_rn(silu(gate_acc[3]) * up_acc[3]);
+                    } else {
+                        if (r0 < m / 2 && c0 < n) {
+                            *output_tile.at(r0, c0) =
+                                __float2bfloat16_rn(silu(gate_acc[0]) * up_acc[0]);
+                        }
+                        if (r0 < m / 2 && c1 < n) {
+                            *output_tile.at(r0, c1) =
+                                __float2bfloat16_rn(silu(gate_acc[1]) * up_acc[1]);
+                        }
+                        if (r1 < m / 2 && c0 < n) {
+                            *output_tile.at(r1, c0) =
+                                __float2bfloat16_rn(silu(gate_acc[2]) * up_acc[2]);
+                        }
+                        if (r1 < m / 2 && c1 < n) {
+                            *output_tile.at(r1, c1) =
+                                __float2bfloat16_rn(silu(gate_acc[3]) * up_acc[3]);
+                        }
+                    }
+                }
+            }
+        } else {
+            static_assert(Cfg::WARPS_M == 2);
+            auto* up_shared = reinterpret_cast<float*>(Bs);
+            __syncthreads();
+            if (wm == 1) {
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+                    const int local_r0 = mi * 16 + gid;
+                    const int local_r1 = local_r0 + 8;
+#pragma unroll
+                    for (int ni = 0; ni < NT; ++ni) {
+                        const int local_c0                  = wn * WN + ni * 8 + 2 * lid;
+                        const int local_c1                  = local_c0 + 1;
+                        const float* up_acc                 = acc[mi][ni];
+                        up_shared[local_r0 * BN + local_c0] = up_acc[0];
+                        up_shared[local_r0 * BN + local_c1] = up_acc[1];
+                        up_shared[local_r1 * BN + local_c0] = up_acc[2];
+                        up_shared[local_r1 * BN + local_c1] = up_acc[3];
+                    }
+                }
+            }
+            __syncthreads();
+            if (wm == 0) {
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+                    const int local_r0 = mi * 16 + gid;
+                    const int local_r1 = local_r0 + 8;
+                    const int r0       = m0 + local_r0;
+                    const int r1       = m0 + local_r1;
+#pragma unroll
+                    for (int ni = 0; ni < NT; ++ni) {
+                        const int local_c0    = wn * WN + ni * 8 + 2 * lid;
+                        const int local_c1    = local_c0 + 1;
+                        const int c0          = n0 + local_c0;
+                        const int c1          = n0 + local_c1;
+                        const float* gate_acc = acc[mi][ni];
+                        const float up00      = up_shared[local_r0 * BN + local_c0];
+                        const float up01      = up_shared[local_r0 * BN + local_c1];
+                        const float up10      = up_shared[local_r1 * BN + local_c0];
+                        const float up11      = up_shared[local_r1 * BN + local_c1];
+                        if constexpr (FullTiles) {
+                            *output_tile.at(r0, c0) = __float2bfloat16_rn(silu(gate_acc[0]) * up00);
+                            *output_tile.at(r0, c1) = __float2bfloat16_rn(silu(gate_acc[1]) * up01);
+                            *output_tile.at(r1, c0) = __float2bfloat16_rn(silu(gate_acc[2]) * up10);
+                            *output_tile.at(r1, c1) = __float2bfloat16_rn(silu(gate_acc[3]) * up11);
+                        } else {
+                            if (r0 < m / 2 && c0 < n) {
+                                *output_tile.at(r0, c0) =
+                                    __float2bfloat16_rn(silu(gate_acc[0]) * up00);
+                            }
+                            if (r0 < m / 2 && c1 < n) {
+                                *output_tile.at(r0, c1) =
+                                    __float2bfloat16_rn(silu(gate_acc[1]) * up01);
+                            }
+                            if (r1 < m / 2 && c0 < n) {
+                                *output_tile.at(r1, c0) =
+                                    __float2bfloat16_rn(silu(gate_acc[2]) * up10);
+                            }
+                            if (r1 < m / 2 && c1 < n) {
+                                *output_tile.at(r1, c1) =
+                                    __float2bfloat16_rn(silu(gate_acc[3]) * up11);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if constexpr (Epilogue == W8Epilogue::Residual) {
         static_assert(BM <= BK && (BM % 8) == 0,
                       "W8 residual epilogue reuses one x stage as a BF16 output tile");
         __syncthreads();

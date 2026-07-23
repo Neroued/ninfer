@@ -22,6 +22,14 @@ namespace ninfer::ops::detail {
 
 struct W8ExactTSplitKStoreEpilogue {};
 
+struct W8ExactTIdentityRows {
+    static constexpr int kOutputRowsPerCta = 16;
+
+    __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
+        return output_row0 + local_row;
+    }
+};
+
 __device__ __forceinline__ int w8_exact_t_swizzle_64(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }
@@ -47,11 +55,12 @@ inline constexpr int kW8ExactTMinBlocks =
     TileCols == 8 ? 5 : (TileCols == 16 ? 4 : (TileCols == 24 ? 3 : 2));
 
 template <int Hidden, int TileCols, int ActiveCols, class Output,
-          class Epilogue = W8ExactTSplitKStoreEpilogue>
+          class Epilogue = W8ExactTSplitKStoreEpilogue, class RowPolicy = W8ExactTIdentityRows>
 __global__
 __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t_splitk_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {}) {
+    const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue = {},
+    RowPolicy row_policy = {}) {
     constexpr int kTileK      = 64;
     constexpr int kWarps      = 8;
     constexpr int kMmaRows    = 16;
@@ -86,7 +95,7 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
     const int lid     = lane & 3;
     const int k_split = warp;
 
-    const int cta_row0 = static_cast<int>(blockIdx.x) * kRowsPerCta;
+    const int cta_row0 = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
 
     const auto stage_x = [&](int group_k0) {
         constexpr int kItemsPerSplit = ActiveCols * (kTileK / 8);
@@ -107,19 +116,21 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
             const int row            = warp * 2 + row_item;
             const int chunk          = lane;
             const int swizzled_chunk = chunk ^ (row & 7);
+            const int weight_row     = row_policy.weight_row(cta_row0, row);
             cp_async<16, Cache::cg>(&code_shared[row][swizzled_chunk * 16],
-                                    codes + static_cast<std::int64_t>(cta_row0 + row) * Hidden +
+                                    codes + static_cast<std::int64_t>(weight_row) * Hidden +
                                         group_k0 + chunk * 16);
         }
         if constexpr (ActiveCols > 4) {
             for (int item = tid; item < kMmaRows * 2; item += kWarps * 32) {
-                const int row   = item >> 1;
-                const int chunk = item & 1;
-                cp_async<16, Cache::cg>(
-                    &scale_shared[row][chunk * 16],
-                    scales + (static_cast<std::int64_t>(cta_row0 + row) * (Hidden / 32) +
-                              group_k0 / 32 + chunk * 8) *
-                                 2);
+                const int row        = item >> 1;
+                const int chunk      = item & 1;
+                const int weight_row = row_policy.weight_row(cta_row0, row);
+                cp_async<16, Cache::cg>(&scale_shared[row][chunk * 16],
+                                        scales +
+                                            (static_cast<std::int64_t>(weight_row) * (Hidden / 32) +
+                                             group_k0 / 32 + chunk * 8) *
+                                                2);
             }
         }
         cp_commit();
@@ -153,7 +164,7 @@ __launch_bounds__(8 * 32, kW8ExactTMinBlocks<TileCols>) void w8_rowsplit_exact_t
                 lane_scale_pair =
                     *reinterpret_cast<const unsigned*>(&scale_shared[scale_row][warp_koff / 16]);
             } else {
-                const int scale_row = cta_row0 + gid + lid * 8;
+                const int scale_row = row_policy.weight_row(cta_row0, gid + lid * 8);
                 lane_scale_pair     = *reinterpret_cast<const unsigned*>(
                     scales + (static_cast<std::int64_t>(scale_row) * (Hidden / 32) + group_k0 / 32 +
                               warp_koff / 32) *

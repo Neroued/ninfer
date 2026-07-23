@@ -1,5 +1,6 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 
 #include <array>
 #include <cstddef>
@@ -116,13 +117,90 @@ void workspace_tests() {
                    [] { (void)ninfer::ops::linear_swiglu_workspace_bytes(34814, 1); });
     expect_invalid("workspace C0",
                    [] { (void)ninfer::ops::linear_swiglu_workspace_bytes(34816, 0); });
+
+    for (const std::int32_t capacity : {1, 2, 16, 17, 32, 33, 1024, 2048}) {
+        if (ninfer::ops::linear_swiglu_workspace_bytes(12288, capacity) != 0) {
+            std::cerr << "W8 workspace C=" << capacity << ": expected zero bytes\n";
+            ++failures;
+        }
+    }
+}
+
+void w8_route_tests() {
+    using WS = ninfer::ops::detail::W8LinearSwiGluScheduleId;
+
+    struct Case {
+        std::int32_t cols;
+        WS schedule;
+        ninfer::ops::detail::W8KernelVariant variant;
+    };
+
+    constexpr std::array<Case, 35> cases{{
+        {1, WS::DecodePairR16, ninfer::ops::detail::W8KernelVariant::None},
+        {2, WS::SplitKMmaExactT, ninfer::ops::detail::W8KernelVariant::None},
+        {32, WS::SplitKMmaExactT, ninfer::ops::detail::W8KernelVariant::None},
+        {33, WS::MmaR32C64, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {64, WS::MmaR32C64, ninfer::ops::detail::W8KernelVariant::Full},
+        {65, WS::MmaR32C80, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {80, WS::MmaR32C80, ninfer::ops::detail::W8KernelVariant::Full},
+        {81, WS::MmaR32C96, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {96, WS::MmaR32C96, ninfer::ops::detail::W8KernelVariant::Full},
+        {97, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {128, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Full},
+        {129, WS::MmaR32C64, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {192, WS::MmaR32C64, ninfer::ops::detail::W8KernelVariant::Full},
+        {193, WS::MmaR128C80, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {240, WS::MmaR128C80, ninfer::ops::detail::W8KernelVariant::Full},
+        {241, WS::MmaR32C128, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {255, WS::MmaR32C128, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {256, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
+        {257, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {264, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {265, WS::MmaR64C96, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {288, WS::MmaR64C96, ninfer::ops::detail::W8KernelVariant::Full},
+        {289, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {320, WS::MmaR64C64, ninfer::ops::detail::W8KernelVariant::Full},
+        {321, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {384, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
+        {385, WS::MmaR128C64, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {448, WS::MmaR128C64, ninfer::ops::detail::W8KernelVariant::Full},
+        {449, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {512, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
+        {513, WS::MmaR128C80, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {560, WS::MmaR128C80, ninfer::ops::detail::W8KernelVariant::Full},
+        {561, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Predicated},
+        {1024, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
+        {2048, WS::MmaR64C128, ninfer::ops::detail::W8KernelVariant::Full},
+    }};
+    for (const Case test : cases) {
+        const ninfer::ops::detail::W8LinearSwiGluProblem problem{12288, 6144, 2048, 2048,
+                                                                 test.cols};
+        if (!ninfer::ops::detail::w8_linear_swiglu_admits(problem)) {
+            std::cerr << "rejected admitted W8 LinearSwiGLU C=" << test.cols << '\n';
+            ++failures;
+            continue;
+        }
+        const auto plan = ninfer::ops::detail::w8_linear_swiglu_resolve_plan(problem);
+        if (plan.schedule != test.schedule || plan.variant != test.variant ||
+            plan.workspace_bytes != 0) {
+            std::cerr << "wrong W8 LinearSwiGLU route C=" << test.cols << '\n';
+            ++failures;
+        }
+    }
+    expect_invalid("W8 C=0", [] {
+        (void)ninfer::ops::detail::w8_linear_swiglu_resolve_plan({12288, 6144, 2048, 2048, 0});
+    });
+    expect_invalid("W8 unsupported output rows", [] {
+        (void)ninfer::ops::detail::w8_linear_swiglu_resolve_plan({12288, 6143, 2048, 2048, 1});
+    });
 }
 
 } // namespace
 
 int main() {
     route_tests();
+    w8_route_tests();
     workspace_tests();
-    std::cout << (failures == 0 ? "OK" : "FAIL") << " Q4 LinearSwiGLU plan\n";
+    std::cout << (failures == 0 ? "OK" : "FAIL") << " Q4/W8 LinearSwiGLU plan\n";
     return failures == 0 ? 0 : 1;
 }

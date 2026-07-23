@@ -27,9 +27,11 @@ namespace ninfer::ops {
  *   gate_up = Linear(x, gate_up_weight); M=gate_up_rows/2;
  *   out[i,t] = BF16(SiLU(gate_up[i,t]) * gate_up[M+i,t]).
  *
- * Logical shapes:
- *   x [5120,T] and out [17408,T] are contiguous BF16. gate_up_weight is Q4G64_F16S RowSplit
- *   [34816,5120] with FP16 scales. T may be any positive value.
+ * Logical shapes / supported domain:
+ *   T may be any positive value. The registered RowSplit profiles are:
+ *   - Q4G64_F16S weight [34816,5120], x [5120,T], out [17408,T];
+ *   - W8G32_F16S weight [12288,2048], x [2048,T], out [6144,T].
+ *   Inputs and output are contiguous BF16; packed scales are FP16.
  *
  * Numeric:
  *   The oracle exact-decodes the registered weight and evaluates the complete expression naively
@@ -41,8 +43,9 @@ namespace ninfer::ops {
  *   Writes the full output; x/weight and output must not alias.
  *
  * Workspace:
- *   Caller-owned transient storage reported by linear_swiglu_workspace_bytes(34816,T), scoped to
- *   the call. There is no persistent state side effect.
+ *   Caller-owned transient storage reported by linear_swiglu_workspace_bytes(gate_up_rows,T),
+ *   scoped to the call. The W8 profile requires zero bytes. There is no persistent state side
+ *   effect.
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);

@@ -15,9 +15,11 @@
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
+#include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 #include "ops/row_split_pack.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -118,16 +120,17 @@ void capture_and_replay(Launch&& launch) {
     cudaStream_t stream  = nullptr;
     cudaGraph_t graph    = nullptr;
     cudaGraphExec_t exec = nullptr;
-    cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
-    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    cuda_check(cudaDeviceSynchronize(), "synchronize before graph capture");
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create capture stream");
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "begin graph capture");
     launch(stream);
-    cudaStreamEndCapture(stream, &graph);
-    cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
-    cudaGraphLaunch(exec, stream);
-    cudaStreamSynchronize(stream);
-    cudaGraphExecDestroy(exec);
-    cudaGraphDestroy(graph);
-    cudaStreamDestroy(stream);
+    cuda_check(cudaStreamEndCapture(stream, &graph), "end graph capture");
+    cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate graph");
+    cuda_check(cudaGraphLaunch(exec, stream), "launch graph");
+    cuda_check(cudaStreamSynchronize(stream), "synchronize graph");
+    cuda_check(cudaGraphExecDestroy(exec), "destroy graph exec");
+    cuda_check(cudaGraphDestroy(graph), "destroy graph");
+    cuda_check(cudaStreamDestroy(stream), "destroy capture stream");
 }
 
 int verify_sampled_projection(const std::string& label, const std::vector<double>& full_output,
@@ -966,6 +969,187 @@ int gate_up_silu_route_correctness() {
     return failures;
 }
 
+std::vector<double>
+complete_sparse_swiglu_oracle(const row_split::PackedWeight& packed, const std::vector<float>& x,
+                              std::int32_t k, std::int32_t cols, std::int32_t intermediate,
+                              const std::array<std::int32_t, 16>& active_columns) {
+    std::vector<double> reference(static_cast<std::size_t>(intermediate) * cols);
+    const unsigned hw            = std::max(1u, std::thread::hardware_concurrency());
+    const std::int32_t n_threads = std::min<std::int32_t>(
+        intermediate, static_cast<std::int32_t>(std::min<unsigned>(hw, 16u)));
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(n_threads));
+    for (std::int32_t tid = 0; tid < n_threads; ++tid) {
+        const std::int32_t row_begin =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(intermediate) * tid) / n_threads);
+        const std::int32_t row_end = static_cast<std::int32_t>(
+            (static_cast<std::int64_t>(intermediate) * (tid + 1)) / n_threads);
+        threads.emplace_back([&, row_begin, row_end] {
+            for (std::int32_t token = 0; token < cols; ++token) {
+                const float* xcol = x.data() + static_cast<std::size_t>(token) * k;
+                for (std::int32_t row = row_begin; row < row_end; ++row) {
+                    double gate = 0.0;
+                    double up   = 0.0;
+                    for (const std::int32_t column : active_columns) {
+                        gate += row_split::decode_row_split_lowbit_fp64(packed, row, column) *
+                                static_cast<double>(xcol[column]);
+                        up += row_split::decode_row_split_lowbit_fp64(packed, intermediate + row,
+                                                                      column) *
+                              static_cast<double>(xcol[column]);
+                    }
+                    reference[static_cast<std::size_t>(token) * intermediate + row] =
+                        silu_fp64(gate) * up;
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    return reference;
+}
+
+int w8_gate_up_silu_correctness() {
+    constexpr std::int32_t kHidden = 2048;
+    constexpr std::int32_t kInter  = 6144;
+    constexpr std::int32_t kRows   = 12288;
+    constexpr std::int32_t kMaxT   = 1024;
+    constexpr std::array<std::int32_t, 16> kActiveColumns{
+        0, 1, 30, 31, 32, 33, 62, 63, 64, 511, 512, 1023, 1024, 2015, 2046, 2047,
+    };
+
+    auto packed = row_split::make_patterned_weight(QType::W8G32_F16S, kRows, kHidden, 3601u);
+    DBuf dweight(packed.payload.size());
+    cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
+    const Weight weight = packed.device_weight(dweight.p);
+    WorkspaceArena ws(1);
+    int failures = 0;
+
+    std::vector<float> sparse_x(static_cast<std::size_t>(kHidden) * 16, 0.0f);
+    for (std::int32_t token = 0; token < 16; ++token) {
+        for (std::size_t index = 0; index < kActiveColumns.size(); ++index) {
+            const float sign = ((token + static_cast<std::int32_t>(index)) & 1) == 0 ? 1.0f : -1.0f;
+            sparse_x[static_cast<std::size_t>(token) * kHidden + kActiveColumns[index]] =
+                sign * (0.015625f + static_cast<float>((token + index) % 7) * 0.0078125f);
+        }
+    }
+    round_to_bf16(sparse_x);
+    const std::vector<double> complete_reference =
+        complete_sparse_swiglu_oracle(packed, sparse_x, kHidden, 16, kInter, kActiveColumns);
+    const bool has_negative   = std::any_of(complete_reference.begin(), complete_reference.end(),
+                                            [](double value) { return value < -1.0; });
+    const bool has_near_zero  = std::any_of(complete_reference.begin(), complete_reference.end(),
+                                            [](double value) { return std::abs(value) < 1e-3; });
+    const bool has_saturation = std::any_of(complete_reference.begin(), complete_reference.end(),
+                                            [](double value) { return value > 100.0; });
+    if (!has_negative || !has_near_zero || !has_saturation) {
+        std::cerr << "W8 LinearSwiGLU oracle did not exercise negative/near-zero/saturation\n";
+        ++failures;
+    }
+
+    DBuf sparse_dx = to_device_bf16(sparse_x);
+    for (std::int32_t t = 1; t <= 16; ++t) {
+        GuardedBf16Output got(static_cast<std::size_t>(kInter) * t);
+        cudaMemset(got.data(), 0xff, static_cast<std::size_t>(kInter) * t * sizeof(std::uint16_t));
+        Tensor tx(sparse_dx.p, DType::BF16, {kHidden, t});
+        Tensor tout(got.data(), DType::BF16, {kInter, t});
+        const auto launch = [&](cudaStream_t stream) {
+            ops::linear_swiglu(tx, weight, tout, ws, stream);
+        };
+        if (t == 2 || t == 16) {
+            capture_and_replay(launch);
+        } else {
+            launch(nullptr);
+            cudaDeviceSynchronize();
+        }
+        const std::vector<double> actual =
+            from_device_bf16_ptr(got.data(), static_cast<std::size_t>(kInter) * t);
+        const std::vector<double> reference(complete_reference.begin(),
+                                            complete_reference.begin() +
+                                                static_cast<std::size_t>(kInter) * t);
+        const auto plan =
+            ops::detail::w8_linear_swiglu_resolve_plan({kRows, kInter, kHidden, kHidden, t});
+        const Tolerance tolerance = ops::detail::w8_linear_swiglu_schedule_uses_mma(plan.schedule)
+                                        ? Tolerance::linear_tc()
+                                        : Tolerance::linear_bf16();
+        const std::string label =
+            "linear_swiglu W8 complete FP64 exact-decode oracle T=" + std::to_string(t);
+        failures += verify(label.c_str(), actual, reference, tolerance);
+        failures += got.verify_guards(label);
+    }
+
+    std::vector<float> dense_x(static_cast<std::size_t>(kHidden) * kMaxT);
+    fill_uniform(dense_x, 3603u, -0.01f, 0.01f);
+    round_to_bf16(dense_x);
+    DBuf dense_dx = to_device_bf16(dense_x);
+    std::vector<std::uint8_t> input_before(dense_dx.bytes);
+    std::vector<std::uint8_t> weight_before(dweight.bytes);
+    dense_dx.copy_to_host(input_before.data(), input_before.size());
+    dweight.copy_to_host(weight_before.data(), weight_before.size());
+    for (const std::int32_t t : {17,  31,  32,  33,  63,  64,  65,  80,  81,  95,  96,  97,  127,
+                                 128, 129, 192, 193, 240, 241, 255, 256, 257, 264, 265, 288, 289,
+                                 320, 321, 384, 385, 448, 449, 512, 513, 560, 561, 896, 1024}) {
+        GuardedBf16Output got(static_cast<std::size_t>(kInter) * t);
+        cudaMemset(got.data(), 0xff, static_cast<std::size_t>(kInter) * t * sizeof(std::uint16_t));
+        Tensor tx(dense_dx.p, DType::BF16, {kHidden, t});
+        Tensor tout(got.data(), DType::BF16, {kInter, t});
+        const auto launch = [&](cudaStream_t stream) {
+            ops::linear_swiglu(tx, weight, tout, ws, stream);
+        };
+        if (t == 33 || t == 193 || t == 385 || t == kMaxT) {
+            capture_and_replay(launch);
+        } else {
+            launch(nullptr);
+            cudaDeviceSynchronize();
+        }
+        const std::vector<double> full =
+            from_device_bf16_ptr(got.data(), static_cast<std::size_t>(kInter) * t);
+        const auto rows = sampled_indices(kInter);
+        const auto cols = sampled_indices(t);
+        std::vector<double> actual;
+        std::vector<double> reference;
+        for (const std::int32_t col : cols) {
+            const float* xcol = dense_x.data() + static_cast<std::size_t>(col) * kHidden;
+            for (const std::int32_t row : rows) {
+                const double gate =
+                    row_split::dot_row_split_lowbit_fp64(packed, row, xcol, kHidden);
+                const double up =
+                    row_split::dot_row_split_lowbit_fp64(packed, kInter + row, xcol, kHidden);
+                actual.push_back(full[static_cast<std::size_t>(col) * kInter + row]);
+                reference.push_back(silu_fp64(gate) * up);
+            }
+        }
+        const std::string label =
+            "linear_swiglu W8 dense sampled FP64 oracle T=" + std::to_string(t);
+        failures += verify(label.c_str(), actual, reference, Tolerance::linear_tc());
+        failures += got.verify_guards(label);
+        const auto first_non_finite = std::find_if(
+            full.begin(), full.end(), [](double value) { return !std::isfinite(value); });
+        if (first_non_finite != full.end()) {
+            const std::size_t first =
+                static_cast<std::size_t>(std::distance(full.begin(), first_non_finite));
+            const std::size_t count = static_cast<std::size_t>(std::count_if(
+                full.begin(), full.end(), [](double value) { return !std::isfinite(value); }));
+            std::cerr << label << ": output has " << count
+                      << " non-finite values; first row=" << first % kInter
+                      << " token=" << first / kInter << '\n';
+            ++failures;
+        }
+    }
+
+    std::vector<std::uint8_t> input_after(dense_dx.bytes);
+    std::vector<std::uint8_t> weight_after(dweight.bytes);
+    dense_dx.copy_to_host(input_after.data(), input_after.size());
+    dweight.copy_to_host(weight_after.data(), weight_after.size());
+    if (input_after != input_before) {
+        std::cerr << "W8 LinearSwiGLU modified input\n";
+        ++failures;
+    }
+    if (weight_after != weight_before) {
+        std::cerr << "W8 LinearSwiGLU modified packed weight\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int q5_residual_epilogue_correctness(std::int32_t k, std::uint32_t seed) {
     constexpr std::int32_t kN    = 5120;
     constexpr std::int32_t kMaxT = 129;
@@ -1107,6 +1291,7 @@ int prefill_fusion_correctness() {
         f += grouped_gdn_correctness(t, t == 6);
     }
     f += gate_up_silu_route_correctness();
+    f += w8_gate_up_silu_correctness();
     f += q5_residual_epilogue_correctness(6144, 37u);
     f += q5_residual_epilogue_correctness(17408, 41u);
     f += w8_residual_epilogue_correctness();
@@ -1282,6 +1467,11 @@ int main() {
     if (std::getenv("NINFER_LINEAR_TEST_W8_LINEAR_ADD_ONLY") != nullptr) {
         const int f = w8_residual_epilogue_correctness();
         std::cout << (f ? "FAIL" : "OK") << " W8 LinearAdd dFlash correctness\n";
+        return f ? 1 : 0;
+    }
+    if (std::getenv("NINFER_LINEAR_TEST_W8_SWIGLU_ONLY") != nullptr) {
+        const int f = w8_gate_up_silu_correctness();
+        std::cout << (f ? "FAIL" : "OK") << " W8 LinearSwiGLU dFlash correctness\n";
         return f ? 1 : 0;
     }
     if (std::getenv("NINFER_LINEAR_TEST_W8G32_ONLY") != nullptr) {

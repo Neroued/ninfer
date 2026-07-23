@@ -234,6 +234,23 @@ Useful traffic is `(2+2B)*4` bytes: two device scalar reads and two complete I32
 This benchmark qualifies block preparation and route selection only; it neither includes nor
 claims the deferred embedding fusion or complete-round performance.
 
+## W8 LinearSwiGLU Op benchmark
+
+`ninfer_w8_linear_swiglu_bench` measures the registered W8 `[12288,2048] -> [6144,T]`
+LinearSwiGLU profile. Production writes only the fused output and uses no workspace. The explicit
+control runs the registered parent `linear` followed by `silu_mul`. Candidate mode retains the
+decode, exact-T split-K Tensor Core, and tiled Tensor Core schedules used to tune every dispatch
+seam. Every cold-cache sample follows a 256 MiB L2 flush.
+
+```bash
+cmake --build build --parallel --target ninfer_w8_linear_swiglu_bench
+./build/bench/ninfer_w8_linear_swiglu_bench \
+  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,96,128,256,512,896,1024 \
+  --warmup 10 --repeat 50 --csv-out profiles/bench/w8_linear_swiglu.csv
+./build/bench/ninfer_w8_linear_swiglu_bench \
+  --profile --t-sweep 1024
+```
+
 ## 35B W8 input-projection Op benchmark
 
 `ninfer_w8_input_proj_bench` measures the registered 35B-A3B target's W8 Attention

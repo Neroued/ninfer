@@ -24,6 +24,7 @@ enum class W8KernelVariant {
 enum class W8Epilogue {
     Store,
     Residual,
+    SwiGluSplitHalf,
 };
 
 struct W8Problem {

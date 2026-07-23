@@ -731,7 +731,7 @@ this contract; that composition requires a fused semantic Op.
 
 ### OP-A06: W8 `linear_swiglu [12288,2048]`
 
-**Status:** [ ] admission [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] admission [x] correctness [x] benchmark [x] route [ ] integration
 
 Extend `linear_swiglu` from its current Q4 geometry to:
 
@@ -752,6 +752,33 @@ not the preferred production route.
 Compare the complete expression directly with an exact-decode FP64 oracle at every `T=1..16`,
 including every product block `B=2..16`. Cover the gate/up row seam, negative and near-zero gates,
 saturation, full writes, Graph replay, and fused-versus-composed timing inside a dense MLP stage.
+
+**Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
+
+- The public Op admits exactly W8 `[12288,2048]`, BF16 `x [2048,T]`, and BF16
+  `out [6144,T]`, with zero workspace. `ninfer_linear_test` compares every output element at every
+  `T=1..16` against a complete independent FP64 exact-decode oracle, then samples the same oracle
+  at every production dispatch seam through `T=1024`. Coverage includes K/group boundaries, the
+  gate/up row seam, negative, near-zero, and saturated gates, guards and full finite writes,
+  preserved input/weight storage, and CUDA Graph replay of exact-T, warp-local, cross-warp, and
+  large prefill routes.
+- `ninfer_w8_linear_swiglu_bench` retains the parent-Linear-plus-`silu_mul` control, three decode
+  CTA-row candidates, exact `T=2..32` split-K, and C32/C48/C64/C80/C96/C128 Tensor Core tile
+  candidates. The selected route is R16 paired decode at `T=1`, exact-T Tensor Core at `T=2..32`,
+  and measured Tensor Core tile schedules above 32. Deep boundary sweeps select smaller tiles and
+  cross-warp R128 schedules where they remove avoidable padding cliffs.
+- Cold-cache production latency is 21.63 us at `T=1`, 25.89 us at `T=16`, 54.27 us at `T=96`,
+  257.25 us at `T=896` (175.3 useful TFLOP/s), and 312.61 us at `T=1024`
+  (164.9 useful TFLOP/s). It is 1.38x/2.42x/1.34x faster than the composed control at
+  `T=1/16/96`, remains faster at all measured prefill points, and reaches 96.6--97.3% of the
+  same-shape W8 parent-GEMM throughput at `T=896/1024`; the fused epilogue removes the parent
+  materialization and second launch.
+- Focused NCU confirms exactly 51,539,607,552 useful BF16-FP32 HMMA operations at `T=1024`,
+  67.7% of the non-sparse BF16 Tensor Core operation roofline and 69.5% tensor-pipe utilization
+  in the serialized capture. Decode sustains 1.15 TB/s with no local/shared spills; 36.0 of 41.6
+  cycles per issued instruction are long-scoreboard stalls. The R4/R8/R16 sweep therefore selects
+  R16 at the empirical memory-latency ceiling, while every `T>=2` production route uses Tensor
+  Cores.
 
 ### OP-A07: W8 `linear_add [2048,6144]`
 

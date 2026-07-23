@@ -735,7 +735,7 @@ void usage(const char* argv0) {
         "  --variant NAME             Fixed kernel variant; auto is the default.\n"
         "  --paired-kv                Benchmark paired MTP K/V (requires MtpKV + W8G32).\n"
         "  --linear-add               Benchmark Q5 [5120,17408]/[5120,6144] or W8 "
-        "[2048,4096] LinearAdd.\n"
+        "[2048,4096]/[2048,6144] LinearAdd.\n"
         "  --linear-swiglu            Benchmark Q4 [34816,5120] LinearSwiGLU.\n"
         "  --warmup N                 Cold-cache warmup GEMV launches (default %d).\n"
         "  --repeat N                 Cold-cache measured GEMV launches (default %d).\n"
@@ -872,12 +872,13 @@ Options parse_args(int argc, char** argv) {
                         (shape.k == 6144 || shape.k == 17408) &&
                         opt.candidate == CandidateKind::Auto;
         const bool w8 =
-            opt.qtype == QType::W8G32_F16S && shape.n == 2048 && shape.k == 4096 &&
+            opt.qtype == QType::W8G32_F16S && shape.n == 2048 &&
+            (shape.k == 4096 || shape.k == 6144) &&
             (opt.candidate == CandidateKind::Auto || opt.candidate == CandidateKind::W8Fixed);
         if (opt.paired_kv || opt.all_targets || (!q5 && !w8)) {
             throw std::invalid_argument(
                 "--linear-add requires Q5 [5120,6144]/[5120,17408] with auto selection, "
-                "or W8G32 [2048,4096] with an auto/W8 candidate");
+                "or W8G32 [2048,4096]/[2048,6144] with an auto/W8 candidate");
         }
     }
     if (opt.linear_swiglu) {
@@ -1329,6 +1330,8 @@ int schedule_col_tile(ops::detail::W8ScheduleId schedule) {
     switch (schedule) {
     case S::SimtR8C4:
         return 4;
+    case S::SimtR8C8:
+        return 8;
     case S::MmaR32C128:
     case S::MmaR64C128:
         return 128;
@@ -1367,11 +1370,29 @@ int linear_add_col_tile(const ops::detail::Q5LinearAddPlan& plan, std::int32_t t
 int linear_add_col_tile(const ops::detail::W8LinearAddPlan& plan, std::int32_t t) {
     using S = ops::detail::W8LinearAddScheduleId;
     switch (plan.schedule) {
+    case S::DecodeR16:
+        return 1;
     case S::SplitKMmaExactT:
+    case S::SplitKMma32PlusTail:
         return t;
     case S::SimtR8C4:
         return 4;
+    case S::MmaR32C64:
+    case S::MmaR48C64:
+    case S::MmaR128C64:
+        return 64;
+    case S::MmaR32C80:
+    case S::MmaR128C80:
+        return 80;
+    case S::MmaR32C96:
+    case S::MmaR48C96:
+    case S::MmaR64C96:
+        return 96;
+    case S::MmaR48C112:
+    case S::MmaR64C112:
+        return 112;
     case S::MmaR32C128:
+    case S::MmaR48C128:
     case S::MmaR64C128:
         return 128;
     }
@@ -1471,12 +1492,28 @@ int candidate_mma_row_tile(const Options& opt, QType qtype, const ShapeSpec& sha
             using S                        = ops::detail::W8LinearAddScheduleId;
             const auto linear_add_schedule = resolve_auto_w8_linear_add_plan(shape, t).schedule;
             switch (linear_add_schedule) {
+            case S::DecodeR16:
+                throw std::logic_error("decode W8 LinearAdd schedule has no MMA row tile");
             case S::SplitKMmaExactT:
+            case S::SplitKMma32PlusTail:
                 return 16;
+            case S::MmaR32C64:
+            case S::MmaR32C80:
+            case S::MmaR32C96:
             case S::MmaR32C128:
                 return 32;
+            case S::MmaR48C64:
+            case S::MmaR48C96:
+            case S::MmaR48C112:
+            case S::MmaR48C128:
+                return 48;
+            case S::MmaR64C96:
+            case S::MmaR64C112:
             case S::MmaR64C128:
                 return 64;
+            case S::MmaR128C64:
+            case S::MmaR128C80:
+                return 128;
             case S::SimtR8C4:
                 throw std::logic_error("SIMT W8 LinearAdd schedule has no MMA row tile");
             }

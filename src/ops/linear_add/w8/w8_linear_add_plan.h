@@ -10,10 +10,23 @@
 namespace ninfer::ops::detail {
 
 enum class W8LinearAddScheduleId {
+    DecodeR16,
     SplitKMmaExactT,
+    SplitKMma32PlusTail,
     SimtR8C4,
+    MmaR32C64,
+    MmaR32C80,
+    MmaR32C96,
     MmaR32C128,
+    MmaR48C64,
+    MmaR48C96,
+    MmaR48C112,
+    MmaR48C128,
+    MmaR64C96,
+    MmaR64C112,
     MmaR64C128,
+    MmaR128C64,
+    MmaR128C80,
 };
 
 struct W8LinearAddPlan {

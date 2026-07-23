@@ -1279,6 +1279,232 @@ int w8_residual_epilogue_correctness() {
     return failures;
 }
 
+std::vector<double> complete_sparse_linear_add_projection(
+    const row_split::PackedWeight& packed, const std::vector<float>& x, std::int32_t k,
+    std::int32_t cols, std::int32_t rows, const std::array<std::int32_t, 16>& active_columns) {
+    std::vector<double> projection(static_cast<std::size_t>(rows) * cols);
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const std::int32_t n_threads =
+        std::min<std::int32_t>(rows, static_cast<std::int32_t>(std::min<unsigned>(hw, 16u)));
+    std::vector<std::thread> threads;
+    threads.reserve(static_cast<std::size_t>(n_threads));
+    for (std::int32_t tid = 0; tid < n_threads; ++tid) {
+        const std::int32_t row_begin =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(rows) * tid) / n_threads);
+        const std::int32_t row_end =
+            static_cast<std::int32_t>((static_cast<std::int64_t>(rows) * (tid + 1)) / n_threads);
+        threads.emplace_back([&, row_begin, row_end] {
+            for (std::int32_t token = 0; token < cols; ++token) {
+                const float* xcol = x.data() + static_cast<std::size_t>(token) * k;
+                for (std::int32_t row = row_begin; row < row_end; ++row) {
+                    double value = 0.0;
+                    for (const std::int32_t column : active_columns) {
+                        value += row_split::decode_row_split_lowbit_fp64(packed, row, column) *
+                                 static_cast<double>(xcol[column]);
+                    }
+                    projection[static_cast<std::size_t>(token) * rows + row] = value;
+                }
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    return projection;
+}
+
+int w8_dflash_linear_add_correctness() {
+    constexpr std::int32_t kRows = 2048;
+    constexpr std::int32_t kK    = 6144;
+    constexpr std::int32_t kMaxT = 1024;
+    constexpr std::array<std::int32_t, 16> kActiveColumns{
+        0, 1, 30, 31, 32, 33, 62, 63, 64, 1023, 1024, 2047, 2048, 4095, 4096, 6143,
+    };
+
+    row_split::PackedWeight packed =
+        row_split::make_patterned_weight(QType::W8G32_F16S, kRows, kK, 3701u);
+    DBuf dweight(packed.payload.size());
+    cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
+    const Weight weight = packed.device_weight(dweight.p);
+    WorkspaceArena ws(1);
+    int failures = 0;
+
+    std::vector<float> sparse_x(static_cast<std::size_t>(kK) * 16, 0.0f);
+    for (std::int32_t token = 0; token < 16; ++token) {
+        for (std::size_t index = 0; index < kActiveColumns.size(); ++index) {
+            const float sign = ((token + static_cast<std::int32_t>(index)) & 1) == 0 ? 1.0f : -1.0f;
+            sparse_x[static_cast<std::size_t>(token) * kK + kActiveColumns[index]] =
+                sign * (0.03125f + static_cast<float>((token + index) % 9) * 0.015625f);
+        }
+    }
+    round_to_bf16(sparse_x);
+    const std::vector<double> projection =
+        complete_sparse_linear_add_projection(packed, sparse_x, kK, 16, kRows, kActiveColumns);
+
+    std::vector<float> sparse_residual(projection.size());
+    for (std::int32_t token = 0; token < 16; ++token) {
+        for (std::int32_t row = 0; row < kRows; ++row) {
+            const std::size_t index = static_cast<std::size_t>(token) * kRows + row;
+            switch (token & 3) {
+            case 0:
+                sparse_residual[index] =
+                    static_cast<float>(-projection[index] + ((row & 1) ? 0.03125 : -0.03125));
+                break;
+            case 1:
+                sparse_residual[index] = static_cast<float>(-projection[index]);
+                break;
+            case 2:
+                sparse_residual[index] = (row & 1) ? -8.0f : 8.0f;
+                break;
+            default:
+                sparse_residual[index] = static_cast<float>((row % 9) - 4) * 0.5f;
+                break;
+            }
+        }
+    }
+    round_to_bf16(sparse_residual);
+
+    std::vector<double> sparse_reference(projection.size());
+    for (std::size_t index = 0; index < projection.size(); ++index) {
+        sparse_reference[index] = static_cast<double>(sparse_residual[index]) + projection[index];
+    }
+    const bool has_positive = std::any_of(sparse_reference.begin(), sparse_reference.end(),
+                                          [](double value) { return value > 1.0; });
+    const bool has_negative = std::any_of(sparse_reference.begin(), sparse_reference.end(),
+                                          [](double value) { return value < -1.0; });
+    const bool has_cancellation =
+        std::any_of(sparse_reference.begin(), sparse_reference.end(),
+                    [](double value) { return std::abs(value) < 0.0625; });
+    if (!has_positive || !has_negative || !has_cancellation) {
+        std::cerr << "W8 [2048,6144] LinearAdd oracle missed signed/cancellation cases\n";
+        ++failures;
+    }
+
+    DBuf sparse_dx = to_device_bf16(sparse_x);
+    std::vector<std::uint8_t> sparse_input_before(sparse_dx.bytes);
+    std::vector<std::uint8_t> weight_before(dweight.bytes);
+    sparse_dx.copy_to_host(sparse_input_before.data(), sparse_input_before.size());
+    dweight.copy_to_host(weight_before.data(), weight_before.size());
+
+    for (std::int32_t t = 1; t <= 16; ++t) {
+        const std::size_t count = static_cast<std::size_t>(kRows) * t;
+        GuardedBf16Output got(count);
+        std::vector<std::uint16_t> initial_bits(count);
+        std::transform(sparse_residual.begin(), sparse_residual.begin() + count,
+                       initial_bits.begin(), f32_to_bf16);
+        cudaMemcpy(got.data(), initial_bits.data(), count * sizeof(std::uint16_t),
+                   cudaMemcpyHostToDevice);
+        Tensor tx(sparse_dx.p, DType::BF16, {kK, t});
+        Tensor tout(got.data(), DType::BF16, {kRows, t});
+        const auto launch = [&](cudaStream_t stream) {
+            ops::linear_add(tx, weight, tout, ws, stream);
+        };
+        if (t == 2 || t == 16) {
+            capture_and_replay(launch);
+        } else {
+            launch(nullptr);
+            cudaDeviceSynchronize();
+        }
+
+        const std::vector<double> actual = from_device_bf16_ptr(got.data(), count);
+        const std::vector<double> reference(sparse_reference.begin(),
+                                            sparse_reference.begin() + count);
+        const auto plan           = ops::detail::w8_linear_add_resolve_plan({kRows, kK, kK, t});
+        const Tolerance tolerance = ops::detail::w8_linear_add_schedule_uses_mma(plan.schedule)
+                                        ? Tolerance::linear_tc()
+                                        : Tolerance::linear_bf16();
+        const std::string label =
+            "linear_add W8 [2048,6144] complete FP64 exact-decode oracle T=" + std::to_string(t);
+        failures += verify(label.c_str(), actual, reference, tolerance);
+        failures += got.verify_guards(label);
+        if (std::any_of(actual.begin(), actual.end(),
+                        [](double value) { return !std::isfinite(value); })) {
+            std::cerr << label << ": non-finite output\n";
+            ++failures;
+        }
+    }
+
+    std::vector<float> dense_x(static_cast<std::size_t>(kK) * kMaxT);
+    std::vector<float> dense_residual(static_cast<std::size_t>(kRows) * kMaxT);
+    fill_uniform(dense_x, 3703u, -0.01f, 0.01f);
+    fill_uniform(dense_residual, 3705u, -2.0f, 2.0f);
+    round_to_bf16(dense_x);
+    round_to_bf16(dense_residual);
+    DBuf dense_dx = to_device_bf16(dense_x);
+    std::vector<std::uint8_t> dense_input_before(dense_dx.bytes);
+    dense_dx.copy_to_host(dense_input_before.data(), dense_input_before.size());
+
+    constexpr std::array<std::int32_t, 44> kDenseRoutePoints{
+        17,  31,  32,  33,  52,  53,  63,  64,  65,  66,  95,  96,  97,   128,  129,
+        191, 192, 193, 256, 257, 384, 385, 399, 400, 401, 447, 448, 449,  480,  481,
+        640, 641, 672, 673, 704, 705, 784, 785, 896, 897, 960, 961, 1023, 1024,
+    };
+    for (const std::int32_t t : kDenseRoutePoints) {
+        const std::size_t count = static_cast<std::size_t>(kRows) * t;
+        GuardedBf16Output got(count);
+        std::vector<std::uint16_t> initial_bits(count);
+        std::transform(dense_residual.begin(), dense_residual.begin() + count, initial_bits.begin(),
+                       f32_to_bf16);
+        cudaMemcpy(got.data(), initial_bits.data(), count * sizeof(std::uint16_t),
+                   cudaMemcpyHostToDevice);
+        Tensor tx(dense_dx.p, DType::BF16, {kK, t});
+        Tensor tout(got.data(), DType::BF16, {kRows, t});
+        const auto launch = [&](cudaStream_t stream) {
+            ops::linear_add(tx, weight, tout, ws, stream);
+        };
+        if (t == 53 || t == 641 || t == 1024) {
+            capture_and_replay(launch);
+        } else {
+            launch(nullptr);
+            cudaDeviceSynchronize();
+        }
+
+        const std::vector<double> full = from_device_bf16_ptr(got.data(), count);
+        const auto rows                = sampled_indices(kRows);
+        const auto cols                = sampled_indices(t);
+        std::vector<double> actual;
+        std::vector<double> reference;
+        actual.reserve(rows.size() * cols.size());
+        reference.reserve(actual.capacity());
+        for (const std::int32_t col : cols) {
+            const float* xcol = dense_x.data() + static_cast<std::size_t>(col) * kK;
+            for (const std::int32_t row : rows) {
+                const std::size_t index = static_cast<std::size_t>(col) * kRows + row;
+                actual.push_back(full[index]);
+                reference.push_back(static_cast<double>(dense_residual[index]) +
+                                    row_split::dot_row_split_lowbit_fp64(packed, row, xcol, kK));
+            }
+        }
+        const auto plan           = ops::detail::w8_linear_add_resolve_plan({kRows, kK, kK, t});
+        const Tolerance tolerance = ops::detail::w8_linear_add_schedule_uses_mma(plan.schedule)
+                                        ? Tolerance::linear_tc()
+                                        : Tolerance::linear_bf16();
+        const std::string label =
+            "linear_add W8 [2048,6144] dense sampled FP64 oracle T=" + std::to_string(t);
+        failures += verify(label.c_str(), actual, reference, tolerance);
+        failures += got.verify_guards(label);
+        if (std::any_of(full.begin(), full.end(),
+                        [](double value) { return !std::isfinite(value); })) {
+            std::cerr << label << ": non-finite output\n";
+            ++failures;
+        }
+    }
+
+    std::vector<std::uint8_t> sparse_input_after(sparse_dx.bytes);
+    std::vector<std::uint8_t> dense_input_after(dense_dx.bytes);
+    std::vector<std::uint8_t> weight_after(dweight.bytes);
+    sparse_dx.copy_to_host(sparse_input_after.data(), sparse_input_after.size());
+    dense_dx.copy_to_host(dense_input_after.data(), dense_input_after.size());
+    dweight.copy_to_host(weight_after.data(), weight_after.size());
+    if (sparse_input_after != sparse_input_before || dense_input_after != dense_input_before) {
+        std::cerr << "W8 [2048,6144] LinearAdd modified input\n";
+        ++failures;
+    }
+    if (weight_after != weight_before) {
+        std::cerr << "W8 [2048,6144] LinearAdd modified packed weight\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int prefill_fusion_correctness() {
     int f = 0;
     for (std::int32_t t = 1; t <= 16; ++t) {
@@ -1295,6 +1521,7 @@ int prefill_fusion_correctness() {
     f += q5_residual_epilogue_correctness(6144, 37u);
     f += q5_residual_epilogue_correctness(17408, 41u);
     f += w8_residual_epilogue_correctness();
+    f += w8_dflash_linear_add_correctness();
     f += w8_attention_input_correctness();
     f += w8_companion_attention_input_correctness();
     f += w8_gdn_input_correctness();
@@ -1465,7 +1692,9 @@ int main() {
         return f ? 1 : 0;
     }
     if (std::getenv("NINFER_LINEAR_TEST_W8_LINEAR_ADD_ONLY") != nullptr) {
-        const int f = w8_residual_epilogue_correctness();
+        int f = 0;
+        f += w8_residual_epilogue_correctness();
+        f += w8_dflash_linear_add_correctness();
         std::cout << (f ? "FAIL" : "OK") << " W8 LinearAdd dFlash correctness\n";
         return f ? 1 : 0;
     }

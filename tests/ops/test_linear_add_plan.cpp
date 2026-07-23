@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -93,8 +94,10 @@ void workspace_tests() {
     expect_invalid("workspace C0",
                    [] { (void)ninfer::ops::linear_add_workspace_bytes(5120, 6144, 0); });
 
-    for (const std::int32_t cols : {1, 52, 53, 640, 641, 1024, 1025, 2048}) {
-        expect("W8 workspace", ninfer::ops::linear_add_workspace_bytes(2048, 4096, cols), 0);
+    for (const std::int32_t k : {4096, 6144}) {
+        for (const std::int32_t cols : {1, 52, 53, 640, 641, 1024, 1025, 2048}) {
+            expect("W8 workspace", ninfer::ops::linear_add_workspace_bytes(2048, k, cols), 0);
+        }
     }
     expect_invalid("W8 workspace C0",
                    [] { (void)ninfer::ops::linear_add_workspace_bytes(2048, 4096, 0); });
@@ -132,6 +135,76 @@ void w8_route_tests() {
             std::cerr << "wrong W8 LinearAdd route C=" << cols << '\n';
             ++failures;
         }
+    }
+
+    struct DFlashRoute {
+        std::int32_t first;
+        std::int32_t last;
+        W8LinearAddScheduleId schedule;
+        std::int32_t tile_rows;
+        std::int32_t tile_cols;
+    };
+
+    constexpr std::array<DFlashRoute, 36> dflash_routes{{
+        {1, 1, W8LinearAddScheduleId::DecodeR16, 0, 0},
+        {2, 32, W8LinearAddScheduleId::SplitKMmaExactT, 0, 0},
+        {33, 65, W8LinearAddScheduleId::SplitKMma32PlusTail, 0, 0},
+        {66, 95, W8LinearAddScheduleId::MmaR32C64, 32, 64},
+        {96, 96, W8LinearAddScheduleId::MmaR32C96, 32, 96},
+        {97, 128, W8LinearAddScheduleId::MmaR32C64, 32, 64},
+        {129, 191, W8LinearAddScheduleId::MmaR32C128, 32, 128},
+        {192, 192, W8LinearAddScheduleId::MmaR32C96, 32, 96},
+        {193, 256, W8LinearAddScheduleId::MmaR32C128, 32, 128},
+        {257, 384, W8LinearAddScheduleId::MmaR32C64, 32, 64},
+        {385, 399, W8LinearAddScheduleId::MmaR32C96, 32, 96},
+        {400, 400, W8LinearAddScheduleId::MmaR32C80, 32, 80},
+        {401, 447, W8LinearAddScheduleId::MmaR32C96, 32, 96},
+        {448, 448, W8LinearAddScheduleId::MmaR32C64, 32, 64},
+        {449, 480, W8LinearAddScheduleId::MmaR32C96, 32, 96},
+        {481, 640, W8LinearAddScheduleId::MmaR32C128, 32, 128},
+        {641, 672, W8LinearAddScheduleId::MmaR48C96, 48, 96},
+        {673, 704, W8LinearAddScheduleId::MmaR48C64, 48, 64},
+        {705, 784, W8LinearAddScheduleId::MmaR48C112, 48, 112},
+        {785, 896, W8LinearAddScheduleId::MmaR48C128, 48, 128},
+        {897, 960, W8LinearAddScheduleId::MmaR64C96, 64, 96},
+        {961, 1023, W8LinearAddScheduleId::MmaR64C112, 64, 112},
+        {1024, 1024, W8LinearAddScheduleId::MmaR64C128, 64, 128},
+        {1025, 1120, W8LinearAddScheduleId::MmaR64C112, 64, 112},
+        {1121, 1280, W8LinearAddScheduleId::MmaR64C128, 64, 128},
+        {1281, 1344, W8LinearAddScheduleId::MmaR128C64, 128, 64},
+        {1345, 1408, W8LinearAddScheduleId::MmaR48C128, 48, 128},
+        {1409, 1680, W8LinearAddScheduleId::MmaR128C80, 128, 80},
+        {1681, 1791, W8LinearAddScheduleId::MmaR48C128, 48, 128},
+        {1792, 1792, W8LinearAddScheduleId::MmaR64C128, 64, 128},
+        {1793, 1919, W8LinearAddScheduleId::MmaR48C128, 48, 128},
+        {1920, 1920, W8LinearAddScheduleId::MmaR64C128, 64, 128},
+        {1921, 2016, W8LinearAddScheduleId::MmaR64C96, 64, 96},
+        {2017, 2047, W8LinearAddScheduleId::MmaR64C112, 64, 112},
+        {2048, 2048, W8LinearAddScheduleId::MmaR64C128, 64, 128},
+        {2049, std::numeric_limits<std::int32_t>::max(), W8LinearAddScheduleId::MmaR64C128, 64,
+         128},
+    }};
+    for (const DFlashRoute& route : dflash_routes) {
+        for (const std::int32_t cols : {route.first, route.last}) {
+            const auto plan =
+                ninfer::ops::detail::w8_linear_add_resolve_plan({2048, 6144, 6144, cols});
+            const W8KernelVariant expected_variant =
+                route.schedule == W8LinearAddScheduleId::DecodeR16 ||
+                        route.schedule == W8LinearAddScheduleId::SplitKMmaExactT ||
+                        route.schedule == W8LinearAddScheduleId::SplitKMma32PlusTail
+                    ? W8KernelVariant::None
+                    : (2048 % route.tile_rows == 0 && cols % route.tile_cols == 0
+                           ? W8KernelVariant::Full
+                           : W8KernelVariant::Predicated);
+            if (plan.schedule != route.schedule || plan.variant != expected_variant) {
+                std::cerr << "wrong W8 [2048,6144] LinearAdd route C=" << cols << '\n';
+                ++failures;
+            }
+        }
+    }
+    if (!ninfer::ops::detail::w8_linear_add_admits({2048, 6144, 6144, 1})) {
+        std::cerr << "W8 [2048,6144] LinearAdd admission missing\n";
+        ++failures;
     }
     expect_invalid("W8 unsupported rows", [] {
         (void)ninfer::ops::detail::w8_linear_add_resolve_plan({2049, 4096, 4096, 1});

@@ -29,7 +29,8 @@ namespace ninfer::ops {
  *
  * Logical shapes:
  *   Contiguous BF16 x [K,T] and residual [N,T]. Weight is either Q5G64_F16S RowSplit with
- *   logical shape [5120,17408] or [5120,6144], or W8G32_F16S RowSplit [2048,4096].
+ *   logical shape [5120,17408] or [5120,6144], or W8G32_F16S RowSplit [2048,4096] or
+ *   [2048,6144].
  *   T may be any positive value.
  *
  * Numeric:

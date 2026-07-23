@@ -381,8 +381,8 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
             }
         }
     } else if constexpr (Epilogue == W8Epilogue::Residual) {
-        static_assert(BM <= BK && (BM % 8) == 0,
-                      "W8 residual epilogue reuses one x stage as a BF16 output tile");
+        static_assert(BM <= Cfg::STAGES * BK && (BM % 8) == 0,
+                      "W8 residual epilogue reuses the x pipeline as a BF16 output tile");
         __syncthreads();
         __nv_bfloat16* projected_shared = Bs[0];
 #pragma unroll

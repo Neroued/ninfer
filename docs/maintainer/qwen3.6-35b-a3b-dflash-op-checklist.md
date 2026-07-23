@@ -782,7 +782,7 @@ saturation, full writes, Graph replay, and fused-versus-composed timing inside a
 
 ### OP-A07: W8 `linear_add [2048,6144]`
 
-**Status:** [ ] admission [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] admission [x] correctness [x] benchmark [x] route [ ] integration
 
 Extend the existing fused residual Op:
 
@@ -798,6 +798,33 @@ Reuse the W8 residual epilogue and exact-T split-K structure already used by
 `linear_add [2048,4096]`. Qualification covers every `T=1..16`, including every product block
 `B=2..16`, cancellation with the incoming residual, exact W8 decode, input preservation, full
 in-place output, Graph replay, and dense-layer timing against `linear` plus an add.
+
+**Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
+
+- The public Op admits W8 `[2048,6144]`, BF16 `x [6144,T]`, and in-place BF16
+  `residual [2048,T]`, with zero workspace. `ninfer_linear_test` checks every output element at
+  every `T=1..16` against an independent FP64 exact-W8-decode oracle with K/group-boundary probes,
+  positive, negative, and cancellation residuals. Dense sampled-oracle checks cover every
+  production dispatch seam through `T=1024`, with guards, full finite writes, preserved
+  input/weight storage, and CUDA Graph replay at exact-T, composite, and prefill routes.
+- `ninfer_w8_linear_add_bench` retains the composed parent-Linear-plus-`residual_add` control and
+  all direct-decode, exact-T, composite exact-T, and C32/C48/C64/C80/C96/C112/C128 Tensor Core
+  candidates. A cold-cache sweep of every `T=1..2048` selects R16 direct decode at `T=1`,
+  exact-T Tensor Core at `T=2..32`, exact32-plus-tail through `T=65`, and measured tiled Tensor
+  Core routes above 65. The resulting table removes the avoidable tile-padding cliffs around
+  641, 673, 705, 897, 1025, 1281, and later prefill boundaries.
+- Cold-cache production latency is 13.60 us at `T=1`, 27.94 us at `T=16`, 93.41 us at `T=96`,
+  154.91 us at `T=896`, 157.73 us at `T=960` (153.2 useful TFLOP/s), 185.57 us at `T=1024`,
+  and 188.45 us at `T=1280` (170.9 useful TFLOP/s). The fused route is 1.88x/1.58x/2.02x faster
+  than the composed control at `T=1/16/33`, remains no slower at the tuned small/prefill
+  boundaries, and reaches 77.4% of the measured 220.9-TFLOP/s non-sparse BF16 Tensor Core ceiling
+  at `T=1280`.
+- Focused NCU confirms exactly 25,769,803,776 useful BF16-FP32 HMMA operations at `T=1024` and
+  70.3% active-cycle tensor-pipe utilization. The `T=1` direct decode sustains 1.06 TB/s with no
+  local/shared spill; 14.7 of 17.8 cycles per issued instruction are long-scoreboard stalls, and
+  its 128-CTA grid reaches only 31.1% achieved occupancy. The measured R4/R8/R16 candidates are
+  therefore at the empirical memory-latency/parallelism ceiling, while every `T>=2` production
+  route uses Tensor Cores.
 
 ## 5. Reuse checks
 

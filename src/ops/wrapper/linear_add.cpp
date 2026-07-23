@@ -44,7 +44,7 @@ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
 
 std::size_t linear_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                        std::int32_t max_tokens) {
-    if (output_rows == 2048 && input_rows == 4096) {
+    if (output_rows == 2048 && (input_rows == 4096 || input_rows == 6144)) {
         (void)detail::w8_linear_add_resolve_plan({output_rows, input_rows, input_rows, max_tokens});
         return 0;
     }
@@ -73,7 +73,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, Workspac
 
     if (w.qtype == QType::W8G32_F16S) {
         require_w8(w);
-        if (w.n != 2048 || w.k != 4096) {
+        if (w.n != 2048 || (w.k != 4096 && w.k != 6144)) {
             throw std::invalid_argument("linear_add: unsupported W8 shape");
         }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||

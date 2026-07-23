@@ -273,7 +273,8 @@ cmake --build build --parallel --target \
   ninfer_gelu_bench ninfer_add_bias_bench
 
 ./build/bench/ninfer_residual_add_bench [--patches P] [--control]
-./build/bench/ninfer_sigmoid_mul_bench [--tokens T] [--control]
+./build/bench/ninfer_sigmoid_mul_bench \
+  [--tokens T[,T...]] [--control | --candidate-block B]
 ./build/bench/ninfer_gelu_bench [--mode tanh|exact --columns C] [--control]
 ./build/bench/ninfer_add_bias_bench [--d D --columns C] [--control]
 ```

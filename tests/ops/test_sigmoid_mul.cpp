@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace ninfer;
@@ -152,8 +153,9 @@ int main() {
 
     // Coverage: requested shapes; >=3 seeds; honest range.
     for (std::uint32_t seed : {1u, 7u, 99u}) {
-        for (std::int32_t tokens = 1; tokens <= 6; ++tokens) {
-            f += one_shape("sigmoid_mul 35b [4096,T]", 4096, tokens, seed + tokens, -8.f, 8.f);
+        for (std::int32_t tokens = 1; tokens <= 16; ++tokens) {
+            const std::string tag = "sigmoid_mul 35b [4096," + std::to_string(tokens) + "]";
+            f += one_shape(tag.c_str(), 4096, tokens, seed + tokens, -8.f, 8.f);
         }
         f += one_shape("sigmoid_mul 35b [4096,1024]", 4096, 1024, seed, -8.f, 8.f);
         f += one_shape("sigmoid_mul [6144,1]", 6144, 1, seed, -8.f, 8.f);

@@ -12,6 +12,16 @@
 
 namespace ninfer::ops::detail {
 
+void sigmoid_gate_mul_bf16x8_launch(const Tensor& gate, Tensor& x, int block, cudaStream_t stream) {
+    const std::int64_t packs = x.numel() / 8;
+    constexpr int kMaxGrid   = 4096;
+    const int grid           = static_cast<int>(std::min<std::int64_t>(
+        kMaxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(block)))));
+    sigmoid_gate_mul_bf16x8_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const Bf16x8Pack*>(gate.data), static_cast<Bf16x8Pack*>(x.data), packs);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream) {
     const std::int64_t n   = x.numel();
     constexpr int kBlock   = 256;
@@ -19,12 +29,7 @@ void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream)
     const auto gate_addr   = reinterpret_cast<std::uintptr_t>(gate.data);
     const auto x_addr      = reinterpret_cast<std::uintptr_t>(x.data);
     if (((gate_addr | x_addr) & (alignof(Bf16x8Pack) - 1)) == 0 && (n % 8) == 0) {
-        const std::int64_t packs = n / 8;
-        const int grid           = static_cast<int>(std::min<std::int64_t>(
-            kMaxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(kBlock)))));
-        sigmoid_gate_mul_bf16x8_kernel<<<grid, kBlock, 0, stream>>>(
-            static_cast<const Bf16x8Pack*>(gate.data), static_cast<Bf16x8Pack*>(x.data), packs);
-        CUDA_CHECK(cudaGetLastError());
+        sigmoid_gate_mul_bf16x8_launch(gate, x, kBlock, stream);
         return;
     }
     if (((gate_addr | x_addr) & (alignof(__nv_bfloat162) - 1)) != 0) {

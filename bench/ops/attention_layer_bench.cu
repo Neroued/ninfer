@@ -28,6 +28,7 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/launcher/gqa_attention.h"
+#include "ops/launcher/sigmoid_gate_mul.h"
 #include "ops/kernel/rmsnorm.cuh"
 #include "ops/kernel/rope.cuh"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
@@ -66,6 +67,7 @@ enum class AttentionSelection { Auto, PromptControl };
 enum class InputSelection { Auto, Dv07Control };
 enum class RmsSelection { Auto, Dv09CandidateB128 };
 enum class RopeSelection { Auto, Dv11CandidateB384 };
+enum class SigmoidSelection { Auto, Dv12CandidateB128 };
 
 struct Options {
     GeometrySelection geometry            = GeometrySelection::All;
@@ -74,6 +76,7 @@ struct Options {
     InputSelection input                  = InputSelection::Auto;
     RmsSelection rms                      = RmsSelection::Auto;
     RopeSelection rope                    = RopeSelection::Auto;
+    SigmoidSelection sigmoid              = SigmoidSelection::Auto;
     std::vector<std::int32_t> contexts    = {128, 8192};
     std::vector<std::int32_t> token_sweep = {1, 2, 3, 4, 5, 6};
     int warmup                            = 5;
@@ -97,6 +100,7 @@ struct Result {
     std::string input_route;
     std::string rms_route;
     std::string rope_route;
+    std::string sigmoid_route;
     std::string attention_route;
     std::string output_route;
     Timing timing;
@@ -313,6 +317,14 @@ Options parse_options(int argc, char** argv) {
                 options.rope = RopeSelection::Dv11CandidateB384;
             else
                 throw std::invalid_argument("--rope-route must be auto or dv11-b384");
+        } else if (arg == "--sigmoid-route") {
+            const std::string_view value = next("--sigmoid-route value");
+            if (value == "auto")
+                options.sigmoid = SigmoidSelection::Auto;
+            else if (value == "dv12-b128")
+                options.sigmoid = SigmoidSelection::Dv12CandidateB128;
+            else
+                throw std::invalid_argument("--sigmoid-route must be auto or dv12-b128");
         } else if (arg == "--t-sweep") {
             options.token_sweep = parse_i32_list(next("--t-sweep value"), false, "--t-sweep");
         } else if (arg == "--warmup") {
@@ -331,6 +343,7 @@ Options parse_options(int argc, char** argv) {
                         "[--input-route auto|dv07-control] "
                         "[--rms-route auto|dv09-b128] "
                         "[--rope-route auto|dv11-b384] "
+                        "[--sigmoid-route auto|dv12-b128] "
                         "[--context 128,8192] [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--csv-out PATH]\n",
                         argv[0]);
@@ -353,6 +366,10 @@ Options parse_options(int argc, char** argv) {
     if (options.rope == RopeSelection::Dv11CandidateB384 &&
         options.geometry != GeometrySelection::B35) {
         throw std::invalid_argument("--rope-route dv11-b384 requires --geometry 35b");
+    }
+    if (options.sigmoid == SigmoidSelection::Dv12CandidateB128 &&
+        options.geometry != GeometrySelection::B35) {
+        throw std::invalid_argument("--sigmoid-route dv12-b128 requires --geometry 35b");
     }
     for (const std::int32_t tokens : options.token_sweep) {
         if (tokens > 16) { throw std::invalid_argument("--t-sweep values must be in [1,16]"); }
@@ -693,7 +710,11 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
                                kAttentionScale, cache.layer_view(0), {visible, visible},
                                resources.workspace, attention, layer_stream);
         }
-        ops::sigmoid_mul(gate, attention, layer_stream);
+        if (options.sigmoid == SigmoidSelection::Dv12CandidateB128) {
+            ops::detail::sigmoid_gate_mul_bf16x8_launch(gate, attention, 128, layer_stream);
+        } else {
+            ops::sigmoid_mul(gate, attention, layer_stream);
+        }
         ops::linear_add(attention.view({Geometry::query_rows, tokens}), resources.output.weight,
                         residual, resources.workspace, layer_stream);
     };
@@ -713,15 +734,18 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
                             : ops::detail::gqa_attention_route_name(selected_route);
     const std::string attention_route =
         std::string("gqa.") + route + ".append." + kv_dtype_name(cache.dtype);
-    const std::string input_route = options.input == InputSelection::Dv07Control
-                                        ? Geometry::input_control_route(tokens)
-                                        : Geometry::input_route(tokens);
-    const std::string rms_route   = options.rms == RmsSelection::Dv09CandidateB128
-                                        ? "rms.candidate.cta_bf16x2_b128"
-                                        : "rms.production";
-    const std::string rope_route  = options.rope == RopeSelection::Dv11CandidateB384
-                                        ? "rope.candidate.fixed_b384"
-                                        : "rope.production";
+    const std::string input_route   = options.input == InputSelection::Dv07Control
+                                          ? Geometry::input_control_route(tokens)
+                                          : Geometry::input_route(tokens);
+    const std::string rms_route     = options.rms == RmsSelection::Dv09CandidateB128
+                                          ? "rms.candidate.cta_bf16x2_b128"
+                                          : "rms.production";
+    const std::string rope_route    = options.rope == RopeSelection::Dv11CandidateB384
+                                          ? "rope.candidate.fixed_b384"
+                                          : "rope.production";
+    const std::string sigmoid_route = options.sigmoid == SigmoidSelection::Dv12CandidateB128
+                                          ? "sigmoid_mul.candidate.bf16x8_b128"
+                                          : "sigmoid_mul.production";
     return {Geometry::name,
             kv_dtype_name(cache.dtype),
             context,
@@ -730,6 +754,7 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
             input_route,
             rms_route,
             rope_route,
+            sigmoid_route,
             attention_route,
             Geometry::output_route(tokens),
             timing};
@@ -770,15 +795,15 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
     out << "geometry,kv_dtype,context,T,graph_nodes,cold_median_us,cold_min_us,cold_p95_us,"
-           "input_route,rms_route,rope_route,attention_route,output_route,flush_bytes,warmup,"
-           "repeat\n";
+           "input_route,rms_route,rope_route,sigmoid_route,attention_route,output_route,"
+           "flush_bytes,warmup,repeat\n";
     for (const Result& result : results) {
         out << result.geometry << ',' << result.kv_dtype << ',' << result.context << ','
             << result.tokens << ',' << result.graph_nodes << ',' << result.timing.median_us << ','
             << result.timing.min_us << ',' << result.timing.p95_us << ',' << result.input_route
-            << ',' << result.rms_route << ',' << result.rope_route << ',' << result.attention_route
-            << ',' << result.output_route << ',' << options.flush_bytes << ',' << options.warmup
-            << ',' << options.repeat << '\n';
+            << ',' << result.rms_route << ',' << result.rope_route << ',' << result.sigmoid_route
+            << ',' << result.attention_route << ',' << result.output_route << ','
+            << options.flush_bytes << ',' << options.warmup << ',' << options.repeat << '\n';
     }
 }
 
@@ -801,10 +826,12 @@ void print_results(const Options& options, const std::vector<Result>& results) {
 
     std::printf("\nRoutes\n");
     for (const Result& result : results) {
-        std::printf("  %s/%s C=%d T=%d  input=%s  rms=%s  rope=%s  attention=%s  output=%s\n",
-                    result.geometry.c_str(), result.kv_dtype.c_str(), result.context, result.tokens,
-                    result.input_route.c_str(), result.rms_route.c_str(), result.rope_route.c_str(),
-                    result.attention_route.c_str(), result.output_route.c_str());
+        std::printf(
+            "  %s/%s C=%d T=%d  input=%s  rms=%s  rope=%s  sigmoid=%s  attention=%s  output=%s\n",
+            result.geometry.c_str(), result.kv_dtype.c_str(), result.context, result.tokens,
+            result.input_route.c_str(), result.rms_route.c_str(), result.rope_route.c_str(),
+            result.sigmoid_route.c_str(), result.attention_route.c_str(),
+            result.output_route.c_str());
     }
 }
 

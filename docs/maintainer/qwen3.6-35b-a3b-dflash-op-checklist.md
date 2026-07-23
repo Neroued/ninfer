@@ -373,7 +373,7 @@ after the P0 contractions and state transitions are optimized.
 | DV-09 | [x] | `rmsnorm` | 71 | Exact `T=1..16` for hidden, Q, and K row counts; assess safe fusion only at an owning semantic boundary. | `test_rmsnorm`; `rmsnorm_bench` |
 | DV-10 | [x] | `gated_rmsnorm` | 30 | `[4096,T]` with z gate; check launch/memory scaling and downstream arithmetic criterion. | `test_rmsnorm`; `rmsnorm_bench` |
 | DV-11 | [x] | `rope` | 10 | `[4096,T]` Q and `[512,T]` K, rotary 64, absolute positions; current launcher changes small-token geometry after 6. | `test_rope`; `rope_bench` |
-| DV-12 | [ ] | `sigmoid_mul` | 10 | Gate `[4096,T]`; exact odd/partial token extents and graph replay. | `test_sigmoid_mul`; `sigmoid_mul_bench` |
+| DV-12 | [x] | `sigmoid_mul` | 10 | Gate `[4096,T]`; exact odd/partial token extents and graph replay. | `test_sigmoid_mul`; `sigmoid_mul_bench` |
 | DV-13 | [ ] | `embedding` | 1 | W8 `[248320,2048]`, gathered ids for `T=1..16`; include repeated ids and physical row decode. | `test_embedding`; `embedding_bench` |
 | DV-14 | [ ] | `offset_i32_positions` | 1 | Exact position construction for all `T`, including near context limit. | `test_position`; dedicated benchmark missing |
 | DV-15 | [ ] | `argmax` | 1 | Q6-head output with `T=1..16`, physical stride, valid vocabulary rows, stable ties. | `test_argmax`; `argmax_bench` |
@@ -445,6 +445,32 @@ The 35B Text RoPE domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `s
   8192, including 142.624/143.744 us and 143.136/142.912 us for candidate/production at `T=16`.
   The production threshold is therefore retained; DV-11 adds complete qualification and
   reproducible candidate evidence without changing the runtime kernel.
+
+#### DV-12 qualification record
+
+The 35B attention output-gate domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1,
+`sm_120a`.
+
+- **C:** the public production route passed the independent naive FP64
+  `x * (1 / (1 + exp(-gate)))` oracle at every exact `[4096,T]`, `T=1..16`, with BF16-rounded
+  represented inputs and BF16 publication. The same suite retains three seeds, large-magnitude
+  sigmoid inputs, an odd 255-element tail, two-byte-only alignment, long rows, validation, and
+  zero-size behavior, directly covering the BF16x8, BF16x2-tail, and scalar routes.
+- **B:** the benchmark now accepts an exact token list and reports the physical vector, block, and
+  grid route. With 20 warmups and at least 100 measured CUDA-event batches over 500 ms, production
+  `bf16x8-b256` hot medians were 9.34--9.61 us across `T=1..16`; grid size grows smoothly from
+  2 to 32 CTAs, with no odd-T cliff.
+- **O:** 64-, 128-, and 192-thread launch geometries were compared without changing the single
+  launch, BF16x8 traffic, FP32 sigmoid arithmetic, or output. The best isolated candidate,
+  `b128`, measured 9.15--9.36 us and usually improved the launch-floor result by about 1%--4%;
+  it remains an explicit private launch control pending containing-layer evidence.
+- **E:** two reverse-order captured attention-mixer pairs covered both contexts 128 and 8192 and
+  every exact `T=1..16`, each with 20 warmups, 200 measured replays, and a 256 MiB L2 flush.
+  Results did not reproduce a stable layer win: at context 128 and `T=12`, candidate/production
+  changed from 56.608/58.624 us in one pair to 58.656/58.624 us in the reverse pair; at context
+  8192 and `T=16`, candidate was slower in both pairs (144.576/143.104 and
+  143.136/142.656 us). Production therefore retains `b256`; DV-12 adds complete exact-T,
+  tail-route, and CUDA Graph qualification without changing the selected runtime geometry.
 
 ### P0 measurement infrastructure
 

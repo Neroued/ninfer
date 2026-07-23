@@ -19,8 +19,8 @@ struct RouteSpec {
 
 constexpr std::array<RouteSpec, 4> kRoutes{{
     {1, 1, W8AttnInputScheduleId::DecodeR8Direct},
-    {2, 12, W8AttnInputScheduleId::SimtR8C4},
-    {13, 128, W8AttnInputScheduleId::MmaR32C128},
+    {2, 16, W8AttnInputScheduleId::SplitKMmaExactT},
+    {17, 128, W8AttnInputScheduleId::MmaR32C128},
     {129, kAnyCols, W8AttnInputScheduleId::MmaR64C128},
 }};
 
@@ -43,6 +43,7 @@ bool supported_shape(const W8AttnInputProblem& problem) noexcept {
 W8KernelVariant variant_for(W8AttnInputScheduleId schedule, std::int32_t cols) {
     switch (schedule) {
     case W8AttnInputScheduleId::DecodeR8Direct:
+    case W8AttnInputScheduleId::SplitKMmaExactT:
         return W8KernelVariant::None;
     case W8AttnInputScheduleId::SimtR8C4:
         return (cols % 4) == 0 ? W8KernelVariant::Full : W8KernelVariant::Predicated;
@@ -59,6 +60,8 @@ const char* w8_attn_input_schedule_name(W8AttnInputScheduleId schedule) noexcept
     switch (schedule) {
     case W8AttnInputScheduleId::DecodeR8Direct:
         return "attn_input_proj.w8.decode.r8.direct.k2048.split4";
+    case W8AttnInputScheduleId::SplitKMmaExactT:
+        return "attn_input_proj.w8.splitk8.mma.r16.exact_t.split4";
     case W8AttnInputScheduleId::SimtR8C4:
         return "attn_input_proj.w8.simt.r8.c4.split4";
     case W8AttnInputScheduleId::MmaR32C128:
@@ -99,6 +102,9 @@ void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, co
     switch (plan.schedule) {
     case W8AttnInputScheduleId::DecodeR8Direct:
         w8_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
+        return;
+    case W8AttnInputScheduleId::SplitKMmaExactT:
+        w8_attn_input_splitk_mma_launch(plan.variant, x, weight, q, gate, k, v, stream);
         return;
     case W8AttnInputScheduleId::SimtR8C4:
         w8_attn_input_simt_r8_c4_launch(plan.variant, x, weight, q, gate, k, v, stream);

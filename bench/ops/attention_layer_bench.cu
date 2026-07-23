@@ -25,6 +25,7 @@
 #include "core/kv_cache.h"
 #include "ninfer_bench_common.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
+#include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/launcher/gqa_attention.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
@@ -60,11 +61,13 @@ constexpr std::size_t kDefaultFlush = 256ULL << 20;
 enum class GeometrySelection { All, B27, B35 };
 enum class KvSelection { TargetDefault, Bf16, Int8 };
 enum class AttentionSelection { Auto, PromptControl };
+enum class InputSelection { Auto, Dv07Control };
 
 struct Options {
     GeometrySelection geometry            = GeometrySelection::All;
     KvSelection kv                        = KvSelection::TargetDefault;
     AttentionSelection attention          = AttentionSelection::Auto;
+    InputSelection input                  = InputSelection::Auto;
     std::vector<std::int32_t> contexts    = {128, 8192};
     std::vector<std::int32_t> token_sweep = {1, 2, 3, 4, 5, 6};
     int warmup                            = 5;
@@ -278,6 +281,14 @@ Options parse_options(int argc, char** argv) {
                 options.attention = AttentionSelection::PromptControl;
             else
                 throw std::invalid_argument("--attention-route must be auto or prompt-control");
+        } else if (arg == "--input-route") {
+            const std::string_view value = next("--input-route value");
+            if (value == "auto")
+                options.input = InputSelection::Auto;
+            else if (value == "dv07-control")
+                options.input = InputSelection::Dv07Control;
+            else
+                throw std::invalid_argument("--input-route must be auto or dv07-control");
         } else if (arg == "--t-sweep") {
             options.token_sweep = parse_i32_list(next("--t-sweep value"), false, "--t-sweep");
         } else if (arg == "--warmup") {
@@ -293,6 +304,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--geometry all|27b|35b] [--kv-dtype default|bf16|int8] "
                         "[--attention-route auto|prompt-control] "
+                        "[--input-route auto|dv07-control] "
                         "[--context 128,8192] [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--csv-out PATH]\n",
                         argv[0]);
@@ -303,6 +315,10 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
+    }
+    if (options.input == InputSelection::Dv07Control &&
+        options.geometry != GeometrySelection::B35) {
+        throw std::invalid_argument("--input-route dv07-control requires --geometry 35b");
     }
     for (const std::int32_t tokens : options.token_sweep) {
         if (tokens > 16) { throw std::invalid_argument("--t-sweep values must be in [1,16]"); }
@@ -434,11 +450,21 @@ struct Geometry27 {
                              workspace, stream);
     }
 
+    static void input_projection_control(const Tensor& hidden_tensor,
+                                         const DevicePackedWeight& input0,
+                                         const std::optional<DevicePackedWeight>& input1,
+                                         Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
+                                         WorkspaceArena& workspace, cudaStream_t stream) {
+        input_projection(hidden_tensor, input0, input1, query, gate, key, value, workspace, stream);
+    }
+
     static std::string input_route(std::int32_t tokens) {
         const auto plan = ops::detail::q4_q5_attn_input_resolve_plan(
             {hidden, query_rows, kv_rows, hidden, tokens});
         return ops::detail::q4_q5_attn_input_schedule_name(plan.schedule);
     }
+
+    static std::string input_control_route(std::int32_t tokens) { return input_route(tokens); }
 
     static std::string output_route(std::int32_t tokens) {
         const auto plan =
@@ -471,10 +497,38 @@ struct Geometry35 {
                              stream);
     }
 
+    static void input_projection_control(const Tensor& hidden_tensor,
+                                         const DevicePackedWeight& input0,
+                                         const std::optional<DevicePackedWeight>&, Tensor& query,
+                                         Tensor& gate, Tensor& key, Tensor& value, WorkspaceArena&,
+                                         cudaStream_t stream) {
+        const std::int32_t tokens = hidden_tensor.ne[1];
+        if (tokens == 1) {
+            ops::detail::w8_attn_input_decode_launch(hidden_tensor, input0.weight, query, gate, key,
+                                                     value, stream);
+        } else if (tokens <= 12) {
+            const auto variant = tokens % 4 == 0 ? ops::detail::W8KernelVariant::Full
+                                                 : ops::detail::W8KernelVariant::Predicated;
+            ops::detail::w8_attn_input_simt_r8_c4_launch(variant, hidden_tensor, input0.weight,
+                                                         query, gate, key, value, stream);
+        } else {
+            ops::detail::w8_attn_input_mma_r32_c128_launch(ops::detail::W8KernelVariant::Predicated,
+                                                           hidden_tensor, input0.weight, query,
+                                                           gate, key, value, stream);
+        }
+    }
+
     static std::string input_route(std::int32_t tokens) {
         const auto plan = ops::detail::w8_attn_input_resolve_plan(
             {hidden, query_rows, kv_rows, parent_rows, hidden, tokens});
         return ops::detail::w8_attn_input_schedule_name(plan.schedule);
+    }
+
+    static std::string input_control_route(std::int32_t tokens) {
+        const auto schedule = tokens == 1    ? ops::detail::W8AttnInputScheduleId::DecodeR8Direct
+                              : tokens <= 12 ? ops::detail::W8AttnInputScheduleId::SimtR8C4
+                                             : ops::detail::W8AttnInputScheduleId::MmaR32C128;
+        return std::string("dv07_control.") + ops::detail::w8_attn_input_schedule_name(schedule);
     }
 
     static std::string output_route(std::int32_t tokens) {
@@ -564,9 +618,15 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
 
     const auto layer = [&](cudaStream_t layer_stream) {
         ops::rmsnorm(residual, input_norm, kRmsEps, true, hidden, layer_stream);
-        Geometry::input_projection(hidden, resources.input0, resources.input1, query_flat,
-                                   gate_flat, key_flat, value_flat, resources.workspace,
-                                   layer_stream);
+        if (options.input == InputSelection::Dv07Control) {
+            Geometry::input_projection_control(hidden, resources.input0, resources.input1,
+                                               query_flat, gate_flat, key_flat, value_flat,
+                                               resources.workspace, layer_stream);
+        } else {
+            Geometry::input_projection(hidden, resources.input0, resources.input1, query_flat,
+                                       gate_flat, key_flat, value_flat, resources.workspace,
+                                       layer_stream);
+        }
         ops::rmsnorm(query, query_norm, kRmsEps, true, query_transformed, layer_stream);
         ops::rmsnorm(key, key_norm, kRmsEps, true, key_transformed, layer_stream);
         ops::rope(positions, kRotaryDim, kRopeTheta, query_transformed, key_transformed,
@@ -601,12 +661,15 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
                             : ops::detail::gqa_attention_route_name(selected_route);
     const std::string attention_route =
         std::string("gqa.") + route + ".append." + kv_dtype_name(cache.dtype);
+    const std::string input_route = options.input == InputSelection::Dv07Control
+                                        ? Geometry::input_control_route(tokens)
+                                        : Geometry::input_route(tokens);
     return {Geometry::name,
             kv_dtype_name(cache.dtype),
             context,
             tokens,
             graph.body_nodes(),
-            Geometry::input_route(tokens),
+            input_route,
             attention_route,
             Geometry::output_route(tokens),
             timing};

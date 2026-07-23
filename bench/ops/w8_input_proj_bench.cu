@@ -299,6 +299,13 @@ int main(int argc, char** argv) {
                     ops::detail::w8_attn_input_simt_r8_c4_launch(simt_variant(t), x, packed.weight,
                                                                  tq, tg, tk, tv, s);
                 });
+                if (t >= 2 && t <= 16) {
+                    run("splitk_mma_exact_t", [&](cudaStream_t s) {
+                        ops::detail::w8_attn_input_splitk_mma_launch(
+                            ops::detail::W8KernelVariant::None, x, packed.weight, tq, tg, tk, tv,
+                            s);
+                    });
+                }
                 run("mma_r32_c128", [&](cudaStream_t s) {
                     ops::detail::w8_attn_input_mma_r32_c128_launch(mma_variant(t), x, packed.weight,
                                                                    tq, tg, tk, tv, s);

@@ -12,6 +12,7 @@ namespace ninfer::ops::detail {
 
 enum class W8AttnInputScheduleId {
     DecodeR8Direct,
+    SplitKMmaExactT,
     SimtR8C4,
     MmaR32C128,
     MmaR64C128,

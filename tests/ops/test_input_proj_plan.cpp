@@ -125,13 +125,24 @@ void w8_attn_route_tests() {
         W8KernelVariant variant;
     };
 
-    constexpr std::array<Case, 12> cases{{
+    constexpr std::array<Case, 23> cases{{
         {1, W8AttnInputScheduleId::DecodeR8Direct, W8KernelVariant::None},
-        {2, W8AttnInputScheduleId::SimtR8C4, W8KernelVariant::Predicated},
-        {4, W8AttnInputScheduleId::SimtR8C4, W8KernelVariant::Full},
-        {12, W8AttnInputScheduleId::SimtR8C4, W8KernelVariant::Full},
-        {13, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Predicated},
-        {14, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Predicated},
+        {2, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {3, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {4, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {5, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {6, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {7, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {8, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {9, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {10, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {11, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {12, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {13, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {14, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {15, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {16, W8AttnInputScheduleId::SplitKMmaExactT, W8KernelVariant::None},
+        {17, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Predicated},
         {127, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Predicated},
         {128, W8AttnInputScheduleId::MmaR32C128, W8KernelVariant::Full},
         {129, W8AttnInputScheduleId::MmaR64C128, W8KernelVariant::Predicated},

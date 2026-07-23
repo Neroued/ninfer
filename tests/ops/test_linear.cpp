@@ -86,6 +86,15 @@ struct GuardedBf16Output {
         return 1;
     }
 
+    int verify_initialized(const std::string& label) const {
+        std::vector<std::uint16_t> bits(words);
+        cudaMemcpy(bits.data(), data(), bits.size() * sizeof(std::uint16_t),
+                   cudaMemcpyDeviceToHost);
+        if (std::find(bits.begin(), bits.end(), std::uint16_t{0xa5a5}) == bits.end()) { return 0; }
+        std::cerr << label << ": output contains an unpublished poison word\n";
+        return 1;
+    }
+
     DBuf storage;
     std::size_t words;
 };
@@ -666,7 +675,8 @@ int w8_attention_input_correctness() {
     WorkspaceArena ws(1);
 
     int failures = 0;
-    for (const std::int32_t t : {1, 2, 4, 12, 13, 14, 128, 129, 1024}) {
+    for (const std::int32_t t :
+         {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 128, 129, 1024}) {
         const std::size_t q_count  = static_cast<std::size_t>(kQRows) * t;
         const std::size_t kv_count = static_cast<std::size_t>(kKvRows) * t;
         GuardedBf16Output q_got(q_count), gate_got(q_count), k_got(kv_count), v_got(kv_count);
@@ -678,7 +688,7 @@ int w8_attention_input_correctness() {
         const auto launch = [&](cudaStream_t stream) {
             ops::attn_input_proj(tx, weight, tq, tgate, tk, tv, ws, stream);
         };
-        if (t == 1) {
+        if (t == 1 || t == 16) {
             capture_and_replay(launch);
         } else {
             launch(nullptr);
@@ -687,7 +697,8 @@ int w8_attention_input_correctness() {
 
         const auto plan =
             ops::detail::w8_attn_input_resolve_plan({kHidden, kQRows, kKvRows, kRows, kHidden, t});
-        const bool mma = plan.schedule == ops::detail::W8AttnInputScheduleId::MmaR32C128 ||
+        const bool mma = plan.schedule == ops::detail::W8AttnInputScheduleId::SplitKMmaExactT ||
+                         plan.schedule == ops::detail::W8AttnInputScheduleId::MmaR32C128 ||
                          plan.schedule == ops::detail::W8AttnInputScheduleId::MmaR64C128;
         const Tolerance tolerance = mma ? Tolerance::linear_tc() : Tolerance::linear_bf16();
         const std::string suffix  = " T=" + std::to_string(t);
@@ -708,6 +719,10 @@ int w8_attention_input_correctness() {
         failures += gate_got.verify_guards("W8 attention gate" + suffix);
         failures += k_got.verify_guards("W8 attention k" + suffix);
         failures += v_got.verify_guards("W8 attention v" + suffix);
+        failures += q_got.verify_initialized("W8 attention q" + suffix);
+        failures += gate_got.verify_initialized("W8 attention gate" + suffix);
+        failures += k_got.verify_initialized("W8 attention k" + suffix);
+        failures += v_got.verify_initialized("W8 attention v" + suffix);
     }
     return failures;
 }
@@ -1133,6 +1148,11 @@ int main() {
         return 0;
     }
 
+    if (std::getenv("NINFER_LINEAR_TEST_W8_ATTN_ONLY") != nullptr) {
+        const int f = w8_attention_input_correctness();
+        std::cout << (f ? "FAIL" : "OK") << " W8 attention-input dFlash correctness\n";
+        return f ? 1 : 0;
+    }
     if (std::getenv("NINFER_LINEAR_TEST_W8G32_ONLY") != nullptr) {
         int f = 0;
         f += one_quant_shape(QType::W8G32_F16S, 1024, 5120, {1, 4, 5, 16, 17}, 119u);

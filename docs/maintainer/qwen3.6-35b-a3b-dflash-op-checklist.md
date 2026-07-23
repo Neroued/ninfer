@@ -113,7 +113,7 @@ Work these rows in order unless whole-round profiling demonstrates a different d
 | DV-04 | [x] | `gqa_attention`, 10 calls | `T<=6` keeps the direct small-T route. For 35B, `T=7..12` uses prompt through 512 visible keys and otherwise 2 small-T chunks; `T=13..16` uses prompt through 1024 and otherwise 3 chunks. Each chunk has at most six sequential columns and reuses one workspace allocation. BF16 and INT8-G64 share the context policy. | `test_gqa_attention`; `gqa_attention_bench --append-small-t`/`--cached-small-t`, `attention_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-05 | [x] | `sparse_moe`, 40 calls | `T=1` keeps decode. Q4+Q5/Q6 stay on Small-T through 44 with three D3 paths/CTA and codec-specific D4 row tiers; W8+W8 stays on Small-T through 17 with 1/9-path D3 and 1/4-row D4 tiers. All dFlash widths therefore avoid the per-token decode loop. | `test_sparse_moe`; `sparse_moe_bench` | [x] | [x] | [x] | [x] |
 | DV-06 | [x] | Q6 `linear` output head `[248320,2048]`, 1 call | `T=1..4` uses SIMT C4, `T=5..8` SIMT C8, and `T=9..64` MMA R64C64; C128 resumes at `T>=65`. The dFlash range has no C128 over-computation or repeated weight pass. | `test_linear`, `test_q6_linear_plan`, `test_q6_linear_dispatch`; `linear_op_bench`, `output_stage_bench` | [x] | [x] | [x] | [x] |
-| DV-07 | [ ] | W8 `attn_input_proj` `[9216,2048]`, 10 calls | `T=1` decode; `T=2..12` SIMT R8C4; `T=13..16` MMA R32C128. The dFlash range crosses `T=12/13`. | `test_linear`, `test_input_proj_plan`; `w8_input_proj_bench`, `attention_layer_bench` | [ ] | [ ] | [ ] | [ ] |
+| DV-07 | [x] | W8 `attn_input_proj` `[9216,2048]`, 10 calls | `T=1` keeps decode; every exact `T=2..16` uses one split-K MMA kernel with compile-time active columns and direct Q/K/gate/V publication. MMA R32C128 resumes at `T=17`. | `test_linear`, `test_input_proj_plan`; `w8_input_proj_bench`, `attention_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-08 | [ ] | W8 `linear_add` `[2048,4096]`, 40 calls | All `T=1..16` use SIMT R8C4. Verify throughput and residual epilogue efficiency across exact partial tiles. | `test_linear`, `test_linear_add_plan`; `linear_op_bench`, layer benches | [ ] | [ ] | [ ] | [ ] |
 
 #### DV-01 qualification record
@@ -300,6 +300,37 @@ The Q6 full-vocabulary output head was qualified on NVIDIA GeForce RTX 5090, CUD
 
 The current fixed `K<=5` controller still cannot issue `target_verify(T=7..16)`, so DV-06 closes
 the Op and complete output-stage criteria without claiming a full long-acceptance dFlash round.
+
+#### DV-07 qualification record
+
+The 35B W8 attention input projection was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1,
+`sm_120a`, with a 256 MiB L2 flush, five warmups, 50 measured Op repetitions, and every exact
+`T=1..16`.
+
+- **C:** the production Op passed an independent payload-decoding FP64 oracle at every exact
+  `T=1..16`. The test independently decodes signed W8 codes and FP16 group scales, checks sampled
+  dot products spanning every physical Q/K/gate/V split and row-tile boundary, verifies that every
+  poisoned output word is published, and protects each allocation with guards. T=16 additionally
+  passes capture and repeated CUDA Graph replay. Plan tests cover every exact dFlash width and the
+  `T=16/17` return to the large-T route.
+- **B:** production cold medians were 19.68 us at T=1, 16.99--17.70 us at T=2..8, and
+  19.71--21.76 us at T=9..16. The benchmark reports the production route and directly launchable
+  decode, SIMT, exact-T split-K, and large-tile MMA candidates at every supported width.
+- **O:** the former route measured 23.62 us at T=2, 34.05 us at T=7/T=8, 42.24 us at T=12,
+  and 46.34 us at T=13/T=16. The selected exact-T kernel measured 17.63, 17.66/17.63, 19.71,
+  and 19.71/21.76 us respectively, improving those points by 25%--57%. It uses eight K-split
+  warps, compile-time active columns, one launch, direct split-output stores, and no workspace.
+  The kernel core is shared with the already-qualified GDN projection rather than copied.
+  Contiguous-parent-plus-extract and C128 MMA candidates were slower and were not retained.
+- **E:** in captured BF16 35B full-attention-layer replay at context 8192, replacing only the
+  original input route improved median latency from 79.10 to 75.01 us at T=2 (5.2%), 121.82 to
+  111.87 us at T=7 (8.2%), 136.48 to 122.14 us at T=12 (10.5%), 173.34 to 148.77 us at T=13
+  (14.2%), and 175.87 to 152.83 us at T=16 (13.1%). Both routes use the same graph-node count at
+  each width.
+
+The current fixed `K<=5` controller still cannot issue `target_verify(T=7..16)`, so DV-07 closes
+the Op and complete full-attention-layer criteria without claiming a full long-acceptance dFlash
+round.
 
 ### P1: frequent elementwise, normalization, and selection Ops
 

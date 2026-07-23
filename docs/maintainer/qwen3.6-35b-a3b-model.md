@@ -556,12 +556,32 @@ cover all 128 head dimensions. This is ordinary one-dimensional split-half Qwen3
 `plain_rmsnorm`; none use the target's offset-norm convention. `plain_head_rmsnorm` is the same
 formula applied independently over each 128-value Q or K head.
 
-All six DFlash layers are non-causal. Layers 0 through 4 apply non-causal local attention with the
-configured sliding-window parameter 4096, and layer 5 applies non-causal full attention. The
-16 query rows therefore attend bidirectionally to one another wherever the corresponding
-local/full mask admits them, while also attending the admitted context K/V. This all-non-causal
-mask is the single model contract and numerical oracle; a causal draft mask computes a different
-head and is not a supported execution profile.
+All six DFlash layers are non-causal. Layers 0 through 4 apply symmetric non-causal local attention
+with the configured sliding-window parameter 4096, and layer 5 applies non-causal full attention.
+For committed context length `L`, query-block length `B`, query position `p_i=L+i`, and any
+populated context or query key position `p_j`, the local-layer predicate is:
+
+```text
+allowed_swa(p_i, p_j) = abs(p_j - p_i) < 4096
+                       = p_i-4095 <= p_j <= p_i+4095
+```
+
+The endpoints at distance 4095 are inclusive and positions at distance 4096 are excluded. This is
+a symmetric mask whose maximum populated extent is 8191 positions, not a 4096-key total span.
+Context keys occupy positions `0..L-1` and temporary query keys occupy `L..L+B-1`; the valid
+sequence bounds clip the interval above. Because `B<=16`, every query row attends all temporary
+query K/V rows. Once the left boundary is populated, row `i` attends context positions
+`L+i-4095..L-1`, or `4095-i` context keys.
+
+This exact inequality follows the checkpoint reference's FlashAttention path: Transformers maps
+the scalar value 4096 to the inclusive FlashAttention window `(4095,4095)`, and FlashAttention
+bottom-right-aligns the shorter Q block with the complete K sequence. The reference's unmasked
+SDPA fallback becomes full attention beyond this boundary and is not an alternate model semantic
+or numerical oracle.
+
+The query rows therefore attend bidirectionally to one another while also attending the admitted
+context K/V. This all-non-causal mask is the single model contract and numerical oracle; a causal
+draft mask computes a different head and is not a supported execution profile.
 
 The companion consumes target Text residual features and owns no Vision component. Its query and
 context positions are scalar one-dimensional positions. This model-side contract does not by
@@ -745,8 +765,9 @@ Allocator alignment, paging metadata, and scratch are not included. Speculative 
 prefix reuse, or transactional rollback multiplies the bounded GDN state by the required snapshot
 slots. Target full-attention KV, MTP KV, and the final DFlash layer's context KV grow with
 configured context; GDN state and the first five DFlash context windows are bounded.
-The first five layers retain exactly the local context admitted by the non-causal 4096-window mask;
-they do not grow with total context.
+The first five layers may use 4096-slot cyclic K/V storage, but a proposal query admits at most the
+last 4095 committed context positions according to its absolute position; a retained row at
+distance 4096 is outside the mask. These caches do not grow with total context.
 
 The Program freezes its feature set at startup. A zero MTP draft window has no MTP weight view,
 MTP KV cache, or optimized proposal head. With Vision disabled, it has no Vision weight view and
@@ -860,7 +881,7 @@ This reference was cross-checked on 2026-07-23 against the following independent
 | Text, GDN, MoE, MTP execution | vLLM commit `92221485aaaa4088491db3f182dd65a390fc9ac5`, especially `qwen3_5.py`, `qwen3_5_mtp.py`, `qwen3_next.py`, and `qwen_gdn_linear_attn.py` |
 | independent Text/MTP recurrence graph | llama.cpp commit `07d937828636e305bc0cfe738b288f9ab05ff748`, especially `src/models/qwen35moe.cpp` and `src/models/delta-net-base.cpp` |
 | Vision and processor semantics | vLLM `qwen3_vl.py` / `qwen2_5_vl.py`, llama.cpp `tools/mtmd/models/qwen3vl.cpp`, and local processor configs |
-| DFlash algorithm, all-non-causal attention, and block verification | [DFlash paper, revision 2](https://arxiv.org/html/2602.06036v2), [pinned Z-Lab PyTorch reference](https://github.com/z-lab/dflash/blob/94e4abc5e0c31b67bc1a9d30f1cc34ece28a8756/dflash/model.py) |
+| DFlash algorithm, all-non-causal attention, block verification, and exact local-window boundary | [DFlash paper, revision 2](https://arxiv.org/html/2602.06036v2), [pinned Z-Lab PyTorch reference](https://github.com/z-lab/dflash/blob/94e4abc5e0c31b67bc1a9d30f1cc34ece28a8756/dflash/model.py), [Transformers 5.7 FlashAttention mapping](https://github.com/huggingface/transformers/blob/v5.7.0/src/transformers/modeling_flash_attention_utils.py#L627-L632), [FlashAttention local-window definition](https://github.com/Dao-AILab/flash-attention/blob/main/README.md#L253-L272) |
 | exact DFlash companion identity and dimensions | [companion model card](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash), [checkpoint `config.json`](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash/blob/f181eece646affea2c38b2765f1aaa01a9734ccd/config.json), [companion PyTorch reference snapshot](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash/blob/0ce151d016ba8f0f0454d160a81b52ad4588c924/dflash.py), local safetensors header |
 
 The registered implementation maps these concerns as follows:

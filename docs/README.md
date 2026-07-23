@@ -33,7 +33,3 @@ The executable `--help` output is the exact source for command-line option spell
 The files under [`maintainer/`](maintainer/) record the current artifact formats, exact model and
 artifact contracts, and Op-development rules used for ongoing project maintenance. They are not
 additional user workflows or installed API documentation.
-
-Active implementation design:
-
-- [Qwen3.6-35B-A3B dFlash operator checklist](maintainer/qwen3.6-35b-a3b-dflash-op-checklist.md)

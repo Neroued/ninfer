@@ -59,5 +59,7 @@ using SequencePlanImpl = qwen3_6::detail::SequencePlanImpl<Variant>;
 void validate_target_options(DeviceContext& device, const EngineOptions& options);
 [[nodiscard]] std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
                                                                    const EngineOptions& options);
+[[nodiscard]] std::size_t target_speculative_workspace_bytes(std::uint32_t prefill_chunk,
+                                                             std::uint32_t draft_window);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

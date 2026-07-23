@@ -112,6 +112,19 @@ void test_round_layout() {
            "exact prefill extension retains established round-region order");
     expect(round.mtp.has_value() && round.mtp->alignment_ids.shape[0] == 6,
            "MTP round extension is explicit");
+
+    ninfer::LayoutBuilder speculative_builder;
+    q36::RoundStateLayout speculative = q36::begin_round_state_layout(
+        speculative_builder,
+        q36::RoundStateSpec{
+            .hidden = 32, .output_rows = 128, .draft_window = 15, .enable_mtp = false});
+    q36::complete_round_state_layout(speculative_builder, speculative);
+    (void)speculative_builder.finish(256);
+    expect(speculative.logits.shape[1] == 16 &&
+               speculative.speculative.draft_tokens.shape[0] == 15 &&
+               speculative.speculative.stats.shape[0] == 19,
+           "K=15 shared speculative geometry");
+    expect(!speculative.mtp.has_value(), "shared speculative state does not imply MTP state");
 }
 
 void test_mtp_alignment() {

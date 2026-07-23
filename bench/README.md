@@ -213,6 +213,25 @@ cmake --build build --parallel --target ninfer_qwen3_6_27b_mtp_round_bench
   --artifact out/qwen3_6_27b.ninfer
 ```
 
+## 35B target-side speculative round benchmark
+
+`ninfer_qwen3_6_35b_a3b_target_speculative_round_bench` measures the shared target verification,
+greedy acceptance, accepted-hidden selection, and target-state publication transaction without
+including MTP or dFlash proposal work. It uses the real 35B Text weights, target KV cache, and 17
+GDN snapshot slots when `K=15`. The default sweep covers `K=1..15` in eager and CUDA Graph modes;
+`--accepted-drafts A` forces one acceptance frontier for every selected K:
+
+```bash
+cmake --build build --parallel \
+  --target ninfer_qwen3_6_35b_a3b_target_speculative_round_bench
+./build/bench/ninfer_qwen3_6_35b_a3b_target_speculative_round_bench \
+  --artifact out/qwen3_6_35b_a3b.ninfer \
+  --context 128 --draft-tokens 7,15 --mode both
+```
+
+The reported `target_side_effective_tok_s` is `(A+1)/target-side latency`. It deliberately excludes
+proposal generation and dFlash-specific context maintenance and is not an end-to-end speed claim.
+
 ## Token-decision Op benchmarks
 
 The G1 benchmark covers the Qwen3.6-35B full physical vocabulary with 248077 valid rows at

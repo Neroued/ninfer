@@ -62,3 +62,16 @@ target_include_directories(ninfer_qwen3_6_27b_mtp_round_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_qwen3_6_27b_mtp_round_bench PRIVATE
   ninfer_engine ninfer_core)
+
+# Target-side speculative transaction benchmark for the 35B target. Drafts are injected so the
+# measurement contains shared target verification/acceptance but no MTP or future dFlash proposal.
+add_executable(ninfer_qwen3_6_35b_a3b_target_speculative_round_bench
+  targets/qwen3_6_35b_a3b/target_speculative_round_bench.cpp)
+target_include_directories(ninfer_qwen3_6_35b_a3b_target_speculative_round_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer_qwen3_6_35b_a3b_target_speculative_round_bench PRIVATE
+  ninfer_engine ninfer_core)

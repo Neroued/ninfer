@@ -254,7 +254,7 @@ std::size_t workspace_bytes(const SequencePlanImpl& plan) {
 
     WorkspaceLayoutBuilder mtp_prefill;
     WorkspaceLayoutBuilder mtp_full;
-    if (plan.draft_window != 0) {
+    if (plan.features.mtp) {
         common_root(mtp_prefill, prefill_tokens);
         matrix(mtp_prefill, DType::I32, 1, prefill_tokens);
         matrix(mtp_prefill, DType::BF16, TextConfig::hidden, prefill_tokens);
@@ -287,6 +287,20 @@ std::size_t workspace_bytes(const SequencePlanImpl& plan) {
 }
 
 } // namespace
+
+std::size_t target_speculative_workspace_bytes(std::uint32_t prefill_chunk,
+                                               std::uint32_t draft_window) {
+    if (prefill_chunk == 0 || draft_window == 0 ||
+        prefill_chunk > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
+        draft_window >= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("target speculative workspace dimensions are invalid");
+    }
+    SequencePlanImpl plan;
+    plan.prefill_chunk = prefill_chunk;
+    plan.draft_window  = draft_window;
+    plan.proposal_head = ProposalHead::Full;
+    return workspace_bytes(plan);
+}
 
 void validate_target_options(DeviceContext& device, const EngineOptions& options) {
     if (options.max_context == 0 || options.max_context > Variant::maximum_context) {

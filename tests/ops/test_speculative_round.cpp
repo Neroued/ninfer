@@ -1,3 +1,5 @@
+#include "ninfer/ops/causal_conv1d_silu.h"
+#include "ninfer/ops/gated_delta_rule.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
@@ -338,7 +340,7 @@ int gdn_initial_slot_case() {
     Tensor slot(d_slot.p, DType::I32, {1});
 
     int failures = 0;
-    for (int value = 0; value <= 5; ++value) {
+    for (int value = 0; value <= 15; ++value) {
         cudaMemcpy(d_accepted.p, &value, sizeof(value), cudaMemcpyHostToDevice);
         ops::assign_i32_scalar(accepted, slot, nullptr);
         cudaDeviceSynchronize();
@@ -348,6 +350,144 @@ int gdn_initial_slot_case() {
     ops::set_i32_scalar(slot, 0, nullptr);
     cudaDeviceSynchronize();
     failures += expect_eq("gdn initial slot reset", from_device_i32(d_slot, 1), {0});
+    return failures;
+}
+
+int accepted_state_resume_case() {
+    constexpr int k       = 15;
+    constexpr int slots   = 17;
+    constexpr int vocab   = 32;
+    constexpr int head    = 16;
+    constexpr int state_n = head * head;
+
+    std::vector<int> targets(k + 1);
+    for (int i = 0; i <= k; ++i) { targets[static_cast<std::size_t>(i)] = i + 1; }
+    DBuf d_targets = to_device_i32(targets);
+    DBuf d_logits  = zero_logits(vocab, k + 1);
+    DBuf d_cfg     = to_device_config(ops::SamplingConfig{});
+    Tensor target_tensor(d_targets.p, DType::I32, {k + 1});
+    Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
+
+    std::vector<float> conv_states_host(3 * slots);
+    std::vector<float> ssm_states_host(state_n * slots);
+    for (int slot = 0; slot < slots; ++slot) {
+        for (int i = 0; i < 3; ++i) {
+            conv_states_host[static_cast<std::size_t>(slot) * 3 + i] =
+                0.125f * static_cast<float>(slot + 1) + 0.03125f * static_cast<float>(i);
+        }
+        for (int i = 0; i < state_n; ++i) {
+            ssm_states_host[static_cast<std::size_t>(slot) * state_n + i] =
+                0.002f * static_cast<float>(slot + 1) + 0.00001f * static_cast<float>(i % head);
+        }
+    }
+    round_to_bf16(conv_states_host);
+
+    const std::vector<float> conv_x_host{0.375f};
+    const std::vector<float> conv_weight_host{0.5f, -0.25f, 0.75f, 0.125f};
+    std::vector<float> q_host(head), k_host(head), v_host(head);
+    for (int i = 0; i < head; ++i) {
+        q_host[static_cast<std::size_t>(i)] = 0.02f * static_cast<float>(i + 1);
+        k_host[static_cast<std::size_t>(i)] = 0.015f * static_cast<float>(head - i);
+        v_host[static_cast<std::size_t>(i)] = 0.01f * static_cast<float>((i % 5) - 2);
+    }
+    round_to_bf16(q_host);
+    round_to_bf16(k_host);
+    round_to_bf16(v_host);
+    const std::vector<float> g_host{0.0f};
+    const std::vector<float> beta_host{0.25f};
+
+    int failures = 0;
+    for (int accepted_count = 0; accepted_count <= k; ++accepted_count) {
+        std::vector<int> drafts(k);
+        for (int i = 0; i < k; ++i) {
+            drafts[static_cast<std::size_t>(i)] =
+                i < accepted_count ? targets[static_cast<std::size_t>(i)] : 0;
+        }
+
+        auto d_drafts = to_device_i32(drafts);
+        auto d_length = to_device_i32({100});
+        auto d_token  = to_device_i32({-1});
+        auto d_stats  = to_device_i64(std::vector<std::int64_t>(4 + k, 0));
+        auto d_slot   = to_device_i32({-1});
+        DBuf d_sampled((k + 1) * sizeof(std::int32_t));
+        DBuf d_num(sizeof(std::int32_t));
+        DBuf d_accepted(sizeof(std::int32_t));
+        Tensor draft_tensor(d_drafts.p, DType::I32, {k});
+        Tensor length(d_length.p, DType::I32, {1});
+        Tensor token(d_token.p, DType::I32, {1});
+        Tensor sampled(d_sampled.p, DType::I32, {k + 1});
+        Tensor num(d_num.p, DType::I32, {1});
+        Tensor accepted(d_accepted.p, DType::I32, {1});
+        Tensor stats(d_stats.p, DType::I64, {4 + k});
+        Tensor initial_slot(d_slot.p, DType::I32, {1});
+
+        ops::speculative_accept_greedy_drafts(
+            target_tensor, logits, draft_tensor, length, token, sampled, num, accepted, stats,
+            vocab, config_ptr(d_cfg), test_sampling_workspace(), nullptr);
+        ops::assign_i32_scalar(accepted, initial_slot, nullptr);
+        cudaDeviceSynchronize();
+        failures += expect_eq("accepted-state slot A=" + std::to_string(accepted_count),
+                              from_device_i32(d_slot, 1), {accepted_count});
+
+        std::vector<float> conv_reference_host(3);
+        std::copy_n(conv_states_host.begin() + static_cast<std::ptrdiff_t>(accepted_count * 3), 3,
+                    conv_reference_host.begin());
+        auto d_conv_states = to_device_bf16(conv_states_host);
+        auto d_conv_ref    = to_device_bf16(conv_reference_host);
+        auto d_conv_x      = to_device_bf16(conv_x_host);
+        auto d_conv_weight = to_device_bf16(conv_weight_host);
+        DBuf d_conv_out(sizeof(std::uint16_t));
+        DBuf d_conv_ref_out(sizeof(std::uint16_t));
+        Tensor conv_states(d_conv_states.p, DType::BF16, {1, 3, slots});
+        Tensor conv_ref(d_conv_ref.p, DType::BF16, {1, 3});
+        Tensor conv_x(d_conv_x.p, DType::BF16, {1, 1});
+        Tensor conv_weight(d_conv_weight.p, DType::BF16, {1, 4});
+        Tensor conv_out(d_conv_out.p, DType::BF16, {1, 1});
+        Tensor conv_ref_out(d_conv_ref_out.p, DType::BF16, {1, 1});
+        ops::causal_conv1d_silu_snapshot(conv_x, conv_weight, conv_states, initial_slot, conv_out,
+                                         nullptr);
+        ops::causal_conv1d_silu(conv_x, conv_weight, conv_ref, conv_ref_out, nullptr);
+
+        std::vector<float> ssm_reference_host(state_n);
+        std::copy_n(ssm_states_host.begin() + static_cast<std::ptrdiff_t>(accepted_count * state_n),
+                    state_n, ssm_reference_host.begin());
+        auto d_ssm_states = to_device_f32(ssm_states_host);
+        auto d_ssm_ref    = to_device_f32(ssm_reference_host);
+        auto d_q          = to_device_bf16(q_host);
+        auto d_k          = to_device_bf16(k_host);
+        auto d_v          = to_device_bf16(v_host);
+        auto d_g          = to_device_f32(g_host);
+        auto d_beta       = to_device_f32(beta_host);
+        DBuf d_ssm_out(head * sizeof(std::uint16_t));
+        DBuf d_ssm_ref_out(head * sizeof(std::uint16_t));
+        Tensor ssm_states(d_ssm_states.p, DType::FP32, {head, head, 1, slots});
+        Tensor ssm_ref(d_ssm_ref.p, DType::FP32, {head, head, 1});
+        Tensor q(d_q.p, DType::BF16, {head, 1, 1});
+        Tensor key(d_k.p, DType::BF16, {head, 1, 1});
+        Tensor value(d_v.p, DType::BF16, {head, 1, 1});
+        Tensor g(d_g.p, DType::FP32, {1, 1});
+        Tensor beta(d_beta.p, DType::FP32, {1, 1});
+        Tensor ssm_out(d_ssm_out.p, DType::BF16, {head, 1, 1});
+        Tensor ssm_ref_out(d_ssm_ref_out.p, DType::BF16, {head, 1, 1});
+        WorkspaceArena recurrent_workspace(256);
+        ops::gated_delta_rule_snapshot(q, key, value, g, beta, 0.25f, false, recurrent_workspace,
+                                       ssm_states, initial_slot, ssm_out, nullptr);
+        ops::gated_delta_rule(q, key, value, g, beta, 0.25f, false, recurrent_workspace, ssm_ref,
+                              ssm_ref_out, nullptr);
+        cudaDeviceSynchronize();
+
+        const std::string suffix = " A=" + std::to_string(accepted_count);
+        failures += expect_eq("accepted-state conv output" + suffix, from_device_u16(d_conv_out, 1),
+                              from_device_u16(d_conv_ref_out, 1));
+        failures += expect_eq("accepted-state conv continuation" + suffix,
+                              from_device_u16(d_conv_states, 3), from_device_u16(d_conv_ref, 3));
+        failures +=
+            expect_eq("accepted-state SSM output" + suffix, from_device_u16(d_ssm_out, head),
+                      from_device_u16(d_ssm_ref_out, head));
+        const std::string state_label = "accepted-state SSM continuation" + suffix;
+        failures += verify(state_label.c_str(), from_device_f32(d_ssm_states, state_n),
+                           from_device_f32(d_ssm_ref, state_n), Tolerance::gdn_state_fp32());
+    }
     return failures;
 }
 
@@ -1015,6 +1155,7 @@ int main() {
     failures += increment_case();
     failures += fallback_count_case();
     failures += gdn_initial_slot_case();
+    failures += accepted_state_resume_case();
     failures += validation_case();
     std::cout << (failures ? "FAIL" : "OK") << " speculative_round correctness\n";
     return failures ? 1 : 0;

@@ -986,7 +986,7 @@ counter state and W8+W8 had no complete-route gain. Per-expert launches, all-exp
 materialized `[8,gate/up,512]` or `[8,2048]` intermediates remain nonconforming.
 
 The closed Op has three private dispatch regimes. `T=1` retains the four-launch decode route. The
-Small-T CUDA Core/SIMT implementation admits `T=2..32`: exact-T router templates share each weight
+Small-T CUDA Core/SIMT implementation admits `T=2..44`: exact-T router templates share each weight
 row across all columns, one warp per token performs independent stable top-8 selection, and one
 persistent D3 plus one persistent D4 launch advances through the token columns while retaining
 disjoint FP32 `[9,512]` activation regions. This is a four-launch route without tensor cores or a
@@ -1001,7 +1001,7 @@ residual write. No host synchronization, selected-weight repack, capacity factor
 introduced.
 
 Production selects the first trace-like RTX 5090 crossover for each routed codec: prefill begins at
-`T=12` for Q4+Q5, `T=11` for Q4+Q6, and `T=7` for W8+W8; smaller multi-column shapes use Small-T.
+`T=45` for Q4+Q5 and Q4+Q6, and `T=18` for W8+W8; smaller multi-column shapes use Small-T.
 The prefill route changes from 32-column/four-warp jobs to 64-column/eight-warp jobs at `T=768` and
 slices extents larger than 4096 without changing semantics. The workspace query reserves the
 largest required decode, Small-T, or at-most-4096-column prefill lifetime, so one caller-owned

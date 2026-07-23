@@ -35,3 +35,5 @@ artifact contracts, and Op-development rules used for ongoing project maintenanc
 additional user workflows or installed API documentation.
 
 Active implementation design:
+
+- [Qwen3.6-35B-A3B dFlash operator checklist](maintainer/qwen3.6-35b-a3b-dflash-op-checklist.md)

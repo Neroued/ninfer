@@ -227,7 +227,7 @@ target directory.
 
 ### OP-N02: `swa`
 
-**Status:** [x] mask contract [ ] definition [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] mask contract [x] definition [x] correctness [x] benchmark [x] route [ ] integration
 
 **Definition**
 
@@ -276,6 +276,54 @@ preferred over a generic runtime attention framework.
   windows. Record the selected route and split count.
 - Close integration only after a six-layer proposal replay shows the local-attention route and no
   query-K/V cache writes.
+
+**Qualification result (2026-07-24)**
+
+The repository now owns the public semantic contract, cyclic BF16 cache view, wrapper, workspace
+calculation, compact `T=1..16` launcher, tensor-core kernel, split reducer, independent test, and
+candidate/production benchmark. Context and temporary query K/V remain separate read-only
+segments. The kernel maps each absolute context position into the 4096-slot ring, globally stages
+only the union needed by the query block, and then applies the per-query
+`abs(context_position-query_position)<4096` mask.
+
+`ninfer_swa_test` passed every `T=1..16` against an independent FP64 oracle. The cases include
+`L=0,1`, both sides of the measured route boundary, `L=4095,4096`, two ring wraps, the
+`L=262144,T=16` maximum model position, forced direct and 64-key controls, input/cache
+immutability, output guards, and repeated CUDA Graph replay. The largest observed relative L2
+error was `2.715e-3`. Analytic equal-logit cases separately prove that distance 4095 is included,
+distance 4096 is excluded, wrapped slots preserve the same rule, and every query row can see the
+entire query block. A dominant-key/cancelling-V case had `1.403e-3` relative L2 error; non-finite
+scales are rejected before launch.
+
+Production dispatch is the measured winner for all `T=1..16`:
+
+| `max_context` | Route | Key tile | Split capacity |
+|---:|---|---:|---:|
+| `0..96` | direct | 32 | 1 |
+| `97..1024` | split-KV | 32 | `ceil(max_context/32)` |
+| `1025+` | split-KV | 32 | 32 |
+
+The route is selected from the host execution envelope, while the device position controls the
+actual live context on every replay. Cold-cache measurements put the direct/split crossover
+between 96 and 128 rows for every `T`; raising a full-window split count from 32 to 40, 43, 48, or
+64 regressed both hot and cold latency, so those occupancy-oriented candidates remain
+benchmark-only.
+
+On RTX 5090, CUDA 13.1, `sm_120a`, a stable full-window CUDA Graph sweep at `L=4096` measured
+`14.973..18.994 us` hot and `21.632..23.808 us` after a 256 MiB cache flush across `T=1..16`.
+That is `49.9..62.7%` hot and `39.9..43.5%` cold against the conservative useful-data roofline,
+which counts the cyclic context once and excludes implementation scratch. At `T=16`, including
+the unavoidable selected-route partial write/read raises the traffic floor from `9.543 us` to
+`14.370 us`; the `18.649 us` hot result is `77.0%` of that implementation-traffic roof.
+
+Nsight Compute on the selected `T=16`, 32-key, 32-split partial kernel reports 256 CTAs,
+0.75 waves/SM, 200 registers/thread, 16.38 KiB dynamic shared memory, 12.50% achieved occupancy,
+53.61% DRAM throughput, and 28.18% SM throughput. This confirms a memory-bound fixed-window
+route whose remaining gap is dominated by its sub-wave launch and required split/reduce
+materialization; profiler replay duration is not substituted for the graph benchmark.
+
+The remaining unchecked integration gate belongs to the six-layer proposal path, which does not
+exist yet.
 
 ### OP-N03: `bidirectional_gqa_attention`
 
@@ -895,7 +943,7 @@ commit together.
 | 2 | `OP-A04` | D128 full-head 1-D RoPE | [ ] | [ ] | [ ] | [ ] |
 | 3 | `OP-A05` | W8 Q/K/V direct projection | [ ] | [ ] | [ ] | [ ] |
 | 4 | `OP-N03` | Bidirectional full GQA | [x] | [x] | [x] | [ ] |
-| 5 | `OP-N02` | Symmetric non-causal SWA | [ ] | [ ] | [ ] | [ ] |
+| 5 | `OP-N02` | Symmetric non-causal SWA | [x] | [x] | [x] | [ ] |
 | 6 | `OP-A06` | W8 fused dense SwiGLU | [ ] | [ ] | [ ] | [ ] |
 | 7 | `OP-A07` | W8 MLP down plus residual | [ ] | [ ] | [ ] | [ ] |
 | 8 | `OP-A01` | W8 target-feature projection | [ ] | [ ] | [ ] | [ ] |

@@ -39,6 +39,7 @@ ninfer_add_op_bench(ninfer_w8_input_proj_bench SOURCES ops/w8_input_proj_bench.c
 ninfer_add_op_bench(ninfer_gqa_attention_bench SOURCES ops/gqa_attention_bench.cu)
 ninfer_add_op_bench(ninfer_bidirectional_gqa_attention_bench
   SOURCES ops/bidirectional_gqa_attention_bench.cu)
+ninfer_add_op_bench(ninfer_swa_bench SOURCES ops/swa_bench.cu)
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES ops/sampling_select_bench.cu)
 ninfer_add_op_bench(ninfer_sparse_moe_bench SOURCES ops/sparse_moe_bench.cu)
 

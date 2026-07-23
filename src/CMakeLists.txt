@@ -54,6 +54,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/gdn_state_passing.cu
   ops/launcher/gelu.cu
   ops/launcher/bidirectional_gqa_attention.cu
+  ops/launcher/swa.cu
   ops/launcher/gqa_attention_decode.cu
   ops/launcher/gqa_attention_prefill.cu
   ops/launcher/l2norm.cu
@@ -138,6 +139,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/gdn_input_proj.cpp
   ops/wrapper/gelu.cpp
   ops/wrapper/bidirectional_gqa_attention.cpp
+  ops/wrapper/swa.cpp
   ops/wrapper/gqa_attention.cpp
   ops/wrapper/attn_input_proj.cpp
   ops/wrapper/l2norm.cpp

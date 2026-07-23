@@ -16,6 +16,7 @@ inline constexpr int kBidirectionalGqaQHeads   = 32;
 inline constexpr int kBidirectionalGqaKVHeads  = 8;
 inline constexpr int kBidirectionalGqaGroup    = 4;
 inline constexpr int kBidirectionalGqaMaxSplit = 85;
+inline constexpr int kSwaWindow                = 4096;
 
 __device__ __forceinline__ int bidirectional_gqa_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
@@ -66,44 +67,46 @@ __device__ __forceinline__ std::int64_t bidirectional_gqa_stat_index(int q_head,
                (static_cast<std::int64_t>(token) + static_cast<std::int64_t>(Tokens) * split);
 }
 
-__device__ __forceinline__ void bidirectional_gqa_row_to_qt(int row, int kv_head, int& q_head,
-                                                            int& token) {
+__device__ __forceinline__ void noncausal_gqa_row_to_qt(int row, int kv_head, int& q_head,
+                                                        int& token) {
     token             = row / kBidirectionalGqaGroup;
     const int q_local = row - token * kBidirectionalGqaGroup;
     q_head            = kv_head * kBidirectionalGqaGroup + q_local;
 }
 
-template <int KeyBlock, int Threads>
+template <bool CyclicSwa, int KeyBlock, int Threads>
 __device__ __forceinline__ void
 bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
                              const __nv_bfloat16* query, int key0, int valid_keys, bool query_tile,
                              int kv_head, int padded_context, int tid) {
     constexpr int VecsPerRow = kBidirectionalGqaHeadDim / 8;
     for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
-        const int row   = chunk / VecsPerRow;
-        const int d     = (chunk - row * VecsPerRow) * 8;
-        const bool live = row < valid_keys;
+        const int row        = chunk / VecsPerRow;
+        const int d          = (chunk - row * VecsPerRow) * 8;
+        const bool live      = row < valid_keys;
+        int context_position = live ? key0 + row : 0;
+        if constexpr (CyclicSwa) { context_position &= kSwaWindow - 1; }
         const std::int64_t src_index =
-            query_tile ? bidirectional_gqa_query_kv_index(kv_head, d, live ? row : 0)
-                       : bidirectional_gqa_context_index(kv_head, d, live ? key0 + row : 0,
-                                                         padded_context);
+            query_tile
+                ? bidirectional_gqa_query_kv_index(kv_head, d, live ? row : 0)
+                : bidirectional_gqa_context_index(kv_head, d, context_position, padded_context);
         const __nv_bfloat16* src = query_tile ? query + src_index : context + src_index;
         __nv_bfloat16* smem = &dst[row * kBidirectionalGqaHeadDim + bidirectional_gqa_swz(row, d)];
         cp_async_zfill<16, Cache::cg>(smem, src, live ? 16 : 0);
     }
 }
 
-template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
-__launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_partial_kernel(
+template <bool CyclicSwa, int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
+__device__ __forceinline__ void noncausal_gqa_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
-    const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
+    const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_state,
     const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
     int padded_context, int max_context, int split_capacity, float scale,
     __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
     float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     static_assert(Tokens >= 1 && Tokens <= 16);
     static_assert(WarpsPerCta == (Tokens + 3) / 4);
-    static_assert(KeyBlock == 16 || KeyBlock == 32 || KeyBlock == 64);
+    static_assert(KeyBlock == 32 || KeyBlock == 64);
 
     constexpr int D             = kBidirectionalGqaHeadDim;
     constexpr int Wc            = WarpsPerCta;
@@ -120,19 +123,20 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
 
     static_assert(RowCount <= Br);
     static_assert(Br <= 2 * KeyBlock);
-
     const int kv_head = static_cast<int>(blockIdx.x);
     const int split   = static_cast<int>(blockIdx.y);
     const int tid     = static_cast<int>(threadIdx.x);
     const int warp    = tid >> 5;
     const int lane    = tid & 31;
-    const int length  = context_length[0];
+    const int length  = context_state[0];
     if (kv_head >= kBidirectionalGqaKVHeads || split >= split_capacity || length < 0 ||
         length > max_context) {
         return;
     }
 
-    const int context_tiles = (length + KeyBlock - 1) / KeyBlock;
+    const int context_count = CyclicSwa ? min(length, kSwaWindow - 1) : length;
+    const int context_start = length - context_count;
+    const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
     if (split >= active_splits) { return; }
 
@@ -154,7 +158,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
         const int row = chunk / (D / 8);
         const int d   = (chunk - row * (D / 8)) * 8;
         int q_head = 0, token = 0;
-        bidirectional_gqa_row_to_qt(row, kv_head, q_head, token);
+        noncausal_gqa_row_to_qt(row, kv_head, q_head, token);
         const bool live = row < RowCount;
         const __nv_bfloat16* src =
             q + bidirectional_gqa_q_index(live ? q_head : 0, d, live ? token : 0);
@@ -176,6 +180,12 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
     const int warp_row0 = warp * 16;
+    const int row0      = warp_row0 + gid;
+    const int row1      = row0 + 8;
+    const int q_position0 =
+        CyclicSwa ? context_state[row0 < RowCount ? row0 / kBidirectionalGqaGroup : 0] : 0;
+    const int q_position1 =
+        CyclicSwa ? context_state[row1 < RowCount ? row1 / kBidirectionalGqaGroup : 0] : 0;
     unsigned af_q[QKKs][4];
 #pragma unroll
     for (int ks = 0; ks < QKKs; ++ks) {
@@ -209,7 +219,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
             key0       = 0;
             valid_keys = Tokens;
         } else {
-            key0       = (tile_begin + iteration) * KeyBlock;
+            key0       = context_start + (tile_begin + iteration) * KeyBlock;
             valid_keys = min(KeyBlock, length - key0);
         }
     };
@@ -218,18 +228,18 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
     int current_key0      = 0;
     int current_valid     = 0;
     tile_metadata(0, current_is_query, current_key0, current_valid);
-    bidirectional_gqa_stage_tile<KeyBlock, Threads>(k_s, context_k, query_k, current_key0,
-                                                    current_valid, current_is_query, kv_head,
-                                                    padded_context, tid);
+    bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
+        k_s, context_k, query_k, current_key0, current_valid, current_is_query, kv_head,
+        padded_context, tid);
     cp_commit();
 
     for (int iteration = 0; iteration < iterations; ++iteration) {
         cp_wait<0>();
         __syncthreads();
 
-        bidirectional_gqa_stage_tile<KeyBlock, Threads>(v_s, context_v, query_v, current_key0,
-                                                        current_valid, current_is_query, kv_head,
-                                                        padded_context, tid);
+        bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
+            v_s, context_v, query_v, current_key0, current_valid, current_is_query, kv_head,
+            padded_context, tid);
         cp_commit();
 
         float score[QKNt][4];
@@ -256,30 +266,36 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
         int next_valid     = 0;
         if (iteration + 1 < iterations) {
             tile_metadata(iteration + 1, next_is_query, next_key0, next_valid);
-            bidirectional_gqa_stage_tile<KeyBlock, Threads>(k_s, context_k, query_k, next_key0,
-                                                            next_valid, next_is_query, kv_head,
-                                                            padded_context, tid);
+            bidirectional_gqa_stage_tile<CyclicSwa, KeyBlock, Threads>(
+                k_s, context_k, query_k, next_key0, next_valid, next_is_query, kv_head,
+                padded_context, tid);
             cp_commit();
         }
 
-        const int row0 = warp_row0 + gid;
-        const int row1 = row0 + 8;
         float block_m0 = -CUDART_INF_F;
         float block_m1 = -CUDART_INF_F;
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
             const int col0 = nt * 8 + 2 * lid;
             const int col1 = col0 + 1;
-            score[nt][0] =
-                (row0 < RowCount && col0 < current_valid) ? score[nt][0] * scale : -CUDART_INF_F;
-            score[nt][1] =
-                (row0 < RowCount && col1 < current_valid) ? score[nt][1] * scale : -CUDART_INF_F;
-            score[nt][2] =
-                (row1 < RowCount && col0 < current_valid) ? score[nt][2] * scale : -CUDART_INF_F;
-            score[nt][3] =
-                (row1 < RowCount && col1 < current_valid) ? score[nt][3] * scale : -CUDART_INF_F;
-            block_m0 = fmaxf(block_m0, fmaxf(score[nt][0], score[nt][1]));
-            block_m1 = fmaxf(block_m1, fmaxf(score[nt][2], score[nt][3]));
+            const bool allow00 =
+                row0 < RowCount && col0 < current_valid &&
+                (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position0 - 4095);
+            const bool allow01 =
+                row0 < RowCount && col1 < current_valid &&
+                (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position0 - 4095);
+            const bool allow10 =
+                row1 < RowCount && col0 < current_valid &&
+                (!CyclicSwa || current_is_query || current_key0 + col0 >= q_position1 - 4095);
+            const bool allow11 =
+                row1 < RowCount && col1 < current_valid &&
+                (!CyclicSwa || current_is_query || current_key0 + col1 >= q_position1 - 4095);
+            score[nt][0] = allow00 ? score[nt][0] * scale : -CUDART_INF_F;
+            score[nt][1] = allow01 ? score[nt][1] * scale : -CUDART_INF_F;
+            score[nt][2] = allow10 ? score[nt][2] * scale : -CUDART_INF_F;
+            score[nt][3] = allow11 ? score[nt][3] * scale : -CUDART_INF_F;
+            block_m0     = fmaxf(block_m0, fmaxf(score[nt][0], score[nt][1]));
+            block_m1     = fmaxf(block_m1, fmaxf(score[nt][2], score[nt][3]));
         }
         block_m0 = warp_max<4>(block_m0, FullMask);
         block_m1 = warp_max<4>(block_m1, FullMask);
@@ -367,13 +383,13 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
             const int row1 = row0 + 8;
             if (row0 < RowCount) {
                 int q_head = 0, token = 0;
-                bidirectional_gqa_row_to_qt(row0, kv_head, q_head, token);
+                noncausal_gqa_row_to_qt(row0, kv_head, q_head, token);
                 partial_m[bidirectional_gqa_stat_index<Tokens>(q_head, token, split)] = m0;
                 partial_l[bidirectional_gqa_stat_index<Tokens>(q_head, token, split)] = l0;
             }
             if (row1 < RowCount) {
                 int q_head = 0, token = 0;
-                bidirectional_gqa_row_to_qt(row1, kv_head, q_head, token);
+                noncausal_gqa_row_to_qt(row1, kv_head, q_head, token);
                 partial_m[bidirectional_gqa_stat_index<Tokens>(q_head, token, split)] = m1;
                 partial_l[bidirectional_gqa_stat_index<Tokens>(q_head, token, split)] = l1;
             }
@@ -387,7 +403,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
         const int row1 = row0 + 8;
         if (row0 < RowCount) {
             int q_head = 0, token = 0;
-            bidirectional_gqa_row_to_qt(row0, kv_head, q_head, token);
+            noncausal_gqa_row_to_qt(row0, kv_head, q_head, token);
             if constexpr (DirectOutput) {
                 const float inv_l = l0 > 0.0f ? 1.0f / l0 : 0.0f;
                 const auto dst    = bidirectional_gqa_q_index(q_head, d0, token);
@@ -399,7 +415,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
         }
         if (row1 < RowCount) {
             int q_head = 0, token = 0;
-            bidirectional_gqa_row_to_qt(row1, kv_head, q_head, token);
+            noncausal_gqa_row_to_qt(row1, kv_head, q_head, token);
             if constexpr (DirectOutput) {
                 const float inv_l = l1 > 0.0f ? 1.0f / l1 : 0.0f;
                 const auto dst    = bidirectional_gqa_q_index(q_head, d0, token);
@@ -412,18 +428,42 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
     }
 }
 
-template <int Tokens, int KeyBlock>
-__launch_bounds__(128, 2) __global__
-    void bidirectional_gqa_reduce_kernel(const __nv_bfloat16* __restrict__ partial_acc,
-                                         const float* __restrict__ partial_m,
-                                         const float* __restrict__ partial_l,
-                                         const std::int32_t* __restrict__ context_length,
-                                         int max_context, int split_capacity,
-                                         __nv_bfloat16* __restrict__ out) {
+template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
+__launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_partial_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
+    const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
+    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    int padded_context, int max_context, int split_capacity, float scale,
+    __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
+    float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+    noncausal_gqa_split_partial_body<false, Tokens, WarpsPerCta, KeyBlock, DirectOutput>(
+        q, query_k, query_v, context_length, context_k, context_v, padded_context, max_context,
+        split_capacity, scale, partial_acc, partial_m, partial_l, out);
+}
+
+template <int Tokens, int WarpsPerCta, int KeyBlock, bool DirectOutput>
+__launch_bounds__(WarpsPerCta * 32, 2) __global__ void swa_split_partial_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
+    const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
+    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    int padded_context, int max_context, int split_capacity, float scale,
+    __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
+    float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+    noncausal_gqa_split_partial_body<true, Tokens, WarpsPerCta, KeyBlock, DirectOutput>(
+        q, query_k, query_v, positions, context_k, context_v, padded_context, max_context,
+        split_capacity, scale, partial_acc, partial_m, partial_l, out);
+}
+
+template <bool CyclicSwa, int Tokens, int KeyBlock>
+__device__ __forceinline__ void
+noncausal_gqa_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
+                          const float* __restrict__ partial_m, const float* __restrict__ partial_l,
+                          const std::int32_t* __restrict__ context_state, int max_context,
+                          int split_capacity, __nv_bfloat16* __restrict__ out) {
     const int q_head = static_cast<int>(blockIdx.x);
     const int token  = static_cast<int>(blockIdx.y);
     const int tid    = static_cast<int>(threadIdx.x);
-    const int length = context_length[0];
+    const int length = context_state[0];
     if (q_head >= kBidirectionalGqaQHeads || token >= Tokens) { return; }
     if (length < 0 || length > max_context) {
         if (tid < kBidirectionalGqaHeadDim) {
@@ -432,7 +472,8 @@ __launch_bounds__(128, 2) __global__
         return;
     }
 
-    const int context_tiles = (length + KeyBlock - 1) / KeyBlock;
+    const int context_count = CyclicSwa ? min(length, kSwaWindow - 1) : length;
+    const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
     const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
     __shared__ float reduce[128];
 
@@ -474,6 +515,81 @@ __launch_bounds__(128, 2) __global__
         }
         const float value = global_l > 0.0f ? numerator / global_l : 0.0f;
         out[bidirectional_gqa_q_index(q_head, tid, token)] = __float2bfloat16(value);
+    }
+}
+
+template <int Tokens, int KeyBlock>
+__launch_bounds__(128, 2) __global__
+    void bidirectional_gqa_reduce_kernel(const __nv_bfloat16* __restrict__ partial_acc,
+                                         const float* __restrict__ partial_m,
+                                         const float* __restrict__ partial_l,
+                                         const std::int32_t* __restrict__ context_length,
+                                         int max_context, int split_capacity,
+                                         __nv_bfloat16* __restrict__ out) {
+    noncausal_gqa_reduce_body<false, Tokens, KeyBlock>(
+        partial_acc, partial_m, partial_l, context_length, max_context, split_capacity, out);
+}
+
+template <int Tokens, int KeyBlock, int WarpsPerBlock>
+__launch_bounds__(WarpsPerBlock * 32, 2) __global__
+    void swa_reduce_kernel(const __nv_bfloat16* __restrict__ partial_acc,
+                           const float* __restrict__ partial_m, const float* __restrict__ partial_l,
+                           const std::int32_t* __restrict__ positions, int max_context,
+                           int split_capacity, __nv_bfloat16* __restrict__ out) {
+    static_assert(WarpsPerBlock >= 1 && WarpsPerBlock <= 8);
+    constexpr int MaxSplits = 128;
+    constexpr unsigned Mask = 0xffffffffu;
+    __shared__ float weights[WarpsPerBlock][MaxSplits];
+
+    const int warp       = static_cast<int>(threadIdx.x) >> 5;
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int output_row = static_cast<int>(blockIdx.x) * WarpsPerBlock + warp;
+    const int token      = output_row / kBidirectionalGqaQHeads;
+    const int q_head     = output_row - token * kBidirectionalGqaQHeads;
+    if (warp >= WarpsPerBlock || token >= Tokens) return;
+
+    const int length = positions[0];
+    if (length < 0 || length > max_context) {
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            const int d                                      = lane + item * 32;
+            out[bidirectional_gqa_q_index(q_head, d, token)] = __float2bfloat16(0.0f);
+        }
+        return;
+    }
+    const int context_count = min(length, kSwaWindow - 1);
+    const int context_tiles = (context_count + KeyBlock - 1) / KeyBlock;
+    const int active_splits = context_tiles > 0 ? min(context_tiles, split_capacity) : 1;
+
+    float local_m = -CUDART_INF_F;
+    for (int split = lane; split < active_splits; split += 32) {
+        local_m =
+            fmaxf(local_m, partial_m[bidirectional_gqa_stat_index<Tokens>(q_head, token, split)]);
+    }
+    const float global_m = warp_max<32>(local_m, Mask);
+
+    float local_l = 0.0f;
+    for (int split = lane; split < active_splits; split += 32) {
+        const auto stat      = bidirectional_gqa_stat_index<Tokens>(q_head, token, split);
+        const float weight   = expf(partial_m[stat] - global_m);
+        weights[warp][split] = weight;
+        local_l += partial_l[stat] * weight;
+    }
+    const float global_l = warp_sum<32>(local_l, Mask);
+    __syncwarp(Mask);
+
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        const int d     = lane + item * 32;
+        float numerator = 0.0f;
+        for (int split = 0; split < active_splits; ++split) {
+            numerator +=
+                __bfloat162float(
+                    partial_acc[bidirectional_gqa_partial_index<Tokens>(q_head, d, token, split)]) *
+                weights[warp][split];
+        }
+        const float value = global_l > 0.0f ? numerator / global_l : 0.0f;
+        out[bidirectional_gqa_q_index(q_head, d, token)] = __float2bfloat16(value);
     }
 }
 

@@ -168,6 +168,28 @@ cmake --build build --parallel --target ninfer_bidirectional_gqa_attention_bench
 The reported useful roofline counts one read of context K/V, query Q/K/V, and one output write,
 plus the full QK and PV FLOPs. It intentionally excludes implementation scratch traffic.
 
+## Symmetric sliding-window GQA Op benchmark
+
+`ninfer_swa_bench` measures the read-only, non-causal Q32/KV8/D128 attention contract over a
+4096-slot cyclic BF16 context and a complete temporary query block for `T=1..16`. Every timed
+invocation is a CUDA Graph replay. `--cold-cache` flushes 256 MiB before each sample outside the
+timed interval. `--route direct|split`, `--key-block`, and `--split-capacity` expose candidate
+controls; `--route production` uses the measured dispatch.
+
+```bash
+cmake --build build --parallel --target ninfer_swa_bench
+./build/bench/ninfer_swa_bench \
+  --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --context 0,32,64,96,128,4095,4096,8192,262144 \
+  --route production --cold-cache --warmup 10 --repeat 61
+./build/bench/ninfer_swa_bench \
+  --tokens 16 --context 4096 --route production --cold-cache --profile-once
+```
+
+The useful roofline counts the admitted cyclic context once, query Q/K/V, one output write, and
+the complete QK/PV FLOPs. It intentionally excludes split/reduce scratch traffic; the
+implementation-traffic comparison is reported separately in the Op qualification.
+
 ## 35B W8 input-projection Op benchmark
 
 `ninfer_w8_input_proj_bench` measures the registered 35B-A3B target's W8 Attention

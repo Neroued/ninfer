@@ -28,6 +28,7 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/launcher/gqa_attention.h"
+#include "ops/kernel/rmsnorm.cuh"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
@@ -62,12 +63,14 @@ enum class GeometrySelection { All, B27, B35 };
 enum class KvSelection { TargetDefault, Bf16, Int8 };
 enum class AttentionSelection { Auto, PromptControl };
 enum class InputSelection { Auto, Dv07Control };
+enum class RmsSelection { Auto, Dv09CandidateB128 };
 
 struct Options {
     GeometrySelection geometry            = GeometrySelection::All;
     KvSelection kv                        = KvSelection::TargetDefault;
     AttentionSelection attention          = AttentionSelection::Auto;
     InputSelection input                  = InputSelection::Auto;
+    RmsSelection rms                      = RmsSelection::Auto;
     std::vector<std::int32_t> contexts    = {128, 8192};
     std::vector<std::int32_t> token_sweep = {1, 2, 3, 4, 5, 6};
     int warmup                            = 5;
@@ -89,6 +92,7 @@ struct Result {
     std::int32_t tokens     = 0;
     std::size_t graph_nodes = 0;
     std::string input_route;
+    std::string rms_route;
     std::string attention_route;
     std::string output_route;
     Timing timing;
@@ -289,6 +293,14 @@ Options parse_options(int argc, char** argv) {
                 options.input = InputSelection::Dv07Control;
             else
                 throw std::invalid_argument("--input-route must be auto or dv07-control");
+        } else if (arg == "--rms-route") {
+            const std::string_view value = next("--rms-route value");
+            if (value == "auto")
+                options.rms = RmsSelection::Auto;
+            else if (value == "dv09-b128")
+                options.rms = RmsSelection::Dv09CandidateB128;
+            else
+                throw std::invalid_argument("--rms-route must be auto or dv09-b128");
         } else if (arg == "--t-sweep") {
             options.token_sweep = parse_i32_list(next("--t-sweep value"), false, "--t-sweep");
         } else if (arg == "--warmup") {
@@ -305,6 +317,7 @@ Options parse_options(int argc, char** argv) {
             std::printf("Usage: %s [--geometry all|27b|35b] [--kv-dtype default|bf16|int8] "
                         "[--attention-route auto|prompt-control] "
                         "[--input-route auto|dv07-control] "
+                        "[--rms-route auto|dv09-b128] "
                         "[--context 128,8192] [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--csv-out PATH]\n",
                         argv[0]);
@@ -319,6 +332,10 @@ Options parse_options(int argc, char** argv) {
     if (options.input == InputSelection::Dv07Control &&
         options.geometry != GeometrySelection::B35) {
         throw std::invalid_argument("--input-route dv07-control requires --geometry 35b");
+    }
+    if (options.rms == RmsSelection::Dv09CandidateB128 &&
+        options.geometry != GeometrySelection::B35) {
+        throw std::invalid_argument("--rms-route dv09-b128 requires --geometry 35b");
     }
     for (const std::int32_t tokens : options.token_sweep) {
         if (tokens > 16) { throw std::invalid_argument("--t-sweep values must be in [1,16]"); }
@@ -617,7 +634,15 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
     Tensor value_flat = value.view({Geometry::kv_rows, tokens});
 
     const auto layer = [&](cudaStream_t layer_stream) {
-        ops::rmsnorm(residual, input_norm, kRmsEps, true, hidden, layer_stream);
+        if (options.rms == RmsSelection::Dv09CandidateB128) {
+            ops::rmsnorm_cta_bf16x2_kernel<ops::RmsEpilogue::Offset, 128, 8>
+                <<<static_cast<unsigned int>(tokens), 128, 0, layer_stream>>>(
+                    static_cast<const __nv_bfloat162*>(residual.data),
+                    static_cast<const __nv_bfloat162*>(input_norm.data), nullptr,
+                    static_cast<__nv_bfloat162*>(hidden.data), Geometry::hidden, tokens, kRmsEps);
+        } else {
+            ops::rmsnorm(residual, input_norm, kRmsEps, true, hidden, layer_stream);
+        }
         if (options.input == InputSelection::Dv07Control) {
             Geometry::input_projection_control(hidden, resources.input0, resources.input1,
                                                query_flat, gate_flat, key_flat, value_flat,
@@ -664,12 +689,16 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
     const std::string input_route = options.input == InputSelection::Dv07Control
                                         ? Geometry::input_control_route(tokens)
                                         : Geometry::input_route(tokens);
+    const std::string rms_route   = options.rms == RmsSelection::Dv09CandidateB128
+                                        ? "rms.candidate.cta_bf16x2_b128"
+                                        : "rms.production";
     return {Geometry::name,
             kv_dtype_name(cache.dtype),
             context,
             tokens,
             graph.body_nodes(),
             input_route,
+            rms_route,
             attention_route,
             Geometry::output_route(tokens),
             timing};
@@ -710,13 +739,14 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
     out << "geometry,kv_dtype,context,T,graph_nodes,cold_median_us,cold_min_us,cold_p95_us,"
-           "input_route,attention_route,output_route,flush_bytes,warmup,repeat\n";
+           "input_route,rms_route,attention_route,output_route,flush_bytes,warmup,repeat\n";
     for (const Result& result : results) {
         out << result.geometry << ',' << result.kv_dtype << ',' << result.context << ','
             << result.tokens << ',' << result.graph_nodes << ',' << result.timing.median_us << ','
             << result.timing.min_us << ',' << result.timing.p95_us << ',' << result.input_route
-            << ',' << result.attention_route << ',' << result.output_route << ','
-            << options.flush_bytes << ',' << options.warmup << ',' << options.repeat << '\n';
+            << ',' << result.rms_route << ',' << result.attention_route << ','
+            << result.output_route << ',' << options.flush_bytes << ',' << options.warmup << ','
+            << options.repeat << '\n';
     }
 }
 
@@ -739,10 +769,10 @@ void print_results(const Options& options, const std::vector<Result>& results) {
 
     std::printf("\nRoutes\n");
     for (const Result& result : results) {
-        std::printf("  %s/%s C=%d T=%d  input=%s  attention=%s  output=%s\n",
+        std::printf("  %s/%s C=%d T=%d  input=%s  rms=%s  attention=%s  output=%s\n",
                     result.geometry.c_str(), result.kv_dtype.c_str(), result.context, result.tokens,
-                    result.input_route.c_str(), result.attention_route.c_str(),
-                    result.output_route.c_str());
+                    result.input_route.c_str(), result.rms_route.c_str(),
+                    result.attention_route.c_str(), result.output_route.c_str());
     }
 }
 

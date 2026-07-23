@@ -370,13 +370,35 @@ after the P0 contractions and state transitions are optimized.
 
 | ID | Status | Op | Calls per verify | Qualification focus | Test/benchmark |
 |---|---|---|---:|---|---|
-| DV-09 | [ ] | `rmsnorm` | 71 | Exact `T=1..16` for hidden, Q, and K row counts; assess safe fusion only at an owning semantic boundary. | `test_rmsnorm`; `rmsnorm_bench` |
+| DV-09 | [x] | `rmsnorm` | 71 | Exact `T=1..16` for hidden, Q, and K row counts; assess safe fusion only at an owning semantic boundary. | `test_rmsnorm`; `rmsnorm_bench` |
 | DV-10 | [ ] | `gated_rmsnorm` | 30 | `[4096,T]` with z gate; check launch/memory scaling and downstream arithmetic criterion. | `test_rmsnorm`; `rmsnorm_bench` |
 | DV-11 | [ ] | `rope` | 10 | `[4096,T]` Q and `[512,T]` K, rotary 64, absolute positions; current launcher changes small-token geometry after 6. | `test_rope`; `rope_bench` |
 | DV-12 | [ ] | `sigmoid_mul` | 10 | Gate `[4096,T]`; exact odd/partial token extents and graph replay. | `test_sigmoid_mul`; `sigmoid_mul_bench` |
 | DV-13 | [ ] | `embedding` | 1 | W8 `[248320,2048]`, gathered ids for `T=1..16`; include repeated ids and physical row decode. | `test_embedding`; `embedding_bench` |
 | DV-14 | [ ] | `offset_i32_positions` | 1 | Exact position construction for all `T`, including near context limit. | `test_position`; dedicated benchmark missing |
 | DV-15 | [ ] | `argmax` | 1 | Q6-head output with `T=1..16`, physical stride, valid vocabulary rows, stable ties. | `test_argmax`; `argmax_bench` |
+
+#### DV-09 qualification record
+
+The 35B offset RMSNorm domains were qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`.
+
+- **C:** the production hidden `[2048,T]`, Q `[256,16,T]`, and K `[256,2,T]` routes passed the
+  independent naive FP64 oracle at every exact `T=1..16`. The existing general-width, plain,
+  unaligned, stress-input, 27B, and gated regressions remain in the same public-Op suite.
+- **B:** the benchmark now accepts an explicit exact-T subset and prints the selected physical
+  route. With 20 warmups and at least 100 measured CUDA-event batches over 500 ms, production hot
+  medians across `T=1..16` were 9.29--9.54 us for hidden, 9.32--9.62 us for Q, and 9.29--9.42 us
+  for K. All three domains remain at the fixed launch/work floor rather than developing a long-T
+  cliff.
+- **O:** production retains the existing 256-thread one-row CTA for hidden RMSNorm and the
+  512-thread, 16-row-warp block for Q/K. A 128-thread hidden candidate was about 2%--4% faster in
+  the isolated hot benchmark at selected `T=8..16`, while smaller Q/K row blocks had no stable
+  benefit. Neither candidate was selected without containing-layer evidence.
+- **E:** the 128-thread hidden candidate was slower in captured, cold-cache 35B attention-mixer
+  replay. At context 128, production/candidate medians were 54.53/56.58 us at `T=8`,
+  58.21/58.62 us at `T=12`, and 58.66/60.70 us at `T=16`; at context 8192 and `T=16` they were
+  142.62/144.67 us. The production route is therefore the qualified winner, and DV-09 deliberately
+  changes qualification coverage and tooling rather than the runtime kernel.
 
 ### P0 measurement infrastructure
 

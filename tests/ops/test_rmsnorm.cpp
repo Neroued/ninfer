@@ -250,9 +250,14 @@ int main() {
         f += one_shape("rmsnorm gdn gated [128,48,7]", 128, 48, 7, false, true, seed, -8.f, 8.f);
         f += one_shape("rmsnorm unaligned [260,3]", 260, 3, 1, true, false, seed, -8.f, 8.f);
     }
-    f += one_shape("rmsnorm 35b hidden [2048,6]", 2048, 6, 1, true, false, 3501u, -8.f, 8.f);
-    f += one_shape("rmsnorm 35b q [256,16,6]", 256, 16, 6, true, false, 3502u, -8.f, 8.f);
-    f += one_shape("rmsnorm 35b k [256,2,6]", 256, 2, 6, true, false, 3503u, -8.f, 8.f);
+    for (std::int32_t tokens = 1; tokens <= 16; ++tokens) {
+        f += one_shape("rmsnorm 35b hidden exact T", 2048, tokens, 1, true, false,
+                       3501u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
+        f += one_shape("rmsnorm 35b q exact T", 256, 16, tokens, true, false,
+                       3601u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
+        f += one_shape("rmsnorm 35b k exact T", 256, 2, tokens, true, false,
+                       3701u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
+    }
     f += one_shape("rmsnorm 35b gated [128,32,6]", 128, 32, 6, false, true, 3504u, -8.f, 8.f);
     f += one_shape("rmsnorm fast plain [192,5]", 192, 5, 1, false, false, 3505u, -8.f, 8.f);
     f += one_shape("rmsnorm stress [-60,60]", 260, 3, 1, true, false, 4242u, -60.f, 60.f);

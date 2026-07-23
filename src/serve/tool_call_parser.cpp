@@ -31,8 +31,8 @@ bool starts_with_at(std::string_view text, std::size_t pos, std::string_view pre
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
 }
 
-bool valid_function_name(std::string_view name) {
-    if (name.empty() || name.size() > 64) { return false; }
+bool valid_function_name(std::string_view name, std::size_t max_name_length) {
+    if (name.empty() || name.size() > max_name_length) { return false; }
     for (const unsigned char c : name) {
         if (std::isalnum(c) == 0 && c != '_' && c != '-') { return false; }
     }
@@ -66,7 +66,7 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args) {
     return true;
 }
 
-bool parse_one_tool_call(std::string_view block, ToolCall& out) {
+bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
     constexpr std::string_view kFunctionOpen  = "<function=";
     constexpr std::string_view kFunctionClose = "</function>";
     std::size_t pos                           = 0;
@@ -76,7 +76,7 @@ bool parse_one_tool_call(std::string_view block, ToolCall& out) {
     const std::size_t name_end   = block.find('>', name_begin);
     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
     const std::string name = std::string(block.substr(name_begin, name_end - name_begin));
-    if (!valid_function_name(name)) { return false; }
+    if (!valid_function_name(name, max_name_length)) { return false; }
     pos = name_end + 1;
 
     const std::size_t function_end = block.find(kFunctionClose, pos);
@@ -108,7 +108,8 @@ ParsedToolCallOutput fallback(const std::string& text) {
 
 } // namespace
 
-ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text) {
+ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
+                                                 std::size_t max_tool_name_length) {
     constexpr std::string_view kToolOpen  = "<tool_call>";
     constexpr std::string_view kToolClose = "</tool_call>";
 
@@ -128,7 +129,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text) {
         if (close == std::string::npos) { return fallback(text); }
         ToolCall call;
         if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
-                                 call)) {
+                                 max_tool_name_length, call)) {
             return fallback(text);
         }
         out.tool_calls.push_back(std::move(call));

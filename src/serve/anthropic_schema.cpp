@@ -15,6 +15,8 @@ namespace {
 
 using Json = nlohmann::json;
 
+constexpr std::size_t kMaxToolNameLength = 128;
+
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {}) {
     ApiError error;
     error.status  = 400;
@@ -62,7 +64,7 @@ std::optional<int> get_int(const Json& obj, const char* key) {
 }
 
 bool is_valid_function_name(const std::string& name) {
-    if (name.empty() || name.size() > 64) { return false; }
+    if (name.empty() || name.size() > kMaxToolNameLength) { return false; }
     for (const unsigned char c : name) {
         if (std::isalnum(c) == 0 && c != '_' && c != '-') { return false; }
     }
@@ -75,7 +77,7 @@ std::string require_function_name(const Json& obj, const char* param) {
     }
     std::string name = obj.at("name").get<std::string>();
     if (!is_valid_function_name(name)) {
-        bad_request("tool name must match [A-Za-z0-9_-]{1,64}", param);
+        bad_request("tool name must match [A-Za-z0-9_-]{1,128}", param);
     }
     return name;
 }
@@ -448,6 +450,7 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
     require_object(body);
 
     GenerationRequest out;
+    out.tool_name_max_length = kMaxToolNameLength;
     if (!body.contains("model") || !body.at("model").is_string() ||
         body.at("model").get<std::string>().empty()) {
         bad_request("missing required field: model", "model");

@@ -24,7 +24,8 @@ int test_single_call() {
                                                    "<parameter=city>\nParis\n</parameter>\n"
                                                    "<parameter=days>\n2\n</parameter>\n"
                                                    "</function>\n"
-                                                   "</tool_call>");
+                                                   "</tool_call>",
+                                                   64);
 
     int failures = 0;
     failures += check(parsed.is_tool_call_response, "single call parsed as tool response");
@@ -49,7 +50,8 @@ int test_multiple_calls_and_json_values() {
         "<function=second>\n"
         "<parameter=value>\nplain text\n</parameter>\n"
         "</function>\n"
-        "</tool_call>");
+        "</tool_call>",
+        64);
 
     int failures = 0;
     failures += check(parsed.is_tool_call_response, "multiple calls parsed as tool response");
@@ -67,7 +69,7 @@ int test_multiple_calls_and_json_values() {
 int test_malformed_falls_back_to_text() {
     const std::string text = "<tool_call>\n<function=get_weather>\n";
     const ninfer::serve::ParsedToolCallOutput parsed =
-        ninfer::serve::parse_qwen_tool_call_output(text);
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "malformed xml is not tool response");
     failures += check(parsed.content == text, "malformed xml preserved as text");
@@ -83,10 +85,34 @@ int test_suffix_after_tool_falls_back_to_text() {
                              "</tool_call>\n"
                              "extra answer";
     const ninfer::serve::ParsedToolCallOutput parsed =
-        ninfer::serve::parse_qwen_tool_call_output(text);
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
     int failures = 0;
     failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
     failures += check(parsed.content == text, "suffix fallback preserves text");
+    return failures;
+}
+
+int test_configured_name_limit() {
+    const std::string name(128, 'a');
+    const std::string text = "<tool_call>\n<function=" + name + ">\n</function>\n</tool_call>";
+
+    const ninfer::serve::ParsedToolCallOutput anthropic =
+        ninfer::serve::parse_qwen_tool_call_output(text, 128);
+    const ninfer::serve::ParsedToolCallOutput openai =
+        ninfer::serve::parse_qwen_tool_call_output(text, 64);
+    const std::string too_long_text =
+        "<tool_call>\n<function=" + std::string(129, 'a') + ">\n</function>\n</tool_call>";
+    const ninfer::serve::ParsedToolCallOutput too_long =
+        ninfer::serve::parse_qwen_tool_call_output(too_long_text, 128);
+
+    int failures = 0;
+    failures += check(anthropic.is_tool_call_response && anthropic.tool_calls.size() == 1 &&
+                          anthropic.tool_calls[0].name == name,
+                      "128-character name accepted with Anthropic limit");
+    failures +=
+        check(!openai.is_tool_call_response, "128-character name rejected with OpenAI limit");
+    failures +=
+        check(!too_long.is_tool_call_response, "129-character name rejected with Anthropic limit");
     return failures;
 }
 
@@ -98,6 +124,7 @@ int main() {
     failures += test_multiple_calls_and_json_values();
     failures += test_malformed_falls_back_to_text();
     failures += test_suffix_after_tool_falls_back_to_text();
+    failures += test_configured_name_limit();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

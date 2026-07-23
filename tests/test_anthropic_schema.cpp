@@ -279,6 +279,23 @@ int test_tools_and_choice() {
     failures +=
         check(throws_api([&] { (void)parse_messages_request(server_tool, default_limits()); }),
               "server tool without input_schema rejected");
+
+    const std::string max_name(128, 'a');
+    Json max_tool          = tool;
+    max_tool["name"]       = max_name;
+    Json max_name_body     = body;
+    max_name_body["tools"] = Json::array({max_tool});
+    failures +=
+        check(parse_messages_request(max_name_body, default_limits()).tools[0].name == max_name,
+              "128-character Anthropic tool name accepted");
+
+    Json too_long_tool     = tool;
+    too_long_tool["name"]  = std::string(129, 'a');
+    Json too_long_body     = body;
+    too_long_body["tools"] = Json::array({too_long_tool});
+    failures +=
+        check(throws_api([&] { (void)parse_messages_request(too_long_body, default_limits()); }),
+              "129-character Anthropic tool name rejected");
     return failures;
 }
 

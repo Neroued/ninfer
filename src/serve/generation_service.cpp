@@ -139,10 +139,11 @@ GenerationService::GenerationService(ServeOptions options) : options_(std::move(
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request) const {
     PreparedRequest prepared;
-    prepared.options         = to_request_options(request, options_);
-    prepared.include_usage   = request.include_usage;
-    prepared.tool_capable    = request.uses_tools() || request.has_tool_history();
-    prepared.enable_thinking = request.enable_thinking.value_or(options_.enable_thinking);
+    prepared.options              = to_request_options(request, options_);
+    prepared.include_usage        = request.include_usage;
+    prepared.tool_capable         = request.uses_tools() || request.has_tool_history();
+    prepared.tool_name_max_length = request.tool_name_max_length;
+    prepared.enable_thinking      = request.enable_thinking.value_or(options_.enable_thinking);
     if (has_media(request)) { prepared.media_permit = std::unique_lock<std::mutex>(media_mutex_); }
 
     const auto start = Clock::now();
@@ -212,8 +213,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.mtp_accepted_per_position = std::move(result.speculative.accepted_per_position);
 
     if (prepared.tool_capable) {
-        ParsedToolCallOutput parsed = parse_qwen_tool_call_output(outcome.text);
-        outcome.text                = std::move(parsed.content);
+        ParsedToolCallOutput parsed =
+            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
+        outcome.text = std::move(parsed.content);
         if (parsed.is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
     }
     return outcome;

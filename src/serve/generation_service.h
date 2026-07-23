@@ -8,6 +8,7 @@
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -55,11 +56,12 @@ struct StreamSink {
 struct PreparedRequest {
     ninfer::PreparedPrompt prompt;
     ninfer::RequestOptions options;
-    double prepare_seconds = 0.0;
-    int prompt_tokens      = 0;
-    bool include_usage     = false;
-    bool tool_capable      = false;
-    bool enable_thinking   = true;
+    double prepare_seconds           = 0.0;
+    int prompt_tokens                = 0;
+    bool include_usage               = false;
+    bool tool_capable                = false;
+    std::size_t tool_name_max_length = 64;
+    bool enable_thinking             = true;
 
     // Limit concurrent ownership of media preprocessing buffers. Text requests
     // do not use this permit.

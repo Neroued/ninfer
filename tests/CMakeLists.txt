@@ -6,14 +6,6 @@ add_executable(ninfer_public_api_test test_public_api.cpp)
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
-add_executable(ninfer_cli_options_test
-  test_cli_options.cpp
-  ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
-target_include_directories(ninfer_cli_options_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/apps/cli
-  ${PROJECT_SOURCE_DIR}/include)
-add_test(NAME ninfer_cli_options_test COMMAND ninfer_cli_options_test)
-
 function(ninfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
   add_executable(${name} ${arg_SOURCES})

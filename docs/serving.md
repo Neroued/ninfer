@@ -27,11 +27,11 @@ For the 35B-A3B artifact, set both the artifact path and public model alias:
 
 The default `--model-id` is `qwen3.6-27b`; it is an HTTP alias and does not select the artifact.
 
-For a permanently text-only server, add `--no-vision`. Vision weights and its maximum workspace are
-then never allocated, and media requests and token-count requests fail with HTTP 400
-`vision_disabled`. MTP residency is likewise fixed by `--mtp-draft-tokens`: `0` omits MTP weights
-and state, while `--lm-head-draft` additionally loads the optimized proposal head. A later request
-cannot enable a capability omitted at startup.
+Vision is disabled by default: its weights and maximum workspace are not allocated, and media
+requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
+server must accept image or video input. MTP residency is likewise fixed by
+`--mtp-draft-tokens`: `0` omits MTP weights and state, while `--lm-head-draft` additionally loads
+the optimized proposal head. A later request cannot enable a capability omitted at startup.
 
 ## Endpoints
 
@@ -79,6 +79,8 @@ finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a
 `choices` chunk contains completed usage.
 
 ### Multimodal request
+
+Start the server with `--vision` before sending media:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -159,7 +161,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--mtp-draft-tokens N` | MTP draft window, `0..5` | `0` |
 | `--lm-head-draft` | optimized MTP proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
-| `--no-vision` | permanently disable Vision and omit its GPU allocations | Vision on |
+| `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |

@@ -108,8 +108,9 @@ Transformers checkpoint, Safetensors distribution, or GGUF file.
 
 The artifact is complete, while GPU residency is fixed at process startup. With the default
 `--mtp-draft-tokens 0`, MTP and optimized draft-head weights are validated but not uploaded.
-Add `--no-vision` to the CLI or server for a permanently text-only Engine that also omits Vision
-weights and the Vision workspace. Disabled capabilities cannot be enabled by a later request.
+Vision is also disabled by default, so its weights and workspace are omitted. Add `--vision` to the
+CLI or server process that must accept image or video input. Disabled capabilities cannot be
+enabled by a later request.
 
 ## Run the CLI
 
@@ -118,7 +119,6 @@ weights and the Vision workspace. Disabled capabilities cannot be enabled by a l
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 \
   --max-new 256 \
-  --no-vision \
   --mtp-draft-tokens 3 \
   --lm-head-draft
 ```
@@ -129,7 +129,8 @@ Use `--messages FILE` instead of `--prompt` for chat history, images, or videos:
 ./build/apps/ninfer models/qwen3_6_27b.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
-  --max-new 128
+  --max-new 128 \
+  --vision
 ```
 
 Answer content is written to stdout. Loading progress, reasoning, timing, throughput, memory, and
@@ -142,7 +143,6 @@ MTP statistics are written to stderr. See the [CLI guide](docs/cli.md) and
 ./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
   --model-id qwen3.6-27b \
   --max-context 16384 \
-  --no-vision \
   --mtp-draft-tokens 3 \
   --lm-head-draft
 ```

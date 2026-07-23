@@ -37,7 +37,7 @@ $CLI "$MODEL" --messages examples/cli/messages/text_code_review.json \
 for CASE in image_chart image_natural video_temporal multi_image_compare \
             mixed_image_video mixed_multiturn; do
   $CLI "$MODEL" --messages "examples/cli/messages/${CASE}.json" \
-    --max-context 8192 --no-thinking --greedy --max-new 128
+    --max-context 8192 --no-thinking --greedy --max-new 128 --vision
 done
 ```
 
@@ -72,7 +72,7 @@ $CLI "$MODEL" --messages examples/cli/messages/thinking_logic_grid.json \
   --greedy --max-context 16384 --max-new 8192
 
 $CLI "$MODEL" --messages examples/cli/messages/thinking_multimodal_checksum.json \
-  --greedy --max-context 8192 --max-new 4096
+  --greedy --max-context 8192 --max-new 4096 --vision
 ```
 
 The logic grid has one solution and must end with `CHECK=4606`. The multimodal case reads independent

@@ -24,7 +24,7 @@ struct Options {
     KvCacheStorage kv_cache        = KvCacheStorage::BFloat16;
     std::uint32_t mtp_draft_tokens = 0;
     ProposalHead proposal_head     = ProposalHead::Full;
-    bool enable_vision             = true;
+    bool enable_vision             = false;
     bool use_cuda_graph            = true;
 
     bool raw_output      = false;

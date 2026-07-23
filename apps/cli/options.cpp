@@ -67,13 +67,13 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--raw-output] [--print-token-ids] [--no-thinking] [--no-vision]\n"
+           "       [--raw-output] [--print-token-ids] [--no-thinking] [--vision]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
-           "--no-vision creates a permanently text-only Engine and omits Vision GPU allocations.\n"
+           "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "Sampling defaults: temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.0.\n";
 }
 
@@ -120,8 +120,8 @@ Options parse_options(int argc, char** argv) {
             options.print_token_ids = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
-        } else if (arg == "--no-vision") {
-            options.enable_vision = false;
+        } else if (arg == "--vision") {
+            options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {

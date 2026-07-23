@@ -9,5 +9,5 @@ static_assert(!std::is_copy_constructible_v<ninfer::Engine>);
 
 int main() {
     const ninfer::EngineOptions options;
-    return options.enable_vision ? 0 : 1;
+    return options.enable_vision ? 1 : 0;
 }

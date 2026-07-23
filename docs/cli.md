@@ -32,11 +32,12 @@ GPU residency is frozen when the Engine starts:
 
 - `--mtp-draft-tokens 0` omits MTP weights, MTP KV/state, and the optimized draft head;
 - MTP with the full proposal head omits the optimized draft head;
-- `--no-vision` omits Vision weights and the maximum Vision workspace.
+- Vision is disabled by default, omitting its weights and maximum workspace;
+- `--vision` loads those allocations and enables image/video input.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
-text-only Engine rejects media and cannot enable Vision later. For the smallest resident profile,
-use the default MTP setting together with `--no-vision`.
+text-only Engine rejects media and cannot enable Vision later. The default MTP and Vision settings
+produce the smallest resident profile.
 
 ## Structured messages
 
@@ -71,7 +72,8 @@ Run message files from the repository root when they contain repository-relative
 ./build/apps/ninfer models/qwen3_6_27b.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
-  --max-new 128
+  --max-new 128 \
+  --vision
 ```
 
 Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`. Message content
@@ -118,7 +120,7 @@ proposal head.
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--mtp-draft-tokens 0..5` | MTP draft window | `0` |
 | `--lm-head-draft` | optimized MTP proposal head | off |
-| `--no-vision` | permanently disable Vision and omit its GPU allocations | Vision on |
+| `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--greedy` | exact argmax decoding | off |

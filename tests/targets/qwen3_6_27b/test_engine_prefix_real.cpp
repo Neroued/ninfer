@@ -16,6 +16,7 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.prefill_chunk             = 1024;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.enable_vision             = true;
     return options;
 }
 

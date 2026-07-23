@@ -18,6 +18,7 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.enable_vision             = true;
     options.use_cuda_graph            = true;
     return options;
 }

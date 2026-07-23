@@ -194,7 +194,7 @@ deferral does not remove adaptations of already-established semantic Ops such as
 
 ### OP-N01: `prepare_masked_block`
 
-**Status:** [ ] definition [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] definition [x] correctness [x] benchmark [x] route [ ] integration
 
 **Definition**
 
@@ -408,7 +408,7 @@ proposal graph, which do not exist yet.
 
 ### OP-N04: `kv_cache_append_prefix`
 
-**Status:** [ ] definition [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] definition [x] correctness [x] benchmark [x] route [ ] integration
 
 **Definition**
 
@@ -461,6 +461,50 @@ policy into the cache container.
 - Capture one `T=16` graph and replay it with every device count without recapture or host reads.
 - Benchmark linear and cyclic layouts. Integration evidence must show cache/frontier agreement
   after all `A=0..15` and on the following proposal round.
+
+**Qualification result (2026-07-24)**
+
+The repository now owns two overloads of one semantic Op for the existing linear cache view and
+the fixed 4096-slot cyclic view. Both consume contiguous BF16 `[128,8,T]` K/V, sequential device
+positions, a device I32 `commit_count`, and a host count envelope. The selected kernel copies 32
+bytes per thread for both K and V and launches `ceil(max_count/4)` 256-thread CTAs. It reads the
+device count inside the captured launch, writes only tokens below that count, and leaves the cache
+unchanged if the count lies outside the declared envelope. The Op owns neither count selection nor
+frontier publication.
+
+`ninfer_kv_cache_append_prefix_test` passed an independent bit-exact state-transition oracle for
+both layouts at every `T=1..16` and every `commit_count=0..T`. Every cache bit is seeded and
+checked, including padded/unrelated rows, rejected candidate rows, two absolute ring wraps, K/V
+separation, input preservation, and cache guards. The test also qualifies all private benchmark
+candidates, proves invalid device counts perform no write, captures one cyclic `T=16` graph, and
+replays that graph for every count `0..16` without recapture. From every resulting prefix it then
+appends the following two-token proposal and checks the complete state again, covering resume
+after every intermediate accepted prefix.
+
+Production uses the same measured 32-byte flat route for linear and cyclic layouts:
+
+| Host `max_count` | Block | Grid | Device behavior |
+|---:|---:|---:|---|
+| `0` | — | — | no launch |
+| `1+` | 256 | `ceil(max_count/4)` | copy exactly `commit_count` rows |
+
+On RTX 5090, CUDA 13.1, `sm_120a`, cold-destination CUDA Graph replay measured approximately
+`3.36 us` for both layouts throughout `T=1..16`; the full `T=C=16` case moved 131072 useful bytes
+at `39.0 GB/s` for both layouts. This small product extent is launch-bound: its raw
+DRAM floor is only `0.073 us`. The one-CTA persistent candidate regressed to `5.408 us` once
+`T>=8`; 16-byte flat and per-token candidates did not beat 32-byte flat in the product domain.
+For the host-known full-prefix use case, 32-byte flat reached `908.1 GB/s` linear and
+`922.8 GB/s` cyclic at `T=C=1024` while using half as many CTAs as 16-byte flat and one quarter as
+many as the per-token route.
+
+Nsight Compute on cyclic `T=C=16` confirms four CTAs, 30 registers/thread, no dynamic shared
+memory, `3.52 us` duration, and only 99.6 average SM-active cycles inside 6981 elapsed cycles.
+The resulting 2.08% DRAM and 0.06% SM throughput identify fixed launch time—not copy work—as the
+small-round limit. Fusion with a producer could remove that launch, but fusion is explicitly
+outside this phase.
+
+The remaining integration gate requires the future proposal Program to prove cache/frontier
+agreement for `A=0..15` and on the following round.
 
 ## 4. Existing Op adaptations
 
@@ -948,7 +992,7 @@ commit together.
 | 7 | `OP-A07` | W8 MLP down plus residual | [ ] | [ ] | [ ] | [ ] |
 | 8 | `OP-A01` | W8 target-feature projection | [ ] | [ ] | [ ] | [ ] |
 | 9 | `OP-A03` | W8 context K/V pair projection | [ ] | [ ] | [ ] | [ ] |
-| 10 | `OP-N04` | Device-count linear/ring prefix append | [ ] | [ ] | [ ] | [ ] |
+| 10 | `OP-N04` | Device-count linear/ring prefix append | [x] | [x] | [x] | [ ] |
 | 11 | `OP-N01` | Masked-block preparation | [ ] | [ ] | [ ] | [ ] |
 | 12 | `OP-R01..R06` | Focused reuse and composed-route checks | [ ] | [ ] | [ ] | [ ] |
 | 13 | `INT-01..06` | Complete Text-only proposal/context round | [ ] | [ ] | [ ] | [ ] |

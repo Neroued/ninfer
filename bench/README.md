@@ -190,6 +190,27 @@ The useful roofline counts the admitted cyclic context once, query Q/K/V, one ou
 the complete QK/PV FLOPs. It intentionally excludes split/reduce scratch traffic; the
 implementation-traffic comparison is reported separately in the Op qualification.
 
+## Device-count K/V prefix-append benchmark
+
+`ninfer_kv_cache_append_prefix_bench` measures exact BF16 D128/KV8 prefix publication into linear
+and 4096-slot cyclic cache layouts. `T` fixes the captured launch envelope, while `C` is the device
+commit count and determines the exact bytes written. Every timed invocation is one CUDA Graph
+replay. `--cold-cache` flushes 256 MiB before each sample outside the timed interval, and
+`--route flat16|flat32|persistent32|token` exposes private candidate controls.
+
+```bash
+cmake --build build --parallel --target ninfer_kv_cache_append_prefix_bench
+./build/bench/ninfer_kv_cache_append_prefix_bench \
+  --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --counts 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --layout all --route production --cold-cache --warmup 10 --repeat 61
+./build/bench/ninfer_kv_cache_append_prefix_bench \
+  --tokens 16 --counts 16 --layout cyclic --route production --profile-once
+```
+
+Useful traffic is the exact committed K/V input read plus cache write, 8192 bytes per committed
+token. `C=0` still exercises the captured device-count launch but has zero useful bytes.
+
 ## 35B W8 input-projection Op benchmark
 
 `ninfer_w8_input_proj_bench` measures the registered 35B-A3B target's W8 Attention

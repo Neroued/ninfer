@@ -54,6 +54,13 @@ std::vector<GraphFrontierRange> Variant::mtp_graph_ranges(std::uint32_t capacity
     for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
         add_shifted(visible_end, 2 * draft_window);
     }
+    // Keep the fixed-T target verify/batch graph on one side of the prompt-to-chunked
+    // attention crossover. The target call has T=draft_window+1; its three-chunk route needs
+    // a longer prompt interval to amortize the third partial/reduce launch pair.
+    if (draft_window >= 6 && draft_window <= 15) {
+        const std::uint32_t route_visible_end = draft_window <= 11 ? 512U : 1024U;
+        add_shifted(route_visible_end, draft_window + 1);
+    }
     std::sort(ends.begin(), ends.end());
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
     return graph_ranges_through(capacity - 2 * draft_window, ends);

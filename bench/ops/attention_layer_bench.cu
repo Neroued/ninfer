@@ -10,7 +10,7 @@
 //   ./build/bench/ninfer_attention_layer_bench
 // Focused examples:
 //   ./build/bench/ninfer_attention_layer_bench --geometry 35b --kv-dtype bf16 \
-//       --context 8192 --t-sweep 1,2,3,4,5,6
+//       --context 8192 --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
 //   ./build/bench/ninfer_attention_layer_bench --geometry 27b --kv-dtype int8 \
 //       --context 128,8192 --repeat 80 --csv-out profiles/bench/attention-layer.csv
 
@@ -26,6 +26,7 @@
 #include "ninfer_bench_common.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
+#include "ops/launcher/gqa_attention.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
@@ -58,10 +59,12 @@ constexpr std::size_t kDefaultFlush = 256ULL << 20;
 
 enum class GeometrySelection { All, B27, B35 };
 enum class KvSelection { TargetDefault, Bf16, Int8 };
+enum class AttentionSelection { Auto, PromptControl };
 
 struct Options {
     GeometrySelection geometry            = GeometrySelection::All;
     KvSelection kv                        = KvSelection::TargetDefault;
+    AttentionSelection attention          = AttentionSelection::Auto;
     std::vector<std::int32_t> contexts    = {128, 8192};
     std::vector<std::int32_t> token_sweep = {1, 2, 3, 4, 5, 6};
     int warmup                            = 5;
@@ -267,6 +270,14 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--kv-dtype must be default, bf16, or int8");
         } else if (arg == "--context") {
             options.contexts = parse_i32_list(next("--context value"), true, "--context");
+        } else if (arg == "--attention-route") {
+            const std::string_view value = next("--attention-route value");
+            if (value == "auto")
+                options.attention = AttentionSelection::Auto;
+            else if (value == "prompt-control")
+                options.attention = AttentionSelection::PromptControl;
+            else
+                throw std::invalid_argument("--attention-route must be auto or prompt-control");
         } else if (arg == "--t-sweep") {
             options.token_sweep = parse_i32_list(next("--t-sweep value"), false, "--t-sweep");
         } else if (arg == "--warmup") {
@@ -281,7 +292,8 @@ Options parse_options(int argc, char** argv) {
             options.csv_out = next("--csv-out path");
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--geometry all|27b|35b] [--kv-dtype default|bf16|int8] "
-                        "[--context 128,8192] [--t-sweep 1,2,...,6] [--warmup N] [--repeat N] "
+                        "[--attention-route auto|prompt-control] "
+                        "[--context 128,8192] [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
@@ -293,7 +305,7 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
     for (const std::int32_t tokens : options.token_sweep) {
-        if (tokens > 6) { throw std::invalid_argument("--t-sweep values must be in [1,6]"); }
+        if (tokens > 16) { throw std::invalid_argument("--t-sweep values must be in [1,16]"); }
     }
     const std::int32_t max_tokens =
         *std::max_element(options.token_sweep.begin(), options.token_sweep.end());
@@ -560,9 +572,15 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
         ops::rope(positions, kRotaryDim, kRopeTheta, query_transformed, key_transformed,
                   layer_stream);
         const auto visible = static_cast<std::uint32_t>(context + tokens);
-        ops::gqa_attention(query_transformed, key_transformed, value, positions, kAttentionScale,
-                           cache.layer_view(0), {visible, visible}, resources.workspace, attention,
-                           layer_stream);
+        if (options.attention == AttentionSelection::PromptControl) {
+            ops::detail::gqa_attention_prompt_launch(query_transformed, key_transformed, value,
+                                                     positions, kAttentionScale,
+                                                     cache.layer_view(0), attention, layer_stream);
+        } else {
+            ops::gqa_attention(query_transformed, key_transformed, value, positions,
+                               kAttentionScale, cache.layer_view(0), {visible, visible},
+                               resources.workspace, attention, layer_stream);
+        }
         ops::sigmoid_mul(gate, attention, layer_stream);
         ops::linear_add(attention.view({Geometry::query_rows, tokens}), resources.output.weight,
                         residual, resources.workspace, layer_stream);
@@ -575,8 +593,14 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, bench::DBuf& flu
     TimedGraph graph;
     graph.capture(stream, layer);
     const Timing timing = measure_cold(graph, flush, stream, options.warmup, options.repeat);
+    const std::uint32_t visible = static_cast<std::uint32_t>(context + tokens);
+    const auto selected_route =
+        ops::detail::gqa_attention_resolve_route(Geometry::query_heads, tokens, {visible, visible});
+    const char* route = options.attention == AttentionSelection::PromptControl
+                            ? "prompt_control"
+                            : ops::detail::gqa_attention_route_name(selected_route);
     const std::string attention_route =
-        std::string("gqa.small_t.append.") + kv_dtype_name(cache.dtype);
+        std::string("gqa.") + route + ".append." + kv_dtype_name(cache.dtype);
     return {Geometry::name,
             kv_dtype_name(cache.dtype),
             context,

@@ -12,9 +12,16 @@
 
 namespace ninfer::ops::detail {
 
+enum class GqaAttentionRoute { SmallT, ChunkedSmallT, Prompt };
+
 std::int32_t gqa_attention_decode_splits(std::int32_t q_heads, std::int32_t kv_heads);
 
 bool gqa_attention_uses_small_t(std::int32_t tokens);
+
+GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t tokens,
+                                              GqaExecutionEnvelope envelope);
+
+const char* gqa_attention_route_name(GqaAttentionRoute route);
 
 void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                   const Tensor& positions, float scale, KVCacheLayerView cache,

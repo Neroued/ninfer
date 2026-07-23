@@ -210,6 +210,30 @@ individual routes are suitable for Nsight Compute capture:
 ./build/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 20
 ```
 
+## 35B dFlash attention qualification
+
+The GQA benchmark covers exact verify widths `T=1..16`, both KV codecs, append-and-attend and
+already-cached attention, and prints the selected context-dependent route:
+
+```bash
+./build/bench/ninfer_gqa_attention_bench --append-small-t --geometry 35b \
+  --kv-dtype bf16 --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --context 128,1024,8192
+./build/bench/ninfer_gqa_attention_bench --cached-small-t --geometry 35b \
+  --kv-dtype int8 --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --context 128,1024,8192
+```
+
+The complete 35B attention mixer benchmark uses cold-cache CUDA Graph replay. Its
+`prompt-control` route preserves the former prompt implementation for a same-build layer A/B:
+
+```bash
+./build/bench/ninfer_attention_layer_bench --geometry 35b --kv-dtype bf16 \
+  --context 128,1024,8192 --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+./build/bench/ninfer_attention_layer_bench --geometry 35b --kv-dtype bf16 \
+  --attention-route prompt-control --context 1024,8192 --t-sweep 7,8,9,10,11,12,13,14,15,16
+```
+
 ## Pointwise Op benchmarks
 
 The Section 5 benchmarks cover the complete Qwen3.6-35B pointwise matrix. Default invocation runs

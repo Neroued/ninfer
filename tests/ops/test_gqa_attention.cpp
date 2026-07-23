@@ -913,7 +913,8 @@ int one_prefill_case(std::int32_t tokens, std::uint32_t seed, std::int32_t cache
 }
 
 int split_api_parity_case(DType cache_dtype, std::int32_t tokens, std::int32_t base,
-                          std::uint32_t seed, bool final_row_only = false) {
+                          std::uint32_t seed, bool final_row_only = false,
+                          bool capture_graph = false) {
     const std::size_t qn =
         static_cast<std::size_t>(kHeadDim) * kQHeads * static_cast<std::size_t>(tokens);
     const std::size_t kvn =
@@ -972,13 +973,17 @@ int split_api_parity_case(DType cache_dtype, std::int32_t tokens, std::int32_t b
     cpu_gqa_cached(oracle_q, logical_cache_k, logical_cache_v, oracle_positions, padded_context,
                    oracle);
 
-    DBuf dq         = to_device_bf16(q);
-    DBuf dk         = to_device_bf16(k);
-    DBuf dv         = to_device_bf16(v);
-    DBuf dpos       = to_device_i32(positions);
-    DBuf dout_full  = DBuf(qn * sizeof(std::uint16_t));
-    DBuf dout_split = DBuf(qn * sizeof(std::uint16_t));
-    WorkspaceArena ws(kGqaWorkspaceBytes);
+    DBuf dq                          = to_device_bf16(q);
+    DBuf dk                          = to_device_bf16(k);
+    DBuf dv                          = to_device_bf16(v);
+    DBuf dpos                        = to_device_i32(positions);
+    DBuf dout_full                   = DBuf(qn * sizeof(std::uint16_t));
+    DBuf dout_split                  = DBuf(qn * sizeof(std::uint16_t));
+    const std::int32_t cached_tokens = final_row_only ? 1 : tokens;
+    const std::size_t workspace_bytes =
+        std::max(ops::gqa_attention_workspace_bytes(kQHeads, tokens),
+                 ops::gqa_attention_workspace_bytes(kQHeads, cached_tokens));
+    WorkspaceArena ws(std::max<std::size_t>(workspace_bytes, 1u));
 
     const std::size_t arena_bytes =
         cache_dtype == DType::BF16
@@ -1007,7 +1012,7 @@ int split_api_parity_case(DType cache_dtype, std::int32_t tokens, std::int32_t b
     Tensor tout_full(dout_full.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     auto* q_split_ptr               = static_cast<std::uint16_t*>(dq.p);
     auto* pos_split_ptr             = static_cast<std::int32_t*>(dpos.p);
-    const std::int32_t split_tokens = final_row_only ? 1 : tokens;
+    const std::int32_t split_tokens = cached_tokens;
     if (final_row_only) {
         q_split_ptr += static_cast<std::size_t>(tokens - 1) * q_col_elems;
         pos_split_ptr += tokens - 1;
@@ -1017,16 +1022,46 @@ int split_api_parity_case(DType cache_dtype, std::int32_t tokens, std::int32_t b
     Tensor tout_split(dout_split.p, DType::BF16, {kHeadDim, kQHeads, split_tokens});
 
     const auto envelope = exact_envelope(static_cast<std::uint32_t>(total));
-    ops::gqa_attention(tq, tk, tv, tpos, kScale, full_cache.layer_view(0), envelope, ws, tout_full,
-                       nullptr);
-    ops::gqa_kv_append(tk, tv, tpos, split_cache.layer_view(0), nullptr);
-    ops::gqa_attention_cached(tq_split, tpos_split, kScale, split_cache.layer_view(0), envelope, ws,
-                              tout_split, nullptr);
-    cudaDeviceSynchronize();
+    if (capture_graph) {
+        cudaStream_t stream = nullptr;
+        cudaStreamCreate(&stream);
+        cudaGraph_t full_graph     = nullptr;
+        cudaGraph_t split_graph    = nullptr;
+        cudaGraphExec_t full_exec  = nullptr;
+        cudaGraphExec_t split_exec = nullptr;
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        ops::gqa_attention(tq, tk, tv, tpos, kScale, full_cache.layer_view(0), envelope, ws,
+                           tout_full, stream);
+        cudaStreamEndCapture(stream, &full_graph);
+        cudaGraphInstantiate(&full_exec, full_graph, nullptr, nullptr, 0);
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        ops::gqa_kv_append(tk, tv, tpos, split_cache.layer_view(0), stream);
+        ops::gqa_attention_cached(tq_split, tpos_split, kScale, split_cache.layer_view(0), envelope,
+                                  ws, tout_split, stream);
+        cudaStreamEndCapture(stream, &split_graph);
+        cudaGraphInstantiate(&split_exec, split_graph, nullptr, nullptr, 0);
+        cudaGraphLaunch(full_exec, stream);
+        cudaGraphLaunch(split_exec, stream);
+        cudaStreamSynchronize(stream);
+        cudaGraphExecDestroy(full_exec);
+        cudaGraphExecDestroy(split_exec);
+        cudaGraphDestroy(full_graph);
+        cudaGraphDestroy(split_graph);
+        cudaStreamDestroy(stream);
+    } else {
+        ops::gqa_attention(tq, tk, tv, tpos, kScale, full_cache.layer_view(0), envelope, ws,
+                           tout_full, nullptr);
+        ops::gqa_kv_append(tk, tv, tpos, split_cache.layer_view(0), nullptr);
+        ops::gqa_attention_cached(tq_split, tpos_split, kScale, split_cache.layer_view(0), envelope,
+                                  ws, tout_split, nullptr);
+        cudaDeviceSynchronize();
+    }
 
     const std::string dtype_label = cache_dtype == DType::BF16 ? "bf16" : "int8";
     const std::string label = "gqa split API " + dtype_label + " base=" + std::to_string(base) +
-                              " T=" + std::to_string(tokens) + (final_row_only ? " final-row" : "");
+                              " T=" + std::to_string(tokens) +
+                              (final_row_only ? " final-row" : "") +
+                              (capture_graph ? " graph" : "");
     std::vector<double> full_output = from_device_bf16(dout_full, qn);
     if (final_row_only) {
         full_output.erase(full_output.begin(),
@@ -1543,6 +1578,30 @@ int main(int argc, char** argv) {
         f += split_api_parity_case(DType::I8, 128, 17, 1404u);
         f += split_api_parity_case(DType::BF16, 1024, 17, 1405u, true);
         f += split_api_parity_case(DType::I8, 1024, 17, 1406u, true);
+        if (q_heads == 16) {
+            // Exact 35B DFlash qualification: every T exercises A1 and A3 directly against the
+            // independent FP64 oracle in both cache formats. The second T=7..16 point is the first
+            // chunked point after the production prompt frontier.
+            for (std::int32_t tokens = 1; tokens <= 16; ++tokens) {
+                f += split_api_parity_case(DType::BF16, tokens, 17,
+                                           1500u + static_cast<std::uint32_t>(tokens));
+                f += split_api_parity_case(DType::I8, tokens, 17,
+                                           1600u + static_cast<std::uint32_t>(tokens));
+                if (tokens > 6) {
+                    const std::int32_t frontier           = tokens <= 12 ? 512 : 1024;
+                    const std::int32_t first_chunked_base = frontier - tokens + 1;
+                    f += split_api_parity_case(DType::BF16, tokens, first_chunked_base,
+                                               1700u + static_cast<std::uint32_t>(tokens));
+                    f += split_api_parity_case(DType::I8, tokens, first_chunked_base,
+                                               1800u + static_cast<std::uint32_t>(tokens));
+                }
+            }
+            // Capture both sides of the three-chunk route frontier.
+            f += split_api_parity_case(DType::BF16, 16, 1008, 1916u, false, true);
+            f += split_api_parity_case(DType::I8, 16, 1008, 2016u, false, true);
+            f += split_api_parity_case(DType::BF16, 16, 1009, 2116u, false, true);
+            f += split_api_parity_case(DType::I8, 16, 1009, 2216u, false, true);
+        }
         f += one_decode_case(1, 11u);
         f += one_decode_case(17, 17u);
         f += one_decode_case(2048, 23u);

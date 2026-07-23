@@ -3,12 +3,14 @@
 // bf16/FP32-accumulate dense tensor-core roofline. Correctness is covered by
 // tests/ops/test_gqa_attention.cpp.
 // Canonical 35B matrix: prefill uses a fixed 1024-token chunk; decode/verify
-// sweeps T=1..6. Both sweep the same live-context list.
+// sweeps T=1..16. Both sweep the same live-context list.
 //   ./ninfer_gqa_attention_bench --append-prompt-baseline --geometry 35b --tokens 1024 \
 //       --context 0,128,512,2048,8192,32768,131072,261120
-//   ./ninfer_gqa_attention_bench --append-small-t --geometry 35b --tokens 1,2,3,4,5,6 \
+//   ./ninfer_gqa_attention_bench --append-small-t \
+//       --geometry 35b --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
 //       --context 0,128,512,2048,8192,32768,131072,261120
-//   ./ninfer_gqa_attention_bench --cached-small-t --geometry 35b --tokens 1,2,3,4,5,6 \
+//   ./ninfer_gqa_attention_bench --cached-small-t \
+//       --geometry 35b --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
 //       --context 0,128,512,2048,8192,32768,131072,261120
 //   ./ninfer_gqa_attention_bench --kv-append --geometry 35b --tokens 1,2,3,4,5,6,1024 \
 //       --context 0,128,512,2048,8192,32768,131072,261120
@@ -168,6 +170,9 @@ struct DecodeBytes {
     std::size_t total     = 0;
 };
 
+double append_prompt_logical_kv_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype);
+double append_prompt_global_floor_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype);
+
 DecodeBytes decode_bytes(std::int32_t pos_value, DType kv_dtype) {
     const auto window      = static_cast<std::size_t>(pos_value) + 1u;
     const auto split_count = static_cast<std::size_t>(decode_active_splits(pos_value, kv_dtype));
@@ -193,7 +198,8 @@ DecodeBytes decode_bytes(std::int32_t pos_value, DType kv_dtype) {
     return bytes;
 }
 
-DecodeBytes append_small_t_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
+DecodeBytes small_t_stage_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype,
+                                bool append) {
     const auto window      = static_cast<std::size_t>(context + tokens);
     const auto token_count = static_cast<std::size_t>(tokens);
     const auto split_count =
@@ -216,17 +222,65 @@ DecodeBytes append_small_t_bytes(std::int32_t tokens, std::int32_t context, DTyp
     DecodeBytes bytes;
     bytes.useful_kv = k_cache_reads + v_cache_reads;
     bytes.scratch   = partial_acc_writes_reads + partial_ml_writes + partial_ml_reads;
-    bytes.total     = bytes.useful_kv + new_kv_writes + q_reads + output_writes + bytes.scratch;
+    bytes.total =
+        bytes.useful_kv + (append ? new_kv_writes : 0u) + q_reads + output_writes + bytes.scratch;
     return bytes;
 }
 
-DecodeBytes cached_small_t_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
-    DecodeBytes bytes              = append_small_t_bytes(tokens, context, kv_dtype);
-    const auto token_count         = static_cast<std::size_t>(tokens);
-    const std::size_t cache_writes = static_cast<std::size_t>(
-        static_cast<double>(token_count * kKVHeads) * kv_cache_pair_bytes_per_head(kv_dtype));
-    bytes.total -= cache_writes;
+using VerifyRoute = ops::detail::GqaAttentionRoute;
+
+VerifyRoute verify_route(std::int32_t tokens, std::int32_t context) {
+    const auto visible = static_cast<std::uint32_t>(context + tokens);
+    return ops::detail::gqa_attention_resolve_route(kQHeads, tokens, {visible, visible});
+}
+
+const char* verify_route_ncu_kernel_regex(VerifyRoute route, DType dtype) {
+    return route == VerifyRoute::Prompt ? prefill_ncu_kernel_regex(dtype)
+                                        : small_t_ncu_kernel_regex(dtype);
+}
+
+std::int32_t verify_route_chunks(std::int32_t tokens, VerifyRoute route) {
+    return route == VerifyRoute::ChunkedSmallT ? ceil_div_i32(tokens, 6) : 1;
+}
+
+DecodeBytes verify_route_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype,
+                               bool append) {
+    const VerifyRoute route = verify_route(tokens, context);
+    if (route == VerifyRoute::SmallT) {
+        return small_t_stage_bytes(tokens, context, kv_dtype, append);
+    }
+    if (route == VerifyRoute::ChunkedSmallT) {
+        DecodeBytes total;
+        for (std::int32_t begin = 0; begin < tokens; begin += 6) {
+            const DecodeBytes chunk =
+                small_t_stage_bytes(std::min(6, tokens - begin), context + begin, kv_dtype, append);
+            total.useful_kv += chunk.useful_kv;
+            total.scratch += chunk.scratch;
+            total.total += chunk.total;
+        }
+        return total;
+    }
+
+    DecodeBytes bytes;
+    bytes.useful_kv =
+        static_cast<std::size_t>(append_prompt_logical_kv_bytes(tokens, context, kv_dtype));
+    bytes.total =
+        static_cast<std::size_t>(append_prompt_global_floor_bytes(tokens, context, kv_dtype));
+    if (!append) {
+        const double token_count = static_cast<double>(tokens);
+        bytes.total -= static_cast<std::size_t>(
+            token_count * static_cast<double>(kKVHeads) *
+            (kv_input_pair_bytes_per_head() + kv_cache_pair_bytes_per_head(kv_dtype)));
+    }
     return bytes;
+}
+
+DecodeBytes append_small_t_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
+    return verify_route_bytes(tokens, context, kv_dtype, true);
+}
+
+DecodeBytes cached_small_t_bytes(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
+    return verify_route_bytes(tokens, context, kv_dtype, false);
 }
 
 struct KvAppendBytes {
@@ -337,15 +391,7 @@ std::size_t decode_workspace_bytes_for_pos(std::int32_t) {
 }
 
 std::size_t small_t_workspace_bytes(std::int32_t tokens) {
-    const auto split_count              = static_cast<std::size_t>(kGqaDecodeSplits);
-    const auto token_count              = static_cast<std::size_t>(tokens);
-    const std::size_t partial_acc_bytes = static_cast<std::size_t>(kHeadDim) * kQHeads *
-                                          token_count * split_count * sizeof(std::uint16_t);
-    const std::size_t partial_m_bytes =
-        static_cast<std::size_t>(kQHeads) * token_count * split_count * sizeof(float);
-    const std::size_t partial_l_bytes =
-        static_cast<std::size_t>(kQHeads) * token_count * split_count * sizeof(float);
-    return partial_acc_bytes + partial_m_bytes + partial_l_bytes + align_overhead(3);
+    return ops::gqa_attention_workspace_bytes(kQHeads, tokens);
 }
 
 std::size_t decode_workspace_bytes(const std::vector<std::int32_t>& positions) {
@@ -525,17 +571,28 @@ void print_append_small_t_result(const char* tag, const Result& r, const DecodeB
     const double total_gbs = (sec > 0.0) ? static_cast<double>(bytes.total) / sec / 1.0e9 : 0.0;
     const double useful_kv_gbs =
         (sec > 0.0) ? static_cast<double>(bytes.useful_kv) / sec / 1.0e9 : 0.0;
-    const double redundancy = bytes.useful_kv > 0 ? static_cast<double>(bytes.total) /
+    const double redundancy   = bytes.useful_kv > 0 ? static_cast<double>(bytes.total) /
                                                         static_cast<double>(bytes.useful_kv)
-                                                  : 0.0;
-    constexpr double kMiB   = 1024.0 * 1024.0;
+                                                    : 0.0;
+    const VerifyRoute route   = verify_route(tokens, context);
+    const std::int32_t chunks = verify_route_chunks(tokens, route);
+    const std::int32_t final_chunk =
+        route == VerifyRoute::ChunkedSmallT ? tokens - 6 * (chunks - 1) : tokens;
+    const std::int32_t final_context =
+        route == VerifyRoute::ChunkedSmallT ? context + 6 * (chunks - 1) : context;
+    const std::int32_t splits = route == VerifyRoute::Prompt
+                                    ? 0
+                                    : small_t_active_splits(final_chunk, final_context, kv_dtype);
+    constexpr double kMiB     = 1024.0 * 1024.0;
     std::printf("%-38s median=%8.2f us  min=%8.2f us  p95=%8.2f us  total_model=%8.1f GB/s  "
                 "useful_kv=%8.1f GB/s  redundancy=%5.2f  bytes useful_kv=%.2f MiB "
-                "scratch=%.2f MiB total=%.2f MiB  T=%d context=%d splits=%d%s\n",
+                "scratch=%.2f MiB total=%.2f MiB  T=%d context=%d route=%s chunks=%d "
+                "final_splits=%d%s\n",
                 tag, r.median_us, r.min_us, r.p95_us, total_gbs, useful_kv_gbs, redundancy,
                 static_cast<double>(bytes.useful_kv) / kMiB,
                 static_cast<double>(bytes.scratch) / kMiB, static_cast<double>(bytes.total) / kMiB,
-                tokens, context, small_t_active_splits(tokens, context, kv_dtype), suffix);
+                tokens, context, ops::detail::gqa_attention_route_name(route), chunks, splits,
+                suffix);
 }
 
 struct AppendPromptMetrics {
@@ -835,18 +892,20 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
         std::snprintf(tag, sizeof(tag), "PROFILE_COLD gqa_attention append-small-T kv=%s",
                       kv_dtype_name(kv.dtype));
         print_append_small_t_result(tag, r, bytes, tokens, context, kv.dtype, " cold_cache");
+        const VerifyRoute route = verify_route(tokens, context);
         std::printf("PROFILE_COLD_METADATA mode=append-small-t T=%d context=%d kv_dtype=%s "
-                    "splits=%d "
+                    "route=%s chunks=%d "
                     "cold_cache_bytes=%zu useful_kv_bytes=%zu scratch_bytes=%zu "
                     "total_modeled_bytes=%zu redundancy=%.6f repeats=%d "
                     "ncu_kernel_regex='%s'\n",
                     tokens, context, kv_dtype_name(kv.dtype),
-                    small_t_active_splits(tokens, context, kv.dtype), cold_cache->bytes,
-                    bytes.useful_kv, bytes.scratch, bytes.total,
+                    ops::detail::gqa_attention_route_name(route),
+                    verify_route_chunks(tokens, route), cold_cache->bytes, bytes.useful_kv,
+                    bytes.scratch, bytes.total,
                     bytes.useful_kv > 0
                         ? static_cast<double>(bytes.total) / static_cast<double>(bytes.useful_kv)
                         : 0.0,
-                    r.n_runs, small_t_ncu_kernel_regex(kv.dtype));
+                    r.n_runs, verify_route_ncu_kernel_regex(route, kv.dtype));
         return;
     }
 
@@ -854,16 +913,18 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
                        exact_envelope(static_cast<std::uint32_t>(context + tokens)), ws, tout,
                        stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::printf("PROFILE_ONCE gqa_attention append-small-T T=%d context=%d kv_dtype=%s splits=%d "
+    const VerifyRoute route = verify_route(tokens, context);
+    std::printf("PROFILE_ONCE gqa_attention append-small-T T=%d context=%d kv_dtype=%s route=%s "
+                "chunks=%d "
                 "useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu redundancy=%.6f "
                 "ncu_kernel_regex='%s'\n",
                 tokens, context, kv_dtype_name(kv.dtype),
-                small_t_active_splits(tokens, context, kv.dtype), bytes.useful_kv, bytes.scratch,
-                bytes.total,
+                ops::detail::gqa_attention_route_name(route), verify_route_chunks(tokens, route),
+                bytes.useful_kv, bytes.scratch, bytes.total,
                 bytes.useful_kv > 0
                     ? static_cast<double>(bytes.total) / static_cast<double>(bytes.useful_kv)
                     : 0.0,
-                small_t_ncu_kernel_regex(kv.dtype));
+                verify_route_ncu_kernel_regex(route, kv.dtype));
 }
 
 void run_cached_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) {
@@ -918,24 +979,27 @@ void run_cached_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
         std::snprintf(tag, sizeof(tag), "PROFILE_COLD gqa_attention cached-small-T kv=%s",
                       kv_dtype_name(kv.dtype));
         print_append_small_t_result(tag, r, bytes, tokens, context, kv.dtype, " cold_cache");
-        std::printf("PROFILE_COLD_METADATA mode=cached-small-t T=%d context=%d kv_dtype=%s "
-                    "splits=%d cold_cache_bytes=%zu useful_kv_bytes=%zu scratch_bytes=%zu "
-                    "total_modeled_bytes=%zu repeats=%d ncu_kernel_regex='%s'\n",
-                    tokens, context, kv_dtype_name(kv.dtype),
-                    small_t_active_splits(tokens, context, kv.dtype), cold_cache->bytes,
-                    bytes.useful_kv, bytes.scratch, bytes.total, r.n_runs,
-                    small_t_ncu_kernel_regex(kv.dtype));
+        const VerifyRoute route = verify_route(tokens, context);
+        std::printf(
+            "PROFILE_COLD_METADATA mode=cached-small-t T=%d context=%d kv_dtype=%s "
+            "route=%s chunks=%d cold_cache_bytes=%zu useful_kv_bytes=%zu scratch_bytes=%zu "
+            "total_modeled_bytes=%zu repeats=%d ncu_kernel_regex='%s'\n",
+            tokens, context, kv_dtype_name(kv.dtype), ops::detail::gqa_attention_route_name(route),
+            verify_route_chunks(tokens, route), cold_cache->bytes, bytes.useful_kv, bytes.scratch,
+            bytes.total, r.n_runs, verify_route_ncu_kernel_regex(route, kv.dtype));
         return;
     }
 
     launch(nullptr);
     CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    const VerifyRoute route = verify_route(tokens, context);
     std::printf("PROFILE_ONCE gqa_attention cached-small-T T=%d context=%d kv_dtype=%s "
-                "splits=%d useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu "
+                "route=%s chunks=%d useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu "
                 "ncu_kernel_regex='%s'\n",
                 tokens, context, kv_dtype_name(kv.dtype),
-                small_t_active_splits(tokens, context, kv.dtype), bytes.useful_kv, bytes.scratch,
-                bytes.total, small_t_ncu_kernel_regex(kv.dtype));
+                ops::detail::gqa_attention_route_name(route), verify_route_chunks(tokens, route),
+                bytes.useful_kv, bytes.scratch, bytes.total,
+                verify_route_ncu_kernel_regex(route, kv.dtype));
 }
 
 void launch_kv_append_control(DType kv_dtype, const DBuf& k, const DBuf& v, DBuf& control_k,
@@ -1723,8 +1787,8 @@ Options parse_options(int argc, char** argv) {
     }
     if (opt.append_small_t || opt.cached_small_t) {
         for (const std::int32_t tokens : opt.tokens) {
-            if (tokens <= 0 || tokens > 6) {
-                fail_usage("small-T attention supports T values in [1,6]");
+            if (tokens <= 0 || tokens > 16) {
+                fail_usage("small-T attention supports T values in [1,16]");
             }
         }
     }

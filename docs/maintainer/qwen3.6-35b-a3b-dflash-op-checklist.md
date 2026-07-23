@@ -110,7 +110,7 @@ Work these rows in order unless whole-round profiling demonstrates a different d
 | DV-01 | [x] | W8 `gdn_input_proj_conv_snapshot`, 30 calls | `T=1` fused decode; every exact `T=2..16` uses one split-K MMA kernel with fused projection, convolution, SiLU, Q/K/V split, z store, and snapshot publication; `T>=17` retains the composed fallback. | `test_gdn_input_proj_conv_snapshot`; `w8_input_proj_bench --op gdn-snapshot`; `gdn_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-02 | [x] | `gdn_norm_gating_proj`, 30 calls | Every exact `T=1..16` uses one cooperative split-32 MMA kernel with fused RMS reduction, normalized BF16 hidden publication, direct normalized A/B projection, and gate/beta transforms; larger T retains the composed route. | `test_gdn_gating_proj`, `test_gdn_gating_proj_plan`; `gdn_gating_proj_bench --35b --norm-control`, `gdn_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-03 | [x] | `gated_delta_rule_snapshot`, 30 calls | Every exact `T=1..16` uses one four-warp recurrent kernel with fused Q/K normalization, register-resident running state, vectorized FP32 snapshot stores, no workspace, and no route boundary. Each 35B layer reads one 2 MiB state and publishes another 2 MiB per column. | `test_gated_delta_rule`; `gated_delta_rule_bench --small-t --H_v 32`, `gdn_layer_bench --qk-norm` | [x] | [x] | [x] | [x] |
-| DV-04 | [ ] | `gqa_attention`, 10 calls | Decode-specialized append/attention covers `T<=6`; `T=7..16` enters the prompt/prefill implementation. Cost and winner depend on live context and KV codec. | `test_gqa_attention`; `gqa_attention_bench`, `attention_layer_bench` | [ ] | [ ] | [ ] | [ ] |
+| DV-04 | [x] | `gqa_attention`, 10 calls | `T<=6` keeps the direct small-T route. For 35B, `T=7..12` uses prompt through 512 visible keys and otherwise 2 small-T chunks; `T=13..16` uses prompt through 1024 and otherwise 3 chunks. Each chunk has at most six sequential columns and reuses one workspace allocation. BF16 and INT8-G64 share the context policy. | `test_gqa_attention`; `gqa_attention_bench --append-small-t`/`--cached-small-t`, `attention_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-05 | [ ] | `sparse_moe`, 40 calls | Main Q4+Q5/Q6 profiles stay on Small-T for all `T=2..16` (Small-T through 44). It has no route cliff here but is invoked after every layer and streams routed/shared weights. | `test_sparse_moe`; `sparse_moe_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-06 | [ ] | Q6 `linear` output head `[248320,2048]`, 1 call | `T=1..4` SIMT C4, `T=5..6` SIMT C8, `T>=7` MMA R64C128. The `T=6/7` transition spans the full vocabulary head. | `test_linear`, `test_q6_linear_plan`; `linear_op_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-07 | [ ] | W8 `attn_input_proj` `[9216,2048]`, 10 calls | `T=1` decode; `T=2..12` SIMT R8C4; `T=13..16` MMA R32C128. The dFlash range crosses `T=12/13`. | `test_linear`, `test_input_proj_plan`; `w8_input_proj_bench`, `attention_layer_bench` | [ ] | [ ] | [ ] | [ ] |
@@ -198,6 +198,44 @@ of FP32 snapshots per GDN layer. Whether dFlash needs every intermediate state i
 decision in Section 5, not a legal shortcut inside this Op qualification. Complete
 `target_verify(T=7..16)` evidence remains blocked by the current fixed `K<=5` controller.
 
+#### DV-04 qualification record
+
+This Op was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`, for A1
+append-and-attend and A3 cached attention, BF16 and INT8-G64 KV, every exact `T=1..16`, and live
+contexts 128, 1024, and 8192. The containing-layer measurements used CUDA Graph replay, a 256 MiB
+L2 flush, five warmups, and 40 measured repetitions.
+
+- **C:** every 35B `T=1..16` A1 and A3 route passed the shared independent FP64 attention oracle
+  directly in both cache formats. The test also compares all A1/A2 cache code and scale bits,
+  exercises the first chunked point after each prompt frontier, and captures T=16 prompt and
+  chunked CUDA Graphs for both cache formats. Sequential chunks preserve causality because each
+  chunk publishes its cache rows before the following chunk; every output column is still checked
+  against the complete logical cache formula.
+- **B:** `gqa_attention_bench` now accepts T=1..16 for append and cached modes, reports
+  `small_t`, `prompt`, or `chunked_small_t`, counts chunks, models each chunk's cache and scratch
+  traffic separately, and allocates through the public workspace query. At context 8192, append
+  BF16 hot-cache medians were 73.24 us at T=7 and 108.97 us at T=16; INT8 measured 65.94 and
+  109.25 us. With a 256 MiB L2 flush before each sample, the same points were 86.85/129.86 us and
+  73.82/125.34 us. Cached timings remained within 2 us of append. The short-context prompt route
+  measured 15--22 us across T=7..16.
+- **O:** the former prompt route measured 474--476 us for BF16 and 430--436 us for INT8 at context
+  8192. Chunking is therefore 77%--85% faster at T=7..16 there. Two chunks become worthwhile
+  beyond 512 visible keys; the third becomes worthwhile beyond 1024. The retained policy avoids
+  the measured three-chunk loss below that second frontier, leaves the 27B route unchanged, and
+  caps transient storage at the reused T=6 allocation (8,486,400 bytes) instead of scaling it
+  with T. The 35B MTP graph ranges include both crossover frontiers so a captured graph never
+  spans a route change.
+- **E:** against the explicit old prompt control, captured 35B attention-layer latency at context
+  8192 improved from 525.54 to 120.10 us (77.1%) at T=7 and from 551.33 to 177.31 us (67.8%) at
+  T=16 for BF16. INT8 improved from 480.42 to 107.90 us (77.5%) and from 505.09 to 173.31 us
+  (65.7%). At context 1024, the gains were 30%/13% for BF16 and 32%/10% for INT8 at T=7/T=16.
+  The route transitions themselves do not introduce a latency cliff: layer latency improves by
+  2%--5% at visible 512/513 for T=12 and by 9%--10% at visible 1024/1025 for T=16.
+
+As with the preceding rows, the current controller cannot issue a complete T=7..16 target verify,
+so DV-04 closes the Op and full-attention-layer criteria rather than claiming a complete dFlash
+round speedup.
+
 ### P1: frequent elementwise, normalization, and selection Ops
 
 These Ops are individually smaller, but their aggregate launch and memory cost can become material
@@ -218,13 +256,13 @@ after the P0 contractions and state transitions are optimized.
 
 - [x] Extend `gdn_layer_bench --t-sweep` from the former hard limit `1..6` to exact `1..16`,
   with sufficient snapshot slots for each case.
-- [ ] Extend `attention_layer_bench --t-sweep` from the current hard limit `1..6` to exact
+- [x] Extend `attention_layer_bench --t-sweep` from the current hard limit `1..6` to exact
   `1..16`.
 - [x] Add an explicit exact `T=1..16` small-state mode to `gated_delta_rule_bench`, with 17
   snapshot slots, complete route labels, and state-publication byte accounting.
 - [ ] Make every P0 benchmark print the selected production route so a fast result cannot hide an
   unintended fallback.
-- [ ] Add one target-layer benchmark for each of the 35B attention and GDN layers at `T=1..16`.
+- [x] Add one target-layer benchmark for each of the 35B attention and GDN layers at `T=1..16`.
 - [ ] Add a complete `target_verify`/speculative-round measurement before accepting any isolated
   Op optimization as an end-to-end win.
 

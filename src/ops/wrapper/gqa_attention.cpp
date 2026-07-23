@@ -4,6 +4,7 @@
 #include "core/layout.h"
 #include "ops/launcher/gqa_attention.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -13,8 +14,12 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kHeadDim = 256;
-constexpr float kExpectedScale  = 0.0625f;
+constexpr std::int32_t kHeadDim                      = 256;
+constexpr float kExpectedScale                       = 0.0625f;
+constexpr std::int32_t kSmallTChunkTokens            = 6;
+constexpr std::int32_t kMaximumVerifyTokens          = 16;
+constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
+constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 
 std::int32_t kv_heads_for_q_heads(std::int32_t q_heads, const char* op) {
     if (q_heads == 24) { return 4; }
@@ -147,10 +152,87 @@ SmallTWorkspace allocate_small_t_workspace(WorkspaceArena& workspace, std::int32
     };
 }
 
+template <typename Launch>
+void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
+                            Tensor& out, Launch&& launch) {
+    for (std::int32_t begin = 0; begin < q.ne[2]; begin += kSmallTChunkTokens) {
+        const std::int32_t count = std::min(kSmallTChunkTokens, q.ne[2] - begin);
+        auto chunk_scope         = workspace.scope();
+        SmallTWorkspace partial  = allocate_small_t_workspace(workspace, q.ne[1], count);
+        Tensor q_chunk           = q.slice(2, begin, count);
+        Tensor position_chunk    = positions.slice(0, begin, count);
+        Tensor out_chunk         = out.slice(2, begin, count);
+        launch(begin, count, q_chunk, position_chunk, partial, out_chunk);
+    }
+}
+
+void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
+                            const Tensor& positions, float scale, KVCacheLayerView cache,
+                            GqaExecutionEnvelope envelope, WorkspaceArena& workspace, Tensor& out,
+                            cudaStream_t stream) {
+    for_each_small_t_chunk(
+        q, positions, workspace, out,
+        [&](std::int32_t begin, std::int32_t count, const Tensor& q_chunk,
+            const Tensor& position_chunk, SmallTWorkspace& partial, Tensor& out_chunk) {
+            Tensor k_chunk = k.slice(2, begin, count);
+            Tensor v_chunk = v.slice(2, begin, count);
+            detail::gqa_attention_small_t_launch(q_chunk, k_chunk, v_chunk, position_chunk, scale,
+                                                 cache, envelope, partial.acc, partial.m, partial.l,
+                                                 out_chunk, stream);
+        });
+}
+
+void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, float scale,
+                                   const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,
+                                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    for_each_small_t_chunk(
+        q, positions, workspace, out,
+        [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
+            SmallTWorkspace& partial, Tensor& out_chunk) {
+            detail::gqa_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
+                                                        envelope, partial.acc, partial.m, partial.l,
+                                                        out_chunk, stream);
+        });
+}
+
 } // namespace
 
+namespace detail {
+
+GqaAttentionRoute gqa_attention_resolve_route(std::int32_t q_heads, std::int32_t tokens,
+                                              GqaExecutionEnvelope envelope) {
+    if (tokens >= 1 && tokens <= kSmallTChunkTokens) { return GqaAttentionRoute::SmallT; }
+    const std::uint32_t prompt_visible_keys = tokens <= 2 * kSmallTChunkTokens
+                                                  ? kTwoChunkPromptVisibleKeys
+                                                  : kThreeChunkPromptVisibleKeys;
+    if (q_heads == 16 && tokens <= kMaximumVerifyTokens &&
+        envelope.max_visible_keys > prompt_visible_keys) {
+        return GqaAttentionRoute::ChunkedSmallT;
+    }
+    return GqaAttentionRoute::Prompt;
+}
+
+const char* gqa_attention_route_name(GqaAttentionRoute route) {
+    switch (route) {
+    case GqaAttentionRoute::SmallT:
+        return "small_t";
+    case GqaAttentionRoute::ChunkedSmallT:
+        return "chunked_small_t";
+    case GqaAttentionRoute::Prompt:
+        return "prompt";
+    }
+    return "unknown";
+}
+
+} // namespace detail
+
 std::size_t gqa_attention_workspace_bytes(std::int32_t q_heads, std::int32_t tokens) {
-    if (tokens <= 0 || !detail::gqa_attention_uses_small_t(tokens)) { return 0; }
+    if (tokens <= 0) { return 0; }
+    const bool direct_small_t = detail::gqa_attention_uses_small_t(tokens);
+    const bool chunkable_35b =
+        q_heads == 16 && tokens <= kMaximumVerifyTokens && tokens > kSmallTChunkTokens;
+    if (!direct_small_t && !chunkable_35b) { return 0; }
+    tokens                      = std::min(tokens, kSmallTChunkTokens);
     const std::int32_t kv_heads = kv_heads_for_q_heads(q_heads, "gqa_attention_workspace_bytes");
     const std::int32_t splits   = detail::gqa_attention_decode_splits(q_heads, kv_heads);
     const Tensor acc(nullptr, DType::BF16, {kHeadDim, q_heads, tokens, splits});
@@ -178,6 +260,11 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     require_contiguous_nonnull(v, op, "v");
 
     auto scope = workspace.scope();
+    if (detail::gqa_attention_resolve_route(q.ne[1], tokens, envelope) ==
+        detail::GqaAttentionRoute::ChunkedSmallT) {
+        launch_chunked_small_t(q, k, v, positions, scale, cache, envelope, workspace, out, stream);
+        return;
+    }
     if (detail::gqa_attention_uses_small_t(tokens)) {
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], tokens);
         detail::gqa_attention_launch(q, k, v, positions, scale, cache, envelope, &partial.acc,
@@ -221,6 +308,11 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
     auto scope = workspace.scope();
+    if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], envelope) ==
+        detail::GqaAttentionRoute::ChunkedSmallT) {
+        launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
+        return;
+    }
     if (detail::gqa_attention_uses_small_t(q.ne[2])) {
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2]);
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,

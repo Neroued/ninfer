@@ -28,6 +28,7 @@
 #include "ninfer_bench_common.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
+#include "ops/kernel/rmsnorm.cuh"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
 #include <cuda_runtime.h>
@@ -71,6 +72,7 @@ struct Options {
     std::string route        = "fused";
     std::string qk_norm      = "fused";
     std::string norm_control = "fused";
+    std::string gated_rms    = "auto";
     std::string output_route = "auto";
     std::string csv_out;
 };
@@ -86,6 +88,7 @@ struct Result {
     std::size_t graph_nodes = 0;
     std::string input_route;
     std::string control_route;
+    std::string gated_rms_route;
     std::string output_route;
     Timing timing;
 };
@@ -240,6 +243,11 @@ Options parse_options(int argc, char** argv) {
             if (options.norm_control != "fused" && options.norm_control != "composed") {
                 throw std::invalid_argument("--norm-control must be fused or composed");
             }
+        } else if (arg == "--gated-rms-route") {
+            options.gated_rms = next("--gated-rms-route value");
+            if (options.gated_rms != "auto" && options.gated_rms != "dv10-b1024") {
+                throw std::invalid_argument("--gated-rms-route must be auto or dv10-b1024");
+            }
         } else if (arg == "--output-route") {
             options.output_route = next("--output-route value");
             if (options.output_route != "auto" && options.output_route != "dv08-control") {
@@ -249,6 +257,7 @@ Options parse_options(int argc, char** argv) {
             std::printf("Usage: %s [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--route fused|composed] "
                         "[--qk-norm fused|composed] [--norm-control fused|composed] "
+                        "[--gated-rms-route auto|dv10-b1024] "
                         "[--output-route auto|dv08-control] "
                         "[--csv-out PATH]\n",
                         argv[0]);
@@ -484,8 +493,21 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
         ops::gated_delta_rule_snapshot(
             q_recurrent, k_recurrent, v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
             fused_qk_norm, resources.workspace, ssm_states, initial_slot, recurrent_out, s);
-        ops::gated_rmsnorm(recurrent_out, gdn_norm, z.view({kHeadDim, kValueHeads, tokens}), kEps,
-                           gated_out, s);
+        if (options.gated_rms == "dv10-b1024") {
+            constexpr int block          = 1024;
+            constexpr int rows_per_block = block / 32;
+            const std::int64_t rows      = static_cast<std::int64_t>(kValueHeads) * tokens;
+            const auto grid =
+                static_cast<unsigned int>((rows + rows_per_block - 1) / rows_per_block);
+            ops::rmsnorm_warp_bf16x2_kernel<ops::RmsEpilogue::Gated, block><<<grid, block, 0, s>>>(
+                static_cast<const __nv_bfloat162*>(recurrent_out.data),
+                static_cast<const __nv_bfloat162*>(gdn_norm.data),
+                static_cast<const __nv_bfloat162*>(z.data),
+                static_cast<__nv_bfloat162*>(gated_out.data), kHeadDim, rows, kEps);
+        } else {
+            ops::gated_rmsnorm(recurrent_out, gdn_norm, z.view({kHeadDim, kValueHeads, tokens}),
+                               kEps, gated_out, s);
+        }
         const Tensor output_input = gated_out.view({kValueRows, tokens});
         if (options.output_route == "dv08-control") {
             const auto variant = tokens % 4 == 0 ? ops::detail::W8KernelVariant::Full
@@ -532,6 +554,8 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
             options.norm_control == "fused"
                 ? ops::detail::bf16_gdn_norm_gating_schedule_name(norm_control_plan.schedule)
                 : ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),
+            options.gated_rms == "dv10-b1024" ? "gated_rms.candidate.warp_bf16x2_b1024"
+                                              : "gated_rms.production",
             options.output_route == "dv08-control"
                 ? std::string("dv08_control.") +
                       ops::detail::w8_schedule_name(ops::detail::W8ScheduleId::SimtR8C4)
@@ -545,12 +569,13 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream out(path);
     out << "T,graph_nodes,cold_median_us,cold_min_us,cold_p95_us,input_route,control_route,"
-           "output_route,flush_bytes,warmup,repeat\n";
+           "gated_rms_route,output_route,flush_bytes,warmup,repeat\n";
     for (const Result& result : results) {
         out << result.tokens << ',' << result.graph_nodes << ',' << result.timing.median_us << ','
             << result.timing.min_us << ',' << result.timing.p95_us << ',' << result.input_route
-            << ',' << result.control_route << ',' << result.output_route << ','
-            << options.flush_bytes << ',' << options.warmup << ',' << options.repeat << '\n';
+            << ',' << result.control_route << ',' << result.gated_rms_route << ','
+            << result.output_route << ',' << options.flush_bytes << ',' << options.warmup << ','
+            << options.repeat << '\n';
     }
 }
 
@@ -609,6 +634,7 @@ void print_route_legend(const std::vector<Result>& results, char id_prefix, cons
 void print_results(const Options& options, const std::vector<Result>& results) {
     const auto input_routes   = unique_routes(results, &Result::input_route);
     const auto control_routes = unique_routes(results, &Result::control_route);
+    const auto gated_routes   = unique_routes(results, &Result::gated_rms_route);
     const auto output_routes  = unique_routes(results, &Result::output_route);
 
     std::printf("Qwen3.6-35B-A3B GDN verify layer\n");
@@ -621,12 +647,13 @@ void print_results(const Options& options, const std::vector<Result>& results) {
 
     std::printf("Latency (us)\n");
     std::printf("  T   nodes    median       min       p95   routes\n");
-    std::printf("---  ------  --------  --------  --------  --------\n");
+    std::printf("---  ------  --------  --------  --------  ------------\n");
     for (const Result& result : results) {
-        std::printf("%3d  %6zu  %8.3f  %8.3f  %8.3f  I%zu/C%zu/O%zu\n", result.tokens,
+        std::printf("%3d  %6zu  %8.3f  %8.3f  %8.3f  I%zu/C%zu/G%zu/O%zu\n", result.tokens,
                     result.graph_nodes, result.timing.median_us, result.timing.min_us,
                     result.timing.p95_us, route_id(input_routes, result.input_route),
                     route_id(control_routes, result.control_route),
+                    route_id(gated_routes, result.gated_rms_route),
                     route_id(output_routes, result.output_route));
     }
 
@@ -634,6 +661,7 @@ void print_results(const Options& options, const std::vector<Result>& results) {
     std::printf("  ID  stage    tokens   implementation\n");
     print_route_legend(results, 'I', "input", &Result::input_route, input_routes);
     print_route_legend(results, 'C', "control", &Result::control_route, control_routes);
+    print_route_legend(results, 'G', "gated", &Result::gated_rms_route, gated_routes);
     print_route_legend(results, 'O', "output", &Result::output_route, output_routes);
 }
 

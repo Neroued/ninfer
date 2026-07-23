@@ -38,6 +38,7 @@ struct Shape {
 enum class Route {
     Production,
     CandidateB128,
+    CandidateB1024,
     Payload,
 };
 
@@ -195,6 +196,17 @@ void run(const Shape& shape, int tokens, Route route) {
                     static_cast<const __nv_bfloat162*>(x.p),
                     static_cast<const __nv_bfloat162*>(weight.p), nullptr,
                     static_cast<__nv_bfloat162*>(out.p), shape.d, rows, 1.0e-6f);
+        } else if (route == Route::CandidateB1024 && shape.gated && shape.d == 128) {
+            constexpr int block          = 1024;
+            constexpr int rows_per_block = block / 32;
+            const auto grid =
+                static_cast<unsigned int>((rows + rows_per_block - 1) / rows_per_block);
+            ops::rmsnorm_warp_bf16x2_kernel<ops::RmsEpilogue::Gated, block>
+                <<<grid, block, 0, stream>>>(static_cast<const __nv_bfloat162*>(x.p),
+                                              static_cast<const __nv_bfloat162*>(weight.p),
+                                              static_cast<const __nv_bfloat162*>(z.p),
+                                              static_cast<__nv_bfloat162*>(out.p), shape.d, rows,
+                                              1.0e-6f);
         } else if (shape.gated) {
             ops::gated_rmsnorm(tx, tw, tz, 1.0e-6f, tout, stream);
         } else {
@@ -204,10 +216,14 @@ void run(const Shape& shape, int tokens, Route route) {
     const Result result = bench_loop(launch, bytes);
 
     char tag[160];
-    const char* route_name =
-        route == Route::Production
-            ? production_route(shape, rows)
-            : (route == Route::CandidateB128 ? "candidate-cta-bf16x2-b128" : "payload-control");
+    const char* route_name = production_route(shape, rows);
+    if (route == Route::CandidateB128) {
+        route_name = "candidate-cta-bf16x2-b128";
+    } else if (route == Route::CandidateB1024) {
+        route_name = "candidate-warp-bf16x2-b1024";
+    } else if (route == Route::Payload) {
+        route_name = "payload-control";
+    }
     std::snprintf(tag, sizeof(tag), "%s %-8s T=%-4d [D=%d,rows=%d] route=%s",
                   route == Route::Payload ? "control" : "rmsnorm", shape.name, tokens, shape.d,
                   rows, route_name);
@@ -244,11 +260,14 @@ int main(int argc, char** argv) {
             route = Route::Payload;
         } else if (!std::strcmp(argv[i], "--candidate-b128")) {
             route = Route::CandidateB128;
+        } else if (!std::strcmp(argv[i], "--candidate-b1024")) {
+            route = Route::CandidateB1024;
         } else {
             std::fprintf(stderr,
                          "usage: %s [--decode] [--prefill] "
                          "[--kind hidden35|q35|k35|gated35|hidden27 "
-                         "(--tokens T|--t-sweep 1,2,...,16)] [--control|--candidate-b128]\n",
+                         "(--tokens T|--t-sweep 1,2,...,16)] "
+                         "[--control|--candidate-b128|--candidate-b1024]\n",
                          argv[0]);
             return 2;
         }
@@ -262,6 +281,10 @@ int main(int argc, char** argv) {
         const Shape& shape = find_shape(selected_kind);
         if (route == Route::CandidateB128 && (shape.gated || shape.d != 2048)) {
             std::fprintf(stderr, "--candidate-b128 requires --kind hidden35\n");
+            return 2;
+        }
+        if (route == Route::CandidateB1024 && (!shape.gated || shape.d != 128)) {
+            std::fprintf(stderr, "--candidate-b1024 requires --kind gated35\n");
             return 2;
         }
         if (selected_tokens > 0) {

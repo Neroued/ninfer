@@ -258,7 +258,10 @@ int main() {
         f += one_shape("rmsnorm 35b k exact T", 256, 2, tokens, true, false,
                        3701u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
     }
-    f += one_shape("rmsnorm 35b gated [128,32,6]", 128, 32, 6, false, true, 3504u, -8.f, 8.f);
+    for (std::int32_t tokens = 1; tokens <= 16; ++tokens) {
+        f += one_shape("rmsnorm 35b gated exact T", 128, 32, tokens, false, true,
+                       3801u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
+    }
     f += one_shape("rmsnorm fast plain [192,5]", 192, 5, 1, false, false, 3505u, -8.f, 8.f);
     f += one_shape("rmsnorm stress [-60,60]", 260, 3, 1, true, false, 4242u, -60.f, 60.f);
     f += one_shape("rmsnorm gated stress [-60,60]", 128, 48, 7, false, true, 4343u, -60.f, 60.f);

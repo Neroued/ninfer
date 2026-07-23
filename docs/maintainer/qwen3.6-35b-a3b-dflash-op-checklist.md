@@ -371,7 +371,7 @@ after the P0 contractions and state transitions are optimized.
 | ID | Status | Op | Calls per verify | Qualification focus | Test/benchmark |
 |---|---|---|---:|---|---|
 | DV-09 | [x] | `rmsnorm` | 71 | Exact `T=1..16` for hidden, Q, and K row counts; assess safe fusion only at an owning semantic boundary. | `test_rmsnorm`; `rmsnorm_bench` |
-| DV-10 | [ ] | `gated_rmsnorm` | 30 | `[4096,T]` with z gate; check launch/memory scaling and downstream arithmetic criterion. | `test_rmsnorm`; `rmsnorm_bench` |
+| DV-10 | [x] | `gated_rmsnorm` | 30 | `[4096,T]` with z gate; check launch/memory scaling and downstream arithmetic criterion. | `test_rmsnorm`; `rmsnorm_bench` |
 | DV-11 | [ ] | `rope` | 10 | `[4096,T]` Q and `[512,T]` K, rotary 64, absolute positions; current launcher changes small-token geometry after 6. | `test_rope`; `rope_bench` |
 | DV-12 | [ ] | `sigmoid_mul` | 10 | Gate `[4096,T]`; exact odd/partial token extents and graph replay. | `test_sigmoid_mul`; `sigmoid_mul_bench` |
 | DV-13 | [ ] | `embedding` | 1 | W8 `[248320,2048]`, gathered ids for `T=1..16`; include repeated ids and physical row decode. | `test_embedding`; `embedding_bench` |
@@ -399,6 +399,27 @@ The 35B offset RMSNorm domains were qualified on NVIDIA GeForce RTX 5090, CUDA 1
   58.21/58.62 us at `T=12`, and 58.66/60.70 us at `T=16`; at context 8192 and `T=16` they were
   142.62/144.67 us. The production route is therefore the qualified winner, and DV-09 deliberately
   changes qualification coverage and tooling rather than the runtime kernel.
+
+#### DV-10 qualification record
+
+The 35B gated RMSNorm domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`.
+
+- **C:** the public production route passed the independent naive FP64 oracle for the complete
+  RMS normalization, weight multiplication, SiLU gate, and BF16 output at every exact
+  `[128,32,T]`, `T=1..16`. Existing general gated and stress-input cases remain covered by the
+  same suite.
+- **B:** the exact-T benchmark reports the production `warp-bf16x2-b512` route. With 20 warmups
+  and at least 100 measured CUDA-event batches over 500 ms, hot medians were 9.41--9.64 us over
+  `T=1..16`, with no route change or long-T cliff.
+- **O:** a 1024-thread candidate packed all 32 row warps for one token into each CTA and measured
+  9.24--9.46 us, improving most isolated points by about 1%--4%. It did not change launch count or
+  external traffic and was retained only as an explicit diagnostic route pending containing-layer
+  evidence.
+- **E:** four reverse-order captured GDN-layer pairs, each with 20 warmups, 200 measured replays,
+  and a 256 MiB L2 flush, found no median improvement: production and candidate both measured
+  50.432 us at `T=8`, 58.624 us at `T=12`, and 64.768 us at `T=16`. Production therefore keeps
+  the existing 512-thread route; DV-10 adds complete qualification and reproducible candidate
+  evidence without changing the runtime kernel.
 
 ### P0 measurement infrastructure
 

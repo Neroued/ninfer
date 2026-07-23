@@ -35,5 +35,3 @@ artifact contracts, and Op-development rules used for ongoing project maintenanc
 additional user workflows or installed API documentation.
 
 Active implementation design:
-
-- [Qwen3.6 small-T GDN fusion](maintainer/qwen3.6-35b-a3b-gdn-small-t-fusion.md)

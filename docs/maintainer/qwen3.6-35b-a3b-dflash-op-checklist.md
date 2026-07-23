@@ -644,7 +644,7 @@ integrate the selected composed routes without adding `FUT-F01` or `FUT-F04` in 
 
 ### OP-A03: W8 `linear_pair [1024,2048]`
 
-**Status:** [ ] admission [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] admission [x] correctness [x] benchmark [x] route [ ] integration
 
 For context feature `c [2048,T]`, create zero-copy row views of one stored QKV parent:
 
@@ -664,6 +664,32 @@ Qualification covers every exact `T=1..16`, every product block `B=2..16`, repre
 extents, exact row-view offsets and group-scale addressing, direct distinct K/V outputs, Graph
 replay, and comparison against two independently decoded FP64 projections. The benchmark includes
 two ordinary `linear` calls as the composed control.
+
+**Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
+
+- The public Op admits the exact adjacent W8 parent row views and rejects shifted, detached, or
+  overlapping operands. `ninfer_linear_test` compares both complete outputs with independently
+  decoded FP64 projections at every `T=1..16`; it also checks every production seam through
+  `T=2271`, row-view and group-scale offsets, distinct poisoned outputs and guards, preserved
+  inputs and packed weights, composed controls, and CUDA Graph replay.
+- The retained benchmark exposes direct decode, exact- and medium-T split-K, dual-MMA,
+  concatenated K/V MMA, exact-tail candidates, and two public `linear` calls. A cold-cache
+  `T=1..2305` sweep selected the measured winner at every seam. Every production-route
+  transition from `T=193` onward is at most 10.2%, and the largest route change below it is
+  13.4% at `T=64/65`; the larger `T=7/8` step is inside one exact-T family rather than a dispatch
+  transition.
+- Production takes 7.424 us at `T=1`, 11.520 us at `T=16`, 64.768 us at `T=1280`
+  (165.8 useful TFLOP/s, 75.2% of the same-process dense Tensor Core ceiling), and 115.872 us
+  at `T=2048` (148.3 useful TFLOP/s). It is 2.06x, 2.04x, 1.18x, and 1.21x faster than two
+  ordinary `linear` calls at those four extents.
+- Focused NCU confirms BF16-FP32 HMMA throughout prefill. `T=1024` executes exactly
+  8,589,934,592 useful HMMA operations. At the measured roofline point `T=1280`, tensor-pipe
+  active cycles reach 74.9%; at `T=2048`, compute throughput is 67.5% versus 4.5% DRAM,
+  tensor-pipe active cycles are 72.9%, and the only excess HMMA work is the selected
+  `96x96` tile fringe. The remaining dense-ceiling gap is required W8 decode/staging and grid
+  wave quantization. Decode uses the measured one-pass R4 winner and is grid/memory-latency
+  limited.
+- Target, Program, and Engine wiring remains intentionally unchecked in this Op-only phase.
 
 ### OP-A04: D128 `rope`
 
@@ -1160,10 +1186,10 @@ commit together.
 | 3 | `OP-A05` | W8 Q/K/V direct projection | [x] | [x] | [x] | [ ] |
 | 4 | `OP-N03` | Bidirectional full GQA | [x] | [x] | [x] | [ ] |
 | 5 | `OP-N02` | Symmetric non-causal SWA | [x] | [x] | [x] | [ ] |
-| 6 | `OP-A06` | W8 fused dense SwiGLU | [ ] | [ ] | [ ] | [ ] |
-| 7 | `OP-A07` | W8 MLP down plus residual | [ ] | [ ] | [ ] | [ ] |
-| 8 | `OP-A01` | W8 target-feature projection | [ ] | [ ] | [ ] | [ ] |
-| 9 | `OP-A03` | W8 context K/V pair projection | [ ] | [ ] | [ ] | [ ] |
+| 6 | `OP-A06` | W8 fused dense SwiGLU | [x] | [x] | [x] | [ ] |
+| 7 | `OP-A07` | W8 MLP down plus residual | [x] | [x] | [x] | [ ] |
+| 8 | `OP-A01` | W8 target-feature projection | [x] | [x] | [x] | [ ] |
+| 9 | `OP-A03` | W8 context K/V pair projection | [x] | [x] | [x] | [ ] |
 | 10 | `OP-N04` | Device-count linear/ring prefix append | [x] | [x] | [x] | [ ] |
 | 11 | `OP-N01` | Masked-block preparation | [x] | [x] | [x] | [ ] |
 | 12 | `OP-R01..R06` | Focused reuse and composed-route checks | [ ] | [ ] | [ ] | [ ] |

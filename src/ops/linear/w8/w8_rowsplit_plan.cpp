@@ -37,7 +37,7 @@ struct W8RouteSpec {
     W8TailPolicy tail_policy = W8TailPolicy::Homogeneous;
 };
 
-constexpr std::array<W8SupportSpec, 14> kSupportSpecs{{
+constexpr std::array<W8SupportSpec, 15> kSupportSpecs{{
     {5120, 10240, 10240, {1, kAnyCols, 1}, 0, 3},
     {14336, 5120, 5120, {1, kAnyCols, 1}, 3, 3},
     {1024, 5120, 5120, {1, kAnyCols, 1}, 6, 3},
@@ -52,9 +52,10 @@ constexpr std::array<W8SupportSpec, 14> kSupportSpecs{{
     {12288, 2048, 2048, {1, kAnyCols, 1}, 45, 2},
     {9216, 2048, 2048, {1, kAnyCols, 1}, 47, 3},
     {2048, 16384, 16384, {1, kAnyCols, 1}, 50, 39},
+    {1024, 2048, 2048, {1, kAnyCols, 1}, 89, 3},
 }};
 
-constexpr std::array<W8RouteSpec, 89> kRouteSpecs{{
+constexpr std::array<W8RouteSpec, 92> kRouteSpecs{{
     // [5120,10240]
     {{1, 4, 1}, W8ScheduleId::SimtR8C4},
     {{5, 16, 1}, W8ScheduleId::SimtR8C8},
@@ -171,6 +172,11 @@ constexpr std::array<W8RouteSpec, 89> kRouteSpecs{{
     {{2017, 2048, 1}, W8ScheduleId::MmaR64C96, W8TailPolicy::ConditioningExact},
     {{2049, 2112, 1}, W8ScheduleId::MmaR96C96},
     {{2113, kAnyCols, 1}, W8ScheduleId::MmaR64C128},
+
+    // DFlash context K/V row views [1024,2048], composed-control parent Linear
+    {{1, 4, 1}, W8ScheduleId::SimtR8C4},
+    {{5, 16, 1}, W8ScheduleId::SimtR8C8},
+    {{17, kAnyCols, 1}, W8ScheduleId::MmaR32C128},
 }};
 
 constexpr bool known_schedule(W8ScheduleId schedule) noexcept {

@@ -134,6 +134,21 @@ Weight device_weight(const PackedW8& packed, void* device) {
     return weight;
 }
 
+Weight w8_row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
+    Weight view                      = parent;
+    const std::size_t code_row_bytes = static_cast<std::size_t>(parent.padded_shape[1]);
+    const std::size_t scale_row_bytes =
+        static_cast<std::size_t>(parent.padded_shape[1] / parent.group) * 2u;
+    view.qdata = static_cast<const std::uint8_t*>(parent.qdata) +
+                 static_cast<std::size_t>(row_begin) * code_row_bytes;
+    view.scales = static_cast<const std::uint8_t*>(parent.scales) +
+                  static_cast<std::size_t>(row_begin) * scale_row_bytes;
+    view.n               = rows;
+    view.shape[0]        = rows;
+    view.padded_shape[0] = rows;
+    return view;
+}
+
 void fill_device_input(void* device, std::size_t count, std::uint32_t seed) {
     constexpr std::array<float, 8> kValues{{
         -1.0f,
@@ -487,6 +502,90 @@ void pair_routes() {
     } catch (const std::invalid_argument&) {}
 }
 
+void dflash_pair_routes() {
+    constexpr std::int32_t rows        = 1024;
+    constexpr std::int32_t k           = 2048;
+    constexpr std::int32_t parent_rows = 6144;
+    constexpr std::int32_t max_cols    = 2271;
+    PackedW8 packed                    = make_deterministic_w8(parent_rows, k, 229u);
+    DeviceBuffer weight_buffer(packed.payload.size());
+    require_cuda(cudaMemcpy(weight_buffer.data(), packed.payload.data(), packed.payload.size(),
+                            cudaMemcpyHostToDevice),
+                 "dFlash pair parent weight cudaMemcpy");
+    const Weight parent        = device_weight(packed, weight_buffer.data());
+    const Weight first_weight  = w8_row_view(parent, 4096, rows);
+    const Weight second_weight = w8_row_view(parent, 5120, rows);
+
+    DeviceBuffer input(static_cast<std::size_t>(k) * max_cols * sizeof(std::uint16_t));
+    DeviceBuffer public_first(static_cast<std::size_t>(rows) * max_cols * sizeof(std::uint16_t));
+    DeviceBuffer public_second(static_cast<std::size_t>(rows) * max_cols * sizeof(std::uint16_t));
+    DeviceBuffer fixed_first(static_cast<std::size_t>(rows) * max_cols * sizeof(std::uint16_t));
+    DeviceBuffer fixed_second(static_cast<std::size_t>(rows) * max_cols * sizeof(std::uint16_t));
+    fill_device_input(input.data(), static_cast<std::size_t>(k) * max_cols, 233u);
+    WorkspaceArena workspace(256);
+
+    for (const std::int32_t cols :
+         {1,    2,    16,   32,   33,   48,   49,   64,   65,   80,   81,   88,   89,   96,   97,
+          104,  105,  112,  113,  128,  129,  160,  161,  192,  193,  384,  385,  480,  481,  640,
+          641,  642,  672,  673,  680,  681,  784,  785,  896,  897,  960,  961,  976,  977,  1280,
+          1281, 1316, 1317, 1344, 1345, 1346, 1440, 1441, 1466, 1467, 1680, 1681, 1708, 1709, 1920,
+          1921, 1922, 1923, 2016, 2017, 2018, 2019, 2048, 2049, 2208, 2209, 2270, 2271}) {
+        const std::string label = "W8 dFlash context pair C=" + std::to_string(cols);
+        Tensor x(input.data(), DType::BF16, {k, cols});
+        Tensor public_a(public_first.data(), DType::BF16, {rows, cols});
+        Tensor public_b(public_second.data(), DType::BF16, {rows, cols});
+        Tensor fixed_a(fixed_first.data(), DType::BF16, {rows, cols});
+        Tensor fixed_b(fixed_second.data(), DType::BF16, {rows, cols});
+        const ops::detail::W8PairPlan plan = ops::detail::w8_pair_resolve_plan({rows, k, k, cols});
+
+        ops::linear_pair(x, first_weight, second_weight, public_a, public_b, workspace, nullptr);
+        require_cuda(cudaDeviceSynchronize(), "public dFlash pair synchronize");
+        ops::detail::w8_pair_execute_plan(plan, x, first_weight, second_weight, fixed_a, fixed_b,
+                                          nullptr);
+        require_cuda(cudaDeviceSynchronize(), "fixed dFlash pair synchronize");
+        const std::size_t words = static_cast<std::size_t>(rows) * cols;
+        failures +=
+            compare_device_bf16(label + " first", public_first.data(), fixed_first.data(), words);
+        failures += compare_device_bf16(label + " second", public_second.data(),
+                                        fixed_second.data(), words);
+    }
+
+    Tensor x(input.data(), DType::BF16, {k, 16});
+    Tensor out_a(public_first.data(), DType::BF16, {rows, 16});
+    Tensor out_b(public_second.data(), DType::BF16, {rows, 16});
+    Weight wrong_first = w8_row_view(parent, 4088, rows);
+    try {
+        ops::linear_pair(x, wrong_first, second_weight, out_a, out_b, workspace, nullptr);
+        std::cerr << "FAIL W8 dFlash pair accepted a wrong parent K row offset\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    Weight wrong_second = w8_row_view(parent, 5112, rows);
+    try {
+        ops::linear_pair(x, first_weight, wrong_second, out_a, out_b, workspace, nullptr);
+        std::cerr << "FAIL W8 dFlash pair accepted a wrong parent V row offset\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    Weight wrong_scale = first_weight;
+    wrong_scale.scales = static_cast<const std::uint8_t*>(wrong_scale.scales) + 4;
+    try {
+        ops::linear_pair(x, wrong_scale, second_weight, out_a, out_b, workspace, nullptr);
+        std::cerr << "FAIL W8 dFlash pair accepted a wrong parent K scale offset\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    Weight detached_second  = second_weight;
+    detached_second.payload = second_weight.qdata;
+    try {
+        ops::linear_pair(x, first_weight, detached_second, out_a, out_b, workspace, nullptr);
+        std::cerr << "FAIL W8 dFlash pair accepted detached V parent metadata\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    try {
+        ops::linear_pair(x, first_weight, second_weight, out_a, out_a, workspace, nullptr);
+        std::cerr << "FAIL W8 dFlash pair accepted overlapping outputs\n";
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+}
+
 void rejection_contract() {
     PackedW8 packed = make_deterministic_w8(64, 256, 251u);
     DeviceBuffer weight_buffer(packed.payload.size());
@@ -516,10 +615,11 @@ int main() {
         return 0;
     }
 
-    constexpr std::array<SupportCase, 14> supports{{
+    constexpr std::array<SupportCase, 15> supports{{
         {"W8 [5120,10240]", 5120, 10240, kDefault17Routes.data(), kDefault17Routes.size(), 11u},
         {"W8 [14336,5120]", 14336, 5120, kEarly9Routes.data(), kEarly9Routes.size(), 13u},
         {"W8 [1024,5120]", 1024, 5120, kR32Routes.data(), kR32Routes.size(), 17u},
+        {"W8 [1024,2048]", 1024, 2048, kR32Routes.data(), kR32Routes.size(), 18u},
         {"W8 [6144,5120]", 6144, 5120, kDefault17Routes.data(), kDefault17Routes.size(), 19u},
         {"W8 [5120,6144]", 5120, 6144, kDefault17Routes.data(), kDefault17Routes.size(), 23u},
         {"W8 [34816,5120]", 34816, 5120, kEarly9Routes.data(), kEarly9Routes.size(), 29u},
@@ -540,6 +640,7 @@ int main() {
     try {
         for (const SupportCase& support : supports) { run_support(support); }
         pair_routes();
+        dflash_pair_routes();
         rejection_contract();
     } catch (const std::exception& error) {
         std::cerr << "FAIL W8 dispatch test infrastructure: " << error.what() << '\n';

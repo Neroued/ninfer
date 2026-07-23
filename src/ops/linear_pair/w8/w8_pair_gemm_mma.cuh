@@ -8,8 +8,12 @@
 
 namespace ninfer::ops::detail {
 
-template <W8KernelVariant Variant>
-__global__ __launch_bounds__(256, 2) void w8_pair_gemm_mma_kernel(
+template <int TileCols>
+inline constexpr int kW8PairMmaMinBlocks = TileCols <= 64 ? 3 : 2;
+
+template <int TileCols, W8KernelVariant Variant>
+__global__
+__launch_bounds__((TileCols / 16) * 32, kW8PairMmaMinBlocks<TileCols>) void w8_pair_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ k_codes,
     const std::uint8_t* __restrict__ k_scales, const std::uint8_t* __restrict__ v_codes,
     const std::uint8_t* __restrict__ v_scales, __nv_bfloat16* __restrict__ k_out,
@@ -18,16 +22,18 @@ __global__ __launch_bounds__(256, 2) void w8_pair_gemm_mma_kernel(
     static_assert(Variant == W8KernelVariant::Full || Variant == W8KernelVariant::Predicated);
     constexpr bool FullTiles        = Variant == W8KernelVariant::Full;
     constexpr int BM                = 32;
-    constexpr int BN                = 128;
+    constexpr int BN                = TileCols;
     constexpr int BK                = 64;
     constexpr int WN                = 16;
     constexpr int MT                = 2;
     constexpr int NT                = 2;
     constexpr int KSUB              = 4;
     constexpr int WARPS_N           = BN / WN;
-    constexpr int WARPS             = 8;
+    constexpr int WARPS             = WARPS_N;
     constexpr int THREADS           = WARPS * 32;
     constexpr int SCALE_CACHE_BYTES = 16;
+    static_assert(TileCols == 64 || TileCols == 80 || TileCols == 96 || TileCols == 112 ||
+                  TileCols == 128);
 
     __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
     __shared__ __align__(16) __nv_bfloat16 Bs[2][BN * BK];

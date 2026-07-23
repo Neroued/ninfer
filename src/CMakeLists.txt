@@ -127,7 +127,10 @@ add_library(ninfer_ops STATIC
   ops/linear/w8/w8_rowsplit_gemm_splitk.cu
   ops/linear/w8/w8_rowsplit_launch.cpp
   ops/linear/w8/w8_rowsplit_plan.cpp
+  ops/linear_pair/w8/w8_pair_decode.cu
+  ops/linear_pair/w8/w8_pair_gemm_concat.cu
   ops/linear_pair/w8/w8_pair_gemm_mma.cu
+  ops/linear_pair/w8/w8_pair_gemm_splitk.cu
   ops/linear_pair/w8/w8_pair_plan.cpp
   ops/sparse_moe/decode/sparse_moe_decode_kernels.cu
   ops/sparse_moe/decode/sparse_moe_decode_plan.cpp

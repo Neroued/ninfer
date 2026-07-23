@@ -93,10 +93,10 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
     const int gid  = lane >> 2;
     const int lid  = lane & 3;
 
-    const int m0                   = static_cast<int>(blockIdx.x) * kOutputRowsPerCta;
-    const int n0                   = static_cast<int>(blockIdx.y) * BN;
-    const int kg                   = padded_k / 32;
-    const W8OutputTile output_tile = output.tile(m0);
+    const int m0           = output.row_begin(static_cast<int>(blockIdx.x), kOutputRowsPerCta);
+    const int n0           = static_cast<int>(blockIdx.y) * BN;
+    const int kg           = padded_k / 32;
+    const auto output_tile = output.tile(m0);
 
     float acc[MT][NT][4];
 #pragma unroll
@@ -152,9 +152,10 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                 const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                 cp_async<16, Cache::cg>(dst, &codes[gi * 32 + chunk * 16]);
             } else {
-                const std::int64_t gi = static_cast<std::int64_t>(grow < m ? grow : 0) * kg + g0;
+                const bool valid_row  = output_tile.valid(grow, m);
+                const std::int64_t gi = static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
                 ninfer::ops::cp_async_zfill<16>(dst, &codes[gi * 32 + chunk * 16],
-                                                grow < m ? 16 : 0);
+                                                valid_row ? 16 : 0);
             }
         }
         if ((kt % SCALE_CACHE_TILES) == 0) {
@@ -166,7 +167,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                     const std::int64_t gi = static_cast<std::int64_t>(grow) * kg + g0;
                     cp_async<16, Cache::cg>(dst, &scales[gi * 2]);
                 } else {
-                    const bool valid_row   = grow < m;
+                    const bool valid_row   = output_tile.valid(grow, m);
                     const int valid_scales = valid_row && g0 < kg ? min(8, kg - g0) : 0;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(valid_row ? grow : 0) * kg + min(g0, kg - 1);
@@ -465,10 +466,18 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
                     *output_tile.at(r1, c0) = __float2bfloat16_rn(a[2]);
                     *output_tile.at(r1, c1) = __float2bfloat16_rn(a[3]);
                 } else {
-                    if (r0 < m && c0 < n) { *output_tile.at(r0, c0) = __float2bfloat16_rn(a[0]); }
-                    if (r0 < m && c1 < n) { *output_tile.at(r0, c1) = __float2bfloat16_rn(a[1]); }
-                    if (r1 < m && c0 < n) { *output_tile.at(r1, c0) = __float2bfloat16_rn(a[2]); }
-                    if (r1 < m && c1 < n) { *output_tile.at(r1, c1) = __float2bfloat16_rn(a[3]); }
+                    if (output_tile.valid(r0, m) && c0 < n) {
+                        *output_tile.at(r0, c0) = __float2bfloat16_rn(a[0]);
+                    }
+                    if (output_tile.valid(r0, m) && c1 < n) {
+                        *output_tile.at(r0, c1) = __float2bfloat16_rn(a[1]);
+                    }
+                    if (output_tile.valid(r1, m) && c0 < n) {
+                        *output_tile.at(r1, c0) = __float2bfloat16_rn(a[2]);
+                    }
+                    if (output_tile.valid(r1, m) && c1 < n) {
+                        *output_tile.at(r1, c1) = __float2bfloat16_rn(a[3]);
+                    }
                 }
             }
         }

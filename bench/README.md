@@ -86,6 +86,33 @@ through their production dispatch at the default `T=1024` prefill extent:
 The benchmark records the selected physical route, kernel variant, cold-cache timing, measured
 tensor-core ceiling, and useful/executed throughput.
 
+## W8 context K/V LinearPair Op benchmark
+
+`ninfer_linear_op_bench` with `--paired-kv` and numeric shape `[1024,2048]` measures the two
+adjacent K/V row views of one W8 `[6144,2048]` parent. Production dispatch includes the direct
+one-pass decode kernel, exact- and medium-T split-K Tensor Core kernels, concatenated K/V Tensor
+Core schedules, and exact residual-T routes. `--pair-composed` retains two ordinary public
+`linear` calls as the semantic and performance control. Fixed `w8-pair-*` candidates expose the
+schedule families used to tune every production seam.
+
+```bash
+cmake --build build --parallel --target ninfer_linear_op_bench
+./build/bench/ninfer_linear_op_bench \
+  --rows 1024 --k 2048 --qtype W8G32 --paired-kv --candidate auto \
+  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,33,48,49,64,65,80,81,88,89,96,97,104,105,112,113,128,129,160,161,192,193,384,385,640,641,672,673,896,897,960,961,976,977,1024,1280,1440,1441,1680,1920,2048,2208,2209,2270,2271,2304 \
+  --warmup 10 --repeat 50 \
+  --csv-out profiles/bench/w8_context_kv_pair.csv
+./build/bench/ninfer_linear_op_bench \
+  --rows 1024 --k 2048 --qtype W8G32 --paired-kv --candidate auto \
+  --t-sweep "$(seq -s, 1 2305)" --warmup 3 --repeat 20 \
+  --csv-out profiles/bench/w8_context_kv_pair_all_t.csv
+./build/bench/ninfer_linear_op_bench \
+  --rows 1024 --k 2048 --qtype W8G32 --paired-kv --pair-composed \
+  --t-sweep 1,16,32,64,128,129,1024,1280,2048,2208 \
+  --warmup 10 --repeat 50 \
+  --csv-out profiles/bench/w8_context_kv_pair_composed.csv
+```
+
 ## GDN control-projection Op benchmark
 
 `ninfer_gdn_gating_proj_bench` measures the registered BF16 control projection. With `--35b

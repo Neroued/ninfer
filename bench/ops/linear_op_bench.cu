@@ -95,6 +95,7 @@ enum class CandidateKind {
     Q5Fixed,
     Q6Fixed,
     W8Fixed,
+    W8PairFixed,
 };
 
 constexpr ShapeSpec kShapes[] = {
@@ -153,38 +154,41 @@ constexpr TargetSpec kTask2Targets[] = {
 };
 
 struct Options {
-    bool all_targets                        = true;
-    bool have_shape                         = false;
-    bool have_qtype                         = false;
-    bool paired_kv                          = false;
-    bool linear_add                         = false;
-    bool linear_swiglu                      = false;
-    bool have_rows                          = false;
-    bool have_k                             = false;
-    ShapeSpec shape                         = kTask2Targets[0].shape;
-    QType qtype                             = kTask2Targets[0].qtype;
-    std::int32_t rows                       = 0;
-    std::int32_t k                          = 0;
-    CandidateKind candidate                 = CandidateKind::Auto;
-    ops::detail::Q4ScheduleId q4_schedule   = ops::detail::Q4ScheduleId::SimtR8C4;
-    ops::detail::Q4KernelVariant q4_variant = ops::detail::Q4KernelVariant::Predicated;
-    bool q4_variant_auto                    = true;
-    ops::detail::Q5ScheduleId q5_schedule   = ops::detail::Q5ScheduleId::SimtR8C4;
-    ops::detail::Q5KernelVariant q5_variant = ops::detail::Q5KernelVariant::Predicated;
-    bool q5_variant_auto                    = true;
-    ops::detail::Q6ScheduleId q6_schedule   = ops::detail::Q6ScheduleId::SimtR8C4;
-    ops::detail::Q6KernelVariant q6_variant = ops::detail::Q6KernelVariant::Predicated;
-    bool q6_variant_auto                    = true;
-    ops::detail::W8ScheduleId w8_schedule   = ops::detail::W8ScheduleId::SimtR8C4;
-    ops::detail::W8KernelVariant w8_variant = ops::detail::W8KernelVariant::Predicated;
-    bool w8_variant_auto                    = true;
-    bool w8_conditioning_exact_tail         = false;
-    int warmup                              = kDefaultWarmup;
-    int repeat                              = kDefaultRepeat;
-    int copy_repeat                         = kDefaultCopyRepeat;
-    std::uint64_t flush_bytes               = kDefaultFlushBytes;
-    std::uint64_t copy_bytes                = kDefaultCopyBytes;
-    double stream_ceiling_gbs               = 0.0;
+    bool all_targets                               = true;
+    bool have_shape                                = false;
+    bool have_qtype                                = false;
+    bool paired_kv                                 = false;
+    bool paired_composed                           = false;
+    bool linear_add                                = false;
+    bool linear_swiglu                             = false;
+    bool have_rows                                 = false;
+    bool have_k                                    = false;
+    ShapeSpec shape                                = kTask2Targets[0].shape;
+    QType qtype                                    = kTask2Targets[0].qtype;
+    std::int32_t rows                              = 0;
+    std::int32_t k                                 = 0;
+    CandidateKind candidate                        = CandidateKind::Auto;
+    ops::detail::Q4ScheduleId q4_schedule          = ops::detail::Q4ScheduleId::SimtR8C4;
+    ops::detail::Q4KernelVariant q4_variant        = ops::detail::Q4KernelVariant::Predicated;
+    bool q4_variant_auto                           = true;
+    ops::detail::Q5ScheduleId q5_schedule          = ops::detail::Q5ScheduleId::SimtR8C4;
+    ops::detail::Q5KernelVariant q5_variant        = ops::detail::Q5KernelVariant::Predicated;
+    bool q5_variant_auto                           = true;
+    ops::detail::Q6ScheduleId q6_schedule          = ops::detail::Q6ScheduleId::SimtR8C4;
+    ops::detail::Q6KernelVariant q6_variant        = ops::detail::Q6KernelVariant::Predicated;
+    bool q6_variant_auto                           = true;
+    ops::detail::W8ScheduleId w8_schedule          = ops::detail::W8ScheduleId::SimtR8C4;
+    ops::detail::W8PairScheduleId w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C128;
+    ops::detail::W8KernelVariant w8_variant        = ops::detail::W8KernelVariant::Predicated;
+    bool w8_variant_auto                           = true;
+    bool w8_conditioning_exact_tail                = false;
+    bool w8_pair_exact_tail                        = false;
+    int warmup                                     = kDefaultWarmup;
+    int repeat                                     = kDefaultRepeat;
+    int copy_repeat                                = kDefaultCopyRepeat;
+    std::uint64_t flush_bytes                      = kDefaultFlushBytes;
+    std::uint64_t copy_bytes                       = kDefaultCopyBytes;
+    double stream_ceiling_gbs                      = 0.0;
     std::vector<int> t_sweep; // activation columns to sweep; empty => default set
     std::string csv_out;
 };
@@ -484,6 +488,8 @@ std::string candidate_name(const Options& opt, QType qtype, const ShapeSpec& sha
         return std::string(opt.linear_add ? "linear_add." : "") +
                ops::detail::w8_schedule_name(opt.w8_schedule) +
                (opt.w8_conditioning_exact_tail ? ".conditioning_exact_tail" : "");
+    case CandidateKind::W8PairFixed:
+        return ops::detail::w8_pair_schedule_name(opt.w8_pair_schedule);
     }
     return "unknown";
 }
@@ -654,6 +660,126 @@ void parse_candidate(Options& opt, std::string_view raw) {
     } else if (candidate == "w8-mma-r128c80") {
         opt.candidate   = CandidateKind::W8Fixed;
         opt.w8_schedule = ops::detail::W8ScheduleId::MmaR128C80;
+    } else if (candidate == "w8-pair-decode-r4") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualDecodeR4;
+    } else if (candidate == "w8-pair-decode-r8") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualDecodeR8;
+    } else if (candidate == "w8-pair-decode-r16") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualDecodeR16;
+    } else if (candidate == "w8-pair-splitk-exact-t") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMmaExactT;
+    } else if (candidate == "w8-pair-splitk-medium-c48") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC48;
+    } else if (candidate == "w8-pair-splitk-medium-c64") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC64;
+    } else if (candidate == "w8-pair-splitk-medium-c80") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC80;
+    } else if (candidate == "w8-pair-splitk-medium-c88") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC88;
+    } else if (candidate == "w8-pair-splitk-medium-c96") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC96;
+    } else if (candidate == "w8-pair-splitk-medium-c104") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC104;
+    } else if (candidate == "w8-pair-splitk-medium-c112") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC112;
+    } else if (candidate == "w8-pair-splitk-medium-c128") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC128;
+    } else if (candidate == "w8-pair-splitk-medium-c160") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC160;
+    } else if (candidate == "w8-pair-splitk-medium-c192") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC192;
+    } else if (candidate == "w8-pair-splitk-medium-c224") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC224;
+    } else if (candidate == "w8-pair-splitk-medium-c256") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualSplitKMediumC256;
+    } else if (candidate == "w8-pair-dual-r32c64") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C64;
+    } else if (candidate == "w8-pair-dual-r32c80") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C80;
+    } else if (candidate == "w8-pair-dual-r32c96") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C96;
+    } else if (candidate == "w8-pair-dual-r32c112") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C112;
+    } else if (candidate == "w8-pair-dual-r32c128") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::DualMmaR32C128;
+    } else if (candidate == "w8-pair-concat-r32c64") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C64;
+    } else if (candidate == "w8-pair-concat-r32c80") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C80;
+    } else if (candidate == "w8-pair-concat-r32c96") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C96;
+    } else if (candidate == "w8-pair-concat-r32c112") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C112;
+    } else if (candidate == "w8-pair-concat-r32c128") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR32C128;
+    } else if (candidate == "w8-pair-concat-r48c64") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR48C64;
+    } else if (candidate == "w8-pair-concat-r48c96") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR48C96;
+    } else if (candidate == "w8-pair-concat-r48c112") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR48C112;
+    } else if (candidate == "w8-pair-concat-r48c128") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR48C128;
+    } else if (candidate == "w8-pair-concat-r64c64") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR64C64;
+    } else if (candidate == "w8-pair-concat-r64c80") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR64C80;
+    } else if (candidate == "w8-pair-concat-r64c96") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR64C96;
+    } else if (candidate == "w8-pair-concat-r64c128") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR64C128;
+    } else if (candidate == "w8-pair-concat-r96c64") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR96C64;
+    } else if (candidate == "w8-pair-concat-r96c80") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR96C80;
+    } else if (candidate == "w8-pair-concat-r96c96") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR96C96;
+    } else if (candidate == "w8-pair-concat-r96c112") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR96C112;
+    } else if (candidate == "w8-pair-concat-r128c64") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR128C64;
+    } else if (candidate == "w8-pair-concat-r128c80") {
+        opt.candidate        = CandidateKind::W8PairFixed;
+        opt.w8_pair_schedule = ops::detail::W8PairScheduleId::ConcatMmaR128C80;
     } else {
         throw std::invalid_argument("unknown candidate: " + std::string(raw));
     }
@@ -839,11 +965,17 @@ void usage(const char* argv0) {
         "                             q6-simt-r8c4, q6-simt-r8c8,\n"
         "                             q6-mma-r64c64, q6-mma-r64c128,\n"
         "                             w8-simt-r8c4, w8-simt-r8c8,\n"
-        "                             w8-mma-r32c128, or w8-mma-r64c128.\n"
+        "                             w8-mma-r32c128, w8-mma-r64c128,\n"
+        "                             w8-pair-decode-r4, w8-pair-splitk-exact-t,\n"
+        "                             w8-pair-splitk-medium-c104,\n"
+        "                             w8-pair-dual-r32c128, or w8-pair-concat-r64c128.\n"
         "  --variant NAME             Fixed kernel variant; auto is the default.\n"
         "  --w8-conditioning-exact-tail\n"
         "                             Use the conditioning MMA core plus exact residual-T path.\n"
-        "  --paired-kv                Benchmark paired MTP K/V (requires MtpKV + W8G32).\n"
+        "  --w8-pair-exact-tail       Use a pair MMA core plus an exact residual-T path.\n"
+        "  --paired-kv                Benchmark paired W8 K/V: registered [1024,5120]\n"
+        "                             or numeric context row views [1024,2048].\n"
+        "  --pair-composed            With --paired-kv, run two public Linear calls.\n"
         "  --linear-add               Benchmark Q5 [5120,17408]/[5120,6144] or W8 "
         "[2048,4096]/[2048,6144] LinearAdd.\n"
         "  --linear-swiglu            Benchmark Q4 [34816,5120] LinearSwiGLU.\n"
@@ -899,9 +1031,15 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--w8-conditioning-exact-tail") {
             opt.w8_conditioning_exact_tail = true;
             opt.all_targets                = false;
+        } else if (arg == "--w8-pair-exact-tail") {
+            opt.w8_pair_exact_tail = true;
+            opt.all_targets        = false;
         } else if (arg == "--paired-kv") {
             opt.paired_kv   = true;
             opt.all_targets = false;
+        } else if (arg == "--pair-composed") {
+            opt.paired_composed = true;
+            opt.all_targets     = false;
         } else if (arg == "--linear-add") {
             opt.linear_add  = true;
             opt.all_targets = false;
@@ -945,8 +1083,15 @@ Options parse_args(int argc, char** argv) {
     if (!opt.all_targets && numeric_shape && !opt.have_qtype) {
         throw std::invalid_argument("--rows/--k require --qtype");
     }
-    if (opt.candidate != CandidateKind::Auto && (opt.paired_kv || opt.all_targets)) {
-        throw std::invalid_argument("fixed candidates require one non-paired shape");
+    if (opt.candidate != CandidateKind::Auto && opt.all_targets) {
+        throw std::invalid_argument("fixed candidates require one shape");
+    }
+    if (opt.paired_kv && opt.candidate != CandidateKind::Auto &&
+        opt.candidate != CandidateKind::W8PairFixed) {
+        throw std::invalid_argument("--paired-kv requires auto or a W8 pair candidate");
+    }
+    if (!opt.paired_kv && opt.candidate == CandidateKind::W8PairFixed) {
+        throw std::invalid_argument("W8 pair candidates require --paired-kv");
     }
     if (opt.candidate == CandidateKind::Q4Fixed && !numeric_shape && !opt.have_shape) {
         throw std::invalid_argument("Q4 fixed candidate requires one shape");
@@ -972,9 +1117,20 @@ Options parse_args(int argc, char** argv) {
     if (opt.candidate == CandidateKind::W8Fixed && opt.qtype != QType::W8G32_F16S) {
         throw std::invalid_argument("W8 fixed candidate requires W8G32");
     }
-    if (opt.paired_kv &&
-        (std::string_view(opt.shape.name) != "MtpKV1024x5120" || opt.qtype != QType::W8G32_F16S)) {
-        throw std::invalid_argument("--paired-kv requires --shape MtpKV1024x5120 --qtype W8G32");
+    if (opt.candidate == CandidateKind::W8PairFixed &&
+        (opt.qtype != QType::W8G32_F16S || opt.paired_composed)) {
+        throw std::invalid_argument("W8 pair candidates require production --paired-kv W8G32");
+    }
+    if (opt.paired_kv) {
+        const ShapeSpec pair_shape =
+            numeric_shape ? ShapeSpec{"Numeric", opt.rows, opt.k} : opt.shape;
+        if (opt.qtype != QType::W8G32_F16S || pair_shape.n != 1024 ||
+            (pair_shape.k != 5120 && pair_shape.k != 2048)) {
+            throw std::invalid_argument(
+                "--paired-kv requires W8G32 [1024,5120] or numeric [1024,2048]");
+        }
+    } else if (opt.paired_composed) {
+        throw std::invalid_argument("--pair-composed requires --paired-kv");
     }
     if (opt.linear_add && opt.linear_swiglu) {
         throw std::invalid_argument("--linear-add and --linear-swiglu are mutually exclusive");
@@ -1016,7 +1172,12 @@ Options parse_args(int argc, char** argv) {
 }
 
 std::vector<int> default_t_sweep(const TargetSpec& target, const Options& opt) {
-    if (opt.paired_kv) { return {1, 4, 5, 16, 17, 56, 57, 128}; }
+    if (opt.paired_kv) {
+        return target.shape.k == 2048
+                   ? std::vector<int>{1,  2,  3,  4,  5,  6,  7,  8,  9,   10,  11,  12,
+                                      13, 14, 15, 16, 17, 32, 33, 64, 128, 256, 512, 1024}
+                   : std::vector<int>{1, 4, 5, 16, 17, 56, 57, 128};
+    }
     if (opt.linear_swiglu) { return {1, 16, 128, 129, 256, 384, 512, 640, 1024}; }
     if (opt.linear_add && target.qtype == QType::Q5G64_F16S) {
         return {1, 24, 25, 64, 128, 129, 512, 1024};
@@ -1308,6 +1469,25 @@ Weight make_weight(const RowSplitPayload& payload, QType qtype, std::int32_t n, 
     return w;
 }
 
+Weight make_w8_row_view(const Weight& parent, std::int32_t row_begin, std::int32_t rows) {
+    if (parent.qtype != QType::W8G32_F16S || parent.layout != QuantLayout::RowSplit ||
+        row_begin < 0 || rows <= 0 || row_begin + rows > parent.n) {
+        throw std::invalid_argument("invalid benchmark W8 row view");
+    }
+    const std::uint64_t code_row_bytes = static_cast<std::uint64_t>(parent.padded_shape[1]);
+    const std::uint64_t scale_row_bytes =
+        static_cast<std::uint64_t>(parent.padded_shape[1] / parent.group) * 2ULL;
+    Weight view = parent;
+    view.qdata  = static_cast<const std::uint8_t*>(parent.qdata) +
+                 static_cast<std::uint64_t>(row_begin) * code_row_bytes;
+    view.scales = static_cast<const std::uint8_t*>(parent.scales) +
+                  static_cast<std::uint64_t>(row_begin) * scale_row_bytes;
+    view.n               = rows;
+    view.shape[0]        = rows;
+    view.padded_shape[0] = rows;
+    return view;
+}
+
 ops::detail::Q4KernelVariant selected_q4_variant(const Options& opt, const ShapeSpec& shape,
                                                  std::int32_t t) {
     if (opt.candidate != CandidateKind::Q4Fixed) { return ops::detail::Q4KernelVariant::None; }
@@ -1379,10 +1559,10 @@ void launch_candidate(const Options& opt, const ShapeSpec& shape, const Tensor& 
         return;
     }
     case CandidateKind::W8Fixed: {
-        const auto variant = selected_w8_variant(opt, shape, x.ne[1]);
-        const auto tail_policy =
-            opt.w8_conditioning_exact_tail ? ops::detail::W8TailPolicy::ConditioningExact
-                                           : ops::detail::W8TailPolicy::Homogeneous;
+        const auto variant     = selected_w8_variant(opt, shape, x.ne[1]);
+        const auto tail_policy = opt.w8_conditioning_exact_tail
+                                     ? ops::detail::W8TailPolicy::ConditioningExact
+                                     : ops::detail::W8TailPolicy::Homogeneous;
         ops::detail::w8_rowsplit_launch_candidate(opt.w8_schedule, variant, x, w, out, stream,
                                                   tail_policy);
         return;
@@ -1602,13 +1782,12 @@ int candidate_col_tile(const Options& opt, QType qtype, const ShapeSpec& shape, 
     throw std::invalid_argument("unknown Linear benchmark candidate tile");
 }
 
-bool candidate_uses_conditioning_exact_tail(const Options& opt, QType qtype,
-                                            const ShapeSpec& shape, std::int32_t t) {
+bool candidate_uses_conditioning_exact_tail(const Options& opt, QType qtype, const ShapeSpec& shape,
+                                            std::int32_t t) {
     if (qtype != QType::W8G32_F16S || opt.linear_add) { return false; }
     if (opt.candidate == CandidateKind::W8Fixed) { return opt.w8_conditioning_exact_tail; }
-    return opt.candidate == CandidateKind::Auto &&
-           resolve_auto_w8_plan(shape, t).tail_policy ==
-               ops::detail::W8TailPolicy::ConditioningExact;
+    return opt.candidate == CandidateKind::Auto && resolve_auto_w8_plan(shape, t).tail_policy ==
+                                                       ops::detail::W8TailPolicy::ConditioningExact;
 }
 
 std::uint64_t candidate_weight_passes(const Options& opt, QType qtype, const ShapeSpec& shape,
@@ -1787,7 +1966,7 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     const std::uint64_t out_bytes = static_cast<std::uint64_t>(output_rows) * tt * 2ULL;
     const std::uint64_t useful_bytes =
         w.payload_bytes + x_bytes + out_bytes * (opt.linear_add ? 2ULL : 1ULL);
-    const int col_tile                = candidate_col_tile(opt, target.qtype, shape, t);
+    const int col_tile = candidate_col_tile(opt, target.qtype, shape, t);
     const std::uint64_t weight_passes =
         candidate_weight_passes(opt, target.qtype, shape, t, col_tile);
     const std::uint64_t weight_replay_lower_bound_bytes =
@@ -1809,7 +1988,7 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
             candidate_uses_conditioning_exact_tail(opt, target.qtype, shape, t)
                 ? t
                 : align_up_u64(t, col_tile);
-        const double executed_flops      = 2.0 * static_cast<double>(executed_rows) *
+        const double executed_flops = 2.0 * static_cast<double>(executed_rows) *
                                       static_cast<double>(shape.k) *
                                       static_cast<double>(executed_cols);
         executed_tflops = sec > 0.0 ? executed_flops / sec / 1e12 : 0.0;
@@ -1889,13 +2068,16 @@ RunResult run_target(const TargetSpec& target, const Options& opt, double stream
     return r;
 }
 
-RunResult run_paired_kv(const Options& opt, double stream_ceiling_gbs, double tc_ceiling_tflops,
-                        std::int32_t t, DeviceBuffer& flush, cudaStream_t stream) {
-    constexpr ShapeSpec shape{"MtpKVPair1024x5120", 1024, 5120};
-    const std::uint64_t tt = static_cast<std::uint64_t>(t);
-    DeviceBuffer x         = make_bf16_device(static_cast<std::uint64_t>(shape.k) * tt);
-    RowSplitPayload kbuf   = make_row_split_payload(QType::W8G32_F16S, shape.n, shape.k, stream);
-    RowSplitPayload vbuf   = make_row_split_payload(QType::W8G32_F16S, shape.n, shape.k, stream);
+RunResult run_paired_kv(const TargetSpec& target, const Options& opt, double stream_ceiling_gbs,
+                        double tc_ceiling_tflops, std::int32_t t, DeviceBuffer& flush,
+                        cudaStream_t stream) {
+    const ShapeSpec shape = target.shape.k == 2048 ? ShapeSpec{"ContextKVPair1024x2048", 1024, 2048}
+                                                   : ShapeSpec{"MtpKVPair1024x5120", 1024, 5120};
+    const std::uint64_t tt         = static_cast<std::uint64_t>(t);
+    DeviceBuffer x                 = make_bf16_device(static_cast<std::uint64_t>(shape.k) * tt);
+    const std::int32_t parent_rows = shape.k == 2048 ? 6144 : 2048;
+    RowSplitPayload parent_buf =
+        make_row_split_payload(QType::W8G32_F16S, parent_rows, shape.k, stream);
     DeviceBuffer kout(static_cast<std::uint64_t>(shape.n) * tt * 2ULL);
     DeviceBuffer vout(static_cast<std::uint64_t>(shape.n) * tt * 2ULL);
     CUDA_CHECK(cudaMemsetAsync(kout.p, 0, kout.bytes, stream));
@@ -1905,38 +2087,163 @@ RunResult run_paired_kv(const Options& opt, double stream_ceiling_gbs, double tc
     Tensor tx(x.p, DType::BF16, {shape.k, t});
     Tensor tk(kout.p, DType::BF16, {shape.n, t});
     Tensor tv(vout.p, DType::BF16, {shape.n, t});
-    Weight wk = make_weight(kbuf, QType::W8G32_F16S, shape.n, shape.k);
-    Weight wv = make_weight(vbuf, QType::W8G32_F16S, shape.n, shape.k);
+    const Weight parent          = make_weight(parent_buf, QType::W8G32_F16S, parent_rows, shape.k);
+    const std::int32_t first_row = shape.k == 2048 ? 4096 : 0;
+    Weight wk                    = make_w8_row_view(parent, first_row, shape.n);
+    Weight wv                    = make_w8_row_view(parent, first_row + shape.n, shape.n);
     WorkspaceArena ws(64ULL << 20);
 
-    const auto launch      = [&](cudaStream_t s) { ops::linear_pair(tx, wk, wv, tk, tv, ws, s); };
+    const ops::detail::W8PairProblem pair_problem{shape.n, shape.k, shape.k, t};
+    const auto resolve_pair_plan = [&]() {
+        if (opt.candidate != CandidateKind::W8PairFixed) {
+            return ops::detail::w8_pair_resolve_plan(pair_problem);
+        }
+        if (!opt.w8_variant_auto) {
+            const ops::detail::W8PairPlan candidate{
+                opt.w8_pair_schedule, opt.w8_variant, 0,
+                opt.w8_pair_exact_tail ? ops::detail::W8PairTailPolicy::Exact
+                                       : ops::detail::W8PairTailPolicy::Homogeneous};
+            if (!ops::detail::w8_pair_candidate_is_legal(candidate, pair_problem)) {
+                throw std::invalid_argument("selected W8 pair candidate/variant is illegal");
+            }
+            return candidate;
+        }
+        for (const ops::detail::W8KernelVariant variant :
+             {ops::detail::W8KernelVariant::None, ops::detail::W8KernelVariant::Full,
+              ops::detail::W8KernelVariant::Predicated}) {
+            const ops::detail::W8PairPlan candidate{
+                opt.w8_pair_schedule, variant, 0,
+                opt.w8_pair_exact_tail ? ops::detail::W8PairTailPolicy::Exact
+                                       : ops::detail::W8PairTailPolicy::Homogeneous};
+            if (ops::detail::w8_pair_candidate_is_legal(candidate, pair_problem)) {
+                return candidate;
+            }
+        }
+        throw std::invalid_argument("selected W8 pair candidate is illegal");
+    };
+    const ops::detail::W8PairPlan pair_plan = resolve_pair_plan();
+
+    const auto launch = [&](cudaStream_t s) {
+        if (opt.paired_composed) {
+            ops::linear(tx, wk, tk, ws, s);
+            ops::linear(tx, wv, tv, ws, s);
+        } else if (opt.candidate == CandidateKind::W8PairFixed) {
+            ops::detail::w8_pair_execute_candidate(pair_plan, tx, wk, wv, tk, tv, s);
+        } else {
+            ops::linear_pair(tx, wk, wv, tk, tv, ws, s);
+        }
+    };
     const TimingStats cold = measure_cold(launch, flush, stream, opt.warmup, opt.repeat);
     const TimingStats warm = measure_warm(launch, stream, opt.warmup, opt.repeat);
 
-    const std::uint64_t weight_bytes = wk.payload_bytes + wv.payload_bytes;
+    const std::uint64_t one_weight_bytes =
+        static_cast<std::uint64_t>(shape.n) * shape.k +
+        static_cast<std::uint64_t>(shape.n) * (shape.k / 32) * 2ULL;
+    const std::uint64_t weight_bytes = 2ULL * one_weight_bytes;
     const std::uint64_t x_bytes      = static_cast<std::uint64_t>(shape.k) * tt * 2ULL;
     const std::uint64_t out_bytes    = 2ULL * static_cast<std::uint64_t>(shape.n) * tt * 2ULL;
     const std::uint64_t useful_bytes = weight_bytes + x_bytes + out_bytes;
     const double sec                 = cold.median_us * 1e-6;
     const double flops =
         4.0 * static_cast<double>(shape.n) * static_cast<double>(shape.k) * static_cast<double>(t);
-    const ops::detail::W8PairPlan plan =
-        ops::detail::w8_pair_resolve_plan({shape.n, shape.k, shape.k, t});
-    const int col_tile = plan.schedule == ops::detail::W8PairScheduleId::TwoSimtR8C4   ? 4
-                         : plan.schedule == ops::detail::W8PairScheduleId::TwoSimtR8C8 ? 8
-                                                                                       : 128;
+    const ops::detail::W8Plan linear_plan =
+        ops::detail::w8_rowsplit_resolve_plan({shape.n, shape.k, shape.k, t});
+    const auto pair_col_tile = [](ops::detail::W8PairScheduleId schedule,
+                                  std::int32_t active_cols) {
+        using PairSchedule = ops::detail::W8PairScheduleId;
+        switch (schedule) {
+        case PairSchedule::TwoSimtR8C4:
+            return 4;
+        case PairSchedule::TwoSimtR8C8:
+            return 8;
+        case PairSchedule::DualDecodeR4:
+        case PairSchedule::DualDecodeR8:
+        case PairSchedule::DualDecodeR16:
+            return 1;
+        case PairSchedule::DualSplitKMmaExactT:
+            return active_cols;
+        case PairSchedule::DualSplitKMediumC48:
+            return 48;
+        case PairSchedule::DualSplitKMediumC64:
+            return 64;
+        case PairSchedule::DualSplitKMediumC80:
+            return 80;
+        case PairSchedule::DualSplitKMediumC88:
+            return 88;
+        case PairSchedule::DualSplitKMediumC96:
+            return 96;
+        case PairSchedule::DualSplitKMediumC104:
+            return 104;
+        case PairSchedule::DualSplitKMediumC112:
+            return 112;
+        case PairSchedule::DualSplitKMediumC128:
+            return 128;
+        case PairSchedule::DualSplitKMediumC160:
+            return 160;
+        case PairSchedule::DualSplitKMediumC192:
+            return 192;
+        case PairSchedule::DualSplitKMediumC224:
+            return 224;
+        case PairSchedule::DualSplitKMediumC256:
+            return 256;
+        case PairSchedule::DualMmaR32C64:
+            return 64;
+        case PairSchedule::DualMmaR32C80:
+        case PairSchedule::ConcatMmaR32C80:
+        case PairSchedule::ConcatMmaR64C80:
+        case PairSchedule::ConcatMmaR96C80:
+        case PairSchedule::ConcatMmaR128C80:
+            return 80;
+        case PairSchedule::DualMmaR32C96:
+            return 96;
+        case PairSchedule::DualMmaR32C112:
+        case PairSchedule::ConcatMmaR32C112:
+        case PairSchedule::ConcatMmaR48C112:
+        case PairSchedule::ConcatMmaR96C112:
+            return 112;
+        case PairSchedule::DualMmaR32C128:
+            return 128;
+        case PairSchedule::ConcatMmaR32C64:
+        case PairSchedule::ConcatMmaR48C64:
+        case PairSchedule::ConcatMmaR64C64:
+        case PairSchedule::ConcatMmaR96C64:
+        case PairSchedule::ConcatMmaR128C64:
+            return 64;
+        case PairSchedule::ConcatMmaR32C96:
+        case PairSchedule::ConcatMmaR48C96:
+        case PairSchedule::ConcatMmaR64C96:
+        case PairSchedule::ConcatMmaR96C96:
+            return 96;
+        case PairSchedule::ConcatMmaR32C128:
+        case PairSchedule::ConcatMmaR48C128:
+        case PairSchedule::ConcatMmaR64C128:
+            return 128;
+        }
+        throw std::logic_error("unknown W8 pair schedule");
+    };
+    const int col_tile                = opt.paired_composed
+                                            ? (linear_plan.schedule == ops::detail::W8ScheduleId::SimtR8C4 ? 4
+                                               : linear_plan.schedule == ops::detail::W8ScheduleId::SimtR8C8 ? 8
+                                                                                                             : 128)
+                                            : pair_col_tile(pair_plan.schedule, t);
     const std::uint64_t weight_passes = static_cast<std::uint64_t>((t + col_tile - 1) / col_tile);
     const std::uint64_t weight_replay_lower_bound_bytes =
         weight_bytes * weight_passes + x_bytes + out_bytes;
 
     RunResult r;
-    r.shape_name                      = shape.name;
-    r.qtype_name                      = "W8G32x2";
-    r.candidate_name                  = ops::detail::w8_pair_schedule_name(plan.schedule);
-    r.kernel_variant                  = ops::detail::w8_kernel_variant_name(plan.variant);
-    r.n                               = shape.n * 2;
-    r.k                               = shape.k;
-    r.t                               = t;
+    r.shape_name = shape.name;
+    r.qtype_name = "W8G32x2";
+    r.candidate_name =
+        opt.paired_composed
+            ? std::string("w8_pair.composed.") + ops::detail::w8_schedule_name(linear_plan.schedule)
+            : std::string(ops::detail::w8_pair_schedule_name(pair_plan.schedule)) +
+                  (pair_plan.tail_policy == ops::detail::W8PairTailPolicy::Exact ? ".exact_tail"
+                                                                                 : "");
+    r.kernel_variant = ops::detail::w8_kernel_variant_name(opt.paired_composed ? linear_plan.variant
+                                                                               : pair_plan.variant);
+    r.n              = shape.n * 2;
+    r.k              = shape.k;
+    r.t              = t;
     r.weight_payload_bytes            = weight_bytes;
     r.x_bytes                         = x_bytes;
     r.out_bytes                       = out_bytes;
@@ -1952,9 +2259,93 @@ RunResult run_paired_kv(const Options& opt, double stream_ceiling_gbs, double tc
     r.useful_copy_ceiling_pct =
         stream_ceiling_gbs > 0.0 ? r.useful_gbs / stream_ceiling_gbs * 100.0 : 0.0;
     r.useful_tflops = sec > 0.0 ? flops / sec / 1e12 : 0.0;
-    if (plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C128) {
-        const auto executed_rows    = align_up_u64(shape.n, 32);
-        const auto executed_cols    = align_up_u64(t, 128);
+    const bool tensor_core =
+        opt.paired_composed
+            ? ops::detail::w8_schedule_uses_mma(linear_plan.schedule)
+            : pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMmaExactT ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC48 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC64 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC80 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC88 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC96 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC104 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC112 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC128 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC160 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC192 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC224 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMediumC256 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C64 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C80 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C96 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C112 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::DualMmaR32C128 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C64 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C80 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C96 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C112 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR32C128 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR48C64 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR48C96 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR48C112 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR48C128 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR64C64 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR64C80 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR64C96 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR64C128 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR96C64 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR96C80 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR96C96 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR96C112 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR128C64 ||
+                  pair_plan.schedule == ops::detail::W8PairScheduleId::ConcatMmaR128C80;
+    if (tensor_core) {
+        std::uint64_t row_tile = 32;
+        if (!opt.paired_composed) {
+            using PairSchedule = ops::detail::W8PairScheduleId;
+            switch (pair_plan.schedule) {
+            case PairSchedule::ConcatMmaR48C64:
+            case PairSchedule::ConcatMmaR48C96:
+            case PairSchedule::ConcatMmaR48C112:
+            case PairSchedule::ConcatMmaR48C128:
+                row_tile = 48;
+                break;
+            case PairSchedule::ConcatMmaR64C64:
+            case PairSchedule::ConcatMmaR64C80:
+            case PairSchedule::ConcatMmaR64C96:
+            case PairSchedule::ConcatMmaR64C128:
+                row_tile = 64;
+                break;
+            case PairSchedule::ConcatMmaR96C64:
+            case PairSchedule::ConcatMmaR96C80:
+            case PairSchedule::ConcatMmaR96C96:
+            case PairSchedule::ConcatMmaR96C112:
+                row_tile = 96;
+                break;
+            case PairSchedule::ConcatMmaR128C64:
+            case PairSchedule::ConcatMmaR128C80:
+                row_tile = 128;
+                break;
+            default:
+                break;
+            }
+        }
+        const auto executed_rows    = align_up_u64(shape.n, row_tile);
+        std::uint64_t executed_cols = align_up_u64(t, static_cast<std::uint64_t>(col_tile));
+        if (!opt.paired_composed &&
+            pair_plan.schedule == ops::detail::W8PairScheduleId::DualSplitKMmaExactT) {
+            executed_cols = static_cast<std::uint64_t>(t);
+        } else if (!opt.paired_composed &&
+                   pair_plan.tail_policy == ops::detail::W8PairTailPolicy::Exact) {
+            const std::uint64_t full_cols = (static_cast<std::uint64_t>(t) / col_tile) * col_tile;
+            const std::uint64_t tail      = static_cast<std::uint64_t>(t) - full_cols;
+            const std::uint64_t executed_tail = tail <= 32   ? tail
+                                                : tail <= 48 ? 48
+                                                : tail <= 64 ? 64
+                                                : tail <= 96 ? 96
+                                                             : 128;
+            executed_cols                     = full_cols + executed_tail;
+        }
         const double executed_flops = 4.0 * static_cast<double>(executed_rows) *
                                       static_cast<double>(shape.k) *
                                       static_cast<double>(executed_cols);
@@ -2067,8 +2458,8 @@ int main(int argc, char** argv) {
                 opt.t_sweep.empty() ? default_t_sweep(target, opt) : opt.t_sweep;
             for (int t : sweep) {
                 if (opt.paired_kv) {
-                    rows.push_back(run_paired_kv(opt, stream_ceiling_gbs, tc_ceiling_tflops, t,
-                                                 flush, stream));
+                    rows.push_back(run_paired_kv(target, opt, stream_ceiling_gbs, tc_ceiling_tflops,
+                                                 t, flush, stream));
                 } else {
                     rows.push_back(run_target(target, opt, stream_ceiling_gbs, tc_ceiling_tflops, t,
                                               flush, stream));

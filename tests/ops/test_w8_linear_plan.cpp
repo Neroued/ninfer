@@ -16,6 +16,7 @@ using ninfer::ops::detail::W8KernelVariant;
 using ninfer::ops::detail::W8PairPlan;
 using ninfer::ops::detail::W8PairProblem;
 using ninfer::ops::detail::W8PairScheduleId;
+using ninfer::ops::detail::W8PairTailPolicy;
 using ninfer::ops::detail::W8Plan;
 using ninfer::ops::detail::W8Problem;
 using ninfer::ops::detail::W8ScheduleId;
@@ -172,44 +173,44 @@ void expect_plan(const std::string& label, const W8Problem& problem) {
 }
 
 void route_boundaries() {
-    constexpr std::array<W8Problem, 78> cases{{
-        {5120, 10240, 10240, 1},  {5120, 10240, 10240, 4},   {5120, 10240, 10240, 5},
-        {5120, 10240, 10240, 16}, {5120, 10240, 10240, 17},  {5120, 10240, 10240, 128},
-        {14336, 5120, 5120, 4},   {14336, 5120, 5120, 5},    {14336, 5120, 5120, 8},
-        {14336, 5120, 5120, 9},   {1024, 5120, 5120, 4},     {1024, 5120, 5120, 5},
-        {1024, 5120, 5120, 16},   {1024, 5120, 5120, 17},    {1024, 5120, 5120, 128},
-        {6144, 5120, 5120, 16},   {6144, 5120, 5120, 17},    {5120, 6144, 6144, 16},
-        {5120, 6144, 6144, 17},   {34816, 5120, 5120, 4},    {34816, 5120, 5120, 8},
-        {34816, 5120, 5120, 9},   {5120, 17408, 17408, 16},  {5120, 17408, 17408, 17},
-        {4608, 4608, 4608, 1},    {4608, 4608, 4608, 8},     {4608, 4608, 4608, 9},
-        {4608, 4608, 4608, 11},   {4608, 4608, 4608, 12},    {4608, 4608, 4608, 13},
-        {4608, 4608, 4608, 256},  {4608, 4608, 4608, 257},   {4608, 4608, 4608, 32768},
-        {5120, 4608, 4608, 4},    {5120, 4608, 4608, 5},     {5120, 4608, 4608, 6},
-        {5120, 4608, 4608, 127},  {5120, 4608, 4608, 128},   {5120, 4608, 4608, 32768},
-        {2048, 4608, 4608, 1},    {2048, 4608, 4608, 14},    {2048, 4608, 4608, 15},
-        {2048, 4608, 4608, 16},   {2048, 4608, 4608, 17},    {2048, 4608, 4608, 19},
-        {2048, 4608, 4608, 20},   {2048, 4608, 4608, 21},    {2048, 4608, 4608, 23},
-        {2048, 4608, 4608, 24},   {2048, 4608, 4608, 25},    {2048, 4608, 4608, 27},
-        {2048, 4608, 4608, 28},   {2048, 4608, 4608, 29},    {2048, 4608, 4608, 31},
-        {2048, 4608, 4608, 32},   {2048, 4608, 4608, 33},    {2048, 4608, 4608, 871},
-        {2048, 4608, 4608, 872},  {2048, 4608, 4608, 32768}, {2048, 4096, 4096, 1},
-        {2048, 4096, 4096, 56},   {2048, 4096, 4096, 57},    {2048, 4096, 4096, 895},
-        {2048, 4096, 4096, 896},  {2048, 4096, 4096, 1024},  {12288, 2048, 2048, 1},
-        {12288, 2048, 2048, 16},  {12288, 2048, 2048, 17},   {12288, 2048, 2048, 1024},
-        {9216, 2048, 2048, 1},    {9216, 2048, 2048, 13},    {9216, 2048, 2048, 14},
-        {9216, 2048, 2048, 128},  {9216, 2048, 2048, 129},   {9216, 2048, 2048, 1024},
-        {2048, 4096, 4096, 1025}, {12288, 2048, 2048, 1025}, {9216, 2048, 2048, 1025},
+    constexpr std::array<W8Problem, 83> cases{{
+        {5120, 10240, 10240, 1},   {5120, 10240, 10240, 4},   {5120, 10240, 10240, 5},
+        {5120, 10240, 10240, 16},  {5120, 10240, 10240, 17},  {5120, 10240, 10240, 128},
+        {14336, 5120, 5120, 4},    {14336, 5120, 5120, 5},    {14336, 5120, 5120, 8},
+        {14336, 5120, 5120, 9},    {1024, 5120, 5120, 4},     {1024, 5120, 5120, 5},
+        {1024, 5120, 5120, 16},    {1024, 5120, 5120, 17},    {1024, 5120, 5120, 128},
+        {1024, 2048, 2048, 1},     {1024, 2048, 2048, 4},     {1024, 2048, 2048, 5},
+        {1024, 2048, 2048, 16},    {1024, 2048, 2048, 17},    {6144, 5120, 5120, 16},
+        {6144, 5120, 5120, 17},    {5120, 6144, 6144, 16},    {5120, 6144, 6144, 17},
+        {34816, 5120, 5120, 4},    {34816, 5120, 5120, 8},    {34816, 5120, 5120, 9},
+        {5120, 17408, 17408, 16},  {5120, 17408, 17408, 17},  {4608, 4608, 4608, 1},
+        {4608, 4608, 4608, 8},     {4608, 4608, 4608, 9},     {4608, 4608, 4608, 11},
+        {4608, 4608, 4608, 12},    {4608, 4608, 4608, 13},    {4608, 4608, 4608, 256},
+        {4608, 4608, 4608, 257},   {4608, 4608, 4608, 32768}, {5120, 4608, 4608, 4},
+        {5120, 4608, 4608, 5},     {5120, 4608, 4608, 6},     {5120, 4608, 4608, 127},
+        {5120, 4608, 4608, 128},   {5120, 4608, 4608, 32768}, {2048, 4608, 4608, 1},
+        {2048, 4608, 4608, 14},    {2048, 4608, 4608, 15},    {2048, 4608, 4608, 16},
+        {2048, 4608, 4608, 17},    {2048, 4608, 4608, 19},    {2048, 4608, 4608, 20},
+        {2048, 4608, 4608, 21},    {2048, 4608, 4608, 23},    {2048, 4608, 4608, 24},
+        {2048, 4608, 4608, 25},    {2048, 4608, 4608, 27},    {2048, 4608, 4608, 28},
+        {2048, 4608, 4608, 29},    {2048, 4608, 4608, 31},    {2048, 4608, 4608, 32},
+        {2048, 4608, 4608, 33},    {2048, 4608, 4608, 871},   {2048, 4608, 4608, 872},
+        {2048, 4608, 4608, 32768}, {2048, 4096, 4096, 1},     {2048, 4096, 4096, 56},
+        {2048, 4096, 4096, 57},    {2048, 4096, 4096, 895},   {2048, 4096, 4096, 896},
+        {2048, 4096, 4096, 1024},  {12288, 2048, 2048, 1},    {12288, 2048, 2048, 16},
+        {12288, 2048, 2048, 17},   {12288, 2048, 2048, 1024}, {9216, 2048, 2048, 1},
+        {9216, 2048, 2048, 13},    {9216, 2048, 2048, 14},    {9216, 2048, 2048, 128},
+        {9216, 2048, 2048, 129},   {9216, 2048, 2048, 1024},  {2048, 4096, 4096, 1025},
+        {12288, 2048, 2048, 1025}, {9216, 2048, 2048, 1025},
     }};
     for (const W8Problem& problem : cases) { expect_plan("route boundary", problem); }
 
     constexpr std::int32_t conditioning_cols[]{
-        1,   2,    31,   32,   33,   88,   89,   96,   97,   128,  129,  144,
-        145, 255,  256,  384,  385,  480,  481,  482,  640,  641,  668,  669,
-        672, 673,  674,  704,  705,  784,  785,  896,  897,  912,  913,  960,
-        961, 1007, 1008, 1009, 1119, 1120, 1121, 1280, 1281, 1313, 1314, 1344,
-        1345, 1440, 1441, 1500, 1501, 1680, 1681, 1745, 1746, 1791, 1792, 1793,
-        1919, 1920, 1921, 1953, 1954, 2016, 2017, 2048, 2049, 2112, 2113, 2176,
-        4096, 8192,
+        1,    2,    31,   32,   33,   88,   89,   96,   97,   128,  129,  144,  145,  255,  256,
+        384,  385,  480,  481,  482,  640,  641,  668,  669,  672,  673,  674,  704,  705,  784,
+        785,  896,  897,  912,  913,  960,  961,  1007, 1008, 1009, 1119, 1120, 1121, 1280, 1281,
+        1313, 1314, 1344, 1345, 1440, 1441, 1500, 1501, 1680, 1681, 1745, 1746, 1791, 1792, 1793,
+        1919, 1920, 1921, 1953, 1954, 2016, 2017, 2048, 2049, 2112, 2113, 2176, 4096, 8192,
     };
     for (const std::int32_t cols : conditioning_cols) {
         expect_plan("conditioning route boundary", {2048, 16384, 16384, cols});
@@ -243,6 +244,7 @@ void rejection_contract() {
 
 void pair_contract() {
     using PS = W8PairScheduleId;
+    using PT = W8PairTailPolicy;
     constexpr std::array<std::int32_t, 9> cols{{
         1,
         4,
@@ -279,8 +281,150 @@ void pair_contract() {
         }
     }
 
+    struct DFlashRoute {
+        std::int32_t cols;
+        PS schedule;
+        PT tail = PT::Homogeneous;
+    };
+
+    constexpr std::array<DFlashRoute, 72> dflash_routes{{
+        {1, PS::DualDecodeR4},
+        {2, PS::DualSplitKMmaExactT},
+        {32, PS::DualSplitKMmaExactT},
+        {33, PS::DualSplitKMediumC48},
+        {48, PS::DualSplitKMediumC48},
+        {49, PS::DualSplitKMediumC64},
+        {64, PS::DualSplitKMediumC64},
+        {65, PS::DualSplitKMediumC80},
+        {80, PS::DualSplitKMediumC80},
+        {81, PS::DualSplitKMediumC88},
+        {88, PS::DualSplitKMediumC88},
+        {89, PS::DualSplitKMediumC96},
+        {96, PS::DualSplitKMediumC96},
+        {97, PS::DualSplitKMediumC104},
+        {104, PS::DualSplitKMediumC104},
+        {105, PS::DualSplitKMediumC112},
+        {112, PS::DualSplitKMediumC112},
+        {113, PS::DualSplitKMediumC128},
+        {128, PS::DualSplitKMediumC128},
+        {129, PS::DualSplitKMediumC160},
+        {160, PS::DualSplitKMediumC160},
+        {161, PS::DualSplitKMediumC192},
+        {192, PS::DualSplitKMediumC192},
+        {193, PS::ConcatMmaR32C64},
+        {384, PS::ConcatMmaR32C64},
+        {385, PS::ConcatMmaR32C96},
+        {480, PS::ConcatMmaR32C96},
+        {481, PS::ConcatMmaR32C128},
+        {640, PS::ConcatMmaR32C128},
+        {641, PS::ConcatMmaR32C128, PT::Exact},
+        {642, PS::ConcatMmaR48C96},
+        {672, PS::ConcatMmaR48C96},
+        {673, PS::ConcatMmaR32C96, PT::Exact},
+        {680, PS::ConcatMmaR32C96, PT::Exact},
+        {681, PS::ConcatMmaR48C112},
+        {784, PS::ConcatMmaR48C112},
+        {785, PS::ConcatMmaR48C128},
+        {896, PS::ConcatMmaR48C128},
+        {897, PS::ConcatMmaR96C64},
+        {960, PS::ConcatMmaR96C64},
+        {961, PS::ConcatMmaR64C96, PT::Exact},
+        {976, PS::ConcatMmaR64C96, PT::Exact},
+        {977, PS::ConcatMmaR64C128},
+        {1280, PS::ConcatMmaR64C128},
+        {1281, PS::ConcatMmaR64C128, PT::Exact},
+        {1316, PS::ConcatMmaR64C128, PT::Exact},
+        {1317, PS::ConcatMmaR128C64},
+        {1344, PS::ConcatMmaR128C64},
+        {1345, PS::ConcatMmaR128C64, PT::Exact},
+        {1346, PS::ConcatMmaR96C96},
+        {1440, PS::ConcatMmaR96C96},
+        {1441, PS::ConcatMmaR96C96, PT::Exact},
+        {1466, PS::ConcatMmaR96C96, PT::Exact},
+        {1467, PS::ConcatMmaR128C80},
+        {1680, PS::ConcatMmaR128C80},
+        {1681, PS::ConcatMmaR128C80, PT::Exact},
+        {1708, PS::ConcatMmaR128C80, PT::Exact},
+        {1709, PS::ConcatMmaR48C128},
+        {1920, PS::ConcatMmaR48C128},
+        {1921, PS::ConcatMmaR64C128, PT::Exact},
+        {1922, PS::ConcatMmaR64C128, PT::Exact},
+        {1923, PS::ConcatMmaR64C96},
+        {2016, PS::ConcatMmaR64C96},
+        {2017, PS::ConcatMmaR64C96, PT::Exact},
+        {2018, PS::ConcatMmaR64C96, PT::Exact},
+        {2019, PS::ConcatMmaR96C96},
+        {2208, PS::ConcatMmaR96C96},
+        {2209, PS::ConcatMmaR96C96, PT::Exact},
+        {2270, PS::ConcatMmaR96C96, PT::Exact},
+        {2271, PS::ConcatMmaR64C128},
+        {4096, PS::ConcatMmaR64C128},
+        {8192, PS::ConcatMmaR64C128},
+    }};
+    for (const DFlashRoute& route : dflash_routes) {
+        const W8PairProblem problem{1024, 2048, 2048, route.cols};
+        if (!ninfer::ops::detail::w8_pair_admits(problem)) {
+            fail("dFlash pair admission", "rejected admitted column count");
+            continue;
+        }
+        const W8PairPlan plan   = ninfer::ops::detail::w8_pair_resolve_plan(problem);
+        V expected_pair_variant = V::None;
+        S base_schedule         = S::SimtR8C4;
+        bool tiled              = true;
+        switch (route.schedule) {
+        case PS::ConcatMmaR32C64:
+            base_schedule = S::MmaR32C64;
+            break;
+        case PS::ConcatMmaR32C96:
+            base_schedule = S::MmaR32C96;
+            break;
+        case PS::ConcatMmaR32C128:
+            base_schedule = S::MmaR32C128;
+            break;
+        case PS::ConcatMmaR48C96:
+            base_schedule = S::MmaR48C96;
+            break;
+        case PS::ConcatMmaR48C112:
+            base_schedule = S::MmaR48C112;
+            break;
+        case PS::ConcatMmaR48C128:
+            base_schedule = S::MmaR48C128;
+            break;
+        case PS::ConcatMmaR64C96:
+            base_schedule = S::MmaR64C96;
+            break;
+        case PS::ConcatMmaR64C128:
+            base_schedule = S::MmaR64C128;
+            break;
+        case PS::ConcatMmaR96C64:
+            base_schedule = S::MmaR96C64;
+            break;
+        case PS::ConcatMmaR96C96:
+            base_schedule = S::MmaR96C96;
+            break;
+        case PS::ConcatMmaR128C64:
+            base_schedule = S::MmaR128C64;
+            break;
+        case PS::ConcatMmaR128C80:
+            base_schedule = S::MmaR128C80;
+            break;
+        default:
+            tiled = false;
+            break;
+        }
+        if (tiled) {
+            expected_pair_variant = expected_variant(base_schedule, {1024, 2048, 2048, route.cols});
+        }
+        if (plan.schedule != route.schedule || plan.variant != expected_pair_variant ||
+            plan.workspace_bytes != 0 || plan.tail_policy != route.tail ||
+            !ninfer::ops::detail::w8_pair_candidate_is_legal(plan, problem)) {
+            fail("dFlash pair route", "unexpected plan at C=" + std::to_string(route.cols));
+        }
+    }
+
     for (const W8PairProblem problem :
-         {W8PairProblem{1024, 5120, 5120, 0}, W8PairProblem{6144, 5120, 5120, 57}}) {
+         {W8PairProblem{1024, 5120, 5120, 0}, W8PairProblem{6144, 5120, 5120, 57},
+          W8PairProblem{1024, 2048, 2176, 16}, W8PairProblem{2048, 2048, 2048, 16}}) {
         if (ninfer::ops::detail::w8_pair_admits(problem)) {
             fail("pair rejection", "accepted an unregistered pair problem");
         }

@@ -20,7 +20,18 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;
     auto* out_bf16     = static_cast<__nv_bfloat16*>(out.data);
 
-    if (aligned2 && d >= 64 && d <= 256 && d % 64 == 0) {
+    if (aligned2 && d == 128 && Epilogue == RmsEpilogue::Plain) {
+        // Plain per-head D128 is latency-bound for Q32/KV8 rows. Four rows per CTA follows the
+        // measured lower envelope from T=1 through the 1024-token prefill point.
+        constexpr int kBlock         = 128;
+        constexpr int kWarpsPerBlock = kBlock / kWarpSize;
+        const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
+        rmsnorm_d128_bf16x2_kernel<Epilogue, kBlock>
+            <<<blocks, kBlock, 0, stream>>>(reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                                            reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+                                            reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+                                            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
+    } else if (aligned2 && d >= 64 && d <= 256 && d % 64 == 0) {
         constexpr int kBlock         = 512;
         constexpr int kWarpsPerBlock = kBlock / kWarpSize;
         const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
@@ -29,6 +40,14 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
             reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+    } else if (aligned2 && d == 2048 && Epilogue == RmsEpilogue::Plain) {
+        // The 512-thread CTA is faster than 128/256-thread alternatives at every measured DFlash
+        // extent and reaches the same-topology payload floor at the prefill endpoint.
+        rmsnorm_d2048_bf16x2_kernel<Epilogue><<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+            reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+            reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+            reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
     } else if (aligned2 && d >= 512 && d <= 3072 && d % 512 == 0) {
         rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6>
             <<<static_cast<unsigned int>(rows), 256, 0, stream>>>(

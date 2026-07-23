@@ -44,7 +44,10 @@ static Tensor tensor_for_shape(void* data, std::int32_t d0, std::int32_t d1, std
 }
 
 static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::int32_t d2,
-                     bool unit_offset, bool gated, std::uint32_t seed, float lo, float hi) {
+                     bool unit_offset, bool gated, std::uint32_t seed, float lo, float hi,
+                     bool use_graph = false) {
+    constexpr std::size_t kGuardElements = 8;
+    constexpr std::uint16_t kGuardBits   = 0xa5a5u;
     const auto rows = static_cast<std::int64_t>(d1) * static_cast<std::int64_t>(d2);
     const auto n    = static_cast<std::size_t>(d0) * static_cast<std::size_t>(rows);
     std::vector<float> x(n), weight(d0), z(n);
@@ -58,22 +61,67 @@ static int one_shape(const char* tag, std::int32_t d0, std::int32_t d1, std::int
     std::vector<double> ref(n);
     cpu_rmsnorm(x, weight, 1e-6f, unit_offset, gated ? &z : nullptr, d0, rows, ref);
 
-    DBuf dx = to_device_bf16(x), dw = to_device_bf16(weight), dout(n * 2);
-    DBuf dz   = gated ? to_device_bf16(z) : DBuf(0);
-    Tensor tx = tensor_for_shape(dx.p, d0, d1, d2);
+    DBuf dx = to_device_bf16(x), dw = to_device_bf16(weight);
+    DBuf dout((n + 2 * kGuardElements) * sizeof(std::uint16_t));
+    dout.fill(0xa5);
+    auto* out_data = static_cast<std::uint16_t*>(dout.p) + kGuardElements;
+    DBuf dz        = gated ? to_device_bf16(z) : DBuf(0);
+    Tensor tx      = tensor_for_shape(dx.p, d0, d1, d2);
     Tensor tw(dw.p, DType::BF16, {d0});
-    Tensor tout = tensor_for_shape(dout.p, d0, d1, d2);
+    Tensor tout = tensor_for_shape(out_data, d0, d1, d2);
     Tensor tz;
     if (gated) { tz = tensor_for_shape(dz.p, d0, d1, d2); }
 
-    if (gated) {
-        ops::gated_rmsnorm(tx, tw, tz, 1e-6f, tout, nullptr);
+    const auto launch = [&](cudaStream_t stream) {
+        if (gated) {
+            ops::gated_rmsnorm(tx, tw, tz, 1e-6f, tout, stream);
+        } else {
+            ops::rmsnorm(tx, tw, 1e-6f, unit_offset, tout, stream);
+        }
+    };
+    if (use_graph) {
+        cudaStream_t stream  = nullptr;
+        cudaGraph_t graph    = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+                   "cudaStreamBeginCapture");
+        launch(stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
+        cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "cudaGraphInstantiate");
+        cuda_check(cudaGraphLaunch(exec, stream), "cudaGraphLaunch first");
+        cuda_check(cudaGraphLaunch(exec, stream), "cudaGraphLaunch replay");
+        cuda_synchronize(stream);
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        cudaStreamDestroy(stream);
     } else {
-        ops::rmsnorm(tx, tw, 1e-6f, unit_offset, tout, nullptr);
+        launch(nullptr);
+        cuda_synchronize();
     }
-    cudaDeviceSynchronize();
 
-    return verify(tag, from_device_bf16(dout, n), ref, Tolerance::bf16_reduction());
+    int failures = verify(tag, from_device_bf16(out_data, n), ref, Tolerance::bf16_reduction());
+    const std::vector<std::uint16_t> guarded =
+        from_device<std::uint16_t>(dout, n + 2 * kGuardElements);
+    for (std::size_t i = 0; i < kGuardElements; ++i) {
+        if (guarded[i] != kGuardBits || guarded[kGuardElements + n + i] != kGuardBits) {
+            std::cerr << tag << ": output guard modified\n";
+            ++failures;
+            break;
+        }
+    }
+    std::vector<double> x_expected(x.begin(), x.end());
+    std::vector<double> weight_expected(weight.begin(), weight.end());
+    failures += verify_exact((std::string(tag) + " preserves x").c_str(), from_device_bf16(dx, n),
+                             x_expected);
+    failures += verify_exact((std::string(tag) + " preserves weight").c_str(),
+                             from_device_bf16(dw, weight.size()), weight_expected);
+    if (gated) {
+        std::vector<double> z_expected(z.begin(), z.end());
+        failures += verify_exact((std::string(tag) + " preserves z").c_str(),
+                                 from_device_bf16(dz, n), z_expected);
+    }
+    return failures;
 }
 
 static DBuf to_device_bf16_unaligned(const std::vector<float>& h) {
@@ -258,6 +306,30 @@ int main() {
         f += one_shape("rmsnorm 35b k exact T", 256, 2, tokens, true, false,
                        3701u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
     }
+    for (std::int32_t tokens = 1; tokens <= 16; ++tokens) {
+        f += one_shape("rmsnorm dflash hidden plain exact T", 2048, tokens, 1, false, false,
+                       4501u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
+        f += one_shape("rmsnorm dflash q plain exact T", 128, 32, tokens, false, false,
+                       4601u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
+        f += one_shape("rmsnorm dflash k plain exact T", 128, 8, tokens, false, false,
+                       4701u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
+    }
+    for (std::int32_t tokens : {128, 1024}) {
+        f += one_shape("rmsnorm dflash hidden plain prefill", 2048, tokens, 1, false, false,
+                       4801u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
+        f += one_shape("rmsnorm dflash context k plain prefill", 128, 8, tokens, false, false,
+                       4901u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);
+    }
+    f +=
+        one_shape("rmsnorm dflash hidden graph", 2048, 16, 1, false, false, 5001u, -8.f, 8.f, true);
+    f += one_shape("rmsnorm dflash q graph B=2", 128, 32, 2, false, false, 5002u, -8.f, 8.f, true);
+    f += one_shape("rmsnorm dflash k graph B=16", 128, 8, 16, false, false, 5003u, -8.f, 8.f, true);
+    f += one_shape("rmsnorm dflash context k graph T=1024", 128, 8, 1024, false, false, 5004u, -8.f,
+                   8.f, true);
+    f += one_shape("rmsnorm dflash plain near-zero", 128, 32, 3, false, false, 5005u, -1.0e-5f,
+                   1.0e-5f);
+    f += one_shape("rmsnorm dflash plain stress [-60,60]", 2048, 3, 1, false, false, 5006u, -60.f,
+                   60.f);
     for (std::int32_t tokens = 1; tokens <= 16; ++tokens) {
         f += one_shape("rmsnorm 35b gated exact T", 128, 32, tokens, false, true,
                        3801u + static_cast<std::uint32_t>(tokens), -8.f, 8.f);

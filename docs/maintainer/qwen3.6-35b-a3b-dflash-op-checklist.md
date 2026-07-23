@@ -577,7 +577,7 @@ phase.
 
 ### OP-A02: plain `rmsnorm`
 
-**Status:** [ ] shape coverage [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] shape coverage [x] correctness [x] benchmark [x] route [ ] integration
 
 The existing formula is already correct with `unit_offset=false`:
 
@@ -598,6 +598,22 @@ The D=128 and D=2048 kernel families already exist. Extend direct qualification 
 Q32/KV8 batching, every `T=1..16` including all product blocks, representative prefill `T_p`,
 near-zero norms, large/small values, and Graph replay. Record separate D128 and D2048 timings;
 integrate the selected composed routes without adding `FUT-F01` or `FUT-F04` in this phase.
+
+**Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
+
+- `ninfer_rmsnorm_test` qualifies plain `[2048,T]`, `[128,32,T]`, and `[128,8,T]` directly
+  against the FP64 oracle for every `T=1..16`, prefill `T=128,1024`, near-zero and stress inputs,
+  output guards, preserved inputs, and CUDA Graph replay.
+- `ninfer_rmsnorm_bench --decode --prefill` measures every `T=1..16` and both prefill points.
+  The selected routes are one fixed-D128 two-pair-per-lane warp kernel with 128-thread CTAs and
+  one D2048 512-thread CTA kernel. The complete small-T sweep has no dispatch boundary or
+  repeatable latency cliff.
+- Narrow NCU captures use one matched launch with `--set basic`. At `T=1024`, D2048 takes
+  6.752 us versus 6.208 us for the same-topology payload control; Q32 D128 takes 8.736 us and KV8
+  D128 takes 4.160 us, both faster than their 10.272 us and 4.192 us payload controls. The
+  production benchmark reports 1720 GB/s for Q32 D128, 96.0% of the measured 1792 GB/s device
+  bandwidth ceiling. Small product extents remain launch/parallelism limited rather than
+  bandwidth limited.
 
 ### OP-A03: W8 `linear_pair [1024,2048]`
 
@@ -1014,7 +1030,7 @@ commit together.
 | Order | ID | Deliverable | C | B | O | E |
 |---:|---|---|:---:|:---:|:---:|:---:|
 | 0 | mask contract | Freeze non-causal symmetry and the inclusive `abs(delta)<4096` predicate | [x] | — | — | — |
-| 1 | `OP-A02` | Plain D2048/D128 RMSNorm domains | [ ] | [ ] | [ ] | [ ] |
+| 1 | `OP-A02` | Plain D2048/D128 RMSNorm domains | [x] | [x] | [x] | [ ] |
 | 2 | `OP-A04` | D128 full-head 1-D RoPE | [ ] | [ ] | [ ] | [ ] |
 | 3 | `OP-A05` | W8 Q/K/V direct projection | [ ] | [ ] | [ ] | [ ] |
 | 4 | `OP-N03` | Bidirectional full GQA | [x] | [x] | [x] | [ ] |

@@ -26,6 +26,18 @@ MTP statistics are written to stderr, so stdout can be redirected independently:
 Thinking is enabled by default. Add `--no-thinking` for direct-response prompt rendering or
 `--greedy` for exact argmax decoding.
 
+## Startup memory profile
+
+GPU residency is frozen when the Engine starts:
+
+- `--mtp-draft-tokens 0` omits MTP weights, MTP KV/state, and the optimized draft head;
+- MTP with the full proposal head omits the optimized draft head;
+- `--no-vision` omits Vision weights and the maximum Vision workspace.
+
+The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
+text-only Engine rejects media and cannot enable Vision later. For the smallest resident profile,
+use the default MTP setting together with `--no-vision`.
+
 ## Structured messages
 
 `--messages` accepts either a non-empty JSON message array or an object containing `messages`
@@ -106,6 +118,7 @@ proposal head.
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--mtp-draft-tokens 0..5` | MTP draft window | `0` |
 | `--lm-head-draft` | optimized MTP proposal head | off |
+| `--no-vision` | permanently disable Vision and omit its GPU allocations | Vision on |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
 | `--greedy` | exact argmax decoding | off |
@@ -130,3 +143,4 @@ one RTX 5090 depends on the selected artifact, media workload, output budget, an
 Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 
+All weight, sequence, workspace, and graph allocations are released when the Engine is destroyed.

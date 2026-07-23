@@ -276,6 +276,12 @@ The binder selected for an executable target validates:
 The binder owns semantic completeness. It may generate repeated layer names and expected shapes
 with model-private loops rather than duplicating a flat JSON table in C++.
 
+Completeness validation and device residency are separate. A registered target always consumes and
+validates its complete artifact inventory, then its frozen Engine startup features select which
+validated tensor groups enter the compact device materialization plan. An omitted group has no
+device address and cannot become resident later; this does not define a partial or alternate
+artifact.
+
 ### 6.3 Payload-content validation
 
 Persistent numeric and layout contracts still apply to the bytes produced by the project-owned

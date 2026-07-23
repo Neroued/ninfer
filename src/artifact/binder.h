@@ -3,11 +3,17 @@
 #include "artifact/reader.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <string_view>
 #include <vector>
 
 namespace ninfer::artifact {
+
+enum class TensorPlacement : std::uint8_t {
+    Device,
+    ValidateOnly,
+};
 
 struct ObjectHandle {
     std::size_t index = 0;
@@ -43,6 +49,7 @@ public:
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);
     void retain_on_host(ObjectHandle handle);
+    void validate_only(ObjectHandle handle);
     MaterializationPlan finish();
 
 private:

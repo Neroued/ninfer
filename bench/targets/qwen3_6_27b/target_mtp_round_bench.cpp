@@ -112,21 +112,7 @@ int run(const Options& options) {
         return 0;
     }
 
-    ninfer::DeviceContext device(options.device);
-    ninfer::artifact::Reader reader(options.artifact);
-    if (reader.model_id() != target::Package::model_id) {
-        throw std::invalid_argument("artifact model_id does not match qwen3.6-27b");
-    }
-    ninfer::artifact::Binder binder(reader);
-    auto load_plan = target::Package::plan_load(binder);
-    auto materialized =
-        ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
-    auto model =
-        target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
-    auto frontend = target::Package::make_frontend(*model);
     const std::vector<ninfer::TokenId> seed{248045, 846, 198, 5834, 248046, 198};
-    auto prompt = frontend.prepare_tokens(seed, false);
-
     const std::uint32_t measured_rounds =
         static_cast<std::uint32_t>(options.warmup + options.repetitions);
     ninfer::EngineOptions engine;
@@ -141,6 +127,20 @@ int run(const Options& options) {
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
+
+    ninfer::DeviceContext device(options.device);
+    ninfer::artifact::Reader reader(options.artifact);
+    if (reader.model_id() != target::Package::model_id) {
+        throw std::invalid_argument("artifact model_id does not match qwen3.6-27b");
+    }
+    ninfer::artifact::Binder binder(reader);
+    auto load_plan = target::Package::plan_load(binder, engine);
+    auto materialized =
+        ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
+    auto model =
+        target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    auto frontend = target::Package::make_frontend(*model);
+    auto prompt   = frontend.prepare_tokens(seed, false);
 
     auto sequence = target::Package::plan_sequence(device, engine);
     auto program  = target::Package::create_program(*model, std::move(sequence), device);

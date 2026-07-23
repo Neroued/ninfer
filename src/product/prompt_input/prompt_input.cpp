@@ -84,7 +84,8 @@ OwnedMedia acquire_media(const Json& part, MediaKind kind, std::size_t message_i
     return result;
 }
 
-std::vector<MessagePart> parse_content(const Json& content, std::size_t message_index) {
+std::vector<MessagePart> parse_content(const Json& content, std::size_t message_index,
+                                       bool vision_enabled) {
     if (content.is_null()) { return {}; }
     if (content.is_string()) {
         MessagePart part;
@@ -113,10 +114,16 @@ std::vector<MessagePart> parse_content(const Json& content, std::size_t message_
             part.text = item.at("text").get<std::string>();
         } else if (type == "image" || type == "image_url" || item.contains("image") ||
                    item.contains("image_url")) {
+            if (!vision_enabled) {
+                throw std::invalid_argument("Vision is disabled for this Engine");
+            }
             part.kind  = MessagePartKind::Media;
             part.media = acquire_media(item, MediaKind::Image, message_index, i);
         } else if (type == "video" || type == "video_url" || item.contains("video") ||
                    item.contains("video_url")) {
+            if (!vision_enabled) {
+                throw std::invalid_argument("Vision is disabled for this Engine");
+            }
             part.kind  = MessagePartKind::Media;
             part.media = acquire_media(item, MediaKind::Video, message_index, i);
         } else {
@@ -164,7 +171,7 @@ std::vector<ToolCall> parse_tool_calls(const Json& value, std::size_t message_in
     return result;
 }
 
-ChatMessage parse_message(const Json& item, std::size_t index) {
+ChatMessage parse_message(const Json& item, std::size_t index, bool vision_enabled) {
     if (!item.is_object() || !item.contains("role") || !item.contains("content")) {
         throw std::invalid_argument("message " + std::to_string(index) +
                                     " must be an object containing role and content");
@@ -186,7 +193,7 @@ ChatMessage parse_message(const Json& item, std::size_t index) {
     if (!supported_role(message.role)) {
         throw std::invalid_argument("unsupported chat role: " + message.role);
     }
-    message.parts = parse_content(item.at("content"), index);
+    message.parts = parse_content(item.at("content"), index, vision_enabled);
 
     if (item.contains("reasoning_content")) {
         if (!item.at("reasoning_content").is_string()) {
@@ -227,7 +234,8 @@ PromptInput prompt_from_text(std::string text, bool enable_thinking) {
     return input;
 }
 
-PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_thinking) {
+PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_thinking,
+                                 bool vision_enabled) {
     std::ifstream stream(path);
     if (!stream) { throw std::runtime_error("failed to open messages JSON: " + path.string()); }
 
@@ -259,7 +267,7 @@ PromptInput prompt_from_messages(const std::filesystem::path& path, bool enable_
     }
     input.messages.reserve(root.size());
     for (std::size_t i = 0; i < root.size(); ++i) {
-        input.messages.push_back(parse_message(root.at(i), i));
+        input.messages.push_back(parse_message(root.at(i), i, vision_enabled));
     }
     return input;
 }

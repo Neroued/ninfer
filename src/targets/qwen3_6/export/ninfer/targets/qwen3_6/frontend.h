@@ -91,9 +91,9 @@ private:
     std::shared_ptr<const Impl> impl_;
 
     friend class FrontendTestAccess;
-    friend Frontend make_frontend(const FrontendResources& resources);
+    friend Frontend make_frontend(const FrontendResources& resources, bool vision_enabled);
 };
 
-[[nodiscard]] Frontend make_frontend(const FrontendResources& resources);
+[[nodiscard]] Frontend make_frontend(const FrontendResources& resources, bool vision_enabled);
 
 } // namespace ninfer::targets::qwen3_6

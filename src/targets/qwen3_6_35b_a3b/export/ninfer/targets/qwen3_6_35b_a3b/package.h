@@ -83,7 +83,7 @@ struct Package {
     using RequestPlan    = qwen3_6::RequestPlan<detail::Variant>;
     using Program        = qwen3_6::Program<detail::Variant>;
 
-    [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder);
+    [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
     [[nodiscard]] static Frontend make_frontend(const LoadedModel& model);

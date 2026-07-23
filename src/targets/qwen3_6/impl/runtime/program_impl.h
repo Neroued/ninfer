@@ -96,12 +96,19 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     : model(model_in), device(device_in), capacity(plan.capacity),
       prefill_chunk(plan.prefill_chunk), mtp_k(plan.mtp_k), kv_dtype(plan.kv_dtype),
       kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
-      use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
+      kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), persistent(plan.persistent.bytes),
       work(plan.workspace_bytes),
       round_host((static_cast<std::size_t>(mtp_k) + 2ULL) * sizeof(std::int32_t)) {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
+    }
+    if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp ||
+        model.optimized_proposal.has_value() != plan.features.optimized_proposal ||
+        model.vision.has_value() != plan.features.vision) {
+        throw std::invalid_argument(
+            "Qwen3.6 loaded weights do not match the frozen startup features");
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);

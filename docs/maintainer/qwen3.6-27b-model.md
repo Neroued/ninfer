@@ -400,6 +400,12 @@ is not a contract or acceptance test.
 KV memory grows with configured context. GDN recurrent state does not, although MTP snapshot count
 changes its fixed allocation.
 
+The Program freezes its feature set at startup. A zero MTP draft window has no MTP weight view,
+MTP KV cache, or optimized proposal head. With Vision disabled, it has no Vision weight view and
+the shared workspace excludes the maximum Vision envelope; media is rejected by the matching
+Frontend. The complete artifact inventory is still validated before these resident views are
+published.
+
 ## 14. Implementation map
 
 | Model concern | Source |

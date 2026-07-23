@@ -61,7 +61,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     auto sequence_plan = Target::plan_sequence(device, options);
 
     artifact::Binder binder(reader);
-    auto load_plan = Target::plan_load(binder);
+    auto load_plan = Target::plan_load(binder, options);
     validate_device_budget(load_plan.materialization().device_capacity_bytes,
                            sequence_plan.device_reservation_bytes());
     auto progress     = artifact_progress(options.load_progress);

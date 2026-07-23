@@ -58,7 +58,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
            "[--kv-dtype bf16|int8] [--mtp-draft-tokens N] [--default-max-tokens N] "
-           "[--no-cuda-graph] [--no-prefix-reuse] "
+           "[--no-vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -68,6 +68,7 @@ std::string serve_usage_text(const char* argv0) {
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --no-vision permanently rejects media and omits Vision GPU allocations\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
            "top-k 20, presence-penalty 1.0); a request may override any field.\n"
@@ -137,6 +138,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
             default_max_tokens_explicit = true;
+        } else if (arg == "--no-vision") {
+            options.enable_vision = false;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {

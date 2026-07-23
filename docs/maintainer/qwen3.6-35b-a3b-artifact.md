@@ -898,19 +898,24 @@ Qwen3.6-35B-A3B binder:
    duplicate-role, or alternate-profile objects;
 3. require every exact shape, format, layout, and resource encoding, including the Q6 routed-down
    set `{34,38,39}`;
-4. materialize the 883 tensors in the Section 4 tensor order directly into one
-   22,360,207,360-byte 256-byte-aligned device arena, with no persistent decoded or repacked copy;
+4. validate all 883 tensors, then materialize the startup-selected groups directly into one compact
+   256-byte-aligned device arena, with no persistent decoded or repacked copy; the all-features
+   profile is 22,360,207,360 bytes;
 5. build the full-attention, GDN half-split A/B, router/shared-gate, shared gate/up, and
    routed-expert views in Section 8 once during binding;
 6. interpret the object rows in the compiled expert-major order, build descriptors for 256
    equal-stride experts and half-split gate/up rows, and use router id directly as expert id;
    converter and offline verification establish the stored value order;
-7. bind all 40 Text layers, the full embedding/head, final norm, and optimized draft head;
+7. always materialize all 40 Text layers, the full embedding/head, and final norm; materialize the
+   validated optimized draft head only when selected at startup;
 8. require 131072 unique draft ids in `0..248076` and bind shortlist row `i` to map entry `i`;
-9. bind all MTP-specific tensors and its Text aliases while retaining independent runtime KV;
-10. bind the complete 27-block Vision tower and 2048-wide merger;
+9. validate all MTP-specific tensors, materializing their Text aliases and independent runtime KV
+   only when the startup draft window is nonzero;
+10. validate the complete 27-block Vision tower and 2048-wide merger, materializing them only when
+    Vision is enabled at startup;
 11. retain and validate all six frontend resources for the loaded-model lifetime; and
-12. publish Text, MTP, Vision, draft head, and Frontend atomically only after complete binding.
+12. publish Text plus exactly the MTP, optimized proposal, and Vision groups selected at startup,
+    and the Frontend, only after complete artifact validation.
 
 The binder does not know checkpoint paths, safetensors shards, GGUF types, importance matrices,
 ranking inputs, quantization operations, or conversion-report fields. The common reader does not

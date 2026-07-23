@@ -92,9 +92,12 @@ struct VisionWeights {
     Tensor merger_fc2_bias;
 };
 
-[[nodiscard]] VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder);
-[[nodiscard]] VisionMergerInputPlan bind_vision_merger_input(artifact::Binder& binder);
-[[nodiscard]] VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder);
+[[nodiscard]] VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
+                                                      artifact::TensorPlacement placement);
+[[nodiscard]] VisionMergerInputPlan bind_vision_merger_input(artifact::Binder& binder,
+                                                             artifact::TensorPlacement placement);
+[[nodiscard]] VisionMergerNormPlan bind_vision_merger_norm(artifact::Binder& binder,
+                                                           artifact::TensorPlacement placement);
 
 [[nodiscard]] VisionCommonWeights materialize_vision_common(
     const artifact::MaterializedArtifact& materialized, const VisionBackbonePlan& backbone,

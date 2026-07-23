@@ -7,6 +7,7 @@
 #include "core/tensor.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
+#include <ninfer/targets/qwen3_6/startup_features.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -40,8 +41,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     DType kv_dtype              = DType::BF16;
     std::int32_t kv_quant_group = 0;
     ProposalHead proposal_head  = ProposalHead::Full;
-    bool use_cuda_graph         = true;
-    int device                  = 0;
+    StartupFeatures features;
+    bool use_cuda_graph = true;
+    int device          = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     std::size_t workspace_bytes          = 0;
     std::size_t graph_allowance_bytes    = 0;

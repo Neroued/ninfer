@@ -180,12 +180,17 @@ void TextContext::bind() {
     embed_      = &weights_.token_embedding;
     final_norm_ = &weights_.final_norm;
     lm_head_    = &weights_.output_head;
-    set_lm_head_draft(&weights_.draft_head,
-                      static_cast<const std::int32_t*>(weights_.draft_head_token_ids.data),
-                      weights_.draft_head.n);
+    if (weights_.optimized_proposal) {
+        const auto& proposal = *weights_.optimized_proposal;
+        set_lm_head_draft(&proposal.head, static_cast<const std::int32_t*>(proposal.token_ids.data),
+                          proposal.head.n);
+    }
 
     if (mtp_kv_ != nullptr) {
-        const auto& source = weights_.mtp;
+        if (!weights_.mtp) {
+            throw std::invalid_argument("MTP state was enabled without materialized MTP weights");
+        }
+        const auto& source = *weights_.mtp;
         mtp_               = MtpW{&source,
                     &source.input_projection,
                     &source.embedding_norm,

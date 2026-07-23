@@ -131,6 +131,7 @@ GenerationService::GenerationService(ServeOptions options) : options_(std::move(
     engine_options.max_context              = options_.max_context;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
+    engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative.draft_tokens = static_cast<std::uint32_t>(options_.mtp_draft_tokens);
     engine_options.speculative.proposal_head = options_.proposal_head;
@@ -144,7 +145,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request) con
     prepared.tool_capable         = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length = request.tool_name_max_length;
     prepared.enable_thinking      = request.enable_thinking.value_or(options_.enable_thinking);
-    if (has_media(request)) { prepared.media_permit = std::unique_lock<std::mutex>(media_mutex_); }
+    const bool request_has_media  = has_media(request);
+    if (request_has_media && !options_.enable_vision) {
+        const std::invalid_argument error("Vision is disabled for this server");
+        throw_invalid_input(error, "vision_disabled");
+    }
+    if (request_has_media) { prepared.media_permit = std::unique_lock<std::mutex>(media_mutex_); }
 
     const auto start = Clock::now();
     try {
@@ -161,7 +167,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request) con
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request) const {
     std::unique_lock<std::mutex> media_permit;
-    if (has_media(request)) { media_permit = std::unique_lock<std::mutex>(media_mutex_); }
+    const bool request_has_media = has_media(request);
+    if (request_has_media && !options_.enable_vision) {
+        const std::invalid_argument error("Vision is disabled for this server");
+        throw_invalid_input(error, "vision_disabled");
+    }
+    if (request_has_media) { media_permit = std::unique_lock<std::mutex>(media_mutex_); }
     try {
         ninfer::PromptInput input = to_prompt_input(
             request, options_, [](const ContentPart& part) { return acquire_media(part); });

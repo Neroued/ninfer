@@ -232,7 +232,8 @@ int main(int argc, char** argv) {
         ninfer::PromptInput input =
             cli.messages_path.empty()
                 ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
-                : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking);
+                : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
+                                                        cli.enable_vision);
 
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
@@ -251,6 +252,7 @@ int main(int argc, char** argv) {
         engine_options.kv_cache                         = cli.kv_cache;
         engine_options.speculative.draft_tokens         = cli.mtp_draft_tokens;
         engine_options.speculative.proposal_head        = cli.proposal_head;
+        engine_options.enable_vision                    = cli.enable_vision;
         engine_options.use_cuda_graph                   = cli.use_cuda_graph;
         engine_options.load_progress.min_interval_bytes = 1ULL << 30;
         engine_options.load_progress.callback = [&](std::string_view phase, std::uint64_t done,

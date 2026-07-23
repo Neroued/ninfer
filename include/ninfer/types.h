@@ -42,6 +42,7 @@ struct EngineOptions {
     std::uint32_t prefill_chunk = 1024;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    bool enable_vision  = true;
     bool use_cuda_graph = true;
     LoadProgress load_progress;
 };

@@ -1,11 +1,13 @@
 #pragma once
 
+#include <ninfer/targets/qwen3_6/startup_features.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
 #include "core/tensor.h"
 
 #include <array>
 #include <cstddef>
+#include <optional>
 
 namespace ninfer {
 
@@ -50,6 +52,11 @@ struct MtpWeights {
     Tensor final_norm;
 };
 
+struct OptimizedProposalWeights {
+    Weight head;
+    Tensor token_ids;
+};
+
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,
           class MtpAttentionPayload, class MtpPostMixerPayload, std::size_t FullAttentionLayers,
           std::size_t GdnLayers>
@@ -64,10 +71,10 @@ struct ModelView {
     std::array<GdnLayer, GdnLayers> gdn_layers;
     Tensor final_norm;
     Weight output_head;
-    Weight draft_head;
-    Tensor draft_head_token_ids;
-    MtpLayer mtp;
-    VisionWeights vision;
+    StartupFeatures features;
+    std::optional<OptimizedProposalWeights> optimized_proposal;
+    std::optional<MtpLayer> mtp;
+    std::optional<VisionWeights> vision;
 };
 
 } // namespace targets::qwen3_6

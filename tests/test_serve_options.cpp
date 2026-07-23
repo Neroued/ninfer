@@ -30,12 +30,15 @@ int main() {
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
+    failures += check(defaults.enable_vision, "Vision is not enabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
 
-    const ServeOptions disabled = parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse"});
+    const ServeOptions disabled =
+        parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--no-vision"});
     failures += check(!disabled.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
+    failures += check(!disabled.enable_vision, "--no-vision did not disable Vision");
 
     GenerationRequest request;
     request.max_tokens = 1;
@@ -47,6 +50,8 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+    failures += check(serve_usage_text("ninfer-serve").find("--no-vision") != std::string::npos,
+                      "serve help omits --no-vision");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

@@ -48,6 +48,7 @@ int main() {
     options.kv_cache           = ninfer::KvCacheStorage::Int8Group64;
     options.mtp_draft_tokens   = 3;
     options.proposal_head      = ninfer::ProposalHead::Optimized;
+    options.enable_vision      = false;
     options.allow_prefix_reuse = false;
     options.startup_argv       = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
@@ -93,6 +94,7 @@ int main() {
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
                       "request log path missing");
     failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");
+    failures += check(server.at("engine").at("vision") == false, "Vision state missing");
     failures +=
         check(server.at("engine").at("mtp_proposal_head") == "optimized", "proposal head missing");
     failures +=

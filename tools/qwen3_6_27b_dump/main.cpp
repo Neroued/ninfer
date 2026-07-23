@@ -424,24 +424,6 @@ std::uint32_t terminal_count(std::span<const ninfer::TokenId> tokens,
 }
 
 int run(const Options& options) {
-    ninfer::DeviceContext device(options.device);
-    ninfer::artifact::Reader reader(options.weights);
-    if (reader.model_id() != target::Package::model_id) {
-        throw std::invalid_argument("artifact model_id does not match qwen3.6-27b");
-    }
-    ninfer::artifact::Binder binder(reader);
-    auto load_plan = target::Package::plan_load(binder);
-    auto materialized =
-        ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
-    auto model =
-        target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
-    auto frontend = target::Package::make_frontend(*model);
-    auto prompt   = options.messages.empty() ? frontend.prepare_tokens(options.ids, false)
-                                             : frontend.prepare(ninfer::product::prompt_from_messages(
-                                                 options.messages, options.enable_thinking));
-    const ninfer::PromptSummary prompt_summary = prompt.summary();
-    Json frontend_dump                         = frontend_metadata(prompt);
-
     ninfer::EngineOptions engine;
     engine.artifact_path             = options.weights;
     engine.device                    = options.device;
@@ -450,7 +432,26 @@ int run(const Options& options) {
     engine.speculative.draft_tokens  = options.mtp_drafts;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = false;
-    const std::uint64_t required     = static_cast<std::uint64_t>(prompt_summary.prompt_tokens) +
+
+    ninfer::DeviceContext device(options.device);
+    ninfer::artifact::Reader reader(options.weights);
+    if (reader.model_id() != target::Package::model_id) {
+        throw std::invalid_argument("artifact model_id does not match qwen3.6-27b");
+    }
+    ninfer::artifact::Binder binder(reader);
+    auto load_plan = target::Package::plan_load(binder, engine);
+    auto materialized =
+        ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
+    auto model =
+        target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
+    auto frontend = target::Package::make_frontend(*model);
+    auto prompt   = options.messages.empty() ? frontend.prepare_tokens(options.ids, false)
+                                             : frontend.prepare(ninfer::product::prompt_from_messages(
+                                                 options.messages, options.enable_thinking, true));
+    const ninfer::PromptSummary prompt_summary = prompt.summary();
+    Json frontend_dump                         = frontend_metadata(prompt);
+
+    const std::uint64_t required = static_cast<std::uint64_t>(prompt_summary.prompt_tokens) +
                                    options.decode + 2ULL * options.mtp_drafts;
     engine.max_context = options.max_context != 0
                              ? options.max_context

@@ -106,6 +106,11 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
 The `.ninfer` file contains the weights and frontend resources needed by NInfer. It is not a
 Transformers checkpoint, Safetensors distribution, or GGUF file.
 
+The artifact is complete, while GPU residency is fixed at process startup. With the default
+`--mtp-draft-tokens 0`, MTP and optimized draft-head weights are validated but not uploaded.
+Add `--no-vision` to the CLI or server for a permanently text-only Engine that also omits Vision
+weights and the Vision workspace. Disabled capabilities cannot be enabled by a later request.
+
 ## Run the CLI
 
 ```bash
@@ -113,6 +118,7 @@ Transformers checkpoint, Safetensors distribution, or GGUF file.
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 \
   --max-new 256 \
+  --no-vision \
   --mtp-draft-tokens 3 \
   --lm-head-draft
 ```
@@ -136,6 +142,7 @@ MTP statistics are written to stderr. See the [CLI guide](docs/cli.md) and
 ./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
   --model-id qwen3.6-27b \
   --max-context 16384 \
+  --no-vision \
   --mtp-draft-tokens 3 \
   --lm-head-draft
 ```

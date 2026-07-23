@@ -590,12 +590,12 @@ DecoderState terminal_state(DecoderState state) {
 
 class Frontend::Impl {
 public:
-    Impl(const FrontendResources& resources, bool registered_checkpoint)
+    Impl(const FrontendResources& resources, bool registered_checkpoint, bool vision_enabled_)
         : tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          processor(processor_options(resources)) {
+          processor(processor_options(resources)), vision_enabled(vision_enabled_) {
         validate_tokenizer_config(resources);
         if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
         for (const int token : tokenizer->default_stop_token_ids()) {
@@ -610,6 +610,7 @@ public:
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
     StopPolicy defaults;
+    bool vision_enabled = true;
 };
 
 class OutputSession::Impl {
@@ -772,12 +773,13 @@ Frontend::Frontend(Frontend&&) noexcept            = default;
 Frontend& Frontend::operator=(Frontend&&) noexcept = default;
 Frontend::~Frontend()                              = default;
 
-Frontend make_frontend(const FrontendResources& resources) {
-    return Frontend(std::make_shared<const Frontend::Impl>(resources, true));
+Frontend make_frontend(const FrontendResources& resources, bool vision_enabled) {
+    return Frontend(std::make_shared<const Frontend::Impl>(resources, true, vision_enabled));
 }
 
-Frontend FrontendTestAccess::create_component(const FrontendResources& resources) {
-    return Frontend(std::make_shared<const Frontend::Impl>(resources, false));
+Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
+                                              bool vision_enabled) {
+    return Frontend(std::make_shared<const Frontend::Impl>(resources, false, vision_enabled));
 }
 
 const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& prompt) {
@@ -807,6 +809,9 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });
+    if (has_media && !impl_->vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
@@ -850,6 +855,9 @@ std::uint32_t Frontend::count_tokens(PromptInput input) const {
     const bool has_media =
         std::any_of(messages.begin(), messages.end(),
                     [](const fi::ChatMessage& message) { return message.has_media(); });
+    if (has_media && !impl_->vision_enabled) {
+        throw std::invalid_argument("Vision is disabled for this Engine");
+    }
     if (!has_media) {
         return checked_token_count(
             impl_->tokenizer->encode(fi::render_chat(messages, render_options(options))).size());

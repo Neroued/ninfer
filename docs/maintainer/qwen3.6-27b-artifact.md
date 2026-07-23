@@ -660,23 +660,25 @@ Qwen3.6-27B binder must perform exactly the model-specific work below.
    object.
 3. Require every tensor's exact shape, format, and layout and every resource's exact
    `raw-bytes-v1` encoding. Encoded byte sizes come from the registered layouts, not this binder.
-4. Build immutable Text bindings for the 16 full-attention layers, 48 GDN layers, all 64 MLPs,
-   embedding, final norm, full head, draft head, and ID map.
+4. Always materialize immutable Text bindings for the 16 full-attention layers, 48 GDN layers, all
+   64 MLPs, embedding, final norm, and full head. Validate the draft head and ID map in every
+   artifact, but materialize them only for the startup-selected optimized MTP proposal path.
 5. Build the fixed row views and aliases in Section 8. These views are derived once during binding;
    Text/MTP/Vision hot paths do not perform artifact-name lookups.
 6. Treat each `[4,10240]` GDN convolution as tap-major and form the consumer's channel-major
    transpose explicitly.
 7. Require 131072 unique draft-head IDs in `0..248076` and bind row `i` to its corresponding mapped
    vocabulary ID.
-8. Bind MTP to the shared Text embedding and full head, plus the mandatory optimized draft head,
-   while keeping MTP KV/state separate at execution time.
-9. Build the complete 27-layer Vision and merger bindings; Vision cannot be omitted merely because
-   the current request is text-only.
+8. Validate every MTP tensor. Materialize and bind MTP to the shared Text embedding and full head
+   only when the startup draft window is nonzero, while keeping MTP KV/state separate at execution
+   time.
+9. Validate the complete 27-layer Vision and merger inventory. Materialize it only when Vision is
+   enabled at startup; a request never changes that decision.
 10. Retain the six frontend resource payloads for the loaded-model lifetime and construct the
     shared Qwen3.6 native Frontend from them. Verify the family resource identity, tokenizer domain,
     required special IDs, template identity, and processor configuration before generation.
-11. Reject a partially bound product. Text, MTP, Vision, draft head, and frontend resources become
-    usable together only after the complete binding succeeds.
+11. Reject an incompletely validated product. Publish Text plus exactly the MTP, optimized proposal,
+    and Vision groups selected at startup only after complete artifact validation succeeds.
 
 The binder does not know source checkpoint paths, safetensors keys, ranking inputs, quantization
 operations, converter arguments, or conversion sidecar fields. Conversely, the common `.ninfer`

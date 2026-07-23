@@ -137,11 +137,15 @@ void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
 } // namespace
 
 VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights) : ctx_(ctx) {
-    patch_embed_      = &weights.vision.common.patch_embedding;
-    patch_embed_bias_ = &weights.vision.common.patch_embedding_bias;
-    position_embed_   = &weights.vision.common.position_embedding;
+    if (!weights.vision) {
+        throw std::invalid_argument("Vision execution was requested without materialized weights");
+    }
+    const auto& vision = *weights.vision;
+    patch_embed_       = &vision.common.patch_embedding;
+    patch_embed_bias_  = &vision.common.patch_embedding_bias;
+    position_embed_    = &vision.common.position_embedding;
     for (std::uint32_t layer = 0; layer < blocks_.size(); ++layer) {
-        const auto& source  = weights.vision.common.layers[layer];
+        const auto& source  = vision.common.layers[layer];
         BlockW& out         = blocks_[layer];
         out.norm1_weight    = &source.norm1_weight;
         out.norm1_bias      = &source.norm1_bias;
@@ -156,12 +160,12 @@ VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights)
         out.fc2             = &source.fc2;
         out.fc2_bias        = &source.fc2_bias;
     }
-    merger_.norm_weight = &weights.vision.common.merger_norm_weight;
-    merger_.norm_bias   = &weights.vision.common.merger_norm_bias;
-    merger_.fc1         = &weights.vision.common.merger_fc1;
-    merger_.fc1_bias    = &weights.vision.common.merger_fc1_bias;
-    merger_.fc2         = &weights.vision.merger_fc2;
-    merger_.fc2_bias    = &weights.vision.merger_fc2_bias;
+    merger_.norm_weight = &vision.common.merger_norm_weight;
+    merger_.norm_bias   = &vision.common.merger_norm_bias;
+    merger_.fc1         = &vision.common.merger_fc1;
+    merger_.fc1_bias    = &vision.common.merger_fc1_bias;
+    merger_.fc2         = &vision.merger_fc2;
+    merger_.fc2_bias    = &vision.merger_fc2_bias;
 }
 
 std::size_t VisionContext::workspace_bytes(const qwen3_6::VisionItemControl& item) {

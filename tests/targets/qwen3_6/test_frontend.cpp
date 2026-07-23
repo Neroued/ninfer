@@ -112,6 +112,21 @@ std::vector<std::uint8_t> gradient_ppm() {
     return ppm;
 }
 
+ninfer::PromptInput image_input() {
+    ninfer::MessagePart image;
+    image.kind              = ninfer::MessagePartKind::Media;
+    image.media.kind        = ninfer::MediaKind::Image;
+    image.media.bytes       = gradient_ppm();
+    image.media.media_type  = "image/x-portable-pixmap";
+    image.media.source_name = "inline.ppm";
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(std::move(image));
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    return input;
+}
+
 bool near(float actual, float expected) { return std::abs(actual - expected) < 1.0e-6F; }
 
 constexpr std::array<std::uint8_t, 32> kGradientDigest{
@@ -534,6 +549,24 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     return failures;
 }
 
+int test_disabled_vision() {
+    const Frontend frontend = FrontendFactory::create_component(resources(), false);
+    int failures = check(throws_invalid_argument([&] { (void)frontend.prepare(image_input()); }),
+                         "Vision-disabled frontend accepted media during prepare");
+    failures += check(throws_invalid_argument([&] { (void)frontend.count_tokens(image_input()); }),
+                      "Vision-disabled frontend accepted media during token counting");
+
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    failures += check(frontend.prepare(std::move(input)).summary().prompt_tokens != 0,
+                      "Vision-disabled frontend rejected a text prompt");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -550,5 +583,6 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
+    failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
 }

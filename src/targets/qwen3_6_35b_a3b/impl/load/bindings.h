@@ -3,6 +3,7 @@
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 #include <ninfer/targets/qwen3_6/model_view.h>
+#include <ninfer/targets/qwen3_6/startup_features.h>
 #include <ninfer/targets/qwen3_6/vision.h>
 
 #include "artifact/binder.h"
@@ -67,6 +68,7 @@ struct MtpPlan {
 
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
+    qwen3_6::StartupFeatures features;
     artifact::ObjectHandle token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
@@ -86,7 +88,7 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder);
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features);
 
 struct SparseMoePayload {
     ops::SparseMoeWeights op;

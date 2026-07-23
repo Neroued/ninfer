@@ -11,6 +11,10 @@ namespace ninfer::artifact {
 
 class MaterializedArtifact;
 
+[[nodiscard]] ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat format,
+                                       std::initializer_list<std::uint64_t> shape,
+                                       TensorPlacement placement);
+
 [[nodiscard]] ObjectHandle bind_device_tensor(Binder& binder, std::string_view name,
                                               NumericFormat format,
                                               std::initializer_list<std::uint64_t> shape);

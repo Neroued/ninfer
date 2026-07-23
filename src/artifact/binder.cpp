@@ -112,6 +112,15 @@ void Binder::retain_on_host(ObjectHandle handle) {
     planned_[handle.index] = true;
 }
 
+void Binder::validate_only(ObjectHandle handle) {
+    const ObjectDescriptor& object = descriptor(handle);
+    if (planned_[handle.index]) {
+        throw ArtifactError("artifact object has more than one materialization placement: " +
+                            std::string(object_name(object)));
+    }
+    planned_[handle.index] = true;
+}
+
 MaterializationPlan Binder::finish() {
     const auto it = std::find(consumed_.begin(), consumed_.end(), false);
     if (it != consumed_.end()) {

@@ -54,7 +54,7 @@ ninfer::test::artifact_fixture::TemporaryArtifact write_fixture() {
                              {"shape", {4}},
                              {"format", "BF16"},
                              {"layout", "contiguous-le-v1"},
-                             {"offset", 512},
+                             {"offset", 8192},
                              {"bytes", 8}},
                         })},
         },
@@ -73,6 +73,28 @@ void require(bool condition, const char* message) {
 
 int main() {
     try {
+        auto fixture = write_fixture();
+        ninfer::artifact::Reader reader(fixture.path);
+        ninfer::artifact::Binder validation_binder(reader);
+        const auto validated_resource = validation_binder.require_resource(
+            "frontend/test.json", ninfer::artifact::ResourceEncoding::RawBytesV1);
+        validation_binder.retain_on_host(validated_resource);
+        constexpr std::array<std::uint64_t, 1> validated_shape = {2};
+        const auto validated_only                              = validation_binder.require_tensor(
+            "weights/test", ninfer::artifact::NumericFormat::BF16,
+            ninfer::artifact::StorageLayout::ContiguousLeV1, validated_shape);
+        validation_binder.validate_only(validated_only);
+        constexpr std::array<std::uint64_t, 1> retained_shape = {4};
+        const auto retained_tensor                            = validation_binder.require_tensor(
+            "weights/second", ninfer::artifact::NumericFormat::BF16,
+            ninfer::artifact::StorageLayout::ContiguousLeV1, retained_shape);
+        validation_binder.materialize_on_device(retained_tensor);
+        const auto validation_plan = validation_binder.finish();
+        require(validation_plan.object_count == 3 && validation_plan.host_objects.size() == 1 &&
+                    validation_plan.device_objects.size() == 1 &&
+                    validation_plan.device_capacity_bytes == kSecondTensor.size(),
+                "validate-only tensor was included in the materialization plan");
+
         int device_count              = 0;
         const cudaError_t count_error = cudaGetDeviceCount(&device_count);
         if (cuda_unavailable(count_error) || device_count == 0) {
@@ -81,8 +103,6 @@ int main() {
         }
         CUDA_CHECK(count_error);
 
-        auto fixture = write_fixture();
-        ninfer::artifact::Reader reader(fixture.path);
         ninfer::artifact::Binder binder(reader);
 
         const auto resource = binder.require_resource(
@@ -127,7 +147,8 @@ int main() {
         const auto& stats = materialized.stats();
         require(stats.tensor_count == 2 && stats.resource_count == 1 &&
                     stats.h2d_bytes == kTensor.size() + kSecondTensor.size() &&
-                    stats.retained_resource_bytes == kResource.size(),
+                    stats.retained_resource_bytes == kResource.size() &&
+                    stats.file_bytes >= stats.h2d_bytes && stats.file_bytes < reader.file_bytes(),
                 "materialization statistics are incomplete");
         require(materialized.device_arena().capacity() == plan.device_capacity_bytes &&
                     materialized.device_arena().used() == plan.device_capacity_bytes,

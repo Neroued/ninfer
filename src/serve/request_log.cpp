@@ -294,6 +294,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                                        {"max_context", options.max_context},
                                        {"prefill_chunk", options.prefill_chunk},
                                        {"kv_cache", kv_cache_name(options.kv_cache)},
+                                       {"vision", options.enable_vision},
                                        {"cuda_graph", options.use_cuda_graph},
                                        {"prefix_reuse", options.allow_prefix_reuse},
                                        {"mtp_draft_window", options.mtp_draft_tokens},

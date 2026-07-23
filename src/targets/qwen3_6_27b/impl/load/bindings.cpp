@@ -4,9 +4,12 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
@@ -76,10 +79,11 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 } // namespace
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder) {
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
+    out.features     = features;
 
     out.token_embedding = artifact::bind_device_tensor(binder, "text/token_embedding",
                                                        NumericFormat::Q6G64_F16S, {248320, 5120});
@@ -129,47 +133,51 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder) {
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head          = artifact::bind_device_tensor(binder, "text/output_head",
-                                                            NumericFormat::Q6G64_F16S, {248320, 5120});
-    out.draft_head           = artifact::bind_device_tensor(binder, "text/draft_head",
-                                                            NumericFormat::Q4G64_F16S, {131072, 5120});
-    out.draft_head_token_ids = artifact::bind_device_tensor(binder, "text/draft_head_token_ids",
-                                                            NumericFormat::I32, {131072});
+    out.output_head = artifact::bind_device_tensor(binder, "text/output_head",
+                                                   NumericFormat::Q6G64_F16S, {248320, 5120});
+    const artifact::TensorPlacement proposal_placement =
+        features.optimized_proposal ? artifact::TensorPlacement::Device
+                                    : artifact::TensorPlacement::ValidateOnly;
+    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
+                                           {131072, 5120}, proposal_placement);
+    out.draft_head_token_ids = artifact::bind_tensor(
+        binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
-    out.mtp.input_projection = artifact::bind_device_tensor(
-        binder, "mtp/input_projection", NumericFormat::W8G32_F16S, {5120, 10240});
-    out.mtp.embedding_norm =
-        artifact::bind_device_tensor(binder, "mtp/embedding_norm", NumericFormat::BF16, {5120});
-    out.mtp.hidden_norm =
-        artifact::bind_device_tensor(binder, "mtp/hidden_norm", NumericFormat::BF16, {5120});
-    out.mtp.input_norm =
-        artifact::bind_device_tensor(binder, "mtp/layer/input_norm", NumericFormat::BF16, {5120});
-    out.mtp.query_key_gate_value =
-        artifact::bind_device_tensor(binder, "mtp/layer/attention/query_key_gate_value",
-                                     NumericFormat::W8G32_F16S, {14336, 5120});
-    out.mtp.query_norm = artifact::bind_device_tensor(binder, "mtp/layer/attention/query_norm",
-                                                      NumericFormat::BF16, {256});
-    out.mtp.key_norm   = artifact::bind_device_tensor(binder, "mtp/layer/attention/key_norm",
-                                                      NumericFormat::BF16, {256});
-    out.mtp.output     = artifact::bind_device_tensor(binder, "mtp/layer/attention/output",
-                                                      NumericFormat::W8G32_F16S, {5120, 6144});
-    out.mtp.post_attention_norm = artifact::bind_device_tensor(
-        binder, "mtp/layer/post_attention_norm", NumericFormat::BF16, {5120});
-    out.mtp.mlp.gate_up = artifact::bind_device_tensor(binder, "mtp/layer/mlp/gate_up",
-                                                       NumericFormat::W8G32_F16S, {34816, 5120});
-    out.mtp.mlp.down    = artifact::bind_device_tensor(binder, "mtp/layer/mlp/down",
-                                                       NumericFormat::W8G32_F16S, {5120, 17408});
-    out.mtp.final_norm =
-        artifact::bind_device_tensor(binder, "mtp/final_norm", NumericFormat::BF16, {5120});
+    const artifact::TensorPlacement mtp_placement =
+        features.mtp ? artifact::TensorPlacement::Device : artifact::TensorPlacement::ValidateOnly;
+    const auto bind_mtp = [&](std::string_view name, NumericFormat format,
+                              std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
+    };
+    out.mtp.input_projection =
+        bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {5120, 10240});
+    out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {5120});
+    out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {5120});
+    out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {5120});
+    out.mtp.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
+                                            NumericFormat::W8G32_F16S, {14336, 5120});
+    out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
+    out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
+    out.mtp.output =
+        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {5120, 6144});
+    out.mtp.post_attention_norm =
+        bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {5120});
+    out.mtp.mlp.gate_up =
+        bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {34816, 5120});
+    out.mtp.mlp.down   = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {5120, 17408});
+    out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 
-    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder);
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder);
-    out.vision_merger_fc2   = artifact::bind_device_tensor(binder, "vision/merger/fc2",
-                                                           NumericFormat::W8G32_F16S, {5120, 4608});
-    out.vision_merger_fc2_bias =
-        artifact::bind_device_tensor(binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120});
-    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder);
+    const artifact::TensorPlacement vision_placement =
+        features.vision ? artifact::TensorPlacement::Device
+                        : artifact::TensorPlacement::ValidateOnly;
+    out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
+    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
+    out.vision_merger_fc2   = artifact::bind_tensor(
+        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {5120, 4608}, vision_placement);
+    out.vision_merger_fc2_bias = artifact::bind_tensor(
+        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {5120}, vision_placement);
+    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
 
     load_plan.materialization = binder.finish();
     return load_plan;
@@ -179,16 +187,13 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     : backing(std::move(materialized)) {
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
-    runtime.weights_arena      = &backing.device_arena();
-    auto& token_embedding      = runtime.token_embedding;
-    auto& full_layers          = runtime.full_layers;
-    auto& gdn_layers           = runtime.gdn_layers;
-    auto& final_norm           = runtime.final_norm;
-    auto& output_head          = runtime.output_head;
-    auto& draft_head           = runtime.draft_head;
-    auto& draft_head_token_ids = runtime.draft_head_token_ids;
-    auto& mtp                  = runtime.mtp;
-    auto& vision               = runtime.vision;
+    runtime.weights_arena = &backing.device_arena();
+    runtime.features      = plan.features;
+    auto& token_embedding = runtime.token_embedding;
+    auto& full_layers     = runtime.full_layers;
+    auto& gdn_layers      = runtime.gdn_layers;
+    auto& final_norm      = runtime.final_norm;
+    auto& output_head     = runtime.output_head;
 
     token_embedding        = artifact::materialized_weight(backing, plan.token_embedding,
                                                            NumericFormat::Q6G64_F16S, 248320, 5120);
@@ -249,43 +254,52 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {5120});
     output_head = artifact::materialized_weight(backing, plan.output_head,
                                                 NumericFormat::Q6G64_F16S, 248320, 5120);
-    draft_head  = artifact::materialized_weight(backing, plan.draft_head, NumericFormat::Q4G64_F16S,
-                                                131072, 5120);
-    draft_head_token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
-                                                         NumericFormat::I32, {131072});
+    if (plan.features.optimized_proposal) {
+        auto& proposal     = runtime.optimized_proposal.emplace();
+        proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
+                                                           NumericFormat::Q4G64_F16S, 131072, 5120);
+        proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
+                                                           NumericFormat::I32, {131072});
+    }
 
-    mtp.input_projection = artifact::materialized_weight(backing, plan.mtp.input_projection,
-                                                         NumericFormat::W8G32_F16S, 5120, 10240);
-    mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
-                                                         NumericFormat::BF16, {5120});
-    mtp.hidden_norm =
-        artifact::materialized_tensor(backing, plan.mtp.hidden_norm, NumericFormat::BF16, {5120});
-    mtp.input_norm =
-        artifact::materialized_tensor(backing, plan.mtp.input_norm, NumericFormat::BF16, {5120});
-    mtp.attention.packed = artifact::materialized_weight(backing, plan.mtp.query_key_gate_value,
-                                                         NumericFormat::W8G32_F16S, 14336, 5120);
-    mtp.attention.query  = row_view(mtp.attention.packed, 0, 6144);
-    mtp.attention.key    = row_view(mtp.attention.packed, 6144, 1024);
-    mtp.attention.output_gate = row_view(mtp.attention.packed, 7168, 6144);
-    mtp.attention.value       = row_view(mtp.attention.packed, 13312, 1024);
-    mtp.query_norm =
-        artifact::materialized_tensor(backing, plan.mtp.query_norm, NumericFormat::BF16, {256});
-    mtp.key_norm =
-        artifact::materialized_tensor(backing, plan.mtp.key_norm, NumericFormat::BF16, {256});
-    mtp.output = artifact::materialized_weight(backing, plan.mtp.output, NumericFormat::W8G32_F16S,
-                                               5120, 6144);
-    mtp.post_attention_norm = artifact::materialized_tensor(backing, plan.mtp.post_attention_norm,
-                                                            NumericFormat::BF16, {5120});
-    mtp.post_mixer          = load_mlp(plan.mtp.mlp, backing, NumericFormat::W8G32_F16S);
-    mtp.final_norm =
-        artifact::materialized_tensor(backing, plan.mtp.final_norm, NumericFormat::BF16, {5120});
+    if (plan.features.mtp) {
+        auto& mtp            = runtime.mtp.emplace();
+        mtp.input_projection = artifact::materialized_weight(
+            backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S, 5120, 10240);
+        mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
+                                                             NumericFormat::BF16, {5120});
+        mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.mtp.hidden_norm,
+                                                             NumericFormat::BF16, {5120});
+        mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
+                                                             NumericFormat::BF16, {5120});
+        mtp.attention.packed = artifact::materialized_weight(
+            backing, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, 14336, 5120);
+        mtp.attention.query       = row_view(mtp.attention.packed, 0, 6144);
+        mtp.attention.key         = row_view(mtp.attention.packed, 6144, 1024);
+        mtp.attention.output_gate = row_view(mtp.attention.packed, 7168, 6144);
+        mtp.attention.value       = row_view(mtp.attention.packed, 13312, 1024);
+        mtp.query_norm =
+            artifact::materialized_tensor(backing, plan.mtp.query_norm, NumericFormat::BF16, {256});
+        mtp.key_norm =
+            artifact::materialized_tensor(backing, plan.mtp.key_norm, NumericFormat::BF16, {256});
+        mtp.output              = artifact::materialized_weight(backing, plan.mtp.output,
+                                                                NumericFormat::W8G32_F16S, 5120, 6144);
+        mtp.post_attention_norm = artifact::materialized_tensor(
+            backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {5120});
+        mtp.post_mixer = load_mlp(plan.mtp.mlp, backing, NumericFormat::W8G32_F16S);
+        mtp.final_norm = artifact::materialized_tensor(backing, plan.mtp.final_norm,
+                                                       NumericFormat::BF16, {5120});
+    }
 
-    vision.common = qwen3_6::materialize_vision_common(
-        backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
-    vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
-                                                           NumericFormat::W8G32_F16S, 5120, 4608);
-    vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
-                                                           NumericFormat::BF16, {5120});
+    if (plan.features.vision) {
+        auto& vision  = runtime.vision.emplace();
+        vision.common = qwen3_6::materialize_vision_common(
+            backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
+        vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,
+                                                               NumericFormat::W8G32_F16S, 5120, 4608);
+        vision.merger_fc2_bias = artifact::materialized_tensor(backing, plan.vision_merger_fc2_bias,
+                                                               NumericFormat::BF16, {5120});
+    }
 }
 
 } // namespace ninfer::targets::qwen3_6_27b::detail

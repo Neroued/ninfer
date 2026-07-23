@@ -18,11 +18,15 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr std::int32_t kHeadDim = 256;
-constexpr std::int32_t kQHeads  = 24;
-constexpr std::int32_t kKHeads  = 4;
-constexpr int kRotaryDim        = 64;
-constexpr float kTheta          = 1.0e7f;
+constexpr std::int32_t kHeadDim       = 256;
+constexpr std::int32_t kQHeads        = 24;
+constexpr std::int32_t kKHeads        = 4;
+constexpr int kRotaryDim              = 64;
+constexpr float kTheta                = 1.0e7f;
+constexpr std::int32_t kDflashHeadDim = 128;
+constexpr std::int32_t kDflashQHeads  = 32;
+constexpr std::int32_t kDflashKHeads  = 8;
+constexpr int kDflashRotaryDim        = 128;
 
 std::size_t tensor_size(std::int32_t heads, std::int32_t T) {
     return static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(heads) *
@@ -481,6 +485,244 @@ int vision_rope_packed_case() {
     return failures;
 }
 
+std::size_t dflash_tensor_size(std::int32_t heads, std::int32_t tokens) {
+    return static_cast<std::size_t>(kDflashHeadDim) * heads * tokens;
+}
+
+int check_all_dflash_dims_mutated(const char* label, const std::vector<std::uint16_t>& got,
+                                  const std::vector<std::uint16_t>& before, std::int32_t heads,
+                                  std::int32_t tokens) {
+    for (int dim = 0; dim < kDflashHeadDim; ++dim) {
+        bool changed = false;
+        for (int token = 0; token < tokens && !changed; ++token) {
+            for (int head = 0; head < heads; ++head) {
+                const std::size_t index =
+                    (static_cast<std::size_t>(token) * heads + head) * kDflashHeadDim + dim;
+                if (got[index] != before[index]) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (!changed) {
+            std::cerr << label << ": dimension " << dim << " was not observably mutated\n";
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int dflash_case(const char* label, int tokens, int first_position, bool graph = false,
+                bool single_parity = false, bool require_identity = false,
+                bool require_full_mutation = false) {
+    const std::size_t qn = dflash_tensor_size(kDflashQHeads, tokens);
+    const std::size_t kn = dflash_tensor_size(kDflashKHeads, tokens);
+    std::vector<float> q(qn);
+    std::vector<float> k(kn);
+    std::vector<int> positions(static_cast<std::size_t>(tokens));
+    fill_uniform(q, 5101u + static_cast<std::uint32_t>(tokens), -8.0F, 8.0F);
+    fill_uniform(k, 5201u + static_cast<std::uint32_t>(tokens), -8.0F, 8.0F);
+    fill_iota_i32(positions, first_position);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    const auto q_before = bf16_bits(q);
+    const auto k_before = bf16_bits(k);
+
+    std::vector<double> q_ref;
+    std::vector<double> k_ref;
+    cpu_rope_nd(q, positions, 1, kDflashHeadDim, kDflashQHeads, tokens, kDflashRotaryDim, kTheta,
+                q_ref);
+    cpu_rope_nd(k, positions, 1, kDflashHeadDim, kDflashKHeads, tokens, kDflashRotaryDim, kTheta,
+                k_ref);
+
+    DBuf dpos = to_device_i32(positions);
+    GuardedDBuf dq(qn * sizeof(std::uint16_t));
+    GuardedDBuf dk(kn * sizeof(std::uint16_t));
+    dq.copy_from_host(q_before.data(), qn * sizeof(std::uint16_t));
+    dk.copy_from_host(k_before.data(), kn * sizeof(std::uint16_t));
+    DBuf dq_single = to_device_bf16(q);
+    DBuf dk_single = to_device_bf16(k);
+    Tensor tpos(dpos.p, DType::I32, {tokens});
+    Tensor tq(dq.data(), DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
+    Tensor tk(dk.data(), DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
+    Tensor tq_single(dq_single.p, DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
+    Tensor tk_single(dk_single.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
+
+    if (graph) {
+        cudaStream_t stream        = nullptr;
+        cudaGraph_t captured       = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        cuda_check(cudaStreamCreate(&stream), "cudaStreamCreate");
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+                   "cudaStreamBeginCapture");
+        ops::rope(tpos, kDflashRotaryDim, kTheta, tq, tk, stream);
+        cuda_check(cudaStreamEndCapture(stream, &captured), "cudaStreamEndCapture");
+        cuda_check(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0),
+                   "cudaGraphInstantiate");
+        cuda_check(cudaGraphLaunch(executable, stream), "cudaGraphLaunch");
+        cuda_synchronize(stream);
+        cudaGraphExecDestroy(executable);
+        cudaGraphDestroy(captured);
+        cudaStreamDestroy(stream);
+    } else {
+        ops::rope(tpos, kDflashRotaryDim, kTheta, tq, tk, nullptr);
+        cuda_synchronize();
+    }
+
+    const auto q_got_bits = from_device<std::uint16_t>(dq.data(), qn);
+    const auto k_got_bits = from_device<std::uint16_t>(dk.data(), kn);
+    int failures          = 0;
+    failures += verify((std::string(label) + " q").c_str(), from_device_bf16(dq.data(), qn), q_ref,
+                       Tolerance::bf16_elementwise());
+    failures += verify((std::string(label) + " k").c_str(), from_device_bf16(dk.data(), kn), k_ref,
+                       Tolerance::bf16_elementwise());
+    failures += verify_exact((std::string(label) + " positions").c_str(),
+                             from_device_i32(dpos, tokens), positions);
+    failures += dq.verify_guards((std::string(label) + " q guards").c_str());
+    failures += dk.verify_guards((std::string(label) + " k guards").c_str());
+    if (require_identity) {
+        failures +=
+            verify_exact((std::string(label) + " q identity").c_str(), q_got_bits, q_before);
+        failures +=
+            verify_exact((std::string(label) + " k identity").c_str(), k_got_bits, k_before);
+    }
+    if (require_full_mutation) {
+        failures += check_all_dflash_dims_mutated((std::string(label) + " q").c_str(), q_got_bits,
+                                                  q_before, kDflashQHeads, tokens);
+        failures += check_all_dflash_dims_mutated((std::string(label) + " k").c_str(), k_got_bits,
+                                                  k_before, kDflashKHeads, tokens);
+    }
+    if (single_parity) {
+        ops::rope(tpos, kDflashRotaryDim, kTheta, tq_single, nullptr);
+        ops::rope(tpos, kDflashRotaryDim, kTheta, tk_single, nullptr);
+        cuda_synchronize();
+        failures += verify_exact((std::string(label) + " q single parity").c_str(),
+                                 from_device_bf16_bits(dq_single, qn), q_got_bits);
+        failures += verify_exact((std::string(label) + " k single parity").c_str(),
+                                 from_device_bf16_bits(dk_single, kn), k_got_bits);
+    }
+    return failures;
+}
+
+int dflash_padded_stride_case() {
+    constexpr int tokens        = 16;
+    constexpr int q_dense       = kDflashHeadDim * kDflashQHeads;
+    constexpr int k_dense       = kDflashHeadDim * kDflashKHeads;
+    constexpr int q_stride      = q_dense + 16;
+    constexpr int k_stride      = k_dense + 32;
+    constexpr std::uint16_t pad = 0x3f81U;
+    std::vector<float> q(static_cast<std::size_t>(q_dense) * tokens);
+    std::vector<float> k(static_cast<std::size_t>(k_dense) * tokens);
+    fill_uniform(q, 5301u, -8.0F, 8.0F);
+    fill_uniform(k, 5302u, -8.0F, 8.0F);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    std::vector<std::uint16_t> q_storage(static_cast<std::size_t>(q_stride) * tokens, pad);
+    std::vector<std::uint16_t> k_storage(static_cast<std::size_t>(k_stride) * tokens, pad);
+    const auto q_bits = bf16_bits(q);
+    const auto k_bits = bf16_bits(k);
+    for (int token = 0; token < tokens; ++token) {
+        std::copy_n(q_bits.data() + static_cast<std::size_t>(token) * q_dense, q_dense,
+                    q_storage.data() + static_cast<std::size_t>(token) * q_stride);
+        std::copy_n(k_bits.data() + static_cast<std::size_t>(token) * k_dense, k_dense,
+                    k_storage.data() + static_cast<std::size_t>(token) * k_stride);
+    }
+    std::vector<int> positions(tokens);
+    fill_iota_i32(positions, 262144 - tokens);
+    std::vector<double> q_ref;
+    std::vector<double> k_ref;
+    cpu_rope_nd(q, positions, 1, kDflashHeadDim, kDflashQHeads, tokens, kDflashRotaryDim, kTheta,
+                q_ref);
+    cpu_rope_nd(k, positions, 1, kDflashHeadDim, kDflashKHeads, tokens, kDflashRotaryDim, kTheta,
+                k_ref);
+
+    GuardedDBuf dq(q_storage.size() * sizeof(std::uint16_t));
+    GuardedDBuf dk(k_storage.size() * sizeof(std::uint16_t));
+    dq.copy_from_host(q_storage.data(), dq.bytes());
+    dk.copy_from_host(k_storage.data(), dk.bytes());
+    DBuf dpos = to_device_i32(positions);
+    Tensor tpos(dpos.p, DType::I32, {tokens});
+    Tensor tq(dq.data(), DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
+    Tensor tk(dk.data(), DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
+    tq.nb[2] = q_stride * sizeof(std::uint16_t);
+    tk.nb[2] = k_stride * sizeof(std::uint16_t);
+    ops::rope(tpos, kDflashRotaryDim, kTheta, tq, tk, nullptr);
+    cuda_synchronize();
+
+    const auto q_got_storage = from_device<std::uint16_t>(dq.data(), q_storage.size());
+    const auto k_got_storage = from_device<std::uint16_t>(dk.data(), k_storage.size());
+    std::vector<double> q_got(q.size());
+    std::vector<double> k_got(k.size());
+    int failures = 0;
+    for (int token = 0; token < tokens; ++token) {
+        for (int index = 0; index < q_dense; ++index) {
+            q_got[static_cast<std::size_t>(token) * q_dense + index] =
+                bf16_to_f32(q_got_storage[static_cast<std::size_t>(token) * q_stride + index]);
+        }
+        for (int index = 0; index < k_dense; ++index) {
+            k_got[static_cast<std::size_t>(token) * k_dense + index] =
+                bf16_to_f32(k_got_storage[static_cast<std::size_t>(token) * k_stride + index]);
+        }
+        for (int index = q_dense; index < q_stride; ++index) {
+            if (q_got_storage[static_cast<std::size_t>(token) * q_stride + index] != pad) {
+                std::cerr << "dflash padded q token padding changed\n";
+                ++failures;
+                break;
+            }
+        }
+        for (int index = k_dense; index < k_stride; ++index) {
+            if (k_got_storage[static_cast<std::size_t>(token) * k_stride + index] != pad) {
+                std::cerr << "dflash padded k token padding changed\n";
+                ++failures;
+                break;
+            }
+        }
+    }
+    failures += verify("dflash padded q", q_got, q_ref, Tolerance::bf16_elementwise());
+    failures += verify("dflash padded k", k_got, k_ref, Tolerance::bf16_elementwise());
+    failures += verify_exact("dflash padded positions", from_device_i32(dpos, tokens), positions);
+    failures += dq.verify_guards("dflash padded q guards");
+    failures += dk.verify_guards("dflash padded k guards");
+    return failures;
+}
+
+int dflash_unaligned_large_phase_case() {
+    constexpr int tokens = 2;
+    const std::size_t qn = dflash_tensor_size(kDflashQHeads, tokens);
+    const std::size_t kn = dflash_tensor_size(kDflashKHeads, tokens);
+    std::vector<float> q(qn);
+    std::vector<float> k(kn);
+    std::vector<int> positions{262142, 262143};
+    fill_uniform(q, 5401u, -8.0F, 8.0F);
+    fill_uniform(k, 5402u, -8.0F, 8.0F);
+    round_to_bf16(q);
+    round_to_bf16(k);
+    std::vector<double> q_ref;
+    std::vector<double> k_ref;
+    cpu_rope_nd(q, positions, 1, kDflashHeadDim, kDflashQHeads, tokens, kDflashRotaryDim, kTheta,
+                q_ref);
+    cpu_rope_nd(k, positions, 1, kDflashHeadDim, kDflashKHeads, tokens, kDflashRotaryDim, kTheta,
+                k_ref);
+    DBuf dpos  = to_device_i32(positions);
+    DBuf dq    = to_device_bf16_unaligned(q);
+    DBuf dk    = to_device_bf16_unaligned(k);
+    auto* qptr = static_cast<std::uint16_t*>(dq.p) + 1;
+    auto* kptr = static_cast<std::uint16_t*>(dk.p) + 1;
+    Tensor tpos(dpos.p, DType::I32, {tokens});
+    Tensor tq(qptr, DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
+    Tensor tk(kptr, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
+    ops::rope(tpos, kDflashRotaryDim, kTheta, tq, tk, nullptr);
+    cuda_synchronize();
+    int failures = 0;
+    failures += verify("dflash unaligned q", from_device_bf16_ptr(qptr, qn), q_ref,
+                       Tolerance::bf16_elementwise());
+    failures += verify("dflash unaligned k", from_device_bf16_ptr(kptr, kn), k_ref,
+                       Tolerance::bf16_elementwise());
+    failures +=
+        verify_exact("dflash unaligned positions", from_device_i32(dpos, tokens), positions);
+    return failures;
+}
+
 template <typename Fn>
 int expect_invalid(const char* label, Fn&& fn) {
     try {
@@ -639,6 +881,22 @@ int main() {
     }
     f += text_35b_case(1024, 3);
     f += vision_rope_packed_case();
+    for (int tokens = 1; tokens <= 16; ++tokens) {
+        f += dflash_case(("dflash T=" + std::to_string(tokens)).c_str(), tokens, 31);
+    }
+    f += dflash_case("dflash split boundary T=17", 17, 2048);
+    f += dflash_case("dflash fixed boundary T=399", 399, 32768);
+    f += dflash_case("dflash fixed boundary T=400", 400, 32768);
+    f += dflash_case("dflash fixed boundary T=401", 401, 32768);
+    f += dflash_case("dflash prefill T=128", 128, 4096);
+    f += dflash_case("dflash prefill T=1024", 1024, 131072);
+    f += dflash_case("dflash position zero", 1, 0, false, false, true);
+    f += dflash_case("dflash large phase", 16, 262144 - 16, false, true, false, true);
+    f += dflash_padded_stride_case();
+    f += dflash_unaligned_large_phase_case();
+    f += dflash_case("dflash graph B=2", 2, 8192, true);
+    f += dflash_case("dflash graph B=16", 16, 16384, true);
+    f += dflash_case("dflash graph prefill", 1024, 65536, true);
 
     std::cout << (f ? "FAIL" : "OK") << " rope correctness\n";
     return f ? 1 : 0;

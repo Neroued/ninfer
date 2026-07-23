@@ -541,7 +541,7 @@ agreement for `A=0..15` and on the following round.
 
 ### OP-A01: W8 `linear [2048,16384]`
 
-**Status:** [ ] admission [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] admission [x] correctness [x] benchmark [x] route [ ] integration
 
 **Definition and shape**
 
@@ -640,7 +640,7 @@ two ordinary `linear` calls as the composed control.
 
 ### OP-A04: D128 `rope`
 
-**Status:** [ ] admission [ ] correctness [ ] benchmark [ ] route [ ] integration
+**Status:** [x] admission [x] correctness [x] benchmark [x] route [ ] integration
 
 Extend the existing one-dimensional split-half Op to:
 
@@ -659,6 +659,26 @@ near maximum context, head and token stride boundaries, full mutation of dimensi
 preserved positions, and Graph replay.
 
 This is one-dimensional RoPE. Target three-axis MRoPE and its `rope_delta` are not inputs.
+
+**Op evidence (RTX 5090, CUDA 13.1, `sm_120a`)**
+
+- `ninfer_rope_test` qualifies D128/R128 Q32/KV8 directly against the independent FP64
+  trigonometric oracle for every `T=1..16`, dispatch boundaries `16/17` and `399/400/401`,
+  prefill `T=128,1024`, position zero, positions near 262144, padded token strides, unaligned
+  fallback, full observable mutation of dimensions `0..127`, output guards, preserved positions,
+  pair/single parity, and CUDA Graph replay. Existing D256 Text/MRoPE and D72 Vision coverage
+  remains passing.
+- `ninfer_rope_bench --text --geometry dflash` measures the public pair route and its
+  same-topology payload control. Candidate sweeps cover every `T=1..16`, representative prefill,
+  64--1024-thread one-token CTAs, and 1/2/4/5/8/10/20-head split CTAs. The selected dispatch is
+  five heads per CTA through `T=16`, eight heads per CTA through `T=400`, and a 160-thread
+  one-token CTA above 400. NCU measures 3.39 us at `T=16`; the two route boundaries are smooth
+  at 3.39/3.46 us for `T=16/17` and 7.62/7.46 us for `T=400/401`.
+- Narrow NCU `--set basic` captures measure 3.39 us for production versus 3.62 us for the
+  same-topology phase-and-payload control at `T=16`. At `T=1024`, production and control both
+  take 12.19 us. The 20,971,520 bytes of compulsory in-place traffic therefore reach 1720 GB/s,
+  96.0% of the 1792 GB/s logical memory-traffic ceiling. Small extents reach the empirical
+  launch/parallelism ceiling, while prefill matches the measured phase-and-payload roofline.
 
 ### OP-A05: W8 `attn_input_proj [6144,2048]`
 
@@ -1031,7 +1051,7 @@ commit together.
 |---:|---|---|:---:|:---:|:---:|:---:|
 | 0 | mask contract | Freeze non-causal symmetry and the inclusive `abs(delta)<4096` predicate | [x] | — | — | — |
 | 1 | `OP-A02` | Plain D2048/D128 RMSNorm domains | [x] | [x] | [x] | [ ] |
-| 2 | `OP-A04` | D128 full-head 1-D RoPE | [ ] | [ ] | [ ] | [ ] |
+| 2 | `OP-A04` | D128 full-head 1-D RoPE | [x] | [x] | [x] | [ ] |
 | 3 | `OP-A05` | W8 Q/K/V direct projection | [ ] | [ ] | [ ] | [ ] |
 | 4 | `OP-N03` | Bidirectional full GQA | [x] | [x] | [x] | [ ] |
 | 5 | `OP-N02` | Symmetric non-causal SWA | [x] | [x] | [x] | [ ] |

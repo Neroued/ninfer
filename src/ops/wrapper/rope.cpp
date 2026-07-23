@@ -87,8 +87,9 @@ void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
         }
         return;
     }
+    if (axes == 1 && head_dim == 128 && rotary_dim == 128) { return; }
     if (head_dim != kTextHeadDim || rotary_dim > kTextHeadDim) {
-        throw std::invalid_argument("rope: Text mode requires head_dim=256");
+        throw std::invalid_argument("rope: Text mode requires D256 or one-dimensional D128/R128");
     }
     if (axes == 3 && rotary_dim != 64) {
         throw std::invalid_argument("rope: 3-D Text MRoPE requires rotary_dim=64");
@@ -108,7 +109,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
     (void)numel_allow_zero(k, "k");
     const std::int32_t tokens   = q.ne[2];
     const int axes              = position_axes(positions, tokens);
-    const std::int32_t head_dim = axes == 2 ? kVisionDim : kTextHeadDim;
+    const std::int32_t head_dim = axes == 2 ? kVisionDim : q.ne[0];
     const std::int32_t q_heads  = q.ne[1];
     const std::int32_t k_heads  = k.ne[1];
     require_model_mode(axes, rotary_dim, head_dim);
@@ -129,7 +130,7 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaS
     const std::int64_t x_numel  = numel_allow_zero(x, "tensor");
     const std::int32_t tokens   = x.ne[2];
     const int axes              = position_axes(positions, tokens);
-    const std::int32_t head_dim = axes == 2 ? kVisionDim : kTextHeadDim;
+    const std::int32_t head_dim = axes == 2 ? kVisionDim : x.ne[0];
     const std::int32_t heads    = x.ne[1];
     require_model_mode(axes, rotary_dim, head_dim);
     require_tensor_layout(x, "tensor", head_dim, heads, tokens);

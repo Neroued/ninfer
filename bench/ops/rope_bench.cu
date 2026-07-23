@@ -1,8 +1,9 @@
 // Exact-domain RoPE benchmark for Qwen3.6 Text and Vision geometries.
 // Examples:
-//   ./ninfer_rope_bench --text --geometry 35b --axes both \
+//   ./ninfer_rope_bench --text --geometry dflash --axes 1 \
 //       --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
-//   ./ninfer_rope_bench --text --geometry 35b --axes 3 --candidate-block 384
+//   ./ninfer_rope_bench --text --geometry dflash --tokens 16 --candidate-block 512
+//   ncu ... ./ninfer_rope_bench --text --geometry dflash --tokens 1024 --profile
 //   ./ninfer_rope_bench --vision --patches 8,256,4096,49152,65536
 // Add --control for the same-grid, same-payload fixed-resource control.
 #include "core/device.h"
@@ -26,6 +27,10 @@ namespace {
 
 constexpr int kTextHeadDim            = 256;
 constexpr int kTextRotaryDim          = 64;
+constexpr int kDflashHeadDim          = 128;
+constexpr int kDflashRotaryDim        = 128;
+constexpr int kDflashQHeads           = 32;
+constexpr int kDflashKHeads           = 8;
 constexpr int kTextChunkMaxTokens     = 1024;
 constexpr int kLargeBlockWaveCapacity = 1020;
 constexpr float kTextTheta            = 1.0e7F;
@@ -134,14 +139,8 @@ rope_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q, __n
     __shared__ volatile float sin_cache[half];
     if (threadIdx.x < half) {
         const int pair = static_cast<int>(threadIdx.x);
-        int axis       = 0;
-        float frequency;
-        ops::fixed_axis_frequency<Mode>(pair, &axis, &frequency);
-        const float angle =
-            static_cast<float>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
-            frequency;
         float sine, cosine;
-        sincosf(angle, &sine, &cosine);
+        ops::fixed_sincos<Mode>(positions, tokens, token, pair, &sine, &cosine);
         cos_cache[pair] = cosine;
         sin_cache[pair] = sine;
     }
@@ -168,6 +167,48 @@ rope_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q, __n
     }
 }
 
+template <ops::RopeKernelMode Mode, int HeadDim, int RotaryDim, int QHeads, int KHeads,
+          int HeadsPerBlock>
+__global__ void rope_split_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q,
+                                                  __nv_bfloat16* k, int tokens,
+                                                  std::int64_t q_token_stride,
+                                                  std::int64_t k_token_stride) {
+    constexpr int kHalf       = RotaryDim / 2;
+    constexpr int kHeadGroups = (QHeads + KHeads + HeadsPerBlock - 1) / HeadsPerBlock;
+    const int token           = static_cast<int>(blockIdx.x) / kHeadGroups;
+    const int head_group      = static_cast<int>(blockIdx.x) % kHeadGroups;
+    if (token >= tokens) { return; }
+    __shared__ volatile float cos_cache[kHalf];
+    __shared__ volatile float sin_cache[kHalf];
+    if (threadIdx.x < kHalf) {
+        const int pair = static_cast<int>(threadIdx.x);
+        float sine, cosine;
+        ops::fixed_sincos<Mode>(positions, tokens, token, pair, &sine, &cosine);
+        cos_cache[pair] = cosine;
+        sin_cache[pair] = sine;
+    }
+    __syncthreads();
+    if (threadIdx.x < kHalf) {
+        const float cosine = cos_cache[threadIdx.x];
+        const float sine   = sin_cache[threadIdx.x];
+        asm volatile("" : : "f"(cosine), "f"(sine) : "memory");
+    }
+
+    const int lane          = static_cast<int>(threadIdx.x) & 31;
+    const int local_head    = static_cast<int>(threadIdx.x) >> 5;
+    const int combined_head = head_group * HeadsPerBlock + local_head;
+    if (local_head >= HeadsPerBlock || combined_head >= QHeads + KHeads) { return; }
+    const bool is_q             = combined_head < QHeads;
+    const int head              = is_q ? combined_head : combined_head - QHeads;
+    __nv_bfloat16* data         = is_q ? q : k;
+    const std::int64_t stride_t = is_q ? q_token_stride : k_token_stride;
+    const std::int64_t base =
+        static_cast<std::int64_t>(token) * stride_t + static_cast<std::int64_t>(head) * HeadDim;
+    for (int vector = lane; vector < RotaryDim / 8; vector += 32) {
+        copy_bf16x8(data, base + vector * 8);
+    }
+}
+
 template <int QHeads, int KHeads>
 int production_text_block(int tokens) {
     int block = 128;
@@ -180,6 +221,7 @@ int production_text_block(int tokens) {
     }
     const int head_warps = (QHeads + KHeads) * 32;
     if (block > head_warps) { block = head_warps; }
+    if (block > 1024) { block = 1024; }
     return block;
 }
 
@@ -226,6 +268,98 @@ void launch_text_candidate(const Tensor& positions, Tensor& q, Tensor& k, int bl
     } else {
         launch_text_candidate_mode<ops::RopeKernelMode::TextMrope, QHeads, KHeads>(positions, q, k,
                                                                                    block, stream);
+    }
+}
+
+void launch_dflash_fixed_control(const Tensor& positions, Tensor& q, Tensor& k, int block,
+                                 cudaStream_t stream) {
+    const int tokens = q.ne[2];
+    rope_payload_control_kernel<ops::RopeKernelMode::DflashText1D, kDflashHeadDim, kDflashRotaryDim,
+                                kDflashQHeads, kDflashKHeads><<<tokens, block, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
+        static_cast<__nv_bfloat16*>(k.data), tokens,
+        q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+        k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int HeadsPerBlock>
+void launch_dflash_split_control(const Tensor& positions, Tensor& q, Tensor& k,
+                                 cudaStream_t stream) {
+    constexpr int kGroups = (kDflashQHeads + kDflashKHeads + HeadsPerBlock - 1) / HeadsPerBlock;
+    constexpr int kBlock  = HeadsPerBlock * 32;
+    rope_split_payload_control_kernel<ops::RopeKernelMode::DflashText1D, kDflashHeadDim,
+                                      kDflashRotaryDim, kDflashQHeads, kDflashKHeads, HeadsPerBlock>
+        <<<q.ne[2] * kGroups, kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
+            static_cast<__nv_bfloat16*>(k.data), q.ne[2],
+            q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+            k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_dflash_control(const Tensor& positions, Tensor& q, Tensor& k, cudaStream_t stream) {
+    if (q.ne[2] <= 16) {
+        launch_dflash_split_control<5>(positions, q, k, stream);
+    } else if (q.ne[2] <= 400) {
+        launch_dflash_split_control<8>(positions, q, k, stream);
+    } else {
+        launch_dflash_fixed_control(positions, q, k, 160, stream);
+    }
+}
+
+std::string dflash_production_route(int tokens) {
+    if (tokens <= 16) { return "split-h5"; }
+    if (tokens <= 400) { return "split-h8"; }
+    return "fixed-b160";
+}
+
+void launch_dflash_candidate(const Tensor& positions, Tensor& q, Tensor& k, int block,
+                             cudaStream_t stream) {
+    launch_text_candidate_mode<ops::RopeKernelMode::DflashText1D, kDflashQHeads, kDflashKHeads>(
+        positions, q, k, block, stream);
+}
+
+template <int HeadsPerBlock>
+void launch_dflash_split_candidate(const Tensor& positions, Tensor& q, Tensor& k,
+                                   cudaStream_t stream) {
+    constexpr int kGroups = (kDflashQHeads + kDflashKHeads + HeadsPerBlock - 1) / HeadsPerBlock;
+    constexpr int kBlock  = HeadsPerBlock <= 2 ? 64 : HeadsPerBlock * 32;
+    ops::rope_fixed_split_kernel<ops::RopeKernelMode::DflashText1D, kDflashQHeads, kDflashKHeads,
+                                 HeadsPerBlock><<<q.ne[2] * kGroups, kBlock, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
+        static_cast<__nv_bfloat16*>(k.data), q.ne[2],
+        q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+        k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_dflash_split_candidate(const Tensor& positions, Tensor& q, Tensor& k,
+                                   int heads_per_block, cudaStream_t stream) {
+    switch (heads_per_block) {
+    case 1:
+        launch_dflash_split_candidate<1>(positions, q, k, stream);
+        break;
+    case 2:
+        launch_dflash_split_candidate<2>(positions, q, k, stream);
+        break;
+    case 4:
+        launch_dflash_split_candidate<4>(positions, q, k, stream);
+        break;
+    case 5:
+        launch_dflash_split_candidate<5>(positions, q, k, stream);
+        break;
+    case 8:
+        launch_dflash_split_candidate<8>(positions, q, k, stream);
+        break;
+    case 10:
+        launch_dflash_split_candidate<10>(positions, q, k, stream);
+        break;
+    case 20:
+        launch_dflash_split_candidate<20>(positions, q, k, stream);
+        break;
+    default:
+        throw std::invalid_argument("unsupported DFlash heads-per-block candidate");
     }
 }
 
@@ -299,6 +433,57 @@ void run_text(int tokens, int axes, bool control, int candidate_block, const cha
     print_result(label.c_str(), result);
 }
 
+void run_dflash(int tokens, bool control, int candidate_block, int candidate_heads, bool profile) {
+    const std::size_t q_elements =
+        static_cast<std::size_t>(kDflashHeadDim) * kDflashQHeads * tokens;
+    const std::size_t k_elements =
+        static_cast<std::size_t>(kDflashHeadDim) * kDflashKHeads * tokens;
+    DBuf positions = make_text_positions(tokens, 1);
+    DBuf q         = make_bf16(q_elements);
+    DBuf k         = make_bf16(k_elements);
+    Tensor tpos(positions.p, DType::I32, {tokens});
+    Tensor tq(q.p, DType::BF16, {kDflashHeadDim, kDflashQHeads, tokens});
+    Tensor tk(k.p, DType::BF16, {kDflashHeadDim, kDflashKHeads, tokens});
+    const int block    = candidate_block == 0 ? 160 : candidate_block;
+    const double bytes = 2.0 *
+                         static_cast<double>((kDflashQHeads + kDflashKHeads) * kDflashRotaryDim) *
+                         tokens * sizeof(__nv_bfloat16);
+    const auto launch = [&](cudaStream_t stream) {
+        if (control) {
+            launch_dflash_control(tpos, tq, tk, stream);
+        } else if (candidate_heads != 0) {
+            launch_dflash_split_candidate(tpos, tq, tk, candidate_heads, stream);
+        } else if (candidate_block != 0) {
+            launch_dflash_candidate(tpos, tq, tk, block, stream);
+        } else {
+            ops::rope(tpos, kDflashRotaryDim, kTextTheta, tq, tk, stream);
+        }
+    };
+    if (profile) {
+        for (int warmup = 0; warmup < 20; ++warmup) { launch(nullptr); }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        launch(nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (candidate_heads != 0) {
+            std::printf("profile rope dflash T=%d route=candidate-h%d\n", tokens, candidate_heads);
+        } else {
+            const std::string selected = candidate_block ? "candidate-b" + std::to_string(block)
+                                         : control ? "control-" + dflash_production_route(tokens)
+                                                   : dflash_production_route(tokens);
+            std::printf("profile rope dflash T=%d route=%s\n", tokens, selected.c_str());
+        }
+        return;
+    }
+    const std::string route = control           ? "control-" + dflash_production_route(tokens)
+                              : candidate_heads ? "candidate-h" + std::to_string(candidate_heads)
+                              : candidate_block ? "candidate-b" + std::to_string(block)
+                                                : dflash_production_route(tokens);
+    const Result result     = bench_loop(launch, bytes);
+    const std::string label =
+        "rope text dflash axes=1 route=" + route + " T=" + std::to_string(tokens);
+    print_result(label.c_str(), result);
+}
+
 void run_vision(int patches, bool control) {
     constexpr int hidden = kVisionHeadDim * kVisionHeads;
     constexpr int qkv    = hidden * 3;
@@ -330,14 +515,17 @@ struct Options {
     bool vision         = false;
     bool control        = false;
     bool geometry27     = false;
-    bool geometry35     = true;
+    bool geometry35     = false;
+    bool geometryDflash = true;
     bool axes1          = true;
     bool axes3          = true;
     bool pair           = true;
     bool single_q       = false;
     bool single_k       = false;
+    bool profile        = false;
     int candidate_block = 0;
-    std::vector<int> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 1024};
+    int candidate_heads = 0;
+    std::vector<int> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 128, 1024};
     std::vector<int> patches{8, 256, 4096, 49152, 65536};
 };
 
@@ -357,10 +545,11 @@ Options parse_options(int argc, char** argv) {
             options.control = true;
         } else if (!std::strcmp(arg, "--geometry")) {
             const std::string selected(value());
-            options.geometry27 = selected == "27b" || selected == "both";
-            options.geometry35 = selected == "35b" || selected == "both";
-            if (!options.geometry27 && !options.geometry35) {
-                throw std::invalid_argument("--geometry must be 27b, 35b, or both");
+            options.geometry27     = selected == "27b" || selected == "all";
+            options.geometry35     = selected == "35b" || selected == "all";
+            options.geometryDflash = selected == "dflash" || selected == "all";
+            if (!options.geometry27 && !options.geometry35 && !options.geometryDflash) {
+                throw std::invalid_argument("--geometry must be dflash, 27b, 35b, or all");
             }
         } else if (!std::strcmp(arg, "--axes")) {
             const std::string selected(value());
@@ -384,20 +573,42 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument(
                     "--candidate-block must be a positive multiple of 32 no larger than 1024");
             }
+        } else if (!std::strcmp(arg, "--candidate-heads")) {
+            options.candidate_heads = std::stoi(value());
+            if (options.candidate_heads != 1 && options.candidate_heads != 2 &&
+                options.candidate_heads != 4 && options.candidate_heads != 5 &&
+                options.candidate_heads != 8 && options.candidate_heads != 10 &&
+                options.candidate_heads != 20) {
+                throw std::invalid_argument("--candidate-heads must be 1,2,4,5,8,10,or 20");
+            }
         } else if (!std::strcmp(arg, "--tokens")) {
             options.tokens = parse_csv(value());
         } else if (!std::strcmp(arg, "--patches")) {
             options.patches = parse_csv(value());
+        } else if (!std::strcmp(arg, "--profile")) {
+            options.profile = true;
         } else {
             throw std::invalid_argument(std::string("unknown option: ") + arg);
         }
     }
     if (!options.text && !options.vision) { options.text = options.vision = true; }
-    if (options.candidate_block != 0 && !options.text) {
-        throw std::invalid_argument("--candidate-block requires --text");
+    if (options.candidate_block != 0 && options.candidate_heads != 0) {
+        throw std::invalid_argument("select only one candidate route");
     }
-    if (options.candidate_block != 0 && (options.control || options.single_q || options.single_k)) {
-        throw std::invalid_argument("--candidate-block is only valid for the production pair form");
+    if (options.candidate_block != 0 &&
+        (!options.text || options.control || options.single_q || options.single_k)) {
+        throw std::invalid_argument("--candidate-block is only valid for a Text pair form");
+    }
+    if (options.candidate_heads != 0 &&
+        (!options.text || !options.geometryDflash || options.geometry27 || options.geometry35 ||
+         options.control || options.single_q || options.single_k)) {
+        throw std::invalid_argument(
+            "--candidate-heads is only valid for the DFlash Text pair form");
+    }
+    if (options.profile && (!options.text || options.vision || !options.geometryDflash ||
+                            options.geometry27 || options.geometry35 || !options.pair ||
+                            options.single_q || options.single_k || options.tokens.size() != 1)) {
+        throw std::invalid_argument("--profile requires one DFlash Text pair token extent");
     }
     return options;
 }
@@ -413,6 +624,12 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         if (options.text) {
+            if (options.geometryDflash && options.axes1 && options.pair) {
+                for (int tokens : options.tokens) {
+                    run_dflash(tokens, options.control, options.candidate_block,
+                               options.candidate_heads, options.profile);
+                }
+            }
             for (int axes : {1, 3}) {
                 if ((axes == 1 && !options.axes1) || (axes == 3 && !options.axes3)) { continue; }
                 for (int tokens : options.tokens) {

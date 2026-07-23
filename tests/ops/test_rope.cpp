@@ -633,7 +633,10 @@ int main() {
     f += split_api_parity_case(7, 2007u);
     f += split_api_parity_case(1024, 2024u);
     f += text_mrope_case();
-    f += text_35b_case(1, 1);
+    for (int tokens = 1; tokens <= 16; ++tokens) {
+        f += text_35b_case(tokens, 1);
+        f += text_35b_case(tokens, 3);
+    }
     f += text_35b_case(1024, 3);
     f += vision_rope_packed_case();
 

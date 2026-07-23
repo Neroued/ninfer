@@ -1,7 +1,8 @@
 // Exact-domain RoPE benchmark for Qwen3.6 Text and Vision geometries.
 // Examples:
-//   ./ninfer_rope_bench --text --geometry 35b --axes both --tokens 1,2,3,4,5,6,1024
-//   ./ninfer_rope_bench --text --geometry 35b --form all --tokens 1,2,3,4,5,6,1024
+//   ./ninfer_rope_bench --text --geometry 35b --axes both \
+//       --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+//   ./ninfer_rope_bench --text --geometry 35b --axes 3 --candidate-block 384
 //   ./ninfer_rope_bench --vision --patches 8,256,4096,49152,65536
 // Add --control for the same-grid, same-payload fixed-resource control.
 #include "core/device.h"
@@ -168,9 +169,8 @@ rope_payload_control_kernel(const std::int32_t* positions, __nv_bfloat16* q, __n
 }
 
 template <int QHeads, int KHeads>
-void launch_text_control(const Tensor& positions, Tensor& q, Tensor& k, cudaStream_t stream) {
-    const int tokens = q.ne[2];
-    int block        = 128;
+int production_text_block(int tokens) {
+    int block = 128;
     if (tokens <= 6) {
         block = (QHeads + KHeads) * 32;
     } else if (tokens <= kLargeBlockWaveCapacity) {
@@ -180,6 +180,13 @@ void launch_text_control(const Tensor& positions, Tensor& q, Tensor& k, cudaStre
     }
     const int head_warps = (QHeads + KHeads) * 32;
     if (block > head_warps) { block = head_warps; }
+    return block;
+}
+
+template <int QHeads, int KHeads>
+void launch_text_control(const Tensor& positions, Tensor& q, Tensor& k, cudaStream_t stream) {
+    const int tokens = q.ne[2];
+    const int block  = production_text_block<QHeads, KHeads>(tokens);
     if (positions.ne[1] == 1) {
         rope_payload_control_kernel<ops::RopeKernelMode::Text1D, kTextHeadDim, kTextRotaryDim,
                                     QHeads, KHeads><<<tokens, block, 0, stream>>>(
@@ -196,6 +203,30 @@ void launch_text_control(const Tensor& positions, Tensor& q, Tensor& k, cudaStre
             k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <ops::RopeKernelMode Mode, int QHeads, int KHeads>
+void launch_text_candidate_mode(const Tensor& positions, Tensor& q, Tensor& k, int block,
+                                cudaStream_t stream) {
+    const int tokens = q.ne[2];
+    ops::rope_fixed_kernel<Mode, QHeads, KHeads><<<tokens, block, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data), static_cast<__nv_bfloat16*>(q.data),
+        static_cast<__nv_bfloat16*>(k.data), tokens,
+        q.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+        k.nb[2] / static_cast<std::int64_t>(sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int QHeads, int KHeads>
+void launch_text_candidate(const Tensor& positions, Tensor& q, Tensor& k, int block,
+                           cudaStream_t stream) {
+    if (positions.ne[1] == 1) {
+        launch_text_candidate_mode<ops::RopeKernelMode::Text1D, QHeads, KHeads>(positions, q, k,
+                                                                                block, stream);
+    } else {
+        launch_text_candidate_mode<ops::RopeKernelMode::TextMrope, QHeads, KHeads>(positions, q, k,
+                                                                                   block, stream);
+    }
 }
 
 template <int Heads>
@@ -216,9 +247,10 @@ void run_text_single(int tokens, int axes, bool control, const char* geometry, c
             }
         },
         bytes);
-    const std::string label = std::string("rope ") + (control ? "control" : "text") + " " +
-                              geometry + " " + role + " axes=" + std::to_string(axes) +
-                              " T=" + std::to_string(tokens);
+    const std::string label =
+        std::string("rope ") + (control ? "control" : "text") + " " + geometry + " " + role +
+        " axes=" + std::to_string(axes) + " route=fixed-b" +
+        std::to_string(production_text_block<Heads, 0>(tokens)) + " T=" + std::to_string(tokens);
     print_result(label.c_str(), result);
 }
 
@@ -234,7 +266,7 @@ void launch_vision_control(const Tensor& positions, Tensor& q, Tensor& k, cudaSt
 }
 
 template <int QHeads, int KHeads>
-void run_text(int tokens, int axes, bool control, const char* geometry) {
+void run_text(int tokens, int axes, bool control, int candidate_block, const char* geometry) {
     const std::size_t q_elements = static_cast<std::size_t>(kTextHeadDim) * QHeads * tokens;
     const std::size_t k_elements = static_cast<std::size_t>(kTextHeadDim) * KHeads * tokens;
     DBuf positions               = make_text_positions(tokens, axes);
@@ -249,13 +281,20 @@ void run_text(int tokens, int axes, bool control, const char* geometry) {
         [&](cudaStream_t stream) {
             if (control) {
                 launch_text_control<QHeads, KHeads>(tpos, tq, tk, stream);
+            } else if (candidate_block != 0) {
+                launch_text_candidate<QHeads, KHeads>(tpos, tq, tk, candidate_block, stream);
             } else {
                 ops::rope(tpos, kTextRotaryDim, kTextTheta, tq, tk, stream);
             }
         },
         bytes);
-    const std::string label = std::string("rope ") + (control ? "control" : "text") + " " +
-                              geometry + " axes=" + std::to_string(axes) +
+    const int production_block = production_text_block<QHeads, KHeads>(tokens);
+    const std::string route    = control ? "control-b" + std::to_string(production_block)
+                                 : candidate_block == 0
+                                     ? "fixed-b" + std::to_string(production_block)
+                                     : "candidate-b" + std::to_string(candidate_block);
+    const std::string label    = std::string("rope text ") + geometry +
+                              " axes=" + std::to_string(axes) + " route=" + route +
                               " T=" + std::to_string(tokens);
     print_result(label.c_str(), result);
 }
@@ -287,17 +326,18 @@ void run_vision(int patches, bool control) {
 }
 
 struct Options {
-    bool text       = false;
-    bool vision     = false;
-    bool control    = false;
-    bool geometry27 = false;
-    bool geometry35 = true;
-    bool axes1      = true;
-    bool axes3      = true;
-    bool pair       = true;
-    bool single_q   = false;
-    bool single_k   = false;
-    std::vector<int> tokens{1, 2, 3, 4, 5, 6, 1024};
+    bool text           = false;
+    bool vision         = false;
+    bool control        = false;
+    bool geometry27     = false;
+    bool geometry35     = true;
+    bool axes1          = true;
+    bool axes3          = true;
+    bool pair           = true;
+    bool single_q       = false;
+    bool single_k       = false;
+    int candidate_block = 0;
+    std::vector<int> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 1024};
     std::vector<int> patches{8, 256, 4096, 49152, 65536};
 };
 
@@ -337,6 +377,13 @@ Options parse_options(int argc, char** argv) {
             if (!options.pair && !options.single_q && !options.single_k) {
                 throw std::invalid_argument("--form must be pair, q, k, or all");
             }
+        } else if (!std::strcmp(arg, "--candidate-block")) {
+            options.candidate_block = std::stoi(value());
+            if (options.candidate_block <= 0 || options.candidate_block > 1024 ||
+                options.candidate_block % 32 != 0) {
+                throw std::invalid_argument(
+                    "--candidate-block must be a positive multiple of 32 no larger than 1024");
+            }
         } else if (!std::strcmp(arg, "--tokens")) {
             options.tokens = parse_csv(value());
         } else if (!std::strcmp(arg, "--patches")) {
@@ -346,6 +393,12 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (!options.text && !options.vision) { options.text = options.vision = true; }
+    if (options.candidate_block != 0 && !options.text) {
+        throw std::invalid_argument("--candidate-block requires --text");
+    }
+    if (options.candidate_block != 0 && (options.control || options.single_q || options.single_k)) {
+        throw std::invalid_argument("--candidate-block is only valid for the production pair form");
+    }
     return options;
 }
 
@@ -364,7 +417,10 @@ int main(int argc, char** argv) {
                 if ((axes == 1 && !options.axes1) || (axes == 3 && !options.axes3)) { continue; }
                 for (int tokens : options.tokens) {
                     if (options.geometry27) {
-                        if (options.pair) { run_text<24, 4>(tokens, axes, options.control, "27b"); }
+                        if (options.pair) {
+                            run_text<24, 4>(tokens, axes, options.control, options.candidate_block,
+                                            "27b");
+                        }
                         if (options.single_q) {
                             run_text_single<24>(tokens, axes, options.control, "27b", "q");
                         }
@@ -373,7 +429,10 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (options.geometry35) {
-                        if (options.pair) { run_text<16, 2>(tokens, axes, options.control, "35b"); }
+                        if (options.pair) {
+                            run_text<16, 2>(tokens, axes, options.control, options.candidate_block,
+                                            "35b");
+                        }
                         if (options.single_q) {
                             run_text_single<16>(tokens, axes, options.control, "35b", "q");
                         }

@@ -372,7 +372,7 @@ after the P0 contractions and state transitions are optimized.
 |---|---|---|---:|---|---|
 | DV-09 | [x] | `rmsnorm` | 71 | Exact `T=1..16` for hidden, Q, and K row counts; assess safe fusion only at an owning semantic boundary. | `test_rmsnorm`; `rmsnorm_bench` |
 | DV-10 | [x] | `gated_rmsnorm` | 30 | `[4096,T]` with z gate; check launch/memory scaling and downstream arithmetic criterion. | `test_rmsnorm`; `rmsnorm_bench` |
-| DV-11 | [ ] | `rope` | 10 | `[4096,T]` Q and `[512,T]` K, rotary 64, absolute positions; current launcher changes small-token geometry after 6. | `test_rope`; `rope_bench` |
+| DV-11 | [x] | `rope` | 10 | `[4096,T]` Q and `[512,T]` K, rotary 64, absolute positions; current launcher changes small-token geometry after 6. | `test_rope`; `rope_bench` |
 | DV-12 | [ ] | `sigmoid_mul` | 10 | Gate `[4096,T]`; exact odd/partial token extents and graph replay. | `test_sigmoid_mul`; `sigmoid_mul_bench` |
 | DV-13 | [ ] | `embedding` | 1 | W8 `[248320,2048]`, gathered ids for `T=1..16`; include repeated ids and physical row decode. | `test_embedding`; `embedding_bench` |
 | DV-14 | [ ] | `offset_i32_positions` | 1 | Exact position construction for all `T`, including near context limit. | `test_position`; dedicated benchmark missing |
@@ -420,6 +420,31 @@ The 35B gated RMSNorm domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1
   50.432 us at `T=8`, 58.624 us at `T=12`, and 64.768 us at `T=16`. Production therefore keeps
   the existing 512-thread route; DV-10 adds complete qualification and reproducible candidate
   evidence without changing the runtime kernel.
+
+#### DV-11 qualification record
+
+The 35B Text RoPE domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`.
+
+- **C:** the public production pair and single-Q/single-K routes passed the independent naive FP64
+  split-half RoPE oracle for both one-dimensional and three-axis MRoPE positions at every exact
+  `T=1..16`. The checks cover Q `[256,16,T]`, K `[256,2,T]`, rotary width 64, theta `1e7`, BF16
+  publication, non-rotary passthrough bits, and pair/single parity. Existing 27B, generic,
+  unaligned, long-sequence, and Vision cases remain in the same suite.
+- **B:** the exact-T benchmark now prints the physical block route and accepts an explicit
+  pair-kernel block candidate. With 20 warmups and at least 100 measured CUDA-event batches over
+  500 ms, the production `fixed-b256` route measured 9.36--9.66 us over three-axis `T=7..16`;
+  there is no material long-T cliff after the `fixed-b576` to `fixed-b256` boundary.
+- **O:** 128-, 192-, 384-, and 576-thread candidates were compared over exact `T=7..16`.
+  `candidate-b384` was the best isolated route at 9.28--9.35 us, about 1%--3% faster at most
+  points, without changing launch count, traffic, or arithmetic. It remains a diagnostic route
+  because the gain is near the launch floor.
+- **E:** two reverse-order captured attention-mixer pairs used 20 warmups, 200 measured replays,
+  and a 256 MiB L2 flush at contexts 128 and 8192 for `T=7,8,12,16`. Candidate and production
+  medians were identical at the context-128 `T=7` point (54.528 us), differed by at most
+  0.29 us in either direction at context-128 `T=8,12,16`, and showed mixed results at context
+  8192, including 142.624/143.744 us and 143.136/142.912 us for candidate/production at `T=16`.
+  The production threshold is therefore retained; DV-11 adds complete qualification and
+  reproducible candidate evidence without changing the runtime kernel.
 
 ### P0 measurement infrastructure
 

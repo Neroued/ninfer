@@ -6,6 +6,7 @@
 #include "ninfer/ops/argmax.h"
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "ops/launcher/argmax.h"
 
 #include <cuda_runtime.h>
 
@@ -25,18 +26,18 @@ constexpr std::int32_t kFullPhysicalRows = 248320;
 constexpr std::int32_t kFullValidRows    = 248077;
 constexpr std::int32_t kShortlistRows    = 131072;
 constexpr int kControlBlock              = 512;
-constexpr int kWindowStride              = 8;
-constexpr int kWindowCount               = 32;
-constexpr int kLogitSlots                = kWindowStride * kWindowCount;
+constexpr int kLogitSlots                = 256;
 
 struct Options {
     std::string shape;
-    int cols     = 0;
-    bool control = false;
+    int cols            = 0;
+    bool control        = false;
+    int candidate_block = 0;
 };
 
 void usage(const char* argv0) {
-    std::printf("usage: %s [--shape full|shortlist --cols N] [--control]\n", argv0);
+    std::printf("usage: %s [--shape full|shortlist --cols N] [--control | --candidate-block B]\n",
+                argv0);
 }
 
 int parse_int(std::string_view value, const char* name) {
@@ -66,12 +67,24 @@ Options parse_args(int argc, char** argv) {
             options.cols = parse_int(need_value("--cols"), "--cols");
         } else if (arg == "--control") {
             options.control = true;
+        } else if (arg == "--candidate-block") {
+            options.candidate_block =
+                parse_int(need_value("--candidate-block"), "--candidate-block");
         } else if (arg == "-h" || arg == "--help") {
             usage(argc > 0 ? argv[0] : "ninfer_argmax_bench");
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(arg));
         }
+    }
+    if (options.candidate_block != 0 &&
+        (options.candidate_block <= 0 || options.candidate_block > 512 ||
+         options.candidate_block % 32 != 0)) {
+        throw std::invalid_argument(
+            "--candidate-block must be a positive multiple of 32 no larger than 512");
+    }
+    if (options.control && options.candidate_block != 0) {
+        throw std::invalid_argument("--control and --candidate-block are mutually exclusive");
     }
     if (options.shape.empty()) {
         if (options.cols != 0) { throw std::invalid_argument("--cols requires --shape"); }
@@ -81,8 +94,8 @@ Options parse_args(int argc, char** argv) {
         throw std::invalid_argument("--shape must be full or shortlist");
     }
     if (options.cols == 0) { options.cols = 1; }
-    if (options.cols < 1 || options.cols > 6) {
-        throw std::invalid_argument("--cols must be in [1,6]");
+    if (options.cols < 1 || options.cols > 16) {
+        throw std::invalid_argument("--cols must be in [1,16]");
     }
     if (options.shape == "shortlist" && options.cols != 1) {
         throw std::invalid_argument("shortlist supports exactly --cols 1");
@@ -114,17 +127,18 @@ __global__ void argmax_payload_control_kernel(const std::uint16_t* logits, std::
 }
 
 void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, bool control,
-               const char* shape) {
+               int candidate_block, const char* shape) {
     DBuf logits       = make_bf16(static_cast<std::size_t>(physical_rows) * kLogitSlots);
     DBuf out          = make_zeros(static_cast<std::size_t>(cols) * sizeof(std::int32_t));
     auto* logits_base = static_cast<std::uint16_t*>(logits.p);
     Tensor tout(out.p, DType::I32, {cols});
 
-    const double bytes  = static_cast<double>(valid_rows) * 2.0 * static_cast<double>(cols);
-    int launch          = 0;
-    const Result result = bench_loop(
+    const double bytes     = static_cast<double>(valid_rows) * 2.0 * static_cast<double>(cols);
+    int launch             = 0;
+    const int window_count = kLogitSlots / cols;
+    const Result result    = bench_loop(
         [&](cudaStream_t stream) {
-            const int slot = (launch++ & (kWindowCount - 1)) * kWindowStride;
+            const int slot = (launch++ % window_count) * cols;
             auto* window   = logits_base + static_cast<std::size_t>(slot) * physical_rows;
             if (control) {
                 CUDA_CHECK(cudaMemsetAsync(
@@ -134,15 +148,24 @@ void run_shape(std::int32_t physical_rows, std::int32_t valid_rows, int cols, bo
                 argmax_payload_control_kernel<<<grid, kControlBlock, 0, stream>>>(
                     window, static_cast<std::uint32_t*>(out.p), valid_rows, physical_rows);
                 CUDA_CHECK(cudaGetLastError());
-            } else {
+            } else if (candidate_block == 0) {
                 Tensor tlogits(window, DType::BF16, {physical_rows, cols});
                 ops::argmax(tlogits, tout, valid_rows, stream);
+            } else {
+                Tensor tlogits(window, DType::BF16, {physical_rows, cols});
+                ops::detail::argmax_tiled_atomic_launch(tlogits, tout, valid_rows, candidate_block,
+                                                           stream);
             }
         },
         bytes);
 
-    const std::string label = std::string(control ? "argmax payload control " : "argmax ") + shape +
-                              " rows=" + std::to_string(valid_rows) + " C=" + std::to_string(cols);
+    const std::string route = control ? "payload-control-b512"
+                              : candidate_block == 0
+                                  ? "tiled-atomic-b512"
+                                  : "candidate-b" + std::to_string(candidate_block);
+    const std::string label = std::string("argmax ") + shape +
+                              " rows=" + std::to_string(valid_rows) + " C=" + std::to_string(cols) +
+                              " route=" + route;
     print_result(label.c_str(), result);
 }
 
@@ -158,14 +181,18 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_args(argc, argv);
         if (options.shape.empty()) {
-            for (int cols = 1; cols <= 6; ++cols) {
-                run_shape(kFullPhysicalRows, kFullValidRows, cols, options.control, "full");
+            for (int cols = 1; cols <= 16; ++cols) {
+                run_shape(kFullPhysicalRows, kFullValidRows, cols, options.control,
+                          options.candidate_block, "full");
             }
-            run_shape(kShortlistRows, kShortlistRows, 1, options.control, "shortlist");
+            run_shape(kShortlistRows, kShortlistRows, 1, options.control, options.candidate_block,
+                      "shortlist");
         } else if (options.shape == "full") {
-            run_shape(kFullPhysicalRows, kFullValidRows, options.cols, options.control, "full");
+            run_shape(kFullPhysicalRows, kFullValidRows, options.cols, options.control,
+                      options.candidate_block, "full");
         } else {
-            run_shape(kShortlistRows, kShortlistRows, 1, options.control, "shortlist");
+            run_shape(kShortlistRows, kShortlistRows, 1, options.control, options.candidate_block,
+                      "shortlist");
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "ninfer_argmax_bench: %s\n", e.what());

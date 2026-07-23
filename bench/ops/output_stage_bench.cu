@@ -9,6 +9,7 @@
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "ops/launcher/argmax.h"
 #include "ops/linear/q6/q6_rowsplit_plan.h"
 
 #include <cuda_runtime.h>
@@ -28,6 +29,7 @@ namespace {
 
 constexpr std::int32_t kHidden          = 2048;
 constexpr std::int32_t kVocab           = 248320;
+constexpr std::int32_t kValidVocab      = 248077;
 constexpr std::int32_t kMaxTokens       = 16;
 constexpr std::size_t kDefaultFlushSize = 256ULL << 20;
 constexpr float kRmsEps                 = 1.0e-6F;
@@ -40,6 +42,7 @@ enum class Route {
 struct Options {
     std::vector<std::int32_t> t_sweep{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     Route route            = Route::Production;
+    int argmax_block       = 0;
     int warmup             = 5;
     int repeat             = 50;
     std::size_t flush_size = kDefaultFlushSize;
@@ -155,6 +158,9 @@ Options parse_options(int argc, char** argv) {
             options.warmup = std::stoi(std::string(next("--warmup value")));
         } else if (arg == "--repeat") {
             options.repeat = std::stoi(std::string(next("--repeat value")));
+        } else if (arg == "--argmax-block") {
+            const std::string_view value = next("--argmax-block value");
+            options.argmax_block         = value == "auto" ? 0 : std::stoi(std::string(value));
         } else if (arg == "--flush-mib") {
             const long mib = std::stol(std::string(next("--flush-mib value")));
             if (mib <= 0) { throw std::invalid_argument("--flush-mib must be positive"); }
@@ -162,7 +168,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--t-sweep 1,2,...,16] "
                         "[--route production|dv06-control] [--warmup N] [--repeat N] "
-                        "[--flush-mib N]\n",
+                        "[--argmax-block auto|128|256|384|512] [--flush-mib N]\n",
                         argv[0]);
             std::exit(0);
         } else {
@@ -171,6 +177,11 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
+    }
+    if (options.argmax_block != 0 && (options.argmax_block <= 0 || options.argmax_block > 512 ||
+                                      options.argmax_block % 32 != 0)) {
+        throw std::invalid_argument(
+            "--argmax-block must be auto or a positive multiple of 32 no larger than 512");
     }
     return options;
 }
@@ -281,8 +292,8 @@ int run(const Options& options) {
 
     std::printf("# gpu=RTX_5090 cuda=13.1 sm=120a flush_mib=%zu warmup=%d repeat=%d\n",
                 options.flush_size >> 20, options.warmup, options.repeat);
-    std::printf("%4s %-14s %5s %10s %10s %10s %s\n", "T", "control", "nodes", "median_us", "min_us",
-                "p95_us", "head_route");
+    std::printf("%4s %-14s %5s %10s %10s %10s %-52s %s\n", "T", "control", "nodes", "median_us",
+                "min_us", "p95_us", "head_route", "argmax_route");
 
     for (const std::int32_t t : options.t_sweep) {
         Tensor x(residual.p, DType::BF16, {kHidden, t});
@@ -303,7 +314,12 @@ int run(const Options& options) {
                 ops::detail::q6_rowsplit_execute_plan(head_plan, normalized, head.weight, output,
                                                       body_stream);
             }
-            ops::argmax(output, selected, kVocab, body_stream);
+            if (options.argmax_block == 0) {
+                ops::argmax(output, selected, kValidVocab, body_stream);
+            } else {
+                ops::detail::argmax_tiled_atomic_launch(output, selected, kValidVocab,
+                                                        options.argmax_block, body_stream);
+            }
         };
 
         body(stream);
@@ -311,9 +327,12 @@ int run(const Options& options) {
         TimedGraph graph;
         graph.capture(stream, body);
         const Timing timing = measure_cold(graph, flush, stream, options.warmup, options.repeat);
-        std::printf("%4d %-14s %5zu %10.3f %10.3f %10.3f %s\n", t, route_name(options.route),
+        const std::string argmax_route = options.argmax_block == 0
+                                             ? "production-b512"
+                                             : "candidate-b" + std::to_string(options.argmax_block);
+        std::printf("%4d %-14s %5zu %10.3f %10.3f %10.3f %-52s %s\n", t, route_name(options.route),
                     graph.nodes(), timing.median_us, timing.min_us, timing.p95_us,
-                    ops::detail::q6_schedule_name(head_plan.schedule));
+                    ops::detail::q6_schedule_name(head_plan.schedule), argmax_route.c_str());
     }
 
     CUDA_CHECK(cudaStreamDestroy(stream));

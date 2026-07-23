@@ -4,6 +4,7 @@
 #include "ninfer/ops/argmax.h"
 #include "ops/op_tester.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -94,14 +95,18 @@ static int one_shape(const char* tag, int vocab, int t_count, std::uint32_t seed
 static int physical_stride_and_valid_rows(int cols) {
     constexpr int physical_rows = 248320;
     constexpr int valid_rows    = 248077;
-    const std::vector<int> all_ref{17, 7919, 65537, 123456, 200003, valid_rows - 1};
-    const std::vector<int> ref(all_ref.begin(), all_ref.begin() + cols);
+    std::vector<int> ref(static_cast<std::size_t>(cols));
     std::vector<float> logits(static_cast<std::size_t>(physical_rows) * cols, -10.0f);
     for (int col = 0; col < cols; ++col) {
         const std::size_t base = static_cast<std::size_t>(col) * physical_rows;
-        logits[base + ref[static_cast<std::size_t>(col)]] = 20.0f + col;
-        logits[base + valid_rows]                         = 100.0f + col;
-        logits[base + physical_rows - 1]                  = 200.0f + col;
+        int first              = (17 + col * 7919) % valid_rows;
+        int second             = valid_rows - 1 - ((11 + col * 65537) % valid_rows);
+        if (first == second) { second = (second + 1) % valid_rows; }
+        ref[static_cast<std::size_t>(col)] = std::min(first, second);
+        logits[base + first]               = 20.0f + col;
+        logits[base + second]              = 20.0f + col;
+        logits[base + valid_rows]          = 100.0f + col;
+        logits[base + physical_rows - 1]   = 200.0f + col;
     }
     round_to_bf16(logits);
 
@@ -258,7 +263,7 @@ int main() {
 
     int f = 0;
     f += validation_checks();
-    for (int cols = 1; cols <= 6; ++cols) { f += physical_stride_and_valid_rows(cols); }
+    for (int cols = 1; cols <= 16; ++cols) { f += physical_stride_and_valid_rows(cols); }
     f += shortlist_shape();
 
     for (std::uint32_t seed : {1u, 7u, 99u}) {

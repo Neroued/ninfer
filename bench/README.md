@@ -216,14 +216,15 @@ cmake --build build --parallel --target ninfer_qwen3_6_27b_mtp_round_bench
 ## Token-decision Op benchmarks
 
 The G1 benchmark covers the Qwen3.6-35B full physical vocabulary with 248077 valid rows at
-`C=1..6`, plus the 131072-row shortlist. Its `--control` route reads the same rotating payload and
+`C=1..16`, plus the 131072-row shortlist. Its `--control` route reads the same rotating payload and
 uses the same launch grid without computing argmax, which provides the fixed-work comparison used
-by the benchmark comparison:
+by the benchmark comparison. `--candidate-block` forces a tiled-atomic CTA geometry:
 
 ```bash
 cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_select_bench
 ./build/bench/ninfer_argmax_bench
 ./build/bench/ninfer_argmax_bench --control
+./build/bench/ninfer_argmax_bench --candidate-block 128
 ```
 
 The G2/G3 benchmark uses physical rows 248320, valid token domain 248077, optional occurrence

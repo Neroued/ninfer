@@ -376,7 +376,7 @@ after the P0 contractions and state transitions are optimized.
 | DV-12 | [x] | `sigmoid_mul` | 10 | Gate `[4096,T]`; exact odd/partial token extents and graph replay. | `test_sigmoid_mul`; `sigmoid_mul_bench` |
 | DV-13 | [x] | `embedding` | 1 | W8 `[248320,2048]`, gathered ids for `T=1..16`; include repeated ids and physical row decode. | `test_embedding`; `embedding_bench` |
 | DV-14 | [x] | `offset_i32_positions` | 1 | Exact position construction for all `T`, including near context limit. | `test_position`; `position_bench` |
-| DV-15 | [ ] | `argmax` | 1 | Q6-head output with `T=1..16`, physical stride, valid vocabulary rows, stable ties. | `test_argmax`; `argmax_bench` |
+| DV-15 | [x] | `argmax` | 1 | Q6-head output with `T=1..16`, physical stride, valid vocabulary rows, stable ties. | `test_argmax`; `argmax_bench` |
 
 #### DV-09 qualification record
 
@@ -519,6 +519,35 @@ The 35B position-offset domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13
   3.33--3.36 us and every candidate remained in the same 3.33--3.36 us band. Production therefore
   retains `b256`; DV-14 closes the previously missing benchmark and graph-replay evidence without
   changing runtime geometry.
+
+#### DV-15 qualification record
+
+The 35B full-vocabulary argmax domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1,
+`sm_120a`.
+
+- **C:** the public production route passed exact I32 index equality for every target shape
+  `[248320,T]`, `T=1..16`, with `valid_rows=248077`. Every column places equal legal maxima at
+  two different indices and larger values in both the first padding row and final physical row;
+  the result is always the lower legal index. This directly covers physical column stride,
+  padding exclusion, stable ties, and all output elements. Existing small-row, shortlist,
+  multi-seed, zero-T, overflow, and validation cases remain in the same suite.
+- **B:** the benchmark now covers the complete `C=1..16` matrix, keeps 256 rotating physical
+  logit columns without overlapping windows, and prints the tiled-atomic route. With 20 warmups
+  and at least 100 measured CUDA-event batches over 500 ms, production `b512` measured
+  15.93--16.96 us for `T=1..7` and 18.69--25.59 us for `T=8..16`; scaling is smooth as each
+  added column contributes another full-vocabulary read.
+- **O:** 128-, 256-, and 384-thread tiled-atomic candidates were compared with the same output
+  initialization, valid-row domain, arithmetic, and two-launch structure. `b128` was the strongest
+  isolated long-T candidate, measuring 23.72 us versus production's 25.59 us at `T=16` (7.3%);
+  its advantage was not uniform at shorter T, while `b256` and `b384` also failed to dominate the
+  exact-T matrix. The private block control is retained for reproducibility.
+- **E:** two reverse-order captured output-stage pairs measured final RMSNorm, the production Q6
+  lm-head, and argmax at every exact `T=1..16`, with 20 warmups, 200 measured replays, and a
+  256 MiB L2 flush. Both routes used four graph nodes. At `T=16`, candidate/production was
+  584.704/584.832 us in one pair and 585.472/585.472 us in the reverse pair; at `T=15`, a
+  0.224 us candidate lead reversed to a 0.864 us loss. The containing stage therefore provides
+  no stable reason to replace production `b512`. The output-stage benchmark now also uses the
+  actual 248077 valid-row domain rather than treating all 248320 storage rows as tokens.
 
 ### P0 measurement infrastructure
 

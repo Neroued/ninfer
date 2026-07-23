@@ -23,6 +23,7 @@ using ninfer::ops::detail::W8AttnInputProblem;
 using ninfer::ops::detail::W8AttnInputScheduleId;
 using ninfer::ops::detail::W8GdnInputProblem;
 using ninfer::ops::detail::W8GdnInputScheduleId;
+using ninfer::ops::detail::W8GdnInputSnapshotScheduleId;
 using ninfer::ops::detail::W8KernelVariant;
 
 int failures = 0;
@@ -190,6 +191,18 @@ void w8_gdn_route_tests() {
             ++failures;
         }
     }
+    for (const std::int32_t cols : {1, 2, 6, 7, 16, 17, 128}) {
+        const auto plan = ninfer::ops::detail::w8_gdn_input_snapshot_resolve_plan(
+            {2048, 8192, 4096, 12288, 2048, cols});
+        const W8GdnInputSnapshotScheduleId expected =
+            cols == 1    ? W8GdnInputSnapshotScheduleId::DecodeFused
+            : cols <= 16 ? W8GdnInputSnapshotScheduleId::SplitKMmaFused
+                         : W8GdnInputSnapshotScheduleId::Composed;
+        if (plan.schedule != expected) {
+            std::cerr << "wrong W8 GDN snapshot route C=" << cols << '\n';
+            ++failures;
+        }
+    }
     expect_invalid("W8 GDN C0", [] {
         (void)ninfer::ops::detail::w8_gdn_input_resolve_plan({2048, 8192, 4096, 12288, 2048, 0});
     });
@@ -231,6 +244,14 @@ void workspace_tests() {
                       << ", got " << actual << '\n';
             ++failures;
         }
+    }
+    const std::size_t w8_t16 =
+        ninfer::ops::gdn_input_proj_conv_snapshot_workspace_bytes(2048, 2048, 4096, 16);
+    const std::size_t w8_t17 =
+        ninfer::ops::gdn_input_proj_conv_snapshot_workspace_bytes(2048, 2048, 4096, 17);
+    if (w8_t16 != 0 || w8_t17 != 2ULL * 8192 * 17 * sizeof(std::uint16_t)) {
+        std::cerr << "wrong W8 GDN snapshot workspace frontier\n";
+        ++failures;
     }
     expect_invalid("workspace unsupported rows",
                    [] { (void)ninfer::ops::gdn_input_proj_workspace_bytes(4095, 6144, 1); });

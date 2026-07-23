@@ -1,6 +1,7 @@
 // Complete-Op benchmark for Qwen3.6-35B W8 attention/GDN multi-output projections.
 
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/scatter.h"
@@ -9,6 +10,7 @@
 #include "ninfer_bench_common.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
+#include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -38,7 +40,7 @@ constexpr std::int32_t kGdnZRows   = 4096;
 constexpr std::int32_t kGdnRows    = 12288;
 constexpr std::size_t kFlushBytes  = 256ULL << 20;
 
-enum class OpSelection { All, Attention, Gdn };
+enum class OpSelection { All, Attention, Gdn, GdnSnapshot };
 
 struct Options {
     OpSelection op = OpSelection::All;
@@ -155,8 +157,10 @@ Options parse_options(int argc, char** argv) {
                 options.op = OpSelection::Attention;
             else if (value == "gdn")
                 options.op = OpSelection::Gdn;
+            else if (value == "gdn-snapshot")
+                options.op = OpSelection::GdnSnapshot;
             else
-                throw std::invalid_argument("--op must be all, attention, or gdn");
+                throw std::invalid_argument("--op must be all, attention, gdn, or gdn-snapshot");
         } else if (arg == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep value"));
         } else if (arg == "--warmup") {
@@ -166,7 +170,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--csv-out") {
             options.csv_out = next("--csv-out path");
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--op all|attention|gdn] [--t-sweep 1,2,...] "
+            std::printf("Usage: %s [--op all|attention|gdn|gdn-snapshot] "
+                        "[--t-sweep 1,2,...] "
                         "[--warmup N] [--repeat N] [--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
@@ -242,6 +247,12 @@ ops::detail::W8KernelVariant mma_variant(std::int32_t t) {
                           : ops::detail::W8KernelVariant::Predicated;
 }
 
+bench::DBuf make_i32(std::int32_t value) {
+    bench::DBuf device(sizeof(value));
+    CUDA_CHECK(cudaMemcpy(device.p, &value, sizeof(value), cudaMemcpyHostToDevice));
+    return device;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -256,7 +267,7 @@ int main(int argc, char** argv) {
         WorkspaceArena workspace(1);
         std::vector<Result> results;
 
-        if (options.op != OpSelection::Gdn) {
+        if (options.op == OpSelection::All || options.op == OpSelection::Attention) {
             DevicePackedWeight packed = make_w8_weight(kAttnRows);
             bench::DBuf parent(static_cast<std::size_t>(kAttnRows) * max_t * 2);
             bench::DBuf q(static_cast<std::size_t>(kAttnQRows) * max_t * 2);
@@ -309,7 +320,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (options.op != OpSelection::Attention) {
+        if (options.op == OpSelection::All || options.op == OpSelection::Gdn) {
             DevicePackedWeight packed = make_w8_weight(kGdnRows);
             bench::DBuf parent(static_cast<std::size_t>(kGdnRows) * max_t * 2);
             bench::DBuf qkv(static_cast<std::size_t>(kGdnQkvRows) * max_t * 2);
@@ -349,6 +360,61 @@ int main(int argc, char** argv) {
                     ops::linear(x, packed.weight, out_parent, workspace, s);
                     ops::extract_bf16_columns(out_parent, 0, tqkv, s);
                     ops::extract_bf16_columns(out_parent, 8192, tz, s);
+                });
+            }
+        }
+
+        if (options.op == OpSelection::All || options.op == OpSelection::GdnSnapshot) {
+            constexpr std::int32_t kQueryRows = 2048;
+            constexpr std::int32_t kKeyRows   = 2048;
+            constexpr std::int32_t kValueRows = 4096;
+            constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+            const std::int32_t slots          = max_t + 1;
+            DevicePackedWeight packed         = make_w8_weight(kGdnRows);
+            bench::DBuf conv_weight = bench::make_bf16(static_cast<std::size_t>(kChannels) * 4);
+            bench::DBuf conv_states =
+                bench::make_bf16(static_cast<std::size_t>(kChannels) * 3 * slots);
+            bench::DBuf initial_slot = make_i32(max_t);
+            bench::DBuf q(static_cast<std::size_t>(kQueryRows) * max_t * 2);
+            bench::DBuf k(static_cast<std::size_t>(kKeyRows) * max_t * 2);
+            bench::DBuf v(static_cast<std::size_t>(kValueRows) * max_t * 2);
+            bench::DBuf z(static_cast<std::size_t>(kValueRows) * max_t * 2);
+            bench::DBuf qkv(static_cast<std::size_t>(kChannels) * max_t * 2);
+            bench::DBuf convolved(static_cast<std::size_t>(kChannels) * max_t * 2);
+            WorkspaceArena snapshot_workspace(
+                std::max<std::size_t>(1, ops::gdn_input_proj_conv_snapshot_workspace_bytes(
+                                             kQueryRows, kKeyRows, kValueRows, max_t)));
+
+            for (const std::int32_t t : options.t_sweep) {
+                Tensor x(input.p, DType::BF16, {kHidden, t});
+                Tensor tw(conv_weight.p, DType::BF16, {kChannels, 4});
+                Tensor states(conv_states.p, DType::BF16, {kChannels, 3, slots});
+                Tensor slot(initial_slot.p, DType::I32, {1});
+                Tensor tq(q.p, DType::BF16, {kQueryRows, t});
+                Tensor tk(k.p, DType::BF16, {kKeyRows, t});
+                Tensor tv(v.p, DType::BF16, {kValueRows, t});
+                Tensor tz(z.p, DType::BF16, {kValueRows, t});
+                Tensor tqkv(qkv.p, DType::BF16, {kChannels, t});
+                Tensor tconvolved(convolved.p, DType::BF16, {kChannels, t});
+                const auto run = [&](const char* path, auto&& launch) {
+                    append(results, "gdn_snap", path, t,
+                           measure_cold(launch, flush, stream, options.warmup, options.repeat),
+                           kGdnRows);
+                };
+
+                const auto snapshot_plan = ops::detail::w8_gdn_input_snapshot_resolve_plan(
+                    {kHidden, kChannels, kValueRows, kGdnRows, kHidden, t});
+                run(ops::detail::w8_gdn_input_snapshot_schedule_name(snapshot_plan.schedule),
+                    [&](cudaStream_t s) {
+                        ops::gdn_input_proj_conv_snapshot(x, packed.weight, tw, states, slot, tq,
+                                                          tk, tv, tz, snapshot_workspace, s);
+                    });
+                run("composed_control", [&](cudaStream_t s) {
+                    ops::gdn_input_proj(x, packed.weight, tqkv, tz, workspace, s);
+                    ops::causal_conv1d_silu_snapshot(tqkv, tw, states, slot, tconvolved, s);
+                    ops::extract_bf16_columns(tconvolved, 0, tq, s);
+                    ops::extract_bf16_columns(tconvolved, kQueryRows, tk, s);
+                    ops::extract_bf16_columns(tconvolved, kQueryRows + kKeyRows, tv, s);
                 });
             }
         }

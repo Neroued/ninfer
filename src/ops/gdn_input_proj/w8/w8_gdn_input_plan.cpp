@@ -65,6 +65,18 @@ const char* w8_gdn_input_schedule_name(W8GdnInputScheduleId schedule) noexcept {
     return "gdn_input_proj.w8.unknown";
 }
 
+const char* w8_gdn_input_snapshot_schedule_name(W8GdnInputSnapshotScheduleId schedule) noexcept {
+    switch (schedule) {
+    case W8GdnInputSnapshotScheduleId::DecodeFused:
+        return "gdn_input_proj_conv_snapshot.w8.decode.fused";
+    case W8GdnInputSnapshotScheduleId::SplitKMmaFused:
+        return "gdn_input_proj_conv_snapshot.w8.mma.splitk.fused";
+    case W8GdnInputSnapshotScheduleId::Composed:
+        return "gdn_input_proj_conv_snapshot.w8.composed";
+    }
+    return "gdn_input_proj_conv_snapshot.w8.unknown";
+}
+
 bool w8_gdn_input_admits(const W8GdnInputProblem& problem) noexcept {
     return supported_shape(problem) && problem.cols > 0;
 }
@@ -79,6 +91,16 @@ W8GdnInputPlan w8_gdn_input_resolve_plan(const W8GdnInputProblem& problem) {
         }
     }
     throw std::logic_error("W8 GDN input: admitted problem has no covering route");
+}
+
+W8GdnInputSnapshotPlan w8_gdn_input_snapshot_resolve_plan(const W8GdnInputProblem& problem) {
+    if (!w8_gdn_input_admits(problem)) {
+        throw std::invalid_argument(
+            "W8 GDN input snapshot: exact problem or column count is not admitted");
+    }
+    if (problem.cols == 1) { return {W8GdnInputSnapshotScheduleId::DecodeFused}; }
+    if (problem.cols <= 16) { return {W8GdnInputSnapshotScheduleId::SplitKMmaFused}; }
+    return {W8GdnInputSnapshotScheduleId::Composed};
 }
 
 std::size_t w8_gdn_input_capacity_workspace_bytes(std::int32_t qkv_rows, std::int32_t z_rows,

@@ -126,10 +126,12 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_bytes(std::int32_t query_rows
     }
     const std::int32_t channels = query_rows + key_rows + value_rows;
     WorkspaceLayoutBuilder layout;
-    if (q4_q5 && max_tokens <= 6) {
-        if (max_tokens < 4) { return 0; }
-        (void)layout.alloc(DType::BF16, {channels, 4});
-        return layout.peak_bytes();
+    if (max_tokens <= 16) {
+        if (w8 || max_tokens < 4) { return 0; }
+        if (max_tokens <= 6) {
+            (void)layout.alloc(DType::BF16, {channels, 4});
+            return layout.peak_bytes();
+        }
     }
     (void)layout.alloc(DType::BF16, {channels, max_tokens});
     (void)layout.alloc(DType::BF16, {channels, max_tokens});
@@ -207,13 +209,15 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
     require_matrix(value, kValueRows, tokens, "value");
     require_matrix(z, kZRows, tokens, "z");
 
-    if (tokens == 1) {
+    const detail::W8GdnInputSnapshotPlan plan = detail::w8_gdn_input_snapshot_resolve_plan(
+        {kHidden, kChannels, kZRows, kChannels + kZRows, kHidden, tokens});
+    if (plan.schedule == detail::W8GdnInputSnapshotScheduleId::DecodeFused) {
         detail::w8_gdn_input_decode_conv_snapshot_launch(x, query_key_value_z_weight, conv_weight,
                                                          conv_states, initial_slot, query, key,
                                                          value, z, stream);
         return;
     }
-    if (tokens <= 6) {
+    if (plan.schedule == detail::W8GdnInputSnapshotScheduleId::SplitKMmaFused) {
         detail::w8_gdn_input_splitk_conv_snapshot_launch(x, query_key_value_z_weight, conv_weight,
                                                          conv_states, initial_slot, query, key,
                                                          value, z, stream);

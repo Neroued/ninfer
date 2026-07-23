@@ -60,10 +60,10 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
                     WorkspaceArena& ws, cudaStream_t stream);
 
 /**
- * Returns the transient capacity required by gdn_input_proj_conv_snapshot. Exact T=1..6 routes
- * normally write final outputs from projection epilogues; a route may reserve private BF16 staging
- * when that is faster. Larger capacities retain the composed implementation and require two BF16
- * [C,T] intermediates.
+ * Returns the transient capacity required by gdn_input_proj_conv_snapshot. The 35B W8 route writes
+ * final outputs from projection epilogues for exact T=1..16; the 27B Q4/Q5 route may reserve
+ * private BF16 staging for its small-T kernels. Extents outside a target route's optimized range
+ * use the composed implementation and require two BF16 [C,T] intermediates.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_bytes(std::int32_t query_rows,
                                                                        std::int32_t key_rows,

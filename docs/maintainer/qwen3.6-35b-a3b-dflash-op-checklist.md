@@ -107,7 +107,7 @@ Work these rows in order unless whole-round profiling demonstrates a different d
 
 | ID | Status | Op and exact role | Current `T=1..16` route/risk | Existing test/benchmark entry points | C | B | O | E |
 |---|---|---|---|---|---|---|---|---|
-| DV-01 | [ ] | W8 `gdn_input_proj_conv_snapshot`, 30 calls | `T=1` fused decode; `T=2..6` fused split-K projection+conv+snapshots; `T=7..16` composed `gdn_input_proj` + `causal_conv1d_silu_snapshot` + 3 extracts. This is the largest known route cliff. | `test_gdn_input_proj_conv_snapshot`; `gdn_layer_bench` | [ ] | [ ] | [ ] | [ ] |
+| DV-01 | [x] | W8 `gdn_input_proj_conv_snapshot`, 30 calls | `T=1` fused decode; every exact `T=2..16` uses one split-K MMA kernel with fused projection, convolution, SiLU, Q/K/V split, z store, and snapshot publication; `T>=17` retains the composed fallback. | `test_gdn_input_proj_conv_snapshot`; `w8_input_proj_bench --op gdn-snapshot`; `gdn_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-02 | [ ] | `gdn_norm_gating_proj`, 30 calls | Fused RMS/control projection only at `T<=6`; `T=7..16` is composed `rmsnorm` plus control projection. | `test_gdn_gating_proj`, `test_gdn_gating_proj_plan`; `gdn_gating_proj_bench`, `gdn_layer_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-03 | [ ] | `gated_delta_rule_snapshot`, 30 calls | Recurrent kernel publishes a full FP32 SSM snapshot after every column. Arithmetic and snapshot traffic both scale with `T_v`; current small-T evidence stops at 6. | `test_gated_delta_rule`; `gated_delta_rule_bench`, `gdn_layer_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-04 | [ ] | `gqa_attention`, 10 calls | Decode-specialized append/attention covers `T<=6`; `T=7..16` enters the prompt/prefill implementation. Cost and winner depend on live context and KV codec. | `test_gqa_attention`; `gqa_attention_bench`, `attention_layer_bench` | [ ] | [ ] | [ ] | [ ] |
@@ -115,6 +115,33 @@ Work these rows in order unless whole-round profiling demonstrates a different d
 | DV-06 | [ ] | Q6 `linear` output head `[248320,2048]`, 1 call | `T=1..4` SIMT C4, `T=5..6` SIMT C8, `T>=7` MMA R64C128. The `T=6/7` transition spans the full vocabulary head. | `test_linear`, `test_q6_linear_plan`; `linear_op_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-07 | [ ] | W8 `attn_input_proj` `[9216,2048]`, 10 calls | `T=1` decode; `T=2..12` SIMT R8C4; `T=13..16` MMA R32C128. The dFlash range crosses `T=12/13`. | `test_linear`, `test_input_proj_plan`; `w8_input_proj_bench`, `attention_layer_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-08 | [ ] | W8 `linear_add` `[2048,4096]`, 40 calls | All `T=1..16` use SIMT R8C4. Verify throughput and residual epilogue efficiency across exact partial tiles. | `test_linear`, `test_linear_add_plan`; `linear_op_bench`, layer benches | [ ] | [ ] | [ ] | [ ] |
+
+#### DV-01 qualification record
+
+The first Op was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`. Timed samples used a
+256 MiB L2 flush, five warmups, 50 measured repetitions, and the exact `T=1..16` sweep.
+
+- **C:** the production Op passed its independent complete FP64 oracle at every exact `T=1..16`.
+  The test exact-decodes the W8 weight, evaluates projection, convolution, SiLU, z, and sequential
+  snapshots from represented inputs, poisons every output and inactive state slot, checks full
+  writes and unchanged slots, and exercises every legal initial slot `0..16` at the maximum extent.
+  The existing Q4/Q5 peer route also passed the expanded exact-T regression.
+- **B:** the dedicated benchmark reports the selected route and the semantically equivalent
+  composed control. Production medians were 23.84 us at `T=1`, 21.70--21.76 us at `T=2..8`,
+  23.81 us at `T=9..12`, and 25.76--25.86 us at `T=13..16`.
+- **O:** the former composed route took 31.52--33.70 us over `T=2..16`. The selected fused route is
+  23%--31% faster over `T=7..16`, removes four launches, and reduces this Op's maximum-`T=16`
+  transient workspace from 512 KiB to zero. A measured projection-plus-post-kernel candidate was
+  also 13%--20% slower over `T=7..16` and was not retained.
+- **E:** in captured 35B GDN-layer replay, production uses six graph nodes at `T=7..16`, versus ten
+  for the explicit composed control. Median layer latency improved from 56.32 to 52.48 us at `T=7`
+  (6.8%) and from 72.99 to 70.94 us at `T=16` (2.8%).
+
+The current fixed `K<=5` MTP controller cannot issue `target_verify(T=7..16)`, so this record makes
+an Op and containing-layer claim, not a complete dFlash-round claim. The public 35B eager Engine
+route passed a `K=5`, `tg8` smoke run. A CUDA Graph smoke at the same current `K` exposed a
+pre-existing graph workspace-planning shortfall (39,325,696 bytes consumed versus 37,748,736
+planned); it was not used as DV-01 evidence.
 
 ### P1: frequent elementwise, normalization, and selection Ops
 
@@ -134,7 +161,7 @@ after the P0 contractions and state transitions are optimized.
 
 ### P0 measurement infrastructure
 
-- [ ] Extend `gdn_layer_bench --t-sweep` from the current hard limit `1..6` to exact `1..16`,
+- [x] Extend `gdn_layer_bench --t-sweep` from the former hard limit `1..6` to exact `1..16`,
   with sufficient snapshot slots for each case.
 - [ ] Extend `attention_layer_bench --t-sweep` from the current hard limit `1..6` to exact
   `1..16`.

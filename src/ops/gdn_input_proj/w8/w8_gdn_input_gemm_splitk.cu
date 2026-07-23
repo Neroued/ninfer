@@ -9,22 +9,27 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
+#include <utility>
 
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kRows       = 12288;
-constexpr int kHidden     = 2048;
-constexpr int kTileK      = 64;
-constexpr int kWarps      = 8;
-constexpr int kMmaRows    = 16;
-constexpr int kRowsPerCta = 16;
-constexpr int kGroupK     = kWarps * kTileK;
-constexpr int kGroups     = kHidden / kGroupK;
-using Output              = W8SplitOutput2<8192, 4096>;
+constexpr int kRows                    = 12288;
+constexpr int kHidden                  = 2048;
+constexpr int kTileK                   = 64;
+constexpr int kWarps                   = 8;
+constexpr int kMmaRows                 = 16;
+constexpr int kRowsPerCta              = 16;
+constexpr int kGroupK                  = kWarps * kTileK;
+constexpr int kGroups                  = kHidden / kGroupK;
+constexpr int kFirstExactCols          = 2;
+constexpr int kLastProjectionExactCols = 32;
+constexpr int kLastSnapshotExactCols   = 16;
+using Output                           = W8SplitOutput2<8192, 4096>;
 
 struct W8SplitKStoreEpilogue {};
 
@@ -539,7 +544,8 @@ void launch_active_cols_conv_snapshot(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, Tensor& conv_states,
                                       const Tensor& initial_slot, Tensor& query, Tensor& key,
                                       Tensor& value, Tensor& z, cudaStream_t stream) {
-    constexpr int TileCols = 8;
+    static_assert(ActiveCols >= 2 && ActiveCols <= 16);
+    constexpr int TileCols = ActiveCols <= 8 ? 8 : 16;
     const Output ignored_output{static_cast<__nv_bfloat16*>(query.data),
                                 static_cast<__nv_bfloat16*>(z.data)};
     const W8GdnSplitKConvEpilogue epilogue{
@@ -577,6 +583,27 @@ void launch_medium_cols(const Tensor& x, const Weight& weight, Tensor& qkv, Tens
             static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
 }
 
+using ProjectionLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, cudaStream_t);
+using SnapshotLauncher   = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&,
+                                  const Tensor&, Tensor&, Tensor&, Tensor&, Tensor&, cudaStream_t);
+
+template <std::size_t... Offsets>
+constexpr auto make_projection_launchers(std::index_sequence<Offsets...>) {
+    return std::array<ProjectionLauncher, sizeof...(Offsets)>{
+        &launch_active_cols<kFirstExactCols + static_cast<int>(Offsets)>...};
+}
+
+template <std::size_t... Offsets>
+constexpr auto make_snapshot_launchers(std::index_sequence<Offsets...>) {
+    return std::array<SnapshotLauncher, sizeof...(Offsets)>{
+        &launch_active_cols_conv_snapshot<kFirstExactCols + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kProjectionLaunchers = make_projection_launchers(
+    std::make_index_sequence<kLastProjectionExactCols - kFirstExactCols + 1>{});
+constexpr auto kSnapshotLaunchers = make_snapshot_launchers(
+    std::make_index_sequence<kLastSnapshotExactCols - kFirstExactCols + 1>{});
+
 } // namespace
 
 void w8_gdn_input_splitk_mma_launch(W8KernelVariant variant, const Tensor& x, const Weight& weight,
@@ -584,110 +611,18 @@ void w8_gdn_input_splitk_mma_launch(W8KernelVariant variant, const Tensor& x, co
     if (variant != W8KernelVariant::None) {
         throw std::invalid_argument("W8 GDN split-K MMA requires the exact direct variant");
     }
-    switch (x.ne[1]) {
-    case 2:
-        launch_active_cols<2>(x, weight, qkv, z, stream);
-        break;
-    case 3:
-        launch_active_cols<3>(x, weight, qkv, z, stream);
-        break;
-    case 4:
-        launch_active_cols<4>(x, weight, qkv, z, stream);
-        break;
-    case 5:
-        launch_active_cols<5>(x, weight, qkv, z, stream);
-        break;
-    case 6:
-        launch_active_cols<6>(x, weight, qkv, z, stream);
-        break;
-    case 7:
-        launch_active_cols<7>(x, weight, qkv, z, stream);
-        break;
-    case 8:
-        launch_active_cols<8>(x, weight, qkv, z, stream);
-        break;
-    case 9:
-        launch_active_cols<9>(x, weight, qkv, z, stream);
-        break;
-    case 10:
-        launch_active_cols<10>(x, weight, qkv, z, stream);
-        break;
-    case 11:
-        launch_active_cols<11>(x, weight, qkv, z, stream);
-        break;
-    case 12:
-        launch_active_cols<12>(x, weight, qkv, z, stream);
-        break;
-    case 13:
-        launch_active_cols<13>(x, weight, qkv, z, stream);
-        break;
-    case 14:
-        launch_active_cols<14>(x, weight, qkv, z, stream);
-        break;
-    case 15:
-        launch_active_cols<15>(x, weight, qkv, z, stream);
-        break;
-    case 16:
-        launch_active_cols<16>(x, weight, qkv, z, stream);
-        break;
-    case 17:
-        launch_active_cols<17>(x, weight, qkv, z, stream);
-        break;
-    case 18:
-        launch_active_cols<18>(x, weight, qkv, z, stream);
-        break;
-    case 19:
-        launch_active_cols<19>(x, weight, qkv, z, stream);
-        break;
-    case 20:
-        launch_active_cols<20>(x, weight, qkv, z, stream);
-        break;
-    case 21:
-        launch_active_cols<21>(x, weight, qkv, z, stream);
-        break;
-    case 22:
-        launch_active_cols<22>(x, weight, qkv, z, stream);
-        break;
-    case 23:
-        launch_active_cols<23>(x, weight, qkv, z, stream);
-        break;
-    case 24:
-        launch_active_cols<24>(x, weight, qkv, z, stream);
-        break;
-    case 25:
-        launch_active_cols<25>(x, weight, qkv, z, stream);
-        break;
-    case 26:
-        launch_active_cols<26>(x, weight, qkv, z, stream);
-        break;
-    case 27:
-        launch_active_cols<27>(x, weight, qkv, z, stream);
-        break;
-    case 28:
-        launch_active_cols<28>(x, weight, qkv, z, stream);
-        break;
-    case 29:
-        launch_active_cols<29>(x, weight, qkv, z, stream);
-        break;
-    case 30:
-        launch_active_cols<30>(x, weight, qkv, z, stream);
-        break;
-    case 31:
-        launch_active_cols<31>(x, weight, qkv, z, stream);
-        break;
-    case 32:
-        launch_active_cols<32>(x, weight, qkv, z, stream);
-        break;
-    default:
-        if (x.ne[1] <= 48) {
-            launch_medium_cols<48, 4, 2, 3>(x, weight, qkv, z, stream);
-        } else if (x.ne[1] <= 64) {
-            launch_medium_cols<64, 4, 2, 2>(x, weight, qkv, z, stream);
-        } else if (x.ne[1] <= 96) {
-            launch_medium_cols<96, 2, 4, 3>(x, weight, qkv, z, stream);
-        } else {
-            throw std::invalid_argument("W8 GDN split-K MMA requires T=2..96");
-        }
+    const std::int32_t cols = x.ne[1];
+    if (cols < kFirstExactCols || cols > 96) {
+        throw std::invalid_argument("W8 GDN split-K MMA requires T=2..96");
+    }
+    if (cols <= kLastProjectionExactCols) {
+        kProjectionLaunchers[cols - kFirstExactCols](x, weight, qkv, z, stream);
+    } else if (cols <= 48) {
+        launch_medium_cols<48, 4, 2, 3>(x, weight, qkv, z, stream);
+    } else if (cols <= 64) {
+        launch_medium_cols<64, 4, 2, 2>(x, weight, qkv, z, stream);
+    } else {
+        launch_medium_cols<96, 2, 4, 3>(x, weight, qkv, z, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -697,30 +632,12 @@ void w8_gdn_input_splitk_conv_snapshot_launch(const Tensor& x, const Weight& wei
                                               const Tensor& initial_slot, Tensor& query,
                                               Tensor& key, Tensor& value, Tensor& z,
                                               cudaStream_t stream) {
-    switch (x.ne[1]) {
-    case 2:
-        launch_active_cols_conv_snapshot<2>(x, weight, conv_weight, conv_states, initial_slot,
-                                            query, key, value, z, stream);
-        break;
-    case 3:
-        launch_active_cols_conv_snapshot<3>(x, weight, conv_weight, conv_states, initial_slot,
-                                            query, key, value, z, stream);
-        break;
-    case 4:
-        launch_active_cols_conv_snapshot<4>(x, weight, conv_weight, conv_states, initial_slot,
-                                            query, key, value, z, stream);
-        break;
-    case 5:
-        launch_active_cols_conv_snapshot<5>(x, weight, conv_weight, conv_states, initial_slot,
-                                            query, key, value, z, stream);
-        break;
-    case 6:
-        launch_active_cols_conv_snapshot<6>(x, weight, conv_weight, conv_states, initial_slot,
-                                            query, key, value, z, stream);
-        break;
-    default:
-        throw std::invalid_argument("W8 fused GDN input snapshot requires T=2..6");
+    const std::int32_t cols = x.ne[1];
+    if (cols < kFirstExactCols || cols > kLastSnapshotExactCols) {
+        throw std::invalid_argument("W8 fused GDN input snapshot requires T=2..16");
     }
+    kSnapshotLaunchers[cols - kFirstExactCols](x, weight, conv_weight, conv_states, initial_slot,
+                                               query, key, value, z, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -115,11 +115,19 @@ directly. The controls expose each compiled SIMT/MMA candidate plus the semantic
 parent Linear alone and parent Linear followed by four or two column extracts. Each timed sample is
 preceded by a 256 MiB L2 flush.
 
+`--op gdn-snapshot` measures the complete stateful GDN input projection, causal convolution, SiLU,
+Q/K/V split, z projection, and snapshot publication contract. It reports the selected production
+route and an explicit five-launch composed control at every requested T.
+
 ```bash
 cmake --build build --parallel --target ninfer_w8_input_proj_bench
 ./build/bench/ninfer_w8_input_proj_bench \
   --op all --t-sweep 1,2,4,8,12,13,16,17,32,64,128,129,256,512,1024 \
   --warmup 10 --repeat 50 --csv-out profiles/bench/w8_input_proj_final.csv
+
+./build/bench/ninfer_w8_input_proj_bench \
+  --op gdn-snapshot --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --warmup 5 --repeat 50 --csv-out profiles/bench/gdn_input_snapshot.csv
 ```
 
 The executable isolates these Op contracts; end-to-end 35B-A3B measurement uses `ninfer_bench`.

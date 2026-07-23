@@ -11,7 +11,8 @@
 
 // Examples:
 //   ./build/bench/ninfer_gdn_layer_bench
-//   ./build/bench/ninfer_gdn_layer_bench --t-sweep 1,2,3,4,5,6 --repeat 50
+//   ./build/bench/ninfer_gdn_layer_bench --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+//       --repeat 50
 
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/gated_delta_rule.h"
@@ -56,14 +57,14 @@ constexpr std::int32_t kValueRows        = kHeadDim * kValueHeads;
 constexpr std::int32_t kConvRows         = 2 * kKeyRows + kValueRows;
 constexpr std::int32_t kInputRows        = kConvRows + kValueRows;
 constexpr std::int32_t kConvStateRows    = 3;
-constexpr std::int32_t kSnapshotSlots    = 7;
-constexpr std::int32_t kInitialSlot      = 6;
+constexpr std::int32_t kSnapshotSlots    = 17;
+constexpr std::int32_t kInitialSlot      = 16;
 constexpr float kEps                     = 1.0e-6F;
 constexpr float kGdnScale                = 0.08838834764831845F; // 1 / sqrt(128)
 constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
 
 struct Options {
-    std::vector<std::int32_t> t_sweep{1, 2, 3, 4, 5, 6};
+    std::vector<std::int32_t> t_sweep{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     int warmup               = 5;
     int repeat               = 40;
     std::size_t flush_bytes  = kDefaultFlushBytes;
@@ -193,7 +194,7 @@ std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
             raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
         const long value = std::stol(token);
         if (value <= 0 || value > kSnapshotSlots - 1) {
-            throw std::invalid_argument("--t-sweep values must be in [1,6]");
+            throw std::invalid_argument("--t-sweep values must be in [1,16]");
         }
         result.push_back(static_cast<std::int32_t>(value));
         if (end == std::string_view::npos) { break; }
@@ -239,7 +240,7 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--norm-control must be fused or composed");
             }
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--t-sweep 1,2,...,6] [--warmup N] [--repeat N] "
+            std::printf("Usage: %s [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--route fused|composed] "
                         "[--qk-norm fused|composed] [--norm-control fused|composed] "
                         "[--csv-out PATH]\n",
@@ -371,8 +372,10 @@ struct Resources {
                                         kSnapshotSlots * sizeof(std::uint16_t))),
           ssm_states(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kHeadDim * kValueHeads *
                                        kSnapshotSlots * sizeof(float))),
-          workspace(
-              std::max<std::size_t>(1, ops::gdn_norm_gating_proj_workspace_bytes(max_tokens))) {}
+          workspace(std::max({std::size_t{1}, ops::gdn_norm_gating_proj_workspace_bytes(max_tokens),
+                              ops::gdn_input_proj_conv_snapshot_workspace_bytes(
+                                  kKeyRows, kKeyRows, kValueRows, max_tokens),
+                              ops::linear_add_workspace_bytes(kHidden, kValueRows, max_tokens)})) {}
 
     static bench::DBuf make_constant_i32(std::int32_t value) {
         bench::DBuf device(sizeof(value));
@@ -490,6 +493,8 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
 
     const auto input_plan = ops::detail::w8_gdn_input_resolve_plan(
         {kHidden, kConvRows, kValueRows, kInputRows, kHidden, tokens});
+    const auto snapshot_plan = ops::detail::w8_gdn_input_snapshot_resolve_plan(
+        {kHidden, kConvRows, kValueRows, kInputRows, kHidden, tokens});
     const auto control_plan =
         ops::detail::bf16_gdn_gating_resolve_plan({kValueHeads, kHidden, tokens});
     const auto norm_control_plan =
@@ -499,8 +504,13 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
 
     return {tokens,
             graph.body_nodes(),
-            options.route + ":" + ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) +
-                "+qk-" + options.qk_norm,
+            options.route == "fused"
+                ? std::string(
+                      ops::detail::w8_gdn_input_snapshot_schedule_name(snapshot_plan.schedule)) +
+                      "+qk-" + options.qk_norm
+                : std::string("gdn_input_proj_conv_snapshot.w8.composed_control+") +
+                      ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) + "+qk-" +
+                      options.qk_norm,
             options.norm_control == "fused"
                 ? ops::detail::bf16_gdn_norm_gating_schedule_name(norm_control_plan.schedule)
                 : ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),

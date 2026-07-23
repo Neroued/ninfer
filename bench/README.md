@@ -275,6 +275,8 @@ cmake --build build --parallel --target \
 ./build/bench/ninfer_residual_add_bench [--patches P] [--control]
 ./build/bench/ninfer_sigmoid_mul_bench \
   [--tokens T[,T...]] [--control | --candidate-block B]
+./build/bench/ninfer_position_bench \
+  [--tokens T[,T...]] [--candidate-block B] [--cold-graph] [--warmup N] [--repeat N]
 ./build/bench/ninfer_gelu_bench [--mode tanh|exact --columns C] [--control]
 ./build/bench/ninfer_add_bias_bench [--d D --columns C] [--control]
 ```

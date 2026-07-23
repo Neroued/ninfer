@@ -375,7 +375,7 @@ after the P0 contractions and state transitions are optimized.
 | DV-11 | [x] | `rope` | 10 | `[4096,T]` Q and `[512,T]` K, rotary 64, absolute positions; current launcher changes small-token geometry after 6. | `test_rope`; `rope_bench` |
 | DV-12 | [x] | `sigmoid_mul` | 10 | Gate `[4096,T]`; exact odd/partial token extents and graph replay. | `test_sigmoid_mul`; `sigmoid_mul_bench` |
 | DV-13 | [x] | `embedding` | 1 | W8 `[248320,2048]`, gathered ids for `T=1..16`; include repeated ids and physical row decode. | `test_embedding`; `embedding_bench` |
-| DV-14 | [ ] | `offset_i32_positions` | 1 | Exact position construction for all `T`, including near context limit. | `test_position`; dedicated benchmark missing |
+| DV-14 | [x] | `offset_i32_positions` | 1 | Exact position construction for all `T`, including near context limit. | `test_position`; `position_bench` |
 | DV-15 | [ ] | `argmax` | 1 | Q6-head output with `T=1..16`, physical stride, valid vocabulary rows, stable ties. | `test_argmax`; `argmax_bench` |
 
 #### DV-09 qualification record
@@ -496,6 +496,29 @@ The 35B W8 embedding domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1,
   supports changing the current `T<=6` boundary. Production routing is retained; DV-13 adds
   full-vocabulary addressing, repeated-id correctness, exact-T performance, and reproducible
   forced-route evidence.
+
+#### DV-14 qualification record
+
+The 35B position-offset domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`.
+
+- **C:** out-of-place and legal in-place calls passed exact I32 equality at every
+  `T=1..16`. Each case constructs source positions next to the 262144-position model limit;
+  the in-place series ends exactly at position 262143, while the out-of-place series exercises a
+  negative device-resident delta. The existing `T=1024` and fill-position checks remain in the
+  same exact-transform suite.
+- **B:** the new dedicated benchmark uses near-limit source values, accepts exact token lists, and
+  reports block and grid geometry. With 20 warmups and at least 100 measured CUDA-event batches
+  over 500 ms, the production one-CTA `b256` route measured 9.37--9.52 us over `T=1..16`, with
+  no odd-T or long-draft cliff.
+- **O:** private launch control compared 32-, 64-, and 128-thread CTAs against production `b256`.
+  Their hot ranges were respectively 9.37--9.70, 9.47--9.70, and 9.40--10.06 us; none produced
+  a coherent improvement. All candidates preserve one launch, exact I32 addition, and identical
+  source/delta/destination traffic.
+- **E:** cold CUDA Graph replay covered every exact `T=1..16` for production and all three
+  candidates, using 20 warmups, 200 measured replays, and a 256 MiB L2 flush. Production measured
+  3.33--3.36 us and every candidate remained in the same 3.33--3.36 us band. Production therefore
+  retains `b256`; DV-14 closes the previously missing benchmark and graph-replay evidence without
+  changing runtime geometry.
 
 ### P0 measurement infrastructure
 

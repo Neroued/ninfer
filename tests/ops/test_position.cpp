@@ -53,8 +53,10 @@ int main() {
     }
 
     int failures = 0;
-    failures += position_case(1, 17, -5, false);
-    failures += position_case(6, 23, 9, true);
+    for (int count = 1; count <= 16; ++count) {
+        failures += position_case(count, 262144 - count, -17, false);
+        failures += position_case(count, 262144 - 2 * count, count, true);
+    }
     failures += position_case(1024, 131072, -17, false);
     std::cout << (failures ? "FAIL" : "OK") << " position Ops\n";
     return failures ? 1 : 0;

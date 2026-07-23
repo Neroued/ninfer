@@ -28,6 +28,7 @@ ninfer_add_op_bench(ninfer_vision_pos_embed_bench SOURCES ops/vision_pos_embed_b
 ninfer_add_op_bench(ninfer_scatter_bench SOURCES ops/scatter_bench.cu)
 ninfer_add_op_bench(ninfer_vision_attention_bench SOURCES ops/vision_attention_bench.cu)
 ninfer_add_op_bench(ninfer_embedding_bench SOURCES ops/embedding_bench.cu)
+ninfer_add_op_bench(ninfer_position_bench SOURCES ops/position_bench.cu)
 ninfer_add_op_bench(ninfer_cast_bench SOURCES ops/cast_bench.cu)
 ninfer_add_op_bench(ninfer_argmax_bench SOURCES ops/argmax_bench.cu)
 ninfer_add_op_bench(ninfer_causal_conv1d_silu_bench SOURCES ops/causal_conv1d_silu_bench.cu)

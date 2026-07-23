@@ -47,8 +47,10 @@ Q6Plan expected_plan(const Q6Problem& problem) {
     if (problem.rows == 248320 && problem.k == 5120) {
         schedule = problem.cols <= 6 ? S::SimtR8C4 : S::MmaR64C128;
     } else if (problem.rows == 248320 && problem.k == 2048) {
-        schedule =
-            problem.cols <= 4 ? S::SimtR8C4 : (problem.cols <= 6 ? S::SimtR8C8 : S::MmaR64C128);
+        schedule = problem.cols <= 4    ? S::SimtR8C4
+                   : problem.cols <= 8  ? S::SimtR8C8
+                   : problem.cols <= 64 ? S::MmaR64C64
+                                        : S::MmaR64C128;
     } else if (problem.rows == 1152 && problem.k == 1536) {
         const int cols = problem.cols;
         if (cols <= 96) {
@@ -99,7 +101,8 @@ void full_support_scan() {
         {248320, 5120, 5120, 1},
         {248320, 2048, 2048, 1},
     }};
-    constexpr std::array<std::int32_t, 8> positive_t{1, 2, 5, 6, 7, 1024, 1025, 2048};
+    constexpr std::array<std::int32_t, 19> positive_t{1,  2,  3,  4,  5,  6,  7,    8,    9,   10,
+                                                      11, 12, 13, 14, 15, 16, 1024, 1025, 2048};
     for (Q6Problem problem : text_shapes) {
         problem.cols = 0;
         if (ninfer::ops::detail::q6_rowsplit_admits(problem)) {
@@ -124,7 +127,7 @@ struct BoundaryCase {
 };
 
 void route_boundaries() {
-    constexpr std::array<BoundaryCase, 27> cases{{
+    constexpr std::array<BoundaryCase, 30> cases{{
         {{248320, 5120, 5120, 1}, {S::SimtR8C4, V::None}},
         {{248320, 5120, 5120, 6}, {S::SimtR8C4, V::None}},
         {{248320, 5120, 5120, 7}, {S::MmaR64C128, V::Predicated}},
@@ -132,8 +135,11 @@ void route_boundaries() {
         {{248320, 2048, 2048, 1}, {S::SimtR8C4, V::None}},
         {{248320, 2048, 2048, 4}, {S::SimtR8C4, V::None}},
         {{248320, 2048, 2048, 5}, {S::SimtR8C8, V::None}},
-        {{248320, 2048, 2048, 6}, {S::SimtR8C8, V::None}},
-        {{248320, 2048, 2048, 7}, {S::MmaR64C128, V::Predicated}},
+        {{248320, 2048, 2048, 8}, {S::SimtR8C8, V::None}},
+        {{248320, 2048, 2048, 9}, {S::MmaR64C64, V::Predicated}},
+        {{248320, 2048, 2048, 16}, {S::MmaR64C64, V::Predicated}},
+        {{248320, 2048, 2048, 64}, {S::MmaR64C64, V::Full}},
+        {{248320, 2048, 2048, 65}, {S::MmaR64C128, V::Predicated}},
         {{1152, 1536, 1536, 4}, {S::SimtR8C4, V::None}},
         {{1152, 1536, 1536, 96}, {S::SimtR8C4, V::None}},
         {{1152, 1536, 1536, 100}, {S::MmaR64C64, V::Predicated}},

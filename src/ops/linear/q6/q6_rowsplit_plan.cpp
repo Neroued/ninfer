@@ -37,19 +37,20 @@ struct Q6RouteSpec {
 
 constexpr std::array<Q6SupportSpec, 3> kSupportSpecs{{
     {248320, 5120, 5120, {1, kAnyCols, 1}, 0, 2},
-    {248320, 2048, 2048, {1, kAnyCols, 1}, 2, 3},
-    {1152, 1536, 1536, {4, 131072, 4}, 5, 9},
+    {248320, 2048, 2048, {1, kAnyCols, 1}, 2, 4},
+    {1152, 1536, 1536, {4, 131072, 4}, 6, 9},
 }};
 
-constexpr std::array<Q6RouteSpec, 14> kRouteSpecs{{
+constexpr std::array<Q6RouteSpec, 15> kRouteSpecs{{
     // [248320, 5120]
     {{1, 6, 1}, Q6ScheduleId::SimtR8C4},
     {{7, kAnyCols, 1}, Q6ScheduleId::MmaR64C128},
 
     // [248320, 2048]
     {{1, 4, 1}, Q6ScheduleId::SimtR8C4},
-    {{5, 6, 1}, Q6ScheduleId::SimtR8C8},
-    {{7, kAnyCols, 1}, Q6ScheduleId::MmaR64C128},
+    {{5, 8, 1}, Q6ScheduleId::SimtR8C8},
+    {{9, 64, 1}, Q6ScheduleId::MmaR64C64},
+    {{65, kAnyCols, 1}, Q6ScheduleId::MmaR64C128},
 
     // [1152, 1536]
     {{4, 96, 4}, Q6ScheduleId::SimtR8C4},

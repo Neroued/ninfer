@@ -112,7 +112,7 @@ Work these rows in order unless whole-round profiling demonstrates a different d
 | DV-03 | [x] | `gated_delta_rule_snapshot`, 30 calls | Every exact `T=1..16` uses one four-warp recurrent kernel with fused Q/K normalization, register-resident running state, vectorized FP32 snapshot stores, no workspace, and no route boundary. Each 35B layer reads one 2 MiB state and publishes another 2 MiB per column. | `test_gated_delta_rule`; `gated_delta_rule_bench --small-t --H_v 32`, `gdn_layer_bench --qk-norm` | [x] | [x] | [x] | [x] |
 | DV-04 | [x] | `gqa_attention`, 10 calls | `T<=6` keeps the direct small-T route. For 35B, `T=7..12` uses prompt through 512 visible keys and otherwise 2 small-T chunks; `T=13..16` uses prompt through 1024 and otherwise 3 chunks. Each chunk has at most six sequential columns and reuses one workspace allocation. BF16 and INT8-G64 share the context policy. | `test_gqa_attention`; `gqa_attention_bench --append-small-t`/`--cached-small-t`, `attention_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-05 | [x] | `sparse_moe`, 40 calls | `T=1` keeps decode. Q4+Q5/Q6 stay on Small-T through 44 with three D3 paths/CTA and codec-specific D4 row tiers; W8+W8 stays on Small-T through 17 with 1/9-path D3 and 1/4-row D4 tiers. All dFlash widths therefore avoid the per-token decode loop. | `test_sparse_moe`; `sparse_moe_bench` | [x] | [x] | [x] | [x] |
-| DV-06 | [ ] | Q6 `linear` output head `[248320,2048]`, 1 call | `T=1..4` SIMT C4, `T=5..6` SIMT C8, `T>=7` MMA R64C128. The `T=6/7` transition spans the full vocabulary head. | `test_linear`, `test_q6_linear_plan`; `linear_op_bench` | [ ] | [ ] | [ ] | [ ] |
+| DV-06 | [x] | Q6 `linear` output head `[248320,2048]`, 1 call | `T=1..4` uses SIMT C4, `T=5..8` SIMT C8, and `T=9..64` MMA R64C64; C128 resumes at `T>=65`. The dFlash range has no C128 over-computation or repeated weight pass. | `test_linear`, `test_q6_linear_plan`, `test_q6_linear_dispatch`; `linear_op_bench`, `output_stage_bench` | [x] | [x] | [x] | [x] |
 | DV-07 | [ ] | W8 `attn_input_proj` `[9216,2048]`, 10 calls | `T=1` decode; `T=2..12` SIMT R8C4; `T=13..16` MMA R32C128. The dFlash range crosses `T=12/13`. | `test_linear`, `test_input_proj_plan`; `w8_input_proj_bench`, `attention_layer_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-08 | [ ] | W8 `linear_add` `[2048,4096]`, 40 calls | All `T=1..16` use SIMT R8C4. Verify throughput and residual epilogue efficiency across exact partial tiles. | `test_linear`, `test_linear_add_plan`; `linear_op_bench`, layer benches | [ ] | [ ] | [ ] | [ ] |
 
@@ -271,6 +271,35 @@ The controller still cannot issue T=7..16 target verification, so the round resu
 a complete long-acceptance dFlash speedup. The W8 schedule is selected for trace-like correlated
 routes expected from one speculative sequence; the independent-expert control is neutral to
 slightly slower near its T=9 crossover and improves again at the upper end.
+
+#### DV-06 qualification record
+
+The Q6 full-vocabulary output head was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1,
+`sm_120a`, with a 256 MiB L2 flush, five warmups, 50 measured repetitions, and every exact
+`T=1..16`.
+
+- **C:** one real `[248320,2048]` patterned Q6 payload is exact-decoded independently from its
+  signed low/high code planes and stored FP16 scales. Every exact `T=1..16` production launch is
+  checked against sampled FP64 dot products for all columns and rows spanning SIMT/MMA tile
+  boundaries; poisoned full outputs and guard regions detect incomplete or out-of-range writes.
+  The T=16 case additionally passes CUDA Graph capture/replay. The dispatch test compares every
+  output word from public production and the resolved fixed route at each exact width.
+- **B:** production cold medians were 273.31--312.64 us at `T=1..4`, 406.82--486.34 us at
+  `T=5..8`, and 566.14--568.58 us at `T=9..16`. The benchmark reports the physical schedule,
+  boundary variant, useful bandwidth, weight-replay lower bound, and executed tensor-core work.
+- **O:** the former C128 route measured 672.77 us at T=7, 664.77 us at T=8, and 668.96 us at
+  T=16. The selected C8/C64 routes measured 457.76, 486.34, and 568.58 us, improving those points
+  by 32.0%, 26.8%, and 15.0%. Experimental R128C8, R128C16, and R64C16 tensor-core tiles did not
+  improve on C64 because Q6 decode and weight streaming limited all three to approximately
+  560--569 us, so they were not retained. C64 remains faster through T=64; C128 resumes at the
+  measured T=64/65 weight-replay boundary to preserve large-T behavior.
+- **E:** in captured final-RMSNorm → Q6-head → argmax replay, production and the explicit old-route
+  control both use four graph nodes. Median output-stage latency improved from 681.15 to 463.49 us
+  at T=7 (32.0%), from 675.10 to 494.59 us at T=8 (26.7%), and from 683.01 to 586.75 us at T=16
+  (14.1%).
+
+The current fixed `K<=5` controller still cannot issue `target_verify(T=7..16)`, so DV-06 closes
+the Op and complete output-stage criteria without claiming a full long-acceptance dFlash round.
 
 ### P1: frequent elementwise, normalization, and selection Ops
 

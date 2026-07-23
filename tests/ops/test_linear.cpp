@@ -389,6 +389,78 @@ int one_patterned_quant_shape_sampled(QType qtype, std::int32_t n, std::int32_t 
                                      n, 0, x, k, t, packed, tolerance);
 }
 
+int q6_output_head_dflash_oracle() {
+    constexpr std::int32_t n     = 248320;
+    constexpr std::int32_t k     = 2048;
+    constexpr std::int32_t max_t = 16;
+
+    row_split::PackedWeight packed =
+        row_split::make_patterned_weight(QType::Q6G64_F16S, n, k, 4226u);
+    std::vector<float> x(static_cast<std::size_t>(k) * max_t);
+    fill_uniform(x, 2226u, -0.01f, 0.01f);
+    round_to_bf16(x);
+
+    DBuf dx = to_device_bf16(x);
+    DBuf dweight(packed.payload.size());
+    cudaMemcpy(dweight.p, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
+    const Weight weight = packed.device_weight(dweight.p);
+    WorkspaceArena ws(64ULL << 20);
+
+    std::vector<std::int32_t> rows = sampled_indices(n);
+    const auto add_row             = [&](std::int32_t row) {
+        if (std::find(rows.begin(), rows.end(), row) == rows.end()) { rows.push_back(row); }
+    };
+    for (const std::int32_t row : {7, 8, 31, 32, 63, 64, 127, 128}) { add_row(row); }
+
+    int failures = 0;
+    for (std::int32_t t = 1; t <= max_t; ++t) {
+        GuardedBf16Output output(static_cast<std::size_t>(n) * t);
+        Tensor tx(dx.p, DType::BF16, {k, t});
+        Tensor tout(output.data(), DType::BF16, {n, t});
+        const std::string label =
+            "linear q6 dFlash output head sampled FP64 oracle T=" + std::to_string(t);
+        try {
+            ops::linear(tx, weight, tout, ws, nullptr);
+            cudaDeviceSynchronize();
+            if (t == max_t) {
+                capture_and_replay(
+                    [&](cudaStream_t stream) { ops::linear(tx, weight, tout, ws, stream); });
+            }
+        } catch (const std::exception& error) {
+            std::cerr << label << ": unexpected exception: " << error.what() << '\n';
+            ++failures;
+            continue;
+        }
+
+        const std::vector<std::uint16_t> output_bits =
+            from_device_bf16_bits(output.data(), static_cast<std::size_t>(n) * t);
+        if (std::find(output_bits.begin(), output_bits.end(), std::uint16_t{0xa5a5u}) !=
+            output_bits.end()) {
+            std::cerr << label << ": poisoned output word remained\n";
+            ++failures;
+        }
+        failures += output.verify_guards(label);
+
+        std::vector<double> actual;
+        std::vector<double> reference;
+        actual.reserve(rows.size() * static_cast<std::size_t>(t));
+        reference.reserve(actual.capacity());
+        for (std::int32_t col = 0; col < t; ++col) {
+            const float* xcol = x.data() + static_cast<std::size_t>(col) * k;
+            for (const std::int32_t row : rows) {
+                actual.push_back(bf16_to_f32(output_bits[static_cast<std::size_t>(col) * n + row]));
+                reference.push_back(row_split::dot_row_split_lowbit_fp64(packed, row, xcol, k));
+            }
+        }
+        const auto plan           = ops::detail::q6_rowsplit_resolve_plan({n, k, k, t});
+        const Tolerance tolerance = ops::detail::q6_schedule_uses_mma(plan.schedule)
+                                        ? Tolerance::linear_tc()
+                                        : Tolerance::linear_bf16();
+        failures += verify(label.c_str(), actual, reference, tolerance);
+    }
+    return failures;
+}
+
 int paired_w8g32_shape(std::int32_t n, std::int32_t k, const std::vector<std::int32_t>& ts,
                        std::uint32_t seed) {
     const std::int32_t max_t = *std::max_element(ts.begin(), ts.end());
@@ -1086,6 +1158,11 @@ int main() {
         std::cout << (f ? "FAIL" : "OK") << " linear prefill fusion correctness\n";
         return f ? 1 : 0;
     }
+    if (std::getenv("NINFER_LINEAR_TEST_Q6_HEAD_ONLY") != nullptr) {
+        const int f = q6_output_head_dflash_oracle();
+        std::cout << (f ? "FAIL" : "OK") << " Q6 output-head dFlash correctness\n";
+        return f ? 1 : 0;
+    }
 
     int f = 0;
     f += prefill_fusion_correctness();
@@ -1136,9 +1213,7 @@ int main() {
     // independent fp64-oracle points cover the real head and Vision geometries.
     f += one_quant_shape(QType::Q6G64_F16S, 248320, 5120, {1}, 211u);
     f += one_patterned_quant_shape_sampled(QType::Q6G64_F16S, 248320, 5120, 7, 212u);
-    f += one_quant_shape(QType::Q6G64_F16S, 248320, 2048, {1}, 223u);
-    f += one_quant_shape_sampled(QType::Q6G64_F16S, 248320, 2048, 6, 225u);
-    f += one_patterned_quant_shape_sampled(QType::Q6G64_F16S, 248320, 2048, 7, 226u);
+    f += q6_output_head_dflash_oracle();
     f += one_quant_shape(QType::Q6G64_F16S, 1152, 1536, {4, 40, 128}, 227u);
 
     std::cout << (f ? "FAIL" : "OK") << " linear correctness\n";

@@ -114,7 +114,7 @@ Work these rows in order unless whole-round profiling demonstrates a different d
 | DV-05 | [x] | `sparse_moe`, 40 calls | `T=1` keeps decode. Q4+Q5/Q6 stay on Small-T through 44 with three D3 paths/CTA and codec-specific D4 row tiers; W8+W8 stays on Small-T through 17 with 1/9-path D3 and 1/4-row D4 tiers. All dFlash widths therefore avoid the per-token decode loop. | `test_sparse_moe`; `sparse_moe_bench` | [x] | [x] | [x] | [x] |
 | DV-06 | [x] | Q6 `linear` output head `[248320,2048]`, 1 call | `T=1..4` uses SIMT C4, `T=5..8` SIMT C8, and `T=9..64` MMA R64C64; C128 resumes at `T>=65`. The dFlash range has no C128 over-computation or repeated weight pass. | `test_linear`, `test_q6_linear_plan`, `test_q6_linear_dispatch`; `linear_op_bench`, `output_stage_bench` | [x] | [x] | [x] | [x] |
 | DV-07 | [x] | W8 `attn_input_proj` `[9216,2048]`, 10 calls | `T=1` keeps decode; every exact `T=2..16` uses one split-K MMA kernel with compile-time active columns and direct Q/K/gate/V publication. MMA R32C128 resumes at `T=17`. | `test_linear`, `test_input_proj_plan`; `w8_input_proj_bench`, `attention_layer_bench` | [x] | [x] | [x] | [x] |
-| DV-08 | [ ] | W8 `linear_add` `[2048,4096]`, 40 calls | All `T=1..16` use SIMT R8C4. Verify throughput and residual epilogue efficiency across exact partial tiles. | `test_linear`, `test_linear_add_plan`; `linear_op_bench`, layer benches | [ ] | [ ] | [ ] | [ ] |
+| DV-08 | [x] | W8 `linear_add` `[2048,4096]`, 40 calls | `T=1..8` retains SIMT R8C4; every exact `T=9..16` uses one split-K MMA kernel with compile-time active columns and a fused residual epilogue. SIMT resumes at `T=17`. | `test_linear`, `test_linear_add_plan`; `linear_op_bench`, `gdn_layer_bench` | [x] | [x] | [x] | [x] |
 
 #### DV-01 qualification record
 
@@ -331,6 +331,37 @@ The 35B W8 attention input projection was qualified on NVIDIA GeForce RTX 5090, 
 The current fixed `K<=5` controller still cannot issue `target_verify(T=7..16)`, so DV-07 closes
 the Op and complete full-attention-layer criteria without claiming a full long-acceptance dFlash
 round.
+
+#### DV-08 qualification record
+
+The 35B W8 residual output projection was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1,
+`sm_120a`. Op timings used a 256 MiB L2 flush, five warmups, 50 measured repetitions, and every
+exact `T=1..16`.
+
+- **C:** every exact production route passed the independent payload-decoding FP64 oracle for the
+  complete `residual + W8(x)` formula. Sampled rows and columns span tensor and row-tile
+  boundaries, guarded output storage detects out-of-range writes, and T=16 passes capture and
+  repeated CUDA Graph replay. Plan tests cover every exact dFlash width and both `T=8/9` and
+  `T=16/17` boundaries.
+- **B:** production cold medians were 17.66--21.76 us at T=1..8, 19.74 us at T=9..12, and
+  21.66--21.79 us at T=13..16. The benchmark labels the physical production route and reports
+  useful throughput, weight-replay traffic, boundary variant, and tensor-core work.
+- **O:** the former C4 route measured 23.84 us at T=9, 27.90 us at T=12, and 32.00 us at T=16;
+  exact-T split-K measured 19.74, 19.74, and 21.79 us, improving those points by 17%, 29%, and
+  32%. The selected kernel loads the W8 payload once per output row across the active columns,
+  reduces eight K-split FP32 partials, fuses the residual add and BF16 publication, uses one
+  launch, and allocates no workspace. C8 was 30--42 us and C128 MMA approximately 63 us over the
+  dFlash range, so neither was retained. Although exact-T was faster in the isolated benchmark at
+  some T=2..8 points, alternating full-layer measurements were neutral or slower there; production
+  therefore deliberately retains C4 through T=8.
+- **E:** alternating captured 35B GDN-layer measurements used ten warmups and 100 measured
+  repetitions per process. Against the explicit C4 control, median latency improved from 58.66 to
+  56.58 us at T=9 (3.5%), 60.67 to 56.58 us at T=10 (6.8%), 64.72 to 60.67 us at T=12 (6.3%),
+  68.86 to 62.72 us at T=13 (8.9%), and 72.96 to 68.77 us at T=16 (5.7%). Both routes use five
+  graph nodes.
+
+The current fixed `K<=5` controller still cannot issue `target_verify(T=7..16)`, so DV-08 closes
+the Op and complete GDN-layer criteria without claiming a full long-acceptance dFlash round.
 
 ### P1: frequent elementwise, normalization, and selection Ops
 

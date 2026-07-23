@@ -9,11 +9,20 @@
 
 namespace ninfer::ops::detail {
 
+enum class W8LinearAddScheduleId {
+    SplitKMmaExactT,
+    SimtR8C4,
+    MmaR32C128,
+    MmaR64C128,
+};
+
 struct W8LinearAddPlan {
-    W8ScheduleId schedule;
+    W8LinearAddScheduleId schedule;
     W8KernelVariant variant;
 };
 
+const char* w8_linear_add_schedule_name(W8LinearAddScheduleId schedule) noexcept;
+bool w8_linear_add_schedule_uses_mma(W8LinearAddScheduleId schedule) noexcept;
 bool w8_linear_add_admits(const W8Problem& problem) noexcept;
 W8LinearAddPlan w8_linear_add_resolve_plan(const W8Problem& problem);
 

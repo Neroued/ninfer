@@ -917,35 +917,32 @@ int w8_residual_epilogue_correctness() {
     WorkspaceArena ws(1);
 
     int failures = 0;
-    for (const std::int32_t t : {1, 52, 53, 640, 641, 1024}) {
+    for (const std::int32_t t :
+         {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 52, 53, 640, 641, 1024}) {
         std::vector<float> initial(residual.begin(),
                                    residual.begin() + static_cast<std::size_t>(kN) * t);
-        DBuf dout = to_device_bf16(initial);
+        GuardedBf16Output got(static_cast<std::size_t>(kN) * t);
+        std::vector<std::uint16_t> initial_bits(initial.size());
+        std::transform(initial.begin(), initial.end(), initial_bits.begin(), f32_to_bf16);
+        cudaMemcpy(got.data(), initial_bits.data(), initial_bits.size() * sizeof(std::uint16_t),
+                   cudaMemcpyHostToDevice);
         Tensor tx(dx.p, DType::BF16, {kK, t});
-        Tensor tout(dout.p, DType::BF16, {kN, t});
+        Tensor tout(got.data(), DType::BF16, {kN, t});
 
-        if (t == kMaxT) {
-            cudaStream_t stream  = nullptr;
-            cudaGraph_t graph    = nullptr;
-            cudaGraphExec_t exec = nullptr;
-            cudaStreamCreate(&stream);
-            cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+        const auto launch = [&](cudaStream_t stream) {
             ops::linear_add(tx, weight, tout, ws, stream);
-            cudaStreamEndCapture(stream, &graph);
-            cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
-            cudaGraphLaunch(exec, stream);
-            cudaStreamSynchronize(stream);
-            cudaGraphExecDestroy(exec);
-            cudaGraphDestroy(graph);
-            cudaStreamDestroy(stream);
+        };
+        if (t == 16 || t == kMaxT) {
+            capture_and_replay(launch);
         } else {
-            ops::linear_add(tx, weight, tout, ws, nullptr);
+            launch(nullptr);
             cudaDeviceSynchronize();
         }
 
-        const std::vector<double> full = from_device_bf16(dout, static_cast<std::size_t>(kN) * t);
-        const auto sample_rows         = sampled_indices(kN);
-        const auto sample_cols         = sampled_indices(t);
+        const std::vector<double> full =
+            from_device_bf16_ptr(got.data(), static_cast<std::size_t>(kN) * t);
+        const auto sample_rows = sampled_indices(kN);
+        const auto sample_cols = sampled_indices(t);
 
         std::vector<double> actual;
         std::vector<double> reference;
@@ -962,12 +959,13 @@ int w8_residual_epilogue_correctness() {
         }
 
         const auto plan           = ops::detail::w8_linear_add_resolve_plan({kN, kK, kK, t});
-        const Tolerance tolerance = ops::detail::w8_schedule_uses_mma(plan.schedule)
+        const Tolerance tolerance = ops::detail::w8_linear_add_schedule_uses_mma(plan.schedule)
                                         ? Tolerance::linear_tc()
                                         : Tolerance::linear_bf16();
         const std::string label =
             "linear_add W8 [2048,4096] sampled FP64 oracle T=" + std::to_string(t);
         failures += verify(label.c_str(), actual, reference, tolerance);
+        failures += got.verify_guards(label);
     }
     return failures;
 }
@@ -1151,6 +1149,11 @@ int main() {
     if (std::getenv("NINFER_LINEAR_TEST_W8_ATTN_ONLY") != nullptr) {
         const int f = w8_attention_input_correctness();
         std::cout << (f ? "FAIL" : "OK") << " W8 attention-input dFlash correctness\n";
+        return f ? 1 : 0;
+    }
+    if (std::getenv("NINFER_LINEAR_TEST_W8_LINEAR_ADD_ONLY") != nullptr) {
+        const int f = w8_residual_epilogue_correctness();
+        std::cout << (f ? "FAIL" : "OK") << " W8 LinearAdd dFlash correctness\n";
         return f ? 1 : 0;
     }
     if (std::getenv("NINFER_LINEAR_TEST_W8G32_ONLY") != nullptr) {

@@ -71,6 +71,7 @@ struct Options {
     std::string route        = "fused";
     std::string qk_norm      = "fused";
     std::string norm_control = "fused";
+    std::string output_route = "auto";
     std::string csv_out;
 };
 
@@ -239,10 +240,16 @@ Options parse_options(int argc, char** argv) {
             if (options.norm_control != "fused" && options.norm_control != "composed") {
                 throw std::invalid_argument("--norm-control must be fused or composed");
             }
+        } else if (arg == "--output-route") {
+            options.output_route = next("--output-route value");
+            if (options.output_route != "auto" && options.output_route != "dv08-control") {
+                throw std::invalid_argument("--output-route must be auto or dv08-control");
+            }
         } else if (arg == "--help" || arg == "-h") {
             std::printf("Usage: %s [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--route fused|composed] "
                         "[--qk-norm fused|composed] [--norm-control fused|composed] "
+                        "[--output-route auto|dv08-control] "
                         "[--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
@@ -479,8 +486,17 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
             fused_qk_norm, resources.workspace, ssm_states, initial_slot, recurrent_out, s);
         ops::gated_rmsnorm(recurrent_out, gdn_norm, z.view({kHeadDim, kValueHeads, tokens}), kEps,
                            gated_out, s);
-        ops::linear_add(gated_out.view({kValueRows, tokens}), resources.output_weight.weight,
-                        residual, resources.workspace, s);
+        const Tensor output_input = gated_out.view({kValueRows, tokens});
+        if (options.output_route == "dv08-control") {
+            const auto variant = tokens % 4 == 0 ? ops::detail::W8KernelVariant::Full
+                                                 : ops::detail::W8KernelVariant::Predicated;
+            ops::detail::w8_linear_add_launch_candidate(
+                ops::detail::W8ScheduleId::SimtR8C4, variant, output_input,
+                resources.output_weight.weight, residual, s);
+        } else {
+            ops::linear_add(output_input, resources.output_weight.weight, residual,
+                            resources.workspace, s);
+        }
     };
 
     // Resolve lazy function attributes and validate the complete production route before capture.
@@ -516,7 +532,10 @@ Result run_case(Resources& resources, bench::DBuf& flush, cudaStream_t stream,
             options.norm_control == "fused"
                 ? ops::detail::bf16_gdn_norm_gating_schedule_name(norm_control_plan.schedule)
                 : ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),
-            ops::detail::w8_schedule_name(output_plan.schedule),
+            options.output_route == "dv08-control"
+                ? std::string("dv08_control.") +
+                      ops::detail::w8_schedule_name(ops::detail::W8ScheduleId::SimtR8C4)
+                : ops::detail::w8_linear_add_schedule_name(output_plan.schedule),
             timing};
 }
 

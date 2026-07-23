@@ -534,7 +534,7 @@ struct Geometry35 {
     static std::string output_route(std::int32_t tokens) {
         const auto plan =
             ops::detail::w8_linear_add_resolve_plan({hidden, query_rows, query_rows, tokens});
-        return ops::detail::w8_schedule_name(plan.schedule);
+        return ops::detail::w8_linear_add_schedule_name(plan.schedule);
     }
 };
 

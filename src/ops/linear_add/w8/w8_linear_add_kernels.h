@@ -11,6 +11,8 @@ void w8_linear_add_simt_r8_c4_launch(W8KernelVariant variant, const Tensor& x, c
                                      Tensor& residual_out, cudaStream_t stream);
 void w8_linear_add_simt_r8_c8_launch(W8KernelVariant variant, const Tensor& x, const Weight& w,
                                      Tensor& residual_out, cudaStream_t stream);
+void w8_linear_add_splitk_mma_launch(W8KernelVariant variant, const Tensor& x, const Weight& w,
+                                     Tensor& residual_out, cudaStream_t stream);
 void w8_linear_add_mma_r32_c128_launch(W8KernelVariant variant, const Tensor& x, const Weight& w,
                                        Tensor& residual_out, cudaStream_t stream);
 void w8_linear_add_mma_r64_c128_launch(W8KernelVariant variant, const Tensor& x, const Weight& w,

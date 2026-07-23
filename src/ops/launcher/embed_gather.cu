@@ -30,6 +30,37 @@ int grid_for_q6_grouped(std::int32_t d, std::int32_t T) {
 
 } // namespace
 
+const char* w8_embed_route_name(W8EmbedRoute route) {
+    switch (route) {
+    case W8EmbedRoute::Auto:
+        return "auto";
+    case W8EmbedRoute::Grouped:
+        return "grouped-b32";
+    case W8EmbedRoute::Row:
+        return "row-b256";
+    }
+    return "unknown";
+}
+
+void embed_gather_w8_2048_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                                 W8EmbedRoute route, cudaStream_t stream) {
+    const std::int32_t T = ids.ne[0];
+    const auto* codes    = static_cast<const std::uint8_t*>(table.qdata);
+    const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
+    if (route == W8EmbedRoute::Auto) { route = T <= 6 ? W8EmbedRoute::Grouped : W8EmbedRoute::Row; }
+    if (route == W8EmbedRoute::Grouped) {
+        const int grid = T * kEmbedGatherW8Groups;
+        embed_gather_w8_grouped_2048_kernel<<<grid, kW8GroupedBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data), codes, scales,
+            static_cast<__nv_bfloat16*>(out.data));
+    } else {
+        embed_gather_w8_row_2048_kernel<<<T, kW8RowBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data), codes, scales,
+            static_cast<__nv_bfloat16*>(out.data));
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void embed_gather_dense_launch(const Tensor& ids, const Tensor& table, Tensor& out,
                                cudaStream_t stream) {
     const std::int32_t d = out.ne[0];
@@ -70,17 +101,7 @@ void embed_gather_w8_launch(const Tensor& ids, const Weight& table, Tensor& out,
     const auto* codes    = static_cast<const std::uint8_t*>(table.qdata);
     const auto* scales   = static_cast<const std::uint8_t*>(table.scales);
     if (d == kEmbedGatherW8D && table.padded_shape[1] == kEmbedGatherW8D) {
-        if (T <= 6) {
-            const int grid = T * kEmbedGatherW8Groups;
-            embed_gather_w8_grouped_2048_kernel<<<grid, kW8GroupedBlock, 0, stream>>>(
-                static_cast<const std::int32_t*>(ids.data), codes, scales,
-                static_cast<__nv_bfloat16*>(out.data));
-        } else {
-            embed_gather_w8_row_2048_kernel<<<T, kW8RowBlock, 0, stream>>>(
-                static_cast<const std::int32_t*>(ids.data), codes, scales,
-                static_cast<__nv_bfloat16*>(out.data));
-        }
-        CUDA_CHECK(cudaGetLastError());
+        embed_gather_w8_2048_launch(ids, table, out, W8EmbedRoute::Auto, stream);
         return;
     }
 

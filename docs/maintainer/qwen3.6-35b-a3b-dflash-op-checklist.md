@@ -374,7 +374,7 @@ after the P0 contractions and state transitions are optimized.
 | DV-10 | [x] | `gated_rmsnorm` | 30 | `[4096,T]` with z gate; check launch/memory scaling and downstream arithmetic criterion. | `test_rmsnorm`; `rmsnorm_bench` |
 | DV-11 | [x] | `rope` | 10 | `[4096,T]` Q and `[512,T]` K, rotary 64, absolute positions; current launcher changes small-token geometry after 6. | `test_rope`; `rope_bench` |
 | DV-12 | [x] | `sigmoid_mul` | 10 | Gate `[4096,T]`; exact odd/partial token extents and graph replay. | `test_sigmoid_mul`; `sigmoid_mul_bench` |
-| DV-13 | [ ] | `embedding` | 1 | W8 `[248320,2048]`, gathered ids for `T=1..16`; include repeated ids and physical row decode. | `test_embedding`; `embedding_bench` |
+| DV-13 | [x] | `embedding` | 1 | W8 `[248320,2048]`, gathered ids for `T=1..16`; include repeated ids and physical row decode. | `test_embedding`; `embedding_bench` |
 | DV-14 | [ ] | `offset_i32_positions` | 1 | Exact position construction for all `T`, including near context limit. | `test_position`; dedicated benchmark missing |
 | DV-15 | [ ] | `argmax` | 1 | Q6-head output with `T=1..16`, physical stride, valid vocabulary rows, stable ties. | `test_argmax`; `argmax_bench` |
 
@@ -471,6 +471,31 @@ The 35B attention output-gate domain was qualified on NVIDIA GeForce RTX 5090, C
   8192 and `T=16`, candidate was slower in both pairs (144.576/143.104 and
   143.136/142.656 us). Production therefore retains `b256`; DV-12 adds complete exact-T,
   tail-route, and CUDA Graph qualification without changing the selected runtime geometry.
+
+#### DV-13 qualification record
+
+The 35B W8 embedding domain was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`.
+
+- **C:** every exact W8 `[2048,T]`, `T=1..16`, passed an independent oracle that decodes signed
+  W8 codes and stored FP16 group scales from final RowSplit payload bytes before BF16 publication.
+  A separate real-shape case allocates the complete `[248320,2048]` physical payload and gathers
+  16 ids spanning row 0, row 248319, distant interior rows, and repeated ids; it passes the same
+  decode oracle. Existing dense, Q6, general-width, validation, empty-T, and `T=1024` cases remain
+  in the public-Op suite.
+- **B:** the benchmark now accepts exact token lists and prints the selected physical route. With
+  20 warmups and at least 100 measured CUDA-event batches over 500 ms against the full-size table,
+  production hot medians were 9.30--9.67 us for `grouped-b32` at `T=1..6` and 9.26--9.38 us for
+  `row-b256` at `T=7..16`; the route boundary has no long-draft cliff.
+- **O:** the benchmark can force either registered topology independently of the production
+  threshold. Across `T=1..16`, forced grouped measured 9.28--9.49 us and forced row measured
+  9.29--9.59 us, with pointwise differences at the launch floor and no coherent alternate
+  threshold. Both retain one launch and the same W8-code, FP16-scale, and BF16-output traffic.
+- **E:** cold CUDA Graph replay of each forced route covered every exact `T=1..16`, using
+  20 warmups, 200 measured replays, and a 256 MiB L2 flush. Grouped medians were
+  3.33--3.36 us and row medians were 3.36 us throughout, so no material graph-level difference
+  supports changing the current `T<=6` boundary. Production routing is retained; DV-13 adds
+  full-vocabulary addressing, repeated-id correctness, exact-T performance, and reproducible
+  forced-route evidence.
 
 ### P0 measurement infrastructure
 

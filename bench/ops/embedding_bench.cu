@@ -4,12 +4,16 @@
 #include "ninfer/ops/embedding.h"
 #include "core/device.h"
 #include "ninfer_bench_common.h"
+#include "ops/launcher/embed_gather.h"
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace ninfer;
@@ -44,6 +48,23 @@ DBuf make_ids(std::int32_t t) {
     DBuf d(h.size() * sizeof(std::int32_t));
     cudaMemcpy(d.p, h.data(), d.bytes, cudaMemcpyHostToDevice);
     return d;
+}
+
+std::vector<std::int32_t> parse_tokens(const char* raw) {
+    std::vector<std::int32_t> values;
+    const std::string text(raw);
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        const std::size_t end  = text.find(',', begin);
+        const std::string item = text.substr(begin, end == std::string::npos ? end : end - begin);
+        const int value        = std::stoi(item);
+        if (value <= 0) { throw std::invalid_argument("tokens must be positive"); }
+        values.push_back(value);
+        if (end == std::string::npos) { break; }
+        begin = end + 1;
+    }
+    if (values.empty()) { throw std::invalid_argument("tokens must not be empty"); }
+    return values;
 }
 
 Weight q6_weight(void* payload) {
@@ -167,7 +188,61 @@ Weight w8_weight(void* payload) {
     return w;
 }
 
-void run_w8(std::int32_t t, bool control) {
+Result bench_cold_graph(const launch_fn& launch, double bytes, DBuf& flush, int warmup,
+                        int repeat) {
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    launch(stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    cudaGraph_t graph    = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    launch(stream);
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t end   = nullptr;
+    CUDA_CHECK(cudaEventCreate(&begin));
+    CUDA_CHECK(cudaEventCreate(&end));
+    for (int i = 0; i < warmup; ++i) {
+        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
+        CUDA_CHECK(cudaGraphLaunch(exec, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<double> samples;
+    samples.reserve(static_cast<std::size_t>(repeat));
+    for (int i = 0; i < repeat; ++i) {
+        CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
+        CUDA_CHECK(cudaEventRecord(begin, stream));
+        CUDA_CHECK(cudaGraphLaunch(exec, stream));
+        CUDA_CHECK(cudaEventRecord(end, stream));
+        CUDA_CHECK(cudaEventSynchronize(end));
+        float milliseconds = 0.0F;
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, begin, end));
+        samples.push_back(static_cast<double>(milliseconds) * 1000.0);
+    }
+    CUDA_CHECK(cudaEventDestroy(begin));
+    CUDA_CHECK(cudaEventDestroy(end));
+    CUDA_CHECK(cudaGraphExecDestroy(exec));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+
+    std::sort(samples.begin(), samples.end());
+    Result result;
+    result.n_runs    = repeat;
+    result.median_us = samples[samples.size() / 2];
+    result.min_us    = samples.front();
+    result.p95_us    = samples[std::min(
+        samples.size() - 1, static_cast<std::size_t>(0.95 * static_cast<double>(samples.size())))];
+    result.gbs       = bytes / (result.median_us * 1.0e-6) / 1.0e9;
+    return result;
+}
+
+void run_w8(std::int32_t t, bool control, ops::detail::W8EmbedRoute route, DBuf* flush, int warmup,
+            int repeat) {
     const std::size_t out_elems = static_cast<std::size_t>(kW8D) * static_cast<std::size_t>(t);
     DBuf payload(kW8PayloadBytes);
     DBuf ids = make_ids(t);
@@ -181,8 +256,13 @@ void run_w8(std::int32_t t, bool control) {
                          static_cast<double>(kW8D + kW8Kg * 2 + kW8D * 2 + sizeof(std::int32_t));
     const auto launch = [&](cudaStream_t s) {
         if (!control) {
-            ops::embedding(tids, table, tout, s);
-        } else if (t <= 6) {
+            if (route == ops::detail::W8EmbedRoute::Auto) {
+                ops::embedding(tids, table, tout, s);
+            } else {
+                ops::detail::embed_gather_w8_2048_launch(tids, table, tout, route, s);
+            }
+        } else if (route == ops::detail::W8EmbedRoute::Grouped ||
+                   (route == ops::detail::W8EmbedRoute::Auto && t <= 6)) {
             w8_grouped_payload_control_kernel<<<t * kW8Kg, 32, 0, s>>>(
                 static_cast<const std::int32_t*>(ids.p),
                 static_cast<const std::uint8_t*>(table.qdata),
@@ -194,10 +274,16 @@ void run_w8(std::int32_t t, bool control) {
                 static_cast<const std::uint8_t*>(table.scales), static_cast<__nv_bfloat16*>(out.p));
         }
     };
-    const Result r = bench_loop(launch, bytes);
-    char tag[96];
-    std::snprintf(tag, sizeof(tag), "embedding w8%s [248320,2048] T=%d", control ? " control" : "",
-                  t);
+    const Result r = flush == nullptr ? bench_loop(launch, bytes)
+                                      : bench_cold_graph(launch, bytes, *flush, warmup, repeat);
+    const auto selected =
+        route == ops::detail::W8EmbedRoute::Auto
+            ? (t <= 6 ? ops::detail::W8EmbedRoute::Grouped : ops::detail::W8EmbedRoute::Row)
+            : route;
+    char tag[128];
+    std::snprintf(tag, sizeof(tag), "embedding w8 [248320,2048] T=%d route=%s%s%s", t,
+                  ops::detail::w8_embed_route_name(selected), control ? "-control" : "",
+                  flush == nullptr ? "" : "-cold-graph");
     print_result(tag, r);
 }
 
@@ -211,6 +297,11 @@ int main(int argc, char** argv) {
     }
 
     bool q6 = false, w8 = false, decode = false, prefill = false, control = false;
+    bool cold_graph                 = false;
+    int warmup                      = 20;
+    int repeat                      = 200;
+    ops::detail::W8EmbedRoute route = ops::detail::W8EmbedRoute::Auto;
+    std::vector<std::int32_t> tokens;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--q6"))
             q6 = true;
@@ -222,15 +313,52 @@ int main(int argc, char** argv) {
             prefill = true;
         else if (!std::strcmp(argv[i], "--control"))
             control = true;
+        else if (!std::strcmp(argv[i], "--cold-graph"))
+            cold_graph = true;
+        else if (!std::strcmp(argv[i], "--warmup") && i + 1 < argc)
+            warmup = std::stoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--repeat") && i + 1 < argc)
+            repeat = std::stoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc)
+            tokens = parse_tokens(argv[++i]);
+        else if (!std::strcmp(argv[i], "--route") && i + 1 < argc) {
+            const std::string selected(argv[++i]);
+            if (selected == "auto")
+                route = ops::detail::W8EmbedRoute::Auto;
+            else if (selected == "grouped")
+                route = ops::detail::W8EmbedRoute::Grouped;
+            else if (selected == "row")
+                route = ops::detail::W8EmbedRoute::Row;
+            else
+                throw std::invalid_argument("--route must be auto, grouped, or row");
+        } else {
+            throw std::invalid_argument("unknown embedding benchmark argument");
+        }
     }
     if (!q6 && !w8) { w8 = true; }
     if (!decode && !prefill) { decode = prefill = true; }
+    if (warmup < 0 || repeat <= 0) {
+        throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
+    }
+    if (q6 && cold_graph) {
+        throw std::invalid_argument("--cold-graph qualification is available for --w8");
+    }
+    DBuf flush(cold_graph ? 256ULL << 20 : 1);
+    DBuf* flush_ptr = cold_graph ? &flush : nullptr;
 
     if (q6 && decode) run(1, "embedding q6 [248320,5120] T=1");
     if (q6 && prefill) run(64, "embedding q6 [248320,5120] T=64");
-    if (w8 && decode) {
-        for (std::int32_t t = 1; t <= 6; ++t) { run_w8(t, control); }
+    if (w8 && !tokens.empty()) {
+        for (const std::int32_t t : tokens) {
+            run_w8(t, control, route, flush_ptr, warmup, repeat);
+        }
+    } else if (w8) {
+        if (decode) {
+            for (std::int32_t t = 1; t <= 16; ++t) {
+                run_w8(t, control, route, flush_ptr, warmup, repeat);
+            }
+        }
+        if (prefill) { run_w8(1024, control, route, flush_ptr, warmup, repeat); }
     }
-    if (w8 && prefill) { run_w8(1024, control); }
     return 0;
 }

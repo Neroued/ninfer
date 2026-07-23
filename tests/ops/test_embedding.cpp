@@ -20,6 +20,7 @@ using namespace ninfer::test;
 namespace {
 
 constexpr std::int32_t kVocab       = 16;
+constexpr std::int32_t kFullVocab   = 248320;
 constexpr std::int32_t kD           = 128;
 constexpr std::int32_t kQwenHiddenD = 5120;
 constexpr std::int32_t kGroup       = 64;
@@ -384,13 +385,13 @@ static Weight q6_weight(void* payload, std::int32_t d = kD) {
     return w;
 }
 
-static Weight w8_weight(void* payload, std::int32_t d = kD) {
+static Weight w8_weight(void* payload, std::int32_t d = kD, std::int32_t vocab = kVocab) {
     const std::int32_t kg = w8_groups_for_d(d);
     const std::uint64_t code_plane_bytes =
-        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * kW8Group;
+        static_cast<std::uint64_t>(vocab) * static_cast<std::uint64_t>(kg) * kW8Group;
     const std::uint64_t scale_plane_offset = ((code_plane_bytes + 255ULL) / 256ULL) * 256ULL;
     const std::uint64_t scale_plane_bytes =
-        static_cast<std::uint64_t>(kVocab) * static_cast<std::uint64_t>(kg) * 2ULL;
+        static_cast<std::uint64_t>(vocab) * static_cast<std::uint64_t>(kg) * 2ULL;
     Weight w{};
     w.qtype            = QType::W8G32_F16S;
     w.layout           = QuantLayout::RowSplit;
@@ -406,13 +407,74 @@ static Weight w8_weight(void* payload, std::int32_t d = kD) {
     w.group_size      = kW8Group;
     w.group           = kW8Group;
     w.ndim            = 2;
-    w.shape[0]        = kVocab;
+    w.shape[0]        = vocab;
     w.shape[1]        = d;
-    w.padded_shape[0] = kVocab;
+    w.padded_shape[0] = vocab;
     w.padded_shape[1] = d;
-    w.n               = kVocab;
+    w.n               = vocab;
     w.k               = d;
     return w;
+}
+
+static int full_vocab_w8_shape() {
+    constexpr std::int32_t d  = 2048;
+    constexpr std::int32_t kg = d / kW8Group;
+    const std::uint64_t code_plane_bytes =
+        static_cast<std::uint64_t>(kFullVocab) * static_cast<std::uint64_t>(d);
+    const std::uint64_t scale_plane_offset = ((code_plane_bytes + 255ULL) / 256ULL) * 256ULL;
+    const std::uint64_t payload_bytes =
+        scale_plane_offset + static_cast<std::uint64_t>(kFullVocab) * kg * 2ULL;
+    const std::vector<int> ids = {0,      kFullVocab - 1, 12345, 0,      200000, 17,
+                                  65535,  12345,          42,    200000, 99999,  42,
+                                  131071, kFullVocab - 1, 7,     0};
+
+    DBuf dtable(static_cast<std::size_t>(payload_bytes));
+    cudaMemset(dtable.p, 0, dtable.bytes);
+    std::vector<std::int8_t> codes(d);
+    std::vector<std::uint8_t> scales(static_cast<std::size_t>(kg) * 2);
+    std::vector<int> populated;
+    for (const int row : ids) {
+        if (std::find(populated.begin(), populated.end(), row) != populated.end()) { continue; }
+        populated.push_back(row);
+        for (std::int32_t col = 0; col < d; ++col) {
+            codes[static_cast<std::size_t>(col)] =
+                static_cast<std::int8_t>(((row % 251 + col * 17) % 255) - 127);
+        }
+        for (std::int32_t group = 0; group < kg; ++group) {
+            const std::uint16_t bits = f32_to_f16(0.00390625F * static_cast<float>(group % 7 + 1));
+            scales[static_cast<std::size_t>(group) * 2] = static_cast<std::uint8_t>(bits & 0xffu);
+            scales[static_cast<std::size_t>(group) * 2 + 1] = static_cast<std::uint8_t>(bits >> 8);
+        }
+        cudaMemcpy(static_cast<std::uint8_t*>(dtable.p) + static_cast<std::uint64_t>(row) * d,
+                   codes.data(), codes.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(static_cast<std::uint8_t*>(dtable.p) + scale_plane_offset +
+                       static_cast<std::uint64_t>(row) * kg * 2ULL,
+                   scales.data(), scales.size(), cudaMemcpyHostToDevice);
+    }
+
+    std::vector<double> ref(static_cast<std::size_t>(d) * ids.size());
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+        const int row = ids[t];
+        for (std::int32_t col = 0; col < d; ++col) {
+            const int code           = ((row % 251 + col * 17) % 255) - 127;
+            const std::int32_t group = col / kW8Group;
+            const std::uint16_t bits = f32_to_f16(0.00390625F * static_cast<float>(group % 7 + 1));
+            ref[t * static_cast<std::size_t>(d) + col] =
+                static_cast<double>(code) * static_cast<double>(f16_to_f32(bits));
+        }
+    }
+
+    DBuf dids = to_device_i32(ids);
+    DBuf dout(static_cast<std::size_t>(d) * ids.size() * 2u);
+    cudaMemset(dout.p, 0x7d, dout.bytes);
+    Tensor tids(dids.p, DType::I32, {static_cast<std::int32_t>(ids.size())});
+    Tensor tout(dout.p, DType::BF16, {d, static_cast<std::int32_t>(ids.size())});
+    ops::embedding(tids, w8_weight(dtable.p, d, kFullVocab), tout, nullptr);
+    cudaDeviceSynchronize();
+
+    return verify("embedding w8 full vocab repeated ids",
+                  from_device_bf16(dout, static_cast<std::size_t>(d) * ids.size()), ref,
+                  Tolerance::bf16_elementwise());
 }
 
 static int one_dense_shape(std::int32_t T, std::int32_t d) {
@@ -627,7 +689,9 @@ int main() {
     f += one_dense_shape(5, kQwenHiddenD);
     f += one_q6_shape(5, kQwenHiddenD);
     f += one_w8_shape(4, kD);
-    for (std::int32_t T : {1, 2, 3, 4, 5, 6, 1024}) { f += one_w8_shape(T, 2048); }
+    for (std::int32_t T = 1; T <= 16; ++T) { f += one_w8_shape(T, 2048); }
+    f += one_w8_shape(1024, 2048);
+    f += full_vocab_w8_shape();
 
     std::cout << (f ? "FAIL" : "OK") << " embedding correctness\n";
     return f ? 1 : 0;

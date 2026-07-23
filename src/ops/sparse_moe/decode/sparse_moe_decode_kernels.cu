@@ -9,6 +9,7 @@
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
 #include "ops/linear/w8/w8_rowsplit_storage.cuh"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
+#include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -473,43 +474,54 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     }
 }
 
-template <class RoutedCodec>
+template <class RoutedCodec, int Rows>
 __global__ void sparse_moe_d4_token_kernel(
     const int* __restrict__ token_ids, const float* __restrict__ token_alpha,
     const float* __restrict__ shared_scale, const float* __restrict__ token_activations,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination) {
-    // Token is a grid dimension rather than an in-CTA serial loop. This removes the small-T wave
-    // tail while retaining the deterministic rank-order FP32 epilogue below.
-    __shared__ float paths[kTopK + 1];
-    const int warp  = static_cast<int>(threadIdx.x) >> 5;
-    const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const int row   = static_cast<int>(blockIdx.x);
-    const int token = static_cast<int>(blockIdx.y);
+    // Token is a grid dimension rather than an in-CTA serial loop. Rows lets one routed-weight
+    // stream serve adjacent outputs while retaining the deterministic rank-order FP32 epilogue.
+    __shared__ float paths[kTopK + 1][Rows];
+    const int warp     = static_cast<int>(threadIdx.x) >> 5;
+    const int lane     = static_cast<int>(threadIdx.x) & 31;
+    const int row_base = static_cast<int>(blockIdx.x) * Rows;
+    const int token    = static_cast<int>(blockIdx.y);
     const float* act =
         token_activations + static_cast<std::int64_t>(token) * (kTopK + 1) * kIntermediate;
     if (warp < kTopK) {
         const int expert = token_ids[token * kTopK + warp];
-        float dot[1];
-        dot_fp32_rows<RoutedCodec, 1>(routed_codes, routed_high, routed_scales,
-                                      expert * kHidden + row,
-                                      act + static_cast<std::int64_t>(warp) * kIntermediate, 0,
-                                      kIntermediate / RoutedCodec::kGroupK, dot);
-        if (lane == 0) { paths[warp] = token_alpha[token * kTopK + warp] * dot[0]; }
+        float dot[Rows];
+        dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
+                                         expert * kHidden + row_base,
+                                         act + static_cast<std::int64_t>(warp) * kIntermediate, 0,
+                                         kIntermediate / RoutedCodec::kGroupK, dot);
+        if (lane == 0) {
+#pragma unroll
+            for (int row = 0; row < Rows; ++row) {
+                paths[warp][row] = token_alpha[token * kTopK + warp] * dot[row];
+            }
+        }
     } else {
-        float dot[1];
-        dot_fp32_rows<W8Codec, 1>(shared_codes, nullptr, shared_scales, row,
-                                  act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
-                                  kIntermediate / W8Codec::kGroupK, dot);
-        if (lane == 0) { paths[kTopK] = shared_scale[token] * dot[0]; }
+        float dot[Rows];
+        dot_fp32_rows<W8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
+                                     act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
+                                     kIntermediate / W8Codec::kGroupK, dot);
+        if (lane == 0) {
+#pragma unroll
+            for (int row = 0; row < Rows; ++row) {
+                paths[kTopK][row] = shared_scale[token] * dot[row];
+            }
+        }
     }
     __syncthreads();
-    if (warp == 0 && lane == 0) {
-        __nv_bfloat16* output = destination + static_cast<std::int64_t>(token) * kHidden + row;
-        float value           = __bfloat162float(*output);
+    if (warp == 0 && lane < Rows) {
+        __nv_bfloat16* output =
+            destination + static_cast<std::int64_t>(token) * kHidden + row_base + lane;
+        float value = __bfloat162float(*output);
 #pragma unroll
-        for (int path = 0; path < kTopK + 1; ++path) { value += paths[path]; }
+        for (int path = 0; path < kTopK + 1; ++path) { value += paths[path][lane]; }
         *output = __float2bfloat16_rn(value);
     }
 }
@@ -621,13 +633,12 @@ void launch_d4_codec(const SparseMoeWeights& weights, Tensor& destination,
     throw std::logic_error("sparse_moe: unknown D4 schedule");
 }
 
-template <class Codec>
-void launch_d3_small_t_codec(const Tensor& x, const SparseMoeWeights& weights, const int* token_ids,
+template <class Codec, int PathsPerBlock>
+void launch_d3_small_t_paths(const Tensor& x, const SparseMoeWeights& weights, const int* token_ids,
                              float* token_activations, std::int32_t tokens, cudaStream_t stream) {
-    constexpr int kPathsPerBlock = 3;
-    constexpr int kPathBlocks    = (kTopK + 1) / kPathsPerBlock;
-    sparse_moe_d3_path_tiled_kernel<Codec, kPathsPerBlock>
-        <<<dim3(kIntermediate, tokens * kPathBlocks), kPathsPerBlock * 32, 0, stream>>>(
+    constexpr int kPathBlocks = (kTopK + 1) / PathsPerBlock;
+    sparse_moe_d3_path_tiled_kernel<Codec, PathsPerBlock>
+        <<<dim3(kIntermediate, tokens * kPathBlocks), PathsPerBlock * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), token_ids,
             static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata),
             static_cast<const std::uint8_t*>(weights.routed_gate_up.qhigh),
@@ -638,11 +649,29 @@ void launch_d3_small_t_codec(const Tensor& x, const SparseMoeWeights& weights, c
 }
 
 template <class Codec>
-void launch_d4_small_t_codec(const SparseMoeWeights& weights, Tensor& destination,
-                             const int* token_ids, const float* token_alpha,
-                             const float* shared_scale, const float* token_activations,
-                             std::int32_t tokens, cudaStream_t stream) {
-    sparse_moe_d4_token_kernel<Codec><<<dim3(kHidden, tokens), 9 * 32, 0, stream>>>(
+void launch_d3_small_t_codec(const Tensor& x, const SparseMoeWeights& weights, const int* token_ids,
+                             float* token_activations, std::int32_t tokens,
+                             SparseMoeSmallTD3Schedule schedule, cudaStream_t stream) {
+    switch (schedule) {
+    case SparseMoeSmallTD3Schedule::Paths1:
+        launch_d3_small_t_paths<Codec, 1>(x, weights, token_ids, token_activations, tokens, stream);
+        return;
+    case SparseMoeSmallTD3Schedule::Paths3:
+        launch_d3_small_t_paths<Codec, 3>(x, weights, token_ids, token_activations, tokens, stream);
+        return;
+    case SparseMoeSmallTD3Schedule::Paths9:
+        launch_d3_small_t_paths<Codec, 9>(x, weights, token_ids, token_activations, tokens, stream);
+        return;
+    }
+    throw std::logic_error("sparse_moe: unknown small-T D3 schedule");
+}
+
+template <class Codec, int Rows>
+void launch_d4_small_t_rows(const SparseMoeWeights& weights, Tensor& destination,
+                            const int* token_ids, const float* token_alpha,
+                            const float* shared_scale, const float* token_activations,
+                            std::int32_t tokens, cudaStream_t stream) {
+    sparse_moe_d4_token_kernel<Codec, Rows><<<dim3(kHidden / Rows, tokens), 9 * 32, 0, stream>>>(
         token_ids, token_alpha, shared_scale, token_activations,
         static_cast<const std::uint8_t*>(weights.routed_down.qdata),
         static_cast<const std::uint8_t*>(weights.routed_down.qhigh),
@@ -651,6 +680,29 @@ void launch_d4_small_t_codec(const SparseMoeWeights& weights, Tensor& destinatio
         static_cast<const std::uint8_t*>(weights.shared_down.scales),
         static_cast<__nv_bfloat16*>(destination.data));
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Codec>
+void launch_d4_small_t_codec(const SparseMoeWeights& weights, Tensor& destination,
+                             const int* token_ids, const float* token_alpha,
+                             const float* shared_scale, const float* token_activations,
+                             std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
+                             cudaStream_t stream) {
+    switch (schedule) {
+    case SparseMoeSmallTD4Schedule::Rows1:
+        launch_d4_small_t_rows<Codec, 1>(weights, destination, token_ids, token_alpha, shared_scale,
+                                         token_activations, tokens, stream);
+        return;
+    case SparseMoeSmallTD4Schedule::Rows2:
+        launch_d4_small_t_rows<Codec, 2>(weights, destination, token_ids, token_alpha, shared_scale,
+                                         token_activations, tokens, stream);
+        return;
+    case SparseMoeSmallTD4Schedule::Rows4:
+        launch_d4_small_t_rows<Codec, 4>(weights, destination, token_ids, token_alpha, shared_scale,
+                                         token_activations, tokens, stream);
+        return;
+    }
+    throw std::logic_error("sparse_moe: unknown small-T D4 schedule");
 }
 
 } // namespace
@@ -729,13 +781,16 @@ void sparse_moe_decode_launch_d4(const SparseMoeWeights& weights, Tensor& destin
 
 void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
                                          const int* token_ids, float* token_activations,
-                                         std::int32_t tokens, cudaStream_t stream) {
+                                         std::int32_t tokens, SparseMoeSmallTD3Schedule schedule,
+                                         cudaStream_t stream) {
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
-        launch_d3_small_t_codec<Q4Codec>(x, weights, token_ids, token_activations, tokens, stream);
+        launch_d3_small_t_codec<Q4Codec>(x, weights, token_ids, token_activations, tokens, schedule,
+                                         stream);
         return;
     case QType::W8G32_F16S:
-        launch_d3_small_t_codec<W8Codec>(x, weights, token_ids, token_activations, tokens, stream);
+        launch_d3_small_t_codec<W8Codec>(x, weights, token_ids, token_activations, tokens, schedule,
+                                         stream);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported small-T D3 codec");
@@ -745,19 +800,20 @@ void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights
 void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destination,
                                          const int* token_ids, const float* token_alpha,
                                          const float* shared_scale, const float* token_activations,
-                                         std::int32_t tokens, cudaStream_t stream) {
+                                         std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
+                                         cudaStream_t stream) {
     switch (weights.routed_down.qtype) {
     case QType::Q5G64_F16S:
         launch_d4_small_t_codec<Q5Codec>(weights, destination, token_ids, token_alpha, shared_scale,
-                                         token_activations, tokens, stream);
+                                         token_activations, tokens, schedule, stream);
         return;
     case QType::Q6G64_F16S:
         launch_d4_small_t_codec<Q6Codec>(weights, destination, token_ids, token_alpha, shared_scale,
-                                         token_activations, tokens, stream);
+                                         token_activations, tokens, schedule, stream);
         return;
     case QType::W8G32_F16S:
         launch_d4_small_t_codec<W8Codec>(weights, destination, token_ids, token_alpha, shared_scale,
-                                         token_activations, tokens, stream);
+                                         token_activations, tokens, schedule, stream);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported small-T D4 codec");

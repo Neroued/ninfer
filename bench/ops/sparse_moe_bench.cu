@@ -84,8 +84,8 @@ QuantGeometry geometry(QType qtype) {
 }
 
 __device__ __forceinline__ std::uint32_t payload_hash(std::size_t index, std::uint32_t seed) {
-    std::uint32_t value = static_cast<std::uint32_t>(index) ^
-                          static_cast<std::uint32_t>(index >> 32) ^ seed;
+    std::uint32_t value =
+        static_cast<std::uint32_t>(index) ^ static_cast<std::uint32_t>(index >> 32) ^ seed;
     value ^= value >> 16;
     value *= 0x7feb352du;
     value ^= value >> 15;
@@ -94,8 +94,7 @@ __device__ __forceinline__ std::uint32_t payload_hash(std::size_t index, std::ui
     return value;
 }
 
-__global__ void fill_payload_kernel(std::uint8_t* payload, std::size_t count,
-                                    std::uint32_t seed) {
+__global__ void fill_payload_kernel(std::uint8_t* payload, std::size_t count, std::uint32_t seed) {
     const std::size_t start  = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
     const std::size_t stride = gridDim.x * static_cast<std::size_t>(blockDim.x);
     for (std::size_t index = start; index < count; index += stride) {
@@ -560,6 +559,8 @@ struct Candidate {
     bool payload_control        = false;
     int grid                    = 0;
     int block                   = 0;
+    int paths_per_block         = 0;
+    int rows_per_block          = 0;
     const char* matched_control = "";
 };
 
@@ -660,7 +661,7 @@ Options parse_options(int argc, char** argv) {
                         "[--distribution trace-like|independent|same] [--seed N] [--warmup N] "
                         "[--repeat N] [--csv-out PATH]\n\n"
                         "Candidates: production, small-t-tiled, decode-loop, payload-control, "
-                        "row-cta-4w, row-cta-8w, serial-control, "
+                        "small-t-p{1,3,9}-r{1,2,4}, row-cta-4w, row-cta-8w, serial-control, "
                         "warp-register, nine-warp-control, balanced-eight-warp, nine-warp-r1, "
                         "balanced-eight-warp-r4.\n",
                         argv[0]);
@@ -696,12 +697,10 @@ public:
           destination_(static_cast<std::size_t>(tokens) * kHidden * 2),
           router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
           routed_gate_(gate_codec(profile), kExperts * 1024, kHidden, seed ^ 0xa4093822u),
-          routed_down_(down_codec(profile), kExperts * kHidden, kIntermediate,
-                       seed ^ 0x299f31d0u),
+          routed_down_(down_codec(profile), kExperts * kHidden, kIntermediate, seed ^ 0x299f31d0u),
           shared_gate_(QType::W8G32_F16S, 1024, kHidden, seed ^ 0x082efa98u),
           shared_down_(QType::W8G32_F16S, kHidden, kIntermediate, seed ^ 0xec4e6c89u),
-          flush_(kFlushBytes),
-          private_arena_(private_workspace_bytes(tokens)),
+          flush_(kFlushBytes), private_arena_(private_workspace_bytes(tokens)),
           decode_arena_(ops::detail::sparse_moe_decode_workspace_bytes()),
           public_workspace_(ops::sparse_moe_workspace_bytes(tokens)) {
         std::vector<std::uint16_t> input(static_cast<std::size_t>(tokens) * kHidden);
@@ -1081,17 +1080,37 @@ Candidate make_candidate(CodecProfile profile, Scope scope, std::string_view nam
             result.plan.workspace_bytes = ops::detail::sparse_moe_decode_workspace_bytes();
             return result;
         }
-        if (name != "production" && name != "small-t-tiled") {
+        const bool scheduled =
+            name == "small-t-p1-r1" || name == "small-t-p1-r2" || name == "small-t-p1-r4" ||
+            name == "small-t-p3-r1" || name == "small-t-p3-r2" || name == "small-t-p3-r4" ||
+            name == "small-t-p9-r1" || name == "small-t-p9-r2" || name == "small-t-p9-r4";
+        if (name != "production" && name != "small-t-tiled" && !scheduled) {
             throw std::invalid_argument("unknown T > 1 candidate");
         }
-        if (name == "production") {
-            result.name = "production";
-        } else {
-            result.name = "small-t-tiled";
-        }
+        result.name         = name == "production"      ? "production"
+                              : name == "small-t-tiled" ? "small-t-tiled"
+                                                        : name.data();
         result.small_t      = true;
         result.small_t_plan = ops::detail::resolve_sparse_moe_small_t_plan(
             tokens, gate_codec(profile), down_codec(profile));
+        if (scheduled) {
+            result.small_t_plan.d3_schedule =
+                name.starts_with("small-t-p1")   ? ops::detail::SparseMoeSmallTD3Schedule::Paths1
+                : name.starts_with("small-t-p3") ? ops::detail::SparseMoeSmallTD3Schedule::Paths3
+                                                 : ops::detail::SparseMoeSmallTD3Schedule::Paths9;
+            result.small_t_plan.d4_schedule =
+                name.ends_with("r1")   ? ops::detail::SparseMoeSmallTD4Schedule::Rows1
+                : name.ends_with("r2") ? ops::detail::SparseMoeSmallTD4Schedule::Rows2
+                                       : ops::detail::SparseMoeSmallTD4Schedule::Rows4;
+        }
+        result.paths_per_block =
+            result.small_t_plan.d3_schedule == ops::detail::SparseMoeSmallTD3Schedule::Paths1   ? 1
+            : result.small_t_plan.d3_schedule == ops::detail::SparseMoeSmallTD3Schedule::Paths3 ? 3
+                                                                                                : 9;
+        result.rows_per_block =
+            result.small_t_plan.d4_schedule == ops::detail::SparseMoeSmallTD4Schedule::Rows1   ? 1
+            : result.small_t_plan.d4_schedule == ops::detail::SparseMoeSmallTD4Schedule::Rows2 ? 2
+                                                                                               : 4;
         result.public_production = name == "production" && scope == Scope::Full;
         switch (scope) {
         case Scope::D1:
@@ -1103,11 +1122,11 @@ Candidate make_candidate(CodecProfile profile, Scope scope, std::string_view nam
             result.block = std::min(tokens, 32) * 32;
             break;
         case Scope::D3:
-            result.grid  = kIntermediate;
-            result.block = 9 * 32;
+            result.grid  = kIntermediate * tokens * (9 / result.paths_per_block);
+            result.block = result.paths_per_block * 32;
             break;
         case Scope::D4:
-            result.grid  = kHidden;
+            result.grid  = (kHidden / result.rows_per_block) * tokens;
             result.block = 9 * 32;
             break;
         case Scope::Full:
@@ -1325,7 +1344,7 @@ std::vector<std::pair<Scope, const char*>> matrix_candidates(CodecProfile profil
     if (tokens > 1) {
         return {{Scope::D1, "small-t-tiled"},   {Scope::D2, "small-t-tiled"},
                 {Scope::D3, "small-t-tiled"},   {Scope::D4, "small-t-tiled"},
-                {Scope::Full, "small-t-tiled"}, {Scope::Full, "decode-loop"},
+                {Scope::Full, "small-t-p3-r1"}, {Scope::Full, "decode-loop"},
                 {Scope::Full, "production"}};
     }
     if (profile == CodecProfile::Q4Q5) {
@@ -1348,11 +1367,12 @@ std::vector<std::pair<Scope, const char*>> matrix_candidates(CodecProfile profil
 void print_result(const Result& result) {
     const double useful_tflops =
         2.0 * static_cast<double>(result.payload.useful_fma) / (result.warm.median_us * 1.0e6);
-    std::printf("%-6s T=%d %-11s U=%-2d ov=%4.1f %-5s %-16s grid=%-4d block=%-3d "
+    std::printf("%-6s T=%d %-11s U=%-2d ov=%4.1f %-5s %-16s p=%d r=%d grid=%-5d block=%-3d "
                 "cold=%8.3f us warm=%8.3f us useful=%6.1f TFLOP/s",
                 codec_name(result.codec), result.tokens, distribution_name(result.distribution),
                 result.unique_experts, result.adjacent_overlap, scope_name(result.candidate.scope),
-                result.candidate.name, result.candidate.grid, result.candidate.block,
+                result.candidate.name, result.candidate.paths_per_block,
+                result.candidate.rows_per_block, result.candidate.grid, result.candidate.block,
                 result.cold.median_us, result.warm.median_us, useful_tflops);
     if (!std::isnan(result.matched_cold_us)) {
         std::printf(" control=%8.3f us", result.matched_cold_us);
@@ -1392,7 +1412,8 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
     stream << "codec,tokens,distribution,seed,unique_experts,adjacent_overlap,scope,candidate,"
-              "matched_control,matched_cold_us,matched_warm_us,grid,block,"
+              "matched_control,matched_cold_us,matched_warm_us,paths_per_block,rows_per_block,"
+              "grid,block,"
               "cold_median_us,cold_min_us,cold_p95_us,warm_median_us,warm_min_us,warm_p95_us,"
               "code_bytes,high_bytes,scale_bytes,useful_fma,executed_fma,workspace_bytes,warmup,"
               "repeat,build_type,gpu,cuda_runtime\n";
@@ -1402,7 +1423,8 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
                << result.unique_experts << ',' << result.adjacent_overlap << ','
                << scope_name(result.candidate.scope) << ',' << result.candidate.name << ','
                << result.candidate.matched_control << ',' << result.matched_cold_us << ','
-               << result.matched_warm_us << ',' << result.candidate.grid << ','
+               << result.matched_warm_us << ',' << result.candidate.paths_per_block << ','
+               << result.candidate.rows_per_block << ',' << result.candidate.grid << ','
                << result.candidate.block << ',' << result.cold.median_us << ','
                << result.cold.min_us << ',' << result.cold.p95_us << ',' << result.warm.median_us
                << ',' << result.warm.min_us << ',' << result.warm.p95_us << ','

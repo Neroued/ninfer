@@ -174,6 +174,32 @@ cmake --build build --parallel --target ninfer_w8_input_proj_bench
 
 The executable isolates these Op contracts; end-to-end 35B-A3B measurement uses `ninfer_bench`.
 
+## 35B sparse-MoE dFlash benchmark
+
+`ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
+Q4+Q5/Q6 profiles and the MTP W8+W8 profile. Small-T rows report the selected number of D3
+paths/CTA (`p`) and D4 output rows/CTA (`r`). `--matrix` includes the former three-path/one-row
+schedule as a same-process control.
+
+```bash
+cmake --build build --parallel --target ninfer_sparse_moe_bench
+for codec in q4-q5 q4-q6 w8-w8; do
+  for tokens in $(seq 1 16); do
+    ./build/bench/ninfer_sparse_moe_bench \
+      --scope full --candidate production --codec "$codec" --tokens "$tokens" \
+      --distribution trace-like --warmup 5 --repeat 50
+  done
+done
+
+./build/bench/ninfer_sparse_moe_bench \
+  --matrix --tokens 16 --distribution trace-like --warmup 5 --repeat 80
+```
+
+Each cold sample flushes 256 MiB before the timed interval. `trace-like` is the primary
+single-sequence verification distribution; `independent` and `same` bound zero and complete expert
+overlap. Candidate names `small-t-p{1,3,9}-r{1,2,4}` expose the compiled schedule matrix without
+changing public dispatch.
+
 ## Target MTP round benchmark
 
 `ninfer_qwen3_6_27b_mtp_round_bench` measures the registered target's native proposal and

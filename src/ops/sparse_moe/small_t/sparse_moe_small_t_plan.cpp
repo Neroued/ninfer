@@ -33,7 +33,26 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
         throw std::invalid_argument("sparse_moe small-T: unsupported routed codec profile");
     }
 
-    return {tokens, sparse_moe_small_t_workspace_bytes(tokens)};
+    SparseMoeSmallTPlan plan{tokens, sparse_moe_small_t_workspace_bytes(tokens)};
+    if (mtp_profile) {
+        plan.d3_schedule =
+            tokens <= 5 ? SparseMoeSmallTD3Schedule::Paths1 : SparseMoeSmallTD3Schedule::Paths9;
+        plan.d4_schedule =
+            tokens <= 8 ? SparseMoeSmallTD4Schedule::Rows1 : SparseMoeSmallTD4Schedule::Rows4;
+        return plan;
+    }
+
+    plan.d3_schedule = SparseMoeSmallTD3Schedule::Paths3;
+    if (routed_down == QType::Q5G64_F16S) {
+        plan.d4_schedule = tokens <= 2   ? SparseMoeSmallTD4Schedule::Rows1
+                           : tokens <= 5 ? SparseMoeSmallTD4Schedule::Rows2
+                                         : SparseMoeSmallTD4Schedule::Rows4;
+    } else {
+        plan.d4_schedule = tokens <= 2    ? SparseMoeSmallTD4Schedule::Rows1
+                           : tokens <= 11 ? SparseMoeSmallTD4Schedule::Rows2
+                                          : SparseMoeSmallTD4Schedule::Rows4;
+    }
+    return plan;
 }
 
 } // namespace ninfer::ops::detail

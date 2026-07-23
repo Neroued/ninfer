@@ -101,17 +101,16 @@ template <int Tokens>
 void launch_s1(const __nv_bfloat16* x, const __nv_bfloat16* router, float* partial_scores,
                cudaStream_t stream) {
     sparse_moe_small_t_s1_kernel<Tokens>
-        <<<kRouterRows * kRouterPartitions, kRouterWarps * 32, 0, stream>>>(
-            x, router, partial_scores);
+        <<<kRouterRows * kRouterPartitions, kRouterWarps * 32, 0, stream>>>(x, router,
+                                                                            partial_scores);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <int Tokens>
 void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha, float* shared_scale,
                cudaStream_t stream) {
-    sparse_moe_small_t_s2_kernel<Tokens>
-        <<<1, (Tokens < 32 ? Tokens : 32) * 32, 0, stream>>>(partial_scores, token_ids, token_alpha,
-                                                             shared_scale);
+    sparse_moe_small_t_s2_kernel<Tokens><<<1, (Tokens < 32 ? Tokens : 32) * 32, 0, stream>>>(
+        partial_scores, token_ids, token_alpha, shared_scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -120,7 +119,7 @@ void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
                      cudaStream_t stream) {
     sparse_moe_decode_launch_d3_small_t(
         x, weights, static_cast<const int*>(workspace.token_ids.data),
-        static_cast<float*>(workspace.scratch.data), plan.tokens, stream);
+        static_cast<float*>(workspace.scratch.data), plan.tokens, plan.d3_schedule, stream);
 }
 
 void launch_s4_tiled(const SparseMoeWeights& weights, Tensor& destination,
@@ -130,7 +129,7 @@ void launch_s4_tiled(const SparseMoeWeights& weights, Tensor& destination,
         weights, destination, static_cast<const int*>(workspace.token_ids.data),
         static_cast<const float*>(workspace.token_alpha.data),
         static_cast<const float*>(workspace.shared_scale.data),
-        static_cast<const float*>(workspace.scratch.data), plan.tokens, stream);
+        static_cast<const float*>(workspace.scratch.data), plan.tokens, plan.d4_schedule, stream);
 }
 
 template <class Launch>

@@ -11,6 +11,9 @@
 
 namespace ninfer::ops::detail {
 
+enum class SparseMoeSmallTD3Schedule : std::uint8_t;
+enum class SparseMoeSmallTD4Schedule : std::uint8_t;
+
 enum class SparseMoeD1Schedule : std::uint8_t {
     RowCta4,
     RowCta8,
@@ -76,11 +79,13 @@ void sparse_moe_decode_launch_d4(const SparseMoeWeights& weights, Tensor& destin
 
 void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
                                          const int* token_ids, float* token_activations,
-                                         std::int32_t tokens, cudaStream_t stream);
+                                         std::int32_t tokens, SparseMoeSmallTD3Schedule schedule,
+                                         cudaStream_t stream);
 void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destination,
                                          const int* token_ids, const float* token_alpha,
                                          const float* shared_scale, const float* token_activations,
-                                         std::int32_t tokens, cudaStream_t stream);
+                                         std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
+                                         cudaStream_t stream);
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                               const SparseMoeDecodeWorkspace& workspace,
                               const SparseMoeDecodePlan& plan, cudaStream_t stream);

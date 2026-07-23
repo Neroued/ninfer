@@ -111,7 +111,7 @@ Work these rows in order unless whole-round profiling demonstrates a different d
 | DV-02 | [x] | `gdn_norm_gating_proj`, 30 calls | Every exact `T=1..16` uses one cooperative split-32 MMA kernel with fused RMS reduction, normalized BF16 hidden publication, direct normalized A/B projection, and gate/beta transforms; larger T retains the composed route. | `test_gdn_gating_proj`, `test_gdn_gating_proj_plan`; `gdn_gating_proj_bench --35b --norm-control`, `gdn_layer_bench` | [x] | [x] | [x] | [x] |
 | DV-03 | [x] | `gated_delta_rule_snapshot`, 30 calls | Every exact `T=1..16` uses one four-warp recurrent kernel with fused Q/K normalization, register-resident running state, vectorized FP32 snapshot stores, no workspace, and no route boundary. Each 35B layer reads one 2 MiB state and publishes another 2 MiB per column. | `test_gated_delta_rule`; `gated_delta_rule_bench --small-t --H_v 32`, `gdn_layer_bench --qk-norm` | [x] | [x] | [x] | [x] |
 | DV-04 | [x] | `gqa_attention`, 10 calls | `T<=6` keeps the direct small-T route. For 35B, `T=7..12` uses prompt through 512 visible keys and otherwise 2 small-T chunks; `T=13..16` uses prompt through 1024 and otherwise 3 chunks. Each chunk has at most six sequential columns and reuses one workspace allocation. BF16 and INT8-G64 share the context policy. | `test_gqa_attention`; `gqa_attention_bench --append-small-t`/`--cached-small-t`, `attention_layer_bench` | [x] | [x] | [x] | [x] |
-| DV-05 | [ ] | `sparse_moe`, 40 calls | Main Q4+Q5/Q6 profiles stay on Small-T for all `T=2..16` (Small-T through 44). It has no route cliff here but is invoked after every layer and streams routed/shared weights. | `test_sparse_moe`; `sparse_moe_bench` | [ ] | [ ] | [ ] | [ ] |
+| DV-05 | [x] | `sparse_moe`, 40 calls | `T=1` keeps decode. Q4+Q5/Q6 stay on Small-T through 44 with three D3 paths/CTA and codec-specific D4 row tiers; W8+W8 stays on Small-T through 17 with 1/9-path D3 and 1/4-row D4 tiers. All dFlash widths therefore avoid the per-token decode loop. | `test_sparse_moe`; `sparse_moe_bench` | [x] | [x] | [x] | [x] |
 | DV-06 | [ ] | Q6 `linear` output head `[248320,2048]`, 1 call | `T=1..4` SIMT C4, `T=5..6` SIMT C8, `T>=7` MMA R64C128. The `T=6/7` transition spans the full vocabulary head. | `test_linear`, `test_q6_linear_plan`; `linear_op_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-07 | [ ] | W8 `attn_input_proj` `[9216,2048]`, 10 calls | `T=1` decode; `T=2..12` SIMT R8C4; `T=13..16` MMA R32C128. The dFlash range crosses `T=12/13`. | `test_linear`, `test_input_proj_plan`; `w8_input_proj_bench`, `attention_layer_bench` | [ ] | [ ] | [ ] | [ ] |
 | DV-08 | [ ] | W8 `linear_add` `[2048,4096]`, 40 calls | All `T=1..16` use SIMT R8C4. Verify throughput and residual epilogue efficiency across exact partial tiles. | `test_linear`, `test_linear_add_plan`; `linear_op_bench`, layer benches | [ ] | [ ] | [ ] | [ ] |
@@ -235,6 +235,42 @@ L2 flush, five warmups, and 40 measured repetitions.
 As with the preceding rows, the current controller cannot issue a complete T=7..16 target verify,
 so DV-04 closes the Op and full-attention-layer criteria rather than claiming a complete dFlash
 round speedup.
+
+#### DV-05 qualification record
+
+This Op was qualified on NVIDIA GeForce RTX 5090, CUDA 13.1, `sm_120a`, for Q4+Q5, Q4+Q6, and
+W8+W8 routed-weight profiles. Timed Op samples used a 256 MiB L2 flush, five warmups, 50 measured
+repetitions, trace-like expert overlap, and every exact `T=1..16`.
+
+- **C:** all three production profiles passed the same independent complete FP64 oracle at every
+  exact `T=1..16`; Q4+Q5/Q6 additionally passed through T=44 and W8+W8 through T=17. The oracle
+  exact-decodes each selected routed and shared row, independently computes router top-8,
+  softmax, shared sigmoid, SwiGLU, down projections, rank-order accumulation, residual addition,
+  and BF16 publication. Guard regions protect output boundaries and full comparison detects
+  unwritten rows. T=16 for every profile and the last Small-T point before each prefill boundary
+  also pass capture and repeated CUDA Graph replay.
+- **B:** the benchmark reports codec, expert distribution, selected D3 paths/CTA (`p`), selected
+  D4 rows/CTA (`r`), launch geometry, cold/warm latency, payload, useful throughput, and workspace.
+  Cold production medians for Q4+Q5 were 38.88 us at T=1, 47.07 us at T=2, 86.02 us at T=8, and
+  147.49 us at T=16. Q4+Q6 measured 36.83/45.06/90.11/149.25 us; W8+W8 measured
+  49.12/69.60/172.00/276.51 us at the same widths.
+- **O:** D3 retains three paths/CTA for Q4. Q4+Q5 D4 uses rows 1/2/4 at T=2, T=3..5, and T>=6;
+  Q4+Q6 uses rows 1/2/4 at T=2, T=3..11, and T>=12. W8 D3 uses one path through T=5 and nine
+  thereafter, while D4 changes from one to four rows at T=9. At T=16, same-process controls using
+  the former three-path/one-row plan measured 159.74 versus 143.39 us for Q4+Q5 (10.2%),
+  161.79 versus 147.49 us for Q4+Q6 (8.8%), and 296.58 versus 274.46 us for W8+W8 (7.5%).
+  The selected schedules keep the same four launches and workspace; they reduce CTA count and
+  reuse decoded weights across adjacent output rows. Independent and fully shared expert
+  distributions were also checked at each retained crossover.
+- **E:** the public 35B eager Engine route with the currently supported `K=5`, optimized proposal
+  head, and `tg8` improved from 201.87 to 206.62 output token/s (2.4%) over five measured
+  repetitions. This round exercises the main Q4 Small-T route at T=6 and the real 40-layer
+  post-mixer composition; it is supplementary to the direct exact-T evidence.
+
+The controller still cannot issue T=7..16 target verification, so the round result does not claim
+a complete long-acceptance dFlash speedup. The W8 schedule is selected for trace-like correlated
+routes expected from one speculative sequence; the independent-expert control is neutral to
+slightly slower near its T=9 crossover and improves again at the upper end.
 
 ### P1: frequent elementwise, normalization, and selection Ops
 

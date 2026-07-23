@@ -16,9 +16,23 @@ inline constexpr std::int32_t kSparseMoeSmallTMin = 2;
 // 32 resident warps and lets them cover the remaining tokens in a second turn.
 inline constexpr std::int32_t kSparseMoeSmallTMax = 44;
 
+enum class SparseMoeSmallTD3Schedule : std::uint8_t {
+    Paths1,
+    Paths3,
+    Paths9,
+};
+
+enum class SparseMoeSmallTD4Schedule : std::uint8_t {
+    Rows1,
+    Rows2,
+    Rows4,
+};
+
 struct SparseMoeSmallTPlan {
-    std::int32_t tokens         = 0;
-    std::size_t workspace_bytes = 0;
+    std::int32_t tokens                   = 0;
+    std::size_t workspace_bytes           = 0;
+    SparseMoeSmallTD3Schedule d3_schedule = SparseMoeSmallTD3Schedule::Paths3;
+    SparseMoeSmallTD4Schedule d4_schedule = SparseMoeSmallTD4Schedule::Rows1;
 };
 
 struct SparseMoeSmallTWorkspace {

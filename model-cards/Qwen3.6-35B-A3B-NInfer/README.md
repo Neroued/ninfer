@@ -3,7 +3,9 @@ library_name: ninfer
 pipeline_tag: image-text-to-text
 inference: false
 license: apache-2.0
-base_model: Qwen/Qwen3.6-35B-A3B
+base_model:
+  - Qwen/Qwen3.6-35B-A3B
+  - z-lab/Qwen3.6-35B-A3B-DFlash
 base_model_relation: quantized
 tags:
   - ninfer

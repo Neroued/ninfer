@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed two-target serving corpus performance evaluation."""
+"""Run the fixed serving corpus performance evaluation."""
 
 from __future__ import annotations
 
@@ -26,6 +26,10 @@ TARGET_MODEL_IDS = {
     "qwen3_6_27b": "qwen3.6-27b",
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
+MTP_MODES = {
+    "mtp0": 0,
+    "mtp3": 3,
+}
 
 SEEDS = (
     7632647173703958409,
@@ -266,7 +270,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="append",
         required=True,
         metavar="TARGET=PATH",
-        help="artifact for a registered target; pass once for each of the two targets",
+        help="artifact for a registered target; repeat to benchmark multiple targets",
+    )
+    parser.add_argument(
+        "--mode",
+        action="append",
+        choices=tuple(MTP_MODES),
+        help="benchmark only this mode; repeat to select both (default: mtp0 and mtp3)",
     )
     parser.add_argument("--output", type=Path, required=True, help="campaign output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
@@ -289,10 +299,7 @@ def parse_artifacts(values: Sequence[str]) -> list[tuple[str, Path]]:
         if not path.is_file():
             raise CampaignError(f"artifact not found: {path}")
         parsed[target] = path
-    missing = set(TARGET_MODEL_IDS) - set(parsed)
-    if missing:
-        raise CampaignError(f"missing artifact target(s): {', '.join(sorted(missing))}")
-    return [(target, parsed[target]) for target in TARGET_ORDER]
+    return [(target, parsed[target]) for target in TARGET_ORDER if target in parsed]
 
 
 def fixture_metadata(name: str) -> tuple[str, str | None]:
@@ -350,19 +357,21 @@ def block_fixture_names(mtp_draft_tokens: int) -> tuple[str, ...]:
 
 
 def build_specs(
-    artifacts: Sequence[tuple[str, Path]], fixtures: dict[str, Fixture]
+    artifacts: Sequence[tuple[str, Path]],
+    fixtures: dict[str, Fixture],
+    mtp_draft_tokens: Sequence[int],
 ) -> list[RunSpec]:
     specs: list[RunSpec] = []
     for target, artifact in artifacts:
-        for mtp_draft_tokens in (0, 3):
-            for fixture_name in block_fixture_names(mtp_draft_tokens):
+        for draft_tokens in mtp_draft_tokens:
+            for fixture_name in block_fixture_names(draft_tokens):
                 for seed in SEEDS:
                     specs.append(
                         RunSpec(
                             target=target,
                             model_id=TARGET_MODEL_IDS[target],
                             artifact=artifact,
-                            mtp_draft_tokens=mtp_draft_tokens,
+                            mtp_draft_tokens=draft_tokens,
                             fixture=fixtures[fixture_name],
                             seed=seed,
                         )
@@ -814,56 +823,59 @@ def summary_row(
 def build_summary_rows(
     records: dict[tuple[str, int, str, int], dict[str, Any]],
     target_order: Sequence[str],
+    mtp_draft_tokens: Sequence[int],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for target in target_order:
-        for fixture in NIAH_FIXTURES:
-            rows.append(
-                summary_row(
-                    "context_profile",
-                    target,
-                    fixture,
-                    fixture,
-                    0,
-                    select_records(records, target, 0, (fixture,)),
-                )
-            )
-
-        for fixture in LONG_DECODE_FIXTURES:
-            rows.append(
-                summary_row(
-                    "long_decode",
-                    target,
-                    "reasoning",
-                    fixture,
-                    3,
-                    select_records(records, target, 3, (fixture,)),
-                )
-            )
-
-        for category, fixture_names in SCENARIO_FIXTURES.items():
-            for fixture in fixture_names:
+        if 0 in mtp_draft_tokens:
+            for fixture in NIAH_FIXTURES:
                 rows.append(
                     summary_row(
-                        "scenario_fixture",
+                        "context_profile",
                         target,
-                        category,
+                        fixture,
+                        fixture,
+                        0,
+                        select_records(records, target, 0, (fixture,)),
+                    )
+                )
+
+        if 3 in mtp_draft_tokens:
+            for fixture in LONG_DECODE_FIXTURES:
+                rows.append(
+                    summary_row(
+                        "long_decode",
+                        target,
+                        "reasoning",
                         fixture,
                         3,
                         select_records(records, target, 3, (fixture,)),
                     )
                 )
 
-            rows.append(
-                summary_row(
-                    "scenario_category",
-                    target,
-                    category,
-                    "",
-                    3,
-                    select_records(records, target, 3, fixture_names),
+            for category, fixture_names in SCENARIO_FIXTURES.items():
+                for fixture in fixture_names:
+                    rows.append(
+                        summary_row(
+                            "scenario_fixture",
+                            target,
+                            category,
+                            fixture,
+                            3,
+                            select_records(records, target, 3, (fixture,)),
+                        )
+                    )
+
+                rows.append(
+                    summary_row(
+                        "scenario_category",
+                        target,
+                        category,
+                        "",
+                        3,
+                        select_records(records, target, 3, fixture_names),
+                    )
                 )
-            )
     return rows
 
 
@@ -978,15 +990,18 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
         ],
     )
 
+    sections: list[str] = []
+    if context_rows:
+        sections.append(f"## MTP0 context-length profile\n\n{context_table}")
+    if long_decode_rows:
+        sections.append(f"## MTP3 long-decode reasoning\n\n{long_decode_table}")
+    if category_rows:
+        sections.append(f"## MTP3 cross-scenario decode\n\n{scenario_table}")
     markdown = (
         "# Serving corpus performance summary\n\n"
         "All values are arithmetic mean ± sample standard deviation.\n\n"
-        "## MTP0 context-length profile\n\n"
-        f"{context_table}\n\n"
-        "## MTP3 long-decode reasoning\n\n"
-        f"{long_decode_table}\n\n"
-        "## MTP3 cross-scenario decode\n\n"
-        f"{scenario_table}\n"
+        + "\n\n".join(sections)
+        + "\n"
     )
     (output_dir / "summary.md").write_text(markdown, encoding="utf-8")
 
@@ -1005,30 +1020,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise CampaignError(f"ninfer-serve is not executable: {serve}")
 
     artifacts = parse_artifacts(args.artifact)
+    mode_names = args.mode or list(MTP_MODES)
+    if len(mode_names) != len(set(mode_names)):
+        raise CampaignError("duplicate --mode value")
+    mtp_draft_tokens = [MTP_MODES[name] for name in mode_names]
     fixtures = load_fixtures()
-    specs = build_specs(artifacts, fixtures)
+    specs = build_specs(artifacts, fixtures, mtp_draft_tokens)
     expected_specs = {spec.key: spec for spec in specs}
-    if len(expected_specs) != 190:
-        raise CampaignError(f"internal campaign size is {len(expected_specs)}, expected 190")
+    total = len(expected_specs)
 
     output_dir = args.output.expanduser().resolve()
     (output_dir / "server").mkdir(parents=True, exist_ok=True)
     run_path = output_dir / "run.jsonl"
     records = load_existing_records(run_path, expected_specs)
-    print(f"resume state: {len(records)}/190 formal request(s) complete", flush=True)
+    print(f"resume state: {len(records)}/{total} formal request(s) complete", flush=True)
 
     with run_path.open("a", encoding="utf-8") as run_handle:
         for target, _ in artifacts:
-            for mtp_draft_tokens in (0, 3):
+            for draft_tokens in mtp_draft_tokens:
                 block_specs = [
                     spec
                     for spec in specs
                     if spec.target == target
-                    and spec.mtp_draft_tokens == mtp_draft_tokens
+                    and spec.mtp_draft_tokens == draft_tokens
                     and spec.key not in records
                 ]
                 if not block_specs:
-                    print(f"skip {target}/mtp{mtp_draft_tokens}: block complete", flush=True)
+                    print(f"skip {target}/mtp{draft_tokens}: block complete", flush=True)
                     continue
                 run_block(
                     serve,
@@ -1040,16 +1058,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     run_handle,
                     records,
                     len(records),
-                    len(expected_specs),
+                    total,
                 )
 
     missing = set(expected_specs) - set(records)
     if missing:
         raise CampaignError(f"campaign ended with {len(missing)} missing formal request(s)")
     target_order = [target for target, _ in artifacts]
-    summary_rows = build_summary_rows(records, target_order)
+    summary_rows = build_summary_rows(records, target_order, mtp_draft_tokens)
     write_summaries(summary_rows, output_dir)
-    print(f"completed 190 formal requests; summary: {output_dir / 'summary.md'}", flush=True)
+    print(
+        f"completed {total} formal requests; summary: {output_dir / 'summary.md'}",
+        flush=True,
+    )
     return 0
 
 

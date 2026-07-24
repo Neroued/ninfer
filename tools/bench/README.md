@@ -109,6 +109,10 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
+`run_serve_corpus.py` runs both registered targets and both published MTP0/MTP3 suites when both
+artifacts are supplied. Pass one `--artifact` to select a single target and `--mode mtp0` or
+`--mode mtp3` to run only that suite.
+
 Each raw report must be `ninfer_bench_report` schema v8. The flattened summary carries native names
 from the report: selected target and artifact, load/read/upload/staging values, Engine memory arenas
 and KV payload, configured proposal head and graph mode, phase timings and throughput, and

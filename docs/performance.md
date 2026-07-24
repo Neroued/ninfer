@@ -1,6 +1,10 @@
 # Single-GPU serving performance
 
-Tested Git revision: `0795169393cab0f2c16246d4bac20dee735dc2a4`.
+Tested Git revisions:
+
+- Qwen3.6-35B-A3B MTP3: `b1a220f028aa750f75bceb3522ac00bbaab7e42d`;
+- Qwen3.6-35B-A3B MTP0 and all Qwen3.6-27B results:
+  `0795169393cab0f2c16246d4bac20dee735dc2a4`.
 
 These measurements characterize the two registered NInfer targets independently on one NVIDIA
 GeForce RTX 5090. They cover long-context prefill and baseline decode with MTP disabled, plus
@@ -48,7 +52,18 @@ mtp_tokens_per_round = 1 + accepted_tokens / mtp_rounds
 
 ## Reproduction
 
-Build `ninfer-serve`, prepare both registered `.ninfer` artifacts, and run:
+Build `ninfer-serve` and prepare the registered `.ninfer` artifacts. The refreshed 35B-A3B MTP3
+tables use:
+
+```bash
+python3 tools/bench/run_serve_corpus.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer \
+  --mode mtp3 \
+  --output profiles/bench/serve_corpus_35b_mtp3_20260724
+```
+
+Omit `--mode` and supply both artifacts to run the complete two-target MTP0/MTP3 campaign:
 
 ```bash
 python3 tools/bench/run_serve_corpus.py \
@@ -73,9 +88,9 @@ python3 tools/bench/run_serve_corpus.py \
 
 | Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|---:|
-| `long_decode_aime26_01` | 5 | 8,675.4 ± 1,565.6 | 634.3 ± 14.2 | 82.7% ± 2.6% | 3.48 ± 0.08 |
-| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 542.8 ± 12.5 | 73.0% ± 2.5% | 3.19 ± 0.07 |
-| `long_decode_aime26_30` | 5 | 55,171.0 ± 5,407.1 | 572.9 ± 9.1 | 77.7% ± 1.4% | 3.33 ± 0.04 |
+| `long_decode_aime26_01` | 5 | 7,933.0 ± 1,852.3 | 695.1 ± 17.7 | 83.3% ± 2.8% | 3.50 ± 0.08 |
+| `long_decode_aime26_15` | 5 | 65,536.0 ± 0.0 | 584.0 ± 10.6 | 72.4% ± 1.7% | 3.17 ± 0.05 |
+| `long_decode_aime26_30` | 5 | 61,743.6 ± 4,489.5 | 629.4 ± 15.7 | 79.6% ± 3.2% | 3.39 ± 0.10 |
 
 ### MTP3 cross-scenario decode
 
@@ -83,10 +98,10 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 | Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Code | 15 | 576.5 ± 21.7 | 71.0% ± 4.0% | 3.13 ± 0.12 |
-| Story | 15 | 395.9 ± 30.9 | 37.7% ± 5.8% | 2.13 ± 0.17 |
-| Translation | 15 | 559.3 ± 28.1 | 66.6% ± 5.1% | 3.00 ± 0.15 |
-| Structured | 15 | 661.2 ± 29.5 | 87.2% ± 6.0% | 3.62 ± 0.18 |
+| Code | 15 | 635.0 ± 24.2 | 71.8% ± 4.2% | 3.15 ± 0.13 |
+| Story | 15 | 434.9 ± 34.8 | 38.2% ± 5.9% | 2.15 ± 0.18 |
+| Translation | 15 | 598.6 ± 26.6 | 66.1% ± 4.5% | 2.98 ± 0.14 |
+| Structured | 15 | 714.3 ± 36.2 | 87.7% ± 6.6% | 3.63 ± 0.20 |
 
 ## `qwen3_6_27b`
 

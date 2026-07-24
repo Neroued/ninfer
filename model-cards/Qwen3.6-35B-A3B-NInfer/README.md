@@ -152,9 +152,9 @@ Thinking was enabled and the output limit was 65,536 tokens.
 
 | AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Problem 1 | 8,675.4 ± 1,565.6 | 634.3 ± 14.2 | 82.7% ± 2.6% | 3.48 ± 0.08 |
-| Problem 15 | 65,536.0 ± 0.0 | 542.8 ± 12.5 | 73.0% ± 2.5% | 3.19 ± 0.07 |
-| Problem 30 | 55,171.0 ± 5,407.1 | 572.9 ± 9.1 | 77.7% ± 1.4% | 3.33 ± 0.04 |
+| Problem 1 | 7,933.0 ± 1,852.3 | 695.1 ± 17.7 | 83.3% ± 2.8% | 3.50 ± 0.08 |
+| Problem 15 | 65,536.0 ± 0.0 | 584.0 ± 10.6 | 72.4% ± 1.7% | 3.17 ± 0.05 |
+| Problem 30 | 61,743.6 ± 4,489.5 | 629.4 ± 15.7 | 79.6% ± 3.2% | 3.39 ± 0.10 |
 
 ### MTP=3 cross-scenario decode
 
@@ -163,10 +163,10 @@ disabled and the output limit was 4,096 tokens.
 
 | Category | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
-| Code | 576.5 ± 21.7 | 71.0% ± 4.0% | 3.13 ± 0.12 |
-| Story | 395.9 ± 30.9 | 37.7% ± 5.8% | 2.13 ± 0.17 |
-| Translation | 559.3 ± 28.1 | 66.6% ± 5.1% | 3.00 ± 0.15 |
-| Structured output | 661.2 ± 29.5 | 87.2% ± 6.0% | 3.62 ± 0.18 |
+| Code | 635.0 ± 24.2 | 71.8% ± 4.2% | 3.15 ± 0.13 |
+| Story | 434.9 ± 34.8 | 38.2% ± 5.9% | 2.15 ± 0.18 |
+| Translation | 598.6 ± 26.6 | 66.1% ± 4.5% | 2.98 ± 0.14 |
+| Structured output | 714.3 ± 36.2 | 87.7% ± 6.6% | 3.63 ± 0.20 |
 
 See the
 [full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),
@@ -191,8 +191,6 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 - The artifact is accepted only by the matching NInfer target.
 - NInfer currently executes on one RTX 5090, one CUDA device, and one active request per Engine.
-- The artifact contains the DFlash companion weights, but the current Engine does not execute
-  DFlash proposals and leaves that weight group nonresident.
 - It does not provide continuous batching, multi-GPU execution, CPU/GPU offload, or distributed
   serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.

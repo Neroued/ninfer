@@ -25,8 +25,8 @@ cross-target comparisons.
 
 - MTP0 at a 7,680-token prompt: **15,544.3 prefill tok/s** and **271.1 decode tok/s**.
 - MTP0 at a 260,096-token prompt: **5,157.1 prefill tok/s** and **188.2 decode tok/s**.
-- MTP3 long reasoning: **542.8–634.3 decode tok/s** with **73.0–82.7% acceptance**.
-- MTP3 structured output: **661.2 decode tok/s**, **87.2% acceptance**, and **3.62 tokens/round**.
+- MTP3 long reasoning: **584.0–695.1 decode tok/s** with **72.4–83.3% acceptance**.
+- MTP3 structured output: **714.3 decode tok/s**, **87.7% acceptance**, and **3.63 tokens/round**.
 
 **Qwen3.6-27B**
 

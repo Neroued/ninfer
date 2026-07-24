@@ -115,11 +115,13 @@ For DFlash:
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 --max-new 512 \
-  --spec dflash --draft-tokens 15 --lm-head-draft
+  --spec dflash --draft-tokens 7 --lm-head-draft
 ```
 
 MTP and DFlash cannot be enabled together. The published [performance results](performance.md)
-currently use MTP with a draft window of three and the optimized proposal head.
+use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
+the optimized proposal head. DFlash accepts up to fifteen draft tokens; seven is the current
+measured recommendation rather than a semantic limit.
 
 ## Common options
 

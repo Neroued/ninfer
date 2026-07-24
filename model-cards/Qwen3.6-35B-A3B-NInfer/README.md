@@ -113,6 +113,22 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
   --lm-head-draft
 ```
 
+For text-only DFlash, the measured block-8 configuration uses seven draft tokens:
+
+```bash
+./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
+  --prompt "Explain prefill and decode in three sentences." \
+  --max-context 16384 \
+  --max-new 256 \
+  --spec dflash --draft-tokens 7 \
+  --lm-head-draft
+```
+
+`--draft-tokens` accepts `1..5` for MTP and `1..15` for DFlash. The DFlash value `7` is the
+current measured recommendation, not a semantic limit; `15` uses the companion's full native
+16-position block. MTP and DFlash are mutually exclusive. DFlash is text-only and cannot be
+combined with `--vision`; use a separate non-DFlash process for image or video requests.
+
 For images, videos, structured chat history, and HTTP serving, see the
 [NInfer documentation](https://github.com/Neroued/ninfer/tree/master/docs).
 
@@ -167,6 +183,27 @@ disabled and the output limit was 4,096 tokens.
 | Story | 434.9 ± 34.8 | 38.2% ± 5.9% | 2.15 ± 0.18 |
 | Translation | 598.6 ± 26.6 | 66.1% ± 4.5% | 2.98 ± 0.14 |
 | Structured output | 714.3 ± 36.2 | 87.7% ± 6.6% | 3.63 ± 0.20 |
+
+### DFlash block=8 (`k=7`) decode
+
+These stochastic-sampling measurements use the same fixtures, sampling parameters, output limits,
+and server configuration as MTP3. Different speculative backends consume random values
+differently, so this is a fixed-workload comparison rather than a token-identical output
+comparison.
+
+| Workload | Decode tok/s | DFlash acceptance | DFlash tokens/round | Change vs. MTP3 |
+|---|---:|---:|---:|---:|
+| AIME 2026 problem 1 | 764.1 ± 55.6 | 65.2% ± 5.4% | 5.56 ± 0.38 | +9.9% |
+| AIME 2026 problem 15 | 584.0 ± 33.3 | 51.1% ± 3.7% | 4.58 ± 0.26 | 0.0% |
+| AIME 2026 problem 30 | 638.3 ± 15.8 | 56.4% ± 2.5% | 4.95 ± 0.17 | +1.4% |
+| Code | 562.3 ± 36.2 | 43.0% ± 3.7% | 4.01 ± 0.26 | -11.4% |
+| Story | 261.7 ± 51.1 | 12.1% ± 5.3% | 1.85 ± 0.37 | -39.8% |
+| Translation | 490.8 ± 62.6 | 34.8% ± 6.3% | 3.44 ± 0.44 | -18.0% |
+| Structured output | 786.4 ± 124.7 | 66.5% ± 13.5% | 5.66 ± 0.94 | +10.1% |
+
+DFlash throughput is acceptance-sensitive: block=8 leads on the measured long-reasoning and
+structured-output cases with sufficient acceptance, while MTP3 remains faster on the measured
+code, story, and translation categories.
 
 See the
 [full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),

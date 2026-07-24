@@ -65,6 +65,8 @@ The repository contains
 [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) converted to the native
 [NInfer](https://github.com/Neroued/ninfer) `.ninfer` artifact format. The artifact is intended
 only for NInfer; it is not a Transformers checkpoint, Safetensors distribution, or GGUF file.
+Its optional DFlash companion weights come from
+[z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash).
 
 ## Artifact
 
@@ -239,8 +241,8 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 |---|---|
 | Base source repository | `Qwen/Qwen3.6-35B-A3B` |
 | Base source revision | `995ad96eacd98c81ed38be0c5b274b04031597b0` |
-| DFlash source repository | `z-lab/Qwen3.6-35B-A3B-DFlash` |
-| DFlash source revision | `f181eece646affea2c38b2765f1aaa01a9734ccd` |
+| DFlash source repository | [z-lab/Qwen3.6-35B-A3B-DFlash](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash) |
+| DFlash source revision | [`f181eece646affea2c38b2765f1aaa01a9734ccd`](https://huggingface.co/z-lab/Qwen3.6-35B-A3B-DFlash/tree/f181eece646affea2c38b2765f1aaa01a9734ccd) |
 | Conversion recipe | `qwen3_6_35b_a3b-v2` |
 | Converter repository | `https://github.com/Neroued/ninfer` |
 

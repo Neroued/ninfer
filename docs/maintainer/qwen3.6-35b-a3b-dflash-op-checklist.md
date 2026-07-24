@@ -117,8 +117,9 @@ The complete path that this checklist must eventually support is:
    the shared W8 token embeddings into `u_0 [2048,B]`.
 5. Run six plain-norm, QKV, bidirectional attention, output-residual, dense-SwiGLU, and
    down-residual layers.
-6. Plain-normalize only the `K` mask columns, use the shared Q6 full output head, and greedily
-   select one same-position proposal from each column.
+6. Plain-normalize only the `K` mask columns, then use either the shared Q6 full output head or
+   the Q4 optimized shortlist head plus token-id remap to select one greedy same-position proposal
+   from each column.
 7. Run the already-qualified target causal verification pass over `[anchor, proposals...]`.
 8. Publish the accepted target result and make only input columns `0..A`, namely `C=A+1`
    positions, durable in target state and companion context. The correction or bonus token is the
@@ -163,8 +164,8 @@ attention kernel. A parallel model-labelled implementation is not wanted.
 | `OP-R01` | W8 `embedding [248320,2048]` | direct reuse | mask row 248077, repeated masks, every `B=2..16`, Graph replay |
 | `OP-R02` | W8 `linear_add [2048,4096]` | direct reuse for attention output plus residual | containing companion-layer measurement |
 | `OP-R03` | W8 `linear [12288,2048]` plus `silu_mul` | correct composed control | production route is `OP-A06` |
-| `OP-R04` | Q6 `linear [248320,2048]` | direct reuse for the full shared head | run only `K=1..15` mask columns |
-| `OP-R05` | `argmax(valid_rows=248077)` | direct reuse | same-position proposal integration |
+| `OP-R04` | Q6 `linear [248320,2048]` or Q4 `linear [131072,2048]` | direct reuse for full or optimized proposal head | run only `K=1..15` mask columns |
+| `OP-R05` | `argmax` and `proposal_remap_token_ids` | direct reuse; remap only the optimized route | same-position proposal integration for both routes |
 | `OP-R06` | target verify and greedy speculative transaction | target side supports `K=1..15`, `A=0..15` | add companion-context commit/resume checks |
 
 The old 35B `gqa_attention` qualification is target-only: causal, head dimension 256, and
@@ -907,14 +908,23 @@ These checks should not create new implementations unless measurement exposes a 
 After final plain norm, pass only mask columns `1..B-1`, producing hidden `[2048,K]`.
 
 ```text
-logits = Q6_linear(shared_output_head, hidden)   # [248320,K]
-drafts = argmax(logits, valid_rows=248077)       # [K]
+full:
+  logits = Q6_linear(shared_output_head, hidden)       # [248320,K]
+  drafts = argmax(logits, valid_rows=248077)            # [K]
+
+optimized:
+  short_logits = Q4_linear(draft_head, hidden)          # [131072,K]
+  short_rows = argmax(short_logits, valid_rows=131072)  # [K]
+  drafts = proposal_remap_token_ids(
+      short_rows, draft_head_token_ids)                  # [K]
 ```
 
-The prediction is same-position and has no language-model shift. The MTP shortlist head and token
-remap are not used. Existing Q6 and argmax qualifications cover `K=1..15`; add a composed
-same-position proposal check and complete-stage benchmark. The current phase materializes BF16
-logits and calls `argmax`; `FUT-F03` is only a later greedy-mode optimization note.
+The prediction is same-position and has no language-model shift. The optimized proposal head is
+not MTP-specific: either drafter may use its shortlist token as a legal speculative proposal,
+while target verification preserves final output correctness. Existing Q6/Q4 linear, argmax, and
+remap support is reused; add composed same-position checks and complete-stage benchmarks for both
+routes at `K=1..15`. The current phase materializes BF16 logits and calls `argmax`; `FUT-F03` is
+only a later greedy-mode optimization note.
 
 ### OP-R06: target verification and acceptance
 
@@ -983,11 +993,13 @@ out[t] = lowest v attaining max(logical_logits[0:valid_rows,t])
 
 The BF16 logit boundary is semantic because this Op replaces `argmax(BF16(linear(...)))`.
 Comparing private FP32 accumulators could change a near-tied token and is not equivalent. The first
-registered shape is the Q6 `[248320,2048]` head with `K=1..15`.
+registered shapes are the Q6 `[248320,2048]` full head and Q4 `[131072,2048]` optimized head with
+`K=1..15`; the latter still requires the existing token-id remap.
 
-This avoids writing and rereading up to `248320*K` BF16 logits. Preserve the independent full-head
-oracle and tie rule. Do not use this Op for stochastic proposals, target sampling, or any caller
-that requires logits.
+This avoids writing and rereading up to `248320*K` BF16 logits. Preserve the independent
+decoded-weight oracle and tie rule for each registered matrix; optimized output need not equal the
+full-head result. Do not use this Op for stochastic proposals, target sampling, or any caller that
+requires logits.
 
 ### FUT-F04: `linear_add_rmsnorm`
 

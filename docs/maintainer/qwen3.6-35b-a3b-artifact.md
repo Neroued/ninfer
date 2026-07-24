@@ -24,7 +24,7 @@ qwen3_6_35b_a3b
 
 The target key selects this exact checkpoint package and is not serialized as a second `model_id`.
 
-Every conforming artifact is one complete product image containing Text, the optimized MTP draft
+Every conforming artifact is one complete product image containing Text, the optimized proposal
 head, MTP, Vision, DFlash, and the six frontend resources in this document. DFlash is part of the
 same artifact and does not define a second artifact or an optional artifact profile.
 
@@ -105,7 +105,7 @@ both resources into the 248077-entry token domain.
 | router and shared-expert scalar gate | `BF16` |
 | Text norms, convolution, and A/B projections | `BF16` |
 | GDN `A_log` and `dt_bias` | `FP32` |
-| optimized MTP draft head | `Q4G64_F16S` |
+| optimized proposal head | `Q4G64_F16S` |
 | MTP matrices, including routed experts | `W8G32_F16S` |
 | DFlash feature, attention, and MLP matrices | `W8G32_F16S` |
 | DFlash norms | `BF16` |
@@ -152,8 +152,8 @@ Expert ids are not permuted.
 
 ### 4.1 Namespace and writer order
 
-- `text/` contains the embedding, 40 Text layers, final norm, full output head, and optimized MTP
-  draft head.
+- `text/` contains the embedding, 40 Text layers, final norm, full output head, and optimized
+  proposal head.
 - `mtp/` contains MTP-private tensors.
 - `vision/` contains the Vision tower and merger.
 - `dflash/` contains DFlash-private tensors.
@@ -188,7 +188,7 @@ The artifact contains exactly these `raw-bytes-v1` resources:
 
 The artifact retains these resource payloads byte-for-byte.
 
-## 5. Text and optimized MTP draft inventory
+## 5. Text and optimized proposal inventory
 
 ### 5.1 Text-global objects
 
@@ -251,7 +251,7 @@ The routed-down format is `Q6G64_F16S` for layers:
 
 It is `Q5G64_F16S` for the other 37 layers.
 
-### 5.5 Optimized MTP draft head
+### 5.5 Optimized proposal head
 
 | Order | Object name | Shape | Format |
 |---:|---|---|---|
@@ -416,13 +416,15 @@ expert rows = [e*2048,(e+1)*2048)
 |---|---|
 | MTP token embedding | `text/token_embedding` |
 | MTP full output head | `text/output_head` |
-| MTP optimized proposal head | `text/draft_head` plus `text/draft_head_token_ids` |
+| optimized proposal head for MTP or DFlash | `text/draft_head` plus `text/draft_head_token_ids` |
 | DFlash anchor-token embedding | row view of `text/token_embedding` |
 | DFlash mask embedding | row 248077 of `text/token_embedding` |
-| DFlash proposal output head | `text/output_head` |
+| DFlash full proposal output head | `text/output_head` |
+| DFlash optimized proposal head | `text/draft_head` plus `text/draft_head_token_ids` |
 | GDN channel-major convolution | transpose view of the stored `[4,8192]` convolution |
 
-DFlash does not alias or consume `text/draft_head`.
+The optimized proposal pair is independent of the selected drafter. It may be consumed by MTP or
+DFlash, but is materialized only when the startup proposal-head route is `optimized`.
 
 ## 10. Inventory summary
 
@@ -434,7 +436,7 @@ DFlash does not alias or consume `text/draft_head`.
 | full-attention Text layers | `10 × 11` | 110 |
 | GDN Text layers | `30 × 14` | 420 |
 | main Text excluding draft | `3 + 110 + 420` | 533 |
-| optimized MTP draft head | weight + id map | 2 |
+| optimized proposal head | weight + id map | 2 |
 | MTP | fixed inventory | 15 |
 | Vision stem | fixed inventory | 3 |
 | Vision blocks | `27 × 12` | 324 |
@@ -470,7 +472,7 @@ The artifact contains 548 direct tensors using `contiguous-le-v1` and 386 quanti
 
 | Component | Source identity | Tensor source |
 |---|---|---|
-| Text, optimized MTP draft head, MTP, Vision, and frontend | `Qwen/Qwen3.6-35B-A3B` revision `995ad96eacd98c81ed38be0c5b274b04031597b0` | `model.safetensors.index.json` and its 26 shards |
+| Text, optimized proposal head, MTP, Vision, and frontend | `Qwen/Qwen3.6-35B-A3B` revision `995ad96eacd98c81ed38be0c5b274b04031597b0` | `model.safetensors.index.json` and its 26 shards |
 | DFlash | `z-lab/Qwen3.6-35B-A3B-DFlash` revision `f181eece646affea2c38b2765f1aaa01a9734ccd` | `dflash-bf16/model.safetensors` |
 
 The base checkpoint contributes 1045 BF16 source tensors. The DFlash checkpoint contributes 69
@@ -558,7 +560,7 @@ qkgv  = concatenate_rows(query, k_proj, gate, v_proj)
 | `moe/shared_gate_up` | shared `gate_proj.weight`, `up_proj.weight`, each `[512,2048]` | concatenate `[gate,up]`, quantize W8 |
 | `moe/shared_down` | shared `down_proj.weight [2048,512]` | quantize W8 |
 
-### 12.5 Optimized MTP draft-head construction
+### 12.5 Optimized proposal-head construction
 
 The fixed ranking source is:
 

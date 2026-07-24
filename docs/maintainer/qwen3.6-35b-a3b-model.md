@@ -467,8 +467,10 @@ In the DFlash training objective, one clean anchor precedes a block whose remain
 replaced by the internal mask row. Frozen target residual features condition the drafter, and the
 original tokens at all masked positions supply cross-entropy targets in one pass; position-dependent
 loss weighting emphasizes the earlier proposals whose errors would truncate more of the accepted
-prefix. The target model and its shared embedding/output head remain fixed. This objective explains
-the block-parallel inference geometry but does not add a diffusion timestep or iterative sampler.
+prefix. The target model and its shared embedding/output head remain fixed. A deployment may use
+either that full output head or the artifact's optimized proposal shortlist to select DFlash
+drafts; this does not alter the trained DFlash layers. This objective explains the block-parallel
+inference geometry but does not add a diffusion timestep or iterative sampler.
 
 ### Target conditioning
 
@@ -514,11 +516,16 @@ role               anchor    proposal      proposal
 ```
 
 The initial query residuals are the target embeddings of these 16 rows. The anchor row conditions
-the block but is not sampled. After one six-layer forward, final plain RMSNorm and the shared target
-`lm_head` are applied, and only the 15 mask-row logits are sampled. A mask row predicts the token at
-that same absolute position; there is no causal-language-model one-position shift. Consequently,
-the checkpoint's `block_size=16` means one anchor plus 15 proposals. In an API where
-`num_speculative_tokens` counts proposals, the matching value is 15 rather than 16.
+the block but is not sampled. After one six-layer forward, final plain RMSNorm is applied and only
+the 15 mask columns produce proposals. The full route applies the shared target
+`lm_head [248320,2048]` and takes argmax over rows `0..248076`. The optimized route applies
+`text/draft_head [131072,2048]`, takes shortlist argmax, and remaps the selected row through
+`text/draft_head_token_ids`. Either route produces a valid speculative proposal; shortlist output
+need not equal full-head argmax because causal target verification remains the output correctness
+boundary. A mask row predicts the token at that same absolute position; there is no
+causal-language-model one-position shift. Consequently, the checkpoint's `block_size=16` means one
+anchor plus 15 proposals. In an API where `num_speculative_tokens` counts proposals, the matching
+value is 15 rather than 16.
 
 The published companion also permits a shorter total block, such as eight rows. A total block of
 `B` rows always contains one anchor and `B-1` masks. Because the final layer is non-causal, changing
@@ -723,8 +730,9 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
 ## 15. Precision and reference boundaries
 
 - All 1045 base-checkpoint tensors are BF16; the base source has no quantization configuration.
-- All 69 private DFlash-companion tensors are BF16. Its target embedding and `lm_head` are the
-  target's existing matrices rather than companion parameters.
+- All 69 private DFlash-companion tensors are BF16. Its target embedding is the target's existing
+  matrix. Proposal selection may use the existing full `lm_head` or the artifact's existing
+  optimized proposal head; neither is a private companion parameter.
 - Public activation, cache, and recurrent-state dtypes are stated by their owning Op/state contract.
   In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16/INT8 KV
   formats remain real persistent representation boundaries.
@@ -769,11 +777,12 @@ The first five layers may use 4096-slot cyclic K/V storage, but a proposal query
 last 4095 committed context positions according to its absolute position; a retained row at
 distance 4096 is outside the mask. These caches do not grow with total context.
 
-The Program freezes its feature set at startup. A zero MTP draft window has no MTP weight view,
-MTP KV cache, or optimized proposal head. With Vision disabled, it has no Vision weight view and
-the shared workspace excludes the maximum Vision envelope; media is rejected by the matching
-Frontend. The complete artifact inventory is still validated before these resident views are
-published.
+The Program freezes its feature set at startup. A disabled speculative backend has no proposal
+model state or optimized proposal-head view. MTP and DFlash each load the optimized proposal head
+only when that head route is selected; DFlash never loads MTP decoder weights or MTP KV state.
+With Vision disabled, the Program has no Vision weight view and the shared workspace excludes the
+maximum Vision envelope; media is rejected by the matching Frontend. The complete artifact
+inventory is still validated before these resident views are published.
 
 ## 17. Base-checkpoint tensor layout
 

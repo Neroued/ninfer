@@ -26,10 +26,13 @@ TARGET_MODEL_IDS = {
     "qwen3_6_27b": "qwen3.6-27b",
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
-MTP_MODES = {
-    "mtp0": 0,
-    "mtp3": 3,
+SPECULATIVE_MODES = {
+    "mtp0": ("none", 0),
+    "mtp3": ("mtp", 3),
+    "dflash7": ("dflash", 7),
 }
+DEFAULT_MODES = ("mtp0", "mtp3")
+SAMPLING_MODES = ("stochastic", "greedy")
 
 SEEDS = (
     7632647173703958409,
@@ -77,7 +80,7 @@ SCENARIO_FIXTURES = {
 
 WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
-RUN_SCHEMA_VERSION = 3
+RUN_SCHEMA_VERSION = 4
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
 SERVER_LOG_SCHEMA_VERSION = 2
 STARTUP_TIMEOUT_SECONDS = 1800.0
@@ -100,17 +103,22 @@ class RunSpec:
     target: str
     model_id: str
     artifact: Path
-    mtp_draft_tokens: int
+    speculative_mode: str
+    speculative_backend: str
+    draft_tokens: int
+    sampling_mode: str
     fixture: Fixture
     seed: int
 
     @property
-    def mtp_mode(self) -> str:
-        return f"mtp{self.mtp_draft_tokens}"
-
-    @property
-    def key(self) -> tuple[str, int, str, int]:
-        return (self.target, self.mtp_draft_tokens, self.fixture.name, self.seed)
+    def key(self) -> tuple[str, str, str, str, int]:
+        return (
+            self.target,
+            self.speculative_mode,
+            self.sampling_mode,
+            self.fixture.name,
+            self.seed,
+        )
 
 
 class CampaignError(RuntimeError):
@@ -275,8 +283,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         action="append",
-        choices=tuple(MTP_MODES),
-        help="benchmark only this mode; repeat to select both (default: mtp0 and mtp3)",
+        choices=tuple(SPECULATIVE_MODES),
+        help="benchmark only this mode; repeat to select multiple (default: mtp0 and mtp3)",
+    )
+    parser.add_argument(
+        "--sampling",
+        choices=SAMPLING_MODES,
+        default="stochastic",
+        help="sampling profile for all requests (default: stochastic)",
     )
     parser.add_argument("--output", type=Path, required=True, help="campaign output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
@@ -347,31 +361,38 @@ def load_fixtures() -> dict[str, Fixture]:
     return fixtures
 
 
-def block_fixture_names(mtp_draft_tokens: int) -> tuple[str, ...]:
+def block_fixture_names(speculative_backend: str) -> tuple[str, ...]:
     scenarios = tuple(name for names in SCENARIO_FIXTURES.values() for name in names)
-    if mtp_draft_tokens == 0:
+    if speculative_backend == "none":
         return NIAH_FIXTURES
-    if mtp_draft_tokens == 3:
+    if speculative_backend in {"mtp", "dflash"}:
         return (*LONG_DECODE_FIXTURES, *scenarios)
-    raise CampaignError(f"unsupported MTP draft window: {mtp_draft_tokens}")
+    raise CampaignError(f"unsupported speculative backend: {speculative_backend}")
 
 
 def build_specs(
     artifacts: Sequence[tuple[str, Path]],
     fixtures: dict[str, Fixture],
-    mtp_draft_tokens: Sequence[int],
+    mode_names: Sequence[str],
+    sampling_mode: str,
 ) -> list[RunSpec]:
     specs: list[RunSpec] = []
     for target, artifact in artifacts:
-        for draft_tokens in mtp_draft_tokens:
-            for fixture_name in block_fixture_names(draft_tokens):
+        for mode_name in mode_names:
+            backend, draft_tokens = SPECULATIVE_MODES[mode_name]
+            if backend == "dflash" and target != "qwen3_6_35b_a3b":
+                raise CampaignError("DFlash corpus measurements require the 35B-A3B target")
+            for fixture_name in block_fixture_names(backend):
                 for seed in SEEDS:
                     specs.append(
                         RunSpec(
                             target=target,
                             model_id=TARGET_MODEL_IDS[target],
                             artifact=artifact,
-                            mtp_draft_tokens=draft_tokens,
+                            speculative_mode=mode_name,
+                            speculative_backend=backend,
+                            draft_tokens=draft_tokens,
+                            sampling_mode=sampling_mode,
                             fixture=fixtures[fixture_name],
                             seed=seed,
                         )
@@ -452,12 +473,16 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         "kv_cache": "int8-group64",
         "cuda_graph": True,
         "prefix_reuse": False,
-        "speculative_backend": "mtp" if spec.mtp_draft_tokens else "none",
-        "speculative_draft_window": spec.mtp_draft_tokens,
-        "proposal_head": "optimized" if spec.mtp_draft_tokens else "full",
+        "speculative_backend": spec.speculative_backend,
+        "speculative_draft_window": spec.draft_tokens,
+        "proposal_head": "optimized" if spec.draft_tokens else "full",
     }
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
+    if event.get("sampling_defaults", {}).get("greedy") != (
+        spec.sampling_mode == "greedy"
+    ):
+        raise CampaignError("server_start sampling mode does not match the campaign")
     if event.get("artifact", {}).get("target") != spec.target:
         raise CampaignError(
             "loaded artifact target mismatch: "
@@ -515,17 +540,17 @@ def build_result_record(
         decode_seconds = float(timings["decode"])
         total_seconds = float(timings["total"])
         backend = str(speculative["backend"])
-        mtp_rounds = int(speculative["rounds"])
+        speculative_rounds = int(speculative["rounds"])
         drafted_tokens = int(speculative["drafted_tokens"])
         accepted_tokens = int(speculative["accepted_tokens"])
         fallback_steps = int(speculative["fallback_steps"])
     except (KeyError, TypeError, ValueError) as exc:
         raise CampaignError(f"request_done is missing required metrics: {exc}") from exc
 
-    expected_backend = "mtp" if spec.mtp_draft_tokens else "none"
-    if backend != expected_backend:
+    if backend != spec.speculative_backend:
         raise CampaignError(
-            f"request_done speculative backend {backend!r} != {expected_backend!r}"
+            f"request_done speculative backend {backend!r} != "
+            f"{spec.speculative_backend!r}"
         )
 
     usage = response.get("usage", {})
@@ -549,12 +574,12 @@ def build_result_record(
         "prefill_tok_s": safe_ratio(float(prompt_tokens), prefill_seconds),
         "server_ttft_ms": 1000.0 * (prepare_seconds + vision_seconds + prefill_seconds),
         "decode_tok_s": safe_ratio(float(decode_tokens), decode_seconds),
-        "mtp_rounds": mtp_rounds,
+        "speculative_rounds": speculative_rounds,
         "drafted_tokens": drafted_tokens,
         "accepted_tokens": accepted_tokens,
-        "mtp_acceptance": safe_ratio(float(accepted_tokens), float(drafted_tokens)),
-        "mtp_tokens_per_round": (
-            1.0 + accepted_tokens / mtp_rounds if mtp_rounds > 0 else None
+        "speculative_acceptance": safe_ratio(float(accepted_tokens), float(drafted_tokens)),
+        "speculative_tokens_per_round": (
+            1.0 + accepted_tokens / speculative_rounds if speculative_rounds > 0 else None
         ),
         "fallback_steps": fallback_steps,
     }
@@ -568,8 +593,10 @@ def build_result_record(
         "suite": spec.fixture.suite,
         "category": spec.fixture.category,
         "seed": spec.seed,
-        "mtp_mode": spec.mtp_mode,
-        "mtp_draft_tokens": spec.mtp_draft_tokens,
+        "speculative_mode": spec.speculative_mode,
+        "speculative_backend": spec.speculative_backend,
+        "draft_tokens": spec.draft_tokens,
+        "sampling_mode": spec.sampling_mode,
         "request": payload,
         "response": response,
         "server_event": server_event,
@@ -577,11 +604,12 @@ def build_result_record(
     }
 
 
-def record_key(record: dict[str, Any]) -> tuple[str, int, str, int]:
+def record_key(record: dict[str, Any]) -> tuple[str, str, str, str, int]:
     try:
         return (
             str(record["target"]),
-            int(record["mtp_draft_tokens"]),
+            str(record["speculative_mode"]),
+            str(record["sampling_mode"]),
             str(record["fixture"]),
             int(record["seed"]),
         )
@@ -591,9 +619,9 @@ def record_key(record: dict[str, Any]) -> tuple[str, int, str, int]:
 
 def load_existing_records(
     path: Path,
-    expected_specs: dict[tuple[str, int, str, int], RunSpec],
-) -> dict[tuple[str, int, str, int], dict[str, Any]]:
-    records: dict[tuple[str, int, str, int], dict[str, Any]] = {}
+    expected_specs: dict[tuple[str, str, str, str, int], RunSpec],
+) -> dict[tuple[str, str, str, str, int], dict[str, Any]]:
+    records: dict[tuple[str, str, str, str, int], dict[str, Any]] = {}
     if not path.exists():
         return records
     try:
@@ -658,16 +686,18 @@ def server_command(
         "int8",
         "--no-prefix-reuse",
     ]
-    if spec.mtp_draft_tokens:
+    if spec.speculative_backend != "none":
         command.extend(
             [
                 "--spec",
-                "mtp",
+                spec.speculative_backend,
                 "--draft-tokens",
-                str(spec.mtp_draft_tokens),
+                str(spec.draft_tokens),
                 "--lm-head-draft",
             ]
         )
+    if spec.sampling_mode == "greedy":
+        command.append("--greedy")
     return command
 
 
@@ -679,15 +709,20 @@ def run_block(
     port: int,
     device: int,
     run_handle: Any,
-    records: dict[tuple[str, int, str, int], dict[str, Any]],
+    records: dict[tuple[str, str, str, str, int], dict[str, Any]],
     completed_before_block: int,
     total: int,
 ) -> None:
     first = block_specs[0]
-    server_log = output_dir / "server" / f"{first.target}_{first.mtp_mode}.jsonl"
+    server_log = (
+        output_dir
+        / "server"
+        / f"{first.target}_{first.speculative_mode}_{first.sampling_mode}.jsonl"
+    )
     command = server_command(serve, first, server_log, port, device)
     print(
-        f"start {first.target}/{first.mtp_mode}: {len(block_specs)} missing request(s)",
+        f"start {first.target}/{first.speculative_mode}: "
+        f"{len(block_specs)} missing request(s)",
         flush=True,
     )
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
@@ -720,7 +755,7 @@ def run_block(
                 records[spec.key] = record
                 completed = completed_before_block + block_index
                 print(
-                    f"[{completed}/{total}] {spec.target}/{spec.mtp_mode} "
+                    f"[{completed}/{total}] {spec.target}/{spec.speculative_mode} "
                     f"{spec.fixture.name} seed={spec.seed}",
                     flush=True,
                 )
@@ -747,13 +782,14 @@ def sample_stats(records: Sequence[dict[str, Any]], name: str) -> tuple[int, flo
 
 
 def select_records(
-    records: dict[tuple[str, int, str, int], dict[str, Any]],
+    records: dict[tuple[str, str, str, str, int], dict[str, Any]],
     target: str,
-    mtp_draft_tokens: int,
+    speculative_mode: str,
+    sampling_mode: str,
     fixtures: Sequence[str],
 ) -> list[dict[str, Any]]:
     return [
-        records[(target, mtp_draft_tokens, fixture, seed)]
+        records[(target, speculative_mode, sampling_mode, fixture, seed)]
         for fixture in fixtures
         for seed in SEEDS
     ]
@@ -764,7 +800,8 @@ SUMMARY_FIELDS = (
     "target",
     "group",
     "fixture",
-    "mtp_mode",
+    "speculative_mode",
+    "sampling_mode",
     "samples",
     "prompt_tokens_mean",
     "prompt_tokens_stddev",
@@ -776,10 +813,10 @@ SUMMARY_FIELDS = (
     "completion_tokens_stddev",
     "decode_tok_s_mean",
     "decode_tok_s_stddev",
-    "mtp_acceptance_mean",
-    "mtp_acceptance_stddev",
-    "mtp_tokens_per_round_mean",
-    "mtp_tokens_per_round_stddev",
+    "speculative_acceptance_mean",
+    "speculative_acceptance_stddev",
+    "speculative_tokens_per_round_mean",
+    "speculative_tokens_per_round_stddev",
 )
 
 
@@ -799,7 +836,8 @@ def summary_row(
     target: str,
     group: str,
     fixture: str,
-    mtp_draft_tokens: int,
+    speculative_mode: str,
+    sampling_mode: str,
     records: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
@@ -807,7 +845,8 @@ def summary_row(
         "target": target,
         "group": group,
         "fixture": fixture,
-        "mtp_mode": f"mtp{mtp_draft_tokens}",
+        "speculative_mode": speculative_mode,
+        "sampling_mode": sampling_mode,
         "samples": len(records),
     }
     set_stats(row, "prompt_tokens", records, "prompt_tokens")
@@ -815,32 +854,43 @@ def summary_row(
     set_stats(row, "server_ttft_ms", records, "server_ttft_ms")
     set_stats(row, "completion_tokens", records, "completion_tokens")
     set_stats(row, "decode_tok_s", records, "decode_tok_s")
-    set_stats(row, "mtp_acceptance", records, "mtp_acceptance")
-    set_stats(row, "mtp_tokens_per_round", records, "mtp_tokens_per_round")
+    set_stats(row, "speculative_acceptance", records, "speculative_acceptance")
+    set_stats(
+        row,
+        "speculative_tokens_per_round",
+        records,
+        "speculative_tokens_per_round",
+    )
     return row
 
 
 def build_summary_rows(
-    records: dict[tuple[str, int, str, int], dict[str, Any]],
+    records: dict[tuple[str, str, str, str, int], dict[str, Any]],
     target_order: Sequence[str],
-    mtp_draft_tokens: Sequence[int],
+    mode_names: Sequence[str],
+    sampling_mode: str,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for target in target_order:
-        if 0 in mtp_draft_tokens:
-            for fixture in NIAH_FIXTURES:
-                rows.append(
-                    summary_row(
-                        "context_profile",
-                        target,
-                        fixture,
-                        fixture,
-                        0,
-                        select_records(records, target, 0, (fixture,)),
+        for mode_name in mode_names:
+            backend, _ = SPECULATIVE_MODES[mode_name]
+            if backend == "none":
+                for fixture in NIAH_FIXTURES:
+                    rows.append(
+                        summary_row(
+                            "context_profile",
+                            target,
+                            fixture,
+                            fixture,
+                            mode_name,
+                            sampling_mode,
+                            select_records(
+                                records, target, mode_name, sampling_mode, (fixture,)
+                            ),
+                        )
                     )
-                )
+                continue
 
-        if 3 in mtp_draft_tokens:
             for fixture in LONG_DECODE_FIXTURES:
                 rows.append(
                     summary_row(
@@ -848,8 +898,11 @@ def build_summary_rows(
                         target,
                         "reasoning",
                         fixture,
-                        3,
-                        select_records(records, target, 3, (fixture,)),
+                        mode_name,
+                        sampling_mode,
+                        select_records(
+                            records, target, mode_name, sampling_mode, (fixture,)
+                        ),
                     )
                 )
 
@@ -861,8 +914,11 @@ def build_summary_rows(
                             target,
                             category,
                             fixture,
-                            3,
-                            select_records(records, target, 3, (fixture,)),
+                            mode_name,
+                            sampling_mode,
+                            select_records(
+                                records, target, mode_name, sampling_mode, (fixture,)
+                            ),
                         )
                     )
 
@@ -872,8 +928,11 @@ def build_summary_rows(
                         target,
                         category,
                         "",
-                        3,
-                        select_records(records, target, 3, fixture_names),
+                        mode_name,
+                        sampling_mode,
+                        select_records(
+                            records, target, mode_name, sampling_mode, fixture_names
+                        ),
                     )
                 )
     return rows
@@ -910,6 +969,16 @@ def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str
     return "\n".join((header, divider, *body))
 
 
+def mode_display_name(mode_name: str) -> str:
+    if mode_name == "mtp0":
+        return "MTP0"
+    if mode_name == "mtp3":
+        return "MTP3"
+    if mode_name == "dflash7":
+        return "DFlash block=8 (k=7)"
+    raise CampaignError(f"unsupported summary mode: {mode_name}")
+
+
 def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     with (output_dir / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
@@ -918,88 +987,104 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
             {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows
         )
 
-    context_rows = [row for row in rows if row["section"] == "context_profile"]
-    long_decode_rows = [row for row in rows if row["section"] == "long_decode"]
-    category_rows = [row for row in rows if row["section"] == "scenario_category"]
-
-    context_table = markdown_table(
-        (
-            "Target",
-            "Fixture",
-            "n",
-            "Prompt tokens",
-            "Prefill tok/s",
-            "Server TTFT ms",
-            "Decode tok/s",
-        ),
-        [
-            (
-                row["target"],
-                row["fixture"],
-                str(row["samples"]),
-                format_mean_stddev(row, "prompt_tokens"),
-                format_mean_stddev(row, "prefill_tok_s"),
-                format_mean_stddev(row, "server_ttft_ms"),
-                format_mean_stddev(row, "decode_tok_s"),
-            )
-            for row in context_rows
-        ],
-    )
-    long_decode_table = markdown_table(
-        (
-            "Target",
-            "Fixture",
-            "n",
-            "Completion tokens",
-            "Decode tok/s",
-            "MTP acceptance",
-            "MTP tokens/round",
-        ),
-        [
-            (
-                row["target"],
-                row["fixture"],
-                str(row["samples"]),
-                format_mean_stddev(row, "completion_tokens"),
-                format_mean_stddev(row, "decode_tok_s"),
-                format_percent_mean_stddev(row, "mtp_acceptance"),
-                format_mean_stddev(row, "mtp_tokens_per_round", digits=2),
-            )
-            for row in long_decode_rows
-        ],
-    )
-    scenario_table = markdown_table(
-        (
-            "Target",
-            "Category",
-            "n",
-            "Decode tok/s",
-            "MTP acceptance",
-            "MTP tokens/round",
-        ),
-        [
-            (
-                row["target"],
-                row["group"],
-                str(row["samples"]),
-                format_mean_stddev(row, "decode_tok_s"),
-                format_percent_mean_stddev(row, "mtp_acceptance"),
-                format_mean_stddev(row, "mtp_tokens_per_round", digits=2),
-            )
-            for row in category_rows
-        ],
-    )
-
     sections: list[str] = []
-    if context_rows:
-        sections.append(f"## MTP0 context-length profile\n\n{context_table}")
-    if long_decode_rows:
-        sections.append(f"## MTP3 long-decode reasoning\n\n{long_decode_table}")
-    if category_rows:
-        sections.append(f"## MTP3 cross-scenario decode\n\n{scenario_table}")
+    mode_names = list(dict.fromkeys(str(row["speculative_mode"]) for row in rows))
+    for mode_name in mode_names:
+        label = mode_display_name(mode_name)
+        mode_rows = [row for row in rows if row["speculative_mode"] == mode_name]
+        context_rows = [
+            row for row in mode_rows if row["section"] == "context_profile"
+        ]
+        long_decode_rows = [
+            row for row in mode_rows if row["section"] == "long_decode"
+        ]
+        category_rows = [
+            row for row in mode_rows if row["section"] == "scenario_category"
+        ]
+
+        if context_rows:
+            table = markdown_table(
+                (
+                    "Target",
+                    "Fixture",
+                    "n",
+                    "Prompt tokens",
+                    "Prefill tok/s",
+                    "Server TTFT ms",
+                    "Decode tok/s",
+                ),
+                [
+                    (
+                        row["target"],
+                        row["fixture"],
+                        str(row["samples"]),
+                        format_mean_stddev(row, "prompt_tokens"),
+                        format_mean_stddev(row, "prefill_tok_s"),
+                        format_mean_stddev(row, "server_ttft_ms"),
+                        format_mean_stddev(row, "decode_tok_s"),
+                    )
+                    for row in context_rows
+                ],
+            )
+            sections.append(f"## {label} context-length profile\n\n{table}")
+
+        if long_decode_rows:
+            table = markdown_table(
+                (
+                    "Target",
+                    "Fixture",
+                    "n",
+                    "Completion tokens",
+                    "Decode tok/s",
+                    "Spec acceptance",
+                    "Spec tokens/round",
+                ),
+                [
+                    (
+                        row["target"],
+                        row["fixture"],
+                        str(row["samples"]),
+                        format_mean_stddev(row, "completion_tokens"),
+                        format_mean_stddev(row, "decode_tok_s"),
+                        format_percent_mean_stddev(row, "speculative_acceptance"),
+                        format_mean_stddev(
+                            row, "speculative_tokens_per_round", digits=2
+                        ),
+                    )
+                    for row in long_decode_rows
+                ],
+            )
+            sections.append(f"## {label} long-decode reasoning\n\n{table}")
+
+        if category_rows:
+            table = markdown_table(
+                (
+                    "Target",
+                    "Category",
+                    "n",
+                    "Decode tok/s",
+                    "Spec acceptance",
+                    "Spec tokens/round",
+                ),
+                [
+                    (
+                        row["target"],
+                        row["group"],
+                        str(row["samples"]),
+                        format_mean_stddev(row, "decode_tok_s"),
+                        format_percent_mean_stddev(row, "speculative_acceptance"),
+                        format_mean_stddev(
+                            row, "speculative_tokens_per_round", digits=2
+                        ),
+                    )
+                    for row in category_rows
+                ],
+            )
+            sections.append(f"## {label} cross-scenario decode\n\n{table}")
     markdown = (
         "# Serving corpus performance summary\n\n"
-        "All values are arithmetic mean ± sample standard deviation.\n\n"
+        "All values are arithmetic mean ± sample standard deviation. "
+        f"Sampling: {rows[0]['sampling_mode'] if rows else 'n/a'}.\n\n"
         + "\n\n".join(sections)
         + "\n"
     )
@@ -1020,12 +1105,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise CampaignError(f"ninfer-serve is not executable: {serve}")
 
     artifacts = parse_artifacts(args.artifact)
-    mode_names = args.mode or list(MTP_MODES)
+    mode_names = args.mode or list(DEFAULT_MODES)
     if len(mode_names) != len(set(mode_names)):
         raise CampaignError("duplicate --mode value")
-    mtp_draft_tokens = [MTP_MODES[name] for name in mode_names]
     fixtures = load_fixtures()
-    specs = build_specs(artifacts, fixtures, mtp_draft_tokens)
+    specs = build_specs(artifacts, fixtures, mode_names, args.sampling)
     expected_specs = {spec.key: spec for spec in specs}
     total = len(expected_specs)
 
@@ -1037,16 +1121,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     with run_path.open("a", encoding="utf-8") as run_handle:
         for target, _ in artifacts:
-            for draft_tokens in mtp_draft_tokens:
+            for mode_name in mode_names:
                 block_specs = [
                     spec
                     for spec in specs
                     if spec.target == target
-                    and spec.mtp_draft_tokens == draft_tokens
+                    and spec.speculative_mode == mode_name
                     and spec.key not in records
                 ]
                 if not block_specs:
-                    print(f"skip {target}/mtp{draft_tokens}: block complete", flush=True)
+                    print(f"skip {target}/{mode_name}: block complete", flush=True)
                     continue
                 run_block(
                     serve,
@@ -1065,7 +1149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if missing:
         raise CampaignError(f"campaign ended with {len(missing)} missing formal request(s)")
     target_order = [target for target, _ in artifacts]
-    summary_rows = build_summary_rows(records, target_order, mtp_draft_tokens)
+    summary_rows = build_summary_rows(records, target_order, mode_names, args.sampling)
     write_summaries(summary_rows, output_dir)
     print(
         f"completed {total} formal requests; summary: {output_dir / 'summary.md'}",

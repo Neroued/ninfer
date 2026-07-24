@@ -111,7 +111,9 @@ building it.
 
 `run_serve_corpus.py` runs both registered targets and both published MTP0/MTP3 suites when both
 artifacts are supplied. Pass one `--artifact` to select a single target and `--mode mtp0` or
-`--mode mtp3` to run only that suite.
+`--mode mtp3` to run only that suite. The 35B-A3B-only `--mode dflash7` route runs the same
+decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
+`--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
 
 Each raw report must be `ninfer_bench_report` schema v8. The flattened summary carries native names
 from the report: selected target and artifact, load/read/upload/staging values, Engine memory arenas

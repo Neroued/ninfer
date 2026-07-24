@@ -5,12 +5,16 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/bidirectional_gqa_attention.h"
+#include "ninfer/ops/kv_cache_append_prefix.h"
+#include "ninfer/ops/swa.h"
 #include "core/decode_graph.h"
 #include "runtime/contract/transient_region.h"
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include "core/kv_cache.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include "targets/qwen3_6/impl/runtime/text_context.h"
+#include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
@@ -32,6 +36,8 @@ struct State {
     WorkspaceArena& work;
     KVCache& text_kv;
     KVCache* mtp_kv;
+    DFlashPersistentState* dflash;
+    DFlashWorkspace* dflash_workspace;
     qwen3_6::GdnStateStore& gdn;
     qwen3_6::RoundState& io;
     Tensor& prefill_hidden;
@@ -50,6 +56,12 @@ struct MtpGqaEnvelopes {
     ops::GqaExecutionEnvelope target_verify;
     ops::GqaExecutionEnvelope batch;
     std::array<ops::GqaExecutionEnvelope, kMaximumMtpDraftTokens - 1> ar;
+};
+
+struct DFlashEnvelopes {
+    ops::SwaContextExecutionEnvelope local;
+    ops::GqaContextExecutionEnvelope full;
+    ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
 using GraphPrepare = std::function<void()>;
@@ -94,5 +106,22 @@ void ordinary_round(State& state, bool align_mtp, ops::GqaExecutionEnvelope enve
 void warm_capture_mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes,
                             const GraphPrepare& prepare, DecodeGraph& graph);
 void mtp_round(State& state, std::uint32_t k, MtpGqaEnvelopes envelopes, DecodeGraph* graph);
+
+[[nodiscard]] DFlashFeatureSink
+dflash_feature_sink(State& state, DFlashFeatureSink::PrefillConsumer consume_prefill = {});
+void dflash_append_context(State& state, const Tensor& features, const Tensor& positions,
+                           const Tensor& commit_count,
+                           ops::KVCacheAppendPrefixExecutionEnvelope envelope);
+void dflash_propose(State& state, std::uint32_t k, DFlashEnvelopes envelopes);
+void warm_capture_dflash_initial_round(State& state, std::uint32_t k,
+                                       ops::GqaExecutionEnvelope target_envelope,
+                                       const GraphPrepare& prepare, DecodeGraph& graph);
+void dflash_initial_round(State& state, std::uint32_t k, ops::GqaExecutionEnvelope target_envelope,
+                          DecodeGraph* graph);
+void warm_capture_dflash_steady_round(State& state, std::uint32_t k, DFlashEnvelopes envelopes,
+                                      ops::GqaExecutionEnvelope target_envelope,
+                                      const GraphPrepare& prepare, DecodeGraph& graph);
+void dflash_steady_round(State& state, std::uint32_t k, DFlashEnvelopes envelopes,
+                         ops::GqaExecutionEnvelope target_envelope, DecodeGraph* graph);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

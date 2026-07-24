@@ -27,12 +27,11 @@ struct ServeOptions {
     std::uint32_t prefill_chunk   = 1024;
     std::size_t max_request_bytes = kDefaultMaxRequestBytes;
     int device                    = 0;
-    int mtp_draft_tokens          = 0;
     KvCacheStorage kv_cache       = KvCacheStorage::BFloat16;
-    bool enable_vision            = false;
-    bool use_cuda_graph           = true;
-    bool allow_prefix_reuse       = true;
-    ProposalHead proposal_head    = ProposalHead::Full;
+    SpeculativeOptions speculative;
+    bool enable_vision      = false;
+    bool use_cuda_graph     = true;
+    bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     int default_max_tokens = kDefaultMaxTokens;

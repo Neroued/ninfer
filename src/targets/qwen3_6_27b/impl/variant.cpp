@@ -73,6 +73,10 @@ std::vector<GraphFrontierRange> Variant::mtp_graph_ranges(std::uint32_t capacity
     return graph_ranges_through(capacity - 2 * draft_window, ends);
 }
 
+std::vector<GraphFrontierRange> Variant::dflash_graph_ranges(std::uint32_t, std::uint32_t) {
+    return {};
+}
+
 void Variant::attach_diagnostics(qwen3_6::Program<Variant>& program, void* context,
                                  qwen3_6::TextTapCallback text, qwen3_6::VisionTapCallback vision) {
     program.impl_->diagnostic_context    = context;

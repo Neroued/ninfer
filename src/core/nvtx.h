@@ -13,6 +13,7 @@ enum class Category : std::uint32_t {
     Prefill,
     Decode,
     Mtp,
+    DFlash,
     Attention,
     Gdn,
     PostMixer,
@@ -28,6 +29,9 @@ enum class Name : std::size_t {
     DecodeOrdinaryRound,
     DecodeMtpSubmit,
     DecodeMtpWait,
+    DecodeDFlashRound,
+    DecodeDFlashSubmit,
+    DecodeDFlashWait,
     DecodeOrdinarySubmit,
     DecodeOrdinaryWait,
     PrefillMtpChunk,
@@ -58,6 +62,8 @@ enum class Name : std::size_t {
         return 0xfff28e2bu;
     case Category::Mtp:
         return 0xffb279a2u;
+    case Category::DFlash:
+        return 0xffaf7aa1u;
     case Category::Attention:
         return 0xff76b7b2u;
     case Category::Gdn:
@@ -79,6 +85,7 @@ enum class Name : std::size_t {
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Prefill), "prefill");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Decode), "decode");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Mtp), "mtp");
+        nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::DFlash), "dflash");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Attention), "attention");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::Gdn), "gdn");
         nvtxDomainNameCategoryA(out, static_cast<std::uint32_t>(Category::PostMixer), "post-mixer");
@@ -98,6 +105,9 @@ enum class Name : std::size_t {
         "decode.ordinary_round",
         "decode.mtp.submit",
         "decode.mtp.wait",
+        "decode.dflash_round",
+        "decode.dflash.submit",
+        "decode.dflash.wait",
         "decode.ordinary.submit",
         "decode.ordinary.wait",
         "prefill.mtp_chunk",

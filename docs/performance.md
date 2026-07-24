@@ -23,8 +23,8 @@ mean ± sample standard deviation; warm-up requests are excluded.
 | CUDA Graph | Enabled |
 | Prefix reuse | Disabled |
 | Sampling | Temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.0 |
-| MTP0 | `--mtp-draft-tokens 0` |
-| MTP3 | `--mtp-draft-tokens 3 --lm-head-draft` |
+| MTP0 | no `--spec` |
+| MTP3 | `--spec mtp --draft-tokens 3 --lm-head-draft` |
 
 The MTP0 profile uses four Long NIAH prompts with approximately 8K, 64K, 128K, and 256K tokens.
 Thinking is disabled and the output budget is 128 tokens. These runs measure prefill throughput,

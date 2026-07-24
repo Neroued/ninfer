@@ -109,7 +109,7 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 \
   --max-new 256 \
-  --mtp-draft-tokens 3 \
+  --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
 
@@ -123,6 +123,7 @@ The artifact supports:
 - text generation in thinking and non-thinking modes;
 - image, multi-image, video, and mixed multimodal messages;
 - MTP speculative decoding with draft windows from one to five;
+- text-only DFlash speculative decoding with draft windows from one to fifteen;
 - BF16 and INT8 group-64 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
 - the NInfer CLI;

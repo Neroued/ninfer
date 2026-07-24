@@ -8,6 +8,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
+#include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
@@ -39,6 +40,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t reuse_base                  = 0;
     bool needs_mtp_bridge                     = false;
     bool prepare_mtp                          = false;
+    bool prepare_dflash                       = false;
     std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
     std::optional<std::uint32_t> snapshot_boundary;
     ops::SamplingConfig sampling;
@@ -93,6 +95,13 @@ struct MtpGraphVariant {
     DecodeGraph mtp;
 };
 
+struct DFlashGraphVariant {
+    std::uint32_t min_execution_frontier = 0;
+    std::uint32_t max_execution_frontier = 0;
+    DecodeGraph initial;
+    DecodeGraph steady;
+};
+
 class ProgramImplCore {
 public:
     ProgramImplCore(const LoadedModelData& model, const SequencePlanImpl& plan,
@@ -123,6 +132,7 @@ public:
     const std::uint32_t capacity;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
@@ -130,10 +140,14 @@ public:
     const bool use_cuda_graph;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
+    const std::size_t workspace_fixed_bytes;
 
     DeviceArena persistent;
+    DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
+    std::optional<DFlashPersistentState> dflash;
+    std::optional<DFlashWorkspace> dflash_workspace;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
     Tensor sampling_config;
@@ -144,6 +158,7 @@ public:
 
     std::vector<OrdinaryGraphVariant> ordinary_graphs;
     std::vector<MtpGraphVariant> mtp_graphs;
+    std::vector<DFlashGraphVariant> dflash_graphs;
 
     PinnedHostBuffer round_host;
     std::int32_t* host_count = nullptr;
@@ -154,12 +169,23 @@ public:
     std::uint32_t S     = 0;
     std::vector<TokenId> ledger;
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
-    std::int32_t rope_delta       = 0;
-    std::int32_t current_gdn_slot = 0;
-    std::uint32_t text_kv_valid   = 0;
-    std::uint32_t mtp_kv_valid    = 0;
-    bool drafts_ready             = false;
-    bool tail_hidden_valid        = false;
+    std::int32_t rope_delta                = 0;
+    std::int32_t current_gdn_slot          = 0;
+    std::uint32_t text_kv_valid            = 0;
+    std::uint32_t mtp_kv_valid             = 0;
+    std::uint32_t dflash_context_frontier  = 0;
+    std::uint32_t dflash_proposal_frontier = 0;
+    TokenId dflash_proposal_anchor         = 0;
+    std::uint64_t request_epoch            = 0;
+    std::uint64_t dflash_proposal_epoch    = 0;
+    std::uint32_t pending_context_base     = 0;
+    std::uint32_t pending_context_count    = 0;
+    bool pending_context_valid             = false;
+    bool dflash_boundary_valid             = false;
+    std::uint32_t dflash_boundary_frontier = 0;
+    bool ordinary_tail                     = false;
+    bool drafts_ready                      = false;
+    bool tail_hidden_valid                 = false;
     PrefixCheckpoint boundary;
     PendingCandidate pending;
     GenerationTimings timings;
@@ -175,6 +201,7 @@ private:
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(const Tensor& source);
     void copy_round_token();
+    void flush_dflash_context_prefix(std::uint32_t count);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
 };
 

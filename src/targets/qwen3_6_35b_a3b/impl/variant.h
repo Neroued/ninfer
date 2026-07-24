@@ -15,6 +15,7 @@ using GraphFrontierRange = qwen3_6::GraphFrontierRange;
 struct Variant {
     using TextConfig                     = detail::TextConfig;
     using VisionConfig                   = detail::VisionConfig;
+    using DFlashConfig                   = detail::DFlashConfig;
     using ModelView                      = detail::RuntimeModelView;
     using FullAttentionProjectionWeights = detail::AttentionProjectionPayload;
     using GdnProjectionWeights           = detail::GdnProjectionPayload;
@@ -24,17 +25,21 @@ struct Variant {
     using VisionWeights                  = qwen3_6::VisionWeights;
     using GraphFrontierRange             = detail::GraphFrontierRange;
 
-    static constexpr float attention_scale                  = kAttentionScale;
-    static constexpr float gdn_scale                        = kGdnScale;
-    static constexpr std::uint32_t prefill_chunk_alignment  = kPrefillChunkAlignment;
-    static constexpr std::uint32_t maximum_mtp_draft_tokens = kMaximumMtpDraftTokens;
-    static constexpr std::uint32_t maximum_context          = kNativeContext;
-    static constexpr std::int32_t draft_head_rows           = 131072;
+    static constexpr float attention_scale                     = kAttentionScale;
+    static constexpr float gdn_scale                           = kGdnScale;
+    static constexpr std::uint32_t prefill_chunk_alignment     = kPrefillChunkAlignment;
+    static constexpr std::uint32_t maximum_mtp_draft_tokens    = kMaximumMtpDraftTokens;
+    static constexpr std::uint32_t maximum_dflash_draft_tokens = kMaximumDFlashDraftTokens;
+    static constexpr std::uint32_t maximum_context             = kNativeContext;
+    static constexpr bool supports_dflash                      = DFlashConfig::supported;
+    static constexpr std::int32_t draft_head_rows              = 131072;
 
     [[nodiscard]] static std::vector<GraphFrontierRange>
     ordinary_graph_ranges(std::uint32_t capacity);
     [[nodiscard]] static std::vector<GraphFrontierRange>
     mtp_graph_ranges(std::uint32_t capacity, std::uint32_t draft_window);
+    [[nodiscard]] static std::vector<GraphFrontierRange>
+    dflash_graph_ranges(std::uint32_t capacity, std::uint32_t draft_window);
 
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,

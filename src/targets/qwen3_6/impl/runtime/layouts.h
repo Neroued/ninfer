@@ -12,13 +12,32 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 using TensorLayout = TensorRegion;
 
+struct DFlashPersistentLayout {
+    KVCacheLayout local;
+    KVCacheLayout boundary_local;
+    KVCacheLayout full;
+    TensorLayout commit_count;
+
+    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
+        return local.payload_bytes() + boundary_local.payload_bytes() + full.payload_bytes();
+    }
+};
+
+struct DFlashWorkspaceLayout {
+    TensorLayout target_features;
+    TensorLayout feature_positions;
+    std::size_t fixed_bytes = 0;
+};
+
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
+    std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
     TensorLayout token_counts;
@@ -35,17 +54,20 @@ namespace ninfer::targets::qwen3_6::detail {
 
 template <>
 struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
-    std::uint32_t capacity      = 0;
-    std::uint32_t prefill_chunk = 0;
-    std::uint32_t draft_window  = 0;
-    DType kv_dtype              = DType::BF16;
-    std::int32_t kv_quant_group = 0;
-    ProposalHead proposal_head  = ProposalHead::Full;
+    std::uint32_t capacity                 = 0;
+    std::uint32_t prefill_chunk            = 0;
+    std::uint32_t draft_window             = 0;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    DType kv_dtype                         = DType::BF16;
+    std::int32_t kv_quant_group            = 0;
+    ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
-    std::size_t workspace_bytes          = 0;
+    std::size_t workspace_bytes       = 0;
+    std::size_t workspace_fixed_bytes = 0;
+    NINFER_QWEN36_RUNTIME_NS::DFlashWorkspaceLayout dflash_workspace;
     std::size_t graph_allowance_bytes    = 0;
     std::size_t device_reservation_bytes = 0;
 };

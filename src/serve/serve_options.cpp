@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/speculative_options.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -57,7 +58,8 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
-           "[--kv-dtype bf16|int8] [--mtp-draft-tokens N] [--default-max-tokens N] "
+           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
@@ -131,9 +133,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
-        } else if (arg == "--mtp-draft-tokens") {
-            options.mtp_draft_tokens =
-                parse_nonnegative_int(require_value("--mtp-draft-tokens"), "mtp-draft-tokens");
+        } else if (arg == "--spec") {
+            options.speculative.backend =
+                product::parse_speculative_backend(require_value("--spec"));
+        } else if (arg == "--draft-tokens") {
+            options.speculative.draft_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
@@ -145,7 +150,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
-            options.proposal_head = ProposalHead::Optimized;
+            options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--cors") {
@@ -181,12 +186,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
-    if (options.mtp_draft_tokens > 5) {
-        throw std::invalid_argument("--mtp-draft-tokens must be in [0,5]");
-    }
-    if (options.proposal_head == ProposalHead::Optimized && options.mtp_draft_tokens == 0) {
-        throw std::invalid_argument(
-            "--lm-head-draft requires --mtp-draft-tokens greater than zero");
+    product::validate_speculative_cli_options(options.speculative);
+    if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
+        throw std::invalid_argument("--spec dflash cannot be combined with --vision");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {

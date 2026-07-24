@@ -33,6 +33,30 @@ int main() {
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
+    failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
+                      "speculative decoding is not disabled by default");
+
+    const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
+                                       "--draft-tokens", "15", "--lm-head-draft"});
+    failures += check(dflash.speculative.backend == ninfer::SpeculativeBackend::DFlash,
+                      "--spec dflash did not select DFlash");
+    failures += check(dflash.speculative.draft_tokens == 15,
+                      "--draft-tokens did not preserve the DFlash window");
+    failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
+                      "--lm-head-draft did not select the optimized proposal head");
+
+    bool dflash_vision_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash", "--draft-tokens", "15",
+                     "--vision"});
+    } catch (const std::invalid_argument&) { dflash_vision_rejected = true; }
+    failures += check(dflash_vision_rejected, "DFlash and Vision were accepted together");
+
+    bool implicit_backend_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--draft-tokens", "3"});
+    } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
+    failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
     const ServeOptions configured =
         parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision"});

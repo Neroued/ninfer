@@ -152,6 +152,9 @@ int main(int argc, char** argv) {
         engine_options.max_context               = max_context;
         engine_options.prefill_chunk             = options.prefill_chunk;
         engine_options.kv_cache                  = options.kv_cache;
+        engine_options.speculative.backend       = options.mtp_draft_tokens == 0
+                                                       ? ninfer::SpeculativeBackend::None
+                                                       : ninfer::SpeculativeBackend::Mtp;
         engine_options.speculative.draft_tokens  = options.mtp_draft_tokens;
         engine_options.speculative.proposal_head = options.proposal_head;
         engine_options.use_cuda_graph            = options.use_cuda_graph;

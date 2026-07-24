@@ -72,6 +72,10 @@ ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_35b_a3b_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_real_test
+  SOURCES targets/qwen3_6_35b_a3b/test_engine_dflash_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   SOURCES targets/qwen3_6_35b_a3b/test_dflash_load_plan.cpp
   NEEDS_SOURCE_DIR

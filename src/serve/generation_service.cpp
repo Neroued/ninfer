@@ -126,16 +126,15 @@ private:
 
 GenerationService::GenerationService(ServeOptions options) : options_(std::move(options)) {
     ninfer::EngineOptions engine_options;
-    engine_options.artifact_path            = options_.artifact_path;
-    engine_options.device                   = options_.device;
-    engine_options.max_context              = options_.max_context;
-    engine_options.prefill_chunk            = options_.prefill_chunk;
-    engine_options.kv_cache                 = options_.kv_cache;
-    engine_options.enable_vision            = options_.enable_vision;
-    engine_options.use_cuda_graph           = options_.use_cuda_graph;
-    engine_options.speculative.draft_tokens = static_cast<std::uint32_t>(options_.mtp_draft_tokens);
-    engine_options.speculative.proposal_head = options_.proposal_head;
-    engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    engine_options.artifact_path  = options_.artifact_path;
+    engine_options.device         = options_.device;
+    engine_options.max_context    = options_.max_context;
+    engine_options.prefill_chunk  = options_.prefill_chunk;
+    engine_options.kv_cache       = options_.kv_cache;
+    engine_options.enable_vision  = options_.enable_vision;
+    engine_options.use_cuda_graph = options_.use_cuda_graph;
+    engine_options.speculative    = options_.speculative;
+    engine_                       = std::make_unique<ninfer::Engine>(std::move(engine_options));
 }
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request) const {
@@ -214,14 +213,15 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.total_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
-    outcome.metrics.prefix_cache_hit_tokens   = result.reused_prompt_tokens;
-    outcome.metrics.mtp_enabled               = result.speculative.enabled;
-    outcome.metrics.mtp_draft_window          = result.speculative.draft_window;
-    outcome.metrics.mtp_rounds                = result.speculative.rounds;
-    outcome.metrics.mtp_draft_tokens          = result.speculative.drafted_tokens;
-    outcome.metrics.mtp_accepted_tokens       = result.speculative.accepted_tokens;
-    outcome.metrics.mtp_fallback_steps        = result.speculative.fallback_steps;
-    outcome.metrics.mtp_accepted_per_position = std::move(result.speculative.accepted_per_position);
+    outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
+    outcome.metrics.speculative_backend         = result.speculative.backend;
+    outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
+    outcome.metrics.speculative_rounds          = result.speculative.rounds;
+    outcome.metrics.speculative_draft_tokens    = result.speculative.drafted_tokens;
+    outcome.metrics.speculative_accepted_tokens = result.speculative.accepted_tokens;
+    outcome.metrics.speculative_fallback_steps  = result.speculative.fallback_steps;
+    outcome.metrics.speculative_accepted_per_position =
+        std::move(result.speculative.accepted_per_position);
 
     if (prepared.tool_capable) {
         ParsedToolCallOutput parsed =

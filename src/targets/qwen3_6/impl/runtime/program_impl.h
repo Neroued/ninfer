@@ -63,6 +63,15 @@ schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t min_frontier, std::uin
     return out;
 }
 
+schedule::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier, std::uint32_t max_frontier,
+                                           std::uint32_t k) {
+    return schedule::DFlashEnvelopes{
+        .local  = {min_frontier, max_frontier},
+        .full   = {min_frontier, max_frontier},
+        .append = {1, k + 1},
+    };
+}
+
 template <typename Variant>
 Variant& select_graph_variant(std::vector<Variant>& variants, std::uint32_t frontier,
                               const char* label) {
@@ -88,32 +97,61 @@ void validate_graph_ranges(const std::vector<GraphFrontierRange>& ranges,
     }
 }
 
+DeviceSpan workspace_scratch_span(DeviceArena& storage, const SequencePlanImpl& plan) {
+    if (plan.workspace_fixed_bytes > storage.capacity()) {
+        throw std::logic_error("fixed workspace exceeds its backing allocation");
+    }
+    return DeviceSpan{
+        static_cast<std::byte*>(storage.base()) + plan.workspace_fixed_bytes,
+        storage.capacity() - plan.workspace_fixed_bytes,
+    };
+}
+
 } // namespace
 
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const SequencePlanImpl& plan,
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity),
-      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window), kv_dtype(plan.kv_dtype),
+      prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
+      speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
       kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
-      graph_allowance_bytes(plan.graph_allowance_bytes), persistent(plan.persistent.bytes),
-      work(plan.workspace_bytes),
+      graph_allowance_bytes(plan.graph_allowance_bytes),
+      workspace_fixed_bytes(plan.workspace_fixed_bytes), persistent(plan.persistent.bytes),
+      workspace_storage(plan.workspace_bytes),
+      work(workspace_scratch_span(workspace_storage, plan)),
       round_host((static_cast<std::size_t>(draft_window) + 2ULL) * sizeof(std::int32_t)) {
     if (model.weights_arena == nullptr) {
         throw std::invalid_argument("Qwen3.6 model view has no owning weight arena");
     }
-    if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp ||
-        model.optimized_proposal.has_value() != plan.features.optimized_proposal ||
+    if (model.features != plan.features || model.mtp.has_value() != plan.features.mtp() ||
+        model.dflash.has_value() != plan.features.dflash() ||
+        model.optimized_proposal.has_value() != plan.features.optimized_proposal() ||
         model.vision.has_value() != plan.features.vision) {
         throw std::invalid_argument(
             "Qwen3.6 loaded weights do not match the frozen startup features");
     }
+    if (model.mtp.has_value() && model.dflash.has_value()) {
+        throw std::invalid_argument("MTP and DFlash model views are mutually exclusive");
+    }
+    if (model.dflash.has_value() && model.vision.has_value()) {
+        throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
+    }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
+    if (plan.persistent.dflash) { dflash.emplace(backing, *plan.persistent.dflash); }
+    if (plan.features.dflash()) {
+        dflash_workspace.emplace(DeviceSpan{workspace_storage.base(), plan.workspace_fixed_bytes},
+                                 plan.dflash_workspace);
+    }
+    if (dflash.has_value() != plan.features.dflash() ||
+        dflash_workspace.has_value() != plan.features.dflash()) {
+        throw std::logic_error("DFlash state does not match the frozen sequence plan");
+    }
 
     io = qwen3_6::RoundState(backing, plan.persistent.round);
-    if (io.mtp.has_value() != (draft_window != 0)) {
+    if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }
     prefill_hidden  = plan.persistent.prefill_hidden.bind(backing);
@@ -158,13 +196,23 @@ void ProgramImplCore::make_invalid() noexcept {
     S         = 0;
     ledger.clear();
     prefix_identity.clear();
-    current_gdn_slot  = 0;
-    text_kv_valid     = 0;
-    mtp_kv_valid      = 0;
-    drafts_ready      = false;
-    tail_hidden_valid = false;
-    boundary          = {};
-    pending           = {};
+    current_gdn_slot         = 0;
+    text_kv_valid            = 0;
+    mtp_kv_valid             = 0;
+    dflash_context_frontier  = 0;
+    dflash_proposal_frontier = 0;
+    dflash_proposal_anchor   = 0;
+    dflash_proposal_epoch    = 0;
+    pending_context_base     = 0;
+    pending_context_count    = 0;
+    pending_context_valid    = false;
+    dflash_boundary_valid    = false;
+    dflash_boundary_frontier = 0;
+    ordinary_tail            = false;
+    drafts_ready             = false;
+    tail_hidden_valid        = false;
+    boundary                 = {};
+    pending                  = {};
 }
 
 void ProgramImplCore::set_device_i32(Tensor& tensor, std::int32_t value) {
@@ -181,10 +229,21 @@ void ProgramImplCore::ordered_reset() {
     set_device_i32(io.speculative.accepted_drafts, 0);
     set_device_i32(io.gdn_initial_slot, 0);
     if (io.mtp) { set_device_i32(io.mtp->position, 0); }
-    current_gdn_slot = 0;
-    text_kv_valid    = 0;
-    mtp_kv_valid     = 0;
-    drafts_ready     = false;
+    current_gdn_slot         = 0;
+    text_kv_valid            = 0;
+    mtp_kv_valid             = 0;
+    dflash_context_frontier  = 0;
+    dflash_proposal_frontier = 0;
+    dflash_proposal_anchor   = 0;
+    dflash_proposal_epoch    = 0;
+    pending_context_base     = 0;
+    pending_context_count    = 0;
+    pending_context_valid    = false;
+    dflash_boundary_valid    = false;
+    dflash_boundary_frontier = 0;
+    ordinary_tail            = false;
+    drafts_ready             = false;
+    if (dflash) { set_device_i32(dflash->commit_count, 0); }
 }
 
 void ProgramImplCore::prepare_graphs() {
@@ -234,6 +293,14 @@ void ProgramImplCore::prepare_graphs() {
     };
     initialize_cache(decoder->text_kv);
     if (decoder->mtp_cache() != nullptr) { initialize_cache(*decoder->mtp_cache()); }
+    if (dflash) {
+        initialize_cache(dflash->local);
+        initialize_cache(dflash->full);
+        CUDA_CHECK(cudaMemsetAsync(dflash_workspace->target_features.data, 0,
+                                   dflash_workspace->target_features.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(dflash_workspace->feature_positions.data, 0,
+                                   dflash_workspace->feature_positions.bytes(), device.stream));
+    }
     device.synchronize();
 
     const auto prepare_representative = [&](std::uint32_t frontier) {
@@ -246,6 +313,12 @@ void ProgramImplCore::prepare_graphs() {
             set_device_i32(io.mtp->position,
                            checked_i32(frontier, "graph representative MTP position"));
         }
+        if (dflash) {
+            set_device_i32(io.speculative.produced_count, 1);
+            set_device_i32(io.speculative.target_positions,
+                           checked_i32(frontier == 0 ? 0 : frontier - 1,
+                                       "graph representative DFlash append position"));
+        }
     };
     const auto state = [&](std::uint32_t frontier) {
         return schedule::State{device,
@@ -253,6 +326,8 @@ void ProgramImplCore::prepare_graphs() {
                                work,
                                decoder->text_kv,
                                decoder->mtp_cache(),
+                               dflash ? &*dflash : nullptr,
+                               dflash_workspace ? &*dflash_workspace : nullptr,
                                decoder->gdn,
                                io,
                                prefill_hidden,
@@ -290,7 +365,7 @@ void ProgramImplCore::prepare_graphs() {
     }
 
     const auto mtp_ranges = mtp_graph_ranges(capacity, draft_window);
-    if (draft_window != 0) {
+    if (speculative_backend == SpeculativeBackend::Mtp) {
         validate_graph_ranges(mtp_ranges, capacity - 2 * draft_window, "MTP");
         mtp_graphs.reserve(mtp_ranges.size());
         for (const GraphFrontierRange range : mtp_ranges) {
@@ -305,6 +380,29 @@ void ProgramImplCore::prepare_graphs() {
             schedule::warm_capture_mtp_round(mtp_state, draft_window,
                                              mtp_gqa_envelopes(range.min, range.max, draft_window),
                                              prepare, variant.mtp);
+        }
+    }
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        const auto ranges = dflash_graph_ranges(capacity, draft_window);
+        validate_graph_ranges(ranges, capacity - draft_window - 1, "DFlash");
+        dflash_graphs.reserve(ranges.size());
+        for (const GraphFrontierRange range : ranges) {
+            dflash_graphs.emplace_back();
+            DFlashGraphVariant& variant        = dflash_graphs.back();
+            variant.min_execution_frontier     = range.min;
+            variant.max_execution_frontier     = range.max;
+            const std::uint32_t representative = range.min;
+            const auto prepare = [&, representative] { prepare_representative(representative); };
+            const ops::GqaExecutionEnvelope target_envelope{range.min + draft_window + 1,
+                                                            range.max + draft_window + 1};
+
+            auto initial_state = state(representative);
+            schedule::warm_capture_dflash_initial_round(initial_state, draft_window,
+                                                        target_envelope, prepare, variant.initial);
+            auto steady_state = state(representative);
+            schedule::warm_capture_dflash_steady_round(
+                steady_state, draft_window, dflash_envelopes(range.min, range.max, draft_window),
+                target_envelope, prepare, variant.steady);
         }
     }
 
@@ -354,6 +452,45 @@ void ProgramImplCore::copy_tail(const Tensor& source) {
 void ProgramImplCore::copy_round_token() {
     CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.token.data, sizeof(TokenId), cudaMemcpyDeviceToHost,
                                device.stream));
+}
+
+void ProgramImplCore::flush_dflash_context_prefix(std::uint32_t count) {
+    if (!dflash || !dflash_workspace || !pending_context_valid ||
+        dflash_context_frontier != pending_context_base || count == 0 ||
+        count > pending_context_count) {
+        throw std::logic_error("DFlash context flush does not match the pending target features");
+    }
+    schedule::State state{device,
+                          model,
+                          work,
+                          decoder->text_kv,
+                          decoder->mtp_cache(),
+                          &*dflash,
+                          &*dflash_workspace,
+                          decoder->gdn,
+                          io,
+                          prefill_hidden,
+                          prefill_chunk,
+                          pending_context_base,
+                          static_cast<const ops::SamplingConfig*>(sampling_config.data),
+                          proposal_head,
+                          &tail_hidden,
+                          &boundary_hidden,
+                          diagnostic_context,
+                          diagnostic_text_tap,
+                          diagnostic_vision_tap};
+    set_device_i32(dflash->commit_count, checked_i32(count, "DFlash context commit count"));
+    Tensor features =
+        dflash_workspace->target_features.slice(1, 0, static_cast<std::int32_t>(count));
+    Tensor positions =
+        dflash_workspace->feature_positions.slice(0, 0, static_cast<std::int32_t>(count));
+    schedule::dflash_append_context(state, features, positions, dflash->commit_count,
+                                    {count, count});
+    device.synchronize();
+    dflash_context_frontier = pending_context_base + count;
+    pending_context_base    = 0;
+    pending_context_count   = 0;
+    pending_context_valid   = false;
 }
 
 void ProgramImplCore::validate_licensed_tokens(std::span<const TokenId> tokens) const {
@@ -418,6 +555,9 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             text_kv_valid = base;
             ledger.resize(base);
             set_device_i32(io.gdn_initial_slot, current_gdn_slot);
+            if (dflash && (pending_context_valid || dflash_context_frontier != base)) {
+                throw std::logic_error("resident DFlash context is not at the append frontier");
+            }
         } else {
             if (text_kv_valid < base) {
                 throw std::logic_error("resident Text KV is shorter than boundary");
@@ -427,6 +567,13 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             current_gdn_slot = 0;
             set_device_i32(io.gdn_initial_slot, 0);
             ledger.resize(base);
+            if (dflash) {
+                if (!dflash_boundary_valid || dflash_boundary_frontier != base) {
+                    throw std::logic_error("planned DFlash boundary checkpoint is unavailable");
+                }
+                dflash->restore_boundary(device.stream);
+                dflash_context_frontier = base;
+            }
         }
 
         if (plan.prepare_mtp && base != 0) {
@@ -443,8 +590,14 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         // Invalidate the old checkpoint identity now that execution has started. The separately
         // allocated boundary_hidden tensor is deliberately left untouched until a restore bridge
         // consumes h[B-1] below.
-        boundary = {};
-        timings  = {};
+        boundary                 = {};
+        dflash_boundary_valid    = false;
+        dflash_boundary_frontier = 0;
+        timings                  = {};
+        ++request_epoch;
+        drafts_ready          = false;
+        pending_context_valid = false;
+        ordinary_tail         = false;
 
         ledger.assign(prompt.token_ids.begin(), prompt.token_ids.end());
         prefix_identity.assign(prompt);
@@ -455,6 +608,8 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             work,
             decoder->text_kv,
             decoder->mtp_cache(),
+            dflash ? &*dflash : nullptr,
+            dflash_workspace ? &*dflash_workspace : nullptr,
             decoder->gdn,
             io,
             prefill_hidden,
@@ -467,7 +622,8 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
             diagnostic_context,
             diagnostic_text_tap,
             diagnostic_vision_tap};
-        bool mtp_prepared = false;
+        bool mtp_prepared    = false;
+        bool dflash_prepared = false;
 
         if (had_suffix && plan.needs_mtp_bridge) {
             Tensor bridge_token = io.speculative.target_input_ids.slice(0, 0, 1);
@@ -522,6 +678,15 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
                     mtp_prepared = true;
                 }
             }
+            if (dflash) {
+                dflash_context_frontier = prompt_tokens;
+                if (plan.prepare_dflash) {
+                    schedule::dflash_propose(
+                        schedule_state, draft_window,
+                        dflash_envelopes(prompt_tokens, prompt_tokens, draft_window));
+                    dflash_prepared = true;
+                }
+            }
             copy_round_token();
             device.synchronize();
             timings.prefill_seconds =
@@ -538,14 +703,27 @@ runtime::BeginResult ProgramImplCore::begin(PreparedPromptData&& prompt, Request
         // Target prefill leaves its recurrent state in slot 0. Exact-frontier reuse performs no
         // target work, so it must retain the MTP snapshot that was committed at the old frontier.
         if (had_suffix) { current_gdn_slot = 0; }
-        mtp_kv_valid      = mtp_prepared ? prompt_tokens : 0;
-        drafts_ready      = mtp_prepared;
+        mtp_kv_valid = mtp_prepared ? prompt_tokens : 0;
+        drafts_ready = mtp_prepared || dflash_prepared;
+        if (dflash) {
+            if (dflash_context_frontier != prompt_tokens) {
+                throw std::logic_error("DFlash prefill did not reach the prompt frontier");
+            }
+            dflash_proposal_frontier = dflash_prepared ? prompt_tokens : 0;
+            dflash_proposal_anchor   = dflash_prepared ? host_tokens[0] : 0;
+            dflash_proposal_epoch    = dflash_prepared ? request_epoch : 0;
+            ordinary_tail            = !dflash_prepared;
+        }
         tail_hidden_valid = true;
         if (snapshot_boundary) {
             boundary.valid            = true;
             boundary.boundary         = *snapshot_boundary;
             boundary.hidden_valid     = true;
             boundary.mtp_prefix_valid = mtp_prepared;
+            if (dflash) {
+                dflash_boundary_valid    = true;
+                dflash_boundary_frontier = *snapshot_boundary;
+            }
         }
 
         pending   = PendingCandidate{.kind          = PendingKind::Begin,
@@ -584,17 +762,38 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
         throw std::logic_error("Active frontier is inconsistent");
     }
 
-    if (drafts_ready && (decoder->mtp_cache() == nullptr || mtp_kv_valid != E)) {
+    if (speculative_backend == SpeculativeBackend::Mtp && drafts_ready &&
+        (decoder->mtp_cache() == nullptr || mtp_kv_valid != E)) {
         throw std::logic_error("MTP proposal does not match the Active execution frontier");
     }
-    const bool use_mtp = draft_window != 0 && drafts_ready && mtp_kv_valid == E &&
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        if (drafts_ready &&
+            (dflash_context_frontier != E || dflash_proposal_frontier != E ||
+             dflash_proposal_anchor != ledger.back() || dflash_proposal_epoch != request_epoch)) {
+            throw std::logic_error("DFlash proposal does not match the Active execution frontier");
+        }
+        if (pending_context_valid && (dflash_context_frontier != pending_context_base ||
+                                      pending_context_base + pending_context_count != E)) {
+            throw std::logic_error("pending DFlash context update has an invalid frontier");
+        }
+    }
+    const bool use_mtp = speculative_backend == SpeculativeBackend::Mtp && drafts_ready &&
+                         mtp_kv_valid == E &&
                          budget.generated_tokens_remaining >= draft_window + 1 &&
                          static_cast<std::uint64_t>(E) + 2ULL * draft_window <= capacity;
+    const bool use_dflash = speculative_backend == SpeculativeBackend::DFlash && !ordinary_tail &&
+                            (drafts_ready || pending_context_valid) &&
+                            budget.generated_tokens_remaining >= draft_window + 1 &&
+                            static_cast<std::uint64_t>(E) + draft_window + 1ULL <= capacity;
     const std::uint32_t base_E = E;
     const std::uint32_t base_S = S;
-    nvtx::ScopedRange round_range(use_mtp ? nvtx::Name::DecodeMtpRound
-                                          : nvtx::Name::DecodeOrdinaryRound,
-                                  use_mtp ? nvtx::Category::Mtp : nvtx::Category::Decode, base_E);
+    const nvtx::Name round_name =
+        use_dflash ? nvtx::Name::DecodeDFlashRound
+                   : (use_mtp ? nvtx::Name::DecodeMtpRound : nvtx::Name::DecodeOrdinaryRound);
+    const nvtx::Category round_category =
+        use_dflash ? nvtx::Category::DFlash
+                   : (use_mtp ? nvtx::Category::Mtp : nvtx::Category::Decode);
+    nvtx::ScopedRange round_range(round_name, round_category, base_E);
     try {
         set_device_i32(io.gdn_initial_slot, current_gdn_slot);
         schedule::State schedule_state{
@@ -603,6 +802,8 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             work,
             decoder->text_kv,
             decoder->mtp_cache(),
+            dflash ? &*dflash : nullptr,
+            dflash_workspace ? &*dflash_workspace : nullptr,
             decoder->gdn,
             io,
             prefill_hidden,
@@ -659,7 +860,77 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             mtp_kv_valid      = base_E + produced;
             drafts_ready      = true;
             tail_hidden_valid = true;
+        } else if (use_dflash) {
+            const bool steady  = pending_context_valid;
+            DecodeGraph* graph = nullptr;
+            auto envelopes     = dflash_envelopes(base_E, base_E, draft_window);
+            ops::GqaExecutionEnvelope target_envelope{base_E + draft_window + 1,
+                                                      base_E + draft_window + 1};
+            if (use_cuda_graph && diagnostic_text_tap == nullptr) {
+                DFlashGraphVariant& variant = select_graph_variant(dflash_graphs, base_E, "DFlash");
+                graph                       = steady ? &variant.steady : &variant.initial;
+                envelopes                   = dflash_envelopes(variant.min_execution_frontier,
+                                                               variant.max_execution_frontier, draft_window);
+                target_envelope             = {variant.min_execution_frontier + draft_window + 1,
+                                               variant.max_execution_frontier + draft_window + 1};
+            }
+            {
+                nvtx::ScopedRange submit_range(nvtx::Name::DecodeDFlashSubmit,
+                                               nvtx::Category::DFlash, base_E);
+                if (steady) {
+                    schedule::dflash_steady_round(schedule_state, draft_window, envelopes,
+                                                  target_envelope, graph);
+                } else {
+                    schedule::dflash_initial_round(schedule_state, draft_window, target_envelope,
+                                                   graph);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(host_count, io.speculative.produced_count.data,
+                                           sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                           device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(host_tokens, io.speculative.round_tokens.data,
+                                           (draft_window + 1ULL) * sizeof(TokenId),
+                                           cudaMemcpyDeviceToHost, device.stream));
+            }
+            {
+                nvtx::ScopedRange wait_range(nvtx::Name::DecodeDFlashWait, nvtx::Category::Control,
+                                             base_E);
+                device.synchronize();
+            }
+            if (*host_count <= 0 || *host_count > static_cast<std::int32_t>(draft_window + 1)) {
+                throw std::runtime_error("DFlash returned an invalid licensed-token count");
+            }
+            produced = static_cast<std::uint32_t>(*host_count);
+            if (produced > budget.generated_tokens_remaining ||
+                static_cast<std::uint64_t>(base_E) + produced > capacity) {
+                throw std::runtime_error("DFlash round exceeded its budget or context capacity");
+            }
+            accepted                 = produced - 1;
+            kind                     = PendingKind::Speculative;
+            text_kv_valid            = base_E + produced;
+            current_gdn_slot         = static_cast<std::int32_t>(accepted);
+            dflash_context_frontier  = base_E;
+            pending_context_base     = base_E;
+            pending_context_count    = produced;
+            pending_context_valid    = true;
+            dflash_proposal_frontier = 0;
+            dflash_proposal_anchor   = 0;
+            dflash_proposal_epoch    = 0;
+            drafts_ready             = false;
+            tail_hidden_valid        = true;
         } else {
+            if (dflash && pending_context_valid) {
+                Tensor features = dflash_workspace->target_features.slice(
+                    1, 0, static_cast<std::int32_t>(draft_window + 1));
+                Tensor positions = dflash_workspace->feature_positions.slice(
+                    0, 0, static_cast<std::int32_t>(draft_window + 1));
+                schedule::dflash_append_context(schedule_state, features, positions,
+                                                io.speculative.produced_count,
+                                                {1, draft_window + 1});
+                dflash_context_frontier = base_E;
+                pending_context_base    = 0;
+                pending_context_count   = 0;
+                pending_context_valid   = false;
+            }
             const bool align_mtp = decoder->mtp_cache() != nullptr && mtp_kv_valid == base_E;
             DecodeGraph* graph   = nullptr;
             ops::GqaExecutionEnvelope envelope{base_E + 1, base_E + 1};
@@ -684,6 +955,13 @@ runtime::GeneratedRound ProgramImplCore::decode_round(runtime::RoundBudget budge
             text_kv_valid    = base_E + 1;
             current_gdn_slot = 0;
             if (align_mtp) { mtp_kv_valid = base_E + 1; }
+            if (dflash) {
+                dflash_context_frontier  = base_E + 1;
+                dflash_proposal_frontier = 0;
+                dflash_proposal_anchor   = 0;
+                dflash_proposal_epoch    = 0;
+                ordinary_tail            = true;
+            }
             drafts_ready      = false;
             tail_hidden_valid = true;
         }
@@ -717,6 +995,19 @@ void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool termin
     if (!terminal && accepted_tokens != pending.produced) {
         throw std::logic_error("a continuing round must accept every licensed token");
     }
+    if (terminal && speculative_backend == SpeculativeBackend::DFlash &&
+        pending.kind == PendingKind::Speculative) {
+        try {
+            flush_dflash_context_prefix(accepted_tokens);
+        } catch (...) {
+            make_invalid();
+            throw;
+        }
+        drafts_ready             = false;
+        dflash_proposal_frontier = 0;
+        dflash_proposal_anchor   = 0;
+        dflash_proposal_epoch    = 0;
+    }
     if (terminal && pending.kind == PendingKind::Speculative &&
         accepted_tokens < pending.produced) {
         // The output policy may stop inside a target-licensed speculative batch. Target
@@ -736,10 +1027,14 @@ void ProgramImplCore::resolve_pending(std::uint32_t accepted_tokens, bool termin
         S                = committed_S;
         current_gdn_slot = static_cast<std::int32_t>(accepted_tokens - 1);
         text_kv_valid    = committed_E;
-        mtp_kv_valid     = committed_E;
-        drafts_ready     = false;
-        lifecycle        = Lifecycle::Resident;
-        pending          = {};
+        if (speculative_backend == SpeculativeBackend::Mtp) { mtp_kv_valid = committed_E; }
+        set_device_i32(io.pos, checked_i32(committed_E, "partial speculative frontier"));
+        set_device_i32(io.rope_pos,
+                       checked_i32(committed_E, "partial speculative RoPE frontier") + rope_delta);
+        device.synchronize();
+        drafts_ready = false;
+        lifecycle    = Lifecycle::Resident;
+        pending      = {};
         return;
     }
     if (accepted_tokens != pending.produced) {
@@ -770,6 +1065,14 @@ void ProgramImplCore::finish_active() {
     if (lifecycle != Lifecycle::Active) {
         throw std::logic_error("finish_active requires Active Program state");
     }
+    if (speculative_backend == SpeculativeBackend::DFlash && pending_context_valid) {
+        try {
+            flush_dflash_context_prefix(pending_context_count);
+        } catch (...) {
+            make_invalid();
+            throw;
+        }
+    }
     lifecycle = Lifecycle::Resident;
 }
 
@@ -791,14 +1094,17 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
-    out.workspace        = ArenaMemorySummary{work.capacity(), work.used(), work.peak_used()};
+    out.workspace =
+        ArenaMemorySummary{workspace_storage.capacity(), workspace_fixed_bytes + work.used(),
+                           workspace_fixed_bytes + work.peak_used()};
     out.kv_payload_bytes = kv_payload_bytes;
     return out;
 }
 
 SpeculativeStats ProgramImplCore::speculative_stats() const {
     SpeculativeStats out;
-    out.enabled      = draft_window != 0;
+    out.backend      = speculative_backend;
+    out.enabled      = speculative_backend != SpeculativeBackend::None;
     out.draft_window = draft_window;
     if (draft_window == 0) { return out; }
     std::vector<std::int64_t> values(static_cast<std::size_t>(io.speculative.stats.ne[0]));

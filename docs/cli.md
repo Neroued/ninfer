@@ -15,7 +15,7 @@ download an artifact using the [project README](../README.md) before following t
 Exactly one of `--prompt` and `--messages` is required.
 
 Answer content is streamed to stdout. Reasoning, model loading, timings, throughput, GPU memory, and
-MTP statistics are written to stderr, so stdout can be redirected independently:
+speculative-decoding statistics are written to stderr, so stdout can be redirected independently:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_27b.ninfer \
@@ -30,14 +30,16 @@ Thinking is enabled by default. Add `--no-thinking` for direct-response prompt r
 
 GPU residency is frozen when the Engine starts:
 
-- `--mtp-draft-tokens 0` omits MTP weights, MTP KV/state, and the optimized draft head;
-- MTP with the full proposal head omits the optimized draft head;
+- no `--spec` omits MTP/DFlash weights and state and the optimized proposal head;
+- `--spec mtp` loads only MTP, while `--spec dflash` loads only the 35B-A3B text-only DFlash
+  backend;
+- a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights and maximum workspace;
 - `--vision` loads those allocations and enables image/video input.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
-text-only Engine rejects media and cannot enable Vision later. The default MTP and Vision settings
-produce the smallest resident profile.
+text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
+exclusive. The default speculative and Vision settings produce the smallest resident profile.
 
 ## Structured messages
 
@@ -92,22 +94,32 @@ history may include `reasoning_content` and `tool_calls`; a tool result uses rol
 See [`examples/cli/`](../examples/cli/) for committed text, image, video, mixed-media, thinking,
 long-decode, and long-context inputs.
 
-## MTP
+## Speculative decoding
 
-MTP is disabled by default. Enable one to five draft positions with `--mtp-draft-tokens`.
-`--lm-head-draft` selects the optimized proposal head and requires MTP:
+Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
+35B-A3B text-only DFlash backend with one to fifteen. `--lm-head-draft` selects the optimized
+proposal head and requires a selected backend:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Write a short explanation of speculative decoding." \
   --max-context 16384 \
   --max-new 512 \
-  --mtp-draft-tokens 3 \
+  --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
 
-The published [performance results](performance.md) use a draft window of three and the optimized
-proposal head.
+For DFlash:
+
+```bash
+./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
+  --prompt "Write a short explanation of speculative decoding." \
+  --max-context 16384 --max-new 512 \
+  --spec dflash --draft-tokens 15 --lm-head-draft
+```
+
+MTP and DFlash cannot be enabled together. The published [performance results](performance.md)
+currently use MTP with a draft window of three and the optimized proposal head.
 
 ## Common options
 
@@ -118,8 +130,9 @@ proposal head.
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
-| `--mtp-draft-tokens 0..5` | MTP draft window | `0` |
-| `--lm-head-draft` | optimized MTP proposal head | off |
+| `--spec mtp\|dflash` | speculative backend | off |
+| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |

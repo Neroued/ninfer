@@ -10,12 +10,15 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/bidirectional_gqa_attention.h"
+#include "ninfer/ops/swa.h"
 
 #include <algorithm>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 namespace {
@@ -47,7 +50,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim    = TextConfig::head_dim,
                      .kv_dtype              = plan.kv_dtype,
                      .kv_quant_group        = plan.kv_quant_group,
-                     .enable_mtp            = plan.draft_window != 0,
+                     .enable_mtp            = plan.features.mtp(),
                      .gdn =
                          {
                              .layers         = TextConfig::gdn_layers(),
@@ -60,12 +63,26 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .conv_dtype     = DType::BF16,
                          },
                  });
+    if constexpr (Variant::supports_dflash) {
+        if (plan.features.dflash()) {
+            DFlashPersistentLayout& dflash = out.dflash.emplace();
+            dflash.local =
+                plan_kv_cache(builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
+                              DFlashConfig::kv_heads, DFlashConfig::head_dim, DType::BF16);
+            dflash.boundary_local =
+                plan_kv_cache(builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
+                              DFlashConfig::kv_heads, DFlashConfig::head_dim, DType::BF16);
+            dflash.full         = plan_kv_cache(builder, 1, plan.capacity, DFlashConfig::kv_heads,
+                                                DFlashConfig::head_dim, DType::BF16);
+            dflash.commit_count = add_tensor(builder, DType::I32, {1}, "DFlash exact commit count");
+        }
+    }
 
     out.round = qwen3_6::begin_round_state_layout(
         builder, qwen3_6::RoundStateSpec{.hidden       = TextConfig::hidden,
                                          .output_rows  = TextConfig::output_rows,
                                          .draft_window = plan.draft_window,
-                                         .enable_mtp   = plan.draft_window != 0});
+                                         .enable_mtp   = plan.features.mtp()});
     out.prefill_hidden = add_tensor(
         builder, DType::BF16, {TextConfig::hidden, static_cast<std::int32_t>(plan.prefill_chunk)},
         "step prefill hidden");
@@ -80,9 +97,30 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.tail_hidden     = add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "tail hidden");
     out.boundary_hidden =
         add_tensor(builder, DType::BF16, {TextConfig::hidden, 1}, "boundary hidden");
-    out.bytes            = builder.finish(kArenaAlign, "persistent layout");
-    out.kv_payload_bytes = out.decoder.kv_payload_bytes();
+    out.bytes = builder.finish(kArenaAlign, "persistent layout");
+    out.kv_payload_bytes =
+        out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
     return out;
+}
+
+std::pair<DFlashWorkspaceLayout, std::size_t>
+dflash_workspace_layout(const SequencePlanImpl& plan) {
+    DFlashWorkspaceLayout out;
+    if (!plan.features.dflash()) { return {out, 0}; }
+    if constexpr (!Variant::supports_dflash) {
+        throw std::logic_error("unsupported target reached DFlash workspace planning");
+    } else {
+        LayoutBuilder builder;
+        out.target_features =
+            add_tensor(builder, DType::BF16,
+                       {DFlashConfig::feature_rows, static_cast<std::int32_t>(plan.prefill_chunk)},
+                       "DFlash target feature capture");
+        out.feature_positions =
+            add_tensor(builder, DType::I32, {static_cast<std::int32_t>(plan.prefill_chunk)},
+                       "DFlash captured target positions");
+        out.fixed_bytes = builder.finish(kArenaAlign, "DFlash fixed workspace");
+        return {out, out.fixed_bytes};
+    }
 }
 
 std::size_t workspace_bytes(const SequencePlanImpl& plan) {
@@ -254,7 +292,7 @@ std::size_t workspace_bytes(const SequencePlanImpl& plan) {
 
     WorkspaceLayoutBuilder mtp_prefill;
     WorkspaceLayoutBuilder mtp_full;
-    if (plan.features.mtp) {
+    if (plan.features.mtp()) {
         common_root(mtp_prefill, prefill_tokens);
         matrix(mtp_prefill, DType::I32, 1, prefill_tokens);
         matrix(mtp_prefill, DType::BF16, TextConfig::hidden, prefill_tokens);
@@ -277,9 +315,60 @@ std::size_t workspace_bytes(const SequencePlanImpl& plan) {
     decision.alloc_bytes(
         ops::sampling_workspace_bytes(TextConfig::token_domain, std::max(1, verify_tokens)));
 
-    std::size_t maximum =
-        std::max({prefill.peak_bytes(), verify.peak_bytes(), mtp_prefill.peak_bytes(),
-                  mtp_full.peak_bytes(), decision.peak_bytes()});
+    WorkspaceLayoutBuilder dflash_context;
+    WorkspaceLayoutBuilder dflash_proposal;
+    if (plan.features.dflash()) {
+        if constexpr (!Variant::supports_dflash) {
+            throw std::logic_error("unsupported target reached DFlash scratch planning");
+        } else {
+            matrix(dflash_context, DType::BF16, DFlashConfig::hidden, prefill_tokens);
+            matrix(dflash_context, DType::BF16, DFlashConfig::hidden, prefill_tokens);
+            {
+                auto layer_scope = dflash_context.scope();
+                matrix(dflash_context, DType::BF16, DFlashConfig::kv_size, prefill_tokens);
+                matrix(dflash_context, DType::BF16, DFlashConfig::kv_size, prefill_tokens);
+                matrix(dflash_context, DType::BF16, DFlashConfig::kv_size, prefill_tokens);
+            }
+
+            matrix(dflash_proposal, DType::I32, 1, verify_tokens);
+            matrix(dflash_proposal, DType::I32, 1, verify_tokens);
+            matrix(dflash_proposal, DType::BF16, DFlashConfig::hidden, verify_tokens);
+            {
+                auto attention_scope = dflash_proposal.scope();
+                matrix(dflash_proposal, DType::BF16, DFlashConfig::hidden, verify_tokens);
+                matrix(dflash_proposal, DType::BF16, DFlashConfig::query_size, verify_tokens);
+                matrix(dflash_proposal, DType::BF16, DFlashConfig::kv_size, verify_tokens);
+                matrix(dflash_proposal, DType::BF16, DFlashConfig::kv_size, verify_tokens);
+                matrix(dflash_proposal, DType::BF16, DFlashConfig::query_size, verify_tokens);
+                matrix(dflash_proposal, DType::BF16, DFlashConfig::kv_size, verify_tokens);
+                matrix(dflash_proposal, DType::BF16, DFlashConfig::query_size, verify_tokens);
+                dflash_proposal.alloc_bytes(
+                    std::max(ops::swa_workspace_bytes(verify_tokens),
+                             ops::bidirectional_gqa_attention_workspace_bytes(verify_tokens)));
+                dflash_proposal.alloc_bytes(ops::linear_add_workspace_bytes(
+                    DFlashConfig::hidden, DFlashConfig::query_size, verify_tokens));
+            }
+            {
+                auto mlp_scope = dflash_proposal.scope();
+                matrix(dflash_proposal, DType::BF16, DFlashConfig::hidden, verify_tokens);
+                matrix(dflash_proposal, DType::BF16, DFlashConfig::intermediate, verify_tokens);
+                dflash_proposal.alloc_bytes(ops::linear_swiglu_workspace_bytes(
+                    2 * DFlashConfig::intermediate, verify_tokens));
+                dflash_proposal.alloc_bytes(ops::linear_add_workspace_bytes(
+                    DFlashConfig::hidden, DFlashConfig::intermediate, verify_tokens));
+            }
+            matrix(dflash_proposal, DType::BF16, DFlashConfig::hidden,
+                   static_cast<std::int32_t>(plan.draft_window));
+            if (plan.proposal_head == ProposalHead::Optimized) {
+                matrix(dflash_proposal, DType::BF16, Variant::draft_head_rows,
+                       static_cast<std::int32_t>(plan.draft_window));
+            }
+        }
+    }
+
+    std::size_t maximum = std::max(
+        {prefill.peak_bytes(), verify.peak_bytes(), mtp_prefill.peak_bytes(), mtp_full.peak_bytes(),
+         decision.peak_bytes(), dflash_context.peak_bytes(), dflash_proposal.peak_bytes()});
     if (plan.features.vision) {
         maximum = std::max(maximum, schedule::VisionContext::maximum_workspace_bytes());
     }
@@ -309,12 +398,32 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
-    if (options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
-        throw std::invalid_argument("MTP draft window must be in [0,5]");
-    }
-    if (options.speculative.draft_tokens == 0 &&
-        options.speculative.proposal_head == ProposalHead::Optimized) {
-        throw std::invalid_argument("optimized proposal head requires MTP");
+    switch (options.speculative.backend) {
+    case SpeculativeBackend::None:
+        if (options.speculative.draft_tokens != 0 ||
+            options.speculative.proposal_head != ProposalHead::Full) {
+            throw std::invalid_argument(
+                "disabled speculative decoding requires draft_tokens=0 and the full proposal head");
+        }
+        break;
+    case SpeculativeBackend::Mtp:
+        if (options.speculative.draft_tokens == 0 ||
+            options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
+            throw std::invalid_argument("MTP draft window must be in [1,5]");
+        }
+        break;
+    case SpeculativeBackend::DFlash:
+        if (kMaximumDFlashDraftTokens == 0) {
+            throw std::invalid_argument("DFlash is not supported by this target");
+        }
+        if (options.speculative.draft_tokens == 0 ||
+            options.speculative.draft_tokens > kMaximumDFlashDraftTokens) {
+            throw std::invalid_argument("DFlash draft window must be in [1,15]");
+        }
+        if (options.enable_vision) {
+            throw std::invalid_argument("DFlash and Vision cannot be enabled together");
+        }
+        break;
     }
     if (device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
@@ -325,32 +434,49 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
                                                      const EngineOptions& options) {
     validate_target_options(device, options);
 
-    auto impl             = std::make_unique<SequencePlanImpl>();
-    impl->capacity        = options.max_context;
-    impl->prefill_chunk   = options.prefill_chunk;
-    impl->draft_window    = options.speculative.draft_tokens;
-    impl->proposal_head   = options.speculative.proposal_head;
-    impl->features        = qwen3_6::startup_features(options);
-    impl->use_cuda_graph  = options.use_cuda_graph;
-    impl->device          = options.device;
-    impl->kv_dtype        = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8;
-    impl->kv_quant_group  = impl->kv_dtype == DType::I8 ? kKvQuantGroup : 0;
-    impl->persistent      = persistent_layout(*impl);
-    impl->workspace_bytes = workspace_bytes(*impl);
+    auto impl                 = std::make_unique<SequencePlanImpl>();
+    impl->capacity            = options.max_context;
+    impl->prefill_chunk       = options.prefill_chunk;
+    impl->draft_window        = options.speculative.draft_tokens;
+    impl->speculative_backend = options.speculative.backend;
+    impl->proposal_head       = options.speculative.proposal_head;
+    impl->features            = qwen3_6::startup_features(options);
+    impl->use_cuda_graph      = options.use_cuda_graph;
+    impl->device              = options.device;
+    impl->kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8;
+    impl->kv_quant_group = impl->kv_dtype == DType::I8 ? kKvQuantGroup : 0;
+    impl->persistent     = persistent_layout(*impl);
+    const auto [dflash_workspace, fixed_workspace_bytes] = dflash_workspace_layout(*impl);
+    impl->dflash_workspace                               = dflash_workspace;
+    impl->workspace_fixed_bytes                          = fixed_workspace_bytes;
+    impl->workspace_bytes =
+        checked_add(impl->workspace_fixed_bytes, workspace_bytes(*impl), "sequence workspace");
     if (impl->use_cuda_graph) {
         const std::size_t ordinary_variants = ordinary_graph_ranges(impl->capacity).size();
         const std::size_t ordinary_graphs =
-            ordinary_variants * (impl->draft_window == 0 ? 1ULL : 2ULL);
+            ordinary_variants *
+            (impl->speculative_backend == SpeculativeBackend::Mtp ? 2ULL : 1ULL);
         // Cold full-model capture also materializes lazy CUDA module state. The 35B
         // K=3/C=4096 public benchmark measured 123,277,312 bytes across its 12 ordinary/aligned
         // and short-window executables. Keep one conservative family allowance of 12 MiB per
         // executable. Long MTP executables also trigger substantially larger driver allocations.
         impl->graph_allowance_bytes = ordinary_graphs * 12ULL * kMiB;
-        for (const GraphFrontierRange range :
-             mtp_graph_ranges(impl->capacity, impl->draft_window)) {
-            const std::uint64_t final_visible =
-                static_cast<std::uint64_t>(range.max) + 2ULL * impl->draft_window;
-            impl->graph_allowance_bytes += (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+        if (impl->speculative_backend == SpeculativeBackend::Mtp) {
+            for (const GraphFrontierRange range :
+                 mtp_graph_ranges(impl->capacity, impl->draft_window)) {
+                const std::uint64_t final_visible =
+                    static_cast<std::uint64_t>(range.max) + 2ULL * impl->draft_window;
+                impl->graph_allowance_bytes += (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+            }
+        } else if (impl->speculative_backend == SpeculativeBackend::DFlash) {
+            for (const GraphFrontierRange range :
+                 dflash_graph_ranges(impl->capacity, impl->draft_window)) {
+                const std::uint64_t final_visible =
+                    static_cast<std::uint64_t>(range.max) + impl->draft_window + 1ULL;
+                const std::size_t per_graph = final_visible <= 4096 ? 64ULL : 96ULL;
+                impl->graph_allowance_bytes = checked_add(
+                    impl->graph_allowance_bytes, 2ULL * per_graph * kMiB, "DFlash graph allowance");
+            }
         }
     }
 

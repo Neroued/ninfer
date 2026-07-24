@@ -1,4 +1,5 @@
 #include "serve/request_log.h"
+#include "product/speculative_options.h"
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
@@ -137,14 +138,14 @@ Json arena_json(const ninfer::ArenaMemorySummary& arena) {
                 {"peak_used_bytes", arena.peak_used_bytes}};
 }
 
-Json mtp_json(const GenerationMetrics& metrics) {
-    return Json{{"enabled", metrics.mtp_enabled},
-                {"draft_window", metrics.mtp_draft_window},
-                {"rounds", metrics.mtp_rounds},
-                {"drafted_tokens", metrics.mtp_draft_tokens},
-                {"accepted_tokens", metrics.mtp_accepted_tokens},
-                {"fallback_steps", metrics.mtp_fallback_steps},
-                {"accepted_per_position", metrics.mtp_accepted_per_position}};
+Json speculative_json(const GenerationMetrics& metrics) {
+    return Json{{"backend", product::speculative_backend_name(metrics.speculative_backend)},
+                {"draft_window", metrics.speculative_draft_window},
+                {"rounds", metrics.speculative_rounds},
+                {"drafted_tokens", metrics.speculative_draft_tokens},
+                {"accepted_tokens", metrics.speculative_accepted_tokens},
+                {"fallback_steps", metrics.speculative_fallback_steps},
+                {"accepted_per_position", metrics.speculative_accepted_per_position}};
 }
 
 // Tokens/second with fixed precision, or "n/a" when the interval is degenerate.
@@ -177,20 +178,21 @@ std::string sampler_str(const ninfer::SamplingParameters& sampling) {
     return out.str();
 }
 
-std::string mtp_str(const GenerationMetrics& metrics) {
-    if (!metrics.mtp_enabled) { return "off"; }
+std::string speculative_str(const GenerationMetrics& metrics) {
+    if (metrics.speculative_backend == SpeculativeBackend::None) { return "off"; }
     std::ostringstream out;
-    out << std::fixed << std::setprecision(2);
-    if (metrics.mtp_rounds > 0) {
-        const double per_round = 1.0 + static_cast<double>(metrics.mtp_accepted_tokens) /
-                                           static_cast<double>(metrics.mtp_rounds);
+    out << product::speculative_backend_name(metrics.speculative_backend) << ' ' << std::fixed
+        << std::setprecision(2);
+    if (metrics.speculative_rounds > 0) {
+        const double per_round = 1.0 + static_cast<double>(metrics.speculative_accepted_tokens) /
+                                           static_cast<double>(metrics.speculative_rounds);
         out << per_round << "tok/round";
     } else {
         out << "n/a";
     }
-    if (metrics.mtp_draft_tokens > 0) {
-        const double accept_pct = 100.0 * static_cast<double>(metrics.mtp_accepted_tokens) /
-                                  static_cast<double>(metrics.mtp_draft_tokens);
+    if (metrics.speculative_draft_tokens > 0) {
+        const double accept_pct = 100.0 * static_cast<double>(metrics.speculative_accepted_tokens) /
+                                  static_cast<double>(metrics.speculative_draft_tokens);
         out << " (" << std::setprecision(1) << accept_pct << "%)";
     }
     return out.str();
@@ -249,7 +251,8 @@ std::string format_request_done(const RequestLogContext& context,
         << std::setprecision(0) << ttft_ms << "ms"
         << " prefill=" << rate(static_cast<double>(outcome.prompt_tokens), metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
-        << " wall=" << seconds_str(metrics.total_seconds) << " mtp=" << mtp_str(metrics);
+        << " wall=" << seconds_str(metrics.total_seconds)
+        << " speculative=" << speculative_str(metrics);
     return out.str();
 }
 
@@ -271,34 +274,36 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
     Json artifact_size = nullptr;
     if (artifact_size_bytes.has_value()) { artifact_size = *artifact_size_bytes; }
 
-    record["server"]            = Json{{"host", options.host},
-                                       {"port", options.port},
-                                       {"public_model_id", options.model_id},
-                                       {"api_key_configured", !options.api_key.empty()},
-                                       {"cors_enabled", options.enable_cors},
-                                       {"max_request_bytes", options.max_request_bytes},
-                                       {"request_log_jsonl", options.request_log_jsonl},
-                                       {"default_output_tokens", options.default_max_tokens},
-                                       {"default_thinking", options.enable_thinking}};
-    record["artifact"]          = Json{{"path", options.artifact_path},
-                                       {"size_bytes", std::move(artifact_size)},
-                                       {"target", load.target},
-                                       {"bytes_read", load.artifact_bytes_read},
-                                       {"host_to_device_bytes", load.host_to_device_bytes},
-                                       {"peak_staging_bytes", load.peak_staging_bytes},
-                                       {"tensor_count", load.tensor_count},
-                                       {"resource_count", load.resource_count},
-                                       {"load_seconds", load.load_seconds},
-                                       {"upload_seconds", load.upload_seconds}};
-    record["engine"]            = Json{{"device", options.device},
-                                       {"max_context", options.max_context},
-                                       {"prefill_chunk", options.prefill_chunk},
-                                       {"kv_cache", kv_cache_name(options.kv_cache)},
-                                       {"vision", options.enable_vision},
-                                       {"cuda_graph", options.use_cuda_graph},
-                                       {"prefix_reuse", options.allow_prefix_reuse},
-                                       {"mtp_draft_window", options.mtp_draft_tokens},
-                                       {"mtp_proposal_head", proposal_head_name(options.proposal_head)}};
+    record["server"]   = Json{{"host", options.host},
+                              {"port", options.port},
+                              {"public_model_id", options.model_id},
+                              {"api_key_configured", !options.api_key.empty()},
+                              {"cors_enabled", options.enable_cors},
+                              {"max_request_bytes", options.max_request_bytes},
+                              {"request_log_jsonl", options.request_log_jsonl},
+                              {"default_output_tokens", options.default_max_tokens},
+                              {"default_thinking", options.enable_thinking}};
+    record["artifact"] = Json{{"path", options.artifact_path},
+                              {"size_bytes", std::move(artifact_size)},
+                              {"target", load.target},
+                              {"bytes_read", load.artifact_bytes_read},
+                              {"host_to_device_bytes", load.host_to_device_bytes},
+                              {"peak_staging_bytes", load.peak_staging_bytes},
+                              {"tensor_count", load.tensor_count},
+                              {"resource_count", load.resource_count},
+                              {"load_seconds", load.load_seconds},
+                              {"upload_seconds", load.upload_seconds}};
+    record["engine"]   = Json{
+          {"device", options.device},
+          {"max_context", options.max_context},
+          {"prefill_chunk", options.prefill_chunk},
+          {"kv_cache", kv_cache_name(options.kv_cache)},
+          {"vision", options.enable_vision},
+          {"cuda_graph", options.use_cuda_graph},
+          {"prefix_reuse", options.allow_prefix_reuse},
+          {"speculative_backend", product::speculative_backend_name(options.speculative.backend)},
+          {"speculative_draft_window", options.speculative.draft_tokens},
+          {"proposal_head", proposal_head_name(options.speculative.proposal_head)}};
     record["sampling_defaults"] = Json{{"temperature", options.sampling_temperature},
                                        {"top_p", options.sampling_top_p},
                                        {"top_k", options.sampling_top_k},
@@ -347,7 +352,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                      {"prefill", outcome.metrics.prefill_seconds},
                                      {"decode", outcome.metrics.decode_seconds},
                                      {"total", outcome.metrics.total_seconds}};
-    record["mtp"]             = mtp_json(outcome.metrics);
+    record["speculative"]     = speculative_json(outcome.metrics);
     return record.dump();
 }
 

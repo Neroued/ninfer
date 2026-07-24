@@ -157,6 +157,59 @@ struct CallbackTap {
 
 } // namespace
 
+void DFlashFeatureSink::operator()(TapId id, int layer, Phase, const Tensor& value,
+                                   cudaStream_t stream) {
+    if (features == nullptr || positions == nullptr || layers.empty()) {
+        throw std::logic_error("DFlash feature sink is incomplete");
+    }
+    if (id == TapId::AfterEmbed) {
+        captured_mask = 0;
+        active_tokens = value.ne[1];
+        return;
+    }
+    if (id != TapId::AfterMlp) { return; }
+    const auto it = std::find(layers.begin(), layers.end(), layer);
+    if (it == layers.end()) { return; }
+    const std::size_t index = static_cast<std::size_t>(it - layers.begin());
+    if (layers.size() > 32 || active_tokens <= 0 || value.dtype != DType::BF16 ||
+        value.ne[0] * static_cast<std::int32_t>(layers.size()) != features->ne[0] ||
+        value.ne[1] != active_tokens || active_tokens > features->ne[1]) {
+        throw std::logic_error("DFlash feature capture shape is invalid");
+    }
+    const std::size_t element_bytes = dtype_size(DType::BF16);
+    const std::size_t width_bytes   = static_cast<std::size_t>(value.ne[0]) * element_bytes;
+    const std::size_t source_pitch  = static_cast<std::size_t>(value.nb[1]);
+    const std::size_t target_pitch  = static_cast<std::size_t>(features->nb[1]);
+    auto* target                    = static_cast<std::byte*>(features->data) + index * width_bytes;
+    CUDA_CHECK(cudaMemcpy2DAsync(target, target_pitch, value.data, source_pitch, width_bytes,
+                                 static_cast<std::size_t>(active_tokens), cudaMemcpyDeviceToDevice,
+                                 stream));
+    captured_mask |= 1U << index;
+}
+
+void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t stream) {
+    if (active_tokens <= 0 || source.dtype != DType::I32 || source.ne[0] != active_tokens ||
+        positions == nullptr || active_tokens > positions->ne[0]) {
+        throw std::logic_error("DFlash feature positions are invalid");
+    }
+    const std::uint32_t complete_mask = layers.size() == 32 ? ~0U : ((1U << layers.size()) - 1U);
+    if (captured_mask != complete_mask) {
+        throw std::logic_error("DFlash target call did not publish every feature layer");
+    }
+    CUDA_CHECK(cudaMemcpyAsync(positions->data, source.data,
+                               static_cast<std::size_t>(active_tokens) * sizeof(std::int32_t),
+                               cudaMemcpyDeviceToDevice, stream));
+}
+
+void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool boundary) {
+    if (!consume_prefill || tokens != active_tokens) {
+        throw std::logic_error("DFlash prefill feature consumer is unavailable");
+    }
+    Tensor feature_window  = features->slice(1, 0, tokens);
+    Tensor position_window = positions->slice(0, 0, tokens);
+    consume_prefill(feature_window, position_window, boundary);
+}
+
 TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
                          KVCache& kv, qwen3_6::GdnStateStore& state, qwen3_6::RoundState& io,
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
@@ -562,6 +615,9 @@ void TextContext::target_verify_impl(const Tensor& ids, const Tensor& positions,
         ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
         ScopedEnvelope scoped_envelope(active_gqa_envelope_, envelope);
         run_layers(x, Phase::Verify, tap);
+        if constexpr (requires { tap.capture_positions(positions, s); }) {
+            tap.capture_positions(positions, s);
+        }
 
         Tensor hidden = matrix_window(io_.verify_hidden, T);
         Tensor logits = matrix_window(io_.logits, T);
@@ -580,6 +636,11 @@ void TextContext::target_verify(const Tensor& ids, const Tensor& positions,
                                 ops::GqaExecutionEnvelope envelope) {
     NullTap tap;
     target_verify_impl(ids, positions, envelope, tap);
+}
+
+void TextContext::target_verify(const Tensor& ids, const Tensor& positions,
+                                ops::GqaExecutionEnvelope envelope, DFlashFeatureSink& sink) {
+    target_verify_impl(ids, positions, envelope, sink);
 }
 
 void TextContext::diagnostic_target_verify(const Tensor& ids, const Tensor& positions,
@@ -914,6 +975,9 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             }
             if constexpr (Tap::enabled) { tap(TapId::AfterEmbed, -1, Phase::Prefill, x, s); }
             run_layers(x, Phase::Prefill, tap);
+            if constexpr (requires { tap.capture_positions(positions, s); }) {
+                tap.capture_positions(positions, s);
+            }
 
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
@@ -1020,6 +1084,11 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
             }
         }
 
+        if constexpr (requires { tap.consume_prefill_chunk(len, false); }) {
+            work_.reset();
+            tap.consume_prefill_chunk(len, snap_rel > 0 && t0 + len == snap_rel);
+        }
+
         // Snapshot the running GDN state at the requested boundary into the dedicated slot. This
         // chunk ended exactly at the boundary (see the len cap above), so slot 0 is the state
         // there.
@@ -1042,6 +1111,10 @@ void TextContext::prefill_impl(std::span<const int> ids, const MultimodalPrefill
 void TextContext::prefill(std::span<const int> ids) {
     NullTap tap;
     prefill_impl(ids, nullptr, tap);
+}
+
+void TextContext::prefill(std::span<const int> ids, DFlashFeatureSink& sink) {
+    prefill_impl(ids, nullptr, sink);
 }
 
 void TextContext::diagnostic_prefill(std::span<const int> ids, void* context,

@@ -11,7 +11,7 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
   --port 8080 \
   --model-id qwen3.6-27b \
   --max-context 16384 \
-  --mtp-draft-tokens 3 \
+  --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
 
@@ -21,7 +21,7 @@ For the 35B-A3B artifact, set both the artifact path and public model alias:
 ./build/apps/ninfer-serve models/qwen3_6_35b_a3b.ninfer \
   --model-id qwen3.6-35b-a3b \
   --max-context 16384 \
-  --mtp-draft-tokens 3 \
+  --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
 
@@ -29,9 +29,10 @@ The default `--model-id` is `qwen3.6-27b`; it is an HTTP alias and does not sele
 
 Vision is disabled by default: its weights and maximum workspace are not allocated, and media
 requests and token-count requests fail with HTTP 400 `vision_disabled`. Add `--vision` when the
-server must accept image or video input. MTP residency is likewise fixed by
-`--mtp-draft-tokens`: `0` omits MTP weights and state, while `--lm-head-draft` additionally loads
-the optimized proposal head. A later request cannot enable a capability omitted at startup.
+server must accept image or video input. Speculative residency is likewise frozen by
+`--spec mtp|dflash` and `--draft-tokens`; omitting `--spec` loads neither backend.
+`--lm-head-draft` additionally loads the optimized proposal head. DFlash is 35B-A3B text-only and
+cannot be combined with `--vision`. A later request cannot enable a capability omitted at startup.
 
 ## Endpoints
 
@@ -158,8 +159,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
-| `--mtp-draft-tokens N` | MTP draft window, `0..5` | `0` |
-| `--lm-head-draft` | optimized MTP proposal head | off |
+| `--spec mtp\|dflash` | speculative backend | off |
+| `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
+| `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
@@ -187,7 +189,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v1 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v2 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
@@ -195,11 +197,11 @@ that server instance.
 |---|---|
 | `server_start` | target/artifact, resolved Engine and sampler configuration, memory summary, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, thinking mode, output budget, stream/message/tool shape |
-| `request_done` | finish reason, prompt/completion/cache tokens, unrounded phase seconds, and complete MTP counters |
+| `request_done` | finish reason, prompt/completion/cache tokens, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
 
 `request_done.timings_seconds` contains `prepare`, `vision`, `prefill`, `decode`, and `total` as
-full-precision JSON numbers. Its `mtp` object contains `enabled`, `draft_window`, `rounds`,
+full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates and TTFT
 are intentionally derived downstream from raw token counts and seconds instead of being stored as
 rounded strings.
@@ -222,10 +224,11 @@ therefore resets the prefix instead of reusing placeholder-token KV. Media wholl
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
 
-MTP is an engine option and does not change protocol output shapes, stop behavior, or usage
-accounting. If a stop truncates a multi-token MTP round, the Engine commits the exact accepted target
-prefix so a following compatible turn can still reuse it. Output-limit and context-capacity finishes
-map to `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
+Speculative decoding is an engine option and does not change protocol output shapes, stop behavior,
+or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the Engine commits the
+exact accepted target prefix so a following compatible turn can still reuse it. Output-limit and
+context-capacity finishes map to `length`/ `max_tokens`; ordinary model or string stops map to
+`stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
 responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained

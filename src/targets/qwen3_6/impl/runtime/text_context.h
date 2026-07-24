@@ -17,6 +17,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <vector>
 
@@ -115,6 +116,22 @@ struct NullTap {
     static constexpr bool enabled = false;
 };
 
+struct DFlashFeatureSink {
+    static constexpr bool enabled = true;
+    using PrefillConsumer         = std::function<void(const Tensor&, const Tensor&, bool)>;
+
+    Tensor* features  = nullptr;
+    Tensor* positions = nullptr;
+    std::span<const int> layers;
+    PrefillConsumer consume_prefill;
+    std::uint32_t captured_mask = 0;
+    std::int32_t active_tokens  = 0;
+
+    void operator()(TapId id, int layer, Phase phase, const Tensor& value, cudaStream_t stream);
+    void capture_positions(const Tensor& source, cudaStream_t stream);
+    void consume_prefill_chunk(std::int32_t tokens, bool boundary);
+};
+
 class VisionPrefillSession;
 
 class TextContext {
@@ -157,6 +174,7 @@ public:
     }
 
     void prefill(std::span<const int> ids);
+    void prefill(std::span<const int> ids, DFlashFeatureSink& sink);
     void prefill(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                  VisionPrefillSession& vision);
     void diagnostic_prefill(std::span<const int> ids, void* context, TextTapCallback callback);
@@ -164,6 +182,8 @@ public:
                             VisionPrefillSession& vision, void* context, TextTapCallback callback);
     void target_verify(const Tensor& ids, const Tensor& positions,
                        ops::GqaExecutionEnvelope envelope);
+    void target_verify(const Tensor& ids, const Tensor& positions,
+                       ops::GqaExecutionEnvelope envelope, DFlashFeatureSink& sink);
     void diagnostic_target_verify(const Tensor& ids, const Tensor& positions,
                                   ops::GqaExecutionEnvelope envelope, void* context,
                                   TextTapCallback callback);

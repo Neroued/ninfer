@@ -37,20 +37,21 @@ int main() {
                       "request log accepted the model artifact as its output path");
 
     ServeOptions options;
-    options.artifact_path      = "/models/qwen3_6_27b.ninfer";
-    options.host               = "127.0.0.1";
-    options.port               = 8123;
-    options.api_key            = "must-not-appear";
-    options.model_id           = "qwen3.6-27b";
-    options.request_log_jsonl  = "requests.jsonl";
-    options.max_context        = 262144;
-    options.prefill_chunk      = 1024;
-    options.kv_cache           = ninfer::KvCacheStorage::Int8Group64;
-    options.mtp_draft_tokens   = 3;
-    options.proposal_head      = ninfer::ProposalHead::Optimized;
-    options.enable_vision      = false;
-    options.allow_prefix_reuse = false;
-    options.startup_argv       = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
+    options.artifact_path             = "/models/qwen3_6_27b.ninfer";
+    options.host                      = "127.0.0.1";
+    options.port                      = 8123;
+    options.api_key                   = "must-not-appear";
+    options.model_id                  = "qwen3.6-27b";
+    options.request_log_jsonl         = "requests.jsonl";
+    options.max_context               = 262144;
+    options.prefill_chunk             = 1024;
+    options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
+    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens  = 3;
+    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.enable_vision             = false;
+    options.allow_prefix_reuse        = false;
+    options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
     ninfer::LoadSummary load;
     load.target               = "qwen3_6_27b";
@@ -95,8 +96,10 @@ int main() {
                       "request log path missing");
     failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
+    failures += check(server.at("engine").at("speculative_backend") == "mtp",
+                      "speculative backend missing");
     failures +=
-        check(server.at("engine").at("mtp_proposal_head") == "optimized", "proposal head missing");
+        check(server.at("engine").at("proposal_head") == "optimized", "proposal head missing");
     failures +=
         check(server.at("engine").at("prefix_reuse") == false, "prefix-reuse state missing");
     failures += check(server.at("environment").at("gpu_name") == "NVIDIA GeForce RTX 5090",
@@ -136,22 +139,22 @@ int main() {
                       "resolved seed missing");
 
     GenerationOutcome outcome;
-    outcome.prompt_tokens                     = 401;
-    outcome.completion_tokens                 = 1024;
-    outcome.finish_reason                     = ninfer::FinishReason::OutputLimit;
-    outcome.metrics.prepare_seconds           = 0.1234567890123;
-    outcome.metrics.vision_seconds            = 0.0;
-    outcome.metrics.prefill_seconds           = 0.2345678901234;
-    outcome.metrics.decode_seconds            = 5.3456789012345;
-    outcome.metrics.total_seconds             = 5.7037035803702;
-    outcome.metrics.prefix_cache_hit_tokens   = 0;
-    outcome.metrics.mtp_enabled               = true;
-    outcome.metrics.mtp_draft_window          = 3;
-    outcome.metrics.mtp_rounds                = 300;
-    outcome.metrics.mtp_draft_tokens          = 900;
-    outcome.metrics.mtp_accepted_tokens       = 720;
-    outcome.metrics.mtp_fallback_steps        = 2;
-    outcome.metrics.mtp_accepted_per_position = {290, 240, 190};
+    outcome.prompt_tokens                             = 401;
+    outcome.completion_tokens                         = 1024;
+    outcome.finish_reason                             = ninfer::FinishReason::OutputLimit;
+    outcome.metrics.prepare_seconds                   = 0.1234567890123;
+    outcome.metrics.vision_seconds                    = 0.0;
+    outcome.metrics.prefill_seconds                   = 0.2345678901234;
+    outcome.metrics.decode_seconds                    = 5.3456789012345;
+    outcome.metrics.total_seconds                     = 5.7037035803702;
+    outcome.metrics.prefix_cache_hit_tokens           = 0;
+    outcome.metrics.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
+    outcome.metrics.speculative_draft_window          = 3;
+    outcome.metrics.speculative_rounds                = 300;
+    outcome.metrics.speculative_draft_tokens          = 900;
+    outcome.metrics.speculative_accepted_tokens       = 720;
+    outcome.metrics.speculative_fallback_steps        = 2;
+    outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
@@ -160,10 +163,14 @@ int main() {
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
-    failures += check(done.at("mtp").at("draft_window") == 3, "MTP draft window missing");
-    failures += check(done.at("mtp").at("fallback_steps") == 2, "MTP fallback count missing");
-    failures += check(done.at("mtp").at("accepted_per_position") == Json::array({290, 240, 190}),
-                      "MTP position counts missing");
+    failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
+    failures +=
+        check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");
+    failures += check(done.at("speculative").at("fallback_steps") == 2,
+                      "speculative fallback count missing");
+    failures +=
+        check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
+              "speculative position counts missing");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

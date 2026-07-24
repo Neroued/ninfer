@@ -24,6 +24,12 @@ auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envel
         ops::assign_i32_scalar(state.io.token, verify_id, state.device.stream);
         ops::assign_i32_scalar(state.io.pos, position, state.device.stream);
         target_verify(card, state, verify_id, position, envelope);
+        if (state.dflash != nullptr) {
+            ops::set_i32_scalar(state.dflash->commit_count, 1, state.device.stream);
+            Tensor features  = state.dflash_workspace->target_features.slice(1, 0, 1);
+            Tensor positions = state.dflash_workspace->feature_positions.slice(0, 0, 1);
+            dflash_append_context(state, features, positions, state.dflash->commit_count, {1, 1});
+        }
 
         Tensor logits = state.io.logits.slice(1, 0, 1);
         ops::sample(logits, state.io.token, TextConfig::token_domain, state.sampling,
@@ -40,7 +46,7 @@ auto ordinary_body(State& state, bool align_mtp, ops::GqaExecutionEnvelope envel
         ops::increment_i32_scalar(state.io.pos, state.device.stream);
         ops::increment_i32_scalar(state.io.rope_pos, state.device.stream);
         ops::set_i32_scalar(state.io.gdn_initial_slot, 0, state.device.stream);
-        if (state.mtp_kv != nullptr) {
+        if (state.mtp_kv != nullptr || state.dflash != nullptr) {
             Tensor fallback_steps = state.io.speculative.stats.slice(0, 3, 1);
             ops::increment_i64_scalar(fallback_steps, state.device.stream);
         }

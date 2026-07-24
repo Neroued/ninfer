@@ -125,8 +125,8 @@ struct MtpAttentionPayload {
 
 using RuntimeModelView =
     qwen3_6::ModelView<FullAttentionProjectionPayload, GdnProjectionPayload, DensePostMixerPayload,
-                       MtpAttentionPayload, DensePostMixerPayload, kFullAttentionLayers,
-                       kGdnLayers>;
+                       MtpAttentionPayload, DensePostMixerPayload, qwen3_6::DFlashWeights<6>,
+                       kFullAttentionLayers, kGdnLayers>;
 using FullAttentionWeights = RuntimeModelView::FullLayer;
 using GdnWeights           = RuntimeModelView::GdnLayer;
 using MtpWeights           = RuntimeModelView::MtpLayer;

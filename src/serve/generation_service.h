@@ -25,13 +25,13 @@ struct GenerationMetrics {
     double decode_seconds  = 0.0;
     double total_seconds   = 0.0;
 
-    bool mtp_enabled                  = false;
-    std::uint32_t mtp_draft_window    = 0;
-    std::uint64_t mtp_rounds          = 0;
-    std::uint64_t mtp_draft_tokens    = 0;
-    std::uint64_t mtp_accepted_tokens = 0;
-    std::uint64_t mtp_fallback_steps  = 0;
-    std::vector<std::uint64_t> mtp_accepted_per_position;
+    SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
+    std::uint32_t speculative_draft_window    = 0;
+    std::uint64_t speculative_rounds          = 0;
+    std::uint64_t speculative_draft_tokens    = 0;
+    std::uint64_t speculative_accepted_tokens = 0;
+    std::uint64_t speculative_fallback_steps  = 0;
+    std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens = 0;
 };
 

@@ -385,8 +385,7 @@ int run(const Options& options) {
         throw std::invalid_argument("artifact model_id does not match qwen3.6-35b-a3b");
     }
     ninfer::artifact::Binder binder(reader);
-    detail::ArtifactLoadPlan load = detail::bind_artifact(
-        binder, detail::LoadFeatures{.family = family::StartupFeatures{}, .dflash = false});
+    detail::ArtifactLoadPlan load = detail::bind_artifact(binder, family::StartupFeatures{});
     auto materialized =
         ninfer::artifact::materialize(reader, load.materialization, device, nullptr);
     detail::LoadedModelData model(std::move(load.bindings), std::move(materialized));
@@ -449,6 +448,8 @@ int run(const Options& options) {
             model.runtime,
             workspace,
             decoder.text_kv,
+            nullptr,
+            nullptr,
             nullptr,
             decoder.gdn,
             io,

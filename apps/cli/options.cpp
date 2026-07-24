@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/speculative_options.h"
 
 #include <cerrno>
 #include <cmath>
@@ -63,7 +64,8 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--prefill-chunk N] [--max-new N] [--device N]\n"
-           "       [--kv-dtype bf16|int8] [--mtp-draft-tokens 0..5] [--lm-head-draft]\n"
+           "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
@@ -107,13 +109,12 @@ Options parse_options(int argc, char** argv) {
             options.device = parse_device(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
-        } else if (arg == "--mtp-draft-tokens") {
-            options.mtp_draft_tokens = parse_u32(value(arg), "mtp-draft-tokens", true);
-            if (options.mtp_draft_tokens > 5) {
-                throw std::invalid_argument("--mtp-draft-tokens must be in [0,5]");
-            }
+        } else if (arg == "--spec") {
+            options.speculative.backend = product::parse_speculative_backend(value(arg));
+        } else if (arg == "--draft-tokens") {
+            options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--lm-head-draft") {
-            options.proposal_head = ProposalHead::Optimized;
+            options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--raw-output") {
             options.raw_output = true;
         } else if (arg == "--print-token-ids") {
@@ -174,9 +175,9 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
-    if (options.proposal_head == ProposalHead::Optimized && options.mtp_draft_tokens == 0) {
-        throw std::invalid_argument(
-            "--lm-head-draft requires --mtp-draft-tokens greater than zero");
+    product::validate_speculative_cli_options(options.speculative);
+    if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
+        throw std::invalid_argument("--spec dflash cannot be combined with --vision");
     }
     if (options.greedy) { options.sampling = SamplingParameters{}; }
     return options;

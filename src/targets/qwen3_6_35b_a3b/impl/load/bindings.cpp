@@ -22,6 +22,26 @@ NumericFormat routed_down_format(std::size_t layer) {
                                                      : NumericFormat::Q5G64_F16S;
 }
 
+Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
+    if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n ||
+        block.qtype != QType::W8G32_F16S || block.layout != QuantLayout::RowSplit ||
+        block.group != 32) {
+        throw std::logic_error("invalid DFlash W8 row view");
+    }
+    const std::uint64_t code_row = static_cast<std::uint64_t>(block.padded_shape[1]);
+    const std::uint64_t scale_row =
+        static_cast<std::uint64_t>(block.padded_shape[1] / block.group) * sizeof(std::uint16_t);
+    Weight out = block;
+    out.qdata  = static_cast<const std::byte*>(block.qdata) +
+                static_cast<std::uint64_t>(row_begin) * code_row;
+    out.scales = static_cast<const std::byte*>(block.scales) +
+                 static_cast<std::uint64_t>(row_begin) * scale_row;
+    out.n               = row_count;
+    out.shape[0]        = row_count;
+    out.padded_shape[0] = row_count;
+    return out;
+}
+
 MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFormat routed_gate_up,
                  NumericFormat routed_down, artifact::TensorPlacement placement) {
     const auto bind = [&](std::string_view name, NumericFormat format,
@@ -74,7 +94,7 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 } // namespace
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, LoadFeatures features) {
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
     out.frontend        = qwen3_6::bind_frontend_resources(binder);
@@ -125,15 +145,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, LoadFeatures features) 
     out.output_head = artifact::bind_device_tensor(binder, "text/output_head",
                                                    NumericFormat::Q6G64_F16S, {248320, 2048});
     const artifact::TensorPlacement proposal_placement =
-        features.family.optimized_proposal ? artifact::TensorPlacement::Device
-                                           : artifact::TensorPlacement::ValidateOnly;
+        features.optimized_proposal() ? artifact::TensorPlacement::Device
+                                      : artifact::TensorPlacement::ValidateOnly;
     out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
                                            {131072, 2048}, proposal_placement);
     out.draft_head_token_ids = artifact::bind_tensor(
         binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
-    const artifact::TensorPlacement mtp_placement = features.family.mtp
+    const artifact::TensorPlacement mtp_placement = features.mtp()
                                                         ? artifact::TensorPlacement::Device
                                                         : artifact::TensorPlacement::ValidateOnly;
     const auto bind_mtp                           = [&](std::string_view name, NumericFormat format,
@@ -160,8 +180,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, LoadFeatures features) 
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
 
     const artifact::TensorPlacement vision_placement =
-        features.family.vision ? artifact::TensorPlacement::Device
-                               : artifact::TensorPlacement::ValidateOnly;
+        features.vision ? artifact::TensorPlacement::Device
+                        : artifact::TensorPlacement::ValidateOnly;
     out.vision_backbone     = qwen3_6::bind_vision_backbone(binder, vision_placement);
     out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
     out.vision_merger_fc2   = artifact::bind_tensor(
@@ -171,8 +191,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, LoadFeatures features) 
     out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
 
     const artifact::TensorPlacement dflash_placement =
-        features.dflash ? artifact::TensorPlacement::Device
-                        : artifact::TensorPlacement::ValidateOnly;
+        features.dflash() ? artifact::TensorPlacement::Device
+                          : artifact::TensorPlacement::ValidateOnly;
     const auto bind_dflash = [&](std::string_view name, NumericFormat format,
                                  std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, dflash_placement);
@@ -208,7 +228,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
-    runtime.features      = plan.features.family;
+    runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
     auto& gdn_layers      = runtime.gdn_layers;
@@ -271,7 +291,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {2048});
     output_head = artifact::materialized_weight(backing, plan.output_head,
                                                 NumericFormat::Q6G64_F16S, 248320, 2048);
-    if (plan.features.family.optimized_proposal) {
+    if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
                                                            NumericFormat::Q4G64_F16S, 131072, 2048);
@@ -279,7 +299,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                            NumericFormat::I32, {131072});
     }
 
-    if (plan.features.family.mtp) {
+    if (plan.features.mtp()) {
         auto& mtp            = runtime.mtp.emplace();
         mtp.input_projection = artifact::materialized_weight(backing, plan.mtp.input_projection,
                                                              NumericFormat::W8G32_F16S, 2048, 4096);
@@ -306,7 +326,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                        NumericFormat::BF16, {2048});
     }
 
-    if (plan.features.family.vision) {
+    if (plan.features.vision) {
         auto& vision  = runtime.vision.emplace();
         vision.common = qwen3_6::materialize_vision_common(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
@@ -316,11 +336,9 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                                NumericFormat::BF16, {2048});
     }
 
-    if (plan.features.dflash) {
-        DFlashWeights& target       = dflash.emplace();
-        target.token_embedding      = token_embedding;
-        target.proposal_output_head = output_head;
-        target.feature_projection   = artifact::materialized_weight(
+    if (plan.features.dflash()) {
+        DFlashWeights& target     = runtime.dflash.emplace();
+        target.feature_projection = artifact::materialized_weight(
             backing, plan.dflash.feature_projection, NumericFormat::W8G32_F16S, 2048, 16384);
         target.context_norm = artifact::materialized_tensor(backing, plan.dflash.context_norm,
                                                             NumericFormat::BF16, {2048});
@@ -331,8 +349,10 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                                     NumericFormat::BF16, {2048});
             weights.query_key_value = artifact::materialized_weight(
                 backing, source.query_key_value, NumericFormat::W8G32_F16S, 6144, 2048);
-            weights.query_norm = artifact::materialized_tensor(backing, source.query_norm,
-                                                               NumericFormat::BF16, {128});
+            weights.context_key   = row_view(weights.query_key_value, 4096, 1024);
+            weights.context_value = row_view(weights.query_key_value, 5120, 1024);
+            weights.query_norm    = artifact::materialized_tensor(backing, source.query_norm,
+                                                                  NumericFormat::BF16, {128});
             weights.key_norm =
                 artifact::materialized_tensor(backing, source.key_norm, NumericFormat::BF16, {128});
             weights.attention_output = artifact::materialized_weight(

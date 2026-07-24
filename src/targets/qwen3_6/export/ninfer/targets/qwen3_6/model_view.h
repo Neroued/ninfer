@@ -57,13 +57,35 @@ struct OptimizedProposalWeights {
     Tensor token_ids;
 };
 
+struct DFlashLayerWeights {
+    Tensor input_norm;
+    Weight query_key_value;
+    Weight context_key;
+    Weight context_value;
+    Tensor query_norm;
+    Tensor key_norm;
+    Weight attention_output;
+    Tensor post_attention_norm;
+    Weight gate_up;
+    Weight down;
+};
+
+template <std::size_t Layers>
+struct DFlashWeights {
+    Weight feature_projection;
+    Tensor context_norm;
+    std::array<DFlashLayerWeights, Layers> layers;
+    Tensor final_norm;
+};
+
 template <class FullProjectionPayload, class GdnProjectionPayload, class MainPostMixerPayload,
-          class MtpAttentionPayload, class MtpPostMixerPayload, std::size_t FullAttentionLayers,
-          std::size_t GdnLayers>
+          class MtpAttentionPayload, class MtpPostMixerPayload, class DFlashPayload,
+          std::size_t FullAttentionLayers, std::size_t GdnLayers>
 struct ModelView {
     using FullLayer = FullAttentionWeights<FullProjectionPayload, MainPostMixerPayload>;
     using GdnLayer  = GdnWeights<GdnProjectionPayload, MainPostMixerPayload>;
     using MtpLayer  = MtpWeights<MtpAttentionPayload, MtpPostMixerPayload>;
+    using DFlash    = DFlashPayload;
 
     DeviceArena* weights_arena = nullptr;
     Weight token_embedding;
@@ -74,6 +96,7 @@ struct ModelView {
     StartupFeatures features;
     std::optional<OptimizedProposalWeights> optimized_proposal;
     std::optional<MtpLayer> mtp;
+    std::optional<DFlashPayload> dflash;
     std::optional<VisionWeights> vision;
 };
 

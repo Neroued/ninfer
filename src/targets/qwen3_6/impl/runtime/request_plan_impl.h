@@ -100,10 +100,15 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
 
     if (options.allow_prefix_reuse && prompt.identity.reusable &&
         lifecycle == Lifecycle::Resident) {
-        if (E != 0 && qwen3_6::detail::prefix_matches(prompt, ledger, prefix_identity, E)) {
+        const bool dflash_append_ready = speculative_backend != SpeculativeBackend::DFlash ||
+                                         (!pending_context_valid && dflash_context_frontier == E);
+        if (E != 0 && dflash_append_ready &&
+            qwen3_6::detail::prefix_matches(prompt, ledger, prefix_identity, E)) {
             plan->reuse      = ReusePath::AppendAtFrontier;
             plan->reuse_base = E;
         } else if (boundary.valid && boundary.boundary != 0 &&
+                   (speculative_backend != SpeculativeBackend::DFlash ||
+                    (dflash_boundary_valid && dflash_boundary_frontier == boundary.boundary)) &&
                    boundary.boundary < prompt.token_ids.size() &&
                    qwen3_6::detail::prefix_matches(prompt, ledger, prefix_identity,
                                                    boundary.boundary)) {
@@ -114,7 +119,7 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
 
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
     const bool mtp_capacity =
-        draft_window != 0 &&
+        speculative_backend == SpeculativeBackend::Mtp &&
         static_cast<std::uint64_t>(plan->summary.prompt_tokens) + 2ULL * draft_window <= capacity;
     if (mtp_capacity) {
         if (plan->reuse == ReusePath::FullReset) {
@@ -131,6 +136,10 @@ RequestPlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
             plan->needs_mtp_bridge = true;
         }
     }
+
+    plan->prepare_dflash =
+        speculative_backend == SpeculativeBackend::DFlash &&
+        static_cast<std::uint64_t>(plan->summary.prompt_tokens) + draft_window + 1ULL <= capacity;
     if (plan->needs_mtp_bridge && plan->reuse_base < plan->summary.prompt_tokens &&
         prompt.token_types[plan->reuse_base] != 0) {
         // A bridge consumes the first suffix token as the MTP shifted embedding. Reusing target

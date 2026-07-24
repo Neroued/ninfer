@@ -193,12 +193,14 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 
     const ninfer::SpeculativeStats& speculative = result.speculative;
     if (speculative.enabled) {
-        print_metric("mtp draft window", std::to_string(speculative.draft_window));
-        print_metric("mtp rounds", std::to_string(speculative.rounds));
-        print_metric("mtp fallback steps", std::to_string(speculative.fallback_steps));
-        print_metric("mtp drafted tokens", std::to_string(speculative.drafted_tokens));
-        print_metric("mtp accepted tokens", std::to_string(speculative.accepted_tokens));
-        print_metric("mtp acceptance rate",
+        const std::string backend =
+            speculative.backend == ninfer::SpeculativeBackend::DFlash ? "dflash" : "mtp";
+        print_metric(backend + " draft window", std::to_string(speculative.draft_window));
+        print_metric(backend + " rounds", std::to_string(speculative.rounds));
+        print_metric(backend + " fallback steps", std::to_string(speculative.fallback_steps));
+        print_metric(backend + " drafted tokens", std::to_string(speculative.drafted_tokens));
+        print_metric(backend + " accepted tokens", std::to_string(speculative.accepted_tokens));
+        print_metric(backend + " acceptance rate",
                      format_percent(speculative.accepted_tokens, speculative.drafted_tokens));
         if (speculative.rounds != 0) {
             std::ostringstream length;
@@ -206,7 +208,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                    << 1.0 + static_cast<double>(speculative.accepted_tokens) /
                                 static_cast<double>(speculative.rounds)
                    << " tok/round";
-            print_metric("mtp acceptance length", length.str());
+            print_metric(backend + " acceptance length", length.str());
         }
         if (!speculative.accepted_per_position.empty()) {
             std::ostringstream positions;
@@ -214,7 +216,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                 if (i != 0) { positions << ','; }
                 positions << speculative.accepted_per_position[i];
             }
-            print_metric("mtp accepted by pos", positions.str());
+            print_metric(backend + " accepted by pos", positions.str());
         }
     }
 }
@@ -250,8 +252,7 @@ int main(int argc, char** argv) {
         engine_options.max_context                      = cli.max_context;
         engine_options.prefill_chunk                    = cli.prefill_chunk;
         engine_options.kv_cache                         = cli.kv_cache;
-        engine_options.speculative.draft_tokens         = cli.mtp_draft_tokens;
-        engine_options.speculative.proposal_head        = cli.proposal_head;
+        engine_options.speculative                      = cli.speculative;
         engine_options.enable_vision                    = cli.enable_vision;
         engine_options.use_cuda_graph                   = cli.use_cuda_graph;
         engine_options.load_progress.min_interval_bytes = 1ULL << 30;

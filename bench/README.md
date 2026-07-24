@@ -417,6 +417,25 @@ cmake --build build --parallel \
 The reported `target_side_effective_tok_s` is `(A+1)/target-side latency`. It deliberately excludes
 proposal generation and dFlash-specific context maintenance and is not an end-to-end speed claim.
 
+## 35B complete DFlash round benchmark
+
+`ninfer_qwen3_6_35b_a3b_dflash_round_bench` drives the production Program through consecutive
+steady DFlash rounds. A measured round includes the previous confirmed feature-to-context append,
+the six-layer proposal, target verify/accept, and host publication. It reports GPU and wall latency,
+real acceptance, per-position acceptance, mean licensed length, and published tokens/s:
+
+```bash
+cmake --build build --parallel \
+  --target ninfer_qwen3_6_35b_a3b_dflash_round_bench
+./build/bench/ninfer_qwen3_6_35b_a3b_dflash_round_bench \
+  --artifact out/qwen3_6_35b_a3b.ninfer \
+  --context 4096 --draft-tokens 15 --proposal-head optimized
+```
+
+Run separate invocations for `K=1..15`, `full|optimized`, representative contexts, and
+`--no-cuda-graph`. The target-side benchmark above supplies forced `A=0..K` transaction evidence;
+this complete-round benchmark intentionally preserves the DFlash model's real greedy acceptance.
+
 ## Token-decision Op benchmarks
 
 The G1 benchmark covers the Qwen3.6-35B full physical vocabulary with 248077 valid rows at

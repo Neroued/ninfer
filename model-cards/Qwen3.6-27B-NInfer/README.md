@@ -109,7 +109,7 @@ hf download neroued/Qwen3.6-27B-NInfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 \
   --max-new 256 \
-  --mtp-draft-tokens 3 \
+  --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
 

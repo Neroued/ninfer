@@ -59,7 +59,7 @@ To exercise MTP through the same input path:
 ```bash
 $CLI "$MODEL" --messages examples/cli/messages/text_smoke_zh.json \
   --no-thinking --greedy --max-new 8 \
-  --mtp-draft-tokens 3 --lm-head-draft
+  --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
 ## Thinking cases

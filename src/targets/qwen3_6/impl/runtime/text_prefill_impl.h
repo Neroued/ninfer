@@ -3,6 +3,7 @@
 
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/scalar.h"
 
 #include <cuda_runtime.h>
 
@@ -32,7 +33,18 @@ bool prefill_text(State& state, std::span<const TokenId> ids,
     card.set_prefill_snapshot_boundary(
         snapshot_boundary ? static_cast<std::int64_t>(*snapshot_boundary) : -1);
     const std::span<const int> prompt(ids.data(), ids.size());
-    if (state.diagnostic_text_tap != nullptr) {
+    if (state.dflash != nullptr) {
+        DFlashFeatureSink sink = dflash_feature_sink(
+            state, [&state](const Tensor& features, const Tensor& positions, bool boundary) {
+                ops::set_i32_scalar(state.dflash->commit_count, features.ne[1],
+                                    state.device.stream);
+                const auto count = static_cast<std::uint32_t>(features.ne[1]);
+                dflash_append_context(state, features, positions, state.dflash->commit_count,
+                                      {count, count});
+                if (boundary) { state.dflash->save_boundary(state.device.stream); }
+            });
+        card.prefill(prompt, sink);
+    } else if (state.diagnostic_text_tap != nullptr) {
         card.diagnostic_prefill(prompt, state.diagnostic_context, state.diagnostic_text_tap);
     } else {
         card.prefill(prompt);

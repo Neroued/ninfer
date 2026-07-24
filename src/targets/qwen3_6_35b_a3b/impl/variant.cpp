@@ -66,6 +66,30 @@ std::vector<GraphFrontierRange> Variant::mtp_graph_ranges(std::uint32_t capacity
     return graph_ranges_through(capacity - 2 * draft_window, ends);
 }
 
+std::vector<GraphFrontierRange> Variant::dflash_graph_ranges(std::uint32_t capacity,
+                                                             std::uint32_t draft_window) {
+    if (draft_window == 0 || static_cast<std::uint64_t>(draft_window) + 1ULL > capacity) {
+        return {};
+    }
+    const std::uint32_t block        = draft_window + 1;
+    const std::uint32_t max_frontier = capacity - block;
+    std::vector<std::uint32_t> ends{
+        96U, 127U, 511U, 1023U, 2047U, 4095U, 8191U, 16383U, 32767U, 65536U, 131072U, 196608U,
+    };
+    const auto add_target_boundary = [&](std::uint32_t visible_end) {
+        if (visible_end >= block) { ends.push_back(visible_end - block); }
+    };
+    for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
+        add_target_boundary(visible_end);
+    }
+    if (draft_window >= 6 && draft_window <= 15) {
+        add_target_boundary(draft_window <= 11 ? 512U : 1024U);
+    }
+    std::sort(ends.begin(), ends.end());
+    ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
+    return graph_ranges_through(max_frontier, ends);
+}
+
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value,

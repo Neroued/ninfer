@@ -21,11 +21,10 @@ struct Options {
     std::uint32_t prefill_chunk = 1024;
     int device                  = 0;
 
-    KvCacheStorage kv_cache        = KvCacheStorage::BFloat16;
-    std::uint32_t mtp_draft_tokens = 0;
-    ProposalHead proposal_head     = ProposalHead::Full;
-    bool enable_vision             = false;
-    bool use_cuda_graph            = true;
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    SpeculativeOptions speculative;
+    bool enable_vision  = false;
+    bool use_cuda_graph = true;
 
     bool raw_output      = false;
     bool print_token_ids = false;

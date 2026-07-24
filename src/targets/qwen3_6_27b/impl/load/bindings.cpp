@@ -136,17 +136,18 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     out.output_head = artifact::bind_device_tensor(binder, "text/output_head",
                                                    NumericFormat::Q6G64_F16S, {248320, 5120});
     const artifact::TensorPlacement proposal_placement =
-        features.optimized_proposal ? artifact::TensorPlacement::Device
-                                    : artifact::TensorPlacement::ValidateOnly;
+        features.optimized_proposal() ? artifact::TensorPlacement::Device
+                                      : artifact::TensorPlacement::ValidateOnly;
     out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
                                            {131072, 5120}, proposal_placement);
     out.draft_head_token_ids = artifact::bind_tensor(
         binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
     validate_draft_ids(binder, out.draft_head_token_ids);
 
-    const artifact::TensorPlacement mtp_placement =
-        features.mtp ? artifact::TensorPlacement::Device : artifact::TensorPlacement::ValidateOnly;
-    const auto bind_mtp = [&](std::string_view name, NumericFormat format,
+    const artifact::TensorPlacement mtp_placement = features.mtp()
+                                                        ? artifact::TensorPlacement::Device
+                                                        : artifact::TensorPlacement::ValidateOnly;
+    const auto bind_mtp                           = [&](std::string_view name, NumericFormat format,
                               std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
@@ -254,7 +255,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {5120});
     output_head = artifact::materialized_weight(backing, plan.output_head,
                                                 NumericFormat::Q6G64_F16S, 248320, 5120);
-    if (plan.features.optimized_proposal) {
+    if (plan.features.optimized_proposal()) {
         auto& proposal     = runtime.optimized_proposal.emplace();
         proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
                                                            NumericFormat::Q4G64_F16S, 131072, 5120);
@@ -262,7 +263,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
                                                            NumericFormat::I32, {131072});
     }
 
-    if (plan.features.mtp) {
+    if (plan.features.mtp()) {
         auto& mtp            = runtime.mtp.emplace();
         mtp.input_projection = artifact::materialized_weight(
             backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S, 5120, 10240);

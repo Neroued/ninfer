@@ -73,9 +73,9 @@ SCENARIO_FIXTURES = {
 
 WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
-RUN_SCHEMA_VERSION = 2
+RUN_SCHEMA_VERSION = 3
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 1
+SERVER_LOG_SCHEMA_VERSION = 2
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -432,8 +432,9 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         "kv_cache": engine.get("kv_cache"),
         "cuda_graph": engine.get("cuda_graph"),
         "prefix_reuse": engine.get("prefix_reuse"),
-        "mtp_draft_window": engine.get("mtp_draft_window"),
-        "mtp_proposal_head": engine.get("mtp_proposal_head"),
+        "speculative_backend": engine.get("speculative_backend"),
+        "speculative_draft_window": engine.get("speculative_draft_window"),
+        "proposal_head": engine.get("proposal_head"),
     }
     expected = {
         "device": device,
@@ -442,8 +443,9 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         "kv_cache": "int8-group64",
         "cuda_graph": True,
         "prefix_reuse": False,
-        "mtp_draft_window": spec.mtp_draft_tokens,
-        "mtp_proposal_head": "optimized" if spec.mtp_draft_tokens else "full",
+        "speculative_backend": "mtp" if spec.mtp_draft_tokens else "none",
+        "speculative_draft_window": spec.mtp_draft_tokens,
+        "proposal_head": "optimized" if spec.mtp_draft_tokens else "full",
     }
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
@@ -476,7 +478,7 @@ def build_result_record(
     request = server_event.get("request", {})
     result = server_event.get("result", {})
     timings = server_event.get("timings_seconds", {})
-    mtp = server_event.get("mtp", {})
+    speculative = server_event.get("speculative", {})
 
     expected_request = {
         "model": spec.model_id,
@@ -503,12 +505,19 @@ def build_result_record(
         prefill_seconds = float(timings["prefill"])
         decode_seconds = float(timings["decode"])
         total_seconds = float(timings["total"])
-        mtp_rounds = int(mtp["rounds"])
-        drafted_tokens = int(mtp["drafted_tokens"])
-        accepted_tokens = int(mtp["accepted_tokens"])
-        fallback_steps = int(mtp["fallback_steps"])
+        backend = str(speculative["backend"])
+        mtp_rounds = int(speculative["rounds"])
+        drafted_tokens = int(speculative["drafted_tokens"])
+        accepted_tokens = int(speculative["accepted_tokens"])
+        fallback_steps = int(speculative["fallback_steps"])
     except (KeyError, TypeError, ValueError) as exc:
         raise CampaignError(f"request_done is missing required metrics: {exc}") from exc
+
+    expected_backend = "mtp" if spec.mtp_draft_tokens else "none"
+    if backend != expected_backend:
+        raise CampaignError(
+            f"request_done speculative backend {backend!r} != {expected_backend!r}"
+        )
 
     usage = response.get("usage", {})
     if (
@@ -638,12 +647,18 @@ def server_command(
         str(server_log),
         "--kv-dtype",
         "int8",
-        "--mtp-draft-tokens",
-        str(spec.mtp_draft_tokens),
         "--no-prefix-reuse",
     ]
-    if spec.mtp_draft_tokens == 3:
-        command.append("--lm-head-draft")
+    if spec.mtp_draft_tokens:
+        command.extend(
+            [
+                "--spec",
+                "mtp",
+                "--draft-tokens",
+                str(spec.mtp_draft_tokens),
+                "--lm-head-draft",
+            ]
+        )
     return command
 
 

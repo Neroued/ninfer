@@ -10,7 +10,10 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 void target_verify(TextContext& card, State& state, const Tensor& ids, const Tensor& positions,
                    ops::GqaExecutionEnvelope envelope) {
-    if (state.diagnostic_text_tap != nullptr) {
+    if (state.dflash != nullptr) {
+        DFlashFeatureSink sink = dflash_feature_sink(state);
+        card.target_verify(ids, positions, envelope, sink);
+    } else if (state.diagnostic_text_tap != nullptr) {
         card.diagnostic_target_verify(ids, positions, envelope, state.diagnostic_context,
                                       state.diagnostic_text_tap);
     } else {

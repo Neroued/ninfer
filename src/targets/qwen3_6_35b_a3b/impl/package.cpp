@@ -37,9 +37,8 @@ LoadedModel::~LoadedModel() = default;
 namespace ninfer::targets::qwen3_6_35b_a3b {
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options) {
-    return LoadPlan(std::make_unique<LoadPlan::Impl>(detail::bind_artifact(
-        binder,
-        detail::LoadFeatures{.family = qwen3_6::startup_features(options), .dflash = false})));
+    return LoadPlan(std::make_unique<LoadPlan::Impl>(
+        detail::bind_artifact(binder, qwen3_6::startup_features(options))));
 }
 
 std::unique_ptr<Package::LoadedModel>

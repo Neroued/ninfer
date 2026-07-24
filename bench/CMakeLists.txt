@@ -84,3 +84,16 @@ target_include_directories(ninfer_qwen3_6_35b_a3b_target_speculative_round_bench
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_qwen3_6_35b_a3b_target_speculative_round_bench PRIVATE
   ninfer_engine ninfer_core)
+
+# Complete production DFlash steady round: confirmed-context append, next proposal, target
+# verification/acceptance, and host publication over a real 35B artifact.
+add_executable(ninfer_qwen3_6_35b_a3b_dflash_round_bench
+  targets/qwen3_6_35b_a3b/dflash_round_bench.cpp)
+target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_round_bench PRIVATE
+  ninfer_engine ninfer_core)

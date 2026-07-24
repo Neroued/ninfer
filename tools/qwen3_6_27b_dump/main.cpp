@@ -429,6 +429,8 @@ int run(const Options& options) {
     engine.device                    = options.device;
     engine.prefill_chunk             = options.prefill_chunk;
     engine.kv_cache                  = options.kv;
+    engine.speculative.backend       = options.mtp_drafts == 0 ? ninfer::SpeculativeBackend::None
+                                                               : ninfer::SpeculativeBackend::Mtp;
     engine.speculative.draft_tokens  = options.mtp_drafts;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = false;

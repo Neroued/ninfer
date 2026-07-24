@@ -25,7 +25,14 @@ enum class ProposalHead : std::uint8_t {
     Optimized,
 };
 
+enum class SpeculativeBackend : std::uint8_t {
+    None,
+    Mtp,
+    DFlash,
+};
+
 struct SpeculativeOptions {
+    SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
 };
@@ -203,6 +210,7 @@ struct GenerationTimings {
 };
 
 struct SpeculativeStats {
+    SpeculativeBackend backend    = SpeculativeBackend::None;
     bool enabled                  = false;
     std::uint32_t draft_window    = 0;
     std::uint64_t rounds          = 0;

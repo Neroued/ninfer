@@ -2,7 +2,7 @@
 
 // Implements: include/ninfer/ops/sampling.h
 // Match: contiguous BF16 logits, physical stride >= token domain, and at most
-// eight columns on the multi-block route.
+// sixteen columns on the multi-block route.
 // Algorithm assumptions: 256-thread/2-item partial tiles feed bounded top-20
 // group merges through caller-owned workspace; unsupported finite geometries
 // use the semantically identical single-block fallback.

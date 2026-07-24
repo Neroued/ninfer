@@ -23,7 +23,7 @@ inline constexpr int kSamplerGroupTileItems      = kSamplerGroupBlock * kSampler
 inline constexpr int kSamplerPartialsPerGroup    = 25;
 inline constexpr int kSamplerFastCandidates      = 20;
 inline constexpr int kSamplerCandidateCap        = kSamplerFastCandidates;
-inline constexpr int kSamplerMaxColumns          = 8;
+inline constexpr int kSamplerMaxColumns          = 16;
 
 static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTileItems,
               "group merge tile must hold one group's candidates");
@@ -33,7 +33,7 @@ __host__ __device__ inline int sampler_group_count(int partial_blocks) {
 }
 
 // The multi-block route is deliberately finite. A single final merge tile must
-// hold every group candidate and the registered sampling/speculative routes use at most eight
+// hold every group candidate and the registered sampling/speculative routes use at most sixteen
 // columns.
 __host__ __device__ inline bool sampler_multiblock_ok(int vocab, int cols, int partial_blocks,
                                                       int group_count) {

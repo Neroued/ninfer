@@ -39,7 +39,7 @@ const ops::SamplingConfig* config_ptr(const DBuf& d) {
 
 WorkspaceArena& test_sampling_workspace() {
     static WorkspaceArena workspace(
-        std::max<std::size_t>(256, ops::sampling_workspace_bytes(248077, 8)));
+        std::max<std::size_t>(256, ops::sampling_workspace_bytes(248077, 16)));
     return workspace;
 }
 
@@ -861,7 +861,7 @@ std::vector<int> run_one_speculative_round(const std::vector<float>& logits_h, i
     DBuf d_sampled(static_cast<std::size_t>(k + 1) * sizeof(std::int32_t));
     DBuf d_num(sizeof(std::int32_t));
     DBuf d_accepted(sizeof(std::int32_t));
-    auto d_stats = to_device_i64(std::vector<std::int64_t>(kStatsCountersForK5, 0));
+    auto d_stats = to_device_i64(std::vector<std::int64_t>(4 + k, 0));
 
     Tensor targets(d_targets.p, DType::I32, {k + 1});
     Tensor logits(d_logits.p, DType::BF16, {vocab, k + 1});
@@ -871,7 +871,7 @@ std::vector<int> run_one_speculative_round(const std::vector<float>& logits_h, i
     Tensor sampled(d_sampled.p, DType::I32, {k + 1});
     Tensor num(d_num.p, DType::I32, {1});
     Tensor accepted(d_accepted.p, DType::I32, {1});
-    Tensor stats(d_stats.p, DType::I64, {kStatsCountersForK5});
+    Tensor stats(d_stats.p, DType::I64, {4 + k});
 
     ops::speculative_accept_greedy_drafts(targets, logits, drafts, length_t, token, sampled, num,
                                           accepted, stats, token_domain, config_ptr(d_cfg),
@@ -889,7 +889,7 @@ int exact_k_matrix_case() {
     constexpr int token_domain  = 248077;
     int failures                = 0;
 
-    for (int k = 1; k <= 5; ++k) {
+    for (int k = 1; k <= 15; ++k) {
         std::vector<float> logits(static_cast<std::size_t>(physical_rows) * (k + 1), -20.0f);
         std::vector<int> targets(static_cast<std::size_t>(k + 1));
         std::vector<int> drafts(static_cast<std::size_t>(k));
@@ -936,7 +936,7 @@ int exact_k_matrix_case() {
                               greedy_expected);
     }
     if (failures == 0) {
-        std::cout << "    exact speculative K=1..5 greedy/stochastic matrix ok\n";
+        std::cout << "    exact speculative K=1..15 greedy/stochastic matrix ok\n";
     }
     return failures;
 }

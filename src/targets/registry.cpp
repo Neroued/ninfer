@@ -144,7 +144,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
             constructed.load.effective_max_context = local.max_context;
             constructed.active = ActiveTarget(std::move(instance));
             return constructed;
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
             if (!apply_fallback(local.kv_cache, kv_auto_select, local.max_context,
                                 fallback_enabled, fallback_min, fallback_step)) {
                 if (!fallback_enabled || local.max_context <= fallback_min) {
@@ -152,6 +152,8 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                 }
                 break;
             }
+            std::cerr << "ninfer: construction failed (" << e.what()
+                      << "); retrying with reduced configuration\n";
             continue;
         }
     }

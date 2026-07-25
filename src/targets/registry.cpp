@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -55,6 +56,32 @@ void validate_device_budget(std::uint64_t weight_bytes, std::size_t sequence_byt
     }
 }
 
+// Apply one step of memory-adaptive fallback. Returns true if a fallback was
+// applied and the caller should retry construction. Throws if no fallback is
+// possible under the current configuration.
+static bool apply_fallback(KvCacheStorage& kv_cache, bool kv_auto_select,
+                           std::uint32_t& max_context, bool fallback_enabled,
+                           std::uint32_t fallback_min, std::uint32_t fallback_step) {
+    if (kv_auto_select && kv_cache == KvCacheStorage::BFloat16) {
+        std::cerr << "ninfer: BF16 KV-cache would exceed device memory; "
+                     "retrying with INT8 group-64 KV cache\n";
+        kv_cache = KvCacheStorage::Int8Group64;
+        return true;
+    }
+    if (!fallback_enabled || max_context <= fallback_min) {
+        return false; // caller re-throws
+    }
+    if (max_context > fallback_min) {
+        const std::uint32_t prev = max_context;
+        max_context = max_context > fallback_step ? max_context - fallback_step
+                                                   : fallback_min;
+        std::cerr << "ninfer: device memory insufficient for max_context=" << prev
+                  << "; retrying with max_context=" << max_context << "\n";
+        return true;
+    }
+    return false; // max_context <= fallback_min, caller breaks
+}
+
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start) {
@@ -71,50 +98,62 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                 "context fallback exhausted; no usable context length fits in device memory");
         }
 
+        // Binder is recreated each iteration because plan_load depends on
+        // `local`, which may change after a fallback step.
         artifact::Binder binder(reader);
         auto sequence_plan = Target::plan_sequence(device, local);
         auto load_plan = Target::plan_load(binder, local);
+
+        // --- budget validation ---
         try {
             validate_device_budget(load_plan.materialization().device_capacity_bytes,
                                    sequence_plan.device_reservation_bytes());
         } catch (const std::invalid_argument&) {
-            if (kv_auto_select && local.kv_cache == KvCacheStorage::BFloat16) {
-                local.kv_cache = KvCacheStorage::Int8Group64;
-                continue;
-            }
-            if (!fallback_enabled || local.max_context <= fallback_min) {
-                throw;
-            }
-            if (local.max_context > fallback_min) {
-                local.max_context = local.max_context > fallback_step
-                                        ? local.max_context - fallback_step
-                                        : fallback_min;
-            } else {
+            if (!apply_fallback(local.kv_cache, kv_auto_select, local.max_context,
+                                fallback_enabled, fallback_min, fallback_step)) {
+                if (!fallback_enabled || local.max_context <= fallback_min) {
+                    throw;
+                }
                 break;
             }
             continue;
         }
 
-        auto progress     = artifact_progress(local.load_progress);
-        auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
-                                                  progress.callback ? &progress : nullptr);
-        const artifact::MaterializationStats stats = materialized.stats();
+        // --- materialization and construction ---
+        // Wrapped in its own try-catch so that a runtime allocation failure
+        // (e.g. cudaMalloc OOM racing the budget check) can also trigger a
+        // fallback attempt instead of crashing.
+        try {
+            auto progress     = artifact_progress(local.load_progress);
+            auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
+                                                      progress.callback ? &progress : nullptr);
+            const artifact::MaterializationStats stats = materialized.stats();
 
-        auto model    = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
-        auto loaded   = std::make_unique<Loaded>(std::move(model));
-        auto instance = std::make_unique<Instance>(std::move(loaded), std::move(sequence_plan), device);
+            auto model    = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+            auto loaded   = std::make_unique<Loaded>(std::move(model));
+            auto instance = std::make_unique<Instance>(std::move(loaded), std::move(sequence_plan), device);
 
-        constructed.load.target               = std::string(Target::target_key);
-        constructed.load.load_seconds         = std::chrono::duration<double>(Clock::now() - load_start).count();
-        constructed.load.upload_seconds       = stats.upload_seconds;
-        constructed.load.artifact_bytes_read  = stats.file_bytes;
-        constructed.load.host_to_device_bytes = stats.h2d_bytes;
-        constructed.load.peak_staging_bytes   = stats.peak_staging_bytes;
-        constructed.load.tensor_count         = stats.tensor_count;
-        constructed.load.resource_count       = stats.resource_count;
-        constructed.load.effective_max_context = local.max_context;
-        constructed.active = ActiveTarget(std::move(instance));
-        return constructed;
+            constructed.load.target               = std::string(Target::target_key);
+            constructed.load.load_seconds         = std::chrono::duration<double>(Clock::now() - load_start).count();
+            constructed.load.upload_seconds       = stats.upload_seconds;
+            constructed.load.artifact_bytes_read  = stats.file_bytes;
+            constructed.load.host_to_device_bytes = stats.h2d_bytes;
+            constructed.load.peak_staging_bytes   = stats.peak_staging_bytes;
+            constructed.load.tensor_count         = stats.tensor_count;
+            constructed.load.resource_count       = stats.resource_count;
+            constructed.load.effective_max_context = local.max_context;
+            constructed.active = ActiveTarget(std::move(instance));
+            return constructed;
+        } catch (const std::exception&) {
+            if (!apply_fallback(local.kv_cache, kv_auto_select, local.max_context,
+                                fallback_enabled, fallback_min, fallback_step)) {
+                if (!fallback_enabled || local.max_context <= fallback_min) {
+                    throw;
+                }
+                break;
+            }
+            continue;
+        }
     }
     throw std::invalid_argument(
         "context fallback exhausted after reaching minimum context=" + std::to_string(fallback_min));

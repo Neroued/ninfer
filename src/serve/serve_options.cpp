@@ -44,6 +44,9 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
+// "auto" returns BFloat16 as the initial storage selection; the actual
+// BF16→Int8Group64 fallback is driven by the kv_cache_auto_select flag
+// set separately by the caller (parse_serve_options).
 KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
     if (value == "auto")  { return KvCacheStorage::BFloat16; }

@@ -52,6 +52,9 @@ struct EngineOptions {
     bool enable_vision  = false;
     bool use_cuda_graph = true;
     LoadProgress load_progress;
+    bool allow_context_fallback        = false;
+    std::uint32_t context_fallback_min = 4096;
+    std::uint32_t context_fallback_step = 2048;
 };
 
 struct SamplingParameters {
@@ -256,6 +259,7 @@ struct LoadSummary {
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t tensor_count           = 0;
     std::size_t resource_count         = 0;
+    std::uint32_t effective_max_context = 0;
 };
 
 } // namespace ninfer

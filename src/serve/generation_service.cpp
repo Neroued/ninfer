@@ -134,7 +134,14 @@ GenerationService::GenerationService(ServeOptions options) : options_(std::move(
     engine_options.enable_vision  = options_.enable_vision;
     engine_options.use_cuda_graph = options_.use_cuda_graph;
     engine_options.speculative    = options_.speculative;
+    engine_options.allow_context_fallback        = options_.allow_context_fallback;
+    engine_options.context_fallback_min          = options_.context_fallback_min;
+    engine_options.context_fallback_step         = options_.context_fallback_step;
     engine_                       = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    if (const ninfer::LoadSummary summary = load_summary(); summary.effective_max_context != 0) {
+        options_.max_context = summary.effective_max_context;
+    }
+    std::cerr << "ninfer-serve: effective max context = " << options_.max_context << " tokens\n";
 }
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request) const {

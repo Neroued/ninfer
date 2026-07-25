@@ -61,6 +61,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--context-fallback] [--context-fallback-min N] [--context-fallback-step N] "
            "[--lm-head-draft] [--no-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -149,6 +150,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--context-fallback") {
+            options.allow_context_fallback = true;
+        } else if (arg == "--context-fallback-min") {
+            options.context_fallback_min = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--context-fallback-min"), "context-fallback-min"));
+        } else if (arg == "--context-fallback-step") {
+            options.context_fallback_step = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--context-fallback-step"), "context-fallback-step"));
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
@@ -185,6 +194,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (options.allow_context_fallback && options.context_fallback_min == 0) {
+        throw std::invalid_argument("--context-fallback-min must be positive when --context-fallback is enabled");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {

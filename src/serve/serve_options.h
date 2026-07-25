@@ -36,6 +36,9 @@ struct ServeOptions {
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+    bool allow_context_fallback        = false;
+    std::uint32_t context_fallback_min = 4096;
+    std::uint32_t context_fallback_step = 2048;
     // Default sampler applied when a request omits a field. Defaults match the
     // Qwen3 thinking recommendation so real chat clients get non-degenerate
     // decoding out of the box; a request may override any field, and --greedy

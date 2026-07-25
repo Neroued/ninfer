@@ -58,32 +58,61 @@ void validate_device_budget(std::uint64_t weight_bytes, std::size_t sequence_byt
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start) {
-    auto sequence_plan = Target::plan_sequence(device, options);
+    const bool fallback_enabled = options.allow_context_fallback;
+    const std::uint32_t fallback_min = options.context_fallback_min;
+    const std::uint32_t fallback_step = options.context_fallback_step;
 
-    artifact::Binder binder(reader);
-    auto load_plan = Target::plan_load(binder, options);
-    validate_device_budget(load_plan.materialization().device_capacity_bytes,
-                           sequence_plan.device_reservation_bytes());
-    auto progress     = artifact_progress(options.load_progress);
-    auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
-                                              progress.callback ? &progress : nullptr);
-    const artifact::MaterializationStats stats = materialized.stats();
+    EngineOptions local = options;
+    ConstructedTarget constructed;
+    while (true) {
+        if (local.max_context == 0) {
+            throw std::invalid_argument(
+                "context fallback exhausted; no usable context length fits in device memory");
+        }
 
-    auto model    = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
-    auto loaded   = std::make_unique<Loaded>(std::move(model));
-    auto instance = std::make_unique<Instance>(std::move(loaded), std::move(sequence_plan), device);
+        artifact::Binder binder(reader);
+        auto sequence_plan = Target::plan_sequence(device, local);
+        auto load_plan = Target::plan_load(binder, local);
+        try {
+            validate_device_budget(load_plan.materialization().device_capacity_bytes,
+                                   sequence_plan.device_reservation_bytes());
+        } catch (const std::invalid_argument&) {
+            if (!fallback_enabled || local.max_context <= fallback_min) {
+                throw;
+            }
+            if (local.max_context > fallback_min) {
+                local.max_context = local.max_context > fallback_step
+                                        ? local.max_context - fallback_step
+                                        : fallback_min;
+            } else {
+                break;
+            }
+            continue;
+        }
 
-    LoadSummary summary;
-    summary.target               = std::string(Target::target_key);
-    summary.load_seconds         = std::chrono::duration<double>(Clock::now() - load_start).count();
-    summary.upload_seconds       = stats.upload_seconds;
-    summary.artifact_bytes_read  = stats.file_bytes;
-    summary.host_to_device_bytes = stats.h2d_bytes;
-    summary.peak_staging_bytes   = stats.peak_staging_bytes;
-    summary.tensor_count         = stats.tensor_count;
-    summary.resource_count       = stats.resource_count;
-    return ConstructedTarget{.active = ActiveTarget(std::move(instance)),
-                             .load   = std::move(summary)};
+        auto progress     = artifact_progress(local.load_progress);
+        auto materialized = artifact::materialize(reader, load_plan.materialization(), device,
+                                                  progress.callback ? &progress : nullptr);
+        const artifact::MaterializationStats stats = materialized.stats();
+
+        auto model    = Target::construct_loaded_model(std::move(load_plan), std::move(materialized));
+        auto loaded   = std::make_unique<Loaded>(std::move(model));
+        auto instance = std::make_unique<Instance>(std::move(loaded), std::move(sequence_plan), device);
+
+        constructed.load.target               = std::string(Target::target_key);
+        constructed.load.load_seconds         = std::chrono::duration<double>(Clock::now() - load_start).count();
+        constructed.load.upload_seconds       = stats.upload_seconds;
+        constructed.load.artifact_bytes_read  = stats.file_bytes;
+        constructed.load.host_to_device_bytes = stats.h2d_bytes;
+        constructed.load.peak_staging_bytes   = stats.peak_staging_bytes;
+        constructed.load.tensor_count         = stats.tensor_count;
+        constructed.load.resource_count       = stats.resource_count;
+        constructed.load.effective_max_context = local.max_context;
+        constructed.active = ActiveTarget(std::move(instance));
+        return constructed;
+    }
+    throw std::invalid_argument(
+        "context fallback exhausted after reaching minimum context=" + std::to_string(fallback_min));
 }
 
 } // namespace

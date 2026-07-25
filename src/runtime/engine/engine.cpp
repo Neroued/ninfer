@@ -44,6 +44,9 @@ public:
         auto constructed = targets::construct_target(options, device);
         active           = std::move(constructed.active);
         load             = std::move(constructed.load);
+        if (load.effective_max_context != 0) {
+            options.max_context = load.effective_max_context;
+        }
     }
 
     ~Impl() noexcept {

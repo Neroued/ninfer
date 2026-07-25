@@ -48,6 +48,7 @@ struct EngineOptions {
     std::uint32_t max_context   = 2048;
     std::uint32_t prefill_chunk = 1024;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    bool kv_cache_auto_select   = false;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;

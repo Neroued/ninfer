@@ -46,8 +46,9 @@ std::uint64_t parse_u64(const char* text, const char* label) {
 
 KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
-    if (value == "bf16") { return KvCacheStorage::BFloat16; }
-    if (value == "int8") { return KvCacheStorage::Int8Group64; }
+    if (value == "auto")  { return KvCacheStorage::BFloat16; }
+    if (value == "bf16")  { return KvCacheStorage::BFloat16; }
+    if (value == "int8")  { return KvCacheStorage::Int8Group64; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -58,7 +59,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
-           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype auto|bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--context-fallback] [--context-fallback-min N] [--context-fallback-step N] "
@@ -133,7 +134,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
-            options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+            const char* value = require_value("--kv-dtype");
+            if (std::string(value) == "auto") {
+                options.kv_cache = KvCacheStorage::BFloat16;
+                options.kv_cache_auto_select = true;
+            } else {
+                options.kv_cache = parse_kv_dtype(value);
+            }
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));

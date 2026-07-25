@@ -61,6 +61,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     const bool fallback_enabled = options.allow_context_fallback;
     const std::uint32_t fallback_min = options.context_fallback_min;
     const std::uint32_t fallback_step = options.context_fallback_step;
+    const bool kv_auto_select = options.kv_cache_auto_select && options.kv_cache == KvCacheStorage::BFloat16;
 
     EngineOptions local = options;
     ConstructedTarget constructed;
@@ -77,6 +78,10 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
             validate_device_budget(load_plan.materialization().device_capacity_bytes,
                                    sequence_plan.device_reservation_bytes());
         } catch (const std::invalid_argument&) {
+            if (kv_auto_select && local.kv_cache == KvCacheStorage::BFloat16) {
+                local.kv_cache = KvCacheStorage::Int8Group64;
+                continue;
+            }
             if (!fallback_enabled || local.max_context <= fallback_min) {
                 throw;
             }

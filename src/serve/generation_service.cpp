@@ -131,6 +131,7 @@ GenerationService::GenerationService(ServeOptions options) : options_(std::move(
     engine_options.max_context    = options_.max_context;
     engine_options.prefill_chunk  = options_.prefill_chunk;
     engine_options.kv_cache       = options_.kv_cache;
+    engine_options.kv_cache_auto_select = options_.kv_cache_auto_select;
     engine_options.enable_vision  = options_.enable_vision;
     engine_options.use_cuda_graph = options_.use_cuda_graph;
     engine_options.speculative    = options_.speculative;

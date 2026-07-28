@@ -20,6 +20,7 @@ CMakeUserPresets.json
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
 venv/
 *.egg-info/
 
@@ -29,6 +30,8 @@ venv/
 *.safetensors
 *.gguf
 out/
+models/
+vcpkg_installed/
 *.log
 
 # Measurement raw corpora & intermediates (large; produced by offline tooling).
@@ -43,6 +46,10 @@ tools/freq_corpus/fixtures/*
 .DS_Store
 profiles/
 .chatgpt/
+
+# Local release products. Keep the publishing guide, upload archives as GitHub Release assets.
+dist/*
+!dist/README.md
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json

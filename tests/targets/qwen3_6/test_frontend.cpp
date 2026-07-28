@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -164,12 +166,18 @@ bool throws_invalid_argument(Callable&& callable) {
 }
 
 int test_official_tokenizer_merge() {
+    const char* configured_root = std::getenv("NINFER_QWEN3_6_27B_HF_DIR");
+    if (configured_root == nullptr || *configured_root == '\0') {
+        std::cout << "skip: NINFER_QWEN3_6_27B_HF_DIR is not set\n";
+        return 0;
+    }
+    const std::filesystem::path root(configured_root);
     const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_file((root / "tokenizer.json").string().c_str());
     const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_file((root / "tokenizer_config.json").string().c_str());
     const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file((root / "generation_config.json").string().c_str());
     const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                    .tokenizer_config_json  = tokenizer_config_json,
                                    .generation_config_json = generation_config_json});

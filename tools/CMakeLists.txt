@@ -12,4 +12,4 @@ target_link_libraries(ninfer-qwen3_6_27b-dump PRIVATE
   ninfer_product_prompt_input
   ninfer_artifact
   ninfer_core
-  CUDA::cudart)
+  ${NINFER_CUDART_TARGET})

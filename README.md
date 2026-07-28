@@ -56,20 +56,21 @@ card for correct/total counts and the full evaluation notes.
 
 NInfer currently requires:
 
-- 64-bit Linux;
+- 64-bit Linux, WSL2, or 64-bit Windows;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
 - CMake 3.28 or newer and a C++20-capable host compiler;
-- `pkg-config`;
-- FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
-  `libavutil >= 58`, and `libswscale >= 7`;
-- `libcurl >= 7.85`;
-- Ninja, when using the commands below.
+- on Linux/WSL2, `pkg-config`, Ninja, `libcurl >= 7.85`, and FFmpeg development libraries
+  (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and `libswscale >= 7`);
+- on Windows, Visual Studio or Visual Studio Build Tools with C++ and CUDA build support, its
+  bundled vcpkg, and Ninja.
 
 The build rejects CUDA architectures other than `120a`. There is no install target or packaged
 binary distribution; NInfer is run from its source build tree.
 
 ## Build
+
+### Linux and WSL2
 
 ```bash
 git clone https://github.com/Neroued/ninfer.git
@@ -78,6 +79,46 @@ cd ninfer
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ```
+
+### Native Windows
+
+Run the following from PowerShell. The Visual Studio developer shell selects the newest installed
+MSVC toolchain. Change `$cudaToolkit` to the installed CUDA 13.x version. The first configure may
+take several minutes while vcpkg builds FFmpeg and curl.
+
+```powershell
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vsInstall = & $vswhere -latest -products * `
+  -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+  -property installationPath
+$devShell = Join-Path $vsInstall 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
+$vcpkgToolchain = Join-Path $vsInstall 'VC\vcpkg\scripts\buildsystems\vcpkg.cmake'
+$cudaToolkit = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1'
+
+Import-Module $devShell
+Enter-VsDevShell -VsInstallPath $vsInstall -SkipAutomaticLocation `
+  -DevCmdArguments '-arch=x64 -host_arch=x64'
+
+cmake -S . -B build-windows `
+  -G Ninja -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_CUDA_COMPILER="$cudaToolkit\bin\nvcc.exe" `
+  -DCMAKE_TOOLCHAIN_FILE="$vcpkgToolchain" `
+  -DVCPKG_TARGET_TRIPLET=x64-windows
+cmake --build build-windows --parallel
+```
+
+The native executables are written to:
+
+```text
+build-windows\apps\ninfer.exe
+build-windows\apps\ninfer-serve.exe
+```
+
+The native Windows support adapts the portability work from
+[`Don-Chad/ninfer-3090` commit `a1c7c2e`](https://github.com/Don-Chad/ninfer-3090/commit/a1c7c2e11c60e8034e11ff1c90944a84db412ace)
+to the current RTX 5090 (`sm_120a`) upstream. It reuses the Windows build integration, file mapping
+and direct-I/O implementation, Winsock initialization, and MSVC compatibility fixes. The RTX 3090
+kernel retargeting and performance changes are not included.
 
 The default configuration builds:
 

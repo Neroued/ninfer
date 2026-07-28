@@ -24,6 +24,11 @@ constexpr std::int32_t kN = 70;
 constexpr std::int32_t kK = 130;
 
 std::string shell_quote(std::string_view value) {
+#ifdef _WIN32
+    std::string out = "\"";
+    out.append(value);
+    out += '\"';
+#else
     std::string out = "'";
     for (const char c : value) {
         if (c == '\'') {
@@ -33,6 +38,7 @@ std::string shell_quote(std::string_view value) {
         }
     }
     out += "'";
+#endif
     return out;
 }
 
@@ -67,9 +73,13 @@ std::vector<std::uint8_t> read_bytes(const std::filesystem::path& path) {
 }
 
 int run_converter(const std::filesystem::path& script, const std::filesystem::path& output_dir) {
-    const std::string command = shell_quote(NINFER_PYTHON_EXECUTABLE) + " " +
-                                shell_quote(script.string()) + " " +
-                                shell_quote(output_dir.string());
+    std::string command = shell_quote(NINFER_PYTHON_EXECUTABLE) + " " +
+                          shell_quote(script.string()) + " " + shell_quote(output_dir.string());
+#ifdef _WIN32
+    // std::system dispatches through cmd.exe, which consumes the first quoted token unless the
+    // complete command line has its own outer quote pair.
+    command = '"' + command + '"';
+#endif
     const int rc = std::system(command.c_str());
     if (rc != 0) {
         std::cerr << "converter golden command failed: " << command << '\n';

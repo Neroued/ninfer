@@ -13,6 +13,7 @@
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/scalar.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/swa.h"
 
@@ -63,6 +64,26 @@ void dflash_append_context_impl(State& state, const Tensor& features, const Tens
             commit_count.ne[0] != 1) {
             throw std::invalid_argument("DFlash context append inputs are invalid");
         }
+        const bool replace_local_window = tokens > Config::local_capacity;
+        if (replace_local_window &&
+            (envelope.min_count != static_cast<std::uint32_t>(tokens) ||
+             envelope.max_count != static_cast<std::uint32_t>(tokens))) {
+            throw std::invalid_argument(
+                "DFlash oversized local append requires an exact full-prefix commit");
+        }
+        const int local_offset = replace_local_window ? tokens - Config::local_capacity : 0;
+        const int local_tokens =
+            replace_local_window ? Config::local_capacity : tokens;
+        const ops::KVCacheAppendPrefixExecutionEnvelope local_envelope{
+            replace_local_window ? static_cast<std::uint32_t>(Config::local_capacity)
+                                 : envelope.min_count,
+            replace_local_window ? static_cast<std::uint32_t>(Config::local_capacity)
+                                 : envelope.max_count,
+        };
+        Tensor append_count = commit_count;
+        if (replace_local_window) {
+            ops::set_i32_scalar(append_count, Config::local_capacity, state.device.stream);
+        }
 
         state.work.reset();
         Tensor projected = state.work.alloc(DType::BF16, {Config::hidden, tokens});
@@ -75,26 +96,36 @@ void dflash_append_context_impl(State& state, const Tensor& features, const Tens
         for (int layer = 0; layer < Config::layers; ++layer) {
             auto layer_scope   = state.work.scope();
             const auto& weight = state.model.dflash->layers.at(static_cast<std::size_t>(layer));
+            const bool local_layer = layer < Config::local_layers;
+            const int layer_tokens = local_layer ? local_tokens : tokens;
+            Tensor layer_context =
+                local_layer ? context.slice(1, local_offset, local_tokens) : context;
+            Tensor layer_positions =
+                local_layer ? positions.slice(0, local_offset, local_tokens) : positions;
             Tensor key_raw =
-                state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, tokens});
+                state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, layer_tokens});
             Tensor value =
-                state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, tokens});
-            Tensor key_flat   = key_raw.view({Config::kv_size, tokens});
-            Tensor value_flat = value.view({Config::kv_size, tokens});
-            ops::linear_pair(context, weight.context_key, weight.context_value, key_flat,
+                state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, layer_tokens});
+            Tensor key_flat   = key_raw.view({Config::kv_size, layer_tokens});
+            Tensor value_flat = value.view({Config::kv_size, layer_tokens});
+            ops::linear_pair(layer_context, weight.context_key, weight.context_value, key_flat,
                              value_flat, state.work, state.device.stream);
             Tensor key =
-                state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, tokens});
+                state.work.alloc(DType::BF16, {Config::head_dim, Config::kv_heads, layer_tokens});
             ops::rmsnorm(key_raw, weight.key_norm, Config::rms_epsilon, false, key,
                          state.device.stream);
-            ops::rope(positions, Config::head_dim, Config::rope_theta, key, state.device.stream);
-            if (layer < Config::local_layers) {
+            ops::rope(layer_positions, Config::head_dim, Config::rope_theta, key,
+                      state.device.stream);
+            if (local_layer) {
                 ops::kv_cache_append_prefix(
-                    key, value, positions, commit_count, envelope,
+                    key, value, layer_positions, append_count, local_envelope,
                     state.dflash->local_layer(static_cast<std::uint32_t>(layer)),
                     state.device.stream);
             } else {
-                ops::kv_cache_append_prefix(key, value, positions, commit_count, envelope,
+                if (replace_local_window && layer == Config::local_layers) {
+                    ops::set_i32_scalar(append_count, tokens, state.device.stream);
+                }
+                ops::kv_cache_append_prefix(key, value, positions, append_count, envelope,
                                             state.dflash->full_layer(), state.device.stream);
             }
         }

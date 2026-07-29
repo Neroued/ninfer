@@ -15,6 +15,7 @@ from tools.reference.qwen3_6_27b.ops import (
     gated_delta_rule,
 )
 from tools.reference.qwen3_6_27b.state import KVCache
+from tools.reference.qwen3_6_27b.weights import estimate_fixed_bytes
 from tools.reference.qwen3_6.common.vision_ops import vision_attention
 
 
@@ -58,6 +59,26 @@ def test_int8_kv_codec_matches_fp16_scale_contract() -> None:
     expected_code[expected_scale == 0] = 0
     assert np.array_equal(scale.numpy().view(np.uint16), expected_scale.view(np.uint16))
     assert np.array_equal(code.numpy(), expected_code.reshape(code.shape))
+
+
+def test_fixed_memory_estimate_accounts_for_each_kv_side() -> None:
+    expected = {
+        "bf16": 20_557_987_840,
+        "bf16:int8": 16_137_191_424,
+        "int8:bf16": 16_137_191_424,
+        "int8": 11_716_395_008,
+    }
+    for kv_dtype, expected_bytes in expected.items():
+        assert (
+            estimate_fixed_bytes(
+                262_144,
+                kv_dtype,
+                text=True,
+                mtp=True,
+                prefill_chunk=1024,
+            )
+            == expected_bytes
+        )
 
 
 def test_t1_gdn_matches_sequential_oracle() -> None:

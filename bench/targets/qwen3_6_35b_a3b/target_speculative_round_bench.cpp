@@ -199,9 +199,11 @@ StateLayout plan_state(const Options& options, std::uint32_t maximum_k) {
             .capacity              = capacity,
             .kv_heads              = detail::TextConfig::kv_heads,
             .attention_head_dim    = detail::TextConfig::head_dim,
-            .kv_dtype              = options.kv_dtype,
-            .kv_quant_group = options.kv_dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
-            .enable_mtp     = false,
+            .kv_k_dtype            = options.kv_dtype,
+            .kv_v_dtype            = options.kv_dtype,
+            .kv_k_quant_group = options.kv_dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
+            .kv_v_quant_group = options.kv_dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
+            .enable_mtp       = false,
             .gdn =
                 {
                     .layers         = detail::TextConfig::gdn_layers(),

@@ -146,10 +146,10 @@ x = x + o_projection(a)
 ```
 
 Prefill appends all K/V columns and evaluates causal attention for the chunk. Decode appends one
-column and attends over the resident prefix. KV storage may be BF16 or INT8-G64. The exact runtime
-cache codec and the common ideal attention oracle are defined by the repository-internal
-[`gqa_attention.h`](../../include/ninfer/ops/gqa_attention.h) contract. Both cache formats and their
-optimized compute profiles are judged by that one oracle construction rather than by
+column and attends over the resident prefix. K and V independently select BF16 or INT8-G64 storage.
+The exact runtime cache codec and the common ideal attention oracle are defined by the
+repository-internal [`gqa_attention.h`](../../include/ninfer/ops/gqa_attention.h) contract. The
+BF16, INT8, and mixed compute profiles are judged by that one oracle construction rather than by
 implementation-mirroring references.
 
 Text-only positions use the same scalar position for temporal, height, and width MRoPE sections.
@@ -364,11 +364,11 @@ remain consistent.
 - the ideal GQA oracle evaluates dot products, stable softmax, and value reduction in FP64 from
   BF16 Q and logical cache values; the BF16 Op output is promoted to FP64 for comparison;
 - low-bit weight storage changes representation, not the intended dequantized matrix;
-- INT8-G64 KV stores FP16 scales and signed codes, and its ideal logical K/V values are their FP32
-  decode;
-- the target's INT8 attention path intentionally quantizes Q to Q8-G64 for production computation;
-  this native compute profile does not replace BF16 Q in the common ideal oracle, and its delta is
-  accepted through the separate named INT8-cache compute-profile criterion;
+- each INT8-G64 K or V plane stores its own FP16 scales and signed codes, and its ideal logical
+  values are their FP32 decode;
+- the symmetric INT8 attention path intentionally quantizes Q to Q8-G64 for production computation;
+  mixed paths keep BF16 Q/K Tensor Core math and dequantize only the INT8 plane; neither profile
+  replaces BF16 Q in the common ideal oracle, and each delta has a separately named criterion;
 - the full target `lm_head` is used for prefill, verification, and ordinary decode regardless of
   draft-head mode.
 
@@ -379,8 +379,8 @@ route and accepted against the Op's criterion for that implementation profile.
 
 GQA numerical qualification covers both registered geometries, supported prompt and small-T
 regimes, the maintained conformance matrix, and target-representative activation ranges. Its
-BF16-cache and INT8-cache compute-profile criteria are explicitly named in the GQA conformance
-suite; they are not claimed as pointwise bounds for every arbitrary or adversarial BF16 tensor. A1
+BF16-cache, INT8-cache, and mixed-cache compute-profile criteria are explicitly named in the GQA
+conformance suite; they are not claimed as pointwise bounds for every arbitrary or adversarial BF16 tensor. A1
 append-and-attend and A3 cached-only attention are each checked directly against the common ideal
 oracle. Equality between those different numerical paths is not a contract or acceptance test.
 

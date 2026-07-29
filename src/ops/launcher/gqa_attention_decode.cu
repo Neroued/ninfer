@@ -5,6 +5,7 @@
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
+#include "ops/kernel/gqa_attention_decode_mixed.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/gqa_attention.h"
 
@@ -16,7 +17,9 @@ namespace {
 
 // Supplies an upper bound for the device-side active-split policy over one explicit execution
 // envelope. Eager calls normally pass an exact window; graph calls pass their target-private
-// replay interval. The dtype-aware wrapper below adds the measured INT8 specializations.
+// replay interval. The profile-aware wrapper below adds the measured INT8 specializations.
+// The INT8 policy applies only to the symmetric INT8 kernel; mixed-format caches keep the
+// BF16 policy of the kernel skeleton they share.
 template <typename Geometry>
 std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
     if (window <= 0) { return Geometry::DecodeSplits; }
@@ -41,19 +44,19 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
 }
 
 template <typename Geometry>
-std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype) {
+std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, bool i8_profile) {
     // A 64-key default split just above a 32-key boundary makes the partial
     // kernel execute a nearly empty second tile. These short ranges instead
     // launch one 32-key tile per split; the larger CTAs keep the small grid busy.
-    if (kv_dtype == DType::I8 && tokens == 5 && window > 128 && window <= 512) {
+    if (i8_profile && tokens == 5 && window > 128 && window <= 512) {
         return div_up(window, 32 / Geometry::DecodeSplitScale);
     }
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 128 && window <= 160) {
+    if (i8_profile && tokens == 6 && window > 128 && window <= 160) {
         return div_up(window, 24 / Geometry::DecodeSplitScale);
     }
     // Bc=64 is one CTA/SM on these model shapes. Keep the 8K grid at or below
     // one 170-SM wave after accounting for the geometry's KV-head count.
-    if (kv_dtype == DType::I8 && tokens == 6 && window > 5000 && window <= 8198) {
+    if (i8_profile && tokens == 6 && window > 5000 && window <= 8198) {
         const std::int32_t splits   = div_up(window, 192 / Geometry::DecodeSplitScale);
         constexpr std::int32_t kMin = 4 * Geometry::DecodeSplitScale;
         constexpr std::int32_t kMax = 42 * Geometry::DecodeSplitScale;
@@ -65,12 +68,12 @@ std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, D
 
 template <typename Geometry>
 std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int32_t tokens,
-                                         DType dtype) {
+                                         bool i8_profile) {
     std::int32_t capacity = 0;
     const auto include    = [&](std::uint32_t window) {
         if (window < envelope.min_visible_keys || window > envelope.max_visible_keys) { return; }
-        const auto splits =
-            gqa_small_t_split_count<Geometry>(static_cast<std::int32_t>(window), tokens, dtype);
+        const auto splits = gqa_small_t_split_count<Geometry>(
+            static_cast<std::int32_t>(window), tokens, i8_profile);
         capacity = capacity > splits ? capacity : splits;
     };
     include(envelope.min_visible_keys);
@@ -98,6 +101,27 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             static_cast<const __nv_bfloat16*>(q.data), input,
             static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
             static_cast<__nv_bfloat16*>(cache_v.data), tokens, padded_context, max_context, scale,
+            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<float*>(partial_l.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename Geometry, int TokenTile, int WarpsPerCta, bool KInt8, typename CacheInput>
+void launch_tc_partial_mixed(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                             KVCacheLayerView cache, std::int32_t padded_context,
+                             std::int32_t max_context, std::int32_t splits, Tensor& partial_acc,
+                             Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+    constexpr int kBlock = 32 * WarpsPerCta;
+    const int tokens     = q.ne[2];
+    const dim3 grid(Geometry::KVHeads, splits, 1);
+    // Mixed kernel stages through static smem only, like the BF16 kernel.
+    gqa_attention_small_t_tc_partial_mixed_kernel<Geometry, TokenTile, WarpsPerCta, KInt8, !KInt8,
+                                                  CacheInput>
+        <<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), cache.k.data, cache.v.data,
+            static_cast<__half*>(cache.k_scale.data), static_cast<__half*>(cache.v_scale.data),
+            tokens, padded_context, max_context, scale,
             static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
             static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
@@ -206,16 +230,27 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const auto padded_context        = static_cast<std::int32_t>(cache.padded_context);
     const auto max_context           = static_cast<std::int32_t>(cache.max_context);
     const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto splits = gqa_small_t_launch_capacity<Geometry>(envelope, q.ne[2], cache.dtype);
+    const bool k_i8                  = cache.k_dtype == DType::I8;
+    const bool v_i8                  = cache.v_dtype == DType::I8;
+    const bool i8_profile            = k_i8 && v_i8;
+    const auto splits = gqa_small_t_launch_capacity<Geometry>(envelope, q.ne[2], i8_profile);
 
-    // BF16 keeps its row-tile warp count; INT8 selects its producer/consumer
-    // geometry inside launch_tc_partial_i8.
+    // BF16 keeps its row-tile warp count (shared by the mixed kernel); symmetric
+    // INT8 selects its producer/consumer geometry inside launch_tc_partial_i8.
 #define NINFER_GQA_SMALL_T_DISPATCH(TOKENS, WARPS)                                                 \
     do {                                                                                           \
-        if (cache.dtype == DType::I8) {                                                            \
+        if (i8_profile) {                                                                          \
             launch_tc_partial_i8<Geometry, (TOKENS)>(q, input, pos, scale, cache, padded_context,  \
                                                      max_context, implementation_window, splits,   \
                                                      partial_acc, partial_m, partial_l, stream);   \
+        } else if (k_i8) {                                                                         \
+            launch_tc_partial_mixed<Geometry, (TOKENS), (WARPS), true>(                            \
+                q, input, pos, scale, cache, padded_context, max_context, splits, partial_acc,     \
+                partial_m, partial_l, stream);                                                     \
+        } else if (v_i8) {                                                                         \
+            launch_tc_partial_mixed<Geometry, (TOKENS), (WARPS), false>(                           \
+                q, input, pos, scale, cache, padded_context, max_context, splits, partial_acc,     \
+                partial_m, partial_l, stream);                                                     \
         } else {                                                                                   \
             launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS)>(                                   \
                 q, input, pos, scale, cache, padded_context, max_context, splits, partial_acc,     \
@@ -250,7 +285,7 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     constexpr int kReduceBlock = 256;
     constexpr int kDChunk      = 64;
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk), q.ne[2]);
-    if (cache.dtype == DType::I8) {
+    if (i8_profile) {
         gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, true>
             <<<reduce_grid, kReduceBlock, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(partial_acc.data),

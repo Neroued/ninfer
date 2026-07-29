@@ -102,7 +102,9 @@ int test_cli_contract() {
     failures += expect(parsed.repetitions == 3 && parsed.warmup == 2, "repetition settings");
     failures += expect(parsed.max_context == std::optional<std::uint32_t>(4096), "max context");
     failures += expect(parsed.prefill_chunk == 128, "prefill chunk");
-    failures += expect(parsed.kv_cache == ninfer::KvCacheStorage::Int8Group64, "INT8 KV");
+    failures += expect(
+        parsed.kv_cache == ninfer::kv_cache_uniform(ninfer::KvCacheFormat::Int8Group64),
+        "INT8 KV");
     failures += expect(parsed.mtp_draft_tokens == 5, "MTP window");
     failures +=
         expect(parsed.proposal_head == ninfer::ProposalHead::Optimized, "optimized proposal head");
@@ -119,6 +121,20 @@ int test_cli_contract() {
     failures += expect(qb::usage_text("ninfer_bench").find("artifact.ninfer") != std::string::npos,
                        "help names native artifact");
     failures += expect(parse_for_test({"ninfer_bench", "--help"}).help_requested, "help flag");
+
+    const auto mixed = parse_for_test(
+        {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "bf16:int8"});
+    failures += expect(mixed.kv_cache ==
+                            ninfer::KvCacheStorage{ninfer::KvCacheFormat::BFloat16,
+                                                   ninfer::KvCacheFormat::Int8Group64},
+                        "mixed K BF16 / V INT8 KV");
+
+    const auto reverse_mixed = parse_for_test(
+        {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "int8:bf16"});
+    failures += expect(reverse_mixed.kv_cache ==
+                           ninfer::KvCacheStorage{ninfer::KvCacheFormat::Int8Group64,
+                                                  ninfer::KvCacheFormat::BFloat16},
+                       "mixed K INT8 / V BF16 KV");
 
     failures += expect_throws<std::invalid_argument>([] { (void)parse_for_test({"ninfer_bench"}); },
                                                      "missing artifact");
@@ -232,14 +248,16 @@ qb::BenchEnvironment sample_environment() {
                                             .resource_count       = 6};
     env.memory.device                    = 0;
     env.memory.max_context               = 4096;
-    env.memory.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
+    env.memory.kv_cache                  = {ninfer::KvCacheFormat::BFloat16,
+                                            ninfer::KvCacheFormat::Int8Group64};
     env.memory.weights                   = {17400000000ULL, 17400000000ULL, 17400000000ULL};
     env.memory.sequence                  = {2000000000ULL, 1900000000ULL, 1900000000ULL};
     env.memory.workspace                 = {100000000ULL, 0, 0};
     env.memory.kv_payload_bytes          = 123456ULL;
     env.max_context                      = 4096;
     env.prefill_chunk                    = 1024;
-    env.kv_cache                         = ninfer::KvCacheStorage::Int8Group64;
+    env.kv_cache                         = {ninfer::KvCacheFormat::BFloat16,
+                                            ninfer::KvCacheFormat::Int8Group64};
     env.mtp_draft_tokens                 = 5;
     env.proposal_head                    = ninfer::ProposalHead::Optimized;
     env.use_cuda_graph                   = true;
@@ -270,11 +288,13 @@ int test_report_contract() {
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
     failures +=
         expect(report.at("load").at("host_to_device_bytes") == 17400000000ULL, "load H2D bytes");
-    failures += expect(report.at("memory").at("kv_cache") == "int8-group64", "memory KV");
+    failures += expect(report.at("memory").at("kv_cache") == "bf16:int8-group64", "memory KV");
     failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
                        "workspace capacity");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
+    failures +=
+        expect(report.at("config").at("kv_cache") == "bf16:int8-group64", "config mixed KV");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
                        "graph prime output count");
 

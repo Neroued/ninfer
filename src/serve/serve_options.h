@@ -27,7 +27,7 @@ struct ServeOptions {
     std::uint32_t prefill_chunk   = 1024;
     std::size_t max_request_bytes = kDefaultMaxRequestBytes;
     int device                    = 0;
-    KvCacheStorage kv_cache       = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

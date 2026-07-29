@@ -90,10 +90,6 @@ std::string tool_choice_name(const ToolChoice& choice) {
     return "unknown";
 }
 
-const char* kv_cache_name(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
-}
-
 const char* proposal_head_name(ninfer::ProposalHead proposal) {
     return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
 }
@@ -297,7 +293,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
           {"device", options.device},
           {"max_context", options.max_context},
           {"prefill_chunk", options.prefill_chunk},
-          {"kv_cache", kv_cache_name(options.kv_cache)},
+          {"kv_cache", ninfer::kv_cache_storage_name(options.kv_cache)},
           {"vision", options.enable_vision},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},

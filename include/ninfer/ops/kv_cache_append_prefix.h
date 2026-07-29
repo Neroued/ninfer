@@ -42,7 +42,8 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
  * Absolute position p maps to physical slot p mod 4096. The caller guarantees that the live
  * interval ends immediately before positions[0] and that advancing it by commit_count makes every
  * overwritten old slot dead. One invocation may commit at most the ring capacity, so no two live
- * writes race for one physical slot.
+ * writes race for one physical slot. The cyclic cache is BF16 with no scale planes; it belongs to
+ * DFlash and is independent of the target Text/MTP KV format.
  */
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& commit_count,

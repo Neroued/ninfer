@@ -29,11 +29,11 @@ struct SwaContextExecutionEnvelope {
  * q/out are contiguous BF16 [128,32,T], query_k/query_v are contiguous BF16 [128,8,T], and
  * positions is contiguous device I32 [T] with positions[i] = L+i.
  *
- * The read-only cyclic context contains committed absolute positions [max(0,L-4096),L), with
- * absolute position p stored at physical slot p mod 4096. Query K/V is a separate temporary
- * segment at positions [L,L+T). For every query position p_i, the admitted populated keys satisfy
- * abs(p_j-p_i)<4096. Thus distance 4095 is included, distance 4096 is excluded, and every query
- * row sees every temporary query row. scale is 1/sqrt(128).
+ * The read-only cyclic context is BF16 with no scale planes and contains committed absolute
+ * positions [max(0,L-4096),L), with absolute position p stored at physical slot p mod 4096. Query
+ * K/V is a separate temporary segment at positions [L,L+T). For every query position p_i, the
+ * admitted populated keys satisfy abs(p_j-p_i)<4096. Thus distance 4095 is included, distance 4096
+ * is excluded, and every query row sees every temporary query row. scale is 1/sqrt(128).
  *
  * Context and query K/V are unchanged. out is the only observable mutation and is completely
  * overwritten. The current optimized implementation domain is T=1..16 on sm_120a.

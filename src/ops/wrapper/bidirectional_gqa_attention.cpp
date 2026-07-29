@@ -41,7 +41,8 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 void validate_context(const KVCacheLayerView& context, const char* op) {
-    if (context.dtype != DType::BF16 || context.quant_group != 0 ||
+    if (context.k_dtype != DType::BF16 || context.v_dtype != DType::BF16 ||
+        context.k_quant_group != 0 || context.v_quant_group != 0 ||
         context.num_kv_heads != kKVHeads || context.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid context geometry or dtype");
     }

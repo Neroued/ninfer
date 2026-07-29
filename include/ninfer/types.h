@@ -15,10 +15,33 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-enum class KvCacheStorage : std::uint8_t {
+enum class KvCacheFormat : std::uint8_t {
     BFloat16,
     Int8Group64,
 };
+
+/**
+ * KV cache storage selected independently for the K and V planes. INT8-G64 stores one FP16
+ * scale per contiguous 64-element group; a mixed selection (for example K BF16 with V
+ * INT8-G64) quantizes only the selected side.
+ */
+struct KvCacheStorage {
+    KvCacheFormat k = KvCacheFormat::BFloat16;
+    KvCacheFormat v = KvCacheFormat::BFloat16;
+
+    constexpr bool operator==(const KvCacheStorage&) const = default;
+};
+
+[[nodiscard]] constexpr KvCacheStorage kv_cache_uniform(KvCacheFormat format) noexcept {
+    return KvCacheStorage{format, format};
+}
+
+[[nodiscard]] constexpr std::string_view kv_cache_storage_name(KvCacheStorage storage) noexcept {
+    if (storage.k == KvCacheFormat::BFloat16) {
+        return storage.v == KvCacheFormat::BFloat16 ? "bf16" : "bf16:int8-group64";
+    }
+    return storage.v == KvCacheFormat::BFloat16 ? "int8-group64:bf16" : "int8-group64";
+}
 
 enum class ProposalHead : std::uint8_t {
     Full,
@@ -47,7 +70,7 @@ struct EngineOptions {
     int device                  = 0;
     std::uint32_t max_context   = 2048;
     std::uint32_t prefill_chunk = 1024;
-    KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;
@@ -240,7 +263,7 @@ struct ArenaMemorySummary {
 struct MemorySummary {
     int device                = 0;
     std::uint32_t max_context = 0;
-    KvCacheStorage kv_cache   = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;

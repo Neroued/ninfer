@@ -19,8 +19,10 @@ struct KVCacheLayerView {
     std::uint32_t padded_context = 0;
     std::int32_t num_kv_heads    = 0;
     std::int32_t head_dim        = 0;
-    DType dtype                  = DType::BF16;
-    std::int32_t quant_group     = 0;
+    DType k_dtype                = DType::BF16;
+    DType v_dtype                = DType::BF16;
+    std::int32_t k_quant_group   = 0;
+    std::int32_t v_quant_group   = 0;
 };
 
 /**
@@ -47,8 +49,10 @@ struct KVCacheLayout {
     std::uint32_t padded_context = 0;
     std::int32_t num_kv_heads    = 0;
     std::int32_t head_dim        = 0;
-    DType dtype                  = DType::BF16;
-    std::int32_t quant_group     = 0;
+    DType k_dtype                = DType::BF16;
+    DType v_dtype                = DType::BF16;
+    std::int32_t k_quant_group   = 0;
+    std::int32_t v_quant_group   = 0;
     std::vector<LayoutRegion> k;
     std::vector<LayoutRegion> v;
     std::vector<LayoutRegion> k_scale;
@@ -59,8 +63,10 @@ struct KVCacheLayout {
 
 [[nodiscard]] KVCacheLayout plan_kv_cache(LayoutBuilder& builder, std::uint32_t full_layers,
                                           std::uint32_t max_context, std::int32_t num_kv_heads,
-                                          std::int32_t head_dim, DType dtype = DType::BF16,
-                                          std::int32_t quant_group = 0);
+                                          std::int32_t head_dim, DType k_dtype = DType::BF16,
+                                          DType v_dtype = DType::BF16,
+                                          std::int32_t k_quant_group = 0,
+                                          std::int32_t v_quant_group = 0);
 
 struct KVCache {
     std::vector<Tensor> k;
@@ -71,8 +77,10 @@ struct KVCache {
     std::uint32_t padded_context = 0;
     std::int32_t num_kv_heads    = 0;
     std::int32_t head_dim        = 0;
-    DType dtype                  = DType::BF16;
-    std::int32_t quant_group     = 0;
+    DType k_dtype                = DType::BF16;
+    DType v_dtype                = DType::BF16;
+    std::int32_t k_quant_group   = 0;
+    std::int32_t v_quant_group   = 0;
 
     KVCache() = default;
     KVCache(DeviceSpan backing, const KVCacheLayout& layout);

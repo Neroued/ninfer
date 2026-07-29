@@ -52,10 +52,24 @@ float parse_float(const char* text, std::string_view label, float minimum, float
     return static_cast<float>(value);
 }
 
-KvCacheStorage parse_kv_cache(std::string_view text) {
-    if (text == "bf16") { return KvCacheStorage::BFloat16; }
-    if (text == "int8") { return KvCacheStorage::Int8Group64; }
+KvCacheFormat parse_kv_format(std::string_view text) {
+    if (text == "bf16") { return KvCacheFormat::BFloat16; }
+    if (text == "int8") { return KvCacheFormat::Int8Group64; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
+}
+
+// K/V formats are selected independently as "<k>:<v>" (e.g. "bf16:int8" keeps K in
+// BF16 and quantizes V to INT8-G64); a bare value selects the same format for both.
+KvCacheStorage parse_kv_cache(std::string_view text) {
+    const std::size_t separator = text.find(':');
+    if (separator == std::string_view::npos) {
+        return kv_cache_uniform(parse_kv_format(text));
+    }
+    if (separator == 0 || separator + 1 >= text.size()) {
+        throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
+    }
+    return KvCacheStorage{parse_kv_format(text.substr(0, separator)),
+                          parse_kv_format(text.substr(separator + 1))};
 }
 
 } // namespace
@@ -64,7 +78,8 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--prefill-chunk N] [--max-new N] [--device N]\n"
-           "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--kv-dtype bf16|int8|bf16:int8|int8:bf16]\n"
+           "       [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"

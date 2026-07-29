@@ -103,7 +103,7 @@ $CLI "$MODEL" --messages examples/cli/messages/long_8k.json \
   --no-thinking --greedy --max-new 64
 
 $CLI "$MODEL" --messages examples/cli/messages/long_64k.json \
-  --max-context 65536 --kv-dtype int8 --prefill-chunk 1024 \
+  --max-context 65536 --kv-dtype bf16:int8 --prefill-chunk 1024 \
   --no-thinking --greedy --max-new 64
 
 $CLI "$MODEL" --messages examples/cli/messages/long_128k.json \

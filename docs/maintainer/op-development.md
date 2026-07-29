@@ -476,11 +476,13 @@ conformance matrix, and target-representative activations is not a universal err
 arbitrary unbounded or adversarial tensors. Each semantically complete entry point is checked
 directly against the oracle; pairwise implementation parity is supplementary evidence.
 
-GQA applies this rule concretely. BF16-cache and INT8-G64-cache A1/A3 share an FP64 ideal attention
-oracle over BF16 Q and logical cache values (BF16 or FP32-decoded INT8-G64). The target's INT8
-Q8-G64 query compute profile remains an intentional optimized implementation; the GQA suite gives
-the BF16-cache and INT8-cache compute profiles separate named criteria without folding either into
-a second reference. Exact INT8 cache code and scale validation remains a separate codec check.
+GQA applies this rule concretely. K and V independently select BF16 or INT8-G64 storage, while all
+A1/A3 combinations share an FP64 ideal attention oracle over BF16 Q and per-side logical cache
+values (BF16 or FP32-decoded INT8-G64). The symmetric INT8 Q8-G64 query profile remains an
+intentional optimized implementation; mixed profiles keep BF16 Q/K math and dequantize their INT8
+side. The GQA suite gives BF16, INT8, and mixed compute profiles separate named criteria without
+folding any into a second reference. Exact per-side INT8 code and scale validation remains a
+separate codec check.
 
 ### 8.1 Op qualification standard
 

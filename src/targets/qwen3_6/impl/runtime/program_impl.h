@@ -113,8 +113,9 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity),
       prefill_chunk(plan.prefill_chunk), draft_window(plan.draft_window),
-      speculative_backend(plan.speculative_backend), kv_dtype(plan.kv_dtype),
-      kv_quant_group(plan.kv_quant_group), proposal_head(plan.proposal_head),
+      speculative_backend(plan.speculative_backend), kv_k_dtype(plan.kv_k_dtype),
+      kv_v_dtype(plan.kv_v_dtype), kv_k_quant_group(plan.kv_k_quant_group),
+      kv_v_quant_group(plan.kv_v_quant_group), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes),
@@ -1089,7 +1090,10 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     MemorySummary out;
     out.device      = device.device;
     out.max_context = capacity;
-    out.kv_cache = kv_dtype == DType::BF16 ? KvCacheStorage::BFloat16 : KvCacheStorage::Int8Group64;
+    out.kv_cache = KvCacheStorage{
+        kv_k_dtype == DType::BF16 ? KvCacheFormat::BFloat16 : KvCacheFormat::Int8Group64,
+        kv_v_dtype == DType::BF16 ? KvCacheFormat::BFloat16 : KvCacheFormat::Int8Group64,
+    };
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

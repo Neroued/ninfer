@@ -45,7 +45,8 @@ int main() {
     options.request_log_jsonl         = "requests.jsonl";
     options.max_context               = 262144;
     options.prefill_chunk             = 1024;
-    options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
+    options.kv_cache                  = {ninfer::KvCacheFormat::Int8Group64,
+                                         ninfer::KvCacheFormat::BFloat16};
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
@@ -65,7 +66,7 @@ int main() {
 
     ninfer::MemorySummary memory;
     memory.max_context              = 262144;
-    memory.kv_cache                 = ninfer::KvCacheStorage::Int8Group64;
+    memory.kv_cache                     = options.kv_cache;
     memory.weights.capacity_bytes   = 100;
     memory.sequence.capacity_bytes  = 200;
     memory.workspace.capacity_bytes = 300;
@@ -94,7 +95,8 @@ int main() {
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
                       "request log path missing");
-    failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");
+    failures += check(server.at("engine").at("kv_cache") == "int8-group64:bf16",
+                      "mixed KV type missing");
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
     failures += check(server.at("engine").at("speculative_backend") == "mtp",
                       "speculative backend missing");

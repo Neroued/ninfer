@@ -74,11 +74,14 @@ KVCacheLayerView linear_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v) {
         .padded_context = kLinearPadded,
         .num_kv_heads   = kKVHeads,
         .head_dim       = kHeadDim,
-        .dtype          = DType::BF16,
-        .quant_group    = 0,
+        .k_dtype        = DType::BF16,
+        .v_dtype        = DType::BF16,
+        .k_quant_group  = 0,
+        .v_quant_group  = 0,
     };
 }
 
+// DFlash's local cyclic caches are fixed BF16 independently of the target KV format.
 CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v) {
     return {
         .k               = Tensor(k.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads}),

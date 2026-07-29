@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
 import torch
 
 from tools.artifact.container import (
@@ -16,13 +18,14 @@ from tools.artifact.layouts import decode_direct, dequantize_row_split, encoded_
 from tools.convert.qwen3_6_27b import convert, inventory, recipe
 
 
-OFFICIAL_MODEL = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16"
-)
-
-
 def test_official_config_uses_only_nested_mtp_field():
-    config = json.loads((OFFICIAL_MODEL / "config.json").read_text())
+    model = os.environ.get("NINFER_QWEN3_6_27B_MODEL")
+    if not model:
+        pytest.skip("NINFER_QWEN3_6_27B_MODEL is not set")
+    config_path = Path(model) / "config.json"
+    if not config_path.is_file():
+        pytest.skip(f"official model config is unavailable: {config_path}")
+    config = json.loads(config_path.read_text())
 
     assert "mtp_num_hidden_layers" not in config
     summary = convert.validate_config(config)
@@ -125,7 +128,7 @@ def test_synthetic_encode_seam_and_descriptive_report(tmp_path):
     assert report["model_id"] == inventory.MODEL_ID
     assert report["target_key"] == inventory.TARGET_KEY
     assert report["recipe_id"] == convert.RECIPE_ID
-    assert report["source"]["model_path"].endswith("/model")
+    assert Path(report["source"]["model_path"]).name == "model"
     assert report["arguments"]["device"] == "cpu"
     assert report["source_preflight"] == {
         "recipes": 2,

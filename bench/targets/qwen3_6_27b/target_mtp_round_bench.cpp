@@ -123,7 +123,7 @@ int run(const Options& options) {
                                                                       (options.draft_tokens + 1ULL) +
                                                                   2ULL * options.draft_tokens);
     engine.prefill_chunk             = 128;
-    engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
+    engine.kv_cache                  = ninfer::KvCacheStorage{};
     engine.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;

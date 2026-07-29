@@ -61,7 +61,8 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
 
 void validate_linear_cache(const KVCacheLayerView& cache,
                            KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.dtype != DType::BF16 || cache.quant_group != 0 || cache.num_kv_heads != kKVHeads ||
+    if (cache.k_dtype != DType::BF16 || cache.v_dtype != DType::BF16 || cache.k_quant_group != 0 ||
+        cache.v_quant_group != 0 || cache.num_kv_heads != kKVHeads ||
         cache.head_dim != kHeadDim || cache.padded_context < cache.max_context ||
         cache.padded_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||

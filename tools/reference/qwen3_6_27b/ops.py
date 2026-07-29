@@ -162,14 +162,12 @@ def gated_delta_rule(
         )
         kt = k[0].float().index_select(0, head_map)
         qt = q[0].float().index_select(0, head_map)
-        next_state = state.float() * torch.exp(g[0].float()).view(1, CFG.gdn_v_heads, 1, 1)
-        prediction = torch.einsum("bhkv,hk->bhv", next_state, kt)
-        delta = beta[0].float().view(1, CFG.gdn_v_heads, 1) * (v[0].float() - prediction)
-        next_state = next_state + kt.view(
-            1, CFG.gdn_v_heads, CFG.gdn_k_dim, 1
-        ) * delta.unsqueeze(-2)
-        out = torch.einsum("bhkv,hk->bhv", next_state, qt) * GDN_SCALE
-        return bf16(out.squeeze(0).unsqueeze(0)), next_state
+        next_state = state[0].float() * torch.exp(g[0].float()).view(CFG.gdn_v_heads, 1, 1)
+        prediction = torch.einsum("hkv,hk->hv", next_state, kt)
+        delta = beta[0].float().unsqueeze(-1) * (v[0].float() - prediction)
+        next_state = next_state + kt.unsqueeze(-1) * delta.unsqueeze(-2)
+        out = torch.einsum("hkv,hk->hv", next_state, qt) * GDN_SCALE
+        return bf16(out.unsqueeze(0)), next_state.unsqueeze(0)
     try:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     except ImportError as exc:

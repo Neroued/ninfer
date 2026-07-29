@@ -31,7 +31,7 @@ drafts, fallback steps, timing, memory planning, and peak CUDA allocation.
 Important runtime controls include:
 
 - `--gpu-memory auto|24GiB` and `--headroom 2GiB`;
-- `--kv-dtype bf16|int8`;
+- `--kv-dtype bf16|int8|bf16:int8|int8:bf16` (K:V order);
 - `--prefill-chunk N`;
 - `--greedy` or sampling overrides for temperature, top-p, top-k, and penalties;
 - `--vision-attention-limit N`;

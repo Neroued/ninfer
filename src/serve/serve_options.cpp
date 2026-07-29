@@ -44,11 +44,22 @@ std::uint64_t parse_u64(const char* text, const char* label) {
     return static_cast<std::uint64_t>(value);
 }
 
+KvCacheFormat parse_kv_format(const std::string& value) {
+    if (value == "bf16") { return KvCacheFormat::BFloat16; }
+    if (value == "int8") { return KvCacheFormat::Int8Group64; }
+    throw std::invalid_argument("invalid kv-dtype: " + value);
+}
+
+// K/V formats are selected independently as "<k>:<v>"; a bare value selects both.
 KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
-    if (value == "bf16") { return KvCacheStorage::BFloat16; }
-    if (value == "int8") { return KvCacheStorage::Int8Group64; }
-    throw std::invalid_argument("invalid kv-dtype: " + value);
+    const std::size_t separator = value.find(':');
+    if (separator == std::string::npos) { return kv_cache_uniform(parse_kv_format(value)); }
+    if (separator == 0 || separator + 1 >= value.size()) {
+        throw std::invalid_argument("invalid kv-dtype: " + value);
+    }
+    return KvCacheStorage{parse_kv_format(value.substr(0, separator)),
+                          parse_kv_format(value.substr(separator + 1))};
 }
 
 } // namespace
@@ -58,7 +69,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
            "[--max-request-mib N] [--request-log-jsonl FILE] "
-           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|bf16:int8|int8:bf16] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--cors] "

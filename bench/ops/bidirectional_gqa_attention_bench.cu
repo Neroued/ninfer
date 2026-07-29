@@ -151,8 +151,10 @@ KVCacheLayerView make_context(DeviceBuffer& k, DeviceBuffer& v, int maximum, int
         .padded_context = static_cast<std::uint32_t>(padded),
         .num_kv_heads   = kKVHeads,
         .head_dim       = kD,
-        .dtype          = DType::BF16,
-        .quant_group    = 0,
+        .k_dtype        = DType::BF16,
+        .v_dtype        = DType::BF16,
+        .k_quant_group  = 0,
+        .v_quant_group  = 0,
     };
 }
 

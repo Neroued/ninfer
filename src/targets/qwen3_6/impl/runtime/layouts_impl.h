@@ -48,8 +48,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .capacity              = plan.capacity,
                      .kv_heads              = TextConfig::kv_heads,
                      .attention_head_dim    = TextConfig::head_dim,
-                     .kv_dtype              = plan.kv_dtype,
-                     .kv_quant_group        = plan.kv_quant_group,
+                     .kv_k_dtype            = plan.kv_k_dtype,
+                     .kv_v_dtype            = plan.kv_v_dtype,
+                     .kv_k_quant_group      = plan.kv_k_quant_group,
+                     .kv_v_quant_group      = plan.kv_v_quant_group,
                      .enable_mtp            = plan.features.mtp(),
                      .gdn =
                          {
@@ -443,8 +445,10 @@ std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
     impl->features            = qwen3_6::startup_features(options);
     impl->use_cuda_graph      = options.use_cuda_graph;
     impl->device              = options.device;
-    impl->kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8;
-    impl->kv_quant_group = impl->kv_dtype == DType::I8 ? kKvQuantGroup : 0;
+    impl->kv_k_dtype = options.kv_cache.k == KvCacheFormat::BFloat16 ? DType::BF16 : DType::I8;
+    impl->kv_v_dtype = options.kv_cache.v == KvCacheFormat::BFloat16 ? DType::BF16 : DType::I8;
+    impl->kv_k_quant_group = impl->kv_k_dtype == DType::I8 ? kKvQuantGroup : 0;
+    impl->kv_v_quant_group = impl->kv_v_dtype == DType::I8 ? kKvQuantGroup : 0;
     impl->persistent     = persistent_layout(*impl);
     const auto [dflash_workspace, fixed_workspace_bytes] = dflash_workspace_layout(*impl);
     impl->dflash_workspace                               = dflash_workspace;

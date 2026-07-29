@@ -16,7 +16,8 @@ ninfer::EngineOptions ordinary_engine_options(const char* artifact) {
     options.artifact_path  = artifact;
     options.max_context    = 128;
     options.prefill_chunk  = 128;
-    options.kv_cache       = ninfer::KvCacheStorage::BFloat16;
+    options.kv_cache       = {ninfer::KvCacheFormat::BFloat16,
+                              ninfer::KvCacheFormat::Int8Group64};
     options.use_cuda_graph = false;
     options.enable_vision  = false;
     return options;
@@ -99,8 +100,10 @@ int verify_dflash_load(const ninfer::Engine& engine) {
         return 1;
     }
     const ninfer::MemorySummary memory = engine.memory_summary();
-    if (memory.max_context != 4352 || memory.kv_cache != ninfer::KvCacheStorage::BFloat16 ||
-        memory.kv_payload_bytes != 274'726'912ULL ||
+    if (memory.max_context != 4352 ||
+        memory.kv_cache != ninfer::KvCacheStorage{ninfer::KvCacheFormat::BFloat16,
+                                                  ninfer::KvCacheFormat::Int8Group64} ||
+        memory.kv_payload_bytes != 253'140'992ULL ||
         memory.weights.used_bytes != memory.weights.capacity_bytes) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;

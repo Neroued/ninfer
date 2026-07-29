@@ -769,7 +769,7 @@ void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& 
     DeviceBuffer pos_buf = make_i32(pos_value);
     Tensor pos(pos_buf.p, DType::I32, {1});
 
-    const DecodeBytes bytes  = decode_bytes(pos_value, kv.dtype);
+    const DecodeBytes bytes  = decode_bytes(pos_value, kv.k_dtype);
     std::uint32_t next_layer = 0;
 
     const Result r = bench_loop(
@@ -784,8 +784,8 @@ void run_decode(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Tensor& 
 
     char tag[96];
     std::snprintf(tag, sizeof(tag), "gqa_attention decode combined pos=%d kv=%s", pos_value,
-                  kv_dtype_name(kv.dtype));
-    print_decode_result(tag, r, bytes, pos_value, kv.dtype, round_robin_layers,
+                  kv_dtype_name(kv.k_dtype));
+    print_decode_result(tag, r, bytes, pos_value, kv.k_dtype, round_robin_layers,
                         (round_robin_layers == 1u) ? " hot_cache_info" : "");
 }
 
@@ -794,7 +794,7 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
                       DeviceBuffer* cold_cache) {
     DeviceBuffer pos_buf = make_i32(pos_value);
     Tensor pos(pos_buf.p, DType::I32, {1});
-    const DecodeBytes bytes = decode_bytes(pos_value, kv.dtype);
+    const DecodeBytes bytes = decode_bytes(pos_value, kv.k_dtype);
 
     cudaStream_t stream = nullptr;
     if (cold_cache != nullptr) {
@@ -808,12 +808,13 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
 
         char tag[96];
         std::snprintf(tag, sizeof(tag), "PROFILE_COLD gqa_attention decode pos=%d", pos_value);
-        print_decode_result(tag, r, bytes, pos_value, kv.dtype, 1u, " cold_cache");
+        print_decode_result(tag, r, bytes, pos_value, kv.k_dtype, 1u, " cold_cache");
         std::printf("PROFILE_COLD_METADATA pos=%d kv_dtype=%s splits=%d kps=%d "
                     "cold_cache_bytes=%zu "
                     "useful_kv_bytes=%zu scratch_bytes=%zu total_modeled_bytes=%zu repeats=%d\n",
-                    pos_value, kv_dtype_name(kv.dtype), decode_active_splits(pos_value, kv.dtype),
-                    decode_kps(pos_value, kv.dtype), cold_cache->bytes, bytes.useful_kv,
+                    pos_value, kv_dtype_name(kv.k_dtype),
+                    decode_active_splits(pos_value, kv.k_dtype),
+                    decode_kps(pos_value, kv.k_dtype), cold_cache->bytes, bytes.useful_kv,
                     bytes.scratch, bytes.total, r.n_runs);
         return;
     }
@@ -824,8 +825,9 @@ void run_profile_once(KVCache& kv, WorkspaceArena& ws, const Tensor& q, const Te
 
     std::printf("PROFILE_ONCE gqa_attention decode combined pos=%d kv_dtype=%s splits=%d kps=%d "
                 "useful_kv_bytes=%zu scratch_bytes=%zu total_modeled_bytes=%zu\n",
-                pos_value, kv_dtype_name(kv.dtype), decode_active_splits(pos_value, kv.dtype),
-                decode_kps(pos_value, kv.dtype), bytes.useful_kv, bytes.scratch, bytes.total);
+                pos_value, kv_dtype_name(kv.k_dtype),
+                decode_active_splits(pos_value, kv.k_dtype), decode_kps(pos_value, kv.k_dtype),
+                bytes.useful_kv, bytes.scratch, bytes.total);
 }
 
 void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) {
@@ -846,7 +848,7 @@ void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv.dtype);
+    const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv.k_dtype);
     const Result r          = bench_loop(
         [&](cudaStream_t s) {
             ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
@@ -856,8 +858,9 @@ void run_append_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
         static_cast<double>(bytes.total));
 
     char tag[96];
-    std::snprintf(tag, sizeof(tag), "gqa_attention append-small-T kv=%s", kv_dtype_name(kv.dtype));
-    print_append_small_t_result(tag, r, bytes, tokens, context, kv.dtype, "");
+    std::snprintf(tag, sizeof(tag), "gqa_attention append-small-T kv=%s",
+                  kv_dtype_name(kv.k_dtype));
+    print_append_small_t_result(tag, r, bytes, tokens, context, kv.k_dtype, "");
 }
 
 void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t context,
@@ -879,7 +882,7 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv.dtype);
+    const DecodeBytes bytes = append_small_t_bytes(tokens, context, kv.k_dtype);
     cudaStream_t stream     = nullptr;
     if (cold_cache != nullptr) {
         const Result r = bench_cold_cache_loop(
@@ -891,22 +894,22 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
             *cold_cache, static_cast<double>(bytes.total));
         char tag[96];
         std::snprintf(tag, sizeof(tag), "PROFILE_COLD gqa_attention append-small-T kv=%s",
-                      kv_dtype_name(kv.dtype));
-        print_append_small_t_result(tag, r, bytes, tokens, context, kv.dtype, " cold_cache");
+                      kv_dtype_name(kv.k_dtype));
+        print_append_small_t_result(tag, r, bytes, tokens, context, kv.k_dtype, " cold_cache");
         const VerifyRoute route = verify_route(tokens, context);
         std::printf("PROFILE_COLD_METADATA mode=append-small-t T=%d context=%d kv_dtype=%s "
                     "route=%s chunks=%d "
                     "cold_cache_bytes=%zu useful_kv_bytes=%zu scratch_bytes=%zu "
                     "total_modeled_bytes=%zu redundancy=%.6f repeats=%d "
                     "ncu_kernel_regex='%s'\n",
-                    tokens, context, kv_dtype_name(kv.dtype),
+                    tokens, context, kv_dtype_name(kv.k_dtype),
                     ops::detail::gqa_attention_route_name(route),
                     verify_route_chunks(tokens, route), cold_cache->bytes, bytes.useful_kv,
                     bytes.scratch, bytes.total,
                     bytes.useful_kv > 0
                         ? static_cast<double>(bytes.total) / static_cast<double>(bytes.useful_kv)
                         : 0.0,
-                    r.n_runs, verify_route_ncu_kernel_regex(route, kv.dtype));
+                    r.n_runs, verify_route_ncu_kernel_regex(route, kv.k_dtype));
         return;
     }
 
@@ -919,13 +922,13 @@ void run_append_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
                 "chunks=%d "
                 "useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu redundancy=%.6f "
                 "ncu_kernel_regex='%s'\n",
-                tokens, context, kv_dtype_name(kv.dtype),
+                tokens, context, kv_dtype_name(kv.k_dtype),
                 ops::detail::gqa_attention_route_name(route), verify_route_chunks(tokens, route),
                 bytes.useful_kv, bytes.scratch, bytes.total,
                 bytes.useful_kv > 0
                     ? static_cast<double>(bytes.total) / static_cast<double>(bytes.useful_kv)
                     : 0.0,
-                verify_route_ncu_kernel_regex(route, kv.dtype));
+                verify_route_ncu_kernel_regex(route, kv.k_dtype));
 }
 
 void run_cached_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) {
@@ -940,7 +943,7 @@ void run_cached_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    const DecodeBytes bytes = cached_small_t_bytes(tokens, context, kv.dtype);
+    const DecodeBytes bytes = cached_small_t_bytes(tokens, context, kv.k_dtype);
     const Result r          = bench_loop(
         [&](cudaStream_t s) {
             ops::gqa_attention_cached(tq, tpos, kScale, kv.layer_view(0),
@@ -950,8 +953,9 @@ void run_cached_small_t(KVCache& kv, std::int32_t tokens, std::int32_t context) 
         static_cast<double>(bytes.total));
 
     char tag[96];
-    std::snprintf(tag, sizeof(tag), "gqa_attention cached-small-T kv=%s", kv_dtype_name(kv.dtype));
-    print_append_small_t_result(tag, r, bytes, tokens, context, kv.dtype, "");
+    std::snprintf(tag, sizeof(tag), "gqa_attention cached-small-T kv=%s",
+                  kv_dtype_name(kv.k_dtype));
+    print_append_small_t_result(tag, r, bytes, tokens, context, kv.k_dtype, "");
 }
 
 void run_cached_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t context,
@@ -966,7 +970,7 @@ void run_cached_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
     Tensor tq(q.p, DType::BF16, {kHeadDim, kQHeads, tokens});
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
-    const DecodeBytes bytes = cached_small_t_bytes(tokens, context, kv.dtype);
+    const DecodeBytes bytes = cached_small_t_bytes(tokens, context, kv.k_dtype);
 
     const auto launch = [&](cudaStream_t s) {
         ops::gqa_attention_cached(tq, tpos, kScale, kv.layer_view(0),
@@ -978,16 +982,17 @@ void run_cached_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
             bench_cold_cache_loop(launch, *cold_cache, static_cast<double>(bytes.total));
         char tag[96];
         std::snprintf(tag, sizeof(tag), "PROFILE_COLD gqa_attention cached-small-T kv=%s",
-                      kv_dtype_name(kv.dtype));
-        print_append_small_t_result(tag, r, bytes, tokens, context, kv.dtype, " cold_cache");
+                      kv_dtype_name(kv.k_dtype));
+        print_append_small_t_result(tag, r, bytes, tokens, context, kv.k_dtype, " cold_cache");
         const VerifyRoute route = verify_route(tokens, context);
         std::printf(
             "PROFILE_COLD_METADATA mode=cached-small-t T=%d context=%d kv_dtype=%s "
             "route=%s chunks=%d cold_cache_bytes=%zu useful_kv_bytes=%zu scratch_bytes=%zu "
             "total_modeled_bytes=%zu repeats=%d ncu_kernel_regex='%s'\n",
-            tokens, context, kv_dtype_name(kv.dtype), ops::detail::gqa_attention_route_name(route),
+            tokens, context, kv_dtype_name(kv.k_dtype),
+            ops::detail::gqa_attention_route_name(route),
             verify_route_chunks(tokens, route), cold_cache->bytes, bytes.useful_kv, bytes.scratch,
-            bytes.total, r.n_runs, verify_route_ncu_kernel_regex(route, kv.dtype));
+            bytes.total, r.n_runs, verify_route_ncu_kernel_regex(route, kv.k_dtype));
         return;
     }
 
@@ -997,10 +1002,10 @@ void run_cached_small_t_profile_once(KVCache& kv, std::int32_t tokens, std::int3
     std::printf("PROFILE_ONCE gqa_attention cached-small-T T=%d context=%d kv_dtype=%s "
                 "route=%s chunks=%d useful_kv_bytes=%zu scratch_bytes=%zu total_model_bytes=%zu "
                 "ncu_kernel_regex='%s'\n",
-                tokens, context, kv_dtype_name(kv.dtype),
+                tokens, context, kv_dtype_name(kv.k_dtype),
                 ops::detail::gqa_attention_route_name(route), verify_route_chunks(tokens, route),
                 bytes.useful_kv, bytes.scratch, bytes.total,
-                verify_route_ncu_kernel_regex(route, kv.dtype));
+                verify_route_ncu_kernel_regex(route, kv.k_dtype));
 }
 
 void launch_kv_append_control(DType kv_dtype, const DeviceBuffer& k, const DeviceBuffer& v,
@@ -1035,23 +1040,23 @@ KvAppendMetrics run_kv_append(KVCache& kv, std::int32_t tokens, std::int32_t con
     DeviceBuffer v   = make_bf16(kvn);
     DeviceBuffer pos = make_i32_sequence(context, tokens);
     const std::size_t control_bytes =
-        kv.dtype == DType::I8 ? kv_append_bytes(tokens, kv.dtype).cache_write / 2u : k.bytes;
+        kv.k_dtype == DType::I8 ? kv_append_bytes(tokens, kv.k_dtype).cache_write / 2u : k.bytes;
     DeviceBuffer control_k = make_zeros(control_bytes);
     DeviceBuffer control_v = make_zeros(control_bytes);
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
     Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
     Tensor tpos(pos.p, DType::I32, {tokens});
 
-    const KvAppendBytes bytes = kv_append_bytes(tokens, kv.dtype);
+    const KvAppendBytes bytes = kv_append_bytes(tokens, kv.k_dtype);
     const Result r            = bench_loop(
         [&](cudaStream_t s) { ops::gqa_kv_append(tk, tv, tpos, kv.layer_view(0), s); },
         static_cast<double>(bytes.total), timing.warmup, timing.repeat, timing.min_time_ms);
     const Result control = bench_loop(
         [&](cudaStream_t s) {
-            launch_kv_append_control(kv.dtype, k, v, control_k, control_v, tokens, s);
+            launch_kv_append_control(kv.k_dtype, k, v, control_k, control_v, tokens, s);
         },
         static_cast<double>(bytes.total), timing.warmup, timing.repeat, timing.min_time_ms);
-    KvAppendMetrics metrics   = kv_append_metrics_from_result(tokens, context, kv.dtype, r);
+    KvAppendMetrics metrics = kv_append_metrics_from_result(tokens, context, kv.k_dtype, r);
     metrics.control_median_us = control.median_us;
     metrics.control_interval_ratio_pct =
         r.median_us > 0.0 ? control.median_us / r.median_us * 100.0 : 0.0;
@@ -1067,39 +1072,41 @@ void run_kv_append_profile_once(KVCache& kv, std::int32_t tokens, std::int32_t c
     DeviceBuffer v   = make_bf16(kvn);
     DeviceBuffer pos = make_i32_sequence(context, tokens);
     const std::size_t control_bytes =
-        kv.dtype == DType::I8 ? kv_append_bytes(tokens, kv.dtype).cache_write / 2u : k.bytes;
+        kv.k_dtype == DType::I8 ? kv_append_bytes(tokens, kv.k_dtype).cache_write / 2u : k.bytes;
     DeviceBuffer control_k = make_zeros(control_bytes);
     DeviceBuffer control_v = make_zeros(control_bytes);
     Tensor tk(k.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
     Tensor tv(v.p, DType::BF16, {kHeadDim, kKVHeads, tokens});
     Tensor tpos(pos.p, DType::I32, {tokens});
-    const KvAppendBytes bytes = kv_append_bytes(tokens, kv.dtype);
+    const KvAppendBytes bytes = kv_append_bytes(tokens, kv.k_dtype);
 
     cudaStream_t stream = nullptr;
     if (cold_cache != nullptr) {
         const Result r = bench_cold_cache_loop(
             [&](cudaStream_t s) { ops::gqa_kv_append(tk, tv, tpos, kv.layer_view(0), s); },
             *cold_cache, static_cast<double>(bytes.total));
-        const KvAppendMetrics metrics = kv_append_metrics_from_result(tokens, context, kv.dtype, r);
+        const KvAppendMetrics metrics =
+            kv_append_metrics_from_result(tokens, context, kv.k_dtype, r);
         print_kv_append_result(metrics, " cold_cache");
         std::printf("PROFILE_COLD_METADATA mode=kv-append T=%d context=%d kv_dtype=%s CTAs=%d "
                     "cold_cache_bytes=%zu input_read_bytes=%zu cache_write_bytes=%zu "
                     "total_modeled_bytes=%zu repeats=%d ncu_kernel_regex='%s'\n",
-                    tokens, context, kv_dtype_name(kv.dtype), metrics.ctas, cold_cache->bytes,
+                    tokens, context, kv_dtype_name(kv.k_dtype), metrics.ctas, cold_cache->bytes,
                     bytes.input_read, bytes.cache_write, bytes.total, r.n_runs,
-                    kv_append_ncu_kernel_regex(kv.dtype));
+                    kv_append_ncu_kernel_regex(kv.k_dtype));
         return;
     }
 
     ops::gqa_kv_append(tk, tv, tpos, kv.layer_view(0), stream);
-    launch_kv_append_control(kv.dtype, k, v, control_k, control_v, tokens, stream);
+    launch_kv_append_control(kv.k_dtype, k, v, control_k, control_v, tokens, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::printf("PROFILE_ONCE mode=kv-append T=%d context=%d kv_dtype=%s CTAs=%d "
                 "input_read_bytes=%zu cache_write_bytes=%zu total_model_bytes=%zu "
                 "ncu_kernel_regex='%s' control_ncu_kernel_regex='%s'\n",
-                tokens, context, kv_dtype_name(kv.dtype), kv_append_ctas(tokens, kv.dtype),
+                tokens, context, kv_dtype_name(kv.k_dtype), kv_append_ctas(tokens, kv.k_dtype),
                 bytes.input_read, bytes.cache_write, bytes.total,
-                kv_append_ncu_kernel_regex(kv.dtype), kv_append_control_ncu_kernel_regex(kv.dtype));
+                kv_append_ncu_kernel_regex(kv.k_dtype),
+                kv_append_control_ncu_kernel_regex(kv.k_dtype));
 }
 
 void run_copy_ceiling(std::int32_t tokens, std::int32_t context, DType kv_dtype) {
@@ -1151,7 +1158,7 @@ AppendPromptMetrics run_append_prompt_baseline(KVCache& kv, std::int32_t tokens,
     Tensor tpos(pos.p, DType::I32, {tokens});
     Tensor tout(out.p, DType::BF16, {kHeadDim, kQHeads, tokens});
 
-    const double bytes = append_prompt_global_floor_bytes(tokens, context, kv.dtype);
+    const double bytes = append_prompt_global_floor_bytes(tokens, context, kv.k_dtype);
     const Result r     = bench_loop(
         [&](cudaStream_t s) {
             ops::detail::gqa_attention_prompt_launch(tq, tk, tv, tpos, kScale, kv.layer_view(0),
@@ -1159,7 +1166,8 @@ AppendPromptMetrics run_append_prompt_baseline(KVCache& kv, std::int32_t tokens,
         },
         bytes, timing.warmup, timing.repeat, timing.min_time_ms);
 
-    AppendPromptMetrics metrics = append_prompt_metrics_from_result(tokens, context, kv.dtype, r);
+    AppendPromptMetrics metrics =
+        append_prompt_metrics_from_result(tokens, context, kv.k_dtype, r);
     print_append_prompt_result("gqa_attention append-prompt", metrics);
     return metrics;
 }
@@ -1188,7 +1196,7 @@ AppendPromptMetrics run_append_prompt_attention_only(KVCache& kv, std::int32_t t
                                              stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const double bytes = append_prompt_global_floor_bytes(tokens, context, kv.dtype);
+    const double bytes = append_prompt_global_floor_bytes(tokens, context, kv.k_dtype);
     const Result r     = bench_loop(
         [&](cudaStream_t s) {
             ops::detail::gqa_attention_prompt_attention_launch(tq, tpos, kScale, kv.layer_view(0),
@@ -1196,7 +1204,8 @@ AppendPromptMetrics run_append_prompt_attention_only(KVCache& kv, std::int32_t t
         },
         bytes, timing.warmup, timing.repeat, timing.min_time_ms);
 
-    AppendPromptMetrics metrics = append_prompt_metrics_from_result(tokens, context, kv.dtype, r);
+    AppendPromptMetrics metrics =
+        append_prompt_metrics_from_result(tokens, context, kv.k_dtype, r);
     print_append_prompt_result("gqa_attention append-attn-only", metrics);
     return metrics;
 }
@@ -1300,10 +1309,10 @@ PrefillMetrics run_prefill(KVCache& kv, std::int32_t tokens, const PrefillTiming
             ops::gqa_attention(tq, tk, tv, tpos, kScale, kv.layer_view(0),
                                exact_envelope(static_cast<std::uint32_t>(tokens)), ws, tout, s);
         },
-        prefill_model_floor_bytes(tokens, kv.dtype), timing.warmup, timing.repeat,
+        prefill_model_floor_bytes(tokens, kv.k_dtype), timing.warmup, timing.repeat,
         timing.min_time_ms);
 
-    PrefillMetrics metrics = prefill_metrics_from_result(tokens, kv.dtype, r);
+    PrefillMetrics metrics = prefill_metrics_from_result(tokens, kv.k_dtype, r);
     print_prefill_result(metrics);
     return metrics;
 }
@@ -1334,9 +1343,9 @@ void run_prefill_profile_once(KVCache& kv, std::int32_t tokens) {
     std::printf("PROFILE_ONCE gqa_attention prefill T=%d kv_dtype=%s useful_flops=%.0f "
                 "model_floor_bytes=%.0f tc_peak_tflops=%.1f dram_peak_gbps=%.0f "
                 "ncu_kernel_regex='%s'\n",
-                tokens, kv_dtype_name(kv.dtype), prefill_useful_flops(tokens),
-                prefill_model_floor_bytes(tokens, kv.dtype), kDenseTcPeakTflops, kDramPeakGBs,
-                prefill_ncu_kernel_regex(kv.dtype));
+                tokens, kv_dtype_name(kv.k_dtype), prefill_useful_flops(tokens),
+                prefill_model_floor_bytes(tokens, kv.k_dtype), kDenseTcPeakTflops, kDramPeakGBs,
+                prefill_ncu_kernel_regex(kv.k_dtype));
 }
 
 std::string json_number(double value) {
@@ -1940,11 +1949,13 @@ int main(int argc, char** argv) {
     LayoutBuilder cache_layout_builder;
     auto cache_layout = ninfer::plan_kv_cache(
         cache_layout_builder, cache_layers, static_cast<std::uint32_t>(max_context), kKVHeads,
-        kHeadDim, opt.kv_dtype, opt.kv_dtype == DType::I8 ? kBenchKvQuantGroup : 0);
+        kHeadDim, opt.kv_dtype, opt.kv_dtype,
+        opt.kv_dtype == DType::I8 ? kBenchKvQuantGroup : 0,
+        opt.kv_dtype == DType::I8 ? kBenchKvQuantGroup : 0);
     const DeviceSpan cache_backing = cache_arena.alloc_bytes(cache_layout_builder.finish(256));
     KVCache kv(cache_backing, cache_layout);
     for (std::uint32_t layer = 0; layer < kv.layer_count(); ++layer) {
-        if (kv.dtype == DType::I8) {
+        if (kv.k_dtype == DType::I8) {
             CUDA_CHECK(cudaMemset(kv.k[layer].data, 0, kv.k[layer].bytes()));
             CUDA_CHECK(cudaMemset(kv.v[layer].data, 0, kv.v[layer].bytes()));
             CUDA_CHECK(cudaMemset(kv.k_scale[layer].data, 0, kv.k_scale[layer].bytes()));

@@ -56,46 +56,51 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
     }
 }
 
+void validate_cache_side(DType side_dtype, std::int32_t side_quant_group, const Tensor& codes,
+                         const Tensor& scales, std::int32_t padded, std::int32_t kv_heads,
+                         const char* op, const char* name) {
+    if (side_dtype != DType::BF16 && side_dtype != DType::I8) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache side dtype");
+    }
+    if (side_dtype == DType::BF16 && side_quant_group != 0) {
+        throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
+    }
+    if (side_dtype == DType::I8 && side_quant_group != kKvQuantGroup) {
+        throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
+    }
+    const std::string codes_name = std::string("cache ") + name;
+    if (codes.dtype != side_dtype) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
+    }
+    require_shape(codes, kHeadDim, padded, kv_heads, 1, op, codes_name.c_str());
+    require_contiguous_nonnull(codes, op, codes_name.c_str());
+    if (side_dtype == DType::BF16) {
+        if (scales.data != nullptr) {
+            throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
+        }
+        return;
+    }
+    constexpr std::int32_t groups = kHeadDim / kKvQuantGroup;
+    const std::string scales_name = codes_name + " scale";
+    if (scales.dtype != DType::FP16) {
+        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
+    }
+    require_shape(scales, groups, padded, kv_heads, 1, op, scales_name.c_str());
+    require_contiguous_nonnull(scales, op, scales_name.c_str());
+}
+
 void validate_cache(const KVCacheLayerView& cache, std::int32_t kv_heads, const char* op) {
-    if ((cache.dtype != DType::BF16 && cache.dtype != DType::I8) ||
-        cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
+    if (cache.num_kv_heads != kv_heads || cache.head_dim != kHeadDim) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache geometry or dtype");
     }
     if (cache.max_context == 0 || cache.padded_context < cache.max_context) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache capacity");
     }
-    if (cache.dtype == DType::BF16 && cache.quant_group != 0) {
-        throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have quant_group");
-    }
-    if (cache.dtype == DType::I8 && cache.quant_group != kKvQuantGroup) {
-        throw std::invalid_argument(std::string(op) + ": I8 KV cache must use quant_group 64");
-    }
-
     const std::int32_t padded = checked_i32(cache.padded_context, op, "padded_context");
-    const DType code_dtype    = cache.dtype == DType::I8 ? DType::I8 : DType::BF16;
-    if (cache.k.dtype != code_dtype || cache.v.dtype != code_dtype) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache code dtype");
-    }
-    require_shape(cache.k, kHeadDim, padded, kv_heads, 1, op, "cache k");
-    require_shape(cache.v, kHeadDim, padded, kv_heads, 1, op, "cache v");
-    require_contiguous_nonnull(cache.k, op, "cache k");
-    require_contiguous_nonnull(cache.v, op, "cache v");
-
-    if (cache.dtype == DType::BF16) {
-        if (cache.k_scale.data != nullptr || cache.v_scale.data != nullptr) {
-            throw std::invalid_argument(std::string(op) + ": BF16 KV cache must not have scales");
-        }
-        return;
-    }
-
-    constexpr std::int32_t groups = kHeadDim / kKvQuantGroup;
-    if (cache.k_scale.dtype != DType::FP16 || cache.v_scale.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
-    }
-    require_shape(cache.k_scale, groups, padded, kv_heads, 1, op, "cache k scale");
-    require_shape(cache.v_scale, groups, padded, kv_heads, 1, op, "cache v scale");
-    require_contiguous_nonnull(cache.k_scale, op, "cache k scale");
-    require_contiguous_nonnull(cache.v_scale, op, "cache v scale");
+    validate_cache_side(cache.k_dtype, cache.k_quant_group, cache.k, cache.k_scale, padded,
+                        kv_heads, op, "k");
+    validate_cache_side(cache.v_dtype, cache.v_quant_group, cache.v, cache.v_scale, padded,
+                        kv_heads, op, "v");
 }
 
 void validate_envelope(GqaExecutionEnvelope envelope, const KVCacheLayerView& cache,

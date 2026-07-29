@@ -34,7 +34,8 @@ struct GqaContextExecutionEnvelope {
  *
  * q/out are contiguous BF16 [128,32,T]. query_k/query_v are contiguous BF16 [128,8,T].
  * context_length is a contiguous device I32 scalar L. context is a read-only linear BF16 cache
- * with logical shape [128,capacity,8], of which [0,L) is populated. scale is 1/sqrt(128).
+ * with logical shape [128,capacity,8], of which [0,L) is populated. This DFlash companion cache
+ * has no scale planes and is independent of the target Text/MTP KV format. scale is 1/sqrt(128).
  *
  * There is no causal triangle: every query row attends every other query K/V row. Context and
  * query K/V remain separate physical segments and every input/cache byte is unchanged. The oracle

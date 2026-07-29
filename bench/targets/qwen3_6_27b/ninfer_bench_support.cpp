@@ -48,10 +48,20 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
     return static_cast<std::uint32_t>(value);
 }
 
+KvCacheFormat parse_kv_format(std::string_view text) {
+    if (text == "bf16") { return KvCacheFormat::BFloat16; }
+    if (text == "int8") { return KvCacheFormat::Int8Group64; }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8, or <k>:<v> of those");
+}
+
+// K/V formats are selected independently as "<k>:<v>"; a bare value selects both.
 KvCacheStorage parse_kv_cache(std::string_view text) {
-    if (text == "bf16") { return KvCacheStorage::BFloat16; }
-    if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    throw std::invalid_argument("--kv-dtype must be bf16 or int8");
+    const std::size_t separator = text.find(':');
+    if (separator == std::string_view::npos) {
+        return kv_cache_uniform(parse_kv_format(text));
+    }
+    return KvCacheStorage{parse_kv_format(text.substr(0, separator)),
+                          parse_kv_format(text.substr(separator + 1))};
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -270,7 +280,8 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-        << "  --kv-dtype <bf16|int8>      KV cache storage (default: bf16)\n"
+        << "  --kv-dtype <bf16|int8|bf16:int8|int8:bf16>\n"
+        << "                                K:V KV cache storage (default: bf16)\n"
         << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
@@ -562,7 +573,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << format_bytes(env.memory.kv_payload_bytes) << '\n'
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
-        << " kv_cache=" << kv_cache_name(env.kv_cache) << " mtp_k=" << env.mtp_draft_tokens
+        << " kv_cache=" << kv_cache_storage_name(env.kv_cache) << " mtp_k="
+        << env.mtp_draft_tokens
         << " proposal_head=" << proposal_head_name(env.proposal_head)
         << " decode_path=" << decode_path_name(env.use_cuda_graph, env.mtp_draft_tokens)
         << " graph_prime="
@@ -637,7 +649,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"memory\": {\n"
         << "    \"device\": " << env.memory.device << ",\n"
         << "    \"max_context\": " << env.memory.max_context << ",\n"
-        << "    \"kv_cache\": \"" << kv_cache_name(env.memory.kv_cache) << "\",\n";
+        << "    \"kv_cache\": \"" << kv_cache_storage_name(env.memory.kv_cache) << "\",\n";
     append_arena_json(out, "weights", env.memory.weights, "    ", true);
     append_arena_json(out, "sequence", env.memory.sequence, "    ", true);
     append_arena_json(out, "workspace", env.memory.workspace, "    ", true);
@@ -646,7 +658,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
-        << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
+        << "    \"kv_cache\": \"" << kv_cache_storage_name(env.kv_cache) << "\",\n"
         << "    \"mtp_draft_tokens\": " << env.mtp_draft_tokens << ",\n"
         << "    \"proposal_head\": \"" << proposal_head_name(env.proposal_head) << "\",\n"
         << "    \"use_cuda_graph\": " << (env.use_cuda_graph ? "true" : "false") << ",\n"
@@ -734,7 +746,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << env.max_context << ',' << env.prefill_chunk << ',' << env.mtp_draft_tokens << ','
             << proposal_head_name(env.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.mtp_draft_tokens) << ','
-            << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
+            << kv_cache_storage_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes
             << ',' << result.workspace_peak_bytes << ',' << spec.rounds << ','
@@ -781,16 +793,6 @@ std::string json_escape(std::string_view value) {
         }
     }
     return out;
-}
-
-std::string kv_cache_name(KvCacheStorage storage) {
-    switch (storage) {
-    case KvCacheStorage::BFloat16:
-        return "bf16";
-    case KvCacheStorage::Int8Group64:
-        return "int8-group64";
-    }
-    return "unknown";
 }
 
 std::string proposal_head_name(ProposalHead head) {

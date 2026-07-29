@@ -110,6 +110,7 @@ void bidirectional_gqa_oracle(const std::vector<float>& q, const std::vector<flo
     }
 }
 
+// DFlash's full companion cache is fixed BF16; mixed target KV never reaches this Op.
 KVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, int max_context,
                                    int padded_context) {
     return {
@@ -121,8 +122,10 @@ KVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, int max_con
         .padded_context = static_cast<std::uint32_t>(padded_context),
         .num_kv_heads   = kKVHeads,
         .head_dim       = kD,
-        .dtype          = DType::BF16,
-        .quant_group    = 0,
+        .k_dtype        = DType::BF16,
+        .v_dtype        = DType::BF16,
+        .k_quant_group  = 0,
+        .v_quant_group  = 0,
     };
 }
 

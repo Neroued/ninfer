@@ -36,7 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cpp", required=True, help="ninfer-qwen3_6_27b-dump executable")
     parser.add_argument("--messages", required=True, help="mixed image/video messages JSON")
     parser.add_argument("--prefill-chunk", type=int, default=1024)
-    parser.add_argument("--kv-dtype", choices=("bf16", "int8"), default="bf16")
+    parser.add_argument(
+        "--kv-dtype",
+        choices=("bf16", "int8", "bf16:int8", "int8:bf16"),
+        default="bf16",
+    )
     parser.add_argument("--mtp-draft-tokens", type=int, default=1)
     parser.add_argument("--proposal-head", choices=("full", "optimized"), default="full")
     parser.add_argument("--device", type=int, default=0)

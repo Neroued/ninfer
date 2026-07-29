@@ -93,10 +93,6 @@ std::string format_finish(ninfer::FinishReason reason) {
     return "unknown";
 }
 
-std::string format_kv_cache(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
-}
-
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
     std::cerr << std::left << std::setw(12) << group << std::setw(26) << detail << std::right
               << std::setw(12) << format_seconds(seconds) << '\n';
@@ -186,7 +182,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("max context", std::to_string(memory.max_context));
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
-    print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
+    print_metric("kv cache dtype", ninfer::kv_cache_storage_name(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
     print_metric("gpu reserved total", format_bytes(reserved));

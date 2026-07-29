@@ -15,7 +15,8 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.artifact_path             = artifact;
     options.max_context               = 4096;
     options.prefill_chunk             = 1024;
-    options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
+    options.kv_cache                  = {ninfer::KvCacheFormat::Int8Group64,
+                                         ninfer::KvCacheFormat::BFloat16};
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
@@ -27,6 +28,8 @@ ninfer::EngineOptions engine_options(const char* artifact) {
 ninfer::EngineOptions maximum_engine_options(const char* artifact) {
     ninfer::EngineOptions options     = engine_options(artifact);
     options.max_context               = 262144;
+    options.kv_cache                  =
+        ninfer::kv_cache_uniform(ninfer::KvCacheFormat::Int8Group64);
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 5;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
@@ -67,7 +70,9 @@ int verify_loaded_product(const ninfer::Engine& engine) {
     }
 
     const ninfer::MemorySummary memory = engine.memory_summary();
-    if (memory.weights.capacity_bytes != 22'360'207'360ULL ||
+    if (memory.kv_cache != ninfer::KvCacheStorage{ninfer::KvCacheFormat::Int8Group64,
+                                                  ninfer::KvCacheFormat::BFloat16} ||
+        memory.weights.capacity_bytes != 22'360'207'360ULL ||
         memory.weights.used_bytes != memory.weights.capacity_bytes ||
         memory.sequence.capacity_bytes == 0 || memory.workspace.capacity_bytes == 0) {
         std::cerr << "35B Engine construction has an invalid memory summary\n";
@@ -168,7 +173,8 @@ int exercise_vision(ninfer::Engine& engine) {
 int exercise_maximum_configuration(const char* artifact) {
     ninfer::Engine engine(maximum_engine_options(artifact));
     const ninfer::MemorySummary memory = engine.memory_summary();
-    if (memory.max_context != 262144 || memory.kv_cache != ninfer::KvCacheStorage::Int8Group64 ||
+    if (memory.max_context != 262144 ||
+        memory.kv_cache != ninfer::kv_cache_uniform(ninfer::KvCacheFormat::Int8Group64) ||
         memory.kv_payload_bytes != 3'045'064'704ULL ||
         memory.sequence.used_bytes != memory.sequence.capacity_bytes ||
         memory.workspace.capacity_bytes < 1024ULL * 1024ULL * 1024ULL) {

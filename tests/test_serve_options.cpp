@@ -64,6 +64,24 @@ int main() {
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
 
+    const ServeOptions mixed =
+        parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "bf16:int8"});
+    failures += check(mixed.kv_cache ==
+                          ninfer::KvCacheStorage{ninfer::KvCacheFormat::BFloat16,
+                                                 ninfer::KvCacheFormat::Int8Group64},
+                      "--kv-dtype did not preserve independent K/V formats");
+
+    for (const std::string malformed : {"bf16:", ":int8"}) {
+        bool rejected_with_value = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--kv-dtype", malformed});
+        } catch (const std::invalid_argument& error) {
+            rejected_with_value = std::string(error.what()).find(malformed) != std::string::npos;
+        }
+        failures += check(rejected_with_value,
+                          "malformed --kv-dtype did not report the complete value");
+    }
+
     GenerationRequest request;
     request.max_tokens = 1;
     failures += check(to_request_options(request, defaults).execution.allow_prefix_reuse,

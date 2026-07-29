@@ -76,14 +76,16 @@ def estimate_fixed_bytes(
     if not text and not mtp:
         return 0
     kv_layers = (CFG.full_layers if text else 0) + (1 if mtp else 0)
-    if kv_dtype == "bf16":
-        kv_per_layer_token = 2 * CFG.kv_heads * CFG.head_dim * 2
-    elif kv_dtype == "int8":
-        kv_per_layer_token = 2 * CFG.kv_heads * (
-            CFG.head_dim + CFG.head_dim // 64 * 2
-        )
-    else:
+    sides = kv_dtype.split(":")
+    if len(sides) == 1:
+        sides *= 2
+    if len(sides) != 2 or any(side not in {"bf16", "int8"} for side in sides):
         raise ValueError(f"unsupported KV dtype: {kv_dtype!r}")
+    side_bytes = {
+        "bf16": CFG.kv_heads * CFG.head_dim * 2,
+        "int8": CFG.kv_heads * (CFG.head_dim + CFG.head_dim // 64 * 2),
+    }
+    kv_per_layer_token = sum(side_bytes[side] for side in sides)
     kv = capacity * kv_layers * kv_per_layer_token
     if text:
         ssm = CFG.gdn_layers * CFG.gdn_v_heads * CFG.gdn_k_dim * CFG.gdn_v_dim * 4

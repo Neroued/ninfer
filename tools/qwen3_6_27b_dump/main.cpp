@@ -46,7 +46,7 @@ struct Options {
     std::uint32_t prefill_chunk   = 1024;
     std::uint32_t max_context     = 0;
     std::uint32_t mtp_drafts      = 0;
-    ninfer::KvCacheStorage kv     = ninfer::KvCacheStorage::BFloat16;
+    ninfer::KvCacheStorage kv;
     ninfer::ProposalHead proposal = ninfer::ProposalHead::Full;
     int device                    = 0;
     bool greedy                   = false;
@@ -58,7 +58,8 @@ constexpr std::string_view usage_text() {
     return "usage: ninfer-qwen3_6_27b-dump --weights MODEL.ninfer "
            "(--ids ID,...|--messages FILE.json)\n"
            "       --decode N --greedy --activation-dump DIR [--dump-level layer|vision-mtp]\n"
-           "       [--prefill-chunk N] [--max-context N] [--kv-dtype bf16|int8]\n"
+           "       [--prefill-chunk N] [--max-context N]\n"
+           "       [--kv-dtype bf16|int8|bf16:int8|int8:bf16]\n"
            "       [--stop-ids ID,...] [--mtp-draft-tokens 0..5]\n"
            "       [--proposal-head full|optimized] [--device N] [--no-thinking]\n"
            "\n"
@@ -136,12 +137,18 @@ Options parse_options(int argc, char** argv) {
             options.max_context = parse_u32(value(argument), "max-context");
         } else if (argument == "--kv-dtype") {
             const std::string_view kind = value(argument);
-            if (kind == "bf16") {
-                options.kv = ninfer::KvCacheStorage::BFloat16;
-            } else if (kind == "int8") {
-                options.kv = ninfer::KvCacheStorage::Int8Group64;
+            const auto format         = [](std::string_view side) {
+                if (side == "bf16") { return ninfer::KvCacheFormat::BFloat16; }
+                if (side == "int8") { return ninfer::KvCacheFormat::Int8Group64; }
+                usage_error("--kv-dtype must be bf16, int8, or <k>:<v> of those");
+                return ninfer::KvCacheFormat::BFloat16;
+            };
+            const std::size_t separator = kind.find(':');
+            if (separator == std::string_view::npos) {
+                options.kv = ninfer::kv_cache_uniform(format(kind));
             } else {
-                usage_error("--kv-dtype must be bf16 or int8");
+                options.kv = ninfer::KvCacheStorage{format(kind.substr(0, separator)),
+                                                    format(kind.substr(separator + 1))};
             }
         } else if (argument == "--stop-ids") {
             stop_ids = value(argument);
@@ -547,7 +554,14 @@ int run(const Options& options) {
              {"generated_token_ids", generated},
              {"stop_reason", stop_reason},
              {"sampling", std::move(sampling)},
-             {"kv_dtype", options.kv == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8"},
+              {"kv_dtype",
+               [&options] {
+                   const auto side = [](ninfer::KvCacheFormat format) {
+                       return format == ninfer::KvCacheFormat::BFloat16 ? "bf16" : "int8";
+                   };
+                   if (options.kv.k == options.kv.v) { return std::string(side(options.kv.k)); }
+                   return std::string(side(options.kv.k)) + ":" + side(options.kv.v);
+               }()},
              {"prefill_chunk", options.prefill_chunk},
              {"mtp_draft_tokens", options.mtp_drafts},
              {"draft_head", options.proposal == ninfer::ProposalHead::Full ? "full" : "optimized"},

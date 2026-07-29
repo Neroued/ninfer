@@ -23,6 +23,8 @@ TOLERANCE_RULES: tuple[tuple[str, float, float], ...] = (
     (r"logits", 0.35, 0.90),
 )
 
+KV_DTYPES = ("bf16", "int8", "bf16:int8", "int8:bf16")
+
 
 def load_manifest(root: Path) -> dict:
     path = root / "manifest.json"
@@ -102,10 +104,31 @@ def compare(
     *,
     reference_phase: str = "prefill",
     candidate_phase: str = "prefill",
+    kv_dtype: str = "bf16",
 ) -> list[dict]:
-    ref = load_records(reference, reference_phase)
-    got = load_records(candidate, candidate_phase)
     report: list[dict] = []
+    reference_manifest = load_manifest(reference)
+    candidate_manifest = load_manifest(candidate)
+    for side, manifest in (
+        ("reference", reference_manifest),
+        ("candidate", candidate_manifest),
+    ):
+        actual = manifest.get("kv_dtype")
+        if actual != kv_dtype:
+            report.append(
+                {
+                    "key": ["metadata", "kv_dtype"],
+                    "status": "kv_dtype",
+                    "side": side,
+                    "expected": kv_dtype,
+                    "actual": actual,
+                }
+            )
+    if report:
+        return report
+
+    ref = records(reference_manifest, reference_phase)
+    got = records(candidate_manifest, candidate_phase)
     if not ref:
         report.append(
             {
@@ -193,6 +216,7 @@ def compare(
             {
                 "key": display_key,
                 "status": "ok" if passed else "tolerance",
+                "kv_dtype": kv_dtype,
                 **measured,
                 "tolerance": rule,
             }
@@ -206,6 +230,7 @@ def main() -> None:
     parser.add_argument("candidate")
     parser.add_argument("--reference-phase", choices=["prefill", "decode"], default="prefill")
     parser.add_argument("--candidate-phase", choices=["prefill", "decode"], default="prefill")
+    parser.add_argument("--kv-dtype", choices=KV_DTYPES, default="bf16")
     parser.add_argument("--json")
     args = parser.parse_args()
     report = compare(
@@ -213,6 +238,7 @@ def main() -> None:
         Path(args.candidate),
         reference_phase=args.reference_phase,
         candidate_phase=args.candidate_phase,
+        kv_dtype=args.kv_dtype,
     )
     passed = bool(report) and all(item["status"] == "ok" for item in report)
     for item in report:

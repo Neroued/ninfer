@@ -54,7 +54,8 @@ Tensor bind_tensor(DeviceSpan backing, const LayoutRegion& region, DType dtype,
 
 KVCacheLayout plan_kv_cache(LayoutBuilder& builder, std::uint32_t full_layers,
                             std::uint32_t max_context_in, std::int32_t num_kv_heads_in,
-                            std::int32_t head_dim_in, DType dtype_in, std::int32_t quant_group_in) {
+                            std::int32_t head_dim_in, DType k_dtype_in, DType v_dtype_in,
+                            std::int32_t k_quant_group_in, std::int32_t v_quant_group_in) {
     if (full_layers == 0) { throw std::invalid_argument("KVCache layers must be nonzero"); }
     if (max_context_in == 0 ||
         max_context_in > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -69,30 +70,38 @@ KVCacheLayout plan_kv_cache(LayoutBuilder& builder, std::uint32_t full_layers,
     layout.padded_context = align_up_u32(max_context_in, 128);
     layout.num_kv_heads   = num_kv_heads_in;
     layout.head_dim       = head_dim_in;
-    layout.dtype          = dtype_in;
-    layout.quant_group    = normalize_quant_group(dtype_in, quant_group_in, head_dim_in);
+    layout.k_dtype        = k_dtype_in;
+    layout.v_dtype        = v_dtype_in;
+    layout.k_quant_group  = normalize_quant_group(k_dtype_in, k_quant_group_in, head_dim_in);
+    layout.v_quant_group  = normalize_quant_group(v_dtype_in, v_quant_group_in, head_dim_in);
 
     const auto padded_context_i32 = static_cast<std::int32_t>(layout.padded_context);
-    const Tensor code_shape(nullptr, dtype_in, {head_dim_in, padded_context_i32, num_kv_heads_in});
-    const bool quantized      = dtype_in == DType::I8;
-    const std::int32_t groups = quantized ? head_dim_in / layout.quant_group : 0;
-    const std::size_t scale_bytes =
-        quantized
-            ? Tensor(nullptr, DType::FP16, {groups, padded_context_i32, num_kv_heads_in}).bytes()
-            : 0;
+    const Tensor k_code_shape(nullptr, k_dtype_in,
+                              {head_dim_in, padded_context_i32, num_kv_heads_in});
+    const Tensor v_code_shape(nullptr, v_dtype_in,
+                              {head_dim_in, padded_context_i32, num_kv_heads_in});
+    const bool k_quantized = k_dtype_in == DType::I8;
+    const bool v_quantized = v_dtype_in == DType::I8;
+    const auto scale_bytes = [&](bool quantized, std::int32_t quant_group) -> std::size_t {
+        if (!quantized) { return 0; }
+        const std::int32_t groups = head_dim_in / quant_group;
+        return Tensor(nullptr, DType::FP16, {groups, padded_context_i32, num_kv_heads_in}).bytes();
+    };
+    const std::size_t k_scale_bytes = scale_bytes(k_quantized, layout.k_quant_group);
+    const std::size_t v_scale_bytes = scale_bytes(v_quantized, layout.v_quant_group);
     layout.k.reserve(full_layers);
     layout.v.reserve(full_layers);
-    if (quantized) {
-        layout.k_scale.reserve(full_layers);
-        layout.v_scale.reserve(full_layers);
-    }
+    if (k_quantized) { layout.k_scale.reserve(full_layers); }
+    if (v_quantized) { layout.v_scale.reserve(full_layers); }
     for (std::uint32_t layer = 0; layer < full_layers; ++layer) {
         const std::string prefix = "KV layer " + std::to_string(layer);
-        layout.k.push_back(builder.add(code_shape.bytes(), kArenaAlign, prefix + " K"));
-        layout.v.push_back(builder.add(code_shape.bytes(), kArenaAlign, prefix + " V"));
-        if (quantized) {
-            layout.k_scale.push_back(builder.add(scale_bytes, kArenaAlign, prefix + " K scale"));
-            layout.v_scale.push_back(builder.add(scale_bytes, kArenaAlign, prefix + " V scale"));
+        layout.k.push_back(builder.add(k_code_shape.bytes(), kArenaAlign, prefix + " K"));
+        layout.v.push_back(builder.add(v_code_shape.bytes(), kArenaAlign, prefix + " V"));
+        if (k_quantized) {
+            layout.k_scale.push_back(builder.add(k_scale_bytes, kArenaAlign, prefix + " K scale"));
+        }
+        if (v_quantized) {
+            layout.v_scale.push_back(builder.add(v_scale_bytes, kArenaAlign, prefix + " V scale"));
         }
     }
     return layout;
@@ -112,29 +121,36 @@ std::size_t KVCacheLayout::payload_bytes() const noexcept {
 
 KVCache::KVCache(DeviceSpan backing, const KVCacheLayout& layout)
     : max_context(layout.max_context), padded_context(layout.padded_context),
-      num_kv_heads(layout.num_kv_heads), head_dim(layout.head_dim), dtype(layout.dtype),
-      quant_group(layout.quant_group) {
+      num_kv_heads(layout.num_kv_heads), head_dim(layout.head_dim), k_dtype(layout.k_dtype),
+      v_dtype(layout.v_dtype), k_quant_group(layout.k_quant_group),
+      v_quant_group(layout.v_quant_group) {
     const auto layers = layout.k.size();
     if (layers == 0 || layout.v.size() != layers ||
-        (dtype == DType::I8 &&
-         (layout.k_scale.size() != layers || layout.v_scale.size() != layers)) ||
-        (dtype != DType::I8 && (!layout.k_scale.empty() || !layout.v_scale.empty()))) {
+        (k_dtype == DType::I8 && layout.k_scale.size() != layers) ||
+        (k_dtype != DType::I8 && !layout.k_scale.empty()) ||
+        (v_dtype == DType::I8 && layout.v_scale.size() != layers) ||
+        (v_dtype != DType::I8 && !layout.v_scale.empty())) {
         throw std::invalid_argument("KVCache layout plane counts are inconsistent");
     }
-    const auto padded = static_cast<std::int32_t>(padded_context);
-    const auto groups = dtype == DType::I8 ? head_dim / quant_group : 0;
+    const auto padded   = static_cast<std::int32_t>(padded_context);
+    const auto k_groups = k_dtype == DType::I8 ? head_dim / k_quant_group : 0;
+    const auto v_groups = v_dtype == DType::I8 ? head_dim / v_quant_group : 0;
     k.reserve(layers);
     v.reserve(layers);
     k_scale.reserve(layout.k_scale.size());
     v_scale.reserve(layout.v_scale.size());
     for (std::size_t layer = 0; layer < layers; ++layer) {
-        k.push_back(bind_tensor(backing, layout.k[layer], dtype, {head_dim, padded, num_kv_heads}));
-        v.push_back(bind_tensor(backing, layout.v[layer], dtype, {head_dim, padded, num_kv_heads}));
-        if (dtype == DType::I8) {
+        k.push_back(
+            bind_tensor(backing, layout.k[layer], k_dtype, {head_dim, padded, num_kv_heads}));
+        v.push_back(
+            bind_tensor(backing, layout.v[layer], v_dtype, {head_dim, padded, num_kv_heads}));
+        if (k_dtype == DType::I8) {
             k_scale.push_back(bind_tensor(backing, layout.k_scale[layer], DType::FP16,
-                                          {groups, padded, num_kv_heads}));
+                                          {k_groups, padded, num_kv_heads}));
+        }
+        if (v_dtype == DType::I8) {
             v_scale.push_back(bind_tensor(backing, layout.v_scale[layer], DType::FP16,
-                                          {groups, padded, num_kv_heads}));
+                                          {v_groups, padded, num_kv_heads}));
         }
     }
 }
@@ -150,13 +166,13 @@ KVCacheLayerView KVCache::layer_view(std::uint32_t layer) const {
         .padded_context = padded_context,
         .num_kv_heads   = num_kv_heads,
         .head_dim       = head_dim,
-        .dtype          = dtype,
-        .quant_group    = quant_group,
+        .k_dtype        = k_dtype,
+        .v_dtype        = v_dtype,
+        .k_quant_group  = k_quant_group,
+        .v_quant_group  = v_quant_group,
     };
-    if (dtype == DType::I8) {
-        view.k_scale = k_scale[layer];
-        view.v_scale = v_scale[layer];
-    }
+    if (k_dtype == DType::I8) { view.k_scale = k_scale[layer]; }
+    if (v_dtype == DType::I8) { view.v_scale = v_scale[layer]; }
     return view;
 }
 

@@ -32,7 +32,7 @@ def test_schema_v8_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                 "config": {
                     "max_context": 4096,
                     "prefill_chunk": 1024,
-                    "kv_cache": "int8-group64",
+                    "kv_cache": "bf16:int8-group64",
                     "mtp_draft_tokens": 5,
                     "proposal_head": "optimized",
                     "decode_path": "cuda-graph",
@@ -93,6 +93,7 @@ def test_schema_v8_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     assert row["host_to_device_bytes"] == 17_400_000_000
     assert row["workspace_capacity_bytes"] == 100_000_000
     assert row["workspace_peak_bytes"] == 1_048_576
+    assert row["kv_cache"] == "bf16:int8-group64"
     assert row["decode_output_tok_s_mean"] == 4.5
     assert row["decode_engine_tok_s_mean"] == 7.5
     assert row["spec_fallback_steps"] == 3

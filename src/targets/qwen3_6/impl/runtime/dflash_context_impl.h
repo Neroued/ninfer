@@ -11,8 +11,9 @@ DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
     : local(backing, layout.local), boundary_local(backing, layout.boundary_local),
       full(backing, layout.full), commit_count(layout.commit_count.bind(backing)) {
     if (local.layer_count() != 5 || boundary_local.layer_count() != 5 || full.layer_count() != 1 ||
-        local.dtype != DType::BF16 || boundary_local.dtype != DType::BF16 ||
-        full.dtype != DType::BF16) {
+        local.k_dtype != DType::BF16 || local.v_dtype != DType::BF16 ||
+        boundary_local.k_dtype != DType::BF16 || boundary_local.v_dtype != DType::BF16 ||
+        full.k_dtype != DType::BF16 || full.v_dtype != DType::BF16) {
         throw std::invalid_argument("DFlash persistent cache layout is invalid");
     }
 }
@@ -26,8 +27,8 @@ CyclicKVCacheLayerView DFlashPersistentState::local_layer(std::uint32_t layer) c
         .padded_capacity = view.padded_context,
         .num_kv_heads    = view.num_kv_heads,
         .head_dim        = view.head_dim,
-        .dtype           = view.dtype,
-        .quant_group     = view.quant_group,
+        .dtype           = view.k_dtype,
+        .quant_group     = view.k_quant_group,
     };
 }
 

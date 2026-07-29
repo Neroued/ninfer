@@ -14,6 +14,8 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.artifact_path             = artifact;
     options.max_context               = 4096;
     options.prefill_chunk             = 1024;
+    options.kv_cache                  = {ninfer::KvCacheFormat::BFloat16,
+                                         ninfer::KvCacheFormat::Int8Group64};
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
@@ -197,6 +199,22 @@ int exercise_prefix(ninfer::Engine& engine) {
     return 0;
 }
 
+int exercise_prefill_chunk_boundary(ninfer::Engine& engine) {
+    std::vector<ninfer::TokenId> prompt(1025, 198);
+    ninfer::RequestOptions options;
+    options.execution.requested_output_tokens = 1;
+    options.execution.sampling.temperature    = 0.0F;
+    options.execution.allow_prefix_reuse      = false;
+    options.stop.include_model_defaults       = false;
+    const ninfer::GenerationResult result =
+        engine.generate(engine.prepare_tokens(std::move(prompt)), options);
+    if (result.prompt.prompt_tokens != 1025 || result.generated_token_ids.size() != 1) {
+        std::cerr << "mixed-KV prefill did not cross the 1024-token chunk boundary\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_vision(ninfer::Engine& engine) {
     const auto image_bytes = gradient_ppm();
     auto image_part        = [](const std::vector<std::uint8_t>& bytes, std::string name) {
@@ -347,7 +365,9 @@ int verify_loaded_product(const ninfer::Engine& engine) {
         return 1;
     }
     const ninfer::MemorySummary memory = engine.memory_summary();
-    if (memory.weights.capacity_bytes == 0 ||
+    if (memory.kv_cache != ninfer::KvCacheStorage{ninfer::KvCacheFormat::BFloat16,
+                                                  ninfer::KvCacheFormat::Int8Group64} ||
+        memory.weights.capacity_bytes == 0 ||
         memory.weights.used_bytes != memory.weights.capacity_bytes) {
         std::cerr << "Engine construction has incomplete materialized backing\n";
         return 1;
@@ -368,6 +388,7 @@ int main() {
     if (const int result = verify_loaded_product(engine); result != 0) { return result; }
     if (const int result = exercise_registered_frontend(engine); result != 0) { return result; }
     if (const int result = exercise_prefix(engine); result != 0) { return result; }
+    if (const int result = exercise_prefill_chunk_boundary(engine); result != 0) { return result; }
     if (const int result = exercise_vision(engine); result != 0) { return result; }
     std::cout << "ok\n";
     return 0;

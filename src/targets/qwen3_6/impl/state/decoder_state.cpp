@@ -144,12 +144,13 @@ void GdnStateStore::reset_running(cudaStream_t stream) {
 
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
     DecoderStateLayout layout;
-    layout.text_kv =
-        plan_kv_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
-                      spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group);
+    layout.text_kv = plan_kv_cache(builder, spec.full_attention_layers, spec.capacity,
+                                   spec.kv_heads, spec.attention_head_dim, spec.kv_k_dtype,
+                                   spec.kv_v_dtype, spec.kv_k_quant_group, spec.kv_v_quant_group);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_kv_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
-                                      spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group);
+                                      spec.attention_head_dim, spec.kv_k_dtype, spec.kv_v_dtype,
+                                      spec.kv_k_quant_group, spec.kv_v_quant_group);
     }
     layout.gdn = plan_gdn_state(builder, spec.gdn);
     return layout;

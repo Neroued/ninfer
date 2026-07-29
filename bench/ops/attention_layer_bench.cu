@@ -540,7 +540,7 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, ninfer::DeviceBu
                             ? "prompt_control"
                             : ops::detail::gqa_attention_route_name(selected_route);
     const std::string attention_route =
-        std::string("gqa.") + route + ".append." + kv_dtype_name(cache.dtype);
+        std::string("gqa.") + route + ".append." + kv_dtype_name(cache.k_dtype);
     const std::string input_route   = options.input == InputSelection::Dv07Control
                                           ? Geometry::input_control_route(tokens)
                                           : Geometry::input_route(tokens);
@@ -554,7 +554,7 @@ Result run_case(Resources<Geometry>& resources, KVCache& cache, ninfer::DeviceBu
                                           ? "sigmoid_mul.candidate.bf16x8_b128"
                                           : "sigmoid_mul.production";
     return {Geometry::name,
-            kv_dtype_name(cache.dtype),
+            kv_dtype_name(cache.k_dtype),
             context,
             tokens,
             graph.nodes(),
@@ -577,9 +577,10 @@ void run_geometry(const Options& options, cudaStream_t stream, ninfer::DeviceBuf
     const DType kv_dtype = select_kv_dtype(options.kv, Geometry::default_kv_dtype);
 
     LayoutBuilder cache_builder;
-    const KVCacheLayout cache_layout =
-        plan_kv_cache(cache_builder, 1, static_cast<std::uint32_t>(max_context), Geometry::kv_heads,
-                      kHeadDim, kv_dtype, kv_dtype == DType::I8 ? kKvQuantGroup : 0);
+    const KVCacheLayout cache_layout = plan_kv_cache(
+        cache_builder, 1, static_cast<std::uint32_t>(max_context), Geometry::kv_heads, kHeadDim,
+        kv_dtype, kv_dtype, kv_dtype == DType::I8 ? kKvQuantGroup : 0,
+        kv_dtype == DType::I8 ? kKvQuantGroup : 0);
     DeviceArena cache_arena(cache_builder.finish(256));
     KVCache cache(cache_arena.alloc_bytes(cache_arena.capacity()), cache_layout);
     CUDA_CHECK(cudaMemset(cache_arena.base(), 0, cache_arena.capacity()));

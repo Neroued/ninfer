@@ -39,15 +39,17 @@ void test_topology() {
     }
 }
 
-q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
+q36::DecoderStateSpec decoder_spec(ninfer::DType k_dtype, ninfer::DType v_dtype, bool mtp) {
     return q36::DecoderStateSpec{
         .full_attention_layers = 2,
         .mtp_layers            = 1,
         .capacity              = 129,
         .kv_heads              = 2,
         .attention_head_dim    = 64,
-        .kv_dtype              = dtype,
-        .kv_quant_group        = dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
+        .kv_k_dtype            = k_dtype,
+        .kv_v_dtype            = v_dtype,
+        .kv_k_quant_group      = k_dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
+        .kv_v_quant_group      = v_dtype == ninfer::DType::I8 ? ninfer::kKvQuantGroup : 0,
         .enable_mtp            = mtp,
         .gdn =
             {
@@ -66,7 +68,8 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
 void test_decoder_layout() {
     ninfer::LayoutBuilder bf16_builder;
     const q36::DecoderStateLayout bf16 =
-        q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, false));
+        q36::plan_decoder_state(
+            bf16_builder, decoder_spec(ninfer::DType::BF16, ninfer::DType::BF16, false));
     const std::size_t bf16_bytes = bf16_builder.finish(256);
     expect(bf16_bytes != 0, "BF16 decoder layout has storage");
     expect(bf16.text_kv.k.size() == 2 && bf16.text_kv.v.size() == 2, "Text KV layer planes");
@@ -80,7 +83,8 @@ void test_decoder_layout() {
 
     ninfer::LayoutBuilder int8_builder;
     const q36::DecoderStateLayout int8 =
-        q36::plan_decoder_state(int8_builder, decoder_spec(ninfer::DType::I8, true));
+        q36::plan_decoder_state(
+            int8_builder, decoder_spec(ninfer::DType::I8, ninfer::DType::I8, true));
     (void)int8_builder.finish(256);
     expect(int8.text_kv.k_scale.size() == 2 && int8.text_kv.v_scale.size() == 2,
            "INT8 Text KV scale planes");
@@ -89,6 +93,30 @@ void test_decoder_layout() {
            "INT8 MTP KV scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
+
+    ninfer::LayoutBuilder mixed_builder;
+    const q36::DecoderStateLayout mixed = q36::plan_decoder_state(
+        mixed_builder, decoder_spec(ninfer::DType::BF16, ninfer::DType::I8, true));
+    (void)mixed_builder.finish(256);
+    expect(mixed.text_kv.k_scale.empty() && mixed.text_kv.v_scale.size() == 2,
+           "mixed Text KV owns only V scales");
+    expect(mixed.mtp_kv && mixed.mtp_kv->k_scale.empty() && mixed.mtp_kv->v_scale.size() == 1,
+           "mixed MTP KV owns only V scales");
+
+    ninfer::LayoutBuilder reverse_mixed_builder;
+    const q36::DecoderStateLayout reverse_mixed = q36::plan_decoder_state(
+        reverse_mixed_builder, decoder_spec(ninfer::DType::I8, ninfer::DType::BF16, true));
+    (void)reverse_mixed_builder.finish(256);
+    expect(reverse_mixed.text_kv.k_dtype == ninfer::DType::I8 &&
+               reverse_mixed.text_kv.v_dtype == ninfer::DType::BF16 &&
+               reverse_mixed.text_kv.k_scale.size() == 2 &&
+               reverse_mixed.text_kv.v_scale.empty(),
+           "reverse mixed Text KV owns only K scales");
+    expect(reverse_mixed.mtp_kv && reverse_mixed.mtp_kv->k_dtype == ninfer::DType::I8 &&
+               reverse_mixed.mtp_kv->v_dtype == ninfer::DType::BF16 &&
+               reverse_mixed.mtp_kv->k_scale.size() == 1 &&
+               reverse_mixed.mtp_kv->v_scale.empty(),
+           "reverse mixed MTP KV owns only K scales");
 }
 
 void test_round_layout() {

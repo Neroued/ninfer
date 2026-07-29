@@ -150,8 +150,9 @@ components. There is no generic fallback obligation for another combination.
 
 KV-cache quantization, activation quantization, temporary kernel compression, recurrent state, and
 communication formats are runtime-state codecs. They are outside this persistent-tensor registry
-even if they also use signed integers and grouped scales. In particular, an INT8 KV-cache format
-must not be labeled `W8G32_F16S` merely because some of its fields look similar.
+even if they also use signed integers and grouped scales. K and V may independently use BF16 or
+INT8-G64 runtime storage; an INT8 KV-cache plane must not be labeled `W8G32_F16S` merely because
+some of its fields look similar.
 
 ## 3. Canonical identities and direct-format semantics
 

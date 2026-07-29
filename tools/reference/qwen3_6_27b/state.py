@@ -11,14 +11,17 @@ from .config import CFG
 
 class KVCache:
     def __init__(self, layers: int, capacity: int, device: torch.device, dtype: str = "bf16"):
-        if dtype not in {"bf16", "int8"}:
-            raise ValueError(f"kv dtype must be bf16/int8, got {dtype!r}")
+        sides = dtype.split(":")
+        if len(sides) == 1:
+            sides *= 2
+        if len(sides) != 2 or any(side not in {"bf16", "int8"} for side in sides):
+            raise ValueError(f"kv dtype must be bf16/int8 or <k>:<v>, got {dtype!r}")
         if capacity <= 0:
             raise ValueError("KV capacity must be positive")
         self.layers = layers
         self.capacity = capacity
         self.device = device
-        self.dtype = dtype
+        self.k_dtype, self.v_dtype = sides
         self.length = 0
         self._k: dict[int, torch.Tensor] = {}
         self._v: dict[int, torch.Tensor] = {}
@@ -29,14 +32,16 @@ class KVCache:
         if layer in self._k:
             return
         shape = (self.capacity, CFG.kv_heads, CFG.head_dim)
-        if self.dtype == "bf16":
+        scales = (self.capacity, CFG.kv_heads, CFG.head_dim // 64)
+        if self.k_dtype == "bf16":
             self._k[layer] = torch.empty(shape, device=self.device, dtype=torch.bfloat16)
-            self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.bfloat16)
         else:
             self._k[layer] = torch.empty(shape, device=self.device, dtype=torch.int8)
-            self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.int8)
-            scales = (self.capacity, CFG.kv_heads, CFG.head_dim // 64)
             self._ks[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
+        if self.v_dtype == "bf16":
+            self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.bfloat16)
+        else:
+            self._v[layer] = torch.empty(shape, device=self.device, dtype=torch.int8)
             self._vs[layer] = torch.empty(scales, device=self.device, dtype=torch.float16)
 
     @staticmethod
@@ -58,26 +63,29 @@ class KVCache:
         if start < 0 or end > self.capacity or v.shape != k.shape:
             raise ValueError("KV write range or shape mismatch")
         self._allocate(layer)
-        if self.dtype == "bf16":
+        if self.k_dtype == "bf16":
             self._k[layer][start:end].copy_(k)
-            self._v[layer][start:end].copy_(v)
         else:
             kc, ks = self._quantize(k)
-            vc, vs = self._quantize(v)
             self._k[layer][start:end].copy_(kc)
-            self._v[layer][start:end].copy_(vc)
             self._ks[layer][start:end].copy_(ks)
+        if self.v_dtype == "bf16":
+            self._v[layer][start:end].copy_(v)
+        else:
+            vc, vs = self._quantize(v)
+            self._v[layer][start:end].copy_(vc)
             self._vs[layer][start:end].copy_(vs)
 
     def read(self, layer: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
         if end < 0 or end > self.capacity or layer not in self._k:
             raise ValueError("KV read range or layer mismatch")
-        if self.dtype == "bf16":
-            return self._k[layer][:end], self._v[layer][:end]
-        return (
-            self._dequantize(self._k[layer][:end], self._ks[layer][:end]),
-            self._dequantize(self._v[layer][:end], self._vs[layer][:end]),
-        )
+        k = self._k[layer][:end]
+        v = self._v[layer][:end]
+        if self.k_dtype == "int8":
+            k = self._dequantize(k, self._ks[layer][:end])
+        if self.v_dtype == "int8":
+            v = self._dequantize(v, self._vs[layer][:end])
+        return k, v
 
     def rewind(self, position: int) -> None:
         if position < 0 or position > self.length:

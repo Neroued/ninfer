@@ -114,6 +114,7 @@ void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
     }
 }
 
+// DFlash's local cyclic caches are fixed BF16 independently of the target KV format.
 CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v) {
     return {
         .k               = Tensor(k.p, DType::BF16, {kD, kWindow, kKVHeads}),

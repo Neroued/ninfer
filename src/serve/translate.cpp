@@ -138,7 +138,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request, const Serv
 
     input.options.add_generation_prompt = true;
     input.options.enable_thinking       = request.enable_thinking.value_or(server.enable_thinking);
-    input.options.preserve_thinking     = false;
+    input.options.preserve_thinking     = server.preserve_thinking;
     input.options.add_vision_id         = false;
     input.options.tool_jsons            = effective_tool_jsons(request);
     return input;

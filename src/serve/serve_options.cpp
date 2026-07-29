@@ -51,6 +51,14 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
+bool parse_bool(const char* text, const char* label) {
+    const std::string value(text == nullptr ? "" : text);
+    if (value == "true") { return true; }
+    if (value == "false") { return false; }
+    throw std::invalid_argument("invalid " + std::string(label) + ": " + value +
+                                " (expected true or false)");
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
@@ -61,7 +69,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--cors] "
+           "[--lm-head-draft] [--no-thinking] [--preserve_thinking true|false] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves an OpenAI-compatible Chat Completions endpoint\n"
@@ -72,6 +80,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --preserve_thinking controls whether assistant reasoning in history is retained\n"
            "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
            "top-k 20, presence-penalty 1.0); a request may override any field.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -153,6 +162,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--preserve_thinking") {
+            options.preserve_thinking =
+                parse_bool(require_value("--preserve_thinking"), "preserve_thinking");
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {

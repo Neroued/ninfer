@@ -29,6 +29,7 @@ struct Options {
     bool raw_output      = false;
     bool print_token_ids = false;
     bool enable_thinking = true;
+    bool preserve_thinking = true;
 
     std::vector<TokenId> stop_token_ids;
     std::vector<StopString> stop_strings;

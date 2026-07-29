@@ -35,6 +35,19 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
+    failures += check(defaults.preserve_thinking,
+                      "reasoning preservation is not enabled by default");
+
+    const ServeOptions discard_thinking =
+        parse({"ninfer-serve", "model.ninfer", "--preserve_thinking", "false"});
+    failures += check(!discard_thinking.preserve_thinking,
+                      "--preserve_thinking false did not disable reasoning preservation");
+
+    GenerationRequest thinking_history;
+    thinking_history.messages.push_back(
+        ChatTurn{.role = "assistant", .reasoning_content = "reasoning"});
+    failures += check(to_prompt_input(thinking_history, defaults, {}).options.preserve_thinking,
+                      "server reasoning-preservation default did not reach prompt options");
 
     const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
                                        "--draft-tokens", "15", "--lm-head-draft"});
@@ -76,6 +89,9 @@ int main() {
               "serve help omits --no-prefix-reuse");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
+    failures += check(serve_usage_text("ninfer-serve").find("--preserve_thinking") !=
+                          std::string::npos,
+                      "serve help omits --preserve_thinking");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

@@ -23,8 +23,9 @@ speculative-decoding statistics are written to stderr, so stdout can be redirect
   > answer.txt 2> run.log
 ```
 
-Thinking is enabled by default. Add `--no-thinking` for direct-response prompt rendering or
-`--greedy` for exact argmax decoding.
+Thinking is enabled by default. Add `--no-thinking` for direct-response prompt rendering,
+`--preserve_thinking true` to retain non-empty reasoning from assistant history, or `--greedy` for
+exact argmax decoding.
 
 ## Startup memory profile
 
@@ -138,6 +139,7 @@ measured recommendation rather than a semantic limit.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
+| `--preserve_thinking true\|false` | retain non-empty reasoning from assistant history | `true` |
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature | `0.6` |
 | `--top-p F` | nucleus threshold | `0.95` |

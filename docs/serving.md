@@ -34,6 +34,10 @@ server must accept image or video input. Speculative residency is likewise froze
 `--lm-head-draft` additionally loads the optimized proposal head. DFlash is 35B-A3B text-only and
 cannot be combined with `--vision`. A later request cannot enable a capability omitted at startup.
 
+Assistant `reasoning_content` in prior turns is replayed into the prompt by default, as Qwen
+recommends for agentic tasks. Pass `--preserve_thinking false` to discard it for every request,
+including clients that do not send a NInfer-specific option.
+
 ## Endpoints
 
 | Method and path | Behavior |

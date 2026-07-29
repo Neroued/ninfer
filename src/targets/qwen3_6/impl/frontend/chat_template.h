@@ -67,7 +67,7 @@ struct ChatMessage {
 struct ChatRenderOptions {
     bool add_generation_prompt = true;
     bool enable_thinking       = true;
-    bool preserve_thinking     = false;
+    bool preserve_thinking     = true;
     bool add_vision_id         = false;
     std::vector<std::string> tool_jsons;
 };

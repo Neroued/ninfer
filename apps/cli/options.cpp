@@ -52,6 +52,14 @@ float parse_float(const char* text, std::string_view label, float minimum, float
     return static_cast<float>(value);
 }
 
+bool parse_bool(const char* text, std::string_view label) {
+    const std::string_view value(text == nullptr ? "" : text);
+    if (value == "true") { return true; }
+    if (value == "false") { return false; }
+    throw std::invalid_argument("invalid " + std::string(label) + ": " + std::string(value) +
+                                " (expected true or false)");
+}
+
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
@@ -69,7 +77,9 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--raw-output] [--print-token-ids] [--no-thinking] [--vision]\n"
+           "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
+           "       [--preserve_thinking true|false]\n"
+           "       [--vision]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -121,6 +131,8 @@ Options parse_options(int argc, char** argv) {
             options.print_token_ids = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--preserve_thinking") {
+            options.preserve_thinking = parse_bool(value(arg), "preserve_thinking");
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {

@@ -308,11 +308,12 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     auto cancelled           = std::make_shared<std::atomic<bool>>(false);
     auto worker              = std::make_shared<JoiningThread>();
     auto prepared_ptr        = std::make_shared<PreparedRequest>(std::move(prepared));
-    const bool include_usage = prepared_ptr->include_usage;
-    const bool tool_capable  = prepared_ptr->tool_capable;
+    const bool include_usage   = prepared_ptr->include_usage;
+    const bool tool_capable    = prepared_ptr->tool_capable;
+    const bool buffer_reasoning = tool_capable && options_.tolerant_tool_calls;
 
     worker->thread = std::thread([this, queue, cancelled, prepared_ptr, id, created, model,
-                                  include_usage, tool_capable, log_context]() {
+                                  include_usage, tool_capable, buffer_reasoning, log_context]() {
         try {
             queue->push(make_chat_chunk_role(id, model, created, include_usage));
             StreamSink sink;
@@ -326,6 +327,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
             const GenerationOutcome outcome = service_->run(*prepared_ptr, &sink);
             log_request_done(log_context, outcome);
+            if (buffer_reasoning && !outcome.reasoning.empty()) {
+                queue->push(
+                    make_chat_chunk_reasoning(id, model, created, outcome.reasoning, include_usage));
+            }
             if (!outcome.tool_calls.empty()) {
                 if (!outcome.text.empty()) {
                     queue->push(
@@ -497,12 +502,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     auto queue              = std::make_shared<SseQueue>();
     auto cancelled          = std::make_shared<std::atomic<bool>>(false);
-    auto worker             = std::make_shared<JoiningThread>();
-    auto prepared_ptr       = std::make_shared<PreparedRequest>(std::move(prepared));
-    const bool tool_capable = prepared_ptr->tool_capable;
+    auto worker              = std::make_shared<JoiningThread>();
+    auto prepared_ptr        = std::make_shared<PreparedRequest>(std::move(prepared));
+    const bool tool_capable  = prepared_ptr->tool_capable;
+    const bool buffer_reasoning = tool_capable && options_.tolerant_tool_calls;
 
     worker->thread = std::thread([this, queue, cancelled, prepared_ptr, id, model, input_tokens,
-                                  tool_capable, log_context]() {
+                                  tool_capable, buffer_reasoning, log_context]() {
         // Anthropic content-block state machine: an optional thinking block (fed by
         // the reasoning channel) precedes an optional text block; tool_use blocks
         // are appended after generation. Block indices increase in emission order.
@@ -550,6 +556,15 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             if (text_open) {
                 queue->push(make_content_block_stop(text_index));
                 text_open = false;
+            }
+
+            // Tolerant tool recovery buffers reasoning so a call emitted before </think>
+            // cannot leak as thinking before the final parser classifies it.
+            if (buffer_reasoning && !outcome.reasoning.empty()) {
+                const int idx = next_index++;
+                queue->push(make_content_block_start_thinking(idx));
+                queue->push(make_content_block_delta_thinking(idx, outcome.reasoning));
+                queue->push(make_content_block_stop(idx));
             }
 
             // In tool mode the service buffers the answer instead of streaming it;

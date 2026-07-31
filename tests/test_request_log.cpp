@@ -51,6 +51,7 @@ int main() {
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.enable_vision             = false;
     options.allow_prefix_reuse        = false;
+    options.tolerant_tool_calls       = true;
     options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
     ninfer::LoadSummary load;
@@ -89,7 +90,7 @@ int main() {
         "serve-test", 1000, options, load, memory, environment, std::uint64_t{123456}));
     failures += check(server.at("artifact_type") == kRequestLogArtifactType,
                       "server record artifact type mismatch");
-    failures += check(server.at("schema_version") == 4, "server record schema mismatch");
+    failures += check(server.at("schema_version") == 5, "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
     failures += check(server.at("artifact").at("target") == "qwen3_6_27b", "server target missing");
     failures += check(server.at("artifact").at("weights_id") == "groupwise-int",
@@ -98,6 +99,8 @@ int main() {
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("server").at("request_log_jsonl") == "requests.jsonl",
                       "request log path missing");
+    failures += check(server.at("server").at("tolerant_tool_calls") == true,
+                      "tolerant tool-call setting missing");
     failures += check(server.at("engine").at("kv_cache") == "int8-group64", "KV type missing");
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
     failures += check(server.at("engine").at("speculative_backend") == "mtp",

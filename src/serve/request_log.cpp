@@ -282,7 +282,8 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                               {"max_request_bytes", options.max_request_bytes},
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
-                              {"default_thinking", options.enable_thinking}};
+                              {"default_thinking", options.enable_thinking},
+                              {"tolerant_tool_calls", options.tolerant_tool_calls}};
     record["artifact"] = Json{{"path", options.artifact_path},
                               {"size_bytes", std::move(artifact_size)},
                               {"target", load.target},

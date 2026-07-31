@@ -92,6 +92,52 @@ int test_suffix_after_tool_falls_back_to_text() {
     return failures;
 }
 
+int test_tolerant_recovery() {
+    const std::string drifted = "Thought before the call.\n"
+                                "<tool_call>\n"
+                                "<function=read>\n"
+                                "<parameter=filePath>\n"
+                                "/home/matt/Projects/gamemanager/src-tauri/src/main.rs\n"
+                                "</parameter>\n"
+                                "<parameter=limit>\n15\n</parameter>\n"
+                                "<parameter=offset>\n15\n</parameter>\n"
+                                "</function>\n"
+                                "</tool_call>\n"
+                                "</function>\n"
+                                "</function_invocation>\n"
+                                "extra suffix";
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(drifted, 64, true);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "tolerant parser recovered drifted call");
+    failures += check(parsed.content == "Thought before the call.",
+                      "tolerant parser preserved the content prefix");
+    failures += check(parsed.tool_calls.size() == 1, "tolerant parser recovered one call");
+    failures += check(parsed.tool_calls[0].name == "read", "tolerant parser recovered function");
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    failures += check(args.at("filePath") == "/home/matt/Projects/gamemanager/src-tauri/src/main.rs",
+                      "tolerant parser recovered filePath");
+    failures += check(args.at("limit") == 15, "tolerant parser recovered limit");
+    failures += check(args.at("offset") == 15, "tolerant parser recovered offset");
+
+    const std::string missing_outer = "<tool_call>\n"
+                                      "<function=bash>\n"
+                                      "<parameter=command>\ntrue\n</parameter>\n"
+                                      "</function>";
+    const ninfer::serve::ParsedToolCallOutput recovered_missing_outer =
+        ninfer::serve::parse_qwen_tool_call_output(missing_outer, 64, true);
+    failures += check(recovered_missing_outer.is_tool_call_response &&
+                          recovered_missing_outer.tool_calls.size() == 1,
+                      "tolerant parser recovered missing outer close");
+
+    const ninfer::serve::ParsedToolCallOutput strict_missing_outer =
+        ninfer::serve::parse_qwen_tool_call_output(missing_outer, 64);
+    failures += check(!strict_missing_outer.is_tool_call_response,
+                      "strict parser rejected missing outer close");
+    return failures;
+}
+
 int test_configured_name_limit() {
     const std::string name(128, 'a');
     const std::string text = "<tool_call>\n<function=" + name + ">\n</function>\n</tool_call>";
@@ -124,6 +170,7 @@ int main() {
     failures += test_multiple_calls_and_json_values();
     failures += test_malformed_falls_back_to_text();
     failures += test_suffix_after_tool_falls_back_to_text();
+    failures += test_tolerant_recovery();
     failures += test_configured_name_limit();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

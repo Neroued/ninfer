@@ -168,6 +168,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |
+| `--tolerant-tool-calls` | recover complete Qwen calls with malformed wrapper/suffix output | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--greedy` | force exact argmax for all requests | off |
 
@@ -190,7 +191,7 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v4 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v5 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance.
 
@@ -233,7 +234,11 @@ context-capacity finishes map to `length`/ `max_tokens`; ordinary model or strin
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
 responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+decoding. `--tolerant-tool-calls` is an opt-in recovery mode for Qwen3.6 output drift: it can
+recover a complete function call when the model adds trailing wrapper tags, suffix text, omits the
+outer `</tool_call>` tag, or emits the call before `</think>`. For streaming tool requests, reasoning is
+buffered until parsing completes so malformed call text is not emitted as thinking first. It does not
+execute incomplete calls.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

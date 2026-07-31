@@ -35,6 +35,8 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
+    failures += check(!defaults.tolerant_tool_calls,
+                      "tolerant tool-call recovery is not disabled by default");
 
     const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
                                        "--draft-tokens", "15", "--lm-head-draft"});
@@ -59,10 +61,13 @@ int main() {
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
     const ServeOptions configured =
-        parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision"});
+        parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision",
+               "--tolerant-tool-calls"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
+    failures += check(configured.tolerant_tool_calls,
+                      "--tolerant-tool-calls did not enable recovery");
 
     GenerationRequest request;
     request.max_tokens = 1;
@@ -76,6 +81,9 @@ int main() {
               "serve help omits --no-prefix-reuse");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
+    failures += check(serve_usage_text("ninfer-serve").find("--tolerant-tool-calls") !=
+                          std::string::npos,
+                      "serve help omits --tolerant-tool-calls");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
                                        "requests.jsonl", "--api-key", "do-not-log"});

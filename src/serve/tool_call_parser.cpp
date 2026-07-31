@@ -66,7 +66,8 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args) {
     return true;
 }
 
-bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, ToolCall& out) {
+bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, bool tolerant,
+                         ToolCall& out) {
     constexpr std::string_view kFunctionOpen  = "<function=";
     constexpr std::string_view kFunctionClose = "</function>";
     std::size_t pos                           = 0;
@@ -92,7 +93,10 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length, To
 
     pos = function_end + kFunctionClose.size();
     skip_ws(block, pos);
-    if (pos != block.size()) { return false; }
+    // Qwen3.6 occasionally emits a duplicate closing tag or explanatory text
+    // after a complete function. Only discard that suffix in explicit tolerant
+    // mode; the strict parser retains its all-or-nothing behavior.
+    if (!tolerant && pos != block.size()) { return false; }
 
     out.id             = new_tool_call_id();
     out.name           = name;
@@ -109,7 +113,8 @@ ParsedToolCallOutput fallback(const std::string& text) {
 } // namespace
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length) {
+                                                 std::size_t max_tool_name_length,
+                                                 bool tolerant) {
     constexpr std::string_view kToolOpen  = "<tool_call>";
     constexpr std::string_view kToolClose = "</tool_call>";
 
@@ -123,16 +128,24 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     while (pos < text.size()) {
         skip_ws(text, pos);
         if (pos >= text.size()) { break; }
-        if (!starts_with_at(text, pos, kToolOpen)) { return fallback(text); }
+        if (!starts_with_at(text, pos, kToolOpen)) {
+            if (tolerant && !out.tool_calls.empty()) { break; }
+            return fallback(text);
+        }
         const std::size_t inner_begin = pos + kToolOpen.size();
         const std::size_t close       = text.find(kToolClose, inner_begin);
-        if (close == std::string::npos) { return fallback(text); }
+        if (close == std::string::npos && !tolerant) { return fallback(text); }
+        const std::size_t block_end = close == std::string::npos ? text.size() : close;
         ToolCall call;
-        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, close - inner_begin),
-                                 max_tool_name_length, call)) {
+        if (!parse_one_tool_call(std::string_view(text).substr(inner_begin, block_end - inner_begin),
+                                 max_tool_name_length, tolerant, call)) {
+            // Once one complete call has been recovered, do not discard it just
+            // because Qwen started a malformed second call or added a suffix.
+            if (tolerant && !out.tool_calls.empty()) { break; }
             return fallback(text);
         }
         out.tool_calls.push_back(std::move(call));
+        if (close == std::string::npos) { break; }
         pos = close + kToolClose.size();
     }
 

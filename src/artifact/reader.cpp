@@ -1,24 +1,18 @@
 #include "artifact/reader.h"
+#include "core/read_only_file.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstring>
 #include <functional>
 #include <limits>
 #include <span>
 #include <string_view>
-#include <system_error>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace ninfer::artifact {
 namespace {
@@ -176,82 +170,6 @@ struct TransparentStringHash {
     }
 };
 
-class MappedFile {
-public:
-    explicit MappedFile(const std::filesystem::path& path) {
-        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-        if (fd < 0) {
-            throw std::system_error(errno, std::generic_category(), "open " + path.string());
-        }
-
-        struct stat status {};
-
-        if (::fstat(fd, &status) != 0) {
-            const int error = errno;
-            ::close(fd);
-            throw std::system_error(error, std::generic_category(), "fstat " + path.string());
-        }
-        if (status.st_size < 0 ||
-            static_cast<std::uintmax_t>(status.st_size) > std::numeric_limits<std::size_t>::max()) {
-            ::close(fd);
-            throw ArtifactError("artifact size does not fit the process address space");
-        }
-
-        const auto size = static_cast<std::size_t>(status.st_size);
-        void* mapping   = nullptr;
-        if (size != 0) {
-            mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-            if (mapping == MAP_FAILED) {
-                const int error = errno;
-                ::close(fd);
-                throw std::system_error(error, std::generic_category(), "mmap " + path.string());
-            }
-        }
-        fd_   = fd;
-        data_ = static_cast<const std::byte*>(mapping);
-        size_ = size;
-    }
-
-    ~MappedFile() {
-        if (data_ != nullptr) { ::munmap(const_cast<std::byte*>(data_), size_); }
-        if (fd_ >= 0) { ::close(fd_); }
-    }
-
-    MappedFile(const MappedFile&)            = delete;
-    MappedFile& operator=(const MappedFile&) = delete;
-
-    const std::byte* data() const noexcept { return data_; }
-
-    std::size_t size() const noexcept { return size_; }
-
-    std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const {
-        constexpr std::size_t alignment = Reader::direct_io_alignment;
-        if (absolute_offset % alignment != 0 || destination.size() % alignment != 0 ||
-            reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
-            throw ArtifactError("direct artifact read is not 4096-byte aligned");
-        }
-        if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
-            destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
-            throw ArtifactError("direct artifact read exceeds platform I/O limits");
-        }
-
-        ssize_t bytes = -1;
-        do {
-            bytes = ::pread(fd_, destination.data(), destination.size(),
-                            static_cast<off_t>(absolute_offset));
-        } while (bytes < 0 && errno == EINTR);
-        if (bytes < 0) {
-            throw std::system_error(errno, std::generic_category(), "direct artifact read");
-        }
-        return static_cast<std::size_t>(bytes);
-    }
-
-private:
-    int fd_                = -1;
-    const std::byte* data_ = nullptr;
-    std::size_t size_      = 0;
-};
-
 } // namespace
 
 std::string_view object_name(const ObjectDescriptor& object) noexcept {
@@ -269,28 +187,29 @@ std::uint64_t object_bytes(const ObjectDescriptor& object) noexcept {
 
 struct Reader::Impl {
     explicit Impl(const std::filesystem::path& path) : file(path) {
-        if (file.size() < kPrefixBytes) {
+        const auto mapped = file.mapped_bytes();
+        if (mapped.size() < kPrefixBytes) {
             throw ArtifactError("artifact is shorter than the v2 prefix");
         }
-        if (std::equal(kV1Magic.begin(), kV1Magic.end(), file.data())) {
+        if (std::equal(kV1Magic.begin(), kV1Magic.end(), mapped.data())) {
             throw ArtifactError("NInfer artifact v1 is no longer supported; migrate it with: "
                                 "python3 -m tools.artifact.migrate_v1_to_v2 <artifact>");
         }
-        if (!std::equal(kMagic.begin(), kMagic.end(), file.data())) {
+        if (!std::equal(kMagic.begin(), kMagic.end(), mapped.data())) {
             throw ArtifactError("artifact magic is not NInfer v2");
         }
 
-        const auto json_bytes = read_u64_le(file.data() + 8);
+        const auto json_bytes = read_u64_le(mapped.data() + 8);
         if (json_bytes == 0) { throw ArtifactError("json_bytes must be positive"); }
         const auto metadata_end = checked_add(kPrefixBytes, json_bytes, "JSON range");
         payload_start           = align_up(metadata_end, kPayloadAlignment, "payload offset");
-        if (metadata_end > file.size() || payload_start > file.size()) {
+        if (metadata_end > mapped.size() || payload_start > mapped.size()) {
             throw ArtifactError("declared JSON or payload start extends beyond the file");
         }
 
         Json directory;
         try {
-            const auto* begin = reinterpret_cast<const char*>(file.data() + kPrefixBytes);
+            const auto* begin = reinterpret_cast<const char*>(mapped.data() + kPrefixBytes);
             directory         = Json::parse(begin, begin + json_bytes);
         } catch (const Json::exception& error) {
             throw ArtifactError(std::string("invalid JSON directory: ") + error.what());
@@ -311,7 +230,7 @@ struct Reader::Impl {
         entries.reserve(raw_objects.size());
         index.reserve(raw_objects.size());
 
-        const auto payload_bytes = static_cast<std::uint64_t>(file.size()) - payload_start;
+        const auto payload_bytes = static_cast<std::uint64_t>(mapped.size()) - payload_start;
         std::uint64_t cursor     = 0;
         for (const auto& raw_object : raw_objects) {
             auto object          = parse_object(raw_object);
@@ -348,7 +267,7 @@ struct Reader::Impl {
         }
     }
 
-    MappedFile file;
+    ReadOnlyFile file;
     ArtifactIdentity identity;
     std::vector<ObjectDescriptor> entries;
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
@@ -370,18 +289,19 @@ const ObjectDescriptor* Reader::find(std::string_view name) const noexcept {
     return it == impl_->index.end() ? nullptr : &impl_->entries[it->second];
 }
 
-std::uint64_t Reader::file_bytes() const noexcept { return impl_->file.size(); }
+std::uint64_t Reader::file_bytes() const noexcept { return impl_->file.mapped_bytes().size(); }
 
 std::uint64_t Reader::payload_offset() const noexcept { return impl_->payload_start; }
 
 PayloadSpan Reader::payload(const ObjectDescriptor& object) const {
+    const auto mapped = impl_->file.mapped_bytes();
     const auto absolute =
         checked_add(impl_->payload_start, object_offset(object), "absolute payload offset");
     const auto end = checked_add(absolute, object_bytes(object), "absolute payload range");
-    if (end > impl_->file.size()) { throw ArtifactError("object payload extends beyond the file"); }
+    if (end > mapped.size()) { throw ArtifactError("object payload extends beyond the file"); }
     return {
         absolute,
-        std::span<const std::byte>(impl_->file.data() + absolute,
+        std::span<const std::byte>(mapped.data() + absolute,
                                    static_cast<std::size_t>(object_bytes(object))),
     };
 }
@@ -394,6 +314,11 @@ PayloadSpan Reader::payload(std::string_view name) const {
 
 std::size_t Reader::read_direct(std::uint64_t absolute_offset,
                                 std::span<std::byte> destination) const {
+    if (absolute_offset % direct_io_alignment != 0 ||
+        destination.size() % direct_io_alignment != 0 ||
+        reinterpret_cast<std::uintptr_t>(destination.data()) % direct_io_alignment != 0) {
+        throw ArtifactError("direct artifact read is not 4096-byte aligned");
+    }
     return impl_->file.read_direct(absolute_offset, destination);
 }
 

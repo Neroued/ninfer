@@ -15,9 +15,14 @@
 namespace ninfer::ops::detail {
 
 struct Nvfp4W4a4Workspace {
-    std::uint8_t* codes  = nullptr;
-    std::uint8_t* scales = nullptr;
+    std::uint8_t* codes          = nullptr;
+    std::uint8_t* scales         = nullptr;
+    void* tma_descriptor_storage = nullptr;
 };
+
+#ifdef _WIN32
+inline constexpr std::size_t kNvfp4W4a4TmaDescriptorBytes = 4 * 128;
+#endif
 
 inline std::size_t nvfp4_w4a4_checked_bytes(std::int32_t tokens, std::size_t bytes_per_token) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 W4A4 workspace: T must be positive"); }
@@ -40,7 +45,13 @@ Nvfp4W4a4Workspace allocate_nvfp4_w4a4_workspace(Arena& arena, std::int32_t toke
         nvfp4_w4a4_checked_bytes(tokens, static_cast<std::size_t>(input_rows) / 16);
     const DeviceSpan codes  = arena.alloc_bytes(code_bytes, 256);
     const DeviceSpan scales = arena.alloc_bytes(scale_bytes, 256);
-    return {static_cast<std::uint8_t*>(codes.data), static_cast<std::uint8_t*>(scales.data)};
+#ifdef _WIN32
+    const DeviceSpan tma_descriptors = arena.alloc_bytes(kNvfp4W4a4TmaDescriptorBytes, 128);
+    return {static_cast<std::uint8_t*>(codes.data), static_cast<std::uint8_t*>(scales.data),
+            tma_descriptors.data};
+#else
+    return {static_cast<std::uint8_t*>(codes.data), static_cast<std::uint8_t*>(scales.data), nullptr};
+#endif
 }
 
 inline std::size_t nvfp4_w4a4_workspace_capacity_bytes(std::int32_t tokens,

@@ -219,6 +219,10 @@ def _sha256_file(path: Path) -> str:
 
 
 def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # Windows has no O_DIRECTORY and does not expose a portable directory flush through Python.
+        # The metadata file itself is flushed before every call to this helper.
+        return
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(descriptor)

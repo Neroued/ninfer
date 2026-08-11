@@ -38,7 +38,11 @@ std::string format_console_log_prefix(std::chrono::system_clock::time_point time
     const std::time_t wall_seconds =
         std::chrono::system_clock::to_time_t(std::chrono::system_clock::time_point(whole_seconds));
     std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &wall_seconds);
+#else
     localtime_r(&wall_seconds, &local);
+#endif
 
     std::ostringstream out;
     out << '[' << std::put_time(&local, "%Y-%m-%d %H:%M:%S") << '.' << std::setfill('0')

@@ -58,7 +58,8 @@ void launch_problem(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace worksp
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_linear(
             resolve_nvfp4_problem(Geometry::kOutputRows, Geometry::kInputRows), workspace.codes,
-            workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            workspace.scales, workspace.tma_descriptor_storage,
+            static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
             tokens, alpha, stream);
     } else if (tokens <= 64) {

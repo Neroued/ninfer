@@ -29,6 +29,8 @@ venv/
 *.safetensors
 *.gguf
 out/
+models/
+vcpkg_installed/
 *.log
 
 # Measurement raw corpora & intermediates (large; produced by offline tooling).

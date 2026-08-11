@@ -90,17 +90,17 @@ notes.
 
 ## Requirements
 
-NInfer currently requires:
+NInfer requires:
 
-- 64-bit Linux;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
 - CMake 3.28 or newer and a C++20-capable host compiler;
-- `pkg-config`;
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
   `libavutil >= 58`, and `libswscale >= 7`;
 - `libcurl >= 7.85`;
-- Ninja, when using the commands below.
+
+On Linux, use `pkg-config` and Ninja when using the commands below. Native Windows builds use
+Visual Studio and manifest-mode vcpkg; see [Windows development](docs/windows.md).
 
 The build rejects CUDA architectures other than `120a`. There is no install target or packaged
 binary distribution; NInfer is run from its source build tree.

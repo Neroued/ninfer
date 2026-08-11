@@ -12,7 +12,11 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -260,9 +264,14 @@ int main() {
                           console_prefix.ends_with("] [info] ninfer-serve: "),
                       "console log prefix mismatch");
 
+#ifdef _WIN32
+    const auto process_id = ::_getpid();
+#else
+    const auto process_id = ::getpid();
+#endif
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
+        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(process_id)) +
          ".jsonl");
     std::filesystem::remove(log_path);
     {

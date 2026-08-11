@@ -123,7 +123,8 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         launch_nvfp4_w4a4_quantize(x, weight, scratch, stream);
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_linear_swiglu_w4a4_tma(
-            scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            scratch.codes, scratch.scales, scratch.tma_descriptor_storage,
+            static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
             x.ne[1], alpha, stream);
         return;

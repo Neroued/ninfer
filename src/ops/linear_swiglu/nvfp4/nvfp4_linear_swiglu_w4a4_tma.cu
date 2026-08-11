@@ -49,6 +49,7 @@ Nvfp4W4a4TmaDescriptors make_descriptors(const std::uint8_t* activation_codes,
 
 void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
                                          const std::uint8_t* activation_scales,
+                                         void* descriptor_storage,
                                          const std::uint8_t* weight_codes,
                                          const std::uint8_t* weight_scales, __nv_bfloat16* output,
                                          std::int32_t tokens, float alpha, cudaStream_t stream) {
@@ -69,10 +70,22 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
 
     const Nvfp4W4a4TmaDescriptors descriptors = make_descriptors<Geometry, M256N128S3>(
         activation_codes, activation_scales, weight_codes, weight_scales, tokens);
+#ifdef _WIN32
+    CUDA_CHECK(cudaMemcpyAsync(descriptor_storage, &descriptors, sizeof(descriptors),
+                               cudaMemcpyHostToDevice, stream));
+#else
+    (void)descriptor_storage;
+#endif
     constexpr int kPairN = M256N128S3::kBlockN / 2;
     const dim3 grid((Geometry::kOutputRows / 2) / kPairN, tokens / M256N128S3::kBlockM);
     nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
-        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(descriptors, alpha, output);
+        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(
+#ifdef _WIN32
+            static_cast<const Nvfp4W4a4TmaDescriptors*>(descriptor_storage),
+#else
+            descriptors,
+#endif
+            alpha, output);
     CUDA_CHECK(cudaGetLastError());
 }
 

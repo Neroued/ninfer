@@ -45,10 +45,15 @@ struct Nvfp4LinearSwiGluTmaSharedStorage {
 template <class Geometry, class Schedule>
 __global__ __launch_bounds__(
     Schedule::kThreads,
-    Schedule::
-        kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(const __grid_constant__
+    Schedule::kMinBlocksPerSm) void nvfp4_linear_swiglu_w4a4_tma_kernel(
+#ifdef _WIN32
+                                                                  const Nvfp4W4a4TmaDescriptors*
+                                                                      descriptors_pointer,
+#else
+                                                                  const __grid_constant__
                                                                       Nvfp4W4a4TmaDescriptors
                                                                           descriptors,
+#endif
                                                                   float alpha,
                                                                   __nv_bfloat16* __restrict__ output) {
     static_assert(Geometry::kOutputRows == 34816);
@@ -67,6 +72,21 @@ __global__ __launch_bounds__(
     auto& shared = *reinterpret_cast<Nvfp4LinearSwiGluTmaSharedStorage<Schedule>*>(shared_bytes);
     const int token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
     const int pair_begin  = static_cast<int>(blockIdx.x) * kPairN;
+
+#ifdef _WIN32
+    if (threadIdx.x == 0) {
+        const cuda::ptx::n32_t<128> descriptor_bytes;
+        cuda::ptx::fence_proxy_tensormap_generic(cuda::ptx::sem_acquire, cuda::ptx::scope_sys,
+                                                  &descriptors_pointer->a_codes, descriptor_bytes);
+        cuda::ptx::fence_proxy_tensormap_generic(cuda::ptx::sem_acquire, cuda::ptx::scope_sys,
+                                                  &descriptors_pointer->b_codes, descriptor_bytes);
+        cuda::ptx::fence_proxy_tensormap_generic(cuda::ptx::sem_acquire, cuda::ptx::scope_sys,
+                                                  &descriptors_pointer->a_scales, descriptor_bytes);
+        cuda::ptx::fence_proxy_tensormap_generic(cuda::ptx::sem_acquire, cuda::ptx::scope_sys,
+                                                  &descriptors_pointer->b_scales, descriptor_bytes);
+    }
+    const Nvfp4W4a4TmaDescriptors& descriptors = *descriptors_pointer;
+#endif
 
     if (threadIdx.x == 0) {
 #pragma unroll

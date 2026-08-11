@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -164,12 +165,14 @@ bool throws_invalid_argument(Callable&& callable) {
 }
 
 int test_official_tokenizer_merge() {
-    const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+    const std::filesystem::path checkpoint =
+        "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16";
+    if (!std::filesystem::is_directory(checkpoint)) { return 0; }
+    const std::string tokenizer_json = read_file((checkpoint / "tokenizer.json").string().c_str());
     const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_file((checkpoint / "tokenizer_config.json").string().c_str());
     const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file((checkpoint / "generation_config.json").string().c_str());
     const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                    .tokenizer_config_json  = tokenizer_config_json,
                                    .generation_config_json = generation_config_json});

@@ -88,7 +88,8 @@ void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
     if (tokens >= 1024 && (tokens % kTmaBlockM) == 0) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_attention(
-            workspace.codes, workspace.scales, static_cast<const std::uint8_t*>(weight.qdata),
+            workspace.codes, workspace.scales, workspace.tma_descriptor_storage,
+            static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(q.data),
             static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(k.data),
             static_cast<__nv_bfloat16*>(v.data), tokens, alpha, stream);

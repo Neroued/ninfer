@@ -1140,14 +1140,16 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (vision_chunk.control != nullptr) {
                 const auto scatter =
                     std::span<const std::int32_t>(vision_chunk.control->scatter_indices);
-                const auto begin = std::lower_bound(scatter.begin(), scatter.end(), prompt_t0);
-                const auto end   = std::lower_bound(begin, scatter.end(), prompt_t0 + len);
+                const auto chunk_begin = static_cast<std::int32_t>(prompt_t0);
+                const auto chunk_end   = chunk_begin + len;
+                const auto begin = std::lower_bound(scatter.begin(), scatter.end(), chunk_begin);
+                const auto end   = std::lower_bound(begin, scatter.end(), chunk_end);
                 const auto count = static_cast<std::int32_t>(end - begin);
                 visual_begin     = static_cast<std::int32_t>(begin - scatter.begin());
                 local_scatter_indices.resize(static_cast<std::size_t>(count));
                 for (std::int32_t i = 0; i < count; ++i) {
                     local_scatter_indices[static_cast<std::size_t>(i)] =
-                        begin[i] - static_cast<std::int32_t>(prompt_t0);
+                        begin[i] - chunk_begin;
                 }
             }
 

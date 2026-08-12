@@ -497,6 +497,9 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
         out.enable_thinking = get_bool(body, "enable_thinking", false);
     }
+    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
+        out.preserve_thinking = get_bool(body, "preserve_thinking", false);
+    }
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }

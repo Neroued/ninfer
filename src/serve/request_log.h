@@ -32,6 +32,7 @@ struct RequestLogContext {
     ToolChoice tool_choice;
     bool has_tool_history = false;
     bool enable_thinking  = true;
+    bool preserve_thinking = false;
     ninfer::SamplingParameters sampling;
 };
 

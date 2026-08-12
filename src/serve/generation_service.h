@@ -70,6 +70,7 @@ struct PreparedRequest {
     bool tool_capable                = false;
     std::size_t tool_name_max_length = 64;
     bool enable_thinking             = true;
+    bool preserve_thinking          = false;
     std::shared_ptr<RequestLifetime> lifetime;
 };
 

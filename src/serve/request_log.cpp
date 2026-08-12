@@ -134,6 +134,7 @@ Json request_json(const RequestLogContext& context) {
                 {"tool_choice", tool_choice_name(context.tool_choice)},
                 {"has_tool_history", context.has_tool_history},
                 {"enable_thinking", context.enable_thinking},
+                {"preserve_thinking", context.preserve_thinking},
                 {"sampling", sampler_json(context.sampling)}};
 }
 
@@ -220,6 +221,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.tool_choice                        = request.tool_choice;
     context.has_tool_history                   = request.has_tool_history();
     context.enable_thinking                    = prepared.enable_thinking;
+    context.preserve_thinking                  = prepared.preserve_thinking;
     context.sampling                           = prepared.sampling;
     return context;
 }
@@ -233,7 +235,7 @@ std::string format_request_start(const RequestLogContext& context) {
         << " tools=" << context.tool_count
         << " tool_choice=" << tool_choice_name(context.tool_choice)
         << " tool_history=" << (context.has_tool_history ? "yes" : "no")
-        << " thinking=" << (context.enable_thinking ? "on" : "off") << " sampler=["
+        << " thinking=" << (context.enable_thinking ? "on" : "off") << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off") << " sampler=["
         << sampler_str(context.sampling) << "] \xE2\x86\x92 submitted";
     return out.str();
 }
@@ -316,7 +318,8 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                               {"max_request_bytes", options.max_request_bytes},
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
-                              {"default_thinking", options.enable_thinking}};
+                              {"default_thinking", options.enable_thinking},
+                             {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"] = Json{{"path", options.artifact_path},
                               {"size_bytes", std::move(artifact_size)},
                               {"target", load.target},

@@ -126,7 +126,8 @@ struct GenerationRequest {
     bool max_tokens_set = false;
     bool stream         = false;
     bool include_usage  = false;
-    std::optional<bool> enable_thinking; // non-standard extension; falls back to server default
+    std::optional<bool> enable_thinking;     // non-standard extension; falls back to server default
+    std::optional<bool> preserve_thinking;  // keep thinking in prefix cache across user turns
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {

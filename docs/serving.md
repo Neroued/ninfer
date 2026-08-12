@@ -79,7 +79,8 @@ The endpoint supports:
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
-- the `enable_thinking` extension.
+- the `enable_thinking` extension (thinking on/off); and
+- the `preserve_thinking` extension (keep thinking blocks in prefix cache across user turns).
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
@@ -406,6 +407,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |
+| `--preserve-thinking` | keep thinking blocks in cached prefix across user turns | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--greedy` | force exact argmax for all requests | off |
 

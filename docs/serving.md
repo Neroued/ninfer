@@ -80,7 +80,8 @@ The endpoint supports:
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
 - the `enable_thinking` extension (thinking on/off); and
-- the `preserve_thinking` extension (keep thinking blocks in prefix cache across user turns).
+- the `preserve_thinking` extension (keep thinking blocks in the cached prefix across user turns;
+  see [Preserved thinking history](#preserved-thinking-history)).
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
@@ -179,7 +180,8 @@ wire response contains typed `output` Items.
 | `stream_options` | omitted or `{"include_obfuscation":false}` |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
-with a field-specific 400 error instead of being silently ignored.
+with a field-specific 400 error instead of being silently ignored. Responses has no per-request
+`preserve_thinking` field; Responses requests follow the server-wide `--preserve-thinking` setting.
 
 ### Input Item contract
 
@@ -416,6 +418,25 @@ Server sampling defaults are temperature `0.6`, top-p `0.95`, top-k `20`, presen
 server was started with `--greedy`.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
+
+### Preserved thinking history
+
+The official Qwen chat template strips `<think>` blocks from every assistant turn at or before the
+last user query. Each new user message therefore re-renders the earlier assistant turns without
+their thinking, so the conversation's cached prefix changes and resident KV cannot be reused past
+the first divergent turn.
+
+`--preserve-thinking` keeps those blocks in place, making turn N's rendering a byte-exact prefix of
+turn N+1's. Chat Completions requests may override it per request with `preserve_thinking`;
+Anthropic Messages has no equivalent concept and Responses exposes no per-request field, so both
+follow the server setting.
+
+This is an intentional, opt-in departure from official template rendering, traded for prefix
+stability; it is off by default because the codebase otherwise treats HF template parity as a locked
+invariant. It also costs KV: preserved thinking makes every prompt strictly longer, and admission
+reserves the full prompt-plus-output page entitlement from one shared pool. At
+`--max-concurrency 1` that is free, but at `2` or more it is a real trade — more prefix reuse per
+request against less pool for the others, and therefore more FIFO waiting.
 
 ## Structured request log
 

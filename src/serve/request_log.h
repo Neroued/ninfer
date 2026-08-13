@@ -30,8 +30,8 @@ struct RequestLogContext {
     bool requested_output_tokens_client_set = false;
     std::size_t tool_count                  = 0;
     ToolChoice tool_choice;
-    bool has_tool_history = false;
-    bool enable_thinking  = true;
+    bool has_tool_history  = false;
+    bool enable_thinking   = true;
     bool preserve_thinking = false;
     ninfer::SamplingParameters sampling;
 };

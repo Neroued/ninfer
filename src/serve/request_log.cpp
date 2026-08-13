@@ -235,7 +235,8 @@ std::string format_request_start(const RequestLogContext& context) {
         << " tools=" << context.tool_count
         << " tool_choice=" << tool_choice_name(context.tool_choice)
         << " tool_history=" << (context.has_tool_history ? "yes" : "no")
-        << " thinking=" << (context.enable_thinking ? "on" : "off") << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off") << " sampler=["
+        << " thinking=" << (context.enable_thinking ? "on" : "off")
+        << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off") << " sampler=["
         << sampler_str(context.sampling) << "] \xE2\x86\x92 submitted";
     return out.str();
 }
@@ -319,7 +320,7 @@ std::string format_server_start_json(const std::string& server_instance_id, std:
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
                               {"default_thinking", options.enable_thinking},
-                             {"default_preserve_thinking", options.preserve_thinking}};
+                              {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"] = Json{{"path", options.artifact_path},
                               {"size_bytes", std::move(artifact_size)},
                               {"target", load.target},

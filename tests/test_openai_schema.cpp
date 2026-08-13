@@ -537,10 +537,9 @@ int test_parse_preserve_thinking() {
 
     // Test that preserve_thinking: true is parsed into GenerationRequest
     {
-        const Json body = {
-            {"model", "m"},
-            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-            {"preserve_thinking", true}};
+        const Json body             = {{"model", "m"},
+                                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                                       {"preserve_thinking", true}};
         const GenerationRequest req = parse_chat_completion_request(body, default_limits());
         failures += check(req.preserve_thinking.has_value() && *req.preserve_thinking == true,
                           "preserve_thinking true parsed");
@@ -548,10 +547,9 @@ int test_parse_preserve_thinking() {
 
     // Test that preserve_thinking: false is parsed
     {
-        const Json body = {
-            {"model", "m"},
-            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-            {"preserve_thinking", false}};
+        const Json body             = {{"model", "m"},
+                                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                                       {"preserve_thinking", false}};
         const GenerationRequest req = parse_chat_completion_request(body, default_limits());
         failures += check(req.preserve_thinking.has_value() && *req.preserve_thinking == false,
                           "preserve_thinking false parsed");
@@ -559,21 +557,19 @@ int test_parse_preserve_thinking() {
 
     // Test that when omitted, it defaults to std::nullopt
     {
-        const Json body = {
-            {"model", "m"},
-            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+        const Json body             = {{"model", "m"},
+                                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
         const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-        failures += check(!req.preserve_thinking.has_value(),
-                          "preserve_thinking nullopt when omitted");
+        failures +=
+            check(!req.preserve_thinking.has_value(), "preserve_thinking nullopt when omitted");
     }
 
     // Test that preserve_thinking flows through to_prompt_input into ChatRenderOptions
     {
-        const Json body = {
-            {"model", "m"},
-            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-            {"preserve_thinking", true}};
-        const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+        const Json body                  = {{"model", "m"},
+                                            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                                            {"preserve_thinking", true}};
+        const GenerationRequest req      = parse_chat_completion_request(body, default_limits());
         const ninfer::PromptInput prompt = translate(req);
         failures += check(prompt.options.preserve_thinking == true,
                           "preserve_thinking reaches ChatRenderOptions via translate");
@@ -582,11 +578,10 @@ int test_parse_preserve_thinking() {
     // Test server default fallback when per-request value is nullopt
     {
         ServeOptions server;
-        server.preserve_thinking = true;
-        const Json body = {
-            {"model", "m"},
-            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-        const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+        server.preserve_thinking         = true;
+        const Json body                  = {{"model", "m"},
+                                            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+        const GenerationRequest req      = parse_chat_completion_request(body, default_limits());
         const ninfer::PromptInput prompt = to_prompt_input(req, server, fake_media);
         failures += check(prompt.options.preserve_thinking == true,
                           "server preserve_thinking default applied when request omits field");

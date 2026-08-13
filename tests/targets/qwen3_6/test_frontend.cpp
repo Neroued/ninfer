@@ -302,6 +302,43 @@ int test_official_chat_template() {
     return failures;
 }
 
+// preserve_thinking is a deliberate, opt-in departure from the official template: the official
+// template strips <think> from every assistant turn at or before the last user query, which
+// rewrites the cached prefix on every new turn. Mirrors the official-template case above.
+int test_preserve_thinking_chat_template() {
+    const std::vector<fi::ChatMessage> history = {
+        chat_message("user", "q1"),
+        chat_message("assistant", "<think>\nold thought\n</think>\n\nold answer"),
+        chat_message("user", "q2")};
+
+    fi::ChatRenderOptions preserve;
+    preserve.preserve_thinking = true;
+    const std::string expected = "<|im_start|>user\nq1<|im_end|>\n"
+                                 "<|im_start|>assistant\n<think>\nold thought\n</think>\n\n"
+                                 "old answer<|im_end|>\n"
+                                 "<|im_start|>user\nq2<|im_end|>\n"
+                                 "<|im_start|>assistant\n<think>\n";
+    const std::string rendered = fi::render_chat(history, preserve);
+    int failures =
+        check(rendered == expected, "preserve_thinking dropped the historical thinking block");
+
+    // The invariant the option exists for: the earlier turn's rendering stays a byte-exact prefix
+    // of the later turn's rendering, so the resident KV prefix survives the new user message.
+    fi::ChatRenderOptions preserve_no_generation = preserve;
+    preserve_no_generation.add_generation_prompt = false;
+    const std::vector<fi::ChatMessage> earlier_history(history.begin(), history.begin() + 2);
+    const std::string earlier_turn = fi::render_chat(earlier_history, preserve_no_generation);
+    failures += check(rendered.starts_with(earlier_turn),
+                      "preserve_thinking prefix was not byte-stable across user turns");
+
+    // Without the option the same history is rewritten, which is what invalidates the prefix.
+    const std::string official = fi::render_chat(history);
+    failures += check(official.find("old thought") == std::string::npos &&
+                          !official.starts_with(earlier_turn),
+                      "official rendering unexpectedly preserved the thinking history");
+    return failures;
+}
+
 int test_official_resource_guards() {
     FrontendResources stale_pad     = resources();
     nlohmann::json tokenizer_config = nlohmann::json::parse(stale_pad.tokenizer_config_json);
@@ -584,6 +621,7 @@ int main() {
     int failures                  = 0;
     failures += test_official_tokenizer_merge();
     failures += test_official_chat_template();
+    failures += test_preserve_thinking_chat_template();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
     failures += test_video_prepare(frontend);

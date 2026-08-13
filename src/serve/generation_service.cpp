@@ -336,7 +336,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length          = request.tool_name_max_length;
     prepared.enable_thinking      = request.enable_thinking.value_or(options_.enable_thinking);
-    prepared.preserve_thinking  = request.preserve_thinking.value_or(options_.preserve_thinking);
+    prepared.preserve_thinking    = request.preserve_thinking.value_or(options_.preserve_thinking);
     const std::size_t media_items = media_item_count(request);
     const bool request_has_media  = media_items != 0;
     if (request_has_media && !options_.enable_vision) {

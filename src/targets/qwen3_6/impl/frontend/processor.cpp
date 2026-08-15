@@ -404,10 +404,6 @@ void enforce_budget(const PreprocessStats& stats, const ProcessorOptions& option
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "vision tokens exceed processor budget");
     }
-    if (stats.attention_pairs > options.max_attention_pairs) {
-        throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
-                             "vision attention pairs exceed processor budget");
-    }
     if (stats.prompt_tokens > options.max_prompt_tokens) {
         throw ProcessorError(ProcessorErrorKind::BudgetExceeded,
                              "prompt tokens exceed processor budget");

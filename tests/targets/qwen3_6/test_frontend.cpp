@@ -146,6 +146,31 @@ std::vector<std::uint8_t> gradient_ppm() {
     return ppm;
 }
 
+std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t seed) {
+    std::vector<std::uint8_t> ppm;
+    const std::string header =
+        "P6\n" + std::to_string(width) + " " + std::to_string(height) + "\n255\n";
+    for (const char byte : header) {
+        ppm.push_back(static_cast<std::uint8_t>(static_cast<unsigned char>(byte)));
+    }
+    for (std::size_t index = 0; index < static_cast<std::size_t>(width) * height; ++index) {
+        ppm.push_back(static_cast<std::uint8_t>((index + seed) & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 3 + seed) & 0xff));
+        ppm.push_back(static_cast<std::uint8_t>((index * 7 + seed) & 0xff));
+    }
+    return ppm;
+}
+
+ninfer::MessagePart ppm_image_part(int width, int height, std::uint8_t seed) {
+    ninfer::MessagePart image;
+    image.kind              = ninfer::MessagePartKind::Media;
+    image.media.kind        = ninfer::MediaKind::Image;
+    image.media.bytes       = block_ppm(width, height, seed);
+    image.media.media_type  = "image/x-portable-pixmap";
+    image.media.source_name = "inline.ppm";
+    return image;
+}
+
 ninfer::PromptInput image_input() {
     ninfer::MessagePart image;
     image.kind              = ninfer::MessagePartKind::Media;
@@ -630,6 +655,41 @@ int test_video_prepare(const Frontend& frontend) {
     return failures;
 }
 
+int test_multi_image_attention_pairs_not_enforced(const Frontend& frontend) {
+    // The removed attention_pairs guard rejected media requests whose cumulative
+    // t*(h*w)^2 exceeded 128 Mi. Two 2048x1600 images sum to ~328M pairs and must
+    // now prepare cleanly, with the statistic still reported (informational only).
+    constexpr std::uint64_t old_attention_cap = 128ULL * 1024ULL * 1024ULL;
+    ninfer::ChatMessage message;
+    message.role = "user";
+    message.parts.push_back(ppm_image_part(2048, 1600, 11));
+    message.parts.push_back(ppm_image_part(2048, 1600, 97));
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+
+    int failures = 0;
+    try {
+        auto prepared    = frontend.prepare(std::move(input));
+        const auto& data = FrontendFactory::inspect(prepared);
+        failures += check(data.vision_items.size() == 2,
+                          "multi-image prepare did not retain both vision items");
+        std::uint64_t expected_pairs = 0;
+        for (const auto& item : data.vision_items) {
+            const std::uint64_t spatial =
+                static_cast<std::uint64_t>(item.grid.height) * item.grid.width;
+            expected_pairs += static_cast<std::uint64_t>(item.grid.temporal) * spatial * spatial;
+        }
+        failures += check(data.prepare.attention_pairs == expected_pairs,
+                          "multi-image prepare misreported the attention_pairs statistic");
+        failures += check(expected_pairs > old_attention_cap,
+                          "multi-image fixture no longer exceeds the removed 128 Mi cap");
+    } catch (const std::exception& error) {
+        std::cerr << "multi-image prepare threw after guard removal: " << error.what() << '\n';
+        ++failures;
+    }
+    return failures;
+}
+
 int test_cross_round_stop(const Frontend& frontend) {
     auto prompt = frontend.prepare_tokens({0});
     ninfer::StopPolicy stop;
@@ -801,6 +861,7 @@ int main() {
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
     failures += test_video_prepare(frontend);
+    failures += test_multi_image_attention_pairs_not_enforced(frontend);
     failures += test_cross_round_stop(frontend);
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);

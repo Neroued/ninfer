@@ -80,7 +80,6 @@ struct ProcessorOptions {
     std::size_t max_media_items            = 16;
     std::uint64_t max_raw_patches          = 131'072;
     std::uint64_t max_vision_tokens        = 32'768;
-    std::uint64_t max_attention_pairs      = 128ULL * 1024ULL * 1024ULL;
     std::size_t max_prompt_tokens          = 32'768;
     double video_fps                       = 2.0;
     int video_min_frames                   = 4;

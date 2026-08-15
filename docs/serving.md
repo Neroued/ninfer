@@ -54,6 +54,39 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 
+### Models
+
+`GET /v1/models` returns a `list` object holding a single `data` entry, and
+`GET /v1/models/{id}` returns that same model object directly. Both describe the
+one registered artifact's public model ID: the artifact `identity.model_id` by
+default, or the explicit `--model-id` override. A `GET /v1/models/{id}` request
+for any other ID returns HTTP 404 with code `model_not_found`.
+
+Each model object is:
+
+```json
+{
+  "id": "qwen3.6-27b",
+  "object": "model",
+  "created": 1786813490,
+  "owned_by": "ninfer",
+  "max_model_len": 16384
+}
+```
+
+- `id` — the public model ID, identical to the `model` value the other OpenAI
+  endpoints require.
+- `object` — always `"model"`.
+- `created` — the server's current unix time in seconds at request time.
+- `owned_by` — always `"ninfer"`.
+- `max_model_len` — the process's configured context window in tokens, exactly the
+  `--max-context` value used to size every sequence. It is a per-server property,
+  not a per-model one: the `list` and single-object forms report the same value,
+  and it does not change with the request. Clients using these endpoints for
+  context discovery should treat `max_model_len` as the hard per-sequence ceiling;
+  `--kv-capacity` is a separate limit that sizes the shared KV pool and is not
+  advertised here.
+
 ## OpenAI Chat Completions
 
 ```bash

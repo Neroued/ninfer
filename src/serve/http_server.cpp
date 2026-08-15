@@ -300,7 +300,8 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now()), "application/json");
+    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context),
+                    "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
@@ -314,7 +315,8 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
+    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
+                    "application/json");
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {

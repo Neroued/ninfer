@@ -65,9 +65,11 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
                                   std::int64_t created, const CompletionUsage& usage);
 std::string sse_done();
 
-// /v1/models payloads.
-std::string make_models_list(const std::string& model_id, std::int64_t created);
-std::string make_model_object(const std::string& model_id, std::int64_t created);
+// /v1/models payloads. max_model_len is the process's configured context window.
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             std::uint32_t max_model_len);
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t max_model_len);
 
 // Error object body.
 std::string make_error_body(const ApiError& error);

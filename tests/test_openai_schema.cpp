@@ -145,6 +145,22 @@ int test_preserve_thinking_options() {
         check(parse_chat_completion_request(same, default_limits()).preserve_thinking == true,
               "matching preserve_thinking values rejected");
 
+    Json enable                    = base;
+    enable["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures += check(parse_chat_completion_request(enable, default_limits()).enable_thinking ==
+                          false,
+                      "chat_template_kwargs enable_thinking parsed");
+    Json enable_same                 = enable;
+    enable_same["enable_thinking"]   = false;
+    failures += check(parse_chat_completion_request(enable_same, default_limits()).enable_thinking ==
+                          false,
+                      "matching enable_thinking values rejected");
+    Json enable_conflict               = enable;
+    enable_conflict["enable_thinking"] = true;
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(enable_conflict, default_limits()); }),
+        "conflicting enable_thinking values accepted");
+
     Json nulls                    = base;
     nulls["preserve_thinking"]    = nullptr;
     nulls["chat_template_kwargs"] = Json{{"preserve_thinking", nullptr}, {"future", nullptr}};
@@ -168,6 +184,11 @@ int test_preserve_thinking_options() {
     failures +=
         check(throws_api([&] { (void)parse_chat_completion_request(bad_value, default_limits()); }),
               "non-boolean preserve_thinking accepted");
+    Json bad_enable                    = base;
+    bad_enable["chat_template_kwargs"] = Json{{"enable_thinking", "no"}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(bad_enable, default_limits()); }),
+        "non-boolean enable_thinking accepted");
     Json unknown                    = base;
     unknown["chat_template_kwargs"] = Json{{"preserve_thinking", true}, {"foo", 1}};
     failures +=

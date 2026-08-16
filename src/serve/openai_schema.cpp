@@ -479,6 +479,22 @@ std::string sse_event(const Json& payload) { return "data: " + payload.dump() + 
 
 } // namespace
 
+std::optional<bool> parse_openai_template_enable_thinking(const Json& body) {
+    if (!body.contains("chat_template_kwargs")) { return std::nullopt; }
+    const Json& kwargs = body.at("chat_template_kwargs");
+    if (!kwargs.is_object()) {
+        bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
+    }
+    if (!kwargs.contains("enable_thinking") || kwargs.at("enable_thinking").is_null()) {
+        return std::nullopt;
+    }
+    if (!kwargs.at("enable_thinking").is_boolean()) {
+        bad_request("chat_template_kwargs.enable_thinking must be a boolean or null",
+                    "chat_template_kwargs");
+    }
+    return kwargs.at("enable_thinking").get<bool>();
+}
+
 std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
     std::optional<bool> top_level;
     if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
@@ -495,7 +511,8 @@ std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
             bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
         }
         for (auto it = kwargs.begin(); it != kwargs.end(); ++it) {
-            if (it.key() != "preserve_thinking" && !it.value().is_null()) {
+            if (it.key() != "preserve_thinking" && it.key() != "enable_thinking" &&
+                !it.value().is_null()) {
                 bad_request("chat_template_kwargs." + it.key() + " is not supported",
                             "chat_template_kwargs", "chat_template_option_not_supported");
             }
@@ -553,9 +570,18 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
+    std::optional<bool> top_level_thinking;
     if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
-        out.enable_thinking = get_bool(body, "enable_thinking", false);
+        top_level_thinking = get_bool(body, "enable_thinking", false);
     }
+    const std::optional<bool> template_thinking =
+        parse_openai_template_enable_thinking(body);
+    if (top_level_thinking && template_thinking &&
+        *top_level_thinking != *template_thinking) {
+        bad_request("conflicting enable_thinking values", "enable_thinking",
+                    "conflicting_template_option");
+    }
+    out.enable_thinking = template_thinking ? template_thinking : top_level_thinking;
     parse_openai_reasoning_effort(body, out);
     out.preserve_thinking = parse_openai_preserve_thinking(body);
 

@@ -39,6 +39,10 @@ public:
 
 private:
     void register_routes();
+    void mount_webui(const std::string& webui_dir);
+    void register_webui_mime();
+    [[nodiscard]] bool webui_spa_path(const std::string& path) const;
+    [[nodiscard]] bool is_api_path(const std::string& path) const;
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
@@ -66,6 +70,8 @@ private:
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
+    bool webui_serving_ = false;         // true once a static webui dir is mounted
+    std::string webui_index_html_;       // cached index.html for the SPA fallback
     ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;

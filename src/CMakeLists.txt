@@ -337,7 +337,8 @@ if(NINFER_BUILD_SERVE)
     serve/request_log.cpp
     serve/http_server.cpp
     serve/responses_http.cpp
-    serve/serve_options.cpp)
+    serve/serve_options.cpp
+    serve/webui_update.cpp)
   ninfer_internal_includes(ninfer_serve)
   target_include_directories(ninfer_serve PRIVATE
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
@@ -347,5 +348,7 @@ if(NINFER_BUILD_SERVE)
   if(WIN32)
     # cpp-httplib (plain HTTP) uses the Winsock API.
     target_link_libraries(ninfer_serve PRIVATE Ws2_32)
+    # webui_update fetches the stock WebUI bundle over WinHTTP.
+    target_link_libraries(ninfer_serve PRIVATE winhttp)
   endif()
 endif()

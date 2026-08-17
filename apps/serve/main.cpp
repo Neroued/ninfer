@@ -3,11 +3,13 @@
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
 #include "serve/serve_options.h"
+#include "serve/webui_update.h"
 
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
+#include <filesystem>
 #include <exception>
 #include <iomanip>
 #include <iostream>
@@ -40,10 +42,27 @@ std::string format_bytes(std::size_t bytes) {
 
 int main(int argc, char** argv) {
     try {
-        const ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
+        ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
         if (options.help_requested) {
             std::cout << ninfer::serve::serve_usage_text(argv[0]);
             return 0;
+        }
+
+        // Resolve (and, in --webui mode, auto-download) the webui directory before
+        // the port is taken so a failed download aborts startup cleanly. In
+        // --webui-dir mode the directory is trusted to already hold a built UI;
+        // fail early if it does not.
+        if (options.webui_auto) {
+            options.webui_dir =
+                ninfer::serve::ensure_webui_available(ninfer::serve::resolve_webui_dir(options));
+        } else if (!options.webui_dir.empty()) {
+            std::error_code ec;
+            const bool have_index =
+                std::filesystem::exists(std::filesystem::path(options.webui_dir) / "index.html", ec);
+            if (!std::filesystem::is_directory(options.webui_dir, ec) || !have_index) {
+                throw std::invalid_argument(
+                    "--webui-dir must be a directory containing index.html: " + options.webui_dir);
+            }
         }
 
         using Clock = std::chrono::steady_clock;

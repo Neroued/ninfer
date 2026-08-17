@@ -40,6 +40,7 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
 }
 
+#ifdef NINFER_NVFP4_W4A4
 struct Nvfp4LinearSwiGluWorkspace {
     Tensor projected;
     DeviceSpan linear;
@@ -73,6 +74,7 @@ std::size_t fused_workspace_bytes(std::int32_t tokens) {
     (void)allocate_fused_workspace(layout, tokens);
     return layout.peak_bytes(1);
 }
+#endif
 
 } // namespace
 
@@ -85,7 +87,11 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
     if (policy == LinearPolicy::A16Only || max_tokens <= 4) { return 0; }
-
+#ifndef NINFER_NVFP4_W4A4
+    throw std::invalid_argument(
+        "nvfp4 W4A4 linear_swiglu requires the Blackwell FP4 tensor-core build "
+        "(CMAKE_CUDA_ARCHITECTURES=120a)");
+#else
     std::size_t maximum = 0;
     if (min_tokens <= 48 && max_tokens >= 5) {
         maximum = fused_workspace_bytes(std::min(max_tokens, 48));
@@ -102,6 +108,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
         maximum = std::max(maximum, baseline_workspace_bytes(last_baseline));
     }
     return maximum;
+#endif
 }
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
@@ -114,6 +121,7 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
         return;
+#ifdef NINFER_NVFP4_W4A4
     case Nvfp4LinearSwiGluRoute::FusedW4A4:
         nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);
         return;
@@ -130,8 +138,17 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     }
     case Nvfp4LinearSwiGluRoute::LinearW4A4Post:
         break;
+#else
+    case Nvfp4LinearSwiGluRoute::FusedW4A4:
+    case Nvfp4LinearSwiGluRoute::TmaFusedW4A4:
+    case Nvfp4LinearSwiGluRoute::LinearW4A4Post:
+        throw std::invalid_argument(
+            "nvfp4 W4A4 linear_swiglu requires the Blackwell FP4 tensor-core build "
+            "(CMAKE_CUDA_ARCHITECTURES=120a)");
+#endif
     }
 
+#ifdef NINFER_NVFP4_W4A4
     auto scope                         = workspace.scope();
     Nvfp4LinearSwiGluWorkspace scratch = allocate_baseline_workspace(workspace, x.ne[1]);
     WorkspaceArena linear_workspace(scratch.linear);
@@ -139,6 +156,7 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     constexpr std::int32_t kIntermediate = Nvfp4MlpGateUpGeometry::kOutputRows / 2;
     silu_mul(scratch.projected.slice(0, 0, kIntermediate),
              scratch.projected.slice(0, kIntermediate, kIntermediate), out, stream);
+#endif
 }
 
 } // namespace ninfer::ops::detail

@@ -55,9 +55,18 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
         throw std::invalid_argument("nvfp4 linear_add workspace: invalid token interval");
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
+#ifdef NINFER_NVFP4_W4A4
     return resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearAddRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
                : 0;
+#else
+    if (resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearAddRoute::W4A4) {
+        throw std::invalid_argument(
+            "nvfp4 W4A4 linear_add requires the Blackwell FP4 tensor-core build "
+            "(CMAKE_CUDA_ARCHITECTURES=120a)");
+    }
+    return 0;
+#endif
 }
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
@@ -67,9 +76,15 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
         launch_a16(x, weight, residual, stream);
         return;
     }
+#ifdef NINFER_NVFP4_W4A4
     auto scope                       = workspace.scope();
     const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(workspace, x.ne[1], weight.k);
     nvfp4_linear_add_w4a4_launch(x, weight, residual, scratch, stream);
+#else
+    throw std::invalid_argument(
+        "nvfp4 W4A4 linear_add requires the Blackwell FP4 tensor-core build "
+        "(CMAKE_CUDA_ARCHITECTURES=120a)");
+#endif
 }
 
 } // namespace ninfer::ops::detail

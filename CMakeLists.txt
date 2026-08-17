@@ -1,18 +1,26 @@
 cmake_minimum_required(VERSION 3.28)
 
-# The current implementation is compiled only for sm_120a. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
+# The implementation is compiled for exactly one execution architecture:
+# 120a (GeForce RTX 5090) or 90a (H100). Set and validate the architecture
+# before CUDA compiler detection so CMake never injects a generic
 # host-toolchain default or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architectures to build")
+  set(CMAKE_CUDA_ARCHITECTURES 120a CACHE STRING "CUDA architecture to build (120a or 90a)")
 endif()
-if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(120a|90a)$")
   message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
+    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a or 90a; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
+
+# The NVFP4 W4A4 kernels execute on the Blackwell block-scaled FP4 tensor
+# cores, which sm_90a does not implement. Only the 120a build compiles those
+# kernels; every other target carries the portable nvfp4 A16 routes only.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+  add_compile_definitions(NINFER_NVFP4_W4A4=1)
+endif()
 
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)

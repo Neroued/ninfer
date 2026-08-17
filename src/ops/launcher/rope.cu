@@ -2,6 +2,7 @@
 #include "ops/launcher/rope.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "ops/common/device_topology.h"
 #include "ops/kernel/rope.cuh"
 
 #include <cstdint>
@@ -13,8 +14,7 @@ constexpr int kLargeBlock               = 256;
 constexpr int kFullChunkBlock           = 192;
 constexpr int kSmallBlock               = 128;
 constexpr int kDefaultChunkTargetTokens = 1024;
-// RTX 5090 has 170 SMs and admits six of these 256-thread CTAs per SM.
-constexpr int kLargeBlockWaveCapacity = 1020;
+constexpr int kLargeBlockCtasPerSm      = 6;
 
 template <RopeKernelMode Mode>
 inline constexpr bool kTextMode =
@@ -48,7 +48,7 @@ void launch_fixed(const Tensor& positions, Tensor* q, Tensor* k, cudaStream_t st
     if constexpr (kTextMode<Mode>) {
         if (tokens <= 6) {
             block = (QHeads + KHeads) * 32;
-        } else if (tokens <= kLargeBlockWaveCapacity) {
+        } else if (tokens <= kLargeBlockCtasPerSm * device_sm_count()) {
             block = kLargeBlock;
         } else if (tokens <= kDefaultChunkTargetTokens) {
             block = kFullChunkBlock;

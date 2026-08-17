@@ -352,10 +352,12 @@ int run_nvfp4() {
     };
     failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
     failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1621U);
+#ifdef NINFER_NVFP4_W4A4
     failures += run(3, 1, {2}, ops::LinearPolicy::AllowA4, 1631U);
     failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
     failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
     failures += run(6, 3, {6, 4, 1}, ops::LinearPolicy::AllowA4, 1661U);
+#endif
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
 }

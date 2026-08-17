@@ -1,6 +1,7 @@
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include "ninfer/ops/rmsnorm.h"
+#include "ops/common/device_topology.h"
 
 #include <algorithm>
 #include <array>
@@ -123,25 +124,26 @@ bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t
     return grid_ctas <= resident_ctas;
 }
 
-bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
+// These predicates consult the resident device's SM count, so they are not
+// noexcept: a failed device query surfaces as a normal exception.
+bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) {
     // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
-    // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
-    // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
+    // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM. There
+    // are three 16-row tiles per token tile.
+    return cooperative_grid_is_resident(schedule, cols, 128, 3, 2 * device_sm_count());
 }
 
-bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
+bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) {
     // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles. With the registered CUDA
-    // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
-    // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
-    // device-wide limits are 340 and 680 CTAs respectively.
-    const std::int32_t resident_ctas =
-        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 340 : 680;
-    return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
+    // 13.1 builds, split32 uses 91/93 registers per thread and admits two CTAs/SM; split16/8/4/2
+    // use at most 62 registers and admit four CTAs/SM.
+    const std::int32_t ctas_per_sm =
+        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 2 : 4;
+    return cooperative_grid_is_resident(schedule, cols, 64, 2, ctas_per_sm * device_sm_count());
 }
 
 bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
-                        const Bf16GdnGatingProblem& problem) noexcept {
+                        const Bf16GdnGatingProblem& problem) {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
     if (is_27(problem)) {
         switch (schedule) {

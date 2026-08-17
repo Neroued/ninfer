@@ -596,8 +596,9 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
-    if (device.sm() != 120) {
-        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
+    if (device.sm() != 120 && device.sm() != 90) {
+        throw std::invalid_argument(
+            "Qwen3.6 family runtime requires compute capability 12.0 (RTX 5090) or 9.0 (H100)");
     }
 }
 

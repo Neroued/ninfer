@@ -9,6 +9,7 @@
 #include "core/device.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer_bench_common.h"
+#include "ops/common/device_topology.h"
 #include "ops/kernel/rope.cuh"
 
 #include <cuda_bf16.h>
@@ -32,11 +33,16 @@ constexpr int kDflashRotaryDim        = 128;
 constexpr int kDflashQHeads           = 32;
 constexpr int kDflashKHeads           = 8;
 constexpr int kTextChunkMaxTokens     = 1024;
-constexpr int kLargeBlockWaveCapacity = 1020;
+constexpr int kLargeBlockCtasPerSm    = 6;
 constexpr float kTextTheta            = 1.0e7F;
 constexpr int kVisionHeadDim          = 72;
 constexpr int kVisionHeads            = 16;
 constexpr float kVisionTheta          = 10'000.0F;
+
+int large_block_wave_capacity() {
+    // Mirrors the production launcher's one-wave block decision on the resident GPU.
+    return kLargeBlockCtasPerSm * ops::detail::device_sm_count();
+}
 
 std::vector<int> parse_csv(const char* value) {
     std::vector<int> values;
@@ -214,7 +220,7 @@ int production_text_block(int tokens) {
     int block = 128;
     if (tokens <= 6) {
         block = (QHeads + KHeads) * 32;
-    } else if (tokens <= kLargeBlockWaveCapacity) {
+    } else if (tokens <= large_block_wave_capacity()) {
         block = 256;
     } else if (tokens <= kTextChunkMaxTokens) {
         block = 192;

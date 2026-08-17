@@ -64,9 +64,18 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
         throw std::invalid_argument("nvfp4 attn_input_proj workspace: invalid token interval");
     }
     (void)resolve_route(policy, min_tokens);
+#ifdef NINFER_NVFP4_W4A4
     return resolve_route(policy, max_tokens) == Nvfp4AttnInputRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, Nvfp4AttnInputGeometry::kInputRows)
                : 0;
+#else
+    if (resolve_route(policy, max_tokens) == Nvfp4AttnInputRoute::W4A4) {
+        throw std::invalid_argument(
+            "nvfp4 W4A4 attn_input_proj requires the Blackwell FP4 tensor-core build "
+            "(CMAKE_CUDA_ARCHITECTURES=120a)");
+    }
+    return 0;
+#endif
 }
 
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
@@ -76,12 +85,18 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
         launch_a16(x, weight, q, gate, k, v, stream);
         return;
     }
+#ifdef NINFER_NVFP4_W4A4
     if (workspace == nullptr) {
         throw std::invalid_argument("nvfp4 W4A4 attn_input_proj requires caller workspace");
     }
     auto scope                       = workspace->scope();
     const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(*workspace, x.ne[1], weight.k);
     nvfp4_attn_input_w4a4_launch(x, weight, q, gate, k, v, scratch, stream);
+#else
+    throw std::invalid_argument(
+        "nvfp4 W4A4 attn_input_proj requires the Blackwell FP4 tensor-core build "
+        "(CMAKE_CUDA_ARCHITECTURES=120a)");
+#endif
 }
 
 } // namespace ninfer::ops::detail

@@ -107,16 +107,22 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU inference performance on
 a small set of explicitly registered checkpoint artifacts. The supported identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
-`qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled
-for `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. All identities execute Text,
+`qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`. The current implementation compiles one
+execution architecture per build — `sm_120a`, tuned and measured on NVIDIA GeForce RTX 5090, or
+`sm_90a` for NVIDIA H100 — selected by `CMAKE_CUDA_ARCHITECTURES` (`120a` default, `90a` for H100).
+The `nvfp4` identities execute only on the `sm_120a` build: their W4A4 kernels use the Blackwell
+block-scaled FP4 tensor cores, which Hopper does not implement, so an `sm_90a` build rejects those
+identities at load and carries only the portable nvfp4 A16 routes for Op-level callers. All
+identities execute Text,
 image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the
 same public `.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
 
 The current workload is one GPU and one resident model instance with a startup-fixed one to eight
 active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
 FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
-scheduling, additional checkpoint targets, and retargeting the implementation to another execution
-platform are outside the current product. This is a local, single-owner project. Registered models,
+scheduling, additional checkpoint targets, execution platforms beyond the two registered
+architectures, and multi-GPU execution are outside the current product. This is a local,
+single-owner project. Registered models,
 generated artifacts, and the local workflow are trusted.
 Requirements derived from a different workload, trust model, or deployment model are out of scope
 until that product contract is explicitly changed.
@@ -313,7 +319,7 @@ These are conventional project resources, not a checklist of resources every tas
 | conversion report | `out/qwen3_6_27b.ninfer.conversion.json` |
 | normal build | `build/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | RTX 5090, `sm_120a`, CUDA 13.1 |
+| hardware/toolchain | RTX 5090 (`sm_120a`) or H100 (`sm_90a`), CUDA 13.1 |
 
 Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified

@@ -115,6 +115,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
+#ifndef NINFER_NVFP4_W4A4
+        if (invocation.policy == ops::LinearPolicy::AllowA4) { continue; }
+#endif
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(initial_residual.data(), output.bytes());

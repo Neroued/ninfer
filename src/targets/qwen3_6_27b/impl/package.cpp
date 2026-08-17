@@ -124,6 +124,16 @@ Package::Frontend Package::make_frontend(const LoadedModel& model) {
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile) {
+#ifndef NINFER_NVFP4_W4A4
+    // The nvfp4 weights need the W4A4 kernels, which execute on the Blackwell
+    // block-scaled FP4 tensor cores; the sm_90a build does not compile them.
+    if (weights_profile == WeightsProfile::Qwen36Nvfp4 ||
+        weights_profile == WeightsProfile::Qwen38Nvfp4) {
+        throw std::invalid_argument(
+            "nvfp4 weights require the Blackwell FP4 tensor-core build "
+            "(CMAKE_CUDA_ARCHITECTURES=120a)");
+    }
+#endif
     return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 

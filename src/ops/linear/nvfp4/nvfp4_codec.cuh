@@ -31,6 +31,11 @@ struct alignas(8) Nvfp4QuantizedK16 {
 
 static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
+// The E2M1 activation pack converts through cvt.rn.satfinite.e2m1x2.f32,
+// which only the Blackwell FP4 tensor-core architectures implement. The macro
+// is defined while compiling sm_120a; on any other target these helpers are
+// absent and an accidental caller fails at compile time.
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL)
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
     asm volatile("{\n"
@@ -91,5 +96,6 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
     return result;
 }
+#endif // defined(__CUDA_ARCH_FEAT_SM120_ALL)
 
 } // namespace ninfer::ops::detail

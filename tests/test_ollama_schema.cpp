@@ -306,9 +306,32 @@ int test_options_and_think() {
     failures += check(api_code([&] { parse_ollama_chat_request(big_ctx, default_limits()); }) ==
                           "context_length_exceeded",
                       "num_ctx above the server window rejected");
-    Json small_ctx       = user_only("x");
-    small_ctx["options"] = Json{{"num_ctx", 1024}};
-    parse_ollama_chat_request(small_ctx, default_limits());
+    Json small_ctx                  = user_only("x");
+    small_ctx["options"]            = Json{{"num_ctx", 1024}};
+    const GenerationRequest r_small = parse_ollama_chat_request(small_ctx, default_limits());
+    failures += check(r_small.context_window == 1024 && r_small.max_tokens == 512,
+                      "num_ctx narrows the request window without touching the output budget");
+    failures += check(req.context_window == 4096, "num_ctx at the server window carried");
+    failures += check(r_inf.context_window == 0, "no num_ctx => server window");
+
+    // -2 fills the window: the request asks for the whole window (num_ctx if
+    // given, else the server window) and preparation clamps to the remainder.
+    Json fill                      = user_only("x");
+    fill["options"]                = Json{{"num_predict", -2}};
+    const GenerationRequest r_fill = parse_ollama_chat_request(fill, default_limits());
+    failures += check(r_fill.max_tokens == 4096 && r_fill.max_tokens_set,
+                      "num_predict -2 requests the server window");
+    Json fill_ctx                      = user_only("x");
+    fill_ctx["options"]                = Json{{"num_predict", -2}, {"num_ctx", 1024}};
+    const GenerationRequest r_fill_ctx = parse_ollama_chat_request(fill_ctx, default_limits());
+    failures += check(r_fill_ctx.max_tokens == 1024 && r_fill_ctx.max_tokens_set &&
+                          r_fill_ctx.context_window == 1024,
+                      "num_predict -2 with num_ctx requests that window");
+    RequestLimits unbounded;
+    unbounded.default_max_tokens             = 512;
+    const GenerationRequest r_fill_unbounded = parse_ollama_chat_request(fill, unbounded);
+    failures += check(r_fill_unbounded.max_tokens == 512 && !r_fill_unbounded.max_tokens_set,
+                      "num_predict -2 without a known window keeps the server default");
 
     for (const char* key : {"repeat_penalty", "mirostat", "typical_p", "bogus"}) {
         Json rejected       = user_only("x");

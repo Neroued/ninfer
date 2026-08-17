@@ -335,23 +335,32 @@ void parse_options(const Json& body, GenerationRequest& out, const RequestLimits
 
     if (const std::optional<int> num_ctx = get_int(options, "num_ctx", "options.num_ctx")) {
         if (*num_ctx <= 0) { bad_request("options.num_ctx must be positive", "options.num_ctx"); }
-        // The context window is frozen at server startup; a request may ask for
-        // less (no effect) but not for more.
+        // The server window is frozen at startup, so a request may only narrow it;
+        // the narrower window is enforced at preparation (prompt must fit, output
+        // clamped to the remainder) instead of truncating the prompt as Ollama does.
         if (limits.max_context > 0 && *num_ctx > limits.max_context) {
             bad_request("options.num_ctx exceeds the server context window of " +
                             std::to_string(limits.max_context),
                         "options.num_ctx", "context_length_exceeded");
         }
+        out.context_window = *num_ctx;
     }
 
     if (const std::optional<int> num_predict =
             get_int(options, "num_predict", "options.num_predict")) {
-        // Ollama: -1 => no explicit limit, -2 => fill the context. Both resolve to
-        // the server's default output budget; the Engine always bounds output.
+        // Ollama: -1 => no explicit limit (the server default budget applies);
+        // -2 => fill the context window, i.e. request the whole window and let
+        // preparation/the Engine clamp it to what remains after the prompt.
         if (*num_predict > 0) {
             out.max_tokens     = *num_predict;
             out.max_tokens_set = true;
-        } else if (*num_predict != -1 && *num_predict != -2) {
+        } else if (*num_predict == -2) {
+            const int window = out.context_window > 0 ? out.context_window : limits.max_context;
+            if (window > 0) {
+                out.max_tokens     = window;
+                out.max_tokens_set = true;
+            }
+        } else if (*num_predict != -1) {
             bad_request("options.num_predict must be positive, -1, or -2", "options.num_predict");
         }
     }

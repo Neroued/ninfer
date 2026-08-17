@@ -184,6 +184,10 @@ struct GenerationRequest {
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
     SamplingParams sampling;
+    // Per-request prompt+output window (Ollama num_ctx); 0 => the server window.
+    // The prompt must fit and the output budget is clamped to the remainder.
+    int context_window               = 0;
+    std::string context_window_param = "options.num_ctx";
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

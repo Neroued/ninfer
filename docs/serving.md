@@ -460,13 +460,18 @@ boolean or one of the Ollama levels `low`, `medium`, `high`, and `stream`, which
 effort-capable template exposes `low`, `medium`, and `xhigh`, so `high` returns
 `reasoning_effort_not_supported` (Ollama's vocabulary has no `xhigh`). `options`
 maps `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`,
-`stop`, `num_predict` (`-1` and `-2` keep the server default output budget), and `num_ctx`, which
-must not exceed `--max-context`. Sampler options the Engine does not implement (`repeat_penalty`,
-`mirostat*`, `typical_p`, ...) and unknown options are rejected with `option_not_supported`; runner
-options (`num_gpu`, `num_thread`, `use_mmap`, ...) and `keep_alive` are accepted without effect
-because residency is fixed at startup. `format` is rejected because the Engine has no constrained
-decoding. `model` must be the advertised model id or its `:latest` spelling, which Ollama-native
-clients use for untagged names; the response echoes the requested spelling.
+`stop`, `num_predict`, and `num_ctx`. `num_ctx` may narrow, but not widen, the `--max-context`
+window for one request: the expanded prompt must fit it (otherwise HTTP 400
+`context_length_exceeded` at preparation, rather than Ollama's silent prompt truncation) and the
+output budget is clamped to what remains. `num_predict: -1` keeps the server default output budget
+and `-2` fills the request window (`num_ctx` if given, else `--max-context`), ending with
+`done_reason: "length"` when it is reached. Sampler options the Engine does not implement
+(`repeat_penalty`, `mirostat*`, `typical_p`, ...) and unknown options are rejected with
+`option_not_supported`; runner options (`num_gpu`, `num_thread`, `use_mmap`, ...) and `keep_alive`
+are accepted without effect because residency is fixed at startup. `format` is rejected because the
+Engine has no constrained decoding. `model` must be the advertised model id or its `:latest`
+spelling, which Ollama-native clients use for untagged names; the response echoes the requested
+spelling.
 
 An empty `messages` array is Ollama's preload request. It is answered immediately with an empty
 assistant message, `done: true`, and `done_reason: "load"` (never `"unload"`: `keep_alive: 0` has

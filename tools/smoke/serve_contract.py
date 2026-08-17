@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -47,6 +48,23 @@ def request(base_url: str, method: str, path: str, payload: Any | None = None) -
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
         raise ContractError(f"{method} {path} returned HTTP {error.code}: {detail}") from error
+
+
+def expect_http_error(
+    base_url: str, method: str, path: str, payload: Any, status: int
+) -> dict[str, Any]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    req = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as response:
+            raise ContractError(f"{method} {path} returned HTTP {response.status}, expected {status}")
+    except urllib.error.HTTPError as error:
+        if error.code != status:
+            raise ContractError(
+                f"{method} {path} returned HTTP {error.code}, expected {status}"
+            ) from error
+        return json.loads(error.read().decode("utf-8"))
 
 
 def json_response(
@@ -426,6 +444,30 @@ def exercise_ollama(base_url: str, model: str, count_tokens: int) -> dict[str, A
         raise ContractError("Ollama streamed and non-streaming eval_count differ")
     if terminal["done_reason"] != nonstream["done_reason"]:
         raise ContractError("Ollama streamed and non-streaming done_reason differ")
+
+    # num_ctx narrows the request window at preparation: a window the prompt does
+    # not fit is rejected, and num_predict -2 fills what remains of a window it does.
+    too_small = expect_http_error(
+        base_url, "POST", "/api/chat", {**prompt, "options": {"num_ctx": 1}}, 400
+    )
+    match = re.fullmatch(
+        r"prompt of (\d+) tokens exceeds the requested context window of 1 tokens",
+        str(too_small.get("error", "")),
+    )
+    if match is None:
+        raise ContractError("Ollama num_ctx below the prompt length was not rejected")
+    prompt_tokens = int(match.group(1))
+    window = prompt_tokens + 8
+    filled = json_response(
+        base_url,
+        "POST",
+        "/api/chat",
+        {**prompt, "options": {"temperature": 0, "num_ctx": window, "num_predict": -2}},
+    )
+    require_ollama_terminal(filled)
+    # The last generated token needs no context slot: window - prompt + 1 tokens fit.
+    if filled["done_reason"] != "length" or filled["eval_count"] != window - prompt_tokens + 1:
+        raise ContractError("Ollama num_predict -2 did not fill the num_ctx window")
     return {
         "ollama_done_reason": nonstream["done_reason"],
         "ollama_prompt_eval_count": nonstream["prompt_eval_count"],

@@ -308,6 +308,25 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();
+        if (request.context_window > 0) {
+            // Same accounting as the Engine's own capacity clamp: the last generated
+            // token needs no context slot, so prompt + output - 1 must fit the window.
+            if (prepared.prompt_tokens > request.context_window) {
+                ApiError error;
+                error.status  = 400;
+                error.type    = "invalid_request_error";
+                error.code    = "context_length_exceeded";
+                error.param   = request.context_window_param;
+                error.message = "prompt of " + std::to_string(prepared.prompt_tokens) +
+                                " tokens exceeds the requested context window of " +
+                                std::to_string(request.context_window) + " tokens";
+                throw ApiException(std::move(error));
+            }
+            const auto remaining =
+                static_cast<std::uint32_t>(request.context_window - prepared.prompt_tokens + 1);
+            request_options.execution.requested_output_tokens =
+                std::min(request_options.execution.requested_output_tokens, remaining);
+        }
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),

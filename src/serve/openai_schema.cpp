@@ -495,7 +495,8 @@ std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
             bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
         }
         for (auto it = kwargs.begin(); it != kwargs.end(); ++it) {
-            if (it.key() != "preserve_thinking" && !it.value().is_null()) {
+            if (it.key() != "preserve_thinking" && it.key() != "enable_thinking" &&
+                !it.value().is_null()) {
                 bad_request("chat_template_kwargs." + it.key() + " is not supported",
                             "chat_template_kwargs", "chat_template_option_not_supported");
             }
@@ -516,32 +517,83 @@ std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
     return template_value ? template_value : top_level;
 }
 
-void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
-    if (!body.contains("reasoning_effort") || body.at("reasoning_effort").is_null()) { return; }
-    if (!body.at("reasoning_effort").is_string()) {
-        bad_request("reasoning_effort must be a string or null", "reasoning_effort");
+std::optional<bool> parse_chat_enable_thinking(const Json& body) {
+    // Public top-level extension, or the llama.cpp webui dialect where the switch
+    // lives under chat_template_kwargs. Nulls stay unset (server default wins).
+    std::optional<bool> top_level;
+    if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
+        if (!body.at("enable_thinking").is_boolean()) {
+            bad_request("enable_thinking must be a boolean or null", "enable_thinking");
+        }
+        top_level = body.at("enable_thinking").get<bool>();
     }
-    const std::string value = body.at("reasoning_effort").get<std::string>();
-    const std::optional<RequestedReasoningEffort> effort = parse_requested_reasoning_effort(value);
-    if (!effort) {
-        bad_request("reasoning_effort must be one of none, minimal, low, medium, high, xhigh, or "
-                    "max",
-                    "reasoning_effort");
+    std::optional<bool> kwargs_value;
+    if (body.contains("chat_template_kwargs") && body.at("chat_template_kwargs").is_object()) {
+        const Json& kwargs = body.at("chat_template_kwargs");
+        if (kwargs.contains("enable_thinking") && !kwargs.at("enable_thinking").is_null()) {
+            if (!kwargs.at("enable_thinking").is_boolean()) {
+                bad_request("chat_template_kwargs.enable_thinking must be a boolean or null",
+                            "chat_template_kwargs");
+            }
+            kwargs_value = kwargs.at("enable_thinking").get<bool>();
+        }
     }
-    out.reasoning_effort       = *effort;
-    out.reasoning_effort_param = "reasoning_effort";
+    if (top_level && kwargs_value && *top_level != *kwargs_value) {
+        bad_request("conflicting enable_thinking values", "enable_thinking",
+                    "conflicting_template_option");
+    }
+    return top_level ? top_level : kwargs_value;
 }
 
-GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
+void parse_openai_chat_thinking(const Json& body, std::optional<bool>* enable_thinking,
+                                std::optional<RequestedReasoningEffort>* reasoning_effort,
+                                std::string* reasoning_effort_param,
+                                const std::string& conflict_param) {
+    *enable_thinking = parse_chat_enable_thinking(body);
+
+    std::optional<RequestedReasoningEffort> effort;
+    if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
+        if (!body.at("reasoning_effort").is_string()) {
+            bad_request("reasoning_effort must be a string or null", "reasoning_effort");
+        }
+        const std::string value = body.at("reasoning_effort").get<std::string>();
+        const std::optional<RequestedReasoningEffort> parsed = parse_requested_reasoning_effort(value);
+        if (!parsed) {
+            bad_request("reasoning_effort must be one of none, minimal, low, medium, high, xhigh, "
+                        "or max",
+                        "reasoning_effort");
+        }
+        effort = *parsed;
+    }
+
+    if (effort) {
+        *reasoning_effort = *effort;
+        *reasoning_effort_param = "reasoning_effort";
+        if (enable_thinking->has_value() &&
+            *enable_thinking != (*effort != RequestedReasoningEffort::None)) {
+            bad_request("reasoning effort conflicts with " + conflict_param,
+                        "reasoning_effort", "conflicting_template_option");
+        }
+    }
+}
+
+GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits,
+                                                const std::string& default_model_id) {
     require_object(body);
     reject_unsupported_features(body);
 
     GenerationRequest out;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
-        bad_request("missing required field: model", "model");
+    if (body.contains("model") && body.at("model").is_string() &&
+        !body.at("model").get<std::string>().empty()) {
+        out.model = body.at("model").get<std::string>();
+    } else {
+        // Single-model clients (e.g. the llama.cpp webui) omit `model`; serve
+        // against the loaded artifact instead of rejecting the request.
+        if (default_model_id.empty()) {
+            bad_request("missing required field: model", "model");
+        }
+        out.model = default_model_id;
     }
-    out.model = body.at("model").get<std::string>();
 
     parse_tools(body, out);
     parse_tool_choice(body, out);
@@ -553,18 +605,22 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
-    if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
-        out.enable_thinking = get_bool(body, "enable_thinking", false);
-    }
-    parse_openai_reasoning_effort(body, out);
+    parse_openai_chat_thinking(body, &out.enable_thinking, &out.reasoning_effort,
+                               &out.reasoning_effort_param, "enable_thinking");
     out.preserve_thinking = parse_openai_preserve_thinking(body);
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }
     if (max_tokens) {
-        if (*max_tokens <= 0) { bad_request("max_tokens must be positive", "max_tokens"); }
-        out.max_tokens     = *max_tokens;
-        out.max_tokens_set = true;
+        // Non-positive (llama.cpp `-1` = unlimited) falls back to the server
+        // default, which the Engine clamps to its effective context capacity.
+        if (*max_tokens <= 0) {
+            out.max_tokens     = limits.default_max_tokens;
+            out.max_tokens_set = false;
+        } else {
+            out.max_tokens     = *max_tokens;
+            out.max_tokens_set = true;
+        }
     } else {
         out.max_tokens     = limits.default_max_tokens;
         out.max_tokens_set = false;
@@ -682,17 +738,24 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 std::string sse_done() { return "data: [DONE]\n\n"; }
 
 std::string make_models_list(const std::string& model_id, std::int64_t created) {
+    // `status` is a llama.cpp webui extension: the client reads status.value to
+    // decide whether a model is loaded. A single loaded artifact is always loaded.
     const Json payload = {{"object", "list"},
-                          {"data", Json::array({Json{{"id", model_id},
-                                                     {"object", "model"},
-                                                     {"created", created},
-                                                     {"owned_by", "ninfer"}}})}};
+                          {"data",
+                           Json::array({Json{{"id", model_id},
+                                             {"object", "model"},
+                                             {"created", created},
+                                             {"owned_by", "ninfer"},
+                                             {"status", Json{{"value", "loaded"}}}}})}};
     return payload.dump();
 }
 
 std::string make_model_object(const std::string& model_id, std::int64_t created) {
-    const Json payload = {
-        {"id", model_id}, {"object", "model"}, {"created", created}, {"owned_by", "ninfer"}};
+    const Json payload = {{"id", model_id},
+                          {"object", "model"},
+                          {"created", created},
+                          {"owned_by", "ninfer"},
+                          {"status", Json{{"value", "loaded"}}}};
     return payload.dump();
 }
 

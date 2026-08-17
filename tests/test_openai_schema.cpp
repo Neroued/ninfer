@@ -5,6 +5,7 @@
 
 #include "serve/openai_schema.h"
 #include "serve/request.h"
+#include "serve/serve_options.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -51,6 +52,9 @@ RequestLimits default_limits() {
     limits.default_max_tokens = 512;
     return limits;
 }
+
+// Public model id used by the webui-dialect tests (they send it explicitly).
+const char* webui_model() { return "qwen3.6-27b"; }
 
 ServeOptions default_server() { return ServeOptions{}; }
 
@@ -371,9 +375,17 @@ int test_reject_unsupported() {
     failures += check(text_ok, "text response_format accepted");
 
     Json no_model = {{"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(no_model, default_limits()); }),
-              "missing model rejected");
+    failures += check(parse_chat_completion_request(no_model, default_limits(), "qwen3.6-27b").model ==
+                          "qwen3.6-27b",
+                      "omitted model filled from default model id");
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(no_model, default_limits()); }),
+        "missing model rejected without a default model id");
+    Json empty_model = {{"model", ""},
+                        {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
+    failures += check(parse_chat_completion_request(empty_model, default_limits(), "qwen3.6-27b")
+                              .model == "qwen3.6-27b",
+                      "empty model falls back to default model id");
 
     Json function_role = {
         {"model", "m"}, {"messages", Json::array({Json{{"role", "function"}, {"content", "x"}}})}};
@@ -675,9 +687,13 @@ int test_models_and_error() {
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
     failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
 
+    failures += check(list.at("data").at(0).at("status").at("value") == "loaded",
+                      "models list entry reports loaded status");
     const Json one = Json::parse(make_model_object("qwen3.6-27b", 1));
     failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
     failures += check(one.at("owned_by") == "ninfer", "model owner");
+    failures += check(one.at("status").at("value") == "loaded",
+                      "model object reports loaded status");
 
     ApiError error;
     error.status   = 400;
@@ -706,6 +722,143 @@ int test_finish_reason_wire() {
 
 } // namespace
 
+int test_llama_webui_dialect() {
+    const Json base = {
+        {"model", "qwen3.6-27b"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+    };
+    int failures = 0;
+
+    // chat_template_kwargs.enable_thinking (always sent by the webui)
+    Json et                      = base;
+    et["chat_template_kwargs"]   = Json{{"enable_thinking", true}};
+    const GenerationRequest et_request =
+        parse_chat_completion_request(et, default_limits(), webui_model());
+    failures += check(et_request.enable_thinking == true, "kwargs enable_thinking parsed");
+    failures += check(translate(et_request).options.enable_thinking,
+                      "kwargs enable_thinking reached prompt");
+
+    Json et_false                      = base;
+    et_false["chat_template_kwargs"]   = Json{{"enable_thinking", false}};
+    failures += check(
+        parse_chat_completion_request(et_false, default_limits(), webui_model()).enable_thinking ==
+            false,
+        "kwargs enable_thinking=false parsed");
+
+    Json both                      = base;
+    both["enable_thinking"]        = true;
+    both["chat_template_kwargs"]   = Json{{"enable_thinking", true}};
+    failures += check(
+        parse_chat_completion_request(both, default_limits(), webui_model()).enable_thinking ==
+            true,
+        "matching top-level and kwargs enable_thinking accepted");
+    Json et_conflict               = both;
+    et_conflict["enable_thinking"] = false;
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(et_conflict, default_limits(),
+                                                              webui_model());
+                      }) == "conflicting_template_option",
+                      "conflicting enable_thinking values rejected");
+    Json et_bad                      = base;
+    et_bad["chat_template_kwargs"]   = Json{{"enable_thinking", "yes"}};
+    failures += check(
+        throws_api([&] {
+            (void)parse_chat_completion_request(et_bad, default_limits(), webui_model());
+        }),
+        "non-boolean kwargs enable_thinking rejected");
+
+    // webui reasoning_effort=low|medium accepted; none is a public value
+    Json low                    = base;
+    low["reasoning_effort"]     = "low";
+    const GenerationRequest low_request =
+        parse_chat_completion_request(low, default_limits(), webui_model());
+    failures += check(low_request.reasoning_effort == RequestedReasoningEffort::Low,
+                      "webui reasoning_effort=low accepted");
+    const ninfer::PromptInput low_prompt =
+        translate(parse_chat_completion_request(low, default_limits(), webui_model()));
+    failures += check(low_prompt.options.enable_thinking &&
+                          low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
+                      "webui low effort reached prompt");
+
+    // conflicting enable_thinking=false vs effort low rejected at parse time
+    Json c                  = low;
+    c["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(c, default_limits(), webui_model());
+                      }) == "conflicting_template_option",
+                      "conflicting enable_thinking and reasoning_effort rejected");
+
+    // high/max are public protocol values: parse ok, template capability decides
+    Json high                   = base;
+    high["reasoning_effort"]    = "high";
+    failures += check(
+        api_code([&] {
+            (void)resolve_prompt_semantics(
+                parse_chat_completion_request(high, default_limits(), webui_model()),
+                default_server(), effort_capabilities());
+        }) == "reasoning_effort_not_supported",
+        "webui high effort rejected by template capability");
+
+    // max_tokens=-1 (webui "unlimited") falls back to the server default
+    Json unlimited               = base;
+    unlimited["max_tokens"]      = -1;
+    const GenerationRequest unlimited_request =
+        parse_chat_completion_request(unlimited, default_limits(), webui_model());
+    failures += check(unlimited_request.max_tokens == 512 && !unlimited_request.max_tokens_set,
+                      "max_tokens=-1 falls back to server default");
+
+    // full webui-shaped body parses cleanly
+    Json webui                      = base;
+    webui["stream"]                 = true;
+    webui["return_progress"]        = true;
+    webui["sse_ping_interval"]      = 1;
+    webui["reasoning_format"]       = "auto";
+    webui["chat_template_kwargs"]   = Json{{"enable_thinking", true}};
+    webui["reasoning_control"]      = true;
+    webui["thinking_budget_tokens"] = 2048;
+    webui["max_tokens"]             = -1;
+    webui["temperature"]            = 0.7;
+    webui["timings_per_token"]      = true;
+    failures += check(!throws_api([&] {
+                          (void)parse_chat_completion_request(webui, default_limits(),
+                                                              webui_model());
+                      }),
+                      "full webui-shaped body accepted");
+    return failures;
+}
+
+int test_props_stub() {
+    int failures = 0;
+    ServeOptions options;
+    options.artifact_path              = "models/qwen3_6_27b.ninfer";
+    options.max_context                = 16384;
+    options.default_max_tokens         = 4096;
+    options.enable_vision              = true;
+    options.speculative.backend        = SpeculativeBackend::Mtp;
+    options.sampling_overrides.temperature = 1.0F;
+    options.sampling_overrides.top_k       = 20;
+
+    const Json props = make_props_stub(options, "qwen3.6-27b");
+    failures += check(props.at("role") == "model", "props role is model");
+    failures += check(props.at("modalities").at("vision") == true, "props vision follows --vision");
+    failures += check(props.at("modalities").at("audio") == false, "props audio off");
+    const Json params = props.at("default_generation_settings").at("params");
+    failures += check(params.at("n_ctx") == 16384, "props n_ctx from --max-context");
+    failures += check(params.at("n_predict") == 4096, "props n_predict from default max tokens");
+    failures += check(params.at("temperature") == 1.0, "props temperature override reported");
+    failures += check(params.at("top_k") == 20, "props top_k override reported");
+    failures += check(params.at("presence_penalty") == 0, "unreported param stays neutral zero");
+    failures += check(params.at("dry_base") == 0, "dry params stay neutral zero");
+    failures += check(props.at("default_generation_settings").at("speculative") == true,
+                      "props speculative follows --spec");
+    failures += check(props.at("default_generation_settings").at("is_processing") == false,
+                      "props is_processing false");
+    failures += check(props.at("chat_template").get<std::string>().find("enable_thinking") !=
+                          std::string::npos,
+                      "props chat_template exposes enable_thinking for capability probes");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_parse_string_content();
@@ -724,6 +877,8 @@ int main() {
     failures += test_chunk_serialization();
     failures += test_tool_chunk_serialization();
     failures += test_models_and_error();
+    failures += test_llama_webui_dialect();
+    failures += test_props_stub();
     failures += test_finish_reason_wire();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <memory>
@@ -17,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -53,6 +55,7 @@ void write_error(httplib::Response& res, const ApiError& error) {
     res.status = error.status;
     res.set_content(make_error_body(error), "application/json");
 }
+
 
 // Anthropic-shaped error body ({"type":"error","error":{...}}), used by the
 // /v1/messages endpoints so Claude clients see the error format they expect.
@@ -220,8 +223,67 @@ void HttpServer::register_routes() {
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
-        server_.Options(R"(.*)",
-                        [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
+        // Echo the preflight's requested headers (Access-Control-Request-Headers)
+        // so clients using custom headers (e.g. llama.cpp webui's x-conversation-id)
+        // pass the browser's CORS check. The static default above remains the
+        // floor for direct (non-browser) requests.
+        server_.Options(R"(.*)", [](const httplib::Request& req, httplib::Response& res) {
+            res.status = 204;
+            auto it = req.get_header_value("Access-Control-Request-Headers");
+            if (!it.empty()) {
+                std::string joined;
+                std::vector<std::string> seen;
+                std::string part;
+                const std::string& raw = it;
+                for (size_t i = 0; i <= raw.size(); i++) {
+                    const char c = i < raw.size() ? raw[i] : ',';
+                    if (c == ',') {
+                        size_t b = part.find_first_not_of(" \t");
+                        if (b == std::string::npos) {
+                            part.clear();
+                            continue;
+                        }
+                        size_t e = part.find_last_not_of(" \t") + 1;
+                        part = part.substr(b, e - b);
+                        if (!part.empty()) {
+                            std::string key = part;
+                            for (auto& ch : key) {
+                                if (ch >= 'A' && ch <= 'Z') {
+                                    ch = char(ch - 'A' + 'a');
+                                }
+                            }
+                            const bool dup = std::any_of(seen.begin(), seen.end(),
+                                                         [&](const std::string& s) { return s == key; });
+                            if (!dup) {
+                                if (!joined.empty()) {
+                                    joined += ", ";
+                                }
+                                joined += part;
+                                seen.push_back(std::move(key));
+                            }
+                        }
+                        part.clear();
+                    } else {
+                        part += c;
+                    }
+                }
+                if (!joined.empty()) {
+                    // Build the full header set explicitly: httplib's set_header
+                    // uses emplace and cannot replace the statically seeded
+                    // Access-Control-Allow-Headers default.
+                    httplib::Headers headers;
+                    for (const auto& h : res.headers) {
+                        // The seeded default uses exactly this key spelling.
+                        if (h.first == "Access-Control-Allow-Headers") {
+                            headers.emplace(h.first, joined);
+                        } else {
+                            headers.emplace(h.first, h.second);
+                        }
+                    }
+                    res.headers = std::move(headers);
+                }
+            }
+        });
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
@@ -279,6 +341,9 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_props(req, res);
+    });
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });
@@ -315,6 +380,103 @@ void HttpServer::register_routes() {
     });
 }
 
+// llama.cpp webui dialect: /props is the client's server introspection endpoint
+// (role detection, context size, default params, thinking-capability probe, api
+// key validation). NInfer has no llama.cpp server behind it, so serve a faithful
+// stub derived from the process configuration. Only process-level overrides are
+// reported as parameter values; everything else stays at neutral zeros so client
+// side defaults never swallow a user-set request parameter.
+nlohmann::json make_props_stub(const ServeOptions& options, const std::string& model_id) {
+    (void)model_id;
+    const auto& ov = options.sampling_overrides;
+    nlohmann::json params = nlohmann::json::object();
+    params["n_predict"] = options.default_max_tokens;
+    params["seed"] = ov.seed ? static_cast<double>(*ov.seed) : 0;
+    params["temperature"] = ov.temperature ? static_cast<double>(*ov.temperature) : 0;
+    params["dynatemp_range"] = 0;
+    params["dynatemp_exponent"] = 0;
+    params["top_k"] = ov.top_k ? *ov.top_k : 0;
+    params["top_p"] = ov.top_p ? static_cast<double>(*ov.top_p) : 0;
+    params["min_p"] = ov.min_p ? static_cast<double>(*ov.min_p) : 0;
+    params["top_n_sigma"] = 0;
+    params["xtc_probability"] = 0;
+    params["xtc_threshold"] = 0;
+    params["typ_p"] = 0;
+    params["repeat_last_n"] = 0;
+    params["repeat_penalty"] = 0;
+    params["presence_penalty"] =
+        ov.presence_penalty ? static_cast<double>(*ov.presence_penalty) : 0;
+    params["frequency_penalty"] =
+        ov.frequency_penalty ? static_cast<double>(*ov.frequency_penalty) : 0;
+    params["dry_multiplier"] = 0;
+    params["dry_base"] = 0;
+    params["dry_allowed_length"] = 0;
+    params["dry_penalty_last_n"] = 0;
+    params["dry_sequence_breakers"] = nlohmann::json::array();
+    params["mirostat"] = 0;
+    params["mirostat_tau"] = 0;
+    params["mirostat_eta"] = 0;
+    params["stop"] = nlohmann::json::array();
+    params["max_tokens"] = options.default_max_tokens;
+    params["n_keep"] = 0;
+    params["n_discard"] = 0;
+    params["ignore_eos"] = false;
+    params["stream"] = false;
+    params["logit_bias"] = nlohmann::json::array();
+    params["n_probs"] = 0;
+    params["min_keep"] = 0;
+    params["grammar"] = "";
+    params["grammar_lazy"] = false;
+    params["grammar_triggers"] = nlohmann::json::array();
+    params["preserved_tokens"] = nlohmann::json::array();
+    params["chat_format"] = "";
+    params["reasoning_format"] = "";
+    params["reasoning_in_content"] = false;
+    params["generation_prompt"] = "";
+    params["samplers"] = nlohmann::json::array();
+    params["backend_sampling"] = false;
+    params["speculative.n_max"] = 0;
+    params["speculative.n_min"] = 0;
+    params["speculative.p_min"] = 0.0;
+    params["timings_per_token"] = false;
+    params["post_sampling_probs"] = false;
+    params["lora"] = nlohmann::json::array();
+
+    nlohmann::json props = nlohmann::json::object();
+    props["default_generation_settings"] = {
+        {"id", 0},
+        {"id_task", 0},
+        {"n_ctx", static_cast<int>(options.max_context)},
+        {"speculative", options.speculative.backend != SpeculativeBackend::None},
+        {"is_processing", false},
+        {"params", params},
+        {"prompt", ""},
+        {"next_token",
+         {{"has_next_token", false},
+          {"has_new_line", false},
+          {"n_remain", 0},
+          {"n_decoded", 0},
+          {"stopping_word", ""}}},
+    };
+    props["total_slots"] = 1;
+    props["model_path"] = options.artifact_path;
+    props["role"] = "model";
+    props["modalities"] = {{"vision", options.enable_vision}, {"audio", false}, {"video", false}};
+    // Capability marker only: clients that probe the chat template (e.g. the
+    // webui's thinking-support heuristic) need `enable_thinking` to appear; the
+    // real template is embedded in the loaded artifact.
+    props["chat_template"] =
+        "{# ninfer-serve: capability marker; the real chat template is embedded in "
+        "the loaded artifact #}\n"
+        "{%- if enable_thinking is defined %}\n"
+        "  {%- set thinking = enable_thinking %}\n"
+        "{% endif %}";
+    props["bos_token"] = "";
+    props["eos_token"] = "";
+    props["build_info"] = "ninfer-serve";
+    return props;
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now()), "application/json");
 }
@@ -333,6 +495,10 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
     res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
 }
 
+void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(make_props_stub(options_, public_model_id_).dump(), "application/json");
+}
+
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
     nlohmann::json body;
     try {
@@ -349,7 +515,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_chat_completion_request(body, limits);
+        request                   = parse_chat_completion_request(body, limits, public_model_id_);
         if (request.model != public_model_id_) {
             ApiError error;
             error.status  = 404;

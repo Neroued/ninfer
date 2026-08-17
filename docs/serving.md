@@ -1,7 +1,7 @@
 # HTTP serving
 
-`build/apps/ninfer-serve` loads one registered artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
+`build/apps/ninfer-serve` loads one registered artifact and exposes OpenAI-, Anthropic-, and
+Ollama-compatible HTTP endpoints over one resident NInfer Engine.
 
 ## Start the server
 
@@ -53,6 +53,11 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `POST /api/chat` | Ollama-style chat generation with per-request phase timings |
+| `GET /api/tags` | Ollama model list for the resident model |
+| `POST /api/show` | Ollama model details and capabilities |
+| `GET /api/ps` | Ollama loaded-model list |
+| `GET /api/version` | advertised Ollama API level |
 
 ## OpenAI Chat Completions
 
@@ -435,9 +440,83 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
   }'
 ```
 
+## Ollama chat
+
+```bash
+curl http://127.0.0.1:8080/api/chat \
+  -d '{
+    "model": "qwen3.6-27b",
+    "messages": [{"role": "user", "content": "Explain MTP in one sentence."}],
+    "stream": false
+  }'
+```
+
+`POST /api/chat` accepts the Ollama chat request: `system`/`user`/`assistant`/`tool` history with
+string content (a `tool` result may be empty), user `images` as bare base64 payloads, assistant
+`thinking` and `tool_calls` with object arguments, OpenAI-shaped function `tools` (a missing
+`parameters` schema defaults to the empty object schema, as on the OpenAI surfaces), `think` as a
+boolean or one of the Ollama levels `low`, `medium`, `high`, and `stream`, which defaults to true.
+`think` levels are checked against the loaded chat template like `reasoning_effort`; the registered
+effort-capable template exposes `low`, `medium`, and `xhigh`, so `high` returns
+`reasoning_effort_not_supported` (Ollama's vocabulary has no `xhigh`). `options`
+maps `temperature`, `top_p`, `top_k`, `min_p`, `seed`, `presence_penalty`, `frequency_penalty`,
+`stop`, `num_predict` (`-1` and `-2` keep the server default output budget), and `num_ctx`, which
+must not exceed `--max-context`. Sampler options the Engine does not implement (`repeat_penalty`,
+`mirostat*`, `typical_p`, ...) and unknown options are rejected with `option_not_supported`; runner
+options (`num_gpu`, `num_thread`, `use_mmap`, ...) and `keep_alive` are accepted without effect
+because residency is fixed at startup. `format` is rejected because the Engine has no constrained
+decoding. `model` must be the advertised model id or its `:latest` spelling, which Ollama-native
+clients use for untagged names; the response echoes the requested spelling.
+
+An empty `messages` array is Ollama's preload request. It is answered immediately with an empty
+assistant message, `done: true`, and `done_reason: "load"` (never `"unload"`: `keep_alive: 0` has
+no effect because the model stays resident); it is not a generation request and does not appear in
+the request log.
+
+A non-streaming reply is one JSON object; a stream is `application/x-ndjson` with one frame per
+line: content deltas in `message.content`, reasoning deltas in `message.thinking`, one
+`message.tool_calls` frame after generation when the model called tools, then a final frame with
+`done: true`, `done_reason` (`stop` or `length`), and the Ollama timing fields:
+
+```json
+{
+  "model": "qwen3.6-27b",
+  "created_at": "2026-08-15T10:00:00.123456789Z",
+  "message": {"role": "assistant", "content": ""},
+  "done": true,
+  "done_reason": "stop",
+  "total_duration": 1250000000,
+  "load_duration": 0,
+  "prompt_eval_count": 40,
+  "prompt_eval_duration": 500000000,
+  "eval_count": 30,
+  "eval_duration": 750000000
+}
+```
+
+Durations are integer nanoseconds. `prompt_eval_count` is the prompt suffix actually computed by
+prefill, excluding the resident prefix reused by the Engine, and `prompt_eval_duration` is that
+prefill phase; `eval_count` is the number of accepted generated token IDs and `eval_duration` is
+the decode phase that follows the first token. These are the same phase boundaries as
+`request_done.timings_seconds` in the structured request log, so `prompt_eval_count /
+prompt_eval_duration` is the log's prefill rate and `eval_count / eval_duration` is the rate Ollama
+clients such as Open WebUI display; the log's own decode rate divides `completion_tokens - 1` by
+the same phase because the first token is produced by prefill, so `eval_count / eval_duration`
+reads slightly higher for short outputs (and is undefined for a single-token reply, where
+`eval_duration` is `0`), exactly as it does for Ollama's llama.cpp runner. `load_duration` is
+always `0` because the model is resident, and `total_duration` includes CPU/media preparation.
+
+The read-only inventory endpoints describe the one resident model: `GET /api/tags` lists it with
+its artifact size, artifact timestamp, target family, and weight profile; `POST /api/show` (with
+`model` or legacy `name`) adds `model_info` with the frozen context length and the `completion`,
+`tools`, `vision` (only with `--vision`), and `thinking` capabilities; `GET /api/ps` reports it as
+loaded with its resident weight bytes; `GET /api/version` returns the advertised Ollama API level.
+Model management (`pull`, `push`, `create`, `copy`, `delete`), `/api/generate`, and embeddings are
+not served. Errors use the Ollama `{"error": "..."}` body.
+
 ## Authentication and CORS
 
-Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
+Pass `--api-key VALUE` to require the same value as an OpenAI or Ollama bearer token or Anthropic
 `x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated.
 
 ```bash
@@ -534,8 +613,8 @@ derived downstream from raw token counts and seconds instead of rounded stderr s
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
 but are rounded and are not the aggregation source. Console lines use local
-`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. OpenAI Responses, OpenAI Chat, and Anthropic
-generation requests receive a request ID when they enter synchronous preparation. Successful
+`[YYYY-MM-DD HH:MM:SS.mmm] [level]` timestamps. OpenAI Responses, OpenAI Chat, Anthropic, and
+Ollama generation requests receive a request ID when they enter synchronous preparation. Successful
 preparation produces `request_start`; a preparation failure produces `request_rejected` without a
 matching start. Later generation failures produce `request_error`. Schema/model validation
 rejections before preparation and token-count-only calls are not measurement requests and do not

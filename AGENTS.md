@@ -109,8 +109,9 @@ a small set of explicitly registered checkpoint artifacts. The supported identit
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
 `qwen3.8-27b/nvfp4`, and `qwen3.6-35b-a3b/groupwise-int`. The current implementation is compiled
 for `sm_120a` and tuned and measured on NVIDIA GeForce RTX 5090. All identities execute Text,
-image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic serving, and measurement through the
-same public `.ninfer` Engine route; the 35B-A3B target additionally supports text-only DFlash.
+image/video Vision, MTP, prefix reuse, CLI, OpenAI/Anthropic/Ollama serving, and measurement
+through the same public `.ninfer` Engine route; the 35B-A3B target additionally supports
+text-only DFlash.
 
 The current workload is one GPU and one resident model instance with a startup-fixed one to eight
 active requests. The Engine forms one compact decode batch at every round boundary and uses bounded
@@ -154,7 +155,7 @@ routing map, not a mandatory reading list:
 - `README.md` and executable `--help`: delivered capabilities and exact commands;
 - `docs/README.md`: public documentation map;
 - `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
-- `docs/serving.md`: OpenAI/Anthropic HTTP behavior;
+- `docs/serving.md`: OpenAI/Anthropic/Ollama HTTP behavior;
 - `docs/performance.md`: published performance methodology and results;
 - `docs/maintainer/concurrent-inference-architecture.md`: bounded ingress, request/slot lifecycle,
   scheduling, batched execution, CUDA Graph, and speculative-concurrency semantics;
@@ -221,8 +222,8 @@ not preserve backward compatibility. When a task replaces project-owned behavior
 obsolete aliases, fallbacks, transition branches, and tests in the affected contract instead of
 maintaining two paths. Do not turn that rule into unrelated repository-wide cleanup.
 
-The advertised OpenAI and Anthropic protocol surfaces are real external contracts. A change to
-their behavior must update the affected schema tests and serving documentation together.
+The advertised OpenAI, Anthropic, and Ollama protocol surfaces are real external contracts. A
+change to their behavior must update the affected schema tests and serving documentation together.
 
 Integrate stable requirements into the existing active reference. Use a temporary dated plan only
 when active work genuinely needs one; a plan is not a substitute for the requested deliverable.
@@ -292,7 +293,7 @@ The following are typical choices, not a cumulative checklist:
 | CUDA math | independent numerical oracle at relevant shapes |
 | memory/lifetime | the affected execution; sanitizer only for a concrete lifetime risk |
 | performance | measurement at the claimed scope; attribution tools only when needed |
-| serving | affected OpenAI/Anthropic schema tests and observable request/stream behavior |
+| serving | affected OpenAI/Anthropic/Ollama schema tests and observable request/stream behavior |
 
 Do not replace weak verification with low-value tests. State clearly when a relevant check could not
 run and why.

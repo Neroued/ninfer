@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/generation_service.h"
+#include "serve/ollama_schema.h"
 #include "serve/response_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_options.h"
@@ -51,6 +52,13 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    void handle_ollama_chat(const httplib::Request& req, httplib::Response& res);
+    void handle_ollama_tags(const httplib::Request& req, httplib::Response& res) const;
+    void handle_ollama_show(const httplib::Request& req, httplib::Response& res) const;
+    void handle_ollama_ps(const httplib::Request& req, httplib::Response& res) const;
+    void handle_ollama_version(const httplib::Request& req, httplib::Response& res) const;
+    // Throws a 404 model_not_found ApiException unless `requested` names the served model.
+    void require_ollama_model(const std::string& requested) const;
 
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);
@@ -65,6 +73,7 @@ private:
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
+    OllamaModelFacts ollama_facts_;
     ResponseStore response_store_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;

@@ -323,6 +323,119 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     return terminal_content, terminal_reasoning, terminal
 
 
+_OLLAMA_TIMING_KEYS = (
+    "total_duration",
+    "load_duration",
+    "prompt_eval_count",
+    "prompt_eval_duration",
+    "eval_count",
+    "eval_duration",
+)
+
+
+def require_ollama_terminal(frame: dict[str, Any]) -> None:
+    if frame.get("done") is not True or frame.get("done_reason") not in {"stop", "length"}:
+        raise ContractError(f"invalid Ollama terminal frame: {frame!r}")
+    for key in _OLLAMA_TIMING_KEYS:
+        value = frame.get(key)
+        if not isinstance(value, int) or value < 0:
+            raise ContractError(f"invalid Ollama {key}: {value!r}")
+    if frame["eval_count"] <= 0 or frame["eval_duration"] <= 0:
+        raise ContractError("Ollama terminal frame reports no timed decode")
+    if frame["total_duration"] < frame["prompt_eval_duration"] + frame["eval_duration"]:
+        raise ContractError("Ollama total_duration is shorter than its phases")
+
+
+def parse_ollama_stream(response: Response) -> tuple[str, str, dict[str, Any]]:
+    if response.status != 200 or response.content_type != "application/x-ndjson":
+        raise ContractError(
+            f"Ollama stream returned status={response.status} content-type={response.content_type}"
+        )
+    content: list[str] = []
+    thinking: list[str] = []
+    terminal: dict[str, Any] | None = None
+    for line in response.body.decode("utf-8").split("\n"):
+        if not line:
+            continue
+        if terminal is not None:
+            raise ContractError("Ollama stream continued after the done frame")
+        frame = json.loads(line)
+        if "error" in frame:
+            raise ContractError(f"Ollama stream error: {frame['error']!r}")
+        message = frame.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            raise ContractError("Ollama frame is missing the assistant message")
+        content.append(message.get("content", ""))
+        thinking.append(message.get("thinking", ""))
+        if frame.get("done"):
+            terminal = frame
+        elif any(key in frame for key in _OLLAMA_TIMING_KEYS):
+            raise ContractError("Ollama timing fields appeared before the done frame")
+    if terminal is None:
+        raise ContractError("Ollama stream ended without a done frame")
+    require_ollama_terminal(terminal)
+    return "".join(content), "".join(thinking), terminal
+
+
+def exercise_ollama(base_url: str, model: str, count_tokens: int) -> dict[str, Any]:
+    version = json_response(base_url, "GET", "/api/version")
+    if not isinstance(version.get("version"), str):
+        raise ContractError("Ollama version has the wrong shape")
+    tags = json_response(base_url, "GET", "/api/tags")
+    entries = tags.get("models")
+    if not isinstance(entries, list) or len(entries) != 1 or entries[0].get("model") != model:
+        raise ContractError("Ollama tags do not list the configured model")
+    show = json_response(base_url, "POST", "/api/show", {"model": model})
+    if "completion" not in show.get("capabilities", []) or not isinstance(
+        show.get("details"), dict
+    ):
+        raise ContractError("Ollama show has the wrong shape")
+    loaded = json_response(base_url, "GET", "/api/ps")
+    if [entry.get("model") for entry in loaded.get("models", [])] != [model]:
+        raise ContractError("Ollama ps does not report the resident model")
+    # Ollama-native clients address untagged models as name:latest and warm
+    # them with an empty-messages preload call.
+    tagged = f"{model}:latest"
+    if "capabilities" not in json_response(base_url, "POST", "/api/show", {"name": tagged}):
+        raise ContractError("Ollama show does not accept the name:latest spelling")
+    preload = json_response(base_url, "POST", "/api/chat", {"model": tagged, "messages": []})
+    if preload.get("done") is not True or preload.get("done_reason") != "load":
+        raise ContractError("Ollama preload request did not report done_reason load")
+    if preload.get("model") != tagged or preload.get("message", {}).get("content") != "":
+        raise ContractError("Ollama preload response has the wrong shape")
+
+    prompt = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply briefly."}],
+        "options": {"temperature": 0, "num_predict": 4},
+        "stream": False,
+    }
+    nonstream = json_response(base_url, "POST", "/api/chat", prompt)
+    require_ollama_terminal(nonstream)
+    message = nonstream.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+        raise ContractError("Ollama response is missing the assistant message")
+    if nonstream["prompt_eval_count"] > count_tokens:
+        raise ContractError("Ollama prompt_eval_count exceeds the prompt token count")
+
+    streamed = request(base_url, "POST", "/api/chat", {**prompt, "stream": True})
+    content, thinking, terminal = parse_ollama_stream(streamed)
+    if content != message.get("content", "") or thinking != message.get("thinking", ""):
+        raise ContractError("Ollama streamed output differs from the greedy non-streaming reply")
+    if terminal["eval_count"] != nonstream["eval_count"]:
+        raise ContractError("Ollama streamed and non-streaming eval_count differ")
+    if terminal["done_reason"] != nonstream["done_reason"]:
+        raise ContractError("Ollama streamed and non-streaming done_reason differ")
+    return {
+        "ollama_done_reason": nonstream["done_reason"],
+        "ollama_prompt_eval_count": nonstream["prompt_eval_count"],
+        "ollama_eval_count": nonstream["eval_count"],
+        "ollama_eval_tokens_per_second": round(
+            nonstream["eval_count"] / (nonstream["eval_duration"] / 1e9), 1
+        ),
+    }
+
+
 def exercise(base_url: str, model: str) -> dict[str, Any]:
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
@@ -486,8 +599,10 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     if anthropic_input_tokens != input_tokens:
         raise ContractError("Anthropic usage input_tokens differs from count_tokens")
 
+    ollama = exercise_ollama(base_url, model, input_tokens)
+
     return {
-        "format": "ninfer_serve_contract_v2",
+        "format": "ninfer_serve_contract_v3",
         "model": model,
         "count_tokens": input_tokens,
         "openai_finish_reason": stream_finish,
@@ -496,6 +611,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "responses_output_tokens": response_output_tokens,
         "image_prompt_tokens": image_prompt_tokens,
         "anthropic_stop_reason": anthropic["stop_reason"],
+        **ollama,
     }
 
 

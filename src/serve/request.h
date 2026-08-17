@@ -46,6 +46,7 @@ private:
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
     int default_max_tokens = 8192;
+    int max_context        = 0; // startup-frozen prompt+output window; 0 => not validated
 };
 
 struct CompletionUsage {
@@ -104,13 +105,15 @@ struct ChatTurn {
                                    // template)
 };
 
-// OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains
+// Sampling fields carried by the protocol adapters. `logit_bias` remains
 // parsed for wire compatibility; the current public engine sampler has no bias
-// input, so it does not affect generation.
+// input, so it does not affect generation. `min_p` is reachable only from the
+// Ollama surface; the OpenAI and Anthropic contracts have no such field.
 struct SamplingParams {
     std::optional<double> temperature;
     std::optional<double> top_p;
     std::optional<int> top_k;
+    std::optional<double> min_p;
     std::optional<double> presence_penalty;
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;

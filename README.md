@@ -4,7 +4,7 @@
 
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs.
+OpenAI-/Anthropic-/Ollama-compatible HTTP APIs.
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
@@ -288,7 +288,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 The server also implements OpenAI Responses Core (typed Items, semantic SSE, local continuation
-state, and function calls) plus Anthropic Messages, token counting, and multimodal input. See
+state, and function calls), Anthropic Messages, token counting, multimodal input, and Ollama chat
+with per-request prefill/decode timings for Ollama clients such as Open WebUI. See
 [HTTP serving](docs/serving.md).
 
 ## Capabilities
@@ -304,8 +305,8 @@ All three registered model IDs support:
 - model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
   top-k, top-p, min-p, and presence/frequency-penalty overrides;
 - compatible-prefix reuse;
-- OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
-  usage accounting;
+- OpenAI Responses Core, OpenAI Chat Completions, Anthropic Messages, and Ollama chat, including
+  streaming and usage accounting;
 - prompt-rendered function tools and parsed tool calls.
 
 The 35B-A3B target additionally supports text-only DFlash speculative decoding with draft windows

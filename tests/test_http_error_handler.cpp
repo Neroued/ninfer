@@ -69,6 +69,19 @@ int main() {
                               "1234 bytes") != std::string::npos,
                       "empty OpenAI 413 did not become a payload-limit error");
 
+    httplib::Request ollama_request;
+    ollama_request.path = "/api/chat";
+    httplib::Response ollama_response;
+    ollama_response.status = 413;
+    const auto ollama_result =
+        ninfer::serve::handle_unrendered_http_error(options, ollama_request, ollama_response);
+    const Json ollama_body = Json::parse(ollama_response.body);
+    failures += check(ollama_result == httplib::Server::HandlerResponse::Handled &&
+                          ollama_body.at("error").is_string() &&
+                          ollama_body.at("error").get<std::string>().find("1234 bytes") !=
+                              std::string::npos,
+                      "empty Ollama 413 did not become a flat Ollama payload-limit error");
+
     httplib::Response authored_response;
     authored_response.status = 413;
     authored_response.set_content(R"({"error":{"code":"application_error"}})", "application/json");

@@ -77,7 +77,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
-           "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
+           "       serves OpenAI Responses/Chat Completions, Anthropic Messages, and Ollama chat "
+           "endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"

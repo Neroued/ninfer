@@ -8,7 +8,7 @@ run the CLI or HTTP server.
 | Document | Purpose |
 |---|---|
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, and common runtime options |
-| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, and tool calls |
+| [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, Ollama chat, state, streaming, token counting, authentication, and tool calls |
 | [Performance](performance.md) | RTX 5090 single-request and concurrent-decode results, MTP/DFlash measurements, and reproduction commands |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 

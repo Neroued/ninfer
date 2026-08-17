@@ -165,6 +165,10 @@ __launch_bounds__(256) __global__
             float k0_scaled = k0 * kinv;
             float k1_scaled = k1 * kinv;
             e8_project_8d_warp(k0_scaled, k1_scaled, lane);
+            // NOTE: same deliberate half-coset approximation as the rk4v4-e8 decode path
+            // (see gqa_attention_decode_i8.cuh): the D8+0.5 E8 coset is collapsed by the
+            // rintf()+cast below and never reconstructed, since no coset bit exists in the
+            // packed i4/int8 codes. The rk4v4 (non-E8) path is unaffected.
             int q0 = static_cast<int>(rintf(k0_scaled));
             int q1 = static_cast<int>(rintf(k1_scaled));
             c0 = static_cast<std::int8_t>(max(-8, min(7, q0)));
@@ -301,6 +305,10 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
             float k0_scaled = k0 * kinv;
             float k1_scaled = k1 * kinv;
             e8_project_8d_warp(k0_scaled, k1_scaled, lane);
+            // NOTE: same deliberate half-coset approximation as the rk4v4-e8 decode path
+            // (see gqa_attention_decode_i8.cuh): the D8+0.5 E8 coset is collapsed by the
+            // rintf()+cast below and never reconstructed, since no coset bit exists in the
+            // packed i4/int8 codes. The rk4v4 (non-E8) path is unaffected.
             int q0 = static_cast<int>(rintf(k0_scaled));
             int q1 = static_cast<int>(rintf(k1_scaled));
             c0 = static_cast<std::int8_t>(max(-8, min(7, q0)));

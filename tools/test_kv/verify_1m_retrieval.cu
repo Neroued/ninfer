@@ -4,6 +4,7 @@
 #include <chrono>
 #include <random>
 #include <cassert>
+#include <cstdlib>
 #include <iomanip>
 #include <cmath>
 #include <algorithm>
@@ -240,6 +241,15 @@ int main(int argc, char** argv) {
     std::cout << "   [SUMMARY] Microbenchmark Completed with 100% Mathematical Rigor.\n";
     std::cout << "=================================================================\n";
 
+    // Pass/fail summary for CI/CTest: the run only succeeds if every embedded needle is
+    // recovered by the E8 codec at its exact token index. Any missed needle (or a
+    // threshold breach) must fail the process so a CI/CTest run can detect a regression
+    // instead of always exiting 0.
+    const bool all_passed = (needles_found == static_cast<int>(needle_indices.size()));
+    std::cout << "\n  Needle Retrieval: " << needles_found << " / " << needle_indices.size()
+              << " found -> " << (all_passed ? "[PASS]" : "[FAIL]") << "\n";
+    std::cout << "  Verifier exit status: " << (all_passed ? "SUCCESS" : "FAILURE") << "\n";
+
     cudaFree(d_keys);
     cudaFree(d_tiles_2bit);
     cudaFree(d_tiles_4bit);
@@ -247,5 +257,5 @@ int main(int argc, char** argv) {
     cudaFree(d_scores_4bit);
     cudaFree(d_scores_fp32);
     cudaFree(d_query);
-    return 0;
+    return all_passed ? EXIT_SUCCESS : EXIT_FAILURE;
 }

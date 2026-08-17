@@ -260,6 +260,18 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     float kv0_scaled = kv0 * k_inv;
                     float kv1_scaled = kv1 * k_inv;
                     e8_project_8d_warp(kv0_scaled, kv1_scaled, lane);
+                    // NOTE (correctness hardening of the ported codec): e8_project_8d_warp
+                    // returns the nearest E8 lattice point, which may lie in the D8+0.5
+                    // coset (all coordinates half-integral). The i4/int8 codes can only hold
+                    // integers and no coset bit is stored, so the half is intentionally
+                    // collapsed here by the rintf()+cast below and the D8+0.5 coset is NOT
+                    // reconstructed on decode (reconstructed K == code * ks). This is a
+                    // deliberate half-coset approximation of rk4v4-e8, not an exact E8
+                    // lattice projection, for any vector whose nearest lattice point is
+                    // half-integral. Preserving the exact E8 point would require a per-8-dim
+                    // coset bit in the packed layout (a format change, out of scope here).
+                    // The rk4v4 (non-E8) path below is unaffected. Original design credit:
+                    // UDPSendToFailed/ninfer-4090 (and Don-Chad/ninfer-3090 lineage).
                     int q0 = static_cast<int>(rintf(kv0_scaled));
                     int q1 = static_cast<int>(rintf(kv1_scaled));
                     c0 = static_cast<std::int8_t>(max(-8, min(7, q0)));

@@ -236,11 +236,17 @@ __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
         rad_idx = static_cast<uint32_t>(q_rad < 1 ? 1 : (q_rad > 15 ? 15 : q_rad));
     }
 
-    if (rad_idx == 0) {
-        out_root = 0;
-        out_rad_axis = 0;
-        return;
-    }
+    // NOTE (correctness hardening of the ported codec): rad_idx is derived from a
+    // per-8-lane-subgroup norm (the 8-lane butterfly sum below only straddles lane
+    // bits 0-2), so it can differ ACROSS the four 8-lane subgroups of one warp when
+    // the warp's 32 lanes hold different dimensions of the same token. We must NOT
+    // early-return here: every lane named by full_mask (the whole 32-lane warp) has
+    // to converge on each __shfl*_sync below, or the divergent shuffle is undefined
+    // behaviour that can corrupt stored key codes (RK2V4E8). A zero-rad_idx subgroup
+    // is instead zeroed by the guarded output write at the end of the function; its
+    // per-subgroup intermediate values cannot leak into other subgroups because every
+    // shuffle uses XOR masks {1,2,4} that stay inside an 8-lane subgroup. Original
+    // design credit: UDPSendToFailed/ninfer-4090 (and Don-Chad/ninfer-3090 lineage).
 
     // 3. Unit vector
     float inv_norm = 1.0f / (out_norm + 1e-8f);
@@ -356,7 +362,18 @@ __device__ __forceinline__ void e8_encode_cylinder_8d_warp(
     uint32_t sign_bit = (best_res_sign_val >= 0.0f) ? 0 : 1;
     uint32_t axis_idx = (static_cast<uint32_t>(best_dim) << 1) | sign_bit;
 
-    out_rad_axis = static_cast<uint8_t>((rad_idx << 4) | (axis_idx & 0x0F));
+    // Guarded output write: a zero-rad_idx (near-zero-norm) subgroup must still have
+    // participated in every full-mask shuffle above so the whole warp stays converged;
+    // it emits the zero code here, matching the pre-fix behaviour but only AFTER all
+    // __shfl*_sync calls have completed.
+    if (rad_idx == 0) {
+        out_root     = 0;
+        out_rad_axis = 0;
+    } else {
+        // out_root was already selected by the Type A/B decision above; only the
+        // radius/axis byte depends on rad_idx.
+        out_rad_axis = static_cast<uint8_t>((rad_idx << 4) | (axis_idx & 0x0F));
+    }
 }
 
 __device__ __forceinline__ void e8_encode_root_2stage_8d(

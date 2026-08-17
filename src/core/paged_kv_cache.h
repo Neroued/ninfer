@@ -30,6 +30,12 @@ struct PagedKVLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    bool packed_v             = false;
+    bool rotate_k             = false;
+    bool rotate_v             = false;
+    bool packed_k             = false;
+    bool e8_lattice           = false;
+    bool e8_root              = false;
 };
 
 /**
@@ -49,6 +55,12 @@ struct PagedKVBatchLayerView {
     std::int32_t num_kv_heads = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    bool packed_v             = false;
+    bool rotate_k             = false;
+    bool rotate_v             = false;
+    bool packed_k             = false;
+    bool e8_lattice           = false;
+    bool e8_root              = false;
 };
 
 // A pool plane is storage-only. Consumers assign K/V/layer meaning to plane indices.

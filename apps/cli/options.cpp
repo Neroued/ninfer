@@ -55,6 +55,10 @@ float parse_float(const char* text, std::string_view label, float minimum, float
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
+    if (text == "rk8v4") { return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
+    if (text == "rk4v4") { return KvCacheStorage::RotatedInt4KeyInt4ValueGroup64; }
+    if (text == "rk4v4-e8") { return KvCacheStorage::RK4V4E8; }
+    if (text == "rk2v4-e8") { return KvCacheStorage::RK2V4E8; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -75,9 +79,9 @@ ReasoningEffort parse_reasoning_effort(std::string_view text) {
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
-           "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
+           "[--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
+           "[--device N]\n"
+           "[--kv-dtype bf16|int8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"

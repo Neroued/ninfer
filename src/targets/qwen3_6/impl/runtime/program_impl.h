@@ -184,6 +184,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
+      kv_packed_v(plan.kv_packed_v), kv_rotate_k(plan.kv_rotate_k), kv_rotate_v(plan.kv_rotate_v),
+      kv_packed_k(plan.kv_packed_k), kv_e8_lattice(plan.kv_e8_lattice), kv_e8_root(plan.kv_e8_root),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
@@ -2209,7 +2211,16 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.device      = device.device;
     out.max_context = capacity;
     out.kv_capacity = kv_capacity;
-    out.kv_cache = kv_dtype == DType::BF16 ? KvCacheStorage::BFloat16 : KvCacheStorage::Int8Group64;
+    out.kv_cache = kv_dtype == DType::BF16
+                       ? KvCacheStorage::BFloat16
+                       : (kv_e8_root
+                              ? KvCacheStorage::RK2V4E8
+                              : (kv_e8_lattice
+                                     ? KvCacheStorage::RK4V4E8
+                                     : (kv_packed_k
+                                            ? KvCacheStorage::RotatedInt4KeyInt4ValueGroup64
+                                            : (kv_rotate_v ? KvCacheStorage::RotatedInt8KeyInt4ValueGroup64
+                                                           : KvCacheStorage::Int8Group64))));
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

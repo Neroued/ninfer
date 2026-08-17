@@ -87,8 +87,10 @@ std::wstring to_wide(const std::string& s) {
 // Splits "https://host/path..." into (host, path-and-query).
 void split_url(const std::string& url, std::string& host, std::string& path) {
     const size_t scheme_end = url.find("://");
-    const size_t path_start = url.find('/', scheme_end + 3);
-    host = url.substr(0, path_start == std::string::npos ? url.size() : path_start);
+    // Host starts after the scheme so WinHttpConnect never sees "https://host".
+    const size_t host_start = scheme_end == std::string::npos ? 0 : scheme_end + 3;
+    const size_t path_start = url.find('/', host_start);
+    host = url.substr(host_start, path_start == std::string::npos ? std::string::npos : path_start - host_start);
     path = path_start == std::string::npos ? "/" : url.substr(path_start);
 }
 

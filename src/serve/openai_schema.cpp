@@ -570,6 +570,10 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {
         out.include_usage = get_bool(body.at("stream_options"), "include_usage", false);
     }
+
+    parse_openai_reasoning_effort(body, out);
+    out.preserve_thinking = parse_openai_preserve_thinking(body);
+
     std::optional<bool> top_level_thinking;
     if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
         top_level_thinking = get_bool(body, "enable_thinking", false);
@@ -581,9 +585,11 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
         bad_request("conflicting enable_thinking values", "enable_thinking",
                     "conflicting_template_option");
     }
-    out.enable_thinking = template_thinking ? template_thinking : top_level_thinking;
-    parse_openai_reasoning_effort(body, out);
-    out.preserve_thinking = parse_openai_preserve_thinking(body);
+    if (template_thinking) {
+        out.enable_thinking = *template_thinking;
+    } else if (top_level_thinking) {
+        out.enable_thinking = *top_level_thinking;
+    }
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }

@@ -49,7 +49,10 @@ struct BuiltResponse {
 };
 
 // Parse POST /v1/responses. Only NInfer Responses Core capabilities are
-// accepted; recognized but unsupported OpenAI fields fail explicitly.
+// accepted; recognized but unsupported OpenAI fields fail explicitly. Harmless
+// client hints (prompt_cache_key/prompt_cache_options/prompt_cache_retention,
+// include, client_metadata, parallel_tool_calls=false, reasoning.summary, and
+// non-function tool types) are validated for shape and ignored.
 ResponsesRequest parse_responses_request(const nlohmann::json& body, const RequestLimits& limits);
 
 // Parse POST /v1/responses/input_tokens. The current OpenAI endpoint accepts

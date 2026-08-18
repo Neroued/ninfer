@@ -453,8 +453,20 @@ void parse_tools(const Json& body, ResponsesRequest& out) {
         if (!item.is_object() || !item.contains("type") || !item.at("type").is_string()) {
             bad_request("tools entries must be objects with a string type", "tools");
         }
-        if (item.at("type").get<std::string>() != "function") {
-            bad_request("only function tools are supported", "tools", "tool_type_not_supported");
+        const std::string tool_type = item.at("type").get<std::string>();
+        if (tool_type != "function") {
+            // Non-function tools (web search, tool search, freeform custom
+            // tools, tool namespaces, file search) declare client-side
+            // capabilities this server does not execute. They are validated
+            // for shape (a string type) and ignored (vLLM/OpenAI parity); the
+            // model is not primed to call them.
+            if (tool_type != "web_search" && tool_type != "tool_search" &&
+                tool_type != "custom" && tool_type != "namespace" &&
+                tool_type != "file_search") {
+                bad_request("unsupported tool type: " + tool_type, "tools",
+                            "tool_type_not_supported");
+            }
+            continue;
         }
         ToolDefinition tool;
         tool.name = require_function_name(item, "tools");
@@ -532,7 +544,16 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
     const Json& reasoning = body.at("reasoning");
     if (!reasoning.is_object()) { bad_request("reasoning must be an object", "reasoning"); }
     for (auto it = reasoning.begin(); it != reasoning.end(); ++it) {
-        if (it.key() != "effort" && !it.value().is_null()) {
+        if (it.key() == "effort") { continue; }
+        if (it.key() == "summary") {
+            // Client asks to stream reasoning summaries; not implemented, so
+            // the value ("auto", "none", ...) is validated and ignored.
+            if (!it.value().is_null() && !it.value().is_string()) {
+                bad_request("reasoning.summary must be a string", "reasoning");
+            }
+            continue;
+        }
+        if (!it.value().is_null()) {
             bad_request("reasoning." + it.key() + " is not supported", "reasoning",
                         "reasoning_option_not_supported");
         }
@@ -573,6 +594,7 @@ void reject_unknown_top_level(const Json& body) {
     static const std::unordered_set<std::string> allowed = {
         "background",
         "chat_template_kwargs",
+        "client_metadata",
         "context_management",
         "conversation",
         "include",
@@ -614,8 +636,7 @@ void reject_unknown_top_level(const Json& body) {
 
 void reject_server_managed_features(const Json& body) {
     for (const char* key : {"context_management", "conversation", "max_tool_calls", "moderation",
-                            "prompt", "prompt_cache_key", "prompt_cache_options",
-                            "prompt_cache_retention", "safety_identifier", "user"}) {
+                            "prompt", "safety_identifier", "user"}) {
         if (body.contains(key) && !body.at(key).is_null()) {
             bad_request(std::string(key) + " is not supported", key, "parameter_not_supported");
         }
@@ -631,19 +652,19 @@ void reject_server_managed_features(const Json& body) {
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("additional response fields are not supported", "include",
-                        "include_not_supported");
+        for (const Json& value : body.at("include")) {
+            if (!value.is_string()) { bad_request("include entries must be strings", "include"); }
         }
+        // Requested-extra response fields (e.g. "reasoning.encrypted_content") are
+        // accepted and ignored: they do not change generated output.
     }
     if (body.contains("parallel_tool_calls") && !body.at("parallel_tool_calls").is_null()) {
         if (!body.at("parallel_tool_calls").is_boolean()) {
             bad_request("parallel_tool_calls must be a boolean", "parallel_tool_calls");
         }
-        if (!body.at("parallel_tool_calls").get<bool>()) {
-            bad_request("parallel_tool_calls=false cannot be enforced", "parallel_tool_calls",
-                        "parallel_tool_calls_not_supported");
-        }
+        // Parallel tool calls are the server's only mode; a request to disable
+        // them cannot be enforced and is accepted and ignored (vLLM parity).
+        // The response still reports parallel_tool_calls=true.
     }
     if (body.contains("top_logprobs") && !body.at("top_logprobs").is_null()) {
         const std::optional<int> value = optional_int(body, "top_logprobs");
@@ -706,10 +727,34 @@ void reject_server_managed_features(const Json& body) {
     }
 }
 
+// Accepted-and-ignored client hints (mirroring vLLM and other OpenAI-compatible
+// servers). These fields tune client-side prompt caching or carry client
+// metadata and never change generated output, so they are validated for shape
+// and dropped instead of failing the request.
+void validate_ignored_client_hints(const Json& body) {
+    if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null() &&
+        !body.at("prompt_cache_key").is_string()) {
+        bad_request("prompt_cache_key must be a string", "prompt_cache_key");
+    }
+    if (body.contains("prompt_cache_retention") && !body.at("prompt_cache_retention").is_null() &&
+        !body.at("prompt_cache_retention").is_string()) {
+        bad_request("prompt_cache_retention must be a string", "prompt_cache_retention");
+    }
+    if (body.contains("prompt_cache_options") && !body.at("prompt_cache_options").is_null() &&
+        !body.at("prompt_cache_options").is_object()) {
+        bad_request("prompt_cache_options must be an object", "prompt_cache_options");
+    }
+    if (body.contains("client_metadata") && !body.at("client_metadata").is_null() &&
+        !body.at("client_metadata").is_object()) {
+        bad_request("client_metadata must be an object", "client_metadata");
+    }
+}
+
 ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limits) {
     require_object(body);
     reject_unknown_top_level(body);
     reject_server_managed_features(body);
+    validate_ignored_client_hints(body);
 
     ResponsesRequest out;
     if (!body.contains("model") || !body.at("model").is_string() ||

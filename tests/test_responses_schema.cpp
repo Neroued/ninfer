@@ -308,6 +308,135 @@ int test_typed_items_and_tools() {
     return failures;
 }
 
+int test_ignored_client_hints() {
+    // Codex-shaped request: every client hint present at once must parse and
+    // leave generation inputs unchanged.
+    const Json codex = {
+        {"model", "qwen3.6-27b"},
+        {"input", "hello"},
+        {"max_output_tokens", 32},
+        {"instructions", "Be brief."},
+        {"tool_choice", "auto"},
+        {"parallel_tool_calls", false},
+        {"reasoning", Json{{"effort", "medium"}, {"summary", "auto"}}},
+        {"store", false},
+        {"include", Json::array({"reasoning.encrypted_content"})},
+        {"prompt_cache_key", "session/thread:1"},
+        {"prompt_cache_retention", "1h"},
+        {"prompt_cache_options", Json{{"prompt_cache_breakpoint", "auto"}}},
+        {"client_metadata",
+         Json{{"x-codex-session-id", "s1"}, {"x-codex-thread-id", "t1"}}},
+        {"tools",
+         Json::array({Json{{"type", "function"},
+                           {"name", "shell"},
+                           {"parameters", Json{{"type", "object"}}},
+                           {"strict", false}},
+                      Json{{"type", "web_search"}, {"external_web_access", false}}})},
+    };
+    int failures = 0;
+    const ResponsesRequest request = parse_responses_request(codex, limits());
+    failures += check(request.instructions.has_value() && *request.instructions == "Be brief.",
+                      "hints do not drop instructions");
+    failures += check(request.input_turns.size() == 1 &&
+                          request.input_turns[0].role == ninfer::ChatRole::User,
+                      "hints do not change input");
+    failures += check(request.tools.size() == 1, "hints do not drop tools");
+    failures += check(request.generation.tools.size() == 1 &&
+                          request.generation.tools[0].name == "shell",
+                      "non-function tools are not primed");
+    failures += check(!request.store, "store preserved");
+    failures += check(request.generation.max_tokens == 32, "generation options preserved");
+
+    // Each hint is accepted on its own and ignored.
+    for (const char* key : {"prompt_cache_key", "prompt_cache_retention"}) {
+        Json single = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+        single[key] = "value";
+        failures += check(!throws_api([&] { (void)parse_responses_request(single, limits()); }),
+                          std::string("accepted: ") + key);
+    }
+    for (const char* key : {"prompt_cache_options", "client_metadata"}) {
+        Json single = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+        single[key] = Json{{"k", "v"}};
+        failures += check(!throws_api([&] { (void)parse_responses_request(single, limits()); }),
+                          std::string("accepted: ") + key);
+    }
+    Json include_ok         = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    include_ok["include"]   = Json::array({"reasoning.encrypted_content", "response.usage"});
+    const ResponsesRequest include_parsed = parse_responses_request(include_ok, limits());
+    failures += check(include_parsed.input_turns.size() == 1, "include entries accepted and ignored");
+
+    // Malformed hint shapes are still rejected explicitly.
+    Json bad_key = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    bad_key["prompt_cache_key"] = 42;
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_key, limits()); }),
+                      "prompt_cache_key must be a string");
+
+    Json bad_retention                = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    bad_retention["prompt_cache_retention"] = 42;
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_retention, limits()); }),
+                      "prompt_cache_retention must be a string");
+
+    Json bad_options                = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    bad_options["prompt_cache_options"] = "x";
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_options, limits()); }),
+                      "prompt_cache_options must be an object");
+
+    Json bad_metadata                = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    bad_metadata["client_metadata"]  = "x";
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_metadata, limits()); }),
+                      "client_metadata must be an object");
+
+    Json bad_include = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    bad_include["include"] = "x";
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_include, limits()); }),
+                      "include must be an array");
+
+    Json bad_include_entry              = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    bad_include_entry["include"]        = Json::array({"ok", 42});
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_include_entry, limits()); }),
+                      "include entries must be strings");
+
+    // parallel_tool_calls=false (sent by Codex via litellm) is accepted and
+    // ignored; non-boolean shapes are still rejected.
+    Json ptc_false = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    ptc_false["parallel_tool_calls"] = false;
+    failures += check(!throws_api([&] { (void)parse_responses_request(ptc_false, limits()); }),
+                      "parallel_tool_calls=false accepted and ignored");
+
+    Json bad_ptc = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    bad_ptc["parallel_tool_calls"] = "x";
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_ptc, limits()); }),
+                      "parallel_tool_calls must be a boolean");
+
+    // Codex ships a built-in web_search tool; every known non-function tool
+    // type is accepted and ignored, unknown types are rejected.
+    for (const char* type :
+         {"web_search", "tool_search", "custom", "namespace", "file_search"}) {
+        Json with_ignored = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+        with_ignored["tools"] = Json::array({Json{{"type", type}, {"name", "x"}}});
+        failures += check(!throws_api([&] { (void)parse_responses_request(with_ignored, limits()); }),
+                          std::string("non-function tool accepted and ignored: ") + type);
+    }
+    Json unknown_tool = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    unknown_tool["tools"] = Json::array({Json{{"type", "made_up"}}});
+    failures += check(api_code([&] { (void)parse_responses_request(unknown_tool, limits()); }) ==
+                          "tool_type_not_supported",
+                      "unknown tool type rejected");
+
+    // reasoning.summary is a client hint for streaming reasoning summaries;
+    // string values are accepted and ignored, non-string shapes rejected.
+    Json summary_ok = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    summary_ok["reasoning"] = Json{{"effort", "low"}, {"summary", "auto"}};
+    const ResponsesRequest summary_parsed = parse_responses_request(summary_ok, limits());
+    failures += check(summary_parsed.generation.reasoning_effort_param == "reasoning.effort",
+                      "reasoning.summary accepted and ignored");
+    Json bad_summary = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    bad_summary["reasoning"] = Json{{"effort", "low"}, {"summary", 42}};
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_summary, limits()); }),
+                      "reasoning.summary must be a string");
+    return failures;
+}
+
 int test_explicit_rejections() {
     const Json base = {{"model", "qwen3.6-27b"}, {"input", "hello"}, {"max_output_tokens", 32}};
     int failures    = 0;
@@ -522,6 +651,7 @@ int main() {
     failures += test_preserve_thinking_options_and_inheritance();
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();
+    failures += test_ignored_client_hints();
     failures += test_explicit_rejections();
     failures += test_response_object();
     failures += test_sse_sequence();

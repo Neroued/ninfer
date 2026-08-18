@@ -212,21 +212,31 @@ wire response contains typed `output` Items.
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.summary` | optional string (e.g. `auto`) or `null`, accepted and ignored (client hint for streaming reasoning summaries, not implemented) |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
-| `tools` | flat Responses function definitions; see below |
+| `tools` | function definitions are used; known non-function tool types (`web_search`, `tool_search`, `custom`, `namespace`, `file_search`) are validated and ignored; see below |
 | `tool_choice` | `auto` or `none` |
-| `parallel_tool_calls` | omitted or `true` |
+| `parallel_tool_calls` | optional boolean; `true` or `false` both accepted. Parallel tool calls are the server’s only mode; `false` is validated and ignored, the response always reports `true` |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted or an empty array |
+| `include` | accepted array of strings, e.g. `["reasoning.encrypted_content"]`; requested-extra response fields are ignored |
+| `prompt_cache_key` | optional string, accepted and ignored (client-side prompt-cache routing hint) |
+| `prompt_cache_options` | optional object, accepted and ignored (client-side prompt-cache hint) |
+| `prompt_cache_retention` | optional string, accepted and ignored (client-side prompt-cache hint) |
+| `client_metadata` | optional object, accepted and ignored (client-supplied metadata, e.g. Codex trace context) |
 | `stream_options` | omitted or `{"include_obfuscation":false}` |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
-with a field-specific 400 error instead of being silently ignored.
+with a field-specific 400 error instead of being silently ignored. Harmless client hints
+(`prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, `include`,
+`client_metadata`, `parallel_tool_calls=false`, `reasoning.summary`, and non-function tool types)
+are validated for shape and then ignored: they tune client-side caching, carry client metadata,
+request a parallel-tool-call mode or reasoning-summary streaming that cannot be enforced, or
+declare client-side capabilities this server does not execute (matching vLLM behavior).
 
 ### Input Item contract
 
@@ -278,8 +288,10 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. NInfer does not execute functions or enforce JSON Schema through constrained
-decoding, so `strict:true`, `tool_choice:required`, named tool choice, hosted tools, MCP tools, and
-custom free-form tools are rejected.
+decoding, so `strict:true`, `tool_choice:required`, named tool choice, hosted tools, and MCP tools
+are rejected. Known non-function tool types (`web_search`, `tool_search`, `custom`, `namespace`,
+`file_search`) declare client-side capabilities this server does not execute: they are validated
+for shape and ignored, and the model is not primed to call them.
 
 ### Response object and usage
 
@@ -387,8 +399,8 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
 moderation, prompt-cache controls, safety/user identifiers, Structured Outputs/JSON mode,
-non-empty `include`, background execution, compaction, files/audio, and OpenAI-hosted/MCP/custom
-tools. These are compatibility boundaries, not silently accepted placeholders.
+background execution, compaction, files/audio, and OpenAI-hosted/MCP/custom tools that would be
+executed server-side. These are compatibility boundaries, not silently accepted placeholders.
 
 ## Anthropic Messages
 

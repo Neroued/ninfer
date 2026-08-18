@@ -80,6 +80,19 @@ bool valid_function_name(const std::string& name) {
     return true;
 }
 
+constexpr std::string_view kNamespaceToolSeparator = "__";
+
+// Namespaced function tools reach the model under the flat name
+// "<namespace>__<name>" (the same convention vLLM uses), because the Qwen
+// prompt format has no notion of tool namespaces. The flat name is validated
+// against the same character/length rules as a plain function name.
+std::string flat_namespace_tool_name(const std::string& ns, const std::string& name) {
+    std::string flat;
+    flat.reserve(ns.size() + kNamespaceToolSeparator.size() + name.size());
+    flat.append(ns).append(kNamespaceToolSeparator).append(name);
+    return flat;
+}
+
 std::string require_function_name(const Json& object, const char* param) {
     if (!object.contains("name") || !object.at("name").is_string()) {
         bad_request("function name must be a string", param);
@@ -301,8 +314,22 @@ ToolCall parse_function_call_item(const Json& item, Json& canonical) {
         item.at("call_id").get<std::string>().empty()) {
         bad_request("function_call must contain a non-empty call_id", "input");
     }
-    call.id   = item.at("call_id").get<std::string>();
-    call.name = require_function_name(item, "input");
+    call.id                     = item.at("call_id").get<std::string>();
+    const std::string wire_name = require_function_name(item, "input");
+    std::optional<std::string> ns;
+    if (item.contains("namespace") && !item.at("namespace").is_null()) {
+        if (!item.at("namespace").is_string() ||
+            !valid_function_name(item.at("namespace").get<std::string>())) {
+            bad_request("function_call namespace must match [A-Za-z0-9_-]{1,64}", "input");
+        }
+        ns = item.at("namespace").get<std::string>();
+    }
+    // History replays under the same flat name the model was primed with.
+    call.name = ns ? flat_namespace_tool_name(*ns, wire_name) : wire_name;
+    if (ns && !valid_function_name(call.name)) {
+        bad_request("function_call namespace and name must flatten to [A-Za-z0-9_-]{1,64}",
+                    "input");
+    }
     if (!item.contains("arguments") || !item.at("arguments").is_string()) {
         bad_request("function_call arguments must be a JSON string", "input");
     }
@@ -319,8 +346,9 @@ ToolCall parse_function_call_item(const Json& item, Json& canonical) {
                  {"type", "function_call"},
                  {"status", "completed"},
                  {"call_id", call.id},
-                 {"name", call.name},
+                 {"name", wire_name},
                  {"arguments", call.arguments_json}};
+    if (ns) { canonical["namespace"] = *ns; }
     return call;
 }
 
@@ -445,6 +473,91 @@ void parse_input(const Json& input, ResponsesRequest& out) {
     }
 }
 
+void parse_function_tool(const Json& item, const std::string* ns,
+                         std::unordered_set<std::string>& names, ResponsesRequest& out) {
+    ToolDefinition tool;
+    const std::string wire_name = require_function_name(item, "tools");
+    tool.name                   = ns ? flat_namespace_tool_name(*ns, wire_name) : wire_name;
+    if (ns && !valid_function_name(tool.name)) {
+        bad_request("namespaced function name " + *ns + "." + wire_name +
+                        " must flatten to [A-Za-z0-9_-]{1,64}",
+                    "tools");
+    }
+    if (!names.insert(tool.name).second) {
+        bad_request("duplicate function tool name: " + tool.name, "tools");
+    }
+    if (item.contains("description") && !item.at("description").is_null()) {
+        if (!item.at("description").is_string()) {
+            bad_request("function description must be a string", "tools");
+        }
+        tool.description = item.at("description").get<std::string>();
+    }
+    Json parameters = Json{{"type", "object"}, {"properties", Json::object()}};
+    if (item.contains("parameters") && !item.at("parameters").is_null()) {
+        if (!item.at("parameters").is_object()) {
+            bad_request("function parameters must be a JSON object", "tools");
+        }
+        parameters = item.at("parameters");
+    }
+    if (item.contains("strict") && !item.at("strict").is_null()) {
+        if (!item.at("strict").is_boolean()) {
+            bad_request("function strict must be a boolean", "tools");
+        }
+        if (item.at("strict").get<bool>()) {
+            bad_request("strict function schema enforcement is not supported", "tools",
+                        "strict_tools_not_supported");
+        }
+    }
+    tool.strict          = false;
+    tool.parameters_json = parameters.dump();
+    Json nested          = {
+        {"type", "function"},
+        {"function", Json{{"name", tool.name}, {"parameters", parameters}, {"strict", false}}}};
+    if (!tool.description.empty()) { nested["function"]["description"] = tool.description; }
+    tool.definition_json = nested.dump();
+    if (ns) {
+        out.namespaced_tool_names.emplace(tool.name, std::make_pair(*ns, wire_name));
+    } else {
+        Json canonical = {{"type", "function"},
+                          {"name", tool.name},
+                          {"parameters", parameters},
+                          {"strict", false}};
+        if (!tool.description.empty()) { canonical["description"] = tool.description; }
+        out.tools.push_back(std::move(canonical));
+    }
+    out.generation.tools.push_back(std::move(tool));
+}
+
+void parse_namespace_tool(const Json& item, std::unordered_set<std::string>& names,
+                          ResponsesRequest& out) {
+    if (!item.contains("name") || !item.at("name").is_string() ||
+        !valid_function_name(item.at("name").get<std::string>())) {
+        bad_request("namespace name must match [A-Za-z0-9_-]{1,64}", "tools");
+    }
+    const std::string ns = item.at("name").get<std::string>();
+    if (item.contains("description") && !item.at("description").is_null() &&
+        !item.at("description").is_string()) {
+        bad_request("namespace description must be a string", "tools");
+    }
+    if (!item.contains("tools") || !item.at("tools").is_array()) {
+        bad_request("namespace tools must be an array", "tools");
+    }
+    for (const Json& nested : item.at("tools")) {
+        if (!nested.is_object() || !nested.contains("type") || !nested.at("type").is_string()) {
+            bad_request("namespace tools entries must be objects with a string type", "tools");
+        }
+        const std::string nested_type = nested.at("type").get<std::string>();
+        if (nested_type != "function") {
+            bad_request("unsupported tool type in namespace " + ns + ": " + nested_type, "tools",
+                        "tool_type_not_supported");
+        }
+        parse_function_tool(nested, &ns, names, out);
+    }
+    // The namespace object is echoed as received: clients match the response
+    // tools list against what they declared.
+    out.tools.push_back(item);
+}
+
 void parse_tools(const Json& body, ResponsesRequest& out) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return; }
     if (!body.at("tools").is_array()) { bad_request("tools must be an array", "tools"); }
@@ -454,61 +567,21 @@ void parse_tools(const Json& body, ResponsesRequest& out) {
             bad_request("tools entries must be objects with a string type", "tools");
         }
         const std::string tool_type = item.at("type").get<std::string>();
-        if (tool_type != "function") {
-            // Non-function tools (web search, tool search, freeform custom
-            // tools, tool namespaces, file search) declare client-side
-            // capabilities this server does not execute. They are validated
-            // for shape (a string type) and ignored (vLLM/OpenAI parity); the
-            // model is not primed to call them.
-            if (tool_type != "web_search" && tool_type != "tool_search" &&
-                tool_type != "custom" && tool_type != "namespace" &&
-                tool_type != "file_search") {
-                bad_request("unsupported tool type: " + tool_type, "tools",
-                            "tool_type_not_supported");
-            }
+        if (tool_type == "function") {
+            parse_function_tool(item, nullptr, names, out);
+        } else if (tool_type == "namespace") {
+            parse_namespace_tool(item, names, out);
+        } else if (tool_type == "web_search" || tool_type == "tool_search") {
+            // These declare client-side capabilities this server does not
+            // execute; they are validated for shape (a string type) and
+            // ignored, and the model is not primed to call them.
             continue;
+        } else {
+            // Hosted tools (file_search, mcp, code_interpreter, ...) and
+            // grammar-constrained custom tools would require server-side
+            // execution or constrained decoding.
+            bad_request("unsupported tool type: " + tool_type, "tools", "tool_type_not_supported");
         }
-        ToolDefinition tool;
-        tool.name = require_function_name(item, "tools");
-        if (!names.insert(tool.name).second) {
-            bad_request("duplicate function tool name: " + tool.name, "tools");
-        }
-        if (item.contains("description") && !item.at("description").is_null()) {
-            if (!item.at("description").is_string()) {
-                bad_request("function description must be a string", "tools");
-            }
-            tool.description = item.at("description").get<std::string>();
-        }
-        Json parameters = Json{{"type", "object"}, {"properties", Json::object()}};
-        if (item.contains("parameters") && !item.at("parameters").is_null()) {
-            if (!item.at("parameters").is_object()) {
-                bad_request("function parameters must be a JSON object", "tools");
-            }
-            parameters = item.at("parameters");
-        }
-        if (item.contains("strict") && !item.at("strict").is_null()) {
-            if (!item.at("strict").is_boolean()) {
-                bad_request("function strict must be a boolean", "tools");
-            }
-            if (item.at("strict").get<bool>()) {
-                bad_request("strict function schema enforcement is not supported", "tools",
-                            "strict_tools_not_supported");
-            }
-        }
-        tool.strict          = false;
-        tool.parameters_json = parameters.dump();
-        Json canonical       = {{"type", "function"},
-                                {"name", tool.name},
-                                {"parameters", parameters},
-                                {"strict", false}};
-        if (!tool.description.empty()) { canonical["description"] = tool.description; }
-        Json nested = {
-            {"type", "function"},
-            {"function", Json{{"name", tool.name}, {"parameters", parameters}, {"strict", false}}}};
-        if (!tool.description.empty()) { nested["function"]["description"] = tool.description; }
-        tool.definition_json = nested.dump();
-        out.generation.tools.push_back(std::move(tool));
-        out.tools.push_back(std::move(canonical));
     }
 }
 
@@ -845,6 +918,30 @@ std::string response_status(ninfer::FinishReason reason) {
     return "failed";
 }
 
+// Split a model-facing (flat) tool call name back into the wire-level
+// {name, namespace} the client declared. Plain function tools resolve to
+// themselves with no namespace.
+struct WireToolCallName {
+    std::string name;
+    std::optional<std::string> ns;
+};
+
+WireToolCallName wire_tool_call_name(const ResponsesRequest& request, const std::string& flat) {
+    const auto it = request.namespaced_tool_names.find(flat);
+    if (it == request.namespaced_tool_names.end()) { return {flat, std::nullopt}; }
+    return {it->second.second, it->second.first};
+}
+
+// Fields shared by every function_call output Item representation.
+Json function_call_item(const ResponsesRequest& request, const std::string& item_id,
+                        const char* status, const ToolCall& call, const std::string& arguments) {
+    const WireToolCallName wire = wire_tool_call_name(request, call.name);
+    Json item = {{"id", item_id},      {"type", "function_call"}, {"status", status},
+                 {"call_id", call.id}, {"name", wire.name},       {"arguments", arguments}};
+    if (wire.ns) { item["namespace"] = *wire.ns; }
+    return item;
+}
+
 struct ItemIds {
     std::string reasoning;
     std::string message;
@@ -922,12 +1019,8 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
             ids.function_calls[index] = new_response_item_id("fc");
         }
         const ToolCall& call = outcome.tool_calls[index];
-        built.output_items.push_back(Json{{"id", ids.function_calls[index]},
-                                          {"type", "function_call"},
-                                          {"status", "completed"},
-                                          {"call_id", call.id},
-                                          {"name", call.name},
-                                          {"arguments", call.arguments_json}});
+        built.output_items.push_back(function_call_item(request, ids.function_calls[index],
+                                                        "completed", call, call.arguments_json));
     }
 
     ChatTurn history;
@@ -1266,9 +1359,8 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
         const std::string item_id = new_response_item_id("fc");
         impl_->ids.function_calls.push_back(item_id);
         const int output_index = impl_->next_output_index++;
-        const Json added_item  = {{"id", item_id},           {"type", "function_call"},
-                                  {"status", "in_progress"}, {"call_id", call.id},
-                                  {"name", call.name},       {"arguments", ""}};
+        const Json added_item =
+            function_call_item(impl_->request, item_id, "in_progress", call, "");
         finished.events_before_terminal.push_back(
             sse(impl_->event("response.output_item.added",
                              Json{{"output_index", output_index}, {"item", added_item}})));
@@ -1278,14 +1370,14 @@ ResponsesStreamFinish ResponsesEventStream::finish(const GenerationOutcome& outc
                                                                {"output_index", output_index},
                                                                {"delta", call.arguments_json}})));
         }
-        finished.events_before_terminal.push_back(sse(impl_->event(
-            "response.function_call_arguments.done", Json{{"item_id", item_id},
-                                                          {"output_index", output_index},
-                                                          {"name", call.name},
-                                                          {"arguments", call.arguments_json}})));
-        const Json done_item = {{"id", item_id},         {"type", "function_call"},
-                                {"status", "completed"}, {"call_id", call.id},
-                                {"name", call.name},     {"arguments", call.arguments_json}};
+        finished.events_before_terminal.push_back(
+            sse(impl_->event("response.function_call_arguments.done",
+                             Json{{"item_id", item_id},
+                                  {"output_index", output_index},
+                                  {"name", wire_tool_call_name(impl_->request, call.name).name},
+                                  {"arguments", call.arguments_json}})));
+        const Json done_item =
+            function_call_item(impl_->request, item_id, "completed", call, call.arguments_json);
         finished.events_before_terminal.push_back(
             sse(impl_->event("response.output_item.done",
                              Json{{"output_index", output_index}, {"item", done_item}})));

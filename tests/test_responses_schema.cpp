@@ -408,20 +408,23 @@ int test_ignored_client_hints() {
     failures += check(throws_api([&] { (void)parse_responses_request(bad_ptc, limits()); }),
                       "parallel_tool_calls must be a boolean");
 
-    // Codex ships a built-in web_search tool; every known non-function tool
-    // type is accepted and ignored, unknown types are rejected.
-    for (const char* type :
-         {"web_search", "tool_search", "custom", "namespace", "file_search"}) {
+    // Codex ships a built-in web_search tool; client-side capability types are
+    // accepted and ignored. Hosted tools, grammar-constrained custom tools, and
+    // unknown types are rejected explicitly.
+    for (const char* type : {"web_search", "tool_search"}) {
         Json with_ignored = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
         with_ignored["tools"] = Json::array({Json{{"type", type}, {"name", "x"}}});
-        failures += check(!throws_api([&] { (void)parse_responses_request(with_ignored, limits()); }),
-                          std::string("non-function tool accepted and ignored: ") + type);
+        const ResponsesRequest ignored = parse_responses_request(with_ignored, limits());
+        failures += check(ignored.tools.empty() && ignored.generation.tools.empty(),
+                          std::string("client-side tool accepted and ignored: ") + type);
     }
-    Json unknown_tool = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
-    unknown_tool["tools"] = Json::array({Json{{"type", "made_up"}}});
-    failures += check(api_code([&] { (void)parse_responses_request(unknown_tool, limits()); }) ==
-                          "tool_type_not_supported",
-                      "unknown tool type rejected");
+    for (const char* type : {"custom", "file_search", "mcp", "code_interpreter", "made_up"}) {
+        Json rejected     = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+        rejected["tools"] = Json::array({Json{{"type", type}, {"name", "x"}}});
+        failures += check(api_code([&] { (void)parse_responses_request(rejected, limits()); }) ==
+                              "tool_type_not_supported",
+                          std::string("unsupported tool type rejected: ") + type);
+    }
 
     // reasoning.summary is a client hint for streaming reasoning summaries;
     // string values are accepted and ignored, non-string shapes rejected.
@@ -434,6 +437,174 @@ int test_ignored_client_hints() {
     bad_summary["reasoning"] = Json{{"effort", "low"}, {"summary", 42}};
     failures += check(throws_api([&] { (void)parse_responses_request(bad_summary, limits()); }),
                       "reasoning.summary must be a string");
+    return failures;
+}
+
+int test_namespace_tools() {
+    // Codex declares every MCP server as a namespace tool whose nested
+    // functions are the callable surface. They are flattened for the model as
+    // "<namespace>__<name>" and split back on output so the client can route
+    // the call by (namespace, name).
+    const Json request_json = {
+        {"model", "qwen3.6-27b"},
+        {"input", "what time is it"},
+        {"max_output_tokens", 32},
+        {"tools",
+         Json::array({Json{{"type", "web_search"}, {"external_web_access", false}},
+                      Json{{"type", "namespace"},
+                           {"name", "mcp__clock"},
+                           {"description", "Tools for working with clock."},
+                           {"tools",
+                            Json::array({Json{{"type", "function"},
+                                              {"name", "now"},
+                                              {"description", "Return the current time in UTC."},
+                                              {"strict", false},
+                                              {"parameters", Json{{"type", "object"},
+                                                                  {"properties", Json::object()}}}},
+                                         Json{{"type", "function"}, {"name", "sleep"}}})}},
+                      Json{{"type", "namespace"},
+                           {"name", "mcp__fs"},
+                           {"description", "Filesystem"},
+                           {"tools", Json::array({Json{{"type", "function"}, {"name", "now"}}})}},
+                      Json{{"type", "function"},
+                           {"name", "shell"},
+                           {"parameters", Json{{"type", "object"}}}}})},
+    };
+    int failures                   = 0;
+    const ResponsesRequest request = parse_responses_request(request_json, limits());
+
+    // Prompt-facing definitions: flat names, same nested name in two
+    // namespaces stays distinct, plain function untouched.
+    std::vector<std::string> primed;
+    for (const ToolDefinition& tool : request.generation.tools) { primed.push_back(tool.name); }
+    failures += check(primed == std::vector<std::string>{"mcp__clock__now", "mcp__clock__sleep",
+                                                         "mcp__fs__now", "shell"},
+                      "namespaced functions are flattened for the model");
+    const Json nested = Json::parse(request.generation.tools[0].definition_json);
+    failures +=
+        check(nested.at("function").at("name") == "mcp__clock__now" &&
+                  nested.at("function").at("description") == "Return the current time in UTC.",
+              "flat definition keeps nested description");
+
+    // Echoed tools: namespace objects verbatim, web_search dropped.
+    failures += check(request.tools.size() == 3 && request.tools[0].at("type") == "namespace" &&
+                          request.tools[0].at("name") == "mcp__clock" &&
+                          request.tools[0].at("tools").size() == 2 &&
+                          request.tools[2].at("type") == "function",
+                      "namespace tools are echoed as declared");
+
+    // Output: the emitted function_call carries the wire-level split.
+    GenerationOutcome outcome;
+    outcome.prompt_tokens     = 8;
+    outcome.completion_tokens = 4;
+    outcome.finish_reason     = ninfer::FinishReason::StopToken;
+    outcome.tool_calls.push_back(ToolCall{"call_1", "mcp__clock__now", "{}"});
+    outcome.tool_calls.push_back(ToolCall{"call_2", "shell", R"({"cmd":"ls"})"});
+    const BuiltResponse built = make_response_object("resp_ns", 1, request, {}, outcome);
+    const Json& first         = built.body.at("output").at(0);
+    const Json& second        = built.body.at("output").at(1);
+    failures += check(first.at("type") == "function_call" && first.at("name") == "now" &&
+                          first.at("namespace") == "mcp__clock" && first.at("call_id") == "call_1",
+                      "namespaced tool call is split into name and namespace");
+    failures += check(second.at("name") == "shell" && !second.contains("namespace"),
+                      "plain function call carries no namespace");
+    failures +=
+        check(built.output_history.size() == 1 && built.output_history[0].tool_calls.size() == 2 &&
+                  built.output_history[0].tool_calls[0].name == "mcp__clock__now",
+              "stored history keeps the flat model-facing name");
+
+    // Streaming emits the same split on every function_call event.
+    ResponsesRequest stream_request = request;
+    stream_request.stream           = true;
+    ResponsesEventStream encoder("resp_ns_stream", 1, stream_request, {});
+    (void)encoder.start();
+    const ResponsesStreamFinish finish = encoder.finish(outcome);
+    int split_events                   = 0;
+    for (const std::string& event : finish.events_before_terminal) {
+        const Json payload     = parse_event(event);
+        const std::string type = payload.at("type").get<std::string>();
+        if (type == "response.output_item.added" || type == "response.output_item.done") {
+            const Json& item = payload.at("item");
+            if (item.at("type") == "function_call" && item.at("call_id") == "call_1") {
+                split_events += (item.at("name") == "now" && item.at("namespace") == "mcp__clock");
+            }
+        }
+        if (type == "response.function_call_arguments.done" &&
+            payload.at("item_id") == finish.response.body.at("output").at(0).at("id")) {
+            split_events += (payload.at("name") == "now");
+        }
+    }
+    failures += check(split_events == 3, "SSE function_call events carry name and namespace");
+
+    // Inbound history: a namespaced function_call replays under the flat name
+    // and round-trips its namespace in the canonical Item.
+    Json history = {
+        {"model", "qwen3.6-27b"},
+        {"max_output_tokens", 32},
+        {"tools", request_json.at("tools")},
+        {"input",
+         Json::array(
+             {Json{{"role", "user"},
+                   {"content", Json::array({Json{{"type", "input_text"}, {"text", "time?"}}})}},
+              Json{{"type", "function_call"},
+                   {"call_id", "call_1"},
+                   {"namespace", "mcp__clock"},
+                   {"name", "now"},
+                   {"arguments", "{}"}},
+              Json{
+                  {"type", "function_call_output"}, {"call_id", "call_1"}, {"output", "12:00Z"}}})},
+    };
+    const ResponsesRequest replay = parse_responses_request(history, limits());
+    failures +=
+        check(replay.input_turns.size() == 3 && replay.input_turns[1].tool_calls.size() == 1 &&
+                  replay.input_turns[1].tool_calls[0].name == "mcp__clock__now",
+              "inbound namespaced function_call replays under the flat name");
+    failures += check(replay.input_items.size() == 3 && replay.input_items[1].at("name") == "now" &&
+                          replay.input_items[1].at("namespace") == "mcp__clock",
+                      "canonical function_call Item keeps the namespace");
+
+    // Malformed and unsupported namespace shapes.
+    Json base     = {{"model", "qwen3.6-27b"}, {"input", "hello"}};
+    Json bad_name = base;
+    bad_name["tools"] =
+        Json::array({Json{{"type", "namespace"}, {"name", "a b"}, {"tools", Json::array()}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_name, limits()); }),
+                      "namespace name is validated");
+    Json bad_tools     = base;
+    bad_tools["tools"] = Json::array({Json{{"type", "namespace"}, {"name", "ns"}, {"tools", "x"}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_tools, limits()); }),
+                      "namespace tools must be an array");
+    Json nested_custom = base;
+    nested_custom["tools"] =
+        Json::array({Json{{"type", "namespace"},
+                          {"name", "ns"},
+                          {"tools", Json::array({Json{{"type", "custom"}, {"name", "raw"}}})}}});
+    failures += check(api_code([&] { (void)parse_responses_request(nested_custom, limits()); }) ==
+                          "tool_type_not_supported",
+                      "custom tools nested in a namespace are rejected");
+    Json collision = base;
+    collision["tools"] =
+        Json::array({Json{{"type", "function"}, {"name", "ns__f"}},
+                     Json{{"type", "namespace"},
+                          {"name", "ns"},
+                          {"tools", Json::array({Json{{"type", "function"}, {"name", "f"}}})}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(collision, limits()); }),
+                      "flat name colliding with a plain function is rejected");
+    Json too_long     = base;
+    too_long["tools"] = Json::array({Json{
+        {"type", "namespace"},
+        {"name", std::string(40, 'a')},
+        {"tools", Json::array({Json{{"type", "function"}, {"name", std::string(30, 'b')}}})}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(too_long, limits()); }),
+                      "flat name longer than 64 characters is rejected");
+    Json bad_history_ns     = base;
+    bad_history_ns["input"] = Json::array({Json{{"type", "function_call"},
+                                                {"call_id", "c"},
+                                                {"namespace", 5},
+                                                {"name", "f"},
+                                                {"arguments", "{}"}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(bad_history_ns, limits()); }),
+                      "function_call namespace must be a string");
     return failures;
 }
 
@@ -652,6 +823,7 @@ int main() {
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();
     failures += test_ignored_client_hints();
+    failures += test_namespace_tools();
     failures += test_explicit_rejections();
     failures += test_response_object();
     failures += test_sse_sequence();

@@ -216,7 +216,7 @@ wire response contains typed `output` Items.
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
-| `tools` | function definitions are used; known non-function tool types (`web_search`, `tool_search`, `custom`, `namespace`, `file_search`) are validated and ignored; see below |
+| `tools` | flat function definitions and `namespace` groups of function definitions are used; `web_search` and `tool_search` are validated and ignored; other tool types are rejected; see below |
 | `tool_choice` | `auto` or `none` |
 | `parallel_tool_calls` | optional boolean; `true` or `false` both accepted. Parallel tool calls are the server’s only mode; `false` is validated and ignored, the response always reports `true` |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
@@ -233,10 +233,11 @@ wire response contains typed `output` Items.
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
 with a field-specific 400 error instead of being silently ignored. Harmless client hints
 (`prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, `include`,
-`client_metadata`, `parallel_tool_calls=false`, `reasoning.summary`, and non-function tool types)
-are validated for shape and then ignored: they tune client-side caching, carry client metadata,
-request a parallel-tool-call mode or reasoning-summary streaming that cannot be enforced, or
-declare client-side capabilities this server does not execute (matching vLLM behavior).
+`client_metadata`, `parallel_tool_calls=false`, `reasoning.summary`, and the `web_search` and
+`tool_search` tool types) are validated for shape and then ignored: they tune client-side caching,
+carry client metadata, request a parallel-tool-call mode or reasoning-summary streaming that
+cannot be enforced, or declare client-side capabilities this server does not execute. Ignoring
+them never changes generated output.
 
 ### Input Item contract
 
@@ -288,10 +289,35 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. NInfer does not execute functions or enforce JSON Schema through constrained
-decoding, so `strict:true`, `tool_choice:required`, named tool choice, hosted tools, and MCP tools
-are rejected. Known non-function tool types (`web_search`, `tool_search`, `custom`, `namespace`,
-`file_search`) declare client-side capabilities this server does not execute: they are validated
-for shape and ignored, and the model is not primed to call them.
+decoding, so `strict:true`, `tool_choice:required`, and named tool choice are rejected.
+
+Function definitions may also be grouped under a `namespace` tool, which is how the OpenAI Codex CLI
+declares every MCP server:
+
+```json
+{
+  "type": "namespace",
+  "name": "mcp__clock",
+  "description": "Tools for working with clock.",
+  "tools": [
+    {"type": "function", "name": "now", "parameters": {"type": "object", "properties": {}}}
+  ]
+}
+```
+
+The Qwen prompt format has no tool namespaces, so each nested function is primed under the flat
+name `<namespace>__<name>` (`mcp__clock__now` above), following the same convention as vLLM. The
+flat name must still match `[A-Za-z0-9_-]{1,64}` and must not collide with another tool. When the
+model calls a namespaced function, the emitted `function_call` Item carries the wire-level split
+(`"name":"now"`, `"namespace":"mcp__clock"`) so the client can route it; plain function calls carry
+no `namespace`. Inbound `function_call` history Items may carry `namespace` and are replayed to the
+model under the same flat name. The response `tools` array echoes namespace tools as declared.
+
+`web_search` and `tool_search` declare client-side capabilities this server does not execute: they
+are validated for shape and ignored, and the model is not primed to call them. Every other tool
+type (`custom`, `file_search`, `mcp`, `code_interpreter`, and so on) is rejected with
+`tool_type_not_supported`, whether top-level or nested in a namespace, because it would need
+server-side execution or constrained decoding.
 
 ### Response object and usage
 
@@ -398,9 +424,9 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, prompt-cache controls, safety/user identifiers, Structured Outputs/JSON mode,
-background execution, compaction, files/audio, and OpenAI-hosted/MCP/custom tools that would be
-executed server-side. These are compatibility boundaries, not silently accepted placeholders.
+moderation, safety/user identifiers, Structured Outputs/JSON mode, background execution,
+compaction, files/audio, and OpenAI-hosted/MCP/custom tools that would be executed server-side.
+These are compatibility boundaries, not silently accepted placeholders.
 
 ## Anthropic Messages
 

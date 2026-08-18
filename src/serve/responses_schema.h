@@ -12,6 +12,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ninfer::serve {
@@ -34,6 +36,11 @@ struct ResponsesRequest {
     nlohmann::json tool_choice = "auto";
     bool store                 = true;
     bool stream                = false;
+
+    // Namespaced function tools are flattened to "<namespace>__<name>" for the
+    // model. This maps each flat name back to {namespace, name} so emitted
+    // function_call Items carry the wire-level split the client dispatches on.
+    std::unordered_map<std::string, std::pair<std::string, std::string>> namespaced_tool_names;
 };
 
 struct ResponsesRuntimeValues {
@@ -52,7 +59,9 @@ struct BuiltResponse {
 // accepted; recognized but unsupported OpenAI fields fail explicitly. Harmless
 // client hints (prompt_cache_key/prompt_cache_options/prompt_cache_retention,
 // include, client_metadata, parallel_tool_calls=false, reasoning.summary, and
-// non-function tool types) are validated for shape and ignored.
+// the client-side web_search/tool_search tool types) are validated for shape
+// and ignored. Function tools nested in a namespace tool are flattened for the
+// model and split back on output.
 ResponsesRequest parse_responses_request(const nlohmann::json& body, const RequestLimits& limits);
 
 // Parse POST /v1/responses/input_tokens. The current OpenAI endpoint accepts

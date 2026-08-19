@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
     - name: Install prerequisites
       run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2
     - name: Configure the production repository
@@ -31,16 +31,30 @@ jobs:
           libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
           libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}
 
-    - name: Install the NVIDIA Container Toolkit
+    - name: Configure the NVIDIA Container Toolkit
       run: |
         sudo nvidia-ctk config --in-place --set nvidia-container-runtime.log-level=debug
         sudo nvidia-ctk config --in-place --set nvidia-container-runtime.runtimes=crun:runc
         sudo nvidia-ctk runtime configure --runtime=docker
         sudo systemctl restart docker
-    - name: Build the Docker image
-      run: docker build . --file Dockerfile --tag nikobraz/ninfer:latest
-    - name: Build and push
-      uses: docker/build-push-action@v3
+        
+    - name: Build and push docker image
+      uses: docker/build-push-action@v7
       with:
         push: true
-        tags: nikobraz/ninfer:latest
+        tags: |
+          nikobraz/ninfer:1
+          nikobraz/ninfer:latest
+    - uses: shrink/actions-docker-extract@v4
+      with:
+        image: "nikobraz/ninfer:latest"
+        path: "/usr/local/bin/ninfer"
+    - uses: shrink/actions-docker-extract@v4
+      with:
+        image: "nikobraz/ninfer:latest"
+        path: "/usr/local/bin/ninfer-serve"
+        destination: dist
+    - name: Upload Dist
+      uses: actions/upload-artifact@v7
+      with:
+        path: dist

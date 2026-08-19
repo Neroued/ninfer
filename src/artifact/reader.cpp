@@ -15,10 +15,18 @@
 #include <unordered_map>
 #include <utility>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace ninfer::artifact {
 namespace {
@@ -181,6 +189,55 @@ struct TransparentStringHash {
 class MappedFile {
 public:
     explicit MappedFile(const std::filesystem::path& path) {
+#ifdef _WIN32
+        const std::wstring wide = path.wstring();
+        HANDLE file = ::CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            const auto error = ::GetLastError();
+            throw std::system_error(error, std::system_category(), "open " + path.string());
+        }
+
+        LARGE_INTEGER size_info {};
+
+        if (!::GetFileSizeEx(file, &size_info)) {
+            const auto error = ::GetLastError();
+            ::CloseHandle(file);
+            throw std::system_error(error, std::system_category(), "GetFileSizeEx " + path.string());
+        }
+        if (size_info.QuadPart < 0 ||
+            size_info.QuadPart > static_cast<LONGLONG>(std::numeric_limits<std::size_t>::max())) {
+            ::CloseHandle(file);
+            throw ArtifactError("artifact size does not fit the process address space");
+        }
+
+        const auto size = static_cast<std::size_t>(size_info.QuadPart);
+        HANDLE mapping  = nullptr;
+        void* view      = nullptr;
+        if (size != 0) {
+            mapping = ::CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            if (mapping == nullptr) {
+                const auto error = ::GetLastError();
+                ::CloseHandle(file);
+                throw std::system_error(error, std::system_category(),
+                                        "CreateFileMapping " + path.string());
+            }
+            // A zero byte count maps the entire section, which avoids the 32-bit
+            // dwNumberOfBytesToMap limit for artifacts larger than 4 GiB.
+            view = ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+            if (view == nullptr) {
+                const auto error = ::GetLastError();
+                ::CloseHandle(mapping);
+                ::CloseHandle(file);
+                throw std::system_error(error, std::system_category(), "MapViewOfFile " + path.string());
+            }
+        }
+        file_    = file;
+        mapping_ = mapping;
+        view_    = view;
+        data_    = static_cast<const std::byte*>(view);
+        size_    = size;
+#else
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd < 0) {
             throw std::system_error(errno, std::generic_category(), "open " + path.string());
@@ -212,11 +269,18 @@ public:
         fd_   = fd;
         data_ = static_cast<const std::byte*>(mapping);
         size_ = size;
+#endif
     }
 
     ~MappedFile() {
+#ifdef _WIN32
+        if (view_ != nullptr) { ::UnmapViewOfFile(view_); }
+        if (mapping_ != nullptr) { ::CloseHandle(mapping_); }
+        if (file_ != INVALID_HANDLE_VALUE) { ::CloseHandle(file_); }
+#else
         if (data_ != nullptr) { ::munmap(const_cast<std::byte*>(data_), size_); }
         if (fd_ >= 0) { ::close(fd_); }
+#endif
     }
 
     MappedFile(const MappedFile&)            = delete;
@@ -232,6 +296,14 @@ public:
             reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
             throw ArtifactError("direct artifact read is not 4096-byte aligned");
         }
+#ifdef _WIN32
+        // The whole file is already mapped, so a direct read is a copy out of the view.
+        if (absolute_offset > size_ || destination.size() > size_ - absolute_offset) {
+            throw ArtifactError("direct artifact read exceeds the mapped file");
+        }
+        std::memcpy(destination.data(), data_ + absolute_offset, destination.size());
+        return destination.size();
+#else
         if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
             destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
             throw ArtifactError("direct artifact read exceeds platform I/O limits");
@@ -246,10 +318,17 @@ public:
             throw std::system_error(errno, std::generic_category(), "direct artifact read");
         }
         return static_cast<std::size_t>(bytes);
+#endif
     }
 
 private:
-    int fd_                = -1;
+#ifdef _WIN32
+    HANDLE file_    = INVALID_HANDLE_VALUE;
+    HANDLE mapping_ = nullptr;
+    void* view_     = nullptr;
+#else
+    int fd_ = -1;
+#endif
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
 };

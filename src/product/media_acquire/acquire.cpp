@@ -2,9 +2,14 @@
 
 #include <curl/curl.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -93,17 +98,21 @@ bool private_ipv4(std::uint32_t address) {
 
 bool private_address(const sockaddr* address) {
     if (address->sa_family == AF_INET) {
-        return private_ipv4(reinterpret_cast<const sockaddr_in*>(address)->sin_addr.s_addr);
+        std::uint32_t v4 = 0;
+        std::memcpy(&v4, &reinterpret_cast<const sockaddr_in*>(address)->sin_addr, sizeof(v4));
+        return private_ipv4(v4);
     }
     if (address->sa_family != AF_INET6) { return true; }
     const in6_addr& a = reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr;
+    std::array<std::uint8_t, 16> raw{};
+    std::memcpy(raw.data(), &a, sizeof(raw));
     if (IN6_IS_ADDR_UNSPECIFIED(&a) || IN6_IS_ADDR_LOOPBACK(&a) || IN6_IS_ADDR_LINKLOCAL(&a) ||
-        IN6_IS_ADDR_MULTICAST(&a) || (a.s6_addr[0] & 0xfeU) == 0xfcU) {
+        IN6_IS_ADDR_MULTICAST(&a) || (raw[0] & 0xfeU) == 0xfcU) {
         return true;
     }
     if (IN6_IS_ADDR_V4MAPPED(&a)) {
         std::uint32_t v4 = 0;
-        std::memcpy(&v4, &a.s6_addr[12], sizeof(v4));
+        std::memcpy(&v4, raw.data() + 12, sizeof(v4));
         return private_ipv4(v4);
     }
     return false;
@@ -203,6 +212,12 @@ std::vector<std::uint8_t> fetch_url(std::string url, const Policy& policy) {
     if (!policy.allow_remote) { throw std::invalid_argument("remote media URLs are disabled"); }
     static std::once_flag init;
     std::call_once(init, [] {
+#ifdef _WIN32
+        WSADATA wsa{};
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            throw std::runtime_error("failed to initialize Winsock");
+        }
+#endif
         if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
             throw std::runtime_error("failed to initialize libcurl");
         }
@@ -287,7 +302,12 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
-        if (ec || relative.empty() || relative.native().starts_with("..")) {
+        // A leading ".." component means the path escapes the root. Using the path
+        // iterator (rather than native().starts_with("..")) stays portable: on
+        // Windows native() is a wide string and would not match the narrow literal.
+        const bool escapes_root =
+            relative.begin() != relative.end() && *relative.begin() == "..";
+        if (ec || relative.empty() || escapes_root) {
             throw std::invalid_argument("media path is outside configured media root");
         }
     }

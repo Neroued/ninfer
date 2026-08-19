@@ -273,14 +273,18 @@ ninfer_internal_includes(ninfer_text)
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)
 ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+target_link_libraries(ninfer_media_decode PRIVATE NInfer::FFmpeg)
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
   add_library(ninfer_media_acquire STATIC
     product/media_acquire/acquire.cpp)
   ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  target_link_libraries(ninfer_media_acquire PRIVATE NInfer::Curl)
+  if(WIN32)
+    # Host name resolution / Winsock (getaddrinfo, inet_ntop, WSAStartup).
+    target_link_libraries(ninfer_media_acquire PRIVATE Ws2_32)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)
@@ -340,4 +344,8 @@ if(NINFER_BUILD_SERVE)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
     PRIVATE ninfer_media_acquire CUDA::cudart)
+  if(WIN32)
+    # cpp-httplib (plain HTTP) uses the Winsock API.
+    target_link_libraries(ninfer_serve PRIVATE Ws2_32)
+  endif()
 endif()

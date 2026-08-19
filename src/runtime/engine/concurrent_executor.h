@@ -5,6 +5,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
+#include "core/host_kv_log.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
 #include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
@@ -54,6 +55,12 @@ public:
         if (admission_capacity_.active_lanes != max_concurrency_ ||
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
+        }
+        if (options.host_kv_cache_slabs > 0) {
+            // The Program owns the cache: slab sizing and the parked-sequence
+            // layout are target-specific, and the executor is generic over
+            // Program. It only ever asks "park this lane" / "restore this lane".
+            instance.program->enable_host_kv_cache(options.host_kv_cache_slabs);
         }
         worker_ = std::thread([this] { worker_loop(); });
     }
@@ -690,6 +697,72 @@ private:
             request->lane_plans[lane]) {
             return;
         }
+        // plan_request_for_lane() reads this lane's SequenceState to choose
+        // append over rewind, so a parked sequence must be resident before it
+        // runs or it plans a full reset against the wrong occupant.
+        //
+        // The lane is rarely empty: it holds whichever sequence ran last. So
+        // restore whenever the cache serves this prompt better than the
+        // resident sequence does, parking the resident one first to make room.
+        // A request that disabled prefix reuse must not touch the host cache:
+        // the planner will report zero reuse for it, so restoring (and evicting
+        // the resident to make room) is wasted host traffic that can destroy
+        // another session's cache opportunity for nothing.
+        // The identity.reusable half of the gate lives in host_kv_reusable_tokens
+        // (where the PreparedPromptData is in scope), so a request with a
+        // non-reusable identity returns zero cached tokens and skips the block.
+        if (instance_.program->host_kv_cache_enabled() &&
+            request->options.execution.allow_prefix_reuse) {
+            const std::uint32_t cached =
+                instance_.program->host_kv_reusable_tokens(request->prompt);
+            if (cached == 0) {
+                host_kv_log("req " + std::to_string(request->id) +
+                            " host KV miss: no entry matches this prompt");
+            }
+            if (cached != 0) {
+                std::uint32_t resident = 0;
+                if (instance_.program->has_retained_lane(lane)) {
+                    const Plan probe = instance_.program->plan_request_for_lane(
+                        lane, request->prompt, *request->base_plan);
+                    resident = probe.summary().reusable_prompt_tokens;
+                }
+                if (cached > resident) {
+                    // Park the resident to make room, protecting the entry this
+                    // prompt will restore: without it, the LRU eviction that
+                    // frees a slab could evict the very entry the restore needs.
+                    const std::uint64_t protect =
+                        instance_.program->host_kv_match_id(request->prompt);
+                    bool lane_cleared = !instance_.program->has_retained_lane(lane);
+                    if (!lane_cleared) {
+                        if (instance_.program->park_lane(lane, protect)) {
+                            // park_lane cleared the lane; the resident's state is
+                            // now in the cache and the lane is free for the restore.
+                            lane_cleared = true;
+                        } else {
+                            // No slab for the resident: every slab is held by a
+                            // protected entry (the N=1 case, where this prompt's
+                            // own entry holds the only slab). Discard the resident
+                            // rather than destroy the entry the restore needs -
+                            // the request in front of us is this prompt's, so
+                            // restoring it beats parking the resident. The
+                            // resident re-prefills on its next request, exactly as
+                            // it would without the cache.
+                            instance_.program->evict_retained_lane(lane);
+                            lane_cleared = true;
+                        }
+                    }
+                    if (lane_cleared &&
+                        instance_.program->restore_lane(lane, request->prompt)) {
+                        invalidate_lane_plans(lane);
+                    } else if (lane_cleared) {
+                        // The lane was cleared (resident parked or discarded) but
+                        // the restore failed: the lane state changed, so cached
+                        // plans for it are stale.
+                        invalidate_lane_plans(lane);
+                    }
+                }
+            }
+        }
         request->lane_plans[lane].reset();
         request->lane_plans[lane].emplace(
             instance_.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
@@ -761,6 +834,17 @@ private:
         if (!request->lane_plans[lane]) {
             throw std::logic_error("selected admission lane has no request plan");
         }
+        // Park before the lane is overwritten. This cannot live in the
+        // evict_retained branch below: can_admit_lane() counts the candidate
+        // lane's own retained pages as reclaimable, so the first admission loop
+        // succeeds and that branch is unreachable at --max-concurrency 1, which
+        // is exactly the configuration that needs the cache. A plan that reuses
+        // this lane's own prefix must not park it out from under itself.
+        if (instance_.program->host_kv_cache_enabled() &&
+            instance_.program->has_retained_lane(lane) &&
+            request->lane_plans[lane]->summary().reusable_prompt_tokens == 0) {
+            (void)instance_.program->park_lane(lane);
+        }
         if (choice.evict_retained) {
             for (std::uint32_t retained_lane = 0;
                  retained_lane < max_concurrency_ &&
@@ -768,7 +852,13 @@ private:
                  ++retained_lane) {
                 if (retained_lane != lane && slots_[retained_lane] == nullptr &&
                     instance_.program->has_retained_lane(retained_lane)) {
-                    instance_.program->evict_retained_lane(retained_lane);
+                    // Park to host RAM instead of discarding: 0.3s round-trip
+                    // against a 95s re-prefill at 231k. park_lane() clears the
+                    // lane itself on success, so only fall through to the
+                    // discard when no slab was available.
+                    if (!instance_.program->park_lane(retained_lane)) {
+                        instance_.program->evict_retained_lane(retained_lane);
+                    }
                     invalidate_lane_plans(retained_lane);
                 }
             }
@@ -833,7 +923,10 @@ private:
             slots_[lane].reset();
             invalidate_lane_plans(lane);
             complete_error(request, error);
-            throw;
+            // A per-request admission failure must not take the whole executor
+            // down: the request is already marked failed, so report control
+            // progress and let the loop admit the next request.
+            return AdmissionProgress::ControlProgress;
         }
         return AdmissionProgress::RanGpuUnit;
     }

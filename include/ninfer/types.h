@@ -89,6 +89,9 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    // Sequences parked in pinned host RAM rather than discarded when their lane
+    // is taken. Zero keeps the discard-on-eviction behaviour.
+    std::uint32_t host_kv_cache_slabs = 0;
     LoadProgress load_progress;
 };
 

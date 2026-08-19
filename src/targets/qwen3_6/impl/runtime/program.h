@@ -58,6 +58,9 @@ enum class MtpBridgeMode : std::uint8_t {
 
 namespace ninfer::targets::qwen3_6::detail {
 
+struct HostKvEntry;
+class HostKvProvider;
+
 template <>
 struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
@@ -231,6 +234,29 @@ public:
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
+
+    // Bytes one slab must hold to park the largest sequence this Program can
+    // hold. The executor cannot compute this: bytes-per-page is target-specific.
+    [[nodiscard]] std::size_t host_kv_slab_bytes() const;
+    void enable_host_kv_cache(std::uint32_t slabs);
+    [[nodiscard]] bool host_kv_cache_enabled() const noexcept { return host_kv_ != nullptr; }
+    // `protect_id` keeps one parked entry from being LRU-evicted to make room
+    // for the slab; admission passes the entry it is about to restore so the
+    // park that precedes it cannot evict the very entry the restore needs.
+    [[nodiscard]] bool park_lane(std::uint32_t lane, std::uint64_t protect_id = 0);
+    [[nodiscard]] std::uint32_t host_kv_reusable_tokens(const PreparedPromptData& prompt) const;
+    // Stable id of the best parked match for `prompt`, or 0 for none.
+    [[nodiscard]] std::uint64_t host_kv_match_id(const PreparedPromptData& prompt) const;
+    [[nodiscard]] bool restore_lane(std::uint32_t lane, const PreparedPromptData& prompt);
+
+    // Host KV cache (--host-kv-cache). park lifts a retained lane's pages and
+    // planner-visible state into `entry` (the copies are complete on return;
+    // the caller clears the lane after committing the entry); restore is the
+    // inverse into a possibly different lane. Both are no-ops without a cache.
+    [[nodiscard]] bool park_lane_to_host(std::uint32_t lane, HostKvEntry& entry,
+                                         cudaStream_t stream);
+    void restore_lane_from_host(std::uint32_t lane, const HostKvEntry& entry,
+                                std::uint32_t reuse_tokens, cudaStream_t stream);
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
@@ -261,6 +287,7 @@ public:
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
+    std::unique_ptr<HostKvProvider> host_kv_;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;

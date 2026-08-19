@@ -197,6 +197,41 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 template <>
+std::size_t Program<Variant>::host_kv_slab_bytes() const {
+    return impl_->host_kv_slab_bytes();
+}
+
+template <>
+void Program<Variant>::enable_host_kv_cache(std::uint32_t slabs) {
+    impl_->enable_host_kv_cache(slabs);
+}
+
+template <>
+bool Program<Variant>::host_kv_cache_enabled() const noexcept {
+    return impl_->host_kv_cache_enabled();
+}
+
+template <>
+bool Program<Variant>::park_lane(std::uint32_t lane, std::uint64_t protect_id) {
+    return impl_->park_lane(lane, protect_id);
+}
+
+template <>
+std::uint32_t Program<Variant>::host_kv_reusable_tokens(const PreparedPrompt& prompt) const {
+    return impl_->host_kv_reusable_tokens(PreparedPromptAccess::view(prompt));
+}
+
+template <>
+std::uint64_t Program<Variant>::host_kv_match_id(const PreparedPrompt& prompt) const {
+    return impl_->host_kv_match_id(PreparedPromptAccess::view(prompt));
+}
+
+template <>
+bool Program<Variant>::restore_lane(std::uint32_t lane, const PreparedPrompt& prompt) {
+    return impl_->restore_lane(lane, PreparedPromptAccess::view(prompt));
+}
+
+template <>
 void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
     impl_->evict_retained_lane(lane);
 }

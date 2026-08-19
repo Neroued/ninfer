@@ -57,6 +57,10 @@ struct LinearAttentionStatePool {
     [[nodiscard]] std::int32_t slot_count() const noexcept;
     [[nodiscard]] std::int64_t conv_slot_stride_elements() const noexcept;
     [[nodiscard]] std::int64_t recurrent_slot_stride_elements() const noexcept;
+
+    // Bytes one slot (every layer's conv + recurrent state) occupies. Used to
+    // size host-KV slabs that park a lane's GDN state.
+    [[nodiscard]] std::size_t slot_bytes() const noexcept;
     [[nodiscard]] LinearAttentionStateAllLayersView all_layers_view() const;
     [[nodiscard]] Tensor conv_slot(std::uint32_t layer, std::int32_t slot) const;
     [[nodiscard]] Tensor recurrent_slot(std::uint32_t layer, std::int32_t slot) const;

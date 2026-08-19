@@ -160,6 +160,17 @@ std::int64_t LinearAttentionStatePool::recurrent_slot_stride_elements() const no
            static_cast<std::int64_t>(spec.value_heads);
 }
 
+std::size_t LinearAttentionStatePool::slot_bytes() const noexcept {
+    const std::size_t conv_per_layer =
+        static_cast<std::size_t>(spec.conv_channels) *
+        static_cast<std::size_t>(spec.conv_width) * dtype_size(spec.conv_dtype);
+    const std::size_t rec_per_layer =
+        static_cast<std::size_t>(spec.key_head_dim) *
+        static_cast<std::size_t>(spec.value_head_dim) *
+        static_cast<std::size_t>(spec.value_heads) * dtype_size(DType::FP32);
+    return (conv_per_layer + rec_per_layer) * layer_count();
+}
+
 LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() const {
     if (conv.size() != spec.layers || recurrent.size() != spec.layers || conv.empty()) {
         throw std::logic_error("LinearAttentionStatePool layer inventory is inconsistent");

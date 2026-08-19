@@ -164,6 +164,37 @@ PagedKVAllocation PagedKVPool::reserve(std::uint32_t page_entitlement) {
     return allocation;
 }
 
+std::vector<HostKvPlaneView> PagedKVPool::host_kv_plane_views() const {
+    std::vector<HostKvPlaneView> views;
+    views.reserve(planes_.size());
+    const bool page_major = spec_.plane_order == PagedKVPlaneOrder::PageMajor;
+    for (const Tensor& plane : planes_) {
+        // PageMajor stores pages at dim 3; HeadMajor stores them at dim 2 with
+        // heads strided at dim 3. Mirrors the addressing in zero_pages().
+        views.push_back(HostKvPlaneView{
+            .base        = plane.data,
+            .page_stride = page_major ? plane.nb[3] : plane.nb[2],
+            .head_stride = page_major ? 0 : plane.nb[3],
+            .head_extent = page_major ? 1 : plane.ne[3],
+            .page_major  = page_major,
+            .page_count  = static_cast<std::int32_t>(page_group_count())});
+    }
+    return views;
+}
+
+std::size_t PagedKVPool::park_pages(std::span<const std::int32_t> page_ids, HostKvSlab& slab,
+                                    cudaStream_t stream) {
+    const std::vector<HostKvPlaneView> views = host_kv_plane_views();
+    return host_kv_park(views, page_ids, slab, stream);
+}
+
+void PagedKVPool::restore_pages(std::span<const std::int32_t> page_ids,
+                                std::size_t parked_pages, const HostKvSlab& slab,
+                                cudaStream_t stream) {
+    const std::vector<HostKvPlaneView> views = host_kv_plane_views();
+    host_kv_restore(views, page_ids, parked_pages, slab, stream);
+}
+
 void PagedKVPool::zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream) {
     if (page_ids.empty()) { return; }
 

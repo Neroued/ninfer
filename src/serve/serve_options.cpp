@@ -74,7 +74,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--host-kv-cache N] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -95,6 +96,9 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --host-kv-cache N parks up to N evicted sequences in pinned host RAM instead of discarding them\n"
+            "       --host-kv-cache is not supported with --spec dflash (the lane-affine DFlash caches are not captured)\n"
+            "       --host-kv-cache requires prefix reuse (incompatible with --no-prefix-reuse)\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -229,6 +233,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--host-kv-cache") {
+            options.host_kv_cache_slabs =
+                parse_nonnegative_int(require_value("--host-kv-cache"), "host-kv-cache");
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
@@ -295,6 +302,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");
         }
+    }
+    // --host-kv-cache parks evicted sequences for later RESTORE, but
+    // --no-prefix-reuse makes every request cold-prefill and the host-cache
+    // gate to skip restore. The combination is write-only: every resident is
+    // parked on eviction and no parked entry can ever be restored, which is
+    // strictly worse than no cache. Reject it rather than silently waste
+    // pinned RAM and host traffic.
+    if (options.host_kv_cache_slabs > 0 && !options.allow_prefix_reuse) {
+        throw std::invalid_argument(
+            "--host-kv-cache requires prefix reuse; --no-prefix-reuse makes every "
+            "parked entry unrestorable (write-only caching)");
     }
     return options;
 }

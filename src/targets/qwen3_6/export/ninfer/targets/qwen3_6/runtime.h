@@ -171,6 +171,30 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
+
+    // Host KV cache (--host-kv-cache). The Program owns it: slab sizing and the
+    // parked-sequence layout are target-specific. Callers only park and restore.
+    [[nodiscard]] std::size_t host_kv_slab_bytes() const;
+    void enable_host_kv_cache(std::uint32_t slabs);
+    [[nodiscard]] bool host_kv_cache_enabled() const noexcept;
+
+    // Moves a retained lane's sequence to host RAM, freeing its pages. False if
+    // the lane holds nothing, or no slab could be obtained. `protect_id` keeps
+    // one parked entry from being evicted to make room for the slab.
+    [[nodiscard]] bool park_lane(std::uint32_t lane, std::uint64_t protect_id = 0);
+
+    // Tokens of `prompt` a parked sequence could serve, or 0 for no usable
+    // entry. Lets admission decide before committing a lane.
+    [[nodiscard]] std::uint32_t host_kv_reusable_tokens(const PreparedPrompt& prompt) const;
+
+    // Stable id of the best parked match for `prompt`, or 0 for none. Admission
+    // passes it to park_lane() so the park cannot evict the entry the restore
+    // will consume.
+    [[nodiscard]] std::uint64_t host_kv_match_id(const PreparedPrompt& prompt) const;
+
+    // Restores the best parked match onto `lane`, which must own no KV. False
+    // when nothing matches.
+    [[nodiscard]] bool restore_lane(std::uint32_t lane, const PreparedPrompt& prompt);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 

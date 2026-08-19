@@ -44,6 +44,8 @@ int main() {
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
+    failures += check(defaults.host_kv_cache_slabs == 0,
+                       "the host KV cache is disabled by default");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
@@ -80,6 +82,25 @@ int main() {
                       "--draft-tokens did not preserve the DFlash window");
     failures += check(dflash.speculative.proposal_head == ninfer::ProposalHead::Optimized,
                       "--lm-head-draft did not select the optimized proposal head");
+
+    {
+        const auto host_kv =
+            parse({"ninfer-serve", "model.ninfer", "--host-kv-cache", "4"});
+        failures += check(host_kv.host_kv_cache_slabs == 4,
+                          "--host-kv-cache did not reach the serving options");
+    }
+
+    // The write-only combination: --host-kv-cache parks evicted sequences for
+    // later restore, but --no-prefix-reuse makes every request cold-prefill and
+    // the host-cache gate to skip restore. No parked entry can ever be restored,
+    // so the cache would only waste pinned RAM and host traffic. Reject it.
+    bool host_kv_no_prefix_reuse_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--host-kv-cache", "4",
+                     "--no-prefix-reuse"});
+    } catch (const std::invalid_argument&) { host_kv_no_prefix_reuse_rejected = true; }
+    failures += check(host_kv_no_prefix_reuse_rejected,
+                      "--host-kv-cache + --no-prefix-reuse was accepted (write-only combo)");
 
     bool dflash_vision_rejected = false;
     try {
@@ -197,6 +218,8 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--media-preprocess-threads") !=
                           std::string::npos,
                       "serve help omits media preparation controls");
+    failures += check(serve_usage_text("ninfer-serve").find("--host-kv-cache") != std::string::npos,
+                       "the usage text does not document --host-kv-cache");
     failures += check(serve_usage_text("ninfer-serve").find("--kv-capacity") != std::string::npos,
                       "serve help omits --kv-capacity");
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=

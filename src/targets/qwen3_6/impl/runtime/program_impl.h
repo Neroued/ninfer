@@ -1,4 +1,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "core/host_kv_log.h"
+#include "targets/qwen3_6/impl/runtime/host_kv_cache.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
@@ -856,6 +858,284 @@ void ProgramImplCore::abort_lane(std::uint32_t lane) noexcept {
 
 bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
+}
+
+void ProgramImplCore::enable_host_kv_cache(std::uint32_t slabs) {
+    if (slabs == 0 || host_kv_) { return; }
+    // The parked entry captures the paged KV, the hidden tensors and the GDN
+    // state, but not the DFlash lane-affine caches (local and
+    // rewrite-checkpoint-local cyclic KV) or the DFlash context frontier.
+    // Restoring a DFlash sequence from host would therefore be incomplete, so
+    // refuse to enable the cache for that backend rather than park a state
+    // that cannot be fully reinstated.
+    if (speculative_backend == SpeculativeBackend::DFlash) {
+        throw std::logic_error(
+            "host KV cache is not supported with the DFlash speculative backend: "
+            "the lane-affine DFlash caches are not captured by a parked entry");
+    }
+    host_kv_ = std::make_unique<HostKvCache>(slabs, host_kv_slab_bytes());
+    host_kv_log("host KV cache enabled: slabs=" + std::to_string(slabs) +
+                " slab_bytes=" + std::to_string(host_kv_->slab_bytes()));
+}
+
+bool ProgramImplCore::park_lane(std::uint32_t lane, std::uint64_t protect_id) {
+    if (!host_kv_ || !has_retained_lane(lane)) { return false; }
+    HostKvSlab* slab = host_kv_->acquire_slab(protect_id);
+    if (slab == nullptr) { return false; }
+    // The slab is owned by the park until the entry is committed; a throw in
+    // between (allocation, metadata) must not leak it.
+    struct SlabLease {
+        HostKvProvider* provider;
+        HostKvSlab* slab;
+        bool committed = false;
+        ~SlabLease() {
+            if (!committed && slab != nullptr) { provider->release_slab(slab); }
+        }
+    } lease{host_kv_.get(), slab};
+
+    auto entry  = std::make_unique<HostKvEntry>();
+    entry->slab = slab;
+    if (!park_lane_to_host(lane, *entry, device.stream)) {
+        host_kv_log("park lane " + std::to_string(lane) + " FAILED (needed more than slab)");
+        return false;  // the lease releases the slab; the lane is untouched
+    }
+    host_kv_log("parked lane " + std::to_string(lane) + " to host: " +
+                std::to_string(entry->meta.text_bytes) + "B text + " +
+                std::to_string(entry->meta.backend_bytes) + "B backend + " +
+                std::to_string(entry->meta.hidden_bytes) + "B hidden + " +
+                std::to_string(entry->meta.gdn_bytes) + "B gdn, " +
+                std::to_string(entry->execution_frontier) + " tokens, entries=" +
+                std::to_string(host_kv_->size()));
+    // Commit the entry before clearing the lane: if the insert throws, the lane
+    // still owns its state and the lease releases the slab, so the continuation
+    // is lost nowhere.
+    host_kv_->insert(std::move(entry));
+    lease.committed = true;
+    clear_lane(sequences[lane], requests[lane]);
+    return true;
+}
+
+std::uint32_t ProgramImplCore::host_kv_reusable_tokens(const PreparedPromptData& prompt) const {
+    if (!host_kv_ || !prompt.identity.reusable) { return 0; }
+    const auto match = host_kv_->find(prompt);
+    return match ? match->reuse_tokens : 0;
+}
+
+std::uint64_t ProgramImplCore::host_kv_match_id(const PreparedPromptData& prompt) const {
+    if (!host_kv_) { return 0; }
+    const auto match = host_kv_->find(prompt);
+    return match ? match->entry_id : 0;
+}
+
+bool ProgramImplCore::restore_lane(std::uint32_t lane, const PreparedPromptData& prompt) {
+    if (!host_kv_) { return false; }
+    const auto match = host_kv_->find(prompt);
+    if (!match) { return false; }
+    const HostKvEntry& entry = host_kv_->entry(match->entry_index);
+    // A transient pool shortage must not destroy the entry: if the parked
+    // entitlement cannot be reserved right now, keep the entry and let a later
+    // request (after the active lanes drain) restore it. Mirrors the reservation
+    // reserve_sequence_kv() makes, so the preflight and the reserve agree.
+    if (!decoder->text_kv.pool().can_reserve(entry.meta.text_page_entitlement) ||
+        (backend_kv_cache() != nullptr &&
+         !backend_kv_cache()->pool().can_reserve(entry.meta.backend_page_entitlement))) {
+        host_kv_log("restore lane " + std::to_string(lane) +
+                    " deferred: the pool cannot reserve the parked entitlement yet");
+        // The entry survives, so refresh its recency: without this it keeps
+        // insertion order and acquire_slab() evicts it first under the
+        // multi-lane workload, forcing the session it served to re-prefill.
+        host_kv_->touch(match->entry_index);
+        return false;
+    }
+    try {
+        restore_lane_from_host(lane, entry, match->reuse_tokens, device.stream);
+    } catch (...) {
+        // A failure after the reservation is an invariant violation or a corrupt
+        // entry: restore_lane_from_host rolled the lane back, so drop the entry
+        // to keep it from being restored again.
+        host_kv_->drop(match->entry_index);
+        throw;
+    }
+    host_kv_log("restored lane " + std::to_string(lane) + " from host: " +
+                std::to_string(match->reuse_tokens) + " tokens (entry " +
+                std::to_string(match->entry_index) + ")");
+    // The entry is now resident again; its slab returns to the arena.
+    host_kv_->drop(match->entry_index);
+    return true;
+}
+
+std::size_t ProgramImplCore::host_kv_slab_bytes() const {
+    const PagedKVPool& text_pool = decoder->text_kv.pool();
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    // A single sequence is capped by the logical page capacity (one sequence
+    // cannot span the whole shared physical pool), so size the pages for that
+    // cap, not the pool. The non-paged tail rides along in the slab: the two
+    // per-lane hidden tensors and the GDN conv+recurrent state for both the
+    // current and the rewrite-checkpoint slot.
+    const std::size_t hidden =
+        sequences[0].tail_hidden.bytes() + sequences[0].rewrite_checkpoint_hidden.bytes();
+    const std::size_t gdn = 2 * decoder->linear_attention.slot_bytes();
+    return parked_sequence_bytes(text_pool, backend ? &backend->pool() : nullptr,
+                                 text_pool.logical_page_capacity(),
+                                 backend ? backend->pool().logical_page_capacity() : 0,
+                                 hidden + gdn);
+}
+
+bool ProgramImplCore::park_lane_to_host(std::uint32_t lane, HostKvEntry& entry,
+                                        cudaStream_t stream) {
+    if (!has_retained_lane(lane) || !sequences[lane].kv || entry.slab == nullptr) { return false; }
+    SequenceState& sequence = sequences[lane];
+
+    // page_ids() is the mapped pages, which is the data; entitlement is only a
+    // ceiling, so parking it would copy pages that hold nothing.
+    const std::span<const std::int32_t> text_ids = sequence.kv->text.page_ids();
+    const bool has_backend                       = sequence.kv->backend.has_value();
+    const std::span<const std::int32_t> backend_ids =
+        has_backend ? sequence.kv->backend->page_ids() : std::span<const std::int32_t>{};
+
+    PagedKVPool& text_pool = decoder->text_kv.pool();
+    qwen3_6::PagedKVCache* backend_cache = backend_kv_cache();
+    const std::size_t needed = parked_sequence_bytes(
+        text_pool, has_backend ? &backend_cache->pool() : nullptr,
+        static_cast<std::uint32_t>(text_ids.size()),
+        static_cast<std::uint32_t>(backend_ids.size()),
+        sequence.tail_hidden.bytes() + sequence.rewrite_checkpoint_hidden.bytes() +
+            2 * decoder->linear_attention.slot_bytes());
+    if (needed > entry.slab->bytes()) {
+        return false;
+    }
+
+    entry.meta.text_bytes = text_pool.park_pages(text_ids, *entry.slab, stream);
+    if (has_backend) {
+        // park_pages() rewrites filled(); accumulate across both pools by hand.
+        HostKvSlab tail_view(static_cast<unsigned char*>(entry.slab->base()) + entry.meta.text_bytes,
+                             entry.slab->bytes() - entry.meta.text_bytes);
+        tail_view.set_filled(entry.slab->bytes() - entry.meta.text_bytes);
+        entry.meta.backend_bytes = backend_cache->pool().park_pages(backend_ids, tail_view, stream);
+    }
+    entry.meta.hidden_bytes =
+        park_hidden(sequence.tail_hidden, sequence.rewrite_checkpoint_hidden, *entry.slab,
+                    entry.meta.text_bytes + entry.meta.backend_bytes, stream);
+    // The GDN conv+recurrent state is lane-affine and is NOT in the KV pages:
+    // a side request that runs in this lane zeroes the current slot, so it must
+    // ride in the slab or the restored sequence continues from a zeroed state.
+    // Both the current and the rewrite-checkpoint slot are parked.
+    const std::size_t gdn_offset = entry.meta.text_bytes + entry.meta.backend_bytes +
+                                   entry.meta.hidden_bytes;
+    entry.meta.gdn_bytes = park_gdn_slot(
+        decoder->linear_attention,
+        LinearStateSlots::current_state_slot(lane, max_concurrency), *entry.slab, gdn_offset,
+        stream);
+    entry.meta.gdn_bytes += park_gdn_slot(
+        decoder->linear_attention,
+        LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency), *entry.slab,
+        gdn_offset + entry.meta.gdn_bytes, stream);
+    entry.slab->set_filled(gdn_offset + entry.meta.gdn_bytes);
+
+    entry.meta.text_page_ids.assign(text_ids.begin(), text_ids.end());
+    entry.meta.backend_page_ids.assign(backend_ids.begin(), backend_ids.end());
+    entry.meta.text_page_entitlement    = sequence.kv->text.page_entitlement();
+    entry.meta.backend_page_entitlement =
+        has_backend ? sequence.kv->backend->page_entitlement() : 0;
+    entry.meta.has_backend = has_backend;
+
+    // clear_lane() drops all of this along with the KV, and the planner reads
+    // exactly these fields to choose append over rewind.
+    entry.ledger              = sequence.ledger;
+    entry.prefix_identity     = sequence.prefix_identity;
+    entry.execution_frontier  = sequence.execution_frontier;
+    entry.ledger_frontier     = sequence.ledger_frontier;
+    entry.text_kv_valid       = sequence.text_kv_valid;
+    entry.mtp_kv_valid        = sequence.mtp_kv_valid;
+    entry.rope_delta          = sequence.rope_delta;
+    entry.tail_hidden_valid   = sequence.tail_hidden_valid;
+    entry.checkpoint_valid    = sequence.rewrite_checkpoint.valid;
+    entry.checkpoint_kind     = sequence.rewrite_checkpoint.kind;
+    entry.checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
+
+    // The copies are async on `stream`; sync so they are complete before the
+    // caller clears the lane and the pages are reused. The lane itself is
+    // cleared by the caller, after committing the entry, so a failed insert
+    // cannot leave the lane cleared with the continuation lost.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
+}
+
+void ProgramImplCore::restore_lane_from_host(std::uint32_t lane, const HostKvEntry& entry,
+                                             std::uint32_t reuse_tokens, cudaStream_t stream) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    SequenceState& sequence = sequences[lane];
+    if (sequence.kv) { throw std::logic_error("cannot restore onto a lane that owns KV"); }
+
+    // A rewind needs only the pages up to its checkpoint, so restore the prefix
+    // covering reuse_tokens rather than everything that was parked.
+    const std::uint32_t text_pages = pages_for_tokens(reuse_tokens);
+    if (text_pages > entry.meta.text_page_ids.size()) {
+        throw std::logic_error("host KV entry is shorter than the requested reuse");
+    }
+
+    try {
+        reserve_sequence_kv(sequence, entry.meta.text_page_entitlement,
+                            entry.meta.backend_page_entitlement);
+        sequence.kv->text.materialize_pages(text_pages, stream);
+        const std::span<const std::int32_t> text_ids = sequence.kv->text.page_ids();
+        decoder->text_kv.pool().restore_pages(text_ids, entry.meta.text_page_ids.size(),
+                                              *entry.slab, stream);
+
+        if (entry.meta.has_backend && sequence.kv->backend) {
+            const std::uint32_t backend_pages =
+                static_cast<std::uint32_t>(entry.meta.backend_page_ids.size());
+            sequence.kv->backend->materialize_pages(backend_pages, stream);
+            HostKvSlab tail_view(
+                static_cast<unsigned char*>(entry.slab->base()) + entry.meta.text_bytes,
+                entry.meta.backend_bytes);
+            tail_view.set_filled(entry.meta.backend_bytes);
+            backend_kv_cache()->pool().restore_pages(sequence.kv->backend->page_ids(),
+                                                     entry.meta.backend_page_ids.size(), tail_view,
+                                                     stream);
+        }
+
+        restore_hidden(sequence.tail_hidden, sequence.rewrite_checkpoint_hidden, *entry.slab,
+                       entry.meta.text_bytes + entry.meta.backend_bytes, stream);
+
+        // The GDN conv+recurrent state was zeroed by any side request that ran
+        // in this lane, so it must be reinstated from the slab or the restored
+        // sequence continues from a zeroed recurrent state. Both the current and
+        // the rewrite-checkpoint slot are restored; the planner's existing
+        // checkpoint-restore path copies the checkpoint slot into the current
+        // one when a rewind is selected.
+        const std::size_t gdn_offset = entry.meta.text_bytes + entry.meta.backend_bytes +
+                                       entry.meta.hidden_bytes;
+        const std::size_t gdn_slot   = decoder->linear_attention.slot_bytes();
+        restore_gdn_slot(decoder->linear_attention,
+                         LinearStateSlots::current_state_slot(lane, max_concurrency), *entry.slab,
+                         gdn_offset, stream);
+        restore_gdn_slot(decoder->linear_attention,
+                         LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency),
+                         *entry.slab, gdn_offset + gdn_slot, stream);
+
+        sequence.ledger                    = entry.ledger;
+        sequence.prefix_identity           = entry.prefix_identity;
+        sequence.execution_frontier        = entry.execution_frontier;
+        sequence.ledger_frontier           = entry.ledger_frontier;
+        sequence.text_kv_valid             = entry.text_kv_valid;
+        sequence.mtp_kv_valid              = entry.mtp_kv_valid;
+        sequence.rope_delta                = entry.rope_delta;
+        sequence.tail_hidden_valid         = entry.tail_hidden_valid;
+        sequence.rewrite_checkpoint.valid  = entry.checkpoint_valid;
+        sequence.rewrite_checkpoint.kind   = entry.checkpoint_kind;
+        sequence.rewrite_checkpoint.frontier = entry.checkpoint_frontier;
+        sequence.retained                  = true;
+
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } catch (...) {
+        // A failure after the reservation leaves the lane with a half-built KV
+        // bundle that would poison later restores and leak the entitlement.
+        // Tear it down so the lane is empty again.
+        sequence.kv.reset();
+        sequence.retained = false;
+        throw;
+    }
 }
 
 void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {

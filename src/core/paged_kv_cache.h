@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/host_kv_park.h"
 #include "core/layout.h"
 #include "core/tensor.h"
 
@@ -117,6 +118,22 @@ public:
 
     // Zeros only the named physical page groups across every storage plane.
     void zero_pages(std::span<const std::int32_t> page_ids, cudaStream_t stream = nullptr);
+
+    // Per-plane geometry for host_kv_park/restore. Exposed so the park logic can
+    // live outside the pool while still addressing planes the way zero_pages does.
+    [[nodiscard]] std::vector<HostKvPlaneView> host_kv_plane_views() const;
+
+    // Copies the named physical pages to/from a pinned host slab. Restore may
+    // target different pages than the park: kernels reach pages through the
+    // block table, so the caller rewrites that mapping and captured graphs
+    // pick it up without recapture.
+    std::size_t park_pages(std::span<const std::int32_t> page_ids, HostKvSlab& slab,
+                           cudaStream_t stream = nullptr);
+    // page_ids may be a prefix of what was parked: a rewind to a checkpoint
+    // needs only the pages up to that frontier. parked_pages states the park's
+    // extent so per-plane source offsets resolve.
+    void restore_pages(std::span<const std::int32_t> page_ids, std::size_t parked_pages,
+                       const HostKvSlab& slab, cudaStream_t stream = nullptr);
 
 private:
     friend class PagedKVAllocation;

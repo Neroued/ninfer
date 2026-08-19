@@ -55,13 +55,36 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-  libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+
+# FFmpeg and libcurl are located cross-platform: pkg-config on POSIX, an
+# install prefix / vcpkg tree on Windows. Both are exposed as NInfer::FFmpeg
+# and NInfer::Curl (see cmake/NInferMediaDeps.cmake).
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+include(NInferMediaDeps)
+ninfer_find_ffmpeg()
 if(NINFER_BUILD_MEDIA_ACQUIRE)
-  pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+  ninfer_find_curl()
 endif()
+
 find_package(Threads REQUIRED)
+
+if(MSVC)
+  # CUDA 13's CCCL (cuda/std) requires the conforming MSVC preprocessor. The
+  # flag is forwarded to the cl host compiler nvcc invokes, including for the
+  # host stubs it generates. (The 128-byte-aligned TMA descriptor parameters are
+  # passed by device pointer rather than by value precisely so MSVC's stub
+  # compiler does not reject them.)
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>)
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor")
+  # windows.h defines min/max as macros which clobber std::min/std::max; NOMINMAX
+  # suppresses them. UTF8PROC_STATIC keeps the vendored utf8proc header from
+  # marking its symbols __declspec(dllimport) since we compile it statically. Both
+  # are scoped to C/CXX (no CUDA file needs them) so the CUDA objects keep their
+  # cache.
+  add_compile_definitions(
+    $<$<COMPILE_LANGUAGE:C,CXX>:NOMINMAX>
+    $<$<COMPILE_LANGUAGE:C,CXX>:UTF8PROC_STATIC>)
+endif()
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

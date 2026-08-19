@@ -1,0 +1,46 @@
+name: Docker Image CI
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install prerequisites
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg2
+    - name: Configure the production repository
+      run: |
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+          && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+          sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+          sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    - name: Configure the repository to use experimental packages
+      run: sudo sed -i -e '/experimental/ s/^#//g' /etc/apt/sources.list.d/nvidia-container-toolkit.list
+    - name: Update the packages list
+      run: sudo apt-get update
+    - name: Install the NVIDIA Container Toolkit
+      run: |
+        export NVIDIA_CONTAINER_TOOLKIT_VERSION=1.20.0-1
+          sudo apt-get install -y \
+          nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+          nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+          libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION} \
+          libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}
+
+    - name: Install the NVIDIA Container Toolkit
+      run: |
+        sudo nvidia-ctk config --in-place --set nvidia-container-runtime.log-level=debug
+        sudo nvidia-ctk config --in-place --set nvidia-container-runtime.runtimes=crun:runc
+        sudo nvidia-ctk runtime configure --runtime=docker
+        sudo systemctl restart docker
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --tag nikobraz/ninfer:latest
+    - name: Build and push
+      uses: docker/build-push-action@v3
+      with:
+        push: true
+        tags: nikobraz/ninfer:latest

@@ -197,4 +197,36 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Te
     CUDA_CHECK(cudaGetLastError());
 }
 
+namespace {
+
+template <int QHeads, int KHeads>
+void launch_qk_norm_rope(const Tensor& positions, const Tensor& q_in, const Tensor& q_weight,
+                         Tensor& q_out, const Tensor& k_in, const Tensor& k_weight, Tensor& k_out,
+                         float eps, cudaStream_t stream) {
+    const int tokens = positions.ne[0];
+    qk_norm_rope_text_kernel<QHeads, KHeads><<<tokens, (QHeads + KHeads) * 32, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data),
+        reinterpret_cast<const __nv_bfloat162*>(q_in.data),
+        reinterpret_cast<const __nv_bfloat162*>(q_weight.data),
+        reinterpret_cast<__nv_bfloat162*>(q_out.data),
+        reinterpret_cast<const __nv_bfloat162*>(k_in.data),
+        reinterpret_cast<const __nv_bfloat162*>(k_weight.data),
+        reinterpret_cast<__nv_bfloat162*>(k_out.data), eps);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void qk_norm_rope_text_launch(const Tensor& positions, const Tensor& q_in, const Tensor& q_weight,
+                              Tensor& q_out, const Tensor& k_in, const Tensor& k_weight,
+                              Tensor& k_out, float eps, cudaStream_t stream) {
+    if (q_in.ne[1] == 24 && k_in.ne[1] == 4) {
+        launch_qk_norm_rope<24, 4>(positions, q_in, q_weight, q_out, k_in, k_weight, k_out, eps,
+                                   stream);
+        return;
+    }
+    launch_qk_norm_rope<16, 2>(positions, q_in, q_weight, q_out, k_in, k_weight, k_out, eps,
+                               stream);
+}
+
 } // namespace ninfer::ops::detail

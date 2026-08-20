@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include "ninfer/ops/rmsnorm.h"
 
 namespace ninfer::ops {
 namespace {
@@ -138,6 +139,24 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaS
     require_positions_storage(positions);
     if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
     detail::rope_single_launch(positions, rotary_dim, theta, x, stream);
+}
+
+void qk_norm_rope(const Tensor& positions, int rotary_dim, float theta, const Tensor& q_in,
+                  const Tensor& q_weight, Tensor& q_out, const Tensor& k_in,
+                  const Tensor& k_weight, Tensor& k_out, float eps, cudaStream_t stream) {
+    const bool text_heads = (q_in.ne[1] == 16 && k_in.ne[1] == 2) ||
+                            (q_in.ne[1] == 24 && k_in.ne[1] == 4);
+    const bool fused_shape = text_heads && q_in.ne[0] == 256 && k_in.ne[0] == 256 &&
+                             rotary_dim == 64 && positions.dtype == DType::I32;
+    if (fused_shape) {
+        detail::qk_norm_rope_text_launch(positions, q_in, q_weight, q_out, k_in, k_weight, k_out,
+                                         eps, stream);
+        rope(positions, rotary_dim, theta, q_out, k_out, stream);
+        return;
+    }
+    rmsnorm(q_in, q_weight, eps, true, q_out, stream);
+    rmsnorm(k_in, k_weight, eps, true, k_out, stream);
+    rope(positions, rotary_dim, theta, q_out, k_out, stream);
 }
 
 } // namespace ninfer::ops

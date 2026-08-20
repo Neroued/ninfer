@@ -153,7 +153,7 @@ build/apps/ninfer-serve
 
 Tests, benchmarks, and maintainer tools are excluded from the default build.
 
-## Docker
+## Build Docker Image
 
 Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA
 driver, Docker, and the
@@ -161,6 +161,14 @@ driver, Docker, and the
 
 ```bash
 docker build --tag ninfer:local .
+```
+
+## Public Docker Image
+
+Pull Image from Docker Hub
+
+```bash
+docker pull neroued/ninfer:latest .
 ```
 
 Download a model into `models/` as described below, then run the HTTP server:

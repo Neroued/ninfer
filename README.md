@@ -160,7 +160,8 @@ driver, Docker, and the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 
 ```bash
-docker build --tag ninfer:local .
+export NINFER_DOCKER_IMAGE=ninfer:local
+docker build --tag $NINFER_DOCKER_IMAGE .
 ```
 
 ## Public Docker Image
@@ -168,7 +169,8 @@ docker build --tag ninfer:local .
 Pull Image from Docker Hub
 
 ```bash
-docker pull neroued/ninfer:latest .
+export NINFER_DOCKER_IMAGE=neroued/ninfer:latest
+docker pull $NINFER_DOCKER_IMAGE .
 ```
 
 Download a model into `models/` as described below, then run the HTTP server:
@@ -178,7 +180,7 @@ docker run --rm \
   --gpus '"device=0"' \
   --publish 8080:8080 \
   --volume "$PWD/models:/models:ro" \
-  neroued/ninfer:latest \
+  $NINFER_DOCKER_IMAGE \
   ninfer-serve /models/qwen3_6_27b.ninfer \
   --host 0.0.0.0
 ```
@@ -189,7 +191,7 @@ Run the CLI from the same image:
 docker run --rm \
   --gpus '"device=0"' \
   --volume "$PWD/models:/models:ro" \
-  neroued/ninfer:latest \
+  $NINFER_DOCKER_IMAGE \
   ninfer /models/qwen3_6_27b.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-new 256

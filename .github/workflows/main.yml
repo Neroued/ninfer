@@ -55,13 +55,13 @@ jobs:
           
     - uses: shrink/actions-docker-extract@v4
       with:
-        image: "neroued/ninfer::${{ github.ref_name }}"
+        image: "neroued/ninfer:${{ github.ref_name }}"
         path: "/usr/local/bin/ninfer"
         destination: dist
 
     - uses: shrink/actions-docker-extract@v4
       with:
-        image: "neroued/ninfer::${{ github.ref_name }}"
+        image: "neroued/ninfer:${{ github.ref_name }}"
         path: "/usr/local/bin/ninfer-serve"
         destination: dist
         

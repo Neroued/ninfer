@@ -178,7 +178,7 @@ docker run --rm \
   --gpus '"device=0"' \
   --publish 8080:8080 \
   --volume "$PWD/models:/models:ro" \
-  ninfer:local \
+  neroued/ninfer:latest \
   ninfer-serve /models/qwen3_6_27b.ninfer \
   --host 0.0.0.0
 ```
@@ -189,7 +189,7 @@ Run the CLI from the same image:
 docker run --rm \
   --gpus '"device=0"' \
   --volume "$PWD/models:/models:ro" \
-  ninfer:local \
+  neroued/ninfer:latest \
   ninfer /models/qwen3_6_27b.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-new 256

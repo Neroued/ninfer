@@ -67,15 +67,23 @@ __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __
     return warp_reduce_sum(sum);
 }
 
+// Ticket for the last-arriving D1 block. atomicInc wraps at gridDim.x - 1, so the counter returns
+// to zero on its own and needs no host-side initialisation or workspace slot.
+__device__ unsigned int g_sparse_moe_route_ticket = 0;
+
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
-                                     float* __restrict__ scores,
+                                     float* __restrict__ scores, int* __restrict__ ids,
+                                     float* __restrict__ alpha, float* __restrict__ shared_scale,
                                      const char* __restrict__ shared_down_payload,
                                      unsigned long long shared_down_bytes) {
     __shared__ float partial[kD1Warps];
+    __shared__ float selected_logits[kTopK];
+    __shared__ bool is_last_block;
     const int row   = static_cast<int>(blockIdx.x);
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
     const int lane  = static_cast<int>(threadIdx.x) & 31;
+    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     const float dot = router_row_dot(x, router + static_cast<std::int64_t>(row) * kHidden);
     if (lane == 0) { partial[warp] = dot; }
     __syncthreads();
@@ -95,14 +103,18 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
             asm volatile("prefetch.global.L2 [%0];" ::"l"(shared_down_payload + offset));
         }
     }
-}
-
-__global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int* __restrict__ ids,
-                                          float* __restrict__ alpha,
-                                          float* __restrict__ shared_scale) {
-    __shared__ float selected_logits[kTopK];
-    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
-    sparse_moe_select_top8_warp(scores, ids, alpha, shared_scale, selected_logits);
+    // The top-8 selection used to be its own single-warp grid. Its cost was the price of the node
+    // rather than the work, so the block that arrives last runs the identical routine instead. The
+    // inputs, the comparison order and the softmax are unchanged, so the routing is identical.
+    if (threadIdx.x == 0) {
+        __threadfence();
+        const unsigned int ticket = atomicInc(&g_sparse_moe_route_ticket, gridDim.x - 1u);
+        is_last_block             = ticket == gridDim.x - 1u;
+    }
+    __syncthreads();
+    if (is_last_block && warp == 0) {
+        sparse_moe_select_top8_warp(scores, ids, alpha, shared_scale, selected_logits);
+    }
 }
 
 struct Q4Codec {
@@ -510,7 +522,9 @@ void launch_d1(const Tensor& x, const SparseMoeWeights& weights,
     sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data),
         static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
-        static_cast<float*>(workspace.scratch.data),
+        static_cast<float*>(workspace.scratch.data), static_cast<int*>(workspace.ids.data),
+        static_cast<float*>(workspace.alpha.data),
+        static_cast<float*>(workspace.shared_scale.data),
         static_cast<const char*>(weights.shared_down.qdata),
         static_cast<unsigned long long>(weights.shared_down.payload_bytes));
     CUDA_CHECK(cudaGetLastError());
@@ -534,13 +548,6 @@ void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
 
 void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
                   const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
-    const auto* scores = static_cast<const float*>(workspace.scratch.data);
-    auto* ids          = static_cast<int*>(workspace.ids.data);
-    auto* alpha        = static_cast<float*>(workspace.alpha.data);
-    auto* shared_scale = static_cast<float*>(workspace.shared_scale.data);
-    sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale);
-    CUDA_CHECK(cudaGetLastError());
-
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
         launch_d3_dependent_codec<Q4Codec>(x, weights, workspace, stream);

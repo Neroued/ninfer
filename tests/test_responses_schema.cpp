@@ -308,6 +308,58 @@ int test_typed_items_and_tools() {
     return failures;
 }
 
+int test_function_call_output_content_array() {
+    const Json body = {
+        {"model", "qwen3.6-27b"},
+        {"input",
+         Json::array({Json{{"type", "function_call"},
+                           {"call_id", "call_view"},
+                           {"name", "view_image"},
+                           {"arguments", R"({"path":"shot.png"})"}},
+                      Json{{"type", "function_call_output"},
+                           {"call_id", "call_view"},
+                           {"output",
+                            Json::array({Json{{"type", "input_text"}, {"text", "loaded"}},
+                                         Json{{"type", "input_image"},
+                                              {"image_url", "data:image/png;base64,AA=="},
+                                              {"detail", "high"}}})}}})},
+        {"max_output_tokens", 32}};
+
+    const ResponsesRequest request = parse_responses_request(body, limits());
+    int failures = 0;
+    failures += check(request.input_turns.size() == 2,
+                      "function call and structured output translated to two turns");
+    failures += check(request.input_turns[1].role == ninfer::ChatRole::Tool &&
+                          request.input_turns[1].tool_call_id == "call_view" &&
+                          request.input_turns[1].content.size() == 2,
+                      "structured function output translated to one tool turn");
+    failures += check(request.input_turns[1].content[0].kind == ContentKind::Text &&
+                          request.input_turns[1].content[0].text == "loaded" &&
+                          request.input_turns[1].content[1].kind == ContentKind::Image,
+                      "structured function output preserves text and image parts");
+
+    failures += check(request.input_items[1].at("output") == body.at("input")[1].at("output"),
+                      "structured function output preserved in canonical input Items");
+
+    Json invalid = body;
+    invalid["input"][1]["output"] = Json::array();
+    failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
+                      "empty structured function output was accepted");
+
+    invalid = body;
+    invalid["input"][1]["output"] = Json::array({Json{{"type", "input_text"}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(invalid, limits()); }),
+                      "structured function output accepted input_text without text");
+
+    invalid = body;
+    invalid["input"][1]["output"] =
+        Json::array({Json{{"type", "input_file"}, {"file_id", "file_1"}}});
+    failures += check(api_code([&] { (void)parse_responses_request(invalid, limits()); }) ==
+                          "file_inputs_not_supported",
+                      "structured function output accepted input_file");
+    return failures;
+}
+
 int test_ignored_client_hints() {
     // Codex-shaped request: every client hint present at once must parse and
     // leave generation inputs unchanged.
@@ -822,6 +874,7 @@ int main() {
     failures += test_preserve_thinking_options_and_inheritance();
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();
+    failures += test_function_call_output_content_array();
     failures += test_ignored_client_hints();
     failures += test_namespace_tools();
     failures += test_explicit_rejections();

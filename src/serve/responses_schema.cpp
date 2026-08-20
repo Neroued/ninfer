@@ -126,8 +126,8 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
             bad_request("input_image.detail must be a string", "input");
         }
         const std::string detail = part.at("detail").get<std::string>();
-        if (detail != "auto") {
-            bad_request("only input_image detail 'auto' is supported", "input",
+        if (detail != "auto" && detail != "low" && detail != "high") {
+            bad_request("input_image detail must be 'auto', 'low', or 'high'", "input",
                         "image_detail_not_supported");
         }
     }
@@ -357,9 +357,6 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
         item.at("call_id").get<std::string>().empty()) {
         bad_request("function_call_output must contain a non-empty call_id", "input");
     }
-    if (!item.contains("output") || !item.at("output").is_string()) {
-        bad_request("function_call_output output must be a string", "input");
-    }
     if (item.contains("status") && !item.at("status").is_null() &&
         (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
         bad_request("function_call_output status must be 'completed'", "input");
@@ -367,11 +364,50 @@ ChatTurn parse_function_call_output_item(const Json& item, Json& canonical) {
     ChatTurn turn;
     turn.role         = ChatRole::Tool;
     turn.tool_call_id = item.at("call_id").get<std::string>();
-    ContentPart content;
-    content.kind     = ContentKind::Text;
-    content.type_raw = "input_text";
-    content.text     = item.at("output").get<std::string>();
-    turn.content.push_back(std::move(content));
+    if (!item.contains("output")) {
+        bad_request("function_call_output must contain output", "input");
+    }
+    const Json& output = item.at("output");
+    const auto append_text = [&](const std::string& text) {
+        ContentPart content;
+        content.kind     = ContentKind::Text;
+        content.type_raw = "input_text";
+        content.text     = text;
+        turn.content.push_back(std::move(content));
+    };
+    if (output.is_string()) {
+        append_text(output.get<std::string>());
+    } else if (output.is_array()) {
+        for (const Json& value : output) {
+            if (!value.is_object() || !value.contains("type") ||
+                !value.at("type").is_string()) {
+                bad_request("function_call_output content parts must have a string type", "input");
+            }
+            const std::string type = value.at("type").get<std::string>();
+            if (type == "input_text") {
+                if (!value.contains("text") || !value.at("text").is_string()) {
+                    bad_request("input_text must contain a string text", "input");
+                }
+                append_text(value.at("text").get<std::string>());
+            } else if (type == "input_image") {
+                ContentPart content;
+                content.kind     = ContentKind::Image;
+                content.type_raw = type;
+                content.source   = parse_image_source(value);
+                turn.content.push_back(std::move(content));
+            } else if (type == "input_file") {
+                bad_request("input_file is not supported", "input", "file_inputs_not_supported");
+            } else {
+                bad_request("unsupported function_call_output content type: " + type, "input",
+                            "modality_not_supported");
+            }
+        }
+    } else {
+        bad_request("function_call_output output must be a string or content array", "input");
+    }
+    if (turn.content.empty()) {
+        bad_request("function_call_output output must not be empty", "input");
+    }
     canonical = {{"id", item_id(item, "fco", "input")},
                  {"type", "function_call_output"},
                  {"status", "completed"},

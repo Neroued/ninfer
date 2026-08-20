@@ -248,11 +248,11 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `message` | roles `user`, `assistant`, `system`, and `developer`; string content or typed content array |
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
-| `input_image` | user-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
+| `input_image` | user-message or function-result part with HTTP(S) or data-URI `image_url`; detail omitted, `auto`, `low`, or `high`; requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with an empty `summary` and `reasoning_text` content parts |
 | `function_call` | completed assistant call with optional `id`, and required `call_id`, `name`, and JSON-object string `arguments` |
-| `function_call_output` | completed tool result with required `call_id` and string `output` |
+| `function_call_output` | completed tool result with required `call_id`; `output` may be a string or a content array of `input_text` and `input_image` parts |
 
 Adjacent function-call Items are grouped into one assistant history turn. A reasoning Item attaches
 to the following assistant message or function call. Input Item IDs are preserved when supplied and
@@ -262,10 +262,27 @@ System and developer message Items retain their positions in the input array. To
 `instructions` is represented as a leading developer turn for the current request; target-specific
 role lowering occurs only in the Qwen family frontend.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning summaries or
-encrypted reasoning, message `phase`, and other Item/content types are not supported. HTTP media
-URLs stored in a response chain are fetched again when that chain is continued; use data URIs when
-the historical media bytes must be immutable.
+`input_file`, `input_audio`, image `file_id`, reasoning summaries or encrypted reasoning,
+message `phase`, and other Item/content types are not supported. HTTP media URLs stored in a
+response chain are fetched again when that chain is continued; use data URIs when the historical
+media bytes must be immutable.
+
+A tool can return mixed text and image content, for example:
+
+```json
+{
+  "type": "function_call_output",
+  "call_id": "call_vision",
+  "output": [
+    {"type": "input_text", "text": "Screenshot captured"},
+    {
+      "type": "input_image",
+      "image_url": "data:image/png;base64,...",
+      "detail": "high"
+    }
+  ]
+}
+```
 
 ### Function tools
 

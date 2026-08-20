@@ -50,18 +50,18 @@ jobs:
       with:
         push: true
         tags: |
-          nikobraz/ninfer:${{ github.ref_name }}
-          nikobraz/ninfer:latest
+          neroued/ninfer:${{ github.ref_name }}
+          neroued/ninfer:latest
           
     - uses: shrink/actions-docker-extract@v4
       with:
-        image: "nikobraz/ninfer:latest"
+        image: "neroued/ninfer:latest"
         path: "/usr/local/bin/ninfer"
         destination: dist
 
     - uses: shrink/actions-docker-extract@v4
       with:
-        image: "nikobraz/ninfer:latest"
+        image: "neroued/ninfer:latest"
         path: "/usr/local/bin/ninfer-serve"
         destination: dist
         

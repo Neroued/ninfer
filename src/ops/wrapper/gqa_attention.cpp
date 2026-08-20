@@ -10,6 +10,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include "ninfer/ops/sigmoid_mul.h"
 
 namespace ninfer::ops {
 namespace {
@@ -397,7 +398,8 @@ std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType c
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
                    const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                    PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
-                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                   WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                   const Tensor* gate) {
     constexpr const char* op = "gqa_attention";
     validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
                                        envelope, scale, op);
@@ -418,6 +420,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
     if (route == detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
                                envelope, workspace, out, stream);
+        if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
         return;
     }
     if (route == detail::GqaAttentionRoute::SmallT) {
@@ -427,11 +430,13 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
         detail::gqa_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                              scale, cache, envelope, 0, width, partial.acc,
-                                             partial.m, partial.l, out, stream);
+                                             partial.m, partial.l, out, stream,
+                                             gate == nullptr ? nullptr : gate->data);
         return;
     }
     detail::gqa_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                         cache, out, stream);
+    if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
 }
 
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -462,7 +467,8 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
 
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
                           const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
-                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                          WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                          const Tensor* gate) {
     constexpr const char* op = "gqa_attention_cached";
     validate_attention_tensors(q, positions, out, cache, envelope, scale, op);
 
@@ -470,6 +476,7 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
     if (detail::gqa_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope) ==
         detail::GqaAttentionRoute::ChunkedSmallT) {
         launch_cached_chunked_small_t(q, positions, scale, cache, envelope, workspace, out, stream);
+        if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
         return;
     }
     if (detail::gqa_attention_uses_small_t(q.ne[2])) {
@@ -477,10 +484,12 @@ void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
             detail::gqa_attention_split_capacity(q.ne[1], q.ne[2], cache.dtype, envelope);
         SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits);
         detail::gqa_attention_cached_small_t_launch(q, positions, scale, cache, envelope,
-                                                    partial.acc, partial.m, partial.l, out, stream);
+                                                    partial.acc, partial.m, partial.l, out, stream,
+                                                    gate == nullptr ? nullptr : gate->data);
         return;
     }
     detail::gqa_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
+    if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
 }
 
 } // namespace ninfer::ops

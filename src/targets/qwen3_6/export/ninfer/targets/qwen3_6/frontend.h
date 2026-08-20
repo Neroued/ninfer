@@ -20,6 +20,8 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    // Per-image ceiling in Vision tokens. Zero keeps preprocessor_config.json's own value.
+    std::uint32_t image_token_budget       = 0;
 };
 
 struct FrontendResources;

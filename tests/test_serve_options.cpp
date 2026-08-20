@@ -41,6 +41,8 @@ int main() {
                           defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,
                       "media preparation resource defaults mismatch");
+    failures += check(defaults.image_token_budget == 0,
+                      "an image serving ceiling is unexpectedly applied by default");
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
@@ -71,6 +73,11 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--model-id", ""});
     } catch (const std::invalid_argument&) { empty_model_id_rejected = true; }
     failures += check(empty_model_id_rejected, "empty --model-id was accepted");
+
+    const ServeOptions image_budget =
+        parse({"ninfer-serve", "model.ninfer", "--image-token-budget", "1280"});
+    failures += check(image_budget.image_token_budget == 1280,
+                      "--image-token-budget did not carry the per-image Vision-token ceiling");
 
     const ServeOptions dflash = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash",
                                        "--draft-tokens", "15", "--lm-head-draft"});

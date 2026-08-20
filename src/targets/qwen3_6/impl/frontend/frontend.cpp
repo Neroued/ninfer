@@ -42,6 +42,10 @@ constexpr double kVideoFps             = 2.0;
 constexpr int kVideoMinFrames          = 4;
 constexpr int kVideoMaxFrames          = 768;
 
+// validate_pixel_pipeline() pins patch_size to 16 and merge_size to 2, so one Vision token
+// always covers a 32x32 pixel square.
+constexpr std::uint64_t kPixelsPerVisionToken = (16ULL * 2ULL) * (16ULL * 2ULL);
+
 constexpr std::array<std::pair<std::string_view, TokenId>, 4> kVisionSpecialTokens = {{
     {"<|vision_start|>", 248053},
     {"<|vision_end|>", 248054},
@@ -141,7 +145,8 @@ void validate_pixel_pipeline(const Json& config, std::string_view resource) {
     }
 }
 
-fi::ProcessorOptions processor_options(const FrontendResources& resources) {
+fi::ProcessorOptions processor_options(const FrontendResources& resources,
+                                       std::uint32_t image_token_budget) {
     const Json image =
         parse_resource_json(resources.preprocessor_config_json, "preprocessor_config.json");
     const Json video = parse_resource_json(resources.video_preprocessor_config_json,
@@ -159,6 +164,19 @@ fi::ProcessorOptions processor_options(const FrontendResources& resources) {
     options.image_max_pixels =
         positive_u64(require_integer(image_size, "longest_edge", "preprocessor_config.json.size"),
                      "image longest_edge");
+    if (image_token_budget != 0) {
+        // preprocessor_config.json ships the model's *capability* ceiling: longest_edge there is
+        // large enough that a full-resolution screen capture is never resized, so a single image
+        // occupies thousands of prompt tokens. An agent conversation resends every screenshot it
+        // has read on every turn, so a serving endpoint wants a *policy* ceiling on top, the way
+        // every hosted API applies one: fit-and-scale rather than reject. The budget is per image
+        // and deliberately does not depend on how many images a request carries; waterfilling
+        // across items would move the prompt prefix as a conversation grows and invalidate prefix
+        // reuse on every turn. Nothing else in the pipeline reads image_max_pixels.
+        options.image_max_pixels =
+            std::min(options.image_max_pixels,
+                     static_cast<std::uint64_t>(image_token_budget) * kPixelsPerVisionToken);
+    }
     options.video_min_pixels = positive_u64(
         require_integer(video_size, "shortest_edge", "video_preprocessor_config.json.size"),
         "video shortest_edge");
@@ -600,7 +618,8 @@ public:
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          processor(processor_options(resources)), vision_enabled(options.vision_enabled) {
+          processor(processor_options(resources, options.image_token_budget)),
+          vision_enabled(options.vision_enabled) {
         if (options.max_context == 0) {
             throw std::invalid_argument("frontend max_context must be nonzero");
         }

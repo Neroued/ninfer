@@ -151,6 +151,25 @@ not invalidate a request reference, and live bytes are returned only when the fi
 released. A request-level preparation gate derived from the live limit prevents concurrent partial
 builds from deadlocking the memory account.
 
+`preprocessor_config.json` ships the model's *capability* ceiling: `size.longest_edge` there is
+large enough that a full-resolution screen capture is never resized, so a single image can occupy
+thousands of prompt tokens. An agent client resends every screenshot it has read on every turn,
+so that number decides how many turns fit the context at all. `--image-token-budget N` applies a
+serving *policy* ceiling on top of the capability one, counted in Vision tokens, one Vision token
+being a 32x32 pixel square: an image above the budget is scaled to fit rather than rejected, and
+`0` keeps the artifact's own number. It is a per-image ceiling and deliberately does not depend on
+how many images a request carries, because waterfilling a shared budget across items would move
+the prompt prefix as a conversation grows and invalidate prefix reuse on every turn. Videos are
+unaffected.
+
+On the Qwen3.8-27B NVFP4 artifact served with `--vision --max-context 32768`, a one-image chat
+request reports these `usage.prompt_tokens`; the same request without an image reports 53:
+
+| image | default | `--image-token-budget 1280` | `--image-token-budget 256` |
+| --- | ---: | ---: | ---: |
+| 2880x1800 | 5,095 | 1,315 | 295 |
+| 1600x1200 | 1,955 | 1,285 | 289 |
+
 An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
 the prepared token count and configured context ceiling. A media preprocessing resource rejection
 returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
@@ -467,6 +486,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
+| `--image-token-budget N` | per-image serving ceiling in Vision tokens; `0` keeps the artifact ceiling | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |

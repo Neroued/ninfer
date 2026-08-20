@@ -45,10 +45,17 @@ jobs:
       with:
         username: ${{ secrets.DOCKERHUB_USERNAME }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
+        
+    - name: Strip 'v' from ref name
+      run: |
+        # ${GITHUB_REF_NAME#v} removes a leading 'v' if it exists
+        CLEAN_VERSION=${GITHUB_REF_NAME#v}
+        echo "VERSION=$CLEAN_VERSION" >> $GITHUB_ENV
+
     - name: Build and push docker image
       uses: docker/build-push-action@v7
       with:
         push: true
         tags: |
-          neroued/ninfer:${{ github.ref_name }}
+          neroued/ninfer:${{ env.VERSION }}
           neroued/ninfer:latest

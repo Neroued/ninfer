@@ -55,20 +55,21 @@ jobs:
           
     - uses: shrink/actions-docker-extract@v4
       with:
-        image: "neroued/ninfer:latest"
+        image: "neroued/ninfer::${{ github.ref_name }}"
         path: "/usr/local/bin/ninfer"
         destination: dist
 
     - uses: shrink/actions-docker-extract@v4
       with:
-        image: "neroued/ninfer:latest"
+        image: "neroued/ninfer::${{ github.ref_name }}"
         path: "/usr/local/bin/ninfer-serve"
         destination: dist
         
     - name: Archive files
       run: |
+        cp LICENSE README.md ./dist/
         cd dist
-        zip -r release-artifacts-$GITHUB_REF_NAME.zip ./ninfer ./ninfer-serve README.md
+        zip -r release-artifacts-$GITHUB_REF_NAME.zip ./ninfer ./ninfer-serve LICENSE README.md
         
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2

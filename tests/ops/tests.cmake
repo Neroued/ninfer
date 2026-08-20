@@ -9,6 +9,7 @@ set(ninfer_op_tests
   gated_rmsnorm
   l2norm
   gated_delta_net
+  kimi_delta_attention
   causal_conv1d_silu
   layer_norm
   embedding

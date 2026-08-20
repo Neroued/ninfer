@@ -50,4 +50,17 @@ void kimi_delta_attention(const Tensor& q, const Tensor& k, const Tensor& v, con
                           float lower_bound, float scale, const Tensor& ssm_state_in,
                           Tensor& ssm_state_out, Tensor& out, cudaStream_t stream);
 
+/**
+ * One-token update for B independent state-pool slots. q/k/v/g/out are contiguous BF16
+ * [128,H,1,B], beta is BF16 [H,1,B], A_log is FP32 [H], dt_bias is FP32 [128,H], `ssm_states`
+ * is contiguous FP32 [128,128,H,Slots], and `state_slots` is contiguous device I32 [B]. B is in
+ * [1,8]. Row b reads and writes state_slots[b], publishing its state after the single transition.
+ * The caller supplies valid distinct active slots. This form uses no workspace allocation.
+ */
+void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
+                                       const Tensor& g, const Tensor& beta, const Tensor& A_log,
+                                       const Tensor& dt_bias, float lower_bound, float scale,
+                                       Tensor& ssm_states, const Tensor& state_slots, Tensor& out,
+                                       cudaStream_t stream);
+
 } // namespace ninfer::ops

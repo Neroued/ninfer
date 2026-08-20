@@ -130,6 +130,39 @@ __device__ __forceinline__ void store_readout(const float (&state)[kDvPerWarp][k
     if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(result * scale); }
 }
 
+__device__ __forceinline__ void
+run_recurrent_token(float (&state)[kDvPerWarp][kQkPerLane], const __nv_bfloat16* query_source,
+                    const __nv_bfloat16* key_source, const __nv_bfloat16* value_source,
+                    const __nv_bfloat16* gate_source, const __nv_bfloat16* beta_source,
+                    const float* dt_bias_source, __nv_bfloat16* output, GateStage& gate_stage,
+                    int stage, int lane, int thread, int dv_base, int dqk_base, float a_scale,
+                    float lower_bound, float scale) {
+    float key[kQkPerLane];
+    float query[kQkPerLane];
+    load_bf16x4(key, key_source + dqk_base);
+    load_bf16x4(query, query_source + dqk_base);
+    normalize_qk(key, lane);
+    normalize_qk(query, lane);
+
+    const float gate_raw = __bfloat162float(gate_source[thread]);
+    const float log_alpha =
+        lower_bound * sigmoid_approx(a_scale * (gate_raw + dt_bias_source[thread]));
+    gate_stage.alpha[stage][thread] = exp_approx(log_alpha);
+    if (thread == 0) { gate_stage.beta[stage] = sigmoid_approx(__bfloat162float(*beta_source)); }
+
+    // Alpha and beta are produced once per CTA. Direct alternates buffers so the writes for a
+    // later token cannot race state warps still consuming the preceding token.
+    __syncthreads();
+
+    float alpha[kQkPerLane];
+    store_vec(alpha, load_vec<float4>(gate_stage.alpha[stage] + dqk_base));
+
+    float value_local = 0.0F;
+    if (lane < kDvPerWarp) { value_local = __bfloat162float(value_source[dv_base + lane]); }
+    apply_transition(state, key, alpha, value_local, gate_stage.beta[stage]);
+    store_readout(state, query, output, dv_base, lane, scale);
+}
+
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_direct_kernel(const __nv_bfloat16* __restrict__ q,
                             const __nv_bfloat16* __restrict__ k,
@@ -160,40 +193,52 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     for (std::int32_t token = 0; token < width; ++token) {
         const std::int64_t vector_offset =
             (static_cast<std::int64_t>(token) * heads + head) * kStateDim;
-
-        float key[kQkPerLane];
-        float query[kQkPerLane];
-        load_bf16x4(key, k + vector_offset + dqk_base);
-        load_bf16x4(query, q + vector_offset + dqk_base);
-        normalize_qk(key, lane);
-        normalize_qk(query, lane);
-
-        const int stage      = token & 1;
-        const float gate_raw = __bfloat162float(g[vector_offset + thread]);
-        const float log_alpha =
-            lower_bound * sigmoid_approx(a_scale * (gate_raw + dt_bias[head * kStateDim + thread]));
-        gate_stage.alpha[stage][thread] = exp_approx(log_alpha);
-        if (thread == 0) {
-            gate_stage.beta[stage] = sigmoid_approx(
-                __bfloat162float(beta[static_cast<std::int64_t>(token) * heads + head]));
-        }
-
-        // Alpha and beta are produced once per CTA. Alternating buffers make the pre-barrier
-        // writes race-free with state warps that may still consume the preceding token.
-        __syncthreads();
-
-        float alpha[kQkPerLane];
-        store_vec(alpha, load_vec<float4>(gate_stage.alpha[stage] + dqk_base));
-
-        float value_local = 0.0F;
-        if (lane < kDvPerWarp) {
-            value_local = __bfloat162float(v[vector_offset + dv_base + lane]);
-        }
-        apply_transition(state, key, alpha, value_local, gate_stage.beta[stage]);
-        store_readout(state, query, out + vector_offset, dv_base, lane, scale);
+        run_recurrent_token(
+            state, q + vector_offset, k + vector_offset, v + vector_offset, g + vector_offset,
+            beta + static_cast<std::int64_t>(token) * heads + head,
+            dt_bias + static_cast<std::int64_t>(head) * kStateDim, out + vector_offset, gate_stage,
+            token & 1, lane, thread, dv_base, dqk_base, a_scale, lower_bound, scale);
     }
 
     store_state(state, state_write + state_offset, dv_base, dqk_base);
+}
+
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_batch_update_kernel(
+    const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ v, const __nv_bfloat16* __restrict__ g,
+    const __nv_bfloat16* __restrict__ beta, const float* __restrict__ a_log,
+    const float* __restrict__ dt_bias, float* __restrict__ states,
+    const std::int32_t* __restrict__ state_slots, __nv_bfloat16* __restrict__ out,
+    std::int32_t heads, std::int64_t state_slot_stride, float lower_bound, float scale) {
+    __shared__ GateStage gate_stage;
+
+    const int lane       = threadIdx.x;
+    const int warp       = threadIdx.y;
+    const int thread     = warp * kWarpSize + lane;
+    const int head       = static_cast<int>(blockIdx.x);
+    const int batch      = static_cast<int>(blockIdx.y);
+    const int state_tile = static_cast<int>(blockIdx.z);
+    const int dv_base    = state_tile * kBlockDv + warp * kDvPerWarp;
+    const int dqk_base   = lane * kQkPerLane;
+    const std::int64_t state_offset =
+        static_cast<std::int64_t>(state_slots[batch]) * state_slot_stride +
+        static_cast<std::int64_t>(head) * kStateDim * kStateDim;
+    const std::int64_t vector_offset =
+        (static_cast<std::int64_t>(batch) * heads + head) * kStateDim;
+
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    load_state(state, states + state_offset, dv_base, dqk_base);
+
+    if (thread == 0) { gate_stage.a_log_exp = expf(a_log[head]); }
+    __syncthreads();
+
+    run_recurrent_token(state, q + vector_offset, k + vector_offset, v + vector_offset,
+                        g + vector_offset, beta + static_cast<std::int64_t>(batch) * heads + head,
+                        dt_bias + static_cast<std::int64_t>(head) * kStateDim, out + vector_offset,
+                        gate_stage, 0, lane, thread, dv_base, dqk_base, gate_stage.a_log_exp,
+                        lower_bound, scale);
+
+    store_state(state, states + state_offset, dv_base, dqk_base);
 }
 
 } // namespace ninfer::ops::detail::kimi_delta_attention

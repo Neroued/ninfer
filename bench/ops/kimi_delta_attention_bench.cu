@@ -1,6 +1,6 @@
-// Cold-L2 CUDA Graph benchmark for the public recurrent Kimi Delta Attention Direct path.
-// Kimi Linear uses H=32 and Kimi K3 uses H=96; both use K=V=128 and enter the same runtime-H
-// production kernel.
+// Cold-L2 CUDA Graph benchmark for the public recurrent Kimi Delta Attention Direct and selected
+// state-pool batch-update paths. Kimi Linear uses H=32 and Kimi K3 uses H=96; both use K=V=128
+// and enter runtime-H production kernels.
 #include "ninfer/ops/kimi_delta_attention.h"
 
 #include "ninfer_bench_common.h"
@@ -33,9 +33,13 @@ struct Options {
     std::string profile     = "kimi-k3";
     std::int32_t heads      = 96;
     std::int32_t tokens     = kDefaultTokens;
+    std::int32_t batch      = 1;
     bool heads_explicit     = false;
     bool tokens_explicit    = false;
+    bool batch_explicit     = false;
+    bool batch_update       = false;
     bool sweep              = false;
+    bool batch_sweep        = false;
     bool csv                = false;
     bool help               = false;
     int warmup              = 20;
@@ -47,6 +51,8 @@ struct Problem {
     const char* profile;
     std::int32_t heads;
     std::int32_t tokens;
+    std::int32_t batch;
+    bool batch_update;
 };
 
 [[noreturn]] void fail(const std::string& message) { throw std::invalid_argument(message); }
@@ -94,8 +100,15 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--tokens") {
             options.tokens          = parse_integer("--tokens", take("--tokens"), 1);
             options.tokens_explicit = true;
+        } else if (argument == "--batch-update") {
+            options.batch_update = true;
+        } else if (argument == "--batch") {
+            options.batch          = parse_integer("--batch", take("--batch"), 1);
+            options.batch_explicit = true;
         } else if (argument == "--sweep") {
             options.sweep = true;
+        } else if (argument == "--batch-sweep") {
+            options.batch_sweep = true;
         } else if (argument == "--warmup") {
             options.warmup = parse_integer("--warmup", take("--warmup"), 0);
         } else if (argument == "--repeat") {
@@ -115,17 +128,33 @@ Options parse_options(int argc, char** argv) {
     if (options.sweep && options.tokens_explicit) {
         fail("--tokens and --sweep are mutually exclusive");
     }
+    if (options.batch_sweep && options.batch_explicit) {
+        fail("--batch and --batch-sweep are mutually exclusive");
+    }
+    if (options.batch_update) {
+        if (options.tokens_explicit || options.sweep) {
+            fail("--batch-update has a fixed token extent of 1");
+        }
+        if (options.batch > 8) { fail("--batch-update requires B in [1,8]"); }
+    } else if (options.batch_explicit || options.batch_sweep) {
+        fail("--batch and --batch-sweep require --batch-update");
+    }
     return options;
 }
 
 void print_help(const char* program) {
     std::printf("Usage: %s [options]\n"
                 "\n"
+                "Mode (default: Direct):\n"
+                "  --batch-update  selected-slot one-token update\n"
+                "\n"
                 "Workload:\n"
                 "  --profile NAME   kimi-linear (H=32), kimi-k3 (H=96), or all (default: kimi-k3)\n"
                 "  --heads H        custom positive runtime head count\n"
-                "  --tokens T       exact positive token extent (default: 1)\n"
-                "  --sweep          run T in {1,2,4,8,16,32,64}\n"
+                "  --tokens T       Direct token extent (default: 1)\n"
+                "  --sweep          Direct T in {1,2,4,8,16,32,64}\n"
+                "  --batch B        batch-update B in [1,8] (default: 1)\n"
+                "  --batch-sweep    batch-update B in {1,2,4,8}\n"
                 "\n"
                 "Measurement:\n"
                 "  --warmup N       cold-L2 graph warmups (default: 20)\n"
@@ -147,22 +176,26 @@ DeviceBuffer make_f32(std::size_t count, float base, float step) {
 }
 
 double traffic_bytes(const Problem& problem) {
-    const double vectors    = static_cast<double>(kStateDim) * problem.heads * problem.tokens;
-    const double state      = static_cast<double>(kStateDim) * kStateDim * problem.heads;
-    const double controls   = static_cast<double>(problem.heads) * problem.tokens;
+    const double batch   = static_cast<double>(problem.batch);
+    const double vectors = static_cast<double>(kStateDim) * problem.heads * problem.tokens * batch;
+    const double state   = static_cast<double>(kStateDim) * kStateDim * problem.heads *
+                         (problem.batch_update ? batch : 1.0);
+    const double controls   = static_cast<double>(problem.heads) * problem.tokens * batch;
     const double parameters = static_cast<double>(problem.heads) * (kStateDim + 1);
     // q/k/v/g reads plus out write, beta read, A_log/dt_bias reads, and state read+write.
     return 5.0 * vectors * sizeof(std::uint16_t) + controls * sizeof(std::uint16_t) +
-           parameters * sizeof(float) + 2.0 * state * sizeof(float);
+           parameters * sizeof(float) + 2.0 * state * sizeof(float) +
+           (problem.batch_update ? batch * sizeof(std::int32_t) : 0.0);
 }
 
 ColdTiming measure_problem(const Problem& problem, const Options& options,
                            std::size_t& graph_nodes) {
     const std::size_t vector_elements =
-        static_cast<std::size_t>(kStateDim) * problem.heads * problem.tokens;
-    const std::size_t state_elements =
-        static_cast<std::size_t>(kStateDim) * kStateDim * problem.heads;
-    const std::size_t beta_elements = static_cast<std::size_t>(problem.heads) * problem.tokens;
+        static_cast<std::size_t>(kStateDim) * problem.heads * problem.tokens * problem.batch;
+    const std::size_t state_elements = static_cast<std::size_t>(kStateDim) * kStateDim *
+                                       problem.heads * (problem.batch_update ? problem.batch : 1);
+    const std::size_t beta_elements =
+        static_cast<std::size_t>(problem.heads) * problem.tokens * problem.batch;
 
     DeviceBuffer q     = make_bf16(vector_elements);
     DeviceBuffer k     = make_bf16(vector_elements);
@@ -175,16 +208,26 @@ ColdTiming measure_problem(const Problem& problem, const Options& options,
     DeviceBuffer state = make_zeros(state_elements * sizeof(float));
     DeviceBuffer out   = make_zeros(vector_elements * sizeof(std::uint16_t));
     DeviceBuffer flush(options.flush_bytes);
+    std::vector<std::int32_t> host_state_slots(static_cast<std::size_t>(problem.batch));
+    for (std::int32_t row = 0; row < problem.batch; ++row) {
+        host_state_slots[static_cast<std::size_t>(row)] = row;
+    }
+    DeviceBuffer state_slots(host_state_slots.size() * sizeof(std::int32_t));
+    state_slots.copy_from_host(host_state_slots.data(), state_slots.bytes);
 
-    Tensor q_tensor(q.p, DType::BF16, {kStateDim, problem.heads, problem.tokens});
-    Tensor k_tensor(k.p, DType::BF16, {kStateDim, problem.heads, problem.tokens});
-    Tensor v_tensor(v.p, DType::BF16, {kStateDim, problem.heads, problem.tokens});
-    Tensor g_tensor(g.p, DType::BF16, {kStateDim, problem.heads, problem.tokens});
-    Tensor beta_tensor(beta.p, DType::BF16, {problem.heads, problem.tokens});
+    Tensor q_tensor(q.p, DType::BF16, {kStateDim, problem.heads, problem.tokens, problem.batch});
+    Tensor k_tensor(k.p, DType::BF16, {kStateDim, problem.heads, problem.tokens, problem.batch});
+    Tensor v_tensor(v.p, DType::BF16, {kStateDim, problem.heads, problem.tokens, problem.batch});
+    Tensor g_tensor(g.p, DType::BF16, {kStateDim, problem.heads, problem.tokens, problem.batch});
+    Tensor beta_tensor(beta.p, DType::BF16, {problem.heads, problem.tokens, problem.batch});
     Tensor a_log_tensor(a_log.p, DType::FP32, {problem.heads});
     Tensor dt_bias_tensor(dt_bias.p, DType::FP32, {kStateDim, problem.heads});
-    Tensor state_tensor(state.p, DType::FP32, {kStateDim, kStateDim, problem.heads});
-    Tensor out_tensor(out.p, DType::BF16, {kStateDim, problem.heads, problem.tokens});
+    Tensor state_tensor(
+        state.p, DType::FP32,
+        {kStateDim, kStateDim, problem.heads, problem.batch_update ? problem.batch : 1});
+    Tensor state_slots_tensor(state_slots.p, DType::I32, {problem.batch});
+    Tensor out_tensor(out.p, DType::BF16,
+                      {kStateDim, problem.heads, problem.tokens, problem.batch});
 
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -192,9 +235,16 @@ ColdTiming measure_problem(const Problem& problem, const Options& options,
     {
         TimedGraph graph;
         graph.capture(stream, [&](cudaStream_t capture_stream) {
-            ops::kimi_delta_attention(q_tensor, k_tensor, v_tensor, g_tensor, beta_tensor,
-                                      a_log_tensor, dt_bias_tensor, kLowerBound, kScale,
-                                      state_tensor, out_tensor, capture_stream);
+            if (problem.batch_update) {
+                ops::kimi_delta_attention_batch_update(
+                    q_tensor, k_tensor, v_tensor, g_tensor, beta_tensor, a_log_tensor,
+                    dt_bias_tensor, kLowerBound, kScale, state_tensor, state_slots_tensor,
+                    out_tensor, capture_stream);
+            } else {
+                ops::kimi_delta_attention(q_tensor, k_tensor, v_tensor, g_tensor, beta_tensor,
+                                          a_log_tensor, dt_bias_tensor, kLowerBound, kScale,
+                                          state_tensor, out_tensor, capture_stream);
+            }
         });
         graph_nodes = graph.nodes();
         timing      = measure_cold_graph(graph, flush, stream, options.warmup, options.repeat);
@@ -207,15 +257,17 @@ void emit(const Problem& problem, const ColdTiming& timing, std::size_t graph_no
     const double bytes = traffic_bytes(problem);
     const double gbs   = bytes / timing.median_us / 1000.0;
     if (csv) {
-        std::printf("%s,%d,%d,%zu,%.6f,%.6f,%.6f,%.3f,%.0f\n", problem.profile, problem.heads,
-                    problem.tokens, graph_nodes, timing.median_us, timing.min_us, timing.p95_us,
-                    gbs, bytes);
+        std::printf("%s,%s,%d,%d,%d,%zu,%.6f,%.6f,%.6f,%.3f,%.0f\n",
+                    problem.batch_update ? "batch_update" : "direct", problem.profile,
+                    problem.heads, problem.tokens, problem.batch, graph_nodes, timing.median_us,
+                    timing.min_us, timing.p95_us, gbs, bytes);
         return;
     }
-    std::printf("profile=%-11s H=%3d T=%3d graph_nodes=%zu median=%8.3f us min=%8.3f us "
-                "p95=%8.3f us traffic=%7.1f GB/s\n",
-                problem.profile, problem.heads, problem.tokens, graph_nodes, timing.median_us,
-                timing.min_us, timing.p95_us, gbs);
+    std::printf("mode=%-12s profile=%-11s H=%3d T=%3d B=%d graph_nodes=%zu median=%8.3f us "
+                "min=%8.3f us p95=%8.3f us traffic=%7.1f GB/s\n",
+                problem.batch_update ? "batch_update" : "direct", problem.profile, problem.heads,
+                problem.tokens, problem.batch, graph_nodes, timing.median_us, timing.min_us,
+                timing.p95_us, gbs);
 }
 
 std::vector<std::int32_t> token_extents(const Options& options) {
@@ -225,12 +277,20 @@ std::vector<std::int32_t> token_extents(const Options& options) {
 
 std::vector<Problem> problems(const Options& options) {
     std::vector<Problem> result;
-    for (const std::int32_t tokens : token_extents(options)) {
-        if (options.profile == "all") {
-            result.push_back({"kimi-linear", 32, tokens});
-            result.push_back({"kimi-k3", 96, tokens});
-        } else {
-            result.push_back({options.profile.c_str(), options.heads, tokens});
+    const std::vector<std::int32_t> batches = options.batch_sweep
+                                                  ? std::vector<std::int32_t>{1, 2, 4, 8}
+                                                  : std::vector<std::int32_t>{options.batch};
+    const std::vector<std::int32_t> tokens =
+        options.batch_update ? std::vector<std::int32_t>{1} : token_extents(options);
+    for (const std::int32_t token_count : tokens) {
+        for (const std::int32_t batch : batches) {
+            if (options.profile == "all") {
+                result.push_back({"kimi-linear", 32, token_count, batch, options.batch_update});
+                result.push_back({"kimi-k3", 96, token_count, batch, options.batch_update});
+            } else {
+                result.push_back({options.profile.c_str(), options.heads, token_count, batch,
+                                  options.batch_update});
+            }
         }
     }
     return result;
@@ -246,8 +306,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (options.csv) {
-            std::printf("profile,heads,tokens,graph_nodes,median_us,min_us,p95_us,traffic_gbs,"
-                        "traffic_bytes\n");
+            std::printf("mode,profile,heads,tokens,batch,graph_nodes,median_us,min_us,p95_us,"
+                        "traffic_gbs,traffic_bytes\n");
         }
         for (const Problem& problem : problems(options)) {
             std::size_t graph_nodes = 0;

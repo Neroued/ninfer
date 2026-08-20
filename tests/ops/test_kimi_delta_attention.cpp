@@ -256,6 +256,165 @@ int distinct_exact_alias_case(const Case& test_case, std::uint32_t seed) {
     return failures;
 }
 
+int batch_update_case(const Case& test_case, const std::vector<int>& state_slots, int slots,
+                      std::uint32_t seed) {
+    if (test_case.tokens != 1) { throw std::logic_error("batch_update_case requires W=1"); }
+    const int batch                   = static_cast<int>(state_slots.size());
+    const std::size_t vector_row_size = static_cast<std::size_t>(kStateDim) * test_case.heads;
+    const std::size_t state_size =
+        static_cast<std::size_t>(kStateDim) * kStateDim * test_case.heads;
+
+    const kda_ref::Inputs shared = make_inputs(test_case, seed ^ 0x51a7U);
+    kda_ref::Inputs aggregate;
+    aggregate.heads   = test_case.heads;
+    aggregate.tokens  = batch;
+    aggregate.a_log   = shared.a_log;
+    aggregate.dt_bias = shared.dt_bias;
+    aggregate.q.reserve(vector_row_size * static_cast<std::size_t>(batch));
+    aggregate.k.reserve(vector_row_size * static_cast<std::size_t>(batch));
+    aggregate.v.reserve(vector_row_size * static_cast<std::size_t>(batch));
+    aggregate.g.reserve(vector_row_size * static_cast<std::size_t>(batch));
+    aggregate.beta.reserve(static_cast<std::size_t>(test_case.heads * batch));
+
+    std::vector<float> initial_states(state_size * static_cast<std::size_t>(slots));
+    std::mt19937 state_generator(seed ^ 0xa3c59ac3U);
+    fill_uniform(initial_states, state_generator, -0.02F, 0.02F);
+
+    std::vector<kda_ref::Result> references;
+    references.reserve(static_cast<std::size_t>(batch));
+    std::vector<double> expected_output(vector_row_size * static_cast<std::size_t>(batch));
+    std::vector<bool> written_slots(static_cast<std::size_t>(slots), false);
+    for (int row = 0; row < batch; ++row) {
+        const int slot = state_slots[static_cast<std::size_t>(row)];
+        if (slot < 0 || slot >= slots || written_slots[static_cast<std::size_t>(slot)]) {
+            throw std::logic_error("batch_update_case requires valid distinct slots");
+        }
+
+        kda_ref::Inputs input =
+            make_inputs(test_case, seed + static_cast<std::uint32_t>(row) * 97U);
+        input.a_log   = aggregate.a_log;
+        input.dt_bias = aggregate.dt_bias;
+        aggregate.q.insert(aggregate.q.end(), input.q.begin(), input.q.end());
+        aggregate.k.insert(aggregate.k.end(), input.k.begin(), input.k.end());
+        aggregate.v.insert(aggregate.v.end(), input.v.begin(), input.v.end());
+        aggregate.g.insert(aggregate.g.end(), input.g.begin(), input.g.end());
+        aggregate.beta.insert(aggregate.beta.end(), input.beta.begin(), input.beta.end());
+        std::copy(input.state.begin(), input.state.end(),
+                  initial_states.begin() + static_cast<std::size_t>(slot) * state_size);
+
+        kda_ref::Result reference =
+            kda_ref::evaluate(input, static_cast<double>(kLowerBound), static_cast<double>(kScale));
+        std::copy(reference.out.begin(), reference.out.end(),
+                  expected_output.begin() + static_cast<std::size_t>(row) * vector_row_size);
+        references.push_back(std::move(reference));
+        written_slots[static_cast<std::size_t>(slot)] = true;
+    }
+
+    DeviceInputs device(aggregate);
+    DeviceBuffer device_state_slots = to_device_i32(state_slots);
+    GuardedDeviceBuffer states(initial_states.size() * sizeof(float));
+    GuardedDeviceBuffer out(aggregate.v.size() * sizeof(std::uint16_t));
+    states.copy_from_host(initial_states.data(), states.bytes());
+    out.fill(0xff);
+
+    Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
+    Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
+    Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
+    Tensor g(device.g.p, DType::BF16, {kStateDim, test_case.heads, 1, batch});
+    Tensor beta(device.beta.p, DType::BF16, {test_case.heads, 1, batch});
+    Tensor a_log(device.a_log.p, DType::FP32, {test_case.heads});
+    Tensor dt_bias(device.dt_bias.p, DType::FP32, {kStateDim, test_case.heads});
+    Tensor states_tensor(states.data(), DType::FP32,
+                         {kStateDim, kStateDim, test_case.heads, slots});
+    Tensor state_slots_tensor(device_state_slots.p, DType::I32, {batch});
+    Tensor out_tensor(out.data(), DType::BF16, {kStateDim, test_case.heads, 1, batch});
+
+    ops::kimi_delta_attention_batch_update(q, k, v, g, beta, a_log, dt_bias, kLowerBound, kScale,
+                                           states_tensor, state_slots_tensor, out_tensor, nullptr);
+    cuda_synchronize();
+
+    const std::string label =
+        std::string(test_case.name) + " batch update B=" + std::to_string(batch);
+    int failures =
+        verify_reduction(label + " out", from_device_bf16(out.data(), aggregate.v.size()),
+                         expected_output, output_criterion());
+    const std::vector<float> got_states = from_device<float>(states.data(), initial_states.size());
+    for (int row = 0; row < batch; ++row) {
+        const int slot          = state_slots[static_cast<std::size_t>(row)];
+        const std::size_t begin = static_cast<std::size_t>(slot) * state_size;
+        failures += verify_reduction(
+            label + " row " + std::to_string(row) + " state",
+            doubles(std::vector<float>(got_states.begin() + begin,
+                                       got_states.begin() + begin + state_size)),
+            references[static_cast<std::size_t>(row)].final_state, state_criterion());
+    }
+    for (int slot = 0; slot < slots; ++slot) {
+        if (written_slots[static_cast<std::size_t>(slot)]) continue;
+        const std::size_t begin      = static_cast<std::size_t>(slot) * state_size;
+        const std::string slot_label = label + " untouched slot " + std::to_string(slot);
+        failures += verify_exact(
+            slot_label.c_str(),
+            std::vector<float>(got_states.begin() + begin, got_states.begin() + begin + state_size),
+            std::vector<float>(initial_states.begin() + begin,
+                               initial_states.begin() + begin + state_size));
+    }
+    const std::string selector_label = label + " state selectors unchanged";
+    failures += verify_exact(selector_label.c_str(),
+                             from_device_i32(device_state_slots, state_slots.size()), state_slots);
+    failures += states.verify_guards(label + " states");
+    failures += out.verify_guards(label + " out");
+    failures += verify_inputs_unchanged(label, aggregate, device);
+    return failures;
+}
+
+int batch_contract_rejection_cases() {
+    constexpr int heads          = 2;
+    constexpr int batch_capacity = 9;
+    DeviceBuffer vectors(static_cast<std::size_t>(kStateDim) * heads * batch_capacity *
+                         sizeof(std::uint16_t));
+    DeviceBuffer beta_buffer(static_cast<std::size_t>(heads) * batch_capacity *
+                             sizeof(std::uint16_t));
+    DeviceBuffer a_log_buffer(static_cast<std::size_t>(heads) * sizeof(float));
+    DeviceBuffer dt_buffer(static_cast<std::size_t>(kStateDim) * heads * sizeof(float));
+    DeviceBuffer state_buffer(static_cast<std::size_t>(kStateDim) * kStateDim * heads * 2 *
+                              sizeof(float));
+    DeviceBuffer slot_buffer(static_cast<std::size_t>(batch_capacity) * sizeof(std::int32_t));
+
+    const auto rejects = [&](int tokens, int batch, DType slot_dtype) {
+        Tensor q(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
+        Tensor k(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
+        Tensor v(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
+        Tensor g(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
+        Tensor beta(beta_buffer.p, DType::BF16, {heads, tokens, batch});
+        Tensor a_log(a_log_buffer.p, DType::FP32, {heads});
+        Tensor dt_bias(dt_buffer.p, DType::FP32, {kStateDim, heads});
+        Tensor states(state_buffer.p, DType::FP32, {kStateDim, kStateDim, heads, 2});
+        Tensor state_slots(slot_buffer.p, slot_dtype, {batch});
+        Tensor out(vectors.p, DType::BF16, {kStateDim, heads, tokens, batch});
+        try {
+            ops::kimi_delta_attention_batch_update(q, k, v, g, beta, a_log, dt_bias, kLowerBound,
+                                                   kScale, states, state_slots, out, nullptr);
+        } catch (const std::invalid_argument&) { return true; }
+        cuda_synchronize();
+        return false;
+    };
+
+    int failures = 0;
+    if (!rejects(1, 9, DType::I32)) {
+        std::cerr << "kimi_delta_attention batch update accepted B=9\n";
+        ++failures;
+    }
+    if (!rejects(2, 2, DType::I32)) {
+        std::cerr << "kimi_delta_attention batch update accepted W=2\n";
+        ++failures;
+    }
+    if (!rejects(1, 2, DType::FP32)) {
+        std::cerr << "kimi_delta_attention batch update accepted FP32 state selectors\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int contract_rejection_cases() {
     constexpr int heads = 2;
     DeviceBuffer vectors(static_cast<std::size_t>(kStateDim) * heads * sizeof(std::uint16_t));
@@ -310,6 +469,7 @@ int main() {
     }
 
     int failures = contract_rejection_cases();
+    failures += batch_contract_rejection_cases();
     failures += inplace_case({"Kimi Linear ordinary", 32, 7}, 32007U);
     failures += distinct_case({"Kimi Linear ordinary", 32, 7}, 32107U);
     failures += inplace_case({"Kimi K3 ordinary", 96, 3}, 96003U);
@@ -318,6 +478,10 @@ int main() {
     failures += inplace_case({"near-zero normalized QK", 32, 1, true}, 32201U);
     failures += distinct_case({"saturated safe gate", 32, 2, false, true}, 32202U);
     failures += distinct_exact_alias_case({"state alias contract", 32, 2}, 32302U);
+    failures += batch_update_case({"Kimi Linear ordinary", 32, 1}, {4, 0, 5, 2}, 6, 32401U);
+    failures +=
+        batch_update_case({"Kimi K3 ordinary", 96, 1}, {10, 3, 7, 0, 9, 5, 1, 8}, 11, 96801U);
+    failures += batch_update_case({"runtime head count", 5, 1}, {3, 0, 4}, 5, 50301U);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " kimi_delta_attention correctness\n";
     return failures == 0 ? 0 : 1;

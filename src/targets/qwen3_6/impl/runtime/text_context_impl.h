@@ -25,6 +25,7 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
+#include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
@@ -955,13 +956,27 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     Variant::gdn_output_projection(on.view({kCfg.value_dim, T}), *w.out_proj, x, ph, work_, s);
 }
 
-void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph) {
+ops::WeightPrefetchSpan TextContext::next_projection_prefetch(int layer) const {
+    // Names the next layer's projection payload so the current post-mixer can warm L2 for it
+    // while its own tail runs. The last layer names nothing.
+    const int next = layer + 1;
+    if (next >= kCfg.n_layers) { return {}; }
+    if (ModelConfig::is_full(next)) {
+        return Variant::projection_prefetch_span(
+            *full_.at(static_cast<std::size_t>(ModelConfig::full_idx(next))).projection);
+    }
+    return Variant::projection_prefetch_span(
+        *gdn_.at(static_cast<std::size_t>(ModelConfig::gdn_idx(next))).projection);
+}
+
+void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Phase ph,
+                           ops::WeightPrefetchSpan next_prefetch) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
-    Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+    Variant::post_mixer(h, *m.payload, x, ph, work_, s, next_prefetch);
 }
 
 template <class Tap>
@@ -986,7 +1001,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(full.post_attn_norm, full.mlp, x, ph);
+                mlp_tail(full.post_attn_norm, full.mlp, x, ph, next_projection_prefetch(layer));
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
@@ -1007,7 +1022,7 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
+                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph, next_projection_prefetch(layer));
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }

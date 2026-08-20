@@ -53,6 +53,7 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                          cudaStream_t stream,
                                          const int* adaptive_route_jobs = nullptr);
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
-                              const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream);
+                              const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                              const void* prefetch_data = nullptr, std::size_t prefetch_bytes = 0);
 
 } // namespace ninfer::ops::detail

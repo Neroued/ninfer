@@ -1,4 +1,4 @@
-name: Docker Image CI
+name: Build Docker Image, Push and Release binaries
 on:
   push:
     tags:

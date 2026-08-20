@@ -57,7 +57,8 @@ jobs:
       with:
         image: "nikobraz/ninfer:latest"
         path: "/usr/local/bin/ninfer"
-        
+        destination: 
+
     - uses: shrink/actions-docker-extract@v4
       with:
         image: "nikobraz/ninfer:latest"
@@ -66,12 +67,13 @@ jobs:
         
     - name: Archive files
       run: |
-        zip -r release-artifacts-$GITHUB_REF_NAME.zip ./dist/ninfer ./dist/ninfer-serve README.md
+        cd dist
+        zip -r release-artifacts-$GITHUB_REF_NAME.zip ./ninfer ./ninfer-serve ../README.md
         
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        files: release-artifacts-${{ github.ref_name }}.zip
+        files: ./dist/release-artifacts-${{ github.ref_name }}.zip
         draft: false
         prerelease: false
       env:

@@ -182,7 +182,12 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
-    const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
+    // The tensor maps travel as separate grid-constant parameters because MSVC's x64
+    // ABI cannot pass the over-aligned Nvfp4W4a4TmaDescriptors aggregate by value.
+    const __grid_constant__ CUtensorMap a_codes_map,
+    const __grid_constant__ CUtensorMap b_codes_map,
+    const __grid_constant__ CUtensorMap a_scales_map,
+    const __grid_constant__ CUtensorMap b_scales_map, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
@@ -222,17 +227,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
                 nvfp4_mbarrier_arrive_expect_tx(&shared.full[stage], kTransactionBytes);
 
                 auto& tensors = shared.scratch.tensors;
-                nvfp4_tma_load_2d(tensors.a_codes[stage], &descriptors.a_codes,
+                nvfp4_tma_load_2d(tensors.a_codes[stage], &a_codes_map,
                                   k_tile * Schedule::kCodeRowBytes, token_begin,
                                   &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.b_codes[stage], &descriptors.b_codes,
+                nvfp4_tma_load_2d(tensors.b_codes[stage], &b_codes_map,
                                   k_tile * Schedule::kCodeRowBytes, row_begin, &shared.full[stage]);
-                nvfp4_tma_load_2d(tensors.a_scale4[stage], &descriptors.a_scales, (k_tile / 2) * 16,
+                nvfp4_tma_load_2d(tensors.a_scale4[stage], &a_scales_map, (k_tile / 2) * 16,
                                   token_begin, &shared.full[stage]);
                 const int b_scale_row = ((row_begin / 128) * Geometry::kScaleTilesPerRow +
                                          k_tile * Schedule::kK64PerStage) *
                                         32;
-                nvfp4_tma_load_2d(tensors.b_scales[stage], &descriptors.b_scales, 0, b_scale_row,
+                nvfp4_tma_load_2d(tensors.b_scales[stage], &b_scales_map, 0, b_scale_row,
                                   &shared.full[stage]);
             }
         }

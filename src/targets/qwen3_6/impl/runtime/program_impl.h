@@ -304,7 +304,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     CUDA_CHECK(cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     device.synchronize();
-    if (plan.kv_host_cache_bytes != 0 && speculative_backend != SpeculativeBackend::DFlash) {
+    if (plan.kv_host_cache_bytes != 0 && speculative_backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument(
+            "the KV host cache is not supported with the DFlash backend yet: content anchors "
+            "do not carry the DFlash drafter context");
+    }
+    if (plan.kv_host_cache_bytes != 0) {
         std::uint64_t salt = content_chain::fold(0x6b76636163686531ULL,
                                                  static_cast<std::uint64_t>(kv_dtype));
         salt               = content_chain::fold(salt, static_cast<std::uint64_t>(kv_quant_group));

@@ -319,6 +319,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
     }
+    if (options.kv_host_cache_mib != 0 && !options.allow_prefix_reuse) {
+        throw std::invalid_argument(
+            "--kv-host-cache-mib conflicts with --no-prefix-reuse: the host cache is only "
+            "reachable through prefix reuse; drop one of the two flags");
+    }
+    if (options.kv_host_cache_mib != 0 &&
+        options.speculative.backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument(
+            "--kv-host-cache-mib is not supported with --spec dflash yet: content anchors do "
+            "not carry the DFlash drafter context; drop one of the two flags");
+    }
     if (options.vision_residency == ninfer::VisionResidency::Overlay && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay requires --vision");
     }

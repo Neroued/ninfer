@@ -142,18 +142,25 @@ def main() -> int:
         return ask(args.base_url, args.model, payload(long_gen), max_tokens=256)
     walls_e: list[float] = []
     errors_e: list[str] = []
+    answers_e: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
         futures = [pool.submit(ask_long, i) for i in range(n)]
         for future in concurrent.futures.as_completed(futures):
             try:
-                _, wall = future.result()
+                answer, wall = future.result()
+                answers_e.append(answer)
                 walls_e.append(wall)
             except (urllib.error.URLError, urllib.error.HTTPError, OSError) as error:
                 errors_e.append(str(error))
     spread = f"walls {min(walls_e):.2f}s..{max(walls_e):.2f}s" if walls_e else "no walls"
+    # distinct_answers is informational: long greedy continuations under batched decode are
+    # not bitwise-stable across batch composition (measured: a cold burst with the cache off
+    # diverges the same way), so only transport errors fail this phase. Short-answer parity
+    # is asserted by phase B.
+    ok_e = not errors_e
     print(f"E long-gen identical burst: errors={len(errors_e)} {spread} "
-          f"[{'ok' if not errors_e else 'FAIL'}]")
-    passed &= not errors_e
+          f"distinct_answers={len(set(answers_e))} [{'ok' if ok_e else 'FAIL'}]")
+    passed &= ok_e
 
     print("concurrency battery:", "OK" if passed else "FAIL")
     return 0 if passed else 1

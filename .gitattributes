@@ -1,0 +1,7 @@
+# Normalize all text files to LF so content-addressed resources (chat-template
+# SHA-256 digests, test fixtures) are byte-identical on every platform.
+* text=auto eol=lf
+
+# Binary assets.
+*.png binary
+*.mp4 binary

@@ -115,7 +115,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     Tensor value_record_tensor(value_record.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor gate_record_tensor(gate_record.p, DType::FP32, {2, value_heads, width, batch});
 
-    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    const float kScale = 1.0F / std::sqrt(128.0F);
     ops::gated_delta_net_snapshot(q, k, v, g_tensor, beta_tensor, kScale, true, snapshot_states,
                                   valid, initial, bases, snapshot_output, nullptr);
     ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states, valid,

@@ -9,14 +9,32 @@
 #include <stdexcept>
 #include <utility>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 namespace {
 
-using AlignedBacking = std::unique_ptr<void, decltype(&std::free)>;
+// The MSVC CRT provides no std::aligned_alloc, and blocks from _aligned_malloc
+// must be released with _aligned_free rather than free.
+void aligned_release(void* data) {
+#ifdef _WIN32
+    ::_aligned_free(data);
+#else
+    std::free(data);
+#endif
+}
+
+using AlignedBacking = std::unique_ptr<void, decltype(&aligned_release)>;
 
 AlignedBacking make_backing(std::size_t bytes) {
+#ifdef _WIN32
+    void* data = ::_aligned_malloc(bytes, 256);
+#else
     void* data = std::aligned_alloc(256, bytes);
+#endif
     if (data == nullptr) { throw std::bad_alloc(); }
-    return AlignedBacking(data, &std::free);
+    return AlignedBacking(data, &aligned_release);
 }
 
 int fail(const char* label) {

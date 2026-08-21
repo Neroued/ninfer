@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -88,13 +89,31 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+// The official tokenizer fixtures are a local HF checkout, not part of this
+// repository, so a checkout without them skips instead of failing.
+constexpr const char* kOfficialTokenizerDir =
+    "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16";
+
+std::string official_tokenizer_file(const char* name) {
+    return (std::filesystem::path(kOfficialTokenizerDir) / name).string();
+}
+
+bool official_tokenizer_available() {
+    for (const char* name :
+         {"tokenizer.json", "tokenizer_config.json", "generation_config.json"}) {
+        std::error_code error;
+        if (!std::filesystem::exists(official_tokenizer_file(name), error)) { return false; }
+    }
+    return true;
+}
+
 const fi::Tokenizer& official_tokenizer() {
     static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_file(official_tokenizer_file("tokenizer.json").c_str());
     static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_file(official_tokenizer_file("tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file(official_tokenizer_file("generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -1305,6 +1324,11 @@ int test_media_preparation_cancellation() {
 } // namespace
 
 int main() {
+    if (!official_tokenizer_available()) {
+        std::cerr << "skipping: official tokenizer fixtures not found under "
+                  << kOfficialTokenizerDir << '\n';
+        return 77;
+    }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;

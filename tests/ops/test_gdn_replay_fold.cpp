@@ -318,7 +318,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
     Tensor initial_selector(initial_device.p, DType::I32, {1});
     Tensor base_selector(base_device.p, DType::I32, {1});
-    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    const float kScale = 1.0F / std::sqrt(128.0F);
 
     for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
         const GdnReplayRecordLayer layer_records = records.layer(layer, rows);
@@ -503,7 +503,7 @@ int run_record_fold_rounds() {
     constexpr std::int32_t kStateSlots   = 3;
     constexpr std::int32_t kInitialSlot  = 2;
     constexpr std::int32_t kSnapshotBase = 0;
-    constexpr float kScale               = 1.0F / std::sqrt(128.0F);
+    const float kScale               = 1.0F / std::sqrt(128.0F);
 
     DevicePackedWeight parent(
         quantized_weight::make_patterned_weight(QType::W8G32_F16S, kParentRows, kHidden, 1901U));

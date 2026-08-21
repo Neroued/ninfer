@@ -119,11 +119,29 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
 
+        // A wildcard bind address is not reachable as a destination: browsers reject
+        // http://0.0.0.0/ with ERR_ADDRESS_INVALID. Announce a loopback URL that can
+        // actually be opened, alongside the address the socket is bound to.
+        const bool wildcard_bind = options.host == "0.0.0.0" || options.host == "::" ||
+                                   options.host == "[::]";
+        const std::string browse_host =
+            !wildcard_bind ? options.host : (options.host == "0.0.0.0" ? "127.0.0.1" : "[::1]");
+        const std::string browse_url =
+            "http://" + browse_host + ':' + std::to_string(options.port);
+
         std::ostringstream listening;
-        listening << "listening on http://" << options.host << ':' << options.port
-                  << " (model id: " << server.public_model_id()
+        listening << "listening on http://" << options.host << ':' << options.port;
+        if (wildcard_bind) { listening << " (all interfaces)"; }
+        listening << " (model id: " << server.public_model_id()
                   << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer") << ')';
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, listening.str());
+
+        if (!options.webui_dir.empty()) {
+            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info,
+                                             "webui: open " + browse_url + '/');
+        }
+        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info,
+                                         "api base: " + browse_url + "/v1");
 
         const bool ok = server.listen();
         g_server.store(nullptr);

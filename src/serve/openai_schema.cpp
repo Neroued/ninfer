@@ -569,11 +569,10 @@ void parse_openai_chat_thinking(const Json& body, std::optional<bool>* enable_th
     if (effort) {
         *reasoning_effort = *effort;
         *reasoning_effort_param = "reasoning_effort";
-        if (enable_thinking->has_value() &&
-            *enable_thinking != (*effort != RequestedReasoningEffort::None)) {
-            bad_request("reasoning effort conflicts with " + conflict_param,
-                        "reasoning_effort", "conflicting_template_option");
-        }
+        // An effort that disagrees with enable_thinking is a semantic conflict, not a
+        // protocol-shape one: resolve_prompt_semantics owns that check so it can weigh
+        // the request against the loaded template's capabilities. Rejecting it here too
+        // would only move the same error earlier and break that layering.
     }
 }
 

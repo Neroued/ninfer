@@ -300,11 +300,16 @@ public:
         }
 #ifdef _WIN32
         // The whole file is already mapped, so a direct read is a copy out of the view.
-        if (absolute_offset > size_ || destination.size() > size_ - absolute_offset) {
+        if (absolute_offset > size_) {
             throw ArtifactError("direct artifact read exceeds the mapped file");
         }
-        std::memcpy(destination.data(), data_ + absolute_offset, destination.size());
-        return destination.size();
+        // Direct I/O rounds every request up to the alignment, so the final one runs
+        // past the last byte by design. pread() answers that with a short count and
+        // callers rely on it, so clamp and report what was actually copied.
+        const auto offset           = static_cast<std::size_t>(absolute_offset);
+        const std::size_t available = std::min(destination.size(), size_ - offset);
+        std::memcpy(destination.data(), data_ + offset, available);
+        return available;
 #else
         if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
             destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {

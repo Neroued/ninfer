@@ -175,6 +175,7 @@ public:
     [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] KvHostCacheStats host_cache_stats() const noexcept;
     void reset_memory_peaks() noexcept;
 
 private:

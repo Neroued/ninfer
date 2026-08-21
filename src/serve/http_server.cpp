@@ -184,7 +184,20 @@ void HttpServer::run_stats_reporter() {
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
-        if (report_has_activity(report)) { log_throughput(report); }
+        if (report_has_activity(report)) {
+            log_throughput(report);
+            const ninfer::KvHostCacheStats cache = service_->host_cache_stats();
+            if (cache.enabled) {
+                log_line("host-cache stored=" + std::to_string(cache.stored_bytes >> 20) + "/" +
+                         std::to_string(cache.budget_bytes >> 20) + "MiB segments=" +
+                         std::to_string(cache.stored_segments) + " hits=" +
+                         std::to_string(cache.hit_requests) + " (" +
+                         std::to_string(cache.hit_tokens) + " tokens) restored=" +
+                         std::to_string(cache.restored_bytes >> 20) + "MiB writeback=" +
+                         std::to_string(cache.writeback_bytes >> 20) + "MiB evicted=" +
+                         std::to_string(cache.evicted_segments));
+            }
+        }
         previous      = current;
         previous_time = now;
     }

@@ -459,6 +459,20 @@ struct MemorySummary {
     std::size_t kv_payload_bytes                  = 0;
 };
 
+// Content-addressed host KV cache counters; all zeros when the cache is disabled.
+struct KvHostCacheStats {
+    bool enabled                   = false;
+    std::uint64_t budget_bytes     = 0;
+    std::uint64_t stored_bytes     = 0;
+    std::uint64_t stored_segments  = 0;
+    std::uint64_t stored_pages     = 0;
+    std::uint64_t hit_requests     = 0;
+    std::uint64_t hit_tokens       = 0;
+    std::uint64_t restored_bytes   = 0;
+    std::uint64_t writeback_bytes  = 0;
+    std::uint64_t evicted_segments = 0;
+};
+
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive
 // interval throughput by subtracting two snapshots and dividing by their own monotonic wall time.
 struct RuntimeStats {

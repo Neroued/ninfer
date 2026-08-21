@@ -485,6 +485,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--kv-host-cache-mib N` | pinned-host content cache for computed context: previously computed prefixes restore through PCIe instead of re-prefilling, and branches sharing a prefix deduplicate against the same stored pages; conflicts with `--no-prefix-reuse` and `--spec dflash`; the budget shares process pinned host RAM with the vision pinned block and overlay mirrors, carved pinned chunks are retained until shutdown (RSS follows the high-water mark), and a failed pinned allocation degrades to skipping the save, never to an error | `0` (off) |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |

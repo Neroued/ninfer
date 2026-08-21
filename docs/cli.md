@@ -153,7 +153,6 @@ measured recommendation rather than a semantic limit.
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-max-merged N` | per-item merged vision-token budget (`[64, 32768]`): oversized images/videos are downscaled at preprocessing to fit, never rejected; also bounds the vision share of the startup workspace/transient reservations, so smaller values return memory to KV | `32768` |
-| `--kv-host-cache-mib N` | Pinned-host content cache for computed context: previously computed prefixes restore through PCIe instead of re-prefilling; branches sharing a prefix deduplicate against the same stored pages | `0` (off) |
 | `--vision-residency resident\|overlay` | `overlay` keeps Vision weights in pinned host memory and encodes each image through device memory temporarily borrowed from evicted read-only text weights (lm_head, embedding, draft/MTP heads), freeing the resident Vision footprint for KV; requires `--vision` and CUDA VMM | `resident` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |

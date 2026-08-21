@@ -94,6 +94,9 @@ public:
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
+    [[nodiscard]] ninfer::KvHostCacheStats host_cache_stats() const {
+        return engine_->host_cache_stats();
+    }
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 

@@ -167,6 +167,11 @@ public:
         return Submission(*this, std::move(request));
     }
 
+    [[nodiscard]] KvHostCacheStats host_cache_stats() const {
+        std::scoped_lock lock(execution_mutex_);
+        return instance_.program->host_cache_stats();
+    }
+
     [[nodiscard]] MemorySummary memory_summary() const {
         std::scoped_lock lock(execution_mutex_);
         MemorySummary out                      = instance_.program->memory_summary();
@@ -496,7 +501,12 @@ private:
 
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
-        invalidate_lane_plans(lane);
+        // Completion runs the host-cache save, whose staging may evict store segments that
+        // other lanes' cached plans reference (ContentRestore anchors). Invalidate every
+        // lane's cached plan so waiting requests replan against the mutated store.
+        for (std::uint32_t index = 0; index < max_concurrency_; ++index) {
+            invalidate_lane_plans(index);
+        }
     }
 
     void consume_service_work(const std::shared_ptr<Request>& request, std::uint64_t work) {

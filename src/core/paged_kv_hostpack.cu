@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstring>
 #include <stdexcept>
 
 namespace ninfer {
@@ -54,8 +55,16 @@ void launch(const HostpackGeometry& geometry, const std::int32_t* device_page_id
     if (geometry.plane_count == 0 || geometry.plane_count > kHostpackMaxPlanes) {
         throw std::invalid_argument("hostpack geometry has an unsupported plane count");
     }
-    static thread_local const HostpackGeometry* uploaded = nullptr;
-    if (uploaded != &geometry) {
+    // Compare by content, not address: a rebuilt geometry can reuse the same address with
+    // different planes, which would silently keep stale __constant__ data.
+    static thread_local HostpackGeometry uploaded_geometry{};
+    static thread_local bool uploaded = false;
+    const bool same =
+        uploaded && uploaded_geometry.plane_count == geometry.plane_count &&
+        uploaded_geometry.packed_page_bytes == geometry.packed_page_bytes &&
+        std::memcmp(uploaded_geometry.planes, geometry.planes,
+                    sizeof(HostpackPlaneGeom) * geometry.plane_count) == 0;
+    if (!same) {
         DevicePlaneGeom device_geoms[kHostpackMaxPlanes];
         for (std::uint32_t index = 0; index < geometry.plane_count; ++index) {
             const HostpackPlaneGeom& plane = geometry.planes[index];
@@ -66,7 +75,8 @@ void launch(const HostpackGeometry& geometry, const std::int32_t* device_page_id
         CUDA_CHECK(cudaMemcpyToSymbolAsync(g_hostpack_planes, device_geoms,
                                            sizeof(DevicePlaneGeom) * geometry.plane_count, 0,
                                            cudaMemcpyHostToDevice, stream));
-        uploaded = &geometry;
+        uploaded_geometry = geometry;
+        uploaded          = true;
     }
     const dim3 grid(page_count, geometry.plane_count);
     if (to_packed) {

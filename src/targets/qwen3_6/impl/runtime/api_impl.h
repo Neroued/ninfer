@@ -212,6 +212,11 @@ SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) co
 }
 
 template <>
+KvHostCacheStats Program<Variant>::host_cache_stats() const noexcept {
+    return impl_->host_cache_stats();
+}
+
+template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
 }

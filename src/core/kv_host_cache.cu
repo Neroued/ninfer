@@ -219,6 +219,10 @@ bool KvHostCache::stage_page(PageKind kind, std::uint64_t key,
 bool KvHostCache::stage_anchor(std::uint64_t chain_key, const AnchorMeta& meta,
                                std::span<const KvHostCopySlice> state_slices,
                                cudaStream_t stream) {
+    if (staged_anchor_) {
+        throw std::logic_error(
+            "staging a KV host cache anchor while a previous transaction is still open");
+    }
     if (segments_.contains(chain_key)) {
         touch_segment(chain_key);
         return false;

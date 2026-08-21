@@ -541,6 +541,15 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             if (!content_cache || !request_plan.content_restore) {
                 throw std::logic_error("content restore was planned without a host cache");
             }
+            // The store may have evicted the planned anchor between planning and execution
+            // (a completed request's save can trigger eviction). Fail before any lane
+            // mutation so the caller can replan; the engine's executor invalidates cached
+            // plans on every completion, which keeps this path unreachable there.
+            if (!content_cache->plan_valid(*request_plan.content_restore)) {
+                throw std::runtime_error(
+                    "content restore plan is stale: the planned anchor was evicted; replan "
+                    "the request");
+            }
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
@@ -628,6 +637,12 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 } else {
                     sequence.rewrite_checkpoint = {};
                 }
+            } else if (sequence.rewrite_checkpoint.frontier != base) {
+                // The restore just overwrote rewrite_checkpoint_hidden with the anchor's
+                // boundary hidden at `base`; a kept checkpoint at a different frontier would
+                // pair its (valid) linear slot with that foreign hidden, and save() would
+                // seal the torn pair into the host store. Drop it instead.
+                sequence.rewrite_checkpoint = {};
             }
         }
         install_sampling(sequence, request, request_plan.sampling);
@@ -2306,6 +2321,23 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     }
     request.lifecycle = terminal ? Lifecycle::Complete : Lifecycle::Active;
     request.pending   = {};
+}
+
+KvHostCacheStats ProgramImplCore::host_cache_stats() const noexcept {
+    KvHostCacheStats out;
+    if (!content_cache) { return out; }
+    const KvHostCache::Stats& stats = content_cache->stats();
+    out.enabled          = true;
+    out.budget_bytes     = content_cache->budget_bytes();
+    out.stored_bytes     = stats.stored_bytes;
+    out.stored_segments  = stats.stored_segments;
+    out.stored_pages     = stats.stored_pages;
+    out.hit_requests     = stats.hit_requests;
+    out.hit_tokens       = stats.hit_tokens;
+    out.restored_bytes   = stats.restored_bytes;
+    out.writeback_bytes  = stats.writeback_bytes;
+    out.evicted_segments = stats.evicted_segments;
+    return out;
 }
 
 MemorySummary ProgramImplCore::memory_summary() const noexcept {

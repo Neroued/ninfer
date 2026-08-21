@@ -87,6 +87,14 @@ public:
         return std::nullopt;
     }
 
+    // O(1) staleness check for a previously planned restore: eviction is whole-segment, so a
+    // live anchor implies every page its segment references is still stored.
+    [[nodiscard]] bool plan_valid(const RestorePlan& plan) const {
+        const auto meta = store_->find_anchor(plan.anchor_key);
+        return meta && meta->frontier == plan.frontier &&
+               meta->backend_tokens == plan.backend_tokens;
+    }
+
     // Sequence KV must already be reserved, bound, and materialized past the plan's frontier.
     void restore(SequenceState& sequence, const RestorePlan& plan,
                  const PreparedPromptData& prompt, WorkspaceArena& work, DeviceContext& device) {
@@ -237,11 +245,22 @@ private:
         }
     }
 
+    // Aborts the open staging transaction on every exit except a successful seal, so a CUDA
+    // or invariant exception mid-save cannot leave staged pages, pins, or a staged anchor
+    // behind (abort_segment is idempotent).
+    struct TransactionAbortGuard {
+        KvHostCache* store;
+        ~TransactionAbortGuard() {
+            if (store != nullptr) { store->abort_segment(); }
+        }
+    };
+
     [[nodiscard]] bool stage_segment(const SequenceState& sequence,
                                      const content_chain::Chain& chain, std::uint32_t frontier,
                                      std::uint64_t anchor_key, std::uint32_t backend_tokens,
                                      std::int32_t state_slot, const Tensor& boundary_hidden,
                                      WorkspaceArena& work, DeviceContext& device) {
+        TransactionAbortGuard guard{store_.get()};
         const std::vector<std::uint64_t> text_keys =
             page_keys_for(KvHostCache::PageKind::Text, chain, frontier, anchor_key);
         const std::vector<std::uint64_t> backend_keys =
@@ -262,12 +281,10 @@ private:
             staged_text && staged_backend &&
             store_->stage_anchor(anchor_key, meta,
                                  anchor_state_slices(state_slot, boundary_hidden), device.stream);
-        if (!staged_anchor) {
-            store_->abort_segment();
-            return false;
-        }
+        if (!staged_anchor) { return false; }
         store_->seal_segment(anchor_key, text_keys, backend_keys,
                              chain.page_keys[frontier / kPagedKVPageSize - 1]);
+        guard.store = nullptr;
         return true;
     }
 

@@ -1,0 +1,129 @@
+schema_version: 1
+
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 2
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  text_full:
+    jobs:
+      - id: ifbench
+        backend: evalscope
+        dataset: ifbench
+        target: qwen38_api
+        max_concurrency: 2
+        generation:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # IFBench responses are normally short, but this leaves ample room for
+          # instruction-constrained long-form answers and hidden reasoning.
+          max_tokens: 65536
+          seed: 42
+          extra_body: &thinking_extra_body
+            enable_thinking: true
+            min_p: 0.0
+        backend_args:
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &aime_generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # NInfer has no repetition_penalty field; the recommended 1.0 is the identity operation.
+          # At C=2, two full budgets use 245,760 of the measured 255,360-token KV pool.
+          max_tokens: 122880
+          seed: 42
+          extra_body: *thinking_extra_body
+        backend_args: &aime_backend
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *aime_generation
+        backend_args: *aime_backend
+
+      - id: gpqa_diamond
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: qwen38_api
+        max_concurrency: 1
+        generation:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # C=1 leaves enough shared KV for the prior 154,453-token completed long tail.
+          max_tokens: 245760
+          seed: 42
+          extra_body: *thinking_extra_body
+        backend_args:
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+  multimodal_full:
+    jobs:
+      - id: erqa
+        backend: evalscope
+        dataset: erqa
+        target: qwen38_api
+        max_concurrency: 2
+        generation: &multimodal_generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # ERQA_75 is the largest cached prepared prompt at 12,394 tokens.
+          # The Vision server's 81,920 context therefore leaves 3,990 tokens
+          # beyond this prompt plus the 65,536-token output bound.
+          max_tokens: 65536
+          seed: 42
+          extra_body: *thinking_extra_body
+        backend_args: &multimodal_backend
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: real_world_qa
+        backend: evalscope
+        dataset: real_world_qa
+        target: qwen38_api
+        max_concurrency: 2
+        generation: *multimodal_generation
+        backend_args: *multimodal_backend
+
+runtime:
+  # Keep datasets sequential inside each independently invoked evaluation step.
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 900
+  samples:
+    retention: all

@@ -20,7 +20,19 @@ from .base import BackendDependencyError, BackendRun, RunContext, WorkPlan
 _DATASET_COUNTS = {
     "aime25": {"default": 30},
     "aime26": {"default": 30},
+    "erqa": {
+        "Trajectory Reasoning": 66,
+        "Action Reasoning": 72,
+        "Pointing": 34,
+        "State Estimation": 55,
+        "Spatial Reasoning": 84,
+        "Multi-view Reasoning": 37,
+        "Task Reasoning": 38,
+        "Other": 14,
+    },
     "gpqa_diamond": {"default": 198},
+    "ifbench": {"default": 300},
+    "real_world_qa": {"default": 765},
     "bfcl_v4": {
         "simple_python": 400,
         "simple_java": 100,
@@ -54,6 +66,14 @@ _BFCL_AGGREGATES = {
     "live",
     "hallucination",
     "overall",
+}
+
+_EVALSCOPE_VERSION = "1.10.0"
+_IFBENCH_METRICS = {
+    "prompt_level_strict",
+    "inst_level_strict",
+    "prompt_level_loose",
+    "inst_level_loose",
 }
 
 
@@ -105,7 +125,7 @@ class EvalScopeBackend:
         if job.dataset == "bfcl_v4":
             self._validate_bfcl(job, for_run)
         if for_run:
-            self._require_package("evalscope", "1.9.0")
+            self._require_package("evalscope", _EVALSCOPE_VERSION)
 
     def _validate_bfcl(self, job: JobConfig, for_run: bool) -> None:
         subsets = set(job.backend_args.get("subset_list") or _DATASET_COUNTS["bfcl_v4"])
@@ -169,7 +189,7 @@ class EvalScopeBackend:
                 elif isinstance(job.limit, float):
                     count = max(1, int(count * job.limit))
                 total += count * job.repeats
-        requirements = ["evalscope==1.9.0"]
+        requirements = [f"evalscope=={_EVALSCOPE_VERSION}"]
         warnings: list[str] = []
         if job.dataset == "bfcl_v4":
             requirements.append("bfcl-eval==2025.10.27.1")
@@ -181,6 +201,8 @@ class EvalScopeBackend:
             warnings.append(
                 "BFCL multi-turn samples may issue more than one model request"
             )
+        elif job.dataset == "ifbench":
+            requirements.append("EvalScope ifbench extra (emoji, nltk>=3.9, syllapy)")
         return WorkPlan(
             total=total,
             unit="samples",
@@ -388,6 +410,13 @@ class EvalScopeBackend:
                 # run. Use the report's selected-sample accuracy for smoke/custom
                 # subsets and reserve official OVERALL for the complete benchmark.
                 metrics.pop("overall", None)
+        elif context.job.dataset == "ifbench":
+            metrics.update(self._named_metrics(report, _IFBENCH_METRICS))
+            primary = "prompt_level_strict"
+            if "prompt_level_strict" in metrics:
+                score = metrics["prompt_level_strict"]
+            elif isinstance(score, (int, float)):
+                metrics["prompt_level_strict"] = float(score)
         if primary == "accuracy":
             metrics["accuracy"] = (
                 float(score) if isinstance(score, (int, float)) else 0.0
@@ -423,6 +452,20 @@ class EvalScopeBackend:
             duration_seconds=run.duration_seconds,
             artifacts=artifacts,
         )
+
+    @staticmethod
+    def _named_metrics(
+        report: dict[str, Any], names: set[str]
+    ) -> dict[str, float]:
+        values: dict[str, float] = {}
+        for metric in report.get("metrics", []):
+            name = str(metric.get("name", "")).lower()
+            if name.startswith("mean_"):
+                name = name.removeprefix("mean_")
+            score = metric.get("score")
+            if name in names and isinstance(score, (int, float)):
+                values[name] = float(score)
+        return values
 
     @staticmethod
     def _needle_haystack_metrics(

@@ -100,15 +100,18 @@ and per-fixture results.
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
 enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
 
-| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond |
-|---|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
-| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | — | — | 88.38% |
+| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
+|---|---:|---:|---:|---:|---:|
+| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
+| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
+| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
+| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
+| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
 
-The Qwen3.8-27B groupwise-int profile has not yet been added to this published evaluation campaign;
-the Qwen3.8-27B NVFP4 profile currently reports GPQA-Diamond only.
+The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8-27B rows used
+temperature 1.0 and presence penalty 0.0. The multimodal columns (ERQA and RealWorldQA) ran with
+`--vision` at a 81,920-token context limit; the text columns used a 262,144-token limit except
+Qwen3.8-27B NVFP4, which needs 252,928 to fit the RTX 5090 after weights.
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
 cards and [full performance document](docs/performance.md) for correct/total counts and evaluation

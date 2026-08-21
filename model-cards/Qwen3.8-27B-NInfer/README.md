@@ -12,6 +12,87 @@ tags:
   - conversational
   - cuda
   - rtx-5090
+model-index:
+  - name: Qwen3.8-27B-NInfer
+    results:
+      - task:
+          type: text-generation
+          name: Text Generation
+        dataset:
+          name: IFBench
+          type: ifbench
+        metrics:
+          - type: accuracy
+            value: 77.67
+            name: Prompt-level strict (0-shot, rule)
+        source:
+          url: https://github.com/Neroued/ninfer/tree/master/eval
+          name: NInfer EvalScope 1.9.0
+      - task:
+          type: text-generation
+          name: Text Generation
+        dataset:
+          name: AIME 2025
+          type: aime25
+        metrics:
+          - type: accuracy
+            value: 96.67
+            name: Accuracy (0-shot, rule)
+        source:
+          url: https://github.com/Neroued/ninfer/tree/master/eval
+          name: NInfer EvalScope 1.9.0
+      - task:
+          type: text-generation
+          name: Text Generation
+        dataset:
+          name: AIME 2026
+          type: aime26
+        metrics:
+          - type: accuracy
+            value: 96.67
+            name: Accuracy (0-shot, rule)
+        source:
+          url: https://github.com/Neroued/ninfer/tree/master/eval
+          name: NInfer EvalScope 1.9.0
+      - task:
+          type: text-generation
+          name: Text Generation
+        dataset:
+          name: GPQA-Diamond
+          type: gpqa_diamond
+        metrics:
+          - type: accuracy
+            value: 87.37
+            name: Accuracy (0-shot, rule)
+        source:
+          url: https://github.com/Neroued/ninfer/tree/master/eval
+          name: NInfer EvalScope 1.9.0
+      - task:
+          type: image-text-to-text
+          name: Image Text to Text
+        dataset:
+          name: ERQA
+          type: erqa
+        metrics:
+          - type: accuracy
+            value: 66.25
+            name: Accuracy (0-shot, rule)
+        source:
+          url: https://github.com/Neroued/ninfer/tree/master/eval
+          name: NInfer EvalScope 1.9.0
+      - task:
+          type: image-text-to-text
+          name: Image Text to Text
+        dataset:
+          name: RealWorldQA
+          type: real_world_qa
+        metrics:
+          - type: accuracy
+            value: 82.22
+            name: Accuracy (0-shot, rule)
+        source:
+          url: https://github.com/Neroued/ninfer/tree/master/eval
+          name: NInfer EvalScope 1.9.0
 ---
 
 # Qwen3.8-27B for NInfer
@@ -92,6 +173,33 @@ The artifact supports:
 - startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;
 - OpenAI- and Anthropic-compatible serving.
+
+## Evaluation
+
+The artifact was evaluated through NInfer's OpenAI-compatible serving route with thinking enabled,
+MTP=3, and INT8 group-64 KV. EvalScope 1.9.0 used 0-shot prompts, rule-based scoring, and one sample
+per problem with temperature 1.0, top-p 0.95, top-k 20, presence penalty 0.0, and seed 42. The text
+suite ran at a 262,144-token context limit; the multimodal suite ran with `--vision` at a
+81,920-token limit.
+
+| Benchmark | NInfer groupwise-int | Correct / total | Official Qwen3.8-27B BF16 |
+|---|---:|---:|---:|
+| IFBench (prompt-level strict) | 77.67% | 233 / 300 | 79.5 |
+| AIME 2025 | 96.67% | 29 / 30 | — |
+| AIME 2026 | 96.67% | 29 / 30 | — |
+| GPQA-Diamond | 87.37% | 173 / 198 | 89.2 |
+| ERQA | 66.25% | 265 / 400 | 65.5 |
+| RealWorldQA | 82.22% | 629 / 765 | 85.9 |
+
+All 1,723 configured samples completed and were scored. IFBench additionally reports 81.00%
+instruction-level strict, 80.67% prompt-level loose, and 83.67% instruction-level loose. These are
+single-sample results, not pass@k.
+
+The official Qwen3.8-27B BF16 figures come from the
+[upstream model card](https://huggingface.co/Qwen/Qwen3.8-27B); its sampling settings and IFBench
+metric level are not stated there, so the last column is not a same-protocol comparison. The
+groupwise-int deltas stay within ±3.1 points on the four overlapping benchmarks, and the upstream
+card reports no AIME results.
 
 ## Limits
 

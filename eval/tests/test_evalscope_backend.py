@@ -12,6 +12,28 @@ from ninfer_eval.config import JobConfig
 
 
 class EvalScopeBackendTest(unittest.TestCase):
+    def test_plans_new_text_and_multimodal_datasets(self):
+        backend = EvalScopeBackend()
+        expected = {
+            "erqa": 400,
+            "ifbench": 300,
+            "real_world_qa": 765,
+        }
+        for dataset, total in expected.items():
+            with self.subTest(dataset=dataset):
+                job = JobConfig(
+                    dataset,
+                    "evalscope",
+                    dataset,
+                    "api",
+                    2,
+                    None,
+                    1,
+                    {},
+                    {},
+                )
+                self.assertEqual(backend.plan(job, None).total, total)
+
     def test_plans_needle_haystack_generated_matrix(self):
         backend = EvalScopeBackend()
         job = JobConfig(
@@ -107,6 +129,40 @@ class EvalScopeBackendTest(unittest.TestCase):
             self.assertEqual(result.primary_metric, "accuracy")
             self.assertEqual(result.metrics["accuracy"], 0.625)
             self.assertEqual(result.counts.completed, 198)
+
+    def test_normalizes_ifbench_official_metrics(self):
+        backend = EvalScopeBackend()
+        job = JobConfig(
+            "ifbench", "evalscope", "ifbench", "api", 2, None, 1, {}, {}
+        )
+        scores = {
+            "prompt_level_strict": 0.51,
+            "inst_level_strict": 0.61,
+            "prompt_level_loose": 0.71,
+            "inst_level_loose": 0.81,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp) / "backends" / "ifbench"
+            job_dir.mkdir(parents=True)
+            context = RunContext(
+                "run", job, job_dir, None, 2, threading.Event(), False, WorkPlan(300)
+            )
+            raw = {
+                "ifbench": {
+                    "score": scores["prompt_level_strict"],
+                    "num": 300,
+                    "metrics": [
+                        {"name": f"mean_{name}", "score": score, "num": 300}
+                        for name, score in scores.items()
+                    ],
+                }
+            }
+            result = backend.normalize(
+                context, BackendRun(time.monotonic(), time.monotonic(), raw)
+            )
+            self.assertEqual(result.primary_metric, "prompt_level_strict")
+            self.assertEqual(result.metrics, scores)
+            self.assertEqual(result.counts.completed, 300)
 
     def test_normalizes_bfcl_official_aggregates(self):
         backend = EvalScopeBackend()

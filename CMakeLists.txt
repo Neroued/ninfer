@@ -68,13 +68,20 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# MSVC is true for any MSVC-ABI compiler, which includes clang-cl. Settings that
+# every such compiler needs go here; settings specific to cl are gated further.
 if(MSVC)
-  # CUDA 13's CCCL (cuda/std) requires the conforming MSVC preprocessor. The
-  # flag is forwarded to the cl host compiler nvcc invokes, including for the
-  # host stubs it generates. (The 128-byte-aligned TMA descriptor parameters are
-  # passed by device pointer rather than by value precisely so MSVC's stub
+  # CUDA 13's CCCL (cuda/std) requires the conforming MSVC preprocessor. cl needs
+  # to be told; clang-cl's preprocessor is already conforming and rejects the flag
+  # as unknown, so ask only when the C++ frontend really is cl. The -Xcompiler
+  # form is unconditional because nvcc drives cl as its host compiler on Windows
+  # regardless of which compiler CMake uses for C++, and the host stubs it
+  # generates need the flag too. (The 128-byte-aligned TMA descriptor parameters
+  # are passed by device pointer rather than by value precisely so MSVC's stub
   # compiler does not reject them.)
-  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>)
+  endif()
   set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/Zc:preprocessor")
   # windows.h defines min/max as macros which clobber std::min/std::max; NOMINMAX
   # suppresses them. UTF8PROC_STATIC keeps the vendored utf8proc header from

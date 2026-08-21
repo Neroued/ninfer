@@ -499,13 +499,23 @@ private:
 
     void invalidate_lane_plans(std::uint32_t lane) noexcept { ++lane_plan_versions_[lane]; }
 
+    std::uint64_t observed_store_epoch_ = 0;
+
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
         // Completion runs the host-cache save, whose staging may evict store segments that
-        // other lanes' cached plans reference (ContentRestore anchors). Invalidate every
-        // lane's cached plan so waiting requests replan against the mutated store.
-        for (std::uint32_t index = 0; index < max_concurrency_; ++index) {
-            invalidate_lane_plans(index);
+        // other lanes' cached plans reference (ContentRestore anchors), and whose sealed
+        // segment may improve waiting plans. Replan everyone only when the store actually
+        // mutated; a completion that stored nothing (short prompts, duplicate trajectories,
+        // cache off) keeps the pre-cache single-lane invalidation.
+        const std::uint64_t epoch = instance_.program->host_cache_epoch();
+        if (epoch != observed_store_epoch_) {
+            observed_store_epoch_ = epoch;
+            for (std::uint32_t index = 0; index < max_concurrency_; ++index) {
+                invalidate_lane_plans(index);
+            }
+        } else {
+            invalidate_lane_plans(lane);
         }
     }
 

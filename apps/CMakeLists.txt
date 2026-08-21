@@ -11,12 +11,16 @@ target_link_libraries(ninfer PRIVATE
   ninfer_product_prompt_input)
 
 add_executable(ninfer-serve serve/main.cpp)
-execute_process(
-  COMMAND git describe --always --dirty --tags
-  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-  OUTPUT_VARIABLE NINFER_BUILD_ID
-  OUTPUT_STRIP_TRAILING_WHITESPACE
-  ERROR_QUIET)
+if(DEFINED ENV{NINFER_BUILD_ID})
+  set(NINFER_BUILD_ID "$ENV{NINFER_BUILD_ID}")
+else()
+  execute_process(
+    COMMAND git describe --always --dirty --tags
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE NINFER_BUILD_ID
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+endif()
 if(NOT NINFER_BUILD_ID)
   set(NINFER_BUILD_ID "unknown")
 endif()

@@ -2330,6 +2330,10 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     request.pending   = {};
 }
 
+std::uint64_t ProgramImplCore::host_cache_epoch() const noexcept {
+    return content_cache ? content_cache->mutation_epoch() : 0;
+}
+
 KvHostCacheStats ProgramImplCore::host_cache_stats() const noexcept {
     KvHostCacheStats out;
     if (!content_cache) { return out; }

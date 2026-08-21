@@ -222,6 +222,11 @@ KvHostCacheStats Program<Variant>::host_cache_stats() const noexcept {
 }
 
 template <>
+std::uint64_t Program<Variant>::host_cache_epoch() const noexcept {
+    return impl_->host_cache_epoch();
+}
+
+template <>
 MemorySummary Program<Variant>::memory_summary() const noexcept {
     return impl_->memory_summary();
 }

@@ -58,6 +58,9 @@ public:
 
     [[nodiscard]] const KvHostCache::Stats& stats() const noexcept { return store_->stats(); }
     [[nodiscard]] std::size_t used_bytes() const noexcept { return store_->used_bytes(); }
+    [[nodiscard]] std::uint64_t mutation_epoch() const noexcept {
+        return store_->mutation_epoch();
+    }
     [[nodiscard]] std::size_t budget_bytes() const noexcept { return store_->budget_bytes(); }
 
     [[nodiscard]] std::optional<RestorePlan> probe(const PreparedPromptData& prompt) const {

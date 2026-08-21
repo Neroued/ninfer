@@ -168,7 +168,9 @@ void KvHostCache::drop_segment(std::uint64_t chain_key, Segment& segment) noexce
     };
     drop_keys(PageKind::Text, segment.text_keys);
     drop_keys(PageKind::Backend, segment.backend_keys);
+    stats_.stored_bytes -= segment.anchor_slot.bytes;
     release_slot(segment.anchor_slot);
+    ++mutation_epoch_;
     const auto index = anchors_by_page_.find(segment.index_page_key);
     if (index != anchors_by_page_.end()) {
         std::erase(index->second, chain_key);
@@ -292,7 +294,9 @@ void KvHostCache::seal_segment(std::uint64_t chain_key, std::span<const std::uin
     segment.text_keys      = {text_keys.begin(), text_keys.end()};
     segment.backend_keys   = {backend_keys.begin(), backend_keys.end()};
     segment.index_page_key = index_page_key;
+    stats_.stored_bytes += segment.anchor_slot.bytes;
     anchors_by_page_[index_page_key].push_back(chain_key);
+    ++mutation_epoch_;
     lru_.push_front(chain_key);
     segment.lru_position = lru_.begin();
     segments_.emplace(chain_key, std::move(segment));

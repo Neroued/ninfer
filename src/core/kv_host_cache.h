@@ -94,6 +94,9 @@ public:
     void touch_segment(std::uint64_t chain_key);
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+    // Monotonic counter of store mutations (segment sealed or dropped). Lets plan caches skip
+    // invalidation when a completion changed nothing a probe could see.
+    [[nodiscard]] std::uint64_t mutation_epoch() const noexcept { return mutation_epoch_; }
     [[nodiscard]] std::size_t budget_bytes() const noexcept { return config_.budget_bytes; }
     [[nodiscard]] std::size_t used_bytes() const noexcept { return used_bytes_; }
 
@@ -150,7 +153,8 @@ private:
     std::vector<StagedPage> staged_pages_;
     std::vector<std::pair<PageKind, std::uint64_t>> staged_pins_;
     std::optional<std::pair<std::uint64_t, Segment>> staged_anchor_;
-    std::size_t carved_bytes_ = 0;
+    std::size_t carved_bytes_   = 0;
+    std::uint64_t mutation_epoch_ = 0;
 };
 
 } // namespace ninfer

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -206,7 +207,8 @@ public:
             throw std::system_error(error, std::system_category(), "GetFileSizeEx " + path.string());
         }
         if (size_info.QuadPart < 0 ||
-            size_info.QuadPart > static_cast<LONGLONG>(std::numeric_limits<std::size_t>::max())) {
+            static_cast<std::uintmax_t>(size_info.QuadPart) >
+                std::numeric_limits<std::size_t>::max()) {
             ::CloseHandle(file);
             throw ArtifactError("artifact size does not fit the process address space");
         }

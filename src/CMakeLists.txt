@@ -269,18 +269,25 @@ add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+# utf8proc.h falls back to dllimport declarations for the shared-library build on
+# Windows; this tree compiles it into a static archive.
+target_compile_definitions(ninfer_text PUBLIC UTF8PROC_STATIC)
 
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)
 ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+target_link_libraries(ninfer_media_decode PRIVATE ${NINFER_FFMPEG_TARGET})
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
   add_library(ninfer_media_acquire STATIC
     product/media_acquire/acquire.cpp)
   ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  target_link_libraries(ninfer_media_acquire PRIVATE ${NINFER_CURL_TARGET})
+  if(WIN32)
+    # curl's Winsock transport requires ws2_32 at link time.
+    target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)

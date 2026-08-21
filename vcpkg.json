@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "ninfer",
+  "version-string": "0.1.0",
+  "builtin-baseline": "7f3781e19cc7d4e4882a4caec01668c6f7b5c163",
+  "dependencies": [
+    "curl",
+    {
+      "name": "ffmpeg",
+      "features": [
+        "zlib"
+      ]
+    }
+  ]
+}

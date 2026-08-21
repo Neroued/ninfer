@@ -92,6 +92,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::optional<qwen3_6::detail::ContentRestorePlan> content_restore;
+    std::uint64_t content_identity = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -219,6 +220,8 @@ public:
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);
     [[nodiscard]] bool content_restore_valid(const RequestPlan& plan) const noexcept;
+    [[nodiscard]] std::uint64_t content_identity(const RequestPlan& plan) const noexcept;
+    [[nodiscard]] bool save_prefill_checkpoint(std::uint32_t lane);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,

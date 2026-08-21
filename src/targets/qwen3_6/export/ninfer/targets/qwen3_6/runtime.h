@@ -152,6 +152,12 @@ public:
     // False when the plan carries a content restore whose anchor the host cache no longer
     // stores (a concurrent completion's save may evict between planning and admission).
     [[nodiscard]] bool content_restore_valid(const RequestPlan<Variant>& plan) const noexcept;
+    // Content identity of the plan's full prompt (0 when the host cache is off or the prompt
+    // is below the cache minimum). Equal identities mean identical prefill state.
+    [[nodiscard]] std::uint64_t content_identity(const RequestPlan<Variant>& plan) const noexcept;
+    // Publishes the lane's rewrite-checkpoint anchor into the host cache right after prefill,
+    // so identical queued prompts restore the boundary instead of re-prefilling.
+    [[nodiscard]] bool save_prefill_checkpoint(std::uint32_t lane);
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] bool

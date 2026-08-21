@@ -137,6 +137,24 @@ def main() -> int:
     answers_d, walls, errors = fire(args.base_url, args.model, forks)
     passed &= report("D mid-turn fork burst", answers_d, walls, errors, [[i] for i in range(n)])
 
+    long_gen = f"LongGen {salt}. " + filler * args.filler + " Write a short story about an audit."
+    def ask_long(_):
+        return ask(args.base_url, args.model, payload(long_gen), max_tokens=256)
+    walls_e: list[float] = []
+    errors_e: list[str] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        futures = [pool.submit(ask_long, i) for i in range(n)]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                _, wall = future.result()
+                walls_e.append(wall)
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError) as error:
+                errors_e.append(str(error))
+    spread = f"walls {min(walls_e):.2f}s..{max(walls_e):.2f}s" if walls_e else "no walls"
+    print(f"E long-gen identical burst: errors={len(errors_e)} {spread} "
+          f"[{'ok' if not errors_e else 'FAIL'}]")
+    passed &= not errors_e
+
     print("concurrency battery:", "OK" if passed else "FAIL")
     return 0 if passed else 1
 

@@ -63,11 +63,13 @@ public:
     }
     [[nodiscard]] std::size_t budget_bytes() const noexcept { return store_->budget_bytes(); }
 
-    [[nodiscard]] std::optional<RestorePlan> probe(const PreparedPromptData& prompt) const {
+    [[nodiscard]] std::optional<RestorePlan> probe(const PreparedPromptData& prompt,
+                                                   std::uint64_t* identity = nullptr) const {
         const auto tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
         if (tokens < 2 * kPagedKVPageSize) { return std::nullopt; }
         const auto stream                = content_chain::stream_of(prompt);
         const content_chain::Chain chain = content_chain::build(stream, tokens, salt_);
+        if (identity != nullptr) { *identity = chain.final_key; }
         const std::uint32_t present =
             store_->present_prefix(KvHostCache::PageKind::Text, chain.page_keys);
         for (std::uint32_t pages = present; pages >= 1; --pages) {
@@ -76,7 +78,7 @@ public:
                  store_->find_anchor_keys(chain.page_keys[pages - 1])) {
                 const auto meta = store_->find_anchor(anchor_key);
                 if (!meta) { continue; }
-                if (meta->frontier >= tokens ||
+                if (meta->frontier > tokens ||
                     meta->frontier / kPagedKVPageSize != pages ||
                     meta->rope_delta != prompt.rope_delta ||
                     meta->frontier <= best.frontier) {
@@ -121,6 +123,36 @@ public:
         store_->restore_anchor_state(plan.anchor_key, slices, device.stream);
         store_->note_hit(plan.frontier);
         store_->touch_segment(plan.anchor_key);
+    }
+
+    // Publishes an anchor at the prompt boundary of a lane whose prefill just completed
+    // (called before its first decode round is resolved): the current linear-attention slot
+    // still holds the state after the last prompt token, tail_hidden is that boundary's
+    // hidden, and KV pages up to the boundary stay stable during generation. Identical
+    // queued prompts then content-restore the boundary (an exact-frontier hit) instead of
+    // repeating the full prefill while this lane is still generating.
+    [[nodiscard]] bool save_prompt_anchor(const SequenceState& sequence, WorkspaceArena& work,
+                                          DeviceContext& device) {
+        if (!sequence.kv) { return false; }
+        const std::uint32_t boundary = static_cast<std::uint32_t>(
+            std::min<std::size_t>(sequence.ledger.size(), sequence.text_kv_valid));
+        if (boundary < 2 * kPagedKVPageSize || sequence.prefix_identity.size() < boundary) {
+            return false;
+        }
+        const auto stream = content_chain::stream_of(sequence.ledger, sequence.prefix_identity);
+        const content_chain::Chain chain = content_chain::build(stream, boundary, salt_);
+        if (store_->find_anchor(chain.final_key)) {
+            store_->touch_segment(chain.final_key);
+            return true;
+        }
+        const std::uint32_t backend_tokens =
+            sequence.kv->backend ? std::min(sequence.mtp_kv_valid, boundary) : 0;
+        const bool staged = stage_segment(
+            sequence, chain, boundary, chain.final_key, backend_tokens,
+            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency_),
+            sequence.tail_hidden, work, device);
+        if (staged) { CUDA_CHECK(cudaStreamSynchronize(device.stream)); }
+        return staged;
     }
 
     void save(const SequenceState& sequence, WorkspaceArena& work, DeviceContext& device) {

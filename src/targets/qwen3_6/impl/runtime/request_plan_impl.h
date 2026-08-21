@@ -226,7 +226,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     if (plan->reuse == ReusePath::FullReset && content_cache != nullptr &&
         base.allow_prefix_reuse && prompt.identity.reusable) {
-        if (const auto restore = content_cache->probe(prompt)) {
+        if (const auto restore = content_cache->probe(prompt, &plan->content_identity)) {
             const std::uint32_t mtp_base = restore->frontier == 0 ? 0 : restore->frontier - 1;
             if (speculative_backend != SpeculativeBackend::Mtp ||
                 restore->backend_tokens >= mtp_base) {

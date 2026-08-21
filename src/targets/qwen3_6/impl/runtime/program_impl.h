@@ -337,6 +337,15 @@ bool ProgramImplCore::content_restore_valid(const RequestPlan& plan) const noexc
            content_cache->plan_valid(*plan.impl_->content_restore);
 }
 
+std::uint64_t ProgramImplCore::content_identity(const RequestPlan& plan) const noexcept {
+    return plan.impl_ == nullptr ? 0 : plan.impl_->content_identity;
+}
+
+bool ProgramImplCore::save_prefill_checkpoint(std::uint32_t lane) {
+    if (!content_cache || lane >= max_concurrency) { return false; }
+    return content_cache->save_prompt_anchor(sequences[lane], work, device);
+}
+
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
     const RequestControl& request = requests[lane];

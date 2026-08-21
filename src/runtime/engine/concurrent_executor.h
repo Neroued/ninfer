@@ -297,6 +297,7 @@ private:
         std::string content;
         std::string reasoning;
         std::optional<std::uint32_t> lane;
+        std::uint64_t content_identity = 0;
         std::atomic<bool> cancelled{false};
         bool decode_ready = false;
 
@@ -501,8 +502,36 @@ private:
 
     std::uint64_t observed_store_epoch_ = 0;
 
+    // When identical prompts wait in the queue, publish this lane's prompt-boundary anchor
+    // into the host cache now (one D2H of the prompt state) so the twins content-restore in
+    // milliseconds instead of repeating the full prefill they were held back from.
+    bool maybe_publish_prefill_checkpoint(std::uint32_t lane) {
+        const std::uint64_t identity = lane_identities_[lane];
+        if (identity == 0 || lane_publish_attempted_[lane]) { return false; }
+        bool waiting = false;
+        {
+            std::lock_guard lock(queue_mutex_);
+            for (const auto& pending : pending_) {
+                if (pending->content_identity == identity) {
+                    waiting = true;
+                    break;
+                }
+            }
+        }
+        if (!waiting) { return false; }
+        lane_publish_attempted_[lane] = true;
+        if (!instance_.program->save_prefill_checkpoint(lane)) { return false; }
+        observed_store_epoch_ = instance_.program->host_cache_epoch();
+        for (std::uint32_t index = 0; index < max_concurrency_; ++index) {
+            invalidate_lane_plans(index);
+        }
+        return true;
+    }
+
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
+        lane_identities_[lane]        = 0;
+        lane_publish_attempted_[lane] = false;
         // Completion runs the host-cache save, whose staging may evict store segments that
         // other lanes' cached plans reference (ContentRestore anchors), and whose sealed
         // segment may improve waiting plans. Replan everyone only when the store actually
@@ -652,6 +681,7 @@ private:
             instance_.request_memory.deactivate();
             prefill_lane_.reset();
         }
+        maybe_publish_prefill_checkpoint(*request->lane);
         request->begin = step.summary;
         if (step.round.tokens.size() != 1) {
             throw std::logic_error("prefill did not license exactly one token");
@@ -714,10 +744,13 @@ private:
         request->lane_plans[lane].emplace(
             instance_.program->plan_request_for_lane(lane, request->prompt, *request->base_plan));
         request->lane_plan_versions[lane] = lane_plan_versions_[lane];
+        request->content_identity =
+            instance_.program->content_identity(*request->lane_plans[lane]);
     }
 
     [[nodiscard]] std::optional<LaneChoice>
-    find_admission_lane(const std::shared_ptr<Request>& request) {
+    find_admission_lane(const std::shared_ptr<Request>& request,
+                        std::optional<std::uint32_t>* held_by_twin_lane = nullptr) {
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -725,6 +758,21 @@ private:
             ensure_lane_plan(request, lane);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
+            // An identical prompt is active on another lane and this plan would still pay the
+            // full prefill: hold it. When the twin's prefill completes its prompt-boundary
+            // anchor is published, the replan turns into a content restore (reuse > 0) and
+            // this gate stops matching. Checked against every active lane, not just the one
+            // currently prefilling — a burst can admit two twins in one scheduling pass
+            // before the first prefill starts.
+            if (request->content_identity != 0 && reuse == 0) {
+                for (std::uint32_t occupied = 0; occupied < max_concurrency_; ++occupied) {
+                    if (slots_[occupied] != nullptr &&
+                        lane_identities_[occupied] == request->content_identity) {
+                        if (held_by_twin_lane != nullptr) { *held_by_twin_lane = occupied; }
+                        return std::nullopt;
+                    }
+                }
+            }
             if (instance_.program->can_admit_lane(lane, plan) &&
                 (!selected || reuse > selected_reuse)) {
                 selected       = LaneChoice{.lane = lane};
@@ -804,6 +852,7 @@ private:
             invalidate_lane_plans(lane);
             ensure_lane_plan(request, lane);
         }
+        const std::uint64_t plan_identity = request->content_identity;
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
         if (!erase_pending(request)) { return AdmissionProgress::None; }
@@ -831,6 +880,8 @@ private:
             request->backfill_epoch         = backfill_epoch;
             request->backfill_class         = backfill_class;
             slots_[lane]                    = request;
+            lane_identities_[lane]          = plan_identity;
+            lane_publish_attempted_[lane]   = false;
             invalidate_lane_plans(lane);
 
             TransientRegion transient;
@@ -912,8 +963,9 @@ private:
             }
 
             std::optional<LaneChoice> head_lane;
+            std::optional<std::uint32_t> head_held_by;
             try {
-                head_lane = find_admission_lane(head);
+                head_lane = find_admission_lane(head, &head_held_by);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
@@ -921,6 +973,19 @@ private:
             }
             if (head_lane) {
                 return admit_planned_request(head, *head_lane, BackfillClass::None, 0);
+            }
+            if (head_held_by) {
+                // Identity hold, not resource blockage: lanes are free by choice, so the
+                // protected-admission math must not run. If the twin is already generating,
+                // publish its prompt-boundary anchor now; the head replans into a restore on
+                // the next pass. While the twin is still prefilling, its completion hook
+                // publishes and invalidates plans.
+                if ((!prefill_lane_ || *prefill_lane_ != *head_held_by) &&
+                    maybe_publish_prefill_checkpoint(*head_held_by)) {
+                    control_progress = true;
+                }
+                return control_progress ? AdmissionProgress::ControlProgress
+                                        : AdmissionProgress::None;
             }
 
             const ActiveAdmissionSet active = active_admission_set();
@@ -980,8 +1045,9 @@ private:
                 }
 
                 std::optional<LaneChoice> candidate_lane;
+                std::optional<std::uint32_t> candidate_held_by;
                 try {
-                    candidate_lane = find_admission_lane(candidate);
+                    candidate_lane = find_admission_lane(candidate, &candidate_held_by);
                 } catch (...) {
                     (void)remove_pending_error(candidate, std::current_exception());
                     control_progress = true;
@@ -1193,6 +1259,8 @@ private:
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};
+    std::array<std::uint64_t, kMaximumConcurrency> lane_identities_{};
+    std::array<bool, kMaximumConcurrency> lane_publish_attempted_{};
     std::optional<AdmissionProtection> protection_;
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;

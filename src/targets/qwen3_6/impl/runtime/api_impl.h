@@ -136,6 +136,11 @@ RequestPlan<Variant> Program<Variant>::plan_request_for_lane(std::uint32_t lane,
 }
 
 template <>
+bool Program<Variant>::content_restore_valid(const RequestPlan<Variant>& plan) const noexcept {
+    return impl_->content_restore_valid(plan);
+}
+
+template <>
 bool Program<Variant>::can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept {
     return impl_->can_admit_lane(lane, plan);

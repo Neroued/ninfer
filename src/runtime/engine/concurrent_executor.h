@@ -787,6 +787,13 @@ private:
             }
         }
 
+        if (!instance_.program->content_restore_valid(*request->lane_plans[lane])) {
+            // A completion processed inside this scheduling pass ran save(), and its staging
+            // evicted the anchor this cached plan restores from. Replan against the current
+            // store instead of executing a stale restore.
+            invalidate_lane_plans(lane);
+            ensure_lane_plan(request, lane);
+        }
         Plan selected_plan = std::move(*request->lane_plans[lane]);
         request->lane_plans[lane].reset();
         if (!erase_pending(request)) { return AdmissionProgress::None; }

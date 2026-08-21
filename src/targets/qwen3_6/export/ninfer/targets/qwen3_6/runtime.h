@@ -149,6 +149,9 @@ public:
     [[nodiscard]] RequestPlan<Variant> plan_request_for_lane(std::uint32_t lane,
                                                              const PreparedPrompt& prompt,
                                                              const RequestBasePlan<Variant>& base);
+    // False when the plan carries a content restore whose anchor the host cache no longer
+    // stores (a concurrent completion's save may evict between planning and admission).
+    [[nodiscard]] bool content_restore_valid(const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane,
                                       const RequestPlan<Variant>& plan) const noexcept;
     [[nodiscard]] bool

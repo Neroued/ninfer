@@ -330,6 +330,13 @@ ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
+bool ProgramImplCore::content_restore_valid(const RequestPlan& plan) const noexcept {
+    if (plan.impl_ == nullptr) { return false; }
+    if (plan.impl_->reuse != ReusePath::ContentRestore) { return true; }
+    return content_cache && plan.impl_->content_restore &&
+           content_cache->plan_valid(*plan.impl_->content_restore);
+}
+
 bool ProgramImplCore::can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept {
     if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
     const RequestControl& request = requests[lane];

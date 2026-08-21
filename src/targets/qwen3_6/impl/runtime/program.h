@@ -218,6 +218,7 @@ public:
     [[nodiscard]] RequestPlan plan_request_for_lane(std::uint32_t lane,
                                                     const PreparedPromptData& prompt,
                                                     const RequestBasePlan& base);
+    [[nodiscard]] bool content_restore_valid(const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool can_admit_lane(std::uint32_t lane, const RequestPlan& plan) const noexcept;
     [[nodiscard]] bool
     can_admit_lane_after_retained_eviction(std::uint32_t lane,

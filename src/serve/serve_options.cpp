@@ -73,7 +73,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
-           "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--vision-residency resident|overlay] [--vision-max-merged N] [--kv-host-cache-mib N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -90,7 +90,10 @@ std::string serve_usage_text(const char* argv0) {
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
-           "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --kv-host-cache-mib N keeps computed context in pinned host RAM: previously\n"
+           "         computed prefixes restore through PCIe instead of re-prefilling, and\n"
+           "         branches sharing a prefix deduplicate against the same pages (0 = off)\n"
+"       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --vision-residency overlay keeps Vision weights in pinned host memory\n"
            "         and encodes images through device memory temporarily borrowed from\n"
            "         evicted read-only text weights; resident (default) is the fixed\n"
@@ -234,6 +237,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--vision-max-merged must be in [64, 32768]");
             }
             options.vision_max_merged_tokens = static_cast<std::uint32_t>(value);
+        } else if (arg == "--kv-host-cache-mib") {
+            const int value =
+                parse_nonnegative_int(require_value("--kv-host-cache-mib"), "kv-host-cache-mib");
+            options.kv_host_cache_mib = static_cast<std::size_t>(value);
         } else if (arg == "--vision-residency") {
             const std::string_view value = require_value("--vision-residency");
             if (value == "resident") {

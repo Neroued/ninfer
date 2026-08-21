@@ -45,6 +45,7 @@ struct ServeOptions {
     bool enable_vision      = false;
     ninfer::VisionResidency vision_residency = ninfer::VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens   = 32768;
+    std::size_t kv_host_cache_mib            = 0;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     bool enable_thinking =

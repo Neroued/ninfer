@@ -105,6 +105,7 @@ public:
     [[nodiscard]] std::uint32_t logical_page_capacity() const noexcept;
     [[nodiscard]] std::int32_t table_row_count() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
+    [[nodiscard]] PagedKVPlaneOrder plane_order() const noexcept { return spec_.plane_order; }
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
     [[nodiscard]] const Tensor& block_tables() const noexcept;
     [[nodiscard]] Tensor block_table_row(std::int32_t row) const;

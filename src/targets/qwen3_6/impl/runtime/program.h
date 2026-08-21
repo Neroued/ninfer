@@ -70,6 +70,12 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     bool allow_prefix_reuse = false;
 };
 
+struct ContentRestorePlan {
+    std::uint32_t frontier       = 0;
+    std::uint32_t backend_tokens = 0;
+    std::uint64_t anchor_key     = 0;
+};
+
 template <>
 struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     runtime::RequestPlanSummary summary;
@@ -85,6 +91,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
+    std::optional<qwen3_6::detail::ContentRestorePlan> content_restore;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail
@@ -261,6 +268,7 @@ public:
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    std::unique_ptr<class ContentKvCache> content_cache;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<DFlashPersistentState> dflash;

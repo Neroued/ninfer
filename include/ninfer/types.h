@@ -103,6 +103,8 @@ struct EngineOptions {
     // values return the difference to KV capacity.
     std::uint32_t vision_max_merged_tokens = 32768;
     bool use_cuda_graph                    = true;
+    // Pinned-host content cache for computed context (0 disables the feature entirely).
+    std::size_t kv_host_cache_mib          = 0;
     LoadProgress load_progress;
 };
 
@@ -405,10 +407,12 @@ struct SpeculativeStats {
 };
 
 enum class PrefixReusePath : std::uint8_t {
+
     FullReset,
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
+    ContentRestore,
 };
 
 struct GenerationResult {

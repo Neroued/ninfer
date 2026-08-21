@@ -1,3 +1,4 @@
+#include "targets/qwen3_6/impl/runtime/content_kv_cache_impl.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
@@ -223,6 +224,19 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
+    if (plan->reuse == ReusePath::FullReset && content_cache != nullptr &&
+        base.allow_prefix_reuse && prompt.identity.reusable) {
+        if (const auto restore = content_cache->probe(prompt)) {
+            const std::uint32_t mtp_base = restore->frontier == 0 ? 0 : restore->frontier - 1;
+            if (speculative_backend != SpeculativeBackend::Mtp ||
+                restore->backend_tokens >= mtp_base) {
+                plan->reuse           = ReusePath::ContentRestore;
+                plan->reuse_base      = restore->frontier;
+                plan->content_restore = *restore;
+            }
+        }
+    }
+
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
@@ -231,7 +245,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
-        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
+        if (plan->reuse != ReusePath::FullReset && plan->reuse != ReusePath::ContentRestore &&
+            !append_ready && !checkpoint_ready) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
         }
@@ -276,7 +291,8 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix
                                     : MtpBridgeMode::AfterExactHit;
-        } else if (is_rewrite_checkpoint_restore(plan->reuse)) {
+        } else if (is_rewrite_checkpoint_restore(plan->reuse) ||
+                   plan->reuse == ReusePath::ContentRestore) {
             plan->prepare_mtp = true;
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix

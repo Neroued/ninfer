@@ -238,6 +238,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_residency         = options_.vision_residency;
     engine_options.vision_max_merged_tokens = options_.vision_max_merged_tokens;
+    engine_options.kv_host_cache_mib        = options_.kv_host_cache_mib;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;

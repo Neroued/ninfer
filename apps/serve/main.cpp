@@ -1,3 +1,4 @@
+#include <string>
 #include "product/load_progress/load_progress.h"
 #include "serve/console_log.h"
 #include "serve/generation_service.h"
@@ -55,6 +56,10 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+#ifdef NINFER_BUILD_ID
+        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info,
+                                         std::string("build ") + NINFER_BUILD_ID);
+#endif
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "loading model...");
         auto load_progress_options        = ninfer::product::stderr_load_progress_options();
         load_progress_options.line_prefix = [] {

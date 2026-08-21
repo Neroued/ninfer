@@ -121,15 +121,16 @@ notes.
 
 NInfer currently requires:
 
-- 64-bit Linux;
+- 64-bit Linux or 64-bit Windows;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
-- CMake 3.28 or newer and a C++20-capable host compiler;
-- `pkg-config`;
+- CMake 3.28 or newer and a C++20-capable host compiler (MSVC 2022 on Windows);
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
   `libavutil >= 58`, and `libswscale >= 7`;
 - `libcurl >= 7.85`;
-- Ninja, when using the commands below.
+- on Linux, `pkg-config` plus Ninja for the commands below;
+- on Windows, [vcpkg](https://github.com/microsoft/vcpkg); the `vcpkg.json` manifest
+  supplies FFmpeg and curl.
 
 The build rejects CUDA architectures other than `120a`. There is no install target or packaged
 binary distribution; NInfer is run from its source build tree.
@@ -152,6 +153,35 @@ build/apps/ninfer-serve
 ```
 
 Tests, benchmarks, and maintainer tools are excluded from the default build.
+
+### Windows
+
+Windows builds are native (MSVC + nvcc) and resolve FFmpeg and curl through the `vcpkg.json`
+manifest instead of `pkg-config`. From a PowerShell prompt:
+
+```powershell
+git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+
+git clone https://github.com/Neroued/ninfer.git
+cd ninfer
+
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release --parallel
+```
+
+The first configure restores or builds the manifest dependencies; packages are cached under
+`%LOCALAPPDATA%\vcpkg\archives`, so later configurations are fast. The executables land in
+`build\apps\Release\`. Before launching them, put the vcpkg runtime DLLs and the CUDA runtime
+on `PATH`:
+
+```powershell
+$env:PATH = "$PWD\build\vcpkg_installed\x64-windows\bin;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin;$env:PATH"
+.\build\apps\Release\ninfer models\qwen3_8_27b.ninfer --prompt "Hello"
+```
+
+Debug builds follow the same steps with `--config Debug`.
 
 ## Docker
 

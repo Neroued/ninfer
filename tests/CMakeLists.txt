@@ -55,7 +55,18 @@ endfunction()
 function(ninfer_add_op_test name)
   ninfer_add_test(${name} ${ARGN})
   set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # Op tests check GPU kernels against a CPU reference, so the host build must not
+  # reassociate or fuse the reference arithmetic. clang-cl reports its id as Clang
+  # but takes cl-style flags, and silently ignores the GNU spelling: route those
+  # through /clang: instead, or the reference loses the guarantee without a word.
+  # cl keeps its default, which is what the suite is verified against today.
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      target_compile_options(${name} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/clang:-fno-fast-math>
+        $<$<COMPILE_LANGUAGE:CXX>:/clang:-ffp-contract=off>)
+    endif()
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${name} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
       $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)

@@ -1,4 +1,4 @@
-#include "core/host_kv_arena.h"
+#include "core/host_kv_budget.h"
 #include "core/host_kv_park.h"
 
 #include <cuda_runtime_api.h>
@@ -75,6 +75,13 @@ std::vector<std::uint8_t> pages_of(const std::vector<std::uint8_t>& buffer, std:
 }  // namespace
 
 int main() {
+    int count = 0;
+    const cudaError_t count_err = cudaGetDeviceCount(&count);
+    if (count_err == cudaErrorNoDevice || count_err == cudaErrorInsufficientDriver || count == 0) {
+        std::printf("SKIP: no usable CUDA device\n");
+        return 77;
+    }
+
     constexpr std::size_t kPageBytes = 4096;
     constexpr std::uint32_t kPages   = 64;
 
@@ -91,12 +98,12 @@ int main() {
     // A deliberately non-contiguous, unsorted page set: the runs logic must
     // handle both, and restore must tolerate a different physical mapping.
     const std::vector<std::int32_t> parked_ids{9, 10, 11, 40, 3};
-    ninfer::HostKvArena arena(2, per_page * parked_ids.size());
-    check(arena.free_slabs() == 2, "arena starts with every slab free");
+    ninfer::HostKvBudget arena(2 * per_page * parked_ids.size());
+    check(arena.used_bytes() == 0, "budget starts with the whole budget free");
 
-    ninfer::HostKvSlab* slab = arena.acquire();
+    ninfer::HostKvSlab* slab = arena.acquire(per_page * parked_ids.size());
     check(slab != nullptr, "acquire returns a slab");
-    check(arena.free_slabs() == 1, "acquire consumes a slab");
+    check(arena.used_bytes() == per_page * parked_ids.size(), "acquire consumes the region");
 
     const auto before_a = plane_a.read();
     const auto before_b = plane_b.read();
@@ -136,8 +143,8 @@ int main() {
     // Guard rails.
     bool threw = false;
     try {
-        ninfer::HostKvArena tiny(1, per_page);            // room for one page only
-        ninfer::HostKvSlab* small = tiny.acquire();
+        ninfer::HostKvBudget tiny(per_page);            // room for one page only
+        ninfer::HostKvSlab* small = tiny.acquire(per_page);
         ninfer::host_kv_park(planes, parked_ids, *small, nullptr);
     } catch (const std::invalid_argument&) { threw = true; }
     check(threw, "park rejects a slab that cannot hold the pages");
@@ -242,10 +249,10 @@ int main() {
 
         // Parked set: 5 pages, physical run shape 1+1+3 (non-contiguous).
         const std::vector<std::int32_t> head_parked{7, 20, 30, 31, 32};
-        ninfer::HostKvArena head_arena(1,
-                                       ninfer::host_kv_bytes_per_page(head_planes) *
-                                           head_parked.size());
-        ninfer::HostKvSlab* head_slab = head_arena.acquire();
+        const std::size_t head_needed =
+            ninfer::host_kv_bytes_per_page(head_planes) * head_parked.size();
+        ninfer::HostKvBudget head_arena(head_needed);
+        ninfer::HostKvSlab* head_slab = head_arena.acquire(head_needed);
         const auto head_before = head_plane.read();
         (void)ninfer::host_kv_park(head_planes, head_parked, *head_slab, nullptr);
         (void)cudaStreamSynchronize(nullptr);
@@ -273,7 +280,7 @@ int main() {
     }
 
     arena.release(slab);
-    check(arena.free_slabs() == 2, "release returns the slab to the arena");
+    check(arena.used_bytes() == 0, "release returns the region to the budget");
 
     std::printf("\n%s\n", failures == 0 ? "all checks passed" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;

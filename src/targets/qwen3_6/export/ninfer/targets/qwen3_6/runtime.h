@@ -172,10 +172,9 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
 
-    // Host KV cache (--host-kv-cache). The Program owns it: slab sizing and the
-    // parked-sequence layout are target-specific. Callers only park and restore.
-    [[nodiscard]] std::size_t host_kv_slab_bytes() const;
-    void enable_host_kv_cache(std::uint32_t slabs);
+    // Host KV cache (--host-kv-cache-mib). The Program owns it: the parked-sequence
+    // layout is target-specific. Callers only park and restore.
+    void enable_host_kv_cache(std::uint64_t budget_bytes);
     [[nodiscard]] bool host_kv_cache_enabled() const noexcept;
 
     // Moves a retained lane's sequence to host RAM, freeing its pages. False if

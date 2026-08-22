@@ -104,6 +104,7 @@ target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
 ninfer_add_test(ninfer_host_kv_park_test
   SOURCES test_host_kv_park.cpp
   LIBRARIES ninfer_core)
+set_tests_properties(ninfer_host_kv_park_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_host_kv_cache_test
   SOURCES test_host_kv_cache.cpp
   NEEDS_SOURCE_DIR
@@ -111,6 +112,7 @@ ninfer_add_test(ninfer_host_kv_cache_test
 target_include_directories(ninfer_host_kv_cache_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+set_tests_properties(ninfer_host_kv_cache_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_host_kv_gdn_test
   SOURCES test_host_kv_gdn.cpp
   LIBRARIES ninfer_engine ninfer_core)

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/host_kv_arena.h"
+#include "core/host_kv_budget.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime_api.h>

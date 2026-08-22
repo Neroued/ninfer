@@ -1,5 +1,5 @@
 #include "core/device.h"
-#include "core/host_kv_arena.h"
+#include "core/host_kv_budget.h"
 #include "core/linear_attention_state.h"
 
 #include "targets/qwen3_6/impl/runtime/host_kv_sequence.h"
@@ -67,10 +67,14 @@ int main() {
     (void)cudaMemcpyAsync(arena.base(), before.data(), bytes, cudaMemcpyHostToDevice, stream);
     (void)cudaStreamSynchronize(stream);
 
-    // Park both slots into a slab, exactly as park_lane_to_host does.
+    // Park both slots into a slab, exactly as park_lane_to_host does. The budget
+    // must hold the aligned request: acquire() rounds the region up to 64 bytes,
+    // so a budget of exactly 2 * slot_bytes would be too small when it is not
+    // 64-aligned.
     const std::size_t slot_bytes = pool.slot_bytes();
-    ninfer::HostKvArena slab_arena(1, 2 * slot_bytes);
-    ninfer::HostKvSlab* slab = slab_arena.acquire();
+    const std::size_t gdn_budget = (2 * slot_bytes + 63) & ~std::size_t(63);
+    ninfer::HostKvBudget slab_arena(gdn_budget);
+    ninfer::HostKvSlab* slab = slab_arena.acquire(2 * slot_bytes);
     check(slab != nullptr, "a slab is available for the GDN state");
     std::size_t gdn_bytes = park_gdn_slot(pool, 0, *slab, 0, stream);
     gdn_bytes += park_gdn_slot(pool, 1, *slab, gdn_bytes, stream);

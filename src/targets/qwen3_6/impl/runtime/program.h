@@ -235,10 +235,7 @@ public:
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
 
-    // Bytes one slab must hold to park the largest sequence this Program can
-    // hold. The executor cannot compute this: bytes-per-page is target-specific.
-    [[nodiscard]] std::size_t host_kv_slab_bytes() const;
-    void enable_host_kv_cache(std::uint32_t slabs);
+    void enable_host_kv_cache(std::uint64_t budget_bytes);
     [[nodiscard]] bool host_kv_cache_enabled() const noexcept { return host_kv_ != nullptr; }
     // `protect_id` keeps one parked entry from being LRU-evicted to make room
     // for the slab; admission passes the entry it is about to restore so the
@@ -253,7 +250,7 @@ public:
     // planner-visible state into `entry` (the copies are complete on return;
     // the caller clears the lane after committing the entry); restore is the
     // inverse into a possibly different lane. Both are no-ops without a cache.
-    [[nodiscard]] bool park_lane_to_host(std::uint32_t lane, HostKvEntry& entry,
+    [[nodiscard]] bool park_lane_to_host(std::uint32_t lane, HostKvEntry& entry, std::size_t needed,
                                          cudaStream_t stream);
     void restore_lane_from_host(std::uint32_t lane, const HostKvEntry& entry,
                                 std::uint32_t reuse_tokens, cudaStream_t stream);
@@ -358,6 +355,14 @@ private:
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;
     [[nodiscard]] qwen3_6::PagedKVCache* backend_kv_cache() noexcept;
     [[nodiscard]] const qwen3_6::PagedKVCache* backend_kv_cache() const noexcept;
+    // Bytes to park the largest sequence this Program can hold (the full
+    // per-sequence page cap plus the hidden + GDN tail). Used only by
+    // enable_host_kv_cache() to size the budget and warn when it is too small;
+    // the executor cannot compute it (bytes-per-page is target-specific).
+    [[nodiscard]] std::size_t max_parked_sequence_bytes() const;
+    // Bytes to park `lane`'s current sequence (its actual mapped page count
+    // plus the hidden + GDN tail). park_lane() sizes the budget region from it.
+    [[nodiscard]] std::size_t parked_lane_bytes(std::uint32_t lane) const;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;

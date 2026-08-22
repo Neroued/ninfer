@@ -48,9 +48,10 @@ struct ServeOptions {
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
-    // Sequences parked in pinned host RAM instead of being discarded when a lane
-    // is needed. 0 disables the cache and keeps the discard-on-eviction behaviour.
-    int host_kv_cache_slabs = 0;
+    // Pinned host RAM budget (MiB) for parking evicted sequences instead of being
+    // discarded when a lane is needed. 0 disables the cache and keeps the
+    // discard-on-eviction behaviour.
+    std::uint64_t host_kv_cache_mib = 0;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request

@@ -471,7 +471,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
-| `--host-kv-cache N` | park up to N evicted sequences in pinned host RAM instead of discarding them; not supported with `--spec dflash` or `--no-prefix-reuse` (startup error) | `0` (off) |
+| `--host-kv-cache-mib N` | park evicted sequences in a pinned host-RAM budget of N MiB instead of discarding them; each parked sequence takes only its real size, and a session larger than the budget falls back to re-prefill; not supported with `--spec dflash` or `--no-prefix-reuse` (startup error) | `0` (off) |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |

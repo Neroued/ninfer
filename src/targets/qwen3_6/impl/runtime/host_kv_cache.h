@@ -14,7 +14,7 @@
 // Lookup instead replays the planner's own test, prefix_matches(), against each
 // entry's ledger and prefix identity.
 
-#include "core/host_kv_arena.h"
+#include "core/host_kv_budget.h"
 #include "core/host_kv_log.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_provider.h"
 
@@ -29,12 +29,18 @@ namespace ninfer::targets::qwen3_6::detail {
 
 class HostKvCache : public HostKvProvider {
 public:
-    HostKvCache(std::size_t slab_count, std::size_t slab_bytes)
-        : arena_(slab_count, slab_bytes) {}
+    explicit HostKvCache(std::size_t budget_bytes) : budget_(budget_bytes) {}
 
     [[nodiscard]] std::size_t size() const noexcept override { return entries_.size(); }
-    [[nodiscard]] std::size_t free_slabs() const noexcept { return arena_.free_slabs(); }
-    [[nodiscard]] std::size_t slab_bytes() const noexcept override { return arena_.slab_bytes(); }
+    [[nodiscard]] std::size_t budget_bytes() const noexcept override {
+        return budget_.budget_bytes();
+    }
+    [[nodiscard]] std::size_t used_bytes() const noexcept override {
+        return budget_.used_bytes();
+    }
+    [[nodiscard]] std::size_t largest_free_range() const noexcept override {
+        return budget_.largest_free_range();
+    }
 
     [[nodiscard]] HostKvEntry& entry(std::size_t index) override { return *entries_[index]; }
     [[nodiscard]] const HostKvEntry& entry(std::size_t index) const override { return *entries_[index]; }
@@ -67,36 +73,66 @@ public:
         return best;
     }
 
-    // Takes a slab for a new park, evicting the least recently used entry when
-    // none is free. `protect_id` is never evicted: it is the entry a restore is
-    // about to consume, and sacrificing it to the park that precedes the restore
-    // would defeat the cache. Returns nullptr when no slab can be made available.
-    [[nodiscard]] HostKvSlab* acquire_slab(std::uint64_t protect_id = 0) override {
-        if (HostKvSlab* slab = arena_.acquire()) { return slab; }
-        if (entries_.empty()) { return nullptr; }
-
-        std::size_t victim = 0;
-        std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
-        bool have_victim    = false;
-        for (std::size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i]->id == protect_id) { continue; }
-            if (entries_[i]->last_used < oldest) {
-                oldest      = entries_[i]->last_used;
-                victim      = i;
-                have_victim = true;
+    // Takes a buffer of `needed_bytes` for a new park, evicting the least
+    // recently used entries until one fits. Eviction is fit-driven, not purely
+    // size-driven: a fragmented free set may force evicting an entry even when
+    // total free bytes suffice (`largest_free_range()` exposes this).
+    // `protect_id` is never evicted: it is the entry a restore is about to
+    // consume, and sacrificing it to the park that precedes the restore would
+    // defeat the cache. Returns nullptr when no buffer can be made available.
+    [[nodiscard]] HostKvSlab* acquire_slab(std::uint64_t protect_id,
+                                           std::size_t needed_bytes) override {
+        if (HostKvSlab* slab = budget_.acquire(needed_bytes)) { return slab; }
+        // Evicting only helps if the request can ever fit as one contiguous
+        // range. The protected entry (if any) is the only immovable region: it
+        // sits at a fixed offset and splits the address space, so a sum of free
+        // bytes can overstate what a single range can hold. Bail out before
+        // evicting anything when even releasing every unprotected entry cannot
+        // make room - without this, an unsatisfiable park would evict the whole
+        // cache one entry at a time and still fail. The model assumes the
+        // protected entry is the only immovable region: a slab handed out by a
+        // concurrent acquire_slab but not yet inserted is invisible to this
+        // scan, so a caller must not hold such a slab across another
+        // acquire_slab (park_lane is the only caller today, and it runs
+        // single-threaded).
+        std::size_t protected_offset = 0, protected_bytes = 0;
+        for (const auto& e : entries_) {
+            if (e->id == protect_id) {
+                protected_offset = budget_.slab_offset(e->slab);
+                protected_bytes  = e->slab->bytes();
+                break;
             }
         }
-        if (!have_victim) { return nullptr; }  // every entry is protected
-        host_kv_log("host KV LRU evicting entry " + std::to_string(victim) +
-                    " (" + std::to_string(entries_[victim]->execution_frontier) +
-                    " tokens) to make room");
-        drop(victim);
-        return arena_.acquire();
+        if (!budget_.can_satisfy(needed_bytes, protected_offset, protected_bytes)) {
+            return nullptr;
+        }
+        // No single free range fits yet: evict LRU entries (skipping the
+        // protected one) until the budget can hold `needed_bytes`, or no
+        // unprotected entry remains.
+        while (true) {
+            std::size_t victim = 0;
+            std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
+            bool have_victim    = false;
+            for (std::size_t i = 0; i < entries_.size(); ++i) {
+                if (entries_[i]->id == protect_id) { continue; }
+                if (entries_[i]->last_used < oldest) {
+                    oldest      = entries_[i]->last_used;
+                    victim      = i;
+                    have_victim = true;
+                }
+            }
+            if (!have_victim) { return nullptr; }  // every entry is protected
+            host_kv_log("host KV LRU evicting entry " + std::to_string(victim) +
+                        " (" + std::to_string(entries_[victim]->execution_frontier) +
+                        " tokens) to make room");
+            drop(victim);
+            if (HostKvSlab* slab = budget_.acquire(needed_bytes)) { return slab; }
+        }
     }
 
     // Returns a slab taken by acquire_slab() when the park it was for did not
     // happen. Without this a failed park would leak the slab.
-    void release_slab(HostKvSlab* slab) override { arena_.release(slab); }
+    void release_slab(HostKvSlab* slab) override { budget_.release(slab); }
 
     void insert(std::unique_ptr<HostKvEntry> entry) override {
         entry->id        = ++id_clock_;
@@ -108,7 +144,7 @@ public:
     // eviction and after a successful restore.
     void drop(std::size_t index) override {
         if (index >= entries_.size()) { return; }
-        arena_.release(entries_[index]->slab);
+        budget_.release(entries_[index]->slab);
         entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
     }
 
@@ -117,7 +153,7 @@ public:
     }
 
 private:
-    HostKvArena arena_;
+    HostKvBudget budget_;
     std::vector<std::unique_ptr<HostKvEntry>> entries_;
     std::uint64_t clock_     = 0;
     std::uint64_t id_clock_  = 0;

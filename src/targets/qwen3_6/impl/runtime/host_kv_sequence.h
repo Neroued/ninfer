@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/host_kv_arena.h"
+#include "core/host_kv_budget.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"

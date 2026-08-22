@@ -14,7 +14,7 @@
 // without touching the materializer; async staging and remote eviction are
 // later widenings of the same seam, not constraints designed for now.
 
-#include "core/host_kv_arena.h"
+#include "core/host_kv_budget.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_sequence.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 
@@ -41,8 +41,6 @@ struct HostKvEntry {
     ResidentPrefixIdentity prefix_identity;
     std::uint32_t execution_frontier = 0;
     std::uint32_t ledger_frontier    = 0;
-    std::uint32_t text_kv_valid      = 0;
-    std::uint32_t mtp_kv_valid       = 0;
     std::int32_t rope_delta          = 0;
     bool tail_hidden_valid           = false;
 
@@ -76,7 +74,11 @@ class HostKvProvider {
 public:
     virtual ~HostKvProvider() = default;
 
-    [[nodiscard]] virtual std::size_t slab_bytes() const = 0;
+    [[nodiscard]] virtual std::size_t budget_bytes() const = 0;
+    // Bytes not currently handed out; 0 for providers that don't track it.
+    [[nodiscard]] virtual std::size_t used_bytes() const { return 0; }
+    // Largest single contiguous free range; 0 for providers that don't track it.
+    [[nodiscard]] virtual std::size_t largest_free_range() const { return 0; }
     [[nodiscard]] virtual std::size_t size() const = 0;
     [[nodiscard]] virtual HostKvEntry& entry(std::size_t index) = 0;
     [[nodiscard]] virtual const HostKvEntry& entry(std::size_t index) const = 0;
@@ -85,13 +87,16 @@ public:
     // tokens, so the cache and the lane chooser agree on what "best" means.
     [[nodiscard]] virtual std::optional<HostKvMatch> find(const PreparedPromptData& prompt) const = 0;
 
-    // Takes a buffer for a new park, evicting the least recently used entry
-    // when none is free. `protect_id` names an entry that must never be
-    // evicted to make room (0 protects nothing); the caller uses it to keep
-    // the entry a restore is about to consume from being sacrificed to the
-    // park that precedes it. Returns nullptr only if no buffer can be made
-    // available (every entry is protected, or the provider holds none).
-    [[nodiscard]] virtual HostKvSlab* acquire_slab(std::uint64_t protect_id = 0) = 0;
+    // Takes a buffer of `needed_bytes` for a new park, evicting the least
+    // recently used entries until one fits (fit-driven: a fragmented free set
+    // may evict an entry even when total free bytes suffice). `protect_id`
+    // names an entry that must never be evicted to make room (0 protects
+    // nothing); the caller uses it to keep the entry a restore is about to
+    // consume from being sacrificed to the park that precedes it. Returns
+    // nullptr only if no buffer can be made available (every entry is
+    // protected, or the budget cannot hold `needed_bytes`).
+    [[nodiscard]] virtual HostKvSlab* acquire_slab(std::uint64_t protect_id,
+                                                   std::size_t needed_bytes) = 0;
 
     // Returns a buffer taken by acquire_slab() when the park it was for did
     // not happen. Without this a failed park would leak the buffer.
@@ -108,7 +113,7 @@ public:
     // entry that must nonetheless survive the call: restore_lane() defers
     // restoration while the pool cannot reserve the entitlement, leaving the
     // entry cached; without a touch it would keep its insertion recency and be
-    // the first evicted once slabs fill, forcing the session it served through a
+    // the first evicted once the budget fills, forcing the session it served through a
     // full re-prefill. Pure probes (find/host_kv_reusable_tokens) stay
     // non-touching so the cache tracks actual use, not curiosity.
     virtual void touch(std::size_t index) = 0;

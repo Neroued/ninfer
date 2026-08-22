@@ -56,11 +56,11 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
-        if (options.host_kv_cache_slabs > 0) {
-            // The Program owns the cache: slab sizing and the parked-sequence
+        if (options.host_kv_cache_bytes > 0) {
+            // The Program owns the cache: budget sizing and the parked-sequence
             // layout are target-specific, and the executor is generic over
             // Program. It only ever asks "park this lane" / "restore this lane".
-            instance.program->enable_host_kv_cache(options.host_kv_cache_slabs);
+            instance.program->enable_host_kv_cache(options.host_kv_cache_bytes);
         }
         worker_ = std::thread([this] { worker_loop(); });
     }
@@ -716,8 +716,16 @@ private:
             const std::uint32_t cached =
                 instance_.program->host_kv_reusable_tokens(request->prompt);
             if (cached == 0) {
-                host_kv_log("req " + std::to_string(request->id) +
-                            " host KV miss: no entry matches this prompt");
+                // Log only the first few misses (the rest are the common case in a
+                // multi-session workload); the park/restore/evict lines stay
+                // unthrottled because they are rare and diagnostic. The counter
+                // re-arms on a successful restore, so the log keeps telling you
+                // "this session stopped matching" instead of going blind after 8.
+                if (host_kv_miss_log_count_ < 8) {
+                    ++host_kv_miss_log_count_;
+                    host_kv_log("req " + std::to_string(request->id) +
+                                " host KV miss: no entry matches this prompt");
+                }
             }
             if (cached != 0) {
                 std::uint32_t resident = 0;
@@ -729,7 +737,7 @@ private:
                 if (cached > resident) {
                     // Park the resident to make room, protecting the entry this
                     // prompt will restore: without it, the LRU eviction that
-                    // frees a slab could evict the very entry the restore needs.
+                    // frees budget room could evict the very entry the restore needs.
                     const std::uint64_t protect =
                         instance_.program->host_kv_match_id(request->prompt);
                     bool lane_cleared = !instance_.program->has_retained_lane(lane);
@@ -739,12 +747,12 @@ private:
                             // now in the cache and the lane is free for the restore.
                             lane_cleared = true;
                         } else {
-                            // No slab for the resident: every slab is held by a
-                            // protected entry (the N=1 case, where this prompt's
-                            // own entry holds the only slab). Discard the resident
-                            // rather than destroy the entry the restore needs -
-                            // the request in front of us is this prompt's, so
-                            // restoring it beats parking the resident. The
+                            // No budget room for the resident: every free range is held by
+                            // protected entries (the budget-holds-only-the-protected-entry
+                            // case, where this prompt's own entry holds the whole budget).
+                            // Discard the resident rather than destroy the entry the
+                            // restore needs - the request in front of us is this
+                            // prompt's, so restoring it beats parking the resident. The
                             // resident re-prefills on its next request, exactly as
                             // it would without the cache.
                             instance_.program->evict_retained_lane(lane);
@@ -754,6 +762,9 @@ private:
                     if (lane_cleared &&
                         instance_.program->restore_lane(lane, request->prompt)) {
                         invalidate_lane_plans(lane);
+                        // The cache is demonstrably working again: re-arm the
+                        // miss log so a later "stopped matching" is visible.
+                        host_kv_miss_log_count_ = 0;
                     } else if (lane_cleared) {
                         // The lane was cleared (resident parked or discarded) but
                         // the restore failed: the lane state changed, so cached
@@ -923,10 +934,17 @@ private:
             slots_[lane].reset();
             invalidate_lane_plans(lane);
             complete_error(request, error);
-            // A per-request admission failure must not take the whole executor
-            // down: the request is already marked failed, so report control
-            // progress and let the loop admit the next request.
-            return AdmissionProgress::ControlProgress;
+            // A prefill-path C++ exception is a genuine invariant violation (or
+            // OOM), not a per-request admission failure: the request is marked
+            // failed above, but the exception propagates so a broken engine fails
+            // loudly rather than keep admitting requests off inconsistent state.
+            // (A CUDA error in this path aborts via CUDA_CHECK, the executor's
+            // established policy, before reaching this catch.) The host-KV
+            // restore path is not in this catch at all: it runs in
+            // find_admission_lane under try_admit_one's catch, and is
+            // non-throwing for C++ exceptions (restore_lane returns bool and
+            // drops the entry on failure).
+            throw;
         }
         return AdmissionProgress::RanGpuUnit;
     }
@@ -1256,6 +1274,11 @@ private:
     std::deque<std::shared_ptr<Request>> pending_;
     std::size_t outstanding_       = 0;
     std::uint64_t next_request_id_ = 1;
+    // Throttles the per-request host-KV miss log: most requests in a
+    // multi-session workload are new sessions, so an unthrottled stderr write
+    // (mutex + localtime + ostringstream) per miss would hit the hot path.
+    // Counts misses since the last successful restore (which re-arms it).
+    std::uint64_t host_kv_miss_log_count_ = 0;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<std::uint32_t> prefill_lane_;
     std::array<std::uint64_t, kMaximumConcurrency> lane_plan_versions_{};

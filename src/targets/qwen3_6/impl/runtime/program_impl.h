@@ -860,8 +860,8 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
 }
 
-void ProgramImplCore::enable_host_kv_cache(std::uint32_t slabs) {
-    if (slabs == 0 || host_kv_) { return; }
+void ProgramImplCore::enable_host_kv_cache(std::uint64_t budget_bytes) {
+    if (budget_bytes == 0 || host_kv_) { return; }
     // The parked entry captures the paged KV, the hidden tensors and the GDN
     // state, but not the DFlash lane-affine caches (local and
     // rewrite-checkpoint-local cyclic KV) or the DFlash context frontier.
@@ -873,15 +873,42 @@ void ProgramImplCore::enable_host_kv_cache(std::uint32_t slabs) {
             "host KV cache is not supported with the DFlash speculative backend: "
             "the lane-affine DFlash caches are not captured by a parked entry");
     }
-    host_kv_ = std::make_unique<HostKvCache>(slabs, host_kv_slab_bytes());
-    host_kv_log("host KV cache enabled: slabs=" + std::to_string(slabs) +
-                " slab_bytes=" + std::to_string(host_kv_->slab_bytes()));
+    // Compute the max-sequence park size before the (multi-GB) allocation, so a
+    // degenerate config fails cheaply and the divisor below is never zero.
+    const std::size_t max_seq = max_parked_sequence_bytes();
+    if (max_seq == 0) {
+        throw std::logic_error("host KV cache: the max-sequence park size is zero");
+    }
+    host_kv_ = std::make_unique<HostKvCache>(budget_bytes);
+    host_kv_log("host KV cache enabled: budget_bytes=" + std::to_string(budget_bytes) +
+                " max_parked_sequence_bytes=" + std::to_string(max_seq) +
+                " (holds " + std::to_string(budget_bytes / max_seq) +
+                " max-size sequences)");
+    if (budget_bytes < max_seq) {
+        host_kv_log("WARNING: host KV budget is smaller than the max-sequence park size; "
+                    "sessions larger than the budget are unparkable and fall back to "
+                    "re-prefill");
+    }
 }
 
 bool ProgramImplCore::park_lane(std::uint32_t lane, std::uint64_t protect_id) {
     if (!host_kv_ || !has_retained_lane(lane)) { return false; }
-    HostKvSlab* slab = host_kv_->acquire_slab(protect_id);
-    if (slab == nullptr) { return false; }
+    // Size the region from the lane's actual page count before asking the
+    // budget for it, so the entry takes only the bytes it needs.
+    const std::size_t needed = parked_lane_bytes(lane);
+    HostKvSlab* slab = host_kv_->acquire_slab(protect_id, needed);
+    if (slab == nullptr) {
+        // The one park failure that can happen in production: the budget could
+        // not make room (a session larger than the budget, or a fragmented free
+        // set). Log it so the operator can tell whether the budget was sized
+        // right - this is the line that says "29645 MiB was too small for this
+        // session". The resident is then discarded by the caller.
+        host_kv_log("park lane " + std::to_string(lane) +
+                    " FAILED: no budget room for " + std::to_string(needed) +
+                    " bytes (largest free range " +
+                    std::to_string(host_kv_->largest_free_range()) + " bytes)");
+        return false;
+    }
     // The slab is owned by the park until the entry is committed; a throw in
     // between (allocation, metadata) must not leak it.
     struct SlabLease {
@@ -895,7 +922,7 @@ bool ProgramImplCore::park_lane(std::uint32_t lane, std::uint64_t protect_id) {
 
     auto entry  = std::make_unique<HostKvEntry>();
     entry->slab = slab;
-    if (!park_lane_to_host(lane, *entry, device.stream)) {
+    if (!park_lane_to_host(lane, *entry, needed, device.stream)) {
         host_kv_log("park lane " + std::to_string(lane) + " FAILED (needed more than slab)");
         return false;  // the lease releases the slab; the lane is untouched
     }
@@ -950,11 +977,19 @@ bool ProgramImplCore::restore_lane(std::uint32_t lane, const PreparedPromptData&
     try {
         restore_lane_from_host(lane, entry, match->reuse_tokens, device.stream);
     } catch (...) {
-        // A failure after the reservation is an invariant violation or a corrupt
-        // entry: restore_lane_from_host rolled the lane back, so drop the entry
-        // to keep it from being restored again.
+        // A C++ failure after the reservation is an invariant violation or a
+        // corrupt entry: restore_lane_from_host rolled the lane back, so drop
+        // the entry to keep it from being restored again. Report failure rather
+        // than propagate: the host-KV path must stay non-throwing for C++
+        // exceptions (like park_lane) so the executor's admission catch-all can
+        // keep its pre-host-KV `throw;` for genuine prefill invariants instead
+        // of swallowing them. (A CUDA error in the restore aborts via
+        // CUDA_CHECK, the executor's established policy, before reaching this
+        // catch.)
+        host_kv_log("restore lane " + std::to_string(lane) +
+                    " FAILED after reservation; dropping the entry");
         host_kv_->drop(match->entry_index);
-        throw;
+        return false;
     }
     host_kv_log("restored lane " + std::to_string(lane) + " from host: " +
                 std::to_string(match->reuse_tokens) + " tokens (entry " +
@@ -964,7 +999,7 @@ bool ProgramImplCore::restore_lane(std::uint32_t lane, const PreparedPromptData&
     return true;
 }
 
-std::size_t ProgramImplCore::host_kv_slab_bytes() const {
+std::size_t ProgramImplCore::max_parked_sequence_bytes() const {
     const PagedKVPool& text_pool = decoder->text_kv.pool();
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
     // A single sequence is capped by the logical page capacity (one sequence
@@ -981,7 +1016,27 @@ std::size_t ProgramImplCore::host_kv_slab_bytes() const {
                                  hidden + gdn);
 }
 
-bool ProgramImplCore::park_lane_to_host(std::uint32_t lane, HostKvEntry& entry,
+// Bytes to park `lane`'s current sequence: its actual mapped page count (not
+// the entitlement ceiling) plus the hidden + GDN tail. This is what the budget
+// must hand the park, so a small session takes a small region.
+std::size_t ProgramImplCore::parked_lane_bytes(std::uint32_t lane) const {
+    const SequenceState& sequence = sequences[lane];
+    if (!sequence.kv) { return 0; }
+    const std::span<const std::int32_t> text_ids = sequence.kv->text.page_ids();
+    const bool has_backend                        = sequence.kv->backend.has_value();
+    const std::span<const std::int32_t> backend_ids =
+        has_backend ? sequence.kv->backend->page_ids() : std::span<const std::int32_t>{};
+    const PagedKVPool& text_pool = decoder->text_kv.pool();
+    const qwen3_6::PagedKVCache* backend_cache = backend_kv_cache();
+    return parked_sequence_bytes(
+        text_pool, has_backend ? &backend_cache->pool() : nullptr,
+        static_cast<std::uint32_t>(text_ids.size()),
+        static_cast<std::uint32_t>(backend_ids.size()),
+        sequence.tail_hidden.bytes() + sequence.rewrite_checkpoint_hidden.bytes() +
+            2 * decoder->linear_attention.slot_bytes());
+}
+
+bool ProgramImplCore::park_lane_to_host(std::uint32_t lane, HostKvEntry& entry, std::size_t needed,
                                         cudaStream_t stream) {
     if (!has_retained_lane(lane) || !sequences[lane].kv || entry.slab == nullptr) { return false; }
     SequenceState& sequence = sequences[lane];
@@ -995,12 +1050,9 @@ bool ProgramImplCore::park_lane_to_host(std::uint32_t lane, HostKvEntry& entry,
 
     PagedKVPool& text_pool = decoder->text_kv.pool();
     qwen3_6::PagedKVCache* backend_cache = backend_kv_cache();
-    const std::size_t needed = parked_sequence_bytes(
-        text_pool, has_backend ? &backend_cache->pool() : nullptr,
-        static_cast<std::uint32_t>(text_ids.size()),
-        static_cast<std::uint32_t>(backend_ids.size()),
-        sequence.tail_hidden.bytes() + sequence.rewrite_checkpoint_hidden.bytes() +
-            2 * decoder->linear_attention.slot_bytes());
+    // `needed` was sized by the caller (parked_lane_bytes) to exactly this
+    // lane's page count, so the region it was handed fits; keep the check as a
+    // guard against a mis-sized region.
     if (needed > entry.slab->bytes()) {
         return false;
     }
@@ -1045,8 +1097,6 @@ bool ProgramImplCore::park_lane_to_host(std::uint32_t lane, HostKvEntry& entry,
     entry.prefix_identity     = sequence.prefix_identity;
     entry.execution_frontier  = sequence.execution_frontier;
     entry.ledger_frontier     = sequence.ledger_frontier;
-    entry.text_kv_valid       = sequence.text_kv_valid;
-    entry.mtp_kv_valid        = sequence.mtp_kv_valid;
     entry.rope_delta          = sequence.rope_delta;
     entry.tail_hidden_valid   = sequence.tail_hidden_valid;
     entry.checkpoint_valid    = sequence.rewrite_checkpoint.valid;
@@ -1118,8 +1168,12 @@ void ProgramImplCore::restore_lane_from_host(std::uint32_t lane, const HostKvEnt
         sequence.prefix_identity           = entry.prefix_identity;
         sequence.execution_frontier        = entry.execution_frontier;
         sequence.ledger_frontier           = entry.ledger_frontier;
-        sequence.text_kv_valid             = entry.text_kv_valid;
-        sequence.mtp_kv_valid              = entry.mtp_kv_valid;
+        // A rewind restores only the text prefix (reuse_tokens), so the valid-KV
+        // extent is that prefix, not the full parked extent: the MTP gate keys on
+        // mtp_kv_valid >= reuse_base - 1, and overstating it would let the planner
+        // read KV past the restored prefix (stale for a rewound path).
+        sequence.text_kv_valid             = reuse_tokens;
+        sequence.mtp_kv_valid              = reuse_tokens;
         sequence.rope_delta                = entry.rope_delta;
         sequence.tail_hidden_valid         = entry.tail_hidden_valid;
         sequence.rewrite_checkpoint.valid  = entry.checkpoint_valid;

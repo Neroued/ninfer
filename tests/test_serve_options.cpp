@@ -44,7 +44,7 @@ int main() {
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
-    failures += check(defaults.host_kv_cache_slabs == 0,
+    failures += check(defaults.host_kv_cache_mib == 0,
                        "the host KV cache is disabled by default");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
@@ -85,22 +85,36 @@ int main() {
 
     {
         const auto host_kv =
-            parse({"ninfer-serve", "model.ninfer", "--host-kv-cache", "4"});
-        failures += check(host_kv.host_kv_cache_slabs == 4,
-                          "--host-kv-cache did not reach the serving options");
+            parse({"ninfer-serve", "model.ninfer", "--host-kv-cache-mib", "4"});
+        failures += check(host_kv.host_kv_cache_mib == 4,
+                          "--host-kv-cache-mib did not reach the serving options");
     }
 
-    // The write-only combination: --host-kv-cache parks evicted sequences for
+    // The MiB field must hold a production-scale budget without wrapping. 29645
+    // MiB is the start-script value; the byte count the engine receives is the
+    // serve->engine conversion (mib * 1024 * 1024) in unsigned arithmetic. A
+    // 32-bit field would wrap 29645 * 1048576 to a negative value and the
+    // cudaHostAlloc would fail at startup.
+    {
+        const auto host_kv_big =
+            parse({"ninfer-serve", "model.ninfer", "--host-kv-cache-mib", "29645"});
+        failures += check(host_kv_big.host_kv_cache_mib == 29645,
+                          "a production-scale MiB budget wraps the options field");
+        failures += check(host_kv_big.host_kv_cache_mib * 1024 * 1024 == 31085035520ULL,
+                          "the MiB-to-bytes conversion overflows 32-bit arithmetic");
+    }
+
+    // The write-only combination: --host-kv-cache-mib parks evicted sequences for
     // later restore, but --no-prefix-reuse makes every request cold-prefill and
     // the host-cache gate to skip restore. No parked entry can ever be restored,
     // so the cache would only waste pinned RAM and host traffic. Reject it.
     bool host_kv_no_prefix_reuse_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--host-kv-cache", "4",
+        (void)parse({"ninfer-serve", "model.ninfer", "--host-kv-cache-mib", "4",
                      "--no-prefix-reuse"});
     } catch (const std::invalid_argument&) { host_kv_no_prefix_reuse_rejected = true; }
     failures += check(host_kv_no_prefix_reuse_rejected,
-                      "--host-kv-cache + --no-prefix-reuse was accepted (write-only combo)");
+                      "--host-kv-cache-mib + --no-prefix-reuse was accepted (write-only combo)");
 
     bool dflash_vision_rejected = false;
     try {

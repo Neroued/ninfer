@@ -273,7 +273,7 @@ lane 的 backing 中，但不再存在 active request control，也不计入 act
 `SequenceState` 不包含 stop/output/transport state，不拥有 batch row、round activations、logits、shared
 workspace 或 graph。当前 fixed-state backing 是 lane-affine 的：retained state 不搬到另一 lane，planner 在
 所有 free lanes 中寻找可复用 continuation，选中后在同一 lane 建立新的 request control；需要 active
-capacity 时可以先驱逐其他 free lanes 上的 retained state。启用 `--host-kv-cache` 时，被驱逐的
+capacity 时可以先驱逐其他 free lanes 上的 retained state。启用 `--host-kv-cache-mib` 时，被驱逐的
 retained state 可以停放到 pinned host RAM 并恢复到另一 lane；lane-affine 规则只约束 resident
 （device）state。新 request 的 sampling、RNG、stop 和 output
 state 始终重新创建。
@@ -737,7 +737,7 @@ limit 和 output state 始终由新 request 创建。
 Retained state 占用实际 state-pool memory，但不占 active control slot，也不保留 future growth
 reservation。Active admission 优先；cache occupancy 阻塞原本可行的 request 前，先驱逐 free lanes 上的
 retained entries。Planner 不复制或迁移 retained physical state，而是在 free lanes 中选择最大合法 reuse；启用
-`--host-kv-cache` 时例外，被驱逐的 retained state 可以停放到 pinned host RAM 并恢复到另一 lane。
+`--host-kv-cache-mib` 时例外，被驱逐的 retained state 可以停放到 pinned host RAM 并恢复到另一 lane。
 只有在 slot/lane 和完整 entitlement 都已满足后才能 claim cache ownership。
 
 Prefix lookup 只改变 uncached prompt work 和 prospective reuse plan，不自行授予 queue priority。它可以保守地

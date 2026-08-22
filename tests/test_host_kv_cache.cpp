@@ -1,5 +1,7 @@
 #include "targets/qwen3_6/impl/runtime/host_kv_cache.h"
 
+#include <cuda_runtime_api.h>
+
 #include <cstdio>
 #include <memory>
 #include <type_traits>
@@ -56,17 +58,25 @@ std::unique_ptr<HostKvEntry> make_entry(const PreparedPromptData& prompt, std::u
 }  // namespace
 
 int main() {
-    // Slabs are irrelevant to matching; sizes just need to be non-zero.
-    HostKvCache cache(2, 4096);
-    check(cache.free_slabs() == 2, "cache starts with every slab free");
+    int count = 0;
+    const cudaError_t count_err = cudaGetDeviceCount(&count);
+    if (count_err == cudaErrorNoDevice || count_err == cudaErrorInsufficientDriver || count == 0) {
+        std::printf("SKIP: no usable CUDA device\n");
+        return 77;
+    }
+
+    // The budget is irrelevant to matching; it just needs to hold the entries.
+    HostKvCache cache(2 * 4096);
+    check(cache.used_bytes() == 0 && cache.budget_bytes() == 2 * 4096,
+          "cache starts with the whole budget free");
     check(cache.size() == 0, "cache starts empty");
     check(!cache.find(make_prompt(10)).has_value(), "empty cache matches nothing");
 
     const PreparedPromptData session_a = make_prompt(100, 0);
     const PreparedPromptData session_b = make_prompt(100, 5000);
 
-    auto* slab_a = cache.acquire_slab();
-    check(slab_a != nullptr, "acquire_slab hands out a free slab");
+    auto* slab_a = cache.acquire_slab(0, 4096);
+    check(slab_a != nullptr, "acquire_slab hands out a free region");
     cache.insert(make_entry(session_a, 80, slab_a));
     check(cache.size() == 1, "insert stores the entry");
 
@@ -88,7 +98,7 @@ int main() {
 
     // Same divergence, but the entry carries a checkpoint below the divergence
     // point. 21% of real requests take this path, so it must resolve.
-    auto* slab_b = cache.acquire_slab();
+    auto* slab_b = cache.acquire_slab(0, 4096);
     auto ckpt    = make_entry(session_a, 80, slab_b);
     ckpt->checkpoint_valid    = true;
     ckpt->checkpoint_kind     = RewriteCheckpointKind::TurnClosure;
@@ -104,11 +114,11 @@ int main() {
     hit = cache.find(a_continued);
     check(hit && hit->reuse_tokens == 80, "the entry reusing the most tokens wins");
 
-    check(cache.free_slabs() == 0, "both slabs are now in use");
+    check(cache.used_bytes() == cache.budget_bytes(), "the whole budget is now in use");
 
-    // No free slab: acquiring must evict the least recently used entry.
+    // No free budget: acquiring must evict the least recently used entry.
     cache.touch(1);  // entry 1 is now newer than entry 0
-    auto* slab_c = cache.acquire_slab();
+    auto* slab_c = cache.acquire_slab(0, 4096);
     check(slab_c != nullptr, "acquire_slab evicts to make room");
     check(cache.size() == 1, "eviction removed exactly one entry");
     check(cache.entry(0).checkpoint_frontier == 30, "the least recently used entry was evicted");
@@ -116,23 +126,65 @@ int main() {
 
     // Eviction protection: the entry a restore is about to consume must never
     // be sacrificed to the park that precedes it. Park a second entry so the
-    // cache holds two (one protected, one to evict) and no slab is free; the
+    // cache holds two (one protected, one to evict) and no budget is free; the
     // protected acquire must evict the other entry, never the protected one.
-    auto* slab_d = cache.acquire_slab();
+    auto* slab_d = cache.acquire_slab(0, 4096);
     cache.insert(make_entry(session_b, 40, slab_d));
     check(cache.size() == 2, "a second entry fills the cache");
     const std::uint64_t protected_id = cache.entry(0).id;
-    auto* slab_p = cache.acquire_slab(protected_id);
+    auto* slab_p = cache.acquire_slab(protected_id, 4096);
     check(slab_p != nullptr, "acquire_slab(protected) evicts the unprotected entry");
     check(cache.size() == 1, "the protected entry survived the eviction");
     check(cache.entry(0).id == protected_id, "the surviving entry is the protected one");
-    // slab_p is still held; with only the protected entry left and no slab free,
+    // slab_p is still held; with only the protected entry left and no budget free,
     // a protected acquire has no victim and returns nullptr rather than
     // destroying the entry the restore needs.
-    auto* slab_q = cache.acquire_slab(protected_id);
+    auto* slab_q = cache.acquire_slab(protected_id, 4096);
     check(slab_q == nullptr, "acquire_slab(protected) with no victim returns nullptr");
     check(cache.size() == 1, "the protected entry is still intact");
     cache.release_slab(slab_p);
+
+    // Oversized park: a request larger than the entire budget can never fit, so
+    // the satisfiability check must bail out before evicting anything. Without
+    // it the eviction loop would evict every entry one at a time and still
+    // fail, wiping the whole cache for a park that cannot happen.
+    auto* slab_e = cache.acquire_slab(0, 4096);
+    check(slab_e != nullptr, "the last free region is handed out");
+    cache.insert(make_entry(session_b, 50, slab_e));
+    check(cache.size() == 2 && cache.used_bytes() == cache.budget_bytes(),
+          "the budget is now full");
+    auto* slab_oversized = cache.acquire_slab(0, cache.budget_bytes() + 1);
+    check(slab_oversized == nullptr, "an oversized park (budget+1) fails");
+    check(cache.size() == 2, "the oversized park evicted nothing (cache intact)");
+    check(cache.used_bytes() == cache.budget_bytes(), "the oversized park left the budget full");
+
+    // Middle-protected park: a protected entry in the middle of the budget
+    // splits the address space, so a SUM of free bytes overstates what one
+    // contiguous range can hold. The satisfiability check must answer the
+    // contiguity question (the largest span between protected boundaries), not
+    // the total-bytes question, or it would evict the unprotected entries and
+    // still fail. Layout after filling: [e0][e1][e2][e3], each 4096; protecting
+    // e1 leaves a 4096-byte front and an 8192-byte back, so a 12288-byte park
+    // cannot fit even after evicting e0, e2 and e3.
+    {
+        HostKvCache cache4(4 * 4096);
+        auto* s0 = cache4.acquire_slab(0, 4096);
+        cache4.insert(make_entry(session_a, 10, s0));
+        auto* s1 = cache4.acquire_slab(0, 4096);
+        cache4.insert(make_entry(session_b, 20, s1));
+        auto* s2 = cache4.acquire_slab(0, 4096);
+        cache4.insert(make_entry(session_a, 30, s2));
+        auto* s3 = cache4.acquire_slab(0, 4096);
+        cache4.insert(make_entry(session_b, 40, s3));
+        check(cache4.size() == 4 && cache4.used_bytes() == cache4.budget_bytes(),
+              "the 4-entry budget is full");
+        const std::uint64_t mid_id = cache4.entry(1).id;  // the middle entry
+        auto* slab_mid = cache4.acquire_slab(mid_id, 3 * 4096);
+        check(slab_mid == nullptr, "a middle-protected park that cannot fit fails");
+        check(cache4.size() == 4, "the middle-protected park evicted nothing");
+        check(cache4.used_bytes() == cache4.budget_bytes(),
+              "the middle-protected park left the budget full");
+    }
 
     std::printf("\n%s\n", failures == 0 ? "all checks passed" : "FAILURES PRESENT");
     return failures == 0 ? 0 : 1;

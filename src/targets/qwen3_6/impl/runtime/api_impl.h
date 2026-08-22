@@ -197,13 +197,8 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 template <>
-std::size_t Program<Variant>::host_kv_slab_bytes() const {
-    return impl_->host_kv_slab_bytes();
-}
-
-template <>
-void Program<Variant>::enable_host_kv_cache(std::uint32_t slabs) {
-    impl_->enable_host_kv_cache(slabs);
+void Program<Variant>::enable_host_kv_cache(std::uint64_t budget_bytes) {
+    impl_->enable_host_kv_cache(budget_bytes);
 }
 
 template <>

@@ -7,10 +7,12 @@
 
 namespace {
 
-// The headline configuration: one slab, one lane, MTP. Session A's parked
-// entry holds the only slab while session B is resident, so A's return must
-// restore A rather than destroy its own entry to park B.
-ninfer::EngineOptions host_kv_engine_options(const char* artifact, std::uint32_t slabs = 1) {
+// The headline configuration: one lane, MTP. Session A's parked entry holds
+// the budget while session B is resident, so A's return must restore A rather
+// than destroy its own entry to park B. The budget is the total pinned bytes;
+// each parked entry takes only its real size (its GDN state alone is ~308 MB,
+// so a small session still costs ~310 MB), and the budget decides how many fit.
+ninfer::EngineOptions host_kv_engine_options(const char* artifact, std::uint64_t budget_bytes) {
     ninfer::EngineOptions options;
     options.artifact_path             = artifact;
     options.max_context               = 4096;
@@ -21,7 +23,7 @@ ninfer::EngineOptions host_kv_engine_options(const char* artifact, std::uint32_t
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.enable_vision             = true;
-    options.host_kv_cache_slabs       = slabs;
+    options.host_kv_cache_bytes       = budget_bytes;
     return options;
 }
 
@@ -90,10 +92,11 @@ int exercise_host_kv_park_restore(ninfer::Engine& engine) {
 }
 
 // A request that disabled prefix reuse must not trigger a host restore or
-// evict the resident to make room. Run on a FRESH N=1 engine so it is
-// mutation-adequate: at N=1, without the gate, A's restore would evict B's
-// only slab to make room, so B's later restore would fail (reused != expected).
-// With the gate, A re-prefills cold (reused == 0) and B's slab survives.
+// evict the resident to make room. Run on a FRESH small-budget engine so it is
+// mutation-adequate: at a budget that holds only one entry, without the gate,
+// A's restore would evict B's entry to make room, so B's later restore would
+// fail (reused != expected). With the gate, A re-prefills cold (reused == 0)
+// and B's entry survives.
 int exercise_no_reuse_skips_host_cache(ninfer::Engine& engine) {
     const std::vector<ninfer::TokenId> prompt_a{248045, 846, 198, 5834, 248046, 198};
     // Park A (generate, so its continuation lands in the only slab).
@@ -211,37 +214,46 @@ int main() {
         return 77;
     }
 
-    // N=1: the failure branch - the protected park of the resident fails (no
-    // free slab) and the resident is discarded so the restore can run.
+    // Each parked entry costs ~310 MB (its GDN state alone is ~308 MB), so a
+    // 512 MiB budget holds one entry but not two, and 2048 MiB holds two. The
+    // MiB constant is uint64_t so the multiply does not wrap 32-bit int.
+    constexpr std::uint64_t kMiB          = 1024 * 1024;
+    constexpr std::uint64_t kOneEntryBudget = 512 * kMiB;     // fits one, not two
+    constexpr std::uint64_t kTwoEntryBudget = 2048 * kMiB;    // fits two
+
+    // Small budget: the failure branch - the protected park of the resident
+    // fails (no free budget) and the resident is discarded so the restore can
+    // run.
     {
-        ninfer::Engine engine(host_kv_engine_options(nvfp4, 1));
+        ninfer::Engine engine(host_kv_engine_options(nvfp4, kOneEntryBudget));
         if (const int result = exercise_host_kv_park_restore(engine); result != 0) {
             return result;
         }
     }
 
-    // N=4: the success branch - the resident park succeeds (a free slab is
-    // available), and the restore must run on the just-parked lane. This is the
-    // general case; the N=1 test above only exercises the emergency discard.
+    // Large budget: the success branch - the resident park succeeds (free
+    // budget is available), and the restore must run on the just-parked lane.
+    // This is the general case; the small-budget test above only exercises the
+    // emergency discard.
     {
-        ninfer::Engine engine(host_kv_engine_options(nvfp4, 4));
+        ninfer::Engine engine(host_kv_engine_options(nvfp4, kTwoEntryBudget));
         if (const int result = exercise_host_kv_park_restore(engine); result != 0) {
             return result;
         }
     }
 
-    // Fresh N=1 engines for the bypass tests, so they are mutation-adequate:
-    // at N=1, removing the gate evicts B's only slab to make room for A, so
-    // B's later restore fails (reused != expected). Each gets its own engine
-    // so a prior test's lane state cannot mask the gate.
+    // Fresh small-budget engines for the bypass tests, so they are
+    // mutation-adequate: at a one-entry budget, removing the gate evicts B's
+    // entry to make room for A, so B's later restore fails (reused != expected).
+    // Each gets its own engine so a prior test's lane state cannot mask the gate.
     {
-        ninfer::Engine engine(host_kv_engine_options(nvfp4, 1));
+        ninfer::Engine engine(host_kv_engine_options(nvfp4, kOneEntryBudget));
         if (const int result = exercise_no_reuse_skips_host_cache(engine); result != 0) {
             return result;
         }
     }
     {
-        ninfer::Engine engine(host_kv_engine_options(nvfp4, 1));
+        ninfer::Engine engine(host_kv_engine_options(nvfp4, kOneEntryBudget));
         if (const int result = exercise_non_reusable_identity_skips_host_cache(engine); result != 0) {
             return result;
         }

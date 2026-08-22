@@ -171,7 +171,7 @@ struct GenerationRequest {
     std::size_t tool_name_max_length = 64;
     ToolChoice tool_choice;
     std::vector<std::string> stop_strings;
-    int max_tokens      = 0; // 0 => use server default
+    int max_tokens      = 0; // 0 => use server default; set via max_tokens_set when client pinned a value
     bool max_tokens_set = false;
     bool stream         = false;
     bool include_usage  = false;

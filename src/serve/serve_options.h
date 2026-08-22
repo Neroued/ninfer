@@ -50,6 +50,10 @@ struct ServeOptions {
     bool preserve_thinking = false;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+    bool webui_auto        = false; // --webui: auto-download the prebuilt llama.cpp
+                                    // webui from the ggml-org/llama-ui HF bucket
+    std::string webui_dir;          // --webui-dir: serve this dir; also the download
+                                    // location for --webui (default: <artifact-dir>/webui)
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

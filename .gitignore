@@ -46,3 +46,14 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+# Qwen CLI personal/local settings
+.qwen/
+
+# Credential files written by the GitHub Actions auth action
+gha-creds-*.json
+
+# Model artifacts and the WebUI bundle downloaded by --webui: both are fetched
+# into the working tree at runtime and must never be committed.
+*.ninfer
+model-cards/*/webui/

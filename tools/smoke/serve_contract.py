@@ -324,6 +324,13 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
 
 
 def exercise(base_url: str, model: str) -> dict[str, Any]:
+    # The startup banner prints the API base as an openable URL; it must answer.
+    index = json_response(base_url, "GET", "/v1")
+    if index.get("object") != "api_base" or index.get("model") != model:
+        raise ContractError("API base index has the wrong shape")
+    if not any(entry.get("path") == "/v1/chat/completions" for entry in index.get("endpoints", [])):
+        raise ContractError("API base index does not advertise chat completions")
+
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
     if models.get("object") != "list" or not isinstance(entries, list) or len(entries) != 1:

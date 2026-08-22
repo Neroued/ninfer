@@ -121,14 +121,16 @@ notes.
 
 NInfer currently requires:
 
-- 64-bit Linux;
+- 64-bit Linux or Windows 11;
 - NVIDIA GeForce RTX 5090 (`sm_120a`);
 - NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
-- CMake 3.28 or newer and a C++20-capable host compiler;
-- `pkg-config`;
+- CMake 3.28 or newer and a C++20-capable host compiler (GCC or Clang on Linux, MSVC from
+  Visual Studio 2022 on Windows);
+- `pkg-config` on Linux;
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
-  `libavutil >= 58`, and `libswscale >= 7`;
-- `libcurl >= 7.85`;
+  `libavutil >= 58`, and `libswscale >= 7` (on Windows, `vcpkg install ffmpeg --triplet
+  x64-windows`);
+- `libcurl >= 7.85` (on Windows, `vcpkg install curl --triplet x64-windows`);
 - Ninja, when using the commands below.
 
 The build rejects CUDA architectures other than `120a`. There is no install target or packaged
@@ -153,11 +155,35 @@ build/apps/ninfer-serve
 
 Tests, benchmarks, and maintainer tools are excluded from the default build.
 
+### Windows
+
+Install the Visual Studio 2022 C++ build tools (the "Desktop development with C++" workload),
+the CUDA Toolkit, CMake, Ninja, and [vcpkg](https://github.com/microsoft/vcpkg), then install
+the media dependencies:
+
+```bat
+vcpkg install ffmpeg curl --triplet x64-windows
+```
+
+Configure and build from a prompt where `cl` is on `PATH` (a VS 2022 Developer Command Prompt,
+or after calling `vcvars64.bat`), pointing the build at the vcpkg install prefix:
+
+```bat
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNINFER_MEDIA_ROOT=%VCPKG_ROOT%\installed\x64-windows
+cmake --build build --parallel
+```
+
+The default configuration produces `build\apps\ninfer.exe` and `build\apps\ninfer-serve.exe`.
+The FFmpeg and libcurl runtime DLLs are copied next to the executables at build time, so both
+apps run directly from the build tree. In the remaining sections, use
+`build\apps\ninfer.exe` and `build\apps\ninfer-serve.exe` in place of the Linux paths.
+
 ## Docker
 
 Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA
 driver, Docker, and the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Windows hosts use the native build above.
 
 ```bash
 docker build --tag ninfer:local .
@@ -228,7 +254,8 @@ python3 -m tools.artifact.migrate_v1_to_v2 models/qwen3_6_27b.ninfer
 
 Use the same command with `qwen3_6_27b_nvfp4.ninfer` or `qwen3_6_35b_a3b.ninfer` for those
 artifacts. The migration updates only container metadata; it does not rewrite the weight payload.
-Alternatively, download the current version-2 file again from its Hugging Face repository.
+Alternatively, download the current version-2 file again from its Hugging Face repository. On
+Windows, invoke the same module with `python -m tools.artifact.migrate_v1_to_v2`.
 
 Each `.ninfer` file contains the weights and frontend resources needed by NInfer. It is not a
 Transformers checkpoint, Safetensors distribution, or GGUF file.

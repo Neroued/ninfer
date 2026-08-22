@@ -1,0 +1,97 @@
+name: Windows build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+# Build-only check on a hosted Windows runner: configure and compile `ninfer`
+# and `ninfer-serve` with MSVC (VS2022 `cl`) + `nvcc` (CUDA) + Ninja, resolving
+# FFmpeg/libcurl from a vcpkg `x64-windows` prefix.
+#
+# Hosted runners have no GPU, so the CUDA test suite is NOT executed here —
+# running `ctest` (numerical Op suites, real-engine routes) requires a
+# self-hosted sm_120a runner. This job guards the Windows *compile* path
+# (MSVC + nvcc, the NVFP4 TMA by-value fix, the plan move-ctor emission, and the
+# Winsock/reader/datetime shims) and smoke-launches both executables.
+#
+# `sm_120a` requires CUDA >= 13.1, which is not on the stock windows-2022 image.
+# The CUDA step uses a preinstalled toolkit if present, otherwise falls back to
+# `choco install cuda`, then hard-guards the version so the job fails loudly
+# (with instructions) rather than as a confusing `sm_120a` compile error.
+env:
+  VCPKG_TRIPLET: x64-windows
+  BUILD_DIR: build
+  NINJA_VERSION: v1.12.1
+
+jobs:
+  build-windows:
+    name: Build + smoke (windows-2022, no GPU)
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install vcpkg dependencies (libcurl, FFmpeg)
+        # FFmpeg is built from source by vcpkg and is the slow step of the job.
+        # The resolved prefix (vcpkg/installed/x64-windows) is the NINFER_MEDIA_ROOT.
+        shell: pwsh
+        run: |
+          $vcpkg = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkg
+          & (Join-Path $vcpkg 'bootstrap-vcpkg.bat')
+          & (Join-Path $vcpkg 'vcpkg.exe') install "curl:$env:VCPKG_TRIPLET" "ffmpeg:$env:VCPKG_TRIPLET"
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg install failed' }
+          Write-Host "NINFER_MEDIA_ROOT=$vcpkg\installed\$env:VCPKG_TRIPLET"
+
+      - name: Locate Visual Studio 2022 (vcvars64)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) { throw 'vswhere.exe not found; is VS2022 present?' }
+          $install = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $install) { throw 'VS2022 C++ workload not found on the runner' }
+          $vcvars = Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat'
+          Write-Host "vcvars=$vcvars"
+          "VCVARS=$vcvars" | Add-Content $env:GITHUB_ENV
+
+      - name: Configure, build, and smoke-launch
+        shell: pwsh
+        run: |
+          # --- Ninja (added to PATH for the cmake steps below) ---
+          curl.exe -sSL -o ninja.zip "https://github.com/ninja-build/ninja/releases/download/$env:NINJA_VERSION/ninja-win.zip"
+          New-Item -ItemType Directory -Force tools | Out-Null
+          Expand-Archive ninja.zip -DestinationPath tools -Force
+          $env:PATH = "$PWD\tools;$env:PATH"
+          & ninja --version
+
+          # --- CUDA 13.x (>= 13.1 for sm_120a) ---
+          $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+          if (-not (Test-Path $cudaRoot)) {
+            Write-Host 'CUDA toolkit not present on the runner; installing via choco (best effort).'
+            choco install -y cuda
+          }
+          $cudaDir = Get-ChildItem $cudaRoot -Directory | Sort-Object Name | Select-Object -Last 1
+          if (-not $cudaDir) { throw "no CUDA toolkit found under $cudaRoot" }
+          $env:PATH = "$($cudaDir.FullName)\bin;$env:PATH"
+          $nvcc = & nvcc --version
+          $nvcc -join "`n" | Write-Host
+          $rel = ($nvcc | Select-String 'release (\d+\.\d+)').Matches[0].Groups[1].Value
+          $num = [int]$rel.Split('.')[0] * 100 + [int]$rel.Split('.')[1]
+          if ($num -lt 1310) {
+            throw "CUDA $rel found; sm_120a requires CUDA >= 13.1. Use a runner image with CUDA 13.x, or provision it before this step."
+          }
+
+          # --- Configure + build + smoke, all in one cmd so the vcvars env is shared ---
+          $media = Join-Path $env:RUNNER_TEMP 'vcpkg\installed\x64-windows'
+          $cmake = "cmake -S . -B $env:BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DNINFER_MEDIA_ROOT=`"$media`" -DBUILD_TESTING=OFF"
+          $build = "cmake --build $env:BUILD_DIR -j"
+          $smoke = "$env:BUILD_DIR\apps\ninfer.exe --help && $env:BUILD_DIR\apps\ninfer-serve.exe --help"
+          cmd /c "call `"$env:VCVARS`" && $cmake && $build && $smoke"
+          if ($LASTEXITCODE -ne 0) { throw "Windows build failed (exit $LASTEXITCODE)" }

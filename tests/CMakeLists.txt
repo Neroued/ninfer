@@ -1,10 +1,33 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# On Windows the FFmpeg/libcurl runtime DLLs are not on the default search path.
+# The app targets copy them next to their executables; tests instead get those
+# directories prepended to PATH, so the suite runs in place without duplicating
+# the DLLs into every test output directory.
+set(NINFER_TEST_DLL_DIRS "")
+if(WIN32)
+  foreach(_prefix ${NINFER_FFMPEG_PREFIX} ${NINFER_CURL_PREFIX})
+    if(_prefix AND EXISTS "${_prefix}/bin")
+      file(TO_NATIVE_PATH "${_prefix}/bin" _native_bin)
+      list(APPEND NINFER_TEST_DLL_DIRS "${_native_bin}")
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES NINFER_TEST_DLL_DIRS)
+endif()
+
+function(ninfer_test_runtime_path name)
+  foreach(_dir IN LISTS NINFER_TEST_DLL_DIRS)
+    set_property(TEST ${name} APPEND PROPERTY
+      ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${_dir}")
+  endforeach()
+endfunction()
+
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the installed product headers stand alone.
 add_executable(ninfer_public_api_test test_public_api.cpp)
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
+ninfer_test_runtime_path(ninfer_public_api_test)
 
 function(ninfer_add_test name)
   cmake_parse_arguments(arg "NEEDS_SOURCE_DIR" "" "SOURCES;LIBRARIES" ${ARGN})
@@ -26,12 +49,24 @@ function(ninfer_add_test name)
       NINFER_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}")
   endif()
   add_test(NAME ${name} COMMAND ${name})
+  ninfer_test_runtime_path(${name})
 endfunction()
 
 function(ninfer_add_op_test name)
   ninfer_add_test(${name} ${ARGN})
   set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # Op tests check GPU kernels against a CPU reference, so the host build must not
+  # reassociate or fuse the reference arithmetic. clang-cl reports its id as Clang
+  # but takes cl-style flags, and silently ignores the GNU spelling: route those
+  # through /clang: instead, or the reference loses the guarantee without a word.
+  # cl keeps its default, which is what the suite is verified against today.
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+      target_compile_options(${name} PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:/clang:-fno-fast-math>
+        $<$<COMPILE_LANGUAGE:CXX>:/clang:-ffp-contract=off>)
+    endif()
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(${name} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
       $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
@@ -101,6 +136,8 @@ ninfer_add_test(ninfer_qwen3_6_frontend_test
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+# Needs a local Qwen3.6-27B HF checkout for the official tokenizer fixtures.
+set_tests_properties(ninfer_qwen3_6_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)

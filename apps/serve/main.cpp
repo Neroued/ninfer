@@ -3,11 +3,13 @@
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
 #include "serve/serve_options.h"
+#include "serve/webui_update.h"
 
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
+#include <filesystem>
 #include <exception>
 #include <iomanip>
 #include <iostream>
@@ -40,10 +42,27 @@ std::string format_bytes(std::size_t bytes) {
 
 int main(int argc, char** argv) {
     try {
-        const ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
+        ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
         if (options.help_requested) {
             std::cout << ninfer::serve::serve_usage_text(argv[0]);
             return 0;
+        }
+
+        // Resolve (and, in --webui mode, auto-download) the webui directory before
+        // the port is taken so a failed download aborts startup cleanly. In
+        // --webui-dir mode the directory is trusted to already hold a built UI;
+        // fail early if it does not.
+        if (options.webui_auto) {
+            options.webui_dir =
+                ninfer::serve::ensure_webui_available(ninfer::serve::resolve_webui_dir(options));
+        } else if (!options.webui_dir.empty()) {
+            std::error_code ec;
+            const bool have_index =
+                std::filesystem::exists(std::filesystem::path(options.webui_dir) / "index.html", ec);
+            if (!std::filesystem::is_directory(options.webui_dir, ec) || !have_index) {
+                throw std::invalid_argument(
+                    "--webui-dir must be a directory containing index.html: " + options.webui_dir);
+            }
         }
 
         using Clock = std::chrono::steady_clock;
@@ -100,11 +119,29 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, handle_signal);
         std::signal(SIGTERM, handle_signal);
 
+        // A wildcard bind address is not reachable as a destination: browsers reject
+        // http://0.0.0.0/ with ERR_ADDRESS_INVALID. Announce a loopback URL that can
+        // actually be opened, alongside the address the socket is bound to.
+        const bool wildcard_bind = options.host == "0.0.0.0" || options.host == "::" ||
+                                   options.host == "[::]";
+        const std::string browse_host =
+            !wildcard_bind ? options.host : (options.host == "0.0.0.0" ? "127.0.0.1" : "[::1]");
+        const std::string browse_url =
+            "http://" + browse_host + ':' + std::to_string(options.port);
+
         std::ostringstream listening;
-        listening << "listening on http://" << options.host << ':' << options.port
-                  << " (model id: " << server.public_model_id()
+        listening << "listening on http://" << options.host << ':' << options.port;
+        if (wildcard_bind) { listening << " (all interfaces)"; }
+        listening << " (model id: " << server.public_model_id()
                   << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer") << ')';
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, listening.str());
+
+        if (!options.webui_dir.empty()) {
+            ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info,
+                                             "webui: open " + browse_url + '/');
+        }
+        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info,
+                                         "api base: " + browse_url + "/v1");
 
         const bool ok = server.listen();
         g_server.store(nullptr);

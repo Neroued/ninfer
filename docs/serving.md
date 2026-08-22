@@ -43,6 +43,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
+| `GET /v1` | endpoint index for the announced API base |
 | `GET /v1/models` | configured OpenAI model alias |
 | `GET /v1/models/{id}` | lookup of the configured alias |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |

@@ -12,12 +12,26 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
 using namespace ninfer::serve;
 using Json = nlohmann::json;
+
+std::uint32_t process_id() {
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return static_cast<std::uint32_t>(::getpid());
+#endif
+}
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -347,7 +361,7 @@ int main() {
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
+        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(process_id())) +
          ".jsonl");
     std::filesystem::remove(log_path);
     {

@@ -5,18 +5,23 @@
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
 #include "serve/translate.h"
+#include "serve/webui_update.h"
 
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -53,6 +58,7 @@ void write_error(httplib::Response& res, const ApiError& error) {
     res.status = error.status;
     res.set_content(make_error_body(error), "application/json");
 }
+
 
 // Anthropic-shaped error body ({"type":"error","error":{...}}), used by the
 // /v1/messages endpoints so Claude clients see the error format they expect.
@@ -135,7 +141,69 @@ HttpServer::HttpServer(ServeOptions options)
         return new httplib::ThreadPool(worker_count, queued_requests);
     };
     server_.set_payload_max_length(options_.max_request_bytes);
+    if (!options_.webui_dir.empty()) {
+        mount_webui(options_.webui_dir);
+        register_webui_mime();
+    }
     register_routes();
+}
+
+void HttpServer::mount_webui(const std::string& webui_dir) {
+    std::ifstream index(webui_dir + "/index.html", std::ios::binary);
+    if (!index) {
+        throw std::runtime_error("webui dir has no index.html: " + webui_dir);
+    }
+    webui_index_html_ = std::string((std::istreambuf_iterator<char>(index)),
+                                     std::istreambuf_iterator<char>());
+    webui_serving_ = true;
+    if (!server_.set_mount_point("/", webui_dir)) {
+        throw std::runtime_error("cannot mount webui directory: " + webui_dir);
+    }
+    log_line("serving webui from " + webui_dir);
+}
+
+void HttpServer::register_webui_mime() {
+    // The vendored httplib's built-in map covers the stock webui's asset types;
+    // pin the ones the UI's runtime loading depends on.
+    server_.set_file_extension_and_mimetype_mapping("js", "text/javascript");
+    server_.set_file_extension_and_mimetype_mapping("css", "text/css");
+    server_.set_file_extension_and_mimetype_mapping("html", "text/html");
+    server_.set_file_extension_and_mimetype_mapping("json", "application/json");
+    server_.set_file_extension_and_mimetype_mapping("svg", "image/svg+xml");
+    server_.set_file_extension_and_mimetype_mapping("ico", "image/x-icon");
+}
+
+bool HttpServer::webui_spa_path(const std::string& path) const {
+    // The SPA fallback must only catch client-side routes: the static file handler
+    // already served every real asset, and API paths (/v1/...), /props, /health,
+    // and hashed bundle paths (_app/...) are never SPA routes. A missing _app file
+    // or an unknown /v1 path must keep falling through to the 404 handler.
+    if (path.size() < 2 || path[0] != '/') { return false; }
+    if (path == "/") { return false; }
+    if (path.rfind("/v1", 0) == 0 && (path.size() == 3 || path[3] == '/')) { return false; }
+    // llama.cpp server endpoints the webui probes but ninfer does not implement, plus
+    // ninfer's own status endpoints: keep them at their natural 404/405 so the UI
+    // degrades exactly as it did against a real llama-server, rather than getting the
+    // SPA shell back for an API call.
+    if (path == "/props" || path == "/health" || path == "/slots" || path == "/tools" ||
+        path == "/v1/streams/lookup") {
+        return false;
+    }
+    if (path.rfind("/_app/", 0) == 0) { return false; }
+    if (path.find_first_of('.') != std::string::npos) { return false; }
+    return true;
+}
+
+bool HttpServer::is_api_path(const std::string& path) const {
+    // The endpoints that require an API key. Deliberately dot-free: static assets
+    // (favicon.ico, app.js) and the UI shell (/, index.html, SPA routes) are never
+    // API paths, so the UI loads freely even when --api-key is set, exactly like
+    // llama-server. The webui supplies the key itself on API calls.
+    if (path.rfind("/v1", 0) == 0 && (path.size() == 3 || path[3] == '/')) { return true; }
+    if (path == "/props" || path == "/slots" || path == "/tools") { return true; }
+    if (path.rfind("/v1/streams/lookup", 0) == 0) { return true; }
+    if (path.rfind("/_app/", 0) == 0) { return false; } // served by the static mount
+    return false;
 }
 
 void HttpServer::log_line(const std::string& line) {
@@ -211,7 +279,21 @@ void HttpServer::stop_stats_reporter() {
 
 void HttpServer::register_routes() {
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
-        return handle_unrendered_http_error(options_, request, response);
+        const auto rendered = handle_unrendered_http_error(options_, request, response);
+        if (rendered == httplib::Server::HandlerResponse::Handled) {
+            return rendered;
+        }
+        // SPA fallback: the file handler already served every real asset and every
+        // registered API route has already been tried, so an unmatched GET/HEAD is
+        // a client-side route (e.g. /chat/123). Hand it the SPA shell; leave every
+        // other error (405 on a real API path, 404 on a missing asset) untouched.
+        if (webui_serving_ && response.status == 404 &&
+            (request.method == "GET" || request.method == "HEAD") &&
+            webui_spa_path(request.path)) {
+            response.set_content(webui_index_html_, "text/html");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
     });
     if (options_.enable_cors) {
         server_.set_default_headers(
@@ -220,12 +302,75 @@ void HttpServer::register_routes() {
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.
-        server_.Options(R"(.*)",
-                        [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
+        // Echo the preflight's requested headers (Access-Control-Request-Headers)
+        // so clients using custom headers (e.g. llama.cpp webui's x-conversation-id)
+        // pass the browser's CORS check. The static default above remains the
+        // floor for direct (non-browser) requests.
+        server_.Options(R"(.*)", [](const httplib::Request& req, httplib::Response& res) {
+            res.status = 204;
+            auto it = req.get_header_value("Access-Control-Request-Headers");
+            if (!it.empty()) {
+                std::string joined;
+                std::vector<std::string> seen;
+                std::string part;
+                const std::string& raw = it;
+                for (size_t i = 0; i <= raw.size(); i++) {
+                    const char c = i < raw.size() ? raw[i] : ',';
+                    if (c == ',') {
+                        size_t b = part.find_first_not_of(" \t");
+                        if (b == std::string::npos) {
+                            part.clear();
+                            continue;
+                        }
+                        size_t e = part.find_last_not_of(" \t") + 1;
+                        part = part.substr(b, e - b);
+                        if (!part.empty()) {
+                            std::string key = part;
+                            for (auto& ch : key) {
+                                if (ch >= 'A' && ch <= 'Z') {
+                                    ch = char(ch - 'A' + 'a');
+                                }
+                            }
+                            const bool dup = std::any_of(seen.begin(), seen.end(),
+                                                         [&](const std::string& s) { return s == key; });
+                            if (!dup) {
+                                if (!joined.empty()) {
+                                    joined += ", ";
+                                }
+                                joined += part;
+                                seen.push_back(std::move(key));
+                            }
+                        }
+                        part.clear();
+                    } else {
+                        part += c;
+                    }
+                }
+                if (!joined.empty()) {
+                    // Build the full header set explicitly: httplib's set_header
+                    // uses emplace and cannot replace the statically seeded
+                    // Access-Control-Allow-Headers default.
+                    httplib::Headers headers;
+                    for (const auto& h : res.headers) {
+                        // The seeded default uses exactly this key spelling.
+                        if (h.first == "Access-Control-Allow-Headers") {
+                            headers.emplace(h.first, joined);
+                        } else {
+                            headers.emplace(h.first, h.second);
+                        }
+                    }
+                    res.headers = std::move(headers);
+                }
+            }
+        });
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        // Only API endpoints require a key. The UI shell and every static asset load
+        // freely so the webui can prompt for and send the key on API calls (same
+        // policy as llama-server). /health stays open and OPTIONS is a CORS preflight.
+        if (options_.api_key.empty() || req.method == "OPTIONS" || !is_api_path(req.path) ||
+            req.path == "/health") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -269,6 +414,14 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
+    // The startup banner prints the API base as a URL and terminals make it clickable,
+    // so the bare base must answer rather than 404. Both spellings, since a browser
+    // address bar happily produces either.
+    for (const char* base : {"/v1", "/v1/"}) {
+        server_.Get(base, [this](const httplib::Request& req, httplib::Response& res) {
+            handle_api_index(req, res);
+        });
+    }
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -279,6 +432,9 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_props(req, res);
+    });
     server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
         handle_responses(req, res);
     });
@@ -315,6 +471,138 @@ void HttpServer::register_routes() {
     });
 }
 
+// The /v1 discovery document. An API base is not itself an OpenAI resource, so
+// there is no upstream shape to match: report the configured model alias and the
+// endpoint table this build serves, which is what someone who opened the URL (or
+// pointed a client at it) needs to see.
+nlohmann::json make_api_index(const std::string& model_id) {
+    const auto endpoint = [](const char* method, const char* path, const char* description) {
+        return nlohmann::json{
+            {"method", method}, {"path", path}, {"description", description}};
+    };
+    nlohmann::json index  = nlohmann::json::object();
+    index["object"]       = "api_base";
+    index["service"]      = "ninfer-serve";
+    index["model"]        = model_id;
+    index["endpoints"]    = nlohmann::json::array(
+        {endpoint("GET", "/health", "process health"),
+            endpoint("GET", "/v1/models", "configured OpenAI model alias"),
+            endpoint("GET", "/v1/models/{id}", "lookup of the configured alias"),
+            endpoint("POST", "/v1/chat/completions", "OpenAI-style chat generation"),
+            endpoint("POST", "/v1/responses", "OpenAI Responses generation, state, and SSE"),
+            endpoint("POST", "/v1/responses/input_tokens",
+                     "Responses prompt-token count without generation"),
+            endpoint("GET", "/v1/responses/{id}", "retrieve a locally stored terminal Response"),
+            endpoint("DELETE", "/v1/responses/{id}", "delete a locally stored Response"),
+            endpoint("GET", "/v1/responses/{id}/input_items",
+                     "list that Response's normalized input Items"),
+            endpoint("POST", "/v1/messages", "Anthropic-style message generation"),
+            endpoint("POST", "/v1/messages/count_tokens",
+                     "checkpoint-native expanded input-token count")});
+    return index;
+}
+
+// llama.cpp webui dialect: /props is the client's server introspection endpoint
+// (role detection, context size, default params, thinking-capability probe, api
+// key validation). NInfer has no llama.cpp server behind it, so serve a faithful
+// stub derived from the process configuration. Only process-level overrides are
+// reported as parameter values; everything else stays at neutral zeros so client
+// side defaults never swallow a user-set request parameter.
+nlohmann::json make_props_stub(const ServeOptions& options, const std::string& model_id) {
+    (void)model_id;
+    const auto& ov = options.sampling_overrides;
+    nlohmann::json params = nlohmann::json::object();
+    params["n_predict"] = options.default_max_tokens;
+    params["seed"] = ov.seed ? static_cast<double>(*ov.seed) : 0;
+    params["temperature"] = ov.temperature ? static_cast<double>(*ov.temperature) : 0;
+    params["dynatemp_range"] = 0;
+    params["dynatemp_exponent"] = 0;
+    params["top_k"] = ov.top_k ? *ov.top_k : 0;
+    params["top_p"] = ov.top_p ? static_cast<double>(*ov.top_p) : 0;
+    params["min_p"] = ov.min_p ? static_cast<double>(*ov.min_p) : 0;
+    params["top_n_sigma"] = 0;
+    params["xtc_probability"] = 0;
+    params["xtc_threshold"] = 0;
+    params["typ_p"] = 0;
+    params["repeat_last_n"] = 0;
+    params["repeat_penalty"] = 0;
+    params["presence_penalty"] =
+        ov.presence_penalty ? static_cast<double>(*ov.presence_penalty) : 0;
+    params["frequency_penalty"] =
+        ov.frequency_penalty ? static_cast<double>(*ov.frequency_penalty) : 0;
+    params["dry_multiplier"] = 0;
+    params["dry_base"] = 0;
+    params["dry_allowed_length"] = 0;
+    params["dry_penalty_last_n"] = 0;
+    params["dry_sequence_breakers"] = nlohmann::json::array();
+    params["mirostat"] = 0;
+    params["mirostat_tau"] = 0;
+    params["mirostat_eta"] = 0;
+    params["stop"] = nlohmann::json::array();
+    params["max_tokens"] = options.default_max_tokens;
+    params["n_keep"] = 0;
+    params["n_discard"] = 0;
+    params["ignore_eos"] = false;
+    params["stream"] = false;
+    params["logit_bias"] = nlohmann::json::array();
+    params["n_probs"] = 0;
+    params["min_keep"] = 0;
+    params["grammar"] = "";
+    params["grammar_lazy"] = false;
+    params["grammar_triggers"] = nlohmann::json::array();
+    params["preserved_tokens"] = nlohmann::json::array();
+    params["chat_format"] = "";
+    params["reasoning_format"] = "";
+    params["reasoning_in_content"] = false;
+    params["generation_prompt"] = "";
+    params["samplers"] = nlohmann::json::array();
+    params["backend_sampling"] = false;
+    params["speculative.n_max"] = 0;
+    params["speculative.n_min"] = 0;
+    params["speculative.p_min"] = 0.0;
+    params["timings_per_token"] = false;
+    params["post_sampling_probs"] = false;
+    params["lora"] = nlohmann::json::array();
+
+    nlohmann::json props = nlohmann::json::object();
+    props["default_generation_settings"] = {
+        {"id", 0},
+        {"id_task", 0},
+        {"n_ctx", static_cast<int>(options.max_context)},
+        {"speculative", options.speculative.backend != SpeculativeBackend::None},
+        {"is_processing", false},
+        {"params", params},
+        {"prompt", ""},
+        {"next_token",
+         {{"has_next_token", false},
+          {"has_new_line", false},
+          {"n_remain", 0},
+          {"n_decoded", 0},
+          {"stopping_word", ""}}},
+    };
+    props["total_slots"] = 1;
+    props["model_path"] = options.artifact_path;
+    props["role"] = "model";
+    props["modalities"] = {{"vision", options.enable_vision}, {"audio", false}, {"video", false}};
+    // Capability marker only: clients that probe the chat template (e.g. the
+    // webui's thinking-support heuristic) need `enable_thinking` to appear; the
+    // real template is embedded in the loaded artifact.
+    props["chat_template"] =
+        "{# ninfer-serve: capability marker; the real chat template is embedded in "
+        "the loaded artifact #}\n"
+        "{%- if enable_thinking is defined %}\n"
+        "  {%- set thinking = enable_thinking %}\n"
+        "{% endif %}";
+    props["bos_token"] = "";
+    props["eos_token"] = "";
+    props["build_info"] = "ninfer-serve";
+    return props;
+}
+
+void HttpServer::handle_api_index(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(make_api_index(public_model_id_).dump(), "application/json");
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
     res.set_content(make_models_list(public_model_id_, unix_time_now()), "application/json");
 }
@@ -333,6 +621,10 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
     res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
 }
 
+void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(make_props_stub(options_, public_model_id_).dump(), "application/json");
+}
+
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
     nlohmann::json body;
     try {
@@ -349,7 +641,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_chat_completion_request(body, limits);
+        request                   = parse_chat_completion_request(body, limits, public_model_id_);
         if (request.model != public_model_id_) {
             ApiError error;
             error.status  = 404;

@@ -867,6 +867,30 @@ int test_props_stub() {
     return failures;
 }
 
+int test_api_index() {
+    int failures      = 0;
+    const Json index  = make_api_index("qwen3.6-27b");
+    failures += check(index.at("object") == "api_base", "api index object");
+    failures += check(index.at("model") == "qwen3.6-27b", "api index reports the model alias");
+    const Json endpoints = index.at("endpoints");
+    failures += check(endpoints.is_array() && !endpoints.empty(), "api index lists endpoints");
+    // Every listed endpoint must be one the server actually registers, otherwise the
+    // discovery document sends clients to a 404 of its own.
+    bool has_chat        = false;
+    bool well_formed     = true;
+    for (const Json& entry : endpoints) {
+        well_formed = well_formed && entry.at("method").is_string() &&
+                      entry.at("path").get<std::string>().rfind('/', 0) == 0 &&
+                      entry.at("description").is_string();
+        if (entry.at("path") == "/v1/chat/completions" && entry.at("method") == "POST") {
+            has_chat = true;
+        }
+    }
+    failures += check(well_formed, "api index entries carry method, absolute path, description");
+    failures += check(has_chat, "api index advertises chat completions");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_parse_string_content();
@@ -887,6 +911,7 @@ int main() {
     failures += test_models_and_error();
     failures += test_llama_webui_dialect();
     failures += test_props_stub();
+    failures += test_api_index();
     failures += test_finish_reason_wire();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

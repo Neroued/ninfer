@@ -90,6 +90,10 @@ std::string sse_done();
 std::string make_models_list(const std::string& model_id, std::int64_t created);
 std::string make_model_object(const std::string& model_id, std::int64_t created);
 
+// /v1 discovery document: the API base is announced as a URL at startup, so the
+// bare path answers with the endpoints this build exposes instead of a 404.
+nlohmann::json make_api_index(const std::string& model_id);
+
 // Error object body.
 std::string make_error_body(const ApiError& error);
 

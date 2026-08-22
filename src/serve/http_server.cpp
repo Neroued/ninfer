@@ -414,6 +414,14 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
+    // The startup banner prints the API base as a URL and terminals make it clickable,
+    // so the bare base must answer rather than 404. Both spellings, since a browser
+    // address bar happily produces either.
+    for (const char* base : {"/v1", "/v1/"}) {
+        server_.Get(base, [this](const httplib::Request& req, httplib::Response& res) {
+            handle_api_index(req, res);
+        });
+    }
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -461,6 +469,37 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+}
+
+// The /v1 discovery document. An API base is not itself an OpenAI resource, so
+// there is no upstream shape to match: report the configured model alias and the
+// endpoint table this build serves, which is what someone who opened the URL (or
+// pointed a client at it) needs to see.
+nlohmann::json make_api_index(const std::string& model_id) {
+    const auto endpoint = [](const char* method, const char* path, const char* description) {
+        return nlohmann::json{
+            {"method", method}, {"path", path}, {"description", description}};
+    };
+    nlohmann::json index  = nlohmann::json::object();
+    index["object"]       = "api_base";
+    index["service"]      = "ninfer-serve";
+    index["model"]        = model_id;
+    index["endpoints"]    = nlohmann::json::array(
+        {endpoint("GET", "/health", "process health"),
+            endpoint("GET", "/v1/models", "configured OpenAI model alias"),
+            endpoint("GET", "/v1/models/{id}", "lookup of the configured alias"),
+            endpoint("POST", "/v1/chat/completions", "OpenAI-style chat generation"),
+            endpoint("POST", "/v1/responses", "OpenAI Responses generation, state, and SSE"),
+            endpoint("POST", "/v1/responses/input_tokens",
+                     "Responses prompt-token count without generation"),
+            endpoint("GET", "/v1/responses/{id}", "retrieve a locally stored terminal Response"),
+            endpoint("DELETE", "/v1/responses/{id}", "delete a locally stored Response"),
+            endpoint("GET", "/v1/responses/{id}/input_items",
+                     "list that Response's normalized input Items"),
+            endpoint("POST", "/v1/messages", "Anthropic-style message generation"),
+            endpoint("POST", "/v1/messages/count_tokens",
+                     "checkpoint-native expanded input-token count")});
+    return index;
 }
 
 // llama.cpp webui dialect: /props is the client's server introspection endpoint
@@ -558,6 +597,10 @@ nlohmann::json make_props_stub(const ServeOptions& options, const std::string& m
     props["eos_token"] = "";
     props["build_info"] = "ninfer-serve";
     return props;
+}
+
+void HttpServer::handle_api_index(const httplib::Request&, httplib::Response& res) const {
+    res.set_content(make_api_index(public_model_id_).dump(), "application/json");
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {

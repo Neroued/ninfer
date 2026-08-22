@@ -435,12 +435,18 @@ void GenerationService::warmup() {
         constexpr auto kWarmupTimeout = std::chrono::seconds(60);
         PreparedRequest prepared      = prepare(request, {}, kWarmupTimeout);
         run(prepared, nullptr);
-    } catch (const ninfer::RequestError& exception) {
-        // A tight --pending-timeout-ms can still expire during warmup on a healthy engine;
-        // that is not a server fault, so it stays non-fatal. Every other warmup failure is.
-        if (exception.kind() == ninfer::RequestErrorKind::QueueTimeout) {
+    } catch (const ApiException& exception) {
+        // Every ninfer::RequestError escaping prepare()/run() has already been converted to an
+        // ApiException by throw_request_error, so the queue-timeout carve-out has to
+        // discriminate on the mapped error code -- catching ninfer::RequestError here would be
+        // dead code (it derives from std::invalid_argument, ApiException from
+        // std::runtime_error, so neither catches the other).
+        //
+        // A queue timeout is the one warmup failure that is not a server fault: the engine can
+        // still be draining an earlier admission when priming runs. Everything else is fatal.
+        if (exception.error().code == "request_queue_timeout") {
             write_console_log(ConsoleLogLevel::Warning,
-                              "warmup exceeded --pending-timeout-ms (non-fatal for warmup); "
+                              "warmup timed out waiting for admission (non-fatal for warmup); "
                               "server ready");
             return;
         }

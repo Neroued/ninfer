@@ -636,6 +636,19 @@ An appended mid-conversation system message is an ordinary prompt suffix, so an 
 history remains eligible for `append_frontier`. If the client modifies, removes, or moves a
 historical system message, the token prefix genuinely differs and a miss/reset is correct.
 
+### Determinism
+
+Greedy decoding is reproducible for an identical execution schedule: the same prompt served on an
+otherwise idle server produces the same tokens on every run. It is not bitwise-reproducible across
+different batch compositions. Decode-phase projection kernels are selected by the number of tokens
+in the step (the sum over active lanes of one plus the accepted speculative drafts), and the
+variants differ in reduction order; the resulting sub-ulp logit differences flip the argmax only on
+near-ties, but over a long greedy continuation such flips accumulate into divergent text. A request
+therefore yields distribution-equivalent, not byte-equivalent, output when other requests share its
+decode steps, with the cache on or off. Short answers are stable in practice; treat long greedy
+continuations under concurrent load as equivalent rather than identical, and compare them against a
+solo run of the same prompt when bitwise reproduction matters (`tools/smoke/determinism_fingerprint.py`).
+
 Speculative decoding is an engine option and does not change protocol output shapes, stop behavior,
 or usage accounting. If a stop truncates a multi-token MTP or DFlash round, the Engine commits the
 exact accepted target prefix so a following compatible turn can still reuse it. Output-limit and

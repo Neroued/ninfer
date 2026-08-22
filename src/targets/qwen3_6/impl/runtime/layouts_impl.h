@@ -30,6 +30,39 @@ namespace {
 constexpr std::size_t kMiB        = 1024ULL * 1024ULL;
 constexpr std::size_t kArenaAlign = 256ULL;
 
+// Adaptive graph allowance: graph sizes scale steeply with context beyond ~128k.
+// Measured MTP per-batch: 64k=2MB, 128k=2MB, 224k=74.62MB, 256k=223MB.
+// Linear interpolation between measured points, capped at maximum.
+constexpr std::uint64_t kGraphBaseCtx = 131072; // 128k - transition point
+constexpr std::uint64_t kGraphHighCtx = 262144; // 256k - cap point
+constexpr std::size_t kMtpGraphBase   = 2ULL * kMiB;
+constexpr std::size_t kMtpGraphHigh  = 240ULL * kMiB; // covers 223MB measured
+constexpr std::size_t kMtpGraphCap    = 256ULL * kMiB;
+constexpr std::size_t kDFlashGraphBase = 64ULL * kMiB;
+constexpr std::size_t kDFlashGraphHigh = 128ULL * kMiB;
+constexpr std::size_t kDFlashGraphCap  = 128ULL * kMiB;
+
+static std::size_t adaptive_mtp_graph_allowance(std::uint64_t final_visible) {
+    if (final_visible <= kGraphBaseCtx) return kMtpGraphBase;
+    if (final_visible >= kGraphHighCtx) return kMtpGraphCap;
+    // Linear interpolation: base + (final_visible - base_ctx) / (high_ctx - base_ctx) * (high - base)
+    const std::size_t range = kMtpGraphHigh - kMtpGraphBase;
+    const std::size_t scaled = kMtpGraphBase +
+        (static_cast<std::size_t>(final_visible - kGraphBaseCtx) * range /
+         static_cast<std::size_t>(kGraphHighCtx - kGraphBaseCtx));
+    return std::min(scaled, kMtpGraphCap);
+}
+
+static std::size_t adaptive_dflash_graph_allowance(std::uint64_t final_visible) {
+    if (final_visible <= kGraphBaseCtx) return kDFlashGraphBase;
+    if (final_visible >= kGraphHighCtx) return kDFlashGraphCap;
+    const std::size_t range = kDFlashGraphHigh - kDFlashGraphBase;
+    const std::size_t scaled = kDFlashGraphBase +
+        (static_cast<std::size_t>(final_visible - kGraphBaseCtx) * range /
+         static_cast<std::size_t>(kGraphHighCtx - kGraphBaseCtx));
+    return std::min(scaled, kDFlashGraphCap);
+}
+
 enum class GdnWorkspacePath : std::uint8_t {
     Prefill,
     Snapshot,
@@ -646,7 +679,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+                    return adaptive_mtp_graph_allowance(final_visible);
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
@@ -661,7 +694,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
                             impl->capacity,
                             static_cast<std::uint64_t>(profile.max) + impl->draft_window + 1ULL);
-                        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+                        return adaptive_dflash_graph_allowance(final_visible);
                     },
                     "DFlash graph allowance");
             };

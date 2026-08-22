@@ -295,6 +295,52 @@ The server also implements OpenAI Responses Core (typed Items, semantic SSE, loc
 state, and function calls) plus Anthropic Messages, token counting, and multimodal input. See
 [HTTP serving](docs/serving.md).
 
+## Sharp chat style
+
+`--chat-style sharp-v22.1` renders prompts with Sharp v22.1 semantics: the model answers far more
+tersely without losing correctness. Sharp is a system-prompt design layered on the fixed Qwen chat
+templates; here it is applied as a compiled-C++ prompt overlay rather than a template swap, because
+NInfer verifies `frontend/chat_template.jinja` against a hard-coded SHA-256 digest and executes a
+compiled renderer instead of interpreting Jinja at runtime. The official `.ninfer` artifact and its
+embedded template hash are never modified.
+
+```bash
+./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+  --chat-style sharp-v22.1 \
+  --max-context 16384
+
+./build/apps/ninfer models/qwen3_6_27b.ninfer \
+  --chat-style sharp-v22.1 \
+  --reasoning-effort medium \
+  --prompt "Explain prefill and decode."
+```
+
+What the overlay changes:
+
+- **Terseness instruction.** Sharp's terse block is appended to the effective system content, in
+  both the plain and the tool-carrying system block. A system block is emitted even when the
+  request supplies no system message.
+- **Reasoning-effort ladder.** Seven levels — `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+  `max` — collapse onto the instruction blocks the template actually carries: `minimal`/`low` use
+  the low block, `high`/`xhigh`/`max` use the xhigh block, and `medium` carries none. The default
+  drops from `xhigh` to `medium`. `none` means thinking off and is equivalent to `--no-thinking`.
+- **History thinking blocks.** Assistant turns in history that carry no reasoning are rendered
+  without an empty `<think>` wrapper, matching Sharp's guard.
+
+Limits:
+
+- Server-wide only: the style is fixed at load time, with no per-request override.
+- Tool-call formatting stays NInfer-native XML; the overlay is pinned to v22.1 semantics and does
+  not adopt the later v22.2/v22.3 tool-path changes.
+- Requires a reasoning-effort artifact (Qwen3.6/3.8). Selecting it on a thinking-toggle template is
+  rejected at load rather than silently degraded.
+- `--chat-style default` is unchanged, byte for byte, from the stock renderer, and
+  `minimal`/`high`/`max` remain rejected there because the stock template has no block for them.
+
+Reported effect on the upstream fork this was ported from (RTX 5090, Qwen3.8-27B NVFP4, INT8 KV,
+MTP3): median completion tokens −42.2%, wall time −22.6%, decode speed unchanged. Those figures are
+from that measurement, not re-measured here.
+
 ## Capabilities
 
 All three registered model IDs support:

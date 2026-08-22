@@ -30,6 +30,15 @@ template's default. An artifact whose template does not expose effort rejects th
 `--no-thinking` for direct-response prompt rendering; it cannot be combined with
 `--reasoning-effort`. `--greedy` selects exact argmax decoding independently.
 
+`--reasoning-effort none` is accepted as a synonym for `--no-thinking`. The remaining rungs of the
+seven-level ladder, `minimal|high|max`, need `--chat-style sharp-v22.1`; the stock template carries
+no instruction block for them and rejects them.
+
+`--chat-style default|sharp-v22.1` selects the prompt-rendering overlay. `sharp-v22.1` appends
+Sharp's terseness instruction to the system content and remaps the effort ladder (default `medium`
+rather than `xhigh`); see [Sharp chat style](../README.md#sharp-chat-style). The style is fixed at
+load time and applies to every request the process renders.
+
 ## Startup memory profile
 
 GPU residency is frozen when the Engine starts:
@@ -147,7 +156,8 @@ measured recommendation rather than a semantic limit.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
-| `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
+| `--reasoning-effort none\|minimal\|low\|medium\|high\|xhigh\|max` | select an effort exposed by the loaded chat template (`none` = thinking off; `minimal\|high\|max` need `--chat-style sharp-v22.1`) | template default |
+| `--chat-style default\|sharp-v22.1` | prompt-rendering overlay | `default` |
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |

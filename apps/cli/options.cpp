@@ -64,10 +64,21 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 }
 
 ReasoningEffort parse_reasoning_effort(std::string_view text) {
+    if (text == "none") { return ReasoningEffort::None; }
+    if (text == "minimal") { return ReasoningEffort::Minimal; }
     if (text == "low") { return ReasoningEffort::Low; }
     if (text == "medium") { return ReasoningEffort::Medium; }
+    if (text == "high") { return ReasoningEffort::High; }
     if (text == "xhigh") { return ReasoningEffort::XHigh; }
+    if (text == "max") { return ReasoningEffort::Max; }
     throw std::invalid_argument("invalid reasoning-effort: " + std::string(text));
+}
+
+ChatStyle parse_chat_style(std::string_view text) {
+    if (text == "default") { return ChatStyle::Default; }
+    if (text == "sharp-v22.1") { return ChatStyle::SharpV22_1; }
+    throw std::invalid_argument("invalid chat-style: " + std::string(text) +
+                                " (expected default or sharp-v22.1)");
 }
 
 } // namespace
@@ -83,7 +94,8 @@ std::string usage_text(const char* argv0) {
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
-           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+           "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
+           "       [--chat-style default|sharp-v22.1]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -145,6 +157,8 @@ Options parse_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--reasoning-effort") {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
+        } else if (arg == "--chat-style") {
+            options.chat_style = parse_chat_style(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
@@ -193,6 +207,21 @@ Options parse_options(int argc, char** argv) {
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+
+    if (options.reasoning_effort == ReasoningEffort::None) {
+        // 'none' means thinking off; it carries no reasoning instruction of its own, so it
+        // normalises to exactly what --no-thinking produces.
+        options.enable_thinking  = false;
+        options.reasoning_effort = std::nullopt;
+    }
+    if (options.chat_style == ChatStyle::Default && options.reasoning_effort &&
+        (*options.reasoning_effort == ReasoningEffort::Minimal ||
+         *options.reasoning_effort == ReasoningEffort::High ||
+         *options.reasoning_effort == ReasoningEffort::Max)) {
+        throw std::invalid_argument(
+            "--reasoning-effort minimal|high|max requires --chat-style sharp-v22.1; the stock "
+            "chat template only carries low, medium, and xhigh");
     }
 
     const bool has_prompt   = !options.prompt.empty();

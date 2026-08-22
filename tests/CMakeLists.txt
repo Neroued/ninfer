@@ -68,6 +68,11 @@ ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
+# CLI flag semantics. apps/cli/options.cpp is pure argv parsing with no CUDA or engine
+# dependency, so this links the translation unit directly rather than a library.
+ninfer_add_test(ninfer_cli_options_test
+  SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
+target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
   LIBRARIES ninfer_engine)
@@ -99,6 +104,15 @@ ninfer_add_test(ninfer_qwen3_6_frontend_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+# Sharp v22.1 chat-style overlay: terseness block, effort ladder, native thinking
+# markers, and default-style isolation. Pure prompt rendering, so it needs no GPU.
+ninfer_add_test(ninfer_qwen3_6_chat_template_sharp_test
+  SOURCES targets/qwen3_6/test_chat_template_sharp.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_chat_template_sharp_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test

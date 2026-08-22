@@ -95,17 +95,23 @@ enum class ChatTemplateSemantics : std::uint8_t {
 
 class CompiledChatTemplate {
 public:
-    [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source);
+    // `chat_style` selects the prompt overlay applied on top of the resolved template.
+    // SharpV22_1 is only defined against ReasoningEffort-semantics templates and is
+    // rejected here for anything else, rather than silently degrading.
+    [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source,
+                                                      ChatStyle chat_style = ChatStyle::Default);
 
     [[nodiscard]] PromptCapabilities capabilities() const noexcept;
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
                                       ChatRenderOptions options = {}) const;
 
 private:
-    explicit CompiledChatTemplate(ChatTemplateSemantics semantics) noexcept
-        : semantics_(semantics) {}
+    explicit CompiledChatTemplate(ChatTemplateSemantics semantics,
+                                  ChatStyle chat_style = ChatStyle::Default) noexcept
+        : semantics_(semantics), chat_style_(chat_style) {}
 
     ChatTemplateSemantics semantics_;
+    ChatStyle chat_style_ = ChatStyle::Default;
 };
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

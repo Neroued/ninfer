@@ -32,6 +32,7 @@ struct Options {
     bool print_token_ids = false;
     bool enable_thinking = true;
     std::optional<ReasoningEffort> reasoning_effort;
+    ChatStyle chat_style = ChatStyle::Default;
 
     std::vector<TokenId> stop_token_ids;
     std::vector<StopString> stop_strings;

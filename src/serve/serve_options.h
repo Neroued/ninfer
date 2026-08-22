@@ -54,6 +54,8 @@ struct ServeOptions {
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;
     bool greedy = false; // --greedy: force temperature 0 (exact argmax)
+    // --chat-style: server-wide prompt overlay. There is no per-request override.
+    ChatStyle chat_style = ChatStyle::Default;
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.

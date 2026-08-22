@@ -75,6 +75,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--chat-style default|sharp-v22.1] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
@@ -93,7 +94,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom\n"
+           " MiB of sizing headroom (bounded by max-context * max-concurrency)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
@@ -231,6 +232,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--chat-style") {
+            const std::string style = require_value("--chat-style");
+            if (style == "default") {
+                options.chat_style = ChatStyle::Default;
+            } else if (style == "sharp-v22.1") {
+                options.chat_style = ChatStyle::SharpV22_1;
+            } else {
+                throw std::invalid_argument("invalid --chat-style: " + style +
+                                            " (expected default or sharp-v22.1)");
+            }
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
         } else if (arg == "--cors") {

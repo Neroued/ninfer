@@ -127,23 +127,29 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         return result;
     }
 
+    // Carry the request's level through unchanged; which rungs are actually answerable is
+    // decided by the loaded template's capabilities below. The stock template advertises
+    // low/medium/xhigh only, so minimal/high/max stay rejected there exactly as before;
+    // --chat-style sharp-v22.1 advertises the full ladder and collapses it when rendering.
     switch (requested) {
+    case RequestedReasoningEffort::Minimal:
+        result.reasoning_effort = ninfer::ReasoningEffort::Minimal;
+        break;
     case RequestedReasoningEffort::Low:
         result.reasoning_effort = ninfer::ReasoningEffort::Low;
         break;
     case RequestedReasoningEffort::Medium:
         result.reasoning_effort = ninfer::ReasoningEffort::Medium;
         break;
+    case RequestedReasoningEffort::High:
+        result.reasoning_effort = ninfer::ReasoningEffort::High;
+        break;
     case RequestedReasoningEffort::XHigh:
         result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
         break;
-    case RequestedReasoningEffort::Minimal:
-    case RequestedReasoningEffort::High:
     case RequestedReasoningEffort::Max:
-        invalid_prompt_option("reasoning effort '" +
-                                  std::string(requested_reasoning_effort_name(requested)) +
-                                  "' is not supported by the loaded chat template",
-                              request.reasoning_effort_param, "reasoning_effort_not_supported");
+        result.reasoning_effort = ninfer::ReasoningEffort::Max;
+        break;
     case RequestedReasoningEffort::None:
         break;
     }

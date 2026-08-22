@@ -4,15 +4,81 @@
 #include "ops/common/math.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
+#include "core/verbose.h"
 #include "core/weight.h"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
+
+// Verbose: true if the stream is in CUDA graph capture mode (blocking readbacks
+// are illegal then).
+bool verbose_stream_capturing(cudaStream_t stream) {
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(stream, &capture) == cudaSuccess &&
+           capture != cudaStreamCaptureStatusNone;
+}
+
+// Verbose probe: validate that each device pointer is a real device allocation,
+// print the weight metadata, and dump the actual token ids (device->host) so an
+// out-of-range row (the usual cause of an illegal address in a gather kernel)
+// is visible. Runs before the launch, so the CUDA context is still clean.
+void verbose_probe_pointers(const char* tag, const Tensor& ids, const Weight& table,
+                            const Tensor& out, cudaStream_t stream) {
+    if (!verbose_enabled()) { return; }
+    auto describe = [](const char* name, const void* p) {
+        if (p == nullptr) {
+            std::fprintf(stderr, "[verbose]   %-8s = (null)\n", name);
+            return;
+        }
+        cudaPointerAttributes attrs {};
+        const cudaError_t err = cudaPointerGetAttributes(&attrs, p);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "[verbose]   %-8s = %p  (cudaPointerGetAttributes FAILED: %s)\n",
+                         name, p, cudaGetErrorString(err));
+            return;
+        }
+        std::fprintf(stderr, "[verbose]   %-8s = %p  type=%d device=%d devptr=%p\n", name, p,
+                     static_cast<int>(attrs.type), attrs.device, attrs.devicePointer);
+    };
+    const std::int32_t T = ids.ne[0];
+    std::fprintf(stderr,
+                 "[verbose] embedding(%s): T=%d vocab(n)=%d hidden(k)=%d out_d=%d "
+                 "payload_bytes=%llu layout=%d scale_dtype=%d padded=[%d,%d,%d,%d]\n",
+                 tag, T, table.n, table.k, out.ne[0],
+                 static_cast<unsigned long long>(table.payload_bytes),
+                 static_cast<int>(table.layout), static_cast<int>(table.scale_dtype),
+                 table.padded_shape[0], table.padded_shape[1], table.padded_shape[2],
+                 table.padded_shape[3]);
+    describe("ids", ids.data);
+    describe("qdata", table.qdata);
+    describe("scales", table.scales);
+    describe("out", out.data);
+    if (ids.data != nullptr && T > 0 && !verbose_stream_capturing(stream)) {
+        std::vector<std::int32_t> host_ids(static_cast<std::size_t>(T));
+        const cudaError_t err = cudaMemcpy(host_ids.data(), ids.data,
+                                           static_cast<std::size_t>(T) * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "[verbose]   ids dump FAILED: %s\n", cudaGetErrorString(err));
+        } else {
+            std::fprintf(stderr, "[verbose]   ids = [");
+            for (std::int32_t i = 0; i < T; ++i) {
+                std::fprintf(stderr, "%s%d%s", i ? ", " : "", host_ids[i],
+                             host_ids[i] >= table.n ? " OOB!" : "");
+            }
+            std::fprintf(stderr, "]\n");
+        }
+    }
+}
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     bool has_zero = false;
@@ -230,6 +296,7 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         require_fp8_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
+        verbose_probe_pointers("fp8", ids, table, out, stream);
         detail::embed_gather_fp8_launch(ids, table, out, stream);
         break;
     default:

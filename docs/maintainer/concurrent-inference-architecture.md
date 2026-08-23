@@ -740,6 +740,57 @@ retained entries。Planner 不复制或迁移 retained physical state，而是�
 `--host-kv-cache-mib` 时例外，被驱逐的 retained state 可以停放到 pinned host RAM 并恢复到另一 lane。
 只有在 slot/lane 和完整 entitlement 都已满足后才能 claim cache ownership。
 
+当 device pool 已饱和、停放 entry 的 entitlement 无法 reserve 时，probe 先做 `can_restore_lane`
+检查（该 entry 的 entitlement 是否在「停放本 lane resident 后」的 free pages 内）：检查失败时 probe
+**不停放** resident（保持 pool 饱和）并 defer，记录该 entry 的 id（而非布尔），entry 保留在 host
+cache，plan 仍按 resident 计算（resident 共享前缀时是非零 reuse 的 append，否则 full reset）。
+不提前停放是关键：`find_admission_lane` 会探测每个 free lane，若 probe 逐 lane 停放 resident，
+累计释放的 pages 会让后续 lane 的 restore 直接成功，evicting-restore 便失去意义。
+
+deferred 操作是一个跨多次 `park_lane` 的事务（`host_kv_restore_transaction.h`），admission 必须
+把它当作一个整体保护，且**绑定到记录的那个 entry id**（而非「当前最佳匹配」）：
+- admission 先**重新校验** deferred entry id（`host_kv_entry_exists`，entry 仍存在）：probe 与
+  admission 之间，并发 admission 可能已 LRU 驱逐该 entry（deferred id 只是提示，lane-plan version
+  未必 bump），若已失效则回退到普通 admission（沿用 resident 的 plan：resident 共享前缀时是
+  非零 reuse 的 append，否则 reuse-0 重新 prefill），不为不存在的 entry 停放/丢弃
+  resident。校验的是「仍存在」而非「仍是最佳匹配」：停放其他 lane 会在事务中途插入更优的 host
+  entry，而事务必须继续寻址 probe 记录的那个 entry（重新走 `find(prompt)` 正是 iteration-2/3 缺陷
+  的来源）。
+- 事务先做**「能否放下」预检**（`can_evicting_restore_fit`）：在**不改动任何 lane** 的前提下，
+  计算「停放所有可停放 retained lane 后」entry 与 plan 是否都放得下。放不下时**立即**返回
+  KeptResident（不停放、不驱逐任何 lane）：否则为了一个从一开始就不可能成功的 restore 去停放
+  （budget 满时甚至永久驱逐）其他 lane，会销毁无关 session 的 retained state（host-KV 特性要消除的
+  正是这种可避免的缓存销毁）。
+- 事务内**每一次** `park_lane`（selected-lane 停放 + evict_retained 循环停放其他 lane）都带上该
+  entry id 作为 `protect_id`：保护是 per-call 而非持久 pin，漏掉任何一次，后续 park 的 LRU 驱逐
+  就可能选中 deferred target（它是最老的 entry、从未 touch，是 LRU 首选受害者），销毁正要恢复的
+  entry。
+- 停放其他 lane 的循环用**双重判据**：直到 `can_restore_lane`（entry 的 entitlement 在释放后
+  free pages 内）**且** `can_admit_lane`（plan 的 growth ceiling 在释放后 free pages 内）同时成立
+  才停。plan 的 entitlement（完整 growth ceiling）可能超过 entry 的 stored entitlement（停放
+  session 的 ceiling），只停到 entry 能放下会让 plan 无法被 admit（`start_prefill_lane` 的 resize
+  会抛 `std::bad_alloc`）。
+- 双重判据成立后才销毁 selected resident（停放或丢弃，target 受保护）并 restore 那个 entry id；
+  在此之前 resident 始终保留。若停放所有其他 lane 后 target 仍放不下（entry 的 stored
+  entitlement 或 plan 的 growth ceiling 超过 pool），则**保留 resident 及其（可能非零 reuse 的）
+  plan**，不 cold prefill：resident 从未被销毁。
+- **KeptResident 只表示「不追求这个不可能的 host restore」，不表示「忽略 lane choice 的普通
+  驱逐要求」**。`find_admission_lane` 可能选中一个 `evict_retained = true` 的 lane（它的
+  resident-based plan 只有在驱逐其他 retained lane 后才放得下）；若该 lane 同时带一个 deferred
+  host entry 且预检判定 target 永远放不下，事务返回 KeptResident，但 admission 仍须**继续跑
+  普通的 retained-lane 驱逐循环**（保留 selected resident），再校验 `can_admit_lane` 后才
+  `start_prefill_lane`。否则一个本可 admit 的 plan 会被原样喂进 prefill，`resize_sequence_kv_entitlement`
+  对未释放的饱和 pool 抛 `std::bad_alloc`，executor 的 catch 会 abort 该 lane、请求失败、resident
+  在错误清理中被销毁 - 正是 KeptResident 要防止的销毁。stale deferred id（entry 已不存在）
+  走同一条普通 admission 回退路径。
+- selected-lane 停放**失败**时（budget 满、target 受保护无法腾出 slab）显式 `evict_retained_lane`
+  丢弃 resident，保证 lane 为空再 restore；不依赖 `restore_lane` 的 occupied-lane 异常作为控制流
+  （那会被 catch 误判为 corrupt entry 而丢弃有效 entry）。
+- restore 成功后 plan 重算为 reuse delta 的 append；preflight 通过后 restore 仍失败（corrupt
+  entry，`restore_lane` 已 drop 该 entry）时 lane 为空，重算是显式回退（cold prefill，resident 若
+  已停放则存活在 host cache）。evicting-restore 不改变 `--max-concurrency 1` 的行为（没有其他
+  lane 可停放）。
+
 Prefix lookup 只改变 uncached prompt work 和 prospective reuse plan，不自行授予 queue priority。它可以保守地
 缩短 §5.5 的 service projection，但仍须通过相同 protected-head qualification；无论是否命中，最终 active
 request 都进入相同 prefill/decode schedule 和 compact batch formation。

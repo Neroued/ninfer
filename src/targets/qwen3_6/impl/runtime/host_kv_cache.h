@@ -55,22 +55,22 @@ public:
     [[nodiscard]] std::optional<HostKvMatch> find(const PreparedPromptData& prompt) const override {
         std::optional<HostKvMatch> best;
         for (std::size_t i = 0; i < entries_.size(); ++i) {
-            const HostKvEntry& e = *entries_[i];
-            std::uint32_t reuse  = 0;
-            if (e.execution_frontier != 0 &&
-                prefix_matches(prompt, e.ledger, e.prefix_identity, e.execution_frontier)) {
-                reuse = e.execution_frontier;
-            } else if (e.checkpoint_valid && e.checkpoint_frontier != 0 &&
-                       e.checkpoint_frontier <= prompt.token_ids.size() &&
-                       prefix_matches(prompt, e.ledger, e.prefix_identity,
-                                      e.checkpoint_frontier)) {
-                reuse = e.checkpoint_frontier;
-            }
+            const std::uint32_t reuse = host_kv_entry_reuse(*entries_[i], prompt);
             if (reuse != 0 && (!best || reuse > best->reuse_tokens)) {
-                best = HostKvMatch{.entry_index = i, .entry_id = e.id, .reuse_tokens = reuse};
+                best = HostKvMatch{.entry_index = i, .entry_id = entries_[i]->id, .reuse_tokens = reuse};
             }
         }
         return best;
+    }
+
+    // Stable-id lookup (see the interface): the evicting-restore transaction
+    // addresses the exact entry it deferred, not whichever entry is currently
+    // the best match.
+    [[nodiscard]] std::optional<std::size_t> find_by_id(std::uint64_t entry_id) const override {
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i]->id == entry_id) { return i; }
+        }
+        return std::nullopt;
     }
 
     // Takes a buffer of `needed_bytes` for a new park, evicting the least

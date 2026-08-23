@@ -19,6 +19,14 @@ option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 
+# Local real-artifact path. When set, the corresponding real-artifact ctest
+# tests run instead of skipping: the tests gate on the matching environment
+# variable and return 77 (skip) when it is unset, and tests/CMakeLists.txt
+# forwards this path into the ctest environment. A local prerequisite, not a
+# build input.
+set(NINFER_QWEN3_6_27B_NVFP4_WEIGHTS "" CACHE PATH
+    "qwen3.6-27b nvfp4 .ninfer artifact; when set, the 27b real-artifact ctest tests run instead of skipping")
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)

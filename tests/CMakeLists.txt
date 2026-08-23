@@ -120,6 +120,11 @@ target_include_directories(ninfer_host_kv_gdn_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 set_tests_properties(ninfer_host_kv_gdn_test PROPERTIES SKIP_RETURN_CODE 77)
+# Deterministic coverage for the deferred host-KV restore transaction
+# (host_kv_restore_transaction.h): CPU-only, no artifact, no CUDA.
+ninfer_add_test(ninfer_host_kv_evicting_restore_test
+  SOURCES test_host_kv_evicting_restore.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)
@@ -142,6 +147,12 @@ ninfer_add_test(ninfer_qwen3_6_27b_host_kv_real_test
   SOURCES targets/qwen3_6_27b/test_engine_host_kv_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_host_kv_real_test PROPERTIES SKIP_RETURN_CODE 77)
+# Forward the local artifact path into the ctest environment so the real-artifact
+# test runs instead of skipping (it gates on the env var and returns 77 when unset).
+if(NINFER_QWEN3_6_27B_NVFP4_WEIGHTS)
+  set_tests_properties(ninfer_qwen3_6_27b_host_kv_real_test
+    PROPERTIES ENVIRONMENT "NINFER_QWEN3_6_27B_NVFP4_WEIGHTS=${NINFER_QWEN3_6_27B_NVFP4_WEIGHTS}")
+endif()
 ninfer_add_test(ninfer_qwen3_6_35b_a3b_real_test
   SOURCES targets/qwen3_6_35b_a3b/test_engine_real.cpp
   LIBRARIES ninfer_engine)

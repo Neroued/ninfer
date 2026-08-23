@@ -67,6 +67,27 @@ struct HostKvMatch {
     std::uint32_t reuse_tokens = 0;  // frontier the prompt matches to
 };
 
+// How much of ONE specific entry a given prompt reuses: the append frontier if
+// the prompt extends it, else the rewrite checkpoint if the prompt rewinds to
+// it, else 0 (the prompt matches neither, so the entry is not usable for it).
+// This is the per-entry core of HostKvCache::find(), exposed so an id-pinned
+// restore computes the reuse for the exact entry it restores rather than
+// re-selecting the best match - which parking another lane can change
+// mid-transaction.
+[[nodiscard]] inline std::uint32_t host_kv_entry_reuse(const HostKvEntry& entry,
+                                                       const PreparedPromptData& prompt) {
+    if (entry.execution_frontier != 0 &&
+        prefix_matches(prompt, entry.ledger, entry.prefix_identity, entry.execution_frontier)) {
+        return entry.execution_frontier;
+    }
+    if (entry.checkpoint_valid && entry.checkpoint_frontier != 0 &&
+        entry.checkpoint_frontier <= prompt.token_ids.size() &&
+        prefix_matches(prompt, entry.ledger, entry.prefix_identity, entry.checkpoint_frontier)) {
+        return entry.checkpoint_frontier;
+    }
+    return 0;
+}
+
 // Storage side of the host KV cache. Implementations own the parked entries
 // and the buffers they live in; the target runtime materializes them back
 // into lanes.
@@ -86,6 +107,12 @@ public:
     // Best entry for this prompt, preferring the one that reuses the most
     // tokens, so the cache and the lane chooser agree on what "best" means.
     [[nodiscard]] virtual std::optional<HostKvMatch> find(const PreparedPromptData& prompt) const = 0;
+
+    // Stable-id lookup: the evicting-restore transaction binds to the exact
+    // entry the probe deferred and must keep addressing that entry even if
+    // parking another lane inserts a better match mid-transaction. Returns the
+    // entry's index, or nullopt when the entry was evicted.
+    [[nodiscard]] virtual std::optional<std::size_t> find_by_id(std::uint64_t entry_id) const = 0;
 
     // Takes a buffer of `needed_bytes` for a new park, evicting the least
     // recently used entries until one fits (fit-driven: a fragmented free set

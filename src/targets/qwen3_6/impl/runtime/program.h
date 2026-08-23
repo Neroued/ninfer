@@ -244,7 +244,28 @@ public:
     [[nodiscard]] std::uint32_t host_kv_reusable_tokens(const PreparedPromptData& prompt) const;
     // Stable id of the best parked match for `prompt`, or 0 for none.
     [[nodiscard]] std::uint64_t host_kv_match_id(const PreparedPromptData& prompt) const;
-    [[nodiscard]] bool restore_lane(std::uint32_t lane, const PreparedPromptData& prompt);
+    // True when the parked entry with this stable id still exists (it may have
+    // been LRU-evicted since the probe recorded it). The evicting-restore
+    // transaction revalidates by id, not by best match: parking another lane
+    // can insert a better match mid-transaction, and the transaction must keep
+    // addressing the exact entry it deferred.
+    [[nodiscard]] bool host_kv_entry_exists(std::uint64_t entry_id) const;
+    // Restores the parked entry with this stable id onto `lane`, which must own
+    // no KV. The reuse is computed for that exact entry (not the current best
+    // match). False when the entry is gone or no longer matches `prompt`.
+    [[nodiscard]] bool restore_lane(std::uint32_t lane, std::uint64_t entry_id,
+                                    const PreparedPromptData& prompt);
+    // True when the parked entry with this stable id would fit on `lane` once
+    // the lane's resident (if any) is parked. Lets the probe defer (keeping the
+    // pool saturated) instead of parking cumulatively and restoring directly.
+    [[nodiscard]] bool can_restore_lane(std::uint32_t lane, std::uint64_t entry_id) const;
+    // The evicting-restore transaction's "can it ever fit" pre-check: true when
+    // BOTH the parked entry `entry_id` and the request `plan` fit after
+    // reclaiming every retained lane except `lane`. Lets the transaction decide,
+    // before mutating any lane, whether the target can ever restore - so an
+    // impossible restore does not destroy unrelated retained state.
+    [[nodiscard]] bool can_evicting_restore_fit(std::uint32_t lane, std::uint64_t entry_id,
+                                                const RequestPlan& plan) const noexcept;
 
     // Host KV cache (--host-kv-cache). park lifts a retained lane's pages and
     // planner-visible state into `entry` (the copies are complete on return;

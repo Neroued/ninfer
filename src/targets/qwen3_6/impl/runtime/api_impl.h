@@ -222,8 +222,25 @@ std::uint64_t Program<Variant>::host_kv_match_id(const PreparedPrompt& prompt) c
 }
 
 template <>
-bool Program<Variant>::restore_lane(std::uint32_t lane, const PreparedPrompt& prompt) {
-    return impl_->restore_lane(lane, PreparedPromptAccess::view(prompt));
+bool Program<Variant>::host_kv_entry_exists(std::uint64_t entry_id) const {
+    return impl_->host_kv_entry_exists(entry_id);
+}
+
+template <>
+bool Program<Variant>::restore_lane(std::uint32_t lane, std::uint64_t entry_id,
+                                    const PreparedPrompt& prompt) {
+    return impl_->restore_lane(lane, entry_id, PreparedPromptAccess::view(prompt));
+}
+
+template <>
+bool Program<Variant>::can_restore_lane(std::uint32_t lane, std::uint64_t entry_id) const {
+    return impl_->can_restore_lane(lane, entry_id);
+}
+
+template <>
+bool Program<Variant>::can_evicting_restore_fit(std::uint32_t lane, std::uint64_t entry_id,
+                                                const RequestPlan<Variant>& plan) const noexcept {
+    return impl_->can_evicting_restore_fit(lane, entry_id, plan);
 }
 
 template <>

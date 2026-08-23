@@ -383,6 +383,69 @@ bool ProgramImplCore::can_admit_lane_after_retained_eviction(
                        plan.impl_->backend_kv_page_entitlement);
 }
 
+// The evicting-restore transaction's "can it ever fit" pre-check: true when,
+// after hypothetically reclaiming every retained lane except `lane` (the
+// selected resident is freed, the other retained lanes are parked), BOTH the
+// parked entry `entry_id` and the request `plan` fit. Active lanes keep their
+// pages (they are not retained), so the reclaimable set is exactly the lanes
+// the transaction can park. If this is false, parking (and possibly evicting)
+// the other lanes would only destroy unrelated retained state for a restore
+// that can never succeed, so the transaction returns KeptResident without
+// touching any lane.
+bool ProgramImplCore::can_evicting_restore_fit(std::uint32_t lane, std::uint64_t entry_id,
+                                               const RequestPlan& plan) const noexcept {
+    if (lane >= max_concurrency || plan.impl_ == nullptr) { return false; }
+    const RequestControl& request = requests[lane];
+    if (request.lifecycle == Lifecycle::Prefilling || request.lifecycle == Lifecycle::Active ||
+        request.lifecycle == Lifecycle::Pending) {
+        return false;
+    }
+    const auto entry_index = host_kv_ ? host_kv_->find_by_id(entry_id) : std::nullopt;
+    if (!entry_index) { return false; }
+    const HostKvEntry& entry = host_kv_->entry(*entry_index);
+
+    std::uint32_t reclaimable_text    = 0;
+    std::uint32_t reclaimable_backend = 0;
+    for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+        if (other == lane || !sequences[other].retained || !sequences[other].kv) { continue; }
+        reclaimable_text += sequences[other].kv->text.page_entitlement();
+        if (sequences[other].kv->backend) {
+            reclaimable_backend += sequences[other].kv->backend->page_entitlement();
+        }
+    }
+
+    const auto fits_after_reclaim = [](const PagedKVPool& pool, std::uint32_t old_pages,
+                                       std::uint32_t reclaimable_pages, std::uint32_t new_pages) {
+        if (old_pages > pool.entitled_pages() ||
+            reclaimable_pages > pool.entitled_pages() - old_pages ||
+            new_pages > pool.logical_page_capacity()) {
+            return false;
+        }
+        const std::uint32_t committed = pool.entitled_pages() - old_pages - reclaimable_pages;
+        return new_pages <= pool.page_group_count() - committed;
+    };
+
+    const SequenceState& sequence = sequences[lane];
+    const std::uint32_t old_text  = sequence.kv ? sequence.kv->text.page_entitlement() : 0;
+    if (!fits_after_reclaim(decoder->text_kv.pool(), old_text, reclaimable_text,
+                            entry.meta.text_page_entitlement) ||
+        !fits_after_reclaim(decoder->text_kv.pool(), old_text, reclaimable_text,
+                            plan.impl_->text_kv_page_entitlement)) {
+        return false;
+    }
+    const qwen3_6::PagedKVCache* backend = backend_kv_cache();
+    if (backend == nullptr) {
+        return entry.meta.backend_page_entitlement == 0 &&
+               plan.impl_->backend_kv_page_entitlement == 0;
+    }
+    const std::uint32_t old_backend =
+        sequence.kv && sequence.kv->backend ? sequence.kv->backend->page_entitlement() : 0;
+    return fits_after_reclaim(backend->pool(), old_backend, reclaimable_backend,
+                              entry.meta.backend_page_entitlement) &&
+           fits_after_reclaim(backend->pool(), old_backend, reclaimable_backend,
+                              plan.impl_->backend_kv_page_entitlement);
+}
+
 runtime::AdmissionResources ProgramImplCore::admission_capacity() const noexcept {
     const qwen3_6::PagedKVCache* backend = backend_kv_cache();
     return runtime::AdmissionResources{
@@ -954,11 +1017,19 @@ std::uint64_t ProgramImplCore::host_kv_match_id(const PreparedPromptData& prompt
     return match ? match->entry_id : 0;
 }
 
-bool ProgramImplCore::restore_lane(std::uint32_t lane, const PreparedPromptData& prompt) {
-    if (!host_kv_) { return false; }
-    const auto match = host_kv_->find(prompt);
-    if (!match) { return false; }
-    const HostKvEntry& entry = host_kv_->entry(match->entry_index);
+bool ProgramImplCore::restore_lane(std::uint32_t lane, std::uint64_t entry_id,
+                                   const PreparedPromptData& prompt) {
+    if (!host_kv_ || entry_id == 0) { return false; }
+    const auto index = host_kv_->find_by_id(entry_id);
+    if (!index) { return false; }
+    const HostKvEntry& entry = host_kv_->entry(*index);
+    // The reuse is computed for THIS entry, not the current best match: the
+    // evicting-restore transaction is bound to the exact entry the probe
+    // deferred, and parking another lane can insert a better match mid-
+    // transaction. If this entry no longer matches the prompt (0), the restore
+    // is a no-op rather than a wrong-prefix restore.
+    const std::uint32_t reuse = host_kv_entry_reuse(entry, prompt);
+    if (reuse == 0) { return false; }
     // A transient pool shortage must not destroy the entry: if the parked
     // entitlement cannot be reserved right now, keep the entry and let a later
     // request (after the active lanes drain) restore it. Mirrors the reservation
@@ -971,11 +1042,11 @@ bool ProgramImplCore::restore_lane(std::uint32_t lane, const PreparedPromptData&
         // The entry survives, so refresh its recency: without this it keeps
         // insertion order and acquire_slab() evicts it first under the
         // multi-lane workload, forcing the session it served to re-prefill.
-        host_kv_->touch(match->entry_index);
+        host_kv_->touch(*index);
         return false;
     }
     try {
-        restore_lane_from_host(lane, entry, match->reuse_tokens, device.stream);
+        restore_lane_from_host(lane, entry, reuse, device.stream);
     } catch (...) {
         // A C++ failure after the reservation is an invariant violation or a
         // corrupt entry: restore_lane_from_host rolled the lane back, so drop
@@ -988,15 +1059,52 @@ bool ProgramImplCore::restore_lane(std::uint32_t lane, const PreparedPromptData&
         // catch.)
         host_kv_log("restore lane " + std::to_string(lane) +
                     " FAILED after reservation; dropping the entry");
-        host_kv_->drop(match->entry_index);
+        host_kv_->drop(*index);
         return false;
     }
     host_kv_log("restored lane " + std::to_string(lane) + " from host: " +
-                std::to_string(match->reuse_tokens) + " tokens (entry " +
-                std::to_string(match->entry_index) + ")");
+                std::to_string(reuse) + " tokens (entry " +
+                std::to_string(entry_id) + ")");
     // The entry is now resident again; its slab returns to the arena.
-    host_kv_->drop(match->entry_index);
+    host_kv_->drop(*index);
     return true;
+}
+
+bool ProgramImplCore::can_restore_lane(std::uint32_t lane, std::uint64_t entry_id) const {
+    if (lane >= max_concurrency) { return false; }
+    if (!host_kv_ || entry_id == 0) { return false; }
+    const auto index = host_kv_->find_by_id(entry_id);
+    if (!index) { return false; }
+    const HostKvEntry& entry = host_kv_->entry(*index);
+    // The probe parks the lane's resident before restoring, so the restore's
+    // can_reserve must account for the resident's entitlement being freed.
+    // Mirror restore_lane's check with the resident's pages hypothetically
+    // released: the entry fits if its entitlement is no more than the pages
+    // the park frees plus the pages already free.
+    const std::uint32_t resident_text =
+        sequences[lane].kv ? sequences[lane].kv->text.page_entitlement() : 0;
+    const PagedKVPool& text_pool = decoder->text_kv.pool();
+    if (entry.meta.text_page_entitlement >
+        text_pool.page_group_count() - (text_pool.entitled_pages() - resident_text)) {
+        return false;
+    }
+    if (backend_kv_cache() != nullptr) {
+        const std::uint32_t resident_backend =
+            (sequences[lane].kv && sequences[lane].kv->backend)
+                ? sequences[lane].kv->backend->page_entitlement()
+                : 0;
+        const PagedKVPool& backend_pool = backend_kv_cache()->pool();
+        if (entry.meta.backend_page_entitlement >
+            backend_pool.page_group_count() - (backend_pool.entitled_pages() - resident_backend)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ProgramImplCore::host_kv_entry_exists(std::uint64_t entry_id) const {
+    if (!host_kv_ || entry_id == 0) { return false; }
+    return host_kv_->find_by_id(entry_id).has_value();
 }
 
 std::size_t ProgramImplCore::max_parked_sequence_bytes() const {

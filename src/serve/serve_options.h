@@ -23,7 +23,7 @@ struct ServeOptions {
     std::string artifact_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
-    std::string api_key;                          // empty => no auth
+    std::string api_key; // --api-key, else $NINFER_API_KEY; empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
     std::uint32_t max_context              = 8192;

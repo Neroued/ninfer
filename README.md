@@ -155,13 +155,18 @@ Tests, benchmarks, and maintainer tools are excluded from the default build.
 
 ## Docker
 
-Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA
+Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.3-compatible NVIDIA
 driver, Docker, and the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Pass `--build-arg CUDA_VERSION=13.2.1` (or `13.1.2`) to build against an older toolkit.
 
 ```bash
 docker build --tag ninfer:local .
 ```
+
+A command given after the image name runs verbatim, as in the examples below. With no arguments the
+image starts a production serving profile on port 11434 instead; see
+[Deployment](docs/deployment.md) for that profile and its `docker compose up -d` quick start.
 
 Download a model into `models/` as described below, then run the HTTP server:
 
@@ -174,6 +179,9 @@ docker run --rm \
   ninfer-serve /models/qwen3_6_27b.ninfer \
   --host 0.0.0.0
 ```
+
+The image's `HEALTHCHECK` probes `$NINFER_PORT`, defaulting to 11434, so an explicit-command run on
+another port reports `unhealthy` in `docker ps`. That is cosmetic for ad-hoc `--rm` runs.
 
 Run the CLI from the same image:
 
@@ -387,6 +395,7 @@ from one to fifteen.
 - [CLI](docs/cli.md)
 - [HTTP serving](docs/serving.md)
 - [Performance](docs/performance.md)
+- [Deployment](docs/deployment.md)
 - [CLI examples](examples/cli/)
 
 ## License

@@ -441,7 +441,10 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
-`x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated.
+`x-api-key` header. When the flag is omitted the server reads `$NINFER_API_KEY` instead; the flag
+wins when both are present, so `--api-key ""` explicitly disables authentication on a host whose
+shell exports the variable. A flag-supplied key is visible in `ps` and `/proc/<pid>/cmdline`, while
+the environment form is not. `GET /health` and CORS preflight requests remain unauthenticated.
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
@@ -456,7 +459,7 @@ curl http://127.0.0.1:8080/v1/models \
 |---|---|---:|
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
-| `--api-key KEY` | required bearer or `x-api-key` value | unset |
+| `--api-key KEY` | required bearer or `x-api-key` value | `$NINFER_API_KEY` |
 | `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |

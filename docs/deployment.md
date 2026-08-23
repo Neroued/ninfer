@@ -18,7 +18,7 @@ Compose refuses to create the container without `NINFER_API_KEY`, because the en
 from the public internet through Tailscale Funnel and an unauthenticated start would be a live
 regression.
 
-A healthy start logs the model load, then `KV capacity auto resolved=196160`, then `warming up...`,
+A healthy start logs the model load, then the resolved KV capacity, then `warming up...`,
 and finally:
 
 ```text
@@ -26,8 +26,9 @@ listening on http://0.0.0.0:11434 (model id: qwen3.8-27b, auth: bearer)
 ```
 
 `auth: bearer` is the confirmation that the key was picked up; `auth: disabled` means
-`NINFER_API_KEY` never reached the process. Nothing answers on the port until all of that finishes — the socket is bound before the weights are
-read, so a TCP check succeeds long before the server does.
+`NINFER_API_KEY` never reached the process. Nothing answers on the port until all of that
+finishes — the socket is bound before the weights are read, so a TCP check succeeds long before
+the server does.
 
 Health: `curl -s localhost:11434/health` (unauthenticated).
 Model id: `qwen3.8-27b` — requests must send exactly this in `model`.
@@ -41,7 +42,7 @@ that is the escape hatch for the values marked fixed.
 | Flag | Value | Override | Reason |
 |---|---|---|---|
 | `--max-context` | `131072` | `NINFER_MAX_CONTEXT` | NVFP4's validated ceiling. Costs nothing to set high — see below. |
-| `--kv-capacity` | `auto` | fixed | Resolves to **196,160 tokens** here, a *shared* pool. |
+| `--kv-capacity` | `auto` | fixed | A *shared* pool, sized from VRAM left after the weights. It resolved to **193,792 tokens** in the container here; the earlier bare-metal profile resolved 196,160. Read the actual figure off the startup line rather than assuming a constant. |
 | `--kv-dtype` | `int8` | fixed | Group-64. Only `bf16` and `int8` exist; `int8` doubles the pool. |
 | `--max-concurrency` | `8` | `NINFER_MAX_CONCURRENCY` | The engine's hard maximum; the range is `1..8`. |
 | `--spec mtp --draft-tokens 3` | | `NINFER_DRAFT_TOKENS` | MTP is the only speculative backend this model supports. |
@@ -78,26 +79,27 @@ the profile's own value as `default_output_tokens`.
 
 This is the part worth understanding before raising it. At admission a request is entitled to
 `prompt_tokens + requested_output_tokens` worth of KV pages, and those pages are held against the
-shared 196,160-token pool for the request's whole life — not allocated lazily as tokens are
+shared ~193.8K-token pool for the request's whole life — not allocated lazily as tokens are
 produced. The requested figure is the client's `max_tokens` or, absent one, this default.
 
 So the number of lanes that can run at once is set by `prompt + cap`:
 
 | Default traffic sends | Entitlement each | Lanes admitted |
 |---|---:|:--|
-| own `max_tokens` = 16K, 8K prompt | ~24.5K | 8 — full batching |
+| own `max_tokens` = 16K, 6K prompt | ~22.4K | 8 — full batching |
 | own `max_tokens` = 32K, 8K prompt | ~40K | 4 |
 | no `max_tokens` (this profile) | 131,072 | **1** |
 
 With a 131,072 default, the entitlement works out to exactly `--max-context` whatever the prompt
 length, because the clamp in (3) is what caps it. Two such requests need 262,144 tokens against a
-196,160-token pool, so the second one waits rather than running beside the first — the queue holds
+~193.8K-token pool, so the second one waits rather than running beside the first — the queue holds
 16 and gives up after 30 s (`--max-pending-requests`, `--pending-timeout-ms`).
 
 This only taxes clients that omit `max_tokens`. Traffic that sets its own cap is entitled to exactly
 that cap and keeps batching normally, which is why the C=8 figures below still stand for
 well-behaved callers. If you need 8-wide batching from default traffic too, the condition is
-`prompt + cap <= ~24,520` — i.e. `NINFER_DEFAULT_MAX_TOKENS=16384` for prompts up to ~8K.
+`prompt + cap <= pool / 8` — about 24,200 tokens at the pool size above, i.e.
+`NINFER_DEFAULT_MAX_TOKENS=16384` for prompts up to roughly 7.8K.
 
 ## Measured throughput
 
@@ -114,6 +116,11 @@ Qwen3.8-27B NVFP4, MTP3, int8 KV, 128K ceiling, thinking enabled:
 > to carry over, and that expectation is the reason `CUDA_VERSION` defaults to the same 13.3 minor:
 > the device code is identical ahead-of-time `sm_120a` with no JIT, GPU compute has no container
 > overhead, and the artifact is read from the same ext4 device through the same `O_DIRECT` path.
+>
+> Spot-checked in the container at C=1: **170.3 tok/s** over a 4,096-token completion, at **59.6%**
+> MTP acceptance. That acceptance is prose-range rather than the 76–91% code range, and 170 tok/s
+> sits inside the 126–200 band the next paragraph describes for it, so the sample neither confirms
+> nor contradicts the 191.9 headline — it is one point, not a re-measurement.
 
 Single-request decode varies strongly with how predictable the text is, because MTP acceptance does:
 structured output and code accept ~76–91% and run near 200 tok/s, prose accepts ~37% and runs near
@@ -124,8 +131,9 @@ Prefill is roughly 8,300 tok/s at 8K of context, 5,300 at 64K, 3,500 at 130K.
 
 ## Context vs concurrency — the one thing to understand
 
-`--max-context` is a *per-sequence ceiling*. `--kv-capacity` is a **shared pool** of 196,160 tokens.
-Setting a 128K ceiling does **not** reserve 8 × 128K, and it does not by itself cost throughput.
+`--max-context` is a *per-sequence ceiling*. `--kv-capacity` is a **shared pool** — 193,792 tokens
+as resolved here. Setting a 128K ceiling does **not** reserve 8 × 128K, and it does not by itself
+cost throughput.
 
 What matters is the live working set:
 

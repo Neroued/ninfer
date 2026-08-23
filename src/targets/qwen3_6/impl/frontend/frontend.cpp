@@ -523,7 +523,28 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
     if (!state.in_reasoning) {
-        feed_content(state, std::string(text), policy, emitted, committed_tokens, best_match);
+        // With preserve_special_tokens enabled (tool-capable requests), a model-emitted
+        // think-close token decodes to literal text. Once reasoning has closed - or never
+        // opened (thinking disabled) - that tag can never be meaningful content, so drop
+        // it instead of leaking the raw marker into client-visible text. The first close
+        // while reasoning is still open is handled above; this guards every subsequent one.
+        std::string cleaned;
+        cleaned.reserve(text.size());
+        std::size_t begin = 0;
+        for (;;) {
+            const std::size_t hit = text.find(kThinkClose, begin);
+            if (hit == std::string_view::npos) {
+                cleaned.append(text.substr(begin));
+                break;
+            }
+            cleaned.append(text.substr(begin, hit - begin));
+            begin = hit + kThinkClose.size();
+        }
+        if (!cleaned.empty()) {
+            state.strip_content_leading = false;
+            feed_channel(state, OutputChannel::Content, cleaned, policy, emitted,
+                         committed_tokens, best_match);
+        }
         return;
     }
 

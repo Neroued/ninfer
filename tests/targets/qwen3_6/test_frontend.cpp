@@ -1304,6 +1304,57 @@ int test_media_preparation_cancellation() {
 
 } // namespace
 
+
+int test_stray_think_close_dropped(const Frontend& frontend) {
+    // Thinking disabled: generation never opens reasoning, so a model-emitted
+    // </think> token (248069, non-special added token) must not leak into content.
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = false;
+    auto prompt                         = frontend.prepare(std::move(input));
+    auto session                        = frontend.make_output_session(prompt, {});
+    // token 3 = "thought</thi", token 4 = "nk>\n\nanswer" -> "</think>\n\nanswer"
+    const std::array<ninfer::TokenId, 2> tokens{3, 4};
+    const auto decision = session.preview(tokens, 2, ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.accepted_tokens == 2,
+                                "stray-close session did not accept both tokens");
+    const auto output   = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
+                      "stray think-close with thinking-off leaked into content");
+    return failures;
+}
+
+int test_second_think_close_dropped(const Frontend& frontend) {
+    // Thinking enabled: the first </think> closes reasoning; a second one in the
+    // content stream must be dropped, not echoed.
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = true;
+    auto prompt                         = frontend.prepare(std::move(input));
+    auto session                        = frontend.make_output_session(prompt, {});
+    // 3+4 close thinking and yield "answer"; then 3+4 again = stray close + "answer".
+    const std::array<ninfer::TokenId, 4> tokens{3, 4, 3, 4};
+    const auto decision = session.preview(tokens, 4, ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.accepted_tokens == 4,
+                                "double-close session did not accept all tokens");
+    const auto output   = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
+                      "reasoning channel text changed by stray-close handling");
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answeranswer",
+                      "second think-close leaked into content");
+    return failures;
+}
+
 int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
@@ -1333,5 +1384,7 @@ int main() {
     failures += test_many_images_prepare_in_one_parallel_batch();
     failures += test_media_preparation_cancellation();
     failures += test_disabled_vision();
+    failures += test_stray_think_close_dropped(frontend);
+    failures += test_second_think_close_dropped(frontend);
     return failures == 0 ? 0 : 1;
 }

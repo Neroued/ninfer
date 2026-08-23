@@ -88,6 +88,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
+           "       --api-key defaults to $NINFER_API_KEY when the flag is omitted\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
@@ -117,6 +118,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool api_key_explicit            = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -134,7 +136,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {
-            options.api_key = require_value("--api-key");
+            options.api_key  = require_value("--api-key");
+            api_key_explicit = true;
         } else if (arg == "--model-id") {
             options.model_id_override = require_value("--model-id");
             if (options.model_id_override->empty()) {
@@ -270,6 +273,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.greedy = true;
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
+        }
+    }
+    if (!api_key_explicit) {
+        if (const char* key = std::getenv("NINFER_API_KEY"); key != nullptr && *key != '\0') {
+            options.api_key = key;
         }
     }
     if (!kv_capacity_explicit) {

@@ -1,6 +1,7 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -27,6 +28,10 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+
+    // parse_serve_options() consults NINFER_API_KEY, and ctest inherits the invoking
+    // shell. Clear it so every assertion below observes the documented default.
+    ::unsetenv("NINFER_API_KEY");
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
@@ -234,6 +239,30 @@ int main() {
     }
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
+
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).api_key.empty(),
+                      "authentication is unexpectedly enabled without a key");
+    ::setenv("NINFER_API_KEY", "from-env", 1);
+    const ServeOptions from_env = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(from_env.api_key == "from-env", "NINFER_API_KEY was not adopted as the key");
+    failures +=
+        check(parse({"ninfer-serve", "model.ninfer", "--api-key", "from-flag"}).api_key ==
+                  "from-flag",
+              "--api-key did not override NINFER_API_KEY");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--api-key", ""}).api_key.empty(),
+                      "an explicit empty --api-key did not disable authentication");
+    bool env_secret_present = false;
+    bool env_redaction      = false;
+    for (const std::string& argument : from_env.startup_argv) {
+        env_secret_present = env_secret_present || argument == "from-env";
+        env_redaction      = env_redaction || argument == "<redacted>";
+    }
+    failures += check(!env_secret_present, "startup argv retained the environment API key");
+    failures += check(!env_redaction, "startup argv redacted an argument that was never passed");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("NINFER_API_KEY") != std::string::npos,
+              "serve help omits the NINFER_API_KEY fallback");
+    ::unsetenv("NINFER_API_KEY");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

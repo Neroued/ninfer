@@ -31,3 +31,7 @@ models
 *.qus
 *.safetensors
 *.sqlite
+
+.env
+.env.example
+compose.yaml

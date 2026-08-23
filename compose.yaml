@@ -1,0 +1,51 @@
+# Production serving profile: Qwen3.8-27B NVFP4, MTP3, C=8, 128K context.
+# Documented in docs/deployment.md. Start with `docker compose up -d`.
+services:
+  ninfer:
+    build:
+      context: .
+      args:
+        CUDA_VERSION: ${NINFER_CUDA_VERSION:-13.3.1}
+    image: ninfer:local
+    container_name: ninfer
+    restart: unless-stopped
+
+    # SIGTERM stops the listener and then drains in-flight generations with no
+    # engine-side timeout, so this is the timeout. At the measured ~113 tok/s
+    # per request at C=8 it covers roughly a 34K-token completion; the
+    # --default-max-tokens worst case is ~19 minutes and is cut off instead.
+    stop_grace_period: 5m
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+    # Loopback only. The Tailscale funnel and tailnet service already proxy to
+    # http://127.0.0.1:11434 from the host network namespace, so they keep
+    # working unchanged -- and the engine is no longer exposed to the LAN.
+    ports:
+      - "127.0.0.1:11434:11434"
+
+    volumes:
+      # Read-only host bind, never a named volume and never baked into a layer:
+      # the artifact is opened O_DIRECT with no fallback, which tmpfs cannot
+      # serve and overlayfs cannot be relied on for.
+      - /path/to/models/Qwen3.8-27B-nvfp4-NInfer:/models:ro
+      # The image pre-creates /var/log/ninfer owned by uid 1000, so this volume
+      # inherits that ownership and --request-log-jsonl finds its parent.
+      - ninfer-logs:/var/log/ninfer
+
+    environment:
+      # Compose refuses to create the container without a key. The engine is
+      # reachable from the public internet through the Tailscale funnel, so an
+      # unauthenticated start would be a live regression.
+      NINFER_API_KEY: ${NINFER_API_KEY:?set NINFER_API_KEY in .env (copy the value from LLAMA_API_KEY if that is the name your shell exports)}
+      NINFER_MODEL: /models/qwen3_8_27b_nvfp4.ninfer
+      NINFER_REQUEST_LOG_JSONL: /var/log/ninfer/requests.jsonl
+
+volumes:
+  ninfer-logs:

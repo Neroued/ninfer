@@ -19,6 +19,7 @@ public:
     PreparedPrompt& operator=(const PreparedPrompt&) = delete;
 
     [[nodiscard]] const PromptSummary& summary() const noexcept;
+    [[nodiscard]] const PromptPreparationStats& preparation_stats() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:
@@ -64,13 +65,15 @@ public:
     Engine(const Engine&)            = delete;
     Engine& operator=(const Engine&) = delete;
 
-    [[nodiscard]] PreparedPrompt prepare(PromptInput input) const;
+    [[nodiscard]] PreparedPrompt prepare(PromptInput input,
+                                         const PreparationControl& control = {}) const;
 
     // Raw token input is retained for parity tools and repeatable performance measurement.
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
 
-    [[nodiscard]] std::uint32_t count_tokens(PromptInput input) const;
+    [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
+                                             const PreparationControl& control = {}) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
@@ -78,8 +81,7 @@ public:
     // request; wait() owns result consumption and may run independently from GPU execution.
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
-           std::chrono::steady_clock::time_point pending_deadline = {},
-           HostInputLease host_input                              = {});
+           std::chrono::steady_clock::time_point pending_deadline = {});
 
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,
@@ -89,6 +91,7 @@ public:
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+    [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;
 
 private:

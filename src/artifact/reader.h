@@ -27,12 +27,14 @@ enum class NumericFormat {
     Q6G64_F16S,
     W8G32_F16S,
     NVFP4,
+    FP8_E4M3FN_ROW_BF16S,
 };
 
 enum class StorageLayout {
     ContiguousLeV1,
     RowSplitK128V1,
     BlockScaleK16M128x4V1,
+    RowScaleV1,
 };
 
 enum class ResourceEncoding {
@@ -79,6 +81,17 @@ struct BlockScaleGeometry {
 };
 
 BlockScaleGeometry block_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+
+struct RowScaleGeometry {
+    std::uint64_t rows               = 0;
+    std::uint64_t columns            = 0;
+    std::uint64_t code_plane_bytes   = 0;
+    std::uint64_t scale_plane_offset = 0;
+    std::uint64_t scale_plane_bytes  = 0;
+    std::uint64_t encoded_bytes      = 0;
+};
+
+RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
 
 struct TensorDescriptor {
     std::string name;

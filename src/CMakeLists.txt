@@ -17,7 +17,9 @@ endfunction()
 add_library(ninfer_core STATIC
   core/arena.cu
   core/device.cu
+  core/phase_trace.cu
   core/dtype.cpp
+  core/host_worker_pool.cpp
   core/gdn_replay_records.cpp
   core/cyclic_kv_cache.cpp
   core/paged_kv_cache.cpp
@@ -31,7 +33,7 @@ add_library(ninfer_core STATIC
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3)
+target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
@@ -102,6 +104,11 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/bf16/bf16_attn_input_gemm_mma.cu
   ops/attn_input_proj/bf16/bf16_attn_input_small_t.cu
   ops/attn_input_proj/bf16/bf16_attn_input_plan.cpp
+  ops/attn_input_proj/fp8/fp8_attn_input_decode.cu
+  ops/attn_input_proj/fp8/fp8_attn_input_small_t.cu
+  ops/attn_input_proj/fp8/fp8_attn_input_a8.cu
+  ops/attn_input_proj/fp8/fp8_attn_input_volta_qpn.cu
+  ops/attn_input_proj/fp8/fp8_attn_input_plan.cpp
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_decode.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_small_t.cu
   ops/attn_input_proj/nvfp4/nvfp4_attn_input_w4a4.cu
@@ -114,6 +121,13 @@ add_library(ninfer_ops STATIC
   ops/attn_input_proj/w8/w8_attn_input_gemm_simt.cu
   ops/attn_input_proj/w8/w8_attn_input_gemm_splitk.cu
   ops/attn_input_proj/w8/w8_attn_input_plan.cpp
+  ops/gdn_input_proj/fp8/fp8_gdn_input_decode.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_input_small_t.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_input_volta_qpn.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_input_plan.cpp
+  ops/gdn_input_proj/fp8/fp8_gdn_conv_fused.cu
+  ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_decode.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_small_t.cu
   ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_w4a4.cu
@@ -137,16 +151,28 @@ add_library(ninfer_ops STATIC
   ops/linear/bf16/bf16_gemm_mma.cu
   ops/linear/bf16/bf16_small_t.cu
   ops/linear/bf16/bf16_dispatch.cpp
+  ops/linear/fp8/fp8_format.cpp
+  ops/linear/fp8/fp8_gemv.cu
+  ops/linear/fp8/fp8_volta_qpn_gemm.cu
+  ops/linear/fp8/fp8_small_t.cu
+  ops/linear/fp8/fp8_a16_mma.cu
+  ops/linear/fp8/fp8_a8.cu
+  ops/linear/fp8/fp8_dispatch.cpp
   ops/linear/nvfp4/nvfp4_format.cpp
   ops/linear/nvfp4/nvfp4_gemv.cu
   ops/linear/nvfp4/nvfp4_small_t.cu
+  ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cu
+  ops/linear/nvfp4/nvfp4_volta_mma_gemm.cu
   ops/linear/nvfp4/nvfp4_w4a4.cu
   ops/linear/nvfp4/nvfp4_dispatch.cpp
   ops/linear/q4/q4_small_t_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_simt.cu
+  ops/linear/q4/q4_volta_mma_gemm.cu
+  ops/linear/q4/q4_volta_qpn_gemm.cu
   ops/linear/q4/q4_rowsplit_gemv.cu
   ops/linear/q4/q4_dispatch.cpp
+  ops/linear/q5/q5_volta_mma_gemm.cu
   ops/linear/q5/q5_dispatch.cpp
   ops/linear/q5/q5_rowsplit_gemm_mma.cu
   ops/linear/q5/q5_rowsplit_gemm_simt.cu
@@ -159,6 +185,10 @@ add_library(ninfer_ops STATIC
   ops/linear_add/nvfp4/nvfp4_linear_add_small_t.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_w4a4.cu
   ops/linear_add/nvfp4/nvfp4_linear_add_plan.cpp
+  ops/linear_add/fp8/fp8_linear_add_decode.cu
+  ops/linear_add/fp8/fp8_linear_add_small_t.cu
+  ops/linear_add/fp8/fp8_linear_add_a8.cu
+  ops/linear_add/fp8/fp8_linear_add_plan.cpp
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu
@@ -172,8 +202,16 @@ add_library(ninfer_ops STATIC
   ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
+  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu
+  ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.cpp
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_decode.cu
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_small_t.cu
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_volta_qpn.cu
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_qpn_split.cu
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_a8.cu
+  ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.cpp
   ops/linear_swiglu/w8/w8_linear_swiglu_decode.cu
   ops/linear_swiglu/w8/w8_linear_swiglu_gemm_mma.cu
   ops/linear_swiglu/w8/w8_linear_swiglu_gemm_splitk.cu
@@ -183,6 +221,8 @@ add_library(ninfer_ops STATIC
   ops/linear/q6/q6_rowsplit_gemm_simt.cu
   ops/linear/w8/w8_rowsplit_gemm_mma.cu
   ops/linear/w8/w8_rowsplit_gemm_simt.cu
+  ops/linear/w8/w8_volta_mma_gemm.cu
+  ops/linear/w8/w8_volta_qpn_gemm.cu
   ops/linear/w8/w8_rowsplit_gemm_decode.cu
   ops/linear/w8/w8_small_t.cu
   ops/linear/w8/w8_rowsplit_gemm_splitk.cu
@@ -235,6 +275,52 @@ add_library(ninfer_ops STATIC
   ops/wrapper/sparse_moe.cpp
   ops/wrapper/vision_attention.cpp
   ops/wrapper/vision_pos_embed.cpp)
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  # CUTLASS Sm70 tensor-core path for the q4 MLP gate/up GEMM (see
+  # q4_linear_swiglu_cutlass_sm70.cu and the V100 implementation). --expt-relaxed-constexpr is
+  # needed by CUTLASS's own headers (e.g. conv3d_problem_size.h's constexpr host calls from
+  # host/device functions); applied target-wide since it doesn't affect codegen for code that
+  # doesn't use it.
+  target_sources(ninfer_ops PRIVATE
+    ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.cu
+    ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.cu
+    ops/linear/fp8/fp8_cutlass_sm70.cu
+    ops/linear/nvfp4/nvfp4_cutlass_sm70.cu
+    ops/linear/nvfp4/nvfp4_prepack_sm70.cu
+    ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.cu
+    ops/linear_swiglu/fp8/fp8_linear_swiglu_cutlass_sm70.cu
+    ops/linear_add/q5/q5_linear_add_cutlass_sm70.cu
+    ops/attn_input_proj/q4_q5/q4_q5_attn_input_cutlass_sm70.cu
+    ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_cutlass_sm70.cu
+    ops/gdn_input_proj/w8/w8_gdn_input_cutlass_sm70.cu)
+  target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
+  target_compile_options(ninfer_ops PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+
+  # Volta flash-attention prefill route, driving the vendored llama.cpp MMA kernel
+  # (third_party/llama_cpp_fattn, pinned at 62bf73d25 -- see its the V100 implementation).
+  #
+  # The include directory is scoped to this one source file rather than added to
+  # ninfer_ops: the vendored tree contains `common.cuh` and `mma.cuh`, and src/ops
+  # has its own `ops/common/mma.cuh` plus two `gated_delta_net/common.cuh`. Nothing
+  # in src/ includes either name unqualified today, so a target-wide include would
+  # happen to work -- but it would make any future unqualified include silently
+  # resolve to the wrong header.
+  #
+  # --extended-lambda: the kernel's tile loaders use __device__ lambdas.
+  # -diag-suppress 940: upstream mma.cuh has a missing-return warning in
+  #   ggml_cuda_mma::unscramble, on a path no flash-attention config instantiates.
+  target_sources(ninfer_ops PRIVATE
+    ops/launcher/gqa_attention_volta_flash.cu
+    ops/launcher/vision_attention_volta_flash.cu)
+  set_source_files_properties(
+    ops/launcher/gqa_attention_volta_flash.cu
+    ops/launcher/vision_attention_volta_flash.cu
+    TARGET_DIRECTORY ninfer_ops
+    PROPERTIES
+      INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
+endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_tma)

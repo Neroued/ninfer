@@ -1,8 +1,11 @@
 #include "ninfer/ops/linear_add.h"
 
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
+#include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
@@ -116,6 +119,17 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::nvfp4_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                  min_tokens, max_tokens);
     }
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        const bool supported = (output_rows == detail::Fp8Residual6144Geometry::kOutputRows &&
+                                input_rows == detail::Fp8Residual6144Geometry::kInputRows) ||
+                               (output_rows == detail::Fp8Residual17408Geometry::kOutputRows &&
+                                input_rows == detail::Fp8Residual17408Geometry::kInputRows);
+        if (!supported || (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8)) {
+            throw std::invalid_argument("linear_add workspace: unsupported FP8 profile");
+        }
+        return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
+                                                               min_tokens, max_tokens);
+    }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
@@ -203,6 +217,25 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             throw std::invalid_argument("linear_add: NVFP4 requires 16-byte x/residual alignment");
         }
         detail::nvfp4_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
+        return;
+    }
+
+    if (w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument("FP8 linear_add admits only A16 or A8");
+        }
+        (void)detail::validate_fp8_weight(w, "fp8 linear_add");
+        const bool supported_shape = (w.n == detail::Fp8Residual6144Geometry::kOutputRows &&
+                                      w.k == detail::Fp8Residual6144Geometry::kInputRows) ||
+                                     (w.n == detail::Fp8Residual17408Geometry::kOutputRows &&
+                                      w.k == detail::Fp8Residual17408Geometry::kInputRows);
+        if (!supported_shape) {
+            throw std::invalid_argument("fp8 linear_add: unsupported weight shape");
+        }
+        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
+            throw std::invalid_argument("linear_add: FP8 requires 16-byte x/residual alignment");
+        }
+        detail::fp8_linear_add_dispatch(x, w, residual_out, policy, ws, stream);
         return;
     }
 

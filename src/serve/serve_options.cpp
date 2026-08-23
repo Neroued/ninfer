@@ -67,7 +67,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
-           "[--max-request-mib N] [--request-log-jsonl FILE] "
+           "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
+           "[--media-preprocess-threads N] "
+           "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
@@ -80,6 +82,9 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
+           "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
+           "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
+           "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
@@ -162,6 +167,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--max-request-mib is out of range");
             }
             options.max_request_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--media-cache-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--media-cache-mib"), "media-cache-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--media-cache-mib is out of range");
+            }
+            options.media_cache_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--media-live-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--media-live-mib"), "media-live-mib");
+            if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--media-live-mib is out of range");
+            }
+            options.media_live_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--media-preprocess-threads") {
+            const int threads = parse_nonnegative_int(require_value("--media-preprocess-threads"),
+                                                      "media-preprocess-threads");
+            if (threads > 64) {
+                throw std::invalid_argument("--media-preprocess-threads must be in [0,64]");
+            }
+            options.media_preprocess_threads = static_cast<std::uint32_t>(threads);
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {

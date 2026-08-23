@@ -59,12 +59,23 @@ struct FusedGdnInputProjectionPlan {
     WeightPlan query_key_value_z;
 };
 
+struct SplitGdnControlProjectionPlan {
+    WeightPlan a_projection;
+    WeightPlan b_projection;
+};
+
+struct FusedGdnControlProjectionPlan {
+    WeightPlan a_b_projection;
+};
+
+using GdnControlProjectionPlan =
+    std::variant<SplitGdnControlProjectionPlan, FusedGdnControlProjectionPlan>;
+
 struct GdnPlan {
     artifact::ObjectHandle a_log;
     artifact::ObjectHandle dt_bias;
     artifact::ObjectHandle convolution;
-    artifact::ObjectHandle a_projection;
-    artifact::ObjectHandle b_projection;
+    GdnControlProjectionPlan control_projection;
     std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan> input_projection;
     artifact::ObjectHandle norm;
     WeightPlan output;
@@ -149,11 +160,22 @@ struct FusedGdnInputProjectionPayload {
 using GdnInputProjectionPayload =
     std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload>;
 
+struct SplitGdnControlProjectionPayload {
+    Weight a_projection;
+    Weight b_projection;
+};
+
+struct FusedGdnControlProjectionPayload {
+    Weight a_b_projection;
+};
+
+using GdnControlProjectionPayload =
+    std::variant<SplitGdnControlProjectionPayload, FusedGdnControlProjectionPayload>;
+
 struct GdnProjectionPayload {
     Tensor a_log;
     Tensor dt_bias;
-    Weight a_projection;
-    Weight b_projection;
+    GdnControlProjectionPayload control_projection;
     GdnInputProjectionPayload input_projection;
 };
 

@@ -58,6 +58,9 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_media_decode_test
+  SOURCES test_media_decode.cpp
+  LIBRARIES ninfer_media_decode)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
@@ -235,6 +238,8 @@ ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
+ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES ninfer_ops)
@@ -271,6 +276,9 @@ ninfer_add_fused_linear_test(
 ninfer_add_op_test(ninfer_linear_add_nvfp4_test
   SOURCES ops/linear_add/test_nvfp4.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_add_fp8_test
+  SOURCES ops/linear_add/test_fp8.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp
@@ -286,6 +294,10 @@ ninfer_add_fused_linear_test(
 ninfer_add_fused_linear_test(
   ninfer_linear_swiglu_nvfp4_test
   ops/linear_swiglu/test_nvfp4.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
+ninfer_add_fused_linear_test(
+  ninfer_linear_swiglu_fp8_test
+  ops/linear_swiglu/test_fp8.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
 
 ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test

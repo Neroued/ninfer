@@ -2,6 +2,8 @@
 #include <ninfer/targets/qwen3_6/frontend_resources.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
+#include "targets/qwen3_6/impl/frontend/media_cache.h"
+#include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
 
@@ -9,13 +11,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -31,6 +40,16 @@ int check(bool condition, const char* message) {
     if (condition) { return 0; }
     std::cerr << message << '\n';
     return 1;
+}
+
+float bf16_value(std::uint16_t bits) {
+    return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16U);
+}
+
+std::uint16_t bf16_bits(float value) {
+    std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+    bits += 0x7fffU + ((bits >> 16U) & 1U);
+    return static_cast<std::uint16_t>(bits >> 16U);
 }
 
 std::string read_file(const char* path) {
@@ -250,6 +269,16 @@ bool throws_invalid_argument(Callable&& callable) {
     return false;
 }
 
+template <class Callable>
+bool throws_processor_budget(Callable&& callable) {
+    try {
+        callable();
+    } catch (const fi::ProcessorError& error) {
+        return error.kind() == fi::ProcessorErrorKind::BudgetExceeded;
+    }
+    return false;
+}
+
 int test_official_tokenizer_merge() {
     const fi::Tokenizer& tokenizer = official_tokenizer();
 
@@ -283,6 +312,17 @@ int test_official_tokenizer_merge() {
         }),
         "conflicting tokenizer/tokenizer_config added-token definitions were accepted");
     return failures;
+}
+
+int test_repeated_special_tokens_scan_linearly() {
+    constexpr std::string_view token = "<|image_pad|>";
+    std::string text;
+    text.reserve(token.size() * 5'000);
+    for (int index = 0; index < 5'000; ++index) { text += token; }
+    const std::vector<int> encoded = official_tokenizer().encode(text);
+    return check(encoded.size() == 5'000 && std::all_of(encoded.begin(), encoded.end(),
+                                                        [](int id) { return id == 248056; }),
+                 "repeated special-token scan changed tokenization semantics");
 }
 
 int test_official_chat_template() {
@@ -787,21 +827,71 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                 "image frontend MRoPE positions are incorrect");
         }
     }
+    const std::span<const std::uint16_t> image_patches =
+        prepared_data.media_payloads.size() == 1 && prepared_data.media_payloads.front()
+            ? prepared_data.media_payloads.front()->span()
+            : std::span<const std::uint16_t>{};
     failures += check(
-        prepared_data.patches.size() == 16 * 1536 && prepared_data.prepare.raw_patches == 16 &&
+        image_patches.size() == 16 * 1536 && prepared_data.prepare.raw_patches == 16 &&
             prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable &&
             prepared_data.identity.rewrite_checkpoint &&
             prepared_data.identity.rewrite_checkpoint->kind ==
                 ninfer::targets::qwen3_6::RewriteCheckpointKind::TurnClosure &&
             prepared_data.identity.rewrite_checkpoint->frontier < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
-    if (prepared_data.patches.size() == 16 * 1536) {
-        failures += check(near(prepared_data.patches[0], -1.0F) &&
-                              near(prepared_data.patches[1], 1.0F / 127.5F - 1.0F) &&
-                              near(prepared_data.patches[256], -1.0F) &&
-                              near(prepared_data.patches[1536], 16.0F / 127.5F - 1.0F),
+    if (image_patches.size() == 16 * 1536) {
+        failures += check(image_patches[0] == bf16_bits(-1.0F) &&
+                              image_patches[1] == bf16_bits(1.0F / 127.5F - 1.0F) &&
+                              image_patches[256] == bf16_bits(-1.0F) &&
+                              image_patches[1536] == bf16_bits(16.0F / 127.5F - 1.0F),
                           "image frontend patch normalization/order is incorrect");
     }
+    return failures;
+}
+
+int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
+    constexpr std::size_t kMediaItems     = 17;
+    const std::vector<std::uint8_t> bytes = gradient_ppm();
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    for (std::size_t index = 0; index < kMediaItems; ++index) {
+        ninfer::OwnedMedia media;
+        media.kind        = ninfer::MediaKind::Image;
+        media.bytes       = bytes;
+        media.media_type  = "image/x-portable-pixmap";
+        media.source_name = "aggregate-" + std::to_string(index) + ".ppm";
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Media, .text = {}, .media = std::move(media)});
+    }
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    const auto prepared = frontend.prepare(std::move(input));
+    const auto& data    = FrontendFactory::inspect(prepared);
+    int failures        = check(data.prepare.media_items == kMediaItems &&
+                                    data.prepare.media_bytes == kMediaItems * bytes.size() &&
+                                    data.prepare.raw_patches == kMediaItems * 16 &&
+                                    data.prepare.vision_tokens == kMediaItems * 4 &&
+                                    data.vision_items.size() == kMediaItems,
+                                "frontend retained an item-count admission limit");
+
+    fi::ProcessorOptions options;
+    options.max_encoded_media_bytes = bytes.size() * 2 - 1;
+    auto cache = std::make_shared<fi::MediaPreprocessCache>(ninfer::kDefaultMediaCacheBytes,
+                                                            ninfer::kDefaultMediaLiveBytes);
+    fi::Processor processor(official_tokenizer(), thinking_toggle_template(), options,
+                            std::move(cache));
+    fi::ChatMessage internal_message;
+    internal_message.role = ninfer::ChatRole::User;
+    for (std::size_t index = 0; index < 2; ++index) {
+        internal_message.parts.push_back(
+            fi::ChatPart::image(fi::MediaData{.bytes       = bytes,
+                                              .media_type  = "image/x-portable-pixmap",
+                                              .source_name = "byte-budget.ppm"}));
+    }
+    failures += check(throws_processor_budget([&] {
+                          (void)processor.process(std::vector<fi::ChatMessage>{internal_message});
+                      }),
+                      "processor did not enforce the aggregate encoded-media byte budget");
     return failures;
 }
 
@@ -861,12 +951,16 @@ int test_video_prepare(const Frontend& frontend) {
                       item.token_spans.size() == 1 && item.token_spans.front().count == 4,
                   "video frontend temporal/grid/placeholder metadata is incorrect");
     }
-    failures +=
-        check(prepared_data.patches.size() == 16 * 1536 &&
-                  near(prepared_data.patches[0], prepared_data.patches[256]) &&
-                  prepared_data.prepare.raw_patches == 16 &&
-                  prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable,
-              "video frontend did not duplicate the odd temporal frame correctly");
+    const std::span<const std::uint16_t> video_patches =
+        prepared_data.media_payloads.size() == 1 && prepared_data.media_payloads.front()
+            ? prepared_data.media_payloads.front()->span()
+            : std::span<const std::uint16_t>{};
+    failures += check(
+        video_patches.size() == 16 * 1536 && video_patches[0] == video_patches[256] &&
+            prepared_data.prepare.raw_patches == 16 && prepared_data.prepare.vision_tokens == 4 &&
+            prepared_data.prepare.media_cache_misses == 1 &&
+            prepared_data.prepare.media_cache_hits == 0 && prepared_data.identity.reusable,
+        "video frontend did not duplicate the odd temporal frame correctly");
     return failures;
 }
 
@@ -1028,6 +1122,186 @@ int test_disabled_vision() {
     return failures;
 }
 
+int test_media_cache_reuses_immutable_payload() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    auto first              = frontend.prepare(image_input());
+    auto second             = frontend.prepare(image_input());
+    const auto& first_data  = FrontendFactory::inspect(first);
+    const auto& second_data = FrontendFactory::inspect(second);
+    int failures            = check(
+        first_data.prepare.media_cache_misses == 1 && first_data.prepare.media_cache_hits == 0 &&
+            first_data.prepare.built_patch_bytes == 16 * 1536 * sizeof(std::uint16_t),
+        "first media preparation did not publish one cache miss");
+    failures += check(
+        second_data.prepare.media_cache_hits == 1 && second_data.prepare.media_cache_misses == 0 &&
+            second_data.prepare.built_patch_bytes == 0 &&
+            second_data.prepare.reused_patch_bytes == 16 * 1536 * sizeof(std::uint16_t),
+        "second media preparation did not use the prepared-media cache");
+    failures +=
+        check(first_data.media_payloads.size() == 1 && second_data.media_payloads.size() == 1 &&
+                  first_data.media_payloads.front() == second_data.media_payloads.front(),
+              "cache hit did not share the immutable per-item patch payload");
+    const ninfer::MediaCacheSummary cache = frontend.media_cache_summary();
+    failures += check(cache.entries == 1 && cache.misses == 1 && cache.hits == 1 &&
+                          cache.retained_bytes == 16 * 1536 * sizeof(std::uint16_t) &&
+                          cache.live_bytes == cache.retained_bytes &&
+                          cache.preprocess_threads >= 1 && cache.preprocess_threads <= 16,
+                      "Frontend media-cache accounting does not describe the retained payload");
+    return failures;
+}
+
+int test_media_payload_outlives_frontend_cache() {
+    ninfer::targets::qwen3_6::PreparedPrompt survivor;
+    {
+        const Frontend frontend = FrontendFactory::create_component(resources());
+        survivor                = frontend.prepare(image_input());
+    }
+    const auto& data = FrontendFactory::inspect(survivor);
+    return check(data.media_payloads.size() == 1 && data.media_payloads.front() &&
+                     data.media_payloads.front()->patch_elements == 16 * 1536 &&
+                     near(bf16_value(data.media_payloads.front()->span().front()), -1.0F),
+                 "request-pinned media payload did not survive its Frontend cache owner");
+}
+
+int test_media_live_bytes_follow_last_payload_reference() {
+    fi::MediaPreprocessCache cache(0, 1ULL << 20, 1);
+    auto payload = cache.allocate_payload(1536, {});
+    int failures = check(cache.stats().live_bytes == 1536 * sizeof(std::uint16_t),
+                         "media live-byte account did not charge the allocated payload");
+    payload.reset();
+    failures += check(cache.stats().live_bytes == 0,
+                      "media live-byte account did not release the final payload reference");
+    return failures;
+}
+
+int test_media_cache_singleflight() {
+    auto cache = std::make_shared<fi::MediaPreprocessCache>(1ULL << 20, 2ULL << 20);
+    fi::MediaCacheKey key;
+    key.digest.front() = 0x5a;
+
+    std::promise<void> producer_started;
+    std::future<void> producer_started_future = producer_started.get_future();
+    std::promise<void> release_producer;
+    std::shared_future<void> release_future = release_producer.get_future().share();
+    std::atomic<int> builders{0};
+    std::array<fi::PreparedMedia, 2> results;
+    std::array<std::exception_ptr, 2> errors;
+    std::array<fi::MediaCacheRequestStats, 2> request_stats;
+
+    const auto builder = [&]() {
+        const int count = ++builders;
+        if (count == 1) { producer_started.set_value(); }
+        release_future.wait();
+        auto payload                    = cache->allocate_payload(1536, {});
+        payload->mutable_span().front() = 42;
+        fi::VisionItem item;
+        item.grid = {1, 1, 1};
+        return fi::PreparedMedia{std::move(item), std::move(payload)};
+    };
+    const auto run = [&](std::size_t index) {
+        try {
+            results[index] = cache->get_or_prepare(key, {}, builder, request_stats[index]);
+        } catch (...) { errors[index] = std::current_exception(); }
+    };
+
+    std::thread first(run, 0);
+    producer_started_future.wait();
+    std::thread second(run, 1);
+    const auto wait_limit = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (cache->stats().singleflight_waits == 0 &&
+           std::chrono::steady_clock::now() < wait_limit) {
+        std::this_thread::yield();
+    }
+    release_producer.set_value();
+    first.join();
+    second.join();
+
+    return check(!errors[0] && !errors[1] && builders == 1 && results[0].payload &&
+                     results[0].payload == results[1].payload &&
+                     cache->stats().singleflight_waits == 1,
+                 "concurrent identical media did not collapse into one preprocessing flight");
+}
+
+int test_media_cache_runs_independent_misses_in_parallel() {
+    auto cache = std::make_shared<fi::MediaPreprocessCache>(1ULL << 20, 2ULL << 20, 4);
+    std::array<fi::PendingMedia, 4> pending;
+    std::atomic<int> started{0};
+    std::atomic<int> active{0};
+    std::atomic<int> maximum_active{0};
+
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        fi::MediaCacheKey key;
+        key.digest.front() = static_cast<std::uint8_t>(index + 1);
+        pending[index]     = cache->begin_prepare(key, {}, [&, index] {
+            ++started;
+            const int now = ++active;
+            int maximum   = maximum_active.load();
+            while (now > maximum && !maximum_active.compare_exchange_weak(maximum, now)) {}
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (started.load() != static_cast<int>(pending.size()) &&
+                   std::chrono::steady_clock::now() < limit) {
+                std::this_thread::yield();
+            }
+            auto payload                    = cache->allocate_payload(1536, {});
+            payload->mutable_span().front() = static_cast<std::uint16_t>(index);
+            --active;
+            fi::VisionItem item;
+            item.grid = {1, 1, 1};
+            return fi::PreparedMedia{std::move(item), std::move(payload)};
+        });
+    }
+
+    fi::MediaCacheRequestStats request_stats;
+    std::array<fi::PreparedMedia, 4> results;
+    for (std::size_t index = 0; index < pending.size(); ++index) {
+        results[index] = cache->await(pending[index], {}, request_stats);
+    }
+    return check(started == 4 && maximum_active == 4 && request_stats.misses == 4 &&
+                     cache->stats().preprocess_threads == 4 && results.back().payload &&
+                     results.back().payload->span().front() == 3,
+                 "independent media misses did not use the bounded preprocessing pool");
+}
+
+int test_many_images_prepare_in_one_parallel_batch() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    for (int index = 0; index < 19; ++index) {
+        ninfer::MessagePart image;
+        image.kind               = ninfer::MessagePartKind::Media;
+        image.media.kind         = ninfer::MediaKind::Image;
+        image.media.bytes        = gradient_ppm();
+        image.media.bytes.back() = static_cast<std::uint8_t>(index);
+        image.media.media_type   = "image/x-portable-pixmap";
+        image.media.source_name  = "parallel-" + std::to_string(index) + ".ppm";
+        message.parts.push_back(std::move(image));
+    }
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    const auto prepared = frontend.prepare(std::move(input));
+    const auto& data    = FrontendFactory::inspect(prepared);
+    return check(data.vision_items.size() == 19 && data.media_payloads.size() == 19 &&
+                     data.prepare.media_cache_misses == 19 && data.prepare.raw_patches == 19 * 16 &&
+                     frontend.media_cache_summary().preprocess_threads > 1,
+                 "one request with 19 distinct images did not complete as a parallel media batch");
+}
+
+int test_media_preparation_cancellation() {
+    const Frontend frontend = FrontendFactory::create_component(resources());
+    ninfer::PreparationControl control{
+        .deadline     = {},
+        .cancellation = ninfer::CancellationView([] { return true; }),
+    };
+    try {
+        (void)frontend.prepare(image_input(), control);
+    } catch (const ninfer::RequestError& error) {
+        return check(error.kind() == ninfer::RequestErrorKind::Cancelled &&
+                         frontend.media_cache_summary().entries == 0,
+                     "cancelled media preparation published a cache entry");
+    }
+    return check(false, "cancelled media preparation completed successfully");
+}
+
 } // namespace
 
 int main() {
@@ -1035,12 +1309,14 @@ int main() {
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
     failures += test_official_tokenizer_merge();
+    failures += test_repeated_special_tokens_scan_linearly();
     failures += test_official_chat_template();
     failures += test_ordered_instruction_turns();
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
+    failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);
@@ -1049,6 +1325,13 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_reasoning_split(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
+    failures += test_media_cache_reuses_immutable_payload();
+    failures += test_media_payload_outlives_frontend_cache();
+    failures += test_media_live_bytes_follow_last_payload_reference();
+    failures += test_media_cache_singleflight();
+    failures += test_media_cache_runs_independent_misses_in_parallel();
+    failures += test_many_images_prepare_in_one_parallel_batch();
+    failures += test_media_preparation_cancellation();
     failures += test_disabled_vision();
     return failures == 0 ? 0 : 1;
 }

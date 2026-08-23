@@ -53,6 +53,13 @@ void validate_options(const EngineOptions& options) {
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
     }
+    if (options.enable_vision && options.media_live_bytes == 0) {
+        throw std::invalid_argument(
+            "Engine media_live_bytes must be nonzero when Vision is enabled");
+    }
+    if (options.media_preprocess_threads > 64) {
+        throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
+    }
 }
 
 artifact::LoadProgress artifact_progress(const LoadProgress& progress) {
@@ -109,7 +116,7 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
         sequence_plan.kv_capacity() != capacity_resolution.resolved_tokens) {
         throw std::logic_error("resolved KV capacity does not match the finalized target plan");
     }
-    auto loaded   = std::make_unique<Loaded>(std::move(model));
+    auto loaded   = std::make_unique<Loaded>(std::move(model), options);
     auto instance = std::make_unique<Instance>(std::move(loaded), capacity_resolution,
                                                std::move(sequence_plan), device);
     device.synchronize();
@@ -133,8 +140,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
 
 } // namespace
 
-LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model)
-    : model(std::move(stable_model)), frontend(Qwen3_6_27B::make_frontend(*model)) {}
+LoadedQwen3_6_27B::LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
+                                     const EngineOptions& options)
+    : model(std::move(stable_model)), frontend(Qwen3_6_27B::make_frontend(*model, options)) {}
 
 LoadedQwen3_6_27B::~LoadedQwen3_6_27B() = default;
 
@@ -150,8 +158,8 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
 LoadedQwen3_6_35BA3B::LoadedQwen3_6_35BA3B(
-    std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model)
-    : model(std::move(stable_model)), frontend(Qwen3_6_35BA3B::make_frontend(*model)) {}
+    std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model, const EngineOptions& options)
+    : model(std::move(stable_model)), frontend(Qwen3_6_35BA3B::make_frontend(*model, options)) {}
 
 LoadedQwen3_6_35BA3B::~LoadedQwen3_6_35BA3B() = default;
 

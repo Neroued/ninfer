@@ -29,6 +29,7 @@ constexpr std::uint8_t kOutputPoisonByte  = 0xff;
 constexpr std::size_t kOutputScanWords    = 1U << 20;
 constexpr int kOracleTBlock               = 8;
 constexpr double kBf16UnitRoundoff        = 1.0 / 256.0;
+constexpr double kA8QuantizationAllowance = 0.04;
 constexpr double kA4QuantizationAllowance = 0.16;
 
 // The criterion belongs to the activation compute path, not to a private kernel, schedule, or
@@ -38,6 +39,8 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     switch (activation_compute) {
     case ActivationCompute::A16:
         return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
+    case ActivationCompute::A8:
+        return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
     case ActivationCompute::A4:
         return {kA4QuantizationAllowance, kBf16UnitRoundoff, kA4QuantizationAllowance};
     }
@@ -236,6 +239,10 @@ quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
     return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
 }
 
+quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
+}
+
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,
                           std::int32_t n, std::int32_t k, std::int32_t t) {
     if (weight == nullptr || activation == nullptr || output == nullptr || n <= 0 || k <= 0 ||
@@ -322,6 +329,15 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
         const std::string case_label = std::string(label) + " [" + std::to_string(shape.n) + "," +
                                        std::to_string(shape.k) +
                                        "] T=" + std::to_string(invocation.t);
+#ifdef NINFER_VOLTA_BUILD
+        // A4 needs cvt.e2m1x2 (Blackwell) and A8 needs mma.sync.kind::f8f6f4 (sm_89+); both are
+        // __trap() here, and an abort in one case takes every later case's result with it. The
+        // A16 invocations in the same list are the ones this port can be held to.
+        if (invocation.policy != ops::LinearPolicy::A16Only) {
+            std::cout << "SKIP " << case_label << ": no Volta route for A4/A8 activation compute\n";
+            continue;
+        }
+#endif
         GuardedOutput output(checked_elements(shape.n, invocation.t, "guarded output"));
         Tensor input(device_activation.p, DType::BF16, {shape.k, invocation.t});
         Tensor destination(output.data(), DType::BF16, {shape.n, invocation.t});

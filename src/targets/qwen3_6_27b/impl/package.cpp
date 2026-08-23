@@ -84,13 +84,16 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
     if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
-        return WeightsProfile::GroupwiseInt;
+        return WeightsProfile::Qwen36GroupwiseInt;
     }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "groupwise-int") {
-        return WeightsProfile::GroupwiseIntW8Endpoints;
+        return WeightsProfile::Qwen38GroupwiseInt;
     }
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
-        return WeightsProfile::Nvfp4;
+        return WeightsProfile::Qwen36Nvfp4;
+    }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
+        return WeightsProfile::Qwen38Nvfp4;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
@@ -112,10 +115,16 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 
-Package::Frontend Package::make_frontend(const LoadedModel& model) {
+Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return qwen3_6::make_frontend(model.impl_->data.frontend,
-                                  model.impl_->data.runtime.features.vision);
+                                  qwen3_6::FrontendOptions{
+                                      .vision_enabled = model.impl_->data.runtime.features.vision,
+                                      .max_context    = options.max_context,
+                                      .media_cache_bytes        = options.media_cache_bytes,
+                                      .media_live_bytes         = options.media_live_bytes,
+                                      .media_preprocess_threads = options.media_preprocess_threads,
+                                  });
 }
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,

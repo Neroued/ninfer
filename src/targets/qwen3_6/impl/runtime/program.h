@@ -191,7 +191,6 @@ struct RequestControl {
         std::uint32_t prompt_tokens      = 0;
         std::uint32_t initial_mtp_extent = 0;
         double elapsed_seconds           = 0.0;
-        bool host_input_consumed_pending = false;
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;

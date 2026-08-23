@@ -132,6 +132,13 @@ struct Nvfp4W4a4TmaSharedStorage {
     alignas(8) std::uint64_t empty[Schedule::kStages];
 };
 
+// This whole file is warp-specialized Hopper+/Blackwell code (TMA, mbarrier, setmaxnreg) --
+// permanently out of scope for Volta the same way nvfp4_codec.cuh's e2m1 hardware
+// conversion is (no relevant hardware, not "no SIMT replacement yet"). See
+// the V100 implementation. Guarded per-helper here, and the kernel body below, purely so
+// ptxas doesn't reject the PTX at compile time.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+
 __device__ __forceinline__ void nvfp4_mbarrier_init(std::uint64_t* barrier,
                                                     std::uint32_t arrivals) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
@@ -179,11 +186,31 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
                  : "memory");
 }
 
+#else // __CUDA_ARCH__ < 900
+
+__device__ __forceinline__ void nvfp4_mbarrier_init(std::uint64_t*, std::uint32_t) { __trap(); }
+
+__device__ __forceinline__ void nvfp4_mbarrier_wait(std::uint64_t*, std::uint32_t) { __trap(); }
+
+__device__ __forceinline__ void nvfp4_mbarrier_arrive(std::uint64_t*) { __trap(); }
+
+__device__ __forceinline__ void nvfp4_mbarrier_arrive_expect_tx(std::uint64_t*, std::uint32_t) {
+    __trap();
+}
+
+__device__ __forceinline__ void nvfp4_tma_load_2d(void*, const CUtensorMap*, std::int32_t,
+                                                  std::int32_t, std::uint64_t*) {
+    __trap();
+}
+
+#endif // __CUDA_ARCH__ >= 900
+
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
     const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
 
@@ -366,6 +393,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
         output.store_vector(row_begin + row_vector * 8, token, values);
     }
+#else  // __CUDA_ARCH__ < 900
+    (void)descriptors;
+    (void)alpha;
+    (void)epilogue;
+    (void)output;
+    __trap();
+#endif // __CUDA_ARCH__ >= 900
 }
 
 } // namespace ninfer::ops::detail

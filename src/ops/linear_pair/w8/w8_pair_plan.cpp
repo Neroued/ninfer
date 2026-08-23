@@ -21,12 +21,33 @@ struct W8PairRouteSpec {
     W8PairScheduleId schedule;
 };
 
+#ifdef NINFER_VOLTA_BUILD
+// DualMmaR32C128 needs Ampere+ mma/ldmatrix, trap-stubbed on sm_70. launch_tiled (below) already
+// wraps every schedule -- TwoSimtR8C8 included -- in for_each_token_slice, tiling over any T in
+// 8-column chunks, so the {57,kAnyCols} split above is a routing choice, not a kernel limit.
+// See the V100 performance summary.
+constexpr std::array<W8PairRouteSpec, 2> kK5120Routes{{
+    {1, 4, W8PairScheduleId::TwoSimtR8C4},
+    {5, kAnyCols, W8PairScheduleId::TwoSimtR8C8},
+}};
+#else
 constexpr std::array<W8PairRouteSpec, 3> kK5120Routes{{
     {1, 4, W8PairScheduleId::TwoSimtR8C4},
     {5, 56, W8PairScheduleId::TwoSimtR8C8},
     {57, kAnyCols, W8PairScheduleId::DualMmaR32C128},
 }};
+#endif
 
+#ifdef NINFER_VOLTA_BUILD
+// DFlash's K/V row views use the same W8G32 RowSplit contract as the dense pair.
+// The two SIMT launchers are generic in K and tile arbitrary T through launch_tiled;
+// only the tuned Ampere+ route table made the k=2048 shape tensor-core-only past T=1.
+constexpr std::array<W8PairRouteSpec, 3> kK2048Routes{{
+    {1, 1, W8PairScheduleId::DualDecodeR4},
+    {2, 4, W8PairScheduleId::TwoSimtR8C4},
+    {5, kAnyCols, W8PairScheduleId::TwoSimtR8C8},
+}};
+#else
 constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
     {1, 1, W8PairScheduleId::DualDecodeR4},
     {2, 32, W8PairScheduleId::DualSplitKMmaExactT},
@@ -66,6 +87,7 @@ constexpr std::array<W8PairRouteSpec, 37> kK2048Routes{{
     {2209, 2270, W8PairScheduleId::ExactConcatMmaR96C96},
     {2271, kAnyCols, W8PairScheduleId::ConcatMmaR64C128},
 }};
+#endif
 
 template <std::size_t N>
 constexpr bool routes_are_closed(const std::array<W8PairRouteSpec, N>& routes) noexcept {

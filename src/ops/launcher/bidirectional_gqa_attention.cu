@@ -2,6 +2,9 @@
 
 #include "core/device.h"
 #include "ops/kernel/bidirectional_gqa_attention.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/kernel/bidirectional_gqa_attention_volta.cuh"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -104,6 +107,61 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
             plan.split_capacity > kBidirectionalGqaMaxSplit) {
             throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
         }
+#ifdef NINFER_VOLTA_BUILD
+        const auto launch_volta = [&]<int KeyBlock, bool Direct>() {
+            const dim3 partial_grid(kBidirectionalGqaQHeads * Tokens, plan.split_capacity,
+                                    q.ne[3]);
+            noncausal_gqa_volta_partial_kernel<false, Tokens, KeyBlock, Direct>
+                <<<partial_grid, kBidirectionalGqaHeadDim, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(query_k.data),
+                    static_cast<const __nv_bfloat16*>(query_v.data),
+                    static_cast<const std::int32_t*>(context_lengths.data),
+                    static_cast<const std::int32_t*>(valid_columns.data),
+                    static_cast<const std::int32_t*>(table_rows.data),
+                    static_cast<const __nv_bfloat16*>(context.k_pages.data),
+                    static_cast<const __nv_bfloat16*>(context.v_pages.data),
+                    static_cast<const std::int32_t*>(context.block_tables.data),
+                    context.k_pages.ne[2], context.block_tables.ne[0],
+                    context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity, scale,
+                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                    static_cast<__nv_bfloat16*>(out.data));
+            CUDA_CHECK(cudaGetLastError());
+            if constexpr (!Direct) {
+                const dim3 reduce_grid(kBidirectionalGqaQHeads, Tokens, q.ne[3]);
+                bidirectional_gqa_reduce_kernel<Tokens, KeyBlock>
+                    <<<reduce_grid, kBidirectionalGqaHeadDim, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(partial_acc.data),
+                        static_cast<const float*>(partial_m.data),
+                        static_cast<const float*>(partial_l.data),
+                        static_cast<const std::int32_t*>(context_lengths.data),
+                        static_cast<const std::int32_t*>(valid_columns.data),
+                        context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity,
+                        static_cast<__nv_bfloat16*>(out.data));
+                CUDA_CHECK(cudaGetLastError());
+            }
+        };
+        if (direct) {
+            if (plan.key_block != 32 || plan.split_capacity != 1) {
+                throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
+            }
+            launch_volta.template operator()<32, true>();
+            return;
+        }
+        if (plan.route != BidirectionalGqaRoute::SplitKv) {
+            throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
+        }
+        if (plan.key_block == 32) {
+            launch_volta.template operator()<32, false>();
+            return;
+        }
+        if (plan.key_block == 64) {
+            launch_volta.template operator()<64, false>();
+            return;
+        }
+        throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
+#else
         if (direct) {
             if (plan.key_block != 32 || plan.split_capacity != 1) {
                 throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
@@ -179,6 +237,7 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
             }
         }
         throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
+#endif
     });
 }
 

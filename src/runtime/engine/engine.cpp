@@ -36,13 +36,13 @@ std::string context_capacity_error(std::uint32_t prompt_tokens, std::uint32_t ma
 
 class PreparedPrompt::Impl {
 public:
-    Impl(PromptSummary prompt_summary, double frontend_seconds, SamplingMode mode,
+    Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
          targets::qwen3_6::PreparedPrompt prepared)
-        : summary(std::move(prompt_summary)), prepare_seconds(frontend_seconds),
-          sampling_mode(mode), value(std::move(prepared)) {}
+        : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
+          value(std::move(prepared)) {}
 
     PromptSummary summary;
-    double prepare_seconds     = 0.0;
+    PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
     targets::qwen3_6::PreparedPrompt value;
 };
@@ -57,6 +57,11 @@ PreparedPrompt::PreparedPrompt(std::unique_ptr<Impl> impl) noexcept : impl_(std:
 const PromptSummary& PreparedPrompt::summary() const noexcept {
     static const PromptSummary empty;
     return impl_ != nullptr ? impl_->summary : empty;
+}
+
+const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept {
+    static const PromptPreparationStats empty;
+    return impl_ != nullptr ? impl_->prepare : empty;
 }
 
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
@@ -170,23 +175,23 @@ Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;
 Engine& Engine::operator=(Engine&&) noexcept = default;
 
-PreparedPrompt Engine::prepare(PromptInput input) const {
+PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     const SamplingMode sampling_mode =
         input.options.enable_thinking ? SamplingMode::Thinking : SamplingMode::NonThinking;
     return std::visit(
         [&](const auto& target_ptr) -> PreparedPrompt {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input));
+            auto prepared      = target_ptr->loaded->frontend.prepare(std::move(input), control);
             PromptSummary info = prepared.summary();
             if (info.prompt_tokens > target_ptr->capacity) {
                 throw RequestError(
                     RequestErrorKind::ContextLengthExceeded,
                     context_capacity_error(info.prompt_tokens, target_ptr->capacity));
             }
-            const double seconds = prepared.prepare_seconds();
+            const PromptPreparationStats preparation = prepared.preparation_stats();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, seconds, sampling_mode, std::move(prepared)));
+                info, preparation, sampling_mode, std::move(prepared)));
         },
         impl_->active);
 }
@@ -205,19 +210,19 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
                     RequestErrorKind::ContextLengthExceeded,
                     context_capacity_error(info.prompt_tokens, target_ptr->capacity));
             }
-            const double seconds = prepared.prepare_seconds();
+            const PromptPreparationStats preparation = prepared.preparation_stats();
             return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
-                info, seconds, SamplingMode::Thinking, std::move(prepared)));
+                info, preparation, SamplingMode::Thinking, std::move(prepared)));
         },
         impl_->active);
 }
 
-std::uint32_t Engine::count_tokens(PromptInput input) const {
+std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(
         [&](const auto& target_ptr) {
             if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
-            return target_ptr->loaded->frontend.count_tokens(std::move(input));
+            return target_ptr->loaded->frontend.count_tokens(std::move(input), control);
         },
         impl_->active);
 }
@@ -238,22 +243,9 @@ ModelSamplingDefaults Engine::sampling_defaults() const {
 }
 
 GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
-                                std::chrono::steady_clock::time_point pending_deadline,
-                                HostInputLease host_input) {
+                                std::chrono::steady_clock::time_point pending_deadline) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
-
-    struct HostInputGuard {
-        PreparedPrompt* prompt;
-        HostInputLease* lease;
-
-        ~HostInputGuard() {
-            if (static_cast<bool>(*lease)) {
-                prompt->impl_.reset();
-                lease->reset();
-            }
-        }
-    } host_input_guard{&prompt, &host_input};
 
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
@@ -265,7 +257,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             RequestErrorKind::ContextLengthExceeded,
             context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
     }
-    const double prepare_seconds = prompt.impl_->prepare_seconds;
+    const double prepare_seconds = prompt.impl_->prepare.seconds;
     if (resolved_options.execution.requested_output_tokens == 0) {
         struct ImmediateSubmission {
             GenerationResult result;
@@ -281,7 +273,6 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
         immediate.result.timings.prepare_seconds = prepare_seconds;
         immediate.result.timings.total_seconds   = prepare_seconds;
         prompt.impl_.reset();
-        host_input.reset();
         return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
             impl_, std::move(immediate), resolved_sampling));
     }
@@ -294,7 +285,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else {
                 auto submission = executor->submit(std::move(prompt.impl_->value), prompt_summary,
                                                    prepare_seconds, std::move(resolved_options),
-                                                   pending_deadline, std::move(host_input));
+                                                   pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -329,6 +320,16 @@ MemorySummary Engine::memory_summary() const {
             }
         },
         impl_->executor);
+}
+
+MediaCacheSummary Engine::media_cache_summary() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& target_ptr) {
+            if (target_ptr == nullptr) { throw std::logic_error("Engine target is not active"); }
+            return target_ptr->loaded->frontend.media_cache_summary();
+        },
+        impl_->active);
 }
 
 RuntimeStats Engine::runtime_stats() const {

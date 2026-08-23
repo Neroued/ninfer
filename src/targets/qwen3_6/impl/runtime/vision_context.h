@@ -20,7 +20,7 @@
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
 struct VisionItemView {
-    std::span<const float> patches;
+    std::span<const std::uint16_t> patches;
     const qwen3_6::VisionItemControl* control = nullptr;
 };
 
@@ -96,7 +96,7 @@ public:
                          const VisionPrefillPlan& plan, runtime::TransientRegion transient);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
-    [[nodiscard]] bool release_consumed_media_payload() noexcept;
+    void release_encoded_media_payloads() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
 
 private:
@@ -107,9 +107,7 @@ private:
     runtime::TransientRegion transient_;
     VisionContext context_;
     std::optional<std::uint32_t> active_item_;
-    std::uint32_t final_item_ = 0;
-    bool final_item_encoded_  = false;
-    bool payload_released_    = false;
+    std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
 };
 

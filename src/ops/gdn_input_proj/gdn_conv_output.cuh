@@ -9,28 +9,30 @@
 
 namespace ninfer::ops::detail {
 
-inline constexpr std::int32_t kNvfp4GdnQueryRows = 2048;
-inline constexpr std::int32_t kNvfp4GdnKeyRows   = 2048;
-inline constexpr std::int32_t kNvfp4GdnValueRows = 6144;
-inline constexpr std::int32_t kNvfp4GdnChannels =
-    kNvfp4GdnQueryRows + kNvfp4GdnKeyRows + kNvfp4GdnValueRows;
-inline constexpr std::int32_t kNvfp4GdnZRows      = 6144;
-inline constexpr std::int32_t kNvfp4GdnParentRows = kNvfp4GdnChannels + kNvfp4GdnZRows;
+inline constexpr std::int32_t kGdnQueryRows  = 2048;
+inline constexpr std::int32_t kGdnKeyRows    = 2048;
+inline constexpr std::int32_t kGdnValueRows  = 6144;
+inline constexpr std::int32_t kGdnChannels   = kGdnQueryRows + kGdnKeyRows + kGdnValueRows;
+inline constexpr std::int32_t kGdnZRows      = 6144;
+inline constexpr std::int32_t kGdnParentRows = kGdnChannels + kGdnZRows;
 
+// Format-neutral output policy for a single-parent [query,key,value,z] contraction. The
+// contraction owns the represented projected values; this adapter owns only the final GDN
+// convolution/state semantics and the physical split between Q/K/V and Z.
 template <int Tokens, class Publish>
-struct Nvfp4GdnConvOutput {
+struct GdnConvOutput {
     GdnConvEpilogue<Publish> conv;
     __nv_bfloat16* z;
 
     __device__ __forceinline__ void store_row(std::int32_t parent_row,
                                               const float (&projected)[Tokens]) const {
-        if (parent_row < kNvfp4GdnChannels) {
+        if (parent_row < kGdnChannels) {
             conv.store(parent_row, projected);
             return;
         }
 #pragma unroll
         for (int token = 0; token < Tokens; ++token) {
-            z[static_cast<std::int64_t>(token) * kNvfp4GdnZRows + parent_row - kNvfp4GdnChannels] =
+            z[static_cast<std::int64_t>(token) * kGdnZRows + parent_row - kGdnChannels] =
                 __float2bfloat16_rn(projected[token]);
         }
     }
@@ -45,10 +47,10 @@ struct Nvfp4GdnConvOutput {
 };
 
 template <int Tokens, class Publish>
-Nvfp4GdnConvOutput<Tokens, Publish>
-make_nvfp4_gdn_conv_output(const Tensor& conv_weight, const Tensor& conv_states,
-                           const Tensor& valid_columns, const Tensor& initial_slot, Tensor& query,
-                           Tensor& key, Tensor& value, Tensor& z, Publish publish) {
+GdnConvOutput<Tokens, Publish>
+make_gdn_conv_output(const Tensor& conv_weight, const Tensor& conv_states,
+                     const Tensor& valid_columns, const Tensor& initial_slot, Tensor& query,
+                     Tensor& key, Tensor& value, Tensor& z, Publish publish) {
     return {
         {
             static_cast<const __nv_bfloat16*>(conv_weight.data),
@@ -59,10 +61,10 @@ make_nvfp4_gdn_conv_output(const Tensor& conv_weight, const Tensor& conv_states,
             static_cast<__nv_bfloat16*>(query.data),
             static_cast<__nv_bfloat16*>(key.data),
             static_cast<__nv_bfloat16*>(value.data),
-            kNvfp4GdnChannels,
-            kNvfp4GdnQueryRows,
-            kNvfp4GdnKeyRows,
-            kNvfp4GdnValueRows,
+            kGdnChannels,
+            kGdnQueryRows,
+            kGdnKeyRows,
+            kGdnValueRows,
             0,
             Tokens,
             0,
@@ -71,5 +73,7 @@ make_nvfp4_gdn_conv_output(const Tensor& conv_weight, const Tensor& conv_states,
         static_cast<__nv_bfloat16*>(z.data),
     };
 }
+
+static_assert(kGdnParentRows == 16384);
 
 } // namespace ninfer::ops::detail

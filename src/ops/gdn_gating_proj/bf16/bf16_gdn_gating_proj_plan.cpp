@@ -26,6 +26,17 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
+#ifdef NINFER_VOLTA_BUILD
+// Volta build: the MmaCooperative*/MmaUnsplit schedules below route through
+// bf16_gdn_gating_proj_gemm_mma_kernel, which is trap-stubbed on sm_70 (Ampere+ mma/ldmatrix).
+// SmallTSplit10 (ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu) is a plain SIMT
+// dot-product kernel that tiles over blockIdx.z in groups of 8 tokens, so it already handles
+// arbitrary T with no new kernel needed -- see the V100 performance summary.
+constexpr std::array<RouteSpec, 2> k27Routes{{
+    {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
+    {{2, kAnyCols}, Bf16GdnGatingScheduleId::SmallTSplit10},
+}};
+#else
 constexpr std::array<RouteSpec, 6> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
     {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
@@ -37,7 +48,19 @@ constexpr std::array<RouteSpec, 6> k27Routes{{
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
+#endif
 
+#ifdef NINFER_VOLTA_BUILD
+// Same story as k27Routes above, for the 35B-A3B geometry: every Mma* schedule
+// routes through the trap-stubbed bf16_gdn_gating_proj_gemm_mma_kernel. Unlike
+// the 27B geometry, GemvPairedRows and SmallTSplit10 are not legal here (see
+// candidate_is_legal), so the SIMT sibling is SimtWarpRowC8 -- a warp-per-row
+// dot product, legal to 8*65535 columns, which is far beyond any context this
+// engine serves. Without this, a3b traps on its first GDN layer.
+constexpr std::array<RouteSpec, 1> k35Routes{{
+    {{1, kAnyCols}, Bf16GdnGatingScheduleId::SimtWarpRowC8},
+}};
+#else
 constexpr std::array<RouteSpec, 5> k35Routes{{
     // The same progression keeps the long-range cooperative routes near 256 CTAs.
     {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
@@ -46,6 +69,7 @@ constexpr std::array<RouteSpec, 5> k35Routes{{
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
+#endif // NINFER_VOLTA_BUILD
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
@@ -148,7 +172,11 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         case Bf16GdnGatingScheduleId::GemvPairedRows:
             return problem.cols == 1;
         case Bf16GdnGatingScheduleId::SmallTSplit10:
+#ifdef NINFER_VOLTA_BUILD
+            return problem.cols >= 2;
+#else
             return problem.cols >= 2 && problem.cols <= 8;
+#endif
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
@@ -383,7 +411,17 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
-    if (is_35(problem) && problem.cols <= 16) {
+    // The fused norm+gating schedule launches
+    // bf16_gdn_norm_gating_proj_35_mma_split32_launch directly, bypassing the
+    // route table above, so the Volta k35Routes entry does not protect it. Its
+    // Composed alternative is the same computation as rmsnorm + the routed gating
+    // projection, which does go through the table.
+#ifdef NINFER_VOLTA_BUILD
+    constexpr bool fused_norm_gating_available = false;
+#else
+    constexpr bool fused_norm_gating_available = true;
+#endif // NINFER_VOLTA_BUILD
+    if (fused_norm_gating_available && is_35(problem) && problem.cols <= 16) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;

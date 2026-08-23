@@ -208,6 +208,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     Nvfp4W4a4MaterializedActivation activation, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales, std::int32_t tokens, float alpha,
     Epilogue epilogue, OutputPolicy output, RowPolicy row_policy = {}) {
+// mma_bf16/ldmatrix (mma.cuh) already trap below sm_80, but this kernel's
+// __shared__ Nvfp4W4a4SharedStorage<Schedule> below is large enough at several of the
+// Schedule instantiations this port's callers use that nvlink rejects it against Volta's
+// 48KB static-shared cap -- a link-time failure independent of whether the mma-using
+// code path is ever reached (nvfp4 is permanently out of scope regardless -- no FP4
+// hardware on Volta -- see the V100 performance summary). Same fix as
+// w8_rowsplit_gemm_medium_t_splitk.cuh: the whole body needs to be behind the guard,
+// not just the mma calls within it.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(!PairRows || (Schedule::kBlockN % 2) == 0);
@@ -382,6 +391,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             }
         }
     }
+#else  // __CUDA_ARCH__ < 800
+    (void)activation;
+    (void)weight_codes;
+    (void)weight_scales;
+    (void)tokens;
+    (void)alpha;
+    (void)epilogue;
+    (void)output;
+    (void)row_policy;
+    __trap();
+#endif // __CUDA_ARCH__ >= 800
 }
 
 template <class Geometry, int Threads = 256>

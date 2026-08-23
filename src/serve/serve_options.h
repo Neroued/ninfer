@@ -34,6 +34,9 @@ struct ServeOptions {
     std::uint32_t prefill_chunk            = 1024;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
+    std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
+    std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
+    std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;

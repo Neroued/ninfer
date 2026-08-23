@@ -37,6 +37,10 @@ int main() {
                       "request JSONL logging is not disabled by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
+    failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
+                          defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
+                          defaults.media_preprocess_threads == 0,
+                      "media preparation resource defaults mismatch");
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
@@ -90,10 +94,29 @@ int main() {
     } catch (const std::invalid_argument&) { implicit_backend_rejected = true; }
     failures += check(implicit_backend_rejected, "--draft-tokens selected a backend implicitly");
 
-    const ServeOptions configured = parse(
-        {"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--vision", "--max-concurrency", "4",
-         "--max-pending-requests", "12", "--pending-timeout-ms", "2500", "--max-context", "4096",
-         "--kv-capacity", "8192", "--log-stats-interval-ms", "0", "--preserve-thinking"});
+    const ServeOptions configured = parse({"ninfer-serve",
+                                           "model.ninfer",
+                                           "--no-prefix-reuse",
+                                           "--vision",
+                                           "--max-concurrency",
+                                           "4",
+                                           "--max-pending-requests",
+                                           "12",
+                                           "--pending-timeout-ms",
+                                           "2500",
+                                           "--max-context",
+                                           "4096",
+                                           "--kv-capacity",
+                                           "8192",
+                                           "--log-stats-interval-ms",
+                                           "0",
+                                           "--preserve-thinking",
+                                           "--media-cache-mib",
+                                           "256",
+                                           "--media-live-mib",
+                                           "512",
+                                           "--media-preprocess-threads",
+                                           "6"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
@@ -111,6 +134,10 @@ int main() {
                       "--pending-timeout-ms did not reach serving options");
     failures += check(configured.log_stats_interval_ms == 0,
                       "--log-stats-interval-ms did not disable periodic reporting");
+    failures += check(configured.media_cache_bytes == (256ULL << 20) &&
+                          configured.media_live_bytes == (512ULL << 20) &&
+                          configured.media_preprocess_threads == 6,
+                      "media preparation limits did not reach serving options");
 
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
@@ -167,6 +194,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");
+    failures += check(serve_usage_text("ninfer-serve").find("--media-preprocess-threads") !=
+                          std::string::npos,
+                      "serve help omits media preparation controls");
     failures += check(serve_usage_text("ninfer-serve").find("--kv-capacity") != std::string::npos,
                       "serve help omits --kv-capacity");
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=

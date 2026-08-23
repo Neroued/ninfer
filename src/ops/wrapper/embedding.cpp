@@ -2,6 +2,7 @@
 #include "ninfer/ops/embedding.h"
 
 #include "ops/common/math.h"
+#include "ops/linear/fp8/fp8_format.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
 #include "core/weight.h"
 
@@ -167,6 +168,19 @@ void require_w8_metadata(const Weight& table, const Tensor& out) {
     }
 }
 
+void require_fp8_metadata(const Weight& table, const Tensor& out) {
+    constexpr std::int32_t kVocabulary = 248320;
+    constexpr std::int32_t kHidden     = 5120;
+    if (table.n != kVocabulary || table.k != kHidden || out.ne[0] != kHidden) {
+        throw std::invalid_argument("embedding: unsupported FP8 table shape");
+    }
+    if ((reinterpret_cast<std::uintptr_t>(out.data) &
+         (static_cast<std::uintptr_t>(alignof(std::uint32_t)) - 1)) != 0) {
+        throw std::invalid_argument("embedding: FP8 output must be 4-byte aligned");
+    }
+    (void)detail::validate_fp8_weight(table, "embedding");
+}
+
 bool is_empty_T(const Tensor& ids, const Tensor& out) { return ids.ne[0] == 0 || out.ne[1] == 0; }
 
 void require_non_empty_tensors(const Tensor& ids, const Tensor& out) {
@@ -211,6 +225,12 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         if (is_empty_T(ids, out)) { return; }
         require_non_empty_tensors(ids, out);
         detail::embed_gather_w8_launch(ids, table, out, stream);
+        break;
+    case QType::FP8_E4M3FN_ROW_BF16S:
+        require_fp8_metadata(table, out);
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::embed_gather_fp8_launch(ids, table, out, stream);
         break;
     default:
         throw std::invalid_argument("embedding: unsupported table qtype");

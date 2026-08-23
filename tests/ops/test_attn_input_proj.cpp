@@ -22,9 +22,14 @@ namespace {
 
 // This criterion belongs to the complete A16 attention-input-projection Op.
 constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
+// FP8 A16 reuses the qualified Linear decode arithmetic profile rather than the other A16
+// attention-input implementations' reduction profile.
+constexpr ReductionCriterion kFp8AttnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+constexpr ReductionCriterion kAttnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
 constexpr ReductionCriterion kAttnInputProjA4Tolerance{0.16, 1.0 / 256.0, 0.16};
 // Retain the original seven grid points while stabilizing the distribution-level A4 criterion.
 constexpr std::int32_t kA4SampleRows = 31;
+constexpr std::int32_t kA8SampleRows = 31;
 
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
                   const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,
@@ -60,7 +65,9 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value
     Tensor g = gate.tensor();
     Tensor k = key.tensor();
     Tensor v = value.tensor();
-    ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, nullptr);
+    const std::size_t capacity = ops::q4_q5_attn_input_proj_workspace_capacity_bytes(tokens, tokens);
+    DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+    ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, workspace, nullptr);
     cuda_synchronize();
 
     const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
@@ -88,7 +95,8 @@ int run_q4_q5() {
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, kParent, kHidden, 107U));
 
     int failures = 0;
-    for (const std::int32_t tokens : {1, 2, 16, 17, 21, 48}) {
+    // 24 and 32 are the C4/C8 MTP operating points, and 12 is the fused route's lower edge.
+    for (const std::int32_t tokens : {1, 2, 12, 16, 17, 21, 24, 32, 48}) {
         failures += run_q4_q5_case(query_key, gate_value, tokens);
     }
     return failures;
@@ -166,6 +174,12 @@ int verify_direct_output_sampled(std::string_view label, const GuardedBf16Tensor
     return failures;
 }
 
+// Two families have no Volta implementation and abort the process rather than run wrong PTX:
+// the BF16 target route reaches ops/common/mma.cuh's ldmatrix helpers, whose sub-sm_75 branch is a
+// __trap(), and NVFP4 needs Blackwell-only cvt.e2m1x2. Both used to run before the W8 cases, so a
+// Volta build lost all W8 coverage in this binary to an abort in a route Volta was never going to
+// have. Skipped here so the Q4/Q5 and W8 assertions actually report.
+#ifndef NINFER_VOLTA_BUILD
 int run_bf16_target_case(DeviceWeight& parent, std::int32_t tokens) {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQRows       = 6144;
@@ -305,6 +319,100 @@ int run_nvfp4_target() {
     failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
     return failures;
 }
+#endif // NINFER_VOLTA_BUILD
+
+int run_fp8_target_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy) {
+#ifdef NINFER_VOLTA_BUILD
+    // A8 activation compute needs mma.sync.kind::f8f6f4 (sm_89+), which traps here and
+    // aborts the binary. The A16 cases in the same suite are what this port is held to.
+    if (policy != ops::LinearPolicy::A16Only) { return 0; }
+#endif
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kQRows  = 6144;
+    constexpr std::int32_t kKvRows = 1024;
+    constexpr std::int32_t kRows   = 14336;
+    const std::vector<float> activation =
+        make_bf16_activation(kHidden, tokens, 353U + static_cast<std::uint32_t>(tokens));
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+
+    GuardedBf16Tensor query(kQRows, tokens);
+    GuardedBf16Tensor gate(kQRows, tokens);
+    GuardedBf16Tensor key(kKvRows, tokens);
+    GuardedBf16Tensor value(kKvRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor q = query.tensor();
+    Tensor g = gate.tensor();
+    Tensor k = key.tensor();
+    Tensor v = value.tensor();
+    if (policy == ops::LinearPolicy::A16Only && tokens < 33) {
+        ops::attn_input_proj(x, parent.view(), q, g, k, v, nullptr);
+    } else {
+        const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, tokens, tokens);
+        DeviceArena workspace(std::max<std::size_t>(capacity, 256));
+        ops::attn_input_proj(x, parent.view(), q, g, k, v, policy, workspace, nullptr);
+    }
+    cuda_synchronize();
+
+    constexpr std::int32_t kKeyBegin   = kQRows;
+    constexpr std::int32_t kGateBegin  = kKeyBegin + kKvRows;
+    constexpr std::int32_t kValueBegin = kGateBegin + kQRows;
+    const bool a8                      = policy == ops::LinearPolicy::AllowA8 && tokens >= 11;
+    const ReductionCriterion& criterion =
+        a8 ? kAttnInputProjA8Tolerance : kFp8AttnInputProjA16Tolerance;
+    const std::int32_t sample_count = a8 ? kA8SampleRows : 7;
+    const std::string suffix =
+        std::string(" FP8 ") + (a8 ? "A8" : "A16") + " T=" + std::to_string(tokens);
+    int failures = 0;
+    failures += verify_output("attn q" + suffix, query, parent.host, 0, kQRows, activation, kHidden,
+                              tokens, criterion, sample_count);
+    failures += verify_output("attn k" + suffix, key, parent.host, kKeyBegin, kKvRows, activation,
+                              kHidden, tokens, criterion, sample_count);
+    failures += verify_output("attn gate" + suffix, gate, parent.host, kGateBegin, kQRows,
+                              activation, kHidden, tokens, criterion, sample_count);
+    failures += verify_output("attn value" + suffix, value, parent.host, kValueBegin, kKvRows,
+                              activation, kHidden, tokens, criterion, sample_count);
+    failures += verify_preserved("attn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("attn parent" + suffix);
+    return failures;
+}
+
+int run_fp8_target() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kRows   = 14336;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, 349U));
+
+    int failures          = 0;
+    const std::size_t one = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1, 1);
+    const std::size_t ten = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 10, 10);
+    const std::size_t eleven = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 11, 11);
+    const std::size_t forty_eight = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 48, 48);
+    const std::size_t hot_interval = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1, 48);
+    const std::size_t exact_1024 = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::AllowA8, 1024, 1024);
+    const std::size_t a16 = ops::attn_input_proj_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, ops::LinearPolicy::A16Only, 1, 2048);
+    if (one != 0 || ten != 0 || eleven == 0 || forty_eight <= eleven ||
+        hot_interval != forty_eight || exact_1024 <= forty_eight || a16 == 0) {
+        std::cerr << "FP8 attention input workspace interval contract mismatch\n";
+        ++failures;
+    }
+    failures += run_fp8_target_case(parent, 1, ops::LinearPolicy::A16Only);
+    failures += run_fp8_target_case(parent, 2, ops::LinearPolicy::A16Only);
+    failures += run_fp8_target_case(parent, 48, ops::LinearPolicy::A16Only);
+    failures += run_fp8_target_case(parent, 2048, ops::LinearPolicy::A16Only);
+    for (const std::int32_t tokens : {1, 2, 10, 11, 48, 65, 1024}) {
+        failures += run_fp8_target_case(parent, tokens, ops::LinearPolicy::AllowA8);
+    }
+    return failures;
+}
 
 int run_w8_target_case(DevicePackedWeight& parent, std::int32_t tokens) {
     constexpr std::int32_t kHidden      = 2048;
@@ -405,8 +513,14 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
+#ifndef NINFER_VOLTA_BUILD
     failures += run_bf16_target();
     failures += run_nvfp4_target();
+#else
+    std::cout << "SKIP bf16 target: no Volta mma/ldmatrix route\n";
+    std::cout << "SKIP nvfp4 target: no FP4 hardware on Volta\n";
+#endif
+    failures += run_fp8_target();
     failures += run_w8_target();
     failures += run_w8_companion();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";

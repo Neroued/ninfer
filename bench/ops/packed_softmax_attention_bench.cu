@@ -226,7 +226,7 @@ public:
     void launch(Entry entry, cudaStream_t stream) {
         if (entry == Entry::Uniform) {
             ops::vision_attention(q_tensor_, k_tensor_, v_tensor_, segment_lengths_.front(),
-                                  output_tensor_, stream);
+                                  workspace_, output_tensor_, stream);
         } else {
             ops::vision_attention(q_tensor_, k_tensor_, v_tensor_, cu_tensor_, workspace_,
                                   output_tensor_, stream);

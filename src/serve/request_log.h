@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 9;
+inline constexpr int kRequestLogSchemaVersion        = 10;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -26,6 +26,7 @@ struct RequestLogContext {
     std::string model;
     bool stream                             = false;
     std::size_t message_count               = 0;
+    std::size_t media_item_count            = 0;
     int requested_output_tokens             = 0;
     bool requested_output_tokens_client_set = false;
     std::size_t tool_count                  = 0;
@@ -35,6 +36,8 @@ struct RequestLogContext {
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
     ninfer::ResolvedSamplingParameters sampling;
+    double acquisition_seconds = 0.0;
+    ninfer::PromptPreparationStats preparation;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a

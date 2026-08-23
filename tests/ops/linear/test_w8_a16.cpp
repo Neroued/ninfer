@@ -15,9 +15,10 @@ constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Conve
 int w8_a16_conformance() {
     int failures = 0;
 
+    // 9 and 96 are the Volta fused route's band edges, 24 the C8 MTP operating point.
     constexpr std::array kN248320K5120{
-        a16(1),  a16(6),  a16(16), a16(17), a16(32), a16(33),
-        a16(34), a16(48), a16(49), a16(64), a16(65),
+        a16(1),  a16(6),  a16(9),  a16(16), a16(17), a16(24), a16(32),
+        a16(33), a16(34), a16(48), a16(49), a16(64), a16(65), a16(96),
     };
     failures += run_shape("W8_A16", ActivationCompute::A16, make_w8g32_f16s_weight,
                           {248320, 5120, 197U, Comparison::Sampled, false, kN248320K5120});

@@ -5,6 +5,10 @@
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/kernel/gqa_attention_decode_i8_tc_volta.cuh"
+#endif
+#include "ops/kernel/gqa_attention_prefill_volta.cuh"
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/gqa_attention.h"
 
@@ -13,6 +17,12 @@
 
 namespace ninfer::ops::detail {
 namespace {
+
+#ifdef NINFER_VOLTA_BUILD
+// Narrowest token tile that takes the Volta tensor-core decode route; anything below stays on the
+// SIMT kernel. Tuned by measurement -- see the note at the route itself and the V100 implementation.
+inline constexpr int kVoltaTcDecodeMinWidth = 3;
+#endif
 
 // Supplies an upper bound for the device-side active-split policy over one explicit execution
 // envelope. Eager calls normally pass an exact window; graph calls pass their target-private
@@ -88,10 +98,31 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
                             PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                             std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                             Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-    constexpr int kBlock = 32 * WarpsPerCta;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k = cache.k_pages;
     Tensor& cache_v = cache.v_pages;
+#ifdef NINFER_VOLTA_BUILD
+    // The Volta tensor-core kernel always splits the head dim 4 ways (DimSplit=4, enforced
+    // by its own static_assert), independent of the Ampere+ dispatch table's per-TokenTile
+    // WarpsPerCta choice -- see gqa_attention_prefill_volta.cuh's file comment for why.
+    constexpr int kBlock = 128;
+    gqa_attention_small_t_tc_volta_partial_kernel<Geometry, TokenTile, 4, MultiBatch, Masked,
+                                                  CacheInput><<<grid, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), input,
+        static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
+        static_cast<__nv_bfloat16*>(cache_v.data),
+        static_cast<const std::int32_t*>(cache.block_tables.data),
+        invocation.valid_columns == nullptr
+            ? nullptr
+            : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+        invocation.table_rows == nullptr
+            ? nullptr
+            : static_cast<const std::int32_t*>(invocation.table_rows->data),
+        cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
+        logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+#else
+    constexpr int kBlock = 32 * WarpsPerCta;
     // bf16 kernel uses only static smem (no dynamic staging).
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
                                                  Masked, CacheInput><<<grid, kBlock, 0, stream>>>(
@@ -108,6 +139,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
         cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
         logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+#endif
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -121,6 +153,37 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_v       = cache.v_pages;
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
+
+#ifdef NINFER_VOLTA_BUILD
+    // Tensor-core route for the verify widths. The SIMT kernel below holds ~1.9 TFLOP/s at every
+    // width, so its cost is linear in the width; the tensor-core tile is flat in the width
+    // instead, which is exactly what a speculative verify pass needs. Narrow widths stay on SIMT:
+    // with no query tile to amortize, the tensor-core kernel pays its fixed cost for nothing (the
+    // bf16 measurements put it 2.5x behind at width 1). See the V100 performance summary.
+    if constexpr (TokenTile >= kVoltaTcDecodeMinWidth) {
+        const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+        gqa_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, 4, MultiBatch, Masked,
+                                                         CacheInput><<<grid, 128, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
+            static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
+            static_cast<__half*>(cache_v_scale.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width,
+            invocation.column_begin, logical_capacity, scale,
+            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<float*>(partial_l.data));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif // NINFER_VOLTA_BUILD
+
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         constexpr std::size_t kDynamicBytes =
@@ -191,10 +254,49 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         if (implementation_window <= 1029) {
             launch.template operator()<16, 1, 32, false>();
         } else {
-            launch.template operator()<8, 2, 32, false>();
+            // MinBlocksPerSm=5 is a register target, not a residency claim: it forces ptxas
+            // down to 48 registers, so 5 blocks (40 warps, 55% occupancy) fit where 2 left
+            // the kernel at 66 registers and 3 blocks (37%). ncu called this one
+            // long_scoreboard-bound -- 4.45 of 10.65 warp cycles per issued instruction --
+            // and the extra warps are what cover that global latency.
+            //
+            // It buys the occupancy with spills, and that is the right trade here but only
+            // just: the tail is steep and NOT monotonic, so re-tune by measurement if this
+            // kernel changes. At 82k, one call:
+            //
+            //   MinBlocks   2      4      5      6       8
+            //   registers  66     64     48     40      32
+            //   occupancy  37%    48%    55%    63%     97%
+            //   time      5042u  5407u  4342u  5363u  34989u
+            //
+            // 4 is slower than 2 despite more warps; 8 spills 63M local stores and costs 7x.
+            // End to end at 82k this is -6.6% round time (144.4 -> 134.9ms, interleaved A/B).
+            launch.template operator()<8, 5, 32, false>();
         }
     } else {
-        launch.template operator()<8, 2, 32, false>();
+        // TokenTile 1-3: the MTP proposal steps and plain single-token decode. The same
+        // register-target trick as TokenTile 4 above pays here too, but it has to be gated on
+        // the window, because unlike that branch this one serves *every* context length and the
+        // trade only works once the split policy is emitting enough CTAs for the extra warps to
+        // matter. Width 1 at 262140 goes 4561 -> 3522us (1.30x), and widths 2 and 3 gain 1.34x,
+        // but short windows lose. Measured over the range, 100 reps each:
+        //
+        //   ctx    2048  8192  10240  12288  16384  65536  262140
+        //   mb=2    59    287    288    295    549   1581    4561      (us)
+        //   mb=5    73    183    296    303    332   1322    3522
+        //
+        // Below ~6k the extra warps cost more than they buy; 2048 loses 18%. Above it the two
+        // wins are 1.56x and 1.65x and the two losses are 3%, so the gate goes at 6144 rather
+        // than at the 8198 split tier -- the 1.56x at 8192 sits just under that boundary.
+        //
+        // Note the non-monotonicity in context is real and reproducible (p95 within 1%): the
+        // wins land where the split policy is at a tier maximum and CTAs are plentiful. The
+        // cliffs either side of those tiers are a separate and probably larger lever.
+        if (implementation_window > 6144) {
+            launch.template operator()<8, 5, 32, false>();
+        } else {
+            launch.template operator()<8, 2, 32, false>();
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

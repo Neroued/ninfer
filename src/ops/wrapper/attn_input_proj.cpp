@@ -1,9 +1,12 @@
 #include "ninfer/ops/attn_input_proj.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
+#include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
+#include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
@@ -125,6 +128,29 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        constexpr std::int32_t kHidden = 5120;
+        constexpr std::int32_t kQRows  = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        constexpr std::int32_t kRows   = 14336;
+        const std::int32_t cols        = x.ne[1];
+        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+        if (policy != LinearPolicy::A16Only && policy != LinearPolicy::AllowA8) {
+            throw std::invalid_argument("FP8 attn_input_proj admits only A16 or A8");
+        }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(q, kQRows, cols, "q");
+        require_matrix(gate, kQRows, cols, "gate");
+        require_matrix(k, kKvRows, cols, "k");
+        require_matrix(v, kKvRows, cols, "v");
+        detail::validate_fp8_weight(weight, "fp8 attn_input_proj");
+        if (weight.n != kRows || weight.k != kHidden) {
+            throw std::invalid_argument("fp8 attn_input_proj: unsupported weight shape");
+        }
+        detail::fp8_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
+        return;
+    }
+
     constexpr std::int32_t kHidden = 2048;
     constexpr std::int32_t kQRows  = 4096;
     constexpr std::int32_t kKvRows = 512;
@@ -167,6 +193,12 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             throw std::invalid_argument("attn_input_proj workspace: unsupported NVFP4 profile");
         }
         return detail::nvfp4_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    case QType::FP8_E4M3FN_ROW_BF16S:
+        if (parent_rows != detail::Fp8AttnInputGeometry::kOutputRows ||
+            input_rows != detail::Fp8AttnInputGeometry::kInputRows) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported FP8 profile");
+        }
+        return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     case QType::W8G32_F16S:
         if (parent_rows != 9216 || input_rows != 2048 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
@@ -188,7 +220,7 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
-                     cudaStream_t stream) {
+                     WorkspaceArena& workspace, cudaStream_t stream) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kQRows  = 6144;
     constexpr std::int32_t kKvRows = 1024;
@@ -202,7 +234,12 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, "gate/value weight");
 
     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
-                                      stream);
+                                      workspace, stream);
+}
+
+std::size_t q4_q5_attn_input_proj_workspace_capacity_bytes(std::int32_t min_tokens,
+                                                            std::int32_t max_tokens) {
+    return detail::q4_q5_attn_input_capacity_workspace_bytes(min_tokens, max_tokens);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

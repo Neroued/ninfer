@@ -1,3 +1,4 @@
+#include "core/nvtx.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
 
@@ -590,24 +591,34 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                        device.stream));
         }
 
-        const bool host_input_consumed = prompt.has_media() && !request_plan.vision;
-        if (host_input_consumed) { prompt.release_media_payload(); }
+        if (request_plan.vision) {
+            std::vector<bool> used(prompt.media_payloads.size(), false);
+            for (const VisionUseSpan& use : request_plan.vision->uses) {
+                if (use.item_index >= used.size()) {
+                    throw std::logic_error("Vision plan references a missing media payload");
+                }
+                used[use.item_index] = true;
+            }
+            for (std::size_t i = 0; i < used.size(); ++i) {
+                if (!used[i]) { prompt.media_payloads[i].reset(); }
+            }
+        }
+        if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
 
         RequestControl::Prefill prefill{
-            .prompt                      = std::move(prompt),
-            .vision_plan                 = std::move(request_plan.vision),
-            .vision                      = nullptr,
-            .transient                   = transient,
-            .rewrite_checkpoint_capture  = request_plan.rewrite_checkpoint_capture,
-            .base                        = base,
-            .cursor                      = base,
-            .prompt_tokens               = prompt_tokens,
-            .initial_mtp_extent          = initial_mtp_extent,
-            .elapsed_seconds             = 0.0,
-            .host_input_consumed_pending = host_input_consumed,
-            .prepare_mtp                 = request_plan.prepare_mtp,
-            .reuse                       = request_plan.reuse,
-            .mtp_bridge                  = request_plan.mtp_bridge,
+            .prompt                     = std::move(prompt),
+            .vision_plan                = std::move(request_plan.vision),
+            .vision                     = nullptr,
+            .transient                  = transient,
+            .rewrite_checkpoint_capture = request_plan.rewrite_checkpoint_capture,
+            .base                       = base,
+            .cursor                     = base,
+            .prompt_tokens              = prompt_tokens,
+            .initial_mtp_extent         = initial_mtp_extent,
+            .elapsed_seconds            = 0.0,
+            .prepare_mtp                = request_plan.prepare_mtp,
+            .reuse                      = request_plan.reuse,
+            .mtp_bridge                 = request_plan.mtp_bridge,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -1512,8 +1523,6 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse};
-    bool host_input_consumed              = staged.host_input_consumed_pending;
-    staged.host_input_consumed_pending    = false;
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
@@ -1592,9 +1601,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("ordinary prefill chunk made invalid progress");
             }
             processed_prompt_tokens = result.processed_tokens;
-            if (staged.vision && staged.vision->release_consumed_media_payload()) {
-                host_input_consumed = true;
-            }
+            if (staged.vision) { staged.vision->release_encoded_media_payloads(); }
             staged.cursor += result.processed_tokens;
             sequence.text_kv_valid = staged.cursor;
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
@@ -1608,10 +1615,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 }
                 staged.elapsed_seconds +=
                     std::chrono::duration<double>(Clock::now() - started).count();
-                return runtime::PrefillStepResult{.summary = summary,
-                                                  .processed_prompt_tokens =
-                                                      processed_prompt_tokens,
-                                                  .host_input_consumed = host_input_consumed};
+                return runtime::PrefillStepResult{
+                    .summary = summary, .processed_prompt_tokens = processed_prompt_tokens};
             }
             if (staged.cursor != staged.prompt_tokens) {
                 throw std::logic_error("staged prefill sampled before the prompt frontier");
@@ -1697,10 +1702,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 .valid = true, .kind = rewrite_checkpoint_capture->kind, .frontier = frontier};
         }
 
-        if (!staged.prompt.patches.empty()) {
-            staged.prompt.release_media_payload();
-            host_input_consumed = true;
-        }
+        staged.prompt.release_all_media_payloads();
 
         request.prefill.reset();
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
@@ -1714,7 +1716,6 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
-            .host_input_consumed     = host_input_consumed,
         };
     } catch (...) {
         try {
@@ -1758,6 +1759,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
 
     const auto start = Clock::now();
     try {
+        nvtx::ScopedRange ordinary_round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode);
         DecodeGraphExecutable* executable = nullptr;
         ops::GqaExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
@@ -1794,9 +1796,15 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             tail_hidden_store};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
-        schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                        envelope, executable);
-        device.synchronize();
+        {
+            nvtx::ScopedRange submit_range(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode);
+            schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                            envelope, executable);
+        }
+        {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Decode);
+            device.synchronize();
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1870,6 +1878,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
     const auto started = Clock::now();
     try {
+        nvtx::ScopedRange mtp_round_range(nvtx::Name::DecodeMtpRound, nvtx::Category::Mtp);
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpGqaEnvelopes envelopes =
             mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
@@ -1926,9 +1935,15 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                  tail_hidden_store};
 
         mark_workspace_usage(workspace_plan.mtp_round);
-        schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                   draft_window, envelopes, executable);
-        device.synchronize();
+        {
+            nvtx::ScopedRange submit_range(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp);
+            schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
+                                       draft_window, envelopes, executable);
+        }
+        {
+            nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Mtp);
+            device.synchronize();
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {

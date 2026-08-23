@@ -20,7 +20,6 @@ namespace ninfer::serve {
 
 struct RequestLifetime;
 struct RequestCapacity;
-struct MediaInputCapacity;
 
 struct GenerationMetrics {
     double prepare_seconds = 0.0;
@@ -68,7 +67,9 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 struct PreparedRequest {
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
-    double prepare_seconds                 = 0.0;
+    double prepare_seconds     = 0.0;
+    double acquisition_seconds = 0.0;
+    PromptPreparationStats preparation;
     int prompt_tokens                      = 0;
     bool include_usage                     = false;
     bool tool_capable                      = false;
@@ -91,6 +92,10 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
+        return engine_->media_cache_summary();
+    }
+
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }
@@ -108,15 +113,11 @@ public:
 
 private:
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
-    [[nodiscard]] HostInputLease
-    acquire_media_input(std::chrono::steady_clock::time_point deadline,
-                        const std::function<bool()>& is_cancelled) const;
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
-    std::shared_ptr<MediaInputCapacity> media_input_capacity_;
 };
 
 } // namespace ninfer::serve

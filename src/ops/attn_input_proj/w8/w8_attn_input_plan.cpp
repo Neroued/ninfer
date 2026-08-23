@@ -100,6 +100,16 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
         throw std::invalid_argument(
             "W8 attention input: exact problem or column count is not admitted");
     }
+#ifdef NINFER_VOLTA_BUILD
+    // Same shape as the w8 linear_add override: every schedule in these tables
+    // except SimtR8C4 and DecodeR8Direct reaches the trap-stubbed mma/split-K
+    // kernels below sm_80, and SimtR8C4's grid derives its token extent from
+    // x.ne[1] at launch, so it already covers arbitrary T.
+    // T=1 keeps DecodeR8Direct: it is already SIMT and is the decode schedule
+    // this port tuned for the 27B target, which shares this Op.
+    if (problem.cols == 1) { return {W8AttnInputScheduleId::DecodeR8Direct}; }
+    return {W8AttnInputScheduleId::SimtR8C4};
+#else
     const auto resolve_from = [&](const auto& routes) -> W8AttnInputPlan {
         for (const RouteSpec& route : routes) {
             if (problem.cols >= route.first && problem.cols <= route.last) {
@@ -110,6 +120,7 @@ W8AttnInputPlan w8_attn_input_resolve_plan(const W8AttnInputProblem& problem) {
     };
     if (is_companion_shape(problem)) { return resolve_from(kCompanionRoutes); }
     return resolve_from(kTargetRoutes);
+#endif // NINFER_VOLTA_BUILD
 }
 
 void w8_attn_input_execute_plan(const W8AttnInputPlan& plan, const Tensor& x, const Weight& weight,

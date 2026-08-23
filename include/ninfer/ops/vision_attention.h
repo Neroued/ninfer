@@ -10,7 +10,11 @@ namespace ninfer::ops {
 /**
  * Returns the caller-owned transient capacity for every legal patch/segment pair in the supplied
  * inclusive envelope. A pair is legal when 1 <= segments <= patches. An envelope with no legal
- * pair throws; a legal uniform single-segment envelope returns zero.
+ * pair throws.
+ *
+ * Zero is returned only when the selected route needs no transient storage: the descriptor-based
+ * route needs none for a single segment, whereas a route that restages q/k/v for a different
+ * kernel geometry always does. Callers must size from this function rather than assume either.
  */
 [[nodiscard]] std::size_t vision_attention_workspace_capacity_bytes(std::int32_t min_patches,
                                                                     std::int32_t max_patches,
@@ -41,10 +45,14 @@ void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v, const T
  * Equal-segment overload of the same packed, non-causal attention operation. P must be divisible
  * by `segment_length`; consecutive ranges `[s*segment_length,(s+1)*segment_length)` are the
  * independent segments. The q/k/v/out shape, layout, dtype, alias, and numerical semantics are
- * identical to the cu_seqlens overload. Segment tiles are derived directly and no workspace or
- * descriptor-setup launch is used.
+ * identical to the cu_seqlens overload, and `workspace` is reported by the same
+ * vision_attention_workspace_capacity_bytes() with segments = P / segment_length.
+ *
+ * Segment bounds are derived arithmetically rather than from a descriptor, so routes that tile
+ * directly consume no capacity; routes that stage q/k/v for a different kernel geometry do.
  */
 void vision_attention(const Tensor& q, const Tensor& k, const Tensor& v,
-                      std::int32_t segment_length, Tensor& out, cudaStream_t stream);
+                      std::int32_t segment_length, WorkspaceArena& workspace, Tensor& out,
+                      cudaStream_t stream);
 
 } // namespace ninfer::ops

@@ -19,6 +19,15 @@ __global__
 __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_splitk_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, int active_cols) {
+// mma_bf16/ldmatrix_x2 (mma.cuh) already trap below sm_80, but that alone isn't enough
+// here: this kernel's __shared__ declarations below are large enough (up to ~90KB across
+// the TileCols/KSplits/NGroups instantiations this port's callers use) that nvlink
+// rejects them outright against Volta's 48KB static-shared-memory cap -- a link-time
+// failure, not a ptxas one, and it happens regardless of whether the mma-using code path
+// is ever reached, because __shared__ is a static allocation independent of control flow.
+// The whole body (declarations included) needs to be behind the guard, not just the mma
+// calls within it, unlike every other kernel this port has trap-stubbed so far.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     constexpr int kTileK       = 64;
     constexpr int kMmaRows     = 16;
     constexpr int kRowsPerCta  = 16;
@@ -229,6 +238,14 @@ __launch_bounds__(KSplits* NGroups * 32, MinBlocks) void w8_rowsplit_medium_t_sp
             }
         }
     }
+#else  // __CUDA_ARCH__ < 800
+    (void)x;
+    (void)codes;
+    (void)scales;
+    (void)output;
+    (void)active_cols;
+    __trap();
+#endif // __CUDA_ARCH__ >= 800
 }
 
 } // namespace ninfer::ops::detail

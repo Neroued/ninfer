@@ -24,6 +24,7 @@ struct Geometry {
 };
 
 constexpr Geometry kQwen27{"qwen3_6_27b", 5120, 48, false};
+constexpr Geometry kQwen38Parent{"qwen3_8_27b_parent", 5120, 48, true};
 constexpr Geometry kQwen35{"qwen3_6_35b_a3b", 2048, 32, true};
 
 constexpr ReductionCriterion kGdnProjectionFp32{/*relative_l2=*/1.4e-6,
@@ -443,6 +444,9 @@ int main() {
         failures +=
             run_projection_case(kQwen27, tokens, 0x1000u + static_cast<std::uint32_t>(tokens));
     }
+    // The Qwen3.8 parent changes only the public storage boundary. One direct oracle case proves
+    // its [A,B] row partition; the split 27B cases above cover every unchanged execution route.
+    failures += run_projection_case(kQwen38Parent, 1, 0x1801u);
     // Every registered 35B projection route and its contiguous-parent storage contract.
     for (const std::int32_t tokens : {1, 127, 128, 1024, 1025, 2049, 4097}) {
         failures +=
@@ -453,6 +457,7 @@ int main() {
     failures += run_norm_projection_case(kQwen27, 1, 0x3001u);
     failures += run_norm_projection_case(kQwen27, 9, 0x3009u);
     failures += run_norm_projection_case(kQwen27, 64, 0x3040u);
+    failures += run_norm_projection_case(kQwen38Parent, 1, 0x3801u);
     failures += run_norm_projection_case(kQwen35, 1, 0x4001u);
     failures += run_norm_projection_case(kQwen35, 16, 0x4010u);
     failures += run_norm_projection_case(kQwen35, 17, 0x4011u);

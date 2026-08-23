@@ -1,7 +1,7 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
 #include "core/device.h"
-#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_conv_output.cuh"
+#include "ops/gdn_input_proj/gdn_conv_output.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_gemv.cuh"
 
@@ -20,11 +20,11 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
     nvfp4_gemv_kernel<Geometry, Schedule><<<kBlocks, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), inverse, Nvfp4IdentityEpilogue{},
-        make_nvfp4_gdn_conv_output<1>(
+        make_gdn_conv_output<1>(
             conv_weight, conv_states, valid_columns, initial_slot, query, key, value, z,
             SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
                                    static_cast<const std::int32_t*>(snapshot_base_slot.data),
-                                   kNvfp4GdnChannels}));
+                                   kGdnChannels}));
     CUDA_CHECK(cudaGetLastError());
 }
 

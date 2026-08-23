@@ -622,6 +622,12 @@ Tokenizer::Tokenizer(TokenizerResources resources) {
                                       vocab_metadata.occupied_ids, vocab_token_to_id_);
     merge_added_tokens_decoder(tokenizer_config, tokenizer_config_label, id_to_token_,
                                vocab_metadata.occupied_ids, vocab_token_to_id_, added_tokens_);
+    for (std::size_t index = 0; index < added_tokens_.size(); ++index) {
+        const std::string& content = added_tokens_[index].content;
+        if (!content.empty()) {
+            added_token_candidates_[static_cast<unsigned char>(content.front())].push_back(index);
+        }
+    }
     if (valid_token_ids_.size() < id_to_token_.size()) {
         valid_token_ids_.resize(id_to_token_.size());
     }
@@ -642,32 +648,37 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     }
 
     std::vector<int> ids;
-    std::size_t pos = 0;
+    std::size_t ordinary_begin = 0;
+    std::size_t pos            = 0;
     while (pos < text.size()) {
-        std::size_t match_pos         = std::string_view::npos;
         const AddedToken* match_token = nullptr;
-        for (const AddedToken& token : added_tokens_) {
-            if (token.content.empty()) { continue; }
-            const std::size_t found = text.find(token.content, pos);
-            if (found == std::string_view::npos) { continue; }
-            if (match_token == nullptr || found < match_pos) {
-                match_pos   = found;
+        const auto& candidates = added_token_candidates_[static_cast<unsigned char>(text[pos])];
+        for (const std::size_t index : candidates) {
+            const AddedToken& token = added_tokens_[index];
+            if (token.content.size() <= text.size() - pos &&
+                text.compare(pos, token.content.size(), token.content) == 0) {
                 match_token = &token;
+                break;
             }
         }
 
         if (match_token == nullptr) {
-            append_bpe_ids(ids, text.substr(pos), has_bpe_merges_, bpe_merge_ranks_,
-                           vocab_token_to_id_);
-            break;
+            ++pos;
+            continue;
         }
-        if (match_pos > pos) {
-            append_bpe_ids(ids, text.substr(pos, match_pos - pos), has_bpe_merges_,
+
+        if (pos > ordinary_begin) {
+            append_bpe_ids(ids, text.substr(ordinary_begin, pos - ordinary_begin), has_bpe_merges_,
                            bpe_merge_ranks_, vocab_token_to_id_);
         }
 
         ids.push_back(match_token->id);
-        pos = match_pos + match_token->content.size();
+        pos += match_token->content.size();
+        ordinary_begin = pos;
+    }
+    if (ordinary_begin < text.size()) {
+        append_bpe_ids(ids, text.substr(ordinary_begin), has_bpe_merges_, bpe_merge_ranks_,
+                       vocab_token_to_id_);
     }
     return ids;
 }

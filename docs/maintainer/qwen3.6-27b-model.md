@@ -315,20 +315,21 @@ The native processor accepts structured text/image/video message parts. For each
 2. decodes the image or samples video frames;
 3. chooses dimensions aligned to the 32-pixel merge factor;
 4. bicubic-resizes and normalizes RGB values;
-5. packs channel-major `2 × 16 × 16` temporal-spatial patches into FP32 rows of width 1536;
+5. packs channel-major `2 × 16 × 16` temporal-spatial patches directly into BF16 rows of width
+   1536, using round-to-nearest-even for the normalized values;
 6. expands the chat-template placeholders and records the token spans;
 7. constructs Vision grids, timestamps, token types, and three-axis text positions;
 8. computes `rope_delta` for subsequent Text decode positions.
 
 Images repeat a frame to form the temporal pair. Videos are sampled at the configured rate and
-packed in temporal pairs. Source bytes, decoded pixels, media count, raw patches, and Vision-token
-budgets reject oversized media work before Vision execution. The computed attention-pair count is
-diagnostic rather than an admission limit. The processor does not impose a separate prompt-token
-ceiling; Engine `max_context` admits the complete rendered text-plus-media prompt.
+packed in temporal pairs. Media items have no standalone count limit; aggregate source bytes,
+decoded pixels, 131,072 raw patches, 32,768 merged Vision tokens, and Engine `max_context` admit the
+work. The prepared BF16 rows are the exact host representation copied into Vision execution, so no
+host FP32 payload or device FP32-to-BF16 staging conversion exists.
 
 ## 10. Vision tower
 
-Patch rows are converted to BF16 and projected into `[1152,P]`. The runtime adds a bilinearly
+BF16 patch rows are projected directly into `[1152,P]`. The runtime adds a bilinearly
 interpolated learned 48×48 position table.
 
 Each of the 27 transformer blocks performs:

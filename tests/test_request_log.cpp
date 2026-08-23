@@ -178,16 +178,24 @@ int main() {
     request.messages.front().content.push_back(ContentPart{.kind = ContentKind::Image});
 
     PreparedRequest prepared;
-    prepared.enable_thinking                   = false;
-    prepared.preserve_thinking                 = true;
-    prepared.preserve_thinking_semantic_change = true;
-    prepared.sampling.temperature              = 0.6F;
-    prepared.sampling.top_p                    = 0.95F;
-    prepared.sampling.top_k                    = 20;
-    prepared.sampling.min_p                    = 0.0F;
-    prepared.sampling.presence_penalty         = 1.0F;
-    prepared.sampling.frequency_penalty        = 0.0F;
-    prepared.sampling.seed                     = 7632647173703958409ULL;
+    prepared.enable_thinking                           = false;
+    prepared.preserve_thinking                         = true;
+    prepared.preserve_thinking_semantic_change         = true;
+    prepared.sampling.temperature                      = 0.6F;
+    prepared.sampling.top_p                            = 0.95F;
+    prepared.sampling.top_k                            = 20;
+    prepared.sampling.min_p                            = 0.0F;
+    prepared.sampling.presence_penalty                 = 1.0F;
+    prepared.sampling.frequency_penalty                = 0.0F;
+    prepared.sampling.seed                             = 7632647173703958409ULL;
+    prepared.acquisition_seconds                       = 0.004;
+    prepared.preparation.seconds                       = 0.12;
+    prepared.preparation.media_preprocess_seconds      = 0.08;
+    prepared.preparation.media_preprocess_work_seconds = 0.31;
+    prepared.preparation.tokenize_seconds              = 0.02;
+    prepared.preparation.media_items                   = 1;
+    prepared.preparation.media_cache_misses            = 1;
+    prepared.preparation.built_patch_bytes             = 49152;
 
     const RequestLogContext context =
         make_request_log_context(7, "openai_chat_completions", request, prepared);
@@ -203,6 +211,12 @@ int main() {
                       "resolved preserve-thinking metadata missing");
     failures += check(started.at("request").at("sampling").at("seed") == 7632647173703958409ULL,
                       "resolved seed missing");
+    failures += check(started.at("request").at("media_item_count") == 1 &&
+                          started.at("preparation_seconds").at("acquisition") == 0.004 &&
+                          started.at("preparation_seconds").at("media_preprocess_work") == 0.31 &&
+                          started.at("preparation_seconds").at("tokenize") == 0.02 &&
+                          started.at("preparation_seconds").at("cache_misses") == 1,
+                      "request-scoped media preparation diagnostics missing");
 
     ApiError preparation_error;
     preparation_error.status = 400;

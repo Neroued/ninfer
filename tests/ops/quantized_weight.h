@@ -98,6 +98,10 @@ inline float f16_to_f32(std::uint16_t h) {
     return bits_float(sign | (exp << 23) | (mant << 13));
 }
 
+inline float bf16_to_f32(std::uint16_t h) {
+    return bits_float(static_cast<std::uint32_t>(h) << 16);
+}
+
 inline void store_u16_le(std::vector<std::uint8_t>& payload, std::size_t off, std::uint16_t v) {
     payload[off]     = static_cast<std::uint8_t>(v & 0xffu);
     payload[off + 1] = static_cast<std::uint8_t>(v >> 8);
@@ -316,6 +320,72 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                                           std::uint32_t seed, PatternedWeightOptions options = {}) {
     if (n <= 0 || k <= 0) {
         throw std::invalid_argument("quantized-weight fixture: shape must be positive");
+    }
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F) {
+            throw std::invalid_argument(
+                "quantized-weight fixture: divisors do not belong to FP8 weights");
+        }
+
+        PackedWeight packed;
+        packed.code_plane_bytes = static_cast<std::uint64_t>(n) * k;
+        packed.scale_plane_offset =
+            detail::align_up_size(static_cast<std::size_t>(packed.code_plane_bytes), 256);
+        packed.scale_plane_bytes = static_cast<std::uint64_t>(n) * 2;
+        packed.payload.assign(
+            static_cast<std::size_t>(packed.scale_plane_offset + packed.scale_plane_bytes), 0);
+
+        constexpr std::uint8_t kCodes[]{
+            0x00U, 0x80U, 0x01U, 0x81U, 0x07U, 0x87U, 0x08U, 0x88U,
+            0x18U, 0x98U, 0x38U, 0xb8U, 0x44U, 0xc4U, 0x7eU, 0xfeU,
+        };
+        for (std::int32_t row = 0; row < n; ++row) {
+            const std::uint32_t row_mix =
+                static_cast<std::uint32_t>(row) ^ (static_cast<std::uint32_t>(row) >> 7);
+            for (std::int32_t column = 0; column < k; ++column) {
+                const std::uint32_t pattern =
+                    row_mix * 13U + static_cast<std::uint32_t>(column) * 7U + seed;
+                packed.payload[static_cast<std::size_t>(row) * k + column] = kCodes[pattern & 15U];
+            }
+        }
+        constexpr std::uint16_t kScales[]{0x3b00U, 0x3b40U, 0x3b80U, 0x3bc0U};
+        for (std::int32_t row = 0; row < n; ++row) {
+            detail::store_u16_le(packed.payload,
+                                 packed.scale_plane_offset + static_cast<std::size_t>(row) * 2,
+                                 kScales[(static_cast<std::uint32_t>(row) + seed) & 3U]);
+        }
+
+        packed.weight.qtype            = QType::FP8_E4M3FN_ROW_BF16S;
+        packed.weight.layout           = QuantLayout::RowScale;
+        packed.weight.scale_dtype      = DType::BF16;
+        packed.weight.payload          = packed.payload.data();
+        packed.weight.payload_bytes    = packed.payload.size();
+        packed.weight.high_plane_bytes = 0;
+        packed.weight.qdata            = packed.payload.data();
+        packed.weight.qhigh            = nullptr;
+        packed.weight.scales           = packed.payload.data() + packed.scale_plane_offset;
+        packed.weight.group_size       = static_cast<std::uint32_t>(k);
+        packed.weight.group            = k;
+        packed.weight.ndim             = 2;
+        packed.weight.shape[0]         = n;
+        packed.weight.shape[1]         = k;
+        packed.weight.shape[2]         = 1;
+        packed.weight.shape[3]         = 1;
+        packed.weight.padded_shape[0]  = n;
+        packed.weight.padded_shape[1]  = k;
+        packed.weight.padded_shape[2]  = 1;
+        packed.weight.padded_shape[3]  = 1;
+        packed.weight.scale_ne[0]      = n;
+        packed.weight.scale_ne[1]      = 1;
+        packed.weight.scale_ne[2]      = 1;
+        packed.weight.scale_ne[3]      = 1;
+        packed.weight.scale_nb[0]      = 2;
+        packed.weight.scale_nb[1]      = static_cast<std::int64_t>(n) * 2;
+        packed.weight.scale_nb[2]      = packed.weight.scale_nb[1];
+        packed.weight.scale_nb[3]      = packed.weight.scale_nb[1];
+        packed.weight.n                = n;
+        packed.weight.k                = k;
+        return packed;
     }
     if (qtype == QType::NVFP4) {
         if ((n % 128) != 0 || (k % 64) != 0) {
@@ -574,6 +644,19 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
     const Weight& weight = packed.weight;
     if (row < 0 || row >= weight.shape[0] || column < 0 || column >= weight.shape[1]) {
         throw std::out_of_range("quantized-weight fixture: logical index out of range");
+    }
+
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        if (weight.layout != QuantLayout::RowScale || weight.scale_dtype != DType::BF16 ||
+            weight.group != weight.k || weight.group_size != static_cast<std::uint32_t>(weight.k)) {
+            throw std::invalid_argument("quantized-weight fixture: invalid FP8 metadata");
+        }
+        const std::uint8_t code = packed.payload[static_cast<std::size_t>(row) * weight.k + column];
+        const std::uint16_t scale_bits = detail::load_u16_le(
+            packed.payload, packed.scale_plane_offset + static_cast<std::size_t>(row) * 2);
+        const float decoded =
+            static_cast<float>(detail::decode_e4m3fn(code)) * detail::bf16_to_f32(scale_bits);
+        return static_cast<double>(decoded);
     }
 
     if (weight.qtype == QType::NVFP4) {

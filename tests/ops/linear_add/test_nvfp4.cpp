@@ -91,6 +91,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     const std::array invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{4, ops::LinearPolicy::A16Only},
+        Invocation{48, ops::LinearPolicy::A16Only},
+        Invocation{1024, ops::LinearPolicy::A16Only},
         Invocation{first_a4, ops::LinearPolicy::AllowA4},
         Invocation{17, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
@@ -115,6 +117,11 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
 
     int failures = 0;
     for (const Invocation invocation : invocations) {
+#ifdef NINFER_VOLTA_BUILD
+        // A4/A8 activation compute is Blackwell / sm_89 hardware and traps here;
+        // the A16 invocations in the same list are what this port is held to.
+        if (invocation.policy != ops::LinearPolicy::A16Only) { continue; }
+#endif
         const std::size_t output_words = static_cast<std::size_t>(n) * invocation.tokens;
         GuardedDeviceBuffer output(output_words * sizeof(std::uint16_t));
         output.copy_from_host(initial_residual.data(), output.bytes());

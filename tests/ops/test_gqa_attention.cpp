@@ -13,6 +13,7 @@
 #include <limits>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -1350,13 +1351,28 @@ int verify_workspace_capacity_contract() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
     int failures = 0;
+    if (argc == 2 && std::string_view(argv[1]) == "--volta-flash-only") {
+        for (const Geometry& geometry : kGeometries) {
+            for (const DType dtype : {DType::BF16, DType::I8}) {
+                for (const MappingPattern mapping : {MappingPattern::Identity,
+                                                     MappingPattern::Offset,
+                                                     MappingPattern::Fragmented}) {
+                    failures += run_a1_case(geometry, dtype, {66, 63, 129, 205u}, mapping);
+                }
+            }
+        }
+        std::cout << (failures == 0 ? "PASS" : "FAIL")
+                  << " gqa_attention Volta-flash correctness\n";
+        return failures == 0 ? 0 : 1;
+    }
+
     failures += verify_workspace_capacity_contract();
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_batch_cases();

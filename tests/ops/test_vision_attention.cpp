@@ -202,7 +202,8 @@ int run_case(const std::vector<int>& cu_seqlens, std::uint32_t seed, StorageProf
                 throw std::logic_error("uniform case requires equal segments");
             }
         }
-        ops::vision_attention(q_tensor, k_tensor, v_tensor, segment_length, out_tensor, nullptr);
+        ops::vision_attention(q_tensor, k_tensor, v_tensor, segment_length, workspace, out_tensor,
+                              nullptr);
     }
     cuda_synchronize();
 
@@ -248,7 +249,17 @@ int main() {
     }
 
     int failures = 0;
-    if (ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 1) != 0 ||
+    // The maximal-legal-pair property is the real contract and holds on every route.
+    // Whether a single-segment envelope needs zero bytes is route-specific: the
+    // descriptor path needs no tiles for one segment, while a staging path restages
+    // q/k/v regardless of how the patches are partitioned.
+#ifndef NINFER_VOLTA_BUILD
+    const bool single_segment_is_free =
+        ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 1) == 0;
+#else
+    const bool single_segment_is_free = true;
+#endif
+    if (!single_segment_is_free ||
         ops::vision_attention_workspace_capacity_bytes(4, 194, 1, 3) !=
             ops::vision_attention_workspace_capacity_bytes(194, 194, 3, 3)) {
         std::cerr << "vision_attention rectangular capacity missed its maximal legal pair\n";
@@ -268,6 +279,15 @@ int main() {
         run_case({0, 68, 136}, 101u, StorageProfile::InterleavedQkv, PublicEntry::UniformSegments);
     failures +=
         run_case({0, 256}, 2026u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+    // Past 256 patches a segment spans several KV tiles and the launch is large
+    // enough to be decomposed across SMs, so these are the cases that exercise the
+    // stream-K fixup and a key extent whose tail tile is partial.
+    failures +=
+        run_case({0, 1088}, 5u, StorageProfile::InterleavedQkv, PublicEntry::CuSeqlensArena);
+    failures += run_case({0, 300, 1088}, 11u, StorageProfile::InterleavedQkv,
+                         PublicEntry::CuSeqlensArena, InputProfile::SegmentIsolation);
+    failures += run_case({0, 544, 1088}, 13u, StorageProfile::InterleavedQkv,
+                         PublicEntry::UniformSegments);
 
     if (failures != 0) {
         std::cerr << "vision_attention failures=" << failures << '\n';

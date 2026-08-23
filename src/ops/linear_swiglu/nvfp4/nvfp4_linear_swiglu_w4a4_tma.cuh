@@ -51,6 +51,9 @@ __global__ __launch_bounds__(
                                                                           descriptors,
                                                                   float alpha,
                                                                   __nv_bfloat16* __restrict__ output) {
+// Same story as nvfp4_w4a4_tma.cuh: warp-specialized Hopper+/Blackwell code (TMA, mbarrier,
+// setmaxnreg), permanently out of scope for Volta. See the V100 performance summary.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     static_assert(Geometry::kOutputRows == 34816);
     static_assert(Geometry::kInputRows == 5120);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
@@ -256,6 +259,12 @@ __global__ __launch_bounds__(
                       row_vector * 8,
                   values);
     }
+#else  // __CUDA_ARCH__ < 900
+    (void)descriptors;
+    (void)alpha;
+    (void)output;
+    __trap();
+#endif // __CUDA_ARCH__ >= 900
 }
 
 } // namespace ninfer::ops::detail

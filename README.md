@@ -1,10 +1,16 @@
-# NInfer
+# NInfer for NVIDIA V100
 
-> Selected checkpoints. Maximum single-GPU inference performance.
+> Blackwell gets NVFP4 in silicon. Volta gets it from software.
 
-NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
-single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs.
+This is the NVIDIA V100 (`sm_70`) port of
+[NInfer](https://github.com/Neroued/ninfer), a from-scratch C++/CUDA inference engine for a closed
+set of Qwen checkpoints. It runs text, image, and video prompts through a local CLI or
+OpenAI-/Anthropic-compatible HTTP APIs. The product model is deliberately narrow: one registered
+artifact, one NVIDIA GPU, and kernels tuned for the exact shapes the model uses.
+
+Upstream targets the GeForce RTX 5090 (`sm_120a`). This fork keeps that path intact and adds a
+separate compile-time Volta implementation. It is not a compatibility shim around an existing
+framework.
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
@@ -14,74 +20,130 @@ runtime:
 | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
 | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 18,324,064,000 bytes (17.07 GiB) | `bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a` |
 | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 18,210,531,328 bytes (16.96 GiB) | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
+| [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | 21,492,695,040 bytes (20.02 GiB) | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
 
-The two Qwen3.6-27B weight profiles bind to the registered `qwen3_6_27b` target; the version-2
-artifact identity selects the profile without a separate runtime flag. Qwen3.8-27B is separately
-registered as `qwen3_8_27b` and shares the 27B execution package while using W8 token-embedding and
-full-output-head weights. The `nvfp4` profile uses W4A4 Tensor Core MMA for prefill and A16 NVFP4
-kernels for decode. All three 27B artifacts retain the same Text, Vision, MTP, prefix-reuse, CLI,
+Qwen3.6-27B and Qwen3.8-27B each expose two registered weight profiles. The version-2 artifact
+identity selects the profile without a separate runtime flag; Qwen3.8 uses target key
+`qwen3_8_27b` while sharing the 27B execution package. The Qwen3.6 `nvfp4` profile uses W4A4 Tensor
+Core MMA for prefill and A16 NVFP4 kernels for decode. The Qwen3.8 `nvfp4` profile preserves its
+source's mixed allocation: NVFP4 MLP weights in Text layers 0–55 and row-scaled FP8 for the token
+embedding, attention input/output projections, GDN Q/K/V/Z and output projections, output head, and
+remaining MLP weights. All four 27B artifacts retain the same Text, Vision, MTP, prefix-reuse, CLI,
 and serving routes.
+
+## The V100 port
+
+The port replaces architecture-specific Blackwell mechanisms while leaving the artifact format,
+model packages, scheduler, frontend, CLI, and HTTP APIs intact. Selection happens at build time:
+`sm_120a` keeps the upstream kernels and `sm_70` compiles the Volta routes.
+
+| Area | V100 implementation |
+|---|---|
+| Groupwise linear layers | Shape-specific Q4, Q5, Q6, and W8 decode kernels; row-split SIMT and Volta `m8n8k4` MMA schedules for narrow batches; CUTLASS SM70 tensor-core GEMMs for wide prefill |
+| NVFP4 and FP8 | Register-level software decode for narrow work; load-time NVFP4 prepack; transient FP16 reconstruction and CUTLASS GEMM for wide work |
+| Attention | Paged BF16 and INT8 group-64 KV decode kernels, plus a vendored and pinned llama.cpp Volta flash-attention kernel for prefill |
+| Gated Delta Net | Volta projection, convolution, recurrent-state, record/replay, and gating routes for the hybrid Text layers |
+| Speculative decoding | CUDA Graph decode, MTP windows from one to five, optimized proposal head, sampling, acceptance, and commit on the existing product path |
+| Serving | The upstream CLI, OpenAI Chat/Responses, Anthropic Messages, streaming, tools, multimodal input, prefix reuse, and bounded concurrent batching |
+
+Groupwise support is the base of the port, not a fallback. Its Q4/Q5/W8 kernels were tuned by
+registered model shape and token width, including separate GEMV, row-split, tensor-core, and
+CUTLASS crossovers. The final decode profile remains dominated by those specialized linear
+kernels; attention and general launch overhead are a small part of an MTP3 round. At full context,
+the groupwise artifact reaches 352.55 prefill tok/s with INT8 KV.
+
+The port also covers the less visible product work needed to run the model correctly on Volta:
+BF16 instruction substitutions, workspace and graph sizing, paged KV behavior, long-context
+attention, vision attention, GDN state transitions, artifact binding, and architecture-specific
+route registration. Unsupported Blackwell-only kernels remain isolated from the V100 build rather
+than being selected and failing at runtime.
+
+## Software NVFP4 on Volta
+
+V100 has no FP4 instructions. The NVFP4 path in this repository is a software implementation of
+the published NVFP4 artifact, not a conversion to groupwise integers and not a persistent FP16
+copy of the model.
+
+At model load, NVFP4 MLP gate/up weights are permuted in place into the fragment order required by
+Volta's `mma.sync.m8n8k4` instruction. The temporary prepack buffer is released immediately, so
+weight residency remains the artifact's packed 4-bit codes plus E4M3 K16 scales. During decode and
+speculative verification, QPN2 streams those packed bytes from HBM, decodes E2M1 values and E4M3
+scales in registers, and feeds FP16 tensor-core operands without materializing an FP16 weight
+matrix. The prepack removes the nibble permutation from the inner loop; this is the change that
+takes the five-draft verification round below the 70 tok/s target budget.
+
+Wide prefill uses a different route. It reconstructs one packed matrix into transient FP16
+workspace, runs a stock CUTLASS SM70 tensor-core GEMM, then reuses that workspace for the next
+operation. The reconstruction uses the same shift decoder as QPN2. Nothing expands persistently,
+which is why the 20.02 GiB Qwen3.8 NVFP4 artifact can still prefill at the 262,144-token model
+limit on a 32GB card with INT8 KV.
 
 ## Performance
 
-The published measurements currently cover the three Qwen3.6 artifact profiles. Qwen3.8-27B is
-supported by current NInfer builds but is not yet included in the benchmark campaign.
+Measurements below use a Tesla V100-SXM2-32GB at a locked 1,530 MHz graphics clock, CUDA 12.8,
+one request, and Qwen3.8-27B. Decode figures are from the target-round benchmark with the optimized
+proposal head. Round latency is independent of speculative acceptance; committed tok/s is not.
 
-### Concurrent MTP3 decode
+### Decode
 
-Saturated decode was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, MTP3, and
-one 8,192-token generation per active request. The values below are aggregate committed decode
-throughput from complete one-second intervals in which the actual decode batch remained equal to
-the configured concurrency. Each profile should be read independently.
+The short target-round benchmark also gives the measured groupwise comparison. These rates use
+each profile's best draft width and the licensed-token mean observed in its ten-round sample;
+acceptance varies with the continuation.
 
-| Model profile | C=1 | C=2 | C=4 | C=8 | C8 / C1 |
-|---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B `groupwise-int` | 185.8 tok/s | 247.0 tok/s | 309.5 tok/s | 535.0 tok/s | 2.88× |
-| Qwen3.6-27B `nvfp4` | 202.4 tok/s | 399.7 tok/s | 699.7 tok/s | 1,146.9 tok/s | 5.67× |
-| Qwen3.6-35B-A3B `groupwise-int` | 593.0 tok/s | 877.7 tok/s | 1,166.0 tok/s | 1,313.8 tok/s | 2.22× |
+| Weight profile | Drafts | Mean round | Mean licensed | Derived rate |
+|---|---:|---:|---:|---:|
+| `groupwise-int` | 3 | **53.79 ms** | 3.2 | 59.5 tok/s |
+| software `nvfp4` | 5 | 60.80 ms | **5.0** | **82.2 tok/s** |
 
-At C=8, Qwen3.6-35B-A3B reaches **1,313.8 aggregate decode tok/s**. The 27B NVFP4 profile reaches
-**1,146.9 tok/s** and **5.67×** its C=1 throughput.
+Groupwise MTP5 was slower: 70.21 ms per round, 3.9 licensed tokens, and 55.5 tok/s in the same
+short sample. Its measured optimum remains MTP3. NVFP4's wider useful verification window is what
+lets it produce the higher committed rate despite the longer round.
 
-### Single-request serving
+#### Software NVFP4 kernel delta
 
-The single-request corpus was measured on the same GPU with INT8 group-64 KV cache, CUDA Graphs,
-and a 1,024-token prefill chunk. Each reported fixture uses five fixed seeds after server warm-up.
-The two measured targets are reported independently and are not cross-target comparisons. The two
-27B weight profiles are reported separately. Requests were submitted serially to a persistent
-server.
+| Five-draft target verification | Mean round | Rate at 4.5 licensed tokens/round |
+|---|---:|---:|
+| Checkpoint-native QPN2 | 68.95 ms | 65.3 tok/s |
+| Load-time-prepacked QPN2 | **60.80 ms** | **74.0 tok/s** |
 
-**Qwen3.6-35B-A3B**
+The prepack reduces the complete MTP5 round by **11.8%** and clears the theorized 70 tok/s point
+when the workload licenses 4.5 tokens per round. A short ten-round sample licensed 5.0 tokens per
+round and therefore computes to 82.2 tok/s; a 100-round synthetic continuation licensed only 3.87
+and would compute to 63.7 tok/s at the final round latency. Those different rates are acceptance
+behavior, not different kernel speed. For a workload with mean licensed width `L`, use
+`L / 0.06080` to estimate the short-context kernel-bound rate.
 
-- MTP0 at a 7,680-token prompt: **15,544.3 prefill tok/s** and **271.1 decode tok/s**.
-- MTP0 at a 260,096-token prompt: **5,157.1 prefill tok/s** and **188.2 decode tok/s**.
-- MTP3 long reasoning: **620.3–726.2 decode tok/s** with **72.7–82.8% acceptance**.
-- MTP3 structured output: **770.9 decode tok/s**, **89.1% acceptance**, and **3.67 tokens/round**.
+MTP6 and MTP7 were also tested. Acceptance did not increase: both averaged 4.8 licensed tokens in
+the test continuation while round time rose to 78.50 and 80.61 ms. The product limit remains five.
 
-**Qwen3.6-27B (`groupwise-int`)**
+### Prefill
 
-- MTP0 at a 7,680-token prompt: **3,218.1 prefill tok/s** and **77.6 decode tok/s**.
-- MTP0 at a 260,096-token prompt: **1,614.8 prefill tok/s** and **54.8 decode tok/s**.
-- MTP3 long reasoning: **161.9–175.4 decode tok/s** with **73.4–78.8% acceptance**.
-- MTP3 structured output: **193.0 decode tok/s**, **88.7% acceptance**, and **3.66 tokens/round**.
+Both profiles use a 2,048-token chunk. The 260,096-token case allocates the full 262,144-token
+context with INT8 group-64 KV and no warm-up; both routes peak at 1.75 GiB of workspace.
 
-**Qwen3.6-27B (`nvfp4`)**
+| Weight profile | 2,048 tokens | 260,096 tokens |
+|---|---:|---:|
+| `groupwise-int` | **1,235.1 tok/s** | **352.55 tok/s** |
+| software `nvfp4` | 1,214.3 tok/s | 351.72 tok/s |
 
-- MTP0 at a 7,680-token prompt: **11,191.5 prefill tok/s** and **86.4 decode tok/s**.
-- MTP0 at a 260,096-token prompt: **2,510.6 prefill tok/s** and **59.9 decode tok/s**.
-- MTP3 long reasoning: **213.1–231.0 decode tok/s** with **76.3–81.1% acceptance**.
-- MTP3 structured output: **252.2 decode tok/s**, **89.8% acceptance**, and **3.69 tokens/round**.
-- Against groupwise-int on the same corpus and runtime options: **3.48× the 7,680-token prefill
-  throughput**, **1.55× the 260,096-token prefill throughput**, and **30–32% higher MTP3 decode
-  throughput**.
+The long-context comparison is the useful one: attention and KV work dominate there, while the
+fixed per-chunk weight reconstruction cost is most visible in the 2K case. At 260,096 tokens the
+software NVFP4 path is within 0.24% of groupwise prefill throughput.
 
-See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
-and per-fixture results.
+### Difference from the RTX 5090 build
+
+The upstream README reports 143.8 tok/s for Qwen3.8-27B NVFP4 at C=1/MTP3 and 2,203.1 prefill
+tok/s at a 260,096-token prompt. The V100 numbers above use MTP5 for the target-round measurement
+and a 2,048-token prefill chunk, so a raw ratio mixes protocol, acceptance, memory bandwidth, and
+native FP4 hardware. The architectural delta is simpler: the 5090 consumes NVFP4 in silicon;
+V100 runs a load-time fragment prepack, software E2M1/E4M3 decode, and FP16 `m8n8k4` tensor-core
+MMA. The artifact and public serving surface stay the same.
 
 ## Evaluation
 
-Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
+These are upstream artifact scores and were not rerun for this V100 release. Capability scores
+were measured through NInfer's OpenAI-compatible serving route with thinking
 enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
 
 | Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond |
@@ -90,7 +152,8 @@ enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per proble
 | [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% |
 | [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
 
-Qwen3.8-27B is supported but has not yet been added to this published evaluation campaign.
+Both Qwen3.8-27B profiles are supported but have not yet been added to this published evaluation
+campaign.
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
 cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
@@ -98,11 +161,11 @@ notes.
 
 ## Requirements
 
-NInfer currently requires:
+The V100 build requires:
 
 - 64-bit Linux;
-- NVIDIA GeForce RTX 5090 (`sm_120a`);
-- NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
+- NVIDIA Tesla V100 (`sm_70`), with 32GB recommended for the published 27B artifacts;
+- CUDA Toolkit 12.8 and a compatible NVIDIA driver;
 - CMake 3.28 or newer and a C++20-capable host compiler;
 - `pkg-config`;
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
@@ -110,61 +173,36 @@ NInfer currently requires:
 - `libcurl >= 7.85`;
 - Ninja, when using the commands below.
 
-The build rejects CUDA architectures other than `120a`. There is no install target or packaged
-binary distribution; NInfer is run from its source build tree.
+CUDA 12.8 is the final toolkit release that can compile `sm_70`; CUDA 13 removes offline Volta
+compilation. The default upstream/Blackwell build still requires CUDA 13.1 or newer. There is no
+install target or packaged binary distribution; NInfer is run from its source build tree.
 
 ## Build
 
 ```bash
-git clone https://github.com/Neroued/ninfer.git
-cd ninfer
+git clone https://github.com/geoffwatts/ninfer-v100.git
+cd ninfer-v100
 
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --parallel
+cmake -S . -B build-v100 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=70
+cmake --build build-v100 --parallel
 ```
 
 The default configuration builds:
 
 ```text
-build/apps/ninfer
-build/apps/ninfer-serve
+build-v100/apps/ninfer
+build-v100/apps/ninfer-serve
 ```
 
 Tests, benchmarks, and maintainer tools are excluded from the default build.
 
 ## Docker
 
-Build the runtime image on a 64-bit Linux host with an RTX 5090, a CUDA 13.1-compatible NVIDIA
-driver, Docker, and the
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-
-```bash
-docker build --tag ninfer:local .
-```
-
-Download a model into `models/` as described below, then run the HTTP server:
-
-```bash
-docker run --rm \
-  --gpus '"device=0"' \
-  --publish 8080:8080 \
-  --volume "$PWD/models:/models:ro" \
-  ninfer:local \
-  ninfer-serve /models/qwen3_6_27b.ninfer \
-  --host 0.0.0.0
-```
-
-Run the CLI from the same image:
-
-```bash
-docker run --rm \
-  --gpus '"device=0"' \
-  --volume "$PWD/models:/models:ro" \
-  ninfer:local \
-  ninfer /models/qwen3_6_27b.ninfer \
-  --prompt "Explain prefill and decode in three sentences." \
-  --max-new 256
-```
+The inherited Dockerfile follows upstream's CUDA 13.1/RTX 5090 build and is not the V100 release
+path. Build natively with CUDA 12.8 as shown above. A Volta runtime image must use a CUDA 12.8
+development base and pass `-DCMAKE_CUDA_ARCHITECTURES=70` during configuration.
 
 ## Download a model
 
@@ -185,16 +223,21 @@ hf download neroued/Qwen3.8-27B-NInfer \
   qwen3_8_27b.ninfer \
   --local-dir models
 
+# Or Qwen3.8-27B NVFP4:
+hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
+  qwen3_8_27b_nvfp4.ninfer \
+  --local-dir models
+
 # Or:
 hf download neroued/Qwen3.6-35B-A3B-NInfer \
   qwen3_6_35b_a3b.ninfer \
   --local-dir models
 ```
 
-Current NInfer builds accept only the version-2 artifact container, and all four downloads above
+Current NInfer builds accept only the version-2 artifact container, and all five downloads above
 are version 2. Migration applies only to Qwen3.6 artifacts downloaded before their version-2
-publication; Qwen3.8-27B was published directly as version 2. Migrate an older exact local file in
-place:
+publication; both Qwen3.8-27B profiles were published directly as version 2. Migrate an older exact
+local file in place:
 
 ```bash
 python3 -m tools.artifact.migrate_v1_to_v2 models/qwen3_6_27b.ninfer
@@ -217,18 +260,18 @@ available only for the 35B-A3B target and is text-only.
 ## Run the CLI
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build-v100/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 \
   --max-new 256 \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 5 \
   --lm-head-draft
 ```
 
 Use `--messages FILE` instead of `--prompt` for chat history, images, or videos:
 
 ```bash
-./build/apps/ninfer models/qwen3_6_27b.ninfer \
+./build-v100/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
@@ -242,13 +285,31 @@ speculative-decoding statistics are written to stderr. See the [CLI guide](docs/
 ## Run the HTTP server
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_6_27b.ninfer \
+./build-v100/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --max-context 16384 \
   --kv-capacity auto \
   --max-concurrency 2 \
-  --spec mtp --draft-tokens 3 \
+  --spec mtp --draft-tokens 5 \
   --lm-head-draft
 ```
+
+For one full-context request on a 32GB V100, use INT8 group-64 KV and the measured 2,048-token
+prefill chunk:
+
+```bash
+./build-v100/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+  --max-context 262144 \
+  --kv-capacity auto \
+  --kv-dtype int8 \
+  --prefill-chunk 2048 \
+  --max-concurrency 1 \
+  --spec mtp --draft-tokens 5 \
+  --lm-head-draft
+```
+
+`--kv-capacity auto` sizes one shared KV pool from the memory left after weight upload. Raising
+`--max-concurrency` does not create another 262,144-token pool per request; active and retained
+requests divide the same token capacity.
 
 The public model ID defaults to the artifact's `identity.model_id`; use `--model-id` only to
 publish a deployment-specific alias.
@@ -259,7 +320,7 @@ Then send an OpenAI-style request:
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "qwen3.6-27b",
+    "model": "qwen3.8-27b",
     "messages": [{"role": "user", "content": "Reply with one short sentence."}],
     "max_tokens": 64
   }'
@@ -291,9 +352,9 @@ from one to fifteen.
 
 ## Current limits
 
-- Only the four `(model_id, weights_id)` artifact identities listed above are accepted product
+- Only the five `(model_id, weights_id)` artifact identities listed above are accepted product
   identities.
-- Execution is specialized for one RTX 5090 and one CUDA device.
+- The Volta build is specialized for one Tesla V100 and one CUDA device.
 - One Engine owns one resident model and supports a startup-fixed capacity of 1–8 active requests.
   Decode-ready requests are compacted at round boundaries and executed in one batched model
   traversal.
@@ -324,8 +385,10 @@ NInfer is licensed under the [Apache License 2.0](LICENSE).
 The published artifacts are derived from
 [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B),
 [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and
-[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The 27B NVFP4 artifact also
-uses the fixed packed weights from
+[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The Qwen3.6-27B NVFP4 artifact
+also uses the fixed packed weights from
 [rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm).
-These source repositories are distributed under Apache-2.0. Vendored dependencies retain their own
-license files under `third_party/`.
+The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
+[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
+repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
+under `third_party/`.

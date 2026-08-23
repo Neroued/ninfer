@@ -21,7 +21,8 @@ struct LoadedQwen3_6_27B {
     std::unique_ptr<Qwen3_6_27B::LoadedModel> model;
     Qwen3_6_27B::Frontend frontend;
 
-    explicit LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model);
+    LoadedQwen3_6_27B(std::unique_ptr<Qwen3_6_27B::LoadedModel> stable_model,
+                      const EngineOptions& options);
     ~LoadedQwen3_6_27B();
 
     LoadedQwen3_6_27B(const LoadedQwen3_6_27B&)            = delete;
@@ -50,7 +51,8 @@ struct LoadedQwen3_6_35BA3B {
     std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> model;
     Qwen3_6_35BA3B::Frontend frontend;
 
-    explicit LoadedQwen3_6_35BA3B(std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model);
+    LoadedQwen3_6_35BA3B(std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model,
+                         const EngineOptions& options);
     ~LoadedQwen3_6_35BA3B();
 
     LoadedQwen3_6_35BA3B(const LoadedQwen3_6_35BA3B&)            = delete;

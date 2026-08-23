@@ -237,7 +237,7 @@ int run(const Options& options) {
         ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
     auto model =
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
-    auto frontend                      = target::Package::make_frontend(*model);
+    auto frontend                      = target::Package::make_frontend(*model, engine);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
     auto program = target::Package::create_program(*model, std::move(sequence), device);
     ninfer::runtime::RequestMemory request_memory(device, request_capacity);

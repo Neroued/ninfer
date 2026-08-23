@@ -26,6 +26,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
+// The tensor-core path below needs ldmatrix (sm_75+) and mma.m16n8k16 (sm_80+), neither
+// available on Volta. Below sm_80 this kernel takes a separate, fully independent SIMT
+// body (see the #else branch) rather than forking individual call sites: the two paths
+// share no tiling geometry (Volta has no equivalent of the m16n8k16 warp tile), so a
+// shared prologue would couple control flow between two algorithms that have nothing in
+// common past "read paged KV, do online softmax." See the V100 performance summary.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+
     constexpr int Wc      = WarpsPerCta;
     constexpr int Br      = Wc * 16;
     constexpr int Bc      = 32;
@@ -424,6 +432,225 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             store_vec(&partial_acc[dst], load_vec<int4>(&qkv_s[row * D + d]));
         }
     }
+
+#else // __CUDA_ARCH__ < 800: Volta SIMT decode, no tensor cores.
+    //
+    // Same paged-KV addressing, GQA row mapping, and online-softmax recurrence as the
+    // tensor-core path (this is a separate copy of that prologue, not a shared one — see
+    // the comment above the #if for why). The tile-batched (Bc=32 keys/iteration) scoring
+    // is replaced with one key at a time, so the split partitioning below is simpler
+    // (plain contiguous ranges, not Bc-aligned) — both are valid, non-overlapping covers
+    // of [0, window), which is all the reduce kernel requires. Each warp handles up to 16
+    // rows sequentially (register cost: one row's state live at a time, not all 16), and
+    // within a row all 32 lanes cooperate on one key: each lane owns an 8-wide d-chunk
+    // (D=256=32*8) of Q/K/V, contributes a partial dot product, and warp_sum (an
+    // all-reduce via shfl_xor) gives every lane the same score. No shared-memory K/V
+    // staging (correctness-first Phase 1 milestone; each row re-reads K/V from
+    // global/cache directly) — see the V100 performance summary for the follow-up to add staging
+    // shared across a warp's rows, matching how the tensor-core path reuses one key tile.
+    constexpr int Wc            = WarpsPerCta;
+    constexpr int D             = kGqaHeadDim;
+    constexpr int Threads       = Wc * 32;
+    constexpr float Log2E       = 1.4426950408889634074f;
+    constexpr unsigned FullMask = 0xffffffffu;
+    constexpr int kDPerLane     = D / 32;
+
+    const int kv_head     = static_cast<int>(blockIdx.x);
+    const int split       = static_cast<int>(blockIdx.y);
+    const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
+    const int split_count = static_cast<int>(gridDim.y);
+    const int tid         = static_cast<int>(threadIdx.x);
+    const int warp        = tid >> 5;
+    const int lane        = tid & 31;
+    int valid_tokens       = tokens;
+    if constexpr (Masked) {
+        const int remaining = valid_columns[batch] - column_begin;
+        valid_tokens         = remaining <= 0 ? 0 : (remaining < tokens ? remaining : tokens);
+    }
+    const int row_count = tokens * Geometry::GroupSize;
+
+    std::int64_t column_base = column_begin;
+    if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
+    q += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::QHeads * column_base;
+    pos += column_base;
+    if constexpr (CacheInput::writes_cache) {
+        input.k += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
+        input.v += static_cast<std::int64_t>(kGqaHeadDim) * Geometry::KVHeads * column_base;
+    }
+    const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
+    const std::int32_t* block_table =
+        block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+    if constexpr (MultiBatch) {
+        partial_acc += static_cast<std::int64_t>(batch) * kGqaHeadDim * Geometry::QHeads * tokens *
+                       split_count;
+        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+    }
+
+    auto write_neutral = [&]() {
+        for (int row = tid; row < row_count; row += Threads) {
+            int q_head = 0;
+            int token  = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+            if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+                partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] =
+                    -CUDART_INF_F;
+                partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = 0.0f;
+            }
+        }
+        for (int idx = tid; idx < row_count * D; idx += Threads) {
+            const int row = idx / D;
+            const int d   = idx - row * D;
+            int q_head    = 0;
+            int token     = 0;
+            gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+            if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+                partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
+                    __float2bfloat16(0.0f);
+            }
+        }
+    };
+
+    if (kv_head < 0 || kv_head >= Geometry::KVHeads || tokens < 1 || tokens > TokenTile ||
+        row_count > Wc * 16 || split_count <= 0) {
+        return;
+    }
+    if (valid_tokens == 0) {
+        write_neutral();
+        return;
+    }
+
+    const std::int32_t first_pos = pos[0];
+    const std::int32_t last_pos  = pos[tokens - 1];
+    if (first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity) {
+        write_neutral();
+        return;
+    }
+
+    const int window = last_pos + 1;
+    const int active_split_count =
+        gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
+    if (split >= active_split_count) { return; }
+
+    const int units_per_split = div_up(window, active_split_count);
+    const int split_start     = split * units_per_split;
+    const int split_end_raw   = split_start + units_per_split;
+    const int split_end       = (split_end_raw < window) ? split_end_raw : window;
+    if (split_start >= split_end) {
+        write_neutral();
+        return;
+    }
+
+    if constexpr (CacheInput::writes_cache) {
+        // Same bypass rationale as the tensor-core path's cache-write loop: current-step
+        // tokens are read directly from `input` below, never from the cache we just wrote,
+        // so no split depends on another split's write completing first.
+        for (int chunk = tid; chunk < valid_tokens * (D / 8); chunk += Threads) {
+            const int token = chunk / (D / 8);
+            const int d      = (chunk - token * (D / 8)) * 8;
+            const int p_tok  = pos[token];
+            if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 &&
+                p_tok < logical_capacity) {
+                const std::int64_t new_off = gqa_kv_new_index<Geometry>(kv_head, d, token);
+                const int lane2             = tid & 31;
+                int physical_page = lane2 == 0 ? paged_kv_physical_page(block_table, p_tok) : 0;
+                physical_page      = __shfl_sync(FullMask, physical_page, 0);
+                const std::int64_t cache_off =
+                    gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
+                store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
+                store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int r = 0; r < 16; ++r) {
+        const int row = warp * 16 + r;
+        if (row >= row_count) { break; }
+        int q_head = 0;
+        int token  = 0;
+        gqa_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+        if (!gqa_valid_q_head<Geometry>(kv_head, q_head)) { continue; }
+
+        const int qabs = pos[token];
+
+        float q_reg[kDPerLane];
+        {
+            const int4 qv =
+                load_vec<int4>(&q[gqa_q_index<Geometry>(q_head, lane * kDPerLane, token)]);
+            const __nv_bfloat16* qp = reinterpret_cast<const __nv_bfloat16*>(&qv);
+#pragma unroll
+            for (int i = 0; i < kDPerLane; ++i) { q_reg[i] = __bfloat162float(qp[i]); }
+        }
+
+        float m = -CUDART_INF_F;
+        float l = 0.0f;
+        float acc[kDPerLane];
+#pragma unroll
+        for (int i = 0; i < kDPerLane; ++i) { acc[i] = 0.0f; }
+
+        int cached_block   = -1;
+        int physical_page  = -1;
+        const int key_last = (qabs < split_end - 1) ? qabs : split_end - 1;
+        for (int key = split_start; key <= key_last; ++key) {
+            const __nv_bfloat16* k_ptr;
+            const __nv_bfloat16* v_ptr;
+            bool from_new = false;
+            if constexpr (CacheInput::writes_cache) {
+                const int new_token = key - first_pos;
+                from_new = new_token >= 0 && new_token < valid_tokens && key >= first_pos;
+                if (from_new) {
+                    k_ptr = &input.k[gqa_kv_new_index<Geometry>(kv_head, lane * kDPerLane, new_token)];
+                    v_ptr = &input.v[gqa_kv_new_index<Geometry>(kv_head, lane * kDPerLane, new_token)];
+                }
+            }
+            if (!from_new) {
+                const int block = key >> kPagedKVPageShift;
+                if (block != cached_block) {
+                    physical_page = block_table[block];
+                    cached_block  = block;
+                }
+                const std::int64_t off = gqa_cache_index<Geometry>(
+                    physical_page, kv_head, lane * kDPerLane, key & kPagedKVPageMask);
+                k_ptr = &cache_k[off];
+                v_ptr = &cache_v[off];
+            }
+
+            const int4 kv           = load_vec<int4>(k_ptr);
+            const __nv_bfloat16* kp = reinterpret_cast<const __nv_bfloat16*>(&kv);
+            float partial           = 0.0f;
+#pragma unroll
+            for (int i = 0; i < kDPerLane; ++i) {
+                partial = fmaf(q_reg[i], __bfloat162float(kp[i]), partial);
+            }
+            const float score = warp_sum(partial, FullMask) * scale;
+
+            const float new_m = fmaxf(m, score);
+            const float alpha = (m == -CUDART_INF_F) ? 0.0f : exp2_approx((m - new_m) * Log2E);
+            const float p      = exp2_approx((score - new_m) * Log2E);
+            l = l * alpha + p;
+            m = new_m;
+
+            const int4 vv           = load_vec<int4>(v_ptr);
+            const __nv_bfloat16* vp = reinterpret_cast<const __nv_bfloat16*>(&vv);
+#pragma unroll
+            for (int i = 0; i < kDPerLane; ++i) {
+                acc[i] = fmaf(acc[i], alpha, p * __bfloat162float(vp[i]));
+            }
+        }
+
+        if (lane == 0) {
+            partial_m[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m;
+            partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l;
+        }
+        const std::int64_t dst_base =
+            gqa_partial_acc_index<Geometry>(q_head, lane * kDPerLane, token, split, tokens);
+        __nv_bfloat16 out8[kDPerLane];
+#pragma unroll
+        for (int i = 0; i < kDPerLane; ++i) { out8[i] = __float2bfloat16(acc[i]); }
+        store_vec(&partial_acc[dst_base], *reinterpret_cast<const int4*>(out8));
+    }
+#endif // __CUDA_ARCH__ >= 800
 }
 
 } // namespace ninfer::ops

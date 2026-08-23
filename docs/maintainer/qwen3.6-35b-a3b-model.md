@@ -647,7 +647,8 @@ The checkpoint processor accepts image and video media. For each media item it:
 1. decodes the image or samples video frames;
 2. chooses spatial dimensions aligned to the 32-pixel `patch_size × spatial_merge_size` factor;
 3. resizes RGB input and normalizes each channel as `(pixel - 0.5) / 0.5`;
-4. groups two frames and packs channel-major `2 × 16 × 16` patches into FP32 rows of width 1536;
+4. groups two frames and packs channel-major `2 × 16 × 16` patches directly into BF16 rows of
+   width 1536 with round-to-nearest-even normalization;
 5. expands one image frame into the required temporal pair, or groups video frames in pairs;
 6. records each media grid as `(grid_t, grid_h, grid_w)` before spatial merge;
 7. emits one Text placeholder per merged 2×2 patch group and records its scatter span;
@@ -656,10 +657,10 @@ The checkpoint processor accepts image and video media. For each media item it:
 The source processor config uses image pixel-count bounds 65,536 through 16,777,216 and video
 pixel-frame bounds 4,096 through 25,165,824. These are frontend work budgets rather than learned
 model dimensions. Before other limits, the resulting Vision-token count is
-`grid_t × grid_h × grid_w / 4`. Source bytes, decoded pixels, media count, raw patches, and
-Vision-token counts remain bounded; the attention-pair count is diagnostic rather than an
-admission limit. The processor has no separate prompt-token ceiling: Engine `max_context` admits
-the complete rendered text-plus-media prompt.
+`grid_t × grid_h × grid_w / 4`. Media item count has no independent fixed ceiling. Aggregate source
+bytes, decoded pixels, 131,072 raw patches, 32,768 Vision tokens, live BF16 payload bytes, and
+Engine `max_context` bound the request. The BF16 payload is copied directly into the Vision patch
+projection workspace without retaining an FP32 host copy or running a device cast.
 
 ## 12. Vision tower
 

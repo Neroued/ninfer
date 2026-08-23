@@ -74,4 +74,19 @@ __device__ __forceinline__ int4 gqa_kv_dequant_i8x8_from(const std::int8_t* code
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
+// Same contract as gqa_kv_dequant_i8x8_from, but packs fp16 instead of bf16: Volta's
+// mma.sync.m8n8k4 accepts fp16 operands only, so the tensor-core decode path needs its staged
+// K/V in fp16, while the SIMT path wants bf16 to match its accumulators. Still one 64-bit load.
+__device__ __forceinline__ int4 gqa_kv_dequant_i8x8_f16_from(const std::int8_t* codes8, float s) {
+    const int2 raw       = load_vec<int2>(codes8);
+    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
+    __half2 packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        packed[i] = __floats2half2_rn(static_cast<float>(c[2 * i]) * s,
+                                      static_cast<float>(c[2 * i + 1]) * s);
+    }
+    return *reinterpret_cast<const int4*>(packed);
+}
+
 } // namespace ninfer::ops

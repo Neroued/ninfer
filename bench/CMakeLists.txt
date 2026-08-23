@@ -41,11 +41,22 @@ ninfer_add_op_bench(ninfer_gdn_input_proj_conv_snapshot_bench
 ninfer_add_op_bench(ninfer_attn_input_proj_bench SOURCES ops/attn_input_proj_bench.cu)
 ninfer_add_op_bench(ninfer_w8_linear_swiglu_bench SOURCES ops/w8_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_swiglu_bench SOURCES ops/nvfp4_linear_swiglu_bench.cu)
+ninfer_add_op_bench(ninfer_fp8_linear_swiglu_bench SOURCES ops/fp8_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_q4_linear_swiglu_bench SOURCES ops/q4_linear_swiglu_bench.cu)
 ninfer_add_op_bench(ninfer_w8_linear_add_bench SOURCES ops/w8_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_q5_linear_add_bench SOURCES ops/q5_linear_add_bench.cu)
+# Split-K tuning for the Volta fused-dequant GEMMs; the launchers it calls are sm_70-only.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  ninfer_add_op_bench(ninfer_volta_mma_split_bench SOURCES ops/volta_mma_split_bench.cu)
+endif()
 ninfer_add_op_bench(ninfer_bf16_linear_add_bench SOURCES ops/bf16_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES ops/nvfp4_linear_add_bench.cu)
+# TEMPORARY: private schedule sweep for the sm_70 A16 retune; delete with the sweep source
+# once production dispatch encodes the winners (docs/maintainer/op-development.md 7.1).
+ninfer_add_op_bench(ninfer_nvfp4_small_t_sweep SOURCES ops/nvfp4_small_t_sweep.cu)
+# TEMPORARY: correctness check for the new NVFP4 wide-T MMA kernel against the verified QPN2
+# route; delete once production dispatch is wired and covered by ninfer_linear_nvfp4_a16_test.
+ninfer_add_op_bench(ninfer_fp8_linear_add_bench SOURCES ops/fp8_linear_add_bench.cu)
 ninfer_add_op_bench(ninfer_causal_softmax_attention_bench
   SOURCES ops/causal_softmax_attention_bench.cu)
 ninfer_add_op_bench(ninfer_context_softmax_attention_bench

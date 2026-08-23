@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -17,6 +18,10 @@ namespace ninfer {
 using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency = 8;
+// Aggregate encoded image/video payload retained by one prompt, independent of item count.
+inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
+inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
+inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -78,8 +83,12 @@ struct EngineOptions {
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
-    bool enable_vision  = false;
-    bool use_cuda_graph = true;
+    std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
+    std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
+    // Zero selects a bounded worker count from the detected host concurrency.
+    std::uint32_t media_preprocess_threads = 0;
+    bool enable_vision                     = false;
+    bool use_cuda_graph                    = true;
     LoadProgress load_progress;
 };
 
@@ -164,29 +173,6 @@ struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
-};
-
-// Owns a bounded host-input reservation whose lifetime may cross from request preparation into
-// Engine execution. The concrete reservation is product-owned; Engine only releases it once the
-// target reports that the retained host payload is no longer needed.
-class HostInputLease {
-public:
-    HostInputLease() noexcept = default;
-
-    explicit HostInputLease(std::shared_ptr<void> owner) noexcept : owner_(std::move(owner)) {}
-
-    HostInputLease(HostInputLease&&) noexcept            = default;
-    HostInputLease& operator=(HostInputLease&&) noexcept = default;
-
-    HostInputLease(const HostInputLease&)            = delete;
-    HostInputLease& operator=(const HostInputLease&) = delete;
-
-    void reset() noexcept { owner_.reset(); }
-
-    [[nodiscard]] explicit operator bool() const noexcept { return owner_ != nullptr; }
-
-private:
-    std::shared_ptr<void> owner_;
 };
 
 enum class MediaKind : std::uint8_t {
@@ -285,6 +271,7 @@ enum class RequestErrorKind : std::uint8_t {
     MediaBudgetExceeded,
     Overloaded,
     QueueTimeout,
+    Cancelled,
     Unavailable,
 };
 
@@ -302,6 +289,40 @@ private:
 struct PromptSummary {
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
+};
+
+struct PromptPreparationStats {
+    double seconds                       = 0.0;
+    double media_preprocess_seconds      = 0.0;
+    double media_preprocess_work_seconds = 0.0;
+    double tokenize_seconds              = 0.0;
+    std::size_t media_items              = 0;
+    std::size_t media_bytes              = 0;
+    std::uint64_t raw_patches            = 0;
+    std::uint64_t vision_tokens          = 0;
+    std::size_t patch_bytes              = 0;
+    std::size_t media_cache_hits         = 0;
+    std::size_t media_cache_misses       = 0;
+    std::size_t media_singleflight_waits = 0;
+    std::size_t built_patch_bytes        = 0;
+    std::size_t reused_patch_bytes       = 0;
+};
+
+struct MediaCacheSummary {
+    std::size_t capacity_bytes       = 0;
+    std::size_t live_capacity_bytes  = 0;
+    std::size_t retained_bytes       = 0;
+    std::size_t live_bytes           = 0;
+    std::size_t entries              = 0;
+    std::size_t inflight             = 0;
+    std::size_t queued_tasks         = 0;
+    std::size_t active_tasks         = 0;
+    std::uint32_t preprocess_threads = 0;
+    std::uint64_t hits               = 0;
+    std::uint64_t misses             = 0;
+    std::uint64_t singleflight_waits = 0;
+    std::uint64_t evictions          = 0;
+    std::uint64_t oversize_bypasses  = 0;
 };
 
 enum class FinishReason : std::uint8_t {
@@ -333,6 +354,13 @@ public:
 
 private:
     std::function<bool()> requested_;
+};
+
+// Deadline and cancellation apply to all host-side prompt preparation work. Empty values mean
+// unbounded preparation.
+struct PreparationControl {
+    std::chrono::steady_clock::time_point deadline;
+    CancellationView cancellation;
 };
 
 struct GenerationTimings {

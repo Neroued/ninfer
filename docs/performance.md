@@ -2,6 +2,10 @@
 
 Tested Git revisions:
 
+- Qwen3.8-27B NVFP4 MTP0 context-length serving:
+  `f08597d6eaafce5b875934aaa85854fcd5426df8`;
+- Qwen3.8-27B NVFP4 MTP3 single-request and concurrent fixed-corpus serving:
+  `32c9881b6783949df4999422a764b3dcaa111b13`;
 - Concurrent MTP3 decode saturation for the three measured Qwen3.6 artifact profiles:
   `26da9df7c1b3d3c04ea7bbd730271aa01d00742a`;
 - Refreshed Qwen3.6-35B-A3B and Qwen3.6-27B NVFP4 MTP3:
@@ -16,12 +20,14 @@ Tested Git revisions:
 - Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B groupwise-int MTP0:
   `0795169393cab0f2c16246d4bac20dee735dc2a4`.
 
-The serving measurements characterize the two measured Qwen3.6 model IDs independently on one
+The Qwen3.6 measurements characterize its three registered artifact profiles independently on one
 NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative
-decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The 27B
-results report its `groupwise-int` and `nvfp4` weight profiles separately. The concurrent
-decode-saturation campaign measures the same three Qwen3.6 artifact profiles at C=1, 2, 4, and 8.
-Qwen3.8-27B is supported by current NInfer builds but is not included in this published campaign.
+decoding disabled, plus long-reasoning and cross-scenario decode with MTP and DFlash. The Qwen3.6
+concurrent decode-saturation campaign measures all three profiles at C=1, 2, 4, and 8. The
+Qwen3.8-27B NVFP4 campaign covers the MTP0 long-context profile and the complete MTP3
+speculative-decode corpus at C=1, 2, 4, and 8; its C=1 point also supplies the single-request MTP3
+results below. The registered Qwen3.8-27B `groupwise-int` profile remains outside the published
+benchmark campaign.
 
 The single-request corpus requests were submitted serially to a persistent `ninfer-serve` process
 over the loopback OpenAI-compatible HTTP endpoint. Each reported corpus fixture used five fixed
@@ -72,6 +78,37 @@ Decode throughput is a transport/execution measurement, not a correctness score.
 finish reason, and fixture-level structural requirements are audited separately below. A request
 that exhausts its output budget or enters a repetition loop remains useful as a sustained-decode
 stress sample, but is not presented as a successfully completed task.
+
+## Qwen3.8-27B NVFP4 concurrent MTP3 corpus makespan
+
+This campaign uses the complete speculative-decode corpus described above: three long-reasoning
+fixtures and twelve cross-scenario fixtures, each with five fixed seeds, for 75 requests. The
+runner shuffles that fixed request set once with seed `20260811` and preserves the same ordered HTTP
+send sequence at every concurrency. Exactly C persistent client workers each submit their next
+request only after receiving the current response. C=1 is therefore a serial single-request corpus
+on one persistent server and supplies the per-fixture Qwen3.8 results in the final section.
+
+Each point starts a fresh server on an RTX 5090 with CUDA 13.1 compile/runtime, CUDA driver API
+13.3, stochastic sampling, INT8 group-64 KV, a 1,024-token prefill chunk, CUDA Graphs, prefix reuse
+disabled, a 131,072-token per-request context ceiling, `--kv-capacity auto`, and
+`--spec mtp --draft-tokens 3 --lm-head-draft`. Makespan begins when all client workers are released
+and ends when the final complete HTTP response has been read. Prefill and decode rates divide the
+corresponding server token totals by that full makespan; average batch includes the entire run,
+including workload transitions and drain.
+
+| C | Requests | Computed prefill tokens | Decode tokens | Makespan (s) | Requests/s | Prefill tok/s | Decode tok/s | Avg batch | MTP acceptance | Speedup vs. C1 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 75 | 15,460 | 752,160 | 4,670.27 | 0.0161 | 3.3 | 161.1 | 1.00 | 60.8% | 1.00× |
+| 2 | 75 | 15,460 | 739,951 | 2,510.78 | 0.0299 | 6.2 | 294.7 | 1.98 | 59.2% | 1.86× |
+| 4 | 75 | 15,460 | 713,384 | 1,647.74 | 0.0455 | 9.4 | 432.9 | 3.29 | 58.0% | 2.83× |
+| 8 | 75 | 15,460 | 723,602 | 2,164.90 | 0.0346 | 7.1 | 334.2 | 2.36 | 57.6% | 2.16× |
+
+All 300 requests completed without a request, CUDA, or out-of-memory failure. C=4 gives the
+shortest complete-corpus makespan. C=8 is limited by memory pressure, which constrains effective
+batching and makes the end-to-end result slower than C=4. Sampling is stochastic: prompts, seeds,
+and send order are fixed, but concurrency-specific numerical routes can change sampled
+continuations and their lengths. The makespan speedup is therefore a fixed-workload serving result
+rather than a fixed-token normalization; the exact decode-token totals are retained in the table.
 
 ## Concurrent MTP3 decode saturation
 
@@ -155,6 +192,20 @@ python3 tools/bench/run_serve_concurrency.py \
   --mode mtp3 --suite corpus-makespan --concurrency 1 \
   --max-context 131072 --kv-capacity auto \
   --output profiles/bench/concurrent_corpus_27b_nvfp4_mtp3_20260811
+
+python3 tools/bench/run_serve_corpus.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
+  --mode mtp0 --sampling stochastic \
+  --output profiles/bench/serve_corpus_qwen3_8_27b_nvfp4_mtp0_20260817
+
+python3 tools/bench/run_serve_concurrency.py \
+  --serve build/apps/ninfer-serve \
+  --artifact qwen3_8_27b=out/qwen3_8_27b_nvfp4.ninfer \
+  --mode mtp3 --suite corpus-makespan \
+  --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
+  --max-context 131072 --kv-capacity auto \
+  --output profiles/bench/concurrent_corpus_qwen3_8_27b_nvfp4_mtp3_20260817
 ```
 
 The concurrent decode-saturation campaigns use:
@@ -467,3 +518,41 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.
+
+## `qwen3_8_27b`
+
+### `nvfp4`
+
+The MTP0 table comes from the serial Long NIAH campaign described by the single-request method. The
+MTP3 tables come from the C=1 point of the fixed concurrent-corpus campaign, which serially runs the
+same three long-reasoning and twelve cross-scenario fixtures. Each fixture has five fixed seeds. The
+tables report arithmetic mean ± sample standard deviation from the server's per-request phase
+timings and speculative counters.
+
+#### MTP0 context-length profile
+
+| Prompt tokens | Samples | Prefill tok/s | Server TTFT (ms) | Decode tok/s |
+|---:|---:|---:|---:|---:|
+| 7,680 | 5 | 8,340.4 ± 13.0 | 931.6 ± 1.6 | 71.2 ± 0.1 |
+| 64,512 | 5 | 5,297.9 ± 259.2 | 12,281.1 ± 561.5 | 65.7 ± 0.8 |
+| 130,048 | 5 | 3,544.7 ± 25.3 | 36,853.5 ± 259.4 | 59.6 ± 0.9 |
+| 260,096 | 5 | 2,203.1 ± 13.4 | 118,354.8 ± 717.2 | 52.9 ± 2.3 |
+
+#### MTP3 long-reasoning decode
+
+| Fixture | Samples | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|---:|
+| `long_decode_aime26_01` | 5 | 1,465.4 ± 417.3 | 195.2 ± 4.6 | 76.0% ± 2.4% | 3.28 ± 0.07 |
+| `long_decode_aime26_15` | 5 | 65,414.4 ± 271.9 | 151.4 ± 2.0 | 56.2% ± 1.1% | 2.69 ± 0.03 |
+| `long_decode_aime26_30` | 5 | 50,023.4 ± 14,839.1 | 167.5 ± 23.7 | 64.6% ± 14.9% | 2.94 ± 0.45 |
+
+#### MTP3 cross-scenario decode
+
+Each category contains three fixtures and five seeds per fixture, for 15 samples.
+
+| Category | Samples | Decode tok/s | MTP acceptance | MTP tokens/round |
+|---|---:|---:|---:|---:|
+| Code | 15 | 194.3 ± 6.1 | 76.4% ± 3.9% | 3.29 ± 0.12 |
+| Story | 15 | 126.1 ± 10.9 | 37.4% ± 5.8% | 2.12 ± 0.17 |
+| Translation | 15 | 192.3 ± 11.9 | 75.0% ± 6.5% | 3.25 ± 0.19 |
+| Structured | 15 | 219.8 ± 8.6 | 90.8% ± 5.1% | 3.72 ± 0.15 |

@@ -168,6 +168,7 @@ Json request_json(const RequestLogContext& context) {
                 {"model", context.model},
                 {"stream", context.stream},
                 {"message_count", context.message_count},
+                {"media_item_count", context.media_item_count},
                 {"requested_output_tokens", context.requested_output_tokens},
                 {"requested_output_tokens_source",
                  context.requested_output_tokens_client_set ? "client" : "server_default"},
@@ -178,6 +179,25 @@ Json request_json(const RequestLogContext& context) {
                 {"preserve_thinking", context.preserve_thinking},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
                 {"sampling", sampler_json(context.sampling)}};
+}
+
+Json preparation_json(const RequestLogContext& context) {
+    const PromptPreparationStats& stats = context.preparation;
+    return Json{{"total", stats.seconds},
+                {"acquisition", context.acquisition_seconds},
+                {"media_preprocess", stats.media_preprocess_seconds},
+                {"media_preprocess_work", stats.media_preprocess_work_seconds},
+                {"tokenize", stats.tokenize_seconds},
+                {"media_items", stats.media_items},
+                {"media_bytes", stats.media_bytes},
+                {"raw_patches", stats.raw_patches},
+                {"vision_tokens", stats.vision_tokens},
+                {"patch_bytes", stats.patch_bytes},
+                {"cache_hits", stats.media_cache_hits},
+                {"cache_misses", stats.media_cache_misses},
+                {"singleflight_waits", stats.media_singleflight_waits},
+                {"built_patch_bytes", stats.built_patch_bytes},
+                {"reused_patch_bytes", stats.reused_patch_bytes}};
 }
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
@@ -282,6 +302,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.model                              = request.model;
     context.stream                             = request.stream;
     context.message_count                      = request.messages.size();
+    context.media_item_count                   = request.media_item_count();
     context.requested_output_tokens            = request.max_tokens;
     context.requested_output_tokens_client_set = request.max_tokens_set;
     context.tool_count                         = request.tools.size();
@@ -291,6 +312,8 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.preserve_thinking                  = prepared.preserve_thinking;
     context.preserve_thinking_semantic_change  = prepared.preserve_thinking_semantic_change;
     context.sampling                           = prepared.sampling;
+    context.acquisition_seconds                = prepared.acquisition_seconds;
+    context.preparation                        = prepared.preparation;
     return context;
 }
 
@@ -326,7 +349,18 @@ std::string format_request_start(const RequestLogContext& context) {
         << " thinking=" << (context.enable_thinking ? "on" : "off")
         << " preserve_thinking=" << (context.preserve_thinking ? "on" : "off")
         << " preserve_change=" << (context.preserve_thinking_semantic_change ? "yes" : "no")
-        << " sampler=[" << sampler_str(context.sampling) << "] \xE2\x86\x92 submitted";
+        << " sampler=[" << sampler_str(context.sampling) << ']';
+    if (context.media_item_count != 0) {
+        out << " prepare=" << seconds_str(context.preparation.seconds)
+            << " acquire=" << seconds_str(context.acquisition_seconds)
+            << " media=" << seconds_str(context.preparation.media_preprocess_seconds) << '/'
+            << seconds_str(context.preparation.media_preprocess_work_seconds)
+            << " tokenize=" << seconds_str(context.preparation.tokenize_seconds)
+            << " media_cache=" << context.preparation.media_cache_hits << '/'
+            << context.preparation.media_cache_misses << '/'
+            << context.preparation.media_singleflight_waits;
+    }
+    out << " \xE2\x86\x92 submitted";
     return out.str();
 }
 
@@ -414,6 +448,9 @@ std::string format_server_start_json(
                               {"api_key_configured", !options.api_key.empty()},
                               {"cors_enabled", options.enable_cors},
                               {"max_request_bytes", options.max_request_bytes},
+                              {"media_cache_bytes", options.media_cache_bytes},
+                              {"media_live_bytes", options.media_live_bytes},
+                              {"media_preprocess_threads", options.media_preprocess_threads},
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
                               {"default_thinking", options.enable_thinking},
@@ -485,8 +522,9 @@ std::string format_server_start_json(
 
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp, const RequestLogContext& context) {
-    Json record       = event_base(server_instance_id, timestamp, "request_start");
-    record["request"] = request_json(context);
+    Json record                   = event_base(server_instance_id, timestamp, "request_start");
+    record["request"]             = request_json(context);
+    record["preparation_seconds"] = preparation_json(context);
     return record.dump();
 }
 

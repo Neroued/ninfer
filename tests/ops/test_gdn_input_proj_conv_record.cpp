@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -20,6 +21,15 @@ namespace {
 
 constexpr std::int32_t kQueryRows = 2048;
 constexpr std::int32_t kKeyRows   = 2048;
+constexpr ReductionCriterion kFp8GdnInputProjConvRecordA16Tolerance{1.0 / 256.0, 1.0 / 256.0,
+                                                                    2.0 / 256.0};
+constexpr ReductionCriterion kFp8GdnInputProjConvRecordA8Tolerance{0.04, 1.0 / 256.0, 0.06};
+
+double silu_fp64(double value) {
+    if (value >= 0.0) { return value / (1.0 + std::exp(-value)); }
+    const double exponential = std::exp(value);
+    return value * exponential / (1.0 + exponential);
+}
 
 std::vector<std::uint16_t> make_bf16_bits(std::size_t elements, std::uint32_t seed, float low,
                                           float high) {
@@ -46,6 +56,24 @@ int verify_zero_tail(std::string_view label, const std::vector<std::uint16_t>& v
             for (std::int32_t row = 0; row < rows; ++row) {
                 if (values[base + row] != 0) {
                     std::cerr << label << ": invalid tail is not exact zero\n";
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int verify_record_prefix_written(std::string_view label, const std::vector<std::uint16_t>& values,
+                                 std::int32_t channels, std::int32_t width, std::int32_t batch,
+                                 const std::vector<std::int32_t>& valid_columns) {
+    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
+        const std::int32_t valid = valid_columns[static_cast<std::size_t>(batch_row)];
+        for (std::int32_t token = 0; token < valid; ++token) {
+            const std::size_t base = static_cast<std::size_t>(batch_row * width + token) * channels;
+            for (std::int32_t row = 0; row < channels; ++row) {
+                if (!std::isfinite(bf16_to_f32(values[base + row]))) {
+                    std::cerr << label << ": valid record prefix was not fully written\n";
                     return 1;
                 }
             }
@@ -282,6 +310,9 @@ int run_w8() {
     return failures;
 }
 
+// NVFP4 needs Blackwell-only cvt.e2m1x2; its sub-sm_80 branch is a __trap(). On Volta the case
+// aborts the process and takes the Q4/Q5 and W8 results down with it, so it is skipped here.
+#ifndef NINFER_VOLTA_BUILD
 int run_nvfp4() {
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kValueRows = 6144;
@@ -332,6 +363,192 @@ int run_nvfp4() {
     return failures;
 }
 
+#endif // NINFER_VOLTA_BUILD
+
+int run_fp8_oracle_case(DevicePackedWeight& parent, std::int32_t width, std::int32_t batch,
+                        std::vector<std::int32_t> valid_columns, ops::LinearPolicy policy,
+                        std::uint32_t seed) {
+#ifdef NINFER_VOLTA_BUILD
+    // A8 activation compute needs mma.sync.kind::f8f6f4 (sm_89+), which traps here and
+    // aborts the binary. The A16 cases in the same suite are what this port is held to.
+    if (policy != ops::LinearPolicy::A16Only) { return 0; }
+#endif
+    constexpr std::int32_t kHidden    = 5120;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows     = 6144;
+    constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kRows      = kChannels + kZRows;
+    const std::int32_t columns        = width * batch;
+    const std::int32_t slots          = batch + 2;
+    const bool dense                  = valid_columns.empty();
+    if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
+
+    const std::vector<float> activation              = make_bf16_activation(kHidden, columns, seed);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    const std::vector<std::uint16_t> conv_weight_bits =
+        make_bf16_bits(static_cast<std::size_t>(kChannels) * 4, seed + 1, -0.02F, 0.02F);
+    const std::vector<std::uint16_t> state_before =
+        make_bf16_bits(static_cast<std::size_t>(kChannels) * 3 * slots, seed + 2, -0.05F, 0.05F);
+    std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
+    for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
+        initial_slots[static_cast<std::size_t>(batch_row)] = batch_row;
+    }
+
+    DeviceBuffer device_x           = to_device(activation_bits);
+    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
+    DeviceBuffer device_state       = to_device(state_before);
+    DeviceBuffer device_initial     = to_device(initial_slots);
+    DeviceBuffer device_valid;
+    if (!dense) { device_valid = to_device(valid_columns); }
+    GuardedBf16Tensor conv_record(kChannels, columns);
+    GuardedBf16Tensor query(kQueryRows, columns);
+    GuardedBf16Tensor key(kKeyRows, columns);
+    GuardedBf16Tensor value(kValueRows, columns);
+    GuardedBf16Tensor z(kZRows, columns);
+
+    Tensor x(device_x.p, DType::BF16, {kHidden, width, batch});
+    Tensor conv_weight(device_conv_weight.p, DType::BF16, {kChannels, 4});
+    Tensor state(device_state.p, DType::BF16, {kChannels, 3, slots});
+    Tensor valid;
+    if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
+    Tensor initial(device_initial.p, DType::I32, {batch});
+    Tensor record_view(conv_record.data(), DType::BF16, {kChannels, width, batch});
+    Tensor query_view(query.data(), DType::BF16, {kQueryRows, width, batch});
+    Tensor key_view(key.data(), DType::BF16, {kKeyRows, width, batch});
+    Tensor value_view(value.data(), DType::BF16, {kValueRows, width, batch});
+    Tensor z_view(z.data(), DType::BF16, {kZRows, width, batch});
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, batch, width, width);
+    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+
+    ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, state, valid, initial,
+                                    record_view, query_view, key_view, value_view, z_view, policy,
+                                    workspace, nullptr);
+    cuda_synchronize();
+
+    const std::vector<double> record_values = conv_record.values();
+    const std::vector<double> query_values  = query.values();
+    const std::vector<double> key_values    = key.values();
+    const std::vector<double> value_values  = value.values();
+    const std::vector<double> z_values      = z.values();
+    std::vector<double> record_actual;
+    std::vector<double> record_expected;
+    std::vector<double> output_actual;
+    std::vector<double> output_expected;
+    std::vector<double> z_actual;
+    std::vector<double> z_expected;
+    const auto append_channel = [&](std::int32_t global_row, std::int32_t output_rows,
+                                    std::int32_t output_row, const std::vector<double>& output) {
+        const double w0 = bf16_to_f32(conv_weight_bits[global_row]);
+        const double w1 = bf16_to_f32(conv_weight_bits[kChannels + global_row]);
+        const double w2 = bf16_to_f32(conv_weight_bits[2LL * kChannels + global_row]);
+        const double w3 = bf16_to_f32(conv_weight_bits[3LL * kChannels + global_row]);
+        for (std::int32_t batch_row = 0; batch_row < batch; ++batch_row) {
+            const std::int32_t valid_extent = valid_columns[static_cast<std::size_t>(batch_row)];
+            const std::size_t initial_base =
+                static_cast<std::size_t>(initial_slots[static_cast<std::size_t>(batch_row)]) * 3 *
+                kChannels;
+            double s0 = bf16_to_f32(state_before[initial_base + global_row]);
+            double s1 = bf16_to_f32(state_before[initial_base + kChannels + global_row]);
+            double s2 = bf16_to_f32(state_before[initial_base + 2LL * kChannels + global_row]);
+            for (std::int32_t token = 0; token < valid_extent; ++token) {
+                const std::int32_t column = batch_row * width + token;
+                const double projected    = quantized_weight::dot_fp64(
+                    parent.host, global_row,
+                    activation.data() + static_cast<std::size_t>(column) * kHidden, kHidden);
+                record_actual.push_back(
+                    record_values[static_cast<std::size_t>(column) * kChannels + global_row]);
+                record_expected.push_back(projected);
+                output_actual.push_back(
+                    output[static_cast<std::size_t>(column) * output_rows + output_row]);
+                output_expected.push_back(silu_fp64(w0 * s0 + w1 * s1 + w2 * s2 + w3 * projected));
+                s0 = s1;
+                s1 = s2;
+                s2 = projected;
+            }
+        }
+    };
+
+    constexpr std::int32_t kSampleRows = 7;
+    for (const std::int32_t row : sampled_rows(kQueryRows, kSampleRows)) {
+        append_channel(row, kQueryRows, row, query_values);
+    }
+    for (const std::int32_t row : sampled_rows(kKeyRows, kSampleRows)) {
+        append_channel(kQueryRows + row, kKeyRows, row, key_values);
+    }
+    for (const std::int32_t row : sampled_rows(kValueRows, kSampleRows)) {
+        append_channel(kQueryRows + kKeyRows + row, kValueRows, row, value_values);
+    }
+    for (const std::int32_t row : sampled_rows(kZRows, kSampleRows)) {
+        for (std::int32_t column = 0; column < columns; ++column) {
+            z_actual.push_back(z_values[static_cast<std::size_t>(column) * kZRows + row]);
+            z_expected.push_back(quantized_weight::dot_fp64(
+                parent.host, kChannels + row,
+                activation.data() + static_cast<std::size_t>(column) * kHidden, kHidden));
+        }
+    }
+
+    const bool uses_a8 =
+        policy == ops::LinearPolicy::AllowA8 && (batch == 1 ? width >= 10 : width * batch >= 8);
+    const ReductionCriterion& criterion =
+        uses_a8 ? kFp8GdnInputProjConvRecordA8Tolerance : kFp8GdnInputProjConvRecordA16Tolerance;
+    const std::string label = std::string("FP8 ") + (uses_a8 ? "A8" : "A16") +
+                              " B=" + std::to_string(batch) + " W=" + std::to_string(width);
+    int failures = compare(label + " record", record_actual, record_expected, criterion);
+    failures += compare(label + " query/key/value", output_actual, output_expected, criterion);
+    failures += compare(label + " z", z_actual, z_expected, criterion);
+    failures +=
+        verify_zero_tail(label + " query", query.bits(), kQueryRows, width, batch, valid_columns);
+    failures += verify_zero_tail(label + " key", key.bits(), kKeyRows, width, batch, valid_columns);
+    failures +=
+        verify_zero_tail(label + " value", value.bits(), kValueRows, width, batch, valid_columns);
+    failures += verify_record_prefix_written(label + " record", conv_record.bits(), kChannels,
+                                             width, batch, valid_columns);
+    failures += query.verify_fully_written(label + " query");
+    failures += key.verify_fully_written(label + " key");
+    failures += value.verify_fully_written(label + " value");
+    failures += z.verify_fully_written(label + " z");
+    failures += conv_record.verify_guards(label + " record");
+    failures += query.verify_guards(label + " query");
+    failures += key.verify_guards(label + " key");
+    failures += value.verify_guards(label + " value");
+    failures += z.verify_guards(label + " z");
+    failures += verify_preserved(label + " x", device_x, activation_bits);
+    failures += verify_preserved(label + " conv weight", device_conv_weight, conv_weight_bits);
+    failures += verify_preserved(label + " initial", device_initial, initial_slots);
+    if (!dense) { failures += verify_preserved(label + " valid", device_valid, valid_columns); }
+    failures += verify_equal(label + " source state", state_before,
+                             from_device<std::uint16_t>(device_state, state_before.size()));
+    failures += parent.verify_preserved(label + " parent weight");
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int run_fp8() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kRows   = 16384;
+    DevicePackedWeight parent(quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S,
+                                                                      kRows, kHidden, 1701U));
+    int failures = 0;
+    failures += run_fp8_oracle_case(parent, 2, 1, {}, ops::LinearPolicy::A16Only, 1711U);
+    failures += run_fp8_oracle_case(parent, 3, 1, {2}, ops::LinearPolicy::A16Only, 1721U);
+    failures += run_fp8_oracle_case(parent, 4, 1, {}, ops::LinearPolicy::A16Only, 1731U);
+    failures += run_fp8_oracle_case(parent, 6, 1, {5}, ops::LinearPolicy::A16Only, 1741U);
+    failures += run_fp8_oracle_case(parent, 7, 1, {}, ops::LinearPolicy::AllowA8, 1751U);
+    failures += run_fp8_oracle_case(parent, 9, 1, {7}, ops::LinearPolicy::AllowA8, 1761U);
+    failures += run_fp8_oracle_case(parent, 10, 1, {}, ops::LinearPolicy::AllowA8, 1771U);
+    failures += run_fp8_oracle_case(parent, 10, 1, {8}, ops::LinearPolicy::A16Only, 1781U);
+    failures += run_fp8_oracle_case(parent, 11, 1, {9}, ops::LinearPolicy::A16Only, 1791U);
+    failures += run_fp8_oracle_case(parent, 3, 2, {3, 1}, ops::LinearPolicy::AllowA8, 1801U);
+    failures += run_fp8_oracle_case(parent, 4, 2, {4, 2}, ops::LinearPolicy::AllowA8, 1811U);
+    failures += run_fp8_oracle_case(parent, 16, 8, {16, 13, 11, 7, 5, 3, 2, 1},
+                                    ops::LinearPolicy::AllowA8, 1821U);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -340,10 +557,30 @@ int main() {
         return 77;
     }
 
-    int failures = 0;
+    int failures                   = 0;
+    const auto fp8_record_capacity = [](ops::LinearPolicy policy, std::int32_t batch,
+                                        std::int32_t min_width, std::int32_t max_width) {
+        return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_ROW_BF16S, 16384, 5120, policy, batch, min_width, max_width);
+    };
+    const std::size_t fp8_b1_w10 = fp8_record_capacity(ops::LinearPolicy::AllowA8, 1, 10, 10);
+    const std::size_t fp8_b2_w4  = fp8_record_capacity(ops::LinearPolicy::AllowA8, 2, 4, 4);
+    if (fp8_record_capacity(ops::LinearPolicy::A16Only, 1, 2, 16) != 0 ||
+        fp8_record_capacity(ops::LinearPolicy::AllowA8, 1, 2, 9) != 0 || fp8_b1_w10 == 0 ||
+        fp8_record_capacity(ops::LinearPolicy::AllowA8, 1, 2, 10) != fp8_b1_w10 ||
+        fp8_record_capacity(ops::LinearPolicy::AllowA8, 2, 2, 3) != 0 || fp8_b2_w4 == 0 ||
+        fp8_record_capacity(ops::LinearPolicy::AllowA8, 2, 2, 4) != fp8_b2_w4) {
+        std::cerr << "FP8 record capacity did not preserve measured route witnesses\n";
+        ++failures;
+    }
     failures += run_q4_q5();
     failures += run_w8();
+#ifndef NINFER_VOLTA_BUILD
     failures += run_nvfp4();
+#else
+    std::cout << "SKIP nvfp4: no FP4 hardware on Volta\n";
+#endif
+    failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

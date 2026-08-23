@@ -11,8 +11,8 @@ int main() {
     try {
         // Public numerical cases straddle each registered Q4 implementation interval. They make
         // no assertion about the private route selected for any T.
-        constexpr std::array<std::int32_t, 18> kTokenCases{
-            1, 2, 32, 33, 40, 41, 48, 49, 128, 129, 256, 257, 384, 385, 512, 513, 640, 641,
+        constexpr std::array<std::int32_t, 20> kTokenCases{
+            1, 2, 3, 4, 32, 33, 40, 41, 48, 49, 128, 129, 256, 257, 384, 385, 512, 513, 640, 641,
         };
         const int failures = run_profile(
             "LinearSwiGLU Q4_A16",

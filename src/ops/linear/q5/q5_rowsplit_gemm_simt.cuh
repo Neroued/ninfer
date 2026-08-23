@@ -25,10 +25,10 @@
 //     fixup is a constant xor folded into the packed word, and one hsub2 yields
 //     two exact signed values; the group scale is applied per 8-value chunk.
 //     fp32 FMA into per-column accumulators; warp-shuffle reduction per column.
-//   - kTt is 4 or 8 only. Larger column tiles blow past the register budget
-//     (kTt=16 needs ~98 regs -> 2 blocks/SM -> latency-bound at ~20% of DRAM),
-//     so T > 8 re-streams the weights once per 8-column tile instead; the mma
-//     tensor-core GEMM takes over where that stops winning.
+//   - The per-warp tile is 4 or 8 only. A 16-column accumulator tile blows past the register
+//     budget (~98 regs), so the Volta wide route instead pairs two C8 warps on one output row.
+//     This keeps the proven register footprint while placing duplicate weight fetches in the
+//     same CTA/L1 working set. The registered Volta T=9..32 interval uses paired tiles.
 //
 // Correctness for arbitrary shapes: full 1024-value slabs require k % 8 == 0
 // (16-byte aligned x columns) and cover [0, k/1024*1024); every remaining group
@@ -409,7 +409,7 @@ __launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
 // full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte
 // aligned, else 0 (everything runs through the scalar tail).
 template <class SC, int kTt, int kRowsPerBlock, int kStages, bool SplitOutput = false,
-          int SplitRow = 0>
+          int SplitRow = 0, bool AddResidual = false, int ColWarpsPerRow = 1>
 __global__ void q5_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
                                              const std::uint8_t* __restrict__ high,
@@ -421,6 +421,9 @@ __global__ void q5_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
     using Codec                = typename SC::Codec;
     constexpr int kPrefetch    = kStages - 1;
     constexpr int kHighU4Alloc = SC::kHighU4 > 0 ? SC::kHighU4 : 1;
+    constexpr int kLogicalRowsPerBlock = kRowsPerBlock / ColWarpsPerRow;
+    constexpr int kColsPerBlock        = kTt * ColWarpsPerRow;
+    static_assert(ColWarpsPerRow > 0 && kRowsPerBlock % ColWarpsPerRow == 0);
     static_assert(!SplitOutput || SplitRow > 0,
                   "split-output Q5 SIMT requires a positive compile-time seam");
 
@@ -428,12 +431,14 @@ __global__ void q5_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
     __shared__ __align__(16) uint4 s_hi[kRowsPerBlock][kStages][kHighU4Alloc];
     __shared__ __align__(16) std::uint32_t s_sc[kRowsPerBlock][kStages][SC::kScaleU32];
 
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int row  = static_cast<int>(blockIdx.x) * kRowsPerBlock + warp;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int warp        = static_cast<int>(threadIdx.x) >> 5;
+    const int row_warp    = warp / ColWarpsPerRow;
+    const int column_warp = warp - row_warp * ColWarpsPerRow;
+    const int row         = static_cast<int>(blockIdx.x) * kLogicalRowsPerBlock + row_warp;
     if (row >= n) { return; }
-    const int col0  = static_cast<int>(blockIdx.y) * kTt;
-    const int ncols = min(kTt, t - col0);
+    const int col0 = static_cast<int>(blockIdx.y) * kColsPerBlock + column_warp * kTt;
+    const int ncols = max(0, min(kTt, t - col0));
 
     const int kg_padded          = padded_k / Codec::kGroupK;
     const std::uint8_t* code_row = codes + static_cast<std::int64_t>(row) * kg_padded * 32;
@@ -506,13 +511,19 @@ __global__ void q5_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x
         if (lane == 0) {
             if constexpr (SplitOutput) {
                 if (row < SplitRow) {
-                    out[static_cast<std::int64_t>(col0 + tt) * out_ld + row] = __float2bfloat16(a);
+                    const std::int64_t index = static_cast<std::int64_t>(col0 + tt) * out_ld + row;
+                    if constexpr (AddResidual) { a += __bfloat162float(out[index]); }
+                    out[index] = __float2bfloat16(a);
                 } else {
-                    out_tail[static_cast<std::int64_t>(col0 + tt) * (n - SplitRow) + row -
-                             SplitRow] = __float2bfloat16(a);
+                    const std::int64_t index =
+                        static_cast<std::int64_t>(col0 + tt) * (n - SplitRow) + row - SplitRow;
+                    if constexpr (AddResidual) { a += __bfloat162float(out_tail[index]); }
+                    out_tail[index] = __float2bfloat16(a);
                 }
             } else {
-                out[static_cast<std::int64_t>(col0 + tt) * out_ld + row] = __float2bfloat16(a);
+                const std::int64_t index = static_cast<std::int64_t>(col0 + tt) * out_ld + row;
+                if constexpr (AddResidual) { a += __bfloat162float(out[index]); }
+                out[index] = __float2bfloat16(a);
             }
         }
     }

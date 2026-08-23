@@ -64,6 +64,14 @@ __launch_bounds__(256, 6) __global__
                                const std::uint8_t* __restrict__ scales,
                                __nv_bfloat16* __restrict__ out, Epilogue epilogue = {},
                                RowPolicy row_policy = {}) {
+// Same ldmatrix/mma.m16n8k16 story as w8_small_t_mma_kernel, and genuinely decode-relevant
+// once more (draft-head projection + linear_swiglu's fused gate/up, both now in scope with
+// MTP back in — see the V100 performance summary). Unlike w8_small_t, there's no single drop-in SIMT
+// replacement here (this kernel's callers need either a plain projection or a fused SwiGLU
+// combine that q4_rowsplit_gemm_simt_kernel doesn't natively do) — so the host callers
+// compose it from the existing, already-validated q4 SIMT kernel instead of calling this
+// one, under NINFER_VOLTA_BUILD. This body still needs its own stub purely to compile.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     using Schedule              = Q4DraftSmallTSchedule;
     constexpr int kHidden       = Geometry::kInputRows;
     constexpr int kTileK        = Schedule::kTileKPerWarp;
@@ -250,6 +258,15 @@ __launch_bounds__(256, 6) __global__
             }
         }
     }
+#else  // __CUDA_ARCH__ < 800
+    (void)x;
+    (void)codes;
+    (void)scales;
+    (void)out;
+    (void)epilogue;
+    (void)row_policy;
+    __trap();
+#endif // __CUDA_ARCH__ >= 800
 }
 
 } // namespace ninfer::ops::detail

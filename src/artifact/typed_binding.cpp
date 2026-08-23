@@ -23,6 +23,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::RowSplitK128V1;
     case NumericFormat::NVFP4:
         return StorageLayout::BlockScaleK16M128x4V1;
+    case NumericFormat::FP8_E4M3FN_ROW_BF16S:
+        return StorageLayout::RowScaleV1;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -45,6 +47,8 @@ QType qtype_for(NumericFormat format) {
         return QType::W8G32_F16S;
     case NumericFormat::NVFP4:
         return QType::NVFP4;
+    case NumericFormat::FP8_E4M3FN_ROW_BF16S:
+        return QType::FP8_E4M3FN_ROW_BF16S;
     }
     throw std::logic_error("unhandled numeric format");
 }
@@ -109,6 +113,38 @@ Weight row_split_weight(const MaterializedArtifact& materialized, ObjectHandle h
     return out;
 }
 
+Weight row_scale_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                        NumericFormat format, std::int32_t rows, std::int32_t columns) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const RowScaleGeometry geometry          = row_scale_geometry(format, shape);
+    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle));
+
+    Weight out{};
+    out.payload         = bytes;
+    out.payload_bytes   = geometry.encoded_bytes;
+    out.qtype           = qtype_for(format);
+    out.layout          = QuantLayout::RowScale;
+    out.group_size      = static_cast<std::uint32_t>(geometry.columns);
+    out.qdata           = bytes;
+    out.scales          = bytes + geometry.scale_plane_offset;
+    out.n               = rows;
+    out.k               = columns;
+    out.group           = columns;
+    out.scale_dtype     = DType::BF16;
+    out.ndim            = 2;
+    out.shape[0]        = rows;
+    out.shape[1]        = columns;
+    out.padded_shape[0] = rows;
+    out.padded_shape[1] = columns;
+    out.scale_ne[0]     = rows;
+    out.scale_nb[0]     = 2;
+    out.scale_nb[1]     = static_cast<std::int64_t>(rows) * 2;
+    out.scale_nb[2]     = out.scale_nb[1];
+    out.scale_nb[3]     = out.scale_nb[1];
+    return out;
+}
+
 } // namespace
 
 ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat format,
@@ -149,6 +185,9 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
     }
     if (storage_layout_for(format) == StorageLayout::ContiguousLeV1) {
         return contiguous_weight(materialized, handle, format, rows, columns);
+    }
+    if (storage_layout_for(format) == StorageLayout::RowScaleV1) {
+        return row_scale_weight(materialized, handle, format, rows, columns);
     }
     return row_split_weight(materialized, handle, format, rows, columns);
 }

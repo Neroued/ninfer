@@ -24,10 +24,13 @@ MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 TARGET_MODEL_IDS = {
     "qwen3_6_35b_a3b": "qwen3.6-35b-a3b",
     "qwen3_6_27b": "qwen3.6-27b",
+    "qwen3_8_27b": "qwen3.8-27b",
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
 SPECULATIVE_MODES = {
     "mtp0": ("none", 0),
+    "mtp1": ("mtp", 1),
+    "mtp2": ("mtp", 2),
     "mtp3": ("mtp", 3),
     "dflash7": ("dflash", 7),
 }

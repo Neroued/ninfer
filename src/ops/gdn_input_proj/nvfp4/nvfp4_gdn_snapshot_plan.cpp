@@ -1,8 +1,10 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
+#include "ops/linear/nvfp4/nvfp4_config.h"
 
 #include "core/layout.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -17,8 +19,10 @@ template <class Allocator>
 Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t tokens) {
     Nvfp4GdnProjectedWorkspace out;
     out.projected = allocator.alloc(DType::BF16, {10240, tokens}, 256);
-    const std::size_t projection_bytes =
-        nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4, tokens, tokens);
+    // Floored for the same reason as the linear_swiglu baseline: the A16 sub-projection declares
+    // no transient, and an arena allocation must be nonzero.
+    const std::size_t projection_bytes = std::max<std::size_t>(
+        nvfp4_gdn_input_workspace_capacity_bytes(kNvfp4InternalPolicy, tokens, tokens), 256);
     out.projection = allocator.alloc_bytes(projection_bytes, 256);
     return out;
 }
@@ -37,7 +41,10 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     if (policy == LinearPolicy::A16Only) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
-        throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=16");
+        // Same reasoning as the A4 branch below: past the fused registration, materialize the
+        // projection and post-process. The sub-projection inherits kNvfp4InternalPolicy, which is
+        // A16 on Volta and chunks internally, so this covers prefill width.
+        return {Nvfp4GdnConvScheduleId::Materialized};
     }
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
     if (tokens <= 3) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
@@ -83,7 +90,7 @@ void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Te
     auto scope                         = workspace.scope();
     Nvfp4GdnProjectedWorkspace scratch = allocate_workspace(workspace, x.ne[1]);
     WorkspaceArena projection_workspace(scratch.projection);
-    nvfp4_gdn_input_dispatch(x, weight, scratch.projected, z, LinearPolicy::AllowA4,
+    nvfp4_gdn_input_dispatch(x, weight, scratch.projected, z, kNvfp4InternalPolicy,
                              &projection_workspace, stream);
     nvfp4_gdn_snapshot_post_launch(scratch.projected, conv_weight, conv_states, valid_columns,
                                    initial_slot, snapshot_base_slot, query, key, value, stream);

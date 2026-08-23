@@ -84,7 +84,9 @@ void process_block(std::array<std::uint32_t, 8>& state, const std::uint8_t* bloc
 
 } // namespace
 
-Sha256Digest sha256(std::span<const std::uint8_t> input) {
+Sha256Digest sha256(std::span<const std::uint8_t> input) { return sha256(input, {}); }
+
+Sha256Digest sha256(std::span<const std::uint8_t> input, const std::function<void()>& checkpoint) {
     if (input.size() > std::numeric_limits<std::uint64_t>::max() / 8ULL) {
         throw std::invalid_argument("payload is too large to fingerprint");
     }
@@ -92,6 +94,7 @@ Sha256Digest sha256(std::span<const std::uint8_t> input) {
                                        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
     std::size_t offset = 0;
     while (input.size() - offset >= 64) {
+        if (checkpoint && offset % (1ULL << 20) == 0) { checkpoint(); }
         process_block(state, input.data() + offset);
         offset += 64;
     }

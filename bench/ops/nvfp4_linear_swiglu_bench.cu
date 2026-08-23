@@ -107,10 +107,6 @@ Options parse_options(int argc, char** argv) {
     if (options.profile && options.t_sweep.size() != 1) {
         throw std::invalid_argument("--profile requires exactly one T");
     }
-    if (options.policy == ops::LinearPolicy::A16Only &&
-        *std::max_element(options.t_sweep.begin(), options.t_sweep.end()) > 16) {
-        throw std::invalid_argument("A16 policy is registered only through T=16");
-    }
     return options;
 }
 

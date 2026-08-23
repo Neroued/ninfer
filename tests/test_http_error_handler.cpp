@@ -36,6 +36,11 @@ int main() {
                   context_limit.message.find("200 tokens") != std::string::npos &&
                   context_limit.message.find("128") != std::string::npos,
               "context rejection lost its HTTP classification or capacity details");
+    const ninfer::serve::ApiError cancelled =
+        ninfer::serve::request_error_to_api_error(ninfer::RequestError(
+            ninfer::RequestErrorKind::Cancelled, "request cancelled during preparation"));
+    failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected",
+                      "preparation cancellation did not retain its HTTP classification");
 
     httplib::Request messages_request;
     messages_request.path = "/v1/messages";

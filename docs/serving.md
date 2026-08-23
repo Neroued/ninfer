@@ -136,11 +136,20 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
 
-Text and media requests use one context contract. After chat-template rendering and media-token
-expansion, the complete prompt is admitted only against Engine `--max-context`; there is no
-separate 32K multimodal prompt ceiling. Media preprocessing retains independent resource limits
-for source bytes, decoded pixels, media-item count, raw patches, and Vision tokens.
-`attention_pairs` remains preparation diagnostics and is not an admission limit.
+Text and media requests use one complete-prompt context contract. After chat-template rendering and
+media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
+has a 32,768 merged-token envelope (131,072 raw patches); the effective Vision limit is therefore
+`min(--max-context, 32768)`. There is no fixed image/video item-count limit: item count is admitted
+through aggregate source-byte, decoded-pixel, raw-patch, Vision-token, and live-memory budgets.
+
+Media cache misses run as independent decode → resize → BF16-pack tasks on a bounded host worker
+pool. Prepared payloads are keyed by SHA-256 of the acquired bytes plus modality, so repeated media
+in later requests reuses the exact immutable BF16 patch input; concurrent identical misses use one
+single-flight build. `--media-cache-mib` bounds LRU-retained payloads, while
+`--media-live-mib` bounds every cache-, request-, or runtime-referenced payload. Cache eviction does
+not invalidate a request reference, and live bytes are returned only when the final reference is
+released. A request-level preparation gate derived from the live limit prevents concurrent partial
+builds from deadlocking the memory account.
 
 An expanded prompt beyond `--max-context` returns HTTP 400 `context_length_exceeded`, including
 the prepared token count and configured context ceiling. A media preprocessing resource rejection
@@ -455,6 +464,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
+| `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
+| `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
+| `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
@@ -499,9 +511,11 @@ is also rejected if it resolves to the model artifact.
   --request-log-jsonl profiles/bench/run/server.requests.jsonl
 ```
 
-Every line is one `ninfer_serve_request_log` schema-v9 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v10 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
-that server instance.
+that server instance. Successful request-start records include request-scoped acquisition,
+media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
+they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|

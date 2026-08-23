@@ -76,8 +76,16 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         prompt.positions.size() != 3ULL * prompt.token_ids.size()) {
         throw std::invalid_argument("prepared prompt token metadata has an invalid shape");
     }
-    if (prompt.has_media() != !prompt.patches.empty()) {
+    if (prompt.has_media() != !prompt.media_payloads.empty() ||
+        prompt.media_payloads.size() != prompt.vision_items.size()) {
         throw std::invalid_argument("prepared prompt media payload is incomplete");
+    }
+    for (std::size_t i = 0; i < prompt.media_payloads.size(); ++i) {
+        if (!prompt.media_payloads[i] ||
+            prompt.media_payloads[i]->patch_elements !=
+                prompt.vision_items[i].patch_count * kPreparedVisionPatchFeatures) {
+            throw std::invalid_argument("prepared prompt media item payload has an invalid shape");
+        }
     }
     if (prompt.has_media() && !vision_enabled) {
         throw std::invalid_argument("Vision is disabled for this Engine");

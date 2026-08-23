@@ -1,0 +1,73 @@
+{
+  "schema": "ninfer.artifact-manifest",
+  "schema_version": 1,
+  "artifact": {
+    "filename": "qwen3_8_27b_nvfp4.ninfer",
+    "bytes": 21492695040,
+    "sha256": "bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32",
+    "container_version": 2,
+    "model_id": "qwen3.8-27b",
+    "weights_id": "nvfp4",
+    "target_key": "qwen3_8_27b"
+  },
+  "source": {
+    "base": {
+      "repo_id": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "download_source": "https://modelscope.cn/models/Qwen/Qwen3.8-27B",
+      "license": "Apache-2.0"
+    },
+    "quantized": {
+      "repo_id": "unsloth/Qwen3.8-27B-NVFP4",
+      "revision": "60e813d4dbbdc5d64cf3f5a8caf2897bedf03679",
+      "license": "Apache-2.0"
+    }
+  },
+  "conversion": {
+    "recipe_id": "qwen3_8_27b_nvfp4-v1",
+    "embedding_encoder": "MAXABS_BF16S_RECIP_E4M3FN_RNE_V1",
+    "converter_repository": "https://github.com/Neroued/ninfer",
+    "converter_revision": "651d779657988dcb943896983d415ff6d38a21e2",
+    "ranking_input": {
+      "path": "tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64",
+      "sha256": "c692dc76388132c910547589b4fb4a0503fbd6ad50aaac6a509bbcb192a8afa5"
+    }
+  },
+  "runtime": {
+    "repository": "https://github.com/Neroued/ninfer",
+    "minimum_revision": "5d2c1f5590b8f4c3d106a75f65210eb4efb8f4e1",
+    "cuda_architecture": "sm_120a"
+  },
+  "inventory": {
+    "objects": 1124,
+    "tensors": 1118,
+    "resources": 6,
+    "formats": {
+      "BF16": 534,
+      "FP32": 208,
+      "I32": 1,
+      "NVFP4": 112,
+      "FP8_E4M3FN_ROW_BF16S": 146,
+      "Q4G64_F16S": 55,
+      "Q5G64_F16S": 54,
+      "Q6G64_F16S": 1,
+      "W8G32_F16S": 7
+    },
+    "layouts": {
+      "blockscale-k16-m128x4-v1": 112,
+      "contiguous-le-v1": 743,
+      "row-scale-v1": 146,
+      "row-split-k128-v1": 117
+    },
+    "encodings": {
+      "raw-bytes-v1": 6
+    },
+    "bytes": {
+      "tensor": 21479607072,
+      "resource": 12837177,
+      "object": 21492444249,
+      "payload_span": 21492514816,
+      "alignment": 70567
+    }
+  }
+}

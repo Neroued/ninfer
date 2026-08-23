@@ -87,10 +87,16 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 
-Package::Frontend Package::make_frontend(const LoadedModel& model) {
+Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return qwen3_6::make_frontend(model.impl_->data.frontend,
-                                  model.impl_->data.runtime.features.vision);
+                                  qwen3_6::FrontendOptions{
+                                      .vision_enabled = model.impl_->data.runtime.features.vision,
+                                      .max_context    = options.max_context,
+                                      .media_cache_bytes        = options.media_cache_bytes,
+                                      .media_live_bytes         = options.media_live_bytes,
+                                      .media_preprocess_threads = options.media_preprocess_threads,
+                                  });
 }
 
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,

@@ -45,13 +45,13 @@ bool valid_divisors(const WeightPlan& weight) {
 
 int verify_groupwise(const std::filesystem::path& path) {
     ninfer::artifact::Reader reader(path);
-    if (Package::resolve_weights(reader.identity()) != WeightsProfile::GroupwiseInt) {
+    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen36GroupwiseInt) {
         std::cerr << "groupwise identity resolved to the wrong profile\n";
         return 1;
     }
     ninfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
-        bind_artifact(binder, WeightsProfile::GroupwiseInt, all_features());
+        bind_artifact(binder, WeightsProfile::Qwen36GroupwiseInt, all_features());
     if (plan.materialization.object_count != 1124 ||
         plan.materialization.device_objects.size() != 1118 ||
         plan.materialization.host_objects.size() != 6 ||
@@ -86,12 +86,13 @@ int verify_groupwise(const std::filesystem::path& path) {
 
 int verify_nvfp4(const std::filesystem::path& path) {
     ninfer::artifact::Reader reader(path);
-    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Nvfp4) {
+    if (Package::resolve_weights(reader.identity()) != WeightsProfile::Qwen36Nvfp4) {
         std::cerr << "NVFP4 identity resolved to the wrong profile\n";
         return 1;
     }
     ninfer::artifact::Binder binder(reader);
-    const ArtifactLoadPlan plan = bind_artifact(binder, WeightsProfile::Nvfp4, all_features());
+    const ArtifactLoadPlan plan =
+        bind_artifact(binder, WeightsProfile::Qwen36Nvfp4, all_features());
     if (plan.materialization.object_count != 1307 ||
         plan.materialization.device_objects.size() != 1054 ||
         plan.materialization.host_objects.size() != 6 ||
@@ -178,13 +179,14 @@ int verify_profile_mismatch_rejection() {
     options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(128);
     options.prefill_chunk  = 128;
     options.use_cuda_graph = false;
-    auto planner = Package::make_sequence_planner(device, options, WeightsProfile::GroupwiseInt);
+    auto planner =
+        Package::make_sequence_planner(device, options, WeightsProfile::Qwen36GroupwiseInt);
     const std::uint32_t pages = planner.capacity_curve().minimum_main_page_groups;
     auto sequence             = std::move(planner).finalize(pages);
     RuntimeModelView empty_model;
     try {
-        (void)ninfer::targets::qwen3_6::create_program<Variant>(empty_model, WeightsProfile::Nvfp4,
-                                                                std::move(sequence), device);
+        (void)ninfer::targets::qwen3_6::create_program<Variant>(
+            empty_model, WeightsProfile::Qwen36Nvfp4, std::move(sequence), device);
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }

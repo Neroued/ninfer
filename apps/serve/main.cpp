@@ -85,6 +85,12 @@ int main(int argc, char** argv) {
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
                  << format_bytes(memory.cuda_graph_allowance_bytes);
+        if (options.enable_vision) {
+            const ninfer::MediaCacheSummary media = service.media_cache_summary();
+            capacity << " media-workers=" << media.preprocess_threads
+                     << " media-cache=" << format_bytes(media.capacity_bytes)
+                     << " media-live=" << format_bytes(media.live_capacity_bytes);
+        }
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());
 
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");

@@ -20,11 +20,12 @@ import torch
 
 from .numeric import (
     DirectFormat,
+    Fp8RowFormat,
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
-    valid_positive_fp32_word,
     get_format,
+    valid_positive_fp32_word,
 )
 
 
@@ -73,6 +74,16 @@ class BlockScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class RowScaleGeometry:
+    n: int
+    k: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
 Plane: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 Payload: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 
@@ -100,6 +111,11 @@ BLOCKSCALE_K16_M128X4_V1 = Layout(
     256,
     frozenset(("NVFP4",)),
 )
+ROW_SCALE_V1 = Layout(
+    "row-scale-v1",
+    256,
+    frozenset(("FP8_E4M3FN_ROW_BF16S",)),
+)
 
 LAYOUTS = MappingProxyType(
     {
@@ -108,6 +124,7 @@ LAYOUTS = MappingProxyType(
             CONTIGUOUS_LE_V1,
             ROW_SPLIT_K128_V1,
             BLOCKSCALE_K16_M128X4_V1,
+            ROW_SCALE_V1,
         )
     }
 )
@@ -232,6 +249,26 @@ def block_scale_geometry(
     )
 
 
+def row_scale_geometry(
+    format: str | Fp8RowFormat, shape: Sequence[int]
+) -> RowScaleGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8RowFormat):
+        raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
+    n, k = _shape(shape, rank=2)
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = n * 2
+    return RowScaleGeometry(
+        n=n,
+        k=k,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -258,6 +295,10 @@ def encoded_size(
         if not isinstance(numeric_spec, Nvfp4Format):
             raise ValueError("blockscale-k16-m128x4-v1 requires NVFP4")
         return block_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is ROW_SCALE_V1:
+        if not isinstance(numeric_spec, Fp8RowFormat):
+            raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
+        return row_scale_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
 
 
@@ -337,6 +378,89 @@ def _exact_uint8_matrix(
     if tensor.dtype != torch.uint8 or tuple(tensor.shape) != shape:
         raise TypeError(f"{label} must be uint8 with shape {shape}")
     return tensor.detach().contiguous().cpu()
+
+
+def _exact_bf16_vector(tensor: torch.Tensor, length: int, label: str) -> torch.Tensor:
+    if tensor.dtype != torch.bfloat16 or tuple(tensor.shape) != (length,):
+        raise TypeError(f"{label} must be BF16 with shape ({length},)")
+    return tensor.detach().contiguous().cpu()
+
+
+def _validate_fp8_row_words(codes: torch.Tensor, scales: torch.Tensor) -> None:
+    if bool(((codes & 0x7F) == 0x7F).any()):
+        raise ValueError("row-scaled FP8 codes must be finite E4M3FN words")
+    scale_words = scales.view(torch.int16).to(torch.int32) & 0xFFFF
+    invalid_scales = ((scale_words & 0x8000) != 0) | (
+        (scale_words & 0x7F80) == 0x7F80
+    )
+    if bool(invalid_scales.any()):
+        raise ValueError("row-scaled FP8 scales must be nonnegative finite BF16 words")
+    zero_scale = scale_words == 0
+    nonzero_code = (codes & 0x7F) != 0
+    if bool((zero_scale.unsqueeze(1) & nonzero_code).any()):
+        raise ValueError("a zero row scale requires only signed-zero FP8 codes")
+
+
+def encode_fp8_row_scaled(
+    code_words: torch.Tensor,
+    row_scales: torch.Tensor,
+    shape: Sequence[int],
+) -> bytes:
+    """Encode exact E4M3FN code words and BF16 row multipliers."""
+
+    geometry = row_scale_geometry("FP8_E4M3FN_ROW_BF16S", shape)
+    codes = _exact_uint8_matrix(
+        code_words,
+        (geometry.n, geometry.k),
+        "row-scaled FP8 codes",
+    )
+    scales = _exact_bf16_vector(
+        row_scales,
+        geometry.n,
+        "row-scaled FP8 scales",
+    )
+    _validate_fp8_row_words(codes, scales)
+    payload = bytearray(geometry.payload_bytes)
+    payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
+    scale_begin = geometry.scale_plane_offset
+    payload[scale_begin : scale_begin + geometry.scale_plane_bytes] = encode_direct(
+        scales, "BF16"
+    )
+    return bytes(payload)
+
+
+def decode_fp8_row_scaled_words(
+    payload: Payload,
+    shape: Sequence[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode exact E4M3FN code words and BF16 row multipliers."""
+
+    geometry = row_scale_geometry("FP8_E4M3FN_ROW_BF16S", shape)
+    if _payload_length(payload) != geometry.payload_bytes:
+        raise ValueError(
+            f"row-scaled FP8 payload has {_payload_length(payload)} bytes, "
+            f"expected {geometry.payload_bytes}"
+        )
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    codes = raw[: geometry.code_plane_bytes].clone().reshape(geometry.n, geometry.k)
+    scale_begin = geometry.scale_plane_offset
+    scale_bytes = raw[scale_begin : scale_begin + geometry.scale_plane_bytes]
+    scales = decode_direct(scale_bytes, "BF16", (geometry.n,))
+    _validate_fp8_row_words(codes, scales)
+    return codes, scales
+
+
+def dequantize_fp8_row_scaled(
+    payload: Payload,
+    shape: Sequence[int],
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Reconstruct a row-scaled FP8 matrix from its exact stored words."""
+
+    codes, scales = decode_fp8_row_scaled_words(payload, shape)
+    return (codes.view(torch.float8_e4m3fn).float() * scales.float().unsqueeze(1)).to(
+        dtype
+    )
 
 
 def swizzle_nvfp4_scales(
@@ -954,21 +1078,27 @@ __all__ = [
     "Layout",
     "PLANE_ALIGNMENT",
     "ROW_SPLIT_K128_V1",
+    "ROW_SCALE_V1",
     "RowPlanes",
+    "RowScaleGeometry",
     "RowSplitGeometry",
     "align_up",
     "assemble_row_planes",
     "block_scale_geometry",
     "decode_direct",
+    "decode_fp8_row_scaled_words",
     "decode_nvfp4_words",
     "decode_row_split_codes",
+    "dequantize_fp8_row_scaled",
     "dequantize_row_split",
     "encode_direct",
+    "encode_fp8_row_scaled",
     "encode_nvfp4",
     "encode_row_split",
     "encoded_size",
     "gather_row_planes",
     "get_layout",
+    "row_scale_geometry",
     "row_split_geometry",
     "split_row_planes",
     "swizzle_nvfp4_scales",

@@ -47,6 +47,12 @@ int run_nvfp4_a4() {
 } // namespace
 
 int main() {
+#ifdef NINFER_VOLTA_BUILD
+    // This binary exists to test NVFP4_A4 activation compute, which needs cvt.e2m1x2 (Blackwell).
+    // There is no Volta route to test, so it skips rather than trapping.
+    std::cout << "SKIP: NVFP4_A4 has no Volta route\n";
+    return 77;
+#else
     if (!ninfer::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -59,4 +65,5 @@ int main() {
         std::cerr << "NVFP4_A4 Linear: " << error.what() << '\n';
         return 1;
     }
+#endif
 }

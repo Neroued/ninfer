@@ -14,6 +14,14 @@ namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::size_t kTokenDomain = 248077;
 
+struct FrontendOptions {
+    bool vision_enabled                    = true;
+    std::uint32_t max_context              = 2'048;
+    std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
+    std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
+    std::uint32_t media_preprocess_threads = 0;
+};
+
 struct FrontendResources;
 struct PreparedPromptData;
 class Frontend;
@@ -31,7 +39,7 @@ public:
     PreparedPrompt& operator=(const PreparedPrompt&) = delete;
 
     [[nodiscard]] PromptSummary summary() const;
-    [[nodiscard]] double prepare_seconds() const noexcept;
+    [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:
@@ -111,11 +119,14 @@ public:
     Frontend& operator=(Frontend&&) noexcept;
     ~Frontend();
 
-    [[nodiscard]] PreparedPrompt prepare(PromptInput input) const;
-    [[nodiscard]] std::uint32_t count_tokens(PromptInput input) const;
+    [[nodiscard]] PreparedPrompt prepare(PromptInput input,
+                                         const PreparationControl& control = {}) const;
+    [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
+                                             const PreparationControl& control = {}) const;
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
+    [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,
                                                     const StopPolicy& caller_stop,
                                                     const OutputOptions& output = {}) const;
@@ -127,9 +138,9 @@ private:
     std::shared_ptr<const Impl> impl_;
 
     friend class FrontendTestAccess;
-    friend Frontend make_frontend(const FrontendResources& resources, bool vision_enabled);
+    friend Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
 };
 
-[[nodiscard]] Frontend make_frontend(const FrontendResources& resources, bool vision_enabled);
+[[nodiscard]] Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
 
 } // namespace ninfer::targets::qwen3_6

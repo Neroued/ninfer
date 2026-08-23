@@ -116,6 +116,13 @@ NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
 ```
 
+The same real-engine test covers the separately registered Qwen3.8 artifact, including Vision:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=$PWD/out/qwen3_8_27b.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+```
+
 Run the peer 35B-A3B route independently:
 
 ```bash

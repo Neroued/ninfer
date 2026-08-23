@@ -63,6 +63,14 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
     const __nv_bfloat16* __restrict__ a_weight, const __nv_bfloat16* __restrict__ b_weight,
     const float* __restrict__ A_log, const float* __restrict__ dt_bias, float* __restrict__ partial,
     float* __restrict__ g, float* __restrict__ beta, std::int32_t t) {
+// Only ever dispatched for T >= 9 (see bf16_gdn_gating_proj_plan.cpp's route tables) —
+// batching/speculative-decode-shaped traffic, out of scope for the decode-only Volta MVP
+// (on V100), where every step is a single token. The T<=8 schedules this file
+// also defines (gemv, small_t_partial/reduce, 35_simt) are plain SIMT/no tensor cores and
+// stay untouched. Same rationale as the rowsplit_grouped_mma.cuh stub: this ldmatrix/
+// mma.m16n8k16 kernel is genuinely unreachable in the current MVP, so it gets a loud
+// __trap() below sm_80 instead of an unvalidated port of code nothing currently exercises.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     constexpr int kBf16GdnHeads       = Geometry::kHeads;
     constexpr int kBf16GdnHidden      = Geometry::kHidden;
     constexpr int kBf16GdnBlockN      = Geometry::kBlockN;
@@ -347,6 +355,21 @@ __global__ __launch_bounds__(Warps * 32, 1) void bf16_gdn_gating_proj_gemm_mma_k
             beta[i] = sigmoid(bv);
         }
     }
+#else  // __CUDA_ARCH__ < 800
+    (void)x;
+    (void)norm_weight;
+    (void)normalized_x;
+    (void)norm_eps;
+    (void)a_weight;
+    (void)b_weight;
+    (void)A_log;
+    (void)dt_bias;
+    (void)partial;
+    (void)g;
+    (void)beta;
+    (void)t;
+    __trap();
+#endif // __CUDA_ARCH__ >= 800
 }
 
 } // namespace ninfer::ops::detail

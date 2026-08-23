@@ -139,6 +139,7 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         codes + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * kBytesPerGroup;
     const std::uint8_t* up_scale_row =
         scales + static_cast<std::int64_t>(out_row + kIntermediate) * kGroups * 2;
+
     const auto* x2 = reinterpret_cast<const __nv_bfloat162*>(x_sh);
 
     float gate_acc = 0.0f;
@@ -171,6 +172,16 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         const auto* up_codes    = reinterpret_cast<const std::uint8_t*>(code_tile[warp][buf][1]);
         const auto* gate_scales = reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][0]);
         const auto* up_scales   = reinterpret_cast<const std::uint16_t*>(scale_tile[warp][buf][1]);
+        // Kept deliberately on the scalar per-byte decode. Routing this loop through
+        // Q4SimtDecodeAtom::decode_eight (one uint32 of codes per lane, four groups per warp step,
+        // as q4_rowsplit_gemv does) was measured on the V100: it does cut SM throughput 62.8% ->
+        // 53.2%, so the arithmetic really is cheaper, but the kernel got *slower* -- 178.2 ->
+        // 186.4 us, DRAM 61.3% -> 56.5%, and MTP0 decode 32.94 -> 32.40 tok/s. Collapsing sixteen
+        // light group-steps into four heavy ones leaves the pipe_wait prefetch less to overlap,
+        // and this kernel is bound by that overlap rather than by ALU throughput. Adding a uint4
+        // activation load to rule out shared-memory bank conflicts changed nothing (32.40).
+        // SM% > DRAM% here is not evidence of an ALU limit: SM throughput counts issue slots for
+        // memory instructions and stalls too.
 #pragma unroll
         for (int tile_group = 0; tile_group < kGroupsPerWarpTile; ++tile_group) {
             const float gate_scale =

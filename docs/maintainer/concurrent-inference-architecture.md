@@ -99,8 +99,8 @@ NInfer 不支持 preemption，因此 request 只有在其 prompt、声明的最�
 
 Engine 与 HTTP server 都把 generation request lifetime 数量限制为
 `max_concurrency + max_pending_requests`。每个 request 还有有限输入大小、有限 effective output token
-bound 和 absolute pending deadline；media preparation 由一份 permit 串行化。因此持续 ingress 只能填满
-有限 request records，不能建立无界等待队列。
+bound 和 absolute pending deadline；media preparation 使用固定 worker 数、有界 FIFO 和 live-byte
+account。因此持续 ingress 只能填满有限 request records，不能建立无界等待队列。
 
 Owning result 的总上界来自“有限 request 数 × 每请求有限输出”；result/event storage 属于各自 request，
 并持续计入 request lifetime capacity，直到 response consumer 释放它。
@@ -314,9 +314,11 @@ empty slot 不进入 model batch，因此 slot reuse 或 hole 不需要不同的
 host side 对以下资源设置有限上限：
 
 - generation-request lifetime 数量，固定为 `C + max_pending_requests`；
-- 每请求 body/media bytes 和 media item 数量；
+- 每请求 body/media bytes、raw patches 和 Vision tokens；media item 没有独立固定上限；
 - 同时占用 request records 的 CPU preparation work；
-- 一份串行 media-input preparation permit；
+- cache-retained bytes 与所有 cache/request/runtime 引用共同计费的 live BF16 payload bytes；
+- 由 `live capacity / 单请求最大 payload` 推导的 CPU preparation permits，避免多个请求各自
+  部分占用后相互等待；permit 在 CPU preparation 结束时释放，不延长到 GPU request lifetime；
 - request 从取得 lifetime capacity 到 admission 的最长时间；
 - 每请求 effective output token bound。
 
@@ -324,8 +326,13 @@ request lifetime count 已满时，新 generation request 立即以 overload 拒
 queue；每请求输入上限与有限 outstanding count 共同约束 host input memory，而不是另设 aggregate byte
 allocator。
 
-CPU preparation 产生 owning、immutable prompt representation。Prepared requests 按 preparation completion
-顺序进入 Engine ordered admission queue，因此等待 media permit 的请求不占住 prepared queue 的首位。
+CPU preparation 产生 owning、immutable prompt representation。一个通用 host worker-pool 实现提供固定
+线程数、有界 FIFO、future/异常传播和 backpressure；Qwen Frontend 用它执行独立 media cache miss 的
+decode、resize 和 BF16 pack。缓存 ready entry、single-flight state、PreparedPrompt 和 Vision runtime
+分别持有同一 per-item payload 的 typed shared reference。每个 item 首次完成 Vision encode 后只释放其
+payload reference；item-index slot 保留到 prompt lifetime 结束，使跨 Text-prefill chunks 的同一 item
+继续复用已经生成的 Vision transient。最后一个引用销毁时精确归还 live bytes。
+Prepared requests 按 preparation completion 顺序进入 Engine ordered admission queue。
 Queue timeout 从请求首次取得 request lifetime capacity 时开始，因而包含 media acquisition、prompt
 preparation 和 Engine admission waiting。
 

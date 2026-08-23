@@ -30,6 +30,7 @@ enum class Profile {
     Q6D5120,
     W8D5120,
     W8D2048,
+    Fp8D5120,
 };
 
 struct ProfileSpec {
@@ -48,6 +49,8 @@ constexpr ProfileSpec profile_spec(Profile profile) {
         return {"w8-d5120", QType::W8G32_F16S, 5120, 32, 5};
     case Profile::W8D2048:
         return {"w8-d2048", QType::W8G32_F16S, 2048, 32, 15};
+    case Profile::Fp8D5120:
+        return {"fp8-d5120", QType::FP8_E4M3FN_ROW_BF16S, 5120, 5120, 5};
     }
     throw std::logic_error("unknown embedding profile");
 }
@@ -56,7 +59,8 @@ Profile parse_profile(const char* raw) {
     if (!std::strcmp(raw, "q6-d5120")) return Profile::Q6D5120;
     if (!std::strcmp(raw, "w8-d5120")) return Profile::W8D5120;
     if (!std::strcmp(raw, "w8-d2048")) return Profile::W8D2048;
-    throw std::invalid_argument("--profile must be q6-d5120, w8-d5120, or w8-d2048");
+    if (!std::strcmp(raw, "fp8-d5120")) return Profile::Fp8D5120;
+    throw std::invalid_argument("--profile must be q6-d5120, w8-d5120, w8-d2048, or fp8-d5120");
 }
 
 std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
@@ -83,9 +87,12 @@ PackedLayout packed_layout(const ProfileSpec& spec) {
         layout.high_plane_bytes  = static_cast<std::uint64_t>(kVocab) * groups * 16;
         layout.scale_plane_offset =
             layout.high_plane_offset + align_up(layout.high_plane_bytes, 256);
-    } else {
+    } else if (spec.qtype == QType::W8G32_F16S) {
         layout.code_plane_bytes =
             static_cast<std::uint64_t>(kVocab) * groups * static_cast<std::uint64_t>(spec.group);
+        layout.scale_plane_offset = align_up(layout.code_plane_bytes, 256);
+    } else {
+        layout.code_plane_bytes   = static_cast<std::uint64_t>(kVocab) * spec.d;
         layout.scale_plane_offset = align_up(layout.code_plane_bytes, 256);
     }
     layout.scale_plane_bytes = static_cast<std::uint64_t>(kVocab) * groups * 2;
@@ -100,20 +107,28 @@ Weight make_weight(const ProfileSpec& spec, const PackedLayout& layout, void* pa
     table.payload_bytes    = layout.payload_bytes;
     table.high_plane_bytes = layout.high_plane_bytes;
     table.qtype            = spec.qtype;
-    table.layout           = QuantLayout::RowSplit;
-    table.scale_dtype      = DType::FP16;
-    table.group_size       = spec.group;
-    table.shape[0]         = kVocab;
-    table.shape[1]         = spec.d;
-    table.padded_shape[0]  = kVocab;
-    table.padded_shape[1]  = layout.padded_d;
-    table.ndim             = 2;
-    table.qdata            = payload;
+    table.layout =
+        spec.qtype == QType::FP8_E4M3FN_ROW_BF16S ? QuantLayout::RowScale : QuantLayout::RowSplit;
+    table.scale_dtype     = spec.qtype == QType::FP8_E4M3FN_ROW_BF16S ? DType::BF16 : DType::FP16;
+    table.group_size      = spec.group;
+    table.shape[0]        = kVocab;
+    table.shape[1]        = spec.d;
+    table.padded_shape[0] = kVocab;
+    table.padded_shape[1] = layout.padded_d;
+    table.ndim            = 2;
+    table.qdata           = payload;
     table.qhigh  = spec.qtype == QType::Q6G64_F16S ? bytes + layout.high_plane_offset : nullptr;
     table.scales = bytes + layout.scale_plane_offset;
     table.n      = kVocab;
     table.k      = spec.d;
     table.group  = spec.group;
+    if (spec.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        table.scale_ne[0] = kVocab;
+        table.scale_nb[0] = 2;
+        table.scale_nb[1] = static_cast<std::int64_t>(kVocab) * 2;
+        table.scale_nb[2] = table.scale_nb[1];
+        table.scale_nb[3] = table.scale_nb[1];
+    }
     return table;
 }
 
@@ -242,7 +257,9 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("unknown or incomplete embedding benchmark argument");
         }
     }
-    if (profiles.empty()) { profiles = {Profile::Q6D5120, Profile::W8D5120, Profile::W8D2048}; }
+    if (profiles.empty()) {
+        profiles = {Profile::Q6D5120, Profile::W8D5120, Profile::W8D2048, Profile::Fp8D5120};
+    }
     if (warmup < 0 || repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }

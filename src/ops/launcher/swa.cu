@@ -2,6 +2,9 @@
 
 #include "core/device.h"
 #include "ops/kernel/bidirectional_gqa_attention.cuh"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/kernel/bidirectional_gqa_attention_volta.cuh"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -92,6 +95,56 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
             throw std::invalid_argument("swa: inconsistent plan");
         }
         constexpr int KeyBlock = 32;
+#ifdef NINFER_VOLTA_BUILD
+        const dim3 partial_grid(kBidirectionalGqaQHeads * Tokens, plan.split_capacity, q.ne[3]);
+        if (direct) {
+            noncausal_gqa_volta_partial_kernel<true, Tokens, KeyBlock, true>
+                <<<partial_grid, kBidirectionalGqaHeadDim, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(query_k.data),
+                    static_cast<const __nv_bfloat16*>(query_v.data),
+                    static_cast<const std::int32_t*>(positions.data),
+                    static_cast<const std::int32_t*>(valid_columns.data),
+                    static_cast<const std::int32_t*>(lanes.data),
+                    static_cast<const __nv_bfloat16*>(context.k.data),
+                    static_cast<const __nv_bfloat16*>(context.v.data), nullptr,
+                    static_cast<int>(context.padded_capacity), 0, plan.max_context, 1, scale,
+                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                    static_cast<__nv_bfloat16*>(out.data));
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+        noncausal_gqa_volta_partial_kernel<true, Tokens, KeyBlock, false>
+            <<<partial_grid, kBidirectionalGqaHeadDim, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const __nv_bfloat16*>(query_k.data),
+                static_cast<const __nv_bfloat16*>(query_v.data),
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<const std::int32_t*>(lanes.data),
+                static_cast<const __nv_bfloat16*>(context.k.data),
+                static_cast<const __nv_bfloat16*>(context.v.data), nullptr,
+                static_cast<int>(context.padded_capacity), 0, plan.max_context,
+                plan.split_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                static_cast<__nv_bfloat16*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
+
+        constexpr int ReduceWarps = 1;
+        constexpr int ReduceRows  = kBidirectionalGqaQHeads * Tokens;
+        const dim3 reduce_grid((ReduceRows + ReduceWarps - 1) / ReduceWarps, 1, q.ne[3]);
+        swa_reduce_kernel<Tokens, KeyBlock, ReduceWarps>
+            <<<reduce_grid, ReduceWarps * 32, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(partial_acc.data),
+                static_cast<const float*>(partial_m.data),
+                static_cast<const float*>(partial_l.data),
+                static_cast<const std::int32_t*>(positions.data),
+                static_cast<const std::int32_t*>(valid_columns.data), plan.max_context,
+                plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+#else
         constexpr std::size_t SmemBytes =
             2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
         if (direct) {
@@ -143,6 +196,7 @@ void swa_launch(const Tensor& q, const Tensor& query_k, const Tensor& query_v,
                 static_cast<const std::int32_t*>(valid_columns.data), plan.max_context,
                 plan.split_capacity, static_cast<__nv_bfloat16*>(out.data));
         CUDA_CHECK(cudaGetLastError());
+#endif
     });
 }
 

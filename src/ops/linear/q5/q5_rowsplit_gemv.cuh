@@ -104,7 +104,31 @@ struct Q5GemvStoreEpilogue {
 template <int kN, int kK, int kRowsPerBlock, int kStages, bool kStageX, bool kResidual,
           bool kSplitOutput = false, int kSplitRow = 0, class Epilogue = Q5GemvStoreEpilogue,
           bool TriggerPdl = false, bool JoinPdl = false>
-__global__ void
+__global__
+#ifdef NINFER_VOLTA_BUILD
+// ncu (real hardware counters, unblocked this session via a host driver-permission fix) measured
+// this kernel's decode-shaped instantiations at 36 registers/thread with 512 threads/block,
+// capping occupancy at 3 blocks/SM (18432 regs/block into a 65536-register/SM budget) against a
+// 4-block ceiling every other limiter (thread count, and shared memory once given full carveout
+// -- see the cudaFuncSetAttribute call in the launch wrapper below) already permits. 36->32
+// regs/thread is the exact threshold for the 4th block (65536/4/32threads-per-warp/... = 32).
+// __launch_bounds__ is a compiler hint, not a semantic change -- same math, so no correctness
+// risk beyond the usual register-spill-if-the-compiler-can't-comply case, which is why this is
+// still validated the same way as any other kernel change (see the V100 performance summary).
+//
+// Applied uniformly across all instantiations of this template. Measured via nsys before/after:
+// a clear win for kStageX=false (down-proj, -14.1% kernel duration -- shared memory has enough
+// headroom there for the 4th block once combined with the carveout request below), small
+// regressions of +0.5-2.8% on the three kStageX=true shapes (their extra x-staging shared-memory
+// buffer keeps shared memory, not registers, the binding constraint even at max carveout, so the
+// tighter register budget buys no occupancy there). Tried gating the target on kStageX to avoid
+// those regressions (minBlocksPerMultiprocessor=1 for kStageX=true) -- that measured *worse*
+// than this blanket version for the GDN shape specifically (explicitly passing 1 is not the same
+// as omitting the attribute; it still perturbs codegen), so the gated version was abandoned. Net
+// effect of the blanket version, validated end-to-end: decode ~30.6 -> ~31.4 tok/s.
+__launch_bounds__(kRowsPerBlock * 32, 2048 / (kRowsPerBlock * 32))
+#endif
+void
 q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
                         const std::uint8_t* __restrict__ high_bits,
                         const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
@@ -199,6 +223,24 @@ q5_rowsplit_gemv_kernel(const __nv_bfloat16* __restrict__ x, const std::uint8_t*
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
+#ifdef NINFER_VOLTA_BUILD
+// ncu measured this kernel family's default shared-memory carveout at 65.54KB/SM (not the full
+// 96KB Volta permits), which -- combined with the register fix above -- still caps occupancy at
+// 3 blocks/SM by shared memory (65.54KB / ~21.5KB per block) even after registers stop being the
+// limiter. cudaFuncAttributePreferredSharedMemoryCarveout=100 asks the driver to favor shared
+// memory over L1 for this specific kernel; done once per instantiation (static local, so each
+// distinct template instantiation gets its own one-time call) since this is a driver call, not
+// free to repeat every decode step.
+template <typename KernelPtr>
+inline void q5_rowsplit_gemv_request_max_shared_carveout(KernelPtr kernel) {
+    static bool done = [&] {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        return true;
+    }();
+    (void)done;
+}
+#endif
+
 // One block per kRowsPerBlock rows; kRowsPerBlock warps per block.
 template <int kN, int kK, int kRowsPerBlock, int kStages = 2, bool kStageX = true>
 inline void q5_rowsplit_gemv_launch_kernel(const __nv_bfloat16* x, const std::uint8_t* codes,
@@ -207,6 +249,10 @@ inline void q5_rowsplit_gemv_launch_kernel(const __nv_bfloat16* x, const std::ui
                                            cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     const int grid              = kN / kRowsPerBlock;
+#ifdef NINFER_VOLTA_BUILD
+    q5_rowsplit_gemv_request_max_shared_carveout(
+        q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, false>);
+#endif
     q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, false>
         <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, out, nullptr);
 }
@@ -218,6 +264,10 @@ q5_rowsplit_gemv_residual_launch_kernel(const __nv_bfloat16* x, const std::uint8
                                         __nv_bfloat16* residual_out, cudaStream_t stream) {
     constexpr int kBlockThreads = kRowsPerBlock * 32;
     const int grid              = kN / kRowsPerBlock;
+#ifdef NINFER_VOLTA_BUILD
+    q5_rowsplit_gemv_request_max_shared_carveout(
+        q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, true>);
+#endif
     q5_rowsplit_gemv_kernel<kN, kK, kRowsPerBlock, kStages, kStageX, true>
         <<<grid, kBlockThreads, 0, stream>>>(x, codes, high_bits, scales, residual_out, nullptr);
 }

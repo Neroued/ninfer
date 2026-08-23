@@ -1,3 +1,4 @@
+#include "core/phase_trace.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
@@ -115,9 +116,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         Tensor ar_valid_columns  = frame.ar_valid_columns.slice(0, 0, batch_size);
         Tensor next_drafts       = frame.next_drafts.slice(0, 0, batch_size);
 
+        phase_trace_begin();
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
+        phase_trace_mark("prepare_verify");
         target_verify_accept(state.execution, state.continuation_hidden_store, card,
                              TargetVerifyFrameView{
                                  .ids             = verify_ids,
@@ -142,19 +145,23 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                              },
                              envelopes.target_verify);
 
+        // target_verify_accept has already marked target_verify / accept / commit_hidden.
         ops::mtp_prepare_next_round(verify_ids, anchors, accepted, frontiers, budgets,
                                     licensed_counts, rope_deltas, alignment_ids, next_extents,
                                     ar_positions, ar_rope_positions, ar_valid_columns,
                                     static_cast<std::int32_t>(state.text_cache.max_context()),
                                     state.execution.device.stream);
+        phase_trace_mark("prepare_next_round");
         card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions, target_rope,
                                       licensed_counts, mtp_rows, envelopes.batch, alignment_hidden);
         ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
                                                 state.execution.device.stream);
+        phase_trace_mark("mtp_align");
 
         Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
         Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
         card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+        phase_trace_mark("propose[0]");
         for (std::uint32_t step = 0; step + 1 < k; ++step) {
             Tensor previous =
                 next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
@@ -174,11 +181,14 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             card.mtp_propose_batch(next_hidden, proposal_logits, next);
             CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                        cudaMemcpyDeviceToDevice, state.execution.device.stream));
+            // One mark per autoregressive draft step, so a k-deep round reports k intervals.
+            phase_trace_mark("ar_step+propose");
         }
 
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::MtpDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        phase_trace_mark("egress");
     };
 }
 

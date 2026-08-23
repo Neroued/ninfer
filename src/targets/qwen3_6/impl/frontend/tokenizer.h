@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -57,6 +58,7 @@ private:
     std::unordered_map<std::string, int> bpe_merge_ranks_;
     bool has_bpe_merges_ = true;
     std::vector<AddedToken> added_tokens_;
+    std::array<std::vector<std::size_t>, 256> added_token_candidates_;
     std::vector<int> default_stop_token_ids_;
 };
 

@@ -5,7 +5,6 @@
 #include "core/layout.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "ninfer/ops/add_bias.h"
-#include "ninfer/ops/cast.h"
 #include "ninfer/ops/gelu.h"
 #include "ninfer/ops/layer_norm.h"
 #include "ninfer/ops/linear.h"
@@ -17,6 +16,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -41,7 +41,6 @@ struct VisionWorkspaceLayout {
     TensorRegion pos_weights;
     TensorRegion x;
     TensorRegion patch_bf16;
-    TensorRegion patch_f32;
     TensorRegion attended;
     TensorRegion qkv;
     TensorRegion attention_norm;
@@ -83,13 +82,8 @@ VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t 
     out.pos_indices = add(DType::I32, {4, patches}, "vision position indices");
     out.pos_weights = add(DType::FP32, {4, patches}, "vision position weights");
     out.x           = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision residual");
-    {
-        auto scope = builder.scope();
-        out.patch_bf16 =
-            add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
-        out.patch_f32 =
-            add(DType::FP32, {VisionScheduleConfig::patch_dim, patches}, "vision FP32 patches");
-    }
+    out.patch_bf16 =
+        add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
     {
         auto attention_scope = builder.scope();
         out.attended = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision attended");
@@ -237,9 +231,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
 
     Tensor x          = layout.x.bind(backing);
     Tensor patch_bf16 = layout.patch_bf16.bind(backing);
-    Tensor patch_f32  = layout.patch_f32.bind(backing);
-    copy_host(item.patches.data(), patch_f32, stream);
-    ops::cast_fp32_to_bf16(patch_f32, patch_bf16, stream);
+    copy_host(item.patches.data(), patch_bf16, stream);
     ops::linear(patch_bf16, *patch_embed_, x, stream);
     ops::add_bias(*patch_embed_bias_, x, stream);
     // The artifact records the source table shape [rows,hidden], while Tensor's
@@ -330,7 +322,7 @@ VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedMo
     if (transient_.data == nullptr || transient_.alignment < kWorkspaceAlignment) {
         throw std::invalid_argument("Vision item output transient is missing or misaligned");
     }
-    final_item_ = plan_.uses.back().item_index;
+    encoded_payloads_pending_release_.reserve(plan_.uses.size());
     timers_.reserve(plan_.uses.size());
 }
 
@@ -359,7 +351,8 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }
     if (active->item_index >= plan_.control->items.size() ||
-        active->item_index >= prompt_.vision_items.size()) {
+        active->item_index >= prompt_.vision_items.size() ||
+        active->item_index >= prompt_.media_payloads.size()) {
         throw std::logic_error("Vision prefill item index is out of range");
     }
     const qwen3_6::VisionItemControl& control = plan_.control->items[active->item_index];
@@ -387,36 +380,30 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         if (active_item_ && active->item_index <= *active_item_) {
             throw std::logic_error("Vision items are not consumed in strictly increasing order");
         }
-        const std::size_t patch_offset = checked_mul(
-            control.patch_begin, static_cast<std::size_t>(VisionScheduleConfig::patch_dim),
-            "item patch offset");
         const std::size_t patch_elements = checked_mul(
             control.patch_count, static_cast<std::size_t>(VisionScheduleConfig::patch_dim),
             "item patch elements");
-        if (patch_offset > prompt_.patches.size() ||
-            patch_elements > prompt_.patches.size() - patch_offset) {
-            throw std::invalid_argument("Vision item patch range exceeds prepared payload");
+        const auto& payload = prompt_.media_payloads[active->item_index];
+        if (!payload || payload->patch_elements != patch_elements) {
+            throw std::invalid_argument("Vision item patch payload has an invalid shape");
         }
         timers_.emplace_back(device_);
         timers_.back().start();
-        context_.encode(
-            VisionItemView{
-                std::span<const float>(prompt_.patches).subspan(patch_offset, patch_elements),
-                &control},
-            output, workspace_);
+        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);
         timers_.back().record_stop();
         workspace_.reset();
-        active_item_        = active->item_index;
-        final_item_encoded_ = active->item_index == final_item_;
+        active_item_ = active->item_index;
+        encoded_payloads_pending_release_.push_back(active->item_index);
     }
     return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
 }
 
-bool VisionPrefillSession::release_consumed_media_payload() noexcept {
-    if (!final_item_encoded_ || payload_released_) { return false; }
-    prompt_.release_media_payload();
-    payload_released_ = true;
-    return true;
+void VisionPrefillSession::release_encoded_media_payloads() noexcept {
+    for (const std::uint32_t item_index : encoded_payloads_pending_release_) {
+        if (item_index >= prompt_.media_payloads.size()) { std::terminate(); }
+        prompt_.media_payloads[item_index].reset();
+    }
+    encoded_payloads_pending_release_.clear();
 }
 
 double VisionPrefillSession::elapsed_seconds() const {

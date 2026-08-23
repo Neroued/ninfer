@@ -10,6 +10,7 @@ namespace ninfer::test::linear_swiglu {
 
 enum class ActivationCompute : std::uint8_t {
     A16,
+    A8,
     A4,
 };
 
@@ -23,6 +24,6 @@ struct Profile {
 };
 
 int run_profile(std::string_view label, const Profile& profile,
-                std::span<const std::int32_t> token_cases);
+                std::span<const std::int32_t> token_cases, bool prepack_nvfp4 = false);
 
 } // namespace ninfer::test::linear_swiglu

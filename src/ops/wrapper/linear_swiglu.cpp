@@ -1,6 +1,8 @@
 #include "ninfer/ops/linear_swiglu.h"
 
+#include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
@@ -55,6 +57,9 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    if (qtype == QType::FP8_E4M3FN_ROW_BF16S && gate_up_rows == 34816 && input_rows == 5120) {
+        return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
 
@@ -103,8 +108,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                            gate_up_weight.qhigh == nullptr &&
                            gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
-    if (!q4_weight && !w8_weight && !nvfp4_weight) {
+    const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16S;
+    if (!q4_weight && !w8_weight && !nvfp4_weight && !fp8_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
+    }
+
+    if (fp8_weight) {
+        (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
+        detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        return;
     }
 
     if (nvfp4_weight) {

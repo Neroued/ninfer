@@ -118,7 +118,7 @@ public:
 
     Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
-                      Clock::time_point pending_deadline = {}, HostInputLease host_input = {}) {
+                      Clock::time_point pending_deadline = {}) {
         const Clock::time_point submitted = Clock::now();
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
@@ -148,7 +148,7 @@ public:
                                                                          options.output);
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
-                                                pending_deadline, submitted, std::move(host_input));
+                                                pending_deadline, submitted);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -272,14 +272,12 @@ private:
         Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
                 targets::qwen3_6::OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
-                Clock::time_point limit, Clock::time_point submit_time, HostInputLease input_lease)
-            : id(request_identity), host_input(std::move(input_lease)), prompt(std::move(input)),
-              output(std::move(output_session)), prompt_summary(summary),
-              prepare_seconds(frontend_seconds), options(std::move(request_options)),
-              deadline(limit), submitted(submit_time) {}
+                Clock::time_point limit, Clock::time_point submit_time)
+            : id(request_identity), prompt(std::move(input)), output(std::move(output_session)),
+              prompt_summary(summary), prepare_seconds(frontend_seconds),
+              options(std::move(request_options)), deadline(limit), submitted(submit_time) {}
 
         const std::uint64_t id;
-        HostInputLease host_input;
         targets::qwen3_6::PreparedPrompt prompt;
         targets::qwen3_6::OutputSession output;
         PromptSummary prompt_summary;
@@ -410,7 +408,6 @@ private:
     void complete_error(const std::shared_ptr<Request>& request, std::exception_ptr error) {
         release_planning_state(request);
         request->prompt = {};
-        request->host_input.reset();
         {
             std::lock_guard lock(request->mutex);
             if (request->done) { return; }
@@ -424,7 +421,6 @@ private:
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         release_planning_state(request);
         request->prompt = {};
-        request->host_input.reset();
         GenerationResult result;
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
@@ -618,7 +614,6 @@ private:
                               const PrefillStepResult& step, bool cancel_at_boundary) {
         cumulative_stats_.computed_prefill_tokens += step.processed_prompt_tokens;
         consume_service_work(request, 1);
-        if (step.host_input_consumed || step.complete) { request->host_input.reset(); }
         if (cancel_at_boundary) {
             if (!request->lane) { throw std::logic_error("cancelled prefill has no request lane"); }
             const std::uint32_t lane = *request->lane;

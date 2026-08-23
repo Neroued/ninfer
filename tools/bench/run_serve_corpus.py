@@ -189,17 +189,28 @@ class RunningServer:
         host: str,
         port: int,
         log_path: Path,
+        stdout_path: Path | None = None,
     ) -> None:
         self.command = list(command)
         self.host = host
         self.port = port
         self.log_path = log_path
+        self.stdout_path = stdout_path
         self.process: subprocess.Popen[bytes] | None = None
         self.tail: ServerLogTail | None = None
+        self._stdout_handle: Any = None
 
     def __enter__(self) -> "RunningServer":
         initial_offset = self.log_path.stat().st_size if self.log_path.exists() else 0
-        self.process = subprocess.Popen(self.command, cwd=REPO_ROOT)
+        if self.stdout_path is not None:
+            # Capture the server's human-readable log (host-KV park/restore/defer
+            # events, throughput intervals) to a file; it is not in the JSONL.
+            self._stdout_handle = self.stdout_path.open("wb")
+            self.process = subprocess.Popen(
+                self.command, cwd=REPO_ROOT, stdout=self._stdout_handle,
+                stderr=subprocess.STDOUT)
+        else:
+            self.process = subprocess.Popen(self.command, cwd=REPO_ROOT)
         self.tail = ServerLogTail(self.log_path, self.process, initial_offset)
         return self
 
@@ -208,6 +219,7 @@ class RunningServer:
 
     def stop(self) -> None:
         if self.process is None or self.process.poll() is not None:
+            self._close_stdout()
             return
         self.process.terminate()
         try:
@@ -215,6 +227,12 @@ class RunningServer:
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait()
+        self._close_stdout()
+
+    def _close_stdout(self) -> None:
+        if self._stdout_handle is not None:
+            self._stdout_handle.close()
+            self._stdout_handle = None
 
     def wait_until_ready(self) -> dict[str, Any]:
         if self.process is None or self.tail is None:

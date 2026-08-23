@@ -431,6 +431,7 @@ struct DecoderState {
     std::array<std::string, 2> stop_pending;
     bool in_reasoning              = false;
     bool strip_content_leading     = false;
+    bool raw_output                = false;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
@@ -522,29 +523,33 @@ void feed_content(DecoderState& state, std::string text, const StopPolicy& polic
 void feed_decoded_text(DecoderState& state, std::string_view text, const StopPolicy& policy,
                        PublishedOutput& emitted, std::uint32_t committed_tokens,
                        StopMatch* best_match) {
-    if (!state.in_reasoning) {
+    if (!state.in_reasoning && !state.raw_output) {
         // With preserve_special_tokens enabled (tool-capable requests), a model-emitted
         // think-close token decodes to literal text. Once reasoning has closed - or never
         // opened (thinking disabled) - that tag can never be meaningful content, so drop
         // it instead of leaking the raw marker into client-visible text. The first close
         // while reasoning is still open is handled above; this guards every subsequent one.
+        // A marker split across decoded tokens is handled by holding the ambiguous tail in
+        // think_marker_pending until it resolves. Raw sessions bypass reasoning handling by
+        // design and keep every byte, so the cleanup does not apply there.
+        state.think_marker_pending.append(text);
+        const std::size_t hit = state.think_marker_pending.find(kThinkClose);
+        const std::size_t hold =
+            longest_suffix_prefix(state.think_marker_pending, kThinkClose, true);
+        const std::size_t resolved_end = state.think_marker_pending.size() - hold;
         std::string cleaned;
-        cleaned.reserve(text.size());
+        cleaned.reserve(resolved_end);
         std::size_t begin = 0;
         for (;;) {
-            const std::size_t hit = text.find(kThinkClose, begin);
-            if (hit == std::string_view::npos) {
-                cleaned.append(text.substr(begin));
-                break;
-            }
-            cleaned.append(text.substr(begin, hit - begin));
-            begin = hit + kThinkClose.size();
+            const std::size_t found = state.think_marker_pending.find(kThinkClose, begin);
+            if (found == std::string::npos || found >= resolved_end) { break; }
+            cleaned.append(state.think_marker_pending.substr(begin, found - begin));
+            begin = found + kThinkClose.size();
         }
-        if (!cleaned.empty()) {
-            state.strip_content_leading = false;
-            feed_channel(state, OutputChannel::Content, cleaned, policy, emitted,
-                         committed_tokens, best_match);
-        }
+        cleaned.append(state.think_marker_pending.substr(begin, resolved_end - begin));
+        state.think_marker_pending.erase(0, resolved_end);
+        if (!cleaned.empty()) { feed_content(state, std::move(cleaned), policy, emitted,
+                                             committed_tokens, best_match); }
         return;
     }
 
@@ -665,11 +670,13 @@ public:
         : tokenizer(std::move(tokenizer_)), policy(std::move(policy_)),
           preserve_special(output.raw || output.preserve_special_tokens) {
         state.in_reasoning = starts_in_reasoning && !output.raw;
+        state.raw_output   = output.raw;
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     bool preserve_special = false;
+    bool raw_output       = false;
     DecoderState state;
     DecoderState preview_state;
     PublishedOutput preview_output;

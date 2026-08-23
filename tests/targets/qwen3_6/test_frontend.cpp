@@ -1355,6 +1355,40 @@ int test_second_think_close_dropped(const Frontend& frontend) {
     return failures;
 }
 
+
+int test_split_think_close_dropped(const Frontend& frontend) {
+    // Thinking disabled: a close marker split across two tokens must never leak.
+    // Token 3 = "thought</thi", token 4 = "nk>\n\nanswer": the marker spans both.
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = false;
+    auto prompt                         = frontend.prepare(std::move(input));
+    auto session                        = frontend.make_output_session(prompt, {});
+    // Two separate preview rounds force the marker to span calls.
+    const auto d1 = session.preview(std::array<ninfer::TokenId, 1>{3}, 1,
+                                    ninfer::FinishReason::OutputLimit);
+    int failures = check(d1.accepted_tokens == 1, "split round one rejected");
+    const auto out1 = session.commit_preview();
+    failures += check(channel_text(out1, ninfer::OutputChannel::Content).find("</thi") ==
+                          std::string::npos,
+                      "split marker first half leaked");
+    const auto d2 = session.preview(std::array<ninfer::TokenId, 1>{4}, 1,
+                                    ninfer::FinishReason::OutputLimit);
+    failures += check(d2.accepted_tokens == 1, "split round two rejected");
+    const auto out2 = session.commit_preview();
+    const std::string content =
+        channel_text(out1, ninfer::OutputChannel::Content) +
+        channel_text(out2, ninfer::OutputChannel::Content);
+    failures += check(content.find("</think>") == std::string::npos,
+                      "split think-close leaked into content");
+    return failures;
+}
+
 int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
@@ -1386,5 +1420,6 @@ int main() {
     failures += test_disabled_vision();
     failures += test_stray_think_close_dropped(frontend);
     failures += test_second_think_close_dropped(frontend);
+    failures += test_split_think_close_dropped(frontend);
     return failures == 0 ? 0 : 1;
 }

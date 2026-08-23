@@ -32,6 +32,8 @@ SPECULATIVE_MODES = {
     "mtp1": ("mtp", 1),
     "mtp2": ("mtp", 2),
     "mtp3": ("mtp", 3),
+    "mtp4": ("mtp", 4),
+    "mtp5": ("mtp", 5),
     "dflash7": ("dflash", 7),
 }
 DEFAULT_MODES = ("mtp0", "mtp3")
@@ -85,7 +87,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 9
+SERVER_LOG_SCHEMA_VERSION = 10
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0

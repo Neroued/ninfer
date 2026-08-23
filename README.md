@@ -12,6 +12,86 @@ Upstream targets the GeForce RTX 5090 (`sm_120a`). This fork keeps that path int
 separate compile-time Volta implementation. It is not a compatibility shim around an existing
 framework.
 
+## Performance
+
+Measurements below use a Tesla V100-SXM2-32GB at a locked 1,530 MHz graphics clock, CUDA 12.8,
+and Qwen3.8-27B. The target-round decode and prefill figures use one request. Round latency is
+independent of speculative acceptance; committed tok/s is not.
+
+### Decode
+
+The short target-round benchmark also gives the measured groupwise comparison. These rates use
+each profile's best draft width and the licensed-token mean observed in its ten-round sample;
+acceptance varies with the continuation.
+
+| Weight profile | Drafts | Mean round | Mean licensed | Derived rate |
+|---|---:|---:|---:|---:|
+| `groupwise-int` | 3 | **53.79 ms** | 3.2 | 59.5 tok/s |
+| software `nvfp4` | 5 | 60.80 ms | **5.0** | **82.2 tok/s** |
+
+Groupwise MTP5 was slower: 70.21 ms per round, 3.9 licensed tokens, and 55.5 tok/s in the same
+short sample. Its measured optimum remains MTP3. NVFP4's wider useful verification window is what
+lets it produce the higher committed rate despite the longer round.
+
+#### Software NVFP4 kernel delta
+
+| Five-draft target verification | Mean round | Rate at 4.5 licensed tokens/round |
+|---|---:|---:|
+| Checkpoint-native QPN2 | 68.95 ms | 65.3 tok/s |
+| Load-time-prepacked QPN2 | **60.80 ms** | **74.0 tok/s** |
+
+The prepack reduces the complete MTP5 round by **11.8%** and clears the theorized 70 tok/s point
+when the workload licenses 4.5 tokens per round. A short ten-round sample licensed 5.0 tokens per
+round and therefore computes to 82.2 tok/s; a 100-round synthetic continuation licensed only 3.87
+and would compute to 63.7 tok/s at the final round latency. Those different rates are acceptance
+behavior, not different kernel speed. For a workload with mean licensed width `L`, use
+`L / 0.06080` to estimate the short-context kernel-bound rate.
+
+MTP6 and MTP7 were also tested. Acceptance did not increase: both averaged 4.8 licensed tokens in
+the test continuation while round time rose to 78.50 and 80.61 ms. The product limit remains five.
+
+### Prefill
+
+Both profiles use a 2,048-token chunk. The 260,096-token case allocates the full 262,144-token
+context with INT8 group-64 KV and no warm-up; both routes peak at 1.75 GiB of workspace.
+
+| Weight profile | 2,048 tokens | 260,096 tokens |
+|---|---:|---:|
+| `groupwise-int` | **1,235.1 tok/s** | **352.55 tok/s** |
+| software `nvfp4` | 1,214.3 tok/s | 351.72 tok/s |
+
+The long-context comparison is the useful one: attention and KV work dominate there, while the
+fixed per-chunk weight reconstruction cost is most visible in the 2K case. At 260,096 tokens the
+software NVFP4 path is within 0.24% of groupwise prefill throughput.
+
+### Concurrent serving
+
+This is aggregate steady-state decode throughput from simultaneous greedy requests. Each request
+uses the same 335-token prompt and generates 512 tokens; the server uses a 16,384-token context,
+INT8 KV, a 2,048-token prefill chunk, prefix reuse disabled, and the full proposal head. Only
+complete intervals at the requested batch size are counted.
+
+| Weight profile | Drafts | C1 | C2 | C4 | C5 | C8 |
+|---|---:|---:|---:|---:|---:|---:|
+| `groupwise-int` | 3 | 51.8 tok/s | 68.5 tok/s | 105.9 tok/s | — | **181.1 tok/s** |
+| software `nvfp4` | 5 | **84.0 tok/s** | **134.0 tok/s** | **175.2 tok/s** | **186.8 tok/s** | does not fit |
+
+Software NVFP4 works best at MTP5 on this workload and is the faster serving profile through C5.
+Its high throughput depends on the full proposal head: acceptance was 98–99% here, while the
+optimized proposal head accepted almost no drafts on the same continuation. Groupwise-int remains
+the capacity choice for C6–C8 on a 32GB V100; NVFP4's larger transient memory plan does not start at
+those concurrency levels. These are saturation results, not a promise that every prompt will have
+the same speculative acceptance.
+
+### Difference from the RTX 5090 build
+
+The upstream README reports 143.8 tok/s for Qwen3.8-27B NVFP4 at C=1/MTP3 and 2,203.1 prefill
+tok/s at a 260,096-token prompt. The V100 numbers above use MTP5 for the target-round measurement
+and a 2,048-token prefill chunk, so a raw ratio mixes protocol, acceptance, memory bandwidth, and
+native FP4 hardware. The architectural delta is simpler: the 5090 consumes NVFP4 in silicon;
+V100 runs a load-time fragment prepack, software E2M1/E4M3 decode, and FP16 `m8n8k4` tensor-core
+MMA. The artifact and public serving surface stay the same.
+
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
 
@@ -79,81 +159,24 @@ operation. The reconstruction uses the same shift decoder as QPN2. Nothing expan
 which is why the 20.02 GiB Qwen3.8 NVFP4 artifact can still prefill at the 262,144-token model
 limit on a 32GB card with INT8 KV.
 
-## Performance
-
-Measurements below use a Tesla V100-SXM2-32GB at a locked 1,530 MHz graphics clock, CUDA 12.8,
-one request, and Qwen3.8-27B. Decode figures are from the target-round benchmark with the optimized
-proposal head. Round latency is independent of speculative acceptance; committed tok/s is not.
-
-### Decode
-
-The short target-round benchmark also gives the measured groupwise comparison. These rates use
-each profile's best draft width and the licensed-token mean observed in its ten-round sample;
-acceptance varies with the continuation.
-
-| Weight profile | Drafts | Mean round | Mean licensed | Derived rate |
-|---|---:|---:|---:|---:|
-| `groupwise-int` | 3 | **53.79 ms** | 3.2 | 59.5 tok/s |
-| software `nvfp4` | 5 | 60.80 ms | **5.0** | **82.2 tok/s** |
-
-Groupwise MTP5 was slower: 70.21 ms per round, 3.9 licensed tokens, and 55.5 tok/s in the same
-short sample. Its measured optimum remains MTP3. NVFP4's wider useful verification window is what
-lets it produce the higher committed rate despite the longer round.
-
-#### Software NVFP4 kernel delta
-
-| Five-draft target verification | Mean round | Rate at 4.5 licensed tokens/round |
-|---|---:|---:|
-| Checkpoint-native QPN2 | 68.95 ms | 65.3 tok/s |
-| Load-time-prepacked QPN2 | **60.80 ms** | **74.0 tok/s** |
-
-The prepack reduces the complete MTP5 round by **11.8%** and clears the theorized 70 tok/s point
-when the workload licenses 4.5 tokens per round. A short ten-round sample licensed 5.0 tokens per
-round and therefore computes to 82.2 tok/s; a 100-round synthetic continuation licensed only 3.87
-and would compute to 63.7 tok/s at the final round latency. Those different rates are acceptance
-behavior, not different kernel speed. For a workload with mean licensed width `L`, use
-`L / 0.06080` to estimate the short-context kernel-bound rate.
-
-MTP6 and MTP7 were also tested. Acceptance did not increase: both averaged 4.8 licensed tokens in
-the test continuation while round time rose to 78.50 and 80.61 ms. The product limit remains five.
-
-### Prefill
-
-Both profiles use a 2,048-token chunk. The 260,096-token case allocates the full 262,144-token
-context with INT8 group-64 KV and no warm-up; both routes peak at 1.75 GiB of workspace.
-
-| Weight profile | 2,048 tokens | 260,096 tokens |
-|---|---:|---:|
-| `groupwise-int` | **1,235.1 tok/s** | **352.55 tok/s** |
-| software `nvfp4` | 1,214.3 tok/s | 351.72 tok/s |
-
-The long-context comparison is the useful one: attention and KV work dominate there, while the
-fixed per-chunk weight reconstruction cost is most visible in the 2K case. At 260,096 tokens the
-software NVFP4 path is within 0.24% of groupwise prefill throughput.
-
-### Difference from the RTX 5090 build
-
-The upstream README reports 143.8 tok/s for Qwen3.8-27B NVFP4 at C=1/MTP3 and 2,203.1 prefill
-tok/s at a 260,096-token prompt. The V100 numbers above use MTP5 for the target-round measurement
-and a 2,048-token prefill chunk, so a raw ratio mixes protocol, acceptance, memory bandwidth, and
-native FP4 hardware. The architectural delta is simpler: the 5090 consumes NVFP4 in silicon;
-V100 runs a load-time fragment prepack, software E2M1/E4M3 decode, and FP16 `m8n8k4` tensor-core
-MMA. The artifact and public serving surface stay the same.
-
 ## Evaluation
 
 These are upstream artifact scores and were not rerun for this V100 release. Capability scores
 were measured through NInfer's OpenAI-compatible serving route with thinking
 enabled, MTP=3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
 
-| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond |
-|---|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% |
+| Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
+|---|---:|---:|---:|---:|---:|
+| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
+| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
+| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
+| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
+| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
 
-Both Qwen3.8-27B profiles are supported but have not yet been added to this published evaluation
-campaign.
+The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8 rows used temperature
+1.0 and presence penalty 0.0. ERQA and RealWorldQA ran with vision enabled at an 81,920-token
+context limit. The text evaluations used 262,144 tokens except Qwen3.8 NVFP4, which used 252,928
+on the RTX 5090 evaluation host.
 
 These are single-sample results under that NInfer evaluation profile, not pass@k. See the model
 cards and [full performance document](docs/performance.md) for correct/total counts and evaluation
@@ -264,8 +287,7 @@ available only for the 35B-A3B target and is text-only.
   --prompt "Explain prefill and decode in three sentences." \
   --max-context 16384 \
   --max-new 256 \
-  --spec mtp --draft-tokens 5 \
-  --lm-head-draft
+  --spec mtp --draft-tokens 5
 ```
 
 Use `--messages FILE` instead of `--prompt` for chat history, images, or videos:
@@ -289,8 +311,7 @@ speculative-decoding statistics are written to stderr. See the [CLI guide](docs/
   --max-context 16384 \
   --kv-capacity auto \
   --max-concurrency 2 \
-  --spec mtp --draft-tokens 5 \
-  --lm-head-draft
+  --spec mtp --draft-tokens 5
 ```
 
 For one full-context request on a 32GB V100, use INT8 group-64 KV and the measured 2,048-token
@@ -303,13 +324,28 @@ prefill chunk:
   --kv-dtype int8 \
   --prefill-chunk 2048 \
   --max-concurrency 1 \
-  --spec mtp --draft-tokens 5 \
-  --lm-head-draft
+  --spec mtp --draft-tokens 5
+```
+
+For the groupwise-int concurrency profile, keep MTP3 and let eight requests share the KV pool:
+
+```bash
+./build-v100/apps/ninfer-serve models/qwen3_8_27b.ninfer \
+  --max-context 262144 \
+  --kv-capacity auto \
+  --kv-dtype int8 \
+  --prefill-chunk 2048 \
+  --max-concurrency 8 \
+  --spec mtp --draft-tokens 3
 ```
 
 `--kv-capacity auto` sizes one shared KV pool from the memory left after weight upload. Raising
 `--max-concurrency` does not create another 262,144-token pool per request; active and retained
 requests divide the same token capacity.
+
+These NVFP4 examples deliberately use the full proposal head. `--lm-head-draft` selects the smaller
+optimized head; it saves memory, but substantially reduced MTP acceptance for the measured NVFP4
+workload. Groupwise-int reaches its measured optimum at MTP3.
 
 The public model ID defaults to the artifact's `identity.model_id`; use `--model-id` only to
 publish a deployment-specific alias.

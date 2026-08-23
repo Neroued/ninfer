@@ -1,0 +1,135 @@
+schema_version: 1
+
+targets:
+  qwen38_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-27b
+    max_concurrency: 4
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  text_full:
+    jobs:
+      - id: ifbench
+        backend: evalscope
+        dataset: ifbench
+        target: qwen38_api
+        max_concurrency: 4
+        generation:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # IFBench responses are normally short, but this leaves ample room for
+          # instruction-constrained long-form answers and hidden reasoning.
+          max_tokens: 65536
+          seed: 42
+          extra_body: &thinking_extra_body
+            enable_thinking: true
+            min_p: 0.0
+        backend_args:
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: qwen38_api
+        max_concurrency: 4
+        generation: &aime_generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # NInfer has no repetition_penalty field; the recommended 1.0 is the identity operation.
+          # The 262,144-token context resolves a 324,224-token KV pool. Four full AIME budgets
+          # would need 502,740 tokens, so an extreme wave queues later requests under admission
+          # rather than truncating earlier ones.
+          max_tokens: 122880
+          seed: 42
+          extra_body: *thinking_extra_body
+        backend_args: &aime_backend
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: aime26
+        backend: evalscope
+        dataset: aime26
+        target: qwen38_api
+        max_concurrency: 4
+        generation: *aime_generation
+        backend_args: *aime_backend
+
+      - id: gpqa_diamond
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: qwen38_api
+        max_concurrency: 1
+        generation:
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # One full 245,760-token budget plus the 2,847-token prompt fits the 324,224-token
+          # pool. Concurrency two would queue the second request behind the full entitlement,
+          # so C=1 stays.
+          max_tokens: 245760
+          seed: 42
+          extra_body: *thinking_extra_body
+        backend_args:
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+  multimodal_full:
+    jobs:
+      - id: erqa
+        backend: evalscope
+        dataset: erqa
+        target: qwen38_api
+        max_concurrency: 4
+        generation: &multimodal_generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # ERQA_75 is the largest cached prepared prompt at 12,394 tokens.
+          # The Vision server's 81,920 context therefore leaves 3,990 tokens
+          # beyond this prompt plus the 65,536-token output bound. Four full
+          # budgets exceed the resolved 261,056-token pool, so extreme waves
+          # queue under admission instead of truncating.
+          max_tokens: 65536
+          seed: 42
+          extra_body: *thinking_extra_body
+        backend_args: &multimodal_backend
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: real_world_qa
+        backend: evalscope
+        dataset: real_world_qa
+        target: qwen38_api
+        max_concurrency: 4
+        generation: *multimodal_generation
+        backend_args: *multimodal_backend
+
+runtime:
+  # Keep datasets sequential inside each independently invoked evaluation step.
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 900
+  samples:
+    retention: all

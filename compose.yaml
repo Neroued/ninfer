@@ -34,7 +34,7 @@ services:
       # Read-only host bind, never a named volume and never baked into a layer:
       # the artifact is opened O_DIRECT with no fallback, which tmpfs cannot
       # serve and overlayfs cannot be relied on for.
-      - /path/to/models/Qwen3.8-27B-nvfp4-NInfer:/models:ro
+      - ${NINFER_ARTIFACT_DIR:?set NINFER_ARTIFACT_DIR in .env to the host directory holding the .ninfer artifact}:/models:ro
       # The image pre-creates /var/log/ninfer owned by uid 1000, so this volume
       # inherits that ownership and --request-log-jsonl finds its parent.
       - ninfer-logs:/var/log/ninfer

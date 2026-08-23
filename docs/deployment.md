@@ -1,7 +1,7 @@
 # Deployment — Qwen3.8-27B NVFP4 as a container
 
-Operating notes for running this build as a dedicated local LLM server, in a container, on
-`<host>` (RTX 5090, 32 GiB, driver 595.84). This is a host-specific operating profile
+Operating notes for running this build as a dedicated local LLM server, in a container, on a
+single-GPU host (RTX 5090, 32 GiB, driver 595.84). This is a host-specific operating profile
 rather than upstream's published methodology; [`performance.md`](performance.md) holds the latter.
 
 > Figures here are serving-performance only. No answers were scored and no accuracy is claimed.
@@ -9,14 +9,15 @@ rather than upstream's published methodology; [`performance.md`](performance.md)
 ## Start it
 
 ```sh
-cp .env.example .env && chmod 600 .env   # then fill in NINFER_API_KEY
+cp .env.example .env && chmod 600 .env   # then set NINFER_API_KEY and NINFER_ARTIFACT_DIR
 docker compose up -d
 docker compose logs -f ninfer
 ```
 
-Compose refuses to create the container without `NINFER_API_KEY`, because the endpoint is reachable
-from the public internet through Tailscale Funnel and an unauthenticated start would be a live
-regression.
+`NINFER_ARTIFACT_DIR` is the host directory holding the `.ninfer` file, bind-mounted read-only at
+`/models`. Compose refuses to create the container without `NINFER_API_KEY`: where the endpoint is
+published through Tailscale Funnel it is reachable from the public internet, and an unauthenticated
+start would be a live regression.
 
 A healthy start logs the model load, then the resolved KV capacity, then `warming up...`,
 and finally:
@@ -42,7 +43,7 @@ that is the escape hatch for the values marked fixed.
 | Flag | Value | Override | Reason |
 |---|---|---|---|
 | `--max-context` | `131072` | `NINFER_MAX_CONTEXT` | NVFP4's validated ceiling. Costs nothing to set high — see below. |
-| `--kv-capacity` | `auto` | fixed | A *shared* pool, sized from VRAM left after the weights. It resolved to **193,792 tokens** in the container here; the earlier bare-metal profile resolved 196,160. Read the actual figure off the startup line rather than assuming a constant. |
+| `--kv-capacity` | `auto` | fixed | A *shared* pool, sized from the VRAM left after the weights land. It is **not a constant**: three restarts on this host resolved 196,160, 193,792, and 188,928 tokens. Read the real figure off the `KV capacity auto resolved=` startup line. |
 | `--kv-dtype` | `int8` | fixed | Group-64. Only `bf16` and `int8` exist; `int8` doubles the pool. |
 | `--max-concurrency` | `8` | `NINFER_MAX_CONCURRENCY` | The engine's hard maximum; the range is `1..8`. |
 | `--spec mtp --draft-tokens 3` | | `NINFER_DRAFT_TOKENS` | MTP is the only speculative backend this model supports. |
@@ -79,7 +80,7 @@ the profile's own value as `default_output_tokens`.
 
 This is the part worth understanding before raising it. At admission a request is entitled to
 `prompt_tokens + requested_output_tokens` worth of KV pages, and those pages are held against the
-shared ~193.8K-token pool for the request's whole life — not allocated lazily as tokens are
+shared pool of roughly 190K tokens for the request's whole life — not allocated lazily as tokens are
 produced. The requested figure is the client's `max_tokens` or, absent one, this default.
 
 So the number of lanes that can run at once is set by `prompt + cap`:
@@ -92,13 +93,13 @@ So the number of lanes that can run at once is set by `prompt + cap`:
 
 With a 131,072 default, the entitlement works out to exactly `--max-context` whatever the prompt
 length, because the clamp in (3) is what caps it. Two such requests need 262,144 tokens against a
-~193.8K-token pool, so the second one waits rather than running beside the first — the queue holds
+~190K-token pool, so the second one waits rather than running beside the first — the queue holds
 16 and gives up after 30 s (`--max-pending-requests`, `--pending-timeout-ms`).
 
 This only taxes clients that omit `max_tokens`. Traffic that sets its own cap is entitled to exactly
 that cap and keeps batching normally, which is why the C=8 figures below still stand for
 well-behaved callers. If you need 8-wide batching from default traffic too, the condition is
-`prompt + cap <= pool / 8` — about 24,200 tokens at the pool size above, i.e.
+`prompt + cap <= pool / 8` — 23.6K to 24.5K across the pool sizes seen here, i.e.
 `NINFER_DEFAULT_MAX_TOKENS=16384` for prompts up to roughly 7.8K.
 
 ## Measured throughput
@@ -131,9 +132,9 @@ Prefill is roughly 8,300 tok/s at 8K of context, 5,300 at 64K, 3,500 at 130K.
 
 ## Context vs concurrency — the one thing to understand
 
-`--max-context` is a *per-sequence ceiling*. `--kv-capacity` is a **shared pool** — 193,792 tokens
-as resolved here. Setting a 128K ceiling does **not** reserve 8 × 128K, and it does not by itself
-cost throughput.
+`--max-context` is a *per-sequence ceiling*. `--kv-capacity` is a **shared pool** — around 190K
+tokens as resolved here. Setting a 128K ceiling does **not** reserve 8 × 128K, and it does not by
+itself cost throughput.
 
 What matters is the live working set:
 
@@ -160,7 +161,7 @@ The container publishes `127.0.0.1:11434` only. Tailscale already fronts that ad
 network namespace, and **no tailscaled change is needed**:
 
 - `https://<host>.<tailnet>.ts.net` — Funnel, proxying `/` to `http://127.0.0.1:11434`
-- `https://<service>.<tailnet>.ts.net` — tailnet-only service (`svc:ollama`), same target
+- `https://<service>.<tailnet>.ts.net` — tailnet-only service, same target
 
 That configuration lives in host `tailscaled`, not in this repository; do not look for it here.
 
@@ -273,6 +274,6 @@ would be root-owned and unwritable by the non-root process — `chown 1000:1000`
 
 ## Relationship to the benchmark spec
 
-`<host>-benchmarks/specs/qwen3.8-27b-nvfp4-ninfer-mtp3-c8.yaml` runs the same engine with two
+The `qwen3.8-27b-nvfp4-ninfer-mtp3-c8` benchmark spec runs the same engine with two
 deliberate differences: prefix reuse disabled (cold prefill by design) and fixed-length generation.
 Do not copy that spec's flags here — its job is comparability across engines, not speed.

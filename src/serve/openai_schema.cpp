@@ -442,19 +442,54 @@ void reject_unsupported_features(const Json& body) {
             throw ApiException(std::move(error));
         }
     }
-    if (body.contains("response_format") && !body.at("response_format").is_null()) {
-        const Json& fmt  = body.at("response_format");
-        std::string type = fmt.is_object() && fmt.contains("type") && fmt.at("type").is_string()
-                               ? fmt.at("type").get<std::string>()
-                               : std::string();
-        if (type != "text") {
-            ApiError error;
-            error.message = "only response_format {type:text} is supported";
-            error.param   = "response_format";
-            error.code    = "response_format_not_supported";
-            throw ApiException(std::move(error));
-        }
+}
+
+// Accepts {type:text}, {type:json_object}, and {type:json_schema} (schema and
+// strict are carried; name is ignored). The `strict` flag is parsed for wire
+// compatibility only — there is no token-level constraint in this engine.
+void parse_response_format(const Json& body, GenerationRequest& out) {
+    if (!body.contains("response_format") || body.at("response_format").is_null()) {
+        return;
     }
+    const Json& fmt = body.at("response_format");
+    if (!fmt.is_object()) {
+        bad_request("response_format must be an object", "response_format",
+                    "response_format_not_supported");
+    }
+    if (!fmt.contains("type") || !fmt.at("type").is_string()) {
+        bad_request("response_format.type must be a string", "response_format",
+                    "response_format_not_supported");
+    }
+    const std::string type = fmt.at("type").get<std::string>();
+    if (type == "text") {
+        out.structured_output = StructuredOutput{StructuredOutputType::Text, {}};
+        return;
+    }
+    if (type == "json_object") {
+        out.structured_output = StructuredOutput{StructuredOutputType::JsonObject, {}};
+        return;
+    }
+    if (type == "json_schema") {
+        if (!fmt.contains("json_schema") || !fmt.at("json_schema").is_object()) {
+            bad_request("response_format.json_schema must be an object", "response_format",
+                        "response_format_not_supported");
+        }
+        const Json& js = fmt.at("json_schema");
+        if (!js.contains("schema") || !js.at("schema").is_object()) {
+            bad_request("response_format.json_schema.schema must be an object",
+                        "response_format", "response_format_not_supported");
+        }
+        out.structured_output =
+            StructuredOutput{StructuredOutputType::JsonSchema, js.at("schema").dump()};
+        return;
+    }
+    ApiError error;
+    error.status  = 400;
+    error.message = "response_format.type '" + type + "' is not supported; only text, "
+                    "json_object, and json_schema are accepted";
+    error.param   = "response_format";
+    error.code    = "response_format_not_supported";
+    throw ApiException(std::move(error));
 }
 
 Json base_chunk(const std::string& id, const std::string& model, std::int64_t created) {
@@ -548,6 +583,7 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, out);
     parse_stop(body, out);
     parse_sampling(body, out);
+    parse_response_format(body, out);
 
     out.stream = get_bool(body, "stream", false);
     if (body.contains("stream_options") && body.at("stream_options").is_object()) {

@@ -19,7 +19,7 @@ namespace ninfer::serve {
 // OpenAI and Anthropic schema layers.
 
 // Parse an already-decoded JSON body into a GenerationRequest. Throws ApiException
-// on malformed or unsupported requests (n>1, tools, non-text response_format, ...).
+// on malformed or unsupported requests (n>1, tools, unknown response_format type, ...).
 GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits);
 

@@ -157,12 +157,42 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     return result;
 }
 
+// JSON response formats have no token-level constraint in this engine, so they
+// are enforced by an instruction injected into the prompt — the same soft-JSON
+// approach llama.cpp pairs with its json_object grammar. JsonObject asks for a
+// bare object; JsonSchema additionally carries the client's schema.
+std::string structured_output_instruction(const StructuredOutput& output) {
+    std::string text = "You must respond with a single JSON object and nothing else: "
+                       "no prose, no explanations, no markdown code fences.";
+    if (output.type == StructuredOutputType::JsonSchema) {
+        text += " The object must conform to this JSON schema:\n" + output.schema_json;
+    }
+    return text;
+}
+
 ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media) {
+    std::vector<ChatTurn> turns = request.messages;
+    const StructuredOutput& output = request.structured_output;
+    if (output.type == StructuredOutputType::JsonObject ||
+        output.type == StructuredOutputType::JsonSchema) {
+        ContentPart instruction;
+        instruction.kind = ContentKind::Text;
+        instruction.text = structured_output_instruction(output);
+        if (!turns.empty() && turns.front().role == ChatRole::System) {
+            turns.front().content.push_back(std::move(instruction));
+        } else {
+            ChatTurn system;
+            system.role    = ChatRole::System;
+            system.content = std::vector<ContentPart>{std::move(instruction)};
+            turns.insert(turns.begin(), std::move(system));
+        }
+    }
+
     ninfer::PromptInput input;
-    input.messages.reserve(request.messages.size());
-    for (const ChatTurn& turn : request.messages) {
+    input.messages.reserve(turns.size());
+    for (const ChatTurn& turn : turns) {
         ninfer::ChatMessage message;
         message.role              = turn.role;
         message.reasoning_content = turn.reasoning_content;

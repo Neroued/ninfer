@@ -358,17 +358,33 @@ int test_reject_unsupported() {
 
     Json rf               = base;
     rf["response_format"] = Json{{"type", "json_object"}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
+    GenerationRequest rf_req =
+        parse_chat_completion_request(rf, default_limits());
+    failures += check(rf_req.structured_output.type == StructuredOutputType::JsonObject,
+                      "json_object response_format accepted");
 
     Json rf_text               = base;
     rf_text["response_format"] = Json{{"type", "text"}};
     bool text_ok               = true;
+    GenerationRequest text_req;
     try {
-        (void)parse_chat_completion_request(rf_text, default_limits());
+        text_req = parse_chat_completion_request(rf_text, default_limits());
     } catch (...) { text_ok = false; }
     failures += check(text_ok, "text response_format accepted");
+    failures += check(text_req.structured_output.type == StructuredOutputType::Text,
+                      "text response_format recorded");
+
+    Json rf_unknown = base;
+    rf_unknown["response_format"] = Json{{"type", "json"}};
+    failures += check(api_code([&] { (void)parse_chat_completion_request(rf_unknown, default_limits()); })
+                          == "response_format_not_supported",
+                      "unknown response_format type rejected with code");
+
+    Json rf_malformed = base;
+    rf_malformed["response_format"] = Json{{"type", "json_schema"}};
+    failures += check(api_code([&] { (void)parse_chat_completion_request(rf_malformed, default_limits()); })
+                          == "response_format_not_supported",
+                      "json_schema without schema rejected");
 
     Json no_model = {{"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
     failures +=
@@ -380,6 +396,86 @@ int test_reject_unsupported() {
     failures += check(
         throws_api([&] { (void)parse_chat_completion_request(function_role, default_limits()); }),
         "function role rejected");
+    return failures;
+}
+
+int test_response_format() {
+    int failures = 0;
+
+    // json_object without a system message: instruction becomes a new leading
+    // system turn, original turns untouched.
+    {
+        Json body = {
+            {"model", "m"},
+            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+            {"response_format", Json{{"type", "json_object"}}},
+        };
+        const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+        const ninfer::PromptInput input = translate(req);
+        failures += check(input.messages.size() == 2, "json_object: system turn injected");
+        failures += check(input.messages.front().role == ninfer::ChatRole::System,
+                          "json_object: leading system");
+        failures += check(joined_text(input.messages.front()).find("single JSON object") !=
+                              std::string::npos,
+                          "json_object: instruction text present");
+        failures += check(input.messages.back().role == ninfer::ChatRole::User,
+                          "json_object: user turn kept");
+        failures += check(joined_text(input.messages.back()) == "hi", "json_object: user text kept");
+    }
+
+    // json_object with an existing system message: appended to it, not duplicated.
+    {
+        Json body = {
+            {"model", "m"},
+            {"messages", Json::array({Json{{"role", "system"}, {"content", "be brief"}},
+                                      Json{{"role", "user"}, {"content", "hi"}}})},
+            {"response_format", Json{{"type", "json_object"}}},
+        };
+        const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+        const ninfer::PromptInput input = translate(req);
+        failures += check(input.messages.size() == 2, "json_object: no duplicate system turn");
+        const std::string system_text = joined_text(input.messages.front());
+        failures += check(system_text.find("be brief") != std::string::npos,
+                          "json_object: original system text kept");
+        failures += check(system_text.find("single JSON object") != std::string::npos,
+                          "json_object: instruction appended to system");
+    }
+
+    // json_schema: the client schema is embedded in the instruction.
+    {
+        Json schema = Json{{"type", "object"},
+                           {"properties", Json{{"facts", Json{{"type", "array"}}}}},
+                           {"required", Json::array({"facts"})}};
+        Json body = {
+            {"model", "m"},
+            {"messages", Json::array({Json{{"role", "user"}, {"content", "extract"}}})},
+            {"response_format",
+             Json{{"type", "json_schema"},
+                  {"json_schema", Json{{"name", "facts"}, {"schema", schema}, {"strict", true}}}}},
+        };
+        const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+        failures += check(req.structured_output.type == StructuredOutputType::JsonSchema,
+                          "json_schema parsed");
+        failures += check(req.structured_output.schema_json.find("\"facts\"") != std::string::npos,
+                          "json_schema: schema serialized");
+        const ninfer::PromptInput input = translate(req);
+        failures += check(joined_text(input.messages.front()).find("\"facts\"") != std::string::npos,
+                          "json_schema: schema embedded in prompt");
+    }
+
+    // text and absent: no injection.
+    {
+        Json body = {
+            {"model", "m"},
+            {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+            {"response_format", Json{{"type", "text"}}},
+        };
+        const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+        const ninfer::PromptInput input = translate(req);
+        failures += check(input.messages.size() == 1, "text: no injection");
+        failures += check(input.messages.front().role == ninfer::ChatRole::User,
+                          "text: user turn is first");
+    }
     return failures;
 }
 
@@ -715,6 +811,7 @@ int main() {
     failures += test_instruction_roles_preserved();
     failures += test_parse_media_in_translate();
     failures += test_reject_unsupported();
+    failures += test_response_format();
     failures += test_parse_function_tools_and_choices();
     failures += test_parse_tool_history_messages();
     failures += test_parse_stop_and_max_tokens();

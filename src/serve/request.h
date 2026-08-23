@@ -89,6 +89,21 @@ enum class ToolChoiceMode {
     Named,
 };
 
+// Wire value of `response_format.type` accepted by the OpenAI layer. The engine
+// performs no token-level constraint; JSON modes are prompt-injected (see
+// translate.cpp) in the same soft-JSON spirit as llama.cpp's json_object path.
+enum class StructuredOutputType : std::uint8_t {
+    None,
+    Text,
+    JsonObject,
+    JsonSchema,
+};
+
+struct StructuredOutput {
+    StructuredOutputType type = StructuredOutputType::None;
+    std::string schema_json; // serialized `json_schema.schema` for JsonSchema
+};
+
 struct ToolChoice {
     ToolChoiceMode mode = ToolChoiceMode::Auto;
     std::string name;
@@ -170,6 +185,7 @@ struct GenerationRequest {
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = 64;
     ToolChoice tool_choice;
+    StructuredOutput structured_output;
     std::vector<std::string> stop_strings;
     int max_tokens      = 0; // 0 => use server default
     bool max_tokens_set = false;

@@ -1324,7 +1324,9 @@ int test_stray_think_close_dropped(const Frontend& frontend) {
     int failures        = check(decision.accepted_tokens == 2,
                                 "stray-close session did not accept both tokens");
     const auto output   = session.commit_preview();
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning).empty(),
+                      "thinking-off session published reasoning text");
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "thought\n\nanswer",
                       "stray think-close with thinking-off leaked into content");
     return failures;
 }
@@ -1350,14 +1352,15 @@ int test_second_think_close_dropped(const Frontend& frontend) {
     const auto output   = session.commit_preview();
     failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
                       "reasoning channel text changed by stray-close handling");
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answeranswer",
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) ==
+                          "answerthought\n\nanswer",
                       "second think-close leaked into content");
     return failures;
 }
 
 
 int test_split_think_close_dropped(const Frontend& frontend) {
-    // Thinking disabled: a close marker split across two tokens must never leak.
+    // Thinking disabled: a close marker split across two rounds must never leak.
     // Token 3 = "thought</thi", token 4 = "nk>\n\nanswer": the marker spans both.
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -1367,10 +1370,11 @@ int test_split_think_close_dropped(const Frontend& frontend) {
     input.messages.push_back(std::move(message));
     input.options.add_generation_prompt = true;
     input.options.enable_thinking       = false;
-    auto prompt                         = frontend.prepare(std::move(input));
-    auto session                        = frontend.make_output_session(prompt, {});
-    // Two separate preview rounds force the marker to span calls.
-    const auto d1 = session.preview(std::array<ninfer::TokenId, 1>{3}, 1,
+    auto prompt  = frontend.prepare(std::move(input));
+    auto session = frontend.make_output_session(prompt, {});
+    // Round one keeps a budget in reserve so the session stays open and the
+    // ambiguous suffix is held; round two resolves it at the output limit.
+    const auto d1 = session.preview(std::array<ninfer::TokenId, 1>{3}, 2,
                                     ninfer::FinishReason::OutputLimit);
     int failures = check(d1.accepted_tokens == 1, "split round one rejected");
     const auto out1 = session.commit_preview();
@@ -1379,21 +1383,50 @@ int test_split_think_close_dropped(const Frontend& frontend) {
                       "split marker first half leaked");
     const auto d2 = session.preview(std::array<ninfer::TokenId, 1>{4}, 1,
                                     ninfer::FinishReason::OutputLimit);
-    failures += check(d2.accepted_tokens == 1, "split round two rejected");
+    failures += check(d2.accepted_tokens == 1 &&
+                          d2.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "split round two rejected");
     const auto out2 = session.commit_preview();
     const std::string content =
         channel_text(out1, ninfer::OutputChannel::Content) +
         channel_text(out2, ninfer::OutputChannel::Content);
-    failures += check(content.find("</think>") == std::string::npos,
+    failures += check(content == "thought\n\nanswer",
                       "split think-close leaked into content");
     return failures;
 }
 
 
-int test_terminal_flushes_marker_prefix(const Frontend& frontend) {
-    // Thinking-off + tool-capable style request: a token ending in a proper prefix
-    // of </think> holds bytes in the pending buffer. At output-limit termination
-    // those bytes must be published as content, not dropped.
+int test_raw_session_bypasses_marker_handling(const Frontend& frontend) {
+    // Raw output must expose the decoded stream byte-exactly on content: ordinary
+    // bytes publish as content (not reasoning), and a literal </think> survives.
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = false;
+    auto prompt                         = frontend.prepare(std::move(input));
+    auto session                        = frontend.make_output_session(
+        prompt, {}, ninfer::OutputOptions{.raw = true});
+    // 3 + 4 contain a complete </think>; then 3 again ends with its proper prefix.
+    const std::array<ninfer::TokenId, 3> tokens{3, 4, 3};
+    const auto decision = session.preview(tokens, 3, ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.accepted_tokens == 3,
+                                "raw session did not accept all tokens");
+    const auto output   = session.commit_preview();
+    const std::string content = channel_text(output, ninfer::OutputChannel::Content);
+    failures += check(content == "thought</think>\n\nanswerthought</thi",
+                      "raw session stream was altered by marker handling");
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning).empty(),
+                      "raw session leaked bytes onto the reasoning channel");
+    return failures;
+}
+
+int test_terminal_flush_drops_complete_marker(const Frontend& frontend) {
+    // Thinking-off termination exactly on a close marker must drop the marker itself
+    // while flushing ordinary bytes held ahead of it.
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
     message.parts.push_back(
@@ -1404,17 +1437,45 @@ int test_terminal_flushes_marker_prefix(const Frontend& frontend) {
     input.options.enable_thinking       = false;
     auto prompt                         = frontend.prepare(std::move(input));
     auto session                        = frontend.make_output_session(prompt, {});
-    // Token 5 does not exist; use raw text path instead: tokens {3} end mid-marker.
-    // 'thought</thi' -> cleanup holds '</thi' (proper prefix), publishes 'thought'.
+    // Token 4 = "nk>\\n\\nanswer" completes the pending '</thi' into '</think>' and
+    // terminates at the output limit in the same round.
+    const auto d1 = session.preview(std::array<ninfer::TokenId, 1>{3}, 2,
+                                    ninfer::FinishReason::OutputLimit);
+    int failures  = check(d1.accepted_tokens == 1, "complete-marker round one rejected");
+    (void)session.commit_preview();
+    const auto d2 = session.preview(std::array<ninfer::TokenId, 1>{4}, 1,
+                                    ninfer::FinishReason::OutputLimit);
+    failures += check(d2.accepted_tokens == 1 &&
+                          d2.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "complete-marker round did not terminate at limit");
+    const auto output = session.commit_preview();
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "\n\nanswer",
+                      "terminating on a complete think-close published it as content");
+    return failures;
+}
+
+int test_terminal_flushes_marker_prefix(const Frontend& frontend) {
+    // Thinking-off termination on a token ending in a PROPER PREFIX of </think>:
+    // the held bytes are ordinary generated text and must be flushed as content.
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = false;
+    auto prompt  = frontend.prepare(std::move(input));
+    auto session = frontend.make_output_session(prompt, {});
+    // 'thought</thi' -> cleanup holds '</thi' and publishes 'thought'; termination
+    // then flushes the held prefix.
     const std::array<ninfer::TokenId, 1> tokens{3};
     const auto decision = session.preview(tokens, 1, ninfer::FinishReason::OutputLimit);
     int failures        = check(decision.accepted_tokens == 1 &&
                                     decision.finish_reason == ninfer::FinishReason::OutputLimit,
                                 "prefix round did not terminate at output limit");
     const auto output   = session.commit_preview();
-    // Termination must flush the held prefix: full content is the whole token text.
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) ==
-                          "thought</thi",
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "thought</thi",
                       "held marker prefix not flushed at termination");
     return failures;
 }
@@ -1452,5 +1513,7 @@ int main() {
     failures += test_second_think_close_dropped(frontend);
     failures += test_split_think_close_dropped(frontend);
     failures += test_terminal_flushes_marker_prefix(frontend);
+    failures += test_raw_session_bypasses_marker_handling(frontend);
+    failures += test_terminal_flush_drops_complete_marker(frontend);
     return failures == 0 ? 0 : 1;
 }

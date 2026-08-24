@@ -1389,6 +1389,36 @@ int test_split_think_close_dropped(const Frontend& frontend) {
     return failures;
 }
 
+
+int test_terminal_flushes_marker_prefix(const Frontend& frontend) {
+    // Thinking-off + tool-capable style request: a token ending in a proper prefix
+    // of </think> holds bytes in the pending buffer. At output-limit termination
+    // those bytes must be published as content, not dropped.
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.add_generation_prompt = true;
+    input.options.enable_thinking       = false;
+    auto prompt                         = frontend.prepare(std::move(input));
+    auto session                        = frontend.make_output_session(prompt, {});
+    // Token 5 does not exist; use raw text path instead: tokens {3} end mid-marker.
+    // 'thought</thi' -> cleanup holds '</thi' (proper prefix), publishes 'thought'.
+    const std::array<ninfer::TokenId, 1> tokens{3};
+    const auto decision = session.preview(tokens, 1, ninfer::FinishReason::OutputLimit);
+    int failures        = check(decision.accepted_tokens == 1 &&
+                                    decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                                "prefix round did not terminate at output limit");
+    const auto output   = session.commit_preview();
+    // Termination must flush the held prefix: full content is the whole token text.
+    failures += check(channel_text(output, ninfer::OutputChannel::Content) ==
+                          "thought</thi",
+                      "held marker prefix not flushed at termination");
+    return failures;
+}
+
 int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
@@ -1421,5 +1451,6 @@ int main() {
     failures += test_stray_think_close_dropped(frontend);
     failures += test_second_think_close_dropped(frontend);
     failures += test_split_think_close_dropped(frontend);
+    failures += test_terminal_flushes_marker_prefix(frontend);
     return failures == 0 ? 0 : 1;
 }

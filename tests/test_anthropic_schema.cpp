@@ -469,6 +469,78 @@ int test_tool_use_result_roundtrip() {
     return failures;
 }
 
+int test_parallel_tool_result_media_order() {
+    const Json image = Json{{"type", "image"},
+                            {"source", Json{{"type", "base64"},
+                                            {"media_type", "image/png"},
+                                            {"data", "AA=="}}}};
+    const auto tool_use = [](const char* id) {
+        return Json{{"type", "tool_use"},
+                    {"id", id},
+                    {"name", "read"},
+                    {"input", Json{{"path", std::string(id) + ".png"}}}};
+    };
+    const auto tool_result = [](const char* id, Json content) {
+        return Json{{"type", "tool_result"}, {"tool_use_id", id}, {"content", content}};
+    };
+
+    const Json body = {
+        {"model", "m"},
+        {"max_tokens", 8},
+        {"tools", Json::array({Json{{"name", "read"},
+                                    {"input_schema", Json{{"type", "object"}}}}})},
+        {"messages",
+         Json::array(
+             {Json{{"role", "user"}, {"content", "inspect"}},
+              Json{{"role", "assistant"},
+                   {"content", Json::array(
+                                   {tool_use("call_A"), tool_use("call_B"), tool_use("call_C")})}},
+              Json{{"role", "user"},
+                   {"content",
+                    Json::array(
+                        {tool_result("call_C", Json::array({Json{{"type", "text"},
+                                                                  {"text", "text only"}}})),
+                         tool_result("call_B", Json::array({image})),
+                         tool_result("call_A",
+                                     Json::array({Json{{"type", "text"}, {"text", "first"}},
+                                                  image,
+                                                  Json{{"type", "text"}, {"text", "second"}},
+                                                  image}))})}}})}};
+
+    const GenerationRequest req = parse_messages_request(body, default_limits());
+    int failures = check(req.messages.size() == 5, "parallel tool results did not expand in place");
+    failures += check(req.messages[1].tool_calls.size() == 3 &&
+                          req.messages[1].tool_calls[0].id == "call_A" &&
+                          req.messages[1].tool_calls[1].id == "call_B" &&
+                          req.messages[1].tool_calls[2].id == "call_C",
+                      "assistant tool_use array order changed");
+    failures += check(req.messages[2].tool_call_id == "call_C" &&
+                          req.messages[3].tool_call_id == "call_B" &&
+                          req.messages[4].tool_call_id == "call_A",
+                      "tool_result blocks were reordered to tool_use order");
+    failures += check(req.messages[2].content.size() == 1 &&
+                          req.messages[2].content[0].kind == ContentKind::Text &&
+                          req.messages[3].content.size() == 1 &&
+                          req.messages[3].content[0].kind == ContentKind::Image &&
+                          req.messages[4].content.size() == 4 &&
+                          req.messages[4].content[0].kind == ContentKind::Text &&
+                          req.messages[4].content[1].kind == ContentKind::Image &&
+                          req.messages[4].content[2].kind == ContentKind::Text &&
+                          req.messages[4].content[3].kind == ContentKind::Image,
+                      "nested tool_result content order changed");
+
+    const ninfer::PromptInput prompt = translate(req);
+    failures += check(prompt.messages.size() == 5 &&
+                          prompt.messages[2].tool_call_id == "call_C" &&
+                          prompt.messages[3].tool_call_id == "call_B" &&
+                          prompt.messages[4].tool_call_id == "call_A" &&
+                          prompt.messages[4].parts.size() == 4 &&
+                          prompt.messages[4].parts[1].kind == ninfer::MessagePartKind::Media &&
+                          prompt.messages[4].parts[3].kind == ninfer::MessagePartKind::Media,
+                      "translation changed tool-result or nested media order");
+    return failures;
+}
+
 int test_thinking_and_sampling() {
     int failures                = 0;
     Json body                   = {{"model", "m"},
@@ -751,6 +823,7 @@ int main() {
     failures += test_parse_image();
     failures += test_tools_and_choice();
     failures += test_tool_use_result_roundtrip();
+    failures += test_parallel_tool_result_media_order();
     failures += test_thinking_and_sampling();
     failures += test_reasoning_effort();
     failures += test_stop_reason_mapping();

@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
 namespace {
@@ -287,23 +288,34 @@ std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
     int& images      = image_count == nullptr ? local_images : *image_count;
     int& videos      = video_count == nullptr ? local_videos : *video_count;
     std::string out;
+    std::string text_run;
+    const auto flush_text_run = [&] {
+        if (text_run.empty()) { return; }
+        out += escape_literal_vision_tokens(std::move(text_run));
+        text_run.clear();
+    };
     for (const ChatPart& part : parts) {
         switch (part.kind) {
         case ChatPartKind::Text:
-            out += escape_literal_vision_tokens(part.text);
+            // Consecutive text parts are one semantic text run. Escape after
+            // coalescing so part boundaries cannot reconstruct a control token.
+            text_run += part.text;
             break;
         case ChatPartKind::Image:
+            flush_text_run();
             ++images;
             if (add_vision_id) { out += "Picture " + std::to_string(images) + ": "; }
             out += "<|vision_start|><|image_pad|><|vision_end|>";
             break;
         case ChatPartKind::Video:
+            flush_text_run();
             ++videos;
             if (add_vision_id) { out += "Video " + std::to_string(videos) + ": "; }
             out += "<|vision_start|><|video_pad|><|vision_end|>";
             break;
         }
     }
+    flush_text_run();
     return out;
 }
 

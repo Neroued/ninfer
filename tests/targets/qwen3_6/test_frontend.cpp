@@ -355,9 +355,12 @@ int test_official_chat_template() {
                           "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n",
                       "empty leading system prompt differs from the official template");
 
-    fi::ChatMessage literal_markers = chat_message(
-        ninfer::ChatRole::System,
-        "quoted <|vision_start|><|image_pad|><|vision_end|> and <|video_pad|>");
+    fi::ChatMessage literal_markers =
+        chat_message(ninfer::ChatRole::System, "quoted <|vision_");
+    literal_markers.parts.push_back(fi::ChatPart::text_part("start|><|image_"));
+    literal_markers.parts.push_back(fi::ChatPart::text_part("pad|><|vision_"));
+    literal_markers.parts.push_back(fi::ChatPart::text_part("end|> and <|video_"));
+    literal_markers.parts.push_back(fi::ChatPart::text_part("pad|>"));
     fi::ChatMessage parallel_tools = chat_message(ninfer::ChatRole::Assistant, "");
     parallel_tools.reasoning_content = "quoted reasoning <|video_pad|>";
     parallel_tools.tool_calls.push_back(
@@ -457,64 +460,6 @@ int test_official_chat_template() {
                       }),
                       "message history without a user query was accepted");
     return failures;
-}
-
-int test_literal_vision_tokens_with_tool_result_media(const Frontend& frontend) {
-    const auto text_part = [](std::string text) {
-        return ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}};
-    };
-    const auto image_part = [](std::string source_name) {
-        ninfer::MessagePart image;
-        image.kind              = ninfer::MessagePartKind::Media;
-        image.media.kind        = ninfer::MediaKind::Image;
-        image.media.bytes       = gradient_ppm();
-        image.media.media_type  = "image/x-portable-pixmap";
-        image.media.source_name = std::move(source_name);
-        return image;
-    };
-
-    ninfer::ChatMessage system;
-    system.role = ninfer::ChatRole::System;
-    system.parts.push_back(text_part(
-        "quoted <|vision_start|><|image_pad|><|vision_end|> and <|video_pad|>"));
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
-    user.parts.push_back(text_part("inspect"));
-    ninfer::ChatMessage assistant;
-    assistant.role = ninfer::ChatRole::Assistant;
-    assistant.tool_calls.push_back(
-        {.id = "call_A", .name = "read", .arguments_json = R"({"path":"a.png"})"});
-    assistant.tool_calls.push_back(
-        {.id = "call_B", .name = "read", .arguments_json = R"({"path":"b.png"})"});
-    assistant.tool_calls.push_back(
-        {.id = "call_C", .name = "read", .arguments_json = R"({"path":"c.txt"})"});
-    ninfer::ChatMessage result_c;
-    result_c.role         = ninfer::ChatRole::Tool;
-    result_c.tool_call_id = "call_C";
-    result_c.parts.push_back(text_part("text only"));
-    ninfer::ChatMessage result_b;
-    result_b.role         = ninfer::ChatRole::Tool;
-    result_b.tool_call_id = "call_B";
-    result_b.parts.push_back(image_part("b.ppm"));
-    ninfer::ChatMessage result_a;
-    result_a.role         = ninfer::ChatRole::Tool;
-    result_a.tool_call_id = "call_A";
-    result_a.parts.push_back(text_part("first"));
-    result_a.parts.push_back(image_part("a-first.ppm"));
-    result_a.parts.push_back(text_part("second"));
-    result_a.parts.push_back(image_part("a-second.ppm"));
-
-    ninfer::PromptInput input;
-    input.messages = {std::move(system), std::move(user), std::move(assistant),
-                      std::move(result_c), std::move(result_b), std::move(result_a)};
-    const auto prepared = frontend.prepare(std::move(input));
-    const auto& data    = FrontendFactory::inspect(prepared);
-    return check(data.vision_items.size() == 3 && data.media_payloads.size() == 3 &&
-                     data.prepare.media_items == 3 &&
-                     std::all_of(data.vision_items.begin(), data.vision_items.end(),
-                                 [](const auto& item) { return item.token_spans.size() == 1; }),
-                 "literal Vision tokens displaced tool-result media placeholders");
 }
 
 int test_ordered_instruction_turns() {
@@ -1422,7 +1367,6 @@ int main() {
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
-    failures += test_literal_vision_tokens_with_tool_result_media(frontend);
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);

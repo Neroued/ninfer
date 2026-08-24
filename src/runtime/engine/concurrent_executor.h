@@ -55,6 +55,7 @@ public:
             admission_capacity_.main_kv_pages == 0) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        published_cache_stats_ = instance_.program->host_cache_stats();
         worker_ = std::thread([this] { worker_loop(); });
     }
 
@@ -168,8 +169,8 @@ public:
     }
 
     [[nodiscard]] KvHostCacheStats host_cache_stats() const {
-        std::scoped_lock lock(execution_mutex_);
-        return instance_.program->host_cache_stats();
+        std::lock_guard lock(stats_mutex_);
+        return published_cache_stats_;
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
@@ -216,8 +217,10 @@ private:
             ++snapshot.running_requests;
             if (slots_[lane]->decode_ready) { ++snapshot.decode_ready_requests; }
         }
+        const KvHostCacheStats cache_snapshot = instance_.program->host_cache_stats();
         std::lock_guard lock(stats_mutex_);
-        published_stats_ = snapshot;
+        published_stats_       = snapshot;
+        published_cache_stats_ = cache_snapshot;
     }
 
     GenerationResult wait_for_request(std::shared_ptr<Request> request, OutputSink* sink,
@@ -1265,6 +1268,7 @@ private:
     std::uint64_t next_protection_epoch_ = 1;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    KvHostCacheStats published_cache_stats_;
     bool stopping_ = false;
     bool failed_   = false;
     std::thread worker_;

@@ -43,7 +43,7 @@ set -- "$MODEL" \
     --lm-head-draft \
     --min-p "${NINFER_MIN_P:-0.05}" \
     --chat-style "${NINFER_CHAT_STYLE:-sharp-v22.1}" \
-    --default-max-tokens "${NINFER_DEFAULT_MAX_TOKENS:-131072}" \
+    --default-max-tokens "${NINFER_DEFAULT_MAX_TOKENS:-16384}" \
     --log-stats-interval-ms "${NINFER_LOG_STATS_INTERVAL_MS:-5000}" \
     "$@"
 

@@ -306,11 +306,16 @@ public:
         std::size_t total = 0;
         while (total < destination.size()) {
             DWORD got = 0;
-            if (!::ReadFile(fd_, destination.data() + total,
-                            static_cast<DWORD>(destination.size() - total), &got, nullptr) ||
-                got == 0) {
+            const BOOL ok = ::ReadFile(fd_, destination.data() + total,
+                                       static_cast<DWORD>(destination.size() - total), &got, nullptr);
+            if (!ok) {
                 throw std::system_error(::GetLastError(), std::generic_category(),
                                         "direct artifact read");
+            }
+            if (got == 0) {
+                // EOF reached. Return partial count; caller's short-read check
+                // will decide whether this is acceptable.
+                break;
             }
             total += got;
         }

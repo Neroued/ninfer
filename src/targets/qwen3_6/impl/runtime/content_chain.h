@@ -23,17 +23,24 @@ namespace content_chain {
 
 inline constexpr std::uint64_t kFormatVersion = 1;
 
+// Non-cryptographic avalanche mixing: the degski64 finalizer multiplier
+// (https://gist.github.com/degski/6e2069d6035ae04d5d6f64981c995ec2) and the
+// splitmix64 golden-ratio increment (2^64 / phi). degski64 applies two
+// xorshift-multiply rounds of the same multiplier by construction.
+inline constexpr std::uint64_t kDegski64Multiplier = 0xd6e8feb86659fd93ULL;
+inline constexpr std::uint64_t kGoldenGamma        = 0x9e3779b97f4a7c15ULL;
+
 [[nodiscard]] inline std::uint64_t mix(std::uint64_t value) noexcept {
     value ^= value >> 32;
-    value *= 0xd6e8feb86659fd93ULL;
+    value *= kDegski64Multiplier;
     value ^= value >> 32;
-    value *= 0xd6e8feb86659fd93ULL;
+    value *= kDegski64Multiplier;
     value ^= value >> 32;
     return value;
 }
 
 [[nodiscard]] inline std::uint64_t fold(std::uint64_t chain, std::uint64_t value) noexcept {
-    return mix(chain ^ mix(value + 0x9e3779b97f4a7c15ULL));
+    return mix(chain ^ mix(value + kGoldenGamma));
 }
 
 struct TokenStream {

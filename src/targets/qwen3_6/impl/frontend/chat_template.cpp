@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace ninfer::targets::qwen3_6::frontend_internal {
 namespace {
@@ -33,6 +34,24 @@ constexpr std::string_view kXHighReasoningInstructions =
     "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
     "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
     "clarity in the final answer.";
+
+constexpr std::array<std::string_view, 4> kVisionControlTokens = {
+    "<|vision_start|>", "<|vision_end|>", "<|image_pad|>", "<|video_pad|>"};
+constexpr std::string_view kControlTokenBreak = "\xE2\x81\xA0"; // U+2060 WORD JOINER
+
+// Text content can legitimately quote the chat template or one of its Vision
+// control tokens. Keep those strings readable, but break their exact added-token
+// spelling so that only structured Image/Video parts can create media slots.
+std::string escape_literal_vision_tokens(std::string text) {
+    for (const std::string_view token : kVisionControlTokens) {
+        std::size_t search = 0;
+        while ((search = text.find(token, search)) != std::string::npos) {
+            text.insert(search + 2, kControlTokenBreak);
+            search += token.size() + kControlTokenBreak.size();
+        }
+    }
+    return text;
+}
 
 bool is_instruction_role(ChatRole role) noexcept {
     return role == ChatRole::System || role == ChatRole::Developer;
@@ -214,7 +233,7 @@ std::string render_tools_system_block(const std::vector<std::string>& tool_jsons
     rendered += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     for (const std::string& tool : tool_jsons) {
         rendered += "\n";
-        rendered += tojson_text(OrderedJson::parse(tool));
+        rendered += escape_literal_vision_tokens(tojson_text(OrderedJson::parse(tool)));
     }
     rendered += "\n</tools>";
     rendered += std::string(kToolInstructions);
@@ -269,23 +288,34 @@ std::string ChatMessage::rendered_content(bool add_vision_id, int* image_count,
     int& images      = image_count == nullptr ? local_images : *image_count;
     int& videos      = video_count == nullptr ? local_videos : *video_count;
     std::string out;
+    std::string text_run;
+    const auto flush_text_run = [&] {
+        if (text_run.empty()) { return; }
+        out += escape_literal_vision_tokens(std::move(text_run));
+        text_run.clear();
+    };
     for (const ChatPart& part : parts) {
         switch (part.kind) {
         case ChatPartKind::Text:
-            out += part.text;
+            // Consecutive text parts are one semantic text run. Escape after
+            // coalescing so part boundaries cannot reconstruct a control token.
+            text_run += part.text;
             break;
         case ChatPartKind::Image:
+            flush_text_run();
             ++images;
             if (add_vision_id) { out += "Picture " + std::to_string(images) + ": "; }
             out += "<|vision_start|><|image_pad|><|vision_end|>";
             break;
         case ChatPartKind::Video:
+            flush_text_run();
             ++videos;
             if (add_vision_id) { out += "Video " + std::to_string(videos) + ": "; }
             out += "<|vision_start|><|video_pad|><|vision_end|>";
             break;
         }
     }
+    flush_text_run();
     return out;
 }
 
@@ -394,7 +424,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         std::string reasoning;
         std::string body = content;
         if (!message.reasoning_content.empty()) {
-            reasoning = message.reasoning_content;
+            reasoning = escape_literal_vision_tokens(message.reasoning_content);
         } else if (!effort_template) {
             ThinkParts parts = derive_think_parts(content);
             reasoning        = std::move(parts.reasoning);
@@ -422,7 +452,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 } else {
                     rendered += "\n";
                 }
-                rendered += render_tool_call(message.tool_calls[call_index], effort_template);
+                rendered += escape_literal_vision_tokens(
+                    render_tool_call(message.tool_calls[call_index], effort_template));
             }
         }
         rendered += "<|im_end|>\n";

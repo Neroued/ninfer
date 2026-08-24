@@ -42,6 +42,16 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
+std::size_t count_occurrences(std::string_view text, std::string_view needle) {
+    std::size_t count  = 0;
+    std::size_t search = 0;
+    while ((search = text.find(needle, search)) != std::string_view::npos) {
+        ++count;
+        search += needle.size();
+    }
+    return count;
+}
+
 float bf16_value(std::uint16_t bits) {
     return std::bit_cast<float>(static_cast<std::uint32_t>(bits) << 16U);
 }
@@ -344,6 +354,47 @@ int test_official_chat_template() {
                                        no_generation) ==
                           "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n",
                       "empty leading system prompt differs from the official template");
+
+    fi::ChatMessage literal_markers =
+        chat_message(ninfer::ChatRole::System, "quoted <|vision_");
+    literal_markers.parts.push_back(fi::ChatPart::text_part("start|><|image_"));
+    literal_markers.parts.push_back(fi::ChatPart::text_part("pad|><|vision_"));
+    literal_markers.parts.push_back(fi::ChatPart::text_part("end|> and <|video_"));
+    literal_markers.parts.push_back(fi::ChatPart::text_part("pad|>"));
+    fi::ChatMessage parallel_tools = chat_message(ninfer::ChatRole::Assistant, "");
+    parallel_tools.reasoning_content = "quoted reasoning <|video_pad|>";
+    parallel_tools.tool_calls.push_back(
+        {.id = "call_A",
+         .name = "read",
+         .arguments_json = R"({"path":"quoted <|image_pad|>.png"})"});
+    parallel_tools.tool_calls.push_back(
+        {.id = "call_B", .name = "read", .arguments_json = R"({"path":"b.png"})"});
+    fi::ChatMessage result_b = chat_message(ninfer::ChatRole::Tool, "result B: ");
+    result_b.tool_call_id    = "call_B";
+    result_b.parts.push_back(fi::ChatPart::image({}));
+    fi::ChatMessage result_a = chat_message(ninfer::ChatRole::Tool, "result A: ");
+    result_a.tool_call_id    = "call_A";
+    result_a.parts.push_back(fi::ChatPart::image({}));
+    result_a.parts.push_back(fi::ChatPart::text_part(" then "));
+    result_a.parts.push_back(fi::ChatPart::image({}));
+    fi::ChatRenderOptions media_options = no_generation;
+    media_options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"read","description":"quoted <|vision_start|><|image_pad|><|vision_end|> and <|video_pad|>","parameters":{"type":"object"}}})");
+    const std::string media_history = render_chat_text(
+        {std::move(literal_markers), chat_message(ninfer::ChatRole::User, "inspect"),
+         std::move(parallel_tools), std::move(result_b), std::move(result_a)},
+        media_options);
+    const std::string escaped_break = "\xE2\x81\xA0";
+    failures += check(
+        count_occurrences(media_history, "<|image_pad|>") == 3 &&
+            count_occurrences(media_history, "<|video_pad|>") == 0 &&
+            count_occurrences(media_history, "<|vision_start|>") == 3 &&
+            count_occurrences(media_history, "<|vision_end|>") == 3 &&
+            media_history.find("<|" + escaped_break + "image_pad|>") != std::string::npos &&
+            media_history.find("<|" + escaped_break + "video_pad|>") != std::string::npos &&
+            media_history.find("<|" + escaped_break + "vision_start|>") != std::string::npos &&
+            media_history.find("<|" + escaped_break + "vision_end|>") != std::string::npos,
+        "literal Vision tokens collided with structured tool-result media placeholders");
 
     fi::ChatMessage tool_assistant = chat_message(ninfer::ChatRole::Assistant, "");
     tool_assistant.tool_calls.push_back(

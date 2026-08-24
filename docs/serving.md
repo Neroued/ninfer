@@ -407,6 +407,10 @@ curl http://127.0.0.1:8080/v1/messages \
 The endpoint supports top-level system text, ordered mid-conversation system messages,
 user/assistant history, text and image blocks, thinking blocks, tool-use history, tool results,
 client-defined tools, non-streaming responses, and Anthropic SSE events.
+`tool_result` blocks remain in request order, including nested text and image blocks; their order
+does not need to match the preceding assistant `tool_use` blocks. Literal Qwen Vision control-token
+spellings in text, reasoning, tool definitions, or tool arguments remain text and do not create
+media placeholders.
 Mid-conversation system messages remain at their `messages` array position and are not merged into
 the top-level system instruction. A system section must follow a user/tool-result message and be
 final or immediately precede an assistant message; it cannot interrupt a tool-use/tool-result pair.

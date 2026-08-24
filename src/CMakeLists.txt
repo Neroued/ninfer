@@ -292,6 +292,9 @@ if(NINFER_BUILD_MEDIA_ACQUIRE)
     add_library(ninfer_media_acquire STATIC
       product/media_acquire/acquire.cpp)
     target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+    if(WIN32)
+      target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+    endif()
   else()
     add_library(ninfer_media_acquire STATIC
       product/media_acquire/acquire_stub.cpp)

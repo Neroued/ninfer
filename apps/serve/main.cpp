@@ -50,7 +50,12 @@ public:
         if (done_) { done_->store(true, std::memory_order_relaxed); }
     }
 
-    ~BootWatchdog() { disarm(); }
+    // No disarm on destruction: when warmup throws, this object unwinds before the
+    // service whose teardown can hang in device synchronization — the watchdog must
+    // stay armed through that unwind. A boot that fails fast exits the process (and
+    // the detached thread) before the deadline; the healthy path disarms explicitly
+    // once the server reaches the listening state.
+    ~BootWatchdog() = default;
 
 private:
     std::chrono::seconds timeout_{0};

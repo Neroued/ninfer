@@ -43,8 +43,8 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
-| `GET /v1/models` | configured OpenAI model alias |
-| `GET /v1/models/{id}` | lookup of the configured alias |
+| `GET /v1/models` | configured OpenAI model alias, including `max_model_len` = `--max-context` |
+| `GET /v1/models/{id}` | lookup of the configured alias, same `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -115,6 +115,16 @@ server setting, which is off unless `--preserve-thinking` is used. If both OpenA
 present they must carry the same boolean value. Unknown non-null `chat_template_kwargs` return
 HTTP 400 `chat_template_option_not_supported`; a misspelled `enable_thinking` key is rejected
 rather than ignored, so thinking cannot remain on by default when a client intended to disable it.
+
+Chat Completions `usage` keeps the OpenAI totals (`prompt_tokens`, `completion_tokens`,
+`total_tokens`) and adds `prompt_tokens_details.cached_tokens` as a subset of `prompt_tokens`,
+never an addend. The same cached count is also emitted as `prefix_cache_hit_tokens`, and
+`prefix_reuse_path` names the Engine path that served the prompt (`full_reset`,
+`append_frontier`, `restore_turn_checkpoint`, `restore_response_checkpoint`, `seed_prefix`) —
+the same strings as `request_done.result` in `--request-log-jsonl`. Anthropic Messages does not
+emit these keys: its `input_tokens` already excludes cache reads, so reporting a cached subset
+would change that field's meaning. Responses already reports `input_tokens_details.cached_tokens`
+and adds the same two log-named fields.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty

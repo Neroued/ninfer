@@ -460,7 +460,9 @@ int test_response_object() {
     failures +=
         check(response.at("usage").at("input_tokens_details").at("cached_tokens") == 4 &&
                   response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
-                  response.at("usage").at("total_tokens") == 18,
+                  response.at("usage").at("total_tokens") == 18 &&
+                  response.at("usage").at("prefix_cache_hit_tokens") == 4 &&
+                  response.at("usage").at("prefix_reuse_path") == "full_reset",
               "Responses usage details serialized");
     failures += check(built.output_history.size() == 1 &&
                           built.output_history[0].reasoning_content == "thought" &&

@@ -259,3 +259,41 @@ cmake --build build-win -j --target ninfer-serve
 
 Coordinator only. `nvidia-smi` >= 20 GiB free; `mkdir C:\Users\igorl\.ninfer-gpu.lock`
 (retry 60 s, up to 30 min); remove the lock directory after, success or failure.
+
+---
+
+# GPU runbook: prefix-cache usage observability
+
+Drive one conversation so all four Engine reuse paths appear, then assert Chat
+Completions `usage` matches `--request-log-jsonl` `request_done.result` for the
+same request. Schema tests already cover field shape; this is the live match.
+
+Server: production flags including `--prefix-cache-mib 4096` and
+`--request-log-jsonl /tmp/ninfer-usage.jsonl`. Model `qwen3.8-27b`.
+`--greedy`. `enable_thinking: false`.
+
+Conversation (serial, same process):
+
+1. Unique user prompt A → expect `prefix_reuse_path=full_reset`,
+   `prefix_cache_hit_tokens=0`.
+2. Repeat prompt A as a new request → expect `seed_prefix` and
+   `prefix_cache_hit_tokens` > 0.
+3. Prompt A + assistant reply + new user turn B → expect
+   `restore_turn_checkpoint` or `append_frontier` (record whichever the log
+   prints; both are valid).
+4. Append another user turn C on that history → expect `append_frontier` or
+   `restore_turn_checkpoint`.
+
+For each request, parse the HTTP `usage` object and the matching
+`request_done` JSONL event. Pass only if:
+
+- `usage.prompt_tokens`, `usage.completion_tokens` match `result.prompt_tokens`
+  / `result.completion_tokens`
+- `usage.prefix_cache_hit_tokens` == `result.prefix_cache_hit_tokens` ==
+  `usage.prompt_tokens_details.cached_tokens`
+- `usage.prefix_reuse_path` == `result.prefix_reuse_path` (string equality)
+- `usage.total_tokens` == prompt + completion (cached_tokens is not an addend)
+- `GET /v1/models` `data[0].max_model_len` equals the process `--max-context`
+
+If a listed path does not appear, do not invent a fifth name; record the
+observed path from the log and fail only if usage disagrees with that log.

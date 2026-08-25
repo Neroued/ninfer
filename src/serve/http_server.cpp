@@ -54,6 +54,15 @@ void write_error(httplib::Response& res, const ApiError& error) {
     res.set_content(make_error_body(error), "application/json");
 }
 
+CompletionUsage completion_usage(const GenerationOutcome& outcome) {
+    CompletionUsage usage;
+    usage.prompt_tokens          = outcome.prompt_tokens;
+    usage.completion_tokens      = outcome.completion_tokens;
+    usage.cached_prompt_tokens   = static_cast<int>(outcome.metrics.prefix_cache_hit_tokens);
+    usage.prefix_reuse_path      = outcome.metrics.prefix_reuse_path;
+    return usage;
+}
+
 // Anthropic-shaped error body ({"type":"error","error":{...}}), used by the
 // /v1/messages endpoints so Claude clients see the error format they expect.
 void write_messages_error(httplib::Response& res, const ApiError& error) {
@@ -316,7 +325,8 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now()), "application/json");
+    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context),
+                    "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
@@ -330,7 +340,8 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
+    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
+                    "application/json");
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
@@ -398,7 +409,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = completion_usage(outcome);
             std::string response_body;
             if (!outcome.tool_calls.empty()) {
                 response_body = make_chat_completion_tool_response(
@@ -483,7 +494,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                               include_usage));
                 }
                 if (include_usage) {
-                    const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+                    const CompletionUsage usage = completion_usage(outcome);
                     write_stream_item(sink, *stream,
                                       make_chat_chunk_usage(id, model, created, usage));
                 }
@@ -611,7 +622,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 return req.is_connection_alive && !req.is_connection_alive();
             });
             log_request_done(log_context, outcome);
-            const CompletionUsage usage{outcome.prompt_tokens, outcome.completion_tokens};
+            const CompletionUsage usage = completion_usage(outcome);
             const char* stop_reason =
                 messages_stop_reason(outcome.finish_reason, !outcome.tool_calls.empty());
             set_owned_content(res,

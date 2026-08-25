@@ -48,9 +48,30 @@ struct RequestLimits {
     int default_max_tokens = 8192;
 };
 
+[[nodiscard]] constexpr const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) noexcept {
+    switch (path) {
+    case ninfer::PrefixReusePath::FullReset:
+        return "full_reset";
+    case ninfer::PrefixReusePath::AppendAtFrontier:
+        return "append_frontier";
+    case ninfer::PrefixReusePath::RestoreTurnCheckpoint:
+        return "restore_turn_checkpoint";
+    case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
+        return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::SeedPrefixCache:
+        return "seed_prefix";
+    }
+    return "unknown";
+}
+
 struct CompletionUsage {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
+    // Subset of prompt_tokens the prefix cache served (OpenAI prompt_tokens_details.cached_tokens).
+    // Not an addend: clients subtract it from prompt_tokens. Anthropic Messages does not emit this
+    // because that surface's input_tokens already excludes cache reads.
+    int cached_prompt_tokens                    = 0;
+    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
 };
 
 enum class ContentKind {

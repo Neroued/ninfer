@@ -915,7 +915,9 @@ BuiltResponse build_response(const std::string& id, std::int64_t created_at,
              {"input_tokens_details", Json{{"cached_tokens", cached_tokens}}},
              {"output_tokens", outcome.completion_tokens},
              {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
-             {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
+             {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens},
+             {"prefix_cache_hit_tokens", cached_tokens},
+             {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)}};
     built.body = std::move(response);
     return built;
 }

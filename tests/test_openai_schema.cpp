@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -666,6 +667,12 @@ int test_response_serialization() {
     failures += check(j.at("usage").at("prompt_tokens") == 10, "usage prompt_tokens");
     failures += check(j.at("usage").at("completion_tokens") == 3, "usage completion_tokens");
     failures += check(j.at("usage").at("total_tokens") == 13, "usage total_tokens");
+    failures += check(j.at("usage").at("prompt_tokens_details").at("cached_tokens") == 0,
+                      "default cached_tokens is additive and zero");
+    failures += check(j.at("usage").at("prefix_cache_hit_tokens") == 0,
+                      "default prefix_cache_hit_tokens matches the log field");
+    failures += check(j.at("usage").at("prefix_reuse_path") == "full_reset",
+                      "default prefix_reuse_path matches the log field");
 
     // Non-empty reasoning is attached as message.reasoning_content, content stays answer-only.
     const Json jr = Json::parse(make_chat_completion_response("id-2", "m", 111, "the answer",
@@ -755,8 +762,56 @@ int test_chunk_serialization() {
     failures +=
         check(usage_chunk.at("usage").at("prompt_tokens") == 2, "usage chunk prompt_tokens");
     failures += check(usage_chunk.at("usage").at("total_tokens") == 7, "usage chunk total");
+    failures += check(usage_chunk.at("usage").at("prompt_tokens_details").at("cached_tokens") == 0,
+                      "usage chunk cached_tokens additive");
 
     failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
+    return failures;
+}
+
+int test_usage_prefix_observability() {
+    int failures = 0;
+    CompletionUsage usage;
+    usage.prompt_tokens        = 100;
+    usage.completion_tokens    = 8;
+    usage.cached_prompt_tokens = 60;
+    usage.prefix_reuse_path    = ninfer::PrefixReusePath::SeedPrefixCache;
+    const Json j =
+        Json::parse(make_chat_completion_response("id", "m", 1, "pong", "", "stop", usage));
+    const Json& u = j.at("usage");
+    failures += check(u.at("prompt_tokens") == 100 && u.at("completion_tokens") == 8 &&
+                          u.at("total_tokens") == 108,
+                      "OpenAI usage totals unchanged");
+    failures += check(u.at("prompt_tokens_details").at("cached_tokens") == 60,
+                      "OpenAI cached_tokens is a subset of prompt_tokens");
+    failures += check(u.at("prefix_cache_hit_tokens") == 60,
+                      "log-named cached count matches prompt_tokens_details");
+    failures += check(u.at("prefix_reuse_path") == "seed_prefix", "log-named reuse path");
+    failures += check(u.at("total_tokens") == u.at("prompt_tokens").get<int>() +
+                                                  u.at("completion_tokens").get<int>(),
+                      "cached_tokens is not an addend of total_tokens");
+
+    CompletionUsage clamped;
+    clamped.prompt_tokens        = 10;
+    clamped.cached_prompt_tokens = 99;
+    clamped.prefix_reuse_path    = ninfer::PrefixReusePath::AppendAtFrontier;
+    const Json c =
+        Json::parse(make_chat_completion_response("id", "m", 1, "x", "", "stop", clamped)).at("usage");
+    failures += check(c.at("prompt_tokens_details").at("cached_tokens") == 10 &&
+                          c.at("prefix_cache_hit_tokens") == 10,
+                      "cached_tokens clamped to prompt_tokens");
+    failures += check(c.at("prefix_reuse_path") == "append_frontier", "append_frontier wire name");
+
+    for (const auto& [path, name] :
+         std::array<std::pair<ninfer::PrefixReusePath, const char*>, 5>{
+             {{ninfer::PrefixReusePath::FullReset, "full_reset"},
+              {ninfer::PrefixReusePath::AppendAtFrontier, "append_frontier"},
+              {ninfer::PrefixReusePath::RestoreTurnCheckpoint, "restore_turn_checkpoint"},
+              {ninfer::PrefixReusePath::RestoreResponseCheckpoint, "restore_response_checkpoint"},
+              {ninfer::PrefixReusePath::SeedPrefixCache, "seed_prefix"}}}) {
+        failures += check(std::string(prefix_reuse_path_name(path)) == name,
+                          std::string("reuse path wire name ") + name);
+    }
     return failures;
 }
 
@@ -784,16 +839,29 @@ int test_tool_chunk_serialization() {
 }
 
 int test_models_and_error() {
-    int failures    = 0;
-    const Json list = Json::parse(make_models_list("qwen3.6-27b", 1));
+    int failures                               = 0;
+    constexpr std::uint32_t configured_context = 131072;
+    const Json list = Json::parse(make_models_list("qwen3.6-27b", 1, configured_context));
     failures += check(list.at("object") == "list", "models list object");
     failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
     failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
     failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
+    failures += check(list.at("data").at(0).at("max_model_len") == configured_context,
+                      "models list configured context");
 
-    const Json one = Json::parse(make_model_object("qwen3.6-27b", 1));
+    const Json one = Json::parse(make_model_object("qwen3.6-27b", 1, configured_context));
     failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
     failures += check(one.at("owned_by") == "ninfer", "model owner");
+    failures += check(one.at("max_model_len") == configured_context,
+                      "model object configured context");
+
+    constexpr std::uint32_t long_context = 262144;
+    const Json long_list = Json::parse(make_models_list("qwen3.8-27b", 1, long_context));
+    failures += check(long_list.at("data").at(0).at("max_model_len") == long_context,
+                      "models list 262144 context");
+    failures += check(Json::parse(make_model_object("qwen3.8-27b", 1, long_context))
+                              .at("max_model_len") == long_context,
+                      "model object 262144 context");
 
     ApiError error;
     error.status   = 400;
@@ -839,6 +907,7 @@ int main() {
     failures += test_response_serialization();
     failures += test_tool_response_serialization();
     failures += test_chunk_serialization();
+    failures += test_usage_prefix_observability();
     failures += test_tool_chunk_serialization();
     failures += test_models_and_error();
     failures += test_finish_reason_wire();

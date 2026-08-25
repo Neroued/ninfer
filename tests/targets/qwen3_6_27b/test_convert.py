@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import pytest
 import torch
 
 from tools.artifact.container import (
@@ -17,13 +19,14 @@ from tools.artifact.layouts import decode_direct, dequantize_row_split, encoded_
 from tools.convert.qwen3_6_27b import convert, inventory, recipe
 
 
-OFFICIAL_MODEL = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16"
-)
-
-
 def test_official_config_uses_only_nested_mtp_field():
-    config = json.loads((OFFICIAL_MODEL / "config.json").read_text())
+    model_dir = Path(os.environ.get("NINFER_QWEN3_6_27B_MODEL", ""))
+    if not (model_dir / "config.json").is_file():
+        pytest.skip(
+            "NINFER_QWEN3_6_27B_MODEL does not point at the Qwen3.6-27B base-hf-bf16 source"
+        )
+
+    config = json.loads((model_dir / "config.json").read_text())
 
     assert "mtp_num_hidden_layers" not in config
     summary = convert.validate_config(config)

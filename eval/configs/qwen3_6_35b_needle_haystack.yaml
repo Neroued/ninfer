@@ -30,7 +30,7 @@ suites:
           subset_list: [english]
           judge_strategy: rule
           dataset_args:
-            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            local_path: $HOME/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
             extra_params:
               context_lengths_min: 8192
               context_lengths_max: 8192
@@ -38,7 +38,7 @@ suites:
               document_depth_percent_min: 50
               document_depth_percent_max: 50
               document_depth_percent_intervals: 1
-              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              tokenizer_path: $HOME/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
               show_score: true
 
   standard:
@@ -53,7 +53,7 @@ suites:
           subset_list: [english, chinese]
           judge_strategy: rule
           dataset_args:
-            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            local_path: $HOME/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
             extra_params:
               context_lengths_min: 1000
               context_lengths_max: 32000
@@ -61,7 +61,7 @@ suites:
               document_depth_percent_min: 0
               document_depth_percent_max: 100
               document_depth_percent_intervals: 10
-              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              tokenizer_path: $HOME/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
               show_score: true
 
   native_long:
@@ -76,7 +76,7 @@ suites:
           subset_list: [english, chinese]
           judge_strategy: rule
           dataset_args:
-            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            local_path: $HOME/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
             extra_params:
               context_lengths_min: 65536
               context_lengths_max: 65536
@@ -84,7 +84,7 @@ suites:
               document_depth_percent_min: 0
               document_depth_percent_max: 100
               document_depth_percent_intervals: 11
-              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              tokenizer_path: $HOME/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
               show_score: true
 
       - id: needle_haystack_128k
@@ -97,7 +97,7 @@ suites:
           subset_list: [english, chinese]
           judge_strategy: rule
           dataset_args:
-            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            local_path: $HOME/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
             extra_params:
               context_lengths_min: 131072
               context_lengths_max: 131072
@@ -105,7 +105,7 @@ suites:
               document_depth_percent_min: 0
               document_depth_percent_max: 100
               document_depth_percent_intervals: 11
-              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              tokenizer_path: $HOME/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
               show_score: true
 
       - id: needle_haystack_260k
@@ -118,7 +118,7 @@ suites:
           subset_list: [english, chinese]
           judge_strategy: rule
           dataset_args:
-            local_path: /home/neroued/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
+            local_path: $HOME/.cache/modelscope/datasets/AI-ModelScope--Needle-in-a-Haystack-Corpus/snapshots/master
             extra_params:
               context_lengths_min: 260000
               context_lengths_max: 260000
@@ -126,7 +126,7 @@ suites:
               document_depth_percent_min: 0
               document_depth_percent_max: 100
               document_depth_percent_intervals: 11
-              tokenizer_path: /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
+              tokenizer_path: $HOME/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16
               show_score: true
 
 runtime:

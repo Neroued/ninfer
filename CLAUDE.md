@@ -68,7 +68,11 @@ PYTHONPATH=eval eval/.venv/bin/python -m unittest discover -s eval/tests -p 'tes
 **Artifact-gated tests.** Anything needing a real `.ninfer` skips without its environment variable:
 Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` / `NINFER_QWEN3_6_35B_A3B_ARTIFACT` (falling
 back to `out/qwen3_6_27b.ninfer` and `out/qwen3_6_35b_a3b.ninfer`); the opt-in real-Engine CTest
-routes use `NINFER_QWEN3_6_27B_WEIGHTS` / `NINFER_QWEN3_6_35B_A3B_WEIGHTS`:
+routes use `NINFER_QWEN3_6_27B_WEIGHTS` / `NINFER_QWEN3_6_35B_A3B_WEIGHTS`. Official-source
+checkpoint tests (27B `test_convert.py` config check, `test_official_resources.py`,
+`test_reference_frontend.py`, and the C++ frontend test's official-tokenizer checks) skip unless
+`NINFER_QWEN3_6_27B_MODEL` / `NINFER_QWEN3_6_35B_A3B_MODEL` point at the `base-hf-bf16`
+source directories:
 
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \

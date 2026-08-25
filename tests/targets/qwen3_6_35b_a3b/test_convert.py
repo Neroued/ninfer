@@ -50,9 +50,6 @@ def test_report_retains_target_specific_provenance_and_component_bytes(
     assert report["source_preflight"]["base"]["tensors"] == 1045
     assert report["source_preflight"]["dflash"]["tensors"] == 69
     assert report["source_preflight"]["combined"]["tensors"] == 1114
-    assert report["source"]["gguf_evidence_path"] == str(
-        convert.GGUF_EVIDENCE_PATH
-    )
     assert report["draft_head"] == {
         "rows": 131072,
         "tokenizer_vocab_size": 248077,

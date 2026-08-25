@@ -3,8 +3,8 @@
 Canonical invocation::
 
     python -m tools.convert.qwen3_6_35b_a3b.convert \
-      --model /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16 \
-      --dflash-model /home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/dflash-bf16 \
+      --model /path/to/Qwen3.6-35B-A3B/base-hf-bf16 \
+      --dflash-model /path/to/Qwen3.6-35B-A3B/dflash-bf16 \
       --out out/qwen3_6_35b_a3b.ninfer
 
 The target deliberately reuses the measured 27B ranking because both checkpoints
@@ -34,10 +34,6 @@ from . import draft_head, inventory, recipe
 
 RECIPE_ID = "qwen3_6_35b_a3b-v2"
 ENCODER_PROFILE = "MAXABS_F16_RECIP_RNE_V1"
-GGUF_EVIDENCE_PATH = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/"
-    "gguf-ud-q4_k_m/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
-)
 
 _ROOT_CONFIG = {
     "architectures": ["Qwen3_5MoeForConditionalGeneration"],
@@ -484,7 +480,6 @@ def build_conversion_report(
         "ranking_source_target": draft_head.RANKING_SOURCE_TARGET,
         "shared_semantic_vocabulary": True,
     }
-    report["source"]["gguf_evidence_path"] = str(GGUF_EVIDENCE_PATH)
     report["quantization"] = {
         "encoder_profile": ENCODER_PROFILE,
         "component_tensor_bytes": {

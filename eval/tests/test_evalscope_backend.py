@@ -333,6 +333,73 @@ class EvalScopeBackendTest(unittest.TestCase):
             else:
                 os.environ["TEST_SERP_KEY"] = old
 
+    def test_task_dict_expands_local_dataset_paths(self):
+        backend = EvalScopeBackend()
+        job = JobConfig(
+            "needle",
+            "evalscope",
+            "needle_haystack",
+            "api",
+            1,
+            None,
+            1,
+            {},
+            {
+                "subset_list": ["english"],
+                "dataset_args": {
+                    "local_path": "$TEST_EVAL_HOME/dataset",
+                    "extra_params": {"tokenizer_path": "~/models/tokenizer"},
+                },
+            },
+        )
+        old_home = os.environ.get("HOME")
+        old_var = os.environ.get("TEST_EVAL_HOME")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["HOME"] = tmp
+            os.environ["TEST_EVAL_HOME"] = tmp
+            try:
+                from ninfer_eval.config import RequestConfig, TargetConfig
+                from ninfer_eval.secrets import ResolvedTarget
+
+                target = ResolvedTarget(
+                    TargetConfig(
+                        "api",
+                        "openai_chat",
+                        "http://localhost/v1",
+                        "m",
+                        None,
+                        1,
+                        RequestConfig(),
+                    ),
+                    None,
+                )
+                context = RunContext(
+                    "run",
+                    job,
+                    Path(tmp),
+                    target,
+                    1,
+                    threading.Event(),
+                    False,
+                    backend.plan(job, target),
+                )
+                dataset_args = backend._task_dict(context)["dataset_args"][
+                    "needle_haystack"
+                ]
+                self.assertEqual(
+                    dataset_args["local_path"], os.path.join(tmp, "dataset")
+                )
+                self.assertEqual(
+                    dataset_args["extra_params"]["tokenizer_path"],
+                    os.path.join(tmp, "models", "tokenizer"),
+                )
+            finally:
+                for name, value in (("HOME", old_home), ("TEST_EVAL_HOME", old_var)):
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
     def test_none_sample_retention_removes_prediction_and_review_caches(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -24,7 +24,7 @@
     "code",
     "math"
   ],
-  "tokenizer_dir": "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16",
+  "tokenizer_dir": "/path/to/Qwen3.6-27B/base-hf-bf16",
   "top_tokens": [
     {
       "count": 173484,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -12,22 +13,31 @@ from tools.convert.qwen3_6_27b import convert as convert_27b
 from tools.convert.qwen3_6_35b_a3b import convert as convert_35b
 
 
-MODEL_27B = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16"
-)
-MODEL_35B = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.6-35B-A3B/base-hf-bf16"
-)
+def _model_dir(env_var: str) -> Path:
+    value = os.environ.get(env_var, "")
+    return Path(value) if value else Path()
+
+
+MODEL_27B = _model_dir("NINFER_QWEN3_6_27B_MODEL")
+MODEL_35B = _model_dir("NINFER_QWEN3_6_35B_A3B_MODEL")
 UNSLOTH_TOKENIZER_SHA256 = (
     "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4"
 )
 
 
 @pytest.mark.parametrize(
-    ("loader", "model_dir"),
-    ((convert_27b.load_resources, MODEL_27B), (convert_35b.load_resources, MODEL_35B)),
+    ("loader", "model_dir", "env_var"),
+    (
+        (convert_27b.load_resources, MODEL_27B, "NINFER_QWEN3_6_27B_MODEL"),
+        (convert_35b.load_resources, MODEL_35B, "NINFER_QWEN3_6_35B_A3B_MODEL"),
+    ),
 )
-def test_both_official_sources_pass_the_shared_preflight(loader, model_dir):
+def test_both_official_sources_pass_the_shared_preflight(loader, model_dir, env_var):
+    if not (model_dir / "tokenizer.json").is_file():
+        pytest.skip(
+            f"{env_var} does not point at the official base-hf-bf16 source directory"
+        )
+
     resources = loader(model_dir)
 
     assert tuple(resource.name for resource in resources) == tuple(

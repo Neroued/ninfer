@@ -108,6 +108,12 @@ artifact. The 35B-A3B reference binding test follows the same rule with
 `NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
 target tests still run without either artifact.
 
+Official-source checkpoint tests skip unless the environment points at the HF source
+directories: `NINFER_QWEN3_6_27B_MODEL` and `NINFER_QWEN3_6_35B_A3B_MODEL` (the
+`base-hf-bf16` checkpoints). The 27B `test_convert.py` config check,
+`test_official_resources.py`, and `test_reference_frontend.py` each skip per test, and the C++
+frontend test skips its official-tokenizer checks without `NINFER_QWEN3_6_27B_MODEL`.
+
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:
 

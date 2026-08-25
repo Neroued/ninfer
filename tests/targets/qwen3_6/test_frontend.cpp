@@ -17,6 +17,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -88,13 +90,29 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+std::filesystem::path official_model_dir() {
+    if (const char* env = std::getenv("NINFER_QWEN3_6_27B_MODEL");
+        env != nullptr && *env != '\0') {
+        return std::filesystem::path(env);
+    }
+    return std::filesystem::path();
+}
+
+bool official_model_available() {
+    const std::filesystem::path dir = official_model_dir();
+    return !dir.empty() && std::filesystem::is_regular_file(dir / "tokenizer.json") &&
+           std::filesystem::is_regular_file(dir / "tokenizer_config.json") &&
+           std::filesystem::is_regular_file(dir / "generation_config.json");
+}
+
 const fi::Tokenizer& official_tokenizer() {
+    const std::filesystem::path dir = official_model_dir();
     static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
+        read_file((dir / "tokenizer.json").c_str());
     static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
+        read_file((dir / "tokenizer_config.json").c_str());
     static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+        read_file((dir / "generation_config.json").c_str());
     static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
                                           .tokenizer_config_json  = tokenizer_config_json,
                                           .generation_config_json = generation_config_json});
@@ -1308,15 +1326,20 @@ int main() {
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
-    failures += test_official_tokenizer_merge();
-    failures += test_repeated_special_tokens_scan_linearly();
+    const bool official           = official_model_available();
+    if (!official) {
+        std::cout << "skip: official-source tokenizer checks (set NINFER_QWEN3_6_27B_MODEL to the "
+                     "Qwen3.6-27B base-hf-bf16 source directory)\n";
+    }
+    failures += official ? test_official_tokenizer_merge() : 0;
+    failures += official ? test_repeated_special_tokens_scan_linearly() : 0;
     failures += test_official_chat_template();
-    failures += test_ordered_instruction_turns();
+    failures += official ? test_ordered_instruction_turns() : 0;
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
     failures += test_text_and_image_prepare(frontend);
-    failures += test_media_admission_uses_aggregate_resources(frontend);
+    failures += official ? test_media_admission_uses_aggregate_resources(frontend) : 0;
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
     failures += test_attention_pairs_are_diagnostic(frontend);
     failures += test_video_prepare(frontend);

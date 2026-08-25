@@ -738,8 +738,8 @@ The canonical command is:
 
 ```bash
 python3 -m tools.convert.qwen3_6_27b.convert_nvfp4 \
-  --model /home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16 \
-  --nvfp4-model /home/neroued/models/llm/qwen/Qwen3.6-27B/vllm-nvfp4-bf16 \
+  --model /path/to/Qwen3.6-27B/base-hf-bf16 \
+  --nvfp4-model /path/to/Qwen3.6-27B/vllm-nvfp4-bf16 \
   --out out/qwen3_6_27b_nvfp4.ninfer
 ```
 

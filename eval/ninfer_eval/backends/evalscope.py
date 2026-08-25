@@ -77,6 +77,18 @@ _IFBENCH_METRICS = {
 }
 
 
+def _expand_local_paths(value: Any) -> Any:
+    """Expand ``~`` and ``$VAR`` references in local dataset and model paths."""
+
+    if isinstance(value, str):
+        return os.path.expandvars(os.path.expanduser(value))
+    if isinstance(value, dict):
+        return {key: _expand_local_paths(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_local_paths(item) for item in value]
+    return value
+
+
 class EvalScopeBackend:
     name = "evalscope"
     _serpapi_lock = threading.Lock()
@@ -284,7 +296,7 @@ class EvalScopeBackend:
         assert context.target is not None
         job = context.job
         args = job.backend_args
-        dataset_args = dict(args.get("dataset_args", {}))
+        dataset_args = _expand_local_paths(dict(args.get("dataset_args", {})))
         if args.get("subset_list") is not None:
             dataset_args["subset_list"] = args["subset_list"]
         if args.get("few_shot_num") is not None:

@@ -246,6 +246,75 @@ int test_preserve_thinking_options_and_inheritance() {
     return failures;
 }
 
+bool thinking_disabled(const ResolvedPromptSemantics& semantics) {
+    return !semantics.enable_thinking && !semantics.reasoning_effort;
+}
+
+int test_enable_thinking_dialect() {
+    const Json base = {{"model", "m"}, {"input", "hello"}, {"max_output_tokens", 32}};
+    int failures    = 0;
+
+    Json none         = base;
+    none["reasoning"] = Json{{"effort", "none"}};
+    const ResolvedPromptSemantics none_semantics = resolve_prompt_semantics(
+        parse_responses_request(none, limits()).generation, ServeOptions{}, effort_capabilities());
+    failures +=
+        check(thinking_disabled(none_semantics), "Responses reasoning.effort none did not disable thinking");
+
+    Json kwargs                    = base;
+    kwargs["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    const GenerationRequest kwargs_request = parse_responses_request(kwargs, limits()).generation;
+    failures += check(kwargs_request.enable_thinking == false,
+                      "Responses chat_template_kwargs enable_thinking was not parsed");
+    failures += check(thinking_disabled(resolve_prompt_semantics(kwargs_request, ServeOptions{},
+                                                                effort_capabilities())),
+                      "Responses kwargs enable_thinking false did not match reasoning.effort none");
+
+    Json top               = base;
+    top["enable_thinking"] = false;
+    failures += check(parse_responses_request(top, limits()).generation.enable_thinking == false,
+                      "Responses top-level enable_thinking was not parsed");
+
+    Json both               = kwargs;
+    both["enable_thinking"] = false;
+    failures +=
+        check(parse_responses_request(both, limits()).generation.enable_thinking == false,
+              "Responses matching enable_thinking values were rejected");
+
+    Json conflict               = kwargs;
+    conflict["enable_thinking"] = true;
+    failures += check(api_code([&] { (void)parse_responses_request(conflict, limits()); }) ==
+                          "conflicting_template_option",
+                      "Responses conflicting enable_thinking values were accepted");
+
+    Json misspelled                    = base;
+    misspelled["chat_template_kwargs"] = Json{{"enable_thinkng", false}};
+    failures += check(api_code([&] { (void)parse_responses_request(misspelled, limits()); }) ==
+                          "chat_template_option_not_supported",
+                      "Responses misspelled enable_thinking was not rejected");
+
+    Json combined                    = base;
+    combined["chat_template_kwargs"] = Json{{"enable_thinking", false}, {"preserve_thinking", true}};
+    const GenerationRequest combined_request =
+        parse_responses_request(combined, limits()).generation;
+    failures += check(combined_request.enable_thinking == false &&
+                          combined_request.preserve_thinking == true,
+                      "Responses enable_thinking and preserve_thinking were not accepted together");
+
+    Json tokens                    = {{"model", "m"}, {"input", "hello"}};
+    tokens["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    failures += check(parse_response_input_tokens_request(tokens, limits())
+                              .generation.enable_thinking == false,
+                      "Responses input_tokens rejected chat_template_kwargs.enable_thinking");
+    tokens.erase("chat_template_kwargs");
+    tokens["enable_thinking"] = false;
+    failures +=
+        check(parse_response_input_tokens_request(tokens, limits()).generation.enable_thinking ==
+                  false,
+              "Responses input_tokens rejected top-level enable_thinking");
+    return failures;
+}
+
 int test_typed_items_and_tools() {
     const Json function = {{"type", "function"},
                            {"name", "weather"},
@@ -520,6 +589,7 @@ int main() {
     failures += test_basic_request();
     failures += test_instruction_message_order();
     failures += test_preserve_thinking_options_and_inheritance();
+    failures += test_enable_thinking_dialect();
     failures += test_reasoning_effort();
     failures += test_typed_items_and_tools();
     failures += test_explicit_rejections();

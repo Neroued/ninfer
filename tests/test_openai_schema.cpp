@@ -176,6 +176,122 @@ int test_preserve_thinking_options() {
     return failures;
 }
 
+bool thinking_disabled(const ResolvedPromptSemantics& semantics) {
+    return !semantics.enable_thinking && !semantics.reasoning_effort;
+}
+
+int test_enable_thinking_dialect() {
+    const Json base = {
+        {"model", "m"},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+    };
+    int failures = 0;
+
+    const ResolvedPromptSemantics omitted =
+        resolve_prompt_semantics(parse_chat_completion_request(base, default_limits()),
+                                 default_server(), effort_capabilities());
+    failures += check(omitted.enable_thinking && !omitted.reasoning_effort,
+                      "omitted thinking did not use the server default on");
+
+    Json none                = base;
+    none["reasoning_effort"] = "none";
+    const ResolvedPromptSemantics none_semantics =
+        resolve_prompt_semantics(parse_chat_completion_request(none, default_limits()),
+                                 default_server(), effort_capabilities());
+    failures += check(thinking_disabled(none_semantics),
+                      "reasoning_effort none did not disable thinking");
+
+    Json kwargs                    = base;
+    kwargs["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    const GenerationRequest kwargs_request =
+        parse_chat_completion_request(kwargs, default_limits());
+    failures += check(kwargs_request.enable_thinking == false,
+                      "chat_template_kwargs enable_thinking was not parsed");
+    const ResolvedPromptSemantics kwargs_semantics =
+        resolve_prompt_semantics(kwargs_request, default_server(), effort_capabilities());
+    failures += check(thinking_disabled(kwargs_semantics),
+                      "chat_template_kwargs enable_thinking false did not match reasoning_effort none");
+
+    Json top                 = base;
+    top["enable_thinking"]   = false;
+    const GenerationRequest top_request = parse_chat_completion_request(top, default_limits());
+    failures +=
+        check(top_request.enable_thinking == false, "top-level enable_thinking was not parsed");
+    const ResolvedPromptSemantics top_semantics =
+        resolve_prompt_semantics(top_request, default_server(), effort_capabilities());
+    failures += check(thinking_disabled(top_semantics),
+                      "top-level enable_thinking false did not match reasoning_effort none");
+
+    Json both               = kwargs;
+    both["enable_thinking"] = false;
+    failures += check(parse_chat_completion_request(both, default_limits()).enable_thinking == false,
+                      "matching enable_thinking values were rejected");
+
+    Json conflict               = kwargs;
+    conflict["enable_thinking"] = true;
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(conflict, default_limits());
+                      }) == "conflicting_template_option",
+                      "conflicting enable_thinking values were accepted");
+
+    Json on                    = base;
+    on["chat_template_kwargs"] = Json{{"enable_thinking", true}};
+    ServeOptions no_think      = default_server();
+    no_think.enable_thinking   = false;
+    failures += check(resolve_prompt_semantics(parse_chat_completion_request(on, default_limits()),
+                                               no_think, effort_capabilities())
+                          .enable_thinking,
+                      "chat_template_kwargs enable_thinking true did not override server default off");
+
+    Json misspelled                    = base;
+    misspelled["chat_template_kwargs"] = Json{{"enable_thinkng", false}};
+    failures += check(api_code([&] {
+                          (void)parse_chat_completion_request(misspelled, default_limits());
+                      }) == "chat_template_option_not_supported",
+                      "misspelled enable_thinking was not rejected");
+
+    Json bad                    = base;
+    bad["chat_template_kwargs"] = Json{{"enable_thinking", "no"}};
+    failures += check(
+        throws_api([&] { (void)parse_chat_completion_request(bad, default_limits()); }),
+        "non-boolean chat_template_kwargs.enable_thinking was accepted");
+
+    Json combined                    = base;
+    combined["chat_template_kwargs"] = Json{{"enable_thinking", false}, {"preserve_thinking", true}};
+    const GenerationRequest combined_request =
+        parse_chat_completion_request(combined, default_limits());
+    failures += check(combined_request.enable_thinking == false &&
+                          combined_request.preserve_thinking == true,
+                      "enable_thinking and preserve_thinking were not accepted together");
+    ServeOptions preserved     = default_server();
+    preserved.preserve_thinking = true;
+    const ResolvedPromptSemantics combined_semantics =
+        resolve_prompt_semantics(combined_request, default_server(), effort_capabilities());
+    failures += check(thinking_disabled(combined_semantics) && combined_semantics.preserve_thinking,
+                      "enable_thinking false cleared request preserve_thinking");
+    const ResolvedPromptSemantics server_preserved =
+        resolve_prompt_semantics(kwargs_request, preserved, effort_capabilities());
+    failures += check(thinking_disabled(server_preserved) && server_preserved.preserve_thinking,
+                      "enable_thinking false cleared server preserve_thinking");
+
+    Json agree               = none;
+    agree["enable_thinking"] = false;
+    failures += check(thinking_disabled(resolve_prompt_semantics(
+                          parse_chat_completion_request(agree, default_limits()), default_server(),
+                          effort_capabilities())),
+                      "enable_thinking false with reasoning_effort none was rejected");
+
+    Json effort_conflict               = none;
+    effort_conflict["enable_thinking"] = true;
+    failures += check(api_code([&] {
+                          (void)resolve_prompt_semantics(
+                              parse_chat_completion_request(effort_conflict, default_limits()),
+                              default_server(), effort_capabilities());
+                      }) == "conflicting_template_option",
+                      "enable_thinking true with reasoning_effort none was accepted");
+    return failures;
+}
+
 int test_reasoning_effort() {
     const Json base = {
         {"model", "m"},
@@ -710,6 +826,7 @@ int main() {
     int failures = 0;
     failures += test_parse_string_content();
     failures += test_preserve_thinking_options();
+    failures += test_enable_thinking_dialect();
     failures += test_reasoning_effort();
     failures += test_parse_parts_and_flatten();
     failures += test_instruction_roles_preserved();

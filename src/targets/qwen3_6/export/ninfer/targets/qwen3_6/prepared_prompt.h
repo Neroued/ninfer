@@ -73,6 +73,9 @@ struct RewriteCheckpointSpec {
 struct PromptIdentity {
     bool reusable = true;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    // Token frontier closing the prompt's leading stable span (the rendered system block).
+    // Message-boundary aligned; drives cross-request prefix-seed capture and matching.
+    std::optional<std::uint32_t> prefix_seed_frontier;
 };
 
 struct PrepareStats {

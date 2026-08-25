@@ -72,6 +72,7 @@ struct SequencePlanningInputs {
     StartupFeatures features;
     bool use_cuda_graph = true;
     int device          = 0;
+    std::size_t prefix_cache_bytes = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -99,6 +100,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t request_transient_capacity_bytes = 0;
     std::size_t graph_allowance_bytes            = 0;
     std::size_t device_reservation_bytes         = 0;
+    std::size_t prefix_cache_bytes               = 0;
 };
 
 template <>

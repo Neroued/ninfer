@@ -924,8 +924,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.prepare.tokenize_seconds =
             std::chrono::duration<double>(Clock::now() - tokenize_started).count();
         fi::check_preparation_control(control, "tokenization");
-        result.token_ids                   = std::move(encoded.input_ids);
-        result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
+        result.token_ids                     = std::move(encoded.input_ids);
+        result.identity.rewrite_checkpoint   = encoded.rewrite_checkpoint;
+        result.identity.prefix_seed_frontier = encoded.prefix_seed_frontier;
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());

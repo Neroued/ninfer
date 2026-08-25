@@ -263,6 +263,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         sequence.prefix_identity.reserve(static_cast<std::size_t>(capacity) + 1ULL);
     }
 
+    prefix_seeds.initialize(
+        plan.prefix_cache_bytes, decoder->linear_attention, decoder->text_kv.pool(),
+        decoder->mtp_cache() != nullptr ? &decoder->mtp_cache()->pool() : nullptr,
+        sequences[0].rewrite_checkpoint_hidden.bytes());
+
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
 
@@ -426,10 +431,17 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
     if (request_plan.reuse != ReusePath::FullReset &&
+        request_plan.reuse != ReusePath::SeedPrefixCache &&
         (!sequence.retained ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           request_plan.reuse_base))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
+    }
+    if (request_plan.reuse == ReusePath::SeedPrefixCache &&
+        (!prefix_seeds.enabled() || request_plan.seed_entry < 0 ||
+         !prefix_seeds.entry_matches(request_plan.seed_entry, prompt) ||
+         prefix_seeds.entry_frontier(request_plan.seed_entry) != request_plan.reuse_base)) {
+        throw std::logic_error("planned prefix seed is no longer available");
     }
     if (is_rewrite_checkpoint_restore(request_plan.reuse) &&
         (!sequence.rewrite_checkpoint.valid ||
@@ -547,6 +559,35 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 device.stream);
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
             sequence.ledger.resize(base);
+        } else if (request_plan.reuse == ReusePath::SeedPrefixCache) {
+            sequence.kv.reset();
+            ordered_reset(sequence);
+            sequence.ledger.clear();
+            sequence.text_kv_valid = 0;
+            sequence.mtp_kv_valid  = 0;
+            reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
+                                request_plan.backend_kv_page_entitlement);
+            sequence.kv->text.materialize_tokens(base, device.stream);
+            if (sequence.kv->backend) {
+                sequence.kv->backend->materialize_tokens(base, device.stream);
+            }
+            prefix_seeds.restore(
+                request_plan.seed_entry, decoder->linear_attention,
+                LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                sequence.tail_hidden, decoder->text_kv.pool(), sequence.kv->text,
+                decoder->mtp_cache() != nullptr ? &decoder->mtp_cache()->pool() : nullptr,
+                sequence.kv->backend ? &*sequence.kv->backend : nullptr, device.stream);
+            const std::span<const TokenId> seed_tokens =
+                prefix_seeds.tokens(request_plan.seed_entry);
+            sequence.ledger.assign(seed_tokens.begin(), seed_tokens.end());
+            sequence.prefix_identity.assign(prompt);
+            sequence.prefix_identity.truncate(base);
+            sequence.rope_delta        = prefix_seeds.entry_rope_delta(request_plan.seed_entry);
+            sequence.tail_hidden_valid = true;
+            sequence.text_kv_valid     = base;
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                sequence.mtp_kv_valid = base == 0 ? 0 : base - 1;
+            }
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
@@ -618,6 +659,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .prepare_mtp                = request_plan.prepare_mtp,
             .reuse                      = request_plan.reuse,
             .mtp_bridge                 = request_plan.mtp_bridge,
+            .seed_capture               = request_plan.seed_capture,
+            .seed_captured              = false,
         };
         request.prefill.emplace(std::move(prefill));
         auto& staged = *request.prefill;
@@ -1573,8 +1616,24 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            std::uint32_t nominal = std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            const std::optional<std::uint32_t> rewrite_frontier =
+                staged.rewrite_checkpoint_capture
+                    ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
+                    : std::nullopt;
+            // The lane checkpoint slot accepts one in-graph capture per chunk. When a pending
+            // seed capture and the request rewrite capture fall inside the same chunk at
+            // different frontiers, split the chunk at the seed frontier so each capture gets its
+            // own chunk (a large stable system head plus a short live turn makes this collision
+            // the common shape, not the exception).
+            if (staged.seed_capture && !staged.seed_captured &&
+                *staged.seed_capture > staged.cursor &&
+                *staged.seed_capture <= staged.cursor + nominal && rewrite_frontier &&
+                *rewrite_frontier > staged.cursor &&
+                *rewrite_frontier <= staged.cursor + nominal &&
+                *rewrite_frontier != *staged.seed_capture) {
+                nominal = *staged.seed_capture - staged.cursor;
+            }
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
@@ -1582,10 +1641,16 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 mark_workspace_usage(workspace_plan.dflash_context);
             }
             schedule::PrefillChunkResult result;
+            const bool rewrite_in_chunk = rewrite_frontier &&
+                                          *rewrite_frontier > staged.cursor &&
+                                          *rewrite_frontier <= staged.cursor + nominal;
+            const bool seed_in_chunk =
+                staged.seed_capture && !staged.seed_captured &&
+                *staged.seed_capture > staged.cursor &&
+                *staged.seed_capture <= staged.cursor + nominal &&
+                (!rewrite_in_chunk || *rewrite_frontier == *staged.seed_capture);
             const std::optional<std::uint32_t> rewrite_checkpoint_capture_frontier =
-                staged.rewrite_checkpoint_capture
-                    ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
-                    : std::nullopt;
+                seed_in_chunk ? staged.seed_capture : rewrite_frontier;
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
@@ -1606,6 +1671,21 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
+            }
+            if (staged.seed_capture && !staged.seed_captured &&
+                staged.cursor >= *staged.seed_capture) {
+                if (seed_in_chunk) {
+                    prefix_seeds.capture(
+                        staged.prompt, *staged.seed_capture, sequence.rope_delta,
+                        decoder->linear_attention,
+                        LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane,
+                                                                        max_concurrency),
+                        sequence.rewrite_checkpoint_hidden, decoder->text_kv.pool(),
+                        sequence.kv->text,
+                        decoder->mtp_cache() != nullptr ? &decoder->mtp_cache()->pool() : nullptr,
+                        sequence.kv->backend ? &*sequence.kv->backend : nullptr, device.stream);
+                }
+                staged.seed_captured = true;
             }
 
             if (!result.finalized) {

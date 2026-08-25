@@ -86,6 +86,8 @@ struct RewriteCheckpointByteSpec {
 struct RenderedChat {
     std::string text;
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
+    // Byte offset just past the rendered leading system block, when one was emitted.
+    std::optional<std::size_t> prefix_seed_offset;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

@@ -349,6 +349,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         rendered += reasoning_instructions;
         rendered += "<|im_end|>\n";
     }
+    const std::optional<std::size_t> prefix_seed_offset =
+        rendered.empty() ? std::nullopt : std::optional<std::size_t>(rendered.size());
 
     const long last_query_index  = last_real_user_query(messages);
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
@@ -447,7 +449,9 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                 .kind = RewriteCheckpointKind::ResponseReplay, .offset = rendered.size()};
         }
     }
-    return RenderedChat{.text = std::move(rendered), .rewrite_checkpoint = rewrite_checkpoint};
+    return RenderedChat{.text               = std::move(rendered),
+                        .rewrite_checkpoint = rewrite_checkpoint,
+                        .prefix_seed_offset = prefix_seed_offset};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

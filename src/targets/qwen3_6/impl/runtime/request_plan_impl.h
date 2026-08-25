@@ -4,6 +4,7 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -161,6 +162,12 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         }
         base->rewrite_checkpoint = candidate;
     }
+    if (prompt.identity.prefix_seed_frontier) {
+        const std::uint32_t frontier = *prompt.identity.prefix_seed_frontier;
+        if (frontier != 0 && frontier < base->summary.prompt_tokens) {
+            base->prefix_seed_frontier = frontier;
+        }
+    }
     const std::size_t cold_prefill_splits =
         (base->vision_control != nullptr ? base->vision_control->items.size() : 0ULL) +
         (base->rewrite_checkpoint &&
@@ -210,6 +217,19 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
+    // Cross-request prefix seeding: only when no resident sequence state is reusable, on a
+    // text-only prompt, outside the DFlash backend (whose context frontier a seed cannot feed).
+    if (plan->reuse == ReusePath::FullReset && prefix_seeds.enabled() && base.allow_prefix_reuse &&
+        prompt.identity.reusable && !prompt.has_media() &&
+        speculative_backend != SpeculativeBackend::DFlash) {
+        const std::int64_t entry = prefix_seeds.find(prompt);
+        if (entry >= 0) {
+            plan->reuse      = ReusePath::SeedPrefixCache;
+            plan->reuse_base = prefix_seeds.entry_frontier(entry);
+            plan->seed_entry = entry;
+        }
+    }
+
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
@@ -218,9 +238,15 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool checkpoint_ready = is_rewrite_checkpoint_restore(plan->reuse) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
                                       sequence.mtp_kv_valid >= plan->reuse_base - 1;
-        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
+        // A seed entry carries its own tail hidden and backend KV span, so its MTP readiness
+        // does not depend on resident sequence state.
+        const bool seed_ready = plan->reuse == ReusePath::SeedPrefixCache &&
+                                decoder->mtp_cache() != nullptr && plan->reuse_base != 0;
+        if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready &&
+            !seed_ready) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
+            plan->seed_entry = -1;
         }
     }
 
@@ -254,6 +280,19 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         plan->rewrite_checkpoint_action = RewriteCheckpointAction::DeferCapture;
     }
 
+    // Cross-request seed capture rides the in-graph checkpoint mechanism, so it is admissible
+    // only while the lane checkpoint slot holds no live state this request must preserve:
+    // CaptureNew rewrites the slot later at a farther frontier and Drop leaves it dead, while
+    // KeepExisting/ReclassifyExisting/DeferCapture all retain live checkpoint state.
+    if (prefix_seeds.enabled() && base.prefix_seed_frontier && !prompt.has_media() &&
+        speculative_backend != SpeculativeBackend::DFlash &&
+        (plan->rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew ||
+         plan->rewrite_checkpoint_action == RewriteCheckpointAction::Drop) &&
+        *base.prefix_seed_frontier > plan->reuse_base &&
+        !prefix_seeds.contains(prompt, *base.prefix_seed_frontier)) {
+        plan->seed_capture = base.prefix_seed_frontier;
+    }
+
     plan->summary.reusable_prompt_tokens = plan->reuse_base;
     if (speculative_backend == SpeculativeBackend::Mtp) {
         if (plan->reuse == ReusePath::FullReset) {
@@ -268,6 +307,16 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
             plan->mtp_bridge  = plan->reuse_base < plan->summary.prompt_tokens
                                     ? MtpBridgeMode::BeforeSuffix
                                     : MtpBridgeMode::AfterExactHit;
+        } else if (plan->reuse == ReusePath::SeedPrefixCache) {
+            if (decoder->mtp_cache() == nullptr) {
+                plan->reuse      = ReusePath::FullReset;
+                plan->reuse_base = 0;
+                plan->seed_entry = -1;
+                plan->prepare_mtp = true;
+            } else {
+                plan->prepare_mtp = true;
+                plan->mtp_bridge  = MtpBridgeMode::BeforeSuffix; // frontier < prompt_tokens
+            }
         }
     }
 

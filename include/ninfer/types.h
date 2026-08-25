@@ -89,6 +89,8 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    // Device bytes reserved at startup for the cross-request prefix-seed store; 0 disables it.
+    std::size_t prefix_cache_bytes = 0;
     LoadProgress load_progress;
 };
 
@@ -388,6 +390,7 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
+    SeedPrefixCache,
 };
 
 struct GenerationResult {

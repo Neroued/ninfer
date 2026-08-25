@@ -67,7 +67,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
-           "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
+           "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] [--prefix-cache-mib N] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -83,6 +83,8 @@ std::string serve_usage_text(const char* argv0) {
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
+           "       --prefix-cache-mib reserves device memory for cross-request prefix seeds; 0 "
+           "(default) disables\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
@@ -167,6 +169,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--max-request-mib is out of range");
             }
             options.max_request_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--prefix-cache-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--prefix-cache-mib"), "prefix-cache-mib");
+            if (mib > (1ULL << 20)) {
+                throw std::invalid_argument("--prefix-cache-mib is out of range");
+            }
+            options.prefix_cache_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--media-cache-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--media-cache-mib"), "media-cache-mib");

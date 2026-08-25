@@ -118,6 +118,7 @@ struct ProcessedInput {
 struct EncodedChat {
     std::vector<int> input_ids;
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
+    std::optional<std::uint32_t> prefix_seed_frontier;
 };
 
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered);

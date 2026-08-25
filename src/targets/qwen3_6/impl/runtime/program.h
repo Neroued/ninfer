@@ -12,6 +12,7 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
+#include "targets/qwen3_6/impl/runtime/prefix_seed_store.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -27,6 +28,7 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 using PreparedPromptData    = qwen3_6::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_6::RewriteCheckpointKind;
+// (prefix-seed store: see targets/qwen3_6/impl/runtime/prefix_seed_store.h)
 using RewriteCheckpointSpec = qwen3_6::RewriteCheckpointSpec;
 
 using ReusePath = ninfer::PrefixReusePath;
@@ -67,6 +69,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::shared_ptr<const qwen3_6::VisionControl> vision_control;
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
+    std::optional<std::uint32_t> prefix_seed_frontier;
     bool allow_prefix_reuse = false;
 };
 
@@ -82,6 +85,8 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint_capture;
+    std::int64_t seed_entry = -1;
+    std::optional<std::uint32_t> seed_capture;
     ops::SamplingConfig sampling;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
@@ -194,6 +199,8 @@ struct RequestControl {
         bool prepare_mtp                 = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
+        std::optional<std::uint32_t> seed_capture;
+        bool seed_captured = false;
     };
 
     std::optional<Prefill> prefill;
@@ -269,6 +276,7 @@ public:
     Tensor token_counts;
     Tensor tail_hidden_store;
     Tensor rewrite_checkpoint_hidden_store;
+    qwen3_6::detail::PrefixSeedStore prefix_seeds;
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;

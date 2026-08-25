@@ -587,9 +587,34 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
 }
 
+namespace {
+
+std::optional<std::uint32_t> exact_prefix_frontier(const Tokenizer& tokenizer,
+                                                   const RenderedChat& rendered,
+                                                   std::size_t offset,
+                                                   const std::vector<int>& input_ids) {
+    if (offset == 0 || offset >= rendered.text.size()) { return std::nullopt; }
+    const std::vector<int> prefix =
+        tokenizer.encode(std::string_view(rendered.text).substr(0, offset));
+    if (prefix.empty() || prefix.size() >= input_ids.size() ||
+        !std::equal(prefix.begin(), prefix.end(), input_ids.begin())) {
+        return std::nullopt;
+    }
+    if (prefix.size() > std::numeric_limits<std::uint32_t>::max()) { return std::nullopt; }
+    return static_cast<std::uint32_t>(prefix.size());
+}
+
+} // namespace
+
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered) {
     EncodedChat encoded;
     encoded.input_ids = tokenizer.encode(rendered.text);
+    if (rendered.prefix_seed_offset) {
+        // Best-effort: a system block whose byte boundary is not an exact token boundary simply
+        // yields no seed frontier; nothing downstream depends on one existing.
+        encoded.prefix_seed_frontier = exact_prefix_frontier(
+            tokenizer, rendered, *rendered.prefix_seed_offset, encoded.input_ids);
+    }
     if (!rendered.rewrite_checkpoint) { return encoded; }
     if (rendered.rewrite_checkpoint->offset > rendered.text.size()) {
         throw std::logic_error("rewrite checkpoint byte offset exceeds rendered chat");

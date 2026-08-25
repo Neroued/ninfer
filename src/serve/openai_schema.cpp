@@ -1,5 +1,6 @@
 #include "serve/openai_schema.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <chrono>

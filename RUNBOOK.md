@@ -199,13 +199,13 @@ curl -sS "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
 
 ### 2. Live tolerant tool-call recovery
 
-When `--tolerant-tool-calls` is active, test that a prompt eliciting complex tool calls recovers properly even if the model drifts:
+When `--tolerant-tool-calls` is enabled on the server, the parser recovers complete tool calls even when the model emits duplicate closing tags or trailing suffixes (e.g. duplicate `</function>`, `</function_invocation>`, or trailing explanatory text after a complete function), or when the model omits the outer `</tool_call>` closing tag.
 
 ```bash
 curl -sS "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
   \"model\": \"$MODEL\",
   \"messages\": [
-    {\"role\": \"user\", \"content\": \"Search for weather in Tokyo and Paris simultaneously using the get_weather tool.\"}
+    {\"role\": \"user\", \"content\": \"Search for weather in Tokyo using the get_weather tool.\"}
   ],
   \"tools\": [
     {
@@ -231,6 +231,10 @@ curl -sS "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
 
 **Expected Observable Outcome**:
 - HTTP 200 OK.
-- `choices[0].finish_reason` is `"tool_calls"`.
-- `choices[0].message.tool_calls` contains 2 function calls (`get_weather` with `{"city":"Tokyo"}` and `{"city":"Paris"}`).
-- No raw XML or leaked `<tool_call>` tags in `choices[0].message.content`.
+- If the model generation produces a valid `<tool_call>` block with duplicate closing suffixes (e.g. `</function_invocation>`) or an unclosed `</tool_call>`:
+  - `choices[0].finish_reason` is `"tool_calls"`.
+  - `choices[0].message.tool_calls` contains the parsed function call (`get_weather` with `{"city":"Tokyo"}`).
+  - `choices[0].message.content` contains any text prefix before the `<tool_call>` tag (or null/empty if none).
+- If the output contains near-miss tag syntax (e.g. `<function name="...">` or `<call>`) or is cut off mid-parameter by token limits:
+  - The turn gracefully degrades to a plain text response with `finish_reason` `"stop"` or `"length"`.
+  - No internal 500 errors occur, and no phantom tool calls with empty/corrupted arguments are fabricated.

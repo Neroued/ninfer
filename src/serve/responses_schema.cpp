@@ -573,6 +573,9 @@ void reject_unknown_top_level(const Json& body) {
     static const std::unordered_set<std::string> allowed = {
         "background",
         "chat_template_kwargs",
+        // Codex uses this provider metadata for request routing and lineage. It
+        // is transport-only for NInfer and must not enter the model prompt.
+        "client_metadata",
         "context_management",
         "conversation",
         "include",

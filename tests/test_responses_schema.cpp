@@ -86,7 +86,10 @@ int test_basic_request() {
                                       {"temperature", 0.3},
                                       {"top_p", 0.8},
                                       {"reasoning", Json{{"effort", "medium"}}},
-                                      {"metadata", Json{{"trace", "abc"}}}};
+                                      {"metadata", Json{{"trace", "abc"}}},
+                                      {"client_metadata",
+                                       Json{{"x-codex-subagent", "ultra"},
+                                            {"x-codex-turn-metadata", "{\"turn_id\":\"t1\"}"}}}};
     const ResponsesRequest request = parse_responses_request(body, limits());
     int failures                   = 0;
     failures += check(request.generation.model == "qwen3.6-27b", "model parsed");

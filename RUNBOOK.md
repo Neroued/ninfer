@@ -142,3 +142,120 @@ curl -sS "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
 
 Compare the three 200 bodies with `jq -S '.choices[0].message'` (or equivalent).
 Pass only when content, reasoning_content, and prompt_tokens match.
+
+---
+
+# GPU runbook: native Windows vs WSL2-container tax
+
+Native `ninfer-serve.exe` now compiles on this box (MSVC 19.44.35228 + CUDA 13.3.33,
+`sm_120a`, `NINFER_BUILD_MEDIA=OFF`). Do not boot it or acquire the GPU lock until
+the coordinator schedules an exclusive window. The Qwen3.8-27B NVFP4 artifact is
+about 20 GiB and does not fit the 16 GiB compact cap.
+
+This runbook measures the WSL2 tax. Decode is expected to be similar (GPU-resident,
+bandwidth-bound). Prefill, TTFT, weight load, boot wall time, and seed-store
+captures all cross the WSL2 boundary on the container arm.
+
+## Arms
+
+| Arm | Runtime | Binary |
+|---|---|---|
+| A container | `ninfer:seedstore` under WSL2/docker | container `ninfer-serve` from `feat/prefix-seed-store` @ 352a49c3 plus this Windows port |
+| B native | `build-win/apps/ninfer-serve.exe` from `task/issue-6-native-windows` | same git tree, MSVC+CUDA 13.3, text-only (`NINFER_BUILD_MEDIA=OFF`) |
+
+Same checkpoint: `neroued/Qwen3.8-27B-nvfp4-NInfer` / public model id `qwen3.8-27b`.
+Same serving flags both arms. Native currently **cannot** honor `--vision` until
+FFmpeg+libcurl are installed. Until then, drop `--vision` on **both** arms so the
+A/B stays matched, or install the media prefix and rebuild native with
+`-DNINFER_BUILD_MEDIA=ON` before the window.
+
+Never stop production containers (`sglang-qwen38` on `:8016`, embeddings, whisper).
+
+## Server flags (matched)
+
+No `--preserve-thinking`. JSONL log required. Port 8018 native or container, one
+at a time.
+
+```text
+--host 127.0.0.1 --port 8018
+--max-context 131072 --kv-capacity 1048576 --max-concurrency 8
+--spec mtp --draft-tokens 5 --lm-head-draft
+--kv-dtype int8 --prefill-chunk 2048 --cors
+--prefix-cache-mib 4096
+--request-log-jsonl <arm>-ninfer.jsonl
+```
+
+Add `--vision` only when both arms actually load Vision.
+
+Native launch (after vcvars64 + CUDA 13.3 on PATH):
+
+```bat
+build-win\apps\ninfer-serve.exe <artifact.ninfer> --host 127.0.0.1 --port 8018 ...
+```
+
+Record wall time from process start to first `GET /health` 200. That is boot
+wall time. Weight-load time is the `load_progress` / startup log span until the
+server accepts connections.
+
+## Metrics
+
+Collect on every request from `request_done` JSONL:
+
+- prefill tok/s = `computed_prefill_tokens / timings_seconds.prefill`
+- decode tok/s = `(completion_tokens - 1) / timings_seconds.decode`
+- TTFT = `timings_seconds.ttft`
+- `prefix_reuse_path`, `prefix_cache_hit_tokens`
+
+### Prefill (~6k and ~57k)
+
+Two prompt lengths, serial, c=1, `--greedy` (prefill is not MTP-luck bound):
+
+- ~6k: a real ~6k-token chat from the serving corpus or long-niah fixture.
+- ~57k: a long-context body in the same family. Report `prompt_tokens` from
+  `request_done` so the two buckets are actual, not nominal.
+
+Three repetitions each length per arm. Report median prefill tok/s.
+
+### Decode c=1, >= 3 boots
+
+Three full process boots per arm, interleaved A/B/A/B/A/B, c=1 n=16,
+`examples/cli/messages/scenario_*.json` cycled to 16, MTP-5, **not** greedy.
+Arm score = median of 3 boot medians. Single-boot deltas under ~10% are noise.
+
+### TTFT cold vs seeded
+
+`--greedy`, prefix-cache on. Two identical temp=0 seed=0 requests:
+
+1. Cold: `prefix_reuse_path=full_reset`. Record TTFT.
+2. Seeded: `prefix_reuse_path=seed_prefix` (or restore_*). Record TTFT.
+
+Pass the seed-store oracle if content is byte-identical and the second path is
+not `full_reset`. Compare TTFT native vs container on both the cold and seeded
+requests.
+
+### Weight-load and boot wall time
+
+Three boots per arm. Median seconds from process start to `/health` ok, and
+median seconds of the weight-load phase from the startup log.
+
+### Soak (after the A/B, not instead of it)
+
+A multi-hour mixed-traffic soak on native, production-shaped chat + tools, before
+native earns any default-local role. The container lane has already survived
+hundreds of live agentic requests; native must match that bar. Out of scope for
+the first exclusive window if time is short — schedule separately, do not skip.
+
+## Configure (native, already proven on this machine)
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
+cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" -DNINFER_BUILD_MEDIA=OFF -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=OFF
+cmake --build build-win -j --target ninfer-serve
+```
+
+## GPU lock
+
+Coordinator only. `nvidia-smi` >= 20 GiB free; `mkdir C:\Users\igorl\.ninfer-gpu.lock`
+(retry 60 s, up to 30 min); remove the lock directory after, success or failure.

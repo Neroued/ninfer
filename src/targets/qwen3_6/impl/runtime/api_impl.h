@@ -18,11 +18,15 @@ SequencePlan<Variant>::SequencePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-SequencePlan<Variant>::SequencePlan(SequencePlan&&) noexcept = default;
+SequencePlan<Variant>::SequencePlan(SequencePlan&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&&) noexcept = default;
+SequencePlan<Variant>& SequencePlan<Variant>::operator=(SequencePlan&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
-SequencePlan<Variant>::~SequencePlan() = default;
+SequencePlan<Variant>::~SequencePlan() { impl_.reset(); }
 
 template <>
 std::uint32_t SequencePlan<Variant>::capacity() const noexcept {
@@ -60,11 +64,15 @@ SequencePlanner<Variant>::SequencePlanner(
     : impl_(std::move(impl)) {}
 
 template <>
-SequencePlanner<Variant>::SequencePlanner(SequencePlanner&&) noexcept = default;
+SequencePlanner<Variant>::SequencePlanner(SequencePlanner&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&&) noexcept = default;
+SequencePlanner<Variant>& SequencePlanner<Variant>::operator=(SequencePlanner&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
-SequencePlanner<Variant>::~SequencePlanner() = default;
+SequencePlanner<Variant>::~SequencePlanner() { impl_.reset(); }
 
 template <>
 const runtime::SequenceCapacityCurve& SequencePlanner<Variant>::capacity_curve() const noexcept {
@@ -85,11 +93,15 @@ RequestBasePlan<Variant>::RequestBasePlan(
     : impl_(std::move(impl)) {}
 
 template <>
-RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&&) noexcept = default;
+RequestBasePlan<Variant>::RequestBasePlan(RequestBasePlan&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&&) noexcept = default;
+RequestBasePlan<Variant>& RequestBasePlan<Variant>::operator=(RequestBasePlan&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
-RequestBasePlan<Variant>::~RequestBasePlan() = default;
+RequestBasePlan<Variant>::~RequestBasePlan() { impl_.reset(); }
 
 template <>
 const runtime::RequestPlanSummary& RequestBasePlan<Variant>::summary() const noexcept {
@@ -102,11 +114,15 @@ RequestPlan<Variant>::RequestPlan(std::unique_ptr<detail::RequestPlanImpl<Varian
     : impl_(std::move(impl)) {}
 
 template <>
-RequestPlan<Variant>::RequestPlan(RequestPlan&&) noexcept = default;
+RequestPlan<Variant>::RequestPlan(RequestPlan&& other) noexcept
+    : impl_(std::move(other.impl_)) {}
 template <>
-RequestPlan<Variant>& RequestPlan<Variant>::operator=(RequestPlan&&) noexcept = default;
+RequestPlan<Variant>& RequestPlan<Variant>::operator=(RequestPlan&& other) noexcept {
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 template <>
-RequestPlan<Variant>::~RequestPlan() = default;
+RequestPlan<Variant>::~RequestPlan() { impl_.reset(); }
 
 template <>
 const runtime::RequestPlanSummary& RequestPlan<Variant>::summary() const noexcept {
@@ -119,7 +135,7 @@ Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) no
     : impl_(std::move(impl)) {}
 
 template <>
-Program<Variant>::~Program() noexcept = default;
+Program<Variant>::~Program() noexcept { impl_.reset(); }
 
 template <>
 RequestBasePlan<Variant>

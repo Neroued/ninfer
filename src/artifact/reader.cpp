@@ -1,10 +1,13 @@
 #include "artifact/reader.h"
 
+#include "core/verbose.h"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -15,10 +18,14 @@
 #include <unordered_map>
 #include <utility>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace ninfer::artifact {
 namespace {
@@ -181,6 +188,46 @@ struct TransparentStringHash {
 class MappedFile {
 public:
     explicit MappedFile(const std::filesystem::path& path) {
+#if defined(_WIN32)
+        HANDLE handle = ::CreateFileW(path.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            throw std::system_error(::GetLastError(), std::generic_category(),
+                                    "open " + path.string());
+        }
+
+        LARGE_INTEGER file_size {};
+        if (!::GetFileSizeEx(handle, &file_size) || file_size.QuadPart < 0 ||
+            static_cast<std::uintmax_t>(file_size.QuadPart) >
+                std::numeric_limits<std::size_t>::max()) {
+            ::CloseHandle(handle);
+            throw ArtifactError("artifact size does not fit the process address space");
+        }
+
+        const auto size = static_cast<std::size_t>(file_size.QuadPart);
+        void* mapping   = nullptr;
+        if (size != 0) {
+            HANDLE file_mapping =
+                ::CreateFileMappingW(handle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            if (file_mapping == nullptr) {
+                const DWORD error = ::GetLastError();
+                ::CloseHandle(handle);
+                throw std::system_error(error, std::generic_category(),
+                                        "CreateFileMapping " + path.string());
+            }
+            mapping = ::MapViewOfFile(file_mapping, FILE_MAP_READ, 0, 0, 0);
+            ::CloseHandle(file_mapping);
+            if (mapping == nullptr) {
+                const DWORD error = ::GetLastError();
+                ::CloseHandle(handle);
+                throw std::system_error(error, std::generic_category(),
+                                        "MapViewOfFile " + path.string());
+            }
+        }
+        fd_   = handle;
+        data_ = static_cast<const std::byte*>(mapping);
+        size_ = size;
+#else
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd < 0) {
             throw std::system_error(errno, std::generic_category(), "open " + path.string());
@@ -212,11 +259,19 @@ public:
         fd_   = fd;
         data_ = static_cast<const std::byte*>(mapping);
         size_ = size;
+#endif
+        NINFER_VERBOSE("MappedFile: %s  base=%p size=%zu", path.string().c_str(),
+                       static_cast<const void*>(data_), size_);
     }
 
     ~MappedFile() {
+#if defined(_WIN32)
+        if (data_ != nullptr) { ::UnmapViewOfFile(const_cast<std::byte*>(data_)); }
+        if (fd_ != INVALID_HANDLE_VALUE) { ::CloseHandle(fd_); }
+#else
         if (data_ != nullptr) { ::munmap(const_cast<std::byte*>(data_), size_); }
         if (fd_ >= 0) { ::close(fd_); }
+#endif
     }
 
     MappedFile(const MappedFile&)            = delete;
@@ -232,6 +287,69 @@ public:
             reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
             throw ArtifactError("direct artifact read is not 4096-byte aligned");
         }
+        NINFER_VERBOSE("read_direct: offset=%llu size=%zu dest=%p",
+                       static_cast<unsigned long long>(absolute_offset), destination.size(),
+                       static_cast<const void*>(destination.data()));
+#if defined(_WIN32)
+        // LARGE_INTEGER is a union whose first member is the anonymous
+        // { DWORD LowPart; LONG HighPart; } struct, NOT QuadPart. Aggregate
+        // initialization with a single value therefore sets LowPart to the low
+        // 32 bits and HighPart to 0, silently truncating any offset >= 2^32.
+        // Set QuadPart explicitly so the full 64-bit offset is used.
+        LARGE_INTEGER position {};
+        position.QuadPart = static_cast<LONGLONG>(absolute_offset);
+        LARGE_INTEGER moved {};
+        if (!::SetFilePointerEx(fd_, position, &moved, FILE_BEGIN)) {
+            throw std::system_error(::GetLastError(), std::generic_category(),
+                                    "direct artifact seek");
+        }
+        std::size_t total = 0;
+        while (total < destination.size()) {
+            DWORD got = 0;
+            const BOOL ok = ::ReadFile(fd_, destination.data() + total,
+                                       static_cast<DWORD>(destination.size() - total), &got, nullptr);
+            if (!ok) {
+                throw std::system_error(::GetLastError(), std::generic_category(),
+                                        "direct artifact read");
+            }
+            if (got == 0) {
+                // EOF reached. Return partial count; caller's short-read check
+                // will decide whether this is acceptable.
+                break;
+            }
+            total += got;
+        }
+        if (ninfer::verbose_enabled()) {
+            static int verify_count   = 0;
+            static int mismatch_count = 0;
+            ++verify_count;
+            const std::size_t n = destination.size() < 64 ? destination.size() : 64;
+            bool match = true;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (destination.data()[i] != data_[absolute_offset + i]) { match = false; break; }
+            }
+            if (verify_count == 1) {
+                std::fprintf(stderr,
+                             "[verbose] read_direct verify probe active (first: offset=%llu match=%s)\n",
+                             (unsigned long long)absolute_offset, match ? "YES" : "NO");
+            }
+            if (!match) {
+                ++mismatch_count;
+                std::fprintf(stderr, "[verbose] read_direct MISMATCH #%d offset=%llu\n",
+                             mismatch_count, (unsigned long long)absolute_offset);
+                std::fprintf(stderr, "[verbose]   read = ");
+                for (std::size_t i = 0; i < n; ++i) {
+                    std::fprintf(stderr, "%02x", (unsigned)destination.data()[i]);
+                }
+                std::fprintf(stderr, "\n[verbose]   mmap = ");
+                for (std::size_t i = 0; i < n; ++i) {
+                    std::fprintf(stderr, "%02x", (unsigned)data_[absolute_offset + i]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        return total;
+#else
         if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
             destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
             throw ArtifactError("direct artifact read exceeds platform I/O limits");
@@ -246,10 +364,15 @@ public:
             throw std::system_error(errno, std::generic_category(), "direct artifact read");
         }
         return static_cast<std::size_t>(bytes);
+#endif
     }
 
 private:
-    int fd_                = -1;
+#if defined(_WIN32)
+    HANDLE fd_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
 };

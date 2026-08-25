@@ -71,8 +71,10 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
         activation_codes, activation_scales, weight_codes, weight_scales, tokens);
     constexpr int kPairN = M256N128S3::kBlockN / 2;
     const dim3 grid((Geometry::kOutputRows / 2) / kPairN, tokens / M256N128S3::kBlockM);
+    static_assert(sizeof(Nvfp4W4a4TmaDescriptors) == 512);
+    const std::uint64_t* descriptor_bytes = nvfp4_stage_tma_descriptor(descriptors, stream);
     nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>
-        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(descriptors, alpha, output);
+        <<<grid, M256N128S3::kThreads, kSharedBytes, stream>>>(descriptor_bytes, alpha, output);
     CUDA_CHECK(cudaGetLastError());
 }
 

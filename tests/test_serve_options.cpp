@@ -43,6 +43,8 @@ int main() {
                           defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,
                       "media preparation resource defaults mismatch");
+    failures += check(defaults.prefix_cache_bytes == 0,
+                      "prefix cache is not disabled by default");
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
@@ -143,6 +145,15 @@ int main() {
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
+
+    const ServeOptions prefix_disabled =
+        parse({"ninfer-serve", "model.ninfer", "--prefix-cache-mib", "0"});
+    failures += check(prefix_disabled.prefix_cache_bytes == 0,
+                      "--prefix-cache-mib 0 did not keep the seed store disabled");
+    const ServeOptions prefix_enabled =
+        parse({"ninfer-serve", "model.ninfer", "--prefix-cache-mib", "4096"});
+    failures += check(prefix_enabled.prefix_cache_bytes == (4096ULL << 20),
+                      "--prefix-cache-mib 4096 did not reserve 4 GiB");
 
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",

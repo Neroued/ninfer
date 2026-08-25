@@ -1410,7 +1410,7 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
 - `EngineOptions.max_context=S` 是 per-sequence logical ceiling，`EngineOptions.kv_capacity` 是
   `Explicit(K_main)` 或 `Automatic(R)`；令 `L=ceil(S/64)`、`M_min=max(L,max_concurrency)`、
   `M_max=max_concurrency*L`，Explicit 取 `M=ceil(K_main/64)`，Automatic 根据完整 target physical
-  reservation curve 与权重加载后的空闲显存扣除 headroom `R` 后，直接求得区间内最大的 `M`；
+  reservation curve（含 prefix-seed arena）与权重加载后的空闲显存扣除 headroom `R` 后，直接求得区间内最大的 `M`；
   CLI/server 的 `R` 为 1 GiB；Main 与 DFlash Full 的
   per-allocation logical capacity 均为 `L`、physical capacity 均为 `M` pages，MTP 的 logical capacity
   为 `L`、physical capacity 为 `M + max_concurrency*ceil((K_draft-1)/64)` pages，其中 `K_draft` 是

@@ -95,6 +95,7 @@ int main() {
     memory.planned_slack_bytes               = 100;
     memory.cuda_graph_allowance_bytes        = 600;
     memory.cuda_graph_observed_bytes         = 550;
+    memory.prefix_cache_bytes                = 4096ULL << 20;
     memory.kv_payload_bytes                  = 400;
 
     ServerLogEnvironment environment;
@@ -165,7 +166,8 @@ int main() {
                           server.at("memory").at("available_after_startup_bytes") == 180 &&
                           server.at("memory").at("kv_capacity_headroom_bytes") == 0 &&
                           server.at("memory").at("planned_slack_bytes") == 100 &&
-                          server.at("memory").at("cuda_graph_observed_bytes") == 550,
+                          server.at("memory").at("cuda_graph_observed_bytes") == 550 &&
+                          server.at("memory").at("prefix_cache_bytes") == (4096ULL << 20),
                       "adaptive KV memory ledger missing");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,
                       "server JSON leaked the API key");

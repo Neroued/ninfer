@@ -65,8 +65,10 @@ public:
      * Copies the state at `frontier` into a new entry. `state_slot` names the Linear Attention
      * pool slot holding the captured image (the lane's rewrite-checkpoint slot immediately after
      * the in-graph capture), `hidden` the captured hidden state at frontier-1, and the
-     * allocations the sequence's live KV whose leading pages cover [0,frontier). Evicts oldest
-     * entries when the arena is full; silently skips capture when the entry cannot fit at all.
+     * allocations the sequence's live KV whose leading pages cover [0,frontier). When the
+     * remaining arena cannot hold the new entry, the store flushes every resident entry and
+     * resets the bump offset, then captures if the empty arena can hold it. Silently skips
+     * capture when the entry cannot fit even in an empty arena.
      */
     void capture(const PreparedPromptData& prompt, std::uint32_t frontier, std::int32_t rope_delta,
                  const LinearAttentionStatePool& state_pool, std::int32_t state_slot,
@@ -115,7 +117,7 @@ private:
 
     void* arena_             = nullptr;
     std::size_t arena_bytes_ = 0;
-    std::size_t arena_used_  = 0; // bump offset; eviction pops front entries in order
+    std::size_t arena_used_  = 0; // bump offset; a full arena is reclaimed by wholesale flush
     std::deque<Entry> entries_;
 
     // Fixed per-entry geometry captured at initialize().

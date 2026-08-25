@@ -152,6 +152,7 @@ int main(int argc, char** argv) {
                  << " tokens pages=" << memory.kv_capacity_page_groups << '/'
                  << memory.kv_capacity_max_page_groups
                  << " runtime=" << format_bytes(memory.runtime_reservation_bytes)
+                 << " prefix-cache=" << format_bytes(memory.prefix_cache_bytes)
                  << " free-after-weights=" << format_bytes(memory.available_after_weights_bytes)
                  << " free-after-startup=" << format_bytes(memory.available_after_startup_bytes)
                  << " headroom=" << format_bytes(memory.kv_capacity_headroom_bytes)

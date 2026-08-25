@@ -434,6 +434,7 @@ struct MemorySummary {
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
+    std::size_t prefix_cache_bytes                = 0;
     std::size_t kv_payload_bytes                  = 0;
 };
 

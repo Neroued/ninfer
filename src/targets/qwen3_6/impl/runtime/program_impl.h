@@ -186,7 +186,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
-      graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
+      graph_allowance_bytes(plan.graph_allowance_bytes), prefix_cache_bytes(plan.prefix_cache_bytes),
+      workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
       round_host(sizeof(TokenId)),
@@ -2298,6 +2299,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
+    out.prefix_cache_bytes           = prefix_cache_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
     return out;
 }

@@ -172,6 +172,46 @@ int verify_rejection() {
     return 1;
 }
 
+int verify_prefix_cache_reservation() {
+    ninfer::DeviceContext device(0);
+    ninfer::EngineOptions options;
+    options.max_context      = 128;
+    options.max_concurrency  = 2;
+    options.kv_capacity      = ninfer::KvCapacityPolicy::explicit_capacity(128);
+    options.prefill_chunk    = 128;
+    options.use_cuda_graph   = false;
+    options.prefix_cache_bytes = 0;
+    auto planner_zero =
+        Package::make_sequence_planner(device, options, WeightsProfile::Qwen36GroupwiseInt);
+    const auto curve_zero         = planner_zero.capacity_curve();
+    const std::uint32_t min_pages = curve_zero.minimum_main_page_groups;
+    auto plan_zero                = std::move(planner_zero).finalize(min_pages);
+
+    options.prefix_cache_bytes = 4ULL << 30;
+    auto planner_seed =
+        Package::make_sequence_planner(device, options, WeightsProfile::Qwen36GroupwiseInt);
+    const auto curve_seed = planner_seed.capacity_curve();
+    auto plan_seed        = std::move(planner_seed).finalize(min_pages);
+
+    if (plan_zero.device_reservation_bytes() == 0 ||
+        plan_seed.device_reservation_bytes() - plan_zero.device_reservation_bytes() !=
+            (4ULL << 30)) {
+        std::cerr << "seed-store bytes were not added to the device reservation\n";
+        return 1;
+    }
+    if (curve_seed.minimum_device_reservation_bytes - curve_zero.minimum_device_reservation_bytes !=
+        (4ULL << 30)) {
+        std::cerr << "seed-store bytes were not added to the minimum reservation\n";
+        return 1;
+    }
+    if (curve_seed.bytes_per_additional_main_page_group !=
+        curve_zero.bytes_per_additional_main_page_group) {
+        std::cerr << "seed-store term changed the KV capacity stride\n";
+        return 1;
+    }
+    return 0;
+}
+
 int verify_profile_mismatch_rejection() {
     ninfer::DeviceContext device(0);
     ninfer::EngineOptions options;
@@ -207,6 +247,7 @@ int main() {
         return 77;
     }
     if (const int result = verify_rejection(); result != 0) { return result; }
+    if (const int result = verify_prefix_cache_reservation(); result != 0) { return result; }
     if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
     if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
     if (const int result = verify_nvfp4(nvfp4); result != 0) { return result; }

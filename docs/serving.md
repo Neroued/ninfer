@@ -603,11 +603,12 @@ after weights are loaded while keeping 1 GiB of sizing headroom. When omitted it
 and is not divided evenly among request lanes.
 
 Automatic sizing evaluates the complete target runtime layout for the chosen concurrency, KV
-dtype, speculative backend, draft window, Vision setting, workspace, and CUDA Graph allowance. It
-uses a direct page-capacity calculation rather than allocation probing. Startup reports the policy,
-resolved capacity, runtime reservation, free memory after weights, automatic headroom, planned
-slack, actual free memory after complete startup, and observed Graph memory. An explicit capacity
-is never silently reduced, and neither policy permits request-time pool growth.
+dtype, speculative backend, draft window, Vision setting, workspace, CUDA Graph allowance, and
+prefix-cache arena. It uses a direct page-capacity calculation rather than allocation probing.
+Startup reports the policy, resolved capacity, runtime reservation, prefix-cache arena, free
+memory after weights, automatic headroom, planned slack, actual free memory after complete
+startup, and observed Graph memory. An explicit capacity is never silently reduced, and neither
+policy permits request-time pool growth.
 
 Admission reserves the full prompt-plus-effective-output page entitlement, so an admitted request
 can finish within its declared bound. A later request waits in FIFO order when the remaining shared

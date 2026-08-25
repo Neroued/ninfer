@@ -199,6 +199,10 @@ int main() {
                       "serve help omits media preparation controls");
     failures += check(serve_usage_text("ninfer-serve").find("--kv-capacity") != std::string::npos,
                       "serve help omits --kv-capacity");
+    failures += check(serve_usage_text("ninfer-serve")
+                              .find("(bounded by max-context * max-concurrency)") !=
+                          std::string::npos,
+                      "serve help omits auto kv-capacity bounding explanation");
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
                       "serve help omits Responses store limits");

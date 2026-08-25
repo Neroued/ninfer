@@ -575,6 +575,7 @@ void reject_unknown_top_level(const Json& body) {
         "chat_template_kwargs",
         "context_management",
         "conversation",
+        "enable_thinking",
         "include",
         "input",
         "instructions",
@@ -742,6 +743,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
     parse_tool_choice(body, out);
     parse_reasoning(body, out);
     out.generation.preserve_thinking = parse_openai_preserve_thinking(body);
+    apply_openai_enable_thinking(body, out.generation);
 
     if (const std::optional<double> temperature = optional_number(body, "temperature")) {
         if (*temperature < 0.0 || *temperature > 2.0) {
@@ -946,7 +948,7 @@ ResponsesRequest parse_response_input_tokens_request(const Json& body,
     require_object(body);
     for (auto it = body.begin(); it != body.end(); ++it) {
         if (it.key() != "model" && it.key() != "input" && it.key() != "chat_template_kwargs" &&
-            it.key() != "preserve_thinking") {
+            it.key() != "preserve_thinking" && it.key() != "enable_thinking") {
             bad_request("unknown parameter: " + it.key(), it.key(), "unknown_parameter");
         }
     }

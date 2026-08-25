@@ -80,7 +80,7 @@ The endpoint supports:
 - `stream_options.include_usage`;
 - function tools, tool choices, assistant tool-call history, and tool-result messages;
 - the top-level `reasoning_effort` field;
-- the `enable_thinking` extension;
+- top-level `enable_thinking` and `chat_template_kwargs.enable_thinking`;
 - `chat_template_kwargs.preserve_thinking` and the top-level `preserve_thinking` alias.
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
@@ -102,13 +102,19 @@ not exposed by the loaded template returns HTTP 400 with code
 For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
 select the corresponding template effort when available. The other OpenAI protocol values
 `minimal`, `high`, and `max` are parsed but rejected when the loaded template does not expose them.
-`enable_thinking` controls the same new-turn thinking switch; a contradictory combination with
-`reasoning_effort` returns `conflicting_template_option`.
+`high` is not an alias of `xhigh`. Top-level `enable_thinking: false` and
+`chat_template_kwargs.enable_thinking: false` disable the same new-turn thinking switch as
+`reasoning_effort: "none"`. The two `enable_thinking` spellings must agree when both are present. A
+contradictory combination of either spelling with `reasoning_effort` returns
+`conflicting_template_option`.
 
 `preserve_thinking` controls whether reasoning from closed assistant turns remains in later
-prompts. It defaults to the server setting, which is off unless `--preserve-thinking` is used. If
-both OpenAI spellings are present they must carry the same boolean value. Unknown non-null
-`chat_template_kwargs` are rejected.
+prompts. It is independent of the new-turn thinking switch: a request may disable thinking on the
+current turn while still preserving closed-turn reasoning, or the reverse. It defaults to the
+server setting, which is off unless `--preserve-thinking` is used. If both OpenAI spellings are
+present they must carry the same boolean value. Unknown non-null `chat_template_kwargs` return
+HTTP 400 `chat_template_option_not_supported`; a misspelled `enable_thinking` key is rejected
+rather than ignored, so thinking cannot remain on by default when a client intended to disable it.
 
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
@@ -211,7 +217,9 @@ wire response contains typed `output` Items.
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
-| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates. `high` is not mapped to `xhigh` |
+| `enable_thinking` | optional boolean; `false` disables new-turn thinking the same way as `reasoning.effort: "none"` |
+| `chat_template_kwargs.enable_thinking` | vLLM-dialect alias for the same option; conflicting values with top-level `enable_thinking` are rejected |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -226,7 +234,8 @@ wire response contains typed `output` Items.
 | `stream_options` | omitted or `{"include_obfuscation":false}` |
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
-with a field-specific 400 error instead of being silently ignored.
+with a field-specific 400 error instead of being silently ignored. Unknown non-null
+`chat_template_kwargs` keys fail with `chat_template_option_not_supported`.
 
 ### Input Item contract
 

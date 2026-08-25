@@ -23,6 +23,8 @@ namespace ninfer::serve {
 GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits);
 
+std::optional<bool> parse_openai_template_enable_thinking(const nlohmann::json& body);
+void apply_openai_enable_thinking(const nlohmann::json& body, GenerationRequest& out);
 std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);
 
 // Non-streaming chat completion response body (JSON string). When `reasoning` is

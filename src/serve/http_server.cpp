@@ -416,9 +416,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         return;
     }
 
-    auto stream              = std::make_shared<StreamingRequest>(std::move(prepared));
-    const bool include_usage = stream->prepared.include_usage;
-    const bool tool_capable  = stream->prepared.tool_capable;
+    auto stream                 = std::make_shared<StreamingRequest>(std::move(prepared));
+    const bool include_usage    = stream->prepared.include_usage;
+    const bool tool_capable     = stream->prepared.tool_capable;
+    const bool buffer_reasoning = tool_capable && options_.tolerant_tool_calls;
 
     // SSE hints: disable client/proxy caching and reverse-proxy response buffering
     // so tokens flush immediately. Content-Type is set by the chunked provider.
@@ -427,7 +428,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, created, model, include_usage, tool_capable,
+        [this, stream, id, created, model, include_usage, tool_capable, buffer_reasoning,
          log_context](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
@@ -455,6 +456,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
+                if (buffer_reasoning && !outcome.reasoning.empty()) {
+                    write_stream_item(sink, *stream,
+                                      make_chat_chunk_reasoning(id, model, created,
+                                                                outcome.reasoning, include_usage));
+                }
                 const std::string_view remaining = unstreamed_content(outcome);
                 if (!outcome.tool_calls.empty()) {
                     if (!remaining.empty()) {
@@ -632,15 +638,16 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    auto stream             = std::make_shared<StreamingRequest>(std::move(prepared));
-    const bool tool_capable = stream->prepared.tool_capable;
+    auto stream                 = std::make_shared<StreamingRequest>(std::move(prepared));
+    const bool tool_capable     = stream->prepared.tool_capable;
+    const bool buffer_reasoning = tool_capable && options_.tolerant_tool_calls;
 
     res.set_header("Cache-Control", "no-cache");
     res.set_header("X-Accel-Buffering", "no");
 
     res.set_chunked_content_provider(
         "text/event-stream",
-        [this, stream, id, model, input_tokens, tool_capable,
+        [this, stream, id, model, input_tokens, tool_capable, buffer_reasoning,
          log_context](std::size_t, httplib::DataSink& sink) -> bool {
             if (stream->started) {
                 sink.done();
@@ -696,6 +703,14 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 if (text_open) {
                     write_stream_item(sink, *stream, make_content_block_stop(text_index));
                     text_open = false;
+                }
+
+                if (buffer_reasoning && !outcome.reasoning.empty()) {
+                    const int idx = next_index++;
+                    write_stream_item(sink, *stream, make_content_block_start_thinking(idx));
+                    write_stream_item(sink, *stream,
+                                      make_content_block_delta_thinking(idx, outcome.reasoning));
+                    write_stream_item(sink, *stream, make_content_block_stop(idx));
                 }
 
                 if (tool_capable) {

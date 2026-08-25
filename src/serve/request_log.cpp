@@ -500,6 +500,7 @@ std::string format_server_start_json(
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"cuda_graph_observed_bytes", memory.cuda_graph_observed_bytes},
+             {"prefix_cache_bytes", memory.prefix_cache_bytes},
              {"kv_payload_bytes", memory.kv_payload_bytes}};
     record["environment"] =
         Json{{"device", environment.device},

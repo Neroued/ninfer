@@ -676,9 +676,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
     impl->device_reservation_bytes = checked_add(
         checked_add(
-            checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
-            impl->request_transient_capacity_bytes, "request transient reservation"),
-        impl->graph_allowance_bytes, "sequence graph allowance");
+            checked_add(
+                checked_add(impl->persistent.bytes, impl->workspace.capacity,
+                            "sequence memory plan"),
+                impl->request_transient_capacity_bytes, "request transient reservation"),
+            impl->graph_allowance_bytes, "sequence graph allowance"),
+        impl->prefix_cache_bytes, "prefix-seed store reservation");
     return impl;
 }
 

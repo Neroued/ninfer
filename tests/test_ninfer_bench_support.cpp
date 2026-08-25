@@ -242,6 +242,7 @@ qb::BenchEnvironment sample_environment() {
     env.memory.workspace                  = {100000000ULL, 0, 0};
     env.memory.request_transient          = {50000000ULL, 0, 40000000ULL};
     env.memory.cuda_graph_allowance_bytes = 150000000ULL;
+    env.memory.prefix_cache_bytes         = 4096ULL << 20;
     env.memory.kv_payload_bytes           = 123456ULL;
     env.max_context                       = 4096;
     env.prefill_chunk                     = 1024;
@@ -286,6 +287,8 @@ int test_report_contract() {
                "request transient capacity");
     failures += expect(report.at("memory").at("cuda_graph_allowance_bytes") == 150000000ULL,
                        "CUDA Graph allowance");
+    failures += expect(report.at("memory").at("prefix_cache_bytes") == (4096ULL << 20),
+                       "prefix cache reservation");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
     failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,

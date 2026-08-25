@@ -43,6 +43,34 @@ int main() {
                   explicit_capacity.runtime_reservation_bytes == 1128,
               "explicit KV capacity did not use page-aligned token semantics");
 
+    constexpr std::size_t kSeedStoreBytes = 4ULL << 30;
+    const ninfer::runtime::SequenceCapacityCurve with_seed{
+        .main_page_tokens                     = 64,
+        .minimum_main_page_groups             = 2,
+        .maximum_main_page_groups             = 6,
+        .minimum_device_reservation_bytes     = 1000 + kSeedStoreBytes,
+        .bytes_per_additional_main_page_group = 128,
+    };
+    const auto explicit_seed = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::explicit_capacity(129), with_seed, 1200 + kSeedStoreBytes);
+    failures += check(explicit_seed.main_page_groups == 3 &&
+                          explicit_seed.runtime_reservation_bytes == 1128 + kSeedStoreBytes &&
+                          explicit_seed.planned_slack_bytes == 72,
+                      "explicit reservation omitted the constant seed-store term");
+
+    const auto automatic_seed = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(50), with_seed, 1360 + kSeedStoreBytes);
+    failures +=
+        check(automatic_seed.main_page_groups == 4 && automatic_seed.resolved_tokens == 256 &&
+                  automatic_seed.runtime_reservation_bytes == 1256 + kSeedStoreBytes &&
+                  automatic_seed.planned_slack_bytes == 104,
+              "automatic KV capacity did not keep the seed-store term as a constant addend");
+
+    const auto zero_seed = ninfer::runtime::resolve_kv_capacity(
+        ninfer::KvCapacityPolicy::explicit_capacity(129), curve, 1200);
+    failures += check(zero_seed.runtime_reservation_bytes == 1128,
+                      "zero extra reservation term changed explicit accounting");
+
     bool insufficient_rejected = false;
     try {
         (void)ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(50), curve,

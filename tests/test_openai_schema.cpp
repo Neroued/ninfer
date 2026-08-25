@@ -882,9 +882,64 @@ int test_finish_reason_wire() {
                       "stop token wire");
     failures +=
         check(std::string(finish_reason_wire(ninfer::FinishReason::OutputLimit)) == "length",
-              "output limit wire");
+               "output limit wire");
     failures += check(std::string(finish_reason_wire(ninfer::FinishReason::Cancelled)) == "stop",
                       "cancelled maps to stop");
+    return failures;
+}
+
+int test_parse_content_parts_allowed_types() {
+    int failures = 0;
+    ChatTurn turn;
+    const Json valid_text = Json::array({Json{{"type", "text"}, {"text", "hello"}}});
+    parse_content_parts(valid_text, turn, 0, {"text"});
+    failures += check(turn.content.size() == 1, "text parsed with allowed_types");
+
+    ChatTurn media_turn;
+    const Json media_parts = Json::array({
+        Json{{"type", "text"}, {"text", "result"}},
+        Json{{"type", "image_url"}, {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}
+    });
+    parse_content_parts(media_parts, media_turn, 0, {"text", "image_url"});
+    failures += check(media_turn.content.size() == 2, "text+image parsed with allowed_types");
+
+    bool rejected = false;
+    std::string error_message;
+    try {
+        ChatTurn rejected_turn;
+        parse_content_parts(media_parts, rejected_turn, 0, {"text"});
+    } catch (const ApiException& e) {
+        rejected      = true;
+        error_message = e.error().message;
+    }
+    failures += check(rejected, "disallowed media part was rejected");
+    failures += check(error_message.find("content parts must have type 'text'") != std::string::npos,
+                      "error message lists allowed types");
+
+    return failures;
+}
+
+int test_parse_tool_message_content_parts() {
+    int failures = 0;
+    const Json body = {
+        {"model", "m"},
+        {"messages", Json::array({
+            Json{{"role", "user"}, {"content", "run screenshot"}},
+            Json{{"role", "assistant"}, {"content", nullptr}, {"tool_calls", Json::array({
+                Json{{"id", "call_1"}, {"type", "function"}, {"function", Json{{"name", "screenshot"}, {"arguments", "{}"}}}}
+            })}},
+            Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", Json::array({
+                Json{{"type", "text"}, {"text", "captured:"}},
+                Json{{"type", "image_url"}, {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}}
+            })}}
+        })}
+    };
+    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
+    failures += check(req.messages.size() == 3, "parsed 3 messages");
+    failures += check(req.messages[2].role == ninfer::ChatRole::Tool, "third message is tool role");
+    failures += check(req.messages[2].content.size() == 2, "tool message has 2 content parts");
+    failures += check(req.messages[2].content[0].kind == ContentKind::Text, "tool content part 0 is text");
+    failures += check(req.messages[2].content[1].kind == ContentKind::Image, "tool content part 1 is image");
     return failures;
 }
 
@@ -911,6 +966,8 @@ int main() {
     failures += test_tool_chunk_serialization();
     failures += test_models_and_error();
     failures += test_finish_reason_wire();
+    failures += test_parse_content_parts_allowed_types();
+    failures += test_parse_tool_message_content_parts();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

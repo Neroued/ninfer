@@ -189,13 +189,13 @@ void check_preparation_control(Clock::time_point deadline,
 
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
-    ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls)
-        : sink_(&sink), filter_tool_calls_(filter_tool_calls) {}
+    ServiceOutputSink(const StreamSink& sink, bool filter_tool_calls, bool hold_reasoning)
+        : sink_(&sink), filter_tool_calls_(filter_tool_calls), hold_reasoning_(hold_reasoning) {}
 
     void publish(ninfer::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
-            if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
+            if (!hold_reasoning_ && sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
         } else {
             std::string visible =
                 filter_tool_calls_ ? tool_filter_.feed(delta.text) : std::move(delta.text);
@@ -217,6 +217,7 @@ private:
 
     const StreamSink* sink_ = nullptr;
     bool filter_tool_calls_ = false;
+    bool hold_reasoning_    = false;
     ToolCallStreamFilter tool_filter_;
     std::size_t content_bytes_ = 0;
 };
@@ -358,7 +359,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;
     if (sink != nullptr) {
-        output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared.tool_capable);
+        output_sink = std::make_unique<ServiceOutputSink>(
+            *sink, prepared.tool_capable,
+            prepared.tool_capable && options_.tolerant_tool_calls);
     }
     ninfer::OutputSink* public_sink = output_sink.get();
     ninfer::CancellationView cancellation;
@@ -405,10 +408,24 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     bool is_tool_call_response = false;
     if (prepared.tool_capable) {
         ParsedToolCallOutput parsed =
-            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
+            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length,
+                                        options_.tolerant_tool_calls);
         outcome.text          = std::move(parsed.content);
         is_tool_call_response = parsed.is_tool_call_response;
-        if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }
+        if (is_tool_call_response) {
+            outcome.tool_calls = std::move(parsed.tool_calls);
+        } else if (options_.tolerant_tool_calls && !outcome.reasoning.empty()) {
+            // A Qwen drift can emit the call before </think>. In that case the
+            // frontend correctly classifies it as reasoning, so give the same
+            // tolerant recovery path a chance before returning raw XML.
+            ParsedToolCallOutput reasoning_parsed =
+                parse_qwen_tool_call_output(outcome.reasoning, prepared.tool_name_max_length, true);
+            if (reasoning_parsed.is_tool_call_response) {
+                outcome.reasoning     = std::move(reasoning_parsed.content);
+                outcome.tool_calls    = std::move(reasoning_parsed.tool_calls);
+                is_tool_call_response = true;
+            }
+        }
     }
     if (output_sink) {
         outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);

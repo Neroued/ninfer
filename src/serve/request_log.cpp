@@ -448,7 +448,8 @@ std::string format_server_start_json(
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
                               {"default_thinking", options.enable_thinking},
-                              {"default_preserve_thinking", options.preserve_thinking}};
+                              {"default_preserve_thinking", options.preserve_thinking},
+                              {"tolerant_tool_calls", options.tolerant_tool_calls}};
     record["artifact"] = Json{{"path", options.artifact_path},
                               {"size_bytes", std::move(artifact_size)},
                               {"target", load.target},

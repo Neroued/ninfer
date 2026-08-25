@@ -23,6 +23,11 @@ namespace ninfer::serve {
 GenerationRequest parse_chat_completion_request(const nlohmann::json& body,
                                                 const RequestLimits& limits);
 
+// Parse a message's `content` field (string or content-part array) into `turn.content`.
+// A non-empty `allowed_types` rejects parts whose `type` is not listed.
+void parse_content_parts(const nlohmann::json& content, ChatTurn& turn, std::size_t index,
+                         std::vector<std::string> allowed_types = {});
+
 std::optional<bool> parse_openai_template_enable_thinking(const nlohmann::json& body);
 void apply_openai_enable_thinking(const nlohmann::json& body, GenerationRequest& out);
 std::optional<bool> parse_openai_preserve_thinking(const nlohmann::json& body);

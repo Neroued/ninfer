@@ -389,3 +389,101 @@ To test the uncooperative hang fallback, run with a short watchdog timeout:
   [YYYY-MM-DD HH:MM:SS.mmm] [error] ninfer-serve: boot watchdog timeout (1 s) exceeded before reaching listening state; terminating process
   ```
 - The watchdog terminates the process immediately via `std::_Exit(1)`.
+
+---
+
+## Issue #5: Tool-calling robustness and multimodal tool results
+
+Schema and parser test suites (`ninfer_tool_call_parser_test`, `ninfer_openai_schema_test`)
+validate the tolerant parser and content parts on CPU without GPU memory. Live-model
+validation for multimodal tool results and parallel tool-calling loops is documented below.
+
+### 1. Multimodal tool result (screenshot in tool message)
+
+Start server with `--vision` and `--tolerant-tool-calls`:
+
+```bash
+BASE=http://127.0.0.1:8018
+MODEL=qwen3.8-27b
+
+# Turn 1 + 2: User requests screenshot, assistant calls tool, tool returns image data part
+curl -sS "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+  \"model\": \"$MODEL\",
+  \"messages\": [
+    {\"role\": \"user\", \"content\": \"Take a screenshot and describe what you see.\"},
+    {
+      \"role\": \"assistant\",
+      \"content\": null,
+      \"tool_calls\": [
+        {
+          \"id\": \"call_screenshot_001\",
+          \"type\": \"function\",
+          \"function\": {\"name\": \"take_screenshot\", \"arguments\": \"{}\"}
+        }
+      ]
+    },
+    {
+      \"role\": \"tool\",
+      \"tool_call_id\": \"call_screenshot_001\",
+      \"content\": [
+        {\"type\": \"text\", \"text\": \"Screenshot taken successfully:\"},
+        {
+          \"type\": \"image_url\",
+          \"image_url\": {\"url\": \"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\"}
+        }
+      ]
+    }
+  ],
+  \"max_completion_tokens\": 128,
+  \"temperature\": 0,
+  \"seed\": 0
+}"
+```
+
+**Expected Observable Outcome**:
+- HTTP 200 OK.
+- The Engine decodes the base64 PNG in the tool message turn, preprocesses image patches via the Vision pipeline, and generates a description of the image content.
+- `finish_reason` is `"stop"`.
+- Token usage reports both text tokens and vision patch tokens in `prompt_tokens`.
+
+### 2. Live tolerant tool-call recovery
+
+When `--tolerant-tool-calls` is enabled on the server, the parser recovers complete tool calls even when the model emits duplicate closing tags or trailing suffixes (e.g. duplicate `</function>`, `</function_invocation>`, or trailing explanatory text after a complete function), or when the model omits the outer `</tool_call>` closing tag.
+
+```bash
+curl -sS "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+  \"model\": \"$MODEL\",
+  \"messages\": [
+    {\"role\": \"user\", \"content\": \"Search for weather in Tokyo using the get_weather tool.\"}
+  ],
+  \"tools\": [
+    {
+      \"type\": \"function\",
+      \"function\": {
+        \"name\": \"get_weather\",
+        \"description\": \"Get current weather for a city\",
+        \"parameters\": {
+          \"type\": \"object\",
+          \"properties\": {
+            \"city\": {\"type\": \"string\"}
+          },
+          \"required\": [\"city\"]
+        }
+      }
+    }
+  ],
+  \"tool_choice\": \"auto\",
+  \"max_completion_tokens\": 256,
+  \"temperature\": 0
+}"
+```
+
+**Expected Observable Outcome**:
+- HTTP 200 OK.
+- If the model generation produces a valid `<tool_call>` block with duplicate closing suffixes (e.g. `</function_invocation>`) or an unclosed `</tool_call>`:
+  - `choices[0].finish_reason` is `"tool_calls"`.
+  - `choices[0].message.tool_calls` contains the parsed function call (`get_weather` with `{"city":"Tokyo"}`).
+  - `choices[0].message.content` contains any text prefix before the `<tool_call>` tag (or null/empty if none).
+- If the output contains near-miss tag syntax (e.g. `<function name="...">` or `<call>`) or is cut off mid-parameter by token limits:
+  - The turn gracefully degrades to a plain text response with `finish_reason` `"stop"` or `"length"`.
+  - No internal 500 errors occur, and no phantom tool calls with empty/corrupted arguments are fabricated.

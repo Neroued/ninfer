@@ -13,6 +13,7 @@ RUN apt-get update \
         libswscale-dev \
         ninja-build \
         pkg-config \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

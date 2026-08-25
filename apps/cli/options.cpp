@@ -92,7 +92,7 @@ std::string usage_text(const char* argv0) {
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom.\n"
+           " MiB of sizing headroom (bounded by max-context).\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }

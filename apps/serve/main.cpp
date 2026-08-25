@@ -8,19 +8,79 @@
 #include <chrono>
 #include <csignal>
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
+#include <string>
+#include <thread>
+#include <typeinfo>
 #include <utility>
 
 namespace {
 
 std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
 
+class BootWatchdog {
+public:
+    explicit BootWatchdog(std::chrono::seconds timeout)
+        : timeout_(timeout), done_(std::make_shared<std::atomic<bool>>(false)) {
+        if (timeout_.count() <= 0) { return; }
+        auto done = done_;
+        std::thread([done, timeout = timeout_] {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (done->load(std::memory_order_relaxed)) { return; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (!done->load(std::memory_order_relaxed)) {
+                ninfer::serve::write_console_log(
+                    ninfer::serve::ConsoleLogLevel::Error,
+                    "boot watchdog timeout (" + std::to_string(timeout.count()) +
+                        " s) exceeded before reaching listening state; terminating process");
+                std::cerr.flush();
+                std::_Exit(1);
+            }
+        }).detach();
+    }
+
+    void disarm() {
+        if (done_) { done_->store(true, std::memory_order_relaxed); }
+    }
+
+    ~BootWatchdog() { disarm(); }
+
+private:
+    std::chrono::seconds timeout_{0};
+    std::shared_ptr<std::atomic<bool>> done_;
+};
+
 void handle_signal(int) {
     ninfer::serve::HttpServer* server = g_server.load();
     if (server != nullptr) { server->stop(); }
+}
+
+// An exception that escapes a request boundary ends the process through
+// std::terminate, and the default handler's message is the only record of which
+// exception it was. That message is worth writing through the server's own log:
+// under a container this process is pid 1, the kernel discards the SIGABRT that
+// abort() raises against itself, glibc falls through to its abort instruction,
+// and all the kernel reports is a bare protection fault inside libc.
+[[noreturn]] void log_terminate() {
+    std::string detail = "terminate called with no active exception";
+    if (std::current_exception() != nullptr) {
+        try {
+            std::rethrow_exception(std::current_exception());
+        } catch (const std::exception& error) {
+            detail = std::string("terminate called after throwing ") + typeid(error).name() + ": " +
+                     error.what();
+        } catch (...) { detail = "terminate called after throwing a non-std exception"; }
+    }
+    ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, detail);
+    std::cerr.flush();
+    std::abort();
 }
 
 std::string format_bytes(std::size_t bytes) {
@@ -39,13 +99,21 @@ std::string format_bytes(std::size_t bytes) {
 } // namespace
 
 int main(int argc, char** argv) {
+    std::set_terminate(log_terminate);
+    ninfer::serve::ServeOptions options;
     try {
-        const ninfer::serve::ServeOptions options = ninfer::serve::parse_serve_options(argc, argv);
-        if (options.help_requested) {
-            std::cout << ninfer::serve::serve_usage_text(argv[0]);
-            return 0;
-        }
+        options = ninfer::serve::parse_serve_options(argc, argv);
+    } catch (const std::exception& exception) {
+        ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
+        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
+        return 1;
+    }
+    if (options.help_requested) {
+        std::cout << ninfer::serve::serve_usage_text(argv[0]);
+        return 0;
+    }
 
+    try {
         using Clock = std::chrono::steady_clock;
         ninfer::serve::HttpServer server(options);
         if (!server.bind()) {
@@ -93,6 +161,8 @@ int main(int argc, char** argv) {
         }
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());
 
+        BootWatchdog watchdog(std::chrono::seconds(options.boot_watchdog_timeout_s));
+
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();
 
@@ -106,18 +176,19 @@ int main(int argc, char** argv) {
                   << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer") << ')';
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, listening.str());
 
+        watchdog.disarm();
+
         const bool ok = server.listen();
         g_server.store(nullptr);
         if (!ok) {
             ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error,
-                                             "failed to bind " + options.host + ':' +
+                                             "accept loop failed on " + options.host + ':' +
                                                  std::to_string(options.port));
             return 1;
         }
         return 0;
     } catch (const std::exception& exception) {
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error, exception.what());
-        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
         return 1;
     }
 }

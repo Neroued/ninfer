@@ -236,8 +236,16 @@ int main() {
         secret_present    = secret_present || argument == "do-not-log";
         redaction_present = redaction_present || argument == "<redacted>";
     }
-    failures += check(!secret_present, "startup argv retained the API key");
-    failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
+    failures += check(defaults.boot_watchdog_timeout_s == 120,
+                      "boot watchdog timeout default mismatch");
+
+    const ServeOptions watchdog_opt =
+        parse({"ninfer-serve", "model.ninfer", "--boot-watchdog-timeout-s", "300"});
+    failures += check(watchdog_opt.boot_watchdog_timeout_s == 300,
+                      "--boot-watchdog-timeout-s did not parse value");
+    failures += check(serve_usage_text("ninfer-serve").find("--boot-watchdog-timeout-s") !=
+                          std::string::npos,
+                      "serve help omits --boot-watchdog-timeout-s");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

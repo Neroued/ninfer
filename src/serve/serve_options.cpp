@@ -65,7 +65,7 @@ std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
-           "[--max-pending-requests N] [--pending-timeout-ms N] "
+           "[--max-pending-requests N] [--pending-timeout-ms N] [--boot-watchdog-timeout-s N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] [--prefix-cache-mib N] "
            "[--media-preprocess-threads N] "
@@ -81,6 +81,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
+           "       --boot-watchdog-timeout-s defaults to 120; 0 disables the pre-listen boot watchdog\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
            "       --prefix-cache-mib reserves device memory for cross-request prefix seeds; 0 "
@@ -156,6 +157,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+        } else if (arg == "--boot-watchdog-timeout-s" || arg == "--boot-watchdog-s") {
+            options.boot_watchdog_timeout_s = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value(arg.c_str()), "boot-watchdog-timeout-s"));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));

@@ -12,14 +12,50 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <typeinfo>
 #include <utility>
 
 namespace {
 
 std::atomic<ninfer::serve::HttpServer*> g_server{nullptr};
+
+class BootWatchdog {
+public:
+    explicit BootWatchdog(std::chrono::seconds timeout)
+        : timeout_(timeout), done_(std::make_shared<std::atomic<bool>>(false)) {
+        if (timeout_.count() <= 0) { return; }
+        auto done = done_;
+        std::thread([done, timeout = timeout_] {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (done->load(std::memory_order_relaxed)) { return; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (!done->load(std::memory_order_relaxed)) {
+                ninfer::serve::write_console_log(
+                    ninfer::serve::ConsoleLogLevel::Error,
+                    "boot watchdog timeout (" + std::to_string(timeout.count()) +
+                        " s) exceeded before reaching listening state; terminating process");
+                std::cerr.flush();
+                std::_Exit(1);
+            }
+        }).detach();
+    }
+
+    void disarm() {
+        if (done_) { done_->store(true, std::memory_order_relaxed); }
+    }
+
+    ~BootWatchdog() { disarm(); }
+
+private:
+    std::chrono::seconds timeout_{0};
+    std::shared_ptr<std::atomic<bool>> done_;
+};
 
 void handle_signal(int) {
     ninfer::serve::HttpServer* server = g_server.load();
@@ -125,6 +161,8 @@ int main(int argc, char** argv) {
         }
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, capacity.str());
 
+        BootWatchdog watchdog(std::chrono::seconds(options.boot_watchdog_timeout_s));
+
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, "warming up...");
         service.warmup();
 
@@ -138,11 +176,13 @@ int main(int argc, char** argv) {
                   << ", auth: " << (options.api_key.empty() ? "disabled" : "bearer") << ')';
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, listening.str());
 
+        watchdog.disarm();
+
         const bool ok = server.listen();
         g_server.store(nullptr);
         if (!ok) {
             ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Error,
-                                             "failed to bind " + options.host + ':' +
+                                             "accept loop failed on " + options.host + ':' +
                                                  std::to_string(options.port));
             return 1;
         }

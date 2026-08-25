@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/neroued/miniconda3/envs/py311/bin/python \"$(git rev-parse --show-toplevel)/.codex/hooks/clang_format.py\"",
+            "command": "/home/ledio/miniconda3/envs/py311/bin/python \"$(git rev-parse --show-toplevel)/.codex/hooks/clang_format.py\"",
             "timeout": 30,
             "statusMessage": "Formatting C++/CUDA files"
           }

@@ -280,6 +280,7 @@ PreparedRequest GenerationService::prepare(
     prepared.include_usage                 = request.include_usage;
     prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
     prepared.tool_name_max_length          = request.tool_name_max_length;
+    prepared.param_types                   = build_tool_param_type_map(request.tools);
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
     prepared.enable_thinking                   = semantics.enable_thinking;
@@ -407,9 +408,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
 
     bool is_tool_call_response = false;
     if (prepared.tool_capable) {
-        ParsedToolCallOutput parsed =
-            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length,
-                                        options_.tolerant_tool_calls);
+        ParsedToolCallOutput parsed = parse_qwen_tool_call_output(
+            outcome.text, prepared.tool_name_max_length, prepared.param_types,
+            options_.tolerant_tool_calls);
         outcome.text          = std::move(parsed.content);
         is_tool_call_response = parsed.is_tool_call_response;
         if (is_tool_call_response) {
@@ -418,8 +419,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
             // A Qwen drift can emit the call before </think>. In that case the
             // frontend correctly classifies it as reasoning, so give the same
             // tolerant recovery path a chance before returning raw XML.
-            ParsedToolCallOutput reasoning_parsed =
-                parse_qwen_tool_call_output(outcome.reasoning, prepared.tool_name_max_length, true);
+            ParsedToolCallOutput reasoning_parsed = parse_qwen_tool_call_output(
+                outcome.reasoning, prepared.tool_name_max_length, prepared.param_types, true);
             if (reasoning_parsed.is_tool_call_response) {
                 outcome.reasoning     = std::move(reasoning_parsed.content);
                 outcome.tool_calls    = std::move(reasoning_parsed.tool_calls);

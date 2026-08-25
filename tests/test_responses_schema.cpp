@@ -418,6 +418,12 @@ int test_explicit_rejections() {
     failures += check(api_code([&] { (void)parse_responses_request(too_small, limits()); }) ==
                           "invalid_value",
                       "OpenAI minimum max_output_tokens enforced");
+
+    Json dup     = base;
+    dup["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"parameters", Json::object()}, {"strict", false}},
+                                Json{{"type", "function"}, {"name", "f"}, {"parameters", Json::object()}, {"strict", false}}});
+    failures += check(throws_api([&] { (void)parse_responses_request(dup, limits()); }),
+                      "duplicate function tool names rejected");
     return failures;
 }
 

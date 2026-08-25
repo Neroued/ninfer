@@ -554,6 +554,13 @@ int test_parse_function_tools_and_choices() {
     failures +=
         check(throws_api([&] { (void)parse_chat_completion_request(unknown, default_limits()); }),
               "unknown named tool_choice rejected");
+
+    // Duplicate function tool names are rejected (matches Responses behavior).
+    Json dup           = base;
+    dup["tools"]       = Json::array({tool, tool});
+    failures +=
+        check(throws_api([&] { (void)parse_chat_completion_request(dup, default_limits()); }),
+              "duplicate function tool names rejected");
     return failures;
 }
 

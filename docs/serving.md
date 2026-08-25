@@ -655,8 +655,25 @@ context-capacity finishes map to `length`/ `max_tokens`; ordinary model or strin
 `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+responses. Inside an explicit `<tool_call>`/`<function=NAME>` wrapper the argument payload may be
+either `<parameter=KEY>` blocks or a single JSON object; JSON-object arguments are typed with the
+same declared-schema rules as parameter blocks. Forms that only resemble tool syntax
+(`[tool_use:…]`, bare `tool_call:`/`arguments:`, or a `<function>` without `<tool_call>`) are not
+parsed as calls. A successful parse leaves assistant `content` empty (OpenAI `content: null` when
+`tool_calls` are present); a preamble before the wrapper is not returned as user-visible text.
+NInfer does not execute tools and does not validate tool arguments against the full
+client JSON Schema through constrained decoding; that remains the client's responsibility. When
+parsing a generated call, NInfer does consult the top-level parameter `"type"` declared in each
+tool's schema to decide whether a parameter value that is valid JSON may be deserialized into the
+corresponding JSON type (number, boolean, array, object, null): only parameters whose declared
+type(s) are all valid non-string JSON Schema types are deserialized. Parameters typed as `"string"`
+(or declared via a type array that includes `"string"`), parameters with an unknown or misspelled
+`"type"`, and parameters absent from the schema preserve the model's raw text so the string
+contract reaches the client intact. Full JSON Schema validation (constraints, required sets,
+formats, nested keywords) is not performed server-side and remains the client's job.
+Duplicate tool names within a single request are rejected with a 400 on all three
+protocol surfaces (OpenAI Chat Completions, OpenAI Responses, Anthropic Messages),
+keeping the per-tool parameter type map unambiguous.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

@@ -40,4 +40,13 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tenso
 // from x; Q versus K role does not change the transformation.
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x, cudaStream_t stream);
 
+/**
+ * Fused q/k RMS-norm (unit-offset weights) + rotary. For the Text D=256 rotary-64
+ * geometries (16Q/2K and 24Q/4K) this runs one kernel; any other geometry falls
+ * back to rmsnorm + rmsnorm + rope with identical results.
+ */
+void qk_norm_rope(const Tensor& positions, int rotary_dim, float theta, const Tensor& q_in,
+                  const Tensor& q_weight, Tensor& q_out, const Tensor& k_in,
+                  const Tensor& k_weight, Tensor& k_out, float eps, cudaStream_t stream);
+
 } // namespace ninfer::ops

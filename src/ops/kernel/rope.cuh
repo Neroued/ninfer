@@ -5,6 +5,8 @@
 // D/R=128/128, plus packed Vision 16Q/16K at D/R=72/72. One CTA owns one token and shares its
 // rotary coefficients across heads.
 
+#include "ops/kernel/rmsnorm.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cmath>
@@ -112,6 +114,78 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
     data2[lane] = __floats2bfloat162_rn(first.x * c0 - second.x * s0, first.y * c1 - second.y * s1);
     data2[lane + kHalfPair] =
         __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
+}
+
+// Fused q/k RMS-norm for the Text D=256, rotary-64 decode geometries. One CTA per
+// token, warp-per-head (QHeads query rows then KHeads key rows). The norm body
+// replicates rmsnorm_warp_bf16x2_kernel (Offset epilogue, identical reduction and
+// BF16x2 rounding), so the pair of standalone norm kernels it replaces is preserved
+// bit-for-bit.
+//
+// The rotary step stays in its own kernel on purpose. Folding it in - reusing the
+// freshly rounded pair and exchanging its partner through shfl_xor(16) - reproduces
+// every formula, coefficient and rounding of apply_rope_head, yet still drifts from
+// the standalone rope kernel by a last-bit amount that surfaces as a diverged token
+// deep inside long greedy generations and costs about one percent of MTP throughput
+// through a lower draft acceptance rate.
+template <int QHeads, int KHeads>
+__launch_bounds__((QHeads + KHeads) * 32) __global__ void qk_norm_rope_text_kernel(
+    const std::int32_t* __restrict__ positions, const __nv_bfloat162* __restrict__ q_in,
+    const __nv_bfloat162* __restrict__ q_weight, __nv_bfloat162* __restrict__ q_out,
+    const __nv_bfloat162* __restrict__ k_in, const __nv_bfloat162* __restrict__ k_weight,
+    __nv_bfloat162* __restrict__ k_out, float eps) {
+    constexpr int kPairs   = 128;
+    constexpr int kQStride = QHeads * kPairs;
+    constexpr int kKStride = KHeads * kPairs;
+    const int token = static_cast<int>(blockIdx.x);
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int warp  = static_cast<int>(threadIdx.x) >> 5;
+
+    // Rotary coefficients: lane l owns scalar pair l, same inputs as fixed_sincos.
+    float lane_sin = 0.0f;
+    float lane_cos = 0.0f;
+    {
+        const float angle = static_cast<float>(positions[token]) * kTextRopeInvFrequency[lane];
+        sincosf(angle, &lane_sin, &lane_cos);
+    }
+    const int half = lane & 15;
+    const float c0 = __shfl_sync(kFullWarpMask, lane_cos, half * 2);
+    const float c1 = __shfl_sync(kFullWarpMask, lane_cos, half * 2 + 1);
+    const float s0 = __shfl_sync(kFullWarpMask, lane_sin, half * 2);
+    const float s1 = __shfl_sync(kFullWarpMask, lane_sin, half * 2 + 1);
+
+    const bool is_q         = warp < QHeads;
+    const int head          = is_q ? warp : warp - QHeads;
+    const __nv_bfloat162* x = is_q ? q_in : k_in;
+    const __nv_bfloat162* w = is_q ? q_weight : k_weight;
+    __nv_bfloat162* out     = is_q ? q_out : k_out;
+    const std::int64_t row_base =
+        static_cast<std::int64_t>(token) * (is_q ? kQStride : kKStride) +
+        static_cast<std::int64_t>(head) * kPairs;
+
+    __nv_bfloat162 values[4];
+    float sum = 0.0f;
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        const int pair  = lane + item * 32;
+        values[item]    = x[row_base + pair];
+        const float2 xf = __bfloat1622float2(values[item]);
+        sum += xf.x * xf.x + xf.y * xf.y;
+    }
+    sum       = warp_reduce_sum(sum);
+    float inv = lane == 0 ? rsqrtf(sum / static_cast<float>(256) + eps) : 0.0f;
+    inv       = __shfl_sync(kFullWarpMask, inv, 0);
+
+#pragma unroll
+    for (int item = 0; item < 4; ++item) {
+        const int pair  = lane + item * 32;
+        const float2 xf = __bfloat1622float2(values[item]);
+        const float2 wf = __bfloat1622float2(w[pair]);
+        __nv_bfloat162 stored =
+            __floats2bfloat162_rn(rmsnorm_epilogue<RmsEpilogue::Offset>(xf.x, inv, wf.x, 0.0f),
+                                  rmsnorm_epilogue<RmsEpilogue::Offset>(xf.y, inv, wf.y, 0.0f));
+        out[row_base + pair] = stored;
+    }
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>

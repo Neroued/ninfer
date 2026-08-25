@@ -147,7 +147,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, __nv_bfloat16* out, const __nv_bfloat16* __restrict__ gate) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -206,7 +206,13 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     if (head_m == -CUDART_INF_F) {
         const int d = d_start + tid;
         if (tid < DChunk && d < kGqaHeadDim) {
-            out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0f);
+            const auto zero_index = gqa_q_index<Geometry>(q_head, d, output_column);
+            if (gate == nullptr) {
+                out[zero_index] = __float2bfloat16(0.0f);
+            } else {
+                const float gated = 0.0f * sigmoid(__bfloat162float(gate[zero_index]));
+                out[zero_index]   = __float2bfloat16_rn(gated);
+            }
         }
         return;
     }
@@ -254,8 +260,18 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         if constexpr (Offset) { absolute_column += column_begin; }
         valid = absolute_column < valid_columns[batch];
     }
-    const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    const float value    = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
+    const auto out_index = gqa_q_index<Geometry>(q_head, d, output_column);
+    if (gate == nullptr) {
+        out[out_index] = __float2bfloat16(value);
+    } else {
+        // Fused sigmoid gate. The standalone elementwise kernel reads the BF16 value
+        // this store would have produced, so replicate its arithmetic exactly: round
+        // the reduce result to BF16 first, multiply in FP32, round-to-nearest store.
+        const __nv_bfloat16 reduced = __float2bfloat16(value);
+        const float gated = __bfloat162float(reduced) * sigmoid(__bfloat162float(gate[out_index]));
+        out[out_index]    = __float2bfloat16_rn(gated);
+    }
 }
 
 } // namespace ninfer::ops

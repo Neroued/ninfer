@@ -1,6 +1,7 @@
 #pragma once
 
 #include "targets/qwen3_6_35b_a3b/impl/config.h"
+#include "ninfer/ops/sparse_moe.h"
 #include "targets/qwen3_6_35b_a3b/impl/load/bindings.h"
 #include <ninfer/targets/qwen3_6/runtime.h>
 
@@ -25,6 +26,17 @@ struct Variant {
     using MtpPostMixerWeights            = detail::SparseMoePayload;
     using VisionWeights                  = qwen3_6::VisionWeights;
     using GraphExecutionProfile          = detail::GraphExecutionProfile;
+
+    static ::ninfer::ops::WeightPrefetchSpan
+    projection_prefetch_span(const FullAttentionProjectionWeights& weights) {
+        return {weights.query_key_gate_value.qdata,
+                static_cast<std::size_t>(weights.query_key_gate_value.payload_bytes)};
+    }
+    static ::ninfer::ops::WeightPrefetchSpan
+    projection_prefetch_span(const GdnProjectionWeights& weights) {
+        return {weights.query_key_value_z.qdata,
+                static_cast<std::size_t>(weights.query_key_value_z.payload_bytes)};
+    }
 
     static constexpr float attention_scale                     = kAttentionScale;
     static constexpr float gdn_scale                           = kGdnScale;
@@ -85,7 +97,7 @@ struct Variant {
                                             WorkspaceArena& workspace, cudaStream_t stream);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                           cudaStream_t stream);
+                           cudaStream_t stream, ops::WeightPrefetchSpan next_prefetch = {});
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 

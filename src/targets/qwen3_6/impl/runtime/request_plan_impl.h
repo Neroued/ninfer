@@ -173,7 +173,9 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         (base->rewrite_checkpoint &&
                  base->rewrite_checkpoint->frontier < base->summary.prompt_tokens
              ? 1ULL
-             : 0ULL);
+             : 0ULL) +
+        // A planned seed capture may split its chunk when the rewrite capture shares it.
+        (base->prefix_seed_frontier ? 1ULL : 0ULL);
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits);
     return RequestBasePlan(std::move(base));
@@ -288,6 +290,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         speculative_backend != SpeculativeBackend::DFlash &&
         (plan->rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew ||
          plan->rewrite_checkpoint_action == RewriteCheckpointAction::Drop) &&
+        *base.prefix_seed_frontier >= kMinimumSeedFrontierTokens &&
         *base.prefix_seed_frontier > plan->reuse_base &&
         !prefix_seeds.contains(prompt, *base.prefix_seed_frontier)) {
         plan->seed_capture = base.prefix_seed_frontier;
@@ -345,7 +348,9 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         (plan->rewrite_checkpoint_capture &&
                  plan->rewrite_checkpoint_capture->frontier < plan->summary.prompt_tokens
              ? 1ULL
-             : 0ULL);
+             : 0ULL) +
+        // The seed capture splits its chunk when the rewrite capture lands in the same one.
+        (plan->seed_capture ? 1ULL : 0ULL);
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, plan->reuse_base, prefill_chunk, prefill_splits);
     return RequestPlan(std::move(plan));

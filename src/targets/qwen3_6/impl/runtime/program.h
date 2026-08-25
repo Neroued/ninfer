@@ -29,6 +29,9 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 using PreparedPromptData    = qwen3_6::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_6::RewriteCheckpointKind;
 // (prefix-seed store: see targets/qwen3_6/impl/runtime/prefix_seed_store.h)
+// A seed entry costs a fixed Linear Attention state image regardless of its frontier, so tiny
+// prompts (warmup probes, smoke requests) are not worth a capture.
+inline constexpr std::uint32_t kMinimumSeedFrontierTokens = 256;
 using RewriteCheckpointSpec = qwen3_6::RewriteCheckpointSpec;
 
 using ReusePath = ninfer::PrefixReusePath;

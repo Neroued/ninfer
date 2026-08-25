@@ -139,6 +139,33 @@ Pass only if all of:
 If (2) or (5) fails, drop the pick. If (4) fails, the seed-store contract
 regressed and the pick is not adoptable.
 
+### Long greedy generation
+
+A 32-token probe cannot catch the 1-ulp class recorded in `src/ops/kernel/rope.cuh`:
+in-kernel rotary drift that "surfaces as a diverged token deep inside long greedy
+generations." Add one long greedy request per arm, same cold-start process as
+the short probe (or a third request after it).
+
+```json
+{
+  "model": "qwen3.8-27b",
+  "messages": [{"role": "user", "content": "Write a detailed technical explanation of speculative decoding with MTP, including a worked numeric example."}],
+  "max_completion_tokens": 2048,
+  "temperature": 0,
+  "seed": 0
+}
+```
+
+Send it twice (cold, then seeded) on arm A and arm B. Pass only if:
+
+1. All four HTTP 200, `finish_reason` is `stop` or `length`.
+2. `choices[0].message.content` is byte-identical across the four responses
+   (both arms, cold and seeded).
+3. Seeded `prefix_reuse_path` is not `full_reset`.
+
+A mismatch anywhere in the 2048-token body fails the pick even if the 32-token
+probe passed.
+
 ## GPU lock
 
 Only the coordinator runs this. Before any process that allocates GPU

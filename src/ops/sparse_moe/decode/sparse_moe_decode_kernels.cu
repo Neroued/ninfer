@@ -69,6 +69,9 @@ __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __
 
 // Ticket for the last-arriving D1 block. atomicInc wraps at gridDim.x - 1, so the counter returns
 // to zero on its own and needs no host-side initialisation or workspace slot.
+// Safety: one Engine per process, one compute stream. A second concurrent D1 grid on this
+// device shares the ticket and silently corrupts routing. Today's executor is a single
+// worker on device.stream; PDL dependents complete before the next decode step.
 __device__ unsigned int g_sparse_moe_route_ticket = 0;
 
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
@@ -110,6 +113,11 @@ __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
         __threadfence();
         const unsigned int ticket = atomicInc(&g_sparse_moe_route_ticket, gridDim.x - 1u);
         is_last_block             = ticket == gridDim.x - 1u;
+        // Writer stores were fence-then-atomicInc. The winning block's later loads of all
+        // 257 scores still need a device-scope fence before those loads; without it this
+        // matches the canonical last-block pattern but is a PTX-model race (stale L1 on a
+        // future arch would change top-8 routing with no error).
+        if (is_last_block) { __threadfence(); }
     }
     __syncthreads();
     if (is_last_block && warp == 0) {

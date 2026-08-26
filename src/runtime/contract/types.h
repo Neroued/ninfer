@@ -237,15 +237,26 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
-    const unsigned __int128 suffix      = suffix_tokens;
-    const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
-    const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
-    constexpr unsigned __int128 maximum = ~static_cast<unsigned __int128>(0);
-    const unsigned __int128 attention =
-        triangular > maximum - linear ? maximum : linear + triangular;
-    result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
-                                 ? std::numeric_limits<std::uint64_t>::max()
-                                 : static_cast<std::uint64_t>(attention);
+    // Overflow-safe without __int128 (MSVC): each term saturates, then the
+    // sum saturates — equivalent to the original min(true_sum, max) clamp.
+    const std::uint64_t max64 = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t linear =
+        prefix_tokens != 0 && suffix_tokens > max64 / prefix_tokens
+            ? max64
+            : prefix_tokens * suffix_tokens;
+    std::uint64_t triangular;
+    if (suffix_tokens == max64) {
+        triangular = max64; // suffix + 1 would overflow
+    } else {
+        // Split the even factor so both operands stay <= suffix:
+        // suffix*(suffix+1)/2 == (suffix/2)*(suffix+1) or suffix*((suffix+1)/2).
+        const std::uint64_t a =
+            suffix_tokens % 2U == 0U ? suffix_tokens / 2U : suffix_tokens;
+        const std::uint64_t b =
+            suffix_tokens % 2U == 0U ? suffix_tokens + 1U : (suffix_tokens + 1U) / 2U;
+        triangular = (a != 0 && b > max64 / a) ? max64 : a * b;
+    }
+    result.attention_pairs = triangular > max64 - linear ? max64 : linear + triangular;
     return result;
 }
 

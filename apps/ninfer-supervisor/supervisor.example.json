@@ -1,0 +1,29 @@
+{
+  "engine": {
+    "executable": "P:/NInfer/build-win/apps/ninfer-serve.exe",
+    "args": [
+      "P:/models/qwen3_8_27b_nvfp4.ninfer",
+      "--host", "127.0.0.1",
+      "--port", "8010"
+    ],
+    "workdir": "P:/NInfer",
+    "api_key_file": "P:/models/ninfer-api-key.txt",
+    "engine_host": "127.0.0.1",
+    "engine_port": 8010,
+    "request_log": "",
+    "device": 0
+  },
+  "supervisor": {
+    "host": "127.0.0.1",
+    "port": 8099,
+    "bind_any": false,
+    "logs_dir": "P:/NInfer/supervisor-logs",
+    "run_at_login": false,
+    "restart": {
+      "max_backoff_s": 60,
+      "crash_loop_window_s": 60,
+      "crash_loop_max": 5,
+      "health_fail_threshold": 3
+    }
+  }
+}

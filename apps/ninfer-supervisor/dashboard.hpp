@@ -47,6 +47,15 @@ inline constexpr std::string_view kDashboardHtml = R"HTML(<!DOCTYPE html>
   button:hover { border-color: var(--accent); }
   pre { margin: 0; max-height: 280px; overflow: auto; white-space: pre-wrap;
     font: 12px/1.35 Consolas, "Cascadia Mono", monospace; color: #c5d0e0; }
+  .span2 { grid-column: 1 / -1; }
+  .finding { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
+  .finding .title { font-weight: 600; }
+  .finding .stmt { margin: 6px 0; }
+  .finding .meta { color: var(--muted); font-size: 12px; }
+  .finding.unavailable { border-color: #3a2f10; }
+  .finding.warning { border-color: var(--warn); }
+  .finding.critical { border-color: var(--bad); }
+  .finding pre { max-height: 140px; }
 </style>
 </head>
 <body>
@@ -59,9 +68,9 @@ inline constexpr std::string_view kDashboardHtml = R"HTML(<!DOCTYPE html>
     <h2>Engine</h2>
     <div class="row"><span>state</span><span id="state" class="pill warn">…</span></div>
     <div class="row"><span>health</span><span id="health" class="num">…</span></div>
-    <div class="row"><span>pid</span><span id="pid" class="num">—</span></div>
-    <div class="row"><span>uptime</span><span id="uptime" class="num">—</span></div>
-    <div class="row"><span>restarts</span><span id="restarts" class="num">0</span></div>
+    <div class="row owned-only"><span>pid</span><span id="pid" class="num">—</span></div>
+    <div class="row owned-only"><span>uptime</span><span id="uptime" class="num">—</span></div>
+    <div class="row owned-only"><span>restarts</span><span id="restarts" class="num">0</span></div>
     <div class="row"><span>last event</span><span id="event" class="muted">—</span></div>
     <div id="actions" class="actions" style="margin-top:12px">
       <button data-act="start">Start</button>
@@ -88,9 +97,14 @@ inline constexpr std::string_view kDashboardHtml = R"HTML(<!DOCTYPE html>
     <div class="row"><span>reuse mix</span><span id="reuse" class="num">—</span></div>
     <div class="row"><span>log</span><span id="lognote" class="muted">—</span></div>
   </section>
-  <section>
+  <section id="logsec">
     <h2>Engine log tail</h2>
     <pre id="log">waiting…</pre>
+  </section>
+  <section class="span2">
+    <h2>Insights</h2>
+    <p class="muted" id="insrc">same objects as GET /api/insights</p>
+    <div id="insights"></div>
   </section>
 </main>
 <script>
@@ -104,6 +118,9 @@ function apply(s){
     ? "monitor-only · no spawn/stop · live SSE"
     : "loopback control surface · live SSE";
   document.getElementById("actions").style.display = s.monitor_only ? "none" : "flex";
+  document.querySelectorAll(".owned-only").forEach(el=>{
+    el.style.display = s.monitor_only ? "none" : "";
+  });
   document.getElementById("health").textContent = (s.health&&s.health.body)||"—";
   document.getElementById("pid").textContent = st.pid||"—";
   document.getElementById("uptime").textContent = st.uptime_s!=null ? st.uptime_s+" s" : "—";
@@ -129,8 +146,33 @@ function apply(s){
   document.getElementById("decode").textContent = r.decode_tok_s_mean? r.decode_tok_s_mean.toFixed(1)+" tok/s":"—";
   document.getElementById("reuse").textContent = "reset "+(r.reuse_full_reset||0)+" · append "+(r.reuse_append||0)+" · seed/restore "+(r.reuse_seed||0);
   document.getElementById("lognote").textContent = r.log_available? "ok" : (r.log_error||"not configured");
-  document.getElementById("log").textContent = s.log_tail||"";
+  if(s.monitor_only){
+    document.getElementById("log").textContent =
+      "unmanaged engine: no child stdout. This is not an empty log.";
+  } else {
+    document.getElementById("log").textContent = s.log_tail||"";
+  }
+  const rep=s.insights||{};
+  const src=rep.source||{};
+  document.getElementById("insrc").textContent =
+    "GET /api/insights · source "+(src.request_log||"?")+(src.path? " · "+src.path:"");
+  const box=document.getElementById("insights");
+  box.innerHTML="";
+  (rep.insights||[]).forEach(it=>{
+    const d=document.createElement("div");
+    const avail=it.availability||"available";
+    d.className="finding "+avail+" "+(it.severity||"");
+    const over=it.measured_over||{};
+    d.innerHTML = "<div class='title'>"+esc(it.title||it.id)+"</div>"+
+      "<div class='stmt'>"+esc(it.statement||"")+"</div>"+
+      "<div class='meta'>"+esc(it.id)+" · "+esc(avail)+" · "+esc(it.confidence||"")+
+      " · measured_over requests="+(over.requests!=null?over.requests:"?")+
+      (it.recommendation? " · "+esc(it.recommendation):"")+"</div>"+
+      "<pre>"+esc(JSON.stringify(it.evidence||{},null,2))+"</pre>";
+    box.appendChild(d);
+  });
 }
+function esc(t){ return String(t==null?"":t).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
 async function act(name){
   await fetch("/api/"+name,{method:"POST", headers:{"X-NInfer-Supervisor":"1"}});
 }

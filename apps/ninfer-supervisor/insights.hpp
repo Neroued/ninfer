@@ -1,0 +1,334 @@
+#pragma once
+
+#include "logic.hpp"
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace ninfer::supervisor {
+
+inline nlohmann::json insight_unavailable(std::string id, std::string title, std::string statement,
+                                          nlohmann::json evidence = nlohmann::json::object()) {
+    return {{"id", std::move(id)},
+            {"severity", "notice"},
+            {"title", std::move(title)},
+            {"statement", std::move(statement)},
+            {"evidence", std::move(evidence)},
+            {"recommendation", ""},
+            {"confidence", "measured"},
+            {"measured_over", {{"requests", 0}}},
+            {"availability", "unavailable"}};
+}
+
+inline nlohmann::json insight_available(std::string id, std::string severity, std::string title,
+                                        std::string statement, nlohmann::json evidence,
+                                        std::string recommendation, std::string confidence,
+                                        nlohmann::json measured_over) {
+    return {{"id", std::move(id)},
+            {"severity", std::move(severity)},
+            {"title", std::move(title)},
+            {"statement", std::move(statement)},
+            {"evidence", std::move(evidence)},
+            {"recommendation", std::move(recommendation)},
+            {"confidence", std::move(confidence)},
+            {"measured_over", std::move(measured_over)},
+            {"availability", "available"}};
+}
+
+inline std::int64_t json_i64(const nlohmann::json& j, const char* key, std::int64_t fallback = 0) {
+    if (!j.contains(key)) { return fallback; }
+    const auto& v = j.at(key);
+    if (v.is_number_integer()) { return v.get<std::int64_t>(); }
+    if (v.is_number()) { return static_cast<std::int64_t>(v.get<double>()); }
+    return fallback;
+}
+
+inline double json_f64(const nlohmann::json& j, const char* key, double fallback = 0) {
+    if (!j.contains(key)) { return fallback; }
+    const auto& v = j.at(key);
+    if (v.is_number()) { return v.get<double>(); }
+    return fallback;
+}
+
+// Analyze a JSONL blob. Does not invent content/reasoning_content — those keys are
+// not written by the engine request log (schema_version 10).
+inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::string_view path) {
+    nlohmann::json report = {
+        {"source",
+         {{"request_log", jsonl.empty() ? "empty" : "ok"}, {"path", std::string(path)}}},
+        {"insights", nlohmann::json::array()},
+    };
+
+    std::unordered_map<std::int64_t, nlohmann::json> starts;
+    std::vector<nlohmann::json> dones;
+    std::vector<nlohmann::json> throughputs;
+    std::int64_t tmin = 0;
+    std::int64_t tmax = 0;
+    int parsed        = 0;
+
+    std::string line;
+    std::istringstream in{std::string(jsonl)};
+    while (std::getline(in, line)) {
+        if (line.empty()) { continue; }
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(line);
+        } catch (...) { continue; }
+        const std::string event = j.value("event", "");
+        if (event.empty()) { continue; }
+        ++parsed;
+        const auto ts = json_i64(j, "timestamp_unix_ms");
+        if (tmin == 0 || ts < tmin) { tmin = ts; }
+        if (ts > tmax) { tmax = ts; }
+        if (event == "request_start" && j.contains("request")) {
+            starts[json_i64(j.at("request"), "request_id")] = j;
+        } else if (event == "request_done") {
+            dones.push_back(std::move(j));
+        } else if (event == "throughput") {
+            throughputs.push_back(std::move(j));
+        }
+    }
+
+    auto& insights = report["insights"];
+    const double window_s =
+        (tmax > tmin) ? static_cast<double>(tmax - tmin) / 1000.0 : 0.0;
+
+    if (parsed == 0) {
+        insights.push_back(insight_unavailable(
+            "source.request_log", "Request log has no usable records",
+            "no request_done records in window",
+            {{"path", std::string(path)}, {"parsed_events", 0}}));
+        report["generated_note"] = "unavailable is not a clean zero";
+        return report;
+    }
+
+    if (dones.empty()) {
+        insights.push_back(insight_unavailable(
+            "source.request_done", "No completed requests in window",
+            "no request_done records in window",
+            {{"parsed_events", parsed}, {"request_start", starts.size()}}));
+        return report;
+    }
+
+    struct Bucket {
+        int queued = 0;
+        int prefill = 0;
+        int decode  = 0;
+        int mixed   = 0;
+        int unpaired = 0;
+        double queue_wait_sum = 0;
+        double prefill_sum    = 0;
+        double decode_sum     = 0;
+        double total_sum      = 0;
+        std::vector<std::int64_t> queued_ids;
+        std::vector<std::int64_t> prefill_ids;
+        std::vector<std::int64_t> decode_ids;
+    } b;
+
+    int output_limit_thinking = 0;
+    int output_limit_hit_cap  = 0;
+    int thinking_requests     = 0;
+    int tools_declared        = 0;
+    std::vector<std::int64_t> output_limit_ids;
+    std::vector<int> output_limit_caps;
+
+    for (const auto& done : dones) {
+        const auto& req = done.contains("request") ? done.at("request") : nlohmann::json::object();
+        const auto id   = json_i64(req, "request_id");
+        if (req.value("enable_thinking", false)) { ++thinking_requests; }
+        if (json_i64(req, "tool_count") > 0) { ++tools_declared; }
+        const auto& result = done.contains("result") ? done.at("result") : nlohmann::json::object();
+        const std::string finish = result.value("finish_reason", "");
+        const int cap            = static_cast<int>(json_i64(req, "requested_output_tokens"));
+        const int completion     = static_cast<int>(json_i64(result, "completion_tokens"));
+        if (finish == "output_limit" && req.value("enable_thinking", false)) {
+            ++output_limit_thinking;
+            output_limit_ids.push_back(id);
+            output_limit_caps.push_back(cap);
+            if (cap > 0 && completion >= cap) { ++output_limit_hit_cap; }
+        }
+
+        const auto& timings =
+            done.contains("timings_seconds") ? done.at("timings_seconds") : nlohmann::json::object();
+        const double total   = json_f64(timings, "total");
+        const double prefill = json_f64(timings, "prefill");
+        const double decode  = json_f64(timings, "decode");
+        b.prefill_sum += prefill;
+        b.decode_sum += decode;
+        b.total_sum += total;
+
+        auto it = starts.find(id);
+        if (it == starts.end()) {
+            ++b.unpaired;
+            continue;
+        }
+        const double wall_s =
+            static_cast<double>(json_i64(done, "timestamp_unix_ms") -
+                                json_i64(it->second, "timestamp_unix_ms")) /
+            1000.0;
+        double queue_wait = wall_s - total;
+        if (queue_wait < 0.0) { queue_wait = 0.0; }
+        b.queue_wait_sum += queue_wait;
+        const bool queued = queue_wait >= 0.020 && wall_s > 0.0 && queue_wait >= 0.25 * wall_s;
+        if (queued) {
+            ++b.queued;
+            if (b.queued_ids.size() < 8) { b.queued_ids.push_back(id); }
+        } else if (total > 0.0 && prefill >= decode && prefill >= 0.4 * total) {
+            ++b.prefill;
+            if (b.prefill_ids.size() < 8) { b.prefill_ids.push_back(id); }
+        } else if (total > 0.0 && decode >= 0.4 * total) {
+            ++b.decode;
+            if (b.decode_ids.size() < 8) { b.decode_ids.push_back(id); }
+        } else {
+            ++b.mixed;
+        }
+    }
+
+    const int paired = static_cast<int>(dones.size()) - b.unpaired;
+    int max_waiting  = 0;
+    int max_running  = 0;
+    int max_prefill  = 0;
+    for (const auto& tp : throughputs) {
+        if (!tp.contains("scheduler")) { continue; }
+        const auto& sch = tp.at("scheduler");
+        max_waiting     = std::max(max_waiting, static_cast<int>(json_i64(sch, "waiting")));
+        max_running     = std::max(max_running, static_cast<int>(json_i64(sch, "running")));
+        max_prefill     = std::max(max_prefill, static_cast<int>(json_i64(sch, "prefilling")));
+    }
+
+    const auto over = nlohmann::json{{"requests", dones.size()},
+                                     {"paired_requests", paired},
+                                     {"unpaired_done", b.unpaired},
+                                     {"window_s", window_s},
+                                     {"throughput_events", throughputs.size()}};
+
+    const double mean_queue = paired > 0 ? b.queue_wait_sum / paired : 0.0;
+    const double mean_prefill =
+        dones.empty() ? 0.0 : b.prefill_sum / static_cast<double>(dones.size());
+    const double mean_decode =
+        dones.empty() ? 0.0 : b.decode_sum / static_cast<double>(dones.size());
+    const int cause_max = std::max({b.queued, b.prefill, b.decode, b.mixed});
+    std::string cause   = "mixed";
+    std::string cause_id = "latency.mixed";
+    std::vector<std::int64_t> cause_ids;
+    if (cause_max == b.queued && b.queued > 0) {
+        cause    = "queued behind concurrency";
+        cause_id = "latency.queued_behind_concurrency";
+        cause_ids = b.queued_ids;
+    } else if (cause_max == b.prefill && b.prefill > 0) {
+        cause    = "long prefill";
+        cause_id = "latency.prefill_dominated";
+        cause_ids = b.prefill_ids;
+    } else if (cause_max == b.decode && b.decode > 0) {
+        cause    = "decode-dominated";
+        cause_id = "latency.decode_dominated";
+        cause_ids = b.decode_ids;
+    }
+
+    std::ostringstream sat;
+    sat << paired << " paired of " << dones.size() << " request_done: " << b.queued
+        << " queued, " << b.prefill << " prefill-dominated, " << b.decode
+        << " decode-dominated, " << b.mixed << " mixed. Dominant cause: " << cause
+        << ". Mean queue wait " << (mean_queue * 1000.0) << " ms, mean prefill "
+        << (mean_prefill * 1000.0) << " ms, mean decode " << (mean_decode * 1000.0)
+        << " ms. Scheduler peak waiting=" << max_waiting << " running=" << max_running
+        << " prefilling=" << max_prefill << ".";
+
+    const bool pressure = b.queued > 0 && (b.queued * 3 >= paired || max_waiting > 0);
+    insights.push_back(insight_available(
+        cause_id, pressure ? "warning" : "info", "Saturation vs latency", sat.str(),
+        {{"queued", b.queued},
+         {"prefill_dominated", b.prefill},
+         {"decode_dominated", b.decode},
+         {"mixed", b.mixed},
+         {"mean_queue_wait_s", mean_queue},
+         {"mean_prefill_s", mean_prefill},
+         {"mean_decode_s", mean_decode},
+         {"scheduler_peak",
+          {{"waiting", max_waiting}, {"running", max_running}, {"prefilling", max_prefill}}},
+         {"sample_request_ids", cause_ids}},
+        pressure ? "Queued wait is a concurrency/backlog problem, not a slow kernel. "
+                   "Raise --max-concurrency only if KV/headroom allows; otherwise the "
+                   "engine is saturated."
+                 : "",
+        "measured", over));
+
+    // Content/reasoning_content are not in schema_version 10 request logs.
+    insights.push_back(insight_unavailable(
+        "client.content_fields", "Visitor content is not in the request log",
+        "result.content and reasoning_content are not written to request_done; "
+        "empty-reply-vs-reasoning cannot be confirmed from this source",
+        {{"schema_version", 10}, {"looked_for", nlohmann::json::array({"content", "reasoning_content"})}}));
+
+    if (output_limit_thinking > 0) {
+        std::ostringstream stmt;
+        stmt << output_limit_thinking << " of " << dones.size()
+             << " request_done finished on output_limit with enable_thinking=true"
+             << " (" << output_limit_hit_cap << " also hit requested_output_tokens). "
+             << thinking_requests << " of " << dones.size() << " had thinking enabled.";
+        int cap_sum = 0;
+        for (int c : output_limit_caps) { cap_sum += c; }
+        const double cap_mean =
+            output_limit_caps.empty()
+                ? 0.0
+                : static_cast<double>(cap_sum) / static_cast<double>(output_limit_caps.size());
+        insights.push_back(insight_available(
+            "client.output_limit_while_thinking",
+            output_limit_thinking * 5 >= static_cast<int>(dones.size()) ? "warning" : "notice",
+            "Thinking requests hitting output_limit", stmt.str(),
+            {{"output_limit_thinking", output_limit_thinking},
+             {"hit_requested_cap", output_limit_hit_cap},
+             {"thinking_requests", thinking_requests},
+             {"mean_requested_output_tokens", cap_mean},
+             {"sample_request_ids", output_limit_ids}},
+            "Inferred: a thinking model with a small max_tokens can spend the budget on "
+            "reasoning and return an empty visitor reply. Content fields are not in this log, "
+            "so raise requested_output_tokens and compare finish_reason.",
+            "measured", over));
+    }
+
+    insights.push_back(insight_unavailable(
+        "client.narrated_tool_intent", "Narrated tool intent cannot be scored from JSONL",
+        "detecting narrated-intent-with-no-tools needs visitor-facing text; the request log "
+        "does not store content. tool_count is measurable and is reported in evidence.",
+        {{"requests_with_tools", tools_declared},
+         {"requests", dones.size()},
+         {"requests_without_tools", static_cast<int>(dones.size()) - tools_declared}}));
+
+    return report;
+}
+
+inline nlohmann::json insights_from_request_log_path(const std::string& path) {
+    nlohmann::json report;
+    report["insights"] = nlohmann::json::array();
+    if (path.empty()) {
+        report["source"] = {{"request_log", "unconfigured"}, {"path", ""}};
+        report["insights"].push_back(insight_unavailable(
+            "source.request_log", "Request log is not configured",
+            "no request_done records in window", {{"path", ""}}));
+        return report;
+    }
+    std::ifstream in(path);
+    if (!in) {
+        report["source"] = {{"request_log", "missing"}, {"path", path}};
+        report["insights"].push_back(insight_unavailable(
+            "source.request_log", "Request log is not present",
+            "no request_done records in window", {{"path", path}}));
+        return report;
+    }
+    std::ostringstream body;
+    body << in.rdbuf();
+    return analyze_request_log_jsonl(body.str(), path);
+}
+
+} // namespace ninfer::supervisor

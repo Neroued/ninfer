@@ -1,5 +1,6 @@
 #include "logic.hpp"
 #include "config.hpp"
+#include "insights.hpp"
 
 #include <iostream>
 #include <string>
@@ -178,6 +179,58 @@ int test_monitor_only_config() {
     return f;
 }
 
+int test_insights_honesty() {
+    using namespace ninfer::supervisor;
+    int f = 0;
+    const auto missing = insights_from_request_log_path("");
+    f += check(missing.at("source").at("request_log") == "unconfigured", "unconfigured source");
+    f += check(missing.at("insights").size() >= 1 &&
+                   missing.at("insights").at(0).at("availability") == "unavailable",
+               "missing log is unavailable, not a zero");
+    f += check(missing.at("insights").at(0).at("statement").get<std::string>().find(
+                   "no request_done records") != std::string::npos,
+               "unavailable statement");
+
+    const auto typed = analyze_request_log_jsonl(
+        R"({"type":"request_done","timestamp_unix_ms":1})"
+        "\n",
+        "mem");
+    f += check(typed.at("insights").at(0).at("availability") == "unavailable",
+               "type-key records do not count as request_done");
+
+    const char* jsonl =
+        R"({"event":"request_start","timestamp_unix_ms":1000,"request":{"request_id":1,"enable_thinking":true,"tool_count":0,"requested_output_tokens":8}})"
+        "\n"
+        R"({"event":"request_done","timestamp_unix_ms":1600,"request":{"request_id":1,"enable_thinking":true,"tool_count":0,"requested_output_tokens":8},"result":{"finish_reason":"output_limit","completion_tokens":8},"timings_seconds":{"prepare":0.01,"prefill":0.02,"decode":0.02,"ttft":0.03,"total":0.1}})"
+        "\n"
+        R"({"event":"throughput","timestamp_unix_ms":1601,"scheduler":{"waiting":2,"running":1,"prefilling":0}})"
+        "\n";
+    const auto r = analyze_request_log_jsonl(jsonl, "mem");
+    bool saw_sat = false, saw_limit = false, saw_content = false;
+    for (const auto& it : r.at("insights")) {
+        const auto id = it.at("id").get<std::string>();
+        if (id.find("latency.") == 0) {
+            saw_sat = true;
+            f += check(it.at("availability") == "available" && it.at("confidence") == "measured",
+                       "saturation is measured");
+            f += check(it.at("measured_over").at("requests") == 1, "measured_over.requests is 1");
+            f += check(it.at("evidence").at("queued") == 1, "0.5s queue wait classifies queued");
+        }
+        if (id == "client.output_limit_while_thinking") {
+            saw_limit = true;
+            f += check(it.at("evidence").at("output_limit_thinking") == 1, "output_limit counted");
+            f += check(it.at("evidence").at("sample_request_ids").at(0) == 1, "request_id evidence");
+        }
+        if (id == "client.content_fields") {
+            saw_content = true;
+            f += check(it.at("availability") == "unavailable",
+                       "content fields unavailable, not fabricated");
+        }
+    }
+    f += check(saw_sat && saw_limit && saw_content, "required insight ids present");
+    return f;
+}
+
 int test_health_threshold() {
     ninfer::supervisor::RestartPolicy p;
     p.health_fail_threshold = 3;
@@ -202,6 +255,7 @@ int main() {
     failures += test_nvidia_csv();
     failures += test_kv_line();
     failures += test_monitor_only_config();
+    failures += test_insights_honesty();
     failures += test_health_threshold();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

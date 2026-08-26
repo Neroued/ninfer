@@ -8,9 +8,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <utility>
 
 namespace ninfer::serve {
@@ -253,6 +256,12 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.vram_idle_release_after_s  = options_.vram_idle_release_after_s;
     engine_options.vram_observe_only          = options_.vram_observe_only;
     engine_options.load_progress              = std::move(load_progress);
+    engine_options.on_fatal_error             = [](std::exception_ptr, const std::string& message) {
+        write_console_log(ConsoleLogLevel::Error, message);
+        std::cerr.flush();
+        std::cout.flush();
+        std::_Exit(1);
+    };
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(

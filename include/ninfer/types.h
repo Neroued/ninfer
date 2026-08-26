@@ -104,6 +104,7 @@ struct EngineOptions {
     std::uint32_t vram_idle_release_after_s  = 0; // 0 disables idle release
     bool vram_observe_only                   = false;
     LoadProgress load_progress;
+    std::function<void(std::exception_ptr, const std::string&)> on_fatal_error;
 };
 
 struct VramTierState {

@@ -180,6 +180,18 @@ int main() {
                                      "30", "--vram-observe-only"});
     failures += check(idle.vram_idle_release_after_s == 30 && idle.vram_observe_only,
                       "idle-release and observe-only flags did not parse");
+    failures += check(!defaults.enable_admin_vram, "admin VRAM routes are not disabled by default");
+    bool admin_without_key_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--admin-vram"});
+    } catch (const std::invalid_argument&) { admin_without_key_rejected = true; }
+    failures += check(admin_without_key_rejected, "--admin-vram without --api-key was accepted");
+    const ServeOptions admin =
+        parse({"ninfer-serve", "model.ninfer", "--admin-vram", "--api-key", "secret"});
+    failures += check(admin.enable_admin_vram && admin.api_key == "secret",
+                      "--admin-vram with --api-key did not enable admin routes");
+    failures += check(serve_usage_text("ninfer-serve").find("--admin-vram") != std::string::npos,
+                      "serve help omits --admin-vram");
 
     bool inverted_prefix_rejected = false;
     try {

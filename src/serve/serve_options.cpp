@@ -71,7 +71,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--prefix-cache-mib N] [--prefix-cache-mib-min N] [--prefix-cache-mib-max N] "
            "[--kv-capacity-min N] [--kv-capacity-max N] "
            "[--vram-guarantee-context N] [--vram-guarantee-concurrency N] [--vram-floor-mib N] "
-           "[--vram-idle-release-after-s N] [--vram-observe-only] "
+           "[--vram-idle-release-after-s N] [--vram-observe-only] [--admin-vram] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -95,7 +95,8 @@ std::string serve_usage_text(const char* argv0) {
            "with a max boots at the max. --kv-capacity N still means min==max==N\n"
            "       --vram-idle-release-after-s N releases the seed store after N idle seconds "
            "(0 disables, default). --vram-observe-only logs would-be releases without changing "
-           "allocations\n"
+           "allocations. --admin-vram exposes GET/POST /admin/vram and requires --api-key; "
+           "default off\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
@@ -247,6 +248,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 require_value("--vram-idle-release-after-s"), "vram-idle-release-after-s"));
         } else if (arg == "--vram-observe-only") {
             options.vram_observe_only = true;
+        } else if (arg == "--admin-vram") {
+            options.enable_admin_vram = true;
         } else if (arg == "--media-cache-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--media-cache-mib"), "media-cache-mib");
@@ -382,6 +385,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.vram_guarantee_context == 0) {
         options.vram_guarantee_context = options.max_context;
+    }
+    if (options.enable_admin_vram && options.api_key.empty()) {
+        throw std::invalid_argument("--admin-vram requires --api-key");
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

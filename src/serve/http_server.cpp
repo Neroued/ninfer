@@ -262,7 +262,17 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (req.path.rfind("/admin", 0) == 0) {
+            if (options_.api_key.empty()) {
+                ApiError error;
+                error.status  = 403;
+                error.type    = "permission_error";
+                error.code    = "admin_disabled";
+                error.message = "admin endpoints require --admin-vram and --api-key";
+                write_error(res, error);
+                return httplib::Server::HandlerResponse::Handled;
+            }
+        } else if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -306,17 +316,18 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
-    server_.Get("/admin/vram", [this](const httplib::Request&, httplib::Response& res) {
-        handle_admin_vram(res);
-    });
-    server_.Post("/admin/vram/release",
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_admin_vram_release(req, res);
-                 });
-    server_.Post("/admin/vram/reclaim",
-                 [this](const httplib::Request&, httplib::Response& res) {
-                     handle_admin_vram_reclaim(res);
-                 });
+    if (options_.enable_admin_vram) {
+        server_.Get("/admin/vram", [this](const httplib::Request&, httplib::Response& res) {
+            handle_admin_vram(res);
+        });
+        server_.Post("/admin/vram/release",
+                     [this](const httplib::Request& req, httplib::Response& res) {
+                         handle_admin_vram_release(req, res);
+                     });
+        server_.Post("/admin/vram/reclaim", [this](const httplib::Request&, httplib::Response& res) {
+            handle_admin_vram_reclaim(res);
+        });
+    }
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });

@@ -43,9 +43,9 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
-| `GET /admin/vram` | current VRAM tier state (seed/KV held bytes, range, last transition) |
-| `POST /admin/vram/release` | release named cache tiers (`{"tiers":["seed"],"target_mib":N}`). KV is refused in this phase |
-| `POST /admin/vram/reclaim` | re-acquire previously released cache tiers; failure stays degraded |
+| `GET /admin/vram` | current VRAM tier state (seed/KV held bytes, range, last transition). Registered only with `--admin-vram`, which requires `--api-key` |
+| `POST /admin/vram/release` | release named cache tiers (`{"tiers":["seed"],"target_mib":N}`). KV is refused in this phase. Same enable-gate as GET |
+| `POST /admin/vram/reclaim` | re-acquire previously released cache tiers; failure stays degraded. Same enable-gate as GET |
 | `GET /v1/models` | configured OpenAI model alias, including `max_model_len` = `--max-context` |
 | `GET /v1/models/{id}` | lookup of the configured alias, same `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -606,7 +606,9 @@ range and boot at max; this phase reports the range and does not yet shrink KV a
 `--prefix-cache-mib-max` boot at max; min 0 is fully releasable via idle release or
 `POST /admin/vram/release`. `--vram-idle-release-after-s N` (default 0, disabled) drops the seed
 store after N seconds with no in-flight GPU work. `--vram-observe-only` logs would-be releases
-without freeing memory. Default flag-free behaviour is unchanged: no idle release, seed store
+without freeing memory. `--admin-vram` (default off) registers the `/admin/vram` routes and
+requires `--api-key`; without both flags the mutation endpoints do not exist. Default flag-free
+behaviour is unchanged: no idle release, no admin routes, seed store
 fixed at `--prefix-cache-mib` (0 disables it).
 `--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
 after weights are loaded while keeping 1 GiB of sizing headroom. When omitted it follows

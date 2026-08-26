@@ -46,6 +46,7 @@ struct ServeOptions {
     std::size_t vram_floor_bytes             = 0;
     std::uint32_t vram_idle_release_after_s  = 0;
     bool vram_observe_only                   = false;
+    bool enable_admin_vram                   = false;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;

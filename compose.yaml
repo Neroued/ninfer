@@ -1,0 +1,32 @@
+services:
+  build:
+    build:
+      context: .
+      target: build-env
+    working_dir: /src
+    environment:
+      CCACHE_DIR: /ccache
+      CCACHE_MAXSIZE: 20G
+    volumes:
+      - .:/src:ro,Z
+      - ninfer-build:/build
+      - ninfer-ccache:/ccache
+    command:
+      - sh
+      - -lc
+      - >-
+        cmake -S /src -B /build -G Ninja
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+        -DNINFER_BUILD_APPS=ON
+        -DBUILD_TESTING=ON
+        -DNINFER_BUILD_BENCHMARKS=OFF
+        && cmake --build /build --parallel --target ninfer ninfer-serve
+        && ccache --show-stats
+
+volumes:
+  ninfer-build:
+  ninfer-ccache:
+    name: ninfer-ccache

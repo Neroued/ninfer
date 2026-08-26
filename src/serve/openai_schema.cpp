@@ -9,6 +9,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <unordered_set>
 
 namespace ninfer::serve {
 namespace {
@@ -318,6 +319,7 @@ void parse_tools(const Json& body, GenerationRequest& out) {
     const Json& tools = body.at("tools");
     if (!tools.is_array()) { bad_request("tools must be an array", "tools"); }
     out.tools.reserve(tools.size());
+    std::unordered_set<std::string> names;
     for (std::size_t i = 0; i < tools.size(); ++i) {
         const Json& item = tools.at(i);
         if (!item.is_object()) { bad_request("tools entries must be objects", "tools"); }
@@ -334,6 +336,9 @@ void parse_tools(const Json& body, GenerationRequest& out) {
         Json& fn        = normalized["function"];
         ToolDefinition tool;
         tool.name = require_function_name(fn, "tools");
+        if (!names.insert(tool.name).second) {
+            bad_request("duplicate function tool name: " + tool.name, "tools");
+        }
         if (fn.contains("description") && !fn.at("description").is_null()) {
             if (!fn.at("description").is_string()) {
                 bad_request("function description must be a string", "tools");

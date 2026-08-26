@@ -8,6 +8,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace ninfer::serve {
@@ -141,6 +142,7 @@ void parse_tools(const Json& body, GenerationRequest& out) {
     const Json& tools = body.at("tools");
     if (!tools.is_array()) { bad_request("tools must be an array", "tools"); }
     out.tools.reserve(tools.size());
+    std::unordered_set<std::string> names;
     for (const Json& item : tools) {
         if (!item.is_object()) { bad_request("tools entries must be objects", "tools"); }
         // Anthropic server/built-in tools carry a `type` and no `input_schema`; we
@@ -155,6 +157,9 @@ void parse_tools(const Json& body, GenerationRequest& out) {
         }
         ToolDefinition tool;
         tool.name     = require_function_name(item, "tools");
+        if (!names.insert(tool.name).second) {
+            bad_request("duplicate tool name: " + tool.name, "tools");
+        }
         Json function = Json{{"name", tool.name}};
         if (item.contains("description") && !item.at("description").is_null()) {
             if (!item.at("description").is_string()) {

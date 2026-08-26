@@ -90,6 +90,9 @@ inline constexpr std::string_view kDashboardHtml = R"HTML(<!DOCTYPE html>
     <div class="row"><span>supervisor process DXGI (not the engine)</span><span id="usage" class="num">—</span></div>
     <div class="row"><span>engine capacity (boot line)</span><span id="capline" class="muted">—</span></div>
     <div class="row"><span>admin tiers</span><span id="tiers" class="muted">—</span></div>
+    <div class="row"><span>released now</span><span id="released" class="num">—</span></div>
+    <div class="row"><span>time since release</span><span id="sincerel" class="num">—</span></div>
+    <div class="row"><span>last vram action</span><span id="vramact" class="muted">—</span></div>
     <div class="row"><span>admin note</span><span id="adminnote" class="muted">—</span></div>
   </section>
   <section class="span2">
@@ -181,6 +184,12 @@ function apply(s){
     document.getElementById("tiers").textContent = v.tiers.map(t=>t.name+": "+gib(t.held_bytes)).join(" · ");
   } else { document.getElementById("tiers").textContent = "unavailable"; }
   document.getElementById("adminnote").textContent = s.admin_vram_note||"—";
+  const vc=s.vram_control||{};
+  document.getElementById("released").textContent = vc.any_released ? "YES — seed store degraded" : "no";
+  document.getElementById("sincerel").textContent =
+    vc.since_release_s!=null ? vc.since_release_s+" s" : "—";
+  document.getElementById("vramact").textContent =
+    ((vc.last_transition||"")+" "+(vc.last_reason||"")).trim()||"—";
   const r=s.requests||{};
   document.getElementById("rdone").textContent = r.done!=null?r.done:"—";
   document.getElementById("ttft").textContent = r.ttft_ms_mean? r.ttft_ms_mean.toFixed(0)+" ms":"—";

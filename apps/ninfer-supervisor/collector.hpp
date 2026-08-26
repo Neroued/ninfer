@@ -58,6 +58,8 @@ public:
     void stop_series();
     Collected snapshot();
     nlohmann::json series_json();
+    nlohmann::json vram_control_json();
+    nlohmann::json insights_report();
     void note_engine_state(const std::string& state, const std::string& last_event);
 
 private:
@@ -75,10 +77,11 @@ private:
     std::atomic<bool> series_run_{false};
     std::thread series_thread_;
     int last_health_status_          = -1;
-    std::string last_admin_transition_;
-    std::string last_admin_reason_;
-    std::string last_admin_released_;
+    AdminVramCursor admin_cursor_;
+    std::int64_t last_release_ms_    = 0;
     std::string last_engine_state_;
+    nlohmann::json last_admin_vram_  = nullptr;
+    std::string last_admin_note_;
     DxgiSnapshot last_dxgi_;
     NvidiaSmiMemory last_nvidia_;
 };

@@ -443,6 +443,68 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
     return report;
 }
 
+inline void append_admin_vram_insights(nlohmann::json& report, const nlohmann::json& admin,
+                                       const std::string& note) {
+    if (!report.contains("insights") || !report["insights"].is_array()) {
+        report["insights"] = nlohmann::json::array();
+    }
+    if (!admin.is_object()) {
+        report["insights"].push_back(insight_unavailable(
+            "vram.admin", "Admin VRAM is not available",
+            note.empty() ? "admin/vram was not readable; cannot tell if any tier is releasable"
+                         : note,
+            {{"note", note}}));
+        return;
+    }
+    nlohmann::json pinned = nlohmann::json::array();
+    nlohmann::json released = nlohmann::json::array();
+    if (admin.contains("tiers") && admin.at("tiers").is_array()) {
+        for (const auto& tier : admin.at("tiers")) {
+            const auto min_b = json_i64(tier, "min_bytes");
+            const auto max_b = json_i64(tier, "max_bytes");
+            const bool rel   = tier.value("released", false);
+            if (rel) { released.push_back(tier.value("name", "?")); }
+            if (min_b > 0 && min_b == max_b) {
+                pinned.push_back({{"name", tier.value("name", "")},
+                                  {"min_bytes", min_b},
+                                  {"max_bytes", max_b},
+                                  {"reclaimable_bytes", json_i64(tier, "reclaimable_bytes")},
+                                  {"released", rel}});
+            }
+        }
+    }
+    const auto over = nlohmann::json{{"requests", 0},
+                                     {"admin_tiers", pinned.size() + released.size()},
+                                     {"last_transition", admin.value("last_transition", "")},
+                                     {"last_reason", admin.value("last_reason", "")}};
+    if (!pinned.empty()) {
+        report["insights"].push_back(insight_available(
+            "vram.tier_pinned_unreleasable", "warning",
+            "Admin VRAM is enabled but a tier cannot be released",
+            "A tier has min_bytes == max_bytes while --admin-vram is on. "
+            "--prefix-cache-mib N pins seed min=max=N, so reclaimable_bytes stays 0 "
+            "and the admin surface looks healthy while nothing can be released.",
+            {{"pinned_tiers", pinned},
+             {"last_transition", admin.value("last_transition", "")},
+             {"last_reason", admin.value("last_reason", "")}},
+            "Omit --prefix-cache-mib or set a max above min if you want idle release.",
+            "measured", over));
+    }
+    if (!released.empty()) {
+        report["insights"].push_back(insight_available(
+            "vram.tier_currently_released", "notice",
+            "A VRAM tier is currently released",
+            "Released tiers: " + released.dump() +
+                ". The engine is serving degraded (no cross-request prefix seeding) until reclaim. "
+                "Release is ~120x cheaper than reclaim on this hardware.",
+            {{"released", released},
+             {"last_transition", admin.value("last_transition", "")},
+             {"last_reason", admin.value("last_reason", "")}},
+            "Reclaim before a traffic burst; a released seed store will full_reset more often.",
+            "measured", over));
+    }
+}
+
 inline nlohmann::json insights_from_request_log_path(const std::string& path) {
     nlohmann::json report;
     report["insights"] = nlohmann::json::array();

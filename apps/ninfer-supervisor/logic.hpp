@@ -178,6 +178,35 @@ struct VramSeriesEvent {
     std::string label;
 };
 
+// Diff last_transition/last_reason, not held_bytes. A 42 ms release finishes
+// between 1 Hz polls; the persisted last_reason is what remains observable.
+struct AdminVramCursor {
+    bool seen                = false;
+    std::string last_transition;
+    std::string last_reason;
+
+    // Returns true if this observation is an event after the baseline poll.
+    bool observe(std::string_view trans, std::string_view reason, std::string& kind) {
+        if (!seen) {
+            seen             = true;
+            last_transition  = std::string(trans);
+            last_reason      = std::string(reason);
+            return false;
+        }
+        if (trans == last_transition && reason == last_reason) { return false; }
+        last_transition = std::string(trans);
+        last_reason     = std::string(reason);
+        if (trans == "release") {
+            kind = "vram_release";
+        } else if (trans == "reclaim" || trans == "reclaim-failed") {
+            kind = "vram_reclaim";
+        } else {
+            kind = "admin_vram";
+        }
+        return true;
+    }
+};
+
 // Ring of raw 10 Hz samples. No averaging. Oldest is dropped on overflow.
 struct VramSeriesRing {
     explicit VramSeriesRing(std::size_t cap = 6000) : cap_(cap), buf_(cap) {}

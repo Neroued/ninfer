@@ -243,6 +243,47 @@ int test_insights_honesty() {
     return f;
 }
 
+int test_admin_vram_markers() {
+    using namespace ninfer::supervisor;
+    AdminVramCursor c;
+    std::string kind;
+    int f = 0;
+    f += check(!c.observe("", "", kind), "first poll is baseline, does not fire");
+    f += check(c.observe("release", "seed store released", kind) && kind == "vram_release",
+               "empty -> release fires vram_release");
+    f += check(c.observe("reclaim", "seed store reclaimed", kind) && kind == "vram_reclaim",
+               "release -> reclaim fires vram_reclaim");
+    f += check(!c.observe("reclaim", "seed store reclaimed", kind), "unchanged does not fire");
+    return f;
+}
+
+int test_insights_pinned_tier() {
+    using namespace ninfer::supervisor;
+    nlohmann::json report = {{"insights", nlohmann::json::array()}};
+    nlohmann::json admin  = {
+        {"last_transition", ""},
+        {"last_reason", ""},
+        {"tiers",
+         nlohmann::json::array(
+             {{{"name", "seed"},
+               {"min_bytes", 4294967296ull},
+               {"max_bytes", 4294967296ull},
+               {"reclaimable_bytes", 0},
+               {"released", false}}})}};
+    append_admin_vram_insights(report, admin, "");
+    int f     = 0;
+    bool saw  = false;
+    for (const auto& it : report.at("insights")) {
+        if (it.at("id") == "vram.tier_pinned_unreleasable") {
+            saw = true;
+            f += check(it.at("severity") == "warning", "pinned tier is warning");
+            f += check(it.at("availability") == "available", "config trap is measured");
+        }
+    }
+    f += check(saw, "pinned min==max insight present");
+    return f;
+}
+
 int test_insights_prefix() {
     using namespace ninfer::supervisor;
     const char* jsonl =
@@ -334,6 +375,8 @@ int main() {
     failures += test_monitor_only_config();
     failures += test_insights_honesty();
     failures += test_insights_prefix();
+    failures += test_admin_vram_markers();
+    failures += test_insights_pinned_tier();
     failures += test_jsonl_event_key();
     failures += test_series_ring();
     failures += test_health_threshold();

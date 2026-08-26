@@ -95,7 +95,7 @@ nlohmann::json DashboardServer::state_json() {
     const std::string log = child_.log_tail(16 * 1024);
     std::string cap       = extract_kv_capacity_line(log);
     if (cap.empty()) { cap = snap.engine_capacity_line; }
-    nlohmann::json insights = insights_from_request_log_path(cfg_.engine.request_log);
+    nlohmann::json insights = collector_.insights_report();
     return {{"monitor_only", !manages_engine_process(cfg_)},
             {"engine", std::move(engine)},
             {"dxgi", std::move(dxgi)},
@@ -103,6 +103,7 @@ nlohmann::json DashboardServer::state_json() {
             {"engine_capacity_line", cap},
             {"admin_vram", snap.admin_vram},
             {"admin_vram_note", snap.admin_vram_note},
+            {"vram_control", collector_.vram_control_json()},
             {"requests", std::move(req)},
             {"insights", insights},
             {"series", collector_.series_json()},
@@ -135,9 +136,8 @@ void DashboardServer::run() {
         res.set_content(state_json().dump(), "application/json");
     });
     svr.Get("/api/insights", [this](const httplib::Request&, httplib::Response& res) {
-        // Same object the HTML renders from /api/state.insights — one computation.
-        res.set_content(insights_from_request_log_path(cfg_.engine.request_log).dump(),
-                        "application/json");
+        (void)collector_.snapshot();
+        res.set_content(collector_.insights_report().dump(), "application/json");
     });
     svr.Get("/api/events", [this](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache");

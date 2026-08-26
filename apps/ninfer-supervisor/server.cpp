@@ -58,11 +58,19 @@ nlohmann::json DashboardServer::state_json() {
                          ? 0
                          : now_unix_s() - st.started_unix_ms / 1000},
     };
-    nlohmann::json dxgi = {{"ok", snap.dxgi.ok},
-                           {"error", snap.dxgi.error},
-                           {"adapter_name", snap.dxgi.adapter_name},
-                           {"budget_bytes", snap.dxgi.budget_bytes},
-                           {"current_usage_bytes", snap.dxgi.current_usage_bytes}};
+    nlohmann::json dxgi = {
+        {"ok", snap.dxgi.ok},
+        {"error", snap.dxgi.error},
+        {"adapter_name", snap.dxgi.adapter_name},
+        {"budget_bytes", snap.dxgi.budget_bytes},
+        {"supervisor_usage_bytes", snap.dxgi.current_usage_bytes},
+        {"supervisor_usage_note", "DXGI CurrentUsage of the supervisor process, not the engine"},
+    };
+    nlohmann::json nvidia = {{"ok", snap.nvidia.ok},
+                             {"error", snap.nvidia.error},
+                             {"index", snap.nvidia.index},
+                             {"used_bytes", mib_to_bytes(snap.nvidia.used_mib)},
+                             {"total_bytes", mib_to_bytes(snap.nvidia.total_mib)}};
     nlohmann::json req  = {{"done", snap.requests.done},
                            {"ttft_ms_mean", snap.requests.ttft_ms_mean},
                            {"decode_tok_s_mean", snap.requests.decode_tok_s_mean},
@@ -74,13 +82,19 @@ nlohmann::json DashboardServer::state_json() {
                            {"log_error", snap.requests.log_error}};
     nlohmann::json health = {{"status", snap.health_status}, {"body", snap.health_body}};
     child_.observe_health(snap.health_status);
-    return {{"engine", std::move(engine)},
+    const std::string log = child_.log_tail(16 * 1024);
+    std::string cap       = extract_kv_capacity_line(log);
+    if (cap.empty()) { cap = snap.engine_capacity_line; }
+    return {{"monitor_only", !manages_engine_process(cfg_)},
+            {"engine", std::move(engine)},
             {"dxgi", std::move(dxgi)},
+            {"nvidia_smi", std::move(nvidia)},
+            {"engine_capacity_line", cap},
             {"admin_vram", snap.admin_vram},
             {"admin_vram_note", snap.admin_vram_note},
             {"requests", std::move(req)},
             {"health", std::move(health)},
-            {"log_tail", child_.log_tail(16 * 1024)}};
+            {"log_tail", log}};
 }
 
 void DashboardServer::stop() {
@@ -91,6 +105,16 @@ void DashboardServer::stop() {
 void DashboardServer::run() {
     httplib::Server svr;
     server_ = &svr;
+    // No Access-Control-Allow-Origin. The custom mutating header is a CSRF
+    // brake only because cross-origin preflight then fails closed.
+    svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        if (!host_header_allowed(req.get_header_value("Host"), cfg_.port, cfg_.host, cfg_.bind_any)) {
+            res.status = 403;
+            res.set_content(nlohmann::json{{"error", "host not allowed"}}.dump(), "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(std::string(kDashboardHtml), "text/html; charset=utf-8");
     });
@@ -117,6 +141,18 @@ void DashboardServer::run() {
         if (!control_allowed(req.remote_addr)) {
             res.status = 403;
             res.set_content(nlohmann::json{{"error", "control is loopback-only"}}.dump(),
+                            "application/json");
+            return;
+        }
+        if (!supervisor_control_header_ok(req.get_header_value(std::string(kSupervisorControlHeader)))) {
+            res.status = 403;
+            res.set_content(nlohmann::json{{"error", "missing X-NInfer-Supervisor header"}}.dump(),
+                            "application/json");
+            return;
+        }
+        if (!manages_engine_process(cfg_)) {
+            res.status = 409;
+            res.set_content(nlohmann::json{{"error", "engine is unmanaged"}}.dump(),
                             "application/json");
             return;
         }

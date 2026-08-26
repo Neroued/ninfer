@@ -8,6 +8,7 @@
 #define CPPHTTPLIB_NO_EXCEPTIONS
 #include <httplib.h>
 
+#include <cstdio>
 #include <fstream>
 #include <vector>
 
@@ -63,6 +64,26 @@ void Collector::poll_admin(Collected& out) {
     }
 }
 
+void Collector::poll_nvidia_smi(Collected& out) {
+    FILE* pipe = _popen(
+        "nvidia-smi --query-gpu=index,memory.used,memory.total "
+        "--format=csv,noheader,nounits",
+        "rt");
+    if (pipe == nullptr) {
+        out.nvidia.error = "nvidia-smi not found";
+        return;
+    }
+    std::string csv;
+    char buf[512];
+    while (fgets(buf, sizeof(buf), pipe) != nullptr) { csv += buf; }
+    const int rc = _pclose(pipe);
+    if (rc != 0 && csv.empty()) {
+        out.nvidia.error = "nvidia-smi exited " + std::to_string(rc);
+        return;
+    }
+    out.nvidia = parse_nvidia_smi_memory_csv(csv, spec_.device);
+}
+
 void Collector::poll_request_log(Collected& out) {
     if (spec_.request_log.empty()) {
         out.requests.log_error = "request log path not configured";
@@ -75,9 +96,35 @@ void Collector::poll_request_log(Collected& out) {
     }
     out.requests.log_available = true;
     std::vector<std::string> lines;
+    std::string last_start;
     std::string line;
     while (std::getline(in, line)) {
-        if (line.find("\"request_done\"") != std::string::npos) { lines.push_back(std::move(line)); }
+        if (line.find("\"request_done\"") != std::string::npos) { lines.push_back(line); }
+        if (line.find("\"server_start\"") != std::string::npos) { last_start = std::move(line); }
+    }
+    if (!last_start.empty()) {
+        try {
+            const auto j = nlohmann::json::parse(last_start);
+            const auto& eng = j.at("engine");
+            const auto& mem = j.at("memory");
+            auto gib = [](const nlohmann::json& obj, const char* key) {
+                const auto n = obj.value(key, std::uint64_t{0});
+                return std::to_string(n / 1048576) + " MiB";
+            };
+            out.engine_capacity_line =
+                std::string("KV capacity ") + eng.value("kv_capacity_mode", std::string("?")) +
+                " resolved=" + std::to_string(eng.value("kv_capacity", 0)) +
+                " tokens pages=" + std::to_string(eng.value("kv_capacity_page_groups", 0)) + "/" +
+                std::to_string(eng.value("kv_capacity_max_page_groups", 0)) +
+                " runtime=" + gib(mem, "runtime_reservation_bytes") +
+                " prefix-cache=" + gib(mem, "prefix_cache_bytes") +
+                " free-after-weights=" + gib(mem, "available_after_weights_bytes") +
+                " free-after-startup=" + gib(mem, "available_after_startup_bytes") +
+                " headroom=" + gib(mem, "kv_capacity_headroom_bytes") +
+                " slack=" + gib(mem, "planned_slack_bytes") +
+                " graphs=" + gib(mem, "cuda_graph_observed_bytes") + "/" +
+                gib(mem, "cuda_graph_allowance_bytes") + " (from request-log server_start)";
+        } catch (...) {}
     }
     const std::size_t start = lines.size() > 32 ? lines.size() - 32 : 0;
     double ttft_sum = 0;
@@ -122,6 +169,7 @@ void Collector::poll_request_log(Collected& out) {
 Collected Collector::snapshot() {
     Collected out;
     out.dxgi = query_dxgi_local(spec_.device);
+    poll_nvidia_smi(out);
     poll_health(out);
     poll_admin(out);
     poll_request_log(out);

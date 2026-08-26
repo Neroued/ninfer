@@ -11,12 +11,14 @@
     "engine_host": "127.0.0.1",
     "engine_port": 8010,
     "request_log": "",
-    "device": 0
+    "device": 0,
+    "unmanaged": false
   },
   "supervisor": {
     "host": "127.0.0.1",
     "port": 8099,
     "bind_any": false,
+    "monitor_only": false,
     "logs_dir": "P:/NInfer/supervisor-logs",
     "run_at_login": false,
     "restart": {

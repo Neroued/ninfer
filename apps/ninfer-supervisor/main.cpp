@@ -43,9 +43,11 @@ void uninstall_run_at_login() {
 void usage() {
     std::cout
         << "usage: ninfer-supervisor --config FILE [--host 127.0.0.1] [--port 8099] [--bind-any]\n"
-           "                         [--install-login] [--uninstall-login]\n"
+           "                         [--monitor-only] [--install-login] [--uninstall-login]\n"
            "  Dashboard binds loopback by default. --bind-any is required for 0.0.0.0 and prints\n"
-           "  a warning. Control POST /api/start|stop|restart is always loopback-peer only.\n";
+           "  a warning. Control POST /api/start|stop|restart is loopback-peer only, requires\n"
+           "  header X-NInfer-Supervisor: 1, and returns 409 in --monitor-only / unmanaged mode.\n"
+           "  Host is allowlisted on every route. Do not send CORS headers.\n";
 }
 
 } // namespace
@@ -56,6 +58,7 @@ int main(int argc, char** argv) {
         std::string host_override;
         int port_override = -1;
         bool bind_any     = false;
+        bool monitor_only = false;
         bool install      = false;
         bool uninstall    = false;
         for (int i = 1; i < argc; ++i) {
@@ -75,6 +78,8 @@ int main(int argc, char** argv) {
                 port_override = std::stoi(need("--port"));
             } else if (a == "--bind-any") {
                 bind_any = true;
+            } else if (a == "--monitor-only") {
+                monitor_only = true;
             } else if (a == "--install-login") {
                 install = true;
             } else if (a == "--uninstall-login") {
@@ -93,10 +98,11 @@ int main(int argc, char** argv) {
             return 2;
         }
         auto cfg = ninfer::supervisor::load_config_json(
-            ninfer::supervisor::read_file_text(config_path));
+            ninfer::supervisor::read_file_text(config_path), monitor_only);
         if (!host_override.empty()) { cfg.host = host_override; }
         if (port_override > 0) { cfg.port = port_override; }
         if (bind_any) { cfg.bind_any = true; }
+        if (monitor_only) { cfg.monitor_only = true; }
         if (cfg.bind_any) {
             std::cerr << "WARNING: binding beyond loopback; engine start/stop is exposed on "
                       << (cfg.host.empty() ? "0.0.0.0" : cfg.host) << ":" << cfg.port << "\n";

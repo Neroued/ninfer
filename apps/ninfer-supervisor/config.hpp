@@ -20,7 +20,8 @@ struct EngineSpec {
     std::string engine_host = "127.0.0.1";
     int engine_port         = 8010;
     std::string request_log;
-    int device = 0;
+    int device      = 0;
+    bool unmanaged  = false; // observe an engine this process did not spawn
 };
 
 struct SupervisorConfig {
@@ -28,10 +29,15 @@ struct SupervisorConfig {
     std::string host = "127.0.0.1";
     int port         = 8099;
     bool bind_any    = false;
+    bool monitor_only = false; // never spawn/stop/restart; HTTP observe only
     std::string logs_dir;
     bool run_at_login = false;
     RestartPolicy restart;
 };
+
+inline bool manages_engine_process(const SupervisorConfig& cfg) noexcept {
+    return !cfg.monitor_only && !cfg.engine.unmanaged;
+}
 
 inline std::string read_file_text(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
@@ -51,7 +57,8 @@ inline std::string read_api_key(const std::string& path) {
     return raw;
 }
 
-inline SupervisorConfig load_config_json(const std::string& json_text) {
+inline SupervisorConfig load_config_json(const std::string& json_text,
+                                         bool monitor_only_cli = false) {
     const auto body = nlohmann::json::parse(json_text);
     SupervisorConfig cfg;
     if (body.contains("engine") && body.at("engine").is_object()) {
@@ -63,6 +70,7 @@ inline SupervisorConfig load_config_json(const std::string& json_text) {
         cfg.engine.engine_port  = e.value("engine_port", 8010);
         cfg.engine.request_log  = e.value("request_log", "");
         cfg.engine.device       = e.value("device", 0);
+        cfg.engine.unmanaged    = e.value("unmanaged", false);
         if (e.contains("args") && e.at("args").is_array()) {
             for (const auto& a : e.at("args")) {
                 if (a.is_string()) { cfg.engine.args.push_back(a.get<std::string>()); }
@@ -73,8 +81,9 @@ inline SupervisorConfig load_config_json(const std::string& json_text) {
         const auto& s = body.at("supervisor");
         cfg.host         = s.value("host", "127.0.0.1");
         cfg.port         = s.value("port", 8099);
-        cfg.bind_any     = s.value("bind_any", false);
-        cfg.logs_dir     = s.value("logs_dir", "");
+        cfg.bind_any      = s.value("bind_any", false);
+        cfg.monitor_only  = s.value("monitor_only", false) || monitor_only_cli;
+        cfg.logs_dir      = s.value("logs_dir", "");
         cfg.run_at_login = s.value("run_at_login", false);
         if (s.contains("restart") && s.at("restart").is_object()) {
             const auto& r = s.at("restart");
@@ -84,8 +93,10 @@ inline SupervisorConfig load_config_json(const std::string& json_text) {
             cfg.restart.health_fail_threshold = r.value("health_fail_threshold", 3);
         }
     }
-    if (cfg.engine.executable.empty()) {
-        throw std::invalid_argument("engine.executable is required");
+    if (monitor_only_cli) { cfg.monitor_only = true; }
+    if (manages_engine_process(cfg) && cfg.engine.executable.empty()) {
+        throw std::invalid_argument(
+            "engine.executable is required unless monitor_only or engine.unmanaged");
     }
     if (!cfg.bind_any && !is_loopback_host(cfg.host)) {
         throw std::invalid_argument(

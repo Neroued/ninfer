@@ -165,6 +165,12 @@ ninfer_add_test(ninfer_request_log_test
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES test_http_error_handler.cpp
   LIBRARIES ninfer_serve)
+add_executable(ninfer_supervisor_test test_ninfer_supervisor.cpp)
+target_include_directories(ninfer_supervisor_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${PROJECT_SOURCE_DIR}/apps/ninfer-supervisor
+  ${PROJECT_SOURCE_DIR}/third_party)
+add_test(NAME ninfer_supervisor_test COMMAND ninfer_supervisor_test)
 target_include_directories(ninfer_http_error_handler_test PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 ninfer_add_test(ninfer_executor_recovery_test

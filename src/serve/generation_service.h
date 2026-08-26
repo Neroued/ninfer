@@ -104,6 +104,9 @@ public:
         engine_->vram_release(tiers, target_mib);
     }
     void vram_reclaim() { engine_->vram_reclaim(); }
+    [[nodiscard]] bool is_healthy() const noexcept {
+        return engine_ != nullptr && engine_->is_healthy();
+    }
 
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();

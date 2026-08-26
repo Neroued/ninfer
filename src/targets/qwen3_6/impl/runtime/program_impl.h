@@ -425,19 +425,20 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         prompt.token_types.begin() + static_cast<std::ptrdiff_t>(request_plan.reuse_base),
         prompt.token_types.end(), [](std::uint8_t type) { return type != 0; });
     if (suffix_has_visual != request_plan.vision.has_value()) {
-        throw std::invalid_argument("request plan does not describe the prompt suffix modality");
+        throw std::logic_error("request plan does not describe the prompt suffix modality");
     }
     if (request_plan.summary.transient_bytes != 0 &&
         (transient.data == nullptr || transient.size < request_plan.summary.transient_bytes ||
          transient.alignment < request_plan.summary.transient_alignment)) {
-        throw std::invalid_argument("request transient region does not satisfy the plan");
+        throw std::logic_error("request transient region does not satisfy the plan");
     }
     if (request_plan.reuse != ReusePath::FullReset &&
         request_plan.reuse != ReusePath::SeedPrefixCache &&
         (!sequence.retained ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           request_plan.reuse_base))) {
-        throw std::logic_error("planned resident prefix is no longer reusable");
+        throw RequestError(RequestErrorKind::Unavailable,
+                           "planned resident prefix is no longer reusable");
     }
     if (request_plan.reuse == ReusePath::SeedPrefixCache) {
         const bool seed_ok =
@@ -457,7 +458,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         (!sequence.rewrite_checkpoint.valid ||
          sequence.rewrite_checkpoint.frontier != request_plan.reuse_base ||
          request_plan.reuse != restore_path(sequence.rewrite_checkpoint.kind))) {
-        throw std::logic_error("planned rewrite checkpoint is unavailable");
+        throw RequestError(RequestErrorKind::Unavailable,
+                           "planned rewrite checkpoint is unavailable");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::KeepExisting &&
         (!prompt.identity.rewrite_checkpoint || !sequence.rewrite_checkpoint.valid ||
@@ -466,7 +468,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          request_plan.reuse == ReusePath::FullReset ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           sequence.rewrite_checkpoint.frontier))) {
-        throw std::logic_error("planned rewrite checkpoint retention is unavailable");
+        throw RequestError(RequestErrorKind::Unavailable,
+                           "planned rewrite checkpoint retention is unavailable");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::ReclassifyExisting &&
         (!prompt.identity.rewrite_checkpoint || !sequence.rewrite_checkpoint.valid ||
@@ -475,7 +478,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          request_plan.reuse == ReusePath::FullReset ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                           sequence.rewrite_checkpoint.frontier))) {
-        throw std::logic_error("planned rewrite checkpoint reclassification is unavailable");
+        throw RequestError(RequestErrorKind::Unavailable,
+                           "planned rewrite checkpoint reclassification is unavailable");
     }
     if (request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::CaptureNew &&
         (!request_plan.rewrite_checkpoint_capture || !prompt.identity.rewrite_checkpoint ||
@@ -645,7 +649,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             std::vector<bool> used(prompt.media_payloads.size(), false);
             for (const VisionUseSpan& use : request_plan.vision->uses) {
                 if (use.item_index >= used.size()) {
-                    throw std::logic_error("Vision plan references a missing media payload");
+                    throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                                       "Vision plan references a missing media payload");
                 }
                 used[use.item_index] = true;
             }

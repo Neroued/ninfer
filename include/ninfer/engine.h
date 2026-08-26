@@ -94,6 +94,7 @@ public:
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
+    [[nodiscard]] bool is_healthy() const noexcept;
     void reset_memory_peaks() noexcept;
 
     [[nodiscard]] VramControlState vram_control_state() const;

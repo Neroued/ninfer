@@ -16,13 +16,13 @@ void validate_sampling(const ResolvedSamplingParameters& sampling) {
     if (!std::isfinite(sampling.temperature) || !std::isfinite(sampling.top_p) ||
         !std::isfinite(sampling.min_p) || !std::isfinite(sampling.presence_penalty) ||
         !std::isfinite(sampling.frequency_penalty)) {
-        throw std::invalid_argument("sampling parameters must be finite");
+        throw RequestError(RequestErrorKind::Unavailable, "sampling parameters must be finite");
     }
     if (sampling.top_p < 0.0F || sampling.top_p > 1.0F) {
-        throw std::invalid_argument("top_p must be in [0,1]");
+        throw RequestError(RequestErrorKind::Unavailable, "top_p must be in [0,1]");
     }
     if (sampling.min_p < 0.0F || sampling.min_p > 1.0F) {
-        throw std::invalid_argument("min_p must be in [0,1]");
+        throw RequestError(RequestErrorKind::Unavailable, "min_p must be in [0,1]");
     }
 }
 
@@ -61,35 +61,43 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
 RequestBasePlan
 ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                                    const runtime::ResolvedExecutionOptions& options) {
-    if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
+    if (prompt.token_ids.empty()) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded, "prompt must contain tokens");
+    }
     if (prompt.token_ids.size() > capacity) {
-        throw std::invalid_argument("prompt exceeds configured context capacity");
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           "prompt exceeds configured context capacity");
     }
     if (prompt.token_ids.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("prompt token count exceeds uint32");
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           "prompt token count exceeds uint32");
     }
     for (const TokenId id : prompt.token_ids) {
         if (id < 0 || id >= TextConfig::token_domain) {
-            throw std::invalid_argument("prompt contains token outside the 248077-token domain");
+            throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                               "prompt contains token outside the 248077-token domain");
         }
     }
     if (prompt.token_types.size() != prompt.token_ids.size() ||
         prompt.positions.size() != 3ULL * prompt.token_ids.size()) {
-        throw std::invalid_argument("prepared prompt token metadata has an invalid shape");
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           "prepared prompt token metadata has an invalid shape");
     }
     if (prompt.has_media() != !prompt.media_payloads.empty() ||
         prompt.media_payloads.size() != prompt.vision_items.size()) {
-        throw std::invalid_argument("prepared prompt media payload is incomplete");
+        throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                           "prepared prompt media payload is incomplete");
     }
     for (std::size_t i = 0; i < prompt.media_payloads.size(); ++i) {
         if (!prompt.media_payloads[i] ||
             prompt.media_payloads[i]->patch_elements !=
                 prompt.vision_items[i].patch_count * kPreparedVisionPatchFeatures) {
-            throw std::invalid_argument("prepared prompt media item payload has an invalid shape");
+            throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                               "prepared prompt media item payload has an invalid shape");
         }
     }
     if (prompt.has_media() && !vision_enabled) {
-        throw std::invalid_argument("Vision is disabled for this Engine");
+        throw RequestError(RequestErrorKind::Unavailable, "Vision is disabled for this Engine");
     }
     validate_sampling(options.sampling);
 
@@ -131,7 +139,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         std::uint32_t previous_end = 0;
         for (const qwen3_6::VisionItemControl& item : control->items) {
             if (item.scatter_indices.empty()) {
-                throw std::invalid_argument("vision item has no Text consumer columns");
+                throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                                   "vision item has no Text consumer columns");
             }
             const auto first = static_cast<std::uint32_t>(item.scatter_indices.front());
             const auto last  = static_cast<std::uint32_t>(item.scatter_indices.back());
@@ -139,13 +148,16 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
                 speculative_backend == SpeculativeBackend::Mtp && first != 0 ? first - 1 : first;
             const std::uint32_t end = last + 1;
             if (begin < previous_end) {
-                throw std::invalid_argument("vision item consumer spans overlap");
+                throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                                   "vision item consumer spans overlap");
             }
             if (end > base->summary.prompt_tokens) {
-                throw std::invalid_argument("vision item consumer span exceeds prompt");
+                throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                                   "vision item consumer span exceeds prompt");
             }
             if (schedule::VisionContext::workspace_bytes(item) > work.capacity()) {
-                throw std::invalid_argument("vision item exceeds the Program workspace envelope");
+                throw RequestError(RequestErrorKind::MediaBudgetExceeded,
+                                   "vision item exceeds the Program workspace envelope");
             }
             previous_end = end;
             max_merged   = std::max(max_merged, item.merged_count);
@@ -157,7 +169,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
     if (prompt.identity.rewrite_checkpoint) {
         const RewriteCheckpointSpec candidate = *prompt.identity.rewrite_checkpoint;
         if (candidate.frontier == 0 || candidate.frontier > base->summary.prompt_tokens) {
-            throw std::invalid_argument(
+            throw RequestError(
+                RequestErrorKind::ContextLengthExceeded,
                 "rewrite checkpoint frontier must lie at or inside the prompt frontier");
         }
         base->rewrite_checkpoint = candidate;

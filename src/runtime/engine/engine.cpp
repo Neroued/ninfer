@@ -346,6 +346,20 @@ RuntimeStats Engine::runtime_stats() const {
         impl_->executor);
 }
 
+bool Engine::is_healthy() const noexcept {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& executor) -> bool {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                return false;
+            } else {
+                return executor != nullptr && executor->is_healthy();
+            }
+        },
+        impl_->executor);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(

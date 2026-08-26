@@ -313,7 +313,16 @@ void HttpServer::register_routes() {
             }
         });
 
-    server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+        if (service_ != nullptr && !service_->is_healthy()) {
+            res.status = 503;
+            res.set_content(
+                nlohmann::json{{"status", "unhealthy"},
+                               {"error", "inference engine is unavailable"}}
+                    .dump(),
+                "application/json");
+            return;
+        }
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
     if (options_.enable_admin_vram) {

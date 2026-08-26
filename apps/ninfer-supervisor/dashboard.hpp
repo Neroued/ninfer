@@ -93,6 +93,7 @@ inline constexpr std::string_view kDashboardHtml = R"HTML(<!DOCTYPE html>
     <div class="row"><span>released now</span><span id="released" class="num">—</span></div>
     <div class="row"><span>time since release</span><span id="sincerel" class="num">—</span></div>
     <div class="row"><span>last vram action</span><span id="vramact" class="muted">—</span></div>
+    <div class="row"><span>detector last ran</span><span id="detector" class="muted">—</span></div>
     <div class="row"><span>admin note</span><span id="adminnote" class="muted">—</span></div>
   </section>
   <section class="span2">
@@ -190,6 +191,10 @@ function apply(s){
     vc.since_release_s!=null ? vc.since_release_s+" s" : "—";
   document.getElementById("vramact").textContent =
     ((vc.last_transition||"")+" "+(vc.last_reason||"")).trim()||"—";
+  document.getElementById("detector").textContent =
+    vc.detector_last_ran_ms
+      ? (vc.detector_age_s==0 ? "now" : vc.detector_age_s+" s ago")
+      : "never — quiet is not the same as nothing happened";
   const r=s.requests||{};
   document.getElementById("rdone").textContent = r.done!=null?r.done:"—";
   document.getElementById("ttft").textContent = r.ttft_ms_mean? r.ttft_ms_mean.toFixed(0)+" ms":"—";

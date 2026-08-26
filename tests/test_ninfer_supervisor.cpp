@@ -281,6 +281,24 @@ int test_insights_pinned_tier() {
         }
     }
     f += check(saw, "pinned min==max insight present");
+
+    nlohmann::json elastic_report = {{"insights", nlohmann::json::array()}};
+    nlohmann::json elastic        = {
+        {"last_transition", ""},
+        {"last_reason", ""},
+        {"tiers",
+         nlohmann::json::array(
+             {{{"name", "seed"},
+               {"min_bytes", 0},
+               {"max_bytes", 4294967296ull},
+               {"reclaimable_bytes", 4294967296ull},
+               {"released", false}}})}};
+    append_admin_vram_insights(elastic_report, elastic, "");
+    bool elastic_fired = false;
+    for (const auto& it : elastic_report.at("insights")) {
+        if (it.at("id") == "vram.tier_pinned_unreleasable") { elastic_fired = true; }
+    }
+    f += check(!elastic_fired, "elastic min!=max does not fire pinned insight");
     return f;
 }
 
@@ -327,6 +345,25 @@ int test_jsonl_event_key() {
     f += check(!jsonl_event_is(R"({"type":"request_done"})", "request_done"),
                "type key is not the event key");
     f += check(!jsonl_event_is(R"({"event":"server_start"})", "request_done"), "other event");
+    return f;
+}
+
+int test_series_persist() {
+    using namespace ninfer::supervisor;
+    int f = 0;
+    VramSample s{};
+    f += check(parse_series_sample_line(R"({"t_ms":10,"budget_bytes":20,"nvidia_used_bytes":30})", s) &&
+                   s.t_ms == 10 && s.budget_bytes == 20 && s.nvidia_used_bytes == 30,
+               "parse sample");
+    VramSeriesEvent e{};
+    f += check(parse_series_event_line(R"({"t_ms":11,"kind":"vram_release","label":"seed store released"})", e) &&
+                   e.kind == "vram_release",
+               "parse event");
+    VramSeriesRing r(8);
+    r.load_jsonl("{\"t_ms\":1,\"budget_bytes\":2,\"nvidia_used_bytes\":3}\n"
+                 "{\"t_ms\":4,\"kind\":\"engine_up\",\"label\":\"health 200\"}\n");
+    f += check(r.size() == 1 && r.events().size() == 1 && r.events()[0].kind == "engine_up",
+               "load_jsonl restores samples and events");
     return f;
 }
 
@@ -378,6 +415,7 @@ int main() {
     failures += test_admin_vram_markers();
     failures += test_insights_pinned_tier();
     failures += test_jsonl_event_key();
+    failures += test_series_persist();
     failures += test_series_ring();
     failures += test_health_threshold();
     if (failures == 0) { std::cout << "ok\n"; }

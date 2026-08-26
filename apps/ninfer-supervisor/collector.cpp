@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <thread>
 #include <vector>
@@ -200,15 +201,76 @@ std::int64_t Collector::now_ms() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+void Collector::load_persisted_series() {
+    if (logs_dir_.empty()) { return; }
+    std::filesystem::create_directories(logs_dir_);
+    series_path_ = (std::filesystem::path(logs_dir_) / "series.jsonl").string();
+    std::ifstream in(series_path_, std::ios::binary);
+    if (in) {
+        in.seekg(0, std::ios::end);
+        const auto sz = static_cast<std::int64_t>(in.tellg());
+        const std::int64_t keep = 2 * 1024 * 1024;
+        if (sz > keep) { in.seekg(sz - keep, std::ios::beg); }
+        else {
+            in.seekg(0, std::ios::beg);
+        }
+        std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        auto nl = body.find('\n');
+        if (sz > keep && nl != std::string::npos) { body.erase(0, nl + 1); }
+        series_.load_jsonl(body);
+    }
+    series_file_.open(series_path_, std::ios::app);
+}
+
+void Collector::persist_sample(const VramSample& s) {
+    if (!series_file_.is_open()) { return; }
+    series_file_ << format_series_sample_line(s) << '\n';
+    series_file_.flush();
+}
+
+void Collector::persist_event(const VramSeriesEvent& e) {
+    if (!series_file_.is_open()) { return; }
+    series_file_ << format_series_event_line(e) << '\n';
+    series_file_.flush();
+}
+
 void Collector::start_series() {
     bool expected = false;
     if (!series_run_.compare_exchange_strong(expected, true)) { return; }
-    series_thread_ = std::thread([this] { series_loop(); });
+    load_persisted_series();
+    series_thread_  = std::thread([this] { series_loop(); });
+    observe_thread_ = std::thread([this] { observe_loop(); });
 }
 
 void Collector::stop_series() {
     series_run_ = false;
     if (series_thread_.joinable()) { series_thread_.join(); }
+    if (observe_thread_.joinable()) { observe_thread_.join(); }
+}
+
+void Collector::observe_loop() {
+    // Health and /admin/vram are HTTP. They do not belong on the 10 Hz DXGI
+    // loop. They also cannot live only inside snapshot() — that is demand-driven
+    // by /api/state, so a dashboard that is closed records nothing. 1 Hz is the
+    // heartbeat: slow enough not to compete with the engine, fast enough that a
+    // 5 s reclaim is visible even with nobody watching.
+    while (series_run_.load()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        try {
+            Collected tmp;
+            poll_health(tmp);
+            poll_admin(tmp);
+            record_transitions(tmp);
+            std::lock_guard lock(mu_);
+            detector_last_ran_ms_ = now_ms();
+        } catch (...) {
+            std::lock_guard lock(mu_);
+            detector_last_ran_ms_ = now_ms();
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        const auto period  = std::chrono::milliseconds(1000);
+        if (elapsed < period) { std::this_thread::sleep_for(period - elapsed); }
+    }
 }
 
 void Collector::series_loop() {
@@ -225,23 +287,26 @@ void Collector::series_loop() {
     NvidiaSmiMemory nvidia_last;
     while (series_run_.load()) {
         const auto t0 = std::chrono::steady_clock::now();
-        VramSample sample;
-        sample.t_ms = now_ms();
-        DxgiSnapshot dxgi = query_dxgi_local(spec_.device);
-        if (nvidia_tick == 0) {
-            Collected nv;
-            poll_nvidia_smi(nv);
-            nvidia_last = nv.nvidia;
-        }
-        nvidia_tick = (nvidia_tick + 1) % kNvidiaEvery;
-        sample.budget_bytes      = dxgi.budget_bytes;
-        sample.nvidia_used_bytes = mib_to_bytes(nvidia_last.used_mib);
-        {
-            std::lock_guard lock(mu_);
-            last_dxgi_   = dxgi;
-            last_nvidia_ = nvidia_last;
-            series_.push(sample);
-        }
+        try {
+            VramSample sample;
+            sample.t_ms = now_ms();
+            DxgiSnapshot dxgi = query_dxgi_local(spec_.device);
+            if (nvidia_tick == 0 && dxgi.ok) {
+                Collected nv;
+                poll_nvidia_smi(nv);
+                nvidia_last = nv.nvidia;
+            }
+            nvidia_tick = (nvidia_tick + 1) % kNvidiaEvery;
+            sample.budget_bytes      = dxgi.budget_bytes;
+            sample.nvidia_used_bytes = mib_to_bytes(nvidia_last.used_mib);
+            {
+                std::lock_guard lock(mu_);
+                last_dxgi_   = dxgi;
+                last_nvidia_ = nvidia_last;
+                series_.push(sample);
+                persist_sample(sample);
+            }
+        } catch (...) {}
         const auto elapsed = std::chrono::steady_clock::now() - t0;
         const auto period  = std::chrono::milliseconds(100);
         if (elapsed < period) { std::this_thread::sleep_for(period - elapsed); }
@@ -253,13 +318,18 @@ void Collector::record_transitions(const Collected& snap) {
     std::lock_guard lock(mu_);
     if (last_health_status_ != -1 && last_health_status_ != snap.health_status) {
         if (snap.health_status == 200) {
-            series_.push_event({t, "engine_up", "health 200"});
+            const VramSeriesEvent ev{t, "engine_up", "health 200"};
+            series_.push_event(ev);
+            persist_event(ev);
         } else if (last_health_status_ == 200) {
-            series_.push_event(
-                {t, "engine_down", "health " + std::to_string(snap.health_status)});
+            const VramSeriesEvent ev{t, "engine_down",
+                                     "health " + std::to_string(snap.health_status)};
+            series_.push_event(ev);
+            persist_event(ev);
         }
     }
     last_health_status_ = snap.health_status;
+    last_health_body_   = snap.health_body;
     last_admin_vram_    = snap.admin_vram;
     last_admin_note_    = snap.admin_vram_note;
     if (snap.admin_vram.is_object()) {
@@ -282,7 +352,9 @@ void Collector::record_transitions(const Collected& snap) {
                 label += reason;
             }
             if (!released.empty()) { label += " released=" + released; }
-            series_.push_event({t, kind, label});
+            const VramSeriesEvent ev{t, kind, label};
+            series_.push_event(ev);
+            persist_event(ev);
             if (kind == "vram_release") { last_release_ms_ = t; }
             if (kind == "vram_reclaim") { last_release_ms_ = 0; }
         }
@@ -301,9 +373,13 @@ void Collector::note_engine_state(const std::string& state, const std::string& l
     if (!last_engine_state_.empty() && state != last_engine_state_) {
         const auto t = now_ms();
         if (state == "Running" || state == "Starting") {
-            series_.push_event({t, "engine_start", last_event.empty() ? state : last_event});
+            const VramSeriesEvent ev{t, "engine_start", last_event.empty() ? state : last_event};
+            series_.push_event(ev);
+            persist_event(ev);
         } else if (state == "Stopped" || state == "Stopping" || state == "Halted") {
-            series_.push_event({t, "engine_stop", last_event.empty() ? state : last_event});
+            const VramSeriesEvent ev{t, "engine_stop", last_event.empty() ? state : last_event};
+            series_.push_event(ev);
+            persist_event(ev);
         }
     }
     last_engine_state_ = state;
@@ -329,7 +405,8 @@ nlohmann::json Collector::series_json() {
             {"t_ms", std::move(t_ms)},
             {"budget_bytes", std::move(budget)},
             {"nvidia_used_bytes", std::move(nvidia_used)},
-            {"events", std::move(events)}};
+            {"events", std::move(events)},
+            {"detector_last_ran_ms", detector_last_ran_ms_}};
 }
 
 nlohmann::json Collector::vram_control_json() {
@@ -360,6 +437,10 @@ nlohmann::json Collector::vram_control_json() {
              : nlohmann::json(nullptr)},
         {"tiers", std::move(tiers)},
         {"note", last_admin_note_},
+        {"detector_last_ran_ms", detector_last_ran_ms_},
+        {"detector_age_s",
+         detector_last_ran_ms_ > 0 ? nlohmann::json((now - detector_last_ran_ms_) / 1000)
+                                   : nlohmann::json(nullptr)},
     };
     return out;
 }
@@ -379,20 +460,21 @@ nlohmann::json Collector::insights_report() {
 
 Collected Collector::snapshot() {
     Collected out;
+    poll_request_log(out);
+    if (series_run_.load()) {
+        std::lock_guard lock(mu_);
+        out.health_status    = last_health_status_ < 0 ? 0 : last_health_status_;
+        out.health_body      = last_health_body_;
+        out.admin_vram       = last_admin_vram_;
+        out.admin_vram_note  = last_admin_note_;
+        out.dxgi             = last_dxgi_;
+        out.nvidia           = last_nvidia_;
+        return out;
+    }
     poll_health(out);
     poll_admin(out);
-    poll_request_log(out);
-    {
-        std::lock_guard lock(mu_);
-        if (series_run_.load() && last_dxgi_.ok) {
-            out.dxgi   = last_dxgi_;
-            out.nvidia = last_nvidia_;
-        }
-    }
-    if (!out.dxgi.ok && out.dxgi.error.empty()) {
-        out.dxgi = query_dxgi_local(spec_.device);
-        poll_nvidia_smi(out);
-    }
+    out.dxgi = query_dxgi_local(spec_.device);
+    poll_nvidia_smi(out);
     record_transitions(out);
     return out;
 }

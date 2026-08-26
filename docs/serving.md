@@ -43,6 +43,9 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
+| `GET /admin/vram` | current VRAM tier state (seed/KV held bytes, range, last transition) |
+| `POST /admin/vram/release` | release named cache tiers (`{"tiers":["seed"],"target_mib":N}`). KV is refused in this phase |
+| `POST /admin/vram/reclaim` | re-acquire previously released cache tiers; failure stays degraded |
 | `GET /v1/models` | configured OpenAI model alias, including `max_model_len` = `--max-context` |
 | `GET /v1/models/{id}` | lookup of the configured alias, same `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -597,7 +600,15 @@ network serialization run outside the GPU executor and do not delay formation of
 sequence's logical ceiling; the latter sizes the shared Main Text KV pool used by all active
 requests and retained prefixes. Both are represented with 64-token pages internally, while a
 sequence can never cross the exact `--max-context` frontier. `--kv-capacity N` requests an explicit
-capacity; `--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
+capacity (and means min==max==N). `--kv-capacity-min` / `--kv-capacity-max` set an elastic token
+range and boot at max; this phase reports the range and does not yet shrink KV at runtime.
+`--prefix-cache-mib N` is the same for the seed store (min==max==N). `--prefix-cache-mib-min` /
+`--prefix-cache-mib-max` boot at max; min 0 is fully releasable via idle release or
+`POST /admin/vram/release`. `--vram-idle-release-after-s N` (default 0, disabled) drops the seed
+store after N seconds with no in-flight GPU work. `--vram-observe-only` logs would-be releases
+without freeing memory. Default flag-free behaviour is unchanged: no idle release, seed store
+fixed at `--prefix-cache-mib` (0 disables it).
+`--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
 after weights are loaded while keeping 1 GiB of sizing headroom. When omitted it follows
 `--max-context`, preserving one full-length request's capacity. The shared pool is fixed at startup
 and is not divided evenly among request lanes.

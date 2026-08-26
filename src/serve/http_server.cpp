@@ -10,13 +10,16 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace ninfer::serve {
 namespace {
@@ -181,19 +184,44 @@ void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
     ninfer::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
-    const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
+    const auto stats_interval       = std::chrono::milliseconds(
+        options_.log_stats_interval_ms == 0 ? 1000 : options_.log_stats_interval_ms);
+    std::optional<Clock::time_point> idle_since;
 
     for (;;) {
         {
             std::unique_lock lock(stats_mutex_);
-            if (stats_cv_.wait_for(lock, interval, [this] { return stats_stopping_; })) { break; }
+            if (stats_cv_.wait_for(lock, stats_interval, [this] { return stats_stopping_; })) {
+                break;
+            }
         }
 
         const ninfer::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
-        const ThroughputReport report      = make_throughput_report(
-            previous, current, std::chrono::duration<double>(now - previous_time).count());
-        if (report_has_activity(report)) { log_throughput(report); }
+        if (options_.log_stats_interval_ms != 0) {
+            const ThroughputReport report = make_throughput_report(
+                previous, current, std::chrono::duration<double>(now - previous_time).count());
+            if (report_has_activity(report)) { log_throughput(report); }
+        }
+        if (options_.vram_idle_release_after_s != 0) {
+            const bool gpu_idle = current.running_requests == 0 &&
+                                  current.prefilling_requests == 0 && current.waiting_requests == 0;
+            if (!gpu_idle) {
+                idle_since.reset();
+            } else {
+                if (!idle_since.has_value()) { idle_since = now; }
+                const auto idle_for = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - *idle_since);
+                if (idle_for.count() >= static_cast<std::int64_t>(options_.vram_idle_release_after_s)) {
+                    try {
+                        service_->vram_release({"seed"}, 0);
+                    } catch (const std::exception& error) {
+                        log_line(std::string("vram idle release skipped: ") + error.what());
+                    }
+                    idle_since = now;
+                }
+            }
+        }
         previous      = current;
         previous_time = now;
     }
@@ -278,6 +306,17 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
+    server_.Get("/admin/vram", [this](const httplib::Request&, httplib::Response& res) {
+        handle_admin_vram(res);
+    });
+    server_.Post("/admin/vram/release",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_admin_vram_release(req, res);
+                 });
+    server_.Post("/admin/vram/reclaim",
+                 [this](const httplib::Request&, httplib::Response& res) {
+                     handle_admin_vram_reclaim(res);
+                 });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -342,6 +381,87 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
                     "application/json");
+}
+
+nlohmann::json vram_state_json(const ninfer::VramControlState& state) {
+    nlohmann::json tiers = nlohmann::json::array();
+    for (const auto& tier : state.tiers) {
+        tiers.push_back({{"name", tier.name},
+                         {"held_bytes", tier.held_bytes},
+                         {"min_bytes", tier.min_bytes},
+                         {"max_bytes", tier.max_bytes},
+                         {"reclaimable_bytes", tier.reclaimable_bytes},
+                         {"released", tier.released}});
+    }
+    return {{"tiers", std::move(tiers)},
+            {"floor_bytes", state.floor_bytes},
+            {"observe_only", state.observe_only},
+            {"last_transition", state.last_transition},
+            {"last_reason", state.last_reason}};
+}
+
+void HttpServer::handle_admin_vram(httplib::Response& res) const {
+    res.set_content(vram_state_json(service_->vram_control_state()).dump(), "application/json");
+}
+
+void HttpServer::handle_admin_vram_release(const httplib::Request& req, httplib::Response& res) {
+    std::vector<std::string> tiers{"seed"};
+    std::size_t target_mib = 0;
+    if (!req.body.empty()) {
+        nlohmann::json body;
+        try {
+            body = nlohmann::json::parse(req.body);
+        } catch (const std::exception&) {
+            ApiError error;
+            error.status  = 400;
+            error.type    = "invalid_request_error";
+            error.code    = "invalid_json";
+            error.message = "request body is not valid JSON";
+            write_error(res, error);
+            return;
+        }
+        if (body.contains("tiers")) {
+            if (!body.at("tiers").is_array()) {
+                ApiError error;
+                error.status  = 400;
+                error.type    = "invalid_request_error";
+                error.message = "tiers must be an array";
+                write_error(res, error);
+                return;
+            }
+            tiers.clear();
+            for (const auto& item : body.at("tiers")) {
+                if (!item.is_string()) {
+                    ApiError error;
+                    error.status  = 400;
+                    error.type    = "invalid_request_error";
+                    error.message = "tiers entries must be strings";
+                    write_error(res, error);
+                    return;
+                }
+                tiers.push_back(item.get<std::string>());
+            }
+        }
+        if (body.contains("target_mib") && body.at("target_mib").is_number_unsigned()) {
+            target_mib = body.at("target_mib").get<std::size_t>();
+        }
+    }
+    try {
+        service_->vram_release(tiers, target_mib);
+    } catch (const std::invalid_argument& error) {
+        ApiError api;
+        api.status  = 400;
+        api.type    = "invalid_request_error";
+        api.message = error.what();
+        write_error(res, api);
+        return;
+    }
+    res.set_content(vram_state_json(service_->vram_control_state()).dump(), "application/json");
+}
+
+void HttpServer::handle_admin_vram_reclaim(httplib::Response& res) {
+    service_->vram_reclaim();
+    res.set_content(vram_state_json(service_->vram_control_state()).dump(), "application/json");
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
@@ -801,7 +921,7 @@ bool HttpServer::listen() {
     if (public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
-    if (options_.log_stats_interval_ms != 0) {
+    if (options_.log_stats_interval_ms != 0 || options_.vram_idle_release_after_s != 0) {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }

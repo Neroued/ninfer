@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -46,7 +47,12 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          admission_capacity_(instance.program->admission_capacity()) {
+          admission_capacity_(instance.program->admission_capacity()),
+          prefix_cache_min_bytes_(options.prefix_cache_min_bytes),
+          prefix_cache_max_bytes_(options.prefix_cache_max_bytes == 0 ? options.prefix_cache_bytes
+                                                                      : options.prefix_cache_max_bytes),
+          vram_floor_bytes_(options.vram_floor_bytes),
+          vram_observe_only_(options.vram_observe_only) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
@@ -196,6 +202,112 @@ public:
             instance_.program->reset_memory_peaks();
             instance_.request_memory.reset_peak();
         } catch (...) {}
+    }
+
+    [[nodiscard]] VramControlState vram_control_state() const {
+        std::scoped_lock lock(execution_mutex_);
+        return make_vram_control_state();
+    }
+
+    void vram_release(const std::vector<std::string>& tiers, std::size_t target_mib) {
+        std::scoped_lock lock(execution_mutex_);
+        bool seed = false;
+        for (const std::string& tier : tiers) {
+            if (tier == "seed") {
+                seed = true;
+            } else if (tier == "kv") {
+                throw std::invalid_argument(
+                    "KV-tier VRAM release is not available in this phase; it needs quiesce and "
+                    "CUDA Graph recapture");
+            } else {
+                throw std::invalid_argument("unknown VRAM tier: " + tier);
+            }
+        }
+        if (!seed) { return; }
+        const std::size_t held = instance_.program->prefix_seed_held_bytes();
+        const std::size_t min_bytes =
+            prefix_cache_min_bytes_ > prefix_cache_max_bytes_ ? 0 : prefix_cache_min_bytes_;
+        if (min_bytes > 0) {
+            throw std::invalid_argument("prefix-cache min is not zero; seed store cannot be released");
+        }
+        (void)target_mib;
+        if (held == 0) {
+            last_transition_ = "noop";
+            last_reason_     = "seed store already released";
+            return;
+        }
+        if (vram_observe_only_) {
+            last_transition_ = "observe";
+            last_reason_     = "would release seed store (" + std::to_string(held) + " bytes)";
+            std::fprintf(stderr, "ninfer: vram observe-only: would release seed %zu MiB\n",
+                         held >> 20);
+            return;
+        }
+        instance_.program->release_prefix_seeds();
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            invalidate_lane_plans(lane);
+        }
+        last_transition_ = "release";
+        last_reason_     = "seed store released";
+        std::fprintf(stderr, "ninfer: vram released seed store (%zu MiB)\n", held >> 20);
+    }
+
+    void vram_reclaim() {
+        std::scoped_lock lock(execution_mutex_);
+        const std::size_t held = instance_.program->prefix_seed_held_bytes();
+        if (held != 0) {
+            last_transition_ = "noop";
+            last_reason_     = "seed store already held";
+            return;
+        }
+        if (prefix_cache_max_bytes_ == 0) {
+            last_transition_ = "noop";
+            last_reason_     = "seed store disabled at startup";
+            return;
+        }
+        if (vram_observe_only_) {
+            last_transition_ = "observe";
+            last_reason_     = "would reclaim seed store";
+            std::fprintf(stderr, "ninfer: vram observe-only: would reclaim seed %zu MiB\n",
+                         prefix_cache_max_bytes_ >> 20);
+            return;
+        }
+        const bool ok = instance_.program->reclaim_prefix_seeds();
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            invalidate_lane_plans(lane);
+        }
+        last_transition_ = ok ? "reclaim" : "reclaim-failed";
+        last_reason_     = ok ? "seed store reclaimed" : "seed store reclaim failed; staying degraded";
+        std::fprintf(stderr, "ninfer: vram %s\n", last_reason_.c_str());
+    }
+
+private:
+    [[nodiscard]] VramControlState make_vram_control_state() const {
+        VramControlState out;
+        out.observe_only    = vram_observe_only_;
+        out.floor_bytes     = vram_floor_bytes_;
+        out.last_transition = last_transition_;
+        out.last_reason     = last_reason_;
+        const std::size_t seed_held = instance_.program->prefix_seed_held_bytes();
+        const std::size_t seed_max  = prefix_cache_max_bytes_;
+        const std::size_t seed_min  = prefix_cache_min_bytes_;
+        VramTierState seed;
+        seed.name              = "seed";
+        seed.held_bytes        = seed_held;
+        seed.min_bytes         = seed_min;
+        seed.max_bytes         = seed_max;
+        seed.reclaimable_bytes = seed_held > seed_min ? seed_held - seed_min : 0;
+        seed.released          = seed_max != 0 && seed_held == 0;
+        out.tiers.push_back(std::move(seed));
+        VramTierState kv;
+        kv.name              = "kv";
+        kv.held_bytes        = instance_.kv_capacity_resolution.runtime_reservation_bytes;
+        kv.min_bytes         = 0;
+        kv.max_bytes         = 0;
+        kv.reclaimable_bytes = 0;
+        kv.released          = false;
+        out.tiers.push_back(std::move(kv));
+        return out;
     }
 
 private:
@@ -1155,6 +1267,12 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const AdmissionResources admission_capacity_;
+    const std::size_t prefix_cache_min_bytes_;
+    const std::size_t prefix_cache_max_bytes_;
+    const std::size_t vram_floor_bytes_;
+    const bool vram_observe_only_;
+    std::string last_transition_;
+    std::string last_reason_;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;

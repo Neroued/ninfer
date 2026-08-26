@@ -51,6 +51,9 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    void handle_admin_vram(httplib::Response& res) const;
+    void handle_admin_vram_release(const httplib::Request& req, httplib::Response& res);
+    void handle_admin_vram_reclaim(httplib::Response& res);
 
     // The process-wide console logger serializes lines from request and reporter threads.
     void log_line(const std::string& line);

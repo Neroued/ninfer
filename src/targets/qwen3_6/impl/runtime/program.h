@@ -249,6 +249,10 @@ public:
 
     void reset_memory_peaks() noexcept;
 
+    void release_prefix_seeds();
+    bool reclaim_prefix_seeds();
+    [[nodiscard]] std::size_t prefix_seed_held_bytes() const noexcept;
+
     const LoadedModelData& model;
     DeviceContext& device;
     const std::uint32_t capacity;

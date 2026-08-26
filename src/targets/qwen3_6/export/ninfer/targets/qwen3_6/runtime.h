@@ -176,6 +176,9 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
+    void release_prefix_seeds();
+    bool reclaim_prefix_seeds();
+    [[nodiscard]] std::size_t prefix_seed_held_bytes() const noexcept;
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) noexcept;

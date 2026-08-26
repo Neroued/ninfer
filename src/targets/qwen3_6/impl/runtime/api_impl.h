@@ -238,6 +238,21 @@ void Program<Variant>::reset_memory_peaks() noexcept {
 }
 
 template <>
+void Program<Variant>::release_prefix_seeds() {
+    impl_->release_prefix_seeds();
+}
+
+template <>
+bool Program<Variant>::reclaim_prefix_seeds() {
+    return impl_->reclaim_prefix_seeds();
+}
+
+template <>
+std::size_t Program<Variant>::prefix_seed_held_bytes() const noexcept {
+    return impl_->prefix_seed_held_bytes();
+}
+
+template <>
 SequencePlanner<Variant> make_sequence_planner<Variant>(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         Variant::WeightsProfile weights_profile) {

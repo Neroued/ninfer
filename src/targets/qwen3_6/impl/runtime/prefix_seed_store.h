@@ -41,15 +41,21 @@ public:
     PrefixSeedStore& operator=(const PrefixSeedStore&) = delete;
 
     /**
-     * Allocates the fixed device arena. budget_bytes==0 leaves the store disabled. The layouts
+     * Allocates the device arena. budget_bytes==0 leaves the store disabled. The layouts
      * fix every entry's device image sizes except the per-entry KV span, which scales with the
-     * entry frontier.
+     * entry frontier. Safe to call again after release(); throws if an arena is already live.
      */
     void initialize(std::size_t budget_bytes, const LinearAttentionStatePool& state_pool,
                     const PagedKVPool& text_pool, const PagedKVPool* backend_pool,
                     std::size_t hidden_bytes);
 
+    // Frees the arena and drops every entry. enabled() becomes false. Must run on the GPU
+    // executor with the device stream idle.
+    void release() noexcept;
+
     [[nodiscard]] bool enabled() const noexcept { return arena_ != nullptr; }
+    [[nodiscard]] std::size_t arena_bytes() const noexcept { return arena_bytes_; }
+    [[nodiscard]] std::size_t entry_count() const noexcept { return entries_.size(); }
 
     /** Exact-token-prefix probe. Returns the entry index or -1. */
     [[nodiscard]] std::int64_t find(const PreparedPromptData& prompt) const;

@@ -358,4 +358,46 @@ void Engine::reset_memory_peaks() noexcept {
         impl_->executor);
 }
 
+VramControlState Engine::vram_control_state() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> VramControlState {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->vram_control_state();
+            }
+        },
+        impl_->executor);
+}
+
+void Engine::vram_release(const std::vector<std::string>& tiers, std::size_t target_mib) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                executor->vram_release(tiers, target_mib);
+            }
+        },
+        impl_->executor);
+}
+
+void Engine::vram_reclaim() {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                executor->vram_reclaim();
+            }
+        },
+        impl_->executor);
+}
+
 } // namespace ninfer

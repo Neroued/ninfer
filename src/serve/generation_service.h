@@ -97,6 +97,14 @@ public:
         return engine_->media_cache_summary();
     }
 
+    [[nodiscard]] ninfer::VramControlState vram_control_state() const {
+        return engine_->vram_control_state();
+    }
+    void vram_release(const std::vector<std::string>& tiers, std::size_t target_mib = 0) {
+        engine_->vram_release(tiers, target_mib);
+    }
+    void vram_reclaim() { engine_->vram_reclaim(); }
+
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }

@@ -243,7 +243,16 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.prefix_cache_bytes       = options_.prefix_cache_bytes;
-    engine_options.load_progress            = std::move(load_progress);
+    engine_options.prefix_cache_min_bytes   = options_.prefix_cache_min_bytes;
+    engine_options.prefix_cache_max_bytes   = options_.prefix_cache_max_bytes;
+    engine_options.kv_capacity_min_tokens   = options_.kv_capacity_min_tokens;
+    engine_options.kv_capacity_max_tokens   = options_.kv_capacity_max_tokens;
+    engine_options.vram_guarantee_context     = options_.vram_guarantee_context;
+    engine_options.vram_guarantee_concurrency = options_.vram_guarantee_concurrency;
+    engine_options.vram_floor_bytes           = options_.vram_floor_bytes;
+    engine_options.vram_idle_release_after_s  = options_.vram_idle_release_after_s;
+    engine_options.vram_observe_only          = options_.vram_observe_only;
+    engine_options.load_progress              = std::move(load_progress);
     engine_              = std::make_unique<ninfer::Engine>(std::move(engine_options));
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(

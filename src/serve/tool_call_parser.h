@@ -43,8 +43,12 @@ ToolParamTypeMap build_tool_param_type_map(const std::vector<ToolDefinition>& to
 
 // Parse Qwen's XML-like tool-call format. In tolerant mode, a complete function
 // call is recovered even when the model adds wrapper garbage or suffix text.
-// A successful parse leaves content empty: a preamble before <tool_call> is
-// not user-visible assistant text (OpenAI content=null when tool_calls exist).
+// A successful parse RETAINS any preamble before <tool_call> as content. It is
+// not user-visible assistant text for a tool turn (OpenAI sends content=null
+// when tool_calls exist), but suppressing it here would make the terminal body
+// shorter than what a streaming response may already have emitted, which aborts
+// the request mid-stream. GenerationService drops it instead, once it knows
+// streamed_content_bytes == 0.
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
                                                  bool tolerant = false);

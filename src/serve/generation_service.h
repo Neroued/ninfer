@@ -97,6 +97,10 @@ public:
         return engine_->media_cache_summary();
     }
 
+    [[nodiscard]] bool is_healthy() const noexcept {
+        return engine_ != nullptr && engine_->is_healthy();
+    }
+
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
     }

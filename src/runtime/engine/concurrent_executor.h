@@ -190,6 +190,11 @@ public:
         return published_stats_;
     }
 
+    [[nodiscard]] bool is_healthy() const noexcept {
+        std::lock_guard lock(queue_mutex_);
+        return !stopping_ && !failed_;
+    }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
@@ -823,6 +828,17 @@ private:
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
+        } catch (const RequestError&) {
+            if (target_started) { instance_.program->abort_lane(lane); }
+            if (prefill_lane_ && *prefill_lane_ == lane) {
+                instance_.request_memory.deactivate();
+                prefill_lane_.reset();
+            }
+            slots_[lane].reset();
+            invalidate_lane_plans(lane);
+            complete_error(request, std::current_exception());
+            publish_runtime_stats();
+            return AdmissionProgress::ControlProgress;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
             if (target_started) { instance_.program->abort_lane(lane); }
@@ -869,7 +885,7 @@ private:
 
             try {
                 ensure_base_plan(head);
-            } catch (...) {
+            } catch (const RequestError&) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
                 continue;
@@ -887,7 +903,7 @@ private:
             std::optional<LaneChoice> head_lane;
             try {
                 head_lane = find_admission_lane(head);
-            } catch (...) {
+            } catch (const RequestError&) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
                 continue;
@@ -902,8 +918,8 @@ private:
             }
             if (!protection_) {
                 protection_.emplace(make_admission_protection(next_protection_epoch_++, head->id,
-                                                              head_base.admission, active.span(),
-                                                              admission_capacity_));
+                                                               head_base.admission, active.span(),
+                                                               admission_capacity_));
             }
             if (protected_head_safe_without_temporal(*protection_, active.span(),
                                                      admission_capacity_)) {
@@ -937,7 +953,7 @@ private:
 
                 try {
                     ensure_base_plan(candidate);
-                } catch (...) {
+                } catch (const RequestError&) {
                     (void)remove_pending_error(candidate, std::current_exception());
                     control_progress = true;
                     continue;
@@ -955,7 +971,7 @@ private:
                 std::optional<LaneChoice> candidate_lane;
                 try {
                     candidate_lane = find_admission_lane(candidate);
-                } catch (...) {
+                } catch (const RequestError&) {
                     (void)remove_pending_error(candidate, std::current_exception());
                     control_progress = true;
                     continue;

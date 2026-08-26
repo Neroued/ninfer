@@ -42,6 +42,24 @@ int main() {
     failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected",
                       "preparation cancellation did not retain its HTTP classification");
 
+    const ninfer::serve::ApiError unavailable =
+        ninfer::serve::request_error_to_api_error(ninfer::RequestError(
+            ninfer::RequestErrorKind::Unavailable, "inference engine is unavailable"));
+    failures += check(unavailable.status == 503 && unavailable.code == "service_unavailable",
+                      "engine unavailability did not map to HTTP 503");
+
+    const ninfer::serve::ApiError overloaded =
+        ninfer::serve::request_error_to_api_error(ninfer::RequestError(
+            ninfer::RequestErrorKind::Overloaded, "inference request queue is full"));
+    failures += check(overloaded.status == 429 && overloaded.code == "server_overloaded",
+                      "queue overflow did not map to HTTP 429");
+
+    const ninfer::serve::ApiError timeout =
+        ninfer::serve::request_error_to_api_error(ninfer::RequestError(
+            ninfer::RequestErrorKind::QueueTimeout, "inference request expired while waiting for admission"));
+    failures += check(timeout.status == 503 && timeout.code == "request_queue_timeout",
+                      "queue timeout did not map to HTTP 503");
+
     httplib::Request messages_request;
     messages_request.path = "/v1/messages";
     httplib::Response messages_response;

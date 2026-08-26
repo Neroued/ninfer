@@ -26,10 +26,12 @@ struct RequestMix {
 
 struct Collected {
     DxgiSnapshot dxgi;
+    NvidiaSmiMemory nvidia;
     nlohmann::json admin_vram = nullptr;
     std::string admin_vram_note;
     RequestMix requests;
     std::string health_body;
+    std::string engine_capacity_line;
     int health_status = 0;
 };
 
@@ -41,6 +43,7 @@ public:
 private:
     void poll_health(Collected& out);
     void poll_admin(Collected& out);
+    void poll_nvidia_smi(Collected& out);
     void poll_request_log(Collected& out);
 
     EngineSpec spec_;

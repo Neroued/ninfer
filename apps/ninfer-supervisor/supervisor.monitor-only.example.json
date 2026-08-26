@@ -1,0 +1,17 @@
+{
+  "engine": {
+    "unmanaged": true,
+    "engine_host": "127.0.0.1",
+    "engine_port": 8010,
+    "api_key_file": "P:/models/ninfer-api-key.txt",
+    "request_log": "",
+    "device": 0
+  },
+  "supervisor": {
+    "host": "127.0.0.1",
+    "port": 8099,
+    "bind_any": false,
+    "monitor_only": true,
+    "logs_dir": "P:/NInfer/supervisor-logs"
+  }
+}

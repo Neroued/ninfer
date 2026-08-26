@@ -52,7 +52,7 @@ inline constexpr std::string_view kDashboardHtml = R"HTML(<!DOCTYPE html>
 <body>
 <header>
   <h1>NInfer supervisor</h1>
-  <div class="muted">loopback control surface · live SSE</div>
+  <div id="mode" class="muted">loopback control surface · live SSE</div>
 </header>
 <main>
   <section>
@@ -63,7 +63,7 @@ inline constexpr std::string_view kDashboardHtml = R"HTML(<!DOCTYPE html>
     <div class="row"><span>uptime</span><span id="uptime" class="num">—</span></div>
     <div class="row"><span>restarts</span><span id="restarts" class="num">0</span></div>
     <div class="row"><span>last event</span><span id="event" class="muted">—</span></div>
-    <div class="actions" style="margin-top:12px">
+    <div id="actions" class="actions" style="margin-top:12px">
       <button data-act="start">Start</button>
       <button data-act="stop">Stop</button>
       <button data-act="restart">Restart</button>
@@ -72,8 +72,11 @@ inline constexpr std::string_view kDashboardHtml = R"HTML(<!DOCTYPE html>
   <section>
     <h2>VRAM</h2>
     <div class="row"><span>adapter</span><span id="adapter" class="muted">—</span></div>
-    <div class="row"><span>budget</span><span id="budget" class="num">—</span></div>
-    <div class="row"><span>this process (DXGI)</span><span id="usage" class="num">—</span></div>
+    <div class="row"><span>DXGI budget (system-wide WDDM pressure)</span><span id="budget" class="num">—</span></div>
+    <div class="row"><span>device used (nvidia-smi)</span><span id="nvused" class="num">—</span></div>
+    <div class="row"><span>device total (nvidia-smi)</span><span id="nvtotal" class="num">—</span></div>
+    <div class="row"><span>supervisor process DXGI (not the engine)</span><span id="usage" class="num">—</span></div>
+    <div class="row"><span>engine capacity (boot line)</span><span id="capline" class="muted">—</span></div>
     <div class="row"><span>admin tiers</span><span id="tiers" class="muted">—</span></div>
     <div class="row"><span>admin note</span><span id="adminnote" class="muted">—</span></div>
   </section>
@@ -97,6 +100,10 @@ function apply(s){
   const st=s.engine||{};
   const map={Stopped:"warn",Starting:"warn",Running:"ok",Stopping:"warn",BackingOff:"warn",Halted:"bad"};
   pill(document.getElementById("state"), st.state||"?", map[st.state]||"warn");
+  document.getElementById("mode").textContent = s.monitor_only
+    ? "monitor-only · no spawn/stop · live SSE"
+    : "loopback control surface · live SSE";
+  document.getElementById("actions").style.display = s.monitor_only ? "none" : "flex";
   document.getElementById("health").textContent = (s.health&&s.health.body)||"—";
   document.getElementById("pid").textContent = st.pid||"—";
   document.getElementById("uptime").textContent = st.uptime_s!=null ? st.uptime_s+" s" : "—";
@@ -105,7 +112,12 @@ function apply(s){
   const d=s.dxgi||{};
   document.getElementById("adapter").textContent = d.adapter_name||d.error||"—";
   document.getElementById("budget").textContent = d.ok?gib(d.budget_bytes):"—";
-  document.getElementById("usage").textContent = d.ok?gib(d.current_usage_bytes):"—";
+  document.getElementById("usage").textContent = d.ok?gib(d.supervisor_usage_bytes):"—";
+  const nv=s.nvidia_smi||{};
+  document.getElementById("nvused").textContent = nv.ok?gib(nv.used_bytes):(nv.error||"—");
+  document.getElementById("nvtotal").textContent = nv.ok?gib(nv.total_bytes):"—";
+  document.getElementById("capline").textContent = s.engine_capacity_line ||
+    (s.monitor_only ? "not in supervisor log (unmanaged); see admin tiers" : "waiting for engine boot line");
   const v=s.admin_vram;
   if(v && v.tiers){
     document.getElementById("tiers").textContent = v.tiers.map(t=>t.name+": "+gib(t.held_bytes)).join(" · ");
@@ -120,7 +132,7 @@ function apply(s){
   document.getElementById("log").textContent = s.log_tail||"";
 }
 async function act(name){
-  await fetch("/api/"+name,{method:"POST"});
+  await fetch("/api/"+name,{method:"POST", headers:{"X-NInfer-Supervisor":"1"}});
 }
 document.querySelectorAll("button[data-act]").forEach(b=>b.onclick=()=>act(b.dataset.act));
 const es=new EventSource("/api/events");

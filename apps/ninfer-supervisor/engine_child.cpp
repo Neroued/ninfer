@@ -51,6 +51,10 @@ EngineChild::EngineChild(SupervisorConfig cfg) : cfg_(std::move(cfg)), gate_(cfg
     if (cfg_.logs_dir.empty()) { cfg_.logs_dir = "ninfer-supervisor-logs"; }
     std::filesystem::create_directories(cfg_.logs_dir);
     log_path_ = (std::filesystem::path(cfg_.logs_dir) / "engine.log").string();
+    if (!manages_engine_process(cfg_)) {
+        auto_restart_  = false;
+        st_.last_event = "monitor-only: not managing engine process";
+    }
 }
 
 EngineChild::~EngineChild() {
@@ -97,6 +101,7 @@ void EngineChild::rotate_logs_if_needed() {
 }
 
 void EngineChild::start() {
+    if (!manages_engine_process(cfg_)) { return; }
     auto_restart_ = true;
     gate_.reset_halt();
     std::lock_guard lock(mu_);
@@ -105,6 +110,7 @@ void EngineChild::start() {
 }
 
 void EngineChild::stop() {
+    if (!manages_engine_process(cfg_)) { return; }
     auto_restart_ = false;
     stop_child_   = true;
     HANDLE proc   = nullptr;
@@ -118,6 +124,23 @@ void EngineChild::stop() {
 }
 
 void EngineChild::observe_health(int http_status) {
+    if (!manages_engine_process(cfg_)) {
+        std::lock_guard lock(mu_);
+        if (http_status == 200) {
+            st_.health     = "ok";
+            st_.state      = EngineState::Running;
+            st_.last_event = "unmanaged engine reachable";
+        } else if (http_status == 503) {
+            st_.health     = "unhealthy";
+            st_.state      = EngineState::Running;
+            st_.last_event = "unmanaged engine unhealthy";
+        } else {
+            st_.health     = "unreachable";
+            st_.state      = EngineState::Stopped;
+            st_.last_event = "unmanaged engine unreachable";
+        }
+        return;
+    }
     bool restart_now = false;
     {
         std::lock_guard lock(mu_);
@@ -140,6 +163,7 @@ void EngineChild::observe_health(int http_status) {
 }
 
 void EngineChild::restart() {
+    if (!manages_engine_process(cfg_)) { return; }
     auto_restart_ = true;
     gate_.reset_halt();
     stop_child_ = true;
@@ -279,7 +303,8 @@ void EngineChild::run_loop() {
             }
             continue;
         }
-        if (auto_restart_.load() && !gate_.halted() && !quit_.load()) {
+        if (manages_engine_process(cfg_) && auto_restart_.load() && !gate_.halted() &&
+            !quit_.load()) {
             try {
                 {
                     std::lock_guard lock(mu_);

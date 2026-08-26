@@ -18,15 +18,15 @@
 namespace ninfer::supervisor {
 
 inline nlohmann::json insight_unavailable(std::string id, std::string title, std::string statement,
-                                          nlohmann::json evidence = nlohmann::json::object()) {
+                                          nlohmann::json evidence = nlohmann::json::object(),
+                                          nlohmann::json measured_over = {{"requests", 0}}) {
     return {{"id", std::move(id)},
             {"severity", "notice"},
             {"title", std::move(title)},
             {"statement", std::move(statement)},
             {"evidence", std::move(evidence)},
-            {"recommendation", ""},
             {"confidence", "measured"},
-            {"measured_over", {{"requests", 0}}},
+            {"measured_over", std::move(measured_over)},
             {"availability", "unavailable"}};
 }
 
@@ -34,15 +34,16 @@ inline nlohmann::json insight_available(std::string id, std::string severity, st
                                         std::string statement, nlohmann::json evidence,
                                         std::string recommendation, std::string confidence,
                                         nlohmann::json measured_over) {
-    return {{"id", std::move(id)},
-            {"severity", std::move(severity)},
-            {"title", std::move(title)},
-            {"statement", std::move(statement)},
-            {"evidence", std::move(evidence)},
-            {"recommendation", std::move(recommendation)},
-            {"confidence", std::move(confidence)},
-            {"measured_over", std::move(measured_over)},
-            {"availability", "available"}};
+    nlohmann::json out = {{"id", std::move(id)},
+                          {"severity", std::move(severity)},
+                          {"title", std::move(title)},
+                          {"statement", std::move(statement)},
+                          {"evidence", std::move(evidence)},
+                          {"confidence", std::move(confidence)},
+                          {"measured_over", std::move(measured_over)},
+                          {"availability", "available"}};
+    if (!recommendation.empty()) { out["recommendation"] = std::move(recommendation); }
+    return out;
 }
 
 inline std::int64_t json_i64(const nlohmann::json& j, const char* key, std::int64_t fallback = 0) {
@@ -117,7 +118,8 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
         insights.push_back(insight_unavailable(
             "source.request_done", "No completed requests in window",
             "no request_done records in window",
-            {{"parsed_events", parsed}, {"request_start", starts.size()}}));
+            {{"parsed_events", parsed}, {"request_start", starts.size()}},
+            {{"requests", 0}, {"parsed_events", parsed}}));
         return report;
     }
 
@@ -128,8 +130,11 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
         int mixed   = 0;
         int unpaired = 0;
         double queue_wait_sum = 0;
+        double prepare_sum    = 0;
         double prefill_sum    = 0;
         double decode_sum     = 0;
+        double vision_sum     = 0;
+        double ttft_sum       = 0;
         double total_sum      = 0;
         std::vector<std::int64_t> queued_ids;
         std::vector<std::int64_t> prefill_ids;
@@ -162,10 +167,16 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
         const auto& timings =
             done.contains("timings_seconds") ? done.at("timings_seconds") : nlohmann::json::object();
         const double total   = json_f64(timings, "total");
+        const double prepare = json_f64(timings, "prepare");
         const double prefill = json_f64(timings, "prefill");
         const double decode  = json_f64(timings, "decode");
+        const double vision  = json_f64(timings, "vision");
+        const double ttft    = json_f64(timings, "ttft");
+        b.prepare_sum += prepare;
         b.prefill_sum += prefill;
         b.decode_sum += decode;
+        b.vision_sum += vision;
+        b.ttft_sum += ttft;
         b.total_sum += total;
 
         const std::string join =
@@ -266,12 +277,52 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
                  : "",
         "measured", over));
 
+    const double n_done = static_cast<double>(dones.size());
+    const double mean_prepare = n_done > 0 ? b.prepare_sum / n_done : 0.0;
+    const double mean_vision  = n_done > 0 ? b.vision_sum / n_done : 0.0;
+    const double mean_ttft    = n_done > 0 ? b.ttft_sum / n_done : 0.0;
+    const double ttft_body    = mean_prepare + mean_prefill + mean_vision;
+    std::string ttft_cause    = "mixed";
+    std::string ttft_id       = "latency.ttft_mixed";
+    std::string ttft_rec;
+    if (mean_prefill >= mean_prepare && mean_prefill >= mean_vision && mean_prefill >= 0.4 * std::max(ttft_body, mean_ttft)) {
+        ttft_cause = "prefill";
+        ttft_id    = "latency.ttft_prefill_dominated";
+        ttft_rec   = "TTFT is prefill-dominated. --prefill-chunk is the lever, not decode kernels.";
+    } else if (mean_prepare >= mean_prefill && mean_prepare >= 0.4 * std::max(ttft_body, mean_ttft)) {
+        ttft_cause = "prepare";
+        ttft_id    = "latency.ttft_prepare_dominated";
+        ttft_rec   = "TTFT is prepare-dominated (tokenize/media), not GPU decode.";
+    } else if (mean_vision >= 0.4 * std::max(ttft_body, mean_ttft) && mean_vision > 0.0) {
+        ttft_cause = "vision";
+        ttft_id    = "latency.ttft_vision_dominated";
+        ttft_rec   = "TTFT is vision-preprocess dominated.";
+    }
+    std::ostringstream ttft_stmt;
+    ttft_stmt << "Mean TTFT " << (mean_ttft * 1000.0) << " ms over " << dones.size()
+              << " request_done: prepare " << (mean_prepare * 1000.0) << " ms, prefill "
+              << (mean_prefill * 1000.0) << " ms, vision " << (mean_vision * 1000.0)
+              << " ms (decode " << (mean_decode * 1000.0)
+              << " ms is after first token). Dominant TTFT component: " << ttft_cause << ".";
+    insights.push_back(insight_available(
+        ttft_id, "info", "TTFT decomposition", ttft_stmt.str(),
+        {{"mean_ttft_s", mean_ttft},
+         {"mean_prepare_s", mean_prepare},
+         {"mean_prefill_s", mean_prefill},
+         {"mean_vision_s", mean_vision},
+         {"mean_decode_s", mean_decode},
+         {"dominant", ttft_cause}},
+        ttft_rec, "measured", over));
+
     // Content/reasoning_content are not in schema_version 10 request logs.
     insights.push_back(insight_unavailable(
         "client.content_fields", "Visitor content is not in the request log",
         "result.content and reasoning_content are not written to request_done; "
         "empty-reply-vs-reasoning cannot be confirmed from this source",
-        {{"schema_version", 10}, {"looked_for", nlohmann::json::array({"content", "reasoning_content"})}}));
+        {{"schema_version", 10},
+         {"looked_for", nlohmann::json::array({"content", "reasoning_content"})},
+         {"requests", dones.size()}},
+        over));
 
     if (output_limit_thinking > 0) {
         std::ostringstream stmt;
@@ -306,7 +357,8 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
         "does not store content. tool_count is measurable and is reported in evidence.",
         {{"requests_with_tools", tools_declared},
          {"requests", dones.size()},
-         {"requests_without_tools", static_cast<int>(dones.size()) - tools_declared}}));
+         {"requests_without_tools", static_cast<int>(dones.size()) - tools_declared}},
+        over));
 
     return report;
 }

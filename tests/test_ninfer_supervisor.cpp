@@ -208,15 +208,22 @@ int test_insights_honesty() {
         R"({"event":"throughput","server_instance_id":"a","timestamp_unix_ms":1601,"scheduler":{"waiting":2,"running":1,"prefilling":0}})"
         "\n";
     const auto r = analyze_request_log_jsonl(jsonl, "mem");
-    bool saw_sat = false, saw_limit = false, saw_content = false;
+    bool saw_sat = false, saw_limit = false, saw_content = false, saw_ttft = false;
     for (const auto& it : r.at("insights")) {
         const auto id = it.at("id").get<std::string>();
-        if (id.find("latency.") == 0) {
+        if (id.find("latency.") == 0 && id.find("ttft") == std::string::npos) {
             saw_sat = true;
             f += check(it.at("availability") == "available" && it.at("confidence") == "measured",
                        "saturation is measured");
             f += check(it.at("measured_over").at("requests") == 1, "measured_over.requests is 1");
             f += check(it.at("evidence").at("queued") == 1, "0.5s queue wait classifies queued");
+        }
+        if (id.find("ttft") != std::string::npos) {
+            saw_ttft = true;
+            f += check(it.at("availability") == "available", "ttft split is measured");
+            f += check(it.at("evidence").contains("mean_prepare_s") &&
+                           it.at("evidence").contains("mean_prefill_s"),
+                       "ttft evidence has the split");
         }
         if (id == "client.output_limit_while_thinking") {
             saw_limit = true;
@@ -227,9 +234,12 @@ int test_insights_honesty() {
             saw_content = true;
             f += check(it.at("availability") == "unavailable",
                        "content fields unavailable, not fabricated");
+            f += check(it.at("measured_over").at("requests") == 1,
+                       "unavailable measured_over is examined count, not 0");
+            f += check(!it.contains("recommendation"), "empty recommendation is omitted");
         }
     }
-    f += check(saw_sat && saw_limit && saw_content, "required insight ids present");
+    f += check(saw_sat && saw_limit && saw_content && saw_ttft, "required insight ids present");
     return f;
 }
 

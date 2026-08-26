@@ -43,7 +43,9 @@ int main() {
                           defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,
                       "media preparation resource defaults mismatch");
-    failures += check(defaults.prefix_cache_bytes == 0,
+    failures += check(defaults.prefix_cache_bytes == 0 && defaults.prefix_cache_min_bytes == 0 &&
+                          defaults.prefix_cache_max_bytes == 0 &&
+                          defaults.vram_idle_release_after_s == 0 && !defaults.vram_observe_only,
                       "prefix cache is not disabled by default");
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
@@ -152,8 +154,51 @@ int main() {
                       "--prefix-cache-mib 0 did not keep the seed store disabled");
     const ServeOptions prefix_enabled =
         parse({"ninfer-serve", "model.ninfer", "--prefix-cache-mib", "4096"});
-    failures += check(prefix_enabled.prefix_cache_bytes == (4096ULL << 20),
-                      "--prefix-cache-mib 4096 did not reserve 4 GiB");
+    failures += check(prefix_enabled.prefix_cache_bytes == (4096ULL << 20) &&
+                          prefix_enabled.prefix_cache_min_bytes == (4096ULL << 20) &&
+                          prefix_enabled.prefix_cache_max_bytes == (4096ULL << 20),
+                      "--prefix-cache-mib 4096 did not reserve a fixed 4 GiB range");
+
+    const ServeOptions prefix_range =
+        parse({"ninfer-serve", "model.ninfer", "--prefix-cache-mib-min", "0",
+               "--prefix-cache-mib-max", "4096"});
+    failures += check(prefix_range.prefix_cache_bytes == (4096ULL << 20) &&
+                          prefix_range.prefix_cache_min_bytes == 0 &&
+                          prefix_range.prefix_cache_max_bytes == (4096ULL << 20),
+                      "prefix-cache range did not boot at max with min 0");
+
+    const ServeOptions kv_range =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "8192", "--kv-capacity-min", "8192",
+               "--kv-capacity-max", "65536"});
+    failures += check(kv_range.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          kv_range.kv_capacity.explicit_tokens == 65536 &&
+                          kv_range.kv_capacity_min_tokens == 8192 &&
+                          kv_range.kv_capacity_max_tokens == 65536,
+                      "kv-capacity range did not boot at max");
+
+    const ServeOptions idle = parse({"ninfer-serve", "model.ninfer", "--vram-idle-release-after-s",
+                                     "30", "--vram-observe-only"});
+    failures += check(idle.vram_idle_release_after_s == 30 && idle.vram_observe_only,
+                      "idle-release and observe-only flags did not parse");
+    failures += check(!defaults.enable_admin_vram, "admin VRAM routes are not disabled by default");
+    bool admin_without_key_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--admin-vram"});
+    } catch (const std::invalid_argument&) { admin_without_key_rejected = true; }
+    failures += check(admin_without_key_rejected, "--admin-vram without --api-key was accepted");
+    const ServeOptions admin =
+        parse({"ninfer-serve", "model.ninfer", "--admin-vram", "--api-key", "secret"});
+    failures += check(admin.enable_admin_vram && admin.api_key == "secret",
+                      "--admin-vram with --api-key did not enable admin routes");
+    failures += check(serve_usage_text("ninfer-serve").find("--admin-vram") != std::string::npos,
+                      "serve help omits --admin-vram");
+
+    bool inverted_prefix_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefix-cache-mib-min", "8",
+                     "--prefix-cache-mib-max", "4"});
+    } catch (const std::invalid_argument&) { inverted_prefix_rejected = true; }
+    failures += check(inverted_prefix_rejected, "inverted prefix-cache range was accepted");
 
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",

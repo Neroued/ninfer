@@ -34,8 +34,20 @@ std::uint64_t prefix_seed_hash(std::span<const TokenId> tokens) {
     return hash;
 }
 
-PrefixSeedStore::~PrefixSeedStore() noexcept {
-    if (arena_ != nullptr) { (void)cudaFree(arena_); }
+PrefixSeedStore::~PrefixSeedStore() noexcept { release(); }
+
+void PrefixSeedStore::release() noexcept {
+    entries_.clear();
+    arena_used_             = 0;
+    arena_bytes_            = 0;
+    state_layers_           = 0;
+    conv_slot_bytes_        = 0;
+    recurrent_slot_bytes_   = 0;
+    hidden_bytes_           = 0;
+    if (arena_ != nullptr) {
+        (void)cudaFree(arena_);
+        arena_ = nullptr;
+    }
 }
 
 void PrefixSeedStore::initialize(std::size_t budget_bytes,

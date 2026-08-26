@@ -67,7 +67,11 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] [--boot-watchdog-timeout-s N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
-           "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] [--prefix-cache-mib N] "
+           "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
+           "[--prefix-cache-mib N] [--prefix-cache-mib-min N] [--prefix-cache-mib-max N] "
+           "[--kv-capacity-min N] [--kv-capacity-max N] "
+           "[--vram-guarantee-context N] [--vram-guarantee-concurrency N] [--vram-floor-mib N] "
+           "[--vram-idle-release-after-s N] [--vram-observe-only] [--admin-vram] "
            "[--media-preprocess-threads N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
@@ -85,7 +89,14 @@ std::string serve_usage_text(const char* argv0) {
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
            "       --prefix-cache-mib reserves device memory for cross-request prefix seeds; 0 "
-           "(default) disables\n"
+           "(default) disables. --prefix-cache-mib-min/max set an elastic range; omitted "
+           "--prefix-cache-mib with a max boots at the max. min 0 is fully releasable\n"
+           "       --kv-capacity-min/max set an elastic KV token range; omitted --kv-capacity "
+           "with a max boots at the max. --kv-capacity N still means min==max==N\n"
+           "       --vram-idle-release-after-s N releases the seed store after N idle seconds "
+           "(0 disables, default). --vram-observe-only logs would-be releases without changing "
+           "allocations. --admin-vram exposes GET/POST /admin/vram and requires --api-key; "
+           "default off\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
@@ -120,6 +131,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool prefix_cache_min_explicit   = false;
+    bool prefix_cache_max_explicit   = false;
+    bool prefix_cache_bytes_explicit = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -181,6 +195,61 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--prefix-cache-mib is out of range");
             }
             options.prefix_cache_bytes = static_cast<std::size_t>(mib << 20);
+            prefix_cache_bytes_explicit = true;
+        } else if (arg == "--prefix-cache-mib-min") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--prefix-cache-mib-min"), "prefix-cache-mib-min");
+            if (mib > (1ULL << 20)) {
+                throw std::invalid_argument("--prefix-cache-mib-min is out of range");
+            }
+            options.prefix_cache_min_bytes = static_cast<std::size_t>(mib << 20);
+            prefix_cache_min_explicit      = true;
+        } else if (arg == "--prefix-cache-mib-max") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--prefix-cache-mib-max"), "prefix-cache-mib-max");
+            if (mib > (1ULL << 20)) {
+                throw std::invalid_argument("--prefix-cache-mib-max is out of range");
+            }
+            options.prefix_cache_max_bytes = static_cast<std::size_t>(mib << 20);
+            prefix_cache_max_explicit      = true;
+        } else if (arg == "--kv-capacity-min") {
+            const int value =
+                parse_nonnegative_int(require_value("--kv-capacity-min"), "kv-capacity-min");
+            if (value == 0) { throw std::invalid_argument("--kv-capacity-min must be positive"); }
+            options.kv_capacity_min_tokens = static_cast<std::uint32_t>(value);
+        } else if (arg == "--kv-capacity-max") {
+            const int value =
+                parse_nonnegative_int(require_value("--kv-capacity-max"), "kv-capacity-max");
+            if (value == 0) { throw std::invalid_argument("--kv-capacity-max must be positive"); }
+            options.kv_capacity_max_tokens = static_cast<std::uint32_t>(value);
+        } else if (arg == "--vram-guarantee-context") {
+            const int value = parse_nonnegative_int(require_value("--vram-guarantee-context"),
+                                                    "vram-guarantee-context");
+            if (value == 0) {
+                throw std::invalid_argument("--vram-guarantee-context must be positive");
+            }
+            options.vram_guarantee_context = static_cast<std::uint32_t>(value);
+        } else if (arg == "--vram-guarantee-concurrency") {
+            const int value = parse_nonnegative_int(require_value("--vram-guarantee-concurrency"),
+                                                    "vram-guarantee-concurrency");
+            if (value == 0) {
+                throw std::invalid_argument("--vram-guarantee-concurrency must be positive");
+            }
+            options.vram_guarantee_concurrency = static_cast<std::uint32_t>(value);
+        } else if (arg == "--vram-floor-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--vram-floor-mib"), "vram-floor-mib");
+            if (mib > (1ULL << 20)) {
+                throw std::invalid_argument("--vram-floor-mib is out of range");
+            }
+            options.vram_floor_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--vram-idle-release-after-s") {
+            options.vram_idle_release_after_s = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--vram-idle-release-after-s"), "vram-idle-release-after-s"));
+        } else if (arg == "--vram-observe-only") {
+            options.vram_observe_only = true;
+        } else if (arg == "--admin-vram") {
+            options.enable_admin_vram = true;
         } else if (arg == "--media-cache-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--media-cache-mib"), "media-cache-mib");
@@ -277,8 +346,48 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
+    if (!prefix_cache_min_explicit && !prefix_cache_max_explicit) {
+        options.prefix_cache_min_bytes = options.prefix_cache_bytes;
+        options.prefix_cache_max_bytes = options.prefix_cache_bytes;
+    } else {
+        if (prefix_cache_max_explicit) {
+            options.prefix_cache_bytes = options.prefix_cache_max_bytes;
+        } else if (prefix_cache_bytes_explicit) {
+            options.prefix_cache_max_bytes = options.prefix_cache_bytes;
+        }
+        if (!prefix_cache_min_explicit) {
+            options.prefix_cache_min_bytes =
+                prefix_cache_bytes_explicit ? options.prefix_cache_bytes : 0;
+        }
+    }
+    if (options.prefix_cache_min_bytes > options.prefix_cache_max_bytes) {
+        throw std::invalid_argument("--prefix-cache-mib-min must not exceed --prefix-cache-mib-max");
+    }
+    if (options.kv_capacity_max_tokens != 0 && !kv_capacity_explicit) {
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.kv_capacity_max_tokens);
+        kv_capacity_explicit = true;
+    }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
+        if (options.kv_capacity_max_tokens == 0) {
+            options.kv_capacity_max_tokens = options.kv_capacity.explicit_tokens;
+        }
+        if (options.kv_capacity_min_tokens == 0) {
+            options.kv_capacity_min_tokens = options.kv_capacity.explicit_tokens;
+        }
+        if (options.kv_capacity_min_tokens > options.kv_capacity_max_tokens) {
+            throw std::invalid_argument("--kv-capacity-min must not exceed --kv-capacity-max");
+        }
+        options.kv_capacity =
+            KvCapacityPolicy::explicit_capacity(options.kv_capacity_max_tokens);
+    }
+    if (options.vram_guarantee_context == 0) {
+        options.vram_guarantee_context = options.max_context;
+    }
+    if (options.enable_admin_vram && options.api_key.empty()) {
+        throw std::invalid_argument("--admin-vram requires --api-key");
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

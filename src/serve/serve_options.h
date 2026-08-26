@@ -37,6 +37,16 @@ struct ServeOptions {
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t prefix_cache_bytes         = 0;
+    std::size_t prefix_cache_min_bytes     = 0;
+    std::size_t prefix_cache_max_bytes     = 0;
+    std::uint32_t kv_capacity_min_tokens   = 0;
+    std::uint32_t kv_capacity_max_tokens   = 0;
+    std::uint32_t vram_guarantee_context     = 0;
+    std::uint32_t vram_guarantee_concurrency = 1;
+    std::size_t vram_floor_bytes             = 0;
+    std::uint32_t vram_idle_release_after_s  = 0;
+    bool vram_observe_only                   = false;
+    bool enable_admin_vram                   = false;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;

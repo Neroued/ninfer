@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -438,11 +439,19 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                           request_plan.reuse_base))) {
         throw std::logic_error("planned resident prefix is no longer reusable");
     }
-    if (request_plan.reuse == ReusePath::SeedPrefixCache &&
-        (!prefix_seeds.enabled() || request_plan.seed_entry < 0 ||
-         !prefix_seeds.entry_matches(request_plan.seed_entry, prompt) ||
-         prefix_seeds.entry_frontier(request_plan.seed_entry) != request_plan.reuse_base)) {
-        throw std::logic_error("planned prefix seed is no longer available");
+    if (request_plan.reuse == ReusePath::SeedPrefixCache) {
+        const bool seed_ok =
+            prefix_seeds.enabled() && request_plan.seed_entry >= 0 &&
+            static_cast<std::size_t>(request_plan.seed_entry) < prefix_seeds.entry_count() &&
+            prefix_seeds.entry_matches(request_plan.seed_entry, prompt) &&
+            prefix_seeds.entry_frontier(request_plan.seed_entry) == request_plan.reuse_base;
+        if (!seed_ok) {
+            request_plan.reuse      = ReusePath::FullReset;
+            request_plan.reuse_base = 0;
+            request_plan.seed_entry = -1;
+            request_plan.mtp_bridge = MtpBridgeMode::None;
+            if (!prefix_seeds.enabled()) { request_plan.seed_capture.reset(); }
+        }
     }
     if (is_rewrite_checkpoint_restore(request_plan.reuse) &&
         (!sequence.rewrite_checkpoint.valid ||
@@ -2300,6 +2309,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.prefix_cache_bytes           = prefix_cache_bytes;
+    out.prefix_cache_held_bytes      = prefix_seeds.arena_bytes();
     out.kv_payload_bytes             = kv_payload_bytes;
     return out;
 }
@@ -2309,6 +2319,30 @@ void ProgramImplCore::reset_memory_peaks() noexcept {
     persistent.reset_peak();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+}
+
+void ProgramImplCore::release_prefix_seeds() {
+    device.synchronize();
+    prefix_seeds.release();
+}
+
+bool ProgramImplCore::reclaim_prefix_seeds() {
+    if (prefix_seeds.enabled() || prefix_cache_bytes == 0) { return prefix_seeds.enabled(); }
+    device.synchronize();
+    try {
+        prefix_seeds.initialize(
+            prefix_cache_bytes, decoder->linear_attention, decoder->text_kv.pool(),
+            decoder->mtp_cache() != nullptr ? &decoder->mtp_cache()->pool() : nullptr,
+            sequences[0].rewrite_checkpoint_hidden.bytes());
+        return prefix_seeds.enabled();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "ninfer: prefix-seed reclaim failed: %s\n", error.what());
+        return false;
+    }
+}
+
+std::size_t ProgramImplCore::prefix_seed_held_bytes() const noexcept {
+    return prefix_seeds.arena_bytes();
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

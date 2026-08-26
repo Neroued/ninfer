@@ -4,6 +4,8 @@
 
 #include <chrono>
 #include <memory>
+#include <string>
+#include <vector>
 
 namespace ninfer {
 
@@ -93,6 +95,11 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     void reset_memory_peaks() noexcept;
+
+    [[nodiscard]] VramControlState vram_control_state() const;
+    // tiers: "seed" is implemented. "kv" is refused. target_mib is optional (0 = floor/min).
+    void vram_release(const std::vector<std::string>& tiers, std::size_t target_mib = 0);
+    void vram_reclaim();
 
 private:
     class Impl;

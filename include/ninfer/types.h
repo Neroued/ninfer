@@ -91,7 +91,36 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     // Device bytes reserved at startup for the cross-request prefix-seed store; 0 disables it.
     std::size_t prefix_cache_bytes = 0;
+    // Elastic seed-store range. Boot allocates prefix_cache_bytes (the max). Min 0 is fully
+    // releasable. When both extra fields are 0 they follow prefix_cache_bytes (fixed size).
+    std::size_t prefix_cache_min_bytes = 0;
+    std::size_t prefix_cache_max_bytes = 0;
+    // Elastic KV range in tokens. Boot uses kv_capacity (the max). 0 follows the resolved policy.
+    std::uint32_t kv_capacity_min_tokens = 0;
+    std::uint32_t kv_capacity_max_tokens = 0;
+    std::uint32_t vram_guarantee_context     = 0; // 0 = max_context
+    std::uint32_t vram_guarantee_concurrency = 1;
+    std::size_t vram_floor_bytes             = 0; // 0 = derive from the capability guarantee
+    std::uint32_t vram_idle_release_after_s  = 0; // 0 disables idle release
+    bool vram_observe_only                   = false;
     LoadProgress load_progress;
+};
+
+struct VramTierState {
+    std::string name;
+    std::size_t held_bytes       = 0;
+    std::size_t min_bytes        = 0;
+    std::size_t max_bytes        = 0;
+    std::size_t reclaimable_bytes = 0;
+    bool released                = false;
+};
+
+struct VramControlState {
+    std::vector<VramTierState> tiers;
+    std::size_t floor_bytes               = 0;
+    bool observe_only                     = false;
+    std::string last_transition;
+    std::string last_reason;
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -435,6 +464,7 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t cuda_graph_observed_bytes         = 0;
     std::size_t prefix_cache_bytes                = 0;
+    std::size_t prefix_cache_held_bytes           = 0;
     std::size_t kv_payload_bytes                  = 0;
 };
 

@@ -1,7 +1,7 @@
-// Complete Qwen3.6-35B-A3B GDN mixer benchmark for the production small-T snapshot path.
+// Complete Qwen3.6-35B-A3B GDN mixer benchmark for the production one-token update path.
 //
 // The measured layer is exactly the gdn_mix composition from hidden RMSNorm through the W8
-// residual output projection. --route fused selects the production fused input/snapshot Op;
+// residual output projection. --route fused selects the production fused input/state-update Op;
 // --route composed retains the projection, convolution, and q/k/v extracts as a control.
 // --qk-norm fused moves the two L2 normalizations into the recurrent kernel; composed retains the
 // standalone kernels. --norm-control fused combines hidden RMSNorm with the control projection;
@@ -11,7 +11,7 @@
 
 // Examples:
 //   ./build/bench/ninfer_gdn_layer_bench
-//   ./build/bench/ninfer_gdn_layer_bench --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+//   ./build/bench/ninfer_gdn_layer_bench --t-sweep 1
 //       --repeat 50
 
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -59,14 +59,14 @@ constexpr std::int32_t kValueRows        = kHeadDim * kValueHeads;
 constexpr std::int32_t kConvRows         = 2 * kKeyRows + kValueRows;
 constexpr std::int32_t kInputRows        = kConvRows + kValueRows;
 constexpr std::int32_t kConvStateRows    = 3;
-constexpr std::int32_t kSnapshotSlots    = 17;
-constexpr std::int32_t kInitialSlot      = 16;
+constexpr std::int32_t kStateSlots       = 1;
+constexpr std::int32_t kStateSlot        = 0;
 constexpr float kEps                     = 1.0e-6F;
 constexpr float kGdnScale                = 0.08838834764831845F; // 1 / sqrt(128)
 constexpr std::size_t kDefaultFlushBytes = 256ULL << 20;
 
 struct Options {
-    std::vector<std::int32_t> t_sweep{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    std::vector<std::int32_t> t_sweep{1};
     int warmup               = 5;
     int repeat               = 40;
     std::size_t flush_bytes  = kDefaultFlushBytes;
@@ -131,8 +131,8 @@ std::vector<std::int32_t> parse_t_sweep(std::string_view raw) {
         const std::string token(
             raw.substr(begin, end == std::string_view::npos ? raw.size() - begin : end - begin));
         const long value = std::stol(token);
-        if (value <= 0 || value > kSnapshotSlots - 1) {
-            throw std::invalid_argument("--t-sweep values must be in [1,16]");
+        if (value != 1) {
+            throw std::invalid_argument("--t-sweep admits only the production update width 1");
         }
         result.push_back(static_cast<std::int32_t>(value));
         if (end == std::string_view::npos) { break; }
@@ -183,7 +183,7 @@ Options parse_options(int argc, char** argv) {
                 throw std::invalid_argument("--gated-rms-route must be auto or dv10-b1024");
             }
         } else if (arg == "--help" || arg == "-h") {
-            std::printf("Usage: %s [--t-sweep 1,2,...,16] [--warmup N] [--repeat N] "
+            std::printf("Usage: %s [--t-sweep 1] [--warmup N] [--repeat N] "
                         "[--flush-mib N] [--route fused|composed] "
                         "[--qk-norm fused|composed] [--norm-control fused|composed] "
                         "[--gated-rms-route auto|dv10-b1024] "
@@ -213,7 +213,8 @@ struct Resources {
           conv_weight(bench::make_bf16(static_cast<std::size_t>(kConvRows) * 4)),
           a_log(make_constant_f32(kValueHeads, -1.0F)),
           dt_bias(make_constant_f32(kValueHeads, 0.0F)),
-          initial_slot(make_constant_i32(kInitialSlot)), snapshot_base_slot(make_constant_i32(0)),
+          initial_slot(make_constant_i32(kStateSlot)),
+          snapshot_base_slot(make_constant_i32(kStateSlot)),
           residual(bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens)),
           hidden(static_cast<std::size_t>(kHidden) * max_tokens * sizeof(std::uint16_t)),
           qkv(static_cast<std::size_t>(kConvRows) * max_tokens * sizeof(std::uint16_t)),
@@ -229,9 +230,9 @@ struct Resources {
           recurrent_out(static_cast<std::size_t>(kValueRows) * max_tokens * sizeof(std::uint16_t)),
           gated_out(static_cast<std::size_t>(kValueRows) * max_tokens * sizeof(std::uint16_t)),
           conv_states(bench::make_zeros(static_cast<std::size_t>(kConvRows) * kConvStateRows *
-                                        kSnapshotSlots * sizeof(std::uint16_t))),
+                                        kStateSlots * sizeof(std::uint16_t))),
           ssm_states(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * kHeadDim * kValueHeads *
-                                       kSnapshotSlots * sizeof(float))),
+                                       kStateSlots * sizeof(float))),
           workspace(std::max({std::size_t{1},
                               ops::gdn_norm_gating_proj_workspace_capacity_bytes(
                                   kValueHeads, kHidden, 1, max_tokens),
@@ -286,7 +287,7 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
     Tensor z(resources.z.p, DType::BF16, {kValueRows, tokens});
     Tensor conv_weight(resources.conv_weight.p, DType::BF16, {kConvRows, 4});
     Tensor conv_states(resources.conv_states.p, DType::BF16,
-                       {kConvRows, kConvStateRows, kSnapshotSlots});
+                       {kConvRows, kConvStateRows, kStateSlots});
     Tensor initial_slot(resources.initial_slot.p, DType::I32, {1});
     Tensor snapshot_base_slot(resources.snapshot_base_slot.p, DType::I32, {1});
     Tensor qkv_conv(resources.qkv_conv.p, DType::BF16, {kConvRows, tokens});
@@ -301,7 +302,7 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
     Tensor k_norm(resources.k_norm.p, DType::BF16, {kHeadDim, kQkHeads, tokens});
     Tensor recurrent_out(resources.recurrent_out.p, DType::BF16, {kHeadDim, kValueHeads, tokens});
     Tensor ssm_states(resources.ssm_states.p, DType::FP32,
-                      {kHeadDim, kHeadDim, kValueHeads, kSnapshotSlots});
+                      {kHeadDim, kHeadDim, kValueHeads, kStateSlots});
     Tensor gdn_norm(resources.gdn_norm.p, DType::BF16, {kHeadDim});
     Tensor gated_out(resources.gated_out.p, DType::BF16, {kHeadDim, kValueHeads, tokens});
 
@@ -338,10 +339,9 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
             q_recurrent = q_norm;
             k_recurrent = k_norm;
         }
-        ops::gated_delta_net_snapshot(q_recurrent, k_recurrent,
-                                      v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
-                                      fused_qk_norm, ssm_states, Tensor{}, initial_slot,
-                                      snapshot_base_slot, recurrent_out, s);
+        ops::gated_delta_net_batch_update(
+            q_recurrent, k_recurrent, v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
+            fused_qk_norm, ssm_states, initial_slot, initial_slot, recurrent_out, s);
         if (options.gated_rms == "dv10-b1024") {
             constexpr int block          = 1024;
             constexpr int rows_per_block = block / 32;
@@ -387,11 +387,11 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
         graph.nodes(),
         options.route == "fused"
             ? std::string(ops::detail::w8_gdn_input_conv_schedule_name(snapshot_plan.schedule)) +
-                  "+gated_delta_net_snapshot.bf16.recurrent." +
+                  "+gated_delta_net_batch_update.bf16.recurrent." +
                   (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4")
             : std::string("gdn_input_proj_conv_snapshot.w8.composed_control+") +
                   ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) +
-                  "+gated_delta_net_snapshot.bf16.recurrent." +
+                  "+gated_delta_net_batch_update.bf16.recurrent." +
                   (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4"),
         options.norm_control == "fused"
             ? ops::detail::bf16_gdn_norm_gating_schedule_name(norm_control_plan.schedule)

@@ -2,13 +2,13 @@
 
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdio>
 #include <random>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 
 namespace ninfer::serve {
 namespace {
@@ -37,14 +37,6 @@ void skip_ws(std::string_view text, std::size_t& pos) {
 
 bool starts_with_at(std::string_view text, std::size_t pos, std::string_view prefix) {
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
-}
-
-std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker) {
-    const std::size_t maximum = std::min(text.size(), marker.size() - 1);
-    for (std::size_t size = maximum; size != 0; --size) {
-        if (text.substr(text.size() - size) == marker.substr(0, size)) { return size; }
-    }
-    return 0;
 }
 
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
@@ -166,29 +158,39 @@ std::string ToolCallStreamFilter::feed(std::string_view text) {
     }
 
     constexpr std::string_view kToolOpen = "<tool_call>";
-    pending_.append(text);
-    const std::size_t marker = pending_.find(kToolOpen);
-    if (marker != std::string::npos) {
-        std::size_t safe_end = marker;
-        while (safe_end != 0 &&
-               std::isspace(static_cast<unsigned char>(pending_[safe_end - 1])) != 0) {
-            --safe_end;
+    std::string visible;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const char byte = text[index];
+        if (marker_prefix_bytes_ != 0) {
+            if (byte == kToolOpen[marker_prefix_bytes_]) {
+                ++marker_prefix_bytes_;
+                if (marker_prefix_bytes_ == kToolOpen.size()) {
+                    tool_region_ = std::move(trailing_whitespace_);
+                    trailing_whitespace_.clear();
+                    tool_region_.append(kToolOpen);
+                    tool_region_.append(text.substr(index + 1));
+                    marker_prefix_bytes_ = 0;
+                    saw_tool_marker_     = true;
+                    break;
+                }
+                continue;
+            }
+            visible.append(trailing_whitespace_);
+            trailing_whitespace_.clear();
+            visible.append(kToolOpen.substr(0, marker_prefix_bytes_));
+            marker_prefix_bytes_ = 0;
         }
-        std::string visible = pending_.substr(0, safe_end);
-        tool_region_        = pending_.substr(safe_end);
-        pending_.clear();
-        saw_tool_marker_ = true;
-        emitted_bytes_ += visible.size();
-        return visible;
-    }
 
-    const std::size_t prefix = longest_suffix_prefix(pending_, kToolOpen);
-    std::size_t safe_end     = pending_.size() - prefix;
-    while (safe_end != 0 && std::isspace(static_cast<unsigned char>(pending_[safe_end - 1])) != 0) {
-        --safe_end;
+        if (byte == kToolOpen.front()) {
+            marker_prefix_bytes_ = 1;
+        } else if (std::isspace(static_cast<unsigned char>(byte)) != 0) {
+            trailing_whitespace_.push_back(byte);
+        } else {
+            visible.append(trailing_whitespace_);
+            trailing_whitespace_.clear();
+            visible.push_back(byte);
+        }
     }
-    std::string visible = pending_.substr(0, safe_end);
-    pending_.erase(0, safe_end);
     emitted_bytes_ += visible.size();
     return visible;
 }
@@ -197,11 +199,15 @@ std::string ToolCallStreamFilter::finish(bool is_tool_call_response) {
     if (finished_) { throw std::logic_error("tool-call stream filter is already finished"); }
     finished_ = true;
     if (is_tool_call_response) {
-        pending_.clear();
+        trailing_whitespace_.clear();
         tool_region_.clear();
+        marker_prefix_bytes_ = 0;
         return {};
     }
-    std::string tail = std::move(pending_);
+    constexpr std::string_view kToolOpen = "<tool_call>";
+    std::string tail                     = std::move(trailing_whitespace_);
+    tail.append(kToolOpen.substr(0, marker_prefix_bytes_));
+    marker_prefix_bytes_ = 0;
     tail += tool_region_;
     tool_region_.clear();
     emitted_bytes_ += tail.size();

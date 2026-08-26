@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -47,6 +48,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     case ninfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
         error.code   = "context_length_exceeded";
+        break;
+    case ninfer::RequestErrorKind::ThinkingBudgetCapacityInsufficient:
+        error.param.clear();
+        error.status = 400;
+        error.code   = "thinking_budget_capacity_insufficient";
         break;
     case ninfer::RequestErrorKind::MediaBudgetExceeded:
         error.status = 400;
@@ -238,6 +244,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
+    engine_options.context_cache            = options_.context_cache;
+    engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
@@ -270,15 +278,27 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
 }
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
-                                           std::function<bool()> is_cancelled) const {
+                                           std::function<bool()> is_cancelled,
+                                           ContextCacheHints context_cache) const {
+    return prepare_impl(request, std::move(is_cancelled), std::move(context_cache),
+                        options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
+                                                    : CacheParticipation::Disabled);
+}
+
+PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
+                                                std::function<bool()> is_cancelled,
+                                                ContextCacheHints context_cache,
+                                                CacheParticipation cache_participation) const {
     PreparedRequest prepared;
-    ninfer::RequestOptions request_options = to_request_options(request, options_);
-    prepared.include_usage                 = request.include_usage;
-    prepared.tool_capable                  = request.uses_tools() || request.has_tool_history();
-    prepared.tool_name_max_length          = request.tool_name_max_length;
+    prepared.include_usage        = request.include_usage;
+    prepared.tool_capable         = request.uses_tools() || request.has_tool_history();
+    prepared.tool_name_max_length = request.tool_name_max_length;
     const ResolvedPromptSemantics semantics =
         resolve_prompt_semantics(request, options_, prompt_capabilities_);
+    ninfer::RequestOptions request_options = to_request_options(
+        request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
     prepared.enable_thinking                   = semantics.enable_thinking;
+    prepared.thinking_budget                   = request_options.execution.thinking.budget;
     prepared.preserve_thinking                 = semantics.preserve_thinking;
     prepared.preserve_thinking_semantic_change = request.preserve_thinking_semantic_change;
     const bool request_has_media               = request.media_item_count() != 0;
@@ -297,6 +317,11 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes);
             });
+        std::vector<PromptCacheMarker> protocol_markers = std::move(input.context_cache.markers);
+        input.context_cache                             = std::move(context_cache);
+        input.context_cache.markers.insert(input.context_cache.markers.end(),
+                                           std::make_move_iterator(protocol_markers.begin()),
+                                           std::make_move_iterator(protocol_markers.end()));
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
@@ -310,9 +335,12 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
-        prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              prepared.lifetime->deadline);
-        prepared.sampling   = prepared.generation.resolved_sampling();
+        prepared.generation =
+            engine_->submit(std::move(prompt), std::move(request_options),
+                            request.stream ? ninfer::OutputConsumerMode::Streaming
+                                           : ninfer::OutputConsumerMode::Aggregate,
+                            prepared.lifetime->deadline);
+        prepared.sampling = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) { throw_invalid_input(exception); }
@@ -376,6 +404,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.prompt_tokens     = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens  = static_cast<int>(result.reasoning_tokens);
+    outcome.thinking          = result.thinking;
     outcome.finish_reason     = result.finish_reason;
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
@@ -388,6 +417,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.total_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
+    outcome.metrics.engine_timing               = result.engine_timing;
     outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
     outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
     outcome.metrics.speculative_backend         = result.speculative.backend;
@@ -426,7 +456,7 @@ void GenerationService::warmup() {
         request.messages.push_back(std::move(turn));
         request.max_tokens       = 4;
         request.max_tokens_set   = true;
-        PreparedRequest prepared = prepare(request);
+        PreparedRequest prepared = prepare_impl(request, {}, {}, CacheParticipation::Disabled);
         run(prepared, nullptr);
     } catch (const std::exception& exception) {
         write_console_log(ConsoleLogLevel::Warning,

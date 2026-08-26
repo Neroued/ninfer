@@ -156,8 +156,11 @@ routing map, not a mandatory reading list:
 - `docs/cli.md`: CLI input, output, sampling, MTP, and runtime options;
 - `docs/serving.md`: OpenAI/Anthropic HTTP behavior;
 - `docs/performance.md`: published performance methodology and results;
-- `docs/maintainer/concurrent-inference-architecture.md`: bounded ingress, request/slot lifecycle,
-  scheduling, batched execution, CUDA Graph, and speculative-concurrency semantics;
+- `docs/maintainer/engine-architecture.md`: Gateway/Frontend/Engine/Runtime boundaries, execution
+  ownership, request/response/continuation lifecycles, admission, scheduling, output transactions,
+  batched execution, and CUDA Graph semantics;
+- `docs/maintainer/resource-scheduling-and-context-cache.md`: resource selection and accounting,
+  continuation/checkpoint ownership, materialization transactions, and Device/Host replica policy;
 - `docs/maintainer/paged-kv-cache.md`: shared KV capacity, page ownership, retention, physical
   layouts, and paged consumer contracts;
 - `docs/maintainer/artifact-container.md`, `storage-layouts.md`, and `tensor-formats.md`:

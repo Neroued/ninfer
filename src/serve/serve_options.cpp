@@ -49,6 +49,7 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
+    if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -67,12 +68,16 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
+           "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+           "[--max-private-continuations N] [--max-shared-prefixes N] "
+           "[--max-long-anchors-per-continuation N] [--max-cache-markers-per-request N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
-           "[--default-max-tokens N] "
+           "[--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N] "
+           "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -95,6 +100,12 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
+           "shared=concurrency, anchors=2, markers=4; Host state=8 slots, Host KV=8192 MiB\n"
+           "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
+           "--host-kv-mib uses MiB\n"
+           "       --default-thinking-budget caps model-origin thinking for enabled requests; "
+           "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
@@ -116,6 +127,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool context_capacity_explicit   = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -157,6 +169,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--context-cost-presets") {
+            options.context_cost_presets = require_value("--context-cost-presets");
+            if (options.context_cost_presets.empty()) {
+                throw std::invalid_argument("--context-cost-presets must not be empty");
+            }
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
@@ -188,6 +205,41 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--media-preprocess-threads must be in [0,64]");
             }
             options.media_preprocess_threads = static_cast<std::uint32_t>(threads);
+        } else if (arg == "--device-state-slots") {
+            options.context_cache.device_state_slots = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--device-state-slots"), "device-state-slots"));
+            context_capacity_explicit = true;
+        } else if (arg == "--host-state-slots") {
+            options.context_cache.host_state_slots = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
+            context_capacity_explicit = true;
+        } else if (arg == "--host-kv-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-kv-mib is out of range");
+            }
+            options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
+            context_capacity_explicit                    = true;
+        } else if (arg == "--max-private-continuations") {
+            options.context_cache.max_private_continuations =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--max-private-continuations"), "max-private-continuations"));
+            context_capacity_explicit = true;
+        } else if (arg == "--max-shared-prefixes") {
+            options.context_cache.max_shared_prefixes =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--max-shared-prefixes"), "max-shared-prefixes"));
+            context_capacity_explicit = true;
+        } else if (arg == "--max-long-anchors-per-continuation") {
+            options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
+                                      "max-long-anchors-per-continuation"));
+            context_capacity_explicit = true;
+        } else if (arg == "--max-cache-markers-per-request") {
+            options.context_cache.max_cache_markers_per_request = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-cache-markers-per-request"),
+                                      "max-cache-markers-per-request"));
+            context_capacity_explicit = true;
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
@@ -221,6 +273,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
             default_max_tokens_explicit = true;
+        } else if (arg == "--default-thinking-budget") {
+            const std::uint64_t budget =
+                parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
+            if (budget == 0 || budget > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--default-thinking-budget is out of range");
+            }
+            options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
@@ -263,6 +322,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (!options.allow_prefix_reuse) {
+        if (context_capacity_explicit) {
+            throw std::invalid_argument(
+                "--no-prefix-reuse cannot be combined with context-cache capacity options");
+        }
+        options.context_cache.enabled                = false;
+        options.context_cache.host_state_slots       = 0;
+        options.context_cache.host_kv_capacity_bytes = 0;
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

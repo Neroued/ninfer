@@ -5,12 +5,12 @@ import json
 from tools.bench.run_ninfer_bench_matrix import BenchCase, report_rows
 
 
-def test_schema_v11_report_is_flattened_for_matrix_summary(tmp_path) -> None:
+def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 11,
+                "schema_version": 13,
                 "artifact_type": "ninfer_bench_report",
                 "tool": "ninfer_bench",
                 "artifact": {"path": "model.ninfer"},
@@ -30,7 +30,10 @@ def test_schema_v11_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                     "weights": {"capacity_bytes": 17_400_000_000},
                     "sequence": {"capacity_bytes": 2_000_000_000},
                     "workspace": {"capacity_bytes": 100_000_000},
-                    "request_transient": {"capacity_bytes": 50_000_000},
+                    "vision_workspace": {
+                        "general_capacity_bytes": 75_000_000,
+                        "handoff_capacity_bytes": 50_000_000,
+                    },
                     "cuda_graph_allowance_bytes": 150_000_000,
                 },
                 "config": {
@@ -99,7 +102,8 @@ def test_schema_v11_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     assert row["kv_capacity"] == 8192
     assert row["host_to_device_bytes"] == 17_400_000_000
     assert row["workspace_capacity_bytes"] == 100_000_000
-    assert row["request_transient_capacity_bytes"] == 50_000_000
+    assert row["workspace_general_capacity_bytes"] == 75_000_000
+    assert row["vision_handoff_capacity_bytes"] == 50_000_000
     assert row["cuda_graph_allowance_bytes"] == 150_000_000
     assert row["workspace_peak_bytes"] == 1_048_576
     assert row["workspace_allocator_peak_bytes"] == 524_288

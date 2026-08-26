@@ -10,7 +10,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rope.h"
-#include "ninfer/ops/vision_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/vision_pos_embed.h"
 
 #include <algorithm>
@@ -32,11 +32,25 @@ std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
     return a * b;
 }
 
+std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
+    if (b > std::numeric_limits<std::size_t>::max() - a) {
+        throw std::overflow_error(std::string("Vision ") + label + " overflows size_t");
+    }
+    return a + b;
+}
+
+std::size_t align_up(std::size_t value, std::size_t alignment, const char* label) {
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        throw std::invalid_argument(std::string("Vision ") + label +
+                                    " alignment must be a power of two");
+    }
+    return checked_add(value, alignment - 1, label) & ~(alignment - 1);
+}
+
 constexpr std::size_t kWorkspaceAlignment = 256;
 
 struct VisionWorkspaceLayout {
     TensorRegion position_ids;
-    TensorRegion cu_seqlens;
     TensorRegion pos_indices;
     TensorRegion pos_weights;
     TensorRegion x;
@@ -44,7 +58,6 @@ struct VisionWorkspaceLayout {
     TensorRegion attended;
     TensorRegion qkv;
     TensorRegion attention_norm;
-    std::optional<LayoutRegion> attention_workspace;
     TensorRegion projected;
     TensorRegion mlp_down;
     TensorRegion mlp_up;
@@ -54,17 +67,28 @@ struct VisionWorkspaceLayout {
     std::size_t bytes = 0;
 };
 
-VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t tokens64,
-                                             std::size_t segment_count) {
+TensorRegion alias_tensor(const TensorRegion& storage, DType dtype,
+                          std::initializer_list<std::int32_t> shape, const char* label) {
+    Tensor tensor(nullptr, dtype, shape);
+    if (tensor.bytes() > storage.region.bytes) {
+        throw std::logic_error(std::string("Vision ") + label +
+                               " does not fit its aliased storage");
+    }
+    TensorRegion out;
+    out.region = LayoutRegion{storage.region.offset, tensor.bytes(), storage.region.alignment};
+    out.dtype  = dtype;
+    std::copy(shape.begin(), shape.end(), out.shape.begin());
+    return out;
+}
+
+VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t tokens64) {
     if (patches64 == 0 || tokens64 == 0 ||
         patches64 !=
             checked_mul(tokens64, VisionScheduleConfig::merge_unit, "patch/token relation")) {
         throw std::invalid_argument("Vision workspace requires P=4V>0");
     }
     if (patches64 > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
-        tokens64 > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) ||
-        segment_count == 0 ||
-        segment_count >= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        tokens64 > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("Vision request dimensions exceed int32");
     }
     const auto patches = static_cast<std::int32_t>(patches64);
@@ -76,53 +100,70 @@ VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t 
                          const char* label) {
         return builder.add_tensor(dtype, shape, kWorkspaceAlignment, label);
     };
-    out.position_ids = add(DType::I32, {patches, 2}, "vision position ids");
-    out.cu_seqlens =
-        add(DType::I32, {static_cast<std::int32_t>(segment_count + 1)}, "vision segment bounds");
-    out.pos_indices = add(DType::I32, {4, patches}, "vision position indices");
-    out.pos_weights = add(DType::FP32, {4, patches}, "vision position weights");
-    out.x           = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision residual");
-    out.patch_bf16 =
-        add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
+    out.x = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision residual");
     {
-        auto attention_scope = builder.scope();
-        out.attended = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision attended");
+        auto position_lifetime = builder.scope();
+        out.position_ids       = add(DType::I32, {patches, 2}, "vision position ids");
         {
-            auto qkv_scope = builder.scope();
+            auto patch_scope = builder.scope();
+            out.patch_bf16 =
+                add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
+        }
+        {
+            auto position_scope = builder.scope();
+            out.pos_indices     = add(DType::I32, {4, patches}, "vision position indices");
+            out.pos_weights     = add(DType::FP32, {4, patches}, "vision position weights");
+        }
+        {
+            auto attention_scope = builder.scope();
             out.qkv = add(DType::BF16, {3 * VisionScheduleConfig::hidden, patches}, "vision QKV");
-            {
-                auto norm_scope    = builder.scope();
-                out.attention_norm = add(DType::BF16, {VisionScheduleConfig::hidden, patches},
-                                         "vision attention norm");
-            }
-            const std::size_t attention_bytes = ops::vision_attention_workspace_capacity_bytes(
-                patches, patches, static_cast<std::int32_t>(segment_count),
-                static_cast<std::int32_t>(segment_count));
-            if (attention_bytes != 0) {
-                out.attention_workspace =
-                    builder.add(attention_bytes, kWorkspaceAlignment, "vision attention workspace");
-            }
+            out.attention_norm = add(DType::BF16, {VisionScheduleConfig::hidden, patches},
+                                     "vision attention norm/attended");
+            out.attended       = out.attention_norm;
+            out.projected =
+                alias_tensor(out.qkv, DType::BF16, {VisionScheduleConfig::hidden, patches},
+                             "attention projection output");
         }
-        out.projected =
-            add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision projected");
+        {
+            auto mlp_scope = builder.scope();
+            out.mlp_up =
+                add(DType::BF16, {VisionScheduleConfig::intermediate, patches}, "vision MLP up");
+            out.mlp_norm =
+                add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision MLP norm/down");
+            out.mlp_down = out.mlp_norm;
+        }
     }
     {
-        auto mlp_scope = builder.scope();
-        out.mlp_up =
-            add(DType::BF16, {VisionScheduleConfig::intermediate, patches}, "vision MLP up");
-        {
-            auto norm_scope = builder.scope();
-            out.mlp_norm =
-                add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision MLP norm");
-        }
-        out.mlp_down = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision MLP down");
+        auto merger_scope = builder.scope();
+        out.normalized =
+            add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision merger norm");
+        out.merger_hidden = alias_tensor(
+            out.x, DType::BF16, {VisionScheduleConfig::merger_hidden, tokens}, "merger hidden");
     }
-    out.normalized =
-        add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision merger norm");
-    out.merger_hidden =
-        add(DType::BF16, {VisionScheduleConfig::merger_hidden, tokens}, "vision merger hidden");
     out.bytes = builder.finish(1, "vision workspace");
     return out;
+}
+
+std::size_t output_handoff_bytes(std::size_t merged_tokens) {
+    if (merged_tokens == 0 ||
+        merged_tokens > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("Vision output handoff extent must fit positive int32");
+    }
+    LayoutBuilder layout;
+    (void)layout.add_tensor(
+        DType::BF16, {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(merged_tokens)},
+        kWorkspaceAlignment, "Vision item output handoff");
+    return layout.finish(kWorkspaceAlignment, "Vision item output handoff layout");
+}
+
+std::size_t merger_hidden_bytes(std::size_t merged_tokens) {
+    if (merged_tokens == 0 ||
+        merged_tokens > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("Vision merger hidden extent must fit positive int32");
+    }
+    Tensor tensor(nullptr, DType::BF16,
+                  {VisionScheduleConfig::merger_hidden, static_cast<std::int32_t>(merged_tokens)});
+    return tensor.bytes();
 }
 
 void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
@@ -165,37 +206,59 @@ VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights)
 }
 
 std::size_t VisionContext::workspace_bytes(const qwen3_6::VisionItemControl& item) {
-    return build_workspace_layout(item.patch_count, item.merged_count,
-                                  static_cast<std::size_t>(item.segment_count))
-        .bytes;
+    return workspace_bytes(item.patch_count, item.merged_count);
 }
 
-std::size_t VisionContext::output_transient_bytes(std::size_t merged_tokens) {
-    if (merged_tokens == 0 ||
-        merged_tokens > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::invalid_argument("Vision output transient extent must fit positive int32");
+std::size_t VisionContext::workspace_bytes(std::size_t patches, std::size_t merged_tokens) {
+    return build_workspace_layout(patches, merged_tokens).bytes;
+}
+
+VisionWorkspacePlan VisionContext::plan_workspace(std::uint32_t max_merged_tokens,
+                                                  std::size_t general_capacity_bytes) {
+    if (max_merged_tokens == 0) {
+        throw std::invalid_argument("Vision workspace capacity bound must be positive");
     }
-    LayoutBuilder layout;
-    (void)layout.add_tensor(
-        DType::BF16, {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(merged_tokens)},
-        kWorkspaceAlignment, "Vision item output transient");
-    return layout.finish(kWorkspaceAlignment, "Vision item output transient layout");
-}
-
-std::size_t VisionContext::workspace_capacity_bytes(std::uint32_t max_merged_tokens,
-                                                    std::uint32_t max_segments) {
-    if (max_merged_tokens == 0 || max_segments == 0) {
-        throw std::invalid_argument("Vision workspace capacity bounds must be positive");
+    if (general_capacity_bytes == 0) {
+        throw std::invalid_argument("Vision general workspace capacity must be positive");
     }
-    const std::uint32_t segments = std::min(max_merged_tokens, max_segments);
-    return build_workspace_layout(checked_mul(max_merged_tokens, VisionScheduleConfig::merge_unit,
-                                              "capacity patch count"),
-                                  max_merged_tokens, segments)
-        .bytes;
+    VisionWorkspacePlan out;
+    out.max_merged_tokens      = max_merged_tokens;
+    out.general_capacity_bytes = general_capacity_bytes;
+    out.encode_peak_bytes =
+        build_workspace_layout(checked_mul(max_merged_tokens, VisionScheduleConfig::merge_unit,
+                                           "capacity patch count"),
+                               max_merged_tokens)
+            .bytes;
+    out.handoff_offset_bytes =
+        align_up(std::max(general_capacity_bytes, merger_hidden_bytes(max_merged_tokens)),
+                 kWorkspaceAlignment, "handoff offset");
+    out.handoff_capacity_bytes = output_handoff_bytes(max_merged_tokens);
+    out.capacity_bytes         = std::max(
+        out.encode_peak_bytes,
+        checked_add(out.handoff_offset_bytes, out.handoff_capacity_bytes, "workspace capacity"));
+    return out;
 }
 
-void VisionContext::encode(const VisionItemView& item, Tensor& output,
-                           WorkspaceArena& workspace) const {
+Tensor VisionContext::bind_output(DeviceSpan backing, const VisionWorkspacePlan& plan,
+                                  std::size_t merged_tokens) {
+    if (backing.data == nullptr || backing.bytes < plan.capacity_bytes || merged_tokens == 0 ||
+        merged_tokens > plan.max_merged_tokens) {
+        throw std::invalid_argument("Vision output binding exceeds its workspace plan");
+    }
+    const std::size_t bytes = output_handoff_bytes(merged_tokens);
+    if (bytes > plan.handoff_capacity_bytes) {
+        throw std::logic_error("Vision output binding exceeds its handoff region");
+    }
+    TensorRegion region;
+    region.region = LayoutRegion{plan.handoff_offset_bytes, bytes, kWorkspaceAlignment};
+    region.dtype  = DType::BF16;
+    region.shape  = {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(merged_tokens), 1,
+                     1};
+    return region.bind(backing);
+}
+
+void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
+                           const VisionWorkspacePlan& plan) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
     const qwen3_6::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;
@@ -209,25 +272,20 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
         output.ne[3] != 1 || !output.is_contiguous() || output.data == nullptr) {
         throw std::invalid_argument("Vision output must be contiguous BF16 [H,V]");
     }
-    const VisionWorkspaceLayout layout = build_workspace_layout(
-        patches64, tokens64, static_cast<std::size_t>(control.segment_count));
-    if (workspace.capacity() < layout.bytes) {
+    const Tensor planned_output = bind_output(backing, plan, tokens64);
+    if (output.data != planned_output.data || output.bytes() != planned_output.bytes()) {
+        throw std::invalid_argument("Vision output does not name the planned handoff region");
+    }
+    const VisionWorkspaceLayout layout = build_workspace_layout(patches64, tokens64);
+    if (layout.bytes > plan.encode_peak_bytes || backing.bytes < plan.capacity_bytes) {
         throw std::invalid_argument("Vision workspace capacity is too small for request");
     }
     const auto patches  = static_cast<std::int32_t>(patches64);
     const auto tokens   = static_cast<std::int32_t>(tokens64);
     cudaStream_t stream = ctx_.stream;
-    workspace.reset();
-    const DeviceSpan backing = workspace.alloc_bytes(layout.bytes, kWorkspaceAlignment);
 
     Tensor position_ids = layout.position_ids.bind(backing);
-    Tensor cu_seqlens   = layout.cu_seqlens.bind(backing);
-    Tensor pos_indices  = layout.pos_indices.bind(backing);
-    Tensor pos_weights  = layout.pos_weights.bind(backing);
     copy_host(control.position_ids.data(), position_ids, stream);
-    copy_host(control.cu_seqlens.data(), cu_seqlens, stream);
-    copy_host(control.position_table_indices.data(), pos_indices, stream);
-    copy_host(control.position_table_weights.data(), pos_weights, stream);
 
     Tensor x          = layout.x.bind(backing);
     Tensor patch_bf16 = layout.patch_bf16.bind(backing);
@@ -237,6 +295,10 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
     // The artifact records the source table shape [rows,hidden], while Tensor's
     // contiguous matrix convention is [inner,columns]. The payload is already
     // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
+    Tensor pos_indices = layout.pos_indices.bind(backing);
+    Tensor pos_weights = layout.pos_weights.bind(backing);
+    copy_host(control.position_table_indices.data(), pos_indices, stream);
+    copy_host(control.position_table_weights.data(), pos_weights, stream);
     Tensor position_table = position_embed_->reshape(
         {VisionScheduleConfig::hidden, VisionScheduleConfig::position_embeddings});
     ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
@@ -268,12 +330,12 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
                           VisionScheduleConfig::rope_theta, q, k, stream);
                 Tensor attended_heads = attended.view(
                     {VisionScheduleConfig::head_dim, VisionScheduleConfig::heads, patches});
-                const DeviceSpan attention_backing = layout.attention_workspace
-                                                         ? layout.attention_workspace->bind(backing)
-                                                         : backing;
-                WorkspaceArena attention_workspace(attention_backing);
-                ops::vision_attention(q, k, v, cu_seqlens, attention_workspace, attended_heads,
-                                      stream);
+                ops::packed_softmax_attention(q, k, v,
+                                              {VisionScheduleConfig::head_dim,
+                                               VisionScheduleConfig::heads,
+                                               VisionScheduleConfig::heads},
+                                              VisionScheduleConfig::attention_scale,
+                                              control.segment_length, attended_heads, stream);
             }
             Tensor projected = layout.projected.bind(backing);
             ops::linear(attended, *block.projection, projected, stream);
@@ -310,17 +372,68 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
 }
 
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
-                                           WorkspaceArena& workspace,
+                                           DeviceSpan workspace,
+                                           const VisionWorkspacePlan& workspace_plan,
                                            qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient)
-    : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
-      context_(device, model) {
+                                           std::size_t& handoff_peak_bytes)
+    : device_(device), workspace_(workspace), workspace_plan_(workspace_plan), prompt_(prompt),
+      plan_(plan), handoff_peak_bytes_(handoff_peak_bytes), context_(device, model) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
-    if (transient_.data == nullptr || transient_.alignment < kWorkspaceAlignment) {
-        throw std::invalid_argument("Vision item output transient is missing or misaligned");
+    if (workspace_.data == nullptr || workspace_.bytes < workspace_plan_.capacity_bytes ||
+        plan_.max_merged_count == 0 || plan_.max_merged_count > workspace_plan_.max_merged_tokens) {
+        throw std::invalid_argument("Vision prefill workspace plan is invalid");
+    }
+    std::uint32_t previous_end = 0;
+    std::optional<std::uint32_t> previous_item;
+    for (const VisionUseSpan& use : plan_.uses) {
+        if (use.begin >= use.end || use.begin < previous_end ||
+            use.end > prompt_.token_ids.size()) {
+            throw std::invalid_argument("Vision suffix item spans are invalid or unordered");
+        }
+        if (use.control_index >= plan_.control->items.size() ||
+            use.prepared_item_index >= prompt_.vision_items.size() ||
+            use.prepared_item_index >= prompt_.media_payloads.size() ||
+            plan_.control->prepared_item_begin + use.control_index != use.prepared_item_index ||
+            (previous_item && use.prepared_item_index <= *previous_item)) {
+            throw std::invalid_argument("Vision suffix item indices are invalid or unordered");
+        }
+        const qwen3_6::VisionItemControl& control = plan_.control->items[use.control_index];
+        const qwen3_6::VisionItem& source         = prompt_.vision_items[use.prepared_item_index];
+        if (control.scatter_indices.empty() ||
+            use.end != static_cast<std::uint32_t>(control.scatter_indices.back()) + 1U ||
+            (use.begin != static_cast<std::uint32_t>(control.scatter_indices.front()) &&
+             use.begin + 1U != static_cast<std::uint32_t>(control.scatter_indices.front())) ||
+            source.modality != control.modality || source.grid.temporal != control.grid.temporal ||
+            source.grid.height != control.grid.height || source.grid.width != control.grid.width ||
+            source.patch_begin != control.patch_begin ||
+            source.patch_count != control.patch_count) {
+            throw std::invalid_argument("Vision suffix plan does not describe the prepared item");
+        }
+        if (control.merged_count > plan_.max_merged_count) {
+            throw std::invalid_argument("Vision suffix item exceeds its request workspace extent");
+        }
+        const Tensor output =
+            VisionContext::bind_output(workspace_, workspace_plan_, control.merged_count);
+        const std::size_t patch_elements = checked_mul(
+            control.patch_count, static_cast<std::size_t>(VisionScheduleConfig::patch_dim),
+            "item patch elements");
+        const auto& payload = prompt_.media_payloads[use.prepared_item_index];
+        if (output.bytes() > workspace_plan_.handoff_capacity_bytes || !payload ||
+            payload->patch_elements != patch_elements) {
+            throw std::invalid_argument("Vision suffix item storage has an invalid shape");
+        }
+        previous_end  = use.end;
+        previous_item = use.prepared_item_index;
+    }
+    if (plan_.max_merged_count != 0 &&
+        std::none_of(plan_.control->items.begin(), plan_.control->items.end(),
+                     [&](const qwen3_6::VisionItemControl& item) {
+                         return item.merged_count == plan_.max_merged_count;
+                     })) {
+        throw std::invalid_argument("Vision request workspace extent has no matching suffix item");
     }
     encoded_payloads_pending_release_.reserve(plan_.uses.size());
     timers_.reserve(plan_.uses.size());
@@ -335,65 +448,32 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     std::uint32_t end = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(nominal_end64, prompt_.token_ids.size()));
 
+    while (next_use_ < plan_.uses.size() && plan_.uses[next_use_].end <= begin) { ++next_use_; }
     const VisionUseSpan* active = nullptr;
-    for (const VisionUseSpan& use : plan_.uses) {
-        if (use.end <= begin) { continue; }
-        if (use.begin >= end) { break; }
-        if (active == nullptr) {
-            active = &use;
-        } else {
-            end = std::min(end, use.begin);
-            break;
+    if (next_use_ < plan_.uses.size() && plan_.uses[next_use_].begin < end) {
+        active = &plan_.uses[next_use_];
+        if (next_use_ + 1U < plan_.uses.size()) {
+            end = std::min(end, plan_.uses[next_use_ + 1U].begin);
         }
     }
     if (end <= begin) { throw std::logic_error("Vision chunk cap made no forward progress"); }
     if (active == nullptr) {
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }
-    if (active->item_index >= plan_.control->items.size() ||
-        active->item_index >= prompt_.vision_items.size() ||
-        active->item_index >= prompt_.media_payloads.size()) {
-        throw std::logic_error("Vision prefill item index is out of range");
-    }
-    const qwen3_6::VisionItemControl& control = plan_.control->items[active->item_index];
-    const qwen3_6::VisionItem& source         = prompt_.vision_items[active->item_index];
-    if (source.modality != control.modality || source.grid.temporal != control.grid.temporal ||
-        source.grid.height != control.grid.height || source.grid.width != control.grid.width ||
-        source.patch_begin != control.patch_begin || source.patch_count != control.patch_count) {
-        throw std::invalid_argument("Vision prefill plan does not describe the prepared item");
-    }
-    if (control.merged_count > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error("Vision item output columns exceed int32");
-    }
-    const std::size_t output_bytes =
-        checked_mul(checked_mul(static_cast<std::size_t>(VisionScheduleConfig::out_hidden),
-                                control.merged_count, "item output elements"),
-                    dtype_size(DType::BF16), "item output bytes");
-    if (output_bytes > transient_.size) {
-        throw std::invalid_argument("Vision item output transient is too small");
-    }
-    Tensor output(
-        transient_.data, DType::BF16,
-        {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(control.merged_count)});
+    const qwen3_6::VisionItemControl& control = plan_.control->items[active->control_index];
+    Tensor output = VisionContext::bind_output(workspace_, workspace_plan_, control.merged_count);
 
-    if (!active_item_ || *active_item_ != active->item_index) {
-        if (active_item_ && active->item_index <= *active_item_) {
-            throw std::logic_error("Vision items are not consumed in strictly increasing order");
-        }
-        const std::size_t patch_elements = checked_mul(
-            control.patch_count, static_cast<std::size_t>(VisionScheduleConfig::patch_dim),
-            "item patch elements");
-        const auto& payload = prompt_.media_payloads[active->item_index];
-        if (!payload || payload->patch_elements != patch_elements) {
-            throw std::invalid_argument("Vision item patch payload has an invalid shape");
-        }
+    if (!active_item_ || *active_item_ != active->prepared_item_index) {
+        const auto& payload = prompt_.media_payloads[active->prepared_item_index];
         timers_.emplace_back(device_);
         timers_.back().start();
-        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);
+        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_,
+                        workspace_plan_);
         timers_.back().record_stop();
-        workspace_.reset();
-        active_item_ = active->item_index;
-        encoded_payloads_pending_release_.push_back(active->item_index);
+        active_item_          = active->prepared_item_index;
+        active_handoff_bytes_ = output.bytes();
+        handoff_peak_bytes_   = std::max(handoff_peak_bytes_, active_handoff_bytes_);
+        encoded_payloads_pending_release_.push_back(active->prepared_item_index);
     }
     return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
 }
@@ -404,6 +484,11 @@ void VisionPrefillSession::release_encoded_media_payloads() noexcept {
         prompt_.media_payloads[item_index].reset();
     }
     encoded_payloads_pending_release_.clear();
+}
+
+void VisionPrefillSession::retire_handoff() noexcept {
+    active_item_.reset();
+    active_handoff_bytes_ = 0;
 }
 
 double VisionPrefillSession::elapsed_seconds() const {

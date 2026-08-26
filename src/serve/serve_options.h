@@ -26,12 +26,13 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
-    std::uint32_t max_context              = 8192;
-    KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
-    std::uint32_t max_concurrency          = 1;
-    std::uint32_t max_pending_requests     = 16;
-    std::uint32_t pending_timeout_ms       = 30000;
-    std::uint32_t prefill_chunk            = 1024;
+    std::uint32_t max_context          = 8192;
+    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
+    std::uint32_t max_concurrency      = 1;
+    std::uint32_t max_pending_requests = 16;
+    std::uint32_t pending_timeout_ms   = 30000;
+    std::uint32_t prefill_chunk        = 1024;
+    std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
@@ -42,12 +43,14 @@ struct ServeOptions {
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    ContextCacheOptions context_cache;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
+    std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request

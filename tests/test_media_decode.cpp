@@ -109,9 +109,11 @@ void expect_pixel(const ninfer::media::decode::Image& image, int x, int y,
 }
 
 void test_issue_20_unaligned_jpeg() {
-    const std::vector<std::uint8_t> encoded  = decode_base64(issue_20_jpeg_base64);
-    const ninfer::media::decode::Image image = ninfer::media::decode::decode_image(encoded, {});
-    if (image.width != 300 || image.height != 200 || image.rgb.size() != 300U * 200U * 3U) {
+    const std::vector<std::uint8_t> encoded     = decode_base64(issue_20_jpeg_base64);
+    const ninfer::media::decode::ImageInfo info = ninfer::media::decode::inspect_image(encoded, {});
+    const ninfer::media::decode::Image image    = ninfer::media::decode::decode_image(encoded, {});
+    if (info.width != image.width || info.height != image.height || image.width != 300 ||
+        image.height != 200 || image.rgb.size() != 300U * 200U * 3U) {
         throw std::runtime_error("decoded JPEG dimensions mismatch");
     }
 
@@ -122,6 +124,16 @@ void test_issue_20_unaligned_jpeg() {
     expect_pixel(image, 0, 199, blue, 3);
     expect_pixel(image, 299, 199, blue, 3);
     expect_pixel(image, 150, 100, yellow, 4);
+
+    const ninfer::media::decode::VideoInfo video_info =
+        ninfer::media::decode::inspect_video(encoded, {}, 2.0, 4, 16);
+    const ninfer::media::decode::Video video =
+        ninfer::media::decode::decode_video(encoded, {}, 2.0, 4, 16);
+    if (video_info.width != video.width || video_info.height != video.height ||
+        video_info.sampled_frames != static_cast<int>(video.frames.size()) ||
+        video_info.indices != video.indices) {
+        throw std::runtime_error("inspected video geometry differs from decoded video");
+    }
 }
 
 } // namespace

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "runtime/engine/request_memory.h"
+#include "runtime/engine/context_cost.h"
 #include <ninfer/targets/qwen3_6_27b/package.h>
 #include <ninfer/targets/qwen3_6_35b_a3b/package.h>
 
@@ -34,7 +34,6 @@ struct Qwen3_6_27BInstance {
 
     std::unique_ptr<LoadedQwen3_6_27B> loaded;
     runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_27B::Program> program;
 
@@ -64,7 +63,6 @@ struct Qwen3_6_35BA3BInstance {
 
     std::unique_ptr<LoadedQwen3_6_35BA3B> loaded;
     runtime::KvCapacityResolution kv_capacity_resolution;
-    runtime::RequestMemory request_memory;
     const std::uint32_t capacity;
     std::unique_ptr<Qwen3_6_35BA3B::Program> program;
 
@@ -84,6 +82,7 @@ struct ConstructedTarget {
     ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
+    runtime::ContextCostModel context_cost;
 };
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,

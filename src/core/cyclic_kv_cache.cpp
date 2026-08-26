@@ -21,6 +21,30 @@ std::uint32_t align_up_u32(std::uint32_t value, std::uint32_t alignment) {
     return static_cast<std::uint32_t>(aligned);
 }
 
+std::ptrdiff_t layer_pitch(const std::vector<Tensor>& layers, const char* label) {
+    if (layers.empty()) { throw std::logic_error(std::string("Cyclic KV has no ") + label); }
+    if (layers.size() == 1) { return 0; }
+    const auto first  = reinterpret_cast<std::uintptr_t>(layers[0].data);
+    const auto second = reinterpret_cast<std::uintptr_t>(layers[1].data);
+    if (second <= first ||
+        second - first > static_cast<std::uintptr_t>(std::numeric_limits<std::ptrdiff_t>::max())) {
+        throw std::logic_error(std::string("Cyclic KV ") + label + " layer pitch is invalid");
+    }
+    const auto pitch = static_cast<std::ptrdiff_t>(second - first);
+    if (static_cast<std::size_t>(pitch) < layers.front().bytes()) {
+        throw std::logic_error(std::string("Cyclic KV ") + label + " layers overlap");
+    }
+    for (std::size_t layer = 2; layer < layers.size(); ++layer) {
+        const auto previous = reinterpret_cast<std::uintptr_t>(layers[layer - 1].data);
+        const auto current  = reinterpret_cast<std::uintptr_t>(layers[layer].data);
+        if (current <= previous || current - previous != static_cast<std::uintptr_t>(pitch)) {
+            throw std::logic_error(std::string("Cyclic KV ") + label +
+                                   " layer pitch is not constant");
+        }
+    }
+    return pitch;
+}
+
 } // namespace
 
 CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t layers,
@@ -100,21 +124,48 @@ CyclicKVCacheLayerView CyclicKVCache::layer_view(std::uint32_t layer) const {
     };
 }
 
-void CyclicKVCache::copy_lane_from(const CyclicKVCache& source, std::int32_t lane,
-                                   cudaStream_t stream) {
+CyclicKVCacheSlotView CyclicKVCache::slot_view(std::int32_t slot) const {
+    if (slot < 0 || slot >= lane_capacity_) {
+        throw std::out_of_range("Cyclic KV slot is out of range");
+    }
+    const Tensor k =
+        k_.front()
+            .slice(3, slot, 1)
+            .view({head_dim_, static_cast<std::int32_t>(padded_capacity_), num_kv_heads_});
+    const Tensor v =
+        v_.front()
+            .slice(3, slot, 1)
+            .view({head_dim_, static_cast<std::int32_t>(padded_capacity_), num_kv_heads_});
+    return {
+        .k_layer0            = k,
+        .v_layer0            = v,
+        .k_layer_bytes       = k.bytes(),
+        .v_layer_bytes       = v.bytes(),
+        .k_layer_pitch_bytes = layer_pitch(k_, "K"),
+        .v_layer_pitch_bytes = layer_pitch(v_, "V"),
+        .layers              = layer_count(),
+    };
+}
+
+void CyclicKVCache::copy_slot_from(const CyclicKVCache& source, std::int32_t source_slot,
+                                   std::int32_t destination_slot, cudaStream_t stream) {
     if (source.layer_count() != layer_count() || source.capacity_ != capacity_ ||
         source.padded_capacity_ != padded_capacity_ || source.num_kv_heads_ != num_kv_heads_ ||
-        source.head_dim_ != head_dim_ || source.lane_capacity_ != lane_capacity_) {
-        throw std::invalid_argument("Cyclic KV copy requires identical layouts");
+        source.head_dim_ != head_dim_) {
+        throw std::invalid_argument("Cyclic KV copy requires identical component geometry");
     }
-    if (lane < 0 || lane >= lane_capacity_) {
-        throw std::out_of_range("Cyclic KV lane is out of range");
+    if (source_slot < 0 || source_slot >= source.lane_capacity_) {
+        throw std::out_of_range("Cyclic KV source slot is out of range");
     }
+    if (destination_slot < 0 || destination_slot >= lane_capacity_) {
+        throw std::out_of_range("Cyclic KV destination slot is out of range");
+    }
+    if (&source == this && source_slot == destination_slot) { return; }
     for (std::size_t layer = 0; layer < k_.size(); ++layer) {
-        Tensor destination_k = k_[layer].slice(3, lane, 1);
-        Tensor destination_v = v_[layer].slice(3, lane, 1);
-        Tensor source_k      = source.k_[layer].slice(3, lane, 1);
-        Tensor source_v      = source.v_[layer].slice(3, lane, 1);
+        Tensor destination_k = k_[layer].slice(3, destination_slot, 1);
+        Tensor destination_v = v_[layer].slice(3, destination_slot, 1);
+        Tensor source_k      = source.k_[layer].slice(3, source_slot, 1);
+        Tensor source_v      = source.v_[layer].slice(3, source_slot, 1);
         CUDA_CHECK(cudaMemcpyAsync(destination_k.data, source_k.data, destination_k.bytes(),
                                    cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(destination_v.data, source_v.data, destination_v.bytes(),

@@ -63,23 +63,19 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      cudaStream_t stream);
 
 /**
- * Snapshot form for B independent recurrences. q/k are contiguous BF16 [128,Hqk,W,B], v/out are
- * BF16 [128,Hv,W,B], g/beta are FP32 [Hv,W,B], and `ssm_states` is contiguous FP32
- * [128,128,Hv,Slots]. `initial_state_slots` and `snapshot_base_slots` are contiguous I32 [B].
- * `valid_columns` is either contiguous I32 [B], with every value in [1,W], or an empty Tensor
- * meaning every row has W valid columns. B=1 accepts every positive W; B=2..8 accepts W=1..16.
- *
- * Row b starts from initial_state_slots[b] and writes the state after valid column j to
- * snapshot_base_slots[b]+j. Invalid-tail output columns are exact BF16 zero and do not mutate
- * state. The caller reserves disjoint complete [base,base+W) intervals and prevents one row from
- * overwriting another row's initial slot; a row may overwrite its own initial slot after loading
- * it. This form uses no arena allocation and `ssm_states` is the only persistent state mutated.
+ * One-token update for B independent state-pool slots. q/k are contiguous BF16 [128,Hqk,1,B],
+ * v/out are BF16 [128,Hv,1,B], g/beta are FP32 [Hv,1,B], `ssm_states` is contiguous FP32
+ * [128,128,Hv,Slots], and both selector tensors are contiguous device I32 [B]. B is in [1,8].
+ * Row b reads source_state_slots[b] and publishes the transition to
+ * destination_state_slots[b]; selectors may be equal for an in-place row. Destination slots are
+ * distinct across active rows. This form uses no arena allocation.
  */
-void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                              const Tensor& beta, float scale, bool normalize_qk,
-                              Tensor& ssm_states, const Tensor& valid_columns,
-                              const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
-                              Tensor& out, cudaStream_t stream);
+void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& g, const Tensor& beta, float scale,
+                                  bool normalize_qk, Tensor& ssm_states,
+                                  const Tensor& source_state_slots,
+                                  const Tensor& destination_state_slots, Tensor& out,
+                                  cudaStream_t stream);
 
 /**
  * Op: gated_delta_net_replay_record

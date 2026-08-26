@@ -81,6 +81,13 @@ ninfer::PromptInput translate(const GenerationRequest& req) {
                            fake_media);
 }
 
+ninfer::RequestOptions translate_options(const GenerationRequest& req) {
+    const ServeOptions server = default_server();
+    return to_request_options(req, server,
+                              resolve_prompt_semantics(req, server, effort_capabilities()),
+                              server.allow_prefix_reuse);
+}
+
 std::string joined_text(const ninfer::ChatMessage& message) {
     std::string text;
     for (const ninfer::MessagePart& part : message.parts) {
@@ -143,6 +150,95 @@ int test_parse_system_array_and_blocks() {
     const ninfer::PromptInput prompt = translate(req);
     failures += check(prompt.messages.size() == 2, "flattened system + user");
     failures += check(joined_text(prompt.messages[1]) == "x\ny", "user blocks joined");
+    return failures;
+}
+
+int test_cache_control_boundaries() {
+    const Json ephemeral = Json{{"type", "ephemeral"}};
+    const Json body      = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"system",
+              Json::array(
+             {Json{{"type", "text"}, {"text", "stable system"}, {"cache_control", ephemeral}},
+                   Json{{"type", "text"}, {"text", "dynamic tail"}}})},
+        {"tools", Json::array({Json{{"name", "inspect"},
+                                         {"input_schema", Json{{"type", "object"}}},
+                                         {"cache_control", ephemeral}}})},
+        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+    };
+    const GenerationRequest request  = parse_messages_request(body, default_limits());
+    const ninfer::PromptInput prompt = translate(request);
+    int failures = check(request.messages[0].shared_cache_boundaries_after_text_bytes.size() == 1 &&
+                             request.messages[0].shared_cache_boundaries_after_text_bytes[0] ==
+                                 std::string("stable system").size(),
+                         "Anthropic system cache_control boundary was flattened away");
+    failures += check(request.tools.size() == 1 && request.tools[0].cache_boundary_after,
+                      "Anthropic tool cache_control boundary was discarded");
+    failures += check(prompt.context_cache.markers.size() == 1 &&
+                          prompt.context_cache.markers[0].location ==
+                              ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary &&
+                          prompt.context_cache.markers[0].leading_instruction_bytes ==
+                              std::string("stable system").size(),
+                      "latest Anthropic cache_control boundary did not reach PromptInput");
+
+    Json tool_only      = body;
+    tool_only["system"] = "dynamic system";
+    const ninfer::PromptInput tool_prompt =
+        translate(parse_messages_request(tool_only, default_limits()));
+    failures += check(tool_prompt.context_cache.markers.size() == 1 &&
+                          tool_prompt.context_cache.markers[0].location ==
+                              ninfer::PromptCacheMarkerLocation::ToolBoundary &&
+                          tool_prompt.context_cache.markers[0].after_tool_count == 1,
+                      "Anthropic tool cache_control boundary did not reach PromptInput");
+
+    const Json message_cached = {
+        {"model", "m"},
+        {"max_tokens", 16},
+        {"messages",
+         Json::array({Json{{"role", "user"},
+                           {"content", Json::array({Json{{"type", "text"},
+                                                         {"text", "question"},
+                                                         {"cache_control", ephemeral}}})}},
+                      Json{{"role", "assistant"},
+                           {"content", Json::array({Json{{"type", "text"},
+                                                         {"text", "answer"},
+                                                         {"cache_control", ephemeral}}})}},
+                      Json{{"role", "user"}, {"content", "next"}}})},
+    };
+    const GenerationRequest message_request =
+        parse_messages_request(message_cached, default_limits());
+    const ninfer::PromptInput message_prompt = translate(message_request);
+    failures += check(message_request.messages.size() == 3 &&
+                          message_request.messages[0].private_cache_boundary_after &&
+                          message_request.messages[1].private_cache_boundary_after &&
+                          !message_request.messages[2].private_cache_boundary_after,
+                      "Anthropic message cache_control boundary was discarded during parsing");
+    failures +=
+        check(message_prompt.context_cache.markers.size() == 2 &&
+                  message_prompt.context_cache.markers[0].kind ==
+                      ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
+                  message_prompt.context_cache.markers[0].location ==
+                      ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                  message_prompt.context_cache.markers[0].after_message_count == 1 &&
+                  message_prompt.context_cache.markers[1].kind ==
+                      ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
+                  message_prompt.context_cache.markers[1].location ==
+                      ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                  message_prompt.context_cache.markers[1].after_message_count == 2,
+              "Anthropic conversation cache_control did not become private message anchors");
+
+    Json unsupported_position = message_cached;
+    unsupported_position["messages"][0]["content"].push_back(
+        Json{{"type", "text"}, {"text", "dynamic tail"}});
+    failures += check(
+        throws_api([&] { (void)parse_messages_request(unsupported_position, default_limits()); }),
+        "non-terminal Anthropic message cache_control was silently approximated");
+
+    Json invalid                          = body;
+    invalid["system"][0]["cache_control"] = Json{{"type", "unknown"}};
+    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
+                      "invalid Anthropic cache_control type was accepted");
     return failures;
 }
 
@@ -357,7 +453,7 @@ int test_tools_and_choice() {
     failures += check(req.tools[0].name == "get_weather", "tool name parsed");
     failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "auto -> Auto");
     failures += check(req.uses_tools(), "uses_tools true");
-    failures += check(to_request_options(req, default_server()).output.preserve_special_tokens,
+    failures += check(translate_options(req).output.preserve_special_tokens,
                       "active tools preserve special tokens in Engine output");
     // definition_json must be a normalized OpenAI function-tool object for the
     // Qwen <tools> renderer.
@@ -489,9 +585,11 @@ int test_thinking_and_sampling() {
     failures += check(req.enable_thinking.has_value() && *req.enable_thinking, "thinking enabled");
     failures += check(!req.preserve_thinking.has_value(),
                       "Anthropic thinking.type unexpectedly enabled history preservation");
-    const ninfer::RequestOptions options = to_request_options(req, default_server());
+    const ninfer::RequestOptions options = translate_options(req);
     failures +=
         check(options.execution.requested_output_tokens == 8, "max_tokens reaches Engine options");
+    failures += check(!options.execution.thinking.budget,
+                      "Anthropic budget_tokens unexpectedly became a request-level thinking cap");
     failures += check(options.execution.sampling.temperature == 0.3F &&
                           options.execution.sampling.top_p == 0.8F &&
                           options.execution.sampling.top_k == 40 &&
@@ -745,6 +843,7 @@ int main() {
     int failures = 0;
     failures += test_parse_basic_and_system();
     failures += test_parse_system_array_and_blocks();
+    failures += test_cache_control_boundaries();
     failures += test_ordered_system_messages();
     failures += test_user_content_block_order();
     failures += test_missing_and_bad_fields();

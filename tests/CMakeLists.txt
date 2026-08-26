@@ -67,16 +67,20 @@ ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
 ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
-ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
 ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
+ninfer_add_test(ninfer_context_cost_test SOURCES test_context_cost.cpp)
+ninfer_add_test(ninfer_resource_manager_test SOURCES test_resource_manager.cpp)
 ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES test_sampling_defaults.cpp
-  LIBRARIES ninfer_engine)
+  LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_sampling_defaults_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
+ninfer_add_test(ninfer_cli_options_test
+  SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
+target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
@@ -91,7 +95,6 @@ set_tests_properties(
   ninfer_device_test
   ninfer_decode_graph_test
   ninfer_arena_test
-  ninfer_request_memory_test
   ninfer_kv_cache_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
@@ -108,6 +111,23 @@ ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_runtime_mechanisms_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_state_image_test
+  SOURCES targets/qwen3_6/test_state_image.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_state_image_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+set_tests_properties(ninfer_qwen3_6_state_image_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_state_image_layout_test
+  SOURCES targets/qwen3_6/test_state_image_layout.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_state_image_layout_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+ninfer_add_test(ninfer_qwen3_6_context_store_test
+  SOURCES targets/qwen3_6/test_context_store.cpp
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_context_store_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+set_tests_properties(ninfer_qwen3_6_context_store_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
@@ -162,6 +182,9 @@ ninfer_add_test(ninfer_serve_options_test
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_host_timing_test
+  SOURCES test_host_timing.cpp
+  LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES test_http_error_handler.cpp
   LIBRARIES ninfer_serve)
@@ -173,6 +196,15 @@ ninfer_add_test(ninfer_bench_support_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine)
 target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b)
+
+# Pure host-side qualification of the fixed-dimension non-negative fit and the exact coefficient
+# quantization used by the context-cost calibrator. It deliberately links no Engine/CUDA target.
+add_executable(ninfer_context_cost_measure_test
+  test_context_cost_measure.cpp
+  ${PROJECT_SOURCE_DIR}/bench/context_cost/context_cost_measure.cpp)
+target_include_directories(ninfer_context_cost_measure_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/bench/context_cost)
+add_test(NAME ninfer_context_cost_measure_test COMMAND ninfer_context_cost_measure_test)
 
 # Shared Op numerical tests. Target-composed schedule tests are registered separately below.
 set(ninfer_op_tests
@@ -193,7 +225,6 @@ set(ninfer_op_tests
   gdn_gating_proj
   rope
   vision_pos_embed
-  vision_attention
   sampling
   scalar
   cast
@@ -207,17 +238,17 @@ endforeach()
 
 # Stateful, fused, and exact-shape Ops remain central even when the current implementation domain
 # is one checkpoint/device.
-ninfer_add_op_test(ninfer_gqa_attention_test
-  SOURCES ops/test_gqa_attention.cpp
+ninfer_add_op_test(ninfer_softmax_attention_test
+  SOURCES ops/softmax_attention/main.cpp
+          ops/softmax_attention/causal_cache.cpp
+          ops/softmax_attention/plain_and_packed.cpp
+          ops/softmax_attention/context.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_bidirectional_gqa_attention_test
-  SOURCES ops/test_bidirectional_gqa_attention.cpp
+ninfer_add_op_test(ninfer_sliding_window_attention_test
+  SOURCES ops/test_sliding_window_attention.cpp
   LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_swa_test
-  SOURCES ops/test_swa.cpp
-  LIBRARIES ninfer_ops)
-ninfer_add_op_test(ninfer_kv_cache_append_prefix_test
-  SOURCES ops/test_kv_cache_append_prefix.cpp
+ninfer_add_op_test(ninfer_kv_cache_append_test
+  SOURCES ops/test_kv_cache_append.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_prepare_masked_block_test
   SOURCES ops/test_prepare_masked_block.cpp

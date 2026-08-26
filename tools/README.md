@@ -20,6 +20,7 @@ for the selected tool.
 | Run the 35B-A3B Python reference | [`reference/qwen3_6_35b_a3b/`](reference/qwen3_6_35b_a3b/README.md) |
 | Compare 27B artifact/source Vision activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
+| Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 
@@ -81,6 +82,10 @@ python3 tools/bench/run_ninfer_bench_matrix.py --preset core
 
 See [`tools/bench/README.md`](bench/README.md) and [`bench/README.md`](../bench/README.md) for the
 orchestrator and executable contracts.
+
+For request-arrival latency, use the managed Qwen3.8-27B NVFP4/FP8 TTFT campaign. Its measurement
+runner remains an external-only HTTP client; the separate controller owns Serve lifecycle and
+artifacts. See [`tools/bench/ttft/README.md`](bench/ttft/README.md).
 
 ## Serving smoke
 

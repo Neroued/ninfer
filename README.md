@@ -235,10 +235,10 @@ Transformers checkpoint, Safetensors distribution, or GGUF file.
 
 Each artifact is complete, while GPU residency is fixed at process startup. Speculative decoding is
 disabled by default, so MTP/DFlash state and the optimized proposal head are not uploaded.
-Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
-request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
-accept image or video input. Disabled capabilities cannot be enabled by a later request. DFlash is
-available only for the 35B-A3B target and is text-only.
+Vision is also disabled by default, so its weights and Vision-specific unified-workspace extent are
+omitted. Add `--vision` to the CLI or server process that must accept image or video input. Disabled
+capabilities cannot be enabled by a later request. DFlash is available only for the 35B-A3B target
+and is text-only.
 
 ## Run the CLI
 
@@ -300,14 +300,15 @@ state, and function calls) plus Anthropic Messages, token counting, and multimod
 All three registered model IDs support:
 
 - text generation with thinking and non-thinking prompt modes;
+- tokenizer-derived Qwen thinking caps through CLI or a server process default;
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill and CUDA Graph decode;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - MTP speculative decoding with draft windows from one to five;
-- BF16 and INT8 group-64 KV cache;
+- BF16, INT8 group-64, and row-scaled FP8 E4M3 KV cache;
 - model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
   top-k, top-p, min-p, and presence/frequency-penalty overrides;
-- compatible-prefix reuse;
+- private and shared compatible-prefix reuse with optional Host-backed retained State/KV;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming and
   usage accounting;
 - prompt-rendered function tools and parsed tool calls.
@@ -324,7 +325,8 @@ from one to fifteen.
   Decode-ready requests are compacted at round boundaries and executed in one batched model
   traversal.
 - NInfer does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
-  multi-GPU execution, CPU/GPU offload, or distributed serving.
+  active-request swapping, weight offload, multi-GPU execution, or distributed serving. Inactive
+  retained context may use explicitly configured pinned Host State/KV backing.
 - `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
   models' native 262,144-token limit. `--kv-capacity N` explicitly sizes the shared Main Text KV
   pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable

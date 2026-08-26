@@ -93,7 +93,15 @@ std::string format_finish(ninfer::FinishReason reason) {
 }
 
 std::string format_kv_cache(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
+    switch (storage) {
+    case ninfer::KvCacheStorage::BFloat16:
+        return "bf16";
+    case ninfer::KvCacheStorage::Int8Group64:
+        return "int8-group64";
+    case ninfer::KvCacheStorage::Fp8E4M3Row256:
+        return "fp8-e4m3-row256";
+    }
+    return "unknown";
 }
 
 std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
@@ -169,6 +177,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("prompt tokens", std::to_string(result.prompt.prompt_tokens));
     print_metric("reused prompt tokens", std::to_string(result.reused_prompt_tokens));
     print_metric("generated tokens", std::to_string(generated));
+    if (result.thinking.configured_budget) {
+        print_metric("thinking budget", std::to_string(*result.thinking.configured_budget));
+        print_metric("model thinking tokens",
+                     std::to_string(result.thinking.model_thinking_tokens));
+        print_metric("thinking control tokens", std::to_string(result.thinking.injected_tokens));
+        print_metric("thinking control", result.thinking.applied ? "applied" : "not applied");
+    }
     print_metric("model elapsed", format_seconds(model_seconds));
     print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
                                               result.timings.prefill_seconds));
@@ -195,8 +210,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("free after startup", format_bytes(memory.available_after_startup_bytes));
     print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
-    print_metric("CUDA Graph memory", format_bytes(memory.cuda_graph_observed_bytes) + " / " +
-                                          format_bytes(memory.cuda_graph_allowance_bytes));
+    print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
     print_metric("planned device total", format_bytes(reserved));
 
     const ninfer::SpeculativeStats& speculative = result.speculative;
@@ -249,6 +263,7 @@ int main(int argc, char** argv) {
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
+        request.execution.thinking.budget         = cli.thinking_budget;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
         request.output.raw                        = cli.raw_output;
@@ -266,7 +281,12 @@ int main(int argc, char** argv) {
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
-        engine_options.load_progress  = load_progress.callback();
+        // One CLI invocation owns exactly one request, so retained cross-request context has no
+        // consumer and must not reserve an extra Device StateImage or run terminal capture.
+        engine_options.context_cache.enabled                = false;
+        engine_options.context_cache.host_state_slots       = 0;
+        engine_options.context_cache.host_kv_capacity_bytes = 0;
+        engine_options.load_progress                        = load_progress.callback();
 
         const auto load_started = Clock::now();
         ninfer::Engine engine(std::move(engine_options));
@@ -277,7 +297,8 @@ int main(int argc, char** argv) {
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;
-        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request));
+        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
+                                                            ninfer::OutputConsumerMode::Streaming);
         const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
         const ninfer::GenerationResult result             = generation.wait(&sink);
         sink.finish_streams();

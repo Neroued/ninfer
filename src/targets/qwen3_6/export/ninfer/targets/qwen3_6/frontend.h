@@ -15,11 +15,12 @@ namespace ninfer::targets::qwen3_6 {
 inline constexpr std::size_t kTokenDomain = 248077;
 
 struct FrontendOptions {
-    bool vision_enabled                    = true;
-    std::uint32_t max_context              = 2'048;
-    std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
-    std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
-    std::uint32_t media_preprocess_threads = 0;
+    bool vision_enabled                         = true;
+    std::uint32_t max_context                   = 2'048;
+    std::size_t media_cache_bytes               = kDefaultMediaCacheBytes;
+    std::size_t media_live_bytes                = kDefaultMediaLiveBytes;
+    std::uint32_t media_preprocess_threads      = 0;
+    std::uint32_t max_cache_markers_per_request = 4;
 };
 
 struct FrontendResources;
@@ -96,12 +97,19 @@ public:
     OutputSession(const OutputSession&)            = delete;
     OutputSession& operator=(const OutputSession&) = delete;
 
-    [[nodiscard]] runtime::OutputDecision preview(std::span<const TokenId> tokens,
-                                                  std::uint32_t budget_remaining,
-                                                  FinishReason limit_reason);
+    [[nodiscard]] runtime::OutputDecision preview_model(std::span<const TokenId> tokens,
+                                                        std::uint32_t total_budget_remaining,
+                                                        FinishReason limit_reason);
+    [[nodiscard]] std::uint32_t
+    model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept;
+    [[nodiscard]] std::span<const TokenId> pending_control_tokens() const noexcept;
+    [[nodiscard]] runtime::OutputDecision preview_control(std::span<const TokenId> tokens,
+                                                          std::uint32_t total_budget_remaining);
+    void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
+    [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
 
 private:
     class Impl;
@@ -127,9 +135,10 @@ public:
                                                 bool allow_prefix_identity = true) const;
     [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
-    [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,
-                                                    const StopPolicy& caller_stop,
-                                                    const OutputOptions& output = {}) const;
+    [[nodiscard]] OutputSession
+    make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,
+                        const OutputOptions& output            = {},
+                        const ThinkingControlOptions& thinking = {}) const;
     [[nodiscard]] const StopPolicy& default_stop_policy() const noexcept;
 
 private:

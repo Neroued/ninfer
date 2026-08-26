@@ -61,7 +61,7 @@ ResponsesRequest parse_response_input_tokens_request(const nlohmann::json& body,
 // instructions are first, followed by the stored response context and current
 // input; previous instructions are intentionally absent from stored context.
 void compose_responses_generation_messages(ResponsesRequest& request,
-                                           const std::vector<ChatTurn>& previous_context);
+                                           std::vector<ChatTurn> previous_context);
 
 void inherit_responses_preserve_thinking(ResponsesRequest& request, bool parent_value);
 

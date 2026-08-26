@@ -1,7 +1,22 @@
 # tools/bench
 
-Offline helper for the `ninfer_bench` throughput tool. Correctness/parity tooling lives separately
-under [`tools/parity`](../parity).
+Maintainer orchestration for the public `ninfer_bench` throughput tool and the external Serve TTFT
+client. Correctness/parity tooling lives separately under [`tools/parity`](../parity).
+
+## External Serve TTFT
+
+[`ttft/README.md`](ttft/README.md) defines the black-box latency benchmark. The measurement runner
+uses frozen text/media requests and public streaming protocols without calling Engine. A separate
+controller manages the fixed Qwen3.8-27B NVFP4/FP8 Serve profiles and fresh-process isolation.
+
+```bash
+python3 tools/bench/run_serve_ttft_campaign.py --campaign resource --samples 5
+```
+
+The controller chooses the profile, starts and stops Serve for every sample, runs the external
+client, stages the NVFP4 artifact once in `/dev/shm`, stores raw/progress/Serve artifacts below
+`profiles/bench/ttft/`, and writes the summary. The case catalog, exact profiles, TTFT boundary, and
+fixture qualification are documented in the dedicated README.
 
 ## Corpus baker
 
@@ -109,10 +124,11 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v11. The flattened summary and schema-v3 matrix
+Each raw report must be `ninfer_bench_report` schema v13. The flattened summary and schema-v3 matrix
 manifest carry native names from the report: selected target, canonical `weights_id`, artifact,
-load/read/upload/staging values, Engine memory arenas including request transient and CUDA Graph
-allowance, per-test planned logical and allocator-observed workspace peaks, KV capacity and
+load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
+inside the unified workspace and CUDA Graph allowance, per-test planned logical and
+allocator-observed workspace peaks, KV capacity and
 payload, configured proposal head and graph mode, phase timings and throughput, and speculative
 rounds/drafts/acceptance/fallbacks. The matrix manifest is descriptive and records the commands and
 selected local inputs; it does not make repository state part of report validity.
@@ -122,8 +138,10 @@ artifacts are supplied. Pass one `--artifact` to select a single target and `--m
 `--mode mtp3` to run only that suite. The 35B-A3B-only `--mode dflash7` route runs the same
 decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
-Its schema-v5 result and flattened summaries retain the canonical `weights_id` received from the
-schema-v9 serving startup record. The stochastic route pins its complete
+Its schema-v6 result and flattened summaries retain the canonical `weights_id`, request Host
+exposure, and decode Host/Device-wait time per round received from the schema-v16 serving records.
+Request exposure is a latency distribution value and is never summed across concurrent requests;
+worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do
 not alter the measurement method.
 

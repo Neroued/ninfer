@@ -1,0 +1,1413 @@
+[
+  {
+    "name": "workspace_action_00",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 00.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_01",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 01.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_02",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 02.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_03",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 03.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_04",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 04.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_05",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 05.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_06",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 06.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_07",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 07.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_08",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 08.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_09",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 09.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_10",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 10.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_11",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 11.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_12",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 12.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_13",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 13.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_14",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 14.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_15",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 15.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_16",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 16.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_17",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 17.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_18",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 18.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_19",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 19.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_20",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 20.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_21",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 21.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_22",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 22.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_23",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 23.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_24",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 24.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_25",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 25.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_26",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 26.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_27",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 27.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_28",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 28.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_29",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 29.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_30",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 30.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "workspace_action_31",
+    "description": "Inspect or validate one repository path and return structured evidence. Fixed benchmark tool 31.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "compare",
+            "validate"
+          ]
+        },
+        "options": {
+          "type": "object",
+          "properties": {
+            "recursive": {
+              "type": "boolean"
+            },
+            "patterns": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "recursive",
+            "patterns"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "operation",
+        "options"
+      ],
+      "additionalProperties": false
+    },
+    "cache_control": {
+      "type": "ephemeral"
+    }
+  }
+]

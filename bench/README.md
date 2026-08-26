@@ -6,6 +6,10 @@ implementation selection behind those contracts. Target benchmarks measure Progr
 composition. Correctness and model parity live outside this directory; development rules are in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
 
+The frozen request corpus for the separate black-box Serve TTFT tool is documented under
+[`fixtures/ttft/`](fixtures/ttft/README.md). That client does not call the benchmark executables or
+Engine directly.
+
 ## Build
 
 ```bash
@@ -44,7 +48,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8>]
+          [--kv-dtype <bf16|int8|fp8>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -60,7 +64,8 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-`bf16` selects BF16 KV storage and `int8` selects INT8 group-64 KV storage. MTP is enabled with
+`bf16` selects BF16 KV storage, `int8` selects INT8 group-64 KV storage, and `fp8` selects
+row-scaled E4M3 D256 KV storage. MTP is enabled with
 `--mtp-draft-tokens`; `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
 
@@ -68,6 +73,85 @@ enabled by default.
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
 `cudaProfilerStart/Stop`. Use it with an Nsight Systems `cudaProfilerApi` capture range so artifact
 load, graph construction, and warmup do not enter topology counts.
+
+## Context-cost calibration
+
+`ninfer_context_cost_bench` measures the static coefficients used to compare context-cache
+materialization alternatives. It is an offline tool, not a startup benchmark or runtime autotuner.
+It has two independent suites:
+
+- `transfer` measures one machine-level D2H/H2D/D2D roofline with the production paged-KV transfer
+  primitives and representative PageMajor/HeadMajor geometries. Contiguous D2D batches independently
+  vary bytes and operation count to represent StateImage components and identify device bandwidth.
+  It uses synthetic non-compressible buffers and never inspects an artifact or loads a model.
+- `prefill` loads one artifact through the public Engine and measures its Text/Vision recomputation
+  cost under the canonical BF16/no-spec configuration. Its result is keyed only by hardware class
+  and artifact `model_id/weights_id`.
+
+The runtime models are:
+
+```text
+transfer = max(batch_ns + copy_operations * operation_ns,
+               payload_bytes * ns_per_byte)
+prefill  = chunks * chunk_ns
+         + suffix_tokens * token_ns
+         + attention_pairs * attention_pair_ns
+         + vision_items * vision_item_ns
+         + vision_patches * vision_patch_ns
+```
+
+`payload_bytes` is the actual copied payload, excluding Host arena padding. `copy_operations` is the
+number of physical `cudaMemcpy*` calls implied by the page geometry and contiguous runs. Resource
+kind, KV dtype, and speculative backend do not select different coefficients; any differences they
+create are represented by those two physical quantities. For a suffix `S` after prefix `B`,
+`attention_pairs = B*S + S*(S+1)/2`. `chunks` is the sum of
+`ceil(segment_tokens/prefill_chunk)` across the actual prefill schedule's capture/rewrite segments;
+with no such boundary it is simply `ceil(S/prefill_chunk)`.
+
+Build the tool, then measure machine transfer without a model:
+
+```bash
+cmake --build build -j --target ninfer_context_cost_bench
+./build/bench/ninfer_context_cost_bench \
+  --suite transfer \
+  --json profiles/bench/context_cost_transfer.json \
+  --preset-out profiles/bench/context_cost_presets.json
+```
+
+Measure prefill separately when the GPU has room for the artifact:
+
+```bash
+./build/bench/ninfer_context_cost_bench \
+  --suite prefill \
+  --artifact out/qwen3_6_27b.ninfer \
+  --corpus bench/fixtures/bench_corpus.ids \
+  --json profiles/bench/qwen3_6_27b_prefill_cost.json \
+  --preset-out profiles/bench/context_cost_presets.json
+```
+
+`--suite all` performs transfer first, releases its fixtures, then loads the artifact for prefill.
+The JSON report retains every repetition, median/MAD, floating and quantized coefficients, and
+training/held-out predictions. A fit is accepted only when both training and held-out p95 relative
+error are at most 35% for transfer and 15% for prefill, and materially different points in either
+partition are never predicted in reverse order. Exact predicted ties are reported separately and
+are allowed: they enter the runtime's deterministic semantic tie-break. Rejection writes the
+report, exits with status 3, and leaves the preset unchanged.
+
+`--preset-out` is valid for every suite. It atomically replaces only the component measured by that
+suite: a transfer run updates the hardware node's three directions, while a prefill run updates one
+artifact entry and preserves machine transfer plus other artifacts. The resulting file is parsed by
+the runtime's strict loader before publication.
+
+[`context_cost_defaults.cpp`](../src/runtime/engine/context_cost_defaults.cpp) is the sole table of
+defaults compiled into the binary. JSON is not a build input: `--preset-out` produces a runtime
+registry that can be selected immediately, without recompilation, through
+`EngineOptions.context_cost.preset_path` or `ninfer-serve --context-cost-presets`. Resolution always
+starts with generic numerical coefficients,
+then independently applies matching compiled transfer/prefill values, then independently applies
+matching external values. A malformed explicit file is an error; a missing hardware or artifact
+entry retains the preceding numerical layer. After real-scenario acceptance, a maintainer may
+promote quantized values into the C++ table. The detailed `--json` report is diagnostic provenance
+and is not a runtime input.
 
 ## Linear Op benchmark
 
@@ -309,8 +393,8 @@ counts, or kernel-name filters in these benchmarks.
 
 `ninfer_causal_softmax_attention_bench` measures the two public causal-cache entries:
 append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
-with BF16 and INT8-G64 KV storage. Production dispatch receives the caller-visible execution
-envelope and owns all decode, prompt, Small-T, and split-KV choices.
+with BF16, INT8-G64, and FP8-E4M3FN-row256 KV storage. Production dispatch receives the
+caller-visible execution envelope and owns all decode, prompt, Small-T, and split-KV choices.
 
 Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
 same context and all `W` columns are valid. One exact mixed profile uses `--row-contexts`,
@@ -333,7 +417,21 @@ cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
 ./build/bench/ninfer_causal_softmax_attention_bench \
   --entry cached --geometry d256-h16-kv2 --kv-dtype int8 \
   --tokens 16 --context 8192 --execution graph --cache cold --profile
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry append --geometry all --kv-dtype fp8 --batch 1 \
+  --tokens 1 --context 16384 --mapping fragmented \
+  --execution graph --cache cold --warmup 100 --repeat 201
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry append --geometry all --kv-dtype fp8 --batch 1 \
+  --tokens 1024 --context 16384 --mapping fragmented \
+  --execution eager --cache cold --warmup 10 --repeat 61
 ```
+
+For FP8 points the report and CSV additionally expose separate QK/PV FLOPs, the mixed Tensor Core
+floor (`419 TFLOP/s` E4M3/FP32 QK plus `209.5 TFLOP/s` FP16/FP32 PV), and a one-stream persistent-KV
+payload. The latter counts one 516-byte K+V row per visible KV head and reports bandwidth against
+the measured `1674.5 GB/s` cold pure-read ceiling; it does not inflate the numerator with Q/output,
+append traffic, metadata, workspace, or duplicate cache reads.
 
 `ninfer_context_softmax_attention_bench` measures the public read-only context-plus-query contract
 at Q32/KV8/D128 with BF16 context storage. `T` is a complete non-causal query block and `L` is its
@@ -379,10 +477,10 @@ instruction utilization require a profiler capture of the complete public call.
 ## KV cache append Op benchmark
 
 `ninfer_kv_cache_append_bench` unifies the two public append contracts without combining them in
-one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16/INT8-G64 caches.
-`--mode prefix` calls device-count prefix publication for BF16 D128/KV8 linear or 4096-slot cyclic
-caches; `T` is the public envelope and `C` is the device commit count. Every measured interval or
-captured graph contains exactly one selected public append call.
+one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16, INT8-G64, or
+FP8-E4M3FN-row256 caches. `--mode prefix` calls device-count prefix publication for BF16 D128/KV8
+linear or 4096-slot cyclic caches; `T` is the public envelope and `C` is the device commit count.
+Every measured interval or captured graph contains exactly one selected public append call.
 
 ```bash
 cmake --build build --parallel --target ninfer_kv_cache_append_bench
@@ -724,12 +822,12 @@ test shapes exercise the scalar fallbacks.
 
 Table, JSON, and CSV reports all identify the selected target, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 10 records the public value objects directly:
+statistics. JSON schema version 13 records the public value objects directly:
 
 - `load`: target, `weights_id`, load/upload time, file/H2D/staging bytes, tensor count, and resource
   count;
-- `memory`: weights/sequence/workspace/request-transient arenas, planned context, KV storage,
-  CUDA Graph allowance, and KV payload;
+- `memory`: weights/sequence/unified-workspace arenas, the optional non-additive Vision layout,
+  planned context, KV storage, CUDA Graph allowance, and KV payload;
 - each repetition's `timings`: prepare, Vision, prefill, decode, and total seconds;
 - each repetition's `speculative`: window, rounds, drafted/accepted tokens, fallbacks, and per-position
 acceptance.

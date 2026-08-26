@@ -66,13 +66,20 @@ int verify_loaded_product(const ninfer::Engine& engine) {
     }
 
     const ninfer::MemorySummary memory = engine.memory_summary();
+    const auto* vision = memory.vision_workspace ? &*memory.vision_workspace : nullptr;
     if (memory.weights.capacity_bytes == 0 || memory.weights.used_bytes == 0 ||
         memory.weights.used_bytes > memory.weights.capacity_bytes ||
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes == 0 ||
-        memory.request_transient.used_bytes != 0 || memory.workspace_logical_peak_bytes != 0 ||
-        memory.cuda_graph_allowance_bytes == 0) {
+        memory.workspace.capacity_bytes == 0 || vision == nullptr ||
+        vision->aggregate_prompt_tokens != 4096 || vision->max_item_tokens != 4096 ||
+        vision->general_capacity_bytes == 0 || vision->encode_peak_bytes == 0 ||
+        vision->handoff_offset_bytes > memory.workspace.capacity_bytes ||
+        vision->handoff_capacity_bytes == 0 ||
+        vision->handoff_capacity_bytes >
+            memory.workspace.capacity_bytes - vision->handoff_offset_bytes ||
+        vision->handoff_active_bytes != 0 || vision->handoff_peak_bytes != 0 ||
+        memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "35B Engine construction has an invalid memory summary\n";
         return 1;
     }
@@ -82,7 +89,7 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
     const std::vector<ninfer::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
     const ninfer::GenerationResult first =
-        engine.generate(engine.prepare_tokens(prompt), greedy_options(5, false));
+        engine.generate(engine.prepare_tokens(prompt), greedy_options(5, true));
     if (first.generated_token_ids.size() != 5 ||
         first.speculative.backend != ninfer::SpeculativeBackend::Mtp ||
         first.speculative.rounds == 0) {
@@ -111,7 +118,7 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
         std::cerr << "35B partial-terminal fixture repeats its first token\n";
         return 1;
     }
-    ninfer::RequestOptions stop_options = greedy_options(5, false);
+    ninfer::RequestOptions stop_options = greedy_options(5, true);
     stop_options.stop.token_ids.push_back(first.generated_token_ids[1]);
     const ninfer::GenerationResult stopped =
         engine.generate(engine.prepare_tokens(prompt), stop_options);
@@ -143,8 +150,9 @@ int exercise_text_mtp_and_prefix(ninfer::Engine& engine) {
 int exercise_vision(ninfer::Engine& engine) {
     engine.reset_memory_peaks();
     const ninfer::MemorySummary before = engine.memory_summary();
-    if (before.request_transient.peak_used_bytes != 0) {
-        std::cerr << "35B request transient peak did not reset before Vision\n";
+    if (!before.vision_workspace || before.vision_workspace->handoff_active_bytes != 0 ||
+        before.vision_workspace->handoff_peak_bytes != 0) {
+        std::cerr << "35B Vision handoff peak did not reset before Vision\n";
         return 1;
     }
     ninfer::MessagePart image;
@@ -172,11 +180,18 @@ int exercise_vision(ninfer::Engine& engine) {
         return 1;
     }
     const ninfer::MemorySummary after = engine.memory_summary();
-    if (after.request_transient.capacity_bytes != before.request_transient.capacity_bytes ||
-        after.request_transient.capacity_bytes == 0 || after.request_transient.used_bytes != 0 ||
-        after.request_transient.peak_used_bytes == 0 || after.workspace_logical_peak_bytes == 0 ||
+    if (!after.vision_workspace ||
+        after.vision_workspace->handoff_offset_bytes !=
+            before.vision_workspace->handoff_offset_bytes ||
+        after.vision_workspace->handoff_capacity_bytes !=
+            before.vision_workspace->handoff_capacity_bytes ||
+        after.vision_workspace->handoff_active_bytes != 0 ||
+        after.vision_workspace->handoff_peak_bytes == 0 ||
+        after.vision_workspace->handoff_peak_bytes >
+            after.vision_workspace->handoff_capacity_bytes ||
+        after.workspace_logical_peak_bytes == 0 ||
         after.workspace_logical_peak_bytes > after.workspace.capacity_bytes) {
-        std::cerr << "35B Vision request did not use the startup-frozen request allocation\n";
+        std::cerr << "35B Vision request did not use the startup-frozen workspace handoff\n";
         return 1;
     }
     return 0;
@@ -185,12 +200,17 @@ int exercise_vision(ninfer::Engine& engine) {
 int exercise_maximum_configuration(const char* artifact) {
     ninfer::Engine engine(maximum_engine_options(artifact));
     const ninfer::MemorySummary memory = engine.memory_summary();
+    const auto* vision = memory.vision_workspace ? &*memory.vision_workspace : nullptr;
     if (memory.max_context != 262144 || memory.kv_cache != ninfer::KvCacheStorage::Int8Group64 ||
         memory.kv_payload_bytes == 0 || memory.sequence.capacity_bytes == 0 ||
         memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes == 0 ||
-        memory.request_transient.used_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
+        memory.workspace.capacity_bytes == 0 || vision == nullptr ||
+        vision->handoff_offset_bytes > memory.workspace.capacity_bytes ||
+        vision->handoff_capacity_bytes == 0 ||
+        vision->handoff_capacity_bytes >
+            memory.workspace.capacity_bytes - vision->handoff_offset_bytes ||
+        vision->handoff_active_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "35B maximum configuration does not match the planned 256K layout: context="
                   << memory.max_context << " kv_payload=" << memory.kv_payload_bytes
                   << " sequence=" << memory.sequence.capacity_bytes

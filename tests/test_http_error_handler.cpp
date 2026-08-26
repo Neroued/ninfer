@@ -36,6 +36,13 @@ int main() {
                   context_limit.message.find("200 tokens") != std::string::npos &&
                   context_limit.message.find("128") != std::string::npos,
               "context rejection lost its HTTP classification or capacity details");
+    const ninfer::serve::ApiError thinking_capacity = ninfer::serve::request_error_to_api_error(
+        ninfer::RequestError(ninfer::RequestErrorKind::ThinkingBudgetCapacityInsufficient,
+                             "thinking control suffix does not fit"));
+    failures += check(thinking_capacity.status == 400 &&
+                          thinking_capacity.code == "thinking_budget_capacity_insufficient" &&
+                          thinking_capacity.param.empty(),
+                      "thinking budget capacity error mapping mismatch");
     const ninfer::serve::ApiError cancelled =
         ninfer::serve::request_error_to_api_error(ninfer::RequestError(
             ninfer::RequestErrorKind::Cancelled, "request cancelled during preparation"));

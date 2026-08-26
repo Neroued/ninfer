@@ -144,10 +144,19 @@ int test_incremental_filter_fallback() {
     ordinary += normal.feed("ordinary text  ");
     ordinary += normal.finish(false);
 
+    const std::string partial_original = "  <tool_x then <tool_";
+    ninfer::serve::ToolCallStreamFilter partial;
+    std::string partial_restored;
+    partial_restored += partial.feed("  <too");
+    partial_restored += partial.feed("l_x then <tool_");
+    partial_restored += partial.finish(false);
+
     int failures = 0;
     failures += check(restored == original, "malformed tool filter fallback lost raw bytes");
     failures +=
         check(ordinary == "ordinary text  ", "ordinary filtered output lost trailing whitespace");
+    failures += check(partial_restored == partial_original,
+                      "partial marker mismatch did not preserve raw bytes");
     return failures;
 }
 

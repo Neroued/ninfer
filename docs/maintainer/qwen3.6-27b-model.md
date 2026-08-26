@@ -146,10 +146,13 @@ x = x + o_projection(a)
 ```
 
 Prefill appends all K/V columns and evaluates causal attention for the chunk. Decode appends one
-column and attends over the resident prefix. KV storage may be BF16 or INT8-G64. The exact runtime
-cache codec and the common ideal attention oracle are defined by the repository-internal
-[`gqa_attention.h`](../../include/ninfer/ops/gqa_attention.h) contract. Both cache formats and their
-optimized compute profiles are judged by that one oracle construction rather than by
+column and attends over the resident prefix. KV storage may be BF16, INT8-G64, or
+FP8-E4M3FN-row256. The exact runtime
+cache codec is defined by the repository-internal
+[`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h) contract; append-and-attend and
+cached-only computation use
+[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h). All cache formats and their
+optimized compute profiles are judged by the common ideal Attention oracle rather than by
 implementation-mirroring references.
 
 Text-only positions use the same scalar position for temporal, height, and width MRoPE sections.
@@ -384,9 +387,11 @@ remain consistent.
 - low-bit weight storage changes representation, not the intended dequantized matrix;
 - INT8-G64 KV stores FP16 scales and signed codes, and its ideal logical K/V values are their FP32
   decode;
-- the target's INT8 attention path intentionally quantizes Q to Q8-G64 for production computation;
-  this native compute profile does not replace BF16 Q in the common ideal oracle, and its delta is
-  accepted through the separate named INT8-cache compute-profile criterion;
+- FP8-E4M3FN-row256 KV stores one FP16 scale per complete D256 row; its ideal logical K/V values
+  are the persistent codec's FP32 decode, including the fixed inverse K rotation;
+- the target's INT8 and FP8 attention paths intentionally quantize Q for production computation;
+  those native compute profiles do not replace BF16 Q in the common ideal oracle, and their deltas
+  are accepted through separate named cache-profile criteria;
 - the full target `lm_head` is used for prefill, verification, and ordinary decode regardless of
   draft-head mode.
 
@@ -397,10 +402,11 @@ route and accepted against the Op's criterion for that implementation profile.
 
 GQA numerical qualification covers both registered geometries, supported prompt and small-T
 regimes, the maintained conformance matrix, and target-representative activation ranges. Its
-BF16-cache and INT8-cache compute-profile criteria are explicitly named in the GQA conformance
-suite; they are not claimed as pointwise bounds for every arbitrary or adversarial BF16 tensor. A1
-append-and-attend and A3 cached-only attention are each checked directly against the common ideal
-oracle. Equality between those different numerical paths is not a contract or acceptance test.
+BF16-cache, INT8-cache, and FP8-cache compute-profile criteria are explicitly named in the GQA
+conformance suite; they are not claimed as pointwise bounds for every arbitrary or adversarial BF16
+tensor. A1 append-and-attend and A3 cached-only attention are each checked directly against the
+common ideal oracle. Equality between those different numerical paths is not a contract or
+acceptance test.
 
 ## 13. State inventory
 
@@ -415,8 +421,7 @@ Let `C=max_concurrency`.
 | ReplaySSM records | 48 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | Program lifetime when MTP enabled; one pending round |
 | Continuation hidden | current and turn-checkpoint `[5120,C]` BF16 stores | Program lifetime |
 | Text step buffers | token, positions, logits, verify/draft/sampling tensors | Program lifetime |
-| Program scratch | Text/MTP/Vision phase temporaries | one phase in the shared workspace arena |
-| Vision request transient | encoded Vision output `[8192,V]` | active prefix during request begin |
+| Unified Program workspace | Text/MTP/Vision phase temporaries plus fixed Vision handoff `[5120,V]` | one physical allocation; `V<=min(max_context,16384)` per item |
 
 KV memory grows with configured context. The fixed GDN state pool depends only on `C` and always has
 the two current/turn-checkpoint planes; it is independent of the speculative window. Enabling MTP
@@ -424,17 +429,20 @@ adds the separate ReplaySSM arena, whose capacity is `C*(draft_window+1)` record
 
 The Program freezes its feature set and memory plan at startup. The Qwen3.6 family builds named
 Text-prefill, ordinary-round, MTP-prefill, MTP-round, and Vision phase capacities from the
-configured execution domains and reserves the maximum as one pure scratch arena. Sequential
-phases and scoped child Ops reuse it. Prefill allocations use
-`min(prefill_chunk,max_context)`; Vision is bounded by both the registered frontend geometry and
-`max_context`.
+configured execution domains. The one workspace preserves a general execution prefix while a
+Vision item output is live; before that output is produced, Vision encode may reuse the complete
+backing according to checked patch/position, attention, MLP, and merger lifetimes. The registered
+Frontend retains an aggregate prompt budget of `min(max_context,32768)` Vision tokens, while the
+sequential Vision tower and `[5120,V]` handoff use the registered single-item bound
+`V<=min(max_context,16384)`. Multiple items reuse the same handoff after the previous scatter span
+is complete. Text prefill allocations use `min(prefill_chunk,max_context)`.
 
-Vision encoded output is not part of that arena: its separate request-transient allocation is
-reserved at startup and only an active prefix is exposed to a request. A zero MTP draft window has
-no MTP weight view, MTP KV cache, or optimized proposal head. With Vision disabled, it has no
-Vision weight view, Vision scratch phase, or request-transient allocation; media is rejected by the
-matching Frontend. CUDA Graph driver allowance is budgeted separately from both arenas. The
-complete artifact inventory is still validated before these resident views are published.
+A zero MTP draft window has no MTP weight view, MTP KV cache, or optimized proposal head. With
+Vision disabled, the Program has no Vision weight view or Vision-specific workspace extent; media
+is rejected by the matching Frontend. CUDA Graph driver allowance is budgeted separately from the
+workspace. `MemorySummary.vision_workspace` describes logical regions inside
+`MemorySummary.workspace` and is not an additional allocation. The complete artifact inventory is
+still validated before these resident views are published.
 
 ## 14. Implementation map
 

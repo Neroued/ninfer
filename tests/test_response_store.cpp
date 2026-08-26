@@ -30,7 +30,8 @@ ChatTurn text_turn(ninfer::ChatRole role, std::string text) {
 
 StoredResponse record(std::string id, ResponseContext context) {
     StoredResponse value;
-    value.id = std::move(id);
+    value.id          = std::move(id);
+    value.session_key = "session-" + value.id;
     value.response =
         nlohmann::json{{"id", value.id}, {"object", "response"}, {"status", "completed"}};
     value.input_items.push_back(nlohmann::json{{"id", "msg_" + value.id}, {"type", "message"}});

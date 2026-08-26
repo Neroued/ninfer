@@ -68,30 +68,27 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     fill_uniform(state, seed + 5, -0.03F, 0.03F);
 
     std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
-    std::vector<std::int32_t> snapshot_bases(static_cast<std::size_t>(batch));
     for (std::int32_t row = 0; row < batch; ++row) {
-        snapshot_bases[static_cast<std::size_t>(row)] = row * width;
-        initial_slots[static_cast<std::size_t>(row)]  = columns + row;
+        initial_slots[static_cast<std::size_t>(row)] = columns + row;
     }
 
-    DeviceBuffer device_q       = to_device(q_bits);
-    DeviceBuffer device_k       = to_device(k_bits);
-    DeviceBuffer device_v       = to_device(v_bits);
-    DeviceBuffer device_g       = to_device(g);
-    DeviceBuffer device_beta    = to_device(beta);
-    DeviceBuffer snapshot_state = to_device(state);
-    DeviceBuffer record_state   = to_device(state);
-    DeviceBuffer device_initial = to_device(initial_slots);
-    DeviceBuffer device_bases   = to_device(snapshot_bases);
+    DeviceBuffer device_q        = to_device(q_bits);
+    DeviceBuffer device_k        = to_device(k_bits);
+    DeviceBuffer device_v        = to_device(v_bits);
+    DeviceBuffer device_g        = to_device(g);
+    DeviceBuffer device_beta     = to_device(beta);
+    DeviceBuffer reference_state = to_device(state);
+    DeviceBuffer record_state    = to_device(state);
+    DeviceBuffer device_initial  = to_device(initial_slots);
     DeviceBuffer device_valid;
     if (!dense) { device_valid = to_device(valid_columns); }
 
-    DeviceBuffer snapshot_out(value_elements * sizeof(std::uint16_t));
+    DeviceBuffer reference_out(value_elements * sizeof(std::uint16_t));
     DeviceBuffer record_out(value_elements * sizeof(std::uint16_t));
     DeviceBuffer key_record(qk_elements * sizeof(std::uint16_t));
     DeviceBuffer value_record(value_elements * sizeof(std::uint16_t));
     DeviceBuffer gate_record(gate_elements * 2 * sizeof(std::uint32_t));
-    snapshot_out.fill(0xff);
+    reference_out.fill(0);
     record_out.fill(0xff);
     key_record.fill(0xff);
     value_record.fill(0xff);
@@ -102,22 +99,43 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     Tensor v(device_v.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor g_tensor(device_g.p, DType::FP32, {value_heads, width, batch});
     Tensor beta_tensor(device_beta.p, DType::FP32, {value_heads, width, batch});
-    Tensor snapshot_states(snapshot_state.p, DType::FP32,
-                           {kStateDim, kStateDim, value_heads, slots});
+    Tensor reference_states(reference_state.p, DType::FP32,
+                            {kStateDim, kStateDim, value_heads, slots});
     Tensor record_states(record_state.p, DType::FP32, {kStateDim, kStateDim, value_heads, slots});
     Tensor valid;
     if (!dense) { valid = Tensor(device_valid.p, DType::I32, {batch}); }
     Tensor initial(device_initial.p, DType::I32, {batch});
-    Tensor bases(device_bases.p, DType::I32, {batch});
-    Tensor snapshot_output(snapshot_out.p, DType::BF16, {kStateDim, value_heads, width, batch});
+    Tensor reference_output(reference_out.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor record_output(record_out.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor key_record_tensor(key_record.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
     Tensor value_record_tensor(value_record.p, DType::BF16, {kStateDim, value_heads, width, batch});
     Tensor gate_record_tensor(gate_record.p, DType::FP32, {2, value_heads, width, batch});
 
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
-    ops::gated_delta_net_snapshot(q, k, v, g_tensor, beta_tensor, kScale, true, snapshot_states,
-                                  valid, initial, bases, snapshot_output, nullptr);
+    WorkspaceArena reference_workspace(256);
+    for (std::int32_t row = 0; row < batch; ++row) {
+        const std::int32_t valid_extent = valid_columns[static_cast<std::size_t>(row)];
+        Tensor q_row =
+            q.slice(3, row, 1).slice(2, 0, valid_extent).view({kStateDim, kQkHeads, valid_extent});
+        Tensor k_row =
+            k.slice(3, row, 1).slice(2, 0, valid_extent).view({kStateDim, kQkHeads, valid_extent});
+        Tensor v_row = v.slice(3, row, 1)
+                           .slice(2, 0, valid_extent)
+                           .view({kStateDim, value_heads, valid_extent});
+        Tensor g_row =
+            g_tensor.slice(2, row, 1).slice(1, 0, valid_extent).view({value_heads, valid_extent});
+        Tensor beta_row = beta_tensor.slice(2, row, 1)
+                              .slice(1, 0, valid_extent)
+                              .view({value_heads, valid_extent});
+        Tensor state_row =
+            reference_states.slice(3, initial_slots[static_cast<std::size_t>(row)], 1)
+                .view({kStateDim, kStateDim, value_heads});
+        Tensor out_row = reference_output.slice(3, row, 1)
+                             .slice(2, 0, valid_extent)
+                             .view({kStateDim, value_heads, valid_extent});
+        ops::gated_delta_net(q_row, k_row, v_row, g_row, beta_row, kScale, true,
+                             reference_workspace, state_row, out_row, nullptr);
+    }
     ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states, valid,
                                        initial, key_record_tensor, value_record_tensor,
                                        gate_record_tensor, record_output, nullptr);
@@ -126,12 +144,12 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     int failures             = 0;
     const std::string suffix = " Hv=" + std::to_string(value_heads) +
                                " T=" + std::to_string(width) + " B=" + std::to_string(batch);
-    const std::vector<std::uint16_t> snapshot_output_bits =
-        from_device<std::uint16_t>(snapshot_out, value_elements);
+    const std::vector<std::uint16_t> reference_output_bits =
+        from_device<std::uint16_t>(reference_out, value_elements);
     const std::vector<std::uint16_t> record_output_bits =
         from_device<std::uint16_t>(record_out, value_elements);
     failures +=
-        verify_equal("replay record output" + suffix, snapshot_output_bits, record_output_bits);
+        verify_equal("replay record output" + suffix, reference_output_bits, record_output_bits);
 
     const std::vector<std::uint16_t> key_bits_after =
         from_device<std::uint16_t>(key_record, qk_elements);

@@ -17,7 +17,7 @@
 
 namespace ninfer::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 10;
+inline constexpr int kRequestLogSchemaVersion        = 16;
 inline constexpr const char* kRequestLogArtifactType = "ninfer_serve_request_log";
 
 struct RequestLogContext {
@@ -31,8 +31,9 @@ struct RequestLogContext {
     bool requested_output_tokens_client_set = false;
     std::size_t tool_count                  = 0;
     ToolChoice tool_choice;
-    bool has_tool_history                  = false;
-    bool enable_thinking                   = true;
+    bool has_tool_history = false;
+    bool enable_thinking  = true;
+    std::optional<std::uint32_t> thinking_budget;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
     ninfer::ResolvedSamplingParameters sampling;
@@ -76,7 +77,8 @@ struct ThroughputReport {
     std::uint64_t committed_decode_tokens = 0;
     std::uint64_t decode_rounds           = 0;
     std::uint64_t decode_row_rounds       = 0;
-    ninfer::RuntimeStats scheduler;
+    ninfer::RuntimeStats previous;
+    ninfer::RuntimeStats current;
 };
 
 RequestLogContext make_request_log_context(std::uint64_t id, std::string protocol,
@@ -96,14 +98,12 @@ std::string format_throughput(const ThroughputReport& report);
 
 // Pure JSON formatters are public to repository tests. Each return value is one complete JSON
 // object without a trailing newline.
-std::string format_server_start_json(const std::string& server_instance_id,
-                                     std::uint64_t timestamp_unix_ms, const ServeOptions& options,
-                                     const ninfer::ModelSamplingDefaults& sampling_defaults,
-                                     const std::string& public_model_id,
-                                     const ninfer::LoadSummary& load,
-                                     const ninfer::MemorySummary& memory,
-                                     const ServerLogEnvironment& environment,
-                                     std::optional<std::uint64_t> artifact_size_bytes);
+std::string format_server_start_json(
+    const std::string& server_instance_id, std::uint64_t timestamp_unix_ms,
+    const ServeOptions& options, const ninfer::EngineOptions& engine_options,
+    const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
+    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
+    const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes);
 std::string format_request_start_json(const std::string& server_instance_id,
                                       std::uint64_t timestamp_unix_ms,
                                       const RequestLogContext& context);
@@ -139,6 +139,7 @@ public:
     }
 
     void write_server_start(const ServeOptions& options,
+                            const ninfer::EngineOptions& engine_options,
                             const ninfer::ModelSamplingDefaults& sampling_defaults,
                             const std::string& public_model_id, const ninfer::LoadSummary& load,
                             const ninfer::MemorySummary& memory);

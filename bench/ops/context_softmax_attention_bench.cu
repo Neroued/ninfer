@@ -2,9 +2,9 @@
 //
 // Fixture construction, cache conditioning, graph construction, and profiling control remain
 // outside the measured body. Every measured eager launch and every captured graph contains one
-// call to the public bidirectional_gqa_attention contract. Production dispatch is opaque here.
+// call to the public context_softmax_attention contract. Production dispatch is opaque here.
 
-#include "ninfer/ops/bidirectional_gqa_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -31,10 +31,11 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kHeadDim     = 128;
-constexpr std::int32_t kQueryHeads  = 32;
-constexpr std::int32_t kKvHeads     = 8;
-constexpr float kScale              = 0.08838834764831844055F;
+constexpr std::int32_t kHeadDim    = 128;
+constexpr std::int32_t kQueryHeads = 32;
+constexpr std::int32_t kKvHeads    = 8;
+constexpr float kScale             = 0.08838834764831844055F;
+constexpr ops::AttentionHeadGeometry kGeometry{kHeadDim, kQueryHeads, kKvHeads};
 constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
 constexpr double kDenseBf16TcTflops = 209.5;
 constexpr double kRtx5090DramGBs    = 1792.0;
@@ -179,9 +180,10 @@ PagedKVBatchLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v,
 }
 
 std::size_t workspace_capacity(std::int32_t tokens, std::int32_t context) {
-    const ops::GqaContextExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
-                                                    static_cast<std::uint32_t>(context)};
-    return ops::bidirectional_gqa_attention_workspace_capacity_bytes(envelope, tokens, tokens, 1);
+    const ops::ContextAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(context),
+                                                          static_cast<std::uint32_t>(context)};
+    return ops::context_softmax_attention_workspace_capacity_bytes(kGeometry, envelope, tokens,
+                                                                   tokens, 1);
 }
 
 class Case {
@@ -226,10 +228,10 @@ public:
     }
 
     void launch(cudaStream_t stream) {
-        ops::bidirectional_gqa_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
-                                         length_tensor_, valid_tensor_, table_row_tensor_, kScale,
-                                         context_view_, envelope_, workspace_, output_tensor_,
-                                         stream);
+        ops::context_softmax_attention(q_tensor_, query_k_tensor_, query_v_tensor_, length_tensor_,
+                                       valid_tensor_, table_row_tensor_, kGeometry, kScale,
+                                       context_view_, envelope_, workspace_, output_tensor_,
+                                       stream);
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
@@ -257,7 +259,7 @@ private:
     Tensor table_row_tensor_;
     Tensor output_tensor_;
     PagedKVBatchLayerView context_view_;
-    ops::GqaContextExecutionEnvelope envelope_;
+    ops::ContextAttentionExecutionEnvelope envelope_;
 };
 
 const char* execution_name(Execution execution) {

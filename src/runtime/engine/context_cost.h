@@ -1,0 +1,101 @@
+#pragma once
+
+#include "core/transfer_work.h"
+#include "ninfer/types.h"
+#include "runtime/contract/types.h"
+
+#include <array>
+#include <cstdint>
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace ninfer::runtime {
+
+inline constexpr std::uint64_t kContextCostQ32One = 1ULL << 32U;
+
+// One machine-level transfer model. Resource type, model, KV dtype, and speculative backend do
+// not participate: their physical byte and copy-operation counts already capture the work.
+struct ContextTransferCost {
+    std::uint64_t batch_ns        = 0;
+    std::uint64_t operation_ns    = 0;
+    std::uint64_t ns_per_byte_q32 = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(ContextTransferCost,
+                                                   ContextTransferCost) noexcept = default;
+};
+
+struct ContextPrefillCost {
+    std::uint64_t chunk_ns              = 0;
+    std::uint64_t token_ns_q32          = 0;
+    std::uint64_t attention_pair_ns_q32 = 0;
+    std::uint64_t vision_item_ns        = 0;
+    std::uint64_t vision_patch_ns_q32   = 0;
+
+    [[nodiscard]] friend constexpr bool operator==(ContextPrefillCost,
+                                                   ContextPrefillCost) noexcept = default;
+};
+
+struct ContextCostModel {
+    // Direction order is DeviceToHost, HostToDevice, DeviceToDevice.
+    std::array<ContextTransferCost, 3> transfer{};
+    ContextPrefillCost prefill;
+
+    // max(batch + copy_operations * operation, payload_bytes * ns_per_byte)
+    [[nodiscard]] std::uint64_t transfer_ns(ContextTransferDirection direction,
+                                            TransferWork work) const noexcept;
+    [[nodiscard]] std::uint64_t prefill_ns(PrefillWork work) const noexcept;
+
+    [[nodiscard]] friend constexpr bool operator==(const ContextCostModel&,
+                                                   const ContextCostModel&) noexcept = default;
+};
+
+struct ContextCostIdentity {
+    std::string hardware_class;
+    std::string model_id;
+    std::string weights_id;
+};
+
+struct ContextPrefillPreset {
+    std::string model_id;
+    std::string weights_id;
+    ContextPrefillCost cost;
+};
+
+struct ContextCostMachinePreset {
+    std::string hardware_class;
+    std::optional<std::array<ContextTransferCost, 3>> transfer;
+    std::vector<ContextPrefillPreset> prefill;
+};
+
+struct ResolvedContextCost {
+    ContextCostModel model;
+    ContextCostSummary summary;
+};
+
+[[nodiscard]] std::string context_cost_hardware_class(std::string_view gpu_name, int major,
+                                                      int minor);
+[[nodiscard]] ContextCostModel generic_context_cost_model();
+
+[[nodiscard]] std::vector<ContextCostMachinePreset>
+parse_context_cost_presets(std::string_view json, std::string_view source_name);
+
+// Transfer and prefill are resolved independently. Generic numerical defaults always exist;
+// compiled hardware/model values and then matching external values override them.
+[[nodiscard]] ResolvedContextCost
+resolve_context_cost(const ContextCostIdentity& identity,
+                     const std::filesystem::path& external_preset_path = {});
+
+// Calibration updates one independently measurable component and preserves every other component.
+void upsert_context_transfer_cost_atomic(const std::filesystem::path& path,
+                                         std::string_view hardware_class,
+                                         const std::array<ContextTransferCost, 3>& transfer,
+                                         std::string_view provenance_json);
+void upsert_context_prefill_cost_atomic(const std::filesystem::path& path,
+                                        const ContextCostIdentity& identity,
+                                        const ContextPrefillCost& prefill,
+                                        std::string_view provenance_json);
+
+} // namespace ninfer::runtime

@@ -266,10 +266,17 @@ y = o_projection(a)                       # [2048,T]
 ```
 
 Each KV head serves eight query heads. Prefill appends all K/V columns and evaluates causal
-attention over the chunk. Decode appends one column and attends over the resident prefix. A cache
-backend may page or quantize K/V, but those are representation choices rather than model math.
+attention over the chunk. Decode appends one column and attends over the resident prefix. Runtime
+KV storage may be BF16, INT8-G64, or FP8-E4M3FN-row256; paging and quantization are representation
+choices rather than model math.
 The persistent cache boundary is the offset-normalized, MRoPE-rotated K and the directly projected
 V; raw K, Q, and the output gate are not cached.
+
+The production append-and-attend and cached-only entries are `causal_softmax_attention` and
+`causal_softmax_attention_cached`; standalone population uses `kv_cache_append`. Their exact
+repository-internal contracts are defined by
+[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) and
+[`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h).
 
 Only 64 of each 256-dimensional Q/K head are rotated. They contain 32 complex frequency pairs split
 across temporal, height, and width MRoPE sections `[11,11,10]`. The checkpoint sets
@@ -596,6 +603,11 @@ The query rows therefore attend bidirectionally to one another while also attend
 context K/V. This all-non-causal mask is the single model contract and numerical oracle; a causal
 draft mask computes a different head and is not a supported execution profile.
 
+Production layers 0 through 4 use `sliding_window_attention`; layer 5 uses
+`context_softmax_attention`. The corresponding exact repository-internal contracts are defined by
+[`sliding_window_attention.h`](../../include/ninfer/ops/sliding_window_attention.h) and
+[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h).
+
 The companion consumes target Text residual features and owns no Vision component. Its query and
 context positions are scalar one-dimensional positions. This model-side contract does not by
 itself claim a product execution route for image/video prompts.
@@ -747,8 +759,8 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
   matrix. Proposal selection may use the existing full `lm_head` or the artifact's existing
   optimized proposal head; neither is a private companion parameter.
 - Public activation, cache, and recurrent-state dtypes are stated by their owning Op/state contract.
-  In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16/INT8 KV
-  formats remain real persistent representation boundaries.
+  In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16,
+  INT8-G64, and FP8-E4M3FN-row256 KV formats remain real persistent representation boundaries.
 - Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over its logical
   inputs. Packed weights are decoded from their stored codes and exact stored scales. Exact
   transforms and codecs use exact oracles.
@@ -786,11 +798,11 @@ The Program-owned memory classes are:
 | DFlash pending target features | `[16384,draft_window+1,C]` BF16 | window dependent | Program lifetime; one pending round |
 | multimodal continuation | `rope_delta` and logical positions | negligible | active sequence |
 | MoE route data | token × 8 ids and weights plus grouping/reduction workspace | implementation-dependent | operator scope |
-| Program scratch | Text/MTP/DFlash/Vision phase temporaries | implementation-dependent | one phase in the shared workspace arena |
-| Vision request transient | encoded Vision output `[8192,V]` | `V<=min(max_context,32768)` | active prefix during request begin |
+| Unified Program workspace | Text/MTP/DFlash/Vision phase temporaries plus fixed Vision handoff `[2048,V]` | implementation-dependent | one physical allocation; `V<=min(max_context,16384)` per item |
 
-Payload estimates exclude allocator alignment and paging metadata; the table separately identifies
-Program scratch and request transient because they are independently frozen allocations.
+Payload estimates exclude allocator alignment and paging metadata. Vision encode scratch and its
+output handoff are logical lifetimes within the one frozen Program workspace, not independent
+allocations.
 The GDN pool always contains exactly the `2C` current/turn-checkpoint slots and is independent of
 the speculative window. Enabling MTP or DFlash adds the separate ReplaySSM arena, which scales with
 `C*(draft_window+1)` rather than full state images. Target full-attention KV, MTP KV, and the final
@@ -801,22 +813,25 @@ last 4095 committed context positions according to its absolute position; a reta
 distance 4096 is outside the mask. These caches do not grow with total context.
 
 The Program freezes its feature set and memory plan at startup. The Qwen3.6 family computes named
-Text, MTP, DFlash, and Vision phase capacities from the configured finite execution domains and
-reserves their maximum as one pure scratch arena; sequential phases and scoped child Ops reuse the
-same addresses. DFlash target features and positions survive between target verification and
-proposal/context publication, so their prefill and pending-round buffers live in the Program
-persistent arena rather than shared phase scratch. Pending features do not become committed
-sequence state before the resolve transaction succeeds. Prefill columns use
-`min(prefill_chunk,max_context)`.
+Text, MTP, DFlash, and Vision phase capacities from the configured finite execution domains. The one
+workspace preserves a general execution prefix while a Vision item output is live; before that
+output is produced, Vision encode may reuse the complete backing according to checked
+patch/position, attention, MLP, and merger lifetimes. The registered Frontend retains an aggregate
+prompt budget of `min(max_context,32768)` Vision tokens, while the sequential Vision tower and
+`[2048,V]` handoff use the registered single-item bound `V<=min(max_context,16384)`. Multiple items
+reuse the same handoff after the previous scatter span is complete. DFlash target features and
+positions survive between target verification and proposal/context publication, so their prefill
+and pending-round buffers live in the Program persistent arena rather than shared phase scratch.
+Pending features do not become committed sequence state before the resolve transaction succeeds.
+Prefill columns use `min(prefill_chunk,max_context)`.
 
-Vision encoded output uses a separate startup-frozen request-transient allocation and is not
-dynamically grown by a request. A disabled speculative backend has no proposal model state or
-optimized proposal-head view. MTP and DFlash each load the optimized proposal head only when that
-head route is selected; DFlash never loads MTP decoder weights or MTP KV state. With Vision
-disabled, the Program has no Vision weight view, Vision scratch phase, or request-transient
-allocation; media is rejected by the matching Frontend. CUDA Graph driver allowance remains a
-separate budget item. The complete artifact inventory is still validated before these resident
-views are published.
+A disabled speculative backend has no proposal model state or optimized proposal-head view. MTP and
+DFlash each load the optimized proposal head only when that head route is selected; DFlash never
+loads MTP decoder weights or MTP KV state. With Vision disabled, the Program has no Vision weight
+view or Vision-specific workspace extent; media is rejected by the matching Frontend. CUDA Graph
+driver allowance remains a separate budget item. `MemorySummary.vision_workspace` describes
+logical regions inside `MemorySummary.workspace` and is not an additional allocation. The complete
+artifact inventory is still validated before these resident views are published.
 
 ## 17. Base-checkpoint tensor layout
 

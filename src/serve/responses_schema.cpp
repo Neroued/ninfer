@@ -10,8 +10,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <limits>
 #include <iterator>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -967,10 +967,11 @@ void inherit_responses_preserve_thinking(ResponsesRequest& request, bool parent_
 }
 
 void compose_responses_generation_messages(ResponsesRequest& request,
-                                           const std::vector<ChatTurn>& previous_context) {
+                                           std::vector<ChatTurn> previous_context) {
+    std::vector<ChatTurn> current_input = std::move(request.generation.messages);
     std::vector<ChatTurn> messages;
     messages.reserve((request.instructions ? 1U : 0U) + previous_context.size() +
-                     request.input_turns.size());
+                     current_input.size());
     if (request.instructions) {
         ChatTurn instructions;
         instructions.role = ChatRole::Developer;
@@ -981,8 +982,10 @@ void compose_responses_generation_messages(ResponsesRequest& request,
         instructions.content.push_back(std::move(part));
         messages.push_back(std::move(instructions));
     }
-    messages.insert(messages.end(), previous_context.begin(), previous_context.end());
-    messages.insert(messages.end(), request.input_turns.begin(), request.input_turns.end());
+    messages.insert(messages.end(), std::make_move_iterator(previous_context.begin()),
+                    std::make_move_iterator(previous_context.end()));
+    messages.insert(messages.end(), std::make_move_iterator(current_input.begin()),
+                    std::make_move_iterator(current_input.end()));
     request.generation.messages = std::move(messages);
 }
 

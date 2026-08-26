@@ -417,12 +417,18 @@ int test_response_object() {
 }
 
 int test_sse_sequence() {
-    ResponsesRequest request = parse_responses_request(Json{{"model", "qwen3.6-27b"},
-                                                            {"input", "hello"},
-                                                            {"max_output_tokens", 32},
-                                                            {"stream", true}},
-                                                       limits());
+    ResponsesRequest request =
+        parse_responses_request(Json{{"model", "qwen3.6-27b"},
+                                     {"input", "hello"},
+                                     {"instructions", "be concise"},
+                                     {"max_output_tokens", 32},
+                                     {"metadata", Json{{"trace", "original"}}},
+                                     {"stream", true}},
+                                limits());
     ResponsesEventStream encoder("resp_stream", 123, request, {});
+    request.generation.model      = "mutated";
+    request.instructions          = "mutated";
+    request.metadata              = Json{{"trace", "mutated"}};
     std::vector<std::string> wire = encoder.start();
     std::vector<std::string> more = encoder.reasoning_delta("thought");
     wire.insert(wire.end(), more.begin(), more.end());
@@ -451,6 +457,11 @@ int test_sse_sequence() {
     }
     failures += check(parse_event(wire.front()).at("type") == "response.created",
                       "stream starts with response.created");
+    const Json created = parse_event(wire.front()).at("response");
+    failures +=
+        check(created.at("model") == "qwen3.6-27b" && created.at("instructions") == "be concise" &&
+                  created.at("metadata").at("trace") == "original",
+              "stream owns stable response fields");
     failures += check(parse_event(wire.back()).at("type") == "response.completed",
                       "stream ends with response.completed");
     failures += check(text_deltas == "answer", "text deltas reconstruct terminal output");

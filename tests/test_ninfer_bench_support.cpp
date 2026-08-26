@@ -139,10 +139,13 @@ int test_cli_contract() {
                 {"ninfer_bench", "--weights", "model.ninfer", "--prefill-chunk", "129"});
         },
         "misaligned prefill chunk");
+    const qb::BenchOptions fp8 =
+        parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
+    failures += expect(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256, "FP8 KV");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp4"});
         },
         "unsupported KV storage");
     return failures;
@@ -218,29 +221,38 @@ std::vector<qb::TestResult> sample_results() {
 
 qb::BenchEnvironment sample_environment() {
     qb::BenchEnvironment env;
-    env.gpu_name                          = "RTX 5090";
-    env.cuda_runtime_version              = "13.1";
-    env.cuda_driver_version               = "590.1";
-    env.device_id                         = 0;
-    env.artifact_path                     = "model.ninfer";
-    env.artifact_file_size_bytes          = 17500000000ULL;
-    env.load                              = {.target               = "qwen3_6_27b",
-                                             .weights_id           = "groupwise-int",
-                                             .load_seconds         = 2.5,
-                                             .upload_seconds       = 2.0,
-                                             .artifact_bytes_read  = 17500000000ULL,
-                                             .host_to_device_bytes = 17400000000ULL,
-                                             .peak_staging_bytes   = 134217728ULL,
-                                             .tensor_count         = 1118,
-                                             .resource_count       = 6};
-    env.memory.device                     = 0;
-    env.memory.max_context                = 4096;
-    env.memory.kv_capacity                = 8192;
-    env.memory.kv_cache                   = ninfer::KvCacheStorage::Int8Group64;
-    env.memory.weights                    = {17400000000ULL, 17400000000ULL, 17400000000ULL};
-    env.memory.sequence                   = {2000000000ULL, 1900000000ULL, 1900000000ULL};
-    env.memory.workspace                  = {100000000ULL, 0, 0};
-    env.memory.request_transient          = {50000000ULL, 0, 40000000ULL};
+    env.gpu_name                 = "RTX 5090";
+    env.cuda_runtime_version     = "13.1";
+    env.cuda_driver_version      = "590.1";
+    env.device_id                = 0;
+    env.artifact_path            = "model.ninfer";
+    env.artifact_file_size_bytes = 17500000000ULL;
+    env.load                     = {.target               = "qwen3_6_27b",
+                                    .weights_id           = "groupwise-int",
+                                    .load_seconds         = 2.5,
+                                    .upload_seconds       = 2.0,
+                                    .artifact_bytes_read  = 17500000000ULL,
+                                    .host_to_device_bytes = 17400000000ULL,
+                                    .peak_staging_bytes   = 134217728ULL,
+                                    .tensor_count         = 1118,
+                                    .resource_count       = 6};
+    env.memory.device            = 0;
+    env.memory.max_context       = 4096;
+    env.memory.kv_capacity       = 8192;
+    env.memory.kv_cache          = ninfer::KvCacheStorage::Int8Group64;
+    env.memory.weights           = {17400000000ULL, 17400000000ULL, 17400000000ULL};
+    env.memory.sequence          = {2000000000ULL, 1900000000ULL, 1900000000ULL};
+    env.memory.workspace         = {100000000ULL, 0, 0};
+    env.memory.vision_workspace  = ninfer::VisionWorkspaceMemorySummary{
+         .aggregate_prompt_tokens = 4096,
+         .max_item_tokens         = 4096,
+         .general_capacity_bytes  = 75000000ULL,
+         .encode_peak_bytes       = 90000000ULL,
+         .handoff_offset_bytes    = 75000000ULL,
+         .handoff_capacity_bytes  = 25000000ULL,
+         .handoff_active_bytes    = 0,
+         .handoff_peak_bytes      = 20000000ULL,
+    };
     env.memory.cuda_graph_allowance_bytes = 150000000ULL;
     env.memory.kv_payload_bytes           = 123456ULL;
     env.max_context                       = 4096;
@@ -270,7 +282,7 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 11, "report schema v11");
+    failures += expect(report.at("schema_version") == 13, "report schema v13");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures += expect(report.at("load").at("target") == "qwen3_6_27b", "load target");
@@ -281,9 +293,10 @@ int test_report_contract() {
     failures += expect(report.at("memory").at("kv_capacity") == 8192, "memory KV capacity");
     failures += expect(report.at("memory").at("workspace").at("capacity_bytes") == 100000000ULL,
                        "workspace capacity");
-    failures +=
-        expect(report.at("memory").at("request_transient").at("capacity_bytes") == 50000000ULL,
-               "request transient capacity");
+    failures += expect(
+        report.at("memory").at("vision_workspace").at("general_capacity_bytes") == 75000000ULL &&
+            report.at("memory").at("vision_workspace").at("handoff_capacity_bytes") == 25000000ULL,
+        "Vision workspace layout");
     failures += expect(report.at("memory").at("cuda_graph_allowance_bytes") == 150000000ULL,
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
@@ -343,9 +356,10 @@ int test_human_and_csv_reports() {
                        "CSV identity columns");
     for (const std::string_view field :
          {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes",
-          "request_transient_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
-          "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
-          "decode_engine_tok_s_mean", "total_seconds_mean"}) {
+          "workspace_general_capacity_bytes", "vision_handoff_capacity_bytes",
+          "cuda_graph_allowance_bytes", "workspace_peak_bytes", "workspace_allocator_peak_bytes",
+          "spec_acceptance_rate", "decode_output_tok_s_mean", "decode_engine_tok_s_mean",
+          "total_seconds_mean"}) {
         failures += expect(csv.find(field) != std::string::npos,
                            std::string("CSV field ") + std::string(field));
     }

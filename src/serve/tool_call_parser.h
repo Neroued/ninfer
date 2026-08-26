@@ -29,11 +29,12 @@ public:
     [[nodiscard]] std::size_t emitted_bytes() const noexcept { return emitted_bytes_; }
 
 private:
-    std::string pending_;
+    std::string trailing_whitespace_;
     std::string tool_region_;
-    std::size_t emitted_bytes_ = 0;
-    bool saw_tool_marker_      = false;
-    bool finished_             = false;
+    std::size_t marker_prefix_bytes_ = 0;
+    std::size_t emitted_bytes_       = 0;
+    bool saw_tool_marker_            = false;
+    bool finished_                   = false;
 };
 
 } // namespace ninfer::serve

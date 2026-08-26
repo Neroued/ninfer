@@ -37,7 +37,7 @@ public:
 void write_stream_item(httplib::DataSink& sink, StreamingRequest& request,
                        const std::string& item) {
     if (request.cancelled.load(std::memory_order_acquire) ||
-        (sink.is_writable && !sink.is_writable()) || !sink.write(item.data(), item.size())) {
+        !sink.write(item.data(), item.size())) {
         request.cancelled.store(true, std::memory_order_release);
         throw ClientDisconnected();
     }
@@ -84,14 +84,72 @@ ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
             current.committed_decode_tokens - previous.committed_decode_tokens,
         .decode_rounds     = current.decode_rounds - previous.decode_rounds,
         .decode_row_rounds = current.decode_row_rounds - previous.decode_row_rounds,
-        .scheduler         = current,
+        .previous          = previous,
+        .current           = current,
     };
 }
 
 bool report_has_activity(const ThroughputReport& report) {
     return report.computed_prefill_tokens != 0 || report.committed_decode_tokens != 0 ||
-           report.decode_rounds != 0 || report.scheduler.running_requests != 0 ||
-           report.scheduler.waiting_requests != 0;
+           report.decode_rounds != 0 || report.current.running_requests != 0 ||
+           report.current.waiting_requests != 0 || report.current.materializing_requests != 0 ||
+           report.current.capture_pending_requests != 0 ||
+           report.current.terminal_pending_requests != 0 ||
+           report.current.active_captures_completed != report.previous.active_captures_completed ||
+           report.current.active_captures_aborted != report.previous.active_captures_aborted ||
+           report.current.root_selections != report.previous.root_selections ||
+           report.current.private_endpoint_selections !=
+               report.previous.private_endpoint_selections ||
+           report.current.private_turn_closure_selections !=
+               report.previous.private_turn_closure_selections ||
+           report.current.private_response_replay_selections !=
+               report.previous.private_response_replay_selections ||
+           report.current.private_long_anchor_selections !=
+               report.previous.private_long_anchor_selections ||
+           report.current.shared_stable_prefix_selections !=
+               report.previous.shared_stable_prefix_selections ||
+           report.current.state_moves != report.previous.state_moves ||
+           report.current.state_forks != report.previous.state_forks ||
+           report.current.state_restores != report.previous.state_restores ||
+           report.current.state_d2h_count != report.previous.state_d2h_count ||
+           report.current.state_h2d_count != report.previous.state_h2d_count ||
+           report.current.state_d2d_count != report.previous.state_d2d_count ||
+           report.current.main_kv_d2h_pages != report.previous.main_kv_d2h_pages ||
+           report.current.main_kv_h2d_pages != report.previous.main_kv_h2d_pages ||
+           report.current.main_kv_d2d_pages != report.previous.main_kv_d2d_pages ||
+           report.current.backend_kv_d2h_pages != report.previous.backend_kv_d2h_pages ||
+           report.current.backend_kv_h2d_pages != report.previous.backend_kv_h2d_pages ||
+           report.current.backend_kv_d2d_pages != report.previous.backend_kv_d2d_pages ||
+           report.current.partial_spill_pages != report.previous.partial_spill_pages ||
+           report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
+           report.current.private_checkpoint_degradations !=
+               report.previous.private_checkpoint_degradations ||
+           report.current.private_checkpoint_evictions !=
+               report.previous.private_checkpoint_evictions ||
+           report.current.shared_checkpoint_degradations !=
+               report.previous.shared_checkpoint_degradations ||
+           report.current.shared_checkpoint_evictions !=
+               report.previous.shared_checkpoint_evictions ||
+           report.current.historical_fork_hits != report.previous.historical_fork_hits ||
+           report.current.device_state_occupied_slots !=
+               report.previous.device_state_occupied_slots ||
+           report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
+           report.current.device_main_kv_occupied_pages !=
+               report.previous.device_main_kv_occupied_pages ||
+           report.current.device_backend_kv_occupied_pages !=
+               report.previous.device_backend_kv_occupied_pages ||
+           report.current.host_kv_occupied_bytes != report.previous.host_kv_occupied_bytes ||
+           report.current.shared_active_references != report.previous.shared_active_references ||
+           report.current.host_work.engine_boundary_ns !=
+               report.previous.host_work.engine_boundary_ns ||
+           report.current.host_work.program_submit_ns !=
+               report.previous.host_work.program_submit_ns ||
+           report.current.host_work.program_post_ns != report.previous.host_work.program_post_ns ||
+           report.current.host_work.engine_commit_output_ns !=
+               report.previous.host_work.engine_commit_output_ns ||
+           report.current.host_work.engine_maintenance_ns !=
+               report.previous.host_work.engine_maintenance_ns ||
+           report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
 }
 
 std::string_view unstreamed_content(const GenerationOutcome& outcome) {
@@ -193,10 +251,7 @@ void HttpServer::run_stats_reporter() {
     const Clock::time_point now        = Clock::now();
     const ThroughputReport tail        = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
-    if (tail.computed_prefill_tokens != 0 || tail.committed_decode_tokens != 0 ||
-        tail.decode_rounds != 0) {
-        log_throughput(tail);
-    }
+    if (report_has_activity(tail)) { log_throughput(tail); }
 }
 
 void HttpServer::stop_stats_reporter() {
@@ -766,7 +821,8 @@ void HttpServer::attach(GenerationService& service) {
     const ninfer::LoadSummary load = service.load_summary();
     public_model_id_               = resolve_public_model_id(options_, load.model_id);
     service_                       = &service;
-    request_jsonl_.write_server_start(options_, service.sampling_defaults(), public_model_id_, load,
+    request_jsonl_.write_server_start(options_, service.engine_options(),
+                                      service.sampling_defaults(), public_model_id_, load,
                                       service.memory_summary());
 }
 

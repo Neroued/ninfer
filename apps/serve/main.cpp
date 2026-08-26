@@ -70,7 +70,10 @@ int main(int argc, char** argv) {
                << std::chrono::duration<double>(Clock::now() - load_start).count() << " s";
         ninfer::serve::write_console_log(ninfer::serve::ConsoleLogLevel::Info, loaded.str());
 
-        const ninfer::MemorySummary memory = service.memory_summary();
+        const ninfer::MemorySummary memory            = service.memory_summary();
+        const ninfer::ContextCostSummary context_cost = service.load_summary().context_cost;
+        const ninfer::EngineOptions& engine           = service.engine_options();
+        const ninfer::ContextCacheOptions& cache      = engine.context_cache;
         std::ostringstream capacity;
         capacity << "KV capacity "
                  << (memory.kv_capacity_mode == ninfer::KvCapacityMode::Automatic ? "auto"
@@ -83,8 +86,21 @@ int main(int argc, char** argv) {
                  << " free-after-startup=" << format_bytes(memory.available_after_startup_bytes)
                  << " headroom=" << format_bytes(memory.kv_capacity_headroom_bytes)
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
-                 << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
-                 << format_bytes(memory.cuda_graph_allowance_bytes);
+                 << " graph-allowance=" << format_bytes(memory.cuda_graph_allowance_bytes)
+                 << " context-cache=" << (cache.enabled ? "on" : "root-only")
+                 << " device-state=" << *cache.device_state_slots << "-cache+"
+                 << engine.max_concurrency << "-active" << " host-state=" << cache.host_state_slots
+                 << " host-kv=" << format_bytes(cache.host_kv_capacity_bytes)
+                 << " private=" << *cache.max_private_continuations
+                 << " shared=" << *cache.max_shared_prefixes
+                 << " anchors=" << *cache.max_long_anchors_per_continuation
+                 << " markers=" << *cache.max_cache_markers_per_request;
+        capacity << " context-cost-transfer="
+                 << ninfer::context_cost_preset_source_name(context_cost.transfer_source)
+                 << " context-cost-prefill="
+                 << ninfer::context_cost_preset_source_name(context_cost.prefill_source)
+                 << " cost-profile=" << context_cost.hardware_class << '/' << context_cost.model_id
+                 << '/' << context_cost.weights_id;
         if (options.enable_vision) {
             const ninfer::MediaCacheSummary media = service.media_cache_summary();
             capacity << " media-workers=" << media.preprocess_threads

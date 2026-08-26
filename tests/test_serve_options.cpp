@@ -35,6 +35,8 @@ int main() {
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.request_log_jsonl.empty(),
                       "request JSONL logging is not disabled by default");
+    failures += check(defaults.context_cost_presets.empty(),
+                      "external context-cost presets are unexpectedly configured by default");
     failures += check(defaults.log_stats_interval_ms == 5000,
                       "periodic throughput interval default mismatch");
     failures += check(defaults.media_cache_bytes == ninfer::kDefaultMediaCacheBytes &&
@@ -44,6 +46,10 @@ int main() {
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           defaults.kv_capacity.explicit_tokens == defaults.max_context,
                       "default KV capacity does not follow max context");
+    failures += check(defaults.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots &&
+                          defaults.context_cache.host_kv_capacity_bytes ==
+                              ninfer::kDefaultHostKvCapacityBytes,
+                      "Host context-cache defaults mismatch");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
                       "speculative decoding is not disabled by default");
     failures += check(defaults.response_store_max_records == kDefaultResponseStoreRecords &&
@@ -51,6 +57,8 @@ int main() {
                       "Responses store defaults mismatch");
     failures += check(!defaults.model_id_override.has_value(),
                       "model id override is unexpectedly configured by default");
+    failures += check(!defaults.default_thinking_budget,
+                      "thinking budget is unexpectedly limited by default");
     failures += check(
         !defaults.sampling_overrides.temperature && !defaults.sampling_overrides.top_p &&
             !defaults.sampling_overrides.top_k && !defaults.sampling_overrides.presence_penalty &&
@@ -59,12 +67,31 @@ int main() {
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
 
+    const ServeOptions fp8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp8"});
+    failures += check(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256,
+                      "--kv-dtype fp8 did not select row-scaled E4M3 KV");
+
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});
     failures +=
         check(model_alias.model_id_override == "deployment-alias" &&
                   resolve_public_model_id(model_alias, "artifact-model") == "deployment-alias",
               "explicit model id did not override the artifact identity");
+
+    const ServeOptions context_cost =
+        parse({"ninfer-serve", "model.ninfer", "--context-cost-presets", "local-costs.json"});
+    failures += check(context_cost.context_cost_presets == "local-costs.json",
+                      "--context-cost-presets did not preserve its path");
+
+    const ServeOptions thinking_budget =
+        parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "37"});
+    failures += check(thinking_budget.default_thinking_budget == 37,
+                      "--default-thinking-budget did not preserve its positive value");
+    bool zero_thinking_budget_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "0"});
+    } catch (const std::invalid_argument&) { zero_thinking_budget_rejected = true; }
+    failures += check(zero_thinking_budget_rejected, "zero --default-thinking-budget was accepted");
 
     bool empty_model_id_rejected = false;
     try {
@@ -119,6 +146,9 @@ int main() {
                                            "6"});
     failures += check(!configured.allow_prefix_reuse,
                       "--no-prefix-reuse did not disable server prefix reuse");
+    failures += check(configured.context_cache.host_state_slots == 0 &&
+                          configured.context_cache.host_kv_capacity_bytes == 0,
+                      "root-only server mode retained default Host capacities");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures +=
         check(configured.preserve_thinking, "--preserve-thinking did not reach serving options");
@@ -138,6 +168,26 @@ int main() {
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
+
+    const ServeOptions context_cache = parse(
+        {"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-state-slots", "5",
+         "--host-kv-mib", "64", "--max-private-continuations", "9", "--max-shared-prefixes", "4",
+         "--max-long-anchors-per-continuation", "2", "--max-cache-markers-per-request", "6"});
+    failures += check(context_cache.context_cache.enabled &&
+                          context_cache.context_cache.device_state_slots == 3 &&
+                          context_cache.context_cache.host_state_slots == 5 &&
+                          context_cache.context_cache.host_kv_capacity_bytes == (64ULL << 20) &&
+                          context_cache.context_cache.max_private_continuations == 9 &&
+                          context_cache.context_cache.max_shared_prefixes == 4 &&
+                          context_cache.context_cache.max_long_anchors_per_continuation == 2 &&
+                          context_cache.context_cache.max_cache_markers_per_request == 6,
+                      "context-cache capacities did not reach serving options");
+    bool disabled_cache_capacity_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--no-prefix-reuse", "--host-kv-mib", "64"});
+    } catch (const std::invalid_argument&) { disabled_cache_capacity_rejected = true; }
+    failures += check(disabled_cache_capacity_rejected,
+                      "root-only server mode accepted context-cache capacity options");
 
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
@@ -163,18 +213,35 @@ int main() {
     request.max_tokens = 1;
     ninfer::PromptCapabilities prompt_capabilities;
     prompt_capabilities.enable_thinking = true;
-    failures += check(to_request_options(request, defaults).execution.allow_prefix_reuse,
-                      "default server policy did not reach Engine options");
-    failures += check(!to_request_options(request, configured).execution.allow_prefix_reuse,
-                      "disabled server policy did not reach Engine options");
-    const ninfer::RequestOptions inherited_sampling = to_request_options(request, sampling);
+    const auto semantics = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    failures +=
+        check(to_request_options(request, defaults, semantics, true).execution.allow_prefix_reuse,
+              "resolved read-write cache policy did not reach Engine options");
+    failures +=
+        check(!to_request_options(request, defaults, semantics, false).execution.allow_prefix_reuse,
+              "resolved disabled cache policy inherited external enablement");
+    const ninfer::RequestOptions inherited_sampling =
+        to_request_options(request, sampling, semantics, sampling.allow_prefix_reuse);
     failures += check(inherited_sampling.execution.sampling.temperature == 0.0F &&
                           inherited_sampling.execution.sampling.top_p == 0.9F &&
                           inherited_sampling.execution.sampling.seed == 0,
                       "server sampling overrides did not reach Engine options");
     request.sampling.temperature = 1.1;
-    failures += check(to_request_options(request, sampling).execution.sampling.temperature == 1.1F,
+    failures += check(to_request_options(request, sampling, semantics, sampling.allow_prefix_reuse)
+                              .execution.sampling.temperature == 1.1F,
                       "request sampling override did not win over the server override");
+    failures += check(
+        to_request_options(request, thinking_budget, semantics, thinking_budget.allow_prefix_reuse)
+                .execution.thinking.budget == 37,
+        "thinking-enabled request did not inherit the server budget");
+    request.enable_thinking = false;
+    const auto non_thinking =
+        resolve_prompt_semantics(request, thinking_budget, prompt_capabilities);
+    failures += check(!to_request_options(request, thinking_budget, non_thinking,
+                                          thinking_budget.allow_prefix_reuse)
+                           .execution.thinking.budget,
+                      "non-thinking request inherited the server thinking budget");
+    request.enable_thinking.reset();
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "server preserve-thinking default was not resolved");
@@ -186,9 +253,17 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+    failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
+                      "serve help omits context-cache capacities");
+    failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=
+                          std::string::npos,
+                      "serve help omits context-cache defaults");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
+    failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
+                          std::string::npos,
+                      "serve help omits --default-thinking-budget");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures +=
@@ -202,6 +277,9 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--response-store-max-mib") !=
                           std::string::npos,
                       "serve help omits Responses store limits");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--context-cost-presets") != std::string::npos,
+              "serve help omits external context-cost presets");
     failures +=
         check(serve_usage_text("ninfer-serve").find("identity.model_id") != std::string::npos,
               "serve help omits the artifact-derived model id default");

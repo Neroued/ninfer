@@ -27,6 +27,16 @@ struct CyclicKVCacheLayerView {
     std::int32_t lane_capacity    = 0;
 };
 
+struct CyclicKVCacheSlotView {
+    Tensor k_layer0;
+    Tensor v_layer0;
+    std::size_t k_layer_bytes          = 0;
+    std::size_t v_layer_bytes          = 0;
+    std::ptrdiff_t k_layer_pitch_bytes = 0;
+    std::ptrdiff_t v_layer_pitch_bytes = 0;
+    std::uint32_t layers               = 0;
+};
+
 struct CyclicKVCacheLayout {
     std::uint32_t capacity        = 0;
     std::uint32_t padded_capacity = 0;
@@ -65,9 +75,11 @@ public:
     [[nodiscard]] std::int32_t lane_capacity() const noexcept { return lane_capacity_; }
 
     [[nodiscard]] CyclicKVCacheLayerView layer_view(std::uint32_t layer) const;
+    [[nodiscard]] CyclicKVCacheSlotView slot_view(std::int32_t slot) const;
 
-    // Copies one lane's complete fixed state. Source and destination must have identical layouts.
-    void copy_lane_from(const CyclicKVCache& source, std::int32_t lane, cudaStream_t stream);
+    // Copies one slot's complete fixed state. Source and destination geometry must match.
+    void copy_slot_from(const CyclicKVCache& source, std::int32_t source_slot,
+                        std::int32_t destination_slot, cudaStream_t stream);
 
 private:
     std::vector<Tensor> k_;

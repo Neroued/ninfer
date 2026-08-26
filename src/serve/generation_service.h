@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,7 @@ struct GenerationMetrics {
     double prefill_seconds = 0.0;
     double decode_seconds  = 0.0;
     double total_seconds   = 0.0;
+    ninfer::GenerationEngineTiming engine_timing;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
     std::uint32_t speculative_draft_window    = 0;
@@ -37,16 +39,17 @@ struct GenerationMetrics {
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
     std::uint32_t prefix_cache_hit_tokens     = 0;
-    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::FullReset;
+    ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
 };
 
 struct GenerationOutcome {
     std::string text;
     std::string reasoning;
     std::vector<ToolCall> tool_calls;
-    int prompt_tokens                  = 0;
-    int completion_tokens              = 0;
-    int reasoning_tokens               = 0;
+    int prompt_tokens     = 0;
+    int completion_tokens = 0;
+    int reasoning_tokens  = 0;
+    ninfer::ThinkingBudgetStats thinking;
     std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
@@ -70,11 +73,12 @@ struct PreparedRequest {
     double prepare_seconds     = 0.0;
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
-    int prompt_tokens                      = 0;
-    bool include_usage                     = false;
-    bool tool_capable                      = false;
-    std::size_t tool_name_max_length       = 64;
-    bool enable_thinking                   = true;
+    int prompt_tokens                = 0;
+    bool include_usage               = false;
+    bool tool_capable                = false;
+    std::size_t tool_name_max_length = 64;
+    bool enable_thinking             = true;
+    std::optional<std::uint32_t> thinking_budget;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
     std::shared_ptr<RequestLifetime> lifetime;
@@ -85,6 +89,10 @@ public:
     explicit GenerationService(ServeOptions options, LoadProgress load_progress = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+
+    // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
+    // value instead of reinterpreting optional defaults from ServeOptions.
+    [[nodiscard]] const ninfer::EngineOptions& engine_options() const { return engine_->options(); }
 
     [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
 
@@ -101,7 +109,8 @@ public:
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
-                                          std::function<bool()> is_cancelled = {}) const;
+                                          std::function<bool()> is_cancelled = {},
+                                          ContextCacheHints context_cache    = {}) const;
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
@@ -112,6 +121,15 @@ public:
     void warmup();
 
 private:
+    enum class CacheParticipation : std::uint8_t {
+        Disabled,
+        ReadWrite,
+    };
+
+    [[nodiscard]] PreparedRequest prepare_impl(const GenerationRequest& req,
+                                               std::function<bool()> is_cancelled,
+                                               ContextCacheHints context_cache,
+                                               CacheParticipation cache_participation) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime> acquire_request_lifetime() const;
 
     ServeOptions options_;

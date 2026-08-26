@@ -4,7 +4,7 @@
 // contracts. Decode, small-T, prompt, split-KV, and kernel selection remain private production
 // implementation details and never enter this benchmark's dispatch or output schema.
 
-#include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
@@ -30,16 +30,20 @@ using namespace ninfer;
 
 namespace {
 
-constexpr std::int32_t kHeadDim     = 256;
-constexpr std::int32_t kKvGroup     = 64;
-constexpr float kScale              = 0.0625F;
-constexpr std::size_t kFlushBytes   = std::size_t{256} << 20;
-constexpr double kDenseBf16TcTflops = 209.5;
-constexpr double kRtx5090DramGBs    = 1792.0;
+constexpr std::int32_t kHeadDim          = 256;
+constexpr std::int32_t kKvGroup          = 64;
+constexpr std::int32_t kFp8KvGroup       = 256;
+constexpr float kScale                   = 0.0625F;
+constexpr std::size_t kFlushBytes        = std::size_t{256} << 20;
+constexpr double kDenseF16Bf16TcTflops   = 209.5;
+constexpr double kDenseFp8TcTflops       = 419.0;
+constexpr double kMixedFp8F16TcTflops    = 279.333;
+constexpr double kRtx5090DramGBs         = 1792.0;
+constexpr double kColdPureReadCeilingGBs = 1674.5;
 
 enum class Entry : std::uint8_t { Append, Cached, Both };
 enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, All };
-enum class KvChoice : std::uint8_t { Bf16, Int8, All };
+enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
@@ -87,7 +91,9 @@ struct Result {
     std::string table_rows;
     std::size_t workspace_bytes;
     double logical_bytes;
-    double useful_flops;
+    double qk_flops;
+    double pv_flops;
+    double physical_kv_read_bytes;
     bench::ColdTiming timing;
 };
 
@@ -97,7 +103,7 @@ struct Result {
                  "usage: ninfer_causal_softmax_attention_bench "
                  "[--entry append|cached|both] "
                  "[--geometry d256-h24-kv4|d256-h16-kv2|all] "
-                 "[--kv-dtype bf16|int8|all] [--batch B,...] [--tokens W,...] "
+                 "[--kv-dtype bf16|int8|fp8|all] [--batch B,...] [--tokens W,...] "
                  "[--context L,...] [--row-contexts L0,...] [--valid-columns V0,...] "
                  "[--table-rows R0,...] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
@@ -170,10 +176,12 @@ Options parse_options(int argc, char** argv) {
                 options.kv = KvChoice::Bf16;
             else if (value == "int8")
                 options.kv = KvChoice::Int8;
+            else if (value == "fp8")
+                options.kv = KvChoice::Fp8;
             else if (value == "all")
                 options.kv = KvChoice::All;
             else
-                usage("--kv-dtype expects bf16, int8, or all");
+                usage("--kv-dtype expects bf16, int8, fp8, or all");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), 1, 262144, "--tokens");
         } else if (argument == "--batch") {
@@ -296,15 +304,22 @@ std::size_t cache_plane_bytes(const Geometry& geometry, DType dtype, std::int32_
            physical_pages * dtype_size(dtype);
 }
 
-std::size_t scale_plane_bytes(const Geometry& geometry, std::int32_t physical_pages) {
-    return static_cast<std::size_t>(kHeadDim / kKvGroup) * geometry.kv_heads * kPagedKVPageSize *
+std::int32_t scale_groups(DType dtype) {
+    if (dtype == DType::I8) return kHeadDim / kKvGroup;
+    if (dtype == DType::FP8_E4M3FN) return kHeadDim / kFp8KvGroup;
+    return 0;
+}
+
+std::size_t scale_plane_bytes(const Geometry& geometry, DType dtype, std::int32_t physical_pages) {
+    return static_cast<std::size_t>(scale_groups(dtype)) * geometry.kv_heads * kPagedKVPageSize *
            physical_pages * dtype_size(DType::FP16);
 }
 
 PagedKVLayerView make_cache_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer& k_scale,
                                  DeviceBuffer& v_scale, DeviceBuffer& block_table,
                                  const Geometry& geometry, DType dtype, std::int32_t padded) {
-    const bool quantized              = dtype == DType::I8;
+    const bool quantized              = dtype != DType::BF16;
+    const std::int32_t groups         = scale_groups(dtype);
     const std::int32_t logical_pages  = padded / kPagedKVPageSize;
     const std::int32_t physical_pages = static_cast<std::int32_t>(
         k.bytes / (static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * kPagedKVPageSize *
@@ -314,19 +329,21 @@ PagedKVLayerView make_cache_view(DeviceBuffer& k, DeviceBuffer& v, DeviceBuffer&
             Tensor(k.p, dtype, {kHeadDim, kPagedKVPageSize, geometry.kv_heads, physical_pages}),
         .v_pages =
             Tensor(v.p, dtype, {kHeadDim, kPagedKVPageSize, geometry.kv_heads, physical_pages}),
-        .k_scale_pages = quantized ? Tensor(k_scale.p, DType::FP16,
-                                            {kHeadDim / kKvGroup, kPagedKVPageSize,
-                                             geometry.kv_heads, physical_pages})
-                                   : Tensor(),
-        .v_scale_pages = quantized ? Tensor(v_scale.p, DType::FP16,
-                                            {kHeadDim / kKvGroup, kPagedKVPageSize,
-                                             geometry.kv_heads, physical_pages})
-                                   : Tensor(),
+        .k_scale_pages = quantized
+                             ? Tensor(k_scale.p, DType::FP16,
+                                      {groups, kPagedKVPageSize, geometry.kv_heads, physical_pages})
+                             : Tensor(),
+        .v_scale_pages = quantized
+                             ? Tensor(v_scale.p, DType::FP16,
+                                      {groups, kPagedKVPageSize, geometry.kv_heads, physical_pages})
+                             : Tensor(),
         .block_table   = Tensor(block_table.p, DType::I32, {logical_pages}),
         .head_dim      = kHeadDim,
         .num_kv_heads  = geometry.kv_heads,
         .dtype         = dtype,
-        .quant_group   = quantized ? kKvGroup : 0,
+        .quant_group   = dtype == DType::I8           ? kKvGroup
+                         : dtype == DType::FP8_E4M3FN ? kFp8KvGroup
+                                                      : 0,
     };
 }
 
@@ -358,10 +375,11 @@ PagedKVBatchLayerView make_batch_cache_view(DeviceBuffer& k, DeviceBuffer& v, De
 
 std::size_t workspace_capacity(const Geometry& geometry, DType dtype, std::int32_t tokens,
                                std::int32_t batch, std::int32_t visible) {
-    const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(visible),
-                                             static_cast<std::uint32_t>(visible)};
-    return ops::gqa_attention_workspace_capacity_bytes(geometry.query_heads, dtype, envelope, batch,
-                                                       tokens, tokens);
+    const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(visible),
+                                                         static_cast<std::uint32_t>(visible)};
+    return ops::causal_softmax_attention_workspace_capacity_bytes(
+        {kHeadDim, geometry.query_heads, geometry.kv_heads}, dtype, envelope, batch, tokens,
+        tokens);
 }
 
 std::int32_t profile_visible(std::span<const std::int32_t> contexts,
@@ -396,10 +414,12 @@ public:
           table_rows_(static_cast<std::size_t>(batch_) * sizeof(std::int32_t)),
           cache_k_(bench::make_zeros(cache_plane_bytes(geometry, dtype, physical_pages_))),
           cache_v_(bench::make_zeros(cache_plane_bytes(geometry, dtype, physical_pages_))),
-          cache_k_scale_(bench::make_zeros(
-              dtype == DType::I8 ? scale_plane_bytes(geometry, physical_pages_) : std::size_t{1})),
-          cache_v_scale_(bench::make_zeros(
-              dtype == DType::I8 ? scale_plane_bytes(geometry, physical_pages_) : std::size_t{1})),
+          cache_k_scale_(bench::make_zeros(dtype != DType::BF16
+                                               ? scale_plane_bytes(geometry, dtype, physical_pages_)
+                                               : std::size_t{1})),
+          cache_v_scale_(bench::make_zeros(dtype != DType::BF16
+                                               ? scale_plane_bytes(geometry, dtype, physical_pages_)
+                                               : std::size_t{1})),
           block_table_(static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
@@ -452,12 +472,14 @@ public:
     void launch(Entry entry, cudaStream_t stream) {
         if (entry == Entry::Append) {
             const Tensor validity = masked_ ? valid_columns_tensor_ : Tensor{};
-            ops::gqa_attention(q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity,
-                               table_rows_tensor_, kScale, batch_cache_view_, envelope_, workspace_,
-                               output_tensor_, stream);
+            ops::causal_softmax_attention(
+                q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, table_rows_tensor_,
+                {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale, batch_cache_view_, envelope_,
+                workspace_, output_tensor_, stream);
         } else {
-            ops::gqa_attention_cached(q_tensor_, positions_tensor_, kScale, cache_view_, envelope_,
-                                      workspace_, output_tensor_, stream);
+            ops::causal_softmax_attention_cached(
+                q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},
+                kScale, cache_view_, envelope_, workspace_, output_tensor_, stream);
         }
     }
 
@@ -494,12 +516,16 @@ private:
     Tensor output_tensor_;
     PagedKVLayerView cache_view_;
     PagedKVBatchLayerView batch_cache_view_;
-    ops::GqaExecutionEnvelope envelope_;
+    ops::CausalAttentionExecutionEnvelope envelope_;
 };
 
 const char* entry_name(Entry entry) { return entry == Entry::Append ? "append" : "cached"; }
 
-const char* dtype_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "int8"; }
+const char* dtype_name(DType dtype) {
+    if (dtype == DType::BF16) return "bf16";
+    if (dtype == DType::I8) return "int8";
+    return "fp8";
+}
 
 const char* execution_name(Execution execution) {
     return execution == Execution::Eager ? "eager" : "graph";
@@ -521,10 +547,9 @@ std::string profile_name(std::span<const std::int32_t> values) {
 }
 
 double cache_vector_bytes(DType dtype) {
-    return dtype == DType::BF16
-               ? static_cast<double>(kHeadDim * dtype_size(DType::BF16))
-               : static_cast<double>(kHeadDim * dtype_size(DType::I8) +
-                                     (kHeadDim / kKvGroup) * dtype_size(DType::FP16));
+    if (dtype == DType::BF16) { return static_cast<double>(kHeadDim * dtype_size(DType::BF16)); }
+    return static_cast<double>(kHeadDim * dtype_size(dtype) +
+                               scale_groups(dtype) * dtype_size(DType::FP16));
 }
 
 double causal_key_sum(std::int32_t tokens, std::int32_t context) {
@@ -556,9 +581,19 @@ double logical_bytes(Entry entry, const Geometry& geometry, DType dtype,
     return q_and_output + cache_reads + input_kv + cache_writes;
 }
 
-double useful_flops(const Geometry& geometry, std::span<const std::int32_t> contexts,
-                    std::span<const std::int32_t> valid_columns) {
-    return 4.0 * kHeadDim * geometry.query_heads * causal_key_sum(contexts, valid_columns);
+double contraction_flops(const Geometry& geometry, std::span<const std::int32_t> contexts,
+                         std::span<const std::int32_t> valid_columns) {
+    return 2.0 * kHeadDim * geometry.query_heads * causal_key_sum(contexts, valid_columns);
+}
+
+double physical_kv_read_bytes(const Geometry& geometry, DType dtype,
+                              std::span<const std::int32_t> contexts,
+                              std::span<const std::int32_t> valid_columns) {
+    double visible_rows = 0.0;
+    for (std::size_t row = 0; row < contexts.size(); ++row) {
+        if (valid_columns[row] > 0) { visible_rows += contexts[row] + valid_columns[row]; }
+    }
+    return visible_rows * geometry.kv_heads * 2.0 * cache_vector_bytes(dtype);
 }
 
 bench::ColdTiming measure(Case& data, Entry entry, Execution execution, CacheState cache,
@@ -578,7 +613,9 @@ bench::ColdTiming measure(Case& data, Entry entry, Execution execution, CacheSta
 void report(const Result& result) {
     const double seconds = result.timing.median_us * 1.0e-6;
     const double gbps    = result.logical_bytes / seconds / 1.0e9;
-    const double tflops  = result.useful_flops / seconds / 1.0e12;
+    const double tflops  = (result.qk_flops + result.pv_flops) / seconds / 1.0e12;
+    const double tensor_core_roofline =
+        result.kv_dtype == DType::FP8_E4M3FN ? kMixedFp8F16TcTflops : kDenseF16Bf16TcTflops;
     std::printf("entry=%-6s geometry=%-14s kv=%-4s mapping=%-10s execution=%-5s cache=%-4s "
                 "B=%d W=%d contexts=%s valid=%s rows=%s "
                 "workspace=%9zu median=%10.3f us min=%10.3f us p95=%10.3f us "
@@ -589,7 +626,20 @@ void report(const Result& result) {
                 result.valid_columns.c_str(), result.table_rows.c_str(), result.workspace_bytes,
                 result.timing.median_us, result.timing.min_us, result.timing.p95_us, gbps,
                 gbps / kRtx5090DramGBs * 100.0, kRtx5090DramGBs, tflops,
-                tflops / kDenseBf16TcTflops * 100.0, kDenseBf16TcTflops);
+                tflops / tensor_core_roofline * 100.0, tensor_core_roofline);
+    if (result.kv_dtype == DType::FP8_E4M3FN) {
+        const double mixed_floor_us = (result.qk_flops / (kDenseFp8TcTflops * 1.0e12) +
+                                       result.pv_flops / (kDenseF16Bf16TcTflops * 1.0e12)) *
+                                      1.0e6;
+        const double physical_gbps = result.physical_kv_read_bytes / seconds / 1.0e9;
+        std::printf("  fp8 qk_flops=%.0f pv_flops=%.0f mixed_tc_floor=%8.3f us "
+                    "mixed_tc_roofline=%5.1f%% physical_kv_read=%.0f bytes "
+                    "physical_kv_read=%8.1f GB/s (%5.1f%% of %.1f)\n",
+                    result.qk_flops, result.pv_flops, mixed_floor_us,
+                    mixed_floor_us / result.timing.median_us * 100.0, result.physical_kv_read_bytes,
+                    physical_gbps, physical_gbps / kColdPureReadCeilingGBs * 100.0,
+                    kColdPureReadCeilingGBs);
+    }
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
@@ -599,16 +649,29 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
     output << "entry,geometry,kv_dtype,mapping,execution,cache,B,W,row_contexts,valid_columns,"
-              "table_rows,workspace_bytes,logical_bytes,"
-              "useful_flops,median_us,min_us,p95_us\n";
+              "table_rows,workspace_bytes,logical_bytes,qk_flops,pv_flops,"
+              "mixed_tc_floor_us,mixed_tc_roofline_pct,physical_kv_read_bytes,"
+              "physical_kv_read_gbps,median_us,min_us,p95_us\n";
     for (const Result& result : results) {
         output << entry_name(result.entry) << ',' << result.geometry.name << ','
                << dtype_name(result.kv_dtype) << ',' << mapping_name(result.mapping) << ','
                << execution_name(result.execution) << ',' << cache_name(result.cache) << ','
                << result.batch << ',' << result.tokens << ',' << result.row_contexts << ','
                << result.valid_columns << ',' << result.table_rows << ',' << result.workspace_bytes
-               << ',' << result.logical_bytes << ',' << result.useful_flops << ','
-               << result.timing.median_us << ',' << result.timing.min_us << ','
+               << ',' << result.logical_bytes << ',' << result.qk_flops << ',' << result.pv_flops
+               << ',';
+        if (result.kv_dtype == DType::FP8_E4M3FN) {
+            const double seconds        = result.timing.median_us * 1.0e-6;
+            const double mixed_floor_us = (result.qk_flops / (kDenseFp8TcTflops * 1.0e12) +
+                                           result.pv_flops / (kDenseF16Bf16TcTflops * 1.0e12)) *
+                                          1.0e6;
+            output << mixed_floor_us << ',' << mixed_floor_us / result.timing.median_us * 100.0
+                   << ',' << result.physical_kv_read_bytes << ','
+                   << result.physical_kv_read_bytes / seconds / 1.0e9;
+        } else {
+            output << ",,,";
+        }
+        output << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
                << result.timing.p95_us << '\n';
     }
 }
@@ -660,7 +723,8 @@ std::vector<Geometry> selected_geometries(GeometryChoice choice) {
 std::vector<DType> selected_dtypes(KvChoice choice) {
     if (choice == KvChoice::Bf16) { return {DType::BF16}; }
     if (choice == KvChoice::Int8) { return {DType::I8}; }
-    return {DType::BF16, DType::I8};
+    if (choice == KvChoice::Fp8) { return {DType::FP8_E4M3FN}; }
+    return {DType::BF16, DType::I8, DType::FP8_E4M3FN};
 }
 
 struct RowProfile {
@@ -691,8 +755,8 @@ RowProfile make_row_profile(const Options& options, std::int32_t batch, std::int
         const std::int32_t context = profile.contexts[static_cast<std::size_t>(row)];
         const std::int32_t valid   = profile.valid_columns[static_cast<std::size_t>(row)];
         if (valid < 0 || valid > width || context < 0 ||
-            context > static_cast<std::int32_t>(ops::kGqaAttentionMaximumVisibleKeys) - valid) {
-            throw std::invalid_argument("row profile exceeds the public GQA domain");
+            context > static_cast<std::int32_t>(ops::kCausalAttentionMaximumVisibleKeys) - valid) {
+            throw std::invalid_argument("row profile exceeds the public causal-attention domain");
         }
     }
     return profile;
@@ -791,8 +855,12 @@ int main(int argc, char** argv) {
                                             data.workspace_bytes(),
                                             logical_bytes(entry, geometry, dtype, rows.contexts,
                                                           rows.valid_columns),
-                                            useful_flops(geometry, rows.contexts,
-                                                         rows.valid_columns),
+                                            contraction_flops(geometry, rows.contexts,
+                                                              rows.valid_columns),
+                                            contraction_flops(geometry, rows.contexts,
+                                                              rows.valid_columns),
+                                            physical_kv_read_bytes(geometry, dtype, rows.contexts,
+                                                                   rows.valid_columns),
                                             measure(data, entry, execution, cache, &graph, flush,
                                                     stream, options.warmup, options.repeat)};
                                         report(result);

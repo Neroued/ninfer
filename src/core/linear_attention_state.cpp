@@ -113,84 +113,99 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
 
 LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
                                                    const LinearAttentionStatePoolLayout& layout)
-    : spec(layout.spec) {
+    : spec_(layout.spec) {
     if (layout.conv.empty() || layout.recurrent.size() != layout.conv.size() ||
-        layout.conv.size() != spec.layers) {
+        layout.conv.size() != spec_.layers) {
         throw std::invalid_argument(
             "LinearAttentionStatePool layout layer counts are inconsistent");
     }
 
-    const Tensor conv_shape(nullptr, spec.conv_dtype,
-                            {spec.conv_channels, spec.conv_width, spec.slot_count});
+    const Tensor conv_shape(nullptr, spec_.conv_dtype,
+                            {spec_.conv_channels, spec_.conv_width, spec_.slot_count});
     const Tensor recurrent_shape(
         nullptr, DType::FP32,
-        {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count});
-    conv.reserve(layout.conv.size());
-    recurrent.reserve(layout.recurrent.size());
+        {spec_.key_head_dim, spec_.value_head_dim, spec_.value_heads, spec_.slot_count});
+    conv_.reserve(layout.conv.size());
+    recurrent_.reserve(layout.recurrent.size());
     for (std::size_t layer = 0; layer < layout.conv.size(); ++layer) {
         if (layout.conv[layer].bytes != conv_shape.bytes() ||
             layout.recurrent[layer].bytes != recurrent_shape.bytes()) {
             throw std::logic_error(
                 "LinearAttentionStatePool layout tensor byte size is inconsistent");
         }
-        conv.emplace_back(layout.conv[layer].bind(backing).data, spec.conv_dtype,
-                          std::initializer_list<std::int32_t>{spec.conv_channels, spec.conv_width,
-                                                              spec.slot_count});
-        recurrent.emplace_back(
+        conv_.emplace_back(layout.conv[layer].bind(backing).data, spec_.conv_dtype,
+                           std::initializer_list<std::int32_t>{spec_.conv_channels,
+                                                               spec_.conv_width, spec_.slot_count});
+        recurrent_.emplace_back(
             layout.recurrent[layer].bind(backing).data, DType::FP32,
-            std::initializer_list<std::int32_t>{spec.key_head_dim, spec.value_head_dim,
-                                                spec.value_heads, spec.slot_count});
+            std::initializer_list<std::int32_t>{spec_.key_head_dim, spec_.value_head_dim,
+                                                spec_.value_heads, spec_.slot_count});
     }
+
+    // Validate the transfer geometry once while binding the immutable inventory.
+    (void)all_layers_view();
 }
 
 std::uint32_t LinearAttentionStatePool::layer_count() const noexcept {
-    return static_cast<std::uint32_t>(conv.size());
+    return static_cast<std::uint32_t>(conv_.size());
 }
 
-std::int32_t LinearAttentionStatePool::slot_count() const noexcept { return spec.slot_count; }
+std::int32_t LinearAttentionStatePool::slot_count() const noexcept { return spec_.slot_count; }
 
-std::int64_t LinearAttentionStatePool::conv_slot_stride_elements() const noexcept {
-    return static_cast<std::int64_t>(spec.conv_channels) *
-           static_cast<std::int64_t>(spec.conv_width);
+LinearAttentionStateLayerView LinearAttentionStatePool::layer_view(std::uint32_t layer) const {
+    if (layer >= layer_count()) {
+        throw std::out_of_range("LinearAttentionStatePool layer_view layer out of range");
+    }
+    return {.conv = conv_[layer], .recurrent = recurrent_[layer]};
 }
 
-std::int64_t LinearAttentionStatePool::recurrent_slot_stride_elements() const noexcept {
-    return static_cast<std::int64_t>(spec.key_head_dim) *
-           static_cast<std::int64_t>(spec.value_head_dim) *
-           static_cast<std::int64_t>(spec.value_heads);
+LinearAttentionStateSlotView LinearAttentionStatePool::slot_view(std::int32_t slot) const {
+    validate_layer_slot(*this, 0, slot, "LinearAttentionStatePool slot_view");
+    const auto all   = all_layers_view();
+    Tensor conv      = conv_slot(0, slot);
+    Tensor recurrent = recurrent_slot(0, slot);
+    return {
+        .conv_layer0                 = conv,
+        .recurrent_layer0            = recurrent,
+        .conv_layer_bytes            = conv.bytes(),
+        .recurrent_layer_bytes       = recurrent.bytes(),
+        .conv_layer_pitch_bytes      = all.conv_layer_stride_bytes,
+        .recurrent_layer_pitch_bytes = all.recurrent_layer_stride_bytes,
+        .layers                      = layer_count(),
+    };
 }
 
 LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() const {
-    if (conv.size() != spec.layers || recurrent.size() != spec.layers || conv.empty()) {
+    if (conv_.size() != spec_.layers || recurrent_.size() != spec_.layers || conv_.empty()) {
         throw std::logic_error("LinearAttentionStatePool layer inventory is inconsistent");
     }
-    for (std::size_t layer = 0; layer < conv.size(); ++layer) {
-        validate_state_tensor(conv[layer], spec.conv_dtype,
-                              {spec.conv_channels, spec.conv_width, spec.slot_count}, "conv");
+    for (std::size_t layer = 0; layer < conv_.size(); ++layer) {
+        validate_state_tensor(conv_[layer], spec_.conv_dtype,
+                              {spec_.conv_channels, spec_.conv_width, spec_.slot_count}, "conv");
         validate_state_tensor(
-            recurrent[layer], DType::FP32,
-            {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count},
+            recurrent_[layer], DType::FP32,
+            {spec_.key_head_dim, spec_.value_head_dim, spec_.value_heads, spec_.slot_count},
             "recurrent");
     }
     return LinearAttentionStateAllLayersView{
-        .conv_layer0                  = conv.front(),
-        .recurrent_layer0             = recurrent.front(),
-        .conv_layer_stride_bytes      = layer_stride_bytes(conv, "conv"),
-        .recurrent_layer_stride_bytes = layer_stride_bytes(recurrent, "recurrent"),
-        .spec                         = spec,
+        .conv_layer0                  = conv_.front(),
+        .recurrent_layer0             = recurrent_.front(),
+        .conv_layer_stride_bytes      = layer_stride_bytes(conv_, "conv"),
+        .recurrent_layer_stride_bytes = layer_stride_bytes(recurrent_, "recurrent"),
+        .spec                         = spec_,
     };
 }
 
 Tensor LinearAttentionStatePool::conv_slot(std::uint32_t layer, std::int32_t slot) const {
     validate_layer_slot(*this, layer, slot, "LinearAttentionStatePool conv_slot");
-    return conv.at(layer).slice(2, slot, 1).view({spec.conv_channels, spec.conv_width});
+    return conv_.at(layer).slice(2, slot, 1).view({spec_.conv_channels, spec_.conv_width});
 }
 
 Tensor LinearAttentionStatePool::recurrent_slot(std::uint32_t layer, std::int32_t slot) const {
     validate_layer_slot(*this, layer, slot, "LinearAttentionStatePool recurrent_slot");
-    return recurrent.at(layer)
+    return recurrent_.at(layer)
         .slice(3, slot, 1)
-        .view({spec.key_head_dim, spec.value_head_dim, spec.value_heads});
+        .view({spec_.key_head_dim, spec_.value_head_dim, spec_.value_heads});
 }
 
 void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream) {
@@ -219,6 +234,15 @@ void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream)
     }
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor state = recurrent_slot(layer, slot);
+        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
+    }
+}
+
+void LinearAttentionStatePool::zero_all(cudaStream_t stream) {
+    for (const Tensor& state : conv_) {
+        CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
+    }
+    for (const Tensor& state : recurrent_) {
         CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
     }
 }

@@ -32,6 +32,7 @@ ninfer::EngineOptions dflash_engine_options(const char* artifact, ninfer::Propos
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = proposal;
     options.use_cuda_graph            = true;
+    options.context_cache.device_state_slots = 2;
     return options;
 }
 
@@ -46,7 +47,9 @@ ninfer::RequestOptions greedy_options(std::uint32_t outputs, bool reuse) {
 
 ninfer::PromptInput initial_conversation() {
     ninfer::PromptInput input;
-    input.options.enable_thinking = false;
+    input.options.enable_thinking   = false;
+    input.context_cache.session_key = "dflash-boundary-real";
+    input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
 
     ninfer::ChatMessage user;
     user.role = ninfer::ChatRole::User;
@@ -105,7 +108,7 @@ int verify_dflash_load(const ninfer::Engine& engine) {
         memory.weights.used_bytes > memory.weights.capacity_bytes ||
         memory.sequence.capacity_bytes == 0 || memory.sequence.used_bytes == 0 ||
         memory.sequence.used_bytes > memory.sequence.capacity_bytes ||
-        memory.workspace.capacity_bytes == 0 || memory.request_transient.capacity_bytes != 0 ||
+        memory.workspace.capacity_bytes == 0 || memory.vision_workspace.has_value() ||
         memory.workspace_logical_peak_bytes != 0 || memory.cuda_graph_allowance_bytes == 0) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;
@@ -121,7 +124,7 @@ int exercise_partial_terminal(ninfer::Engine& engine, const std::vector<ninfer::
                       stop) != baseline.begin() + static_cast<std::ptrdiff_t>(stop_index)) {
             continue;
         }
-        ninfer::RequestOptions options = greedy_options(24, false);
+        ninfer::RequestOptions options = greedy_options(24, true);
         options.stop.token_ids.push_back(stop);
         const ninfer::GenerationResult stopped =
             engine.generate(engine.prepare_tokens(prompt), options);
@@ -161,7 +164,7 @@ int exercise_partial_terminal(ninfer::Engine& engine, const std::vector<ninfer::
 
 int exercise_boundary_restore(ninfer::Engine& engine) {
     const ninfer::GenerationResult first =
-        engine.generate(engine.prepare(initial_conversation()), greedy_options(2, false));
+        engine.generate(engine.prepare(initial_conversation()), greedy_options(2, true));
     if (first.generated_token_ids.size() != 2) {
         std::cerr << "DFlash boundary fixture did not establish resident state\n";
         return 1;
@@ -173,6 +176,8 @@ int exercise_boundary_restore(ninfer::Engine& engine) {
     if (restored.reused_prompt_tokens == 0 || restored.generated_token_ids.size() != 4) {
         std::cerr << "DFlash assistant-boundary restore did not reuse its cache snapshot: reused="
                   << restored.reused_prompt_tokens
+                  << " path=" << static_cast<int>(restored.prefix_reuse_path)
+                  << " source_prompt=" << first.prompt.prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size() << '\n';
         return 1;
     }
@@ -189,7 +194,7 @@ int exercise_boundary_restore(ninfer::Engine& engine) {
 int exercise_long_boundary_restore(ninfer::Engine& engine) {
     constexpr std::uint32_t generated_tokens = 4100;
     const ninfer::GenerationResult long_run  = engine.generate(
-        engine.prepare(initial_conversation()), greedy_options(generated_tokens, false));
+        engine.prepare(initial_conversation()), greedy_options(generated_tokens, true));
     if (long_run.generated_token_ids.size() != generated_tokens) {
         std::cerr << "DFlash long-restore fixture did not cross the cyclic-cache window\n";
         return 1;
@@ -290,10 +295,10 @@ int main() {
         std::cerr << "DFlash fixture did not execute speculative decode\n";
         return 1;
     }
+    if (const int result = exercise_boundary_restore(engine); result != 0) { return result; }
     if (const int result = exercise_partial_terminal(engine, prompt, target_output); result != 0) {
         return result;
     }
-    if (const int result = exercise_boundary_restore(engine); result != 0) { return result; }
     if (const int result = exercise_long_boundary_restore(engine); result != 0) { return result; }
 
     std::cout << "ok\n";

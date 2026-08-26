@@ -225,7 +225,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                             static_cast<std::size_t>(copy_begin - range.source_begin),
                         static_cast<std::byte*>(slot.buffer.data()) +
                             static_cast<std::size_t>(copy_begin - source),
-                        amount, cudaMemcpyHostToDevice, device.load_stream));
+                        amount, cudaMemcpyHostToDevice, device.transfer_stream));
                     copied =
                         checked_add(copied, amount, "artifact copied byte count overflows u64");
                 }
@@ -236,7 +236,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                 }
             }
             next_range = range_index;
-            CUDA_CHECK(cudaEventRecord(slot.event, device.load_stream));
+            CUDA_CHECK(cudaEventRecord(slot.event, device.transfer_stream));
             slot.pending = true;
 
             if (progress != nullptr && progress->callback && copied != last_published &&
@@ -247,7 +247,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         }
     }
     for (const auto& slot : slots) { slot->wait(); }
-    CUDA_CHECK(cudaStreamSynchronize(device.load_stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     if (copied != total || next_range != ranges.size()) {
         throw ArtifactError("direct materialization did not cover every tensor byte");
     }

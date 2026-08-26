@@ -2,7 +2,6 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
-#include "targets/qwen3_6/impl/runtime/linear_state_slots.h"
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -10,7 +9,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
-#include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/softmax_attention.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/round_state.h>
@@ -123,6 +122,7 @@ struct NullTap {
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
+    runtime::ExecutionTiming timing;
 };
 
 struct DFlashFeatureSink {
@@ -171,8 +171,8 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
-    void set_prefill_rewrite_checkpoint_frontier(std::int64_t position) noexcept {
-        prefill_rewrite_checkpoint_frontier_ = position;
+    void set_prefill_split_frontier(std::int64_t position) noexcept {
+        prefill_split_frontier_ = position;
     }
 
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
@@ -181,7 +181,7 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
-    void set_linear_state_slots(std::int32_t current_slot, std::int32_t rewrite_checkpoint_slot);
+    void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
@@ -205,30 +205,33 @@ public:
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
-                               const Tensor& linear_state_slots, ops::GqaExecutionEnvelope envelope,
-                               Tensor& hidden, Tensor& logits);
+                               const Tensor& linear_state_source_slots,
+                               const Tensor& linear_state_destination_slots,
+                               ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                               Tensor& logits);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
-                             const Tensor& kv_table_rows, const Tensor& linear_state_slots,
-                             ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens);
+                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                             Tensor& logits, Tensor& target_tokens);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
-                             const Tensor& kv_table_rows, const Tensor& linear_state_slots,
-                             ops::GqaExecutionEnvelope envelope, Tensor& hidden, Tensor& logits,
-                             Tensor& target_tokens, DFlashFeatureSink& sink);
+                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                             Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                  ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden);
+                                  ops::CausalAttentionExecutionEnvelope envelope,
+                                  Tensor& mtp_hidden);
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                           ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
+                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
                            const Tensor* explicit_rope_positions = nullptr,
                            const Tensor* input_embeddings        = nullptr);
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
-                             const Tensor& position, ops::GqaExecutionEnvelope envelope,
+                             const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
 private:
     void bind();
@@ -247,21 +250,23 @@ private:
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,
-                                  const Tensor& kv_table_rows, const Tensor& linear_state_slots,
-                                  ops::GqaExecutionEnvelope envelope, Tensor& hidden,
+                                  const Tensor& kv_table_rows,
+                                  const Tensor& linear_state_source_slots,
+                                  ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
 
     void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                           Tensor& x, Tensor& ah);
     void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
-                          const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
-                          Tensor& mtp_hidden);
+                          const Tensor& rope_positions,
+                          ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden);
     void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                          const Tensor& rope_positions, ops::GqaExecutionEnvelope envelope,
-                          Tensor& mtp_hidden, const Tensor* input_embeddings);
+                          const Tensor& rope_positions,
+                          ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
+                          const Tensor* input_embeddings);
     void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
                            const Tensor& positions, const Tensor& rope_positions,
-                           ops::GqaExecutionEnvelope envelope, bool final_chunk,
+                           ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
                            Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
     void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
 
@@ -294,23 +299,24 @@ private:
     Tensor& prefill_hidden_;
     std::uint32_t prefill_chunk_;
     std::uint32_t text_kv_base_;
-    const Tensor* active_cache_positions_                 = nullptr;
-    const Tensor* active_rope_positions_                  = nullptr;
-    const Tensor* active_kv_table_rows_                   = nullptr;
-    const Tensor* active_linear_state_slots_              = nullptr;
-    const Tensor* active_valid_columns_                   = nullptr;
-    const Tensor* active_backend_kv_table_rows_           = nullptr;
-    const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
-    std::int32_t active_sequence_batch_                   = 0;
-    std::int32_t active_sequence_width_                   = 0;
-    std::int32_t rope_delta_                              = 0;
-    std::int32_t linear_state_current_slot_               = 0;
-    std::int32_t linear_state_rewrite_checkpoint_slot_    = 0;
-    GdnStateAction gdn_state_action_                      = GdnStateAction::UpdateInPlace;
-    const GdnReplayRecords* replay_records_               = nullptr;
-    std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
-    Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
-    std::uint32_t mtp_proposal_extent_                    = 0;
+    const Tensor* active_cache_positions_                                          = nullptr;
+    const Tensor* active_rope_positions_                                           = nullptr;
+    const Tensor* active_kv_table_rows_                                            = nullptr;
+    const Tensor* active_linear_state_source_slots_                                = nullptr;
+    const Tensor* active_linear_state_destination_slots_                           = nullptr;
+    const Tensor* active_valid_columns_                                            = nullptr;
+    const Tensor* active_backend_kv_table_rows_                                    = nullptr;
+    const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
+    std::int32_t active_sequence_batch_                                            = 0;
+    std::int32_t active_sequence_width_                                            = 0;
+    std::int32_t rope_delta_                                                       = 0;
+    std::int32_t linear_state_source_slot_                                         = 0;
+    std::int32_t linear_state_destination_slot_                                    = 0;
+    GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
+    const GdnReplayRecords* replay_records_   = nullptr;
+    std::int64_t prefill_split_frontier_      = -1;
+    Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
+    std::uint32_t mtp_proposal_extent_        = 0;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

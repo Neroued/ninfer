@@ -98,7 +98,10 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     rope_positions  = ingress_tensor(offsetof(OrdinaryDecodeIngress, rope_positions), DType::I32);
     text_kv_table_rows =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, text_kv_table_rows), DType::I32);
-    lanes    = ingress_tensor(offsetof(OrdinaryDecodeIngress, lanes), DType::I32);
+    state_source_slots =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, state_source_slots), DType::I32);
+    state_destination_slots =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, state_destination_slots), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
@@ -251,7 +254,10 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
         ingress_tensor(offsetof(MtpDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     mtp_kv_table_rows =
         ingress_tensor(offsetof(MtpDecodeIngress, mtp_kv_table_rows), DType::I32, {batch});
-    lanes       = ingress_tensor(offsetof(MtpDecodeIngress, lanes), DType::I32, {batch});
+    state_source_slots =
+        ingress_tensor(offsetof(MtpDecodeIngress, state_source_slots), DType::I32, {batch});
+    state_destination_slots =
+        ingress_tensor(offsetof(MtpDecodeIngress, state_destination_slots), DType::I32, {batch});
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
@@ -319,7 +325,11 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, text_kv_table_rows), DType::I32, {batch});
     dflash_kv_table_rows =
         ingress_tensor(offsetof(DFlashDecodeIngress, dflash_kv_table_rows), DType::I32, {batch});
-    lanes    = ingress_tensor(offsetof(DFlashDecodeIngress, lanes), DType::I32, {batch});
+    active_lanes = ingress_tensor(offsetof(DFlashDecodeIngress, active_lanes), DType::I32, {batch});
+    state_source_slots =
+        ingress_tensor(offsetof(DFlashDecodeIngress, state_source_slots), DType::I32, {batch});
+    state_destination_slots =
+        ingress_tensor(offsetof(DFlashDecodeIngress, state_destination_slots), DType::I32, {batch});
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, sampling));
     licensed_tokens =

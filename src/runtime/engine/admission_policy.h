@@ -1,7 +1,6 @@
 #pragma once
 
 #include "ninfer/types.h"
-#include "runtime/contract/types.h"
 
 #include <array>
 #include <cstddef>
@@ -13,60 +12,42 @@ namespace ninfer::runtime {
 enum class BackfillClass : std::uint8_t {
     None,
     Persistent,
-    Temporal,
 };
 
 struct ActiveAdmissionSnapshot {
-    std::uint64_t request_id = 0;
-    AdmissionResources resources;
-    std::uint64_t remaining_work_quanta = 0;
-    std::uint64_t backfill_epoch        = 0;
-    BackfillClass backfill_class        = BackfillClass::None;
+    std::uint64_t request_id     = 0;
+    std::uint64_t backfill_epoch = 0;
+    BackfillClass backfill_class = BackfillClass::None;
 };
 
-enum class ProtectionPhase : std::uint8_t {
-    Open,
-    Drain,
-};
-
+// Logical half of a blocked-head reservation. Program owns every physical quantity and mints a
+// fresh proof for each borrower; Scheduler freezes only the incumbent identities whose eventual
+// release is allowed to make the FIFO head runnable.
 struct AdmissionProtection {
-    std::uint64_t epoch_id        = 0;
-    std::uint64_t head_request_id = 0;
-    AdmissionResources head_resources;
-    std::array<std::uint64_t, kMaximumConcurrency> incumbent_ids{};
+    std::uint64_t epoch_id          = 0;
+    std::uint64_t head_request_id   = 0;
+    std::uint64_t resource_revision = 0;
     std::array<std::uint64_t, kMaximumConcurrency> donor_ids{};
-    std::size_t incumbent_count   = 0;
-    std::size_t donor_count       = 0;
-    std::uint64_t temporal_credit = 0;
-    ProtectionPhase phase         = ProtectionPhase::Open;
+    std::size_t donor_count = 0;
 };
 
-[[nodiscard]] bool admission_resources_fit(const AdmissionResources& used,
-                                           const AdmissionResources& capacity) noexcept;
+[[nodiscard]] AdmissionProtection
+make_admission_protection(std::uint64_t epoch_id, std::uint64_t head_request_id,
+                          std::uint64_t resource_revision,
+                          std::span<const ActiveAdmissionSnapshot> active);
 
-// Freezes the currently active requests and selects the earliest projected completion prefix
-// whose release makes the protected head componentwise feasible.
-[[nodiscard]] AdmissionProtection make_admission_protection(
-    std::uint64_t epoch_id, std::uint64_t head_request_id, const AdmissionResources& head_resources,
-    std::span<const ActiveAdmissionSnapshot> active, const AdmissionResources& capacity);
+// Revalidates the frozen donor partition after Program topology changed. Current-epoch persistent
+// borrowers are never promoted to donors, so repeated backfill cannot move the head's frontier.
+void rebind_admission_protection(AdmissionProtection& protection,
+                                 std::span<const ActiveAdmissionSnapshot> active,
+                                 std::uint64_t resource_revision);
 
-// Tests the cumulative future-frontier invariant, including every still-active persistent
-// backfill from this epoch and the proposed candidate.
-[[nodiscard]] bool persistent_backfill_is_safe(const AdmissionProtection& protection,
-                                               std::span<const ActiveAdmissionSnapshot> active,
-                                               const AdmissionResources& candidate,
-                                               const AdmissionResources& capacity) noexcept;
-
-// Projected distance to the last still-active frozen donor. Later admissions never contribute.
-[[nodiscard]] std::uint64_t
-protection_frontier_distance(const AdmissionProtection& protection,
-                             std::span<const ActiveAdmissionSnapshot> active) noexcept;
-
-// True once the head would fit if current-epoch temporal borrowers were absent. This recognizes
-// both the frozen donor frontier and an earlier opportunity created by any incumbent release.
 [[nodiscard]] bool
-protected_head_safe_without_temporal(const AdmissionProtection& protection,
-                                     std::span<const ActiveAdmissionSnapshot> active,
-                                     const AdmissionResources& capacity) noexcept;
+protection_has_live_donor(const AdmissionProtection& protection,
+                          std::span<const ActiveAdmissionSnapshot> active) noexcept;
+
+[[nodiscard]] bool persistent_backfill_is_authorized(
+    const AdmissionProtection& protection, std::uint64_t candidate_request_id,
+    std::span<const ActiveAdmissionSnapshot> active, std::uint64_t program_proof_revision) noexcept;
 
 } // namespace ninfer::runtime

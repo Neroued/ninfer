@@ -73,7 +73,8 @@ struct ToolDefinition {
     std::string description;
     std::string parameters_json;
     std::string definition_json; // normalized OpenAI function-tool object for Qwen prompt rendering
-    bool strict = false;
+    bool strict               = false;
+    bool cache_boundary_after = false;
 };
 
 struct ToolCall {
@@ -102,6 +103,10 @@ struct ChatTurn {
     std::string tool_call_id;      // populated for role=tool
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
+    std::vector<std::uint32_t> shared_cache_boundaries_after_text_bytes;
+    // Anthropic conversation cache_control on the terminal content block names the exact
+    // boundary after this normalized turn. It remains private to the continuation lineage.
+    bool private_cache_boundary_after = false;
 };
 
 // OpenAI sampling fields carried by the protocol adapter. `logit_bias` remains

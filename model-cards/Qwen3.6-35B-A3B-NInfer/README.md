@@ -147,7 +147,7 @@ The artifact supports:
 - image, multi-image, video, and mixed multimodal messages;
 - MTP speculative decoding with draft windows from one to five;
 - text-only DFlash speculative decoding with draft windows from one to fifteen;
-- BF16 and INT8 group-64 KV cache;
+- BF16, INT8 group-64, and row-scaled FP8 E4M3 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;

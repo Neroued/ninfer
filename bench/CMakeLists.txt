@@ -73,6 +73,27 @@ target_include_directories(ninfer_bench PRIVATE
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
 
+# Static context-cost calibrator. Transfer measurements call production Paged-KV copy primitives,
+# then release their synthetic fixtures before the public Engine optionally loads one real artifact
+# for text/Vision prefill measurements.
+add_executable(ninfer_context_cost_bench
+  context_cost/context_cost_bench.cpp
+  context_cost/context_cost_measure.cpp
+  context_cost/qwen3_6_context_fixture.cpp)
+target_include_directories(ninfer_context_cost_bench PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/context_cost
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
+target_compile_definitions(ninfer_context_cost_bench PRIVATE
+  NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+target_link_libraries(ninfer_context_cost_bench PRIVATE
+  ninfer_engine ninfer_core CUDA::cudart)
+
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.
 add_executable(ninfer_qwen3_6_27b_mtp_round_bench

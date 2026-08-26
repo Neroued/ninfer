@@ -31,6 +31,12 @@ std::string trim_ascii(std::string_view text) {
     return std::string(text.substr(begin, end - begin));
 }
 
+std::string rtrim_ascii(std::string_view text) {
+    std::size_t end = text.size();
+    while (end != 0 && std::isspace(static_cast<unsigned char>(text[end - 1])) != 0) { --end; }
+    return std::string(text.substr(0, end));
+}
+
 void skip_ws(std::string_view text, std::size_t& pos) {
     while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) { ++pos; }
 }
@@ -368,6 +374,13 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     if (first == std::string::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
+    // Text before the first <tool_call> is ordinary content and is RETAINED here.
+    // Suppressing it in the parser makes the terminal body shorter than what a
+    // streaming response may already have emitted, which trips the
+    // streamed-vs-terminal invariant and kills the request mid-stream. The caller
+    // suppresses it instead, because only the caller knows how many bytes actually
+    // left the process.
+    out.content = rtrim_ascii(std::string_view(text).substr(0, first));
 
     std::size_t pos = first;
     while (pos < text.size()) {

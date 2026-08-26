@@ -431,6 +431,12 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     if (output_sink) {
         outcome.streamed_content_bytes = output_sink->finish(is_tool_call_response);
     }
+    // A tool turn should not show the model's pre-call chatter to the caller, but it
+    // can only be dropped when none of it has already gone out on the wire. Streaming
+    // recognises <tool_call> only once the whole marker lands in one chunk; when the
+    // marker straddles chunks the prefix has already been emitted, and shortening the
+    // terminal body below streamed_content_bytes would abort the request mid-stream.
+    if (is_tool_call_response && outcome.streamed_content_bytes == 0) { outcome.text.clear(); }
     return outcome;
 }
 

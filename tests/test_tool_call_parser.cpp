@@ -46,7 +46,10 @@ int test_single_call() {
 
     int failures = 0;
     failures += check(parsed.is_tool_call_response, "single call parsed as tool response");
-    failures += check(parsed.content.empty(), "tool-call response has no user-visible preamble");
+    // The parser RETAINS the pre-call prefix; suppression happens in the caller,
+    // which alone knows whether those bytes were already streamed.
+    failures += check(parsed.content == "Calling weather.",
+                      "parser retains the pre-call preamble for the caller to suppress");
     failures += check(parsed.tool_calls.size() == 1, "one parsed call");
     failures += check(parsed.tool_calls[0].id.rfind("call_", 0) == 0, "generated call id prefix");
     failures += check(parsed.tool_calls[0].name == "get_weather", "function name parsed");
@@ -246,8 +249,8 @@ int test_tolerant_recovery() {
                                 "extra suffix";
     const auto parsed = ninfer::serve::parse_qwen_tool_call_output(drifted, 64, true);
     failures += check(parsed.is_tool_call_response, "tolerant parser recovered drifted call");
-    failures += check(parsed.content.empty(),
-                      "tolerant parser does not surface the preamble as content");
+    failures += check(!parsed.content.empty(),
+                      "tolerant parser retains the preamble for caller-side suppression");
     failures += check(parsed.tool_calls.size() == 1, "tolerant parser recovered one call");
     failures += check(parsed.tool_calls[0].name == "read", "tolerant parser recovered function");
     const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
@@ -366,7 +369,10 @@ int test_streaming_consistency() {
 
     const auto parsed = ninfer::serve::parse_qwen_tool_call_output(response, 64, true);
     failures += check(parsed.is_tool_call_response, "parsed as tool response");
-    failures += check(parsed.content.empty(), "parsed tool response has empty content");
+    failures += check(parsed.content == "I will check that for you.",
+                      "parser retains the pre-call preamble");
+    failures += check(filter.emitted_bytes() <= parsed.content.size(),
+                      "terminal content is never shorter than what streaming emitted");
     failures += check(streamed == "I will check th",
                       "prefix streamed before the tool marker is recognized cannot be recalled");
 
@@ -926,8 +932,46 @@ int test_json_args_adversarial_string_roundtrip() {
 
 } // namespace
 
+
+// Regression: a preamble followed by a tool call must never leave the terminal
+// body shorter than what streaming already emitted. When the <tool_call> marker
+// straddles two chunks the prefix is already on the wire, and a parser that
+// dropped it would trip unstreamed_content and abort the request mid-stream.
+int test_stream_terminal_consistency() {
+    int failures = 0;
+    const std::string preamble = "I need to search the knowledge base. ";
+    const std::string call =
+        "<tool_call>\n<function=kb_search>\n<parameter=query>\nx\n</parameter>\n</function>\n"
+        "</tool_call>";
+
+    // split marker: prefix is emitted before the call is recognised
+    {
+        ninfer::serve::ToolCallStreamFilter filter;
+        std::string streamed;
+        streamed += filter.feed(preamble + "<tool");
+        streamed += filter.feed(call.substr(std::string("<tool").size()));
+        streamed += filter.finish(true);
+        const auto parsed = ninfer::serve::parse_qwen_tool_call_output(preamble + call, 64, {}, false);
+        failures += check(parsed.tool_calls.size() == 1, "split marker lost the tool call");
+        failures += check(filter.emitted_bytes() <= parsed.content.size(),
+                          "streamed content exceeds terminal content on a split marker");
+    }
+
+    // whole marker in one chunk: nothing is emitted, so the caller may suppress
+    {
+        ninfer::serve::ToolCallStreamFilter filter;
+        std::string streamed;
+        streamed += filter.feed(preamble + call);
+        streamed += filter.finish(true);
+        failures += check(filter.emitted_bytes() == 0,
+                          "whole-marker chunk should withhold the preamble");
+    }
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_stream_terminal_consistency();
     failures += test_single_call();
     failures += test_multiple_calls_and_json_values();
     failures += test_string_param_keeps_numeric_looking_value();

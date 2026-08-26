@@ -8,7 +8,7 @@ services:
       CCACHE_DIR: /ccache
       CCACHE_MAXSIZE: 20G
     volumes:
-      - .:/src:ro
+      - .:/src:ro,Z
       - ninfer-build:/build
       - ninfer-ccache:/ccache
     command:
@@ -28,6 +28,5 @@ services:
 
 volumes:
   ninfer-build:
-    name: ninfer-build
   ninfer-ccache:
     name: ninfer-ccache

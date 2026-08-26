@@ -434,6 +434,7 @@ private:
             result.prefix_reuse_path    = request->begin->prefix_reuse_path;
         }
         if (request->lane) {
+            result.lane    = *request->lane;
             result.timings = instance_.program->generation_timings_lane(*request->lane);
             result.timings.prepare_seconds = request->prepare_seconds;
             result.speculative = instance_.program->speculative_stats_lane(*request->lane);

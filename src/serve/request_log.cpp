@@ -397,6 +397,7 @@ std::string format_request_done(const RequestLogContext& context,
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds)
         << " speculative=" << speculative_str(metrics);
+    if (metrics.lane) { out << " lane=" << *metrics.lane; }
     return out.str();
 }
 
@@ -543,6 +544,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                                      const GenerationOutcome& outcome) {
     Json record       = event_base(server_instance_id, timestamp, "request_done");
     record["request"] = request_json(context);
+    const Json lane = outcome.metrics.lane ? Json(*outcome.metrics.lane) : Json(nullptr);
     record["result"] =
         Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
              {"prompt_tokens", outcome.prompt_tokens},
@@ -552,6 +554,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
                               static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
+             {"lane", lane},
              {"tool_call_count", outcome.tool_calls.size()}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},

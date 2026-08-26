@@ -399,6 +399,7 @@ struct GenerationResult {
     FinishReason finish_reason         = FinishReason::None;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::FullReset;
+    std::optional<std::uint32_t> lane;
     GenerationTimings timings;
     SpeculativeStats speculative;
 };

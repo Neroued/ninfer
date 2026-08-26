@@ -267,6 +267,7 @@ int main() {
     outcome.metrics.speculative_accepted_tokens = 720;
     outcome.metrics.speculative_fallback_steps  = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.lane                              = 2;
 
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
     failures +=
@@ -276,6 +277,7 @@ int main() {
                       "computed prefill tokens missing");
     failures += check(done.at("result").at("prefix_reuse_path") == "restore_turn_checkpoint",
                       "prefix reuse path missing");
+    failures += check(done.at("result").at("lane") == 2, "selected lane missing");
     outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreResponseCheckpoint;
     const Json response_restore =
         Json::parse(format_request_done_json("serve-test", 3001, context, outcome));
@@ -312,6 +314,8 @@ int main() {
         check(format_request_done(context, outcome).find("reuse=restore_response_checkpoint") !=
                   std::string::npos,
               "human request log omits response checkpoint reuse path");
+    failures += check(format_request_done(context, outcome).find(" lane=2") != std::string::npos,
+                      "human request log omits selected lane");
     failures += check(format_request_start(context).find("submitted") != std::string::npos,
                       "human request log mislabels a submitted request");
 

@@ -18,6 +18,7 @@ target_link_options(ninfer-supervisor PRIVATE
   "LINKER:/DEFAULTLIB:ole32"
   "LINKER:/DEFAULTLIB:shell32"
   "LINKER:/DEFAULTLIB:user32"
+  "LINKER:/DEFAULTLIB:gdi32"
   "LINKER:/DEFAULTLIB:advapi32"
   "LINKER:/DEFAULTLIB:ws2_32"
   "LINKER:/DEFAULTLIB:crypt32")

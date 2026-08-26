@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
             "http://" + (cfg.bind_any ? std::string("127.0.0.1") : cfg.host) + ":" +
             std::to_string(cfg.port) + "/";
         std::cout << "ninfer-supervisor dashboard " << url << "\n";
-        ninfer::supervisor::TrayIcon tray(child, url);
+        ninfer::supervisor::TrayIcon tray(child, url, ninfer::supervisor::manages_engine_process(cfg));
         tray.run();
         server.stop();
         child.request_quit();

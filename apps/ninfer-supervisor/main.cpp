@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
         }
 
         ninfer::supervisor::EngineChild child(cfg);
-        ninfer::supervisor::Collector collector(cfg.engine);
+        ninfer::supervisor::Collector collector(cfg.engine, cfg.logs_dir);
         collector.start_series();
         ninfer::supervisor::DashboardServer server(cfg, child, collector);
         std::thread engine_thread([&] { child.run_loop(); });

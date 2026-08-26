@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -48,7 +49,8 @@ struct Collected {
 
 class Collector {
 public:
-    explicit Collector(EngineSpec spec) : spec_(std::move(spec)), series_(6000) {}
+    explicit Collector(EngineSpec spec, std::string logs_dir = {})
+        : spec_(std::move(spec)), logs_dir_(std::move(logs_dir)), series_(6000) {}
     ~Collector() { stop_series(); }
 
     Collector(const Collector&)            = delete;
@@ -68,15 +70,25 @@ private:
     void poll_nvidia_smi(Collected& out);
     void poll_request_log(Collected& out);
     void series_loop();
+    void observe_loop();
     void record_transitions(const Collected& snap);
+    void persist_sample(const VramSample& s);
+    void persist_event(const VramSeriesEvent& e);
+    void load_persisted_series();
     static std::int64_t now_ms();
 
     EngineSpec spec_;
+    std::string logs_dir_;
+    std::string series_path_;
+    std::ofstream series_file_;
     std::mutex mu_;
     VramSeriesRing series_;
     std::atomic<bool> series_run_{false};
     std::thread series_thread_;
+    std::thread observe_thread_;
+    std::int64_t detector_last_ran_ms_ = 0;
     int last_health_status_          = -1;
+    std::string last_health_body_;
     AdminVramCursor admin_cursor_;
     std::int64_t last_release_ms_    = 0;
     std::string last_engine_state_;

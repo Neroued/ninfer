@@ -207,6 +207,9 @@ struct AdminVramCursor {
     }
 };
 
+inline bool parse_series_event_line(std::string_view line, VramSeriesEvent& ev);
+inline bool parse_series_sample_line(std::string_view line, VramSample& s);
+
 // Ring of raw 10 Hz samples. No averaging. Oldest is dropped on overflow.
 struct VramSeriesRing {
     explicit VramSeriesRing(std::size_t cap = 6000) : cap_(cap), buf_(cap) {}
@@ -237,6 +240,23 @@ struct VramSeriesRing {
 
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
 
+    void load_jsonl(std::string_view jsonl) {
+        std::string_view rest = jsonl;
+        while (!rest.empty()) {
+            auto nl   = rest.find('\n');
+            auto line = trim_sv(nl == std::string_view::npos ? rest : rest.substr(0, nl));
+            rest      = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+            if (line.empty()) { continue; }
+            VramSeriesEvent ev;
+            VramSample samp;
+            if (parse_series_event_line(line, ev)) {
+                push_event(std::move(ev));
+            } else if (parse_series_sample_line(line, samp)) {
+                push(samp);
+            }
+        }
+    }
+
 private:
     std::size_t cap_  = 0;
     std::size_t head_ = 0;
@@ -244,6 +264,74 @@ private:
     std::vector<VramSample> buf_;
     std::deque<VramSeriesEvent> events_;
 };
+
+inline bool extract_json_i64(std::string_view line, std::string_view key, std::int64_t& out) {
+    const std::string pat = "\"" + std::string(key) + "\":";
+    auto pos              = line.find(pat);
+    if (pos == std::string_view::npos) { return false; }
+    pos += pat.size();
+    while (pos < line.size() && (line[pos] == ' ')) { ++pos; }
+    bool neg = false;
+    if (pos < line.size() && line[pos] == '-') {
+        neg = true;
+        ++pos;
+    }
+    if (pos >= line.size() || line[pos] < '0' || line[pos] > '9') { return false; }
+    std::int64_t v = 0;
+    while (pos < line.size() && line[pos] >= '0' && line[pos] <= '9') {
+        v = v * 10 + (line[pos] - '0');
+        ++pos;
+    }
+    out = neg ? -v : v;
+    return true;
+}
+
+inline bool extract_json_str(std::string_view line, std::string_view key, std::string& out) {
+    const std::string pat = "\"" + std::string(key) + "\":\"";
+    auto pos              = line.find(pat);
+    if (pos == std::string_view::npos) { return false; }
+    pos += pat.size();
+    std::string s;
+    while (pos < line.size() && line[pos] != '"') {
+        s.push_back(line[pos]);
+        ++pos;
+    }
+    out = std::move(s);
+    return true;
+}
+
+inline bool parse_series_event_line(std::string_view line, VramSeriesEvent& ev) {
+    if (line.find("\"kind\"") == std::string_view::npos) { return false; }
+    std::int64_t t = 0;
+    if (!extract_json_i64(line, "t_ms", t)) { return false; }
+    ev.t_ms = t;
+    extract_json_str(line, "kind", ev.kind);
+    extract_json_str(line, "label", ev.label);
+    return !ev.kind.empty();
+}
+
+inline bool parse_series_sample_line(std::string_view line, VramSample& s) {
+    if (line.find("\"kind\"") != std::string_view::npos) { return false; }
+    std::int64_t t = 0, b = 0, n = 0;
+    if (!extract_json_i64(line, "t_ms", t)) { return false; }
+    extract_json_i64(line, "budget_bytes", b);
+    extract_json_i64(line, "nvidia_used_bytes", n);
+    s.t_ms               = t;
+    s.budget_bytes       = static_cast<std::uint64_t>(b);
+    s.nvidia_used_bytes  = static_cast<std::uint64_t>(n);
+    return true;
+}
+
+inline std::string format_series_sample_line(const VramSample& s) {
+    return std::string("{\"t_ms\":") + std::to_string(s.t_ms) +
+           ",\"budget_bytes\":" + std::to_string(s.budget_bytes) +
+           ",\"nvidia_used_bytes\":" + std::to_string(s.nvidia_used_bytes) + "}";
+}
+
+inline std::string format_series_event_line(const VramSeriesEvent& e) {
+    return std::string("{\"t_ms\":") + std::to_string(e.t_ms) + ",\"kind\":\"" + e.kind +
+           "\",\"label\":\"" + e.label + "\"}";
+}
 
 inline std::string extract_kv_capacity_line(std::string_view log) {
     const auto key = std::string_view("KV capacity ");

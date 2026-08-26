@@ -80,9 +80,18 @@ nlohmann::json DashboardServer::state_json() {
                            {"reuse_seed", snap.requests.reuse_seed},
                            {"last_reuse", snap.requests.last_reuse},
                            {"log_available", snap.requests.log_available},
-                           {"log_error", snap.requests.log_error}};
+                           {"log_error", snap.requests.log_error},
+                           {"mtp_backend", snap.requests.mtp_backend},
+                           {"mtp_draft_window", snap.requests.mtp_draft_window},
+                           {"mtp_drafted", snap.requests.mtp_drafted},
+                           {"mtp_accepted", snap.requests.mtp_accepted},
+                           {"mtp_fallback_steps", snap.requests.mtp_fallback_steps},
+                           {"mtp_rounds", snap.requests.mtp_rounds},
+                           {"mtp_accepted_per_position", snap.requests.mtp_accepted_per_position},
+                           {"mtp_last_accept_rate", snap.requests.mtp_last_accept_rate}};
     nlohmann::json health = {{"status", snap.health_status}, {"body", snap.health_body}};
     child_.observe_health(snap.health_status);
+    collector_.note_engine_state(state_name(st.state), st.last_event);
     const std::string log = child_.log_tail(16 * 1024);
     std::string cap       = extract_kv_capacity_line(log);
     if (cap.empty()) { cap = snap.engine_capacity_line; }
@@ -96,6 +105,7 @@ nlohmann::json DashboardServer::state_json() {
             {"admin_vram_note", snap.admin_vram_note},
             {"requests", std::move(req)},
             {"insights", insights},
+            {"series", collector_.series_json()},
             {"health", std::move(health)},
             {"log_tail", log}};
 }

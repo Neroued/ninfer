@@ -5,6 +5,7 @@
 #include <deque>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::supervisor {
 
@@ -154,6 +155,66 @@ inline NvidiaSmiMemory parse_nvidia_smi_memory_csv(std::string_view csv, int dev
 }
 
 inline std::uint64_t mib_to_bytes(std::uint64_t mib) { return mib * 1024ull * 1024ull; }
+
+// Pre-filter that agrees with the engine JSONL schema: the field is "event",
+// not "type". A substring on the value without the key name is how a panel
+// can look populated while every record is then discarded.
+inline bool jsonl_event_is(std::string_view line, std::string_view event) {
+    const std::string compact = std::string("\"event\":\"") + std::string(event) + "\"";
+    const std::string spaced  = std::string("\"event\": \"") + std::string(event) + "\"";
+    return line.find(compact) != std::string_view::npos ||
+           line.find(spaced) != std::string_view::npos;
+}
+
+struct VramSample {
+    std::int64_t t_ms                = 0;
+    std::uint64_t budget_bytes       = 0;
+    std::uint64_t nvidia_used_bytes  = 0;
+};
+
+struct VramSeriesEvent {
+    std::int64_t t_ms = 0;
+    std::string kind;
+    std::string label;
+};
+
+// Ring of raw 10 Hz samples. No averaging. Oldest is dropped on overflow.
+struct VramSeriesRing {
+    explicit VramSeriesRing(std::size_t cap = 6000) : cap_(cap), buf_(cap) {}
+
+    void push(VramSample s) {
+        if (cap_ == 0) { return; }
+        buf_[head_] = s;
+        head_       = (head_ + 1) % cap_;
+        if (size_ < cap_) { ++size_; }
+    }
+
+    void push_event(VramSeriesEvent e, std::size_t event_cap = 128) {
+        events_.push_back(std::move(e));
+        while (events_.size() > event_cap) { events_.pop_front(); }
+    }
+
+    [[nodiscard]] std::vector<VramSample> samples() const {
+        std::vector<VramSample> out;
+        out.reserve(size_);
+        const std::size_t start = size_ < cap_ ? 0 : head_;
+        for (std::size_t i = 0; i < size_; ++i) { out.push_back(buf_[(start + i) % cap_]); }
+        return out;
+    }
+
+    [[nodiscard]] std::vector<VramSeriesEvent> events() const {
+        return {events_.begin(), events_.end()};
+    }
+
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+private:
+    std::size_t cap_  = 0;
+    std::size_t head_ = 0;
+    std::size_t size_ = 0;
+    std::vector<VramSample> buf_;
+    std::deque<VramSeriesEvent> events_;
+};
 
 inline std::string extract_kv_capacity_line(std::string_view log) {
     const auto key = std::string_view("KV capacity ");

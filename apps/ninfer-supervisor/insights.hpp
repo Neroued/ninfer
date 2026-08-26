@@ -69,7 +69,7 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
         {"insights", nlohmann::json::array()},
     };
 
-    std::unordered_map<std::int64_t, nlohmann::json> starts;
+    std::unordered_map<std::string, nlohmann::json> starts;
     std::vector<nlohmann::json> dones;
     std::vector<nlohmann::json> throughputs;
     std::int64_t tmin = 0;
@@ -91,7 +91,8 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
         if (tmin == 0 || ts < tmin) { tmin = ts; }
         if (ts > tmax) { tmax = ts; }
         if (event == "request_start" && j.contains("request")) {
-            starts[json_i64(j.at("request"), "request_id")] = j;
+            const auto rid = json_i64(j.at("request"), "request_id");
+            starts[j.value("server_instance_id", "") + ":" + std::to_string(rid)] = j;
         } else if (event == "request_done") {
             dones.push_back(std::move(j));
         } else if (event == "throughput") {
@@ -167,7 +168,9 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
         b.decode_sum += decode;
         b.total_sum += total;
 
-        auto it = starts.find(id);
+        const std::string join =
+            done.value("server_instance_id", "") + ":" + std::to_string(id);
+        auto it = starts.find(join);
         if (it == starts.end()) {
             ++b.unpaired;
             continue;

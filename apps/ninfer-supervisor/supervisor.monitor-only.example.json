@@ -4,7 +4,7 @@
     "engine_host": "127.0.0.1",
     "engine_port": 8010,
     "api_key_file": "P:/models/ninfer-api-key.txt",
-    "request_log": "",
+    "request_log": "P:/NInfer/supervisor-logs/prod.jsonl",
     "device": 0
   },
   "supervisor": {

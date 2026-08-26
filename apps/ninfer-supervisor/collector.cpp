@@ -134,7 +134,9 @@ void Collector::poll_request_log(Collected& out) {
     for (std::size_t i = start; i < lines.size(); ++i) {
         try {
             const auto j = nlohmann::json::parse(lines[i]);
-            if (j.value("type", "") != "request_done") { continue; }
+            // The engine writes {"event":"request_done"}, not "type". Reading the wrong
+            // key made every record fall through and the panel read a permanent 0.
+            if (j.value("event", "") != "request_done") { continue; }
             ++out.requests.done;
             if (j.contains("timings_seconds") && j.at("timings_seconds").contains("ttft")) {
                 ttft_sum += j.at("timings_seconds").at("ttft").get<double>() * 1000.0;

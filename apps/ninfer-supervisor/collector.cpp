@@ -8,8 +8,10 @@
 #define CPPHTTPLIB_NO_EXCEPTIONS
 #include <httplib.h>
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <thread>
 #include <vector>
 
 namespace ninfer::supervisor {
@@ -99,8 +101,8 @@ void Collector::poll_request_log(Collected& out) {
     std::string last_start;
     std::string line;
     while (std::getline(in, line)) {
-        if (line.find("\"request_done\"") != std::string::npos) { lines.push_back(line); }
-        if (line.find("\"server_start\"") != std::string::npos) { last_start = std::move(line); }
+        if (jsonl_event_is(line, "request_done")) { lines.push_back(line); }
+        if (jsonl_event_is(line, "server_start")) { last_start = std::move(line); }
     }
     if (!last_start.empty()) {
         try {
@@ -138,6 +140,30 @@ void Collector::poll_request_log(Collected& out) {
             // key made every record fall through and the panel read a permanent 0.
             if (j.value("event", "") != "request_done") { continue; }
             ++out.requests.done;
+            if (j.contains("speculative") && j.at("speculative").is_object()) {
+                const auto& sp = j.at("speculative");
+                out.requests.mtp_backend      = sp.value("backend", out.requests.mtp_backend);
+                out.requests.mtp_draft_window = sp.value("draft_window", out.requests.mtp_draft_window);
+                const auto drafted  = sp.value("drafted_tokens", 0);
+                const auto accepted = sp.value("accepted_tokens", 0);
+                out.requests.mtp_drafted += drafted;
+                out.requests.mtp_accepted += accepted;
+                out.requests.mtp_fallback_steps += sp.value("fallback_steps", 0);
+                out.requests.mtp_rounds += sp.value("rounds", 0);
+                if (drafted > 0) {
+                    out.requests.mtp_last_accept_rate =
+                        static_cast<double>(accepted) / static_cast<double>(drafted);
+                }
+                if (sp.contains("accepted_per_position") && sp.at("accepted_per_position").is_array()) {
+                    const auto& pos = sp.at("accepted_per_position");
+                    if (out.requests.mtp_accepted_per_position.size() < pos.size()) {
+                        out.requests.mtp_accepted_per_position.resize(pos.size(), 0);
+                    }
+                    for (std::size_t p = 0; p < pos.size(); ++p) {
+                        out.requests.mtp_accepted_per_position[p] += pos.at(p).get<std::uint64_t>();
+                    }
+                }
+            }
             if (j.contains("timings_seconds") && j.at("timings_seconds").contains("ttft")) {
                 ttft_sum += j.at("timings_seconds").at("ttft").get<double>() * 1000.0;
                 ++n_ttft;
@@ -168,13 +194,152 @@ void Collector::poll_request_log(Collected& out) {
     if (n_dec != 0) { out.requests.decode_tok_s_mean = decode_sum / n_dec; }
 }
 
+std::int64_t Collector::now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+void Collector::start_series() {
+    bool expected = false;
+    if (!series_run_.compare_exchange_strong(expected, true)) { return; }
+    series_thread_ = std::thread([this] { series_loop(); });
+}
+
+void Collector::stop_series() {
+    series_run_ = false;
+    if (series_thread_.joinable()) { series_thread_.join(); }
+}
+
+void Collector::series_loop() {
+    // DXGI is an in-process API call, cheap enough to sample at the full rate --
+    // and the budget oscillation IS the finding, so it must not be decimated.
+    // nvidia-smi is a PROCESS SPAWN measured at ~51 ms on this box; polling it
+    // every tick cost ~10 spawns/s and ~48% of one core, continuously. That does
+    // not just waste CPU, it perturbs the machine this series exists to observe --
+    // the game-test workload it is meant to measure would be competing with it.
+    // Device totals move slowly, so sample them at 1 Hz and carry the last
+    // reading forward into the fast series.
+    constexpr int kNvidiaEvery = 10;
+    int nvidia_tick            = 0;
+    NvidiaSmiMemory nvidia_last;
+    while (series_run_.load()) {
+        const auto t0 = std::chrono::steady_clock::now();
+        VramSample sample;
+        sample.t_ms = now_ms();
+        DxgiSnapshot dxgi = query_dxgi_local(spec_.device);
+        if (nvidia_tick == 0) {
+            Collected nv;
+            poll_nvidia_smi(nv);
+            nvidia_last = nv.nvidia;
+        }
+        nvidia_tick = (nvidia_tick + 1) % kNvidiaEvery;
+        sample.budget_bytes      = dxgi.budget_bytes;
+        sample.nvidia_used_bytes = mib_to_bytes(nvidia_last.used_mib);
+        {
+            std::lock_guard lock(mu_);
+            last_dxgi_   = dxgi;
+            last_nvidia_ = nvidia_last;
+            series_.push(sample);
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        const auto period  = std::chrono::milliseconds(100);
+        if (elapsed < period) { std::this_thread::sleep_for(period - elapsed); }
+    }
+}
+
+void Collector::record_transitions(const Collected& snap) {
+    const auto t = now_ms();
+    std::lock_guard lock(mu_);
+    if (last_health_status_ != -1 && last_health_status_ != snap.health_status) {
+        if (snap.health_status == 200) {
+            series_.push_event({t, "engine_up", "health 200"});
+        } else if (last_health_status_ == 200) {
+            series_.push_event(
+                {t, "engine_down", "health " + std::to_string(snap.health_status)});
+        }
+    }
+    last_health_status_ = snap.health_status;
+    if (snap.admin_vram.is_object()) {
+        const std::string trans  = snap.admin_vram.value("last_transition", "");
+        const std::string reason = snap.admin_vram.value("last_reason", "");
+        std::string released;
+        if (snap.admin_vram.contains("tiers") && snap.admin_vram.at("tiers").is_array()) {
+            for (const auto& tier : snap.admin_vram.at("tiers")) {
+                if (tier.value("released", false)) {
+                    if (!released.empty()) { released += ","; }
+                    released += tier.value("name", "?");
+                }
+            }
+        }
+        if (!last_admin_transition_.empty() || !last_admin_reason_.empty() ||
+            !last_admin_released_.empty()) {
+            if (trans != last_admin_transition_ || reason != last_admin_reason_ ||
+                released != last_admin_released_) {
+                std::string label = trans.empty() ? "admin/vram" : trans;
+                if (!reason.empty()) { label += " " + reason; }
+                if (!released.empty()) { label += " released=" + released; }
+                series_.push_event({t, "admin_vram", label});
+            }
+        }
+        last_admin_transition_ = trans;
+        last_admin_reason_     = reason;
+        last_admin_released_   = released;
+    }
+}
+
+void Collector::note_engine_state(const std::string& state, const std::string& last_event) {
+    std::lock_guard lock(mu_);
+    if (!last_engine_state_.empty() && state != last_engine_state_) {
+        const auto t = now_ms();
+        if (state == "Running" || state == "Starting") {
+            series_.push_event({t, "engine_start", last_event.empty() ? state : last_event});
+        } else if (state == "Stopped" || state == "Stopping" || state == "Halted") {
+            series_.push_event({t, "engine_stop", last_event.empty() ? state : last_event});
+        }
+    }
+    last_engine_state_ = state;
+}
+
+nlohmann::json Collector::series_json() {
+    std::lock_guard lock(mu_);
+    const auto samples = series_.samples();
+    nlohmann::json t_ms            = nlohmann::json::array();
+    nlohmann::json budget          = nlohmann::json::array();
+    nlohmann::json nvidia_used     = nlohmann::json::array();
+    for (const auto& s : samples) {
+        t_ms.push_back(s.t_ms);
+        budget.push_back(s.budget_bytes);
+        nvidia_used.push_back(s.nvidia_used_bytes);
+    }
+    nlohmann::json events = nlohmann::json::array();
+    for (const auto& e : series_.events()) {
+        events.push_back({{"t_ms", e.t_ms}, {"kind", e.kind}, {"label", e.label}});
+    }
+    return {{"hz", 10},
+            {"raw", true},
+            {"t_ms", std::move(t_ms)},
+            {"budget_bytes", std::move(budget)},
+            {"nvidia_used_bytes", std::move(nvidia_used)},
+            {"events", std::move(events)}};
+}
+
 Collected Collector::snapshot() {
     Collected out;
-    out.dxgi = query_dxgi_local(spec_.device);
-    poll_nvidia_smi(out);
     poll_health(out);
     poll_admin(out);
     poll_request_log(out);
+    {
+        std::lock_guard lock(mu_);
+        if (series_run_.load() && last_dxgi_.ok) {
+            out.dxgi   = last_dxgi_;
+            out.nvidia = last_nvidia_;
+        }
+    }
+    if (!out.dxgi.ok && out.dxgi.error.empty()) {
+        out.dxgi = query_dxgi_local(spec_.device);
+        poll_nvidia_smi(out);
+    }
+    record_transitions(out);
     return out;
 }
 

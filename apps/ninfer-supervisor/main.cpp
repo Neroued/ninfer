@@ -119,6 +119,7 @@ int main(int argc, char** argv) {
 
         ninfer::supervisor::EngineChild child(cfg);
         ninfer::supervisor::Collector collector(cfg.engine);
+        collector.start_series();
         ninfer::supervisor::DashboardServer server(cfg, child, collector);
         std::thread engine_thread([&] { child.run_loop(); });
         std::thread http_thread([&] { server.run(); });
@@ -129,6 +130,7 @@ int main(int argc, char** argv) {
         ninfer::supervisor::TrayIcon tray(child, url, ninfer::supervisor::manages_engine_process(cfg));
         tray.run();
         server.stop();
+        collector.stop_series();
         child.request_quit();
         child.stop();
         if (http_thread.joinable()) { http_thread.join(); }

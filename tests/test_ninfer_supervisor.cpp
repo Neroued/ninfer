@@ -178,6 +178,37 @@ int test_monitor_only_config() {
     return f;
 }
 
+int test_jsonl_event_key() {
+    using namespace ninfer::supervisor;
+    int f = 0;
+    f += check(jsonl_event_is(R"({"event":"request_done","result":{}})", "request_done"),
+               "compact event key");
+    f += check(jsonl_event_is(R"({"event": "request_done"})", "request_done"), "spaced event key");
+    f += check(!jsonl_event_is(R"({"type":"request_done"})", "request_done"),
+               "type key is not the event key");
+    f += check(!jsonl_event_is(R"({"event":"server_start"})", "request_done"), "other event");
+    return f;
+}
+
+int test_series_ring() {
+    ninfer::supervisor::VramSeriesRing r(3);
+    int f = 0;
+    r.push({1, 10, 4});
+    r.push({2, 20, 5});
+    r.push({3, 30, 6});
+    r.push({4, 40, 7});
+    const auto s = r.samples();
+    f += check(s.size() == 3 && s[0].t_ms == 2 && s[2].t_ms == 4 && s[2].budget_bytes == 40,
+               "ring drops oldest, keeps raw values");
+    r.push_event({4, "admin_vram", "release"}, 2);
+    r.push_event({5, "engine_down", "health 0"}, 2);
+    r.push_event({6, "engine_up", "health 200"}, 2);
+    const auto e = r.events();
+    f += check(e.size() == 2 && e[0].kind == "engine_down" && e[1].kind == "engine_up",
+               "event ring cap");
+    return f;
+}
+
 int test_health_threshold() {
     ninfer::supervisor::RestartPolicy p;
     p.health_fail_threshold = 3;
@@ -202,6 +233,8 @@ int main() {
     failures += test_nvidia_csv();
     failures += test_kv_line();
     failures += test_monitor_only_config();
+    failures += test_jsonl_event_key();
+    failures += test_series_ring();
     failures += test_health_threshold();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

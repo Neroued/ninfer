@@ -175,8 +175,10 @@ target_include_directories(ninfer_http_error_handler_test PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 ninfer_add_test(ninfer_executor_recovery_test
   SOURCES test_executor_recovery.cpp
+  NEEDS_SOURCE_DIR
   LIBRARIES ninfer_serve ninfer_engine)
 target_include_directories(ninfer_executor_recovery_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp

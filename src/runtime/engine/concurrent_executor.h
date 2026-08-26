@@ -16,8 +16,10 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
 #include <exception>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -26,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -52,7 +55,8 @@ public:
           prefix_cache_max_bytes_(options.prefix_cache_max_bytes == 0 ? options.prefix_cache_bytes
                                                                       : options.prefix_cache_max_bytes),
           vram_floor_bytes_(options.vram_floor_bytes),
-          vram_observe_only_(options.vram_observe_only) {
+          vram_observe_only_(options.vram_observe_only),
+          on_fatal_error_(options.on_fatal_error) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
@@ -1191,6 +1195,8 @@ private:
         publish_runtime_stats();
     }
 
+    // Fail all active and pending requests. When followed by std::_Exit(1), notification
+    // of in-flight futures is best-effort before the process terminates.
     void fail_all(std::exception_ptr error) noexcept {
         std::vector<std::shared_ptr<Request>> pending;
         {
@@ -1272,10 +1278,41 @@ private:
                     continue;
                 }
             } catch (...) {
-                fail_all(std::current_exception());
+                const std::exception_ptr error = std::current_exception();
+                fail_all(error);
+                handle_fatal_error(error);
                 return;
             }
         }
+    }
+
+    void handle_fatal_error(std::exception_ptr error) noexcept {
+        std::string detail = "unknown fatal failure";
+        if (error != nullptr) {
+            try {
+                std::rethrow_exception(error);
+            } catch (const std::exception& e) {
+                detail = std::string(typeid(e).name()) + ": " + e.what();
+            } catch (...) {
+                detail = "non-std exception";
+            }
+        }
+        const std::string message =
+            "fatal executor failure (" + detail + "); terminating process";
+        if (on_fatal_error_) {
+            try {
+                on_fatal_error_(error, message);
+            } catch (...) {}
+            // When a custom callback is provided (e.g. GenerationService in production, or a
+            // test probe), the callback owns what action to take (logging and exiting hard
+            // in serve, or recording without exit in tests).
+            return;
+        }
+        // Default fallback when no callback is registered: log to stderr and exit hard.
+        std::cerr << message << '\n';
+        std::cerr.flush();
+        std::cout.flush();
+        std::_Exit(1);
     }
 
     Instance& instance_;
@@ -1287,6 +1324,7 @@ private:
     const std::size_t prefix_cache_max_bytes_;
     const std::size_t vram_floor_bytes_;
     const bool vram_observe_only_;
+    std::function<void(std::exception_ptr, const std::string&)> on_fatal_error_;
     std::string last_transition_;
     std::string last_reason_;
 

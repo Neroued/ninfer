@@ -147,6 +147,15 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
     int tools_declared        = 0;
     std::vector<std::int64_t> output_limit_ids;
     std::vector<int> output_limit_caps;
+    int reuse_reset_single = 0;
+    int reuse_reset_multi  = 0;
+    int reuse_restore      = 0;
+    int reuse_seed         = 0;
+    int reuse_append       = 0;
+    int reuse_other        = 0;
+    std::uint64_t multi_prompt_tokens = 0;
+    std::uint64_t multi_hit_tokens    = 0;
+    std::vector<nlohmann::json> reset_multi_samples;
 
     for (const auto& done : dones) {
         const auto& req = done.contains("request") ? done.at("request") : nlohmann::json::object();
@@ -162,6 +171,36 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
             output_limit_ids.push_back(id);
             output_limit_caps.push_back(cap);
             if (cap > 0 && completion >= cap) { ++output_limit_hit_cap; }
+        }
+        const int messages        = static_cast<int>(json_i64(req, "message_count"));
+        const std::string reuse   = result.value("prefix_reuse_path", "");
+        const auto prompt_tokens  = static_cast<std::uint64_t>(json_i64(result, "prompt_tokens"));
+        const auto hit_tokens     = static_cast<std::uint64_t>(json_i64(result, "prefix_cache_hit_tokens"));
+        const bool multiturn      = messages >= 2;
+        if (multiturn) {
+            multi_prompt_tokens += prompt_tokens;
+            multi_hit_tokens += hit_tokens;
+        }
+        if (reuse == "full_reset") {
+            if (multiturn) {
+                ++reuse_reset_multi;
+                if (reset_multi_samples.size() < 8) {
+                    reset_multi_samples.push_back({{"request_id", id},
+                                                   {"message_count", messages},
+                                                   {"prompt_tokens", prompt_tokens},
+                                                   {"prefix_cache_hit_tokens", hit_tokens}});
+                }
+            } else {
+                ++reuse_reset_single;
+            }
+        } else if (reuse.find("restore") != std::string::npos) {
+            ++reuse_restore;
+        } else if (reuse.find("seed") != std::string::npos) {
+            ++reuse_seed;
+        } else if (reuse.find("append") != std::string::npos) {
+            ++reuse_append;
+        } else if (!reuse.empty()) {
+            ++reuse_other;
         }
 
         const auto& timings =
@@ -313,6 +352,47 @@ inline nlohmann::json analyze_request_log_jsonl(std::string_view jsonl, std::str
          {"mean_decode_s", mean_decode},
          {"dominant", ttft_cause}},
         ttft_rec, "measured", over));
+
+    const double multi_hit_ratio =
+        multi_prompt_tokens == 0
+            ? 0.0
+            : static_cast<double>(multi_hit_tokens) / static_cast<double>(multi_prompt_tokens);
+    std::ostringstream reuse_stmt;
+    reuse_stmt << "Reuse mix over " << dones.size() << " request_done: full_reset single-turn "
+               << reuse_reset_single << " (expected), full_reset multi-turn " << reuse_reset_multi
+               << ", restore " << reuse_restore << ", seed " << reuse_seed << ", append "
+               << reuse_append << ", other " << reuse_other << ". Multi-turn prefix-hit ratio "
+               << (multi_hit_ratio * 100.0) << "% (" << multi_hit_tokens << "/"
+               << multi_prompt_tokens << " tokens).";
+    insights.push_back(insight_available(
+        "prefix.reuse_mix", reuse_reset_multi > 0 ? "notice" : "info", "Prefix-cache reuse mix",
+        reuse_stmt.str(),
+        {{"full_reset_single_turn", reuse_reset_single},
+         {"full_reset_multi_turn", reuse_reset_multi},
+         {"restore", reuse_restore},
+         {"seed", reuse_seed},
+         {"append", reuse_append},
+         {"other", reuse_other},
+         {"multi_turn_prompt_tokens", multi_prompt_tokens},
+         {"multi_turn_hit_tokens", multi_hit_tokens},
+         {"multi_turn_hit_ratio", multi_hit_ratio}},
+        "", "measured", over));
+    if (reuse_reset_multi > 0) {
+        std::ostringstream miss;
+        miss << reuse_reset_multi << " of " << dones.size()
+             << " request_done were multi-turn (message_count>=2) on full_reset with "
+             << "prefix_cache_hit_tokens often 0. A single-message full_reset is expected; "
+             << "a multi-turn full_reset is a miss that should have been restore or seed.";
+        insights.push_back(insight_available(
+            "prefix.multiturn_full_reset", "warning", "Multi-turn conversations resetting the prefix",
+            miss.str(),
+            {{"full_reset_multi_turn", reuse_reset_multi},
+             {"full_reset_single_turn", reuse_reset_single},
+             {"samples", reset_multi_samples}},
+            "Check seed store / turn checkpoints. restore_turn_checkpoint or seed_prefix "
+            "should fire when message_count>=2.",
+            "measured", over));
+    }
 
     // Content/reasoning_content are not in schema_version 10 request logs.
     insights.push_back(insight_unavailable(

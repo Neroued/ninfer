@@ -243,6 +243,40 @@ int test_insights_honesty() {
     return f;
 }
 
+int test_insights_prefix() {
+    using namespace ninfer::supervisor;
+    const char* jsonl =
+        R"({"event":"request_start","server_instance_id":"a","timestamp_unix_ms":1,"request":{"request_id":1,"message_count":1}})"
+        "\n"
+        R"({"event":"request_done","server_instance_id":"a","timestamp_unix_ms":2,"request":{"request_id":1,"message_count":1},"result":{"prefix_reuse_path":"full_reset","prompt_tokens":100,"prefix_cache_hit_tokens":0},"timings_seconds":{"total":0.05,"prepare":0.01,"prefill":0.02,"decode":0.02,"ttft":0.03,"vision":0}})"
+        "\n"
+        R"({"event":"request_start","server_instance_id":"a","timestamp_unix_ms":3,"request":{"request_id":2,"message_count":5}})"
+        "\n"
+        R"({"event":"request_done","server_instance_id":"a","timestamp_unix_ms":4,"request":{"request_id":2,"message_count":5},"result":{"prefix_reuse_path":"full_reset","prompt_tokens":7749,"prefix_cache_hit_tokens":0},"timings_seconds":{"total":0.05,"prepare":0.01,"prefill":0.02,"decode":0.02,"ttft":0.03,"vision":0}})"
+        "\n";
+    const auto r = analyze_request_log_jsonl(jsonl, "mem");
+    int f = 0;
+    bool mix = false, miss = false;
+    for (const auto& it : r.at("insights")) {
+        const auto id = it.at("id").get<std::string>();
+        if (id == "prefix.reuse_mix") {
+            mix = true;
+            f += check(it.at("evidence").at("full_reset_single_turn") == 1, "single-turn reset");
+            f += check(it.at("evidence").at("full_reset_multi_turn") == 1, "multi-turn reset");
+            f += check(it.at("availability") == "available", "mix is measured");
+        }
+        if (id == "prefix.multiturn_full_reset") {
+            miss = true;
+            f += check(it.at("severity") == "warning", "multi-turn reset is a warning");
+            f += check(it.at("evidence").at("samples").at(0).at("prompt_tokens") == 7749,
+                       "live-shaped sample");
+            f += check(it.at("measured_over").at("requests") == 2, "examined both dones");
+        }
+    }
+    f += check(mix && miss, "prefix insights present");
+    return f;
+}
+
 int test_jsonl_event_key() {
     using namespace ninfer::supervisor;
     int f = 0;
@@ -299,6 +333,7 @@ int main() {
     failures += test_kv_line();
     failures += test_monitor_only_config();
     failures += test_insights_honesty();
+    failures += test_insights_prefix();
     failures += test_jsonl_event_key();
     failures += test_series_ring();
     failures += test_health_threshold();

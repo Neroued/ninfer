@@ -187,6 +187,19 @@ docker run --rm \
   --max-new 256
 ```
 
+## Iterative Podman builds
+
+For iterative source builds with [Podman Compose](https://docs.podman.io/en/latest/markdown/podman-compose.1.html),
+run:
+
+```bash
+podman compose run --rm build
+```
+
+The build service keeps the CMake/Ninja build tree and [ccache](https://ccache.dev/manual/latest.html)
+in named local volumes. It prints cumulative ccache statistics after each build; an unchanged tree
+reports `ninja: no work to do` and adds no compiler-cache calls.
+
 ## Download a model
 
 Use the Hugging Face CLI to download one of the registered artifacts:

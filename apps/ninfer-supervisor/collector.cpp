@@ -1,4 +1,5 @@
 #include "collector.hpp"
+#include "insights.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -259,31 +260,39 @@ void Collector::record_transitions(const Collected& snap) {
         }
     }
     last_health_status_ = snap.health_status;
+    last_admin_vram_    = snap.admin_vram;
+    last_admin_note_    = snap.admin_vram_note;
     if (snap.admin_vram.is_object()) {
         const std::string trans  = snap.admin_vram.value("last_transition", "");
         const std::string reason = snap.admin_vram.value("last_reason", "");
-        std::string released;
-        if (snap.admin_vram.contains("tiers") && snap.admin_vram.at("tiers").is_array()) {
-            for (const auto& tier : snap.admin_vram.at("tiers")) {
-                if (tier.value("released", false)) {
-                    if (!released.empty()) { released += ","; }
-                    released += tier.value("name", "?");
+        std::string kind;
+        if (admin_cursor_.observe(trans, reason, kind)) {
+            std::string released;
+            if (snap.admin_vram.contains("tiers") && snap.admin_vram.at("tiers").is_array()) {
+                for (const auto& tier : snap.admin_vram.at("tiers")) {
+                    if (tier.value("released", false)) {
+                        if (!released.empty()) { released += ","; }
+                        released += tier.value("name", "?");
+                    }
                 }
             }
+            std::string label = std::string(trans);
+            if (!reason.empty()) {
+                if (!label.empty()) { label += " "; }
+                label += reason;
+            }
+            if (!released.empty()) { label += " released=" + released; }
+            series_.push_event({t, kind, label});
+            if (kind == "vram_release") { last_release_ms_ = t; }
+            if (kind == "vram_reclaim") { last_release_ms_ = 0; }
         }
-        if (!last_admin_transition_.empty() || !last_admin_reason_.empty() ||
-            !last_admin_released_.empty()) {
-            if (trans != last_admin_transition_ || reason != last_admin_reason_ ||
-                released != last_admin_released_) {
-                std::string label = trans.empty() ? "admin/vram" : trans;
-                if (!reason.empty()) { label += " " + reason; }
-                if (!released.empty()) { label += " released=" + released; }
-                series_.push_event({t, "admin_vram", label});
+        bool any_released = false;
+        if (snap.admin_vram.contains("tiers") && snap.admin_vram.at("tiers").is_array()) {
+            for (const auto& tier : snap.admin_vram.at("tiers")) {
+                if (tier.value("released", false)) { any_released = true; }
             }
         }
-        last_admin_transition_ = trans;
-        last_admin_reason_     = reason;
-        last_admin_released_   = released;
+        if (!any_released && trans == "reclaim") { last_release_ms_ = 0; }
     }
 }
 
@@ -321,6 +330,51 @@ nlohmann::json Collector::series_json() {
             {"budget_bytes", std::move(budget)},
             {"nvidia_used_bytes", std::move(nvidia_used)},
             {"events", std::move(events)}};
+}
+
+nlohmann::json Collector::vram_control_json() {
+    std::lock_guard lock(mu_);
+    nlohmann::json tiers = nlohmann::json::array();
+    bool any_released    = false;
+    if (last_admin_vram_.is_object() && last_admin_vram_.contains("tiers") &&
+        last_admin_vram_.at("tiers").is_array()) {
+        for (const auto& tier : last_admin_vram_.at("tiers")) {
+            const bool released = tier.value("released", false);
+            if (released) { any_released = true; }
+            tiers.push_back({{"name", tier.value("name", "")},
+                             {"released", released},
+                             {"held_bytes", tier.value("held_bytes", 0)},
+                             {"min_bytes", tier.value("min_bytes", 0)},
+                             {"max_bytes", tier.value("max_bytes", 0)},
+                             {"reclaimable_bytes", tier.value("reclaimable_bytes", 0)}});
+        }
+    }
+    const auto now = now_ms();
+    nlohmann::json out = {
+        {"last_transition", admin_cursor_.last_transition},
+        {"last_reason", admin_cursor_.last_reason},
+        {"any_released", any_released},
+        {"since_release_s",
+         (any_released && last_release_ms_ > 0)
+             ? nlohmann::json((now - last_release_ms_) / 1000)
+             : nlohmann::json(nullptr)},
+        {"tiers", std::move(tiers)},
+        {"note", last_admin_note_},
+    };
+    return out;
+}
+
+nlohmann::json Collector::insights_report() {
+    auto report = insights_from_request_log_path(spec_.request_log);
+    nlohmann::json admin;
+    std::string note;
+    {
+        std::lock_guard lock(mu_);
+        admin = last_admin_vram_;
+        note  = last_admin_note_;
+    }
+    append_admin_vram_insights(report, admin, note);
+    return report;
 }
 
 Collected Collector::snapshot() {

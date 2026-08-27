@@ -172,6 +172,10 @@ std::string_view remove_parameter_framing_newlines(std::string_view text) {
 // only doubles backslashes that aren't already part of a legal escape --
 // genuinely broken JSON (mismatched brackets, truncated values, ...) still
 // fails to parse after repair and falls through to outright rejection.
+bool is_hex_digit(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
 std::string repair_invalid_json_escapes(std::string_view text) {
     std::string out;
     out.reserve(text.size());
@@ -179,17 +183,27 @@ std::string repair_invalid_json_escapes(std::string_view text) {
     for (std::size_t i = 0; i < text.size(); ++i) {
         const char c = text[i];
         if (in_string && c == '\\') {
-            constexpr std::string_view kLegalEscapes = "\"\\/bfnrtu";
             const bool has_next = i + 1 < text.size();
-            if (has_next && kLegalEscapes.find(text[i + 1]) != std::string_view::npos) {
+            const char next     = has_next ? text[i + 1] : '\0';
+            constexpr std::string_view kSingleByteEscapes = "\"\\/bfnrt";
+            if (has_next && kSingleByteEscapes.find(next) != std::string_view::npos) {
                 out.push_back(c);
-                out.push_back(text[i + 1]);
+                out.push_back(next);
                 ++i;
+            } else if (has_next && next == 'u' && i + 5 < text.size() &&
+                      is_hex_digit(text[i + 2]) && is_hex_digit(text[i + 3]) &&
+                      is_hex_digit(text[i + 4]) && is_hex_digit(text[i + 5])) {
+                // Legal \uXXXX (exactly four hex digits) -- copy all six
+                // bytes through untouched.
+                out.append(text.substr(i, 6));
+                i += 5;
             } else {
-                // Illegal (or trailing) escape -- double the backslash so it
-                // round-trips as a literal backslash; the following byte (if
-                // any) is left for the next loop iteration to copy through
-                // as an ordinary character.
+                // Illegal (or trailing, or incomplete "\u") escape -- double
+                // the backslash so it round-trips as a literal backslash; the
+                // following byte(s) are left for normal per-character copying
+                // (e.g. a Windows path like "C:\users\greg" has a bare "\u"
+                // with no 4-hex-digit tail -- a lone 'u' is just an ordinary
+                // string character once the backslash is repaired).
                 out.push_back('\\');
                 out.push_back('\\');
             }

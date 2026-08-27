@@ -266,12 +266,17 @@ int test_typed_parameter_repairs_invalid_backslash_escape() {
     // legal in the shell command itself but not a legal JSON escape on their
     // own (JSON only allows \" \\ \/ \b \f \n \r \t \uXXXX). The second array
     // element carries genuinely legal escapes (\n, \") that must survive
-    // untouched by the repair pass.
+    // untouched by the repair pass. The third is a Windows-style path with a
+    // bare "\u" that isn't followed by four hex digits -- a naive "\u is
+    // always legal" check would leave it unrepaired and the whole call would
+    // still fail to parse. The fourth carries a genuine \uXXXX escape that
+    // must also survive untouched (only an *incomplete* \u is illegal).
     const auto parsed = ninfer::serve::parse_qwen_tool_call_output(
         "<tool_call>\n"
         "<function=run_commands>\n"
         "<parameter=commands>\n"
-        "[\"grep -n '^\\*\\|^* '\", \"good\\nline\\\"quoted\\\"end\"]\n"
+        "[\"grep -n '^\\*\\|^* '\", \"good\\nline\\\"quoted\\\"end\", "
+        "\"C:\\users\\greg\", \"snowman \\u2603\"]\n"
         "</parameter>\n"
         "</function>\n"
         "</tool_call>",
@@ -282,12 +287,17 @@ int test_typed_parameter_repairs_invalid_backslash_escape() {
                       "typed array with an un-doubled backslash was not recovered");
     const Json args = Json::parse(parsed.tool_calls.at(0).arguments_json);
     const Json& commands = args.at("commands");
-    failures += check(commands.is_array() && commands.size() == 2,
-                      "repaired parameter did not decode as a two-element array");
+    failures += check(commands.is_array() && commands.size() == 4,
+                      "repaired parameter did not decode as a four-element array");
     failures += check(commands.at(0) == "grep -n '^\\*\\|^* '",
                       "illegal backslash escape was not repaired to a literal backslash");
     failures += check(commands.at(1) == "good\nline\"quoted\"end",
                       "legal escapes were altered by the repair pass");
+    failures += check(commands.at(2) == "C:\\users\\greg",
+                      "a bare \\u not followed by four hex digits was not repaired "
+                      "(Windows-style path)");
+    failures += check(commands.at(3) == "snowman \u2603",
+                      "a genuine \\uXXXX escape was altered by the repair pass");
 
     // Genuinely broken JSON (not just an escaping quirk) must still be
     // rejected -- repair is a narrow fallback, not a lenient JSON parser.

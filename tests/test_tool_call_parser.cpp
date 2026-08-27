@@ -258,6 +258,53 @@ int test_declared_type_mismatches_are_forwarded_without_coercion() {
     return failures;
 }
 
+int test_typed_parameter_repairs_invalid_backslash_escape() {
+    const auto contracts =
+        contracts_for("run_commands", Json{{"commands", Json{{"type", "array"}}}});
+
+    // "\*" and "\|" are common shell/regex metacharacter escapes that are
+    // legal in the shell command itself but not a legal JSON escape on their
+    // own (JSON only allows \" \\ \/ \b \f \n \r \t \uXXXX). The second array
+    // element carries genuinely legal escapes (\n, \") that must survive
+    // untouched by the repair pass.
+    const auto parsed = ninfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n"
+        "<function=run_commands>\n"
+        "<parameter=commands>\n"
+        "[\"grep -n '^\\*\\|^* '\", \"good\\nline\\\"quoted\\\"end\"]\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>",
+        64, contracts);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                      "typed array with an un-doubled backslash was not recovered");
+    const Json args = Json::parse(parsed.tool_calls.at(0).arguments_json);
+    const Json& commands = args.at("commands");
+    failures += check(commands.is_array() && commands.size() == 2,
+                      "repaired parameter did not decode as a two-element array");
+    failures += check(commands.at(0) == "grep -n '^\\*\\|^* '",
+                      "illegal backslash escape was not repaired to a literal backslash");
+    failures += check(commands.at(1) == "good\nline\"quoted\"end",
+                      "legal escapes were altered by the repair pass");
+
+    // Genuinely broken JSON (not just an escaping quirk) must still be
+    // rejected -- repair is a narrow fallback, not a lenient JSON parser.
+    const auto still_rejected = ninfer::serve::parse_qwen_tool_call_output(
+        "<tool_call>\n"
+        "<function=run_commands>\n"
+        "<parameter=commands>\n"
+        "[\"unterminated\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>",
+        64, contracts);
+    failures += check(!still_rejected.is_tool_call_response,
+                      "structurally truncated JSON was incorrectly recovered by the repair pass");
+    return failures;
+}
+
 int test_unknown_schema_keeps_legacy_inference() {
     const auto contracts = contracts_for(
         "legacy", Json{{"missing_type", Json::object()}, {"invalid_type", Json{{"type", "int"}}}});
@@ -335,6 +382,7 @@ int main() {
     failures += test_declared_strings_are_not_json_sniffed();
     failures += test_declared_non_string_values_are_json_decoded();
     failures += test_declared_type_mismatches_are_forwarded_without_coercion();
+    failures += test_typed_parameter_repairs_invalid_backslash_escape();
     failures += test_unknown_schema_keeps_legacy_inference();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();

@@ -162,6 +162,45 @@ std::string_view remove_parameter_framing_newlines(std::string_view text) {
     return text.substr(begin, end - begin);
 }
 
+// Best-effort repair for a common Qwen tool-call quirk: a strictly-typed
+// (array/object/number/...) parameter value that is otherwise well-formed
+// JSON except for a backslash the model didn't double for JSON string
+// escaping -- e.g. a shell/regex "\*" or "\|" embedded verbatim inside a
+// command string argument (legal in the shell command itself, not a legal
+// JSON escape on its own: JSON only allows \" \\ \/ \b \f \n \r \t \uXXXX).
+// Only ever called as a fallback after a strict decode already failed, and
+// only doubles backslashes that aren't already part of a legal escape --
+// genuinely broken JSON (mismatched brackets, truncated values, ...) still
+// fails to parse after repair and falls through to outright rejection.
+std::string repair_invalid_json_escapes(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    bool in_string = false;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (in_string && c == '\\') {
+            constexpr std::string_view kLegalEscapes = "\"\\/bfnrtu";
+            const bool has_next = i + 1 < text.size();
+            if (has_next && kLegalEscapes.find(text[i + 1]) != std::string_view::npos) {
+                out.push_back(c);
+                out.push_back(text[i + 1]);
+                ++i;
+            } else {
+                // Illegal (or trailing) escape -- double the backslash so it
+                // round-trips as a literal backslash; the following byte (if
+                // any) is left for the next loop iteration to copy through
+                // as an ordinary character.
+                out.push_back('\\');
+                out.push_back('\\');
+            }
+            continue;
+        }
+        out.push_back(c);
+        if (c == '"') { in_string = !in_string; }
+    }
+    return out;
+}
+
 bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
                      std::string_view tool_name, const ToolArgumentTypeContracts& contracts) {
     constexpr std::string_view kParamOpen  = "<parameter=";
@@ -189,7 +228,10 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
             args[key] = value;
         } else {
             Json parsed = Json::parse(value, nullptr, false);
-            if (parsed.is_discarded()) { return false; }
+            if (parsed.is_discarded()) {
+                parsed = Json::parse(repair_invalid_json_escapes(value), nullptr, false);
+                if (parsed.is_discarded()) { return false; }
+            }
             args[key] = std::move(parsed);
         }
     }

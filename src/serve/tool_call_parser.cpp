@@ -319,7 +319,7 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
     const std::size_t name_begin = pos + kFunctionOpen.size();
     const std::size_t name_end   = block.find('>', name_begin);
     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
-    const std::string name = std::string(block.substr(name_begin, name_end - name_begin));
+    const std::string name = trim_ascii(block.substr(name_begin, name_end - name_begin));
     if (!valid_function_name(name, max_name_length)) { return false; }
     pos = name_end + 1;
 
@@ -352,7 +352,8 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
 
 ParsedToolCallOutput fallback(const std::string& text) {
     ParsedToolCallOutput out;
-    out.content = text;
+    out.is_tool_call_response = false;
+    out.content               = text;
     return out;
 }
 
@@ -387,8 +388,12 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         skip_ws(text, pos);
         if (pos >= text.size()) { break; }
         if (!starts_with_at(text, pos, kToolOpen)) {
-            if (tolerant && !out.tool_calls.empty()) { break; }
-            return fallback(text);
+            const std::size_t next = text.find(kToolOpen, pos);
+            if (next == std::string::npos) {
+                if (!out.tool_calls.empty()) { break; }
+                return fallback(text);
+            }
+            pos = next;
         }
         const std::size_t inner_begin = pos + kToolOpen.size();
         ToolCall call;
@@ -396,8 +401,9 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         if (!parse_one_tool_call(std::string_view(text).substr(inner_begin), max_tool_name_length,
                                  param_types, call, consumed)) {
             // Once one complete call has been recovered, do not discard it just
-            // because Qwen started a malformed second call or added a suffix.
-            if (tolerant && !out.tool_calls.empty()) { break; }
+            // because Qwen started a malformed second call, had conversational text,
+            // or was cut off by token budget.
+            if (!out.tool_calls.empty()) { break; }
             return fallback(text);
         }
         pos = inner_begin + consumed;
@@ -405,6 +411,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         if (starts_with_at(text, pos, kToolClose)) {
             pos += kToolClose.size();
         } else if (!tolerant) {
+            if (!out.tool_calls.empty()) { break; }
             return fallback(text);
         } else {
             out.tool_calls.push_back(std::move(call));

@@ -148,18 +148,25 @@ int test_malformed_falls_back_to_text() {
     return failures;
 }
 
-int test_suffix_after_tool_falls_back_to_text() {
+int test_partial_recovery_trailing_suffix() {
     const std::string text = "   <tool_call>\n"
                              "<function=get_weather>\n"
                              "<parameter=city>\nParis\n</parameter>\n"
                              "</function>\n"
                              "</tool_call>\n"
                              "extra answer";
-    const ninfer::serve::ParsedToolCallOutput parsed =
-        ninfer::serve::parse_qwen_tool_call_output(text, 64, {});
     int failures = 0;
-    failures += check(!parsed.is_tool_call_response, "non-whitespace suffix falls back to text");
-    failures += check(parsed.content == text, "suffix fallback preserves text");
+    for (const bool tolerant : {false, true}) {
+        const ninfer::serve::ParsedToolCallOutput parsed =
+            ninfer::serve::parse_qwen_tool_call_output(text, 64, {}, tolerant);
+        failures += check(parsed.is_tool_call_response, "trailing suffix retains completed tool call");
+        failures += check(parsed.tool_calls.size() == 1, "one call recovered despite trailing suffix");
+        if (parsed.tool_calls.size() == 1) {
+            failures += check(parsed.tool_calls[0].name == "get_weather", "correct tool name");
+            const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+            failures += check(args.at("city") == "Paris", "correct parameter value");
+        }
+    }
     return failures;
 }
 
@@ -969,6 +976,136 @@ int test_stream_terminal_consistency() {
     return failures;
 }
 
+int test_partial_recovery_multiple_calls_with_trailing_prose() {
+    const std::string text = "<tool_call>\n"
+                             "<function=replace_string_in_file>\n"
+                             "<parameter=filePath>styles.css</parameter>\n"
+                             "<parameter=newString>--temper-sans: Inter</parameter>\n"
+                             "<parameter=oldString>--font: Arial</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "<tool_call>\n"
+                             "<function=replace_string_in_file>\n"
+                             "<parameter=filePath>index.html</parameter>\n"
+                             "<parameter=newString><link rel=\"preconnect\"></parameter>\n"
+                             "<parameter=oldString><link></parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "I have finished updating both files.";
+
+    int failures = 0;
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = ninfer::serve::parse_qwen_tool_call_output(text, 64, {}, tolerant);
+        failures += check(parsed.is_tool_call_response, "two calls with trailing prose parsed as tool response");
+        failures += check(parsed.tool_calls.size() == 2, "two calls recovered despite trailing prose");
+        if (parsed.tool_calls.size() == 2) {
+            failures += check(parsed.tool_calls[0].name == "replace_string_in_file", "first call name");
+            failures += check(parsed.tool_calls[1].name == "replace_string_in_file", "second call name");
+            const Json arg0 = Json::parse(parsed.tool_calls[0].arguments_json);
+            const Json arg1 = Json::parse(parsed.tool_calls[1].arguments_json);
+            failures += check(arg0.at("filePath") == "styles.css", "first call filePath");
+            failures += check(arg1.at("filePath") == "index.html", "second call filePath");
+        }
+    }
+    return failures;
+}
+
+int test_partial_recovery_text_between_calls() {
+    const std::string text = "<tool_call>\n"
+                             "<function=get_weather>\n"
+                             "<parameter=city>Tokyo</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "Next, checking the second city:\n"
+                             "<tool_call>\n"
+                             "<function=get_weather>\n"
+                             "<parameter=city>Kyoto</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>";
+
+    int failures = 0;
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = ninfer::serve::parse_qwen_tool_call_output(text, 64, {}, tolerant);
+        failures += check(parsed.is_tool_call_response, "calls separated by text parsed as tool response");
+        failures += check(parsed.tool_calls.size() == 2, "both calls recovered across intermediate text");
+        if (parsed.tool_calls.size() == 2) {
+            const Json arg0 = Json::parse(parsed.tool_calls[0].arguments_json);
+            const Json arg1 = Json::parse(parsed.tool_calls[1].arguments_json);
+            failures += check(arg0.at("city") == "Tokyo", "first city Tokyo");
+            failures += check(arg1.at("city") == "Kyoto", "second city Kyoto");
+        }
+    }
+    return failures;
+}
+
+int test_partial_recovery_truncated_tail() {
+    const std::string text = "<tool_call>\n"
+                             "<function=replace_string_in_file>\n"
+                             "<parameter=filePath>styles.css</parameter>\n"
+                             "<parameter=newString>--temper-sans: Inter</parameter>\n"
+                             "<parameter=oldString>--font: Arial</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "<tool_call>\n"
+                             "<function=replace_string_in_file>\n"
+                             "<parameter=filePath>index.html</parameter>\n"
+                             "<parameter=newString>";
+
+    int failures = 0;
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = ninfer::serve::parse_qwen_tool_call_output(text, 64, {}, tolerant);
+        failures += check(parsed.is_tool_call_response, "truncated tail retains complete prior call");
+        failures += check(parsed.tool_calls.size() == 1, "exactly one valid call recovered");
+        if (parsed.tool_calls.size() == 1) {
+            failures += check(parsed.tool_calls[0].name == "replace_string_in_file", "valid call name preserved");
+            const Json arg0 = Json::parse(parsed.tool_calls[0].arguments_json);
+            failures += check(arg0.at("filePath") == "styles.css", "valid call filePath preserved");
+        }
+    }
+    return failures;
+}
+
+int test_partial_recovery_fuzz_split_boundaries() {
+    const std::string text = "<tool_call>\n"
+                             "<function=func_one>\n"
+                             "<parameter=a>123</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             " intermediate prose \n"
+                             "<tool_call>\n"
+                             "<function=func_two>\n"
+                             "<parameter=b>456</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             " trailing prose";
+
+    const auto parsed = ninfer::serve::parse_qwen_tool_call_output(text, 64, {}, false);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "fuzz test input parsed as tool response");
+    failures += check(parsed.tool_calls.size() == 2, "fuzz test input recovered 2 calls");
+
+    for (std::size_t split = 0; split <= text.size(); ++split) {
+        ninfer::serve::ToolCallStreamFilter filter;
+        std::string s1 = filter.feed(text.substr(0, split));
+        std::string s2 = filter.feed(text.substr(split));
+        std::string s3 = filter.finish(true);
+        std::string total = s1 + s2 + s3;
+        failures += check(total.empty(), "stream filter leaked during partial-recovery split");
+    }
+
+    for (std::size_t chunk_sz : {1, 2, 3, 5, 8, 13, 21}) {
+        ninfer::serve::ToolCallStreamFilter filter;
+        std::string total;
+        for (std::size_t i = 0; i < text.size(); i += chunk_sz) {
+            total += filter.feed(text.substr(i, chunk_sz));
+        }
+        total += filter.finish(true);
+        failures += check(total.empty(), "stream filter leaked during chunked streaming");
+    }
+
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_stream_terminal_consistency();
@@ -977,7 +1114,11 @@ int main() {
     failures += test_string_param_keeps_numeric_looking_value();
     failures += test_unknown_param_defaults_to_string();
     failures += test_malformed_falls_back_to_text();
-    failures += test_suffix_after_tool_falls_back_to_text();
+    failures += test_partial_recovery_trailing_suffix();
+    failures += test_partial_recovery_multiple_calls_with_trailing_prose();
+    failures += test_partial_recovery_text_between_calls();
+    failures += test_partial_recovery_truncated_tail();
+    failures += test_partial_recovery_fuzz_split_boundaries();
     failures += test_configured_name_limit();
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();

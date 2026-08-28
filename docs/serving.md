@@ -49,8 +49,8 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
-| `GET /v1/models` | configured OpenAI model alias |
-| `GET /v1/models/{id}` | lookup of the configured alias |
+| `GET /v1/models` | model list; each entry carries the configured OpenAI model alias and `context_length` |
+| `GET /v1/models/{id}` | lookup of the configured alias with `context_length` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -490,7 +490,17 @@ Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or An
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
-  -H 'Authorization: Bearer local-secret'
+  -H 'Authorization: Bearer ***'
+```
+
+The model object advertises `context_length`: the engine's per-request logical
+ceiling set by `--max-context` (not the shared Main Text KV pool size).
+OpenAI-compatible clients read it to discover the window instead of
+hardcoding or guessing it.
+
+```json
+{"data":[{"context_length":240000,"created":1756272000,"id":"qwen3.8-27b",
+          "object":"model","owned_by":"ninfer"}],"object":"list"}
 ```
 
 `--cors` adds permissive browser CORS headers. It is disabled by default.

@@ -66,8 +66,13 @@ std::string make_chat_chunk_usage(const std::string& id, const std::string& mode
 std::string sse_done();
 
 // /v1/models payloads.
-std::string make_models_list(const std::string& model_id, std::int64_t created);
-std::string make_model_object(const std::string& model_id, std::int64_t created);
+// context_length advertises the engine's per-request logical ceiling
+// (--max-context) so OpenAI-compatible clients (e.g. Hermes Agent) can read
+// the live context window instead of relying on a static config value.
+std::string make_models_list(const std::string& model_id, std::int64_t created,
+                             std::uint32_t context_length);
+std::string make_model_object(const std::string& model_id, std::int64_t created,
+                              std::uint32_t context_length);
 
 // Error object body.
 std::string make_error_body(const ApiError& error);

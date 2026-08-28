@@ -15,6 +15,7 @@ struct DeviceContext;
 
 namespace artifact {
 class Binder;
+class Reader;
 class MaterializedArtifact;
 struct ArtifactIdentity;
 struct MaterializationPlan;
@@ -121,7 +122,8 @@ struct Package {
     using Program                    = qwen3_6::Program<detail::Variant>;
 
     [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
-    [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
+    [[nodiscard]] static WeightsProfile
+    resolve_weights(const artifact::ArtifactIdentity& identity, const artifact::Reader& reader);
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>

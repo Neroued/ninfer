@@ -8,6 +8,7 @@
 
 #include <stdexcept>
 #include <utility>
+#include <variant>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
 
@@ -82,7 +83,8 @@ ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
                              std::string(target_key) + "'");
 }
 
-Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
+Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity,
+                                                  const artifact::Reader& reader) {
     if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
         return WeightsProfile::Qwen36GroupwiseInt;
     }
@@ -93,6 +95,17 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
         return WeightsProfile::Qwen36Nvfp4;
     }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
+        // Qwen3.8-27B NVFP4 ships in two wire formats. The upstream FP8 profile keeps the
+        // vocabulary and attention endpoints in row-scaled FP8; the community W8+NVFP4
+        // profile (e.g. Ostfralla/Qwen3.8-27B-NVFP4-NInfer) uses W8 vocabulary endpoints
+        // and the Qwen3.6 NVFP4 layer layout. Detect the wire format from the artifact's
+        // text/token_embedding descriptor instead of guessing.
+        const artifact::ObjectDescriptor* embedding = reader.find("text/token_embedding");
+        const auto* tensor =
+            embedding == nullptr ? nullptr : std::get_if<artifact::TensorDescriptor>(embedding);
+        if (tensor != nullptr && tensor->format == artifact::NumericFormat::W8G32_F16S) {
+            return WeightsProfile::Qwen36Nvfp4;
+        }
         return WeightsProfile::Qwen38Nvfp4;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +

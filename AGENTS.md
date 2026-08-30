@@ -176,6 +176,21 @@ routing map, not a mandatory reading list:
 Do not survey unrelated references for completeness. Read additional documents only when they
 govern a live decision in the current task.
 
+## Build (Windows)
+
+The agent terminal is **not** a VS Developer prompt, so `INCLUDE`/`LIB` are unset and a bare
+`cmake --build` fails with `fatal error C1083: Cannot open include file: 'chrono'`. Initialize the
+MSVC x64 environment in the same command as the build:
+
+```powershell
+cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" && cmake --build ninfer\build --target ninfer-serve'
+```
+
+Run from the workspace root (the parent of `ninfer/`). `ninfer/build` is already configured
+(Ninja, Release, CUDA 13.3); only re-run `cmake -S ninfer -B ninfer/build -G Ninja
+-DCMAKE_BUILD_TYPE=Release` if the CMake configuration itself changes. The server binary lands at
+`ninfer/build/apps/ninfer-serve.exe`.
+
 ## Product and ownership boundaries
 
 These boundaries govern ordinary implementation work. An explicit architecture task may revise

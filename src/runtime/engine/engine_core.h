@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -1528,7 +1529,18 @@ private:
             const ActiveAdmissionSet active =
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
-                throw std::logic_error("isolated-feasible request is blocked in an idle Engine");
+                // The head request is isolated-feasible but temporarily blocked while the
+                // Engine is idle. This is an anomaly (e.g. a leaked ResourceManager lane
+                // or an eviction-logic gap) but not fatal: re-arm the admission check so
+                // the next worker-loop iteration retries, and let the request time out at
+                // its deadline if the condition is persistent. Do not kill the Engine.
+                std::fprintf(stderr,
+                             "[admission] anomaly: isolated-feasible request %llu is "
+                             "blocked in an idle Engine; will retry or time out\n",
+                             static_cast<unsigned long long>(head->id));
+                request_admission_check();
+                return control_progress ? AdmissionProgress::ControlProgress
+                                        : AdmissionProgress::None;
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {

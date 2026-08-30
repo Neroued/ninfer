@@ -2,6 +2,8 @@
 #include "product/speculative_options.h"
 #include "serve/console_log.h"
 
+#include "core/paged_kv_cache.h"
+
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
@@ -541,7 +543,14 @@ std::string format_request_done(const RequestLogContext& context,
 
 std::string format_request_error(const RequestLogContext& context, const std::string& message) {
     std::ostringstream out;
-    out << "[req " << context.id << "] error " << message;
+    out << "[req " << context.id << "] error " << context.protocol << ' '
+        << (context.stream ? "stream" : "non-stream") << " msgs=" << context.message_count
+        << " media=" << context.media_item_count
+        << " max_tokens=" << context.requested_output_tokens << ' '
+        << (context.requested_output_tokens_client_set ? "(client)" : "(server default)")
+        << " tools=" << context.tool_count
+        << " thinking=" << (context.enable_thinking ? "on" : "off")
+        << " message=" << message;
     return out.str();
 }
 
@@ -556,16 +565,34 @@ std::string format_throughput(const ThroughputReport& report) {
             : 0.0;
     const ninfer::RuntimeHostWorkStats host =
         host_work_delta(report.previous.host_work, report.current.host_work);
+    const auto& cur = report.current;
     std::ostringstream out;
-    out << "throughput interval=" << std::fixed << std::setprecision(3) << report.interval_seconds
-        << "s prefill=" << std::setprecision(1) << prefill_rate << "tok/s decode=" << decode_rate
-        << "tok/s running=" << report.current.running_requests
-        << " prefilling=" << report.current.prefilling_requests
-        << " decode_ready=" << report.current.decode_ready_requests
-        << " waiting=" << report.current.waiting_requests
-        << " materializing=" << report.current.materializing_requests
-        << " capture_pending=" << report.current.capture_pending_requests
-        << " terminal_pending=" << report.current.terminal_pending_requests << " avg_decode_batch=";
+    out << "throughput prefill=" << std::fixed << std::setprecision(1) << prefill_rate
+        << "tok/s decode=" << decode_rate << "tok/s";
+    // Device Main KV utilization: occupied pages * page size / resolved capacity.
+    if (report.kv_capacity_tokens > 0) {
+        const std::uint64_t occupied_tokens =
+            static_cast<std::uint64_t>(cur.device_main_kv_occupied_pages) *
+            static_cast<std::uint64_t>(ninfer::kPagedKVPageSize);
+        const double pct = 100.0 * static_cast<double>(occupied_tokens) /
+                           static_cast<double>(report.kv_capacity_tokens);
+        out << " kv=" << std::setprecision(0) << pct << "%";
+    } else {
+        out << " kv=n/a";
+    }
+    out << " running=" << cur.running_requests
+        << " prefilling=" << cur.prefilling_requests
+        << " decode_ready=" << cur.decode_ready_requests
+        << " waiting=" << cur.waiting_requests;
+    // Transient in-flight states are only interesting when non-zero.
+    if (cur.materializing_requests != 0) { out << " materializing=" << cur.materializing_requests; }
+    if (cur.capture_pending_requests != 0) {
+        out << " capture_pending=" << cur.capture_pending_requests;
+    }
+    if (cur.terminal_pending_requests != 0) {
+        out << " terminal_pending=" << cur.terminal_pending_requests;
+    }
+    out << " batch=";
     if (report.decode_rounds == 0) {
         out << "n/a";
     } else {
@@ -573,22 +600,25 @@ std::string format_throughput(const ThroughputReport& report) {
             << static_cast<double>(report.decode_row_rounds) /
                    static_cast<double>(report.decode_rounds);
     }
-    out << " host=" << std::setprecision(2) << nanoseconds_to_seconds(host_active_ns(host)) * 1000.0
+    out << " host=" << std::setprecision(1) << nanoseconds_to_seconds(host_active_ns(host)) * 1000.0
         << "ms";
     if (report.decode_rounds == 0) {
-        out << " decode-host=n/a wait=n/a";
+        out << " dhost=n/a devwait=n/a";
     } else {
-        out << " decode-host=" << std::setprecision(1)
-            << nanoseconds_to_microseconds(host.decode_host_ns) /
-                   static_cast<double>(report.decode_rounds)
-            << "us/round wait="
-            << nanoseconds_to_microseconds(host.decode_device_wait_ns) /
-                   static_cast<double>(report.decode_rounds)
-            << "us/round";
+        const double dhost_us =
+            nanoseconds_to_microseconds(host.decode_host_ns) /
+            static_cast<double>(report.decode_rounds);
+        const double devwait_us =
+            nanoseconds_to_microseconds(host.decode_device_wait_ns) /
+            static_cast<double>(report.decode_rounds);
+        out << " dhost=" << std::setprecision(1) << dhost_us << "us/rd";
+        // Auto-scale device wait to ms when it is the dominant per-round cost.
+        if (devwait_us >= 1000.0) {
+            out << " devwait=" << std::setprecision(1) << devwait_us / 1000.0 << "ms/rd";
+        } else {
+            out << " devwait=" << std::setprecision(1) << devwait_us << "us/rd";
+        }
     }
-    out << " boundary=" << std::setprecision(2)
-        << nanoseconds_to_seconds(host.engine_boundary_ns) * 1000.0
-        << "ms maintenance=" << nanoseconds_to_seconds(host.engine_maintenance_ns) * 1000.0 << "ms";
     return out.str();
 }
 

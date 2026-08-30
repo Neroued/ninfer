@@ -380,6 +380,8 @@ def build(tokenizer_path: Path) -> None:
 
     seed_8k_path = REPO_ROOT / "examples" / "cli" / "messages" / "long_niah_8k.json"
     seed_8k = json.loads(seed_8k_path.read_text(encoding="utf-8"))
+    seed_64k_path = REPO_ROOT / "examples" / "cli" / "messages" / "long_niah_64k.json"
+    seed_64k = json.loads(seed_64k_path.read_text(encoding="utf-8"))
     independent_8k = _fit_user_prompt(
         tokenizer,
         source_ids,
@@ -401,6 +403,28 @@ def build(tokenizer_path: Path) -> None:
         )
     independent_8k_path = TEXT_ROOT / "long_8k_independent.json"
     _write_json(independent_8k_path, independent_8k)
+
+    independent_64k = _fit_user_prompt(
+        tokenizer,
+        source_ids,
+        64512,
+        leading_messages=[
+            {
+                "role": "system",
+                "content": (
+                    "TTFT-INDEPENDENT-COLD-LONG-64K-B. "
+                    "Answer the supplied document independently."
+                ),
+            }
+        ],
+    )
+    independent_64k_common = _common_rendered_tokens(tokenizer, seed_64k, independent_64k)
+    if independent_64k_common > 3:
+        raise RuntimeError(
+            "independent 64K fixture does not diverge at the first system-content token"
+        )
+    independent_64k_path = TEXT_ROOT / "long_64k_independent.json"
+    _write_json(independent_64k_path, independent_64k)
 
     exact = _fit_user_prompt(tokenizer, source_ids, 8129)
     over = _fit_user_prompt(tokenizer, source_ids, 8193)
@@ -482,6 +506,12 @@ def build(tokenizer_path: Path) -> None:
                 seed_common_prefix_tokens=independent_8k_common,
             ),
             "long-64k-32": _existing_case("long_niah_64k", 64512, 32),
+            "long-64k-independent-32": _file_record(
+                independent_64k_path,
+                prompt_tokens=64512,
+                max_output_tokens=32,
+                seed_common_prefix_tokens=independent_64k_common,
+            ),
             "long-256k-32": _existing_case("long_niah_256k", 260096, 32),
             "interferer-256": _existing_case("scenario_story_zh_scifi", 127, 256),
             "holder-4096": _existing_case("scenario_story_zh_scifi", 127, 4096),

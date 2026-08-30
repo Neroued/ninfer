@@ -214,8 +214,8 @@ them, but must update the corresponding active authorities and affected implemen
 - `src/product/prompt_input` owns the shared product-side JSON/message-to-owning-input adapter.
 - `src/serve` owns protocol translation and transport. CLI, server, and benchmark call only the
   public Engine for inference.
-- `tools/convert/<target>`, `tools/reference/<target>`, and `tools/parity/<target>` remain
-  target-private conversion, correctness, and diagnostic implementations.
+- `tools/convert/<target>` owns target-private artifact inventories, source recipes, conversion,
+  and converter-side payload verification. NInfer maintains no Python model-inference route.
 
 ## Compatibility and document lifecycle
 

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Summarize Serve TTFT run JSON without inferring internal cache actions."""
+"""Write the standard human- and machine-readable summary for one TTFT campaign."""
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -12,23 +11,32 @@ from typing import Sequence
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.bench.ttft.report import load_runs, summarize, write_csv
+from tools.bench.ttft.render import write_campaign_summary
+from tools.bench.ttft.report import ReportError
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("inputs", nargs="+", type=Path)
-    parser.add_argument("--output-json", type=Path)
-    parser.add_argument("--output-csv", type=Path)
+    parser.add_argument("campaign_dir", type=Path)
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        help="optional compatible campaign used for cross-campaign median comparisons",
+    )
     args = parser.parse_args(argv)
-    summary = summarize(load_runs(args.inputs))
-    text = json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
-    if args.output_json:
-        args.output_json.parent.mkdir(parents=True, exist_ok=True)
-        args.output_json.write_text(text, encoding="utf-8")
-    if args.output_csv:
-        write_csv(args.output_csv, summary)
-    print(text, end="")
+    try:
+        summary, paths = write_campaign_summary(args.campaign_dir, args.baseline)
+    except ReportError as error:
+        parser.exit(1, f"cannot summarize TTFT campaign: {error}\n")
+    coverage = summary["coverage"]
+    print(
+        "TTFT summary: "
+        f"{coverage['constructed_runs']}/{coverage['planned_runs']} constructed, "
+        f"{coverage['failure_records']} failure(s)"
+    )
+    print(f"report: {paths['markdown']}")
+    print(f"json: {paths['json']}")
+    print(f"csv: {paths['csv']}")
     return 0
 
 

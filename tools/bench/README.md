@@ -1,7 +1,7 @@
 # tools/bench
 
 Maintainer orchestration for the public `ninfer_bench` throughput tool and the external Serve TTFT
-client. Correctness/parity tooling lives separately under [`tools/parity`](../parity).
+client. Correctness is owned by the affected suites under [`tests/`](../../tests/README.md).
 
 ## External Serve TTFT
 
@@ -15,8 +15,9 @@ python3 tools/bench/run_serve_ttft_campaign.py --campaign resource --samples 5
 
 The controller chooses the profile, starts and stops Serve for every sample, runs the external
 client, stages the NVFP4 artifact once in `/dev/shm`, stores raw/progress/Serve artifacts below
-`profiles/bench/ttft/`, and writes the summary. The case catalog, exact profiles, TTFT boundary, and
-fixture qualification are documented in the dedicated README.
+`profiles/bench/ttft/`, records structured per-request Serve diagnostics, and writes Markdown,
+JSON, and CSV summaries. The case catalog, exact profiles, TTFT boundary, and fixture qualification
+are documented in the dedicated README.
 
 ## Corpus baker
 
@@ -139,7 +140,7 @@ artifacts are supplied. Pass one `--artifact` to select a single target and `--m
 decode corpus with DFlash block=8 (`k=7`) and the optimized proposal head. Add
 `--sampling greedy` to force exact argmax while retaining the same fixtures and repetition count.
 Its schema-v6 result and flattened summaries retain the canonical `weights_id`, request Host
-exposure, and decode Host/Device-wait time per round received from the schema-v16 serving records.
+exposure, and decode Host/Device-wait time per round received from the schema-v18 serving records.
 Request exposure is a latency distribution value and is never summed across concurrent requests;
 worker aggregation uses the serving `throughput.host_work` interval deltas. The stochastic route pins its complete
 temperature/top-p/top-k/min-p/presence/frequency profile explicitly, so model-default changes do

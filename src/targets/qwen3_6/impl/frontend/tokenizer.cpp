@@ -790,11 +790,19 @@ std::vector<int> Tokenizer::encode(std::string_view text, EncodeOptions options)
     return std::move(encoded.input_ids);
 }
 
-BoundaryEncodedText Tokenizer::encode_with_boundaries(std::string_view text,
-                                                      std::span<const std::size_t> byte_boundaries,
-                                                      EncodeOptions options) const {
+BoundaryEncodedText Tokenizer::encode_with_boundaries(
+    std::string_view text, std::span<const std::size_t> byte_boundaries, EncodeOptions options,
+    std::span<const ByteSpan> literal_spans) const {
     BoundaryEncodedText encoded;
     encoded.boundaries.resize(byte_boundaries.size());
+    std::size_t previous_literal_end = 0;
+    for (const ByteSpan span : literal_spans) {
+        if (span.begin >= span.end || span.end > text.size() || span.begin < previous_literal_end) {
+            throw std::invalid_argument(
+                "Tokenizer literal byte spans must be ordered, disjoint, nonempty, and in range");
+        }
+        previous_literal_end = span.end;
+    }
     std::vector<IndexedByteBoundary> boundaries;
     boundaries.reserve(byte_boundaries.size());
     for (std::size_t index = 0; index < byte_boundaries.size(); ++index) {
@@ -832,6 +840,7 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(std::string_view text,
 
     std::size_t ordinary_begin = 0;
     std::size_t pos            = 0;
+    std::size_t literal_cursor = 0;
     while (pos < text.size()) {
         const AddedToken* match_token = nullptr;
         const auto& candidates = added_token_candidates_[static_cast<unsigned char>(text[pos])];
@@ -839,6 +848,15 @@ BoundaryEncodedText Tokenizer::encode_with_boundaries(std::string_view text,
             const AddedToken& token = added_tokens_[index];
             if (token.content.size() <= text.size() - pos &&
                 text.compare(pos, token.content.size(), token.content) == 0) {
+                while (literal_cursor < literal_spans.size() &&
+                       literal_spans[literal_cursor].end <= pos) {
+                    ++literal_cursor;
+                }
+                const std::size_t token_end = pos + token.content.size();
+                if (literal_cursor < literal_spans.size() &&
+                    literal_spans[literal_cursor].begin < token_end) {
+                    continue;
+                }
                 match_token = &token;
                 break;
             }

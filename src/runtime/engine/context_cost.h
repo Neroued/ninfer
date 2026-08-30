@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -38,7 +39,23 @@ struct ContextPrefillCost {
                                                    ContextPrefillCost) noexcept = default;
 };
 
-struct ContextCostModel {
+enum class MaterializationCopyPhase : std::uint8_t {
+    PressureToHost,
+    Candidate,
+};
+
+// Work already coalesced for one ordered copy phase and one direction. Distinct entries are serial;
+// callers merge work that shares both fields before asking the machine model to price it.
+struct TransferBatchWork {
+    MaterializationCopyPhase phase     = MaterializationCopyPhase::Candidate;
+    ContextTransferDirection direction = ContextTransferDirection::HostToDevice;
+    TransferWork work;
+
+    [[nodiscard]] friend constexpr bool operator==(TransferBatchWork,
+                                                   TransferBatchWork) noexcept = default;
+};
+
+struct ContextMachineCostModel {
     // Direction order is DeviceToHost, HostToDevice, DeviceToDevice.
     std::array<ContextTransferCost, 3> transfer{};
     ContextPrefillCost prefill;
@@ -46,10 +63,12 @@ struct ContextCostModel {
     // max(batch + copy_operations * operation, payload_bytes * ns_per_byte)
     [[nodiscard]] std::uint64_t transfer_ns(ContextTransferDirection direction,
                                             TransferWork work) const noexcept;
+    [[nodiscard]] std::uint64_t
+    transfer_batches_ns(std::span<const TransferBatchWork> batches) const noexcept;
     [[nodiscard]] std::uint64_t prefill_ns(PrefillWork work) const noexcept;
 
-    [[nodiscard]] friend constexpr bool operator==(const ContextCostModel&,
-                                                   const ContextCostModel&) noexcept = default;
+    [[nodiscard]] friend constexpr bool
+    operator==(const ContextMachineCostModel&, const ContextMachineCostModel&) noexcept = default;
 };
 
 struct ContextCostIdentity {
@@ -70,23 +89,23 @@ struct ContextCostMachinePreset {
     std::vector<ContextPrefillPreset> prefill;
 };
 
-struct ResolvedContextCost {
-    ContextCostModel model;
+struct ResolvedContextMachineCost {
+    ContextMachineCostModel model;
     ContextCostSummary summary;
 };
 
 [[nodiscard]] std::string context_cost_hardware_class(std::string_view gpu_name, int major,
                                                       int minor);
-[[nodiscard]] ContextCostModel generic_context_cost_model();
+[[nodiscard]] ContextMachineCostModel generic_context_machine_cost_model();
 
 [[nodiscard]] std::vector<ContextCostMachinePreset>
 parse_context_cost_presets(std::string_view json, std::string_view source_name);
 
 // Transfer and prefill are resolved independently. Generic numerical defaults always exist;
 // compiled hardware/model values and then matching external values override them.
-[[nodiscard]] ResolvedContextCost
-resolve_context_cost(const ContextCostIdentity& identity,
-                     const std::filesystem::path& external_preset_path = {});
+[[nodiscard]] ResolvedContextMachineCost
+resolve_context_machine_cost(const ContextCostIdentity& identity,
+                             const std::filesystem::path& external_preset_path = {});
 
 // Calibration updates one independently measurable component and preserves every other component.
 void upsert_context_transfer_cost_atomic(const std::filesystem::path& path,

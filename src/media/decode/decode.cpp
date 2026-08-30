@@ -35,9 +35,13 @@ std::string av_error(int code) {
     return text.data();
 }
 
+[[noreturn]] void throw_invalid_media(std::string message) {
+    throw Error(ErrorKind::InvalidInput, std::move(message));
+}
+
 void validate_input(std::span<const std::uint8_t> bytes, const Policy& policy) {
     if (policy.max_bytes == 0) { throw std::invalid_argument("media byte limit must be positive"); }
-    if (bytes.empty()) { throw std::invalid_argument("media bytes are empty"); }
+    if (bytes.empty()) { throw_invalid_media("media bytes are empty"); }
     if (bytes.size() > policy.max_bytes) {
         throw Error(ErrorKind::BudgetExceeded, "media bytes exceed byte limit");
     }
@@ -185,22 +189,20 @@ public:
             AVFormatContext* raw = format_;
             int rc               = avformat_open_input(&raw, nullptr, nullptr, nullptr);
             format_              = raw;
-            if (rc < 0) { throw std::invalid_argument("failed to open media: " + av_error(rc)); }
+            if (rc < 0) { throw_invalid_media("failed to open media: " + av_error(rc)); }
             if ((rc = avformat_find_stream_info(format_, nullptr)) < 0) {
-                throw std::invalid_argument("failed to inspect media: " + av_error(rc));
+                throw_invalid_media("failed to inspect media: " + av_error(rc));
             }
             stream_index_ = av_find_best_stream(format_, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-            if (stream_index_ < 0) {
-                throw std::invalid_argument("media has no decodable video stream");
-            }
+            if (stream_index_ < 0) { throw_invalid_media("media has no decodable video stream"); }
             stream_              = format_->streams[stream_index_];
             const AVCodec* codec = avcodec_find_decoder(stream_->codecpar->codec_id);
-            if (codec == nullptr) { throw std::invalid_argument("media codec is not supported"); }
+            if (codec == nullptr) { throw_invalid_media("media codec is not supported"); }
             codec_ = avcodec_alloc_context3(codec);
             if (codec_ == nullptr) { throw std::bad_alloc(); }
             if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0 ||
                 (rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
-                throw std::invalid_argument("failed to open media codec: " + av_error(rc));
+                throw_invalid_media("failed to open media codec: " + av_error(rc));
             }
             packet_ = av_packet_alloc();
             frame_  = av_frame_alloc();
@@ -234,14 +236,14 @@ public:
                 const int rc = avcodec_receive_frame(codec_, frame_);
                 if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) { return true; }
                 if (rc < 0) {
-                    throw std::runtime_error("failed to decode media frame: " + av_error(rc));
+                    throw_invalid_media("failed to decode media frame: " + av_error(rc));
                 }
                 if (frame_->crop_top != 0 || frame_->crop_bottom != 0 || frame_->crop_left != 0 ||
                     frame_->crop_right != 0) {
                     const int crop = av_frame_apply_cropping(frame_, 0);
                     if (crop < 0) {
-                        throw std::runtime_error("failed to apply media display crop: " +
-                                                 av_error(crop));
+                        throw_invalid_media("failed to apply media display crop: " +
+                                            av_error(crop));
                     }
                 }
                 const bool keep_decoding = callback(index++, frame_);
@@ -252,12 +254,12 @@ public:
         while (true) {
             const int rc = av_read_frame(format_, packet_);
             if (rc == AVERROR_EOF) { break; }
-            if (rc < 0) { throw std::runtime_error("failed while reading media: " + av_error(rc)); }
+            if (rc < 0) { throw_invalid_media("failed while reading media: " + av_error(rc)); }
             if (packet_->stream_index == stream_index_) {
                 const int send = avcodec_send_packet(codec_, packet_);
                 if (send < 0 && send != AVERROR(EAGAIN)) {
                     av_packet_unref(packet_);
-                    throw std::runtime_error("failed to submit media packet: " + av_error(send));
+                    throw_invalid_media("failed to submit media packet: " + av_error(send));
                 }
                 if (!receive()) {
                     av_packet_unref(packet_);
@@ -268,7 +270,7 @@ public:
         }
         const int flush = avcodec_send_packet(codec_, nullptr);
         if (flush < 0 && flush != AVERROR_EOF) {
-            throw std::runtime_error("failed to flush media decoder: " + av_error(flush));
+            throw_invalid_media("failed to flush media decoder: " + av_error(flush));
         }
         (void)receive();
     }
@@ -277,7 +279,7 @@ public:
         const int width  = frame->width;
         const int height = frame->height;
         if (width <= 0 || height <= 0) {
-            throw std::invalid_argument("decoded media dimensions are invalid");
+            throw_invalid_media("decoded media dimensions are invalid");
         }
         if (static_cast<std::uint64_t>(width) * height > max_decoded_pixels_) {
             throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
@@ -418,9 +420,7 @@ int orientation_from_rotation(int rotation) {
 ImageInfo frame_info(const AVFrame* frame, int orientation, std::uint64_t max_decoded_pixels) {
     const int width  = frame->width;
     const int height = frame->height;
-    if (width <= 0 || height <= 0) {
-        throw std::invalid_argument("decoded media dimensions are invalid");
-    }
+    if (width <= 0 || height <= 0) { throw_invalid_media("decoded media dimensions are invalid"); }
     if (static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) >
         max_decoded_pixels) {
         throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
@@ -496,6 +496,7 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
         throw Error(ErrorKind::BudgetExceeded, "video duration exceeds processor limit");
     }
     if (plan.total_frames == 0) { plan.total_frames = count_frames(bytes, policy); }
+    if (plan.total_frames == 0) { throw_invalid_media("video contains no decoded frame"); }
     if (plan.total_frames > policy.max_video_source_frames) {
         throw Error(ErrorKind::BudgetExceeded, "video source frame count exceeds processor limit");
     }
@@ -545,11 +546,11 @@ VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
         return wanted != plan.indices.size();
     });
     if (wanted < static_cast<std::size_t>(plan.minimum_frames)) {
-        throw std::runtime_error("video decoder produced fewer than the minimum sampled frames");
+        throw_invalid_media("video decoder produced fewer than the minimum sampled frames");
     }
     for (std::size_t index = wanted; index < plan.indices.size(); ++index) {
         if (plan.indices[index] < decoded) {
-            throw std::runtime_error("video decoder skipped a requested internal frame");
+            throw_invalid_media("video decoder skipped a requested internal frame");
         }
     }
     scan.sampled_frames = static_cast<int>(wanted);
@@ -576,7 +577,7 @@ ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& polic
         return true;
     });
     if (result.width == 0 || result.height == 0) {
-        throw std::invalid_argument("image contains no decoded frame");
+        throw_invalid_media("image contains no decoded frame");
     }
     return result;
 }
@@ -616,7 +617,7 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
         }
         return true;
     });
-    if (result.rgb.empty()) { throw std::invalid_argument("image contains no decoded frame"); }
+    if (result.rgb.empty()) { throw_invalid_media("image contains no decoded frame"); }
     return result;
 }
 

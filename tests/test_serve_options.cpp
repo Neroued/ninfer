@@ -169,18 +169,17 @@ int main() {
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
 
-    const ServeOptions context_cache = parse(
-        {"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-state-slots", "5",
-         "--host-kv-mib", "64", "--max-private-continuations", "9", "--max-shared-prefixes", "4",
-         "--max-long-anchors-per-continuation", "2", "--max-cache-markers-per-request", "6"});
+    const ServeOptions context_cache =
+        parse({"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-state-slots",
+               "5", "--host-kv-mib", "64", "--max-private-continuations", "9",
+               "--max-shared-prefixes", "4", "--max-long-anchors-per-continuation", "2"});
     failures += check(context_cache.context_cache.enabled &&
                           context_cache.context_cache.device_state_slots == 3 &&
                           context_cache.context_cache.host_state_slots == 5 &&
                           context_cache.context_cache.host_kv_capacity_bytes == (64ULL << 20) &&
                           context_cache.context_cache.max_private_continuations == 9 &&
                           context_cache.context_cache.max_shared_prefixes == 4 &&
-                          context_cache.context_cache.max_long_anchors_per_continuation == 2 &&
-                          context_cache.context_cache.max_cache_markers_per_request == 6,
+                          context_cache.context_cache.max_long_anchors_per_continuation == 2,
                       "context-cache capacities did not reach serving options");
     bool disabled_cache_capacity_rejected = false;
     try {
@@ -198,22 +197,34 @@ int main() {
 
     const ServeOptions sampling =
         parse({"ninfer-serve", "model.ninfer", "--temperature", "0", "--top-p", "0.9", "--top-k",
-               "40", "--min-p", "0.1", "--presence-penalty", "1.25", "--frequency-penalty", "-0.5",
+               "20", "--min-p", "0.1", "--presence-penalty", "1.25", "--frequency-penalty", "-0.5",
                "--seed", "0"});
     failures += check(sampling.sampling_overrides.temperature == 0.0F &&
                           sampling.sampling_overrides.top_p == 0.9F &&
-                          sampling.sampling_overrides.top_k == 40 &&
+                          sampling.sampling_overrides.top_k == 20 &&
                           sampling.sampling_overrides.min_p == 0.1F &&
                           sampling.sampling_overrides.presence_penalty == 1.25F &&
                           sampling.sampling_overrides.frequency_penalty == -0.5F &&
                           sampling.sampling_overrides.seed == 0,
                       "server sampling flags did not preserve explicit values and zeros");
+    bool oversized_top_k_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--top-k", "21"});
+    } catch (const std::invalid_argument&) { oversized_top_k_rejected = true; }
+    failures += check(oversized_top_k_rejected,
+                      "server accepted top_k beyond the executable candidate domain");
 
     GenerationRequest request;
     request.max_tokens = 1;
     ninfer::PromptCapabilities prompt_capabilities;
-    prompt_capabilities.enable_thinking = true;
+    prompt_capabilities.enable_thinking                 = true;
+    prompt_capabilities.reasoning_effort.low            = true;
+    prompt_capabilities.reasoning_effort.xhigh          = true;
+    prompt_capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
     const auto semantics = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    failures += check(!semantics.reasoning_effort &&
+                          semantics.effective_reasoning_effort == ninfer::ReasoningEffort::XHigh,
+                      "omitted reasoning effort did not resolve to the template default");
     failures +=
         check(to_request_options(request, defaults, semantics, true).execution.allow_prefix_reuse,
               "resolved read-write cache policy did not reach Engine options");
@@ -237,11 +248,20 @@ int main() {
     request.enable_thinking = false;
     const auto non_thinking =
         resolve_prompt_semantics(request, thinking_budget, prompt_capabilities);
+    failures += check(!non_thinking.effective_reasoning_effort,
+                      "disabled thinking retained an effective reasoning effort");
     failures += check(!to_request_options(request, thinking_budget, non_thinking,
                                           thinking_budget.allow_prefix_reuse)
                            .execution.thinking.budget,
                       "non-thinking request inherited the server thinking budget");
     request.enable_thinking.reset();
+    request.reasoning_effort   = RequestedReasoningEffort::Low;
+    const auto explicit_effort = resolve_prompt_semantics(request, defaults, prompt_capabilities);
+    failures +=
+        check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::Low &&
+                  explicit_effort.effective_reasoning_effort == ninfer::ReasoningEffort::Low,
+              "explicit reasoning effort did not remain the effective effort");
+    request.reasoning_effort.reset();
     failures +=
         check(resolve_prompt_semantics(request, configured, prompt_capabilities).preserve_thinking,
               "server preserve-thinking default was not resolved");

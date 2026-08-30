@@ -20,10 +20,10 @@ enum SamplePurpose : std::int32_t {
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32
-// [token_domain] occurrence-count array used by both penalties.
+// [token_domain] committed generated-token occurrence-count array used by both penalties.
 struct SamplingConfig {
     float temperature          = 0.0f; // <= 0 => greedy argmax (bit-identical to argmax())
-    std::int32_t top_k         = 0;    // clamped to 20: top_k <= 0 or top_k > 20 => 20
+    std::int32_t top_k         = 20;   // runtime contract is [1,20]; Op defensively caps otherwise
     float top_p                = 1.0f; // >= 1 => disabled
     float min_p                = 0.0f; // <= 0 => disabled
     float presence_penalty     = 0.0f;
@@ -48,16 +48,16 @@ struct SamplingConfig {
  *
  * For row b with configs[b].temperature<=0:
  *
- *   out[b] = min argmax_v float(logits[v,b]).
- *
- * Penalties, filters, RNG, and token_counts updates are skipped for that row. With positive
- * temperature, let c_v=configs[b].token_counts[v] (or zero when the pointer is null):
+ * With either greedy or positive-temperature sampling, let
+ * c_v=configs[b].token_counts[v] (or zero when the pointer is null):
  *
  *   adjusted_v = float(logits[v,b])
  *                - configs[b].presence_penalty * (c_v > 0)
  *                - configs[b].frequency_penalty * c_v.
  *
- * Candidates are sorted by adjusted_v descending with lower token id breaking ties. Per-row top_k
+ * A greedy row selects min argmax_v adjusted_v and skips filters and RNG. Candidates for a
+ * positive-temperature row are sorted by adjusted_v descending with lower token id breaking
+ * ties. Per-row top_k
  * in [1,19] keeps that many candidates; top_k<=0 or top_k>=20 keeps min(20,token_domain).
  * Candidate weights are exp(adjusted_v/temperature-max). min_p removes the suffix below
  * min_p*max_weight; top_p keeps the shortest remaining prefix whose cumulative weight reaches
@@ -66,7 +66,7 @@ struct SamplingConfig {
  *
  * Row b uses counter-based RNG key
  * (configs[b].seed,logical_positions[b],purpose), without mutable RNG state or dependence on the
- * compact row index. In the positive-temperature branch the selected token atomically increments
+ * compact row index. In every mode the selected token atomically increments
  * configs[b].token_counts when it is non-null. Non-null token-count arrays belonging to distinct
  * active requests must not alias. `out` must not overlap logits, configs, logical_positions, or any
  * token-count array. The Op writes all of out, uses caller-owned transient storage reported by
@@ -75,5 +75,9 @@ struct SamplingConfig {
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream);
+
+// Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
+// [token_domain] committed count array. IDs must be in [0,token_domain).
+void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream);
 
 } // namespace ninfer::ops

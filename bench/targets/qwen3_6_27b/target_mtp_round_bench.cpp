@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "runtime/engine/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <cuda_runtime.h>
@@ -162,10 +163,12 @@ int run(const Options& options) {
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
     auto request_base                 = program->plan_request(prompt, execution);
-    auto request_plan = program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{0},
-                                                   nullptr, nullptr, std::nullopt, false);
+    const auto machine_cost           = ninfer::runtime::generic_context_machine_cost_model();
+    auto request_plan =
+        program->inspect_admission(prompt, request_base, ninfer::runtime::LaneId{0}, nullptr,
+                                   nullptr, std::nullopt, false, machine_cost);
     if (!request_plan) { throw std::runtime_error("benchmark root admission was rejected"); }
-    auto resource_plan = program->seal_resource_plan(*request_plan, prompt, {}, {}, {}, {});
+    auto resource_plan = program->seal_identity(*request_plan, prompt);
     if (!resource_plan) { throw std::runtime_error("benchmark root resources were not sealed"); }
     const auto reserved =
         program->start_resource_transaction(std::move(*resource_plan), std::move(prompt), {});

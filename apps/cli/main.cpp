@@ -119,6 +119,8 @@ void print_metric(std::string_view label, std::string_view value) {
 
 class StreamingSink final : public ninfer::OutputSink {
 public:
+    void start(ninfer::GenerationStart) override {}
+
     void publish(ninfer::OutputDelta delta) override {
         std::ostream& output =
             delta.channel == ninfer::OutputChannel::Reasoning ? std::cerr : std::cout;

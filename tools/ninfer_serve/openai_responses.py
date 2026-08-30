@@ -18,8 +18,8 @@ def responses_request(
     previous_response_id: str | None = None,
     stream: bool = True,
 ) -> ProtocolRequest:
-    if max_output_tokens < 16:
-        raise ValueError("Responses max_output_tokens must be at least 16")
+    if max_output_tokens < 0:
+        raise ValueError("Responses max_output_tokens must be non-negative")
     payload: dict[str, Any] = {
         "model": model,
         "input": input_value,

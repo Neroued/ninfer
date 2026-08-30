@@ -430,6 +430,97 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.allocated_pages() == 0,
            "shared full-page occupancy survives until its final address reference releases");
 
+    const auto mixed_source = addresses.create_active(4, 0);
+    expect(mixed_source.has_value(), "mixed snapshot retained-prefix source allocation");
+    addresses.materialize_to_tokens(*mixed_source, 65, device.stream);
+    addresses.commit_frontier(*mixed_source, 65);
+    addresses.set_checkpoint_requirement(*mixed_source, 65);
+    addresses.deactivate(*mixed_source);
+    const auto mixed_shared_full = addresses.logical_page(*mixed_source, 0);
+
+    const auto mixed_active = addresses.create_inactive();
+    expect(mixed_active.has_value(), "mixed snapshot active branch allocation");
+    auto mixed_fork = addresses.prepare_prefix_fork(*mixed_source, *mixed_active, 65, 4, 0);
+    physical_pages.copy_page(addresses.prefix_fork_tail_source(mixed_fork),
+                             addresses.prefix_fork_tail_destination(mixed_fork),
+                             device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    addresses.commit_prefix_fork(std::move(mixed_fork), device.stream);
+    addresses.materialize_to_tokens(*mixed_active, 130, device.stream);
+    addresses.commit_frontier(*mixed_active, 130);
+    const auto mixed_mutable_full = addresses.logical_page(*mixed_active, 1);
+    const auto mixed_tail         = addresses.logical_page(*mixed_active, 2);
+    const store::KVActiveSnapshotShape first_shape =
+        addresses.active_snapshot_shape(*mixed_active, 130);
+    expect(first_shape.full_pages == 2 && first_shape.immutable_full_pages == 1 &&
+               first_shape.unique_full_pages == 1 && first_shape.tail_columns == 2 &&
+               first_shape.copied_pages() == 1,
+           "mixed snapshot analysis distinguishes aliased prefix, mutable suffix, and tail");
+
+    const auto aborted_destination = addresses.create_inactive();
+    expect(aborted_destination.has_value(), "mixed snapshot abort destination allocation");
+    {
+        auto aborted = addresses.prepare_active_snapshot(*mixed_active, *aborted_destination, 130);
+        expect(pages.source_pins(mixed_shared_full) == 1 &&
+                   pages.source_pins(mixed_mutable_full) == 1 && pages.source_pins(mixed_tail) == 1,
+               "mixed snapshot preparation pins every source ownership class");
+        addresses.abort_active_snapshot(aborted);
+    }
+    expect(addresses.active(*mixed_active) && pages.source_pins(mixed_shared_full) == 0 &&
+               pages.source_pins(mixed_mutable_full) == 0 && pages.source_pins(mixed_tail) == 0 &&
+               pages.writer_references(mixed_shared_full) == 0 &&
+               pages.writer_references(mixed_mutable_full) == 1 &&
+               pages.writer_references(mixed_tail) == 1 && addresses.release(*aborted_destination),
+           "aborted mixed snapshot restores pins without changing page ownership");
+
+    const auto first_snapshot_active = addresses.create_inactive();
+    expect(first_snapshot_active.has_value(), "mixed snapshot destination allocation");
+    auto first_mixed_snapshot =
+        addresses.prepare_active_snapshot(*mixed_active, *first_snapshot_active, 130);
+    physical_pages.copy_page(addresses.active_snapshot_tail_source(first_mixed_snapshot),
+                             addresses.active_snapshot_tail_destination(first_mixed_snapshot),
+                             device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    addresses.commit_active_snapshot(std::move(first_mixed_snapshot), device.stream);
+    const auto first_snapshot_tail = addresses.logical_page(*first_snapshot_active, 2);
+    expect(
+        !addresses.active(*mixed_active) && addresses.active(*first_snapshot_active) &&
+            addresses.logical_page(*first_snapshot_active, 0) == mixed_shared_full &&
+            addresses.logical_page(*first_snapshot_active, 1) == mixed_mutable_full &&
+            first_snapshot_tail != mixed_tail && pages.address_references(mixed_shared_full) == 3 &&
+            pages.address_references(mixed_mutable_full) == 2 &&
+            pages.writer_references(mixed_shared_full) == 0 &&
+            pages.writer_references(mixed_mutable_full) == 0 &&
+            pages.writer_references(mixed_tail) == 0 &&
+            pages.writer_references(first_snapshot_tail) == 1,
+        "mixed snapshot reuses immutable full pages, freezes mutable full pages, and copies tail");
+
+    addresses.materialize_to_tokens(*first_snapshot_active, 192, device.stream);
+    addresses.commit_frontier(*first_snapshot_active, 192);
+    const store::KVActiveSnapshotShape aligned_shape =
+        addresses.active_snapshot_shape(*first_snapshot_active, 192);
+    expect(aligned_shape.full_pages == 3 && aligned_shape.immutable_full_pages == 2 &&
+               aligned_shape.unique_full_pages == 1 && aligned_shape.tail_columns == 0 &&
+               aligned_shape.copied_pages() == 0,
+           "repeated aligned snapshot analysis preserves the immutable-to-mutable boundary");
+    const auto aligned_active = addresses.create_inactive();
+    expect(aligned_active.has_value(), "aligned mixed snapshot destination allocation");
+    auto aligned_snapshot =
+        addresses.prepare_active_snapshot(*first_snapshot_active, *aligned_active, 192);
+    expect(!aligned_snapshot.needs_tail_copy(), "aligned mixed snapshot requires no KV copy");
+    addresses.commit_active_snapshot(std::move(aligned_snapshot), device.stream);
+    addresses.materialize_to_tokens(*aligned_active, 193, device.stream);
+    addresses.commit_frontier(*aligned_active, 193);
+    expect(addresses.active(*aligned_active) && addresses.mapped_pages(*aligned_active) == 4 &&
+               pages.writer_references(addresses.logical_page(*aligned_active, 3)) == 1,
+           "aligned snapshot continuation materializes a new mutable suffix page");
+
+    addresses.deactivate(*aligned_active);
+    expect(addresses.release(*aligned_active) && addresses.release(*first_snapshot_active) &&
+               addresses.release(*mixed_active) && addresses.release(*mixed_source) &&
+               pages.occupied() == 0 && physical_pages.allocated_pages() == 0,
+           "repeated mixed snapshot ownership closes without leaked logical or physical pages");
+
     const auto filler = addresses.create_active(4, 0);
     expect(filler.has_value(), "full-capacity staged-fork filler allocation");
     addresses.materialize_to_tokens(*filler, 193, device.stream);

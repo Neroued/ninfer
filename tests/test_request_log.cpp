@@ -78,7 +78,6 @@ int main() {
     engine_options.context_cache.max_private_continuations         = 4;
     engine_options.context_cache.max_shared_prefixes               = 2;
     engine_options.context_cache.max_long_anchors_per_continuation = 2;
-    engine_options.context_cache.max_cache_markers_per_request     = 4;
 
     const ninfer::ModelSamplingDefaults sampling_defaults{
         .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
@@ -235,18 +234,15 @@ int main() {
                       "server argv did not retain the redaction marker");
 
     GenerationRequest request;
-    request.model          = "qwen3.6-27b";
-    request.stream         = false;
-    request.max_tokens     = 4096;
-    request.max_tokens_set = true;
+    request.max_tokens = 4096;
     request.messages.resize(2);
     request.messages.front().content.push_back(ContentPart{.kind = ContentKind::Image});
 
     PreparedRequest prepared;
     prepared.enable_thinking                           = true;
     prepared.thinking_budget                           = 256;
+    prepared.effective_reasoning_effort                = ninfer::ReasoningEffort::XHigh;
     prepared.preserve_thinking                         = true;
-    prepared.preserve_thinking_semantic_change         = true;
     prepared.sampling.temperature                      = 0.6F;
     prepared.sampling.top_p                            = 0.95F;
     prepared.sampling.top_k                            = 20;
@@ -263,8 +259,14 @@ int main() {
     prepared.preparation.media_cache_misses            = 1;
     prepared.preparation.built_patch_bytes             = 49152;
 
+    const RequestLogMetadata metadata{
+        .model                             = "qwen3.6-27b",
+        .stream                            = false,
+        .output_tokens_explicit            = true,
+        .preserve_thinking_semantic_change = true,
+    };
     const RequestLogContext context =
-        make_request_log_context(7, "openai_chat_completions", request, prepared);
+        make_request_log_context(7, "openai_chat_completions", request, metadata, prepared);
     const Json started = Json::parse(format_request_start_json("serve-test", 2000, context));
     failures +=
         check(started.at("request").at("request_id") == 7, "request id missing from start record");
@@ -274,6 +276,12 @@ int main() {
                       "resolved thinking mode missing");
     failures += check(started.at("request").at("thinking_budget") == 256,
                       "resolved thinking budget missing");
+    failures += check(started.at("request").at("requested_reasoning_effort").is_null() &&
+                          started.at("request").at("resolved_reasoning_effort") == "xhigh",
+                      "requested and resolved reasoning effort are not distinguished");
+    failures += check(format_request_start(context).find("reasoning_effort=default->xhigh") !=
+                          std::string::npos,
+                      "human request log omits default reasoning resolution");
     failures += check(started.at("request").at("preserve_thinking") == true &&
                           started.at("request").at("preserve_thinking_semantic_change") == true,
                       "resolved preserve-thinking metadata missing");
@@ -293,8 +301,10 @@ int main() {
     preparation_error.code   = "context_length_exceeded";
     preparation_error.message =
         "prepared prompt has 270000 tokens, exceeding Engine max_context 262144";
-    const RequestRejectionLogContext rejected_context =
-        make_request_rejection_log_context(8, "anthropic_messages", request, preparation_error);
+    GenerationRequest rejected_request                = request;
+    rejected_request.reasoning_effort                 = RequestedReasoningEffort::High;
+    const RequestRejectionLogContext rejected_context = make_request_rejection_log_context(
+        8, "anthropic_messages", rejected_request, metadata, preparation_error);
     const Json rejected =
         Json::parse(format_request_rejected_json("serve-test", 2500, rejected_context));
     failures +=
@@ -304,17 +314,22 @@ int main() {
                           rejected.at("request").at("media_item_count") == 1 &&
                           rejected.at("request").at("message_count") == 2,
                       "preparation rejection request shape missing");
+    failures += check(rejected.at("request").at("requested_reasoning_effort") == "high" &&
+                          rejected.at("request").at("resolved_reasoning_effort").is_null(),
+                      "rejection log fabricated a resolved reasoning effort");
     failures += check(rejected.at("error").at("status") == 400 &&
                           rejected.at("error").at("code") == "context_length_exceeded" &&
                           rejected.at("error").at("param") == "messages",
                       "preparation rejection API error missing");
-    failures +=
-        check(format_request_rejected(rejected_context)
-                          .find("rejected phase=prepare protocol=anthropic_messages") !=
-                      std::string::npos &&
-                  format_request_rejected(rejected_context).find("code=context_length_exceeded") !=
-                      std::string::npos,
-              "human preparation rejection log is incomplete");
+    failures += check(
+        format_request_rejected(rejected_context)
+                    .find("rejected phase=prepare protocol=anthropic_messages") !=
+                std::string::npos &&
+            format_request_rejected(rejected_context).find("code=context_length_exceeded") !=
+                std::string::npos &&
+            format_request_rejected(rejected_context).find("reasoning_effort=high->unresolved") !=
+                std::string::npos,
+        "human preparation rejection log is incomplete");
 
     GenerationOutcome outcome;
     outcome.prompt_tokens                   = 401;
@@ -349,6 +364,23 @@ int main() {
     outcome.metrics.speculative_accepted_tokens       = 720;
     outcome.metrics.speculative_fallback_steps        = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
+    outcome.metrics.materialization                   = {
+                          .predicted_now_ns              = 200000,
+                          .predicted_future_loss_ns      = 50000,
+                          .predicted_total_ns            = 250000,
+                          .targets_evaluated             = 7,
+                          .projection_work               = 31,
+                          .planning_elapsed_ns           = 9000,
+                          .search_elapsed_ns             = 6000,
+                          .stop_reason                   = ninfer::MaterializationStopReason::ModelOptimal,
+                          .model_optimal                 = true,
+                          .budget_exhausted              = false,
+                          .best_remaining_lower_bound_ns = 250000,
+                          .absolute_bound_gap_ns         = 0,
+                          .relative_bound_gap            = 0.0,
+                          .selected_degradation_units    = 2,
+                          .selected_maximal_fallback     = false,
+    };
     outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
                                                    .injected_tokens       = 19,
@@ -387,6 +419,11 @@ int main() {
     failures +=
         check(done.at("speculative").at("accepted_per_position") == Json::array({290, 240, 190}),
               "speculative position counts missing");
+    failures += check(done.at("materialization").at("predicted_total_ns") == 250000 &&
+                          done.at("materialization").at("targets_evaluated") == 7 &&
+                          done.at("materialization").at("stop_reason") == "model_optimal" &&
+                          done.at("materialization").at("model_optimal") == true,
+                      "request-owned materialization diagnostics missing");
     failures += check(
         done.at("engine_timing").at("queue_wait_seconds") == 0.001 &&
             std::abs(done.at("engine_timing").at("host_exposed_seconds").at("total").get<double>() -
@@ -420,49 +457,52 @@ int main() {
                       "human request log mislabels a submitted request");
 
     ThroughputReport throughput;
-    throughput.interval_seconds                          = 2.0;
-    throughput.computed_prefill_tokens                   = 100;
-    throughput.committed_decode_tokens                   = 40;
-    throughput.decode_rounds                             = 10;
-    throughput.decode_row_rounds                         = 18;
-    throughput.previous.root_selections                  = 2;
-    throughput.previous.state_h2d_bytes                  = 100;
-    throughput.current.running_requests                  = 2;
-    throughput.current.prefilling_requests               = 1;
-    throughput.current.decode_ready_requests             = 1;
-    throughput.current.waiting_requests                  = 3;
-    throughput.current.materializing_requests            = 1;
-    throughput.current.capture_pending_requests          = 1;
-    throughput.current.terminal_pending_requests         = 1;
-    throughput.current.root_selections                   = 3;
-    throughput.current.state_h2d_count                   = 1;
-    throughput.current.state_h2d_bytes                   = 132;
-    throughput.current.state_h2d_seconds                 = 0.25;
-    throughput.current.device_state_occupied_slots       = 3;
-    throughput.current.host_state_occupied_slots         = 1;
-    throughput.current.last_selected_frontier_tokens     = 64;
-    throughput.current.last_predicted_materialization_ns = 250000;
-    throughput.current.host_work                         = {
-                                .engine_boundary_ns            = 1000000,
-                                .program_submit_ns             = 2000000,
-                                .program_post_ns               = 3000000,
-                                .engine_commit_output_ns       = 4000000,
-                                .engine_maintenance_ns         = 5000000,
-                                .device_wait_ns                = 300000000,
-                                .decode_host_ns                = 10000000,
-                                .decode_device_wait_ns         = 200000000,
-                                .prefill_host_ns               = 3000000,
-                                .prefill_device_wait_ns        = 50000000,
-                                .control_host_ns               = 2000000,
-                                .control_device_wait_ns        = 50000000,
-                                .prefill_units                 = 4,
-                                .control_units                 = 1,
-                                .admission_policy_ns           = 1000000,
-                                .context_progress_ns           = 2000000,
-                                .stats_publication_ns          = 250000,
-                                .admission_policy_invocations  = 2,
-                                .context_progress_invocations  = 4,
-                                .stats_publication_invocations = 5,
+    throughput.interval_seconds                         = 2.0;
+    throughput.computed_prefill_tokens                  = 100;
+    throughput.committed_decode_tokens                  = 40;
+    throughput.decode_rounds                            = 10;
+    throughput.decode_row_rounds                        = 18;
+    throughput.previous.root_selections                 = 2;
+    throughput.previous.state_h2d_bytes                 = 100;
+    throughput.current.running_requests                 = 2;
+    throughput.current.prefilling_requests              = 1;
+    throughput.current.decode_ready_requests            = 1;
+    throughput.current.waiting_requests                 = 3;
+    throughput.current.materializing_requests           = 1;
+    throughput.current.capture_pending_requests         = 1;
+    throughput.current.terminal_pending_requests        = 1;
+    throughput.current.root_selections                  = 3;
+    throughput.current.state_h2d_count                  = 1;
+    throughput.current.state_h2d_bytes                  = 132;
+    throughput.current.state_h2d_seconds                = 0.25;
+    throughput.current.device_state_occupied_slots      = 3;
+    throughput.current.host_state_occupied_slots        = 1;
+    throughput.current.last_selected_frontier_tokens    = 64;
+    throughput.current.pressure_spill_pages             = 4;
+    throughput.current.pressure_private_owners_degraded = 1;
+    throughput.current.pressure_checkpoints_dropped     = 1;
+    throughput.current.pressure_searches                = 1;
+    throughput.current.host_work                        = {
+                               .engine_boundary_ns            = 1000000,
+                               .program_submit_ns             = 2000000,
+                               .program_post_ns               = 3000000,
+                               .engine_commit_output_ns       = 4000000,
+                               .engine_maintenance_ns         = 5000000,
+                               .device_wait_ns                = 300000000,
+                               .decode_host_ns                = 10000000,
+                               .decode_device_wait_ns         = 200000000,
+                               .prefill_host_ns               = 3000000,
+                               .prefill_device_wait_ns        = 50000000,
+                               .control_host_ns               = 2000000,
+                               .control_device_wait_ns        = 50000000,
+                               .prefill_units                 = 4,
+                               .control_units                 = 1,
+                               .admission_policy_ns           = 1000000,
+                               .context_progress_ns           = 2000000,
+                               .stats_publication_ns          = 250000,
+                               .admission_policy_invocations  = 2,
+                               .context_progress_invocations  = 4,
+                               .stats_publication_invocations = 5,
     };
     const std::string human_throughput = format_throughput(throughput);
     failures += check(human_throughput.find("prefill=50.0tok/s") != std::string::npos &&
@@ -521,9 +561,9 @@ int main() {
         throughput_json.at("context_cache").at("selections").at("root") == 1 &&
             throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&
             throughput_json.at("context_cache").at("occupancy").at("device_state_slots") == 3 &&
-            throughput_json.at("context_cache")
-                    .at("last_materialization")
-                    .at("predicted_nanoseconds") == 250000,
+            throughput_json.at("context_cache").at("pressure").at("spill_pages") == 4 &&
+            throughput_json.at("context_cache").at("pressure").at("private_owners_degraded") == 1 &&
+            !throughput_json.at("context_cache").contains("last_materialization"),
         "context-cache throughput statistics missing or not interval-scoped");
 
     const std::string console_prefix =

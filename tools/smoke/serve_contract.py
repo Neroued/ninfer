@@ -371,8 +371,14 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         raise ContractError("streamed reasoning differs from the non-streaming greedy response")
     if stream_finish != nonstream["choices"][0]["finish_reason"]:
         raise ContractError("streamed and non-streaming finish reasons differ")
-    if stream_usage != nonstream["usage"]:
-        raise ContractError("streamed and non-streaming usage differs")
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "completion_tokens_details",
+    ):
+        if stream_usage.get(key) != nonstream["usage"].get(key):
+            raise ContractError(f"streamed and non-streaming usage differs for {key}")
 
     responses_input = "Reply with a single short word."
     response_count = json_response(

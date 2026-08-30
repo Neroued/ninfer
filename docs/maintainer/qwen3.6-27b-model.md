@@ -458,13 +458,9 @@ still validated before these resident views are published.
 | GDN layout/views/reset/copy and Text/MTP/GDN composition | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/decoder_state.h`, `src/targets/qwen3_6/impl/state/decoder_state.cpp` |
 | fixed all-layer GDN state pool, ReplaySSM record arena, and Fold contract | `src/core/linear_attention_state.*`, `src/core/gdn_replay_records.*`, `include/ninfer/ops/gdn_replay.h`, `src/ops/linear_attention/gated_delta_net/replay.cpp` |
 | generated-round buffer schema, MTP alignment, and Vision control | `src/targets/qwen3_6/export/ninfer/targets/qwen3_6/`, `src/targets/qwen3_6/impl/state/round_state.cpp`, `src/targets/qwen3_6/impl/vision/control.cpp` |
-| `.ninfer` tensor assignment and binding | [`qwen3.6-27b-artifact.md`](qwen3.6-27b-artifact.md), `tools/reference/qwen3_6_27b/bindings.py` |
+| `.ninfer` tensor assignment and binding | [`qwen3.6-27b-artifact.md`](qwen3.6-27b-artifact.md), `tools/convert/qwen3_6_27b/`, `src/targets/qwen3_6_27b/impl/load/` |
 | native `.ninfer` converter and verifier | `tools/convert/qwen3_6_27b` |
-| artifact-native Python Text/Vision/MTP reference | `tools/reference/qwen3_6_27b` |
 
-The Python reference is an independent executable implementation for model/artifact inspection and
-diagnosis; it is not the per-Op mathematical oracle, does not prescribe private C++ kernel
-precision, and does not define cross-runtime generated-token equality. Each Op is checked against
-its own naive FP32/FP64 or exact oracle. The C++ target
-implements the complete Text/Vision/MTP product over `.ninfer` through the closed Engine
-architecture.
+NInfer maintains no second Python model implementation. Each Op is checked against its own naive
+FP32/FP64 or exact oracle, while the C++ target implements the complete Text/Vision/MTP product over
+`.ninfer` through the closed Engine architecture.

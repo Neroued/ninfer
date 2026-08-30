@@ -107,7 +107,7 @@ void test_exact_evaluation() {
                "nvidia-example-accelerator-sm90",
            "hardware class did not canonicalize a vendorless CUDA device name");
 
-    ninfer::runtime::ContextCostModel model{.transfer = transfer(), .prefill = prefill()};
+    ninfer::runtime::ContextMachineCostModel model{.transfer = transfer(), .prefill = prefill()};
     expect(model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost,
                              {.payload_bytes = 4, .copy_operations = 2}) == 16,
            "transfer operation roofline changed");
@@ -116,6 +116,26 @@ void test_exact_evaluation() {
            "transfer bandwidth roofline changed");
     expect(model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost, {}) == 0,
            "empty transfer has a nonzero cost");
+    const std::array same_phase{
+        ninfer::runtime::TransferBatchWork{
+            .phase     = ninfer::runtime::MaterializationCopyPhase::PressureToHost,
+            .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+            .work      = {.payload_bytes = 4, .copy_operations = 1}},
+        ninfer::runtime::TransferBatchWork{
+            .phase     = ninfer::runtime::MaterializationCopyPhase::PressureToHost,
+            .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+            .work      = {.payload_bytes = 4, .copy_operations = 1}},
+    };
+    expect(model.transfer_batches_ns(same_phase) == 16,
+           "same-phase transfers paid the batch intercept more than once");
+    auto serial_phases     = same_phase;
+    serial_phases[1].phase = ninfer::runtime::MaterializationCopyPhase::Candidate;
+    expect(model.transfer_batches_ns(serial_phases) == 26,
+           "serial transfer phases were incorrectly coalesced");
+    auto independent_directions         = same_phase;
+    independent_directions[1].direction = ninfer::runtime::ContextTransferDirection::HostToDevice;
+    expect(model.transfer_batches_ns(independent_directions) == 26,
+           "independent transfer directions were incorrectly coalesced");
 
     const ninfer::runtime::PrefillWork work = ninfer::runtime::make_prefill_work(100, 10, 2, 7, 8);
     expect(work.chunks == 2 && work.tokens == 10 && work.attention_pairs == 1055 &&
@@ -230,7 +250,7 @@ void test_resolution_and_atomic_upserts() {
             .model_id       = "qwen3.6-27b",
             .weights_id     = "groupwise-int",
         };
-        const auto compiled = ninfer::runtime::resolve_context_cost(compiled_identity);
+        const auto compiled = ninfer::runtime::resolve_context_machine_cost(compiled_identity);
         expect(
             compiled.summary.transfer_source == ninfer::ContextCostPresetSource::CompiledDefault &&
                 compiled.summary.prefill_source == ninfer::ContextCostPresetSource::CompiledDefault,
@@ -241,7 +261,7 @@ void test_resolution_and_atomic_upserts() {
             .model_id       = "unmeasured-model",
             .weights_id     = "unmeasured-weights",
         };
-        const auto generic = ninfer::runtime::resolve_context_cost(unknown);
+        const auto generic = ninfer::runtime::resolve_context_machine_cost(unknown);
         expect(
             generic.summary.transfer_source == ninfer::ContextCostPresetSource::GenericDefault &&
                 generic.summary.prefill_source == ninfer::ContextCostPresetSource::GenericDefault &&
@@ -252,7 +272,7 @@ void test_resolution_and_atomic_upserts() {
 
         ninfer::runtime::upsert_context_transfer_cost_atomic(path, unknown.hardware_class,
                                                              transfer(77), R"({"run":1})");
-        auto resolved = ninfer::runtime::resolve_context_cost(unknown, path);
+        auto resolved = ninfer::runtime::resolve_context_machine_cost(unknown, path);
         expect(resolved.model.transfer[0].batch_ns == 77 &&
                    resolved.summary.transfer_source == ninfer::ContextCostPresetSource::External &&
                    resolved.summary.prefill_source ==
@@ -261,7 +281,7 @@ void test_resolution_and_atomic_upserts() {
 
         ninfer::runtime::upsert_context_prefill_cost_atomic(path, unknown, prefill(91),
                                                             R"({"run":2})");
-        resolved = ninfer::runtime::resolve_context_cost(unknown, path);
+        resolved = ninfer::runtime::resolve_context_machine_cost(unknown, path);
         expect(resolved.model.transfer[0].batch_ns == 77 && resolved.model.prefill.chunk_ns == 91 &&
                    resolved.summary.transfer_source == ninfer::ContextCostPresetSource::External &&
                    resolved.summary.prefill_source == ninfer::ContextCostPresetSource::External,
@@ -272,7 +292,7 @@ void test_resolution_and_atomic_upserts() {
             .model_id       = "other",
             .weights_id     = "other",
         };
-        const auto layered_miss = ninfer::runtime::resolve_context_cost(other_model, path);
+        const auto layered_miss = ninfer::runtime::resolve_context_machine_cost(other_model, path);
         expect(layered_miss.summary.transfer_source == ninfer::ContextCostPresetSource::External &&
                    layered_miss.summary.prefill_source ==
                        ninfer::ContextCostPresetSource::GenericDefault,

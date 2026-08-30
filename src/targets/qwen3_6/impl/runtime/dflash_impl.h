@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
+#include "core/nvtx.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/embedding.h"
@@ -91,6 +92,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
         const std::int32_t columns = width * batch;
+        nvtx::ScopedRange append_range(nvtx::Name::DFlashContextAppend, nvtx::Category::DFlash,
+                                       static_cast<std::uint64_t>(columns));
         if (width <= 0 || batch <= 0 || features.dtype != DType::BF16 ||
             features.ne[0] != Config::feature_rows || features.ne[3] != 1 ||
             positions.dtype != DType::I32 || positions.ne[0] != width || positions.ne[1] != batch ||
@@ -188,14 +191,16 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
         using Config               = typename V::DFlashConfig;
         const std::int32_t width   = static_cast<std::int32_t>(k) + 1;
         const std::int32_t columns = width * batch_size;
-        Tensor anchors             = frame.anchors.slice(0, 0, batch_size);
-        Tensor frontiers           = frame.execution_frontiers.slice(0, 0, batch_size);
-        Tensor valid_columns       = frame.target_valid_columns.slice(0, 0, batch_size);
-        Tensor state_destinations  = frame.state_destination_slots.slice(0, 0, batch_size);
-        Tensor full_rows           = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
-        Tensor ids                 = frame.proposal_ids.slice(1, 0, batch_size);
-        Tensor positions           = frame.proposal_positions.slice(1, 0, batch_size);
-        Tensor drafts              = frame.draft_tokens.slice(1, 0, batch_size);
+        nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
+                                         static_cast<std::uint64_t>(columns));
+        Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
+        Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
+        Tensor valid_columns      = frame.target_valid_columns.slice(0, 0, batch_size);
+        Tensor state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
+        Tensor full_rows          = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
+        Tensor ids                = frame.proposal_ids.slice(1, 0, batch_size);
+        Tensor positions          = frame.proposal_positions.slice(1, 0, batch_size);
+        Tensor drafts             = frame.draft_tokens.slice(1, 0, batch_size);
 
         state.execution.work.reset();
         ops::prepare_masked_block(anchors, frontiers, valid_columns, Config::mask_token, ids,
@@ -205,9 +210,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                        state.execution.device.stream);
 
         for (int layer = 0; layer < Config::layers; ++layer) {
+            nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
+                                          static_cast<std::uint64_t>(layer));
             const auto& weight =
                 state.execution.model.dflash->layers.at(static_cast<std::size_t>(layer));
             {
+                nvtx::ScopedRange attention_range(nvtx::Name::DFlashAttention,
+                                                  nvtx::Category::Attention,
+                                                  static_cast<std::uint64_t>(layer));
                 auto attention_scope = state.execution.work.scope();
                 auto roots =
                     workspace_recipe::dflash_attention<Config>(state.execution.work, columns);
@@ -260,6 +270,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_6::DFlashDecodeState& f
                                 state.execution.device.stream);
             }
             {
+                nvtx::ScopedRange mlp_range(nvtx::Name::DFlashMlp, nvtx::Category::PostMixer,
+                                            static_cast<std::uint64_t>(layer));
                 auto mlp_scope = state.execution.work.scope();
                 auto roots = workspace_recipe::dflash_mlp<Config>(state.execution.work, columns);
                 ops::rmsnorm(residual, weight.post_attention_norm, Config::rms_epsilon, false,
@@ -368,31 +380,35 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          &state.text_cache);
         DFlashFeatureSink sink =
             batch_feature_sink_impl<Variant>(state, active_lanes, valid_columns, width, batch_size);
-        target_verify_accept(state.execution, state.continuation_hidden_store, card,
-                             TargetVerifyFrameView{
-                                 .ids                     = verify_ids,
-                                 .cache_positions         = target_positions,
-                                 .rope_positions          = target_positions,
-                                 .valid_columns           = valid_columns,
-                                 .kv_table_rows           = text_rows,
-                                 .state_source_slots      = state_sources,
-                                 .state_destination_slots = state_destinations,
-                                 .target_hidden           = target_hidden,
-                                 .target_logits           = target_logits,
-                                 .target_tokens           = target_tokens,
-                                 .drafts                  = drafts,
-                                 .current_extents         = extents,
-                                 .frontiers               = frontiers,
-                                 .anchors                 = anchors,
-                                 .licensed_tokens         = licensed_tokens,
-                                 .licensed_counts         = licensed_counts,
-                                 .accepted_drafts         = accepted,
-                                 .selected_hidden         = selected_hidden,
-                                 .replay_records          = state.execution.replay_records,
-                                 .sampling                = frame.sampling,
-                                 .feature_sink            = &sink,
-                             },
-                             target_envelope);
+        {
+            nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
+                                           static_cast<std::uint64_t>(width) * batch_size);
+            target_verify_accept(state.execution, state.continuation_hidden_store, card,
+                                 TargetVerifyFrameView{
+                                     .ids                     = verify_ids,
+                                     .cache_positions         = target_positions,
+                                     .rope_positions          = target_positions,
+                                     .valid_columns           = valid_columns,
+                                     .kv_table_rows           = text_rows,
+                                     .state_source_slots      = state_sources,
+                                     .state_destination_slots = state_destinations,
+                                     .target_hidden           = target_hidden,
+                                     .target_logits           = target_logits,
+                                     .target_tokens           = target_tokens,
+                                     .drafts                  = drafts,
+                                     .current_extents         = extents,
+                                     .frontiers               = frontiers,
+                                     .anchors                 = anchors,
+                                     .licensed_tokens         = licensed_tokens,
+                                     .licensed_counts         = licensed_counts,
+                                     .accepted_drafts         = accepted,
+                                     .selected_hidden         = selected_hidden,
+                                     .replay_records          = state.execution.replay_records,
+                                     .sampling                = frame.sampling,
+                                     .feature_sink            = &sink,
+                                 },
+                                 target_envelope);
+        }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));

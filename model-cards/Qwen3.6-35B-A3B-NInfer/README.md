@@ -103,9 +103,9 @@ printf '%s  %s\n' \
 - CUDA Toolkit 13.1 or newer.
 
 NInfer does not provide an install target or packaged binary. See the
-[repository README](https://github.com/Neroued/ninfer#build) for source-build dependencies.
+[repository README](https://github.com/Neroued/ninfer#quick-start) for source-build dependencies.
 
-## Download and run
+## Download and run a CLI example
 
 ```bash
 hf download neroued/Qwen3.6-35B-A3B-NInfer \
@@ -114,8 +114,9 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
 
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
-  --max-context 16384 \
-  --max-new 256 \
+  --max-context 32768 \
+  --max-new 8192 \
+  --kv-dtype fp8 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft
 ```
@@ -125,19 +126,47 @@ For text-only DFlash, the measured block-8 configuration uses seven draft tokens
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
   --prompt "Explain prefill and decode in three sentences." \
-  --max-context 16384 \
-  --max-new 256 \
+  --max-context 32768 \
+  --max-new 8192 \
+  --kv-dtype fp8 \
   --spec dflash --draft-tokens 7 \
   --lm-head-draft
 ```
 
 `--draft-tokens` accepts `1..5` for MTP and `1..15` for DFlash. The DFlash value `7` is the
-current measured recommendation, not a semantic limit; `15` uses the companion's full native
-16-position block. MTP and DFlash are mutually exclusive. DFlash is text-only and cannot be
-combined with `--vision`; use a separate non-DFlash process for image or video requests.
+measured block-length-eight profile; `15` uses the companion's full native 16-position block. MTP
+and DFlash are mutually exclusive. DFlash is text-only and cannot be combined with `--vision`; use
+a separate non-DFlash process for image or video requests.
 
-For images, videos, structured chat history, and HTTP serving, see the
-[NInfer documentation](https://github.com/Neroued/ninfer/tree/master/docs).
+For images, videos, and structured chat history, see the
+[CLI guide](https://github.com/Neroued/ninfer/blob/master/docs/cli.md).
+
+## Start a local server
+
+```bash
+./build/apps/ninfer-serve models/qwen3_6_35b_a3b.ninfer \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --max-context 240000 \
+  --kv-capacity 240000 \
+  --max-concurrency 2 \
+  --kv-dtype fp8 \
+  --device-state-slots 2 \
+  --host-state-slots 8 \
+  --host-kv-mib 8192 \
+  --spec mtp --draft-tokens 3 \
+  --lm-head-draft \
+  --preserve-thinking
+```
+
+Each request has a 240,000-token logical ceiling. The shared 240,000-token Device KV pool admits
+two active requests when their combined completion reservations fit; either request may use the
+full pool while running alone. Two extra Device checkpoint slots, eight pinned Host State slots,
+and 8 GiB of pinned Host KV retain reusable continuations under resource pressure.
+
+See the [HTTP serving guide](https://github.com/Neroued/ninfer/blob/master/docs/serving.md) for the
+API surface and the [resource scheduling reference](https://github.com/Neroued/ninfer/blob/master/docs/maintainer/resource-scheduling-and-context-cache.md)
+for cache and admission semantics.
 
 ## Supported use
 
@@ -147,11 +176,11 @@ The artifact supports:
 - image, multi-image, video, and mixed multimodal messages;
 - MTP speculative decoding with draft windows from one to five;
 - text-only DFlash speculative decoding with draft windows from one to fifteen;
-- BF16, INT8 group-64, and row-scaled FP8 E4M3 KV cache;
+- row-scaled FP8 E4M3, INT8 group-64, and BF16 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;
-- OpenAI Chat Completions and Anthropic Messages serving.
+- OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages serving.
 
 ## Performance
 

@@ -1,839 +1,663 @@
-// Contract test for the Anthropic Messages serving layer: request parsing
-// (system field, string + block content, tool_use/tool_result round-trip,
-// tool_choice/thinking/sampling mapping, unsupported-content rejection),
-// non-streaming response + streaming SSE event shapes, stop_reason mapping,
-// count_tokens body, and Anthropic error body. This is the schema boundary
-// consumed by Claude Code / other Anthropic clients.
+#include "serve/anthropic_messages.h"
 
-#include "serve/anthropic_schema.h"
-#include "serve/request.h"
+#include "serve/generation_service.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
-#include <cstddef>
 #include <functional>
 #include <iostream>
+#include <iterator>
+#include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
 using Json = nlohmann::json;
 using namespace ninfer::serve;
 
-int fail(const std::string& message) {
+int check(bool condition, const std::string& message) {
+    if (condition) { return 0; }
     std::cerr << "FAIL: " << message << '\n';
     return 1;
 }
 
-int check(bool condition, const std::string& message) { return condition ? 0 : fail(message); }
-
-bool throws_api(const std::function<void()>& f) {
-    try {
-        f();
-    } catch (const ApiException&) { return true; } catch (...) {
-        return false;
-    }
-    return false;
+Json base_request() {
+    return Json{{"model", "claude-local"},
+                {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+                {"max_tokens", 4096}};
 }
 
-std::string api_code(const std::function<void()>& f) {
+RequestLimits limits() {
+    RequestLimits value;
+    value.default_max_tokens = 8192;
+    return value;
+}
+
+const AnthropicThinkingSigner& thinking_signer() {
+    static const AnthropicThinkingSigner value = [] {
+        AnthropicThinkingSigner::Key key{};
+        for (std::size_t index = 0; index < key.size(); ++index) {
+            key[index] = static_cast<std::uint8_t>(index + 1U);
+        }
+        return AnthropicThinkingSigner(key);
+    }();
+    return value;
+}
+
+AnthropicMessagesRequest parse(const Json& body) {
+    return parse_anthropic_messages_request(body, limits(), thinking_signer());
+}
+
+std::string api_code(const std::function<void()>& action) {
     try {
-        f();
+        action();
     } catch (const ApiException& error) { return error.error().code; } catch (...) {
         return "wrong_exception";
     }
     return {};
 }
 
-RequestLimits default_limits() {
-    RequestLimits limits;
-    limits.default_max_tokens = 512;
-    return limits;
-}
-
-ServeOptions default_server() { return ServeOptions{}; }
-
-ninfer::PromptCapabilities effort_capabilities() {
-    ninfer::PromptCapabilities capabilities;
-    capabilities.enable_thinking                 = true;
-    capabilities.reasoning_effort.low            = true;
-    capabilities.reasoning_effort.medium         = true;
-    capabilities.reasoning_effort.xhigh          = true;
-    capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
-    return capabilities;
-}
-
-ninfer::OwnedMedia fake_media(const ContentPart& part) {
-    ninfer::OwnedMedia media;
-    media.kind =
-        part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
-    media.bytes.push_back(0);
-    media.media_type = part.source.media_type;
-    return media;
-}
-
-ninfer::PromptInput translate(const GenerationRequest& req) {
-    const ServeOptions server = default_server();
-    return to_prompt_input(req, resolve_prompt_semantics(req, server, effort_capabilities()),
-                           fake_media);
-}
-
-ninfer::RequestOptions translate_options(const GenerationRequest& req) {
-    const ServeOptions server = default_server();
-    return to_request_options(req, server,
-                              resolve_prompt_semantics(req, server, effort_capabilities()),
-                              server.allow_prefix_reuse);
-}
-
-std::string joined_text(const ninfer::ChatMessage& message) {
-    std::string text;
-    for (const ninfer::MessagePart& part : message.parts) {
-        if (part.kind == ninfer::MessagePartKind::Text) { text += part.text; }
+std::string api_param(const std::function<void()>& action) {
+    try {
+        action();
+    } catch (const ApiException& error) { return error.error().param; } catch (...) {
+        return "wrong_exception";
     }
-    return text;
+    return {};
 }
 
-// Parse an Anthropic SSE event ("event: <type>\ndata: <json>\n\n") into its JSON
-// payload, optionally returning the event-type line.
-Json parse_sse(const std::string& event, std::string* out_type = nullptr) {
-    const std::string ev_prefix   = "event: ";
-    const std::string data_marker = "\ndata: ";
-    const std::string suffix      = "\n\n";
-    if (event.rfind(ev_prefix, 0) != 0) { throw std::runtime_error("bad SSE framing: " + event); }
-    const std::size_t data_pos = event.find(data_marker);
-    if (data_pos == std::string::npos) { throw std::runtime_error("no data line: " + event); }
-    if (out_type != nullptr) {
-        *out_type = event.substr(ev_prefix.size(), data_pos - ev_prefix.size());
-    }
-    const std::size_t json_begin = data_pos + data_marker.size();
-    if (event.size() < json_begin + suffix.size()) {
-        throw std::runtime_error("short SSE: " + event);
-    }
-    return Json::parse(event.substr(json_begin, event.size() - json_begin - suffix.size()));
+ninfer::PromptCapabilities capabilities() {
+    ninfer::PromptCapabilities result;
+    result.enable_thinking                 = true;
+    result.reasoning_effort.low            = true;
+    result.reasoning_effort.medium         = true;
+    result.reasoning_effort.xhigh          = true;
+    result.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
+    return result;
 }
 
-int test_parse_basic_and_system() {
-    int failures                = 0;
-    const Json body             = {{"model", "claude-sonnet-4-5"},
-                                   {"max_tokens", 256},
-                                   {"system", "be terse"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
-    failures += check(req.model == "claude-sonnet-4-5", "model echoed verbatim");
-    failures += check(req.max_tokens == 256 && req.max_tokens_set, "max_tokens parsed");
-    failures += check(req.messages.size() == 2, "system + user turns");
-    failures += check(req.messages[0].role == ninfer::ChatRole::System, "system turn is first");
-    failures += check(req.messages[0].content[0].text == "be terse", "system text carried");
-    failures += check(req.messages[1].role == ninfer::ChatRole::User, "user turn follows system");
-    failures += check(req.messages[1].content[0].text == "hello", "user text carried");
-    failures += check(!req.stream, "stream defaults false");
+ResolvedPromptSemantics semantics(const GenerationRequest& request, bool default_thinking = true) {
+    ServeOptions options;
+    options.enable_thinking = default_thinking;
+    return resolve_prompt_semantics(request, options, capabilities());
+}
+
+ninfer::PromptInput prompt(const GenerationRequest& request) {
+    return to_prompt_input(request, semantics(request), [](const ContentPart& part) {
+        ninfer::OwnedMedia media;
+        media.kind =
+            part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
+        media.bytes               = {1};
+        media.image_resize_policy = part.image_resize_policy;
+        return media;
+    });
+}
+
+Json parse_event(const std::string& value) {
+    const std::size_t newline = value.find('\n');
+    if (!value.starts_with("event: ") || newline == std::string::npos || !value.ends_with("\n\n")) {
+        throw std::runtime_error("invalid Anthropic SSE framing");
+    }
+    const std::string type   = value.substr(7, newline - 7);
+    const std::string prefix = "data: ";
+    if (value.compare(newline + 1U, prefix.size(), prefix) != 0) {
+        throw std::runtime_error("missing Anthropic SSE data");
+    }
+    Json payload = Json::parse(value.substr(newline + 1U + prefix.size(),
+                                            value.size() - newline - 1U - prefix.size() - 2U));
+    if (payload.at("type") != type) { throw std::runtime_error("Anthropic SSE type mismatch"); }
+    return payload;
+}
+
+int test_envelope_and_field_policy() {
+    Json body             = base_request();
+    body["stream"]        = true;
+    body["temperature"]   = 0.7;
+    body["top_p"]         = 0.8;
+    body["top_k"]         = 20;
+    body["metadata"]      = Json{{"user_id", "u"}};
+    body["service_tier"]  = "auto";
+    body["inference_geo"] = "anywhere";
+    body["future_field"]  = Json{{"unknown", true}};
+    body["output_config"] = Json{{"effort", "low"}, {"future_option", true}};
+
+    const AnthropicMessagesRequest request = parse(body);
+    int failures =
+        check(request.model == "claude-local" && request.stream && request.output_tokens_explicit &&
+                  request.generation.max_tokens == 4096,
+              "Messages envelope fields were not preserved");
+    failures += check(request.generation.sampling.temperature == 0.7 &&
+                          request.generation.sampling.top_p == 0.8 &&
+                          request.generation.sampling.top_k == 20 &&
+                          request.generation.reasoning_effort == RequestedReasoningEffort::Low,
+                      "executable Anthropic generation fields were not lowered");
+
+    body.erase("max_tokens");
+    const AnthropicMessagesRequest defaulted = parse(body);
+    failures += check(!defaulted.output_tokens_explicit && defaulted.generation.max_tokens == 8192,
+                      "omitted max_tokens did not use the server default");
+    body["max_tokens"] = 0;
+    failures += check(api_code([&] { (void)parse(body); }) == "cache_prewarm_not_supported",
+                      "max_tokens=0 was accepted as a false cache prewarm");
+
+    body                = base_request();
+    body["temperature"] = 1.01;
+    failures += check(api_param([&] { (void)parse(body); }) == "temperature",
+                      "Anthropic temperature range was not enforced");
+    body          = base_request();
+    body["top_k"] = 21;
+    failures += check(api_param([&] { (void)parse(body); }) == "top_k",
+                      "Engine top_k range was not enforced");
+    body                  = base_request();
+    body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
+    failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",
+                      "structured output was silently downgraded");
+    body              = base_request();
+    body["container"] = "container_1";
+    failures += check(api_code([&] { (void)parse(body); }) == "container_not_supported",
+                      "container execution was silently ignored");
     return failures;
 }
 
-int test_parse_system_array_and_blocks() {
-    int failures    = 0;
-    const Json body = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"system", Json::array({Json{{"type", "text"}, {"text", "a"}},
-                                Json{{"type", "text"}, {"text", "b"}}})},
-        {"messages",
-         Json::array({Json{{"role", "user"},
-                           {"content", Json::array({Json{{"type", "text"}, {"text", "x"}},
-                                                    Json{{"type", "text"}, {"text", "y"}}})}}})}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
-    failures += check(req.messages[0].role == ninfer::ChatRole::System, "system first");
-    failures += check(req.messages[0].content[0].text == "a\nb", "system blocks joined");
-    const ninfer::PromptInput prompt = translate(req);
-    failures += check(prompt.messages.size() == 2, "flattened system + user");
-    failures += check(joined_text(prompt.messages[1]) == "x\ny", "user blocks joined");
+int test_message_normalization() {
+    Json body        = base_request();
+    body["thinking"] = Json{{"type", "disabled"}};
+    body["system"] =
+        Json::array({Json{{"type", "text"}, {"text", "A"}},
+                     Json{{"type", "text"},
+                          {"text", "B"},
+                          {"cache_control", Json{{"type", "ephemeral"}, {"ttl", "1h"}}}}});
+    body["messages"] =
+        Json::array({Json{{"role", "user"},
+                          {"content", Json::array({Json{{"type", "text"}, {"text", "one"}},
+                                                   Json{{"type", "text"}, {"text", "two"}}})}},
+                     Json{{"role", "user"}, {"content", "three"}},
+                     Json{{"role", "assistant"}, {"content", "prefix"}}});
+
+    const GenerationRequest request = parse(body).generation;
+    int failures                    = check(request.messages.size() == 3 &&
+                                                request.messages[0].role == ninfer::ChatRole::System &&
+                                                request.messages[1].role == ninfer::ChatRole::User &&
+                                                request.messages[1].content.size() == 3,
+                                            "consecutive Anthropic roles were not merged by block concatenation");
+    failures += check(request.messages[0].content[0].text == "A" &&
+                          request.messages[0].content[1].text == "B" &&
+                          request.messages[1].content[0].text == "one" &&
+                          request.messages[1].content[1].text == "two" &&
+                          request.messages[1].content[2].text == "three",
+                      "message normalization inserted or removed text");
+    failures +=
+        check(request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant,
+              "final assistant text did not select continuation mode");
+    const ninfer::PromptInput translated = prompt(request);
+    failures += check(translated.options.continuation ==
+                              ninfer::PromptContinuationMode::ContinueFinalAssistant &&
+                          translated.context_cache.markers.size() == 1 &&
+                          translated.context_cache.markers[0].location ==
+                              ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+                      "assistant continuation or system block cache boundary was lost");
     return failures;
 }
 
-int test_cache_control_boundaries() {
-    const Json ephemeral = Json{{"type", "ephemeral"}};
-    const Json body      = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"system",
-              Json::array(
-             {Json{{"type", "text"}, {"text", "stable system"}, {"cache_control", ephemeral}},
-                   Json{{"type", "text"}, {"text", "dynamic tail"}}})},
-        {"tools", Json::array({Json{{"name", "inspect"},
-                                         {"input_schema", Json{{"type", "object"}}},
-                                         {"cache_control", ephemeral}}})},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+Json tool_use(std::string id, std::string name = "lookup") {
+    return Json{{"type", "tool_use"},
+                {"id", std::move(id)},
+                {"name", std::move(name)},
+                {"input", Json::object()}};
+}
+
+Json tool_result(std::string id, std::string content, bool is_error = false) {
+    return Json{{"type", "tool_result"},
+                {"tool_use_id", std::move(id)},
+                {"content", std::move(content)},
+                {"is_error", is_error}};
+}
+
+int test_tool_history() {
+    Json body        = base_request();
+    body["messages"] = Json::array(
+        {Json{{"role", "assistant"},
+              {"content", Json::array({tool_use("toolu_a"), tool_use("toolu_b")})}},
+         Json{{"role", "user"},
+              {"content", Json::array({Json{{"type", "tool_result"},
+                                            {"tool_use_id", "toolu_b"},
+                                            {"content", "result B"},
+                                            {"is_error", true},
+                                            {"cache_control", Json{{"type", "ephemeral"}}}},
+                                       tool_result("toolu_a", "result A"),
+                                       Json{{"type", "text"}, {"text", "continue"}}})}}});
+    const GenerationRequest normalized          = parse(body).generation;
+    int failures                                = check(normalized.messages.size() == 4 &&
+                                                            normalized.messages[0].role == ninfer::ChatRole::Assistant &&
+                                                            normalized.messages[1].role == ninfer::ChatRole::Tool &&
+                                                            normalized.messages[1].tool_call_id == "toolu_a" &&
+                                                            normalized.messages[1].content[0].text == "result A" &&
+                                                            normalized.messages[2].role == ninfer::ChatRole::Tool &&
+                                                            normalized.messages[2].tool_call_id == "toolu_b" &&
+                                                            normalized.messages[2].content[0].text == "result B" &&
+                                                            normalized.messages[2].tool_result_is_error &&
+                                                            normalized.messages[2].cache_boundary_after &&
+                                                            normalized.messages[2].cache_boundary_after->kind ==
+                                                                ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                                                            normalized.messages[3].role == ninfer::ChatRole::User &&
+                                                            normalized.messages[3].content[0].text == "continue",
+                                                        "valid out-of-order tool results were not associated by ID");
+    const ninfer::PromptInput normalized_prompt = prompt(normalized);
+    failures += check(normalized_prompt.messages[2].parts.size() == 2 &&
+                          normalized_prompt.messages[2].parts[0].text == "[tool_error]\n" &&
+                          normalized_prompt.messages[2].parts[1].text == "result B",
+                      "tool result error state did not follow its ID during normalization");
+
+    body["messages"][1]["content"] =
+        Json::array({tool_result("toolu_unknown", "wrong"), tool_result("toolu_a", "A")});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history" &&
+                          api_param([&] { (void)parse(body); }) == "messages",
+                      "unknown tool_result ID was accepted");
+
+    body["messages"][1]["content"] =
+        Json::array({tool_result("toolu_a", "first"), tool_result("toolu_a", "duplicate")});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
+                      "duplicate tool_result ID was accepted");
+
+    body["messages"][1]["content"] = Json::array({tool_result("toolu_a", "only one")});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
+                      "missing tool_result was accepted");
+
+    body["messages"] =
+        Json::array({Json{{"role", "assistant"}, {"content", Json::array({tool_use("toolu_a")})}},
+                     Json{{"role", "user"},
+                          {"content", Json::array({Json{{"type", "text"}, {"text", "before"}},
+                                                   tool_result("toolu_a", "result")})}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
+                      "tool_result after ordinary user content was accepted");
+
+    body["messages"] = Json::array(
+        {Json{{"role", "assistant"}, {"content", Json::array({tool_use("toolu_a")})}},
+         Json{{"role", "user"}, {"content", "before"}},
+         Json{{"role", "user"}, {"content", Json::array({tool_result("toolu_a", "result")})}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
+                      "same-role message joining bypassed tool_result ordering");
+
+    body["messages"] = Json::array(
+        {Json{{"role", "user"},
+              {"content", Json::array({tool_result("toolu_external", "imported"),
+                                       Json{{"type", "text"}, {"text", "continue"}}})}}});
+    const GenerationRequest truncated = parse(body).generation;
+    failures += check(truncated.messages.size() == 2 &&
+                          truncated.messages[0].role == ninfer::ChatRole::Tool &&
+                          truncated.messages[0].tool_call_id == "toolu_external" &&
+                          truncated.messages[1].role == ninfer::ChatRole::User,
+                      "leading tool_result from a truncated history was rejected or reordered");
+
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "first"}},
+         Json{{"role", "assistant"}, {"content", "ordinary"}},
+         Json{{"role", "user"}, {"content", Json::array({tool_result("toolu_orphan", "late")})}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
+                      "orphan tool_result inside a visible history was accepted");
+
+    body["messages"] = Json::array(
+        {Json{{"role", "assistant"},
+              {"content", Json::array({tool_use("toolu_same"), tool_use("toolu_same", "other")})}},
+         Json{{"role", "user"}, {"content", Json::array({tool_result("toolu_same", "result")})}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
+                      "duplicate tool_use ID was accepted");
+    failures += check(api_code([&] {
+                          (void)parse_anthropic_count_tokens_request(body, thinking_signer());
+                      }) == "invalid_tool_history",
+                      "Count Tokens did not share Messages tool-history validation");
+    return failures;
+}
+
+Json ordinary_tool(bool strict = false) {
+    return Json{{"name", "weather"},
+                {"description", "Get weather"},
+                {"input_schema", Json{{"type", "object"},
+                                      {"properties", Json{{"city", Json{{"type", "string"}}}}}}},
+                {"input_examples", Json::array({Json{{"city", "Paris"}}})},
+                {"strict", strict}};
+}
+
+int test_tools() {
+    Json body                       = base_request();
+    body["tools"]                   = Json::array({ordinary_tool()});
+    body["tool_choice"]             = Json{{"type", "auto"}, {"disable_parallel_tool_use", false}};
+    const GenerationRequest request = parse(body).generation;
+    const ninfer::PromptInput translated = prompt(request);
+    const Json rendered                  = Json::parse(translated.options.tool_jsons.at(0));
+    int failures = check(request.uses_tools() && rendered["function"]["name"] == "weather" &&
+                             rendered["function"]["input_examples"].is_array(),
+                         "Anthropic tool schema/examples did not reach the Qwen prompt");
+
+    body["tools"] = Json::array({ordinary_tool(true)});
+    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported",
+                      "active strict tool was accepted without constrained decoding");
+    body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
+    body["tools"][0]["defer_loading"] = true;
+    body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
+    const GenerationRequest disabled    = parse(body).generation;
+    failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.empty(),
+                      "tool_choice:none did not neutralize inactive tool guarantees");
+
+    body                = base_request();
+    body["tools"]       = Json::array({ordinary_tool()});
+    body["tool_choice"] = Json{{"type", "any"}};
+    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
+                      "forced any-tool choice was silently downgraded");
+    body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
+    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
+                      "named tool choice was silently downgraded");
+    body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", true}};
+    failures += check(api_code([&] { (void)parse(body); }) == "parallel_tool_use_not_supported",
+                      "active single-tool-call guarantee was silently downgraded");
+
+    body          = base_request();
+    body["tools"] = Json::array({Json{{"type", "web_search_20250305"}, {"name", "web_search"}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "anthropic_tools_not_supported",
+                      "Anthropic-provided tool was treated as a user tool");
+    body["tool_choice"] = Json{{"type", "none"}};
+    failures += check(api_code([&] { (void)parse(body); }).empty(),
+                      "inactive Anthropic-provided tool unnecessarily blocked generation");
+
+    body          = base_request();
+    body["tools"] = Json::array({ordinary_tool(), ordinary_tool()});
+    failures += check(api_param([&] { (void)parse(body); }) == "tools",
+                      "duplicate tool names were accepted");
+    return failures;
+}
+
+int test_thinking_and_count_tokens() {
+    Json body = base_request();
+    body["thinking"] =
+        Json{{"type", "enabled"}, {"budget_tokens", 1024}, {"display", "summarized"}};
+    const GenerationRequest enabled = parse(body).generation;
+    ServeOptions server;
+    server.default_thinking_budget = 777;
+    const ninfer::RequestOptions options =
+        to_request_options(enabled, server, semantics(enabled), true);
+    int failures = check(enabled.enable_thinking == true && enabled.thinking_budget == 1024 &&
+                             options.execution.thinking.budget == 1024,
+                         "request Thinking budget did not reach Engine options");
+
+    body["thinking"]["budget_tokens"] = 4096;
+    failures += check(api_param([&] { (void)parse(body); }) == "thinking",
+                      "Thinking budget equal to max_tokens was accepted");
+    body["thinking"] = Json{{"type", "future"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "thinking",
+                      "unknown Thinking mode defaulted to enabled");
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
+    failures += check(api_code([&] { (void)parse(body); }) == "thinking_display_not_supported",
+                      "hidden Thinking was accepted without restore semantics");
+
+    body["max_tokens"]    = 0;
+    body["temperature"]   = "ignored for counting";
+    body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
+    const AnthropicCountTokensRequest counted =
+        parse_anthropic_count_tokens_request(body, thinking_signer());
+    failures += check(counted.generation.enable_thinking == true,
+                      "Count Tokens did not share prompt-affecting Thinking parsing");
+
+    body             = base_request();
+    body["thinking"] = Json{{"type", "disabled"}};
+    body["messages"].push_back(Json{{"role", "assistant"}, {"content", "prefix"}});
+    failures += check(api_code([&] { (void)semantics(parse(body).generation); }).empty(),
+                      "disabled-Thinking assistant prefill was rejected");
+    body.erase("thinking");
+    failures += check(api_code([&] { (void)semantics(parse(body).generation); }) ==
+                          "assistant_prefill_not_supported",
+                      "Thinking-on assistant prefill was not rejected at capability resolution");
+    return failures;
+}
+
+int test_thinking_history_integrity() {
+    constexpr std::string_view thought = "thought";
+    const std::string signature        = thinking_signer().sign(thought, 0);
+    int failures =
+        check(signature ==
+                  "sig_ninfer_v1_72f7f5bccf8a10a8e5de051274eb2643f6a0fe99764bf463f935af5e2b845198",
+              "Anthropic Thinking signature does not match the HMAC-SHA256 contract");
+    AnthropicThinkingSigner::Key other_key{};
+    other_key.fill(0xa5U);
+    const AnthropicThinkingSigner other_process(other_key);
+    failures += check(!other_process.verify(thought, 0, signature),
+                      "Thinking signature remained valid under another process key");
+    std::string changed_encoding = signature;
+    const std::size_t hex_letter = changed_encoding.find_first_of("abcdef");
+    changed_encoding[hex_letter] = static_cast<char>(changed_encoding[hex_letter] - 'a' + 'A');
+    failures += check(!thinking_signer().verify(thought, 0, changed_encoding),
+                      "textually modified Thinking signature was accepted");
+
+    Json body        = base_request();
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "before"}},
+         Json{{"role", "assistant"},
+              {"content",
+               Json::array(
+                   {Json{{"type", "thinking"}, {"thinking", thought}, {"signature", signature}},
+                    Json{{"type", "text"}, {"text", "answer"}}})}},
+         Json{{"role", "user"}, {"content", "after"}}});
+    const GenerationRequest accepted = parse(body).generation;
+    failures +=
+        check(accepted.messages.size() == 3 && accepted.messages[1].reasoning_content == thought &&
+                  accepted.messages[1].content[0].text == "answer",
+              "valid signed Thinking history was not lowered");
+
+    Json changed_text                                     = body;
+    changed_text["messages"][1]["content"][0]["thinking"] = "changed";
+    failures += check(api_code([&] { (void)parse(changed_text); }) == "invalid_thinking_signature",
+                      "Thinking text changed under an existing signature was accepted");
+
+    Json changed_signature                                      = body;
+    std::string invalid                                         = signature;
+    invalid.back()                                              = invalid.back() == '0' ? '1' : '0';
+    changed_signature["messages"][1]["content"][0]["signature"] = invalid;
+    failures +=
+        check(api_code([&] { (void)parse(changed_signature); }) == "invalid_thinking_signature",
+              "changed Thinking signature was accepted");
+
+    Json missing_signature = body;
+    missing_signature["messages"][1]["content"][0].erase("signature");
+    failures +=
+        check(api_code([&] { (void)parse(missing_signature); }) == "invalid_thinking_signature",
+              "missing Thinking signature was accepted");
+
+    Json wrong_type                                      = body;
+    wrong_type["messages"][1]["content"][0]["signature"] = 1;
+    failures += check(api_code([&] { (void)parse(wrong_type); }) == "invalid_thinking_signature",
+                      "non-string Thinking signature was accepted");
+
+    Json reordered = body;
+    reordered["messages"][1]["content"].insert(reordered["messages"][1]["content"].begin(),
+                                               Json{{"type", "text"}, {"text", "first"}});
+    failures += check(api_code([&] { (void)parse(reordered); }) == "invalid_thinking_signature",
+                      "signed Thinking block was accepted at a changed content position");
+    failures +=
+        check(api_code([&] {
+                  (void)parse_anthropic_count_tokens_request(missing_signature, thinking_signer());
+              }) == "invalid_thinking_signature",
+              "Count Tokens bypassed Thinking signature validation");
+    return failures;
+}
+
+int test_content_and_cache_hints() {
+    Json body                       = base_request();
+    body["cache_control"]           = Json{{"type", "ephemeral"}, {"ttl", "5m"}};
+    body["messages"]                = Json::array({Json{
+                       {"role", "user"},
+                       {"content",
+                        Json::array({Json{{"type", "text"},
+                                          {"text", "look"},
+                                          {"cache_control", Json{{"type", "ephemeral"}}}},
+                                     Json{{"type", "image"},
+                                          {"source", Json{{"type", "url"}, {"url", "https://example/image.png"}}},
+                                          {"transformations", Json{{"oversized_image", "error"}}}}})}}});
+    const GenerationRequest request = parse(body).generation;
+    int failures                    = check(request.messages[0].content[1].cache_boundary_after &&
+                                                ninfer::has_shared_candidate_evidence(
+                                 request.messages[0].content[1].cache_boundary_after->evidence,
+                                 ninfer::SharedCandidateEvidence::RequestedAutomatic) &&
+                                                request.media_item_count() == 1 &&
+                                                request.messages[0].content[1].image_resize_policy ==
+                                                    ninfer::ImageResizePolicy::RejectOversized,
+                                            "automatic caching or image transformation policy was lost");
+    const ninfer::PromptInput translated = prompt(request);
+    failures += check(translated.context_cache.markers.size() == 2 &&
+                          translated.context_cache.markers[1].location ==
+                              ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+                      "message-part cache boundary was not represented in PromptInput");
+
+    body                           = base_request();
+    body["messages"][0]["content"] = Json::array(
+        {Json{{"type", "image"}, {"source", Json{{"type", "file"}, {"file_id", "file_1"}}}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "files_not_supported",
+                      "Files image source was flattened or ignored");
+    body["messages"][0]["content"] =
+        Json::array({Json{{"type", "document"}, {"source", Json::object()}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "documents_not_supported",
+                      "document citation semantics were silently discarded");
+    return failures;
+}
+
+GenerationOutcome sample_outcome() {
+    GenerationOutcome outcome;
+    outcome.text                            = "answer";
+    outcome.reasoning                       = "thought";
+    outcome.prompt_tokens                   = 100;
+    outcome.completion_tokens               = 12;
+    outcome.reasoning_tokens                = 5;
+    outcome.finish_reason                   = ninfer::FinishReason::StopString;
+    outcome.matched_stop_string             = "STOP";
+    outcome.metrics.prefix_cache_hit_tokens = 60;
+    return outcome;
+}
+
+int test_aggregate_and_errors() {
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_test", "claude-local");
+    GenerationOutcome outcome = sample_outcome();
+    const Json response =
+        Json::parse(make_anthropic_messages_response(identity, outcome, thinking_signer()));
+    int failures = check(
+        response["content"].size() == 2 && response["content"][0]["type"] == "thinking" &&
+            !response["content"][0]["signature"].get<std::string>().empty() &&
+            thinking_signer().verify(response["content"][0]["thinking"].get<std::string>(), 0,
+                                     response["content"][0]["signature"].get<std::string>()) &&
+            response["stop_reason"] == "stop_sequence" && response["stop_sequence"] == "STOP",
+        "aggregate Thinking or stop-sequence presentation is incomplete");
+    failures += check(response["usage"]["input_tokens"] == 40 &&
+                          response["usage"]["cache_read_input_tokens"] == 60 &&
+                          response["usage"]["cache_creation_input_tokens"].is_null() &&
+                          response["usage"]["output_tokens_details"]["thinking_tokens"] == 5,
+                      "aggregate cache/reasoning usage was fabricated or lost");
+
+    outcome.prompt_tokens                   = 10;
+    outcome.metrics.prefix_cache_hit_tokens = 1000;
+    const Json clamped =
+        Json::parse(make_anthropic_messages_response(identity, outcome, thinking_signer()));
+    failures += check(clamped["usage"]["input_tokens"] == 0 &&
+                          clamped["usage"]["cache_read_input_tokens"] == 10,
+                      "cache-read usage was not clamped to the prompt token count");
+
+    outcome               = {};
+    outcome.finish_reason = ninfer::FinishReason::ContextCapacity;
+    const Json empty =
+        Json::parse(make_anthropic_messages_response(identity, outcome, thinking_signer()));
+    failures +=
+        check(empty["content"].empty() && empty["stop_reason"] == "model_context_window_exceeded",
+              "empty output was fabricated or context capacity was misclassified");
+
+    ApiError overloaded;
+    overloaded.status         = 429;
+    overloaded.code           = "server_overloaded";
+    overloaded.message        = "full";
+    const ApiError normalized = normalize_anthropic_error(overloaded);
+    const Json error          = Json::parse(make_anthropic_error_body(overloaded, "req_error"));
+    failures += check(normalized.status == 529 && normalized.type == "overloaded_error" &&
+                          error["request_id"] == "req_error" &&
+                          error["error"]["type"] == "overloaded_error",
+                      "Anthropic overload or request-id error mapping is wrong");
+    return failures;
+}
+
+int test_stream() {
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_stream", "claude-local");
+    AnthropicMessagesStream stream(identity, 100, thinking_signer());
+    const ninfer::GenerationStart warm_start{
+        .prompt               = ninfer::PromptSummary{.prompt_tokens = 100},
+        .reused_prompt_tokens = 60,
     };
-    const GenerationRequest request  = parse_messages_request(body, default_limits());
-    const ninfer::PromptInput prompt = translate(request);
-    int failures = check(request.messages[0].shared_cache_boundaries_after_text_bytes.size() == 1 &&
-                             request.messages[0].shared_cache_boundaries_after_text_bytes[0] ==
-                                 std::string("stable system").size(),
-                         "Anthropic system cache_control boundary was flattened away");
-    failures += check(request.tools.size() == 1 && request.tools[0].cache_boundary_after,
-                      "Anthropic tool cache_control boundary was discarded");
-    failures += check(prompt.context_cache.markers.size() == 1 &&
-                          prompt.context_cache.markers[0].location ==
-                              ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary &&
-                          prompt.context_cache.markers[0].leading_instruction_bytes ==
-                              std::string("stable system").size(),
-                      "latest Anthropic cache_control boundary did not reach PromptInput");
-
-    Json tool_only      = body;
-    tool_only["system"] = "dynamic system";
-    const ninfer::PromptInput tool_prompt =
-        translate(parse_messages_request(tool_only, default_limits()));
-    failures += check(tool_prompt.context_cache.markers.size() == 1 &&
-                          tool_prompt.context_cache.markers[0].location ==
-                              ninfer::PromptCacheMarkerLocation::ToolBoundary &&
-                          tool_prompt.context_cache.markers[0].after_tool_count == 1,
-                      "Anthropic tool cache_control boundary did not reach PromptInput");
-
-    const Json message_cached = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"messages",
-         Json::array({Json{{"role", "user"},
-                           {"content", Json::array({Json{{"type", "text"},
-                                                         {"text", "question"},
-                                                         {"cache_control", ephemeral}}})}},
-                      Json{{"role", "assistant"},
-                           {"content", Json::array({Json{{"type", "text"},
-                                                         {"text", "answer"},
-                                                         {"cache_control", ephemeral}}})}},
-                      Json{{"role", "user"}, {"content", "next"}}})},
+    std::vector<std::string> events{stream.start(warm_start)};
+    auto append_events = [&](std::vector<std::string> values) {
+        events.insert(events.end(), std::make_move_iterator(values.begin()),
+                      std::make_move_iterator(values.end()));
     };
-    const GenerationRequest message_request =
-        parse_messages_request(message_cached, default_limits());
-    const ninfer::PromptInput message_prompt = translate(message_request);
-    failures += check(message_request.messages.size() == 3 &&
-                          message_request.messages[0].private_cache_boundary_after &&
-                          message_request.messages[1].private_cache_boundary_after &&
-                          !message_request.messages[2].private_cache_boundary_after,
-                      "Anthropic message cache_control boundary was discarded during parsing");
-    failures +=
-        check(message_prompt.context_cache.markers.size() == 2 &&
-                  message_prompt.context_cache.markers[0].kind ==
-                      ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
-                  message_prompt.context_cache.markers[0].location ==
-                      ninfer::PromptCacheMarkerLocation::MessageBoundary &&
-                  message_prompt.context_cache.markers[0].after_message_count == 1 &&
-                  message_prompt.context_cache.markers[1].kind ==
-                      ninfer::PromptCacheMarkerKind::PrivateLongAnchor &&
-                  message_prompt.context_cache.markers[1].location ==
-                      ninfer::PromptCacheMarkerLocation::MessageBoundary &&
-                  message_prompt.context_cache.markers[1].after_message_count == 2,
-              "Anthropic conversation cache_control did not become private message anchors");
+    append_events(stream.reasoning_delta("thought"));
+    append_events(stream.content_delta("answer"));
+    append_events(stream.finish(sample_outcome()));
 
-    Json unsupported_position = message_cached;
-    unsupported_position["messages"][0]["content"].push_back(
-        Json{{"type", "text"}, {"text", "dynamic tail"}});
-    failures += check(
-        throws_api([&] { (void)parse_messages_request(unsupported_position, default_limits()); }),
-        "non-terminal Anthropic message cache_control was silently approximated");
-
-    Json invalid                          = body;
-    invalid["system"][0]["cache_control"] = Json{{"type", "unknown"}};
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
-                      "invalid Anthropic cache_control type was accepted");
-    return failures;
-}
-
-int test_ordered_system_messages() {
-    int failures    = 0;
-    const Json body = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"system", "top-level system"},
-        {"messages", Json::array({
-                         Json{{"role", "user"}, {"content", "hello"}},
-                         Json{{"role", "system"}, {"content", "reminder from messages"}},
-                     })}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
-    failures += check(req.messages.size() == 3, "top-level, user, and dynamic system kept");
-    failures += check(req.messages[0].role == ninfer::ChatRole::System &&
-                          req.messages[0].content[0].text == "top-level system",
-                      "top-level system was not preserved independently");
-    failures += check(req.messages[1].role == ninfer::ChatRole::User &&
-                          req.messages[1].content[0].text == "hello",
-                      "user turn moved around dynamic system");
-    failures += check(req.messages[2].role == ninfer::ChatRole::System &&
-                          req.messages[2].content[0].text == "reminder from messages",
-                      "dynamic system was not preserved at its message-array position");
-    const ninfer::PromptInput prompt = translate(req);
-    failures +=
-        check(prompt.messages.size() == 3 && prompt.messages[0].role == ninfer::ChatRole::System &&
-                  prompt.messages[1].role == ninfer::ChatRole::User &&
-                  prompt.messages[2].role == ninfer::ChatRole::System,
-              "translation reordered or lowered Anthropic system turns");
-
-    const Json blocks_body = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"messages", Json::array({
-                         Json{{"role", "user"}, {"content", "hi"}},
-                         Json{{"role", "system"},
-                              {"content", Json::array({Json{{"type", "text"}, {"text", "r"}}})}},
-                     })}};
-    const GenerationRequest breq = parse_messages_request(blocks_body, default_limits());
-    failures +=
-        check(breq.messages.size() == 2 && breq.messages[0].role == ninfer::ChatRole::User &&
-                  breq.messages[1].role == ninfer::ChatRole::System &&
-                  breq.messages[1].content[0].text == "r",
-              "array-valued dynamic system did not retain its position");
-
-    const Json consecutive = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}},
-                                  Json{{"role", "system"}, {"content", "first"}},
-                                  Json{{"role", "system"}, {"content", "second"}},
-                                  Json{{"role", "assistant"}, {"content", "answer"}}})}};
-    const GenerationRequest creq = parse_messages_request(consecutive, default_limits());
-    failures +=
-        check(creq.messages.size() == 4 && creq.messages[1].role == ninfer::ChatRole::System &&
-                  creq.messages[1].content[0].text == "first" &&
-                  creq.messages[2].role == ninfer::ChatRole::System &&
-                  creq.messages[2].content[0].text == "second",
-              "consecutive dynamic system turns were merged or reordered");
-
-    const Json leading = {{"model", "m"},
-                          {"max_tokens", 16},
-                          {"messages", Json::array({Json{{"role", "system"}, {"content", "bad"}},
-                                                    Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures += check(api_code([&] { (void)parse_messages_request(leading, default_limits()); }) ==
-                          "invalid_message_order",
-                      "leading array system was not rejected by the Anthropic schema");
-
-    const Json followed_by_user = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "first"}},
-                                  Json{{"role", "system"}, {"content", "bad"}},
-                                  Json{{"role", "user"}, {"content", "second"}}})}};
-    failures += check(api_code([&] {
-                          (void)parse_messages_request(followed_by_user, default_limits());
-                      }) == "invalid_message_order",
-                      "system section followed by user was not rejected by the Anthropic schema");
-
-    const Json tool_use          = Json{{"role", "assistant"},
-                                        {"content", Json::array({Json{{"type", "tool_use"},
-                                                                      {"id", "toolu_1"},
-                                                                      {"name", "inspect"},
-                                                                      {"input", Json::object()}}})}};
-    const Json tool_result       = Json{{"role", "user"},
-                                        {"content", Json::array({Json{{"type", "tool_result"},
-                                                                      {"tool_use_id", "toolu_1"},
-                                                                      {"content", "done"}}})}};
-    const Json after_tool_result = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"messages",
-         Json::array({Json{{"role", "user"}, {"content", "inspect"}}, tool_use, tool_result,
-                      Json{{"role", "system"}, {"content", "diagnostics"}}})}};
-    const GenerationRequest tool_req = parse_messages_request(after_tool_result, default_limits());
-    failures += check(tool_req.messages.size() == 4 &&
-                          tool_req.messages[0].role == ninfer::ChatRole::User &&
-                          tool_req.messages[1].role == ninfer::ChatRole::Assistant &&
-                          tool_req.messages[2].role == ninfer::ChatRole::Tool &&
-                          tool_req.messages[3].role == ninfer::ChatRole::System,
-                      "system after tool_result did not retain the expected semantic position");
-
-    const Json interrupted_tool_pair = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "inspect"}}, tool_use,
-                                  Json{{"role", "system"}, {"content", "bad"}}, tool_result})}};
-    failures += check(api_code([&] {
-                          (void)parse_messages_request(interrupted_tool_pair, default_limits());
-                      }) == "invalid_message_order",
-                      "system interrupting tool_use/tool_result was not rejected");
-    return failures;
-}
-
-int test_user_content_block_order() {
-    const Json body = {
-        {"model", "m"},
-        {"max_tokens", 16},
-        {"messages", Json::array({Json{
-                         {"role", "user"},
-                         {"content", Json::array({Json{{"type", "text"}, {"text", "before"}},
-                                                  Json{{"type", "tool_result"},
-                                                       {"tool_use_id", "toolu_1"},
-                                                       {"content", "result"}},
-                                                  Json{{"type", "text"}, {"text", "after"}}})}}})}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
-    int failures = check(req.messages.size() == 3, "mixed user content did not expand in place");
-    failures += check(req.messages[0].role == ninfer::ChatRole::User &&
-                          req.messages[0].content[0].text == "before" &&
-                          req.messages[1].role == ninfer::ChatRole::Tool &&
-                          req.messages[1].content[0].text == "result" &&
-                          req.messages[2].role == ninfer::ChatRole::User &&
-                          req.messages[2].content[0].text == "after",
-                      "tool_result expansion reordered surrounding user blocks");
-    return failures;
-}
-
-int test_missing_and_bad_fields() {
-    int failures        = 0;
-    const Json no_model = {{"max_tokens", 8},
-                           {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures += check(throws_api([&] { (void)parse_messages_request(no_model, default_limits()); }),
-                      "missing model rejected");
-
-    const Json bad_role = {
-        {"model", "m"},
-        {"max_tokens", 8},
-        {"messages", Json::array({Json{{"role", "developer"}, {"content", "hi"}}})}};
-    failures += check(throws_api([&] { (void)parse_messages_request(bad_role, default_limits()); }),
-                      "unknown message role rejected");
-
-    const Json empty_msgs = {{"model", "m"}, {"max_tokens", 8}, {"messages", Json::array()}};
-    failures +=
-        check(throws_api([&] { (void)parse_messages_request(empty_msgs, default_limits()); }),
-              "empty messages rejected");
-
-    const Json bad_max = {{"model", "m"},
-                          {"max_tokens", 0},
-                          {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures += check(throws_api([&] { (void)parse_messages_request(bad_max, default_limits()); }),
-                      "non-positive max_tokens rejected");
-
-    // Omitting max_tokens falls back to the server default (lenient vs the API).
-    const Json no_max           = {{"model", "m"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    const GenerationRequest req = parse_messages_request(no_max, default_limits());
-    failures += check(req.max_tokens == 512 && !req.max_tokens_set, "max_tokens default applied");
-    return failures;
-}
-
-int test_parse_image() {
-    const Json body = {
-        {"model", "m"},
-        {"max_tokens", 8},
-        {"messages", Json::array({Json{
-                         {"role", "user"},
-                         {"content", Json::array({Json{{"type", "image"},
-                                                       {"source", Json{{"type", "base64"},
-                                                                       {"media_type", "image/png"},
-                                                                       {"data", "AA=="}}}}})}}})}};
-    const GenerationRequest req      = parse_messages_request(body, default_limits());
-    const ninfer::PromptInput prompt = translate(req);
-    int failures                     = 0;
-    failures += check(req.messages[0].content[0].kind == ContentKind::Image,
-                      "Anthropic image kind preserved");
-    failures += check(req.messages[0].content[0].source.value == "data:image/png;base64,AA==",
-                      "Anthropic base64 converted to data URI");
-    failures += check(prompt.messages[0].parts[0].kind == ninfer::MessagePartKind::Media &&
-                          prompt.messages[0].parts[0].media.kind == ninfer::MediaKind::Image,
-                      "Anthropic image translated to structured chat part");
-    return failures;
-}
-
-int test_tools_and_choice() {
-    int failures = 0;
-    const Json tool =
-        Json{{"name", "get_weather"},
-             {"description", "Look up weather"},
-             {"input_schema", Json{{"type", "object"},
-                                   {"properties", Json{{"city", Json{{"type", "string"}}}}},
-                                   {"required", Json::array({"city"})}}}};
-    Json body = {
-        {"model", "m"},
-        {"max_tokens", 8},
-        {"tools", Json::array({tool})},
-        {"tool_choice", Json{{"type", "auto"}}},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "weather in Paris?"}}})}};
-
-    const GenerationRequest req = parse_messages_request(body, default_limits());
-    failures += check(req.tools.size() == 1, "one tool parsed");
-    failures += check(req.tools[0].name == "get_weather", "tool name parsed");
-    failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "auto -> Auto");
-    failures += check(req.uses_tools(), "uses_tools true");
-    failures += check(translate_options(req).output.preserve_special_tokens,
-                      "active tools preserve special tokens in Engine output");
-    // definition_json must be a normalized OpenAI function-tool object for the
-    // Qwen <tools> renderer.
-    const Json def = Json::parse(req.tools[0].definition_json);
-    failures += check(def.at("type") == "function", "definition type function");
-    failures += check(def.at("function").at("name") == "get_weather", "definition name");
-    failures += check(def.at("function").at("parameters").at("required").at(0) == "city",
-                      "input_schema mapped to parameters");
-    failures += check(def.at("function").at("strict") == false, "strict defaulted false");
-
-    Json any           = body;
-    any["tool_choice"] = Json{{"type", "any"}};
-    failures += check(parse_messages_request(any, default_limits()).tool_choice.mode ==
-                          ToolChoiceMode::Required,
-                      "any -> Required");
-
-    Json none           = body;
-    none["tool_choice"] = Json{{"type", "none"}};
-    failures += check(parse_messages_request(none, default_limits()).tool_choice.mode ==
-                          ToolChoiceMode::None,
-                      "none -> None");
-
-    Json named                        = body;
-    named["tool_choice"]              = Json{{"type", "tool"}, {"name", "get_weather"}};
-    const GenerationRequest named_req = parse_messages_request(named, default_limits());
-    failures += check(named_req.tool_choice.mode == ToolChoiceMode::Named &&
-                          named_req.tool_choice.name == "get_weather",
-                      "tool+name -> Named");
-
-    Json unknown           = body;
-    unknown["tool_choice"] = Json{{"type", "tool"}, {"name", "nope"}};
-    failures += check(throws_api([&] { (void)parse_messages_request(unknown, default_limits()); }),
-                      "unknown named tool rejected");
-
-    Json server_tool     = body;
-    server_tool["tools"] = Json::array({Json{{"type", "bash_20250124"}, {"name", "bash"}}});
-    failures +=
-        check(throws_api([&] { (void)parse_messages_request(server_tool, default_limits()); }),
-              "server tool without input_schema rejected");
-
-    const std::string max_name(128, 'a');
-    Json max_tool          = tool;
-    max_tool["name"]       = max_name;
-    Json max_name_body     = body;
-    max_name_body["tools"] = Json::array({max_tool});
-    failures +=
-        check(parse_messages_request(max_name_body, default_limits()).tools[0].name == max_name,
-              "128-character Anthropic tool name accepted");
-
-    Json too_long_tool     = tool;
-    too_long_tool["name"]  = std::string(129, 'a');
-    Json too_long_body     = body;
-    too_long_body["tools"] = Json::array({too_long_tool});
-    failures +=
-        check(throws_api([&] { (void)parse_messages_request(too_long_body, default_limits()); }),
-              "129-character Anthropic tool name rejected");
-    return failures;
-}
-
-int test_tool_use_result_roundtrip() {
-    int failures    = 0;
-    const Json tool = Json{{"name", "get_weather"}, {"input_schema", Json{{"type", "object"}}}};
-    const Json assistant =
-        Json{{"role", "assistant"},
-             {"content", Json::array({Json{{"type", "text"}, {"text", "let me check"}},
-                                      Json{{"type", "tool_use"},
-                                           {"id", "toolu_1"},
-                                           {"name", "get_weather"},
-                                           {"input", Json{{"city", "Paris"}}}}})}};
-    const Json user_result =
-        Json{{"role", "user"},
-             {"content",
-              Json::array(
-                  {Json{{"type", "tool_result"},
-                        {"tool_use_id", "toolu_1"},
-                        {"content", Json::array({Json{{"type", "text"}, {"text", "sunny"}},
-                                                 Json{{"type", "image"},
-                                                      {"source", Json{{"type", "base64"},
-                                                                      {"media_type", "image/png"},
-                                                                      {"data", "AA=="}}}}})}}})}};
-    const Json body = {{"model", "m"},
-                       {"max_tokens", 8},
-                       {"tools", Json::array({tool})},
-                       {"messages", Json::array({Json{{"role", "user"}, {"content", "weather?"}},
-                                                 assistant, user_result})}};
-
-    const GenerationRequest req = parse_messages_request(body, default_limits());
-    // user, assistant, tool
-    failures += check(req.messages.size() == 3, "user + assistant + tool turns");
-    failures += check(req.messages[1].role == ninfer::ChatRole::Assistant, "assistant turn");
-    failures += check(req.messages[1].tool_calls.size() == 1, "assistant tool_call parsed");
-    failures += check(req.messages[1].tool_calls[0].id == "toolu_1", "tool_use id carried");
-    failures += check(req.messages[1].tool_calls[0].name == "get_weather", "tool_use name carried");
-    const Json args = Json::parse(req.messages[1].tool_calls[0].arguments_json);
-    failures += check(args.at("city") == "Paris", "tool_use input stringified to arguments");
-    failures += check(req.messages[1].content[0].text == "let me check", "assistant text carried");
-    failures += check(req.messages[2].role == ninfer::ChatRole::Tool, "tool_result -> tool turn");
-    failures += check(req.messages[2].tool_call_id == "toolu_1", "tool_result tool_use_id carried");
-    failures += check(req.messages[2].content[0].text == "sunny", "tool_result text carried");
-    failures += check(req.messages[2].content.size() == 2 &&
-                          req.messages[2].content[1].kind == ContentKind::Image,
-                      "tool_result image carried");
-    const ninfer::PromptInput prompt = translate(req);
-    failures += check(prompt.messages[2].parts.size() == 2 &&
-                          prompt.messages[2].parts[1].kind == ninfer::MessagePartKind::Media &&
-                          prompt.messages[2].parts[1].media.kind == ninfer::MediaKind::Image,
-                      "tool_result image translated to structured chat");
-    failures += check(req.has_tool_history(), "tool history detected");
-    return failures;
-}
-
-int test_thinking_and_sampling() {
-    int failures                = 0;
-    Json body                   = {{"model", "m"},
-                                   {"max_tokens", 8},
-                                   {"temperature", 0.3},
-                                   {"top_p", 0.8},
-                                   {"top_k", 40},
-                                   {"stop_sequences", Json::array({"STOP", "END"})},
-                                   {"thinking", Json{{"type", "enabled"}, {"budget_tokens", 1024}}},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    const GenerationRequest req = parse_messages_request(body, default_limits());
-    failures += check(req.sampling.temperature.has_value() && *req.sampling.temperature == 0.3,
-                      "temperature parsed");
-    failures += check(req.sampling.top_p.has_value() && *req.sampling.top_p == 0.8, "top_p parsed");
-    failures += check(req.sampling.top_k.has_value() && *req.sampling.top_k == 40, "top_k parsed");
-    failures += check(req.stop_strings.size() == 2 && req.stop_strings[0] == "STOP",
-                      "stop_sequences parsed");
-    failures += check(req.enable_thinking.has_value() && *req.enable_thinking, "thinking enabled");
-    failures += check(!req.preserve_thinking.has_value(),
-                      "Anthropic thinking.type unexpectedly enabled history preservation");
-    const ninfer::RequestOptions options = translate_options(req);
-    failures +=
-        check(options.execution.requested_output_tokens == 8, "max_tokens reaches Engine options");
-    failures += check(!options.execution.thinking.budget,
-                      "Anthropic budget_tokens unexpectedly became a request-level thinking cap");
-    failures += check(options.execution.sampling.temperature == 0.3F &&
-                          options.execution.sampling.top_p == 0.8F &&
-                          options.execution.sampling.top_k == 40 &&
-                          !options.execution.sampling.presence_penalty,
-                      "sampling reaches Engine overrides without inventing omitted fields");
-    failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "STOP" &&
-                          options.stop.strings[1].text == "END",
-                      "stop_sequences reach Engine options");
-
-    Json disabled                = body;
-    disabled["thinking"]         = Json{{"type", "disabled"}};
-    const GenerationRequest dreq = parse_messages_request(disabled, default_limits());
-    failures +=
-        check(dreq.enable_thinking.has_value() && !*dreq.enable_thinking, "thinking disabled");
-
-    // Claude Code sends thinking.type == "adaptive" (extended thinking); any
-    // non-"disabled" mode must map to thinking-on, not a 400.
-    Json adaptive                = body;
-    adaptive["thinking"]         = Json{{"type", "adaptive"}};
-    const GenerationRequest areq = parse_messages_request(adaptive, default_limits());
-    failures +=
-        check(areq.enable_thinking.has_value() && *areq.enable_thinking, "adaptive -> thinking on");
-
-    Json preserve                 = body;
-    preserve["thinking"]          = Json{{"type", "disabled"}};
-    preserve["preserve_thinking"] = true;
-    const GenerationRequest preq  = parse_messages_request(preserve, default_limits());
-    failures += check(preq.enable_thinking == false && preq.preserve_thinking == true,
-                      "Anthropic preserve_thinking was not independent from thinking.type");
-    Json invalid                 = body;
-    invalid["preserve_thinking"] = "yes";
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
-                      "Anthropic accepted non-boolean preserve_thinking");
-    return failures;
-}
-
-int test_reasoning_effort() {
-    const Json base = {
-        {"model", "m"},
-        {"max_tokens", 8},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
-    };
-    int failures = 0;
-
-    for (const auto& [wire, expected] :
-         std::array<std::pair<const char*, RequestedReasoningEffort>, 5>{
-             {{"low", RequestedReasoningEffort::Low},
-              {"medium", RequestedReasoningEffort::Medium},
-              {"high", RequestedReasoningEffort::High},
-              {"xhigh", RequestedReasoningEffort::XHigh},
-              {"max", RequestedReasoningEffort::Max}}}) {
-        Json body                       = base;
-        body["output_config"]           = Json{{"effort", wire}};
-        const GenerationRequest request = parse_messages_request(body, default_limits());
-        failures += check(request.reasoning_effort == expected,
-                          std::string("Anthropic did not accept protocol effort ") + wire);
+    std::vector<std::string> types;
+    bool saw_signature        = false;
+    bool start_usage_is_exact = false;
+    Json terminal_usage;
+    for (const std::string& value : events) {
+        const Json parsed = parse_event(value);
+        types.push_back(parsed.at("type").get<std::string>());
+        if (parsed.at("type") == "message_start") {
+            start_usage_is_exact = parsed["message"]["usage"]["input_tokens"] == 40 &&
+                                   parsed["message"]["usage"]["cache_read_input_tokens"] == 60;
+        }
+        if (parsed.at("type") == "content_block_delta" &&
+            parsed["delta"]["type"] == "signature_delta") {
+            const std::string signature = parsed["delta"]["signature"].get<std::string>();
+            saw_signature               = thinking_signer().verify("thought", 0, signature);
+        }
+        if (parsed.at("type") == "message_delta") { terminal_usage = parsed.at("usage"); }
     }
-
-    Json low                             = base;
-    low["output_config"]                 = Json{{"effort", "low"}};
-    const GenerationRequest low_request  = parse_messages_request(low, default_limits());
-    const ninfer::PromptInput low_prompt = translate(low_request);
-    failures += check(low_prompt.options.enable_thinking &&
-                          low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
-                      "Anthropic low effort did not reach PromptInput");
-
-    Json high                            = base;
-    high["output_config"]                = Json{{"effort", "high"}};
-    const GenerationRequest high_request = parse_messages_request(high, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "Anthropic high effort bypassed template capability validation");
-
-    Json conflict        = low;
-    conflict["thinking"] = Json{{"type", "disabled"}};
-    const GenerationRequest conflicting_request =
-        parse_messages_request(conflict, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(conflicting_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "conflicting_template_option",
-                      "Anthropic disabled thinking and effort were accepted together");
-
-    Json invalid             = base;
-    invalid["output_config"] = Json{{"effort", "minimal"}};
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
-                      "Anthropic accepted an effort outside its protocol vocabulary");
-    invalid["output_config"] = Json{{"effort", 1}};
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
-                      "Anthropic accepted non-string output_config.effort");
-    invalid["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
-    failures += check(throws_api([&] { (void)parse_messages_request(invalid, default_limits()); }),
-                      "unsupported Anthropic output_config option was ignored");
-    return failures;
-}
-
-int test_stop_reason_mapping() {
-    int failures = 0;
-    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::OutputLimit, false)) ==
-                          "max_tokens",
-                      "output limit -> max_tokens");
-    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::StopToken, false)) ==
-                          "end_turn",
-                      "stop token -> end_turn");
-    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::Cancelled, false)) ==
-                          "end_turn",
-                      "cancelled -> end_turn");
-    failures += check(std::string(messages_stop_reason(ninfer::FinishReason::StopString, true)) ==
-                          "tool_use",
-                      "tool calls -> tool_use");
-    return failures;
-}
-
-int test_response_serialization() {
-    int failures = 0;
-    const CompletionUsage usage{7, 3};
-    const std::vector<ToolCall> tools = {ToolCall{"toolu_9", "get_weather", R"({"city":"Paris"})"}};
-
-    const Json resp = Json::parse(make_messages_response(
-        "msg_1", "claude-x", "the answer", "the reasoning", tools, "tool_use", usage));
-    failures += check(resp.at("id") == "msg_1", "id echoed");
-    failures += check(resp.at("type") == "message", "type message");
-    failures += check(resp.at("role") == "assistant", "role assistant");
-    failures += check(resp.at("model") == "claude-x", "model echoed");
-    failures += check(resp.at("stop_reason") == "tool_use", "stop_reason");
-    failures += check(resp.at("stop_sequence").is_null(), "stop_sequence null");
-    failures += check(resp.at("usage").at("input_tokens") == 7, "input_tokens");
-    failures += check(resp.at("usage").at("output_tokens") == 3, "output_tokens");
-    const Json& content = resp.at("content");
-    failures += check(content.size() == 3, "thinking + text + tool_use blocks");
-    failures += check(content.at(0).at("type") == "thinking" &&
-                          content.at(0).at("thinking") == "the reasoning",
-                      "thinking block");
+    int failures = check(types.front() == "message_start" && types.back() == "message_stop" &&
+                             saw_signature && start_usage_is_exact,
+                         "Anthropic stream lifecycle/signature/start usage is incomplete");
+    const auto signature_position =
+        std::find_if(events.begin(), events.end(), [](const auto& value) {
+            return value.find("signature_delta") != std::string::npos;
+        });
+    const auto text_position = std::find_if(events.begin(), events.end(), [](const auto& value) {
+        return value.find("text_delta") != std::string::npos;
+    });
+    failures += check(signature_position < text_position,
+                      "Thinking signature was emitted after the text block began");
+    const Json aggregate = Json::parse(
+        make_anthropic_messages_response(identity, sample_outcome(), thinking_signer()));
     failures +=
-        check(content.at(1).at("type") == "text" && content.at(1).at("text") == "the answer",
-              "text block");
-    failures += check(content.at(2).at("type") == "tool_use" && content.at(2).at("id") == "toolu_9",
-                      "tool_use block");
-    failures += check(content.at(2).at("input").at("city") == "Paris", "tool_use input is object");
+        check(terminal_usage == aggregate.at("usage") && terminal_usage["input_tokens"] == 40 &&
+                  terminal_usage["cache_read_input_tokens"] == 60,
+              "terminal stream usage did not match aggregate cache usage");
 
-    // Empty output falls back to a single empty text block.
-    const Json empty = Json::parse(
-        make_messages_response("msg_2", "m", "", "", {}, "end_turn", CompletionUsage{1, 0}));
-    failures +=
-        check(empty.at("content").size() == 1 && empty.at("content").at(0).at("type") == "text" &&
-                  empty.at("content").at(0).at("text") == "",
-              "empty output -> empty text block");
-    return failures;
-}
+    AnthropicMessagesStream cold_stream(identity, 25, thinking_signer());
+    (void)cold_stream.start(ninfer::GenerationStart{
+        .prompt               = ninfer::PromptSummary{.prompt_tokens = 25},
+        .reused_prompt_tokens = 0,
+    });
+    GenerationOutcome cold;
+    cold.prompt_tokens                         = 25;
+    cold.completion_tokens                     = 3;
+    const std::vector<std::string> cold_events = cold_stream.finish(cold);
+    const Json cold_delta = parse_event(cold_events.at(cold_events.size() - 2U));
+    failures += check(cold_delta["usage"]["input_tokens"] == 25 &&
+                          cold_delta["usage"]["cache_read_input_tokens"] == 0 &&
+                          cold_delta["usage"]["output_tokens"] == 3,
+                      "cold terminal stream usage was not cumulative and exact");
 
-int test_streaming_events() {
-    int failures = 0;
-    std::string type;
-
-    const Json start = parse_sse(make_message_start("msg_1", "claude-x", 11), &type);
-    failures += check(type == "message_start", "message_start event type");
-    failures += check(start.at("type") == "message_start", "message_start payload type");
-    failures += check(start.at("message").at("id") == "msg_1", "message_start id");
-    failures += check(start.at("message").at("model") == "claude-x", "message_start model");
-    failures += check(start.at("message").at("usage").at("input_tokens") == 11,
-                      "message_start input_tokens");
-    failures += check(start.at("message").at("content").is_array() &&
-                          start.at("message").at("content").empty(),
-                      "message_start empty content");
-
-    const Json tstart = parse_sse(make_content_block_start_text(1), &type);
-    failures += check(type == "content_block_start" && tstart.at("index") == 1 &&
-                          tstart.at("content_block").at("type") == "text",
-                      "text block start");
-
-    const Json think_start = parse_sse(make_content_block_start_thinking(0), &type);
-    failures +=
-        check(think_start.at("content_block").at("type") == "thinking", "thinking block start");
-
-    const Json tdelta = parse_sse(make_content_block_delta_text(1, "hi"), &type);
-    failures +=
-        check(type == "content_block_delta" && tdelta.at("delta").at("type") == "text_delta" &&
-                  tdelta.at("delta").at("text") == "hi",
-              "text_delta");
-
-    const Json thdelta = parse_sse(make_content_block_delta_thinking(0, "hmm"), &type);
-    failures += check(thdelta.at("delta").at("type") == "thinking_delta" &&
-                          thdelta.at("delta").at("thinking") == "hmm",
-                      "thinking_delta");
-
-    const ToolCall call{"toolu_2", "get_weather", R"({"city":"Paris"})"};
-    const Json tustart = parse_sse(make_content_block_start_tool_use(2, call), &type);
-    failures += check(tustart.at("content_block").at("type") == "tool_use" &&
-                          tustart.at("content_block").at("id") == "toolu_2" &&
-                          tustart.at("content_block").at("name") == "get_weather" &&
-                          tustart.at("content_block").at("input").is_object() &&
-                          tustart.at("content_block").at("input").empty(),
-                      "tool_use block start with empty input");
-
-    const Json ijdelta =
-        parse_sse(make_content_block_delta_tool_json(2, R"({"city":"Paris"})"), &type);
-    failures += check(ijdelta.at("delta").at("type") == "input_json_delta" &&
-                          ijdelta.at("delta").at("partial_json") == R"({"city":"Paris"})",
-                      "input_json_delta");
-
-    const Json stop = parse_sse(make_content_block_stop(2), &type);
-    failures += check(type == "content_block_stop" && stop.at("index") == 2, "content_block_stop");
-
-    const Json mdelta = parse_sse(make_message_delta("tool_use", 5), &type);
-    failures +=
-        check(type == "message_delta" && mdelta.at("delta").at("stop_reason") == "tool_use" &&
-                  mdelta.at("delta").at("stop_sequence").is_null() &&
-                  mdelta.at("usage").at("output_tokens") == 5,
-              "message_delta stop_reason + usage");
-
-    const Json mstop = parse_sse(make_message_stop(), &type);
-    failures += check(type == "message_stop" && mstop.at("type") == "message_stop", "message_stop");
-
-    const Json ping = parse_sse(make_messages_ping(), &type);
-    failures += check(type == "ping" && ping.at("type") == "ping", "ping");
-    return failures;
-}
-
-int test_count_tokens_and_error() {
-    int failures  = 0;
-    const Json ct = Json::parse(make_count_tokens_response(123));
-    failures += check(ct.at("input_tokens") == 123, "count_tokens body");
-
-    ApiError err;
-    err.status      = 401;
-    err.message     = "missing or invalid API key";
-    const Json body = Json::parse(make_messages_error_body(err));
-    failures += check(body.at("type") == "error", "error envelope type");
-    failures +=
-        check(body.at("error").at("type") == "authentication_error", "401 -> authentication_error");
-    failures +=
-        check(body.at("error").at("message") == "missing or invalid API key", "error message");
-
-    ApiError server;
-    server.status          = 500;
-    server.message         = "boom";
-    const Json server_body = Json::parse(make_messages_error_body(server));
-    failures += check(server_body.at("error").at("type") == "api_error", "500 -> api_error");
-
-    std::string type;
-    const Json sse_err = parse_sse(messages_sse_error_event(err), &type);
-    failures += check(type == "error" && sse_err.at("type") == "error", "sse error event");
+    AnthropicMessagesStream pre_admission_error(identity, 25, thinking_signer());
+    const Json provisional = parse_event(pre_admission_error.start());
+    failures += check(provisional["message"]["usage"]["input_tokens"] == 25 &&
+                          provisional["message"]["usage"]["cache_read_input_tokens"].is_null(),
+                      "pre-admission stream error prefix fabricated cache usage");
     return failures;
 }
 
@@ -841,21 +665,19 @@ int test_count_tokens_and_error() {
 
 int main() {
     int failures = 0;
-    failures += test_parse_basic_and_system();
-    failures += test_parse_system_array_and_blocks();
-    failures += test_cache_control_boundaries();
-    failures += test_ordered_system_messages();
-    failures += test_user_content_block_order();
-    failures += test_missing_and_bad_fields();
-    failures += test_parse_image();
-    failures += test_tools_and_choice();
-    failures += test_tool_use_result_roundtrip();
-    failures += test_thinking_and_sampling();
-    failures += test_reasoning_effort();
-    failures += test_stop_reason_mapping();
-    failures += test_response_serialization();
-    failures += test_streaming_events();
-    failures += test_count_tokens_and_error();
-    if (failures == 0) { std::cout << "ok\n"; }
-    return failures == 0 ? 0 : 1;
+    failures += test_envelope_and_field_policy();
+    failures += test_message_normalization();
+    failures += test_tool_history();
+    failures += test_tools();
+    failures += test_thinking_and_count_tokens();
+    failures += test_thinking_history_integrity();
+    failures += test_content_and_cache_hints();
+    failures += test_aggregate_and_errors();
+    failures += test_stream();
+    if (failures != 0) {
+        std::cerr << failures << " Anthropic adapter checks failed\n";
+        return 1;
+    }
+    std::cout << "Anthropic adapter checks passed\n";
+    return 0;
 }

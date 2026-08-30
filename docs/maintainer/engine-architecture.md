@@ -1,761 +1,501 @@
 # NInfer Engine 架构
 
-本文是NInfer请求路径、执行所有权和生命周期的顶层维护者权威。它只描述当前产品模型及已经选定的架构，
-不记录迁移历史，也不为未支持的部署方式预留抽象。
+本文定义 NInfer 从产品请求到模型执行与结果发布的顶层控制面。它是请求生命周期、调度顺序和跨模块
+提交关系的维护者权威。
 
-资源选择、物理结算和上下文缓存的窄层合同由
-[资源调度与上下文缓存架构](resource-scheduling-and-context-cache.md)定义；两份文档共同描述当前实现，
-不保留迁移期的旧所有权模型。
+本文只规定长期稳定的边界：
 
-本文回答四个问题：
+- 谁拥有请求、顺序、缓存策略和物理状态；
+- 请求在哪些稳定状态之间转换；
+- 模型状态、输出状态和资源状态何时可以对外发布；
+- cancellation 和 failure 如何到达唯一终态。
 
-1. 请求经过哪些边界；
-2. Scheduler、ResourceManager和Program分别决定什么；
-3. admission、模型执行、terminal和输出如何提交；
-4. 单GPU、小并发下如何保证正确性和稳定的热路径。
-
-Paged KV的页几何、物理layout和consumer contract由
-[Paged KV Context Store](paged-kv-cache.md)定义。本文只保留Engine层必须知道的部分。
+资源选择和上下文缓存策略由
+[资源调度与上下文缓存](resource-scheduling-and-context-cache.md)定义；KV 的页、replica、block table
+和 consumer contract 由 [Paged KV Context Store](paged-kv-cache.md)定义。
 
 ---
 
-## 1. 产品边界
+## 1. 产品执行模型
 
-### 1.1 当前工作负载
+Generation purpose 的 NInfer Engine 固定运行：
 
-NInfer运行期固定为：
+- 一张 GPU；
+- 一个常驻模型实例；
+- 启动时确定的 `max_concurrency=1..8`；
+- 一个有界 FIFO 等待队列；
+- 不抢占已经激活的请求；
+- 每个 decode round 将全部 decode-ready 请求组成一个紧凑批次。
 
-- 一张GPU、一个resident model instance；
-- 启动时固定`max_concurrency=1..8`；
-- 有界FIFO ingress，无request preemption；
-- 每个round boundary把全部decode-ready请求组成一个compact batch；
-- Text、Vision、MTP、prefix reuse、CLI和serving走同一公共`ninfer::Engine`路径；
-- 35B-A3B target在text-only模式还可使用DFlash。
+Text、Vision、prefix reuse、MTP、DFlash、CLI 和 HTTP serving 都通过公共 `ninfer::Engine` 路径。
+MTP 和 DFlash 是 Program 内部的执行后端，不产生第二套请求调度或结果发布机制。
 
-`max_concurrency`限制active request数，不把共享KV等分给lane。一个请求可使用共享pool的大部分容量，只要
-Program对全部active reservations、inactive allocations和transaction peaks证明整体可行。
+同一个公共 Engine 还提供启动时固定的 CausalScoring purpose。它只服务离线文本评分：
+`CausalScoreCore` 串行调用 Program，窗口使用临时的空 State 与 Main KV，不创建请求、continuation、
+checkpoint 或 cache replica，也不进入 Scheduler/ResourceManager。Generation 与 CausalScoring
+不在运行期切换，评分专用 staging 只在 CausalScoring 启动时分配。
 
-### 1.2 非目标
+`max_concurrency` 限制同时激活的请求数，不把共享 KV 容量平均切分给 lane。请求只有在 Program
+证明其完整执行资源已经得到保障后才会进入 Active；进入 Active 后，它不会因为另一个请求或
+inactive cache 的保留而丢失完成能力。
 
-当前架构不支持：
-
-- 大规模或抢占式continuous batching；
-- priority/QoS、多租户公平或跨Engine调度；
-- 多GPU placement和active swap；
-- weight offload、跨Engine context storage或独立后台cache worker；
-- runtime model discovery和字符串驱动的通用执行图；
-- 未注册模型、其他GPU架构或假想storage tier的占位接口。
-
-这些能力若进入产品范围，应重新定义调度与资源不变量，不能借用本文的局部机制推导。
+本文不覆盖多 GPU placement、active request preemption、priority/QoS、跨 Engine context store
+或大规模 continuous batching。这些工作负载需要重新定义 admission 与公平性合同，不能直接从当前
+小并发模型外推。
 
 ---
 
-## 2. 请求路径
+## 2. 四个执行边界
 
-NInfer只有四个请求边界：
+请求路径只有四层：
 
 ```text
 Gateway
-  │ protocol/product request, response transport
+  │ product/protocol input
   ▼
 Frontend
-  │ PreparedPrompt, OutputSession
+  │ PreparedPrompt / OutputSession
   ▼
 Engine
-  │ request order, logical cache policy, output transaction
+  │ request order / lifecycle / publication
   ▼
 Program
-    physical state, resource transaction, model execution
+    physical resources / model execution
 ```
-
-公共`ninfer::Engine` facade同时暴露Frontend的prepare能力和Engine的submit/generate能力。CLI、HTTP server和
-直接C++ caller都通过这条路径进入；它们不会绕过Engine调用target Program。
 
 ### 2.1 Gateway
 
-Gateway包括HTTP serving、CLI及其他产品入口，负责：
+Gateway 是 CLI、HTTP server 或其他产品入口，拥有：
 
-- 协议解析、连接、streaming transport和API错误；
-- message/tool/media到公共`PromptInput`的转换；
-- URL/path/data acquisition；
-- usage与response schema；
-- Gateway自身的请求生命周期和容量限制。
+- 协议解析、连接和 streaming transport；
+- message、tool、media 到公共输入的转换；
+- URL、path 和 data acquisition；
+- response schema、usage 和产品侧错误；
+- Gateway 自身的并发与连接生命周期。
 
-Gateway不选择request顺序、checkpoint、physical lane或KV pages。
+Gateway 不选择请求顺序、缓存来源、active lane 或 KV page。
 
 ### 2.2 Frontend
 
-Frontend拥有模型家族的输入与输出语义：
+Frontend 拥有模型家族的输入与输出语义：
 
-- tokenizer、chat template、Vision preprocessing与MRoPE prompt construction；
-- owning `PreparedPrompt`及其内容identity；
-- stop、thinking/content channel、detokenization与最终文本；
-- `OutputSession`的preview/commit状态。
+- tokenizer、chat template、Vision preprocessing 和 MRoPE prompt construction；
+- owning `PreparedPrompt` 及其内容 identity；
+- stop、thinking/content channel、detokenization、最终文本和模型私有结构化输出；
+- 每个请求独占的 `OutputSession`。
 
-`PreparedPrompt`是完成输入语义转换后可由Program规划的owning value。`OutputSession`由一条请求独占，
-可以preview但只有Engine提交后才产生可发布增量。
-
-Frontend不拥有队列、cache catalog、physical state或调度policy。
+Frontend 可以预览一次模型输出将产生的语义效果，但只有 Engine 完成提交后才能发布该效果。
+Frontend 不拥有等待队列、cache catalog 或物理模型状态。
 
 ### 2.3 Engine
 
-Engine是请求控制平面，负责：
+Engine 是请求控制平面，拥有：
 
-- bounded outstanding capacity、FIFO pending queue和deadline；
-- `RequestRecord`、active request slots、cancellation和response events；
-- Scheduler与ResourceManager；
-- admission、prefill、decode、control、capture和terminal的boundary orchestration；
-- OutputSession、GenerationBudget和Program commit的组合事务；
-- failure cleanup和runtime observations。
+- outstanding capacity、FIFO queue 和 request deadline；
+- request record、active slots、cancellation 和 response event；
+- Scheduler 与 ResourceManager；
+- admission、prefill、decode、control、capture 和 terminal 的编排；
+- 模型提交、输出提交和 response publication 的顺序；
+- Engine-wide failure cleanup。
 
-Engine理解request、budget、finish reason与publication，不解释transformer layer、KV plane或CUDA Graph细节。
+Engine 理解请求、预算、finish reason 和可发布输出，不解释 transformer layer、KV plane 或 allocator。
 
 ### 2.4 Program
 
-Program是目标package提供的唯一物理执行入口，负责：
+Program 是 exact target package 的唯一物理执行入口，拥有：
 
-- State/KV stores、allocators、references和reservations；
-- active sequences、immutable checkpoints和physical replicas；
-- prefill、ordinary decode、MTP/DFlash、forced control；
-- provisional state、accepted-prefix commit和rollback；
-- resource planning与`ResourcePlan -> RunningTransaction -> ResourceResult`；
-- workspace、Vision handoff、CUDA Graph和memory summary。
+- active sequence 与完整 continuation state；
+- State/KV stores、allocator、replica、reference 和 reservation；
+- prefill、ordinary decode、MTP/DFlash 和 forced control；
+- provisional model state 及 accepted-prefix commit/rollback；
+- resource feasibility、物理 transition 和 `ResourceResult`；
+- workspace、CUDA Graph 和 target execution schedule；
+- CausalScoring 窗口的临时 State/KV 与 `lm_head`/logprob staging。
 
-Program不维护FIFO、protected-head policy、retention价值或用户输出。
+Program 不维护 FIFO、SessionIndex、cache retention 价值或用户可见输出。
 
 ---
 
-## 3. 所有权
+## 3. 唯一所有权
 
-### 3.1 唯一authority
-
-| 状态或决策 | 唯一authority |
+| 事实或决策 | 唯一所有者 |
 |---|---|
-| protocol、connection、transport | Gateway |
-| prompt、stop、thinking与output语义 | Frontend |
-| pending queue、RequestRecord、response event | EngineCore |
-| FIFO head、backfill、prefill/decode次序、round membership | Scheduler |
-| logical lane、catalog、session、retention与candidate policy | ResourceManager |
-| State/KV occupancy、reservation、placement、allocator、model execution | Program |
+| 协议、连接、transport | Gateway |
+| prompt 与 output 语义 | Frontend |
+| waiting queue、request record、response event | EngineCore |
+| FIFO head、backfill、prefill/decode 顺序、round membership | Scheduler |
+| logical lane、cache catalog、session binding、retention policy | ResourceManager |
+| physical State/KV、reservation、placement、model state | Program |
 
-“唯一authority”允许其他组件读取稳定summary，但不允许它们复制并 independently mutate同一事实。
+其他组件可以读取 owner 发布的稳定 summary，但不能复制一份可独立修改的同类状态。
 
-### 3.2 EngineCore
+### 3.1 Scheduler：只决定“谁在何时运行”
 
-EngineCore持有：
+Scheduler 维护：
 
-- FIFO `pending_`；
-- 固定上限的request slots；
-- Scheduler和ResourceManager；
-- 单一Engine worker；
-- Program稳定引用；
-- outstanding、response和stats状态。
-
-EngineCore只做orchestration。它先从Scheduler取得哪条请求可尝试，再让ResourceManager形成逻辑choice，
-最后把完整choice交给Program规划和执行。它不以raw lane/page/slot绕过任何owner。
-
-### 3.3 Scheduler
-
-Scheduler只拥有时间和顺序：
-
-- FIFO head及其protection状态；
+- 当前 FIFO head；
 - staged-prefill owner；
-- admission/prefill/decode公平门；
-- maximal compact decode membership；
-- persistent-safe backfill判定。
+- admission、prefill 与 decode 的公平门；
+- 每轮紧凑执行成员；
+- blocked head 的 backfill protection。
 
-Scheduler不持有checkpoint handle、eviction list、physical resource vector或allocator facts。
+Scheduler 不读取 checkpoint payload、victim list、resource vector 或 allocator 状态。
 
-### 3.4 ResourceManager
+### 3.2 ResourceManager：只决定“保留什么逻辑上下文”
 
-ResourceManager只拥有逻辑policy：
+ResourceManager 维护：
 
-- `Free | Materializing | Active | TerminalPending` lane状态；
-- private/shared checkpoint catalog与SessionIndex；
-- continuation identity、retention class和bounded candidate indexes；
-- source、placement intent、victim action和capture/retention choice；
-- Program终态结果的逻辑adoption。
+- logical lane 状态；
+- private/shared checkpoint catalog；
+- SessionIndex 与 prefix candidate index；
+- retention class、命中观测和逻辑 claim；
+- admission、capture 与 finish 的缓存策略。
 
-它不维护Device/Host占用账本、per-lane physical charge、page refcount镜像或allocator snapshot。逻辑引用可以
-影响Program计算last reference，却不是物理bytes。
+它把请求和缓存候选交给 Program 评估，并采用 Program 返回的完整物理结果。它不维护一份
+Device/Host bytes、page refcount 或 allocator free space 的镜像。
 
-### 3.5 Program
+### 3.3 Program：只决定“物理上能否执行以及如何执行”
 
-Program中的真实State/KV containers及其allocator是唯一物理权威。所有`SequenceHandle`、
-`ContinuationHandle`和transaction handle均属于产生它们的Program；owner/generation不匹配是内部错误。
+Program 中的真实 stores 与 allocators 是物理事实的唯一权威。Program：
 
-Program可维护由真实stores同步更新的O(1) counters和可重建索引，但这些不是第二份独立账本。物理可行性、
-逐stage peak和联合last-reference reclaim只能由Program判定。
+- 从完整候选终态计算占用、共享、回收和阶段峰值；
+- seal 与当前 `resource_revision` 绑定的 opaque `ResourcePlan`；
+- 执行唯一的物理 transition；
+- 返回足以让 ResourceManager 更新逻辑 catalog 的完整结果。
 
----
+Program 不根据 session、FIFO 位置或用户身份决定缓存价值。
 
-## 4. Package与启动边界
+### 3.4 Package 与 Engine lifetime
 
-### 4.1 Compile-time package
+Engine 构造时读取 `.ninfer` identity，并从 closed registry 选择 exact compile-time package。Package 提供
+同一组 Frontend、request-plan、Program 和 execution-result 语义；target identity、artifact binding、模型
+view 与 execution leaves 保持 package-private。Qwen3.6 family 的共享 schedule 通过 compile-time Variant
+实例化，worker hot path 不执行 runtime family selection。
 
-Engine读取`.ninfer` identity并从closed registry选择exact package。27B与35B-A3B是peer compile-time
-Variants；worker中没有runtime family分派。
-
-每个package向EngineCore提供同构语义类型：
-
-```text
-PreparedPrompt / OutputSession / PublishedOutput
-RequestBasePlan / CandidateMatch / ResourcePlan
-SequenceHandle / ContinuationHandle / PendingBatch
-StartResult / ProgressResult / ResourceResult
-Program
-```
-
-类型名可以在实现中细化，但边界必须保持：Engine不包含模型数学，Program不读取serving request或Scheduler
-私有状态。
-
-### 4.2 Startup
-
-构造顺序为：
-
-```text
-validate EngineOptions
-  -> read artifact identity
-  -> select exact package
-  -> build artifact and SequencePlan
-  -> preflight KV capacity
-  -> load immutable model
-  -> resolve final capacity
-  -> construct Frontend and Program
-  -> construct EngineCore, Scheduler and ResourceManager
-```
-
-权重、State/KV backing、block-table matrices、workspace和graph storage都在启动期建立。运行期可以改变引用、
-mapping和frontier，不重建这些大块device allocations。
-
-公开cache配置的默认关系不是硬上限。Program必须按实际配置完成可表示性和启动分配验证；失败时构造失败，
-不会在运行期缩容或改走备用算法。
-
-`ninfer-serve`在开始接受HTTP请求前可以通过同一公共Engine执行路径运行内部warmup，但warmup不是产品请求，
-其request-level context-cache participation固定为disabled。它不读取prefix candidate、不建立capture、也不发布
-continuation；执行期间取得的active State/KV entitlement在terminal finish时全部释放。warmup可以留下已分配的
-backing、CUDA Graph和kernel/library初始化状态，但首个外部请求看到的logical context cache必须与新建Engine一致。
+权重、State/KV backing、block-table matrices、workspace 与 CUDA Graph resources 在 Engine 开始接受请求前
+建立。运行期改变 ownership、mapping、frontier 与 replica placement，但不重建这些大块 Device allocations。
 
 ---
 
-## 5. 生命周期
+## 4. 请求与资源生命周期
 
-### 5.1 Gateway与Engine capacity
+### 4.1 Request 状态
 
-HTTP Gateway可在prepare前取得独立`RequestLifetime`，覆盖media acquisition、Engine wait和response
-processing。它不等同于Engine outstanding capacity。
-
-非零输出请求在`Engine::submit`时取得outstanding slot。归还由两个latch决定：
+请求沿以下稳定状态前进：
 
 ```text
-response_done       worker已经完成result/error
-consumer_released   wait结束或GenerationHandle被放弃
-
-release_capacity :=
-    response_done && consumer_released && !capacity_released
+Waiting
+  -> Materializing
+  -> Prefill
+  -> DecodeReady | ControlReady
+  -> TerminalPending
+  -> Finished
 ```
 
-二者可以任意先后，capacity只归还一次。`requested_output_tokens == 0`是prepare后的非执行旁路，不建立
-RequestRecord。
+- **Waiting**：只有 owning prompt 和输出状态，没有 Program sequence。
+- **Materializing**：资源 transition 已取得逻辑 claim；source 在 commit 或 abort 前仍有效。
+- **Prefill**：请求已经 Active，正在消费 prompt suffix。
+- **DecodeReady**：可加入下一次紧凑 decode round。
+- **ControlReady**：Frontend 要求提交规范的 forced-control suffix。
+- **TerminalPending**：模型执行已经终止，但 active resources 尚未完成 retain 或 release。
+- **Finished**：资源与输出均已提交，response 可以完成。
 
-### 5.2 Request与lane
+### 4.2 Logical lane 状态
 
-请求控制状态为：
-
-```text
-WAITING
-  -> MATERIALIZING
-  -> PREFILL
-  -> CONTROL_READY | DECODE_READY
-  -> TERMINAL_PENDING
-  -> MODEL_FINISHED
-```
-
-逻辑lane状态为：
+ResourceManager 的 lane 状态是：
 
 ```text
 Free -> Materializing -> Active -> TerminalPending -> Free
 ```
 
-| Lane状态 | Program binding | 允许动作 |
-|---|---|---|
-| Free | 无 | 尝试admission |
-| Materializing | `RunningTransaction`；source仍有效 | progress、commit或abort |
-| Active | `SequenceHandle`与完整completion reservation | prefill、decode、control、capture |
-| TerminalPending | 仍持有`SequenceHandle`与reservation | finish、discard |
+请求只有在 materialization 的物理结果和逻辑结果均成功采用后才能进入 Active。Terminal request
+必须保留 active ownership，直到完整 checkpoint 被发布或全部 active resources 被释放。
+Streaming request 在 admission 选择提交后、任何输出 delta 前发布一次 `GenerationStart`；其中的
+prompt token 和 reused-prefix token 是已提交的资源选择事实，不等待 prefill 完成。
 
-请求只有在materialization commit结果已被ResourceManager采用后才能进入Active。Active终止时先进入
-TerminalPending；checkpoint retention成功或明确release后才回到Free。这样terminal路径不会提前释放完成保障。
+Control lane、StateImage slot、KV execution row 和 decode batch row 是不同身份：
 
-### 5.3 Continuation与session
+- lane 是 Engine 的长期 active request 位置；
+- State/KV execution resource 由 Program 分配；
+- compact row 只是当前 GPU unit 的序号。
 
-Active mutable continuation和published immutable checkpoint是不同对象。Checkpoint脱离原RequestRecord，
-可以有Device、Host或Both replicas；它必须包含同一frontier的完整State和所有必需typed KV。
+它们不得互相推导所有权。
 
-Session key只是lookup hint。每个request在进入Engine时取得单调`publication_order`；finish/capture只有在
-order更大时才能更新SessionIndex。Capability generation验证handle资格，不表达新旧顺序。
+### 4.3 Gateway 与 Engine capacity
 
-### 5.4 两类事务
-
-Engine只跨模块处理两类不同事务：
-
-1. **Resource transition**：在admission、resume、capture、finish或显式inactive release时改变global available
-   capacity、inactive placement或active/checkpoint ownership；需要分配、pressure或transfer时运行
-   `ResourcePlan` transaction，已有active reservation覆盖的finish/discard可以原子同步完成；
-2. **PendingBatch transaction**：一次模型unit产生provisional tokens，再按每行decision提交或回滚。
-
-Planned resource transaction的外部形态只有：
+Gateway 可以在 prepare 或 media acquisition 前取得自己的 request lifetime。Engine outstanding capacity
+从非零输出请求成功 submit 开始，由两个独立事实共同释放：
 
 ```text
-ResourcePlan -> RunningTransaction -> ResourceResult
+response_done       worker 已形成最终 result 或 error
+consumer_released   wait 已结束，或 GenerationHandle 被放弃
+
+release_capacity =
+    response_done && consumer_released && !capacity_released
 ```
 
-PendingBatch只有`Program::commit`或`Program::abort_pending`可以消费。两者都不能靠析构触发隐式GPU工作。
+两者可以任意先后，但 capacity 只释放一次。请求句柄被放弃只设置 cancellation 和
+`consumer_released`，不会从 consumer thread 调用 Program。
+
+### 4.4 Continuation 与 session
+
+Active continuation 是可写的模型状态；published checkpoint 是不可变的可复用状态。一个可复用
+checkpoint 必须证明同一 frontier 上的完整 State、Main KV、selected backend KV 和继续执行所需
+metadata。
+
+Session key 只是查找提示，不拥有 continuation。每个请求进入 Engine 时取得单调的
+`publication_order`；只有更新顺序更晚的完成结果才能替换 SessionIndex binding。
 
 ---
 
-## 6. Admission与资源规划
+## 5. Worker 与调度
 
-### 6.1 先选请求，再选资源
+### 5.1 单一 mutation owner
 
-Scheduler先选择唯一可尝试的waiting request。ResourceManager只为该请求建立有界candidate shortlist：
+只有 Engine worker 修改 request record、Scheduler、ResourceManager 和 Program。Ingress、consumer
+和 transport thread 通过队列、cancellation flag 与 response event 交互，不直接改变模型状态。
 
-- SessionIndex指向的private endpoint或rewrite；
-- marker/shared-prefix index命中的stable prefixes；
-- matching private anchors及有界anonymous candidates；
-- 永久存在的root fallback。
+一个 worker boundary 按语义顺序处理：
 
-Hash、session、marker或KV匹配只是索引。Program必须验证完整checkpoint state、typed KV coverage、frontier和
-target facts。
+1. 接收等待请求的 timeout 或 cancellation；
+2. 推进已经开始的 resource transition；
+3. 完成可以结算的 TerminalPending 请求；
+4. 冻结 active cancellation snapshot；
+5. 在公平门允许时尝试一次 admission；
+6. 选择 staged prefill、forced control 或紧凑 decode；
+7. 运行至多一个模型 execution unit；
+8. 提交模型、预算和 Frontend 输出状态；
+9. 发布 response event 与观测。
 
-### 6.2 完整choice
+具体循环拆分可以变化，但以下顺序不能变化：
 
-ResourceManager交给Program的规划单位同时固定：
+- in-flight GPU unit 必须先到稳定边界，再修改其资源映射；
+- Program commit 必须先于用户输出发布；
+- resource result 必须先被采用，lane 才能改变可见状态；
+- 一个 global resource topology transition 未结算时，不启动另一个 transition。
 
-```text
-request
-+ source checkpoint or root
-+ destination lane
-+ placement intent
-+ complete victim/degradation set
-+ capture/retention intent
-```
+### 5.2 Admission 顺序
 
-Program对完整choice的joint post-state与每个有序stage peak进行验证，并在成功时seal一个opaque
-`ResourcePlan`。ResourceManager看不到raw allocations，也不能把独立victim effects相加。
+Scheduler 先确定唯一可尝试的 waiting request，ResourceManager 再为它选择缓存与资源终态。
+资源条件不能反向改变 FIFO 所有权。
 
-Canonical degradation chain是：
+FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected head 和必须结束的 donor set。
+后续请求只有在 Program 证明以下条件时才能 backfill：
 
-```text
-preferred source, no pressure
-  -> same source, preserving demotion/degradation
-  -> cheaper valid source
-  -> root, preserving demotion/degradation
-  -> root, release all inactive cache
-```
+> borrower 持续占用其完整 active reservation 后，既定 donor set 结束仍足以让 head 以
+> root 且释放全部 inactive cache 的方案进入。
 
-最后一项是admission完整性回退。若它仍不可行，原因必须是active reservations、输入本身或配置限制，而不是
-cache retention policy。
+这个证明不使用“borrower 预计先完成”的时间假设。改变全局资源拓扑的 transition 会推进
+`resource_revision`，之后的 backfill 必须重新证明。
 
-### 6.3 Start、progress与terminal
+### 5.3 Prefill 与 decode
 
-```text
-Scheduler grants request
-  -> ResourceManager prepares logical adoption storage
-  -> Program assesses and seals ResourcePlan
-  -> Program start revalidates resource revision and capabilities
-  -> zero or more progress units
-  -> Program commit or abort returns one ResourceResult
-  -> ResourceManager adopts logical terminal result
-  -> Engine installs Active or adopts the stable result
-```
+Scheduler 保证：
 
-Pre-start stale rejection无物理副作用，可以重新规划。Start成功后source持续有效到commit/abort，且不能静默
-换candidate。Program commit后的logical adoption已经预分配、noexcept、无新的容量判断。
+- 同时最多一个 staged-prefill request；
+- 已有 decode work 不会被连续 prefill 饿死；
+- decode round 包含所有且仅包含当前 decode-ready requests；
+- batch 使用精确 `B`，不以 inactive lane padding 到 `max_concurrency`。
 
-Abort保证target不会半Active，但已安全提交的victim demotion/deletion可以保留；`ResourceResult`必须完整报告
-这些变化。ResourceManager不接收逐copy receipt，也不自行推导physical delta。
+Program 接收紧凑的 `SequenceHandle[B]` 和每行预算。Prefix reuse 只减少 materialization 或 suffix
+prefill，不创建另一条调度路径。
 
-### 6.4 Completion reservation
+### 5.4 Admission invalidation
 
-Program在Active publication前锁定该sequence直到terminal的最大合法增长、State写入和selected backend需求。
-`SequenceHandle`内部持有这份concrete reservation。Active在mapped与reserved之间转换不改变global
-available capacity。
+只有会改变 admission 结论的事实才重新触发检查：
 
-因此普通prefill/decode不会再次admission，也不会被其他cache choice挤出。Active truncate把页归还自己的
-reservation，而不是直接送回global free pool。
+- waiting queue 或 FIFO head 变化；
+- lane 释放；
+- staged-prefill gate 变化；
+- resource transition 到达终态；
+- Program 的全局资源 revision 变化。
 
-### 6.5 Protected head与backfill
-
-当FIFO head因当前active incumbents暂时不可行时，Scheduler记录：
-
-- head identity与base request facts；
-- 必须先terminal的donor set；
-- 用于重新验证的Program resource revision。
-
-Later request只有在Program证明以下persistent条件后才可backfill：
-
-> Borrower持续持有完整active reservation时，在同一donor set结束后，head仍可取得
-> root/release-all-inactive plan。
-
-不使用预计borrower先完成的temporal credit。任一resource transaction终态改变revision后，启动下一个
-backfill前重新验证。普通decode frontier推进不改变global resource revision。
+普通 decode frontier 推进、输出发布和统计更新不扫描 cache catalog，也不重复运行 pressure planner。
 
 ---
 
-## 7. Worker boundary与GPU调度
+## 6. 两类提交事务
 
-### 7.1 单一mutation owner
+Engine 跨模块编排两类互不替代的事务。
 
-只有Engine worker修改RequestRecord模型状态、Scheduler、ResourceManager和Program。Memory introspection与
-fail-all cleanup通过同一execution ownership串行。
+### 6.1 Resource transition
 
-每个boundary依次执行：
+Resource transition 在以下边界改变全局资源或 ownership：
 
-```text
-expire/cancel waiting requests
-  -> finish unique RunningTransaction when present
-  -> resolve TerminalPending
-  -> freeze active cancellation snapshot
-  -> process boundary-cancelled active requests
-  -> consume one invalidated admission check when fairness permits
-  -> choose staged prefill or maximal compact decode
-  -> run at most one GPU model unit
-  -> commit Runtime, budget and output state
-  -> publish events and observations
-```
+- waiting request materialization；
+- active checkpoint capture；
+- terminal retain 或 release；
+- inactive checkpoint 的 placement 或删除。
 
-Materialization/capture transaction与terminal release不并发改变同一topology。Transaction进行时，既有active
-requests只有在其mapping与reservation不受影响时才可执行；它们可以提交已经发出的model unit并进入
-TerminalPending，但finish/discard和active cancellation release必须等待transaction结束。
-
-新active若仍持有未结算State Fork，首个state-writing commit先解除source pin；在此之前Program拒绝启动下一
-global resource transaction。该结算属于active entitlement内部的执行提交，不增加cleanup transaction种类。
-
-### 7.2 Prefill与decode
-
-Scheduler满足：
-
-- 最多一个request处于staged prefill；
-- prefill不能连续饿死已有decode；
-- admission check与decode同时存在时使用明确公平门；
-- decode round包含所有且仅包含当前`DECODE_READY` requests；
-- inactive physical lanes不以padding rows加入batch。
-
-Program接收compact `SequenceHandle[B]`和`RoundBudget[B]`。Lane是长期physical home，batch row只是当前
-round ordinal。
-
-### 7.3 Admission invalidation
-
-Waiting queue变化、lane释放、prefill gate打开或resource transaction terminal会使admission check待处理。
-普通decode、未完成prefill chunk、输出publication和stats不会触发candidate/catalog重扫。
-
-`TemporarilyBlocked`后保持静默，直到上述事实之一变化。Accepted plan在同一worker boundary start；不把未pin
-的choice跨boundary缓存。
-
-### 7.4 Capture与placement
-
-Placement只在具体Resume、Capture、Finish或admission pressure transition中改变。不存在独立周期性promotion/demotion
-scan。
-
-ActiveCapture只有在已提交模型frontier上创建checkpoint offer。若同一boundary同时出现terminal，或另一个resource
-transaction仍open，capture offer被消费并跳过。Capture transaction未完成时，请求停留在记录的post-capture控制状态。
-
----
-
-## 8. 模型输出事务
-
-### 8.1 PendingBatch
-
-Prefill finalization和decode都可返回move-only `PendingBatch`：
+需要 planning、allocation 或 transfer 的路径遵循：
 
 ```text
-rows[B]        frozen SequenceHandle membership
-tokens         Program-owned ragged token view
-row_counts[B]  licensed extent per row
-row_stride     physical row stride
+logical choice
+  -> Program seals ResourcePlan
+  -> RunningTransaction
+  -> ResourceResult
+  -> ResourceManager adopts result
 ```
 
-其中tokens只是provisional。MTP/DFlash可产生多个proposal，但Program在commit前必须能把所有persistent state
-折叠到每行最终accepted prefix。
+`ResourcePlan` 与 Program 的 `resource_revision` 绑定。Start 前过期的 plan 可以无副作用地重新规划；
+start 后不能更换 source、victim 或 stage 顺序。Abort 也必须返回完整终态，使所有 claim、pin 和已提交
+的安全降级得到唯一解释。
 
-### 8.2 Preview、commit、publish
+资源候选、可行性公式、成本模型和有界搜索由
+[资源调度与上下文缓存](resource-scheduling-and-context-cache.md)定义。
 
-每个PendingBatch遵循：
+### 6.2 Model-unit transaction
+
+Prefill finalization、decode 和 control execution 可以产生 move-only `PendingBatch`：
 
 ```text
-freeze cancellation snapshot
-  -> OutputSession previews every row
-  -> stage accepted token IDs
-  -> Program::commit(PendingBatch, decisions)
-  -> adopt row dispositions
-  -> move successful terminal rows to TerminalPending
-  -> finish/discard terminal rows
-  -> commit GenerationBudget and Scheduler service state
-  -> OutputSession::commit_preview
-  -> publish per-request events
-  -> complete responses
+frozen sequence membership
+provisional tokens
+per-row produced extent
+Program-owned provisional state
 ```
 
-Program state、terminal resource result和Frontend state都提交后，consumer才看到输出。Preview失败时，
-Engine回滚staged token IDs并以`abort_pending`消费整个frozen membership；不能逐row释放未决batch。
+Engine 对每行输出进行 Frontend preview，形成 accepted-prefix decision，再用一次
+`Program::commit` 或 `Program::abort_pending` 消费整个 batch。Program 同时提交或回滚该 prefix
+对应的 Main/backend KV、recurrent state、RNG 和 speculative state。
 
-Aggregate模式不建立per-token event queue；Streaming模式才发布增量事件。Consumer mode在submit时固定。
-
-### 8.3 Row decision
-
-非取消row必须满足：
+非取消行遵循：
 
 ```text
 1 <= accepted_tokens <= produced_tokens
-nonterminal => accepted_tokens == produced_tokens
-terminal    => accepted_tokens may be a produced prefix
+nonterminal -> accepted_tokens == produced_tokens
+terminal    -> accepted_tokens may be a produced prefix
 ```
 
-取消snapshot row使用`accepted_tokens=0, terminal=true, cancelled=true`。Program返回：
+取消行使用零 accepted token 并进入 terminal。Engine 不允许逐行遗弃一个仍未消费的
+`PendingBatch`。
 
-| disposition | 含义 | Engine动作 |
-|---|---|---|
-| Active | committed continuation仍可执行 | 保持DecodeReady |
-| Finishable | accepted state已提交 | 进入TerminalPending；无open resource transaction后finish |
-| Cancelled | provisional state已回滚 | 无open resource transaction时release；否则下一boundary取消 |
+### 6.3 输出发布顺序
 
-Main/Backend KV frontier、Linear Attention/GDN state、RNG、anchor和speculative state在Program中作为一个
-accepted frontier提交；Engine不分别更新。
+一次模型输出的可见顺序是：
 
-### 8.4 Thinking cap与forced control
+```text
+Frontend preview
+  -> Program commits accepted model state
+  -> terminal resource result, when required
+  -> generation budget and scheduler accounting
+  -> OutputSession commits preview
+  -> publish stream/aggregate event
+```
 
-Thinking budget由Frontend按accepted model-origin tokens追踪。自然close、stop、总output/context limit和
-cancellation优先；只有thinking仍打开且准确到达cap的nonterminal request进入`CONTROL_READY`。
-
-Frontend在构造期编码规范control suffix。Control transaction先preview完整span，再由Program执行短
-no-sample continuation，最后提交budget、Frontend和output。Forced tokens：
-
-- 消耗generated-token、context和service-work；
-- 不调用sampler；
-- 不推进RNG或sampling occurrence counter；
-- 提交后进入prefix identity；
-- Program成功前不可见。
-
-Sequence token ledger在startup按max context预留，control只做事务式suffix append，不复制完整历史。
+因此 consumer 不会看到尚未提交的 token，也不会看到与 Program frontier 不一致的 continuation。
+Forced control 使用同一提交顺序，但 token 由 Frontend 提供，不调用 sampler，也不推进 sampling RNG。
 
 ---
 
-## 9. Terminal、取消与错误
+## 7. Terminal、cancellation 与 failure
 
-### 9.1 Finish与retention
+### 7.1 Terminal
 
-成功终止的Active request先进入TerminalPending：
+成功终止的 Active request 先进入 TerminalPending：
 
 ```text
-ResourceManager selects retain or discard
-  -> wait until no planned resource transaction is open
-  -> Program atomically publishes complete checkpoint or releases sequence
+choose retain or release
+  -> Program publishes one complete checkpoint or releases the sequence
   -> ResourceManager adopts the terminal result
-  -> optional SessionIndex update by publication_order
+  -> optional SessionIndex update
   -> lane becomes Free
 ```
 
-Catalog slot在active publication时已经预留，finish不临时搜索或分配逻辑storage。若retention因内部状态条件失败，
-确定性fallback是release sequence；请求不能永久停在TerminalPending。
+Checkpoint 的逻辑 publication slot 在 activation 时已经保留。若 retention 无法形成完整 continuation，
+确定性终态是 release，而不是让请求停留在 TerminalPending。
 
-Checkpoint只有在State、Main/Backend KV、hidden/position和selected speculative state属于同一frontier时才
-可发布。
+### 7.2 Cancellation
 
-### 9.2 Cancellation
+Cancellation 在 Engine worker 的稳定边界生效：
 
-Engine在GPU boundary观察cancellation；已经启动的unit先到稳定终态：
-
-| 状态 | 动作 |
+| 观察到 cancellation 时的状态 | 结果 |
 |---|---|
-| Waiting | 无Program state，直接terminal output |
-| Materializing | abort RunningTransaction，采用完整ResourceResult |
-| Active/ControlReady | 无open resource transaction时进入TerminalPending并discard；否则冻结cancel intent |
-| Frozen PendingBatch | 无open resource transaction时按cancelled decision提交；否则本unit按原snapshot提交，下一boundary取消 |
-| 已commit尚未adopt | 先采用commit结果，再执行terminal路径 |
+| Waiting | 不创建 Program state，直接结束请求 |
+| Materializing | abort resource transition，并采用其完整结果 |
+| Active | 当前 GPU unit 稳定后进入 TerminalPending 并 release |
+| PendingBatch | 通过 cancelled row decision 提交或整体 abort |
+| 已 commit、尚未 adopt | 先 adopt 已提交结果，再执行 terminal 路径 |
 
-GenerationHandle abandonment只设置cancellation并完成`consumer_released`，不会从consumer线程调用Program。
-每条请求的terminal preview恰好一次。
+Cancellation 不修改 in-flight mapping，也不从未完成的 active state 发布 checkpoint。
 
-### 9.3 Request-local rejection
+### 7.3 Request-local rejection
 
-以下错误若发生在Program mutation前，只结束当前request：
+在 Program mutation 前可以只拒绝当前请求：
 
-- queue timeout或overload；
-- waiting cancellation；
-- represented input超过公开context contract；
-- request planning拒绝输入；
-- root/release-all-inactive证明该请求本身不可行。
+- queue timeout、overload 或 waiting cancellation；
+- 输入超过公开 context contract；
+- prompt 或 generation request 无法表示；
+- 即使采用 root source 并释放全部 inactive cache，单请求仍不可行。
 
-### 9.4 Engine-wide failure
+### 7.4 Engine-wide failure
 
-以下表示内部状态已不能安全继续：
+以下情况说明共享物理状态已无法安全解释，必须使整个 Engine 失败：
 
-- GPU unit或physical mutation开始后Program抛出且无法形成稳定abort result；
-- PendingBatch layout/disposition不一致；
-- capability owner/generation不匹配；
-- checkpoint完整性、resource invariant或noexcept adoption被破坏；
-- unresolved output/resource transaction无法线性消费。
+- GPU mutation 后既不能 commit 也不能形成稳定 abort；
+- `PendingBatch` membership 或 disposition 不一致；
+- handle owner/generation 不匹配；
+- resource、checkpoint completeness 或 noexcept adoption invariant 被破坏。
 
-Worker在execution ownership内：
-
-```text
-mark Engine failed and detach pending
-  -> reset Scheduler
-  -> Program aborts any resource transaction, then releases active lanes
-  -> clear ResourceManager logical catalog/lanes
-  -> complete active and waiting responses with error
-```
-
-并发执行路径发现错误时不得先局部释放active ownership；resource transaction的pins和destinations必须先被
-Program终止。无open resource transaction时，执行路径可以直接做幂等的lane cleanup。不变量错误不得伪装为
-cache miss或无限retry。
+Cleanup 顺序必须先终止 Program 中未决的 resource/model transaction，再释放 active state，最后清空
+ResourceManager 与完成所有 request response。内部不变量错误不能降级成 cache miss、等待或重试。
 
 ---
 
-## 10. Physical execution与热路径
+## 8. 物理执行的顶层约束
 
-### 10.1 Fixed lanes、compact rows
+以下约束属于 Engine 架构，但具体实现由 Program 和下层文档定义：
 
-Program在startup建立`max_concurrency`个control lanes。每轮映射为：
+- Program 在启动时建立固定数量的 control/state/table resources；
+- growing KV 由共享 paged pools 支持，active request 持有完整增长 reservation；
+- 一个 GPU execution unit 内 State/KV mapping 保持稳定；
+- CUDA Graph 按合法 exact-`B` topology 建立，request identity 和 page IDs 是稳定输入数据，不是 graph key；
+- ordinary decode 不运行 catalog scan、pressure search 或后台 replica scan；
+- workspace 是 Program 启动时统一规划的 backing，Vision、Text 和 speculative schedule 按互斥 lifetime
+  使用其内部区域。
 
-```text
-compact row -> SequenceHandle -> physical lane -> block-table/state selectors
-```
-
-Active lanes可以稀疏，GPU launch仍使用精确`B`。Catalogued checkpoint不占active lane。
-
-### 10.2 Paged KV
-
-Growing Main/backend KV使用shared page pools和固定block-table matrices。Program维护page allocation、
-reservation、mapping、valid/provisional frontier与COW。
-
-一个GPU unit内mapping稳定。Unit前的Program boundary可在同一active reservation内materialize或truncate；
-改变global capacity、inactive placement或checkpoint ownership的transition必须与其他resource transition串行；
-需要分配、pressure或transfer时使用ResourceTransaction。Prefix reuse要求完整continuation，不能以KV page
-match代替State验证。
-
-### 10.3 Workspace与Vision
-
-Program拥有一个startup-frozen workspace allocation。普通Text/MTP/DFlash/control/graph使用共同高水位；
-Vision encode和固定handoff region复用同一backing，但生命周期保证handoff active时普通consumer不会覆盖它。
-
-`MemorySummary.workspace`是唯一可相加容量；Vision layout/active extent只是其内部视图。
-
-### 10.4 Exact-B CUDA Graph
-
-Program为合法`B=1..max_concurrency`建立decode graph families。Graph key描述执行topology，不包含request
-identity、page IDs或active lane集合。变化通过稳定buffers、row selectors、frontiers和block tables输入。
-
-CUDA Graph executable的driver-owned内存没有Program-owned精确计数器。SequencePlan在startup
-预留`cuda_graph_allowance_bytes`，Graph实例化或其他CUDA操作的真实分配失败直接终止启动；
-不得用两次`cudaMemGetInfo`的process-global差值归属到单个Program，也不得由该差值
-构造Program内存不变量。`available_after_startup_bytes`仅是完成启动后的全局可用显存快照。
-
-### 10.5 Speculative backends
-
-MTP与DFlash是Program内部closed schedules，不是第二套Engine。它们只改变unit内部provisional width和state
-transition，不改变：
-
-- round membership冻结；
-- 每行output policy独立；
-- persistent state一次commit；
-- 只有accepted tokens推进budget；
-- published continuation与accepted frontier一致。
-
-### 10.6 普通decode开销
-
-正常decode round不执行：
-
-```text
-catalog scan
-pressure scan
-physical snapshot synchronization
-ResourceManager accounting update
-background replica scan
-```
-
-Host observations由实际owner在已有boundary累计；统计不驱动额外结构遍历，也不根据总耗时差值反推阶段。
+Serve warmup 使用同一个公共 Engine 执行路径，但其 request-level context cache 固定关闭。Warmup 可以建立
+CUDA Graph、library 和 allocator 的运行时状态，结束后不得留下可供外部请求命中的 continuation 或占用
+checkpoint catalog。
 
 ---
 
-## 11. 端到端路径
+## 9. 核心不变量
 
-普通非零输出请求的完整路径为：
-
-```text
-Gateway/product adapter
-  -> Engine::prepare
-  -> Frontend produces PreparedPrompt
-  -> Engine::submit reserves outstanding capacity
-  -> FIFO Waiting
-  -> Scheduler selects request
-  -> ResourceManager forms logical choice
-  -> Program seals and runs resource transaction
-  -> ResourceResult adoption
-  -> Active Prefill
-  -> zero or more prefill units
-  -> PendingBatch preview/commit
-  -> repeated maximal compact decode
-  -> optional forced control
-  -> TerminalPending
-  -> serialized finish retain or discard transition
-  -> optional checkpoint/session publication
-  -> OutputSession commit and response_done
-  -> consumer_released
-  -> exactly-once outstanding capacity release
-```
-
-Prefix reuse只改变source、materialization和suffix prefill，不创建第二条请求生命周期。MTP/DFlash只改变Program
-unit内部，不创建第二套调度或publication路径。
+1. 请求顺序只由 Scheduler 决定。
+2. logical cache policy 只由 ResourceManager 决定。
+3. physical occupancy、reservation、feasibility 和 model state 只由 Program 决定。
+4. Active publication 前必须具备完整 continuation 和完成 reservation。
+5. 一个 global resource topology transition 在任意时刻至多一个。
+6. 一个 `PendingBatch` 必须由一次 Program commit 或 abort 完整消费。
+7. Program、Frontend 和 budget 均提交后，模型输出才对 consumer 可见。
+8. TerminalPending 结束前不得释放或复用该请求的 active ownership。
+9. Cancellation 只能在线性化的 worker boundary 改变请求状态。
+10. 每个 accepted request、resource transaction 和 model transaction 都有有限且唯一的终态。
 
 ---
 
-## 12. 架构检查表
-
-一个Engine层变更只有在以下问题都有唯一答案时才完整：
-
-1. 请求顺序是否仍只由Scheduler决定？
-2. 逻辑cache policy是否仍只由ResourceManager决定？
-3. 物理occupancy、reservation和reclaim是否只由Program真实stores决定？
-4. Global resource topology mutation是否由Program串行，并在需要分配、pressure或transfer时使用ResourceTransaction？
-5. Provisional model output是否在publication前完成Program、Frontend和terminal commit？
-6. Active request的完成reservation是否始终保留到TerminalPending结束？
-7. Cancel、stale plan、retention failure和Engine failure是否都有有限终态？
-8. 普通decode是否仍不触发catalog、pressure或physical accounting工作？
-
-任何需要跨层“补账”、猜测另一层状态或在失败后重放部分receipt的设计都违反这些边界。
-
----
-
-## 13. 代码映射与相关权威
-
-### 13.1 主要位置
+## 10. 实现位置与相邻权威
 
 | 职责 | 主要位置 |
 |---|---|
-| 公共Engine facade | `include/ninfer/engine.h`, `src/runtime/engine/engine.cpp` |
-| RequestRecord与response latch | `src/runtime/engine/request_record.h`, `engine_core.h` |
+| 公共 Engine facade | `include/ninfer/engine.h`, `src/runtime/engine/engine.cpp` |
+| Engine worker 与 request lifecycle | `src/runtime/engine/engine_core.h`, `src/runtime/engine/request_record.h` |
 | Scheduler | `src/runtime/engine/scheduler.h`, `admission_policy.*` |
-| ResourceManager logical policy | `src/runtime/engine/resource_manager.h` |
-| package-neutral contracts | `src/runtime/contract/types.h` |
-| package registry/startup | `src/targets/registry.*`, `src/targets/<package>/` |
-| Qwen3.6 Frontend | `src/targets/qwen3_6/impl/frontend/` |
-| Qwen3.6 Program | `src/targets/qwen3_6/impl/runtime/` |
+| ResourceManager 与 materialization planner | `src/runtime/engine/resource_manager.h`, `materialization_planner.h` |
+| package-neutral runtime contracts | `src/runtime/contract/types.h` |
+| target Program | `src/targets/qwen3_6/impl/runtime/` |
 | physical primitives | `src/core/` |
-| semantic CUDA Ops | `src/ops/`, `include/ninfer/ops/` |
+| semantic Ops | `src/ops/`, `include/ninfer/ops/` |
 | HTTP Gateway | `src/serve/` |
 
-路径用于定位authority，不把当前文件拆分固化成外部API。
+这些路径用于定位当前 authority，不把文件拆分固化为外部接口。
 
-### 13.2 相关文档
+相邻文档：
 
-- [资源调度与上下文缓存架构](resource-scheduling-and-context-cache.md)：资源公式、checkpoint、transaction、
-  retention与session；
-- [Paged KV Context Store](paged-kv-cache.md)：KV pool、page ownership、layout、frontier与consumer contract；
-- [Op development](op-development.md)：Op正确性与性能准入；
-- [Qwen3.6-27B model](qwen3.6-27b-model.md)和
-  [Qwen3.6-35B-A3B model](qwen3.6-35b-a3b-model.md)：模型数学与持久状态；
-- [Artifact container](artifact-container.md)、[storage layouts](storage-layouts.md)和
-  [tensor formats](tensor-formats.md)：`.ninfer`格式；
-- [CLI](../cli.md)、[HTTP serving](../serving.md)和[Performance](../performance.md)：外部行为与测量。
+- [资源调度与上下文缓存](resource-scheduling-and-context-cache.md)：resource vector、checkpoint
+  capability、pressure planning 和 physical transition；
+- [Paged KV Context Store](paged-kv-cache.md)：typed pools、logical pages、replicas、block tables
+  和 consumer address contract；
+- [Op development](op-development.md)：Op 正确性与性能准入；
+- [CLI](../cli.md)与 [HTTP serving](../serving.md)：外部行为。

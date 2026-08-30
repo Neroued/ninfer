@@ -24,6 +24,8 @@ struct DeviceContext {
     DeviceContext(DeviceContext&& other) noexcept;
     DeviceContext& operator=(DeviceContext&& other) noexcept;
 
+    void bind_to_current_thread() const;
+    void bind_to_current_thread_noexcept() const noexcept;
     int sm() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;

@@ -82,7 +82,7 @@ struct ConstructedTarget {
     ActiveTarget active;
     LoadSummary load;
     ModelSamplingDefaults sampling_defaults;
-    runtime::ContextCostModel context_cost;
+    runtime::ContextMachineCostModel context_cost;
 };
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,

@@ -78,6 +78,11 @@ target_include_directories(ninfer_sampling_defaults_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
+ninfer_add_test(ninfer_perplexity_evaluation_test
+  SOURCES test_perplexity_evaluation.cpp
+          ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp)
+target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/apps/perplexity)
 ninfer_add_test(ninfer_cli_options_test
   SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
@@ -132,6 +137,10 @@ ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_score_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
@@ -164,18 +173,18 @@ set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES test_openai_schema.cpp
   LIBRARIES ninfer_serve)
-ninfer_add_test(ninfer_responses_schema_test
-  SOURCES test_responses_schema.cpp
+ninfer_add_test(ninfer_openai_responses_test
+  SOURCES test_openai_responses.cpp
   LIBRARIES ninfer_serve)
-ninfer_add_test(ninfer_response_store_test
-  SOURCES test_response_store.cpp
+ninfer_add_test(ninfer_openai_responses_store_test
+  SOURCES test_openai_responses_store.cpp
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
   LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES test_tool_call_parser.cpp
-  LIBRARIES ninfer_serve)
+  LIBRARIES ninfer_engine)
 ninfer_add_test(ninfer_serve_options_test
   SOURCES test_serve_options.cpp
   LIBRARIES ninfer_serve)
@@ -189,6 +198,11 @@ ninfer_add_test(ninfer_http_error_handler_test
   SOURCES test_http_error_handler.cpp
   LIBRARIES ninfer_serve)
 target_include_directories(ninfer_http_error_handler_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+ninfer_add_test(ninfer_http_transport_test
+  SOURCES test_http_transport.cpp
+  LIBRARIES ninfer_serve)
+target_include_directories(ninfer_http_transport_test PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
@@ -229,6 +243,7 @@ set(ninfer_op_tests
   scalar
   cast
   scatter
+  target_logprobs
   position)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test

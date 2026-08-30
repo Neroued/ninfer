@@ -13,6 +13,10 @@
 
 namespace ninfer::targets::qwen3_6 {
 
+namespace frontend_internal {
+struct ToolCallOutputContract;
+}
+
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
 // Aggregate prompt capacity and one-item execution capacity are intentionally distinct. Multiple
@@ -98,9 +102,10 @@ struct PreparedSessionKey {
 };
 
 struct PreparedCacheOpportunity {
-    PromptCacheMarkerKind kind = PromptCacheMarkerKind::SharedStablePrefix;
-    std::uint32_t frontier     = 0;
-    std::uint32_t input_order  = 0;
+    PromptCacheMarkerKind kind       = PromptCacheMarkerKind::SharedStablePrefix;
+    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
+    std::uint32_t frontier           = 0;
+    std::uint32_t input_order        = 0;
 
     [[nodiscard]] friend bool operator==(PreparedCacheOpportunity,
                                          PreparedCacheOpportunity) noexcept = default;
@@ -142,6 +147,7 @@ struct PreparedPromptData {
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
     PreparedContextCache context_cache;
+    std::shared_ptr<const frontend_internal::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
 

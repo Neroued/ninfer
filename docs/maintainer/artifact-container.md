@@ -330,8 +330,8 @@ would duplicate work in a trusted, project-owned conversion path without improvi
 contract. The common directory parser therefore owns structural decoding only.
 
 How the Engine allocates, uploads, owns, or publishes a loaded product is outside the container ABI.
-A Python reference may keep an mmap open and stream rows; a C++ target may materialize packed device
-spans. Both consume the same directory and registered layout bytes.
+A converter-side verifier may keep an mmap open and stream rows; a C++ target may materialize
+packed device spans. Both consume the same directory and registered layout bytes.
 
 ## 7. Writing an artifact
 
@@ -408,9 +408,8 @@ correctly without carrying it.
 
 ## 11. Required implementation evidence
 
-The native implementation in `tools/artifact/`, `tools/convert/qwen3_6_27b/`,
-`tools/convert/qwen3_8_27b/`, `tools/reference/qwen3_6_27b/`, and `src/artifact/` satisfies this
-layer. The compact evidence retained for later changes is:
+The native implementation in `tools/artifact/`, `tools/convert/`, and `src/artifact/` satisfies
+this layer. The compact evidence retained for later changes is:
 
 - Python version-2 round trips for all nine numeric formats and a raw resource;
 - representative framing, schema, offset/alignment, overlap, bounds, and encoded-size failures;
@@ -421,8 +420,9 @@ layer. The compact evidence retained for later changes is:
 - the complete registered target inventories, including both 1124-object 27B groupwise contracts,
   the 1307-object Qwen3.6 NVFP4 contract with 247 validation-only input divisors, and the
   1124-object Qwen3.8 NVFP4 contract with 112 input divisors;
-- inspection, representative source probes, Python reference inference, and public Engine loading
-  of the real converter-generated Qwen3.6-27B, Qwen3.8-27B, and 35B-A3B artifacts.
+- inspection, representative source probes, converter-side payload verification, C++ binding, and
+  public Engine loading of the real converter-generated Qwen3.6-27B, Qwen3.8-27B, and 35B-A3B
+  artifacts.
 
 This contract does not require canonical-JSON spelling tests, arbitrary malformed-input matrices,
 fuzz/resource-exhaustion campaigns, failure injection, interrupted-publication tests, full-file

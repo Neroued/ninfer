@@ -296,6 +296,7 @@ struct ContextOperationCounts {
     std::uint64_t state_moves            = 0;
     std::uint64_t state_forks            = 0;
     std::uint64_t state_restores         = 0;
+    std::uint64_t pressure_spill_pages   = 0;
     std::uint64_t partial_tail_cow_pages = 0;
     std::uint64_t historical_fork_hits   = 0;
 };
@@ -381,7 +382,8 @@ enum class FinishDisposition : std::uint8_t {
 struct CheckpointRef {
     CheckpointKind kind    = CheckpointKind::SessionEndpoint;
     std::uint32_t frontier = 0;
-    std::uint32_t ordinal  = 0;
+    // Singleton checkpoint kinds use zero. LongAnchor uses a nonzero, per-continuation slot.
+    std::uint32_t ordinal = 0;
 
     [[nodiscard]] friend constexpr bool operator==(CheckpointRef, CheckpointRef) noexcept = default;
 };
@@ -403,10 +405,88 @@ struct RequestPlanSummary {
     bool publish_continuation             = true;
 };
 
+enum class MaterializationPhysicalStatus : std::uint8_t {
+    Feasible,
+    Infeasible,
+    StructuralInvalid,
+};
+
+// Compact machine-only result of one complete materialization projection. Cache retention value
+// is deliberately absent; ResourceManager owns that policy and combines it with this summary.
+struct MaterializationMachineSummary {
+    std::uint64_t minimum_request_ns = 0;
+    std::uint64_t immediate_ns       = 0;
+    PrefillWork remaining_prefill_work;
+    std::uint64_t transferred_bytes    = 0;
+    std::uint32_t copy_operations      = 0;
+    std::uint32_t reused_prompt_tokens = 0;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const MaterializationMachineSummary&,
+               const MaterializationMachineSummary&) noexcept = default;
+};
+
+struct IdentityMaterializationAssessment {
+    MaterializationPhysicalStatus physical_status =
+        MaterializationPhysicalStatus::StructuralInvalid;
+    ClaimDisposition source_disposition = ClaimDisposition::ConsumedToActive;
+    MaterializationMachineSummary machine;
+    bool expandable                 = false;
+    std::uint64_t projection_work   = 0;
+    std::uint64_t assessment_digest = 0;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const IdentityMaterializationAssessment&,
+               const IdentityMaterializationAssessment&) noexcept = default;
+};
+
+struct PressureCheckpointRecoveryImpact {
+    std::uint32_t owner_ordinal = 0;
+    CheckpointRef checkpoint;
+    std::uint64_t baseline_recovery_ns = 0;
+    std::uint64_t target_recovery_ns   = 0;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const PressureCheckpointRecoveryImpact&,
+               const PressureCheckpointRecoveryImpact&) noexcept = default;
+};
+
+struct PressureOwnerOutcome {
+    std::uint32_t owner_ordinal       = 0;
+    ClaimDisposition disposition      = ClaimDisposition::Retained;
+    std::uint32_t degradation_units   = 0;
+    std::uint32_t dropped_checkpoints = 0;
+    bool shared                       = false;
+
+    [[nodiscard]] friend constexpr bool operator==(const PressureOwnerOutcome&,
+                                                   const PressureOwnerOutcome&) noexcept = default;
+};
+
+// The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only
+// until the next session mutation. The common planner folds them immediately into owning values.
+struct PressureTargetAssessment {
+    MaterializationPhysicalStatus physical_status =
+        MaterializationPhysicalStatus::StructuralInvalid;
+    ClaimDisposition source_disposition = ClaimDisposition::ConsumedToActive;
+    MaterializationMachineSummary machine;
+    std::span<const PressureOwnerOutcome> owner_outcomes;
+    std::span<const PressureCheckpointRecoveryImpact> checkpoint_impacts;
+    std::uint32_t candidate_ordinal     = 0;
+    std::uint32_t stable_target_ordinal = 0;
+    std::uint32_t degradation_units     = 0;
+    std::uint32_t dropped_checkpoints   = 0;
+    std::uint64_t projection_work       = 0;
+    std::uint64_t assessment_digest     = 0;
+    bool expandable                     = false;
+    bool root_maximal                   = false;
+};
+
 struct BeginSummary {
     std::uint32_t prompt_tokens        = 0;
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
+
+    [[nodiscard]] friend constexpr bool operator==(BeginSummary, BeginSummary) noexcept = default;
 };
 
 struct GeneratedRound {

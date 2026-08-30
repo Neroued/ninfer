@@ -46,7 +46,6 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 2,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
     ),
     "cache-pressure-device": _args(
         "--max-context", 8192,
@@ -58,7 +57,6 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 4,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
     ),
     "cache-pressure-state-host": _args(
         "--max-context", 8192,
@@ -70,7 +68,6 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 4,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
     ),
     "cache-pressure-kv-host": _args(
         "--max-context", 8192,
@@ -82,7 +79,17 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 4,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
+    ),
+    "cache-swap-64k-host": _args(
+        "--max-context", 65536,
+        "--kv-capacity", 65536,
+        "--max-concurrency", 2,
+        "--device-state-slots", 4,
+        "--host-state-slots", 0,
+        "--host-kv-mib", 4608,
+        "--max-private-continuations", 4,
+        "--max-shared-prefixes", 0,
+        "--max-long-anchors-per-continuation", 0,
     ),
     "cache-pressure-both-host": _args(
         "--max-context", 8192,
@@ -94,7 +101,6 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 4,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
     ),
     "cache-pressure-evict": _args(
         "--max-context", 8192,
@@ -106,7 +112,6 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 4,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
     ),
     "cache-pressure-catalog": _args(
         "--max-context", 8192,
@@ -118,7 +123,6 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 2,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
     ),
     "cache-off": _args(
         "--max-context", 8192,
@@ -136,19 +140,17 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 2,
         "--max-shared-prefixes", 1,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 1,
     ),
-    "shared-replacement": _args(
-        "--max-context", 8192,
-        "--kv-capacity", 8192,
+    "shared-value": _args(
+        "--max-context", 16384,
+        "--kv-capacity", 16384,
         "--max-concurrency", 1,
-        "--device-state-slots", 2,
+        "--device-state-slots", 3,
         "--host-state-slots", 0,
         "--host-kv-mib", 0,
         "--max-private-continuations", 1,
         "--max-shared-prefixes", 1,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 1,
     ),
     "session-order": _args(
         "--max-context", 8192,
@@ -160,7 +162,6 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 4,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
     ),
     "scheduler-overlap": _args(
         "--max-context", 8192,
@@ -222,7 +223,6 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 2,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
         "--vision",
         "--media-cache-mib", 512,
         "--media-live-mib", 512,
@@ -237,7 +237,6 @@ PROFILE_ARGS: dict[str, tuple[str, ...]] = {
         "--max-private-continuations", 2,
         "--max-shared-prefixes", 0,
         "--max-long-anchors-per-continuation", 0,
-        "--max-cache-markers-per-request", 0,
         "--vision",
         "--media-cache-mib", 512,
         "--media-live-mib", 512,

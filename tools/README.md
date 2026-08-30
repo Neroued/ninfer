@@ -1,9 +1,8 @@
 # NInfer maintainer tools
 
-`tools/` contains the project-owner workflows for artifact conversion and inspection, independent
-Python references, numerical parity diagnostics, benchmark orchestration, and serving smoke checks.
-These tools are not part of the public download-and-run path; normal users should start with the
-[project README](../README.md).
+`tools/` contains the project-owner workflows for artifact conversion and inspection, benchmark
+orchestration, and serving smoke checks. These tools are not part of the public download-and-run
+path; normal users should start with the [project README](../README.md).
 
 Run commands from the repository root with a Python 3.11 environment containing the dependencies
 for the selected tool.
@@ -16,9 +15,6 @@ for the selected tool.
 | Build the Qwen3.8-27B artifact | [`convert/qwen3_8_27b/`](convert/qwen3_8_27b/) |
 | Build the 35B-A3B artifact | [`convert/qwen3_6_35b_a3b/`](convert/qwen3_6_35b_a3b/) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
-| Run the 27B Python reference | [`reference/qwen3_6_27b/`](reference/qwen3_6_27b/README.md) |
-| Run the 35B-A3B Python reference | [`reference/qwen3_6_35b_a3b/`](reference/qwen3_6_35b_a3b/README.md) |
-| Compare 27B artifact/source Vision activations | [`parity/qwen3_6_27b/`](parity/qwen3_6_27b/README.md) |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
@@ -53,22 +49,6 @@ python3 -m tools.artifact.inspect out/qwen3_6_27b.ninfer --objects
 The exact source revisions, inventories, formats, and conversion recipes are recorded in
 [`docs/maintainer/`](../docs/maintainer/). Published users download the completed artifacts from
 Hugging Face instead of running these workflows.
-
-## Python references and parity
-
-```bash
-python3 -m tools.reference.qwen3_6_27b \
-  --weights out/qwen3_6_27b.ninfer \
-  --prompt "请简短介绍一下你自己。" --decode 128
-
-python3 -m tools.reference.qwen3_6_35b_a3b \
-  --weights out/qwen3_6_35b_a3b.ninfer \
-  --prompt "请简短介绍一下你自己。" --decode 128
-```
-
-The Python implementations are independent diagnostic references, not alternate public inference
-products or generated-token goldens for the C++ engine. See the parity README for the direct 27B
-artifact/source Vision comparison command.
 
 ## Benchmark orchestration
 

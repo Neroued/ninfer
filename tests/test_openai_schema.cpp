@@ -1,713 +1,683 @@
-// Contract test for the OpenAI serving layer: request parsing (string + parts
-// content, unsupported-feature rejection), response/chunk/models/error
-// serialization shapes, and finish_reason mapping. This is the schema boundary
-// consumed by external OpenAI clients.
-
-#include "serve/openai_schema.h"
-#include "serve/request.h"
+#include "serve/generation_service.h"
+#include "serve/openai_chat.h"
+#include "serve/openai_common.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
 
-#include <array>
-#include <cstddef>
-#include <functional>
+#include <cstdint>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
 using Json = nlohmann::json;
 using namespace ninfer::serve;
 
-int fail(const std::string& message) {
-    std::cerr << "FAIL: " << message << '\n';
+int check(bool condition, const std::string& label) {
+    if (condition) { return 0; }
+    std::cerr << "FAIL: " << label << '\n';
     return 1;
 }
 
-int check(bool condition, const std::string& message) { return condition ? 0 : fail(message); }
-
-bool throws_api(const std::function<void()>& f) {
+template <typename Function>
+ApiError api_error(Function&& function) {
     try {
-        f();
-    } catch (const ApiException&) { return true; } catch (...) {
-        return false;
-    }
+        function();
+    } catch (const ApiException& exception) { return exception.error(); }
+    return ApiError{.status = 0, .message = "no exception"};
+}
+
+template <typename Function>
+bool throws_logic(Function&& function) {
+    try {
+        function();
+    } catch (const std::logic_error&) { return true; }
     return false;
 }
 
-std::string api_code(const std::function<void()>& f) {
-    try {
-        f();
-    } catch (const ApiException& error) { return error.error().code; } catch (...) {
-        return "wrong_exception";
-    }
-    return {};
+RequestLimits limits() { return RequestLimits{.default_max_tokens = 512}; }
+
+Json base_request() {
+    return Json{{"model", "qwen"},
+                {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
 }
 
-RequestLimits default_limits() {
-    RequestLimits limits;
-    limits.default_max_tokens = 512;
-    return limits;
-}
+OpenAIChatRequest parse(Json body) { return parse_chat_completion_request(body, limits()); }
 
-ServeOptions default_server() { return ServeOptions{}; }
-
-ninfer::PromptCapabilities effort_capabilities() {
+ResolvedPromptSemantics semantics(const GenerationRequest& request) {
+    ServeOptions server;
     ninfer::PromptCapabilities capabilities;
-    capabilities.enable_thinking                 = true;
-    capabilities.reasoning_effort.low            = true;
-    capabilities.reasoning_effort.medium         = true;
-    capabilities.reasoning_effort.xhigh          = true;
-    capabilities.reasoning_effort.default_effort = ninfer::ReasoningEffort::XHigh;
-    return capabilities;
+    capabilities.enable_thinking = true;
+    return resolve_prompt_semantics(request, server, capabilities);
 }
 
-ninfer::OwnedMedia fake_media(const ContentPart& part) {
-    ninfer::OwnedMedia media;
-    media.kind =
-        part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
-    media.bytes.push_back(0);
-    media.media_type = part.source.media_type;
-    return media;
+ninfer::PromptInput prompt(const GenerationRequest& request) {
+    return to_prompt_input(request, semantics(request), {});
 }
 
-ninfer::PromptInput translate(const GenerationRequest& req) {
-    const ServeOptions server = default_server();
-    return to_prompt_input(req, resolve_prompt_semantics(req, server, effort_capabilities()),
-                           fake_media);
+ninfer::RequestOptions options(const GenerationRequest& request) {
+    ServeOptions server;
+    return to_request_options(request, server, semantics(request), true);
 }
 
-ninfer::RequestOptions translate_options(const GenerationRequest& req) {
-    const ServeOptions server = default_server();
-    return to_request_options(req, server,
-                              resolve_prompt_semantics(req, server, effort_capabilities()),
-                              server.allow_prefix_reuse);
-}
-
-std::string joined_text(const ninfer::ChatMessage& message) {
-    std::string text;
-    for (const ninfer::MessagePart& part : message.parts) {
-        if (part.kind == ninfer::MessagePartKind::Text) { text += part.text; }
-    }
-    return text;
-}
-
-// Strip "data: " prefix and trailing blank line from an SSE event, returning the
-// parsed JSON payload.
 Json parse_sse(const std::string& event) {
-    const std::string prefix = "data: ";
-    const std::string suffix = "\n\n";
-    if (event.rfind(prefix, 0) != 0 || event.size() < prefix.size() + suffix.size()) {
-        throw std::runtime_error("bad SSE framing: " + event);
+    constexpr std::string_view prefix = "data: ";
+    if (!event.starts_with(prefix) || !event.ends_with("\n\n")) {
+        throw std::runtime_error("invalid SSE framing");
     }
-    const std::string json =
-        event.substr(prefix.size(), event.size() - prefix.size() - suffix.size());
-    return Json::parse(json);
+    return Json::parse(event.substr(prefix.size(), event.size() - prefix.size() - 2));
 }
 
-int test_parse_string_content() {
-    int failures                = 0;
-    const Json body             = {{"model", "qwen3.6-27b"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})}};
-    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    failures += check(req.model == "qwen3.6-27b", "model parsed");
-    failures += check(req.messages.size() == 1, "one message parsed");
-    failures += check(req.messages[0].role == ninfer::ChatRole::User, "role parsed");
-    failures += check(req.messages[0].content.size() == 1, "one content part");
-    failures += check(req.messages[0].content[0].kind == ContentKind::Text, "text part kind");
-    failures += check(req.messages[0].content[0].text == "hello", "text part content");
-    failures += check(!req.stream, "stream defaults false");
-    failures += check(req.max_tokens == 512, "max_tokens default applied");
-    failures += check(!req.max_tokens_set, "max_tokens_set false when defaulted");
+int test_request_envelope_and_sampling() {
+    int failures                  = 0;
+    Json body                     = base_request();
+    body["stream"]                = true;
+    body["stream_options"]        = Json{{"include_usage", true}, {"include_obfuscation", false}};
+    body["max_completion_tokens"] = 48;
+    body["max_tokens"]            = 9;
+    body["temperature"]           = 0.7;
+    body["top_p"]                 = 0.8;
+    body["presence_penalty"]      = 0.3;
+    body["frequency_penalty"]     = -0.2;
+    body["seed"]                  = -1;
+    body["top_k"]                 = 17;
+    body["min_p"]                 = 0.05;
+
+    const OpenAIChatRequest request = parse(body);
+    failures += check(request.model == "qwen", "model remains in OpenAI envelope");
+    failures += check(request.stream && request.include_usage, "stream metadata parsed");
+    failures += check(request.output_tokens_explicit && request.generation.max_tokens == 48,
+                      "max_completion_tokens wins and explicitness stays in envelope");
+    failures += check(request.generation.sampling.seed == std::numeric_limits<std::uint64_t>::max(),
+                      "signed seed maps modulo 2^64");
+    failures +=
+        check(request.generation.sampling.top_k == 17 && request.generation.sampling.min_p == 0.05,
+              "compatible sampler extensions parsed");
+    const ninfer::RequestOptions translated = options(request.generation);
+    failures +=
+        check(translated.execution.sampling.top_k == 17, "top_k reaches Engine request options");
+    failures +=
+        check(translated.execution.sampling.min_p && *translated.execution.sampling.min_p == 0.05F,
+              "min_p reaches Engine request options");
+    failures +=
+        check(translated.execution.sampling.seed == std::numeric_limits<std::uint64_t>::max(),
+              "signed seed reaches Engine request options");
+
+    const OpenAIChatRequest defaults = parse(base_request());
+    failures +=
+        check(!defaults.stream && !defaults.include_usage && !defaults.output_tokens_explicit &&
+                  defaults.generation.max_tokens == limits().default_max_tokens,
+              "protocol defaults remain outside GenerationRequest");
+
+    Json malformed              = base_request();
+    malformed["stream_options"] = true;
+    failures += check(api_error([&] { (void)parse(malformed); }).param == "stream_options",
+                      "malformed stream_options rejected");
     return failures;
 }
 
-int test_preserve_thinking_options() {
-    const Json base = {
-        {"model", "m"},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+int test_standard_field_policy() {
+    int failures  = 0;
+    auto rejected = [&](const char* key, Json value, const char* code) {
+        Json body            = base_request();
+        body[key]            = std::move(value);
+        const ApiError error = api_error([&] { (void)parse(body); });
+        failures += check(error.param == key && error.code == code,
+                          std::string(key) + " non-neutral value rejected");
     };
-    int failures = 0;
 
-    Json kwargs                    = base;
-    kwargs["chat_template_kwargs"] = Json{{"preserve_thinking", true}};
-    const GenerationRequest kwargs_request =
-        parse_chat_completion_request(kwargs, default_limits());
-    failures += check(kwargs_request.preserve_thinking == true,
-                      "chat_template_kwargs preserve_thinking parsed");
-    failures += check(translate(kwargs_request).options.preserve_thinking,
-                      "resolved preserve_thinking reached PromptInput");
+    rejected("n", 2, "n_not_supported");
+    rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
+    rejected("logprobs", true, "logprobs_not_supported");
+    rejected("top_logprobs", 2, "logprobs_not_supported");
+    rejected("response_format", Json{{"type", "json_schema"}}, "response_format_not_supported");
+    rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
+    rejected("web_search_options", Json::object(), "web_search_not_supported");
+    rejected("moderation", Json::object(), "moderation_not_supported");
+    rejected("verbosity", "high", "verbosity_not_supported");
+    rejected("store", true, "store_not_supported");
+    rejected("functions", Json::array({Json{{"name", "legacy"}}}), "legacy_tools_not_supported");
 
-    Json alias                 = base;
-    alias["preserve_thinking"] = false;
-    failures +=
-        check(parse_chat_completion_request(alias, default_limits()).preserve_thinking == false,
-              "top-level preserve_thinking alias parsed");
+    Json neutral                      = base_request();
+    neutral["n"]                      = 1;
+    neutral["logit_bias"]             = Json{{"12", 0}, {"13", 0.0}};
+    neutral["logprobs"]               = false;
+    neutral["top_logprobs"]           = 0;
+    neutral["response_format"]        = Json{{"type", "text"}};
+    neutral["modalities"]             = Json::array({"text"});
+    neutral["audio"]                  = Json{{"voice", "alloy"}};
+    neutral["prediction"]             = Json{{"type", "content"}, {"content", "expected"}};
+    neutral["verbosity"]              = "medium";
+    neutral["store"]                  = false;
+    neutral["functions"]              = Json::array();
+    neutral["function_call"]          = "auto";
+    neutral["metadata"]               = Json{{"trace", "client"}};
+    neutral["user"]                   = "user-1";
+    neutral["safety_identifier"]      = "safe-1";
+    neutral["prompt_cache_key"]       = "cache-1";
+    neutral["prompt_cache_options"]   = Json{{"retention", "24h"}};
+    neutral["prompt_cache_retention"] = "24h";
+    neutral["service_tier"]           = "priority";
+    neutral["future_unknown_field"]   = Json{{"value", 1}};
+    failures += check(parse(neutral).generation.messages.size() == 1,
+                      "neutral controls and advisory hints are accepted");
 
-    Json same                 = kwargs;
-    same["preserve_thinking"] = true;
-    failures +=
-        check(parse_chat_completion_request(same, default_limits()).preserve_thinking == true,
-              "matching preserve_thinking values rejected");
-
-    Json nulls                    = base;
-    nulls["preserve_thinking"]    = nullptr;
-    nulls["chat_template_kwargs"] = Json{{"preserve_thinking", nullptr}, {"future", nullptr}};
-    failures +=
-        check(!parse_chat_completion_request(nulls, default_limits()).preserve_thinking.has_value(),
-              "null preserve_thinking did not remain omitted");
-
-    Json conflict                 = kwargs;
-    conflict["preserve_thinking"] = false;
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(conflict, default_limits()); }),
-              "conflicting preserve_thinking values accepted");
-
-    Json bad_kwargs                    = base;
-    bad_kwargs["chat_template_kwargs"] = true;
-    failures += check(
-        throws_api([&] { (void)parse_chat_completion_request(bad_kwargs, default_limits()); }),
-        "non-object chat_template_kwargs accepted");
-    Json bad_value                    = base;
-    bad_value["chat_template_kwargs"] = Json{{"preserve_thinking", "yes"}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(bad_value, default_limits()); }),
-              "non-boolean preserve_thinking accepted");
-    Json unknown                    = base;
-    unknown["chat_template_kwargs"] = Json{{"preserve_thinking", true}, {"foo", 1}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(unknown, default_limits()); }),
-              "unknown non-null chat template option accepted");
+    Json zero_limit                     = base_request();
+    zero_limit["max_completion_tokens"] = 0;
+    const OpenAIChatRequest zero        = parse(zero_limit);
+    failures += check(zero.output_tokens_explicit && zero.generation.max_tokens == 0,
+                      "an explicit zero output limit reaches Engine's no-generation path");
     return failures;
 }
 
-int test_reasoning_effort() {
-    const Json base = {
-        {"model", "m"},
-        {"messages", Json::array({Json{{"role", "user"}, {"content", "hello"}}})},
+int test_constrained_decoding_extensions() {
+    int failures                                           = 0;
+    const std::vector<std::pair<const char*, Json>> active = {
+        {"grammar", "root ::= \"yes\" | \"no\""},
+        {"structured_outputs", Json{{"json", Json{{"type", "object"}}}}},
+        {"guided_json", Json{{"type", "object"}}},
+        {"guided_regex", "[a-z]+"},
+        {"guided_choice", Json::array({"yes", "no"})},
+        {"guided_grammar", "root ::= \"yes\" | \"no\""},
     };
-    int failures = 0;
-
-    Json low                            = base;
-    low["reasoning_effort"]             = "low";
-    const GenerationRequest low_request = parse_chat_completion_request(low, default_limits());
-    failures += check(low_request.reasoning_effort == RequestedReasoningEffort::Low,
-                      "Chat Completions reasoning_effort was not parsed");
-    const ninfer::PromptInput low_prompt = translate(low_request);
-    failures += check(low_prompt.options.enable_thinking &&
-                          low_prompt.options.reasoning_effort == ninfer::ReasoningEffort::Low,
-                      "Chat Completions low effort did not reach PromptInput");
-
-    Json none                = base;
-    none["reasoning_effort"] = "none";
-    const ninfer::PromptInput none_prompt =
-        translate(parse_chat_completion_request(none, default_limits()));
-    failures += check(!none_prompt.options.enable_thinking && !none_prompt.options.reasoning_effort,
-                      "Chat Completions none effort did not disable thinking");
-
-    for (const auto& [wire, expected] :
-         std::array<std::pair<const char*, RequestedReasoningEffort>, 6>{
-             {{"minimal", RequestedReasoningEffort::Minimal},
-              {"medium", RequestedReasoningEffort::Medium},
-              {"high", RequestedReasoningEffort::High},
-              {"xhigh", RequestedReasoningEffort::XHigh},
-              {"max", RequestedReasoningEffort::Max},
-              {"none", RequestedReasoningEffort::None}}}) {
-        Json body                = base;
-        body["reasoning_effort"] = wire;
-        failures += check(parse_chat_completion_request(body, default_limits()).reasoning_effort ==
-                              expected,
-                          std::string("Chat Completions did not accept protocol effort ") + wire);
+    for (const auto& [field, value] : active) {
+        Json body            = base_request();
+        body[field]          = value;
+        const ApiError error = api_error([&] { (void)parse(body); });
+        failures +=
+            check(error.param == field && error.code == "constrained_decoding_not_supported" &&
+                      error.message.find(field) != std::string::npos,
+                  std::string(field) + " constrained decoding is explicitly rejected");
     }
 
-    Json high                            = base;
-    high["reasoning_effort"]             = "high";
-    const GenerationRequest high_request = parse_chat_completion_request(high, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "protocol-valid high effort was not rejected by template capability");
-
-    ninfer::PromptCapabilities toggle_capabilities;
-    toggle_capabilities.enable_thinking = true;
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(low_request, default_server(),
-                                                         toggle_capabilities);
-                      }) == "reasoning_effort_not_supported",
-                      "reasoning effort was accepted without template support");
-
-    Json conflict               = low;
-    conflict["enable_thinking"] = false;
-    const GenerationRequest conflicting_request =
-        parse_chat_completion_request(conflict, default_limits());
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(conflicting_request, default_server(),
-                                                         effort_capabilities());
-                      }) == "conflicting_template_option",
-                      "conflicting enable_thinking and reasoning_effort were accepted");
-
-    Json invalid                = base;
-    invalid["reasoning_effort"] = "ultra";
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(invalid, default_limits()); }),
-              "unknown Chat Completions reasoning effort was accepted");
-    invalid["reasoning_effort"] = 1;
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(invalid, default_limits()); }),
-              "non-string Chat Completions reasoning effort was accepted");
+    Json neutral                  = base_request();
+    neutral["grammar"]            = "";
+    neutral["structured_outputs"] = nullptr;
+    neutral["guided_json"]        = nullptr;
+    neutral["guided_regex"]       = nullptr;
+    neutral["guided_choice"]      = nullptr;
+    neutral["guided_grammar"]     = nullptr;
+    failures += check(parse(neutral).generation.messages.size() == 1,
+                      "neutral constrained-decoding extension values are accepted");
     return failures;
 }
 
-int test_parse_parts_and_flatten() {
-    int failures    = 0;
-    const Json body = {
-        {"model", "m"},
-        {"messages",
-         Json::array({Json{{"role", "user"},
-                           {"content", Json::array({Json{{"type", "text"}, {"text", "a"}},
-                                                    Json{{"type", "text"}, {"text", "b"}}})}}})}};
-    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    failures += check(req.messages[0].content.size() == 2, "two content parts");
-    const ninfer::PromptInput prompt = translate(req);
-    failures += check(prompt.messages.size() == 1, "flattened to one message");
-    failures += check(joined_text(prompt.messages[0]) == "a\nb", "text parts joined");
-    return failures;
+Json function_tool(std::string name = "weather", bool strict = false) {
+    return Json{{"type", "function"},
+                {"function", Json{{"name", std::move(name)},
+                                  {"description", "Get weather"},
+                                  {"parameters", Json{{"type", "object"}}},
+                                  {"strict", strict}}}};
 }
 
-int test_parse_media_in_translate() {
-    const Json body = {
-        {"model", "m"},
-        {"messages",
-         Json::array({Json{
-             {"role", "user"},
-             {"content",
-              Json::array(
-                  {Json{{"type", "image_url"},
-                        {"image_url", Json{{"url", "data:image/png;base64,AA=="}}}},
-                   Json{{"type", "video_url"},
-                        {"video_url", Json{{"url", "https://example.test/clip.mp4"}}}}})}}})}};
-    const GenerationRequest req      = parse_chat_completion_request(body, default_limits());
-    const ninfer::PromptInput prompt = translate(req);
-    int failures                     = 0;
-    failures += check(req.messages[0].content[0].kind == ContentKind::Image,
-                      "image content kind preserved");
-    failures += check(req.messages[0].content[0].source.kind ==
-                          ninfer::product::media_acquire::SourceKind::Data,
-                      "image data URI source preserved");
-    failures += check(prompt.messages[0].parts[0].kind == ninfer::MessagePartKind::Media &&
-                          prompt.messages[0].parts[0].media.kind == ninfer::MediaKind::Image,
-                      "image translated to structured chat part");
-    failures += check(req.messages[0].content[1].kind == ContentKind::Video,
-                      "video content kind preserved");
-    failures += check(req.messages[0].content[1].source.kind ==
-                          ninfer::product::media_acquire::SourceKind::Url,
-                      "video URL source preserved");
-    failures += check(prompt.messages[0].parts[1].kind == ninfer::MessagePartKind::Media &&
-                          prompt.messages[0].parts[1].media.kind == ninfer::MediaKind::Video,
-                      "video translated to structured chat part");
-    return failures;
-}
-
-int test_instruction_roles_preserved() {
-    const Json body = {
-        {"model", "m"},
-        {"messages", Json::array({Json{{"role", "developer"}, {"content", "be terse"}},
-                                  Json{{"role", "user"}, {"content", "hi"}},
-                                  Json{{"role", "system"}, {"content", "new context"}}})}};
-    const GenerationRequest req      = parse_chat_completion_request(body, default_limits());
-    const ninfer::PromptInput prompt = translate(req);
-    int failures                     = 0;
-    failures +=
-        check(req.messages.size() == 3 && req.messages[0].role == ninfer::ChatRole::Developer &&
-                  req.messages[1].role == ninfer::ChatRole::User &&
-                  req.messages[2].role == ninfer::ChatRole::System,
-              "schema did not preserve ordered developer/system roles");
-    failures += check(prompt.messages.size() == 3 &&
-                          prompt.messages[0].role == ninfer::ChatRole::Developer &&
-                          prompt.messages[1].role == ninfer::ChatRole::User &&
-                          prompt.messages[2].role == ninfer::ChatRole::System,
-                      "translation changed roles before target-specific lowering");
-    return failures;
-}
-
-int test_reject_unsupported() {
-    int failures    = 0;
-    const Json base = {{"model", "m"},
-                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-
-    Json n2 = base;
-    n2["n"] = 2;
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(n2, default_limits()); }),
-              "n>1 rejected");
-
-    Json custom_tool = base;
-    custom_tool["tools"] =
-        Json::array({Json{{"type", "custom"}, {"custom", Json{{"name", "search"}}}}});
-    failures += check(
-        throws_api([&] { (void)parse_chat_completion_request(custom_tool, default_limits()); }),
-        "custom tools rejected");
-
-    Json functions         = base;
-    functions["functions"] = Json::array({Json::object()});
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(functions, default_limits()); }),
-              "deprecated functions rejected");
-
-    Json function_call             = base;
-    function_call["function_call"] = "auto";
-    failures += check(
-        throws_api([&] { (void)parse_chat_completion_request(function_call, default_limits()); }),
-        "deprecated function_call rejected");
-
-    Json rf               = base;
-    rf["response_format"] = Json{{"type", "json_object"}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(rf, default_limits()); }),
-              "json response_format rejected");
-
-    Json rf_text               = base;
-    rf_text["response_format"] = Json{{"type", "text"}};
-    bool text_ok               = true;
-    try {
-        (void)parse_chat_completion_request(rf_text, default_limits());
-    } catch (...) { text_ok = false; }
-    failures += check(text_ok, "text response_format accepted");
-
-    Json no_model = {{"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(no_model, default_limits()); }),
-              "missing model rejected");
-
-    Json function_role = {
-        {"model", "m"}, {"messages", Json::array({Json{{"role", "function"}, {"content", "x"}}})}};
-    failures += check(
-        throws_api([&] { (void)parse_chat_completion_request(function_role, default_limits()); }),
-        "function role rejected");
-    return failures;
-}
-
-int test_parse_function_tools_and_choices() {
-    int failures = 0;
-    const Json tool =
-        Json{{"type", "function"},
-             {"function",
-              Json{{"name", "get_weather"},
-                   {"description", "Fetch weather"},
-                   {"parameters", Json{{"type", "object"},
-                                       {"properties", Json{{"city", Json{{"type", "string"}}}}},
-                                       {"required", Json::array({"city"})}}},
-                   {"strict", true}}}};
-    const Json base = {{"model", "m"},
-                       {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-                       {"tools", Json::array({tool})}};
-
-    GenerationRequest req = parse_chat_completion_request(base, default_limits());
-    failures += check(req.tools.size() == 1, "one tool parsed");
-    failures += check(req.tools[0].name == "get_weather", "tool name parsed");
-    failures += check(req.tools[0].description == "Fetch weather", "tool description parsed");
-    failures += check(req.tools[0].strict, "tool strict metadata parsed");
-    failures += check(Json::parse(req.tools[0].parameters_json).at("required").at(0) == "city",
-                      "tool parameters carried");
-    failures += check(Json::parse(req.tools[0].definition_json).at("type") == "function",
-                      "tool definition json carried");
-    failures += check(req.tool_choice.mode == ToolChoiceMode::Auto, "default tool choice is auto");
-    failures += check(req.uses_tools(), "tools enabled by default");
-    failures += check(translate_options(req).output.preserve_special_tokens,
-                      "active tools preserve special tokens in Engine output");
-
-    Json none           = base;
-    none["tool_choice"] = "none";
-    req                 = parse_chat_completion_request(none, default_limits());
-    failures += check(req.tool_choice.mode == ToolChoiceMode::None, "tool_choice none parsed");
-    failures += check(!req.uses_tools(), "tool_choice none disables tools");
-    failures += check(!translate_options(req).output.preserve_special_tokens,
-                      "disabled tools do not preserve special tokens");
-
-    Json required           = base;
-    required["tool_choice"] = "required";
-    req                     = parse_chat_completion_request(required, default_limits());
-    failures +=
-        check(req.tool_choice.mode == ToolChoiceMode::Required, "tool_choice required parsed");
-
-    Json named           = base;
-    named["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "get_weather"}}}};
-    req                  = parse_chat_completion_request(named, default_limits());
-    failures += check(req.tool_choice.mode == ToolChoiceMode::Named, "named tool_choice parsed");
-    failures += check(req.tool_choice.name == "get_weather", "named tool_choice name parsed");
-
-    Json unknown           = base;
-    unknown["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "missing"}}}};
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(unknown, default_limits()); }),
-              "unknown named tool_choice rejected");
-    return failures;
-}
-
-int test_parse_tool_history_messages() {
-    int failures    = 0;
-    const Json body = {
-        {"model", "m"},
-        {"messages",
-         Json::array(
-             {Json{{"role", "user"}, {"content", "weather?"}},
-              Json{{"role", "assistant"},
-                   {"content", nullptr},
-                   {"tool_calls",
-                    Json::array({Json{{"id", "call_1"},
-                                      {"type", "function"},
-                                      {"function", Json{{"name", "get_weather"},
-                                                        {"arguments", R"({"city":"Paris"})"}}}}})}},
-              Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", R"({"temp":20})"}}})}};
-    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    failures += check(req.messages.size() == 3, "tool history message count");
-    failures += check(req.messages[1].tool_calls.size() == 1, "assistant tool call parsed");
-    failures += check(req.messages[1].tool_calls[0].id == "call_1", "tool call id parsed");
-    failures += check(req.messages[1].tool_calls[0].name == "get_weather", "tool call name parsed");
-    failures += check(req.messages[1].tool_calls[0].arguments_json == R"({"city":"Paris"})",
-                      "tool call arguments parsed");
-    failures += check(req.messages[2].role == ninfer::ChatRole::Tool, "tool role parsed");
-    failures += check(req.messages[2].tool_call_id == "call_1", "tool_call_id parsed");
-    failures +=
-        check(req.messages[2].content.at(0).text == R"({"temp":20})", "tool content parsed");
-    failures += check(translate_options(req).output.preserve_special_tokens,
-                      "tool history preserves special tokens in Engine output");
-
-    Json bad_args                                                     = body;
-    bad_args["messages"][1]["tool_calls"][0]["function"]["arguments"] = R"(["Paris"])";
-    failures +=
-        check(throws_api([&] { (void)parse_chat_completion_request(bad_args, default_limits()); }),
-              "non-object tool call arguments rejected");
-    return failures;
-}
-
-int test_parse_stop_and_max_tokens() {
-    int failures          = 0;
-    Json body             = {{"model", "m"},
-                             {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-                             {"stop", Json::array({"</s>", "STOP"})},
-                             {"max_completion_tokens", 42}};
-    GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    failures += check(req.stop_strings.size() == 2, "two stop strings");
-    failures += check(req.stop_strings[0] == "</s>", "stop string 0");
-    failures += check(req.max_tokens == 42 && req.max_tokens_set, "max_completion_tokens alias");
-    const ninfer::RequestOptions options = translate_options(req);
-    failures += check(options.execution.requested_output_tokens == 42,
-                      "max_completion_tokens reaches Engine options");
-    failures += check(options.stop.strings.size() == 2 && options.stop.strings[0].text == "</s>" &&
-                          options.stop.strings[1].text == "STOP",
-                      "stop strings reach Engine options");
-
-    Json single = {{"model", "m"},
-                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-                   {"stop", "END"}};
-    req         = parse_chat_completion_request(single, default_limits());
-    failures +=
-        check(req.stop_strings.size() == 1 && req.stop_strings[0] == "END", "single stop string");
-    return failures;
-}
-
-int test_parse_sampling_carried() {
-    int failures                = 0;
-    const Json body             = {{"model", "m"},
-                                   {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
-                                   {"temperature", 0.7},
-                                   {"top_p", 0.9},
-                                   {"seed", 123},
-                                   {"logit_bias", Json{{"5", -1.5}}}};
-    const GenerationRequest req = parse_chat_completion_request(body, default_limits());
-    failures += check(req.sampling.temperature.has_value() && *req.sampling.temperature == 0.7,
-                      "temperature carried");
-    failures +=
-        check(req.sampling.top_p.has_value() && *req.sampling.top_p == 0.9, "top_p carried");
-    failures += check(req.sampling.seed.has_value() && *req.sampling.seed == 123u, "seed carried");
-    failures +=
-        check(req.sampling.logit_bias.count(5) == 1 && req.sampling.logit_bias.at(5) == -1.5,
-              "logit_bias carried");
-    const ninfer::RequestOptions options = translate_options(req);
-    failures += check(options.execution.sampling.temperature == 0.7F,
-                      "temperature reaches Engine overrides");
-    failures += check(options.execution.sampling.top_p == 0.9F, "top_p reaches Engine overrides");
-    failures += check(options.execution.sampling.seed == 123u, "seed reaches Engine overrides");
-    failures +=
-        check(!options.execution.sampling.top_k && !options.execution.sampling.presence_penalty,
-              "omitted request fields unexpectedly replaced model defaults");
-    return failures;
-}
-
-int test_response_serialization() {
-    int failures = 0;
-    const CompletionUsage usage{10, 3};
-    const Json j = Json::parse(
-        make_chat_completion_response("id-1", "m", 111, "hello world", "", "stop", usage));
-    failures += check(j.at("object") == "chat.completion", "response object");
-    failures += check(j.at("id") == "id-1", "response id");
-    failures +=
-        check(j.at("choices").at(0).at("message").at("role") == "assistant", "assistant role");
-    failures += check(j.at("choices").at(0).at("message").at("content") == "hello world",
-                      "response content");
-    // Empty reasoning must not emit the reasoning_content key at all.
-    failures += check(!j.at("choices").at(0).at("message").contains("reasoning_content"),
-                      "no reasoning_content when reasoning empty");
-    failures +=
-        check(j.at("choices").at(0).at("finish_reason") == "stop", "response finish_reason");
-    failures += check(j.at("usage").at("prompt_tokens") == 10, "usage prompt_tokens");
-    failures += check(j.at("usage").at("completion_tokens") == 3, "usage completion_tokens");
-    failures += check(j.at("usage").at("total_tokens") == 13, "usage total_tokens");
-
-    // Non-empty reasoning is attached as message.reasoning_content, content stays answer-only.
-    const Json jr = Json::parse(make_chat_completion_response("id-2", "m", 111, "the answer",
-                                                              "let me think", "stop", usage));
-    failures += check(jr.at("choices").at(0).at("message").at("content") == "the answer",
-                      "reasoning response content is answer only");
-    failures +=
-        check(jr.at("choices").at(0).at("message").at("reasoning_content") == "let me think",
-              "reasoning_content carried");
-    return failures;
-}
-
-int test_tool_response_serialization() {
-    int failures = 0;
-    const CompletionUsage usage{12, 6};
-    const std::vector<ToolCall> calls = {
-        ToolCall{"call_abc", "get_weather", R"({"city":"Paris"})"}};
-    const Json j = Json::parse(
-        make_chat_completion_tool_response("id-tool", "m", 222, "", "need weather", calls, usage));
-
-    failures += check(j.at("object") == "chat.completion", "tool response object");
-    const Json& choice = j.at("choices").at(0);
-    failures += check(choice.at("finish_reason") == "tool_calls", "tool finish reason");
-    const Json& message = choice.at("message");
-    failures += check(message.at("role") == "assistant", "tool message role");
-    failures += check(message.at("content").is_null(), "empty tool content is null");
-    failures += check(message.at("reasoning_content") == "need weather", "tool reasoning carried");
-    const Json& call = message.at("tool_calls").at(0);
-    failures += check(call.at("id") == "call_abc", "tool call id");
-    failures += check(call.at("type") == "function", "tool call type");
-    failures += check(call.at("function").at("name") == "get_weather", "tool function name");
-    failures += check(call.at("function").at("arguments") == R"({"city":"Paris"})",
-                      "tool function arguments");
-    failures += check(j.at("usage").at("total_tokens") == 18, "tool usage total");
-
-    const Json with_content = Json::parse(make_chat_completion_tool_response(
-        "id-tool-2", "m", 223, "Calling weather.", "", calls, usage));
-    failures +=
-        check(with_content.at("choices").at(0).at("message").at("content") == "Calling weather.",
-              "tool content prefix carried");
-    return failures;
-}
-
-int test_chunk_serialization() {
-    int failures    = 0;
-    const Json role = parse_sse(make_chat_chunk_role("id", "m", 1, false));
-    failures += check(role.at("object") == "chat.completion.chunk", "chunk object");
-    failures += check(role.at("choices").at(0).at("delta").at("role") == "assistant", "role delta");
-    failures += check(!role.contains("usage"), "no usage key when include_usage=false");
-
-    const Json content = parse_sse(make_chat_chunk_content("id", "m", 1, "tok", false));
-    failures +=
-        check(content.at("choices").at(0).at("delta").at("content") == "tok", "content delta");
-
-    // Reasoning deltas carry reasoning_content (not content) so clients render them
-    // as a separate thinking channel.
-    const Json reasoning = parse_sse(make_chat_chunk_reasoning("id", "m", 1, "why", false));
-    failures += check(reasoning.at("choices").at(0).at("delta").at("reasoning_content") == "why",
-                      "reasoning delta");
-    failures += check(!reasoning.at("choices").at(0).at("delta").contains("content"),
-                      "reasoning delta has no content key");
-
-    // When usage reporting is on, content-bearing chunks carry usage: null.
-    const Json role_usage = parse_sse(make_chat_chunk_role("id", "m", 1, true));
-    failures += check(role_usage.contains("usage") && role_usage.at("usage").is_null(),
-                      "role usage null when include_usage=true");
-    const Json content_usage = parse_sse(make_chat_chunk_content("id", "m", 1, "x", true));
-    failures += check(content_usage.contains("usage") && content_usage.at("usage").is_null(),
-                      "content usage null when include_usage=true");
-
-    // Final chunk carries finish_reason with an empty delta and no usage stats.
-    const Json final_chunk = parse_sse(make_chat_chunk_final("id", "m", 1, "length", true));
-    failures += check(final_chunk.at("choices").at(0).at("finish_reason") == "length",
-                      "final finish_reason");
-    failures += check(final_chunk.at("choices").at(0).at("delta").empty(), "final delta empty");
-    failures += check(final_chunk.contains("usage") && final_chunk.at("usage").is_null(),
-                      "final usage null (stats live on dedicated chunk)");
-
-    const Json final_no_usage = parse_sse(make_chat_chunk_final("id", "m", 1, "stop", false));
-    failures += check(!final_no_usage.contains("usage"), "no usage key when include_usage=false");
-
-    // Dedicated usage chunk: empty choices, populated usage.
-    const CompletionUsage usage{2, 5};
-    const Json usage_chunk = parse_sse(make_chat_chunk_usage("id", "m", 1, usage));
-    failures += check(usage_chunk.at("choices").is_array() && usage_chunk.at("choices").empty(),
-                      "usage chunk has empty choices");
-    failures +=
-        check(usage_chunk.at("usage").at("prompt_tokens") == 2, "usage chunk prompt_tokens");
-    failures += check(usage_chunk.at("usage").at("total_tokens") == 7, "usage chunk total");
-
-    failures += check(sse_done() == "data: [DONE]\n\n", "done sentinel");
-    return failures;
-}
-
-int test_tool_chunk_serialization() {
+int test_tools() {
     int failures                      = 0;
-    const std::vector<ToolCall> calls = {
-        ToolCall{"call_abc", "get_weather", R"({"city":"Paris"})"}};
-    const Json chunk = parse_sse(make_chat_chunk_tool_calls("id", "m", 1, calls, true));
-    failures += check(chunk.at("object") == "chat.completion.chunk", "tool chunk object");
-    const Json& delta = chunk.at("choices").at(0).at("delta");
-    const Json& call  = delta.at("tool_calls").at(0);
-    failures += check(call.at("index") == 0, "tool chunk index");
-    failures += check(call.at("id") == "call_abc", "tool chunk id");
-    failures += check(call.at("type") == "function", "tool chunk type");
-    failures += check(call.at("function").at("name") == "get_weather", "tool chunk name");
-    failures +=
-        check(call.at("function").at("arguments") == R"({"city":"Paris"})", "tool chunk arguments");
-    failures +=
-        check(chunk.contains("usage") && chunk.at("usage").is_null(), "tool chunk usage null");
+    Json body                         = base_request();
+    body["tools"]                     = Json::array({function_tool()});
+    const OpenAIChatRequest automatic = parse(body);
+    failures += check(automatic.generation.uses_tools(), "function tools default to auto");
+    failures += check(prompt(automatic.generation).options.tool_jsons.size() == 1,
+                      "auto tools reach PromptInput");
 
-    const Json final_chunk = parse_sse(make_chat_chunk_final("id", "m", 1, "tool_calls", true));
-    failures += check(final_chunk.at("choices").at(0).at("finish_reason") == "tool_calls",
-                      "tool final finish reason");
+    body["tools"][0]["future_item_field"]                 = "ignored";
+    body["tools"][0]["function"]["future_function_field"] = "ignored";
+    const std::string normalized_definition = prompt(parse(body).generation).options.tool_jsons[0];
+    failures += check(normalized_definition.find("future_item_field") == std::string::npos &&
+                          normalized_definition.find("future_function_field") == std::string::npos,
+                      "unknown tool fields do not silently alter the model prompt");
+
+    body["tool_choice"]          = "none";
+    body["parallel_tool_calls"]  = false;
+    const OpenAIChatRequest none = parse(body);
+    failures +=
+        check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
+              "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
+
+    body["tool_choice"] = "required";
+    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
+                      "required tool choice rejected");
+    body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
+    failures += check(api_error([&] { (void)parse(body); }).code == "tool_choice_not_supported",
+                      "named tool choice rejected");
+
+    body          = base_request();
+    body["tools"] = Json::array({function_tool(), function_tool("search")});
+    body["tool_choice"] =
+        Json{{"type", "allowed_tools"},
+             {"allowed_tools",
+              Json{{"mode", "auto"},
+                   {"tools", Json::array({Json{{"type", "function"}, {"name", "search"}}})}}}};
+    const GenerationRequest allowed = parse(body).generation;
+    failures += check(allowed.tools.size() == 1 && allowed.tools[0].name == "search" &&
+                          prompt(allowed).options.tool_jsons.size() == 1,
+                      "allowed_tools auto narrows the executable function set");
+
+    body["tool_choice"] =
+        Json{{"type", "allowed_tools"},
+             {"mode", "auto"},
+             {"tools", Json::array({Json{{"type", "function"}, {"name", "weather"}}})}};
+    const GenerationRequest direct_allowed = parse(body).generation;
+    failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
+                      "direct allowed_tools compatibility shape is accepted");
+    body["tool_choice"]["mode"]     = "required";
+    const ApiError required_allowed = api_error([&] { (void)parse(body); });
+    failures +=
+        check(required_allowed.code == "tool_choice_not_supported" &&
+                  required_allowed.message.find("at least one tool call") != std::string::npos,
+              "required allowed_tools reports the unenforceable guarantee");
+    body["tool_choice"]["mode"]             = "auto";
+    body["tool_choice"]["tools"][0]["name"] = "missing";
+    failures += check(api_error([&] { (void)parse(body); }).param == "tool_choice",
+                      "allowed_tools rejects names absent from the declared tool set");
+
+    body          = base_request();
+    body["tools"] = Json::array({function_tool("weather", true)});
+    failures += check(api_error([&] { (void)parse(body); }).code == "strict_tools_not_supported",
+                      "strict tools rejected");
+    body["tools"] = Json::array({Json{{"type", "custom"}, {"name", "shell"}}});
+    failures += check(api_error([&] { (void)parse(body); }).code == "tool_type_not_supported",
+                      "custom tools rejected");
+
+    body                        = base_request();
+    body["tools"]               = Json::array({function_tool()});
+    body["parallel_tool_calls"] = false;
+    failures +=
+        check(api_error([&] { (void)parse(body); }).code == "parallel_tool_calls_not_supported",
+              "parallel_tool_calls=false rejected when tools exist");
+    body.erase("tools");
+    failures += check(parse(body).generation.tools.empty(),
+                      "parallel_tool_calls=false is neutral without tools");
+    body["tool_choice"] = "auto";
+    failures +=
+        check(parse(body).generation.tools.empty(), "tool_choice auto is neutral without tools");
+
+    Json history = base_request();
+    history["messages"] =
+        Json::array({Json{{"role", "user"}, {"content", "weather?"}},
+                     Json{{"role", "assistant"},
+                          {"content", nullptr},
+                          {"tool_calls",
+                           Json::array({Json{{"id", "call_1"},
+                                             {"type", "function"},
+                                             {"function", Json{{"name", "weather"},
+                                                               {"arguments", "not-json-yet"}}}}})}},
+                     Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "sunny"}}});
+    failures += check(parse(history).generation.has_tool_history(),
+                      "tool-call history follows wire types without inventing JSON validation");
+
+    Json mixed_assistant        = base_request();
+    mixed_assistant["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "inspect"}},
+         Json{{"role", "assistant"},
+              {"content", "I will inspect it"},
+              {"tool_calls",
+               Json::array({Json{
+                   {"id", "call_2"},
+                   {"type", "function"},
+                   {"function", Json{{"name", "inspect"}, {"arguments", R"({"path":"a"})"}}}}})}}});
+    const GenerationRequest mixed_request  = parse(mixed_assistant).generation;
+    const ninfer::PromptInput mixed_prompt = prompt(mixed_request);
+    failures += check(mixed_request.messages[1].cache_boundary_after &&
+                          !mixed_request.messages[1].content[0].cache_boundary_after &&
+                          !mixed_prompt.context_cache.markers.empty() &&
+                          mixed_prompt.context_cache.markers.back().location ==
+                              ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                          mixed_prompt.context_cache.markers.back().after_message_count == 2,
+                      "automatic caching stops after a complete assistant text/tool-call turn");
     return failures;
 }
 
-int test_models_and_error() {
-    int failures    = 0;
-    const Json list = Json::parse(make_models_list("qwen3.6-27b", 1));
-    failures += check(list.at("object") == "list", "models list object");
-    failures += check(list.at("data").at(0).at("id") == "qwen3.6-27b", "models list id");
-    failures += check(list.at("data").at(0).at("object") == "model", "models list entry object");
-    failures += check(list.at("data").at(0).at("owned_by") == "ninfer", "models list owner");
+int test_messages_and_media() {
+    int failures                   = 0;
+    Json body                      = base_request();
+    body["messages"][0]["content"] = Json::array(
+        {Json{{"type", "text"}, {"text", "alpha"}}, Json{{"type", "text"}, {"text", "beta"}}});
+    const ninfer::PromptInput translated = prompt(parse(body).generation);
+    failures += check(translated.messages[0].parts.size() == 2 &&
+                          translated.messages[0].parts[0].text == "alpha" &&
+                          translated.messages[0].parts[1].text == "beta",
+                      "adjacent text parts preserve exact text without inserted newline");
 
-    const Json one = Json::parse(make_model_object("qwen3.6-27b", 1));
-    failures += check(one.at("id") == "qwen3.6-27b" && one.at("object") == "model", "model object");
-    failures += check(one.at("owned_by") == "ninfer", "model owner");
+    body                           = base_request();
+    body["messages"][0]["content"] = Json::array(
+        {Json{{"type", "image_url"},
+              {"image_url", Json{{"url", "https://example.test/a.png"}, {"detail", "auto"}}}},
+         Json{{"type", "video_url"}, {"video_url", "https://example.test/a.mp4"}}});
+    const GenerationRequest media = parse(body).generation;
+    failures += check(media.media_item_count() == 2 &&
+                          media.messages[0].content[0].kind == ContentKind::Image &&
+                          media.messages[0].content[1].kind == ContentKind::Video,
+                      "image and video compatibility inputs normalize to Engine media");
 
-    ApiError error;
-    error.status   = 400;
-    error.type     = "invalid_request_error";
-    error.message  = "bad";
-    error.param    = "messages";
-    const Json err = Json::parse(make_error_body(error));
-    failures += check(err.at("error").at("message") == "bad", "error message");
-    failures += check(err.at("error").at("type") == "invalid_request_error", "error type");
-    failures += check(err.at("error").at("param") == "messages", "error param");
-    failures += check(err.at("error").at("code").is_null(), "error code null when empty");
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "high";
+    failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
+                      "explicit image preprocessing detail rejected");
+
+    auto content_rejected = [&](const char* role, const char* type) {
+        Json invalid                   = base_request();
+        invalid["messages"][0]["role"] = role;
+        invalid["messages"][0]["content"] =
+            Json::array({Json{{"type", type}, {type, "https://example.test/x"}}});
+        return api_error([&] { (void)parse(invalid); }).code == "modality_not_supported";
+    };
+    failures +=
+        check(content_rejected("assistant", "image_url"), "assistant media history rejected");
+    failures += check(content_rejected("system", "image_url"),
+                      "system media rejected at protocol boundary");
+
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "capture it"}},
+         Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls",
+               Json::array({Json{{"id", "call_capture"},
+                                 {"type", "function"},
+                                 {"function", Json{{"name", "capture"}, {"arguments", "{}"}}}}})}},
+         Json{{"role", "tool"},
+              {"tool_call_id", "call_capture"},
+              {"content",
+               Json::array({Json{{"type", "text"}, {"text", "captured"}},
+                            Json{{"type", "image_url"},
+                                 {"image_url", Json{{"url", "https://example.test/capture.png"},
+                                                    {"detail", "auto"}}}}})}}});
+    const GenerationRequest tool_image = parse(body).generation;
+    failures += check(tool_image.messages.back().role == ninfer::ChatRole::Tool &&
+                          tool_image.messages.back().tool_call_id == "call_capture" &&
+                          tool_image.messages.back().content.size() == 2 &&
+                          tool_image.messages.back().content[0].kind == ContentKind::Text &&
+                          tool_image.messages.back().content[1].kind == ContentKind::Image,
+                      "tool result text and image parts normalize to one tool turn");
+
+    body["messages"].back()["content"] = Json::array(
+        {Json{{"type", "video_url"}, {"video_url", "https://example.test/capture.mp4"}}});
+    failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
+                      "tool result video remains outside the Chat compatibility extension");
+
+    body = base_request();
+    body["messages"][0]["content"] =
+        Json::array({Json{{"type", "input_audio"}, {"input_audio", Json::object()}}});
+    failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
+                      "input audio rejected");
+    body["messages"][0]["content"] =
+        Json::array({Json{{"type", "file"}, {"file", Json::object()}}});
+    failures += check(api_error([&] { (void)parse(body); }).code == "modality_not_supported",
+                      "file input rejected");
+
+    body                        = base_request();
+    body["messages"][0]["name"] = "speaker";
+    failures += check(api_error([&] { (void)parse(body); }).code == "message_name_not_supported",
+                      "message name rejected");
+
+    body = base_request();
+    body["messages"].push_back(Json{
+        {"role", "assistant"},
+        {"content", nullptr},
+        {"tool_calls",
+         Json::array({Json{{"id", "call_1"},
+                           {"type", "function"},
+                           {"function", Json{{"name", "get_status"}, {"arguments", "{}"}}}}})}});
+    body["messages"].push_back(Json{
+        {"role", "tool"}, {"name", "get_status"}, {"tool_call_id", "call_1"}, {"content", "ok"}});
+    const GenerationRequest named_tool_history = parse(body).generation;
+    const ChatTurn& named_tool                 = named_tool_history.messages.back();
+    failures += check(named_tool.role == ninfer::ChatRole::Tool &&
+                          named_tool.tool_call_id == "call_1" && !named_tool.tool_result_name &&
+                          named_tool.content.size() == 1 && named_tool.content[0].text == "ok",
+                      "tool message name is an ignored compatibility extension");
+
+    body["messages"].back()["name"] = Json::array();
+    failures +=
+        check(api_error([&] { (void)parse(body); }).message == "message name must be a string",
+              "tool message name remains type checked");
+
+    body                           = base_request();
+    body["messages"][0]["name"]    = "";
+    body["messages"][0]["content"] = Json::array();
+    failures += check(parse(body).generation.messages[0].content.empty(),
+                      "empty names and empty content arrays remain neutral");
+
+    body = base_request();
+    body["messages"].push_back(
+        Json{{"role", "assistant"},
+             {"content", Json::array({Json{{"type", "refusal"}, {"refusal", "part"}}})},
+             {"refusal", "top-level"}});
+    const GenerationRequest refusal_history = parse(body).generation;
+    const ChatTurn& refusal                 = refusal_history.messages.back();
+    failures += check(refusal.content.size() == 2 && refusal.content[0].text == "part" &&
+                          refusal.content[1].text == "top-level",
+                      "assistant refusal history is preserved as assistant text");
+
+    body = base_request();
+    body["messages"].push_back(Json{{"role", "assistant"}});
+    failures += check(parse(body).generation.messages.back().content.empty(),
+                      "an empty assistant history turn is representable");
+
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "run it"}},
+         Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"function_call", Json{{"name", "legacy"}, {"arguments", R"({"value":1})"}}}},
+         Json{{"role", "function"}, {"name", "legacy"}, {"content", "done"}}});
+    const GenerationRequest legacy = parse(body).generation;
+    failures += check(legacy.messages[1].tool_calls.size() == 1 &&
+                          legacy.messages[1].tool_calls[0].name == "legacy" &&
+                          legacy.messages[2].role == ninfer::ChatRole::Tool,
+                      "legacy function-call history lowers to Engine tool history");
+
+    body["messages"] = Json::array(
+        {Json{{"role", "assistant"},
+              {"content", nullptr},
+              {"tool_calls",
+               Json::array({Json{{"id", ""},
+                                 {"type", "function"},
+                                 {"function", Json{{"name", "weather"}, {"arguments", "{}"}}}}})}},
+         Json{{"role", "tool"}, {"tool_call_id", ""}, {"content", "done"}}});
+    failures += check(parse(body).generation.has_tool_history(),
+                      "string tool-call identifiers may be empty without changing history");
     return failures;
 }
 
-int test_finish_reason_wire() {
+int test_reasoning_and_extensions() {
     int failures = 0;
-    failures += check(std::string(finish_reason_wire(ninfer::FinishReason::StopToken)) == "stop",
-                      "stop token wire");
+    Json body    = base_request();
+    body["messages"].push_back(Json{{"role", "assistant"},
+                                    {"content", "answer"},
+                                    {"reasoning_content", "thought"},
+                                    {"reasoning", "thought"}});
+    failures += check(parse(body).generation.messages.back().reasoning_content == "thought",
+                      "assistant reasoning aliases normalize");
+    body["messages"].back()["reasoning"] = "different";
+    failures += check(api_error([&] { (void)parse(body); }).code == "conflicting_template_option",
+                      "conflicting assistant reasoning aliases rejected");
+    body["messages"].back()["reasoning_content"] = "";
+    failures += check(parse(body).generation.messages.back().reasoning_content == "different",
+                      "an empty reasoning alias does not conflict with a meaningful alias");
+    body = base_request();
+    body["messages"].push_back(Json{
+        {"role", "assistant"}, {"content", nullptr}, {"reasoning_content", "unfinished thought"}});
     failures +=
-        check(std::string(finish_reason_wire(ninfer::FinishReason::OutputLimit)) == "length",
-              "output limit wire");
-    failures += check(std::string(finish_reason_wire(ninfer::FinishReason::Cancelled)) == "stop",
-                      "cancelled maps to stop");
+        check(parse(body).generation.messages.back().reasoning_content == "unfinished thought",
+              "reasoning-only assistant history is preserved");
+
+    body                         = base_request();
+    body["enable_thinking"]      = true;
+    body["preserve_thinking"]    = false;
+    body["chat_template_kwargs"] = Json{{"enable_thinking", true}, {"preserve_thinking", false}};
+    const GenerationRequest normalized = parse(body).generation;
+    failures += check(normalized.enable_thinking == true && normalized.preserve_thinking == false,
+                      "Qwen/vLLM template aliases normalize");
+    body["chat_template_kwargs"]["enable_thinking"] = false;
+    failures += check(api_error([&] { (void)parse(body); }).code == "conflicting_template_option",
+                      "conflicting thinking aliases rejected");
+    body                         = base_request();
+    body["chat_template_kwargs"] = Json{{"future", 1}};
+    failures +=
+        check(api_error([&] { (void)parse(body); }).code == "chat_template_option_not_supported",
+              "unknown meaningful template option rejected");
+    body["chat_template_kwargs"] = Json{{"future", nullptr}};
+    failures += check(parse(body).generation.messages.size() == 1,
+                      "null unknown template option is neutral");
+
+    body                        = base_request();
+    body["repetition_penalty"]  = 1.0;
+    body["mm_processor_kwargs"] = Json{{"max_pixels", nullptr}};
+    failures +=
+        check(parse(body).generation.messages.size() == 1, "neutral ecosystem defaults accepted");
+    body["repetition_penalty"] = 1.1;
+    failures +=
+        check(api_error([&] { (void)parse(body); }).code == "repetition_penalty_not_supported",
+              "non-neutral repetition penalty rejected");
+    body                        = base_request();
+    body["mm_processor_kwargs"] = Json{{"max_pixels", 100}};
+    failures +=
+        check(api_error([&] { (void)parse(body); }).code == "mm_processor_kwargs_not_supported",
+              "non-empty media processor kwargs rejected");
+    return failures;
+}
+
+int test_stops_and_ranges() {
+    int failures                            = 0;
+    Json body                               = base_request();
+    body["stop"]                            = Json::array({"A", "B"});
+    const ninfer::RequestOptions translated = options(parse(body).generation);
+    failures += check(translated.stop.strings.size() == 4,
+                      "each stop string applies to Content and Reasoning");
+    failures += check(translated.stop.strings[0].channel == ninfer::OutputChannel::Content &&
+                          translated.stop.strings[1].channel == ninfer::OutputChannel::Reasoning,
+                      "stop channel ordering is explicit");
+
+    body["stop"] = Json::array({"1", "2", "3", "4", "5"});
+    failures += check(api_error([&] { (void)parse(body); }).param == "stop",
+                      "more than four stop strings rejected");
+    body["stop"] = "";
+    failures +=
+        check(api_error([&] { (void)parse(body); }).param == "stop", "empty stop string rejected");
+
+    body                                  = base_request();
+    body["top_k"]                         = 21;
+    const GenerationRequest invalid_top_k = parse(body).generation;
+    failures += check(api_error([&] { (void)options(invalid_top_k); }).param == "top_k",
+                      "Engine translator owns sampler value range");
+    body["top_k"]                         = 5;
+    body["min_p"]                         = 1.1;
+    const GenerationRequest invalid_min_p = parse(body).generation;
+    failures += check(api_error([&] { (void)options(invalid_min_p); }).param == "min_p",
+                      "min_p range enforced by common Engine translator");
+    return failures;
+}
+
+GenerationOutcome sample_outcome() {
+    GenerationOutcome outcome;
+    outcome.text                            = "answer";
+    outcome.reasoning                       = "thought";
+    outcome.prompt_tokens                   = 20;
+    outcome.completion_tokens               = 7;
+    outcome.reasoning_tokens                = 3;
+    outcome.finish_reason                   = ninfer::FinishReason::StopToken;
+    outcome.metrics.prefix_cache_hit_tokens = 12;
+    return outcome;
+}
+
+OpenAIChatResponseIdentity identity() {
+    return OpenAIChatResponseIdentity{.id = "chatcmpl-test", .model = "qwen", .created = 42};
+}
+
+int test_aggregate_response() {
+    int failures              = 0;
+    GenerationOutcome outcome = sample_outcome();
+    Json response             = Json::parse(make_chat_completion_response(identity(), outcome));
+    failures += check(response["choices"][0]["message"]["content"] == "answer" &&
+                          response["choices"][0]["message"]["reasoning_content"] == "thought" &&
+                          response["choices"][0]["message"]["refusal"].is_null(),
+                      "aggregate response separates reasoning and content");
+    failures += check(response["choices"][0]["logprobs"].is_null(),
+                      "aggregate choice carries nullable logprobs");
+    failures += check(response["usage"]["prompt_tokens_details"]["cached_tokens"] == 12 &&
+                          response["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3,
+                      "aggregate usage exposes cache hits and reasoning tokens");
+
+    outcome.text.clear();
+    outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
+    response         = Json::parse(make_chat_completion_response(identity(), outcome));
+    const Json& call = response["choices"][0]["message"]["tool_calls"][0];
+    failures += check(response["choices"][0]["finish_reason"] == "tool_calls" &&
+                          response["choices"][0]["message"]["content"].is_null(),
+                      "aggregate tool call has OpenAI terminal shape");
+    failures += check(call["id"].get<std::string>().starts_with("call_") &&
+                          call["function"]["name"] == "weather",
+                      "OpenAI adapter owns wire tool-call identifiers");
+    return failures;
+}
+
+int test_stream_response() {
+    int failures = 0;
+    OpenAIChatStream stream(identity(), true);
+    Json role = parse_sse(stream.start());
+    failures += check(role["choices"][0]["delta"]["role"] == "assistant" &&
+                          role["choices"][0]["logprobs"].is_null() && role["usage"].is_null(),
+                      "stream starts with role, nullable logprobs, and null usage");
+    Json reasoning = parse_sse(stream.reasoning_delta("thought"));
+    Json content   = parse_sse(stream.content_delta("ans"));
+    failures += check(reasoning["choices"][0]["delta"]["reasoning_content"] == "thought" &&
+                          content["choices"][0]["delta"]["content"] == "ans",
+                      "stream separates reasoning and content deltas");
+
+    GenerationOutcome outcome             = sample_outcome();
+    const std::vector<std::string> events = stream.finish(outcome);
+    failures +=
+        check(events.size() == 4, "finish emits buffered suffix, terminal, usage, and done");
+    failures += check(parse_sse(events[0])["choices"][0]["delta"]["content"] == "wer",
+                      "terminal content suffix is emitted exactly once");
+    failures += check(parse_sse(events[1])["choices"][0]["finish_reason"] == "stop",
+                      "stream terminal finish reason emitted");
+    const Json usage = parse_sse(events[2]);
+    failures += check(usage["choices"].empty() &&
+                          usage["usage"]["prompt_tokens_details"]["cached_tokens"] == 12 &&
+                          usage["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3,
+                      "dedicated stream usage carries detailed token accounting");
+    failures += check(events.back() == "data: [DONE]\n\n", "stream ends with DONE sentinel");
+
+    OpenAIChatStream mismatch(identity(), false);
+    (void)mismatch.start();
+    (void)mismatch.content_delta("different");
+    failures += check(throws_logic([&] { (void)mismatch.finish(outcome); }),
+                      "stream encoder rejects terminal/content divergence");
+
+    OpenAIChatStream tool_stream(identity(), false);
+    (void)tool_stream.start();
+    GenerationOutcome tool_outcome;
+    tool_outcome.tool_calls.push_back(
+        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = "{}"});
+    tool_outcome.finish_reason                 = ninfer::FinishReason::StopToken;
+    const std::vector<std::string> tool_events = tool_stream.finish(tool_outcome);
+    const Json tool_delta                      = parse_sse(tool_events[0]);
+    failures += check(
+        tool_delta["choices"][0]["delta"]["tool_calls"][0]["id"].get<std::string>().starts_with(
+            "call_") &&
+            parse_sse(tool_events[1])["choices"][0]["finish_reason"] == "tool_calls",
+        "stream encoder owns stable OpenAI tool-call shape");
+    return failures;
+}
+
+int test_common_objects() {
+    int failures      = 0;
+    const Json models = Json::parse(make_models_list("qwen", 7, 240000));
+    failures +=
+        check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
+              "models list advertises the configured context limit");
+    const Json model = Json::parse(make_model_object("qwen", 7, 240000));
+    failures += check(model["max_model_len"] == 240000,
+                      "model lookup advertises the configured context limit");
+    const Json error = Json::parse(make_error_body(
+        ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
+    failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",
+                      "OpenAI common error shape remains stable");
     return failures;
 }
 
@@ -715,23 +685,16 @@ int test_finish_reason_wire() {
 
 int main() {
     int failures = 0;
-    failures += test_parse_string_content();
-    failures += test_preserve_thinking_options();
-    failures += test_reasoning_effort();
-    failures += test_parse_parts_and_flatten();
-    failures += test_instruction_roles_preserved();
-    failures += test_parse_media_in_translate();
-    failures += test_reject_unsupported();
-    failures += test_parse_function_tools_and_choices();
-    failures += test_parse_tool_history_messages();
-    failures += test_parse_stop_and_max_tokens();
-    failures += test_parse_sampling_carried();
-    failures += test_response_serialization();
-    failures += test_tool_response_serialization();
-    failures += test_chunk_serialization();
-    failures += test_tool_chunk_serialization();
-    failures += test_models_and_error();
-    failures += test_finish_reason_wire();
-    if (failures == 0) { std::cout << "ok\n"; }
+    failures += test_request_envelope_and_sampling();
+    failures += test_standard_field_policy();
+    failures += test_constrained_decoding_extensions();
+    failures += test_tools();
+    failures += test_messages_and_media();
+    failures += test_reasoning_and_extensions();
+    failures += test_stops_and_ranges();
+    failures += test_aggregate_response();
+    failures += test_stream_response();
+    failures += test_common_objects();
+    if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -55,7 +55,8 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *
  * Algorithm:
  *   Independently for each row b, greedy mode accepts the longest available draft prefix matching
- *   target_tokens and commits the target token at the first mismatch (or the bonus column).
+ *   the per-column penalty-adjusted argmax and commits that argmax at the first mismatch (or the
+ *   bonus column). With both penalties disabled, target_tokens is the exact raw-logit fast path.
  *   Sampling mode applies configs[b] to each valid verification column, accepts draft i with
  *   target probability p_i(draft_i), samples from the residual distribution on first rejection,
  *   and samples a bonus from column Pcur[b] when every available draft is accepted. The draft
@@ -77,9 +78,9 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
  *   For each row, let A be the accepted draft count and L=A+1. licensed_tokens[0:A,b] receives
  *   accepted drafts, licensed_tokens[A,b] receives the correction/bonus token, and the remaining
  *   physical slots are zero. licensed_counts[b]=L; accepted[b]=A; anchors[b] becomes the
- *   correction/bonus token; lengths[b]+=L. In sampling mode, each produced token increments
- *   configs[b].token_counts when that pointer is non-null. Greedy mode does not update
- *   token_counts. current_extents and all other inputs remain unchanged. Request statistics are
+ *   correction/bonus token; lengths[b]+=L. In every mode, each produced token increments
+ *   configs[b].token_counts when that pointer is non-null. current_extents and all other inputs
+ *   remain unchanged. Request statistics are
  *   deliberately outside this Op.
  *
  * Workspace:
